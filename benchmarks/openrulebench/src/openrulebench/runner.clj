@@ -97,7 +97,7 @@
 (def default-options
   {:systems default-systems
    :warmup 1
-   :iterations 5
+   :iterations 1
    :verify? true
    :output nil})
 
@@ -195,9 +195,9 @@
     "Usage: ./bench.clj [options] [benchmark ... | GROUP]\n\n"
     "Options:\n"
     "  --systems LIST    Comma-separated systems (default datalevin,sqlite)\n"
-    "  --warmup N        Fresh-database warmup runs (default 1)\n"
-    "  --iterations N    Measured fresh-database runs (default 5)\n"
-    "  --output PATH     Write combined metadata and raw samples as EDN\n"
+    "  --warmup N        Complete warmup passes (default 1)\n"
+    "  --iterations N    Complete measured passes (default 1)\n"
+    "  --output PATH     Write combined metadata and raw measurements as EDN\n"
     "  --no-verify       Skip independent result-count oracles\n"
     "  --help            Show this help\n\n"
     "Systems: datalevin, sqlite, postgresql, xsb, souffle, clara, odoyle\n"
@@ -270,6 +270,17 @@
     (mapv vector supported)
     [supported]))
 
+(defn- run-child-groups
+  [system opts task-groups]
+  (mapv #(run-child system opts %) task-groups))
+
+(defn- nonzero-child-exit
+  [children]
+  (some (fn [{:keys [child-exit]}]
+          (when (and child-exit (not= 0 child-exit))
+            child-exit))
+        children))
+
 (defn- order-results
   [system benchmarks child-results]
   (let [by-benchmark (into {} (map (juxt :benchmark identity)) child-results)]
@@ -288,16 +299,15 @@
   [system {:keys [benchmarks] :as opts}]
   (let [supported  (filterv #(supported? system %) benchmarks)
         children   (when (seq supported)
-                     (mapv #(run-child system opts %)
-                           (child-task-groups system supported)))
-        child-exit (some (fn [{:keys [child-exit]}]
-                           (when (and child-exit (not= 0 child-exit))
-                             child-exit))
-                         children)
-        results    (order-results system benchmarks
-                                  (mapcat :results children))]
+                     (run-child-groups
+                       system opts (child-task-groups system supported)))
+        child-exit      (nonzero-child-exit children)
+        results         (order-results
+                          system benchmarks
+                          (mapcat :results children))]
     {:system system
      :host (:host (first children))
+     :child-hosts (mapv :host children)
      :child-exit child-exit
      :results results}))
 
@@ -326,6 +336,13 @@
                  :benchmark-suite :openrulebench
                  :contract :portable-tc-sg-join1-v1
                  :host (core/host-info)
+                 :measurement-protocol
+                 {:style :job-pass
+                  :order :warmup-passes-then-measurement-passes
+                  :pass-process :same-child-jvm
+                  :reported-statistic
+                  (if (= 1 (:iterations opts))
+                    :single-measurement :median)}
                  :configuration (select-keys opts
                                              [:systems :benchmarks :warmup
                                               :iterations :verify?])
@@ -333,6 +350,10 @@
                                                  :failed :passed)
                                        :mismatches mismatches}
                  :system-hosts (into {} (map (juxt :system :host)) system-reports)
+                 :system-child-hosts
+                 (into {}
+                       (map (juxt :system :child-hosts))
+                       system-reports)
                  :results results}
         child-failed? (some #(not (contains? #{nil 0} (:child-exit %)))
                             system-reports)

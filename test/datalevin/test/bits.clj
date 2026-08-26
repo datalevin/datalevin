@@ -22,3 +22,16 @@
     (is (= "inline" (b/avg->inline-value normal)))
     (is (= 2 (b/avg->aid giant)))
     (is (= 42 (b/avg->giant-id giant)))))
+
+(deftest empty-homogeneous-tuple-test
+  (is (not (b/valid-data? [] [:string])))
+  (let [bf    (ByteBuffer/allocate 16)
+        error (try
+                (b/put-buffer bf [] [:string])
+                nil
+                (catch clojure.lang.ExceptionInfo e e))]
+    (is (= "Cannot store an empty homogeneous tuple" (.getMessage error)))
+    (is (= {:error      :data/validation
+            :value      []
+            :tuple-type :string}
+           (ex-data error)))))

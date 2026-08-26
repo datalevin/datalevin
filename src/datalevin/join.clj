@@ -520,17 +520,18 @@
                               (recur (.nextSetBit
                                        ^BitSet known
                                        (unchecked-inc-int ordinal))))))))
-                    (with-meta
-                      (r/relation! (zipmap vars (range)) output)
-                      {::dense-composition
-                       {:candidate-pairs candidate-pairs
-                        :input-tuples   input-size
-                        :output-tuples  (aget total-output 0)
-                        :anchor-count   anchor-count
-                        :domain-size    domain-size
-                        :bitmap         (if roaring? :roaring :dense)
-                        :memory-limit   dense-composition-max-bitset-bytes
-                        :memory-upper-bound bitset-bytes}})))))))))))
+                    (-> (r/relation! (zipmap vars (range)) output)
+                        (r/with-unique-key vars)
+                        (vary-meta
+                          assoc ::dense-composition
+                          {:candidate-pairs candidate-pairs
+                           :input-tuples   input-size
+                           :output-tuples  (aget total-output 0)
+                           :anchor-count   anchor-count
+                           :domain-size    domain-size
+                           :bitmap         (if roaring? :roaring :dense)
+                           :memory-limit   dense-composition-max-bitset-bytes
+                           :memory-upper-bound bitset-bytes}))))))))))))
 
 (defn hash-join-project-distinct
   "Hash-join two relations while retaining only distinct `vars`, without
@@ -550,118 +551,125 @@
                                  {:missing   missing
                                   :available available}))
         output-attrs  (zipmap vars (range))
-        output        (FastList.)]
-    (if (or (nil? tuples1) (nil? tuples2)
-            (zero? (.size tuples1)) (zero? (.size tuples2)))
-      (r/relation! output-attrs output)
-      (if-some [composed (dense-binary-composition rel1 rel2 vars)]
-        composed
-        (let [common-attrs   (qu/intersect-keys attrs1 attrs2)
-              hash-first?    (< (.size tuples1) (.size tuples2))
-              ^List hash-input-tuples (if hash-first? tuples1 tuples2)
-              ^List scan-tuples (if hash-first? tuples2 tuples1)
-              hash-attrs     (if hash-first? attrs1 attrs2)
-              scan-attrs     (if hash-first? attrs2 attrs1)
-              [hash-key-fn _] (tuple-key-fns hash-attrs common-attrs)
-              [_ scan-key-fn] (tuple-key-fns scan-attrs common-attrs)
-              ^LongObjectHashMap lhash
-              (when (== 1 (count common-attrs))
-                (hash-long-tuples hash-key-fn hash-input-tuples))
-              ^HashMap hash   (when-not lhash
-                                (hash-tuples hash-key-fn hash-input-tuples))
-              value-vars      (filterv #(and (contains? hash-attrs %)
-                                              (not (contains? scan-attrs %)))
-                                       vars)
-              anchor-vars     (filterv #(contains? scan-attrs %) vars)
-              composition?    (and (seq value-vars)
-                                    (not-any?
-                                      #(contains? qu/*lookup-attrs* %) vars)
-                                    (= (count vars)
-                                       (+ (count anchor-vars)
-                                          (count value-vars))))
-              output-plan     (mapv (fn [var]
-                                  (if-let [idx (get attrs1 var)]
-                                    [0 (int idx)]
-                                    [1 (int (attrs2 var))]))
-                                vars)
-            output-width  (count output-plan)
-            output-scratch (object-array output-width)
-            emit!
-            (fn [^objects tuple1 ^objects tuple2]
-              (dotimes [i output-width]
-                (let [[side idx] (nth output-plan i)]
-                  (aset output-scratch i
-                        (aget (if (zero? ^long side) tuple1 tuple2)
-                              ^long idx))))
-              (.add output (aclone output-scratch)))]
-        (if composition?
-          (let [value-key     (projection-key-fn hash-attrs value-vars)
-                anchor-key    (projection-key-fn scan-attrs anchor-vars)
-                value-domain  (HashSet.)
-                groups        (HashMap.)]
-            (dotimes [i (.size hash-input-tuples)]
-              (.add value-domain (value-key (.get hash-input-tuples i))))
-            (let [domain-size (.size value-domain)]
-              (dotimes [i (.size scan-tuples)]
-                (let [^objects scan-tuple (.get scan-tuples i)
-                      anchor               (anchor-key scan-tuple)
-                      ^HashSet known       (.get groups anchor)]
-                  (when-not (and known (= (.size known) domain-size))
-                    (let [join-key (scan-key-fn scan-tuple)]
+        output        (FastList.)
+        result
+        (if (or (nil? tuples1) (nil? tuples2)
+                (zero? (.size tuples1)) (zero? (.size tuples2)))
+          (r/relation! output-attrs output)
+          (if-some [composed (dense-binary-composition rel1 rel2 vars)]
+            composed
+            (let [common-attrs   (qu/intersect-keys attrs1 attrs2)
+                  hash-first?    (< (.size tuples1) (.size tuples2))
+                  ^List hash-input-tuples (if hash-first? tuples1 tuples2)
+                  ^List scan-tuples (if hash-first? tuples2 tuples1)
+                  hash-attrs     (if hash-first? attrs1 attrs2)
+                  scan-attrs     (if hash-first? attrs2 attrs1)
+                  [hash-key-fn _] (tuple-key-fns hash-attrs common-attrs)
+                  [_ scan-key-fn] (tuple-key-fns scan-attrs common-attrs)
+                  ^LongObjectHashMap lhash
+                  (when (== 1 (count common-attrs))
+                    (hash-long-tuples hash-key-fn hash-input-tuples))
+                  ^HashMap hash   (when-not lhash
+                                    (hash-tuples hash-key-fn hash-input-tuples))
+                  value-vars      (filterv
+                                    #(and (contains? hash-attrs %)
+                                          (not (contains? scan-attrs %)))
+                                    vars)
+                  anchor-vars     (filterv #(contains? scan-attrs %) vars)
+                  composition?    (and (seq value-vars)
+                                        (not-any?
+                                          #(contains? qu/*lookup-attrs* %) vars)
+                                        (= (count vars)
+                                           (+ (count anchor-vars)
+                                              (count value-vars))))
+                  output-plan     (mapv
+                                    (fn [var]
+                                      (if-let [idx (get attrs1 var)]
+                                        [0 (int idx)]
+                                        [1 (int (attrs2 var))]))
+                                    vars)
+                  output-width    (count output-plan)
+                  output-scratch  (object-array output-width)
+                  emit!
+                  (fn [^objects tuple1 ^objects tuple2]
+                    (dotimes [i output-width]
+                      (let [[side idx] (nth output-plan i)]
+                        (aset output-scratch i
+                              (aget (if (zero? ^long side) tuple1 tuple2)
+                                    ^long idx))))
+                    (.add output (aclone output-scratch)))]
+              (if composition?
+                (let [value-key     (projection-key-fn hash-attrs value-vars)
+                      anchor-key    (projection-key-fn scan-attrs anchor-vars)
+                      value-domain  (HashSet.)
+                      groups        (HashMap.)]
+                  (dotimes [i (.size hash-input-tuples)]
+                    (.add value-domain
+                          (value-key (.get hash-input-tuples i))))
+                  (let [domain-size (.size value-domain)]
+                    (dotimes [i (.size scan-tuples)]
+                      (let [^objects scan-tuple (.get scan-tuples i)
+                            anchor               (anchor-key scan-tuple)
+                            ^HashSet known       (.get groups anchor)]
+                        (when-not (and known (= (.size known) domain-size))
+                          (let [join-key (scan-key-fn scan-tuple)]
+                            (when-some [bucket (if lhash
+                                                 (long-bucket lhash join-key)
+                                                 (.get hash join-key))]
+                              (let [^HashSet known
+                                    (or known
+                                        (let [values (HashSet.)]
+                                          (.put groups anchor values)
+                                          values))
+                                    accept!
+                                    (fn [^objects hash-tuple]
+                                      (when (.add known
+                                                  (value-key hash-tuple))
+                                        (if hash-first?
+                                          (emit! hash-tuple scan-tuple)
+                                          (emit! scan-tuple hash-tuple))))]
+                                (if (u/array? bucket)
+                                  (accept! bucket)
+                                  (let [^List bucket bucket]
+                                    (loop [j 0]
+                                      (when (and (< j (.size bucket))
+                                                 (< (.size known) domain-size))
+                                        (accept! (.get bucket j))
+                                        (recur
+                                          (unchecked-inc-int j))))))))))))))
+                (let [seen   (HashSet.)
+                      lookup (r/array-lookup)]
+                  (dotimes [i (.size scan-tuples)]
+                    (let [^objects scan-tuple (.get scan-tuples i)
+                          join-key            (scan-key-fn scan-tuple)]
                       (when-some [bucket (if lhash
                                            (long-bucket lhash join-key)
                                            (.get hash join-key))]
-                        (let [^HashSet known
-                              (or known
-                                  (let [values (HashSet.)]
-                                    (.put groups anchor values)
-                                    values))
-                              accept!
+                        (let [accept!
                               (fn [^objects hash-tuple]
-                                (when (.add known (value-key hash-tuple))
-                                  (if hash-first?
-                                    (emit! hash-tuple scan-tuple)
-                                    (emit! scan-tuple hash-tuple))))]
+                                (let [tuple1 (if hash-first?
+                                               hash-tuple scan-tuple)
+                                      tuple2 (if hash-first?
+                                               scan-tuple hash-tuple)]
+                                  (dotimes [j output-width]
+                                    (let [[side idx] (nth output-plan j)]
+                                      (aset output-scratch j
+                                            (aget ^objects
+                                                  (if (zero? ^long side)
+                                                    tuple1 tuple2)
+                                                  ^long idx))))
+                                  (r/reset-array-lookup! lookup output-scratch)
+                                  (when-not (.contains seen lookup)
+                                    (let [projected (aclone output-scratch)]
+                                      (.add seen (r/wrap-array projected))
+                                      (.add output projected)))))]
                           (if (u/array? bucket)
                             (accept! bucket)
                             (let [^List bucket bucket]
-                              (loop [j 0]
-                                (when (and (< j (.size bucket))
-                                           (< (.size known) domain-size))
-                                  (accept! (.get bucket j))
-                                  (recur (unchecked-inc-int j))))))))))))))
-          (let [seen   (HashSet.)
-                lookup (r/array-lookup)]
-            (dotimes [i (.size scan-tuples)]
-              (let [^objects scan-tuple (.get scan-tuples i)
-                    join-key            (scan-key-fn scan-tuple)]
-                (when-some [bucket (if lhash
-                                     (long-bucket lhash join-key)
-                                     (.get hash join-key))]
-                  (let [accept!
-                        (fn [^objects hash-tuple]
-                          (let [tuple1 (if hash-first?
-                                         hash-tuple scan-tuple)
-                                tuple2 (if hash-first?
-                                         scan-tuple hash-tuple)]
-                            (dotimes [j output-width]
-                              (let [[side idx] (nth output-plan j)]
-                                (aset output-scratch j
-                                      (aget ^objects
-                                            (if (zero? ^long side)
-                                              tuple1 tuple2)
-                                            ^long idx))))
-                            (r/reset-array-lookup! lookup output-scratch)
-                            (when-not (.contains seen lookup)
-                              (let [projected (aclone output-scratch)]
-                                (.add seen (r/wrap-array projected))
-                                (.add output projected)))))]
-                    (if (u/array? bucket)
-                      (accept! bucket)
-                      (let [^List bucket bucket]
-                        (dotimes [j (.size bucket)]
-                          (accept! (.get bucket j)))))))))))
-          (r/relation! output-attrs output))))))
+                              (dotimes [j (.size bucket)]
+                                (accept! (.get bucket j)))))))))))
+              (r/relation! output-attrs output))))]
+    (r/with-unique-key result vars)))
 
 (defn subtract-rel
   [a b]

@@ -4,6 +4,9 @@
    [openrulebench.runner :as runner]))
 
 (deftest orchestrator-argument-test
+  (let [defaults (runner/parse-args [])]
+    (is (= 1 (:warmup defaults)))
+    (is (= 1 (:iterations defaults))))
   (let [opts (runner/parse-args
                ["--systems" "datalevin,sqlite"
                 "--warmup" "0"
@@ -13,6 +16,33 @@
     (is (= 0 (:warmup opts)))
     (is (= 2 (:iterations opts)))
     (is (= ["tc:tiny" "sg:tiny"] (:benchmarks opts)))))
+
+(deftest orchestrator-keeps-warmup-and-measurement-in-one-child-test
+  (let [tasks ["tc:tiny-cyclic-ff" "sg:tiny-cyclic-ff"]
+        opts  (runner/parse-args
+                ["--systems" "datalevin"
+                 "tc:tiny-cyclic-ff" "sg:tiny-cyclic-ff"])
+        calls (atom [])]
+    (with-redefs-fn
+      {#'runner/run-child
+       (fn [system child-opts supported]
+         (swap! calls conj [(:warmup child-opts)
+                            (:iterations child-opts)
+                            supported])
+         {:host {:child system}
+          :results (mapv (fn [spec]
+                           {:system (name system)
+                            :benchmark spec
+                            :status :ok
+                            :time-ms 1.0
+                            :result-count 1
+                            :input-digest spec})
+                         supported)})}
+      (fn []
+        (let [report (#'runner/run-system :datalevin opts)]
+          (is (= [[1 1 tasks]] @calls))
+          (is (= [{:child :datalevin}] (:child-hosts report)))
+          (is (every? #(= :ok (:status %)) (:results report))))))))
 
 (deftest help-does-not-resolve-to-benchmarks-test
   (is (true? (:help? (runner/parse-args ["--help"])))))

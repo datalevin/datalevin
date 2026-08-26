@@ -86,6 +86,25 @@
     (is (= 3.0 (:time-ms result)))
     (is (= :skipped (get-in result [:correctness :status])))))
 
+(deftest job-style-pass-order-test
+  (let [tasks ["tc:tiny-cyclic-ff" "sg:tiny-cyclic-ff"]
+        calls (atom [])
+        results
+        (core/run-benchmark-passes
+          "test" tasks
+          (fn [spec]
+            (let [n (count (swap! calls conj spec))]
+              {:status :ok
+               :result-count 7
+               :time-ms (double n)
+               :input-digest spec}))
+          {:warmup 1 :iterations 1 :verify? false})]
+    (is (= ["tc:tiny-cyclic-ff" "sg:tiny-cyclic-ff"
+            "tc:tiny-cyclic-ff" "sg:tiny-cyclic-ff"]
+           @calls))
+    (is (= [[3.0] [4.0]] (mapv :samples-ms results)))
+    (is (every? #(= :single-measurement (:reported-statistic %)) results))))
+
 (deftest correctness-and-failure-gates-test
   (let [incorrect (core/run-repeated
                     "test" "tc:tiny"
@@ -111,6 +130,8 @@
   (is (not (core/out-of-memory? (ex-info "ordinary failure" {})))))
 
 (deftest runner-argument-test
+  (is (= 1 (:iterations
+             (core/parse-run-args [] ["tc:tiny-cyclic-ff"]))))
   (is (= {:warmup 0
           :iterations 3
           :verify? false

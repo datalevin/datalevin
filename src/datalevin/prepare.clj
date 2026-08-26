@@ -190,6 +190,15 @@
   attribute properties."
   [store-opts props a v]
   (let [vt (idx/value-type props)]
+    (when (and (contains? props :db/tupleType)
+               (some? v)
+               (seqable? v)
+               (empty? v))
+      (u/raise "Cannot store an empty homogeneous tuple for attribute " a
+               {:error      :transact/syntax
+                :attribute  a
+                :value      v
+                :tuple-type (:db/tupleType props)}))
     (if (identical? vt :db.type/idoc)
       ((requiring-resolve 'datalevin.idoc/parse-value)
        a props store-opts v)

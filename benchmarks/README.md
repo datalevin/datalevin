@@ -25,7 +25,8 @@ The following benchmarks are included:
 * [OpenRuleBench](openrulebench) compares a portable TC, SG, and Join1 task
   matrix across Datalevin and compatible rule/SQL engines. Every accepted task
   has deterministic set-valued inputs, an independent answer-count reference,
-  repeated measurements, and raw artifacts; unreproducible DBLP/LUBM
-  placeholders are explicitly outside the comparison suite.
+  one warmup pass plus one retained measurement pass, and raw artifacts;
+  unreproducible DBLP/LUBM placeholders are explicitly outside the comparison
+  suite.
 * [Write](write-bench) studies writing synthetic data to measure Datalevin's write
   performance in various conditions, and compares with SQLite.

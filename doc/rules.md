@@ -186,6 +186,25 @@ binary head variables, one ref-valued EAV base branch, and one recursive branch
 with two ref-valued EAV links that preserve argument position. Other shapes and
 multi-valued demands retain the general semi-naive rule evaluator.
 
+### Dense full synchronized closure
+
+The same synchronized recursive form has a separate free/free execution path
+when the entity domain is compact. The evaluator assigns the ref-valued EAV
+domain dense ordinals and stores each binary-relation row as a `BitSet`. A
+semi-naive round first unions the right-link rows reached by every new recursive
+row, then propagates that complete row through the left-link callers. New rows
+are obtained with `andNot` against the accumulated result. Thus duplicate proof
+paths are collapsed by machine-word operations instead of allocating, hashing,
+and comparing one tuple per proof.
+
+Ordinary result tuples are allocated only after the fixed point is complete.
+The compiler uses this path only for the exact two-branch, two-argument
+synchronized EAV shape described above, with both call arguments free and all
+three attributes ref-valued. A conservative 64 MiB upper bound covers the
+result, current and next delta, and both link matrices. Wider domains fall back
+to the general semi-naive evaluator. Pending transaction overlays are safe:
+the dense domain and matrices are built from transaction-aware EAV tuple scans.
+
 ## Benchmarks
 
 ### Math Genealogy Benchmark

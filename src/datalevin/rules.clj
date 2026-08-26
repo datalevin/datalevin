@@ -19,7 +19,7 @@
    [datalevin.query-util :as qu]
    [datalevin.join :as j]
    [datalevin.constants :as c]
-   [datalevin.util :as u :refer [raise concatv cond+ map+]]
+   [datalevin.util :as u :refer [raise concatv cond+]]
    [datalevin.relation :as r])
   (:import
    [datalevin.utl ArrayUtil]
@@ -30,7 +30,7 @@
    [org.eclipse.collections.impl.list.mutable.primitive LongArrayList]
    [org.eclipse.collections.impl.map.mutable.primitive LongObjectHashMap]
    [org.eclipse.collections.impl.set.mutable.primitive LongHashSet]
-   [java.util List HashMap HashSet ArrayDeque]))
+   [java.util List HashMap HashSet ArrayDeque BitSet]))
 
 (defn parse-rules
   [rules]
@@ -328,28 +328,30 @@
         (projection-indices var->positions head-idxs unique-call-vars)
         n                (alength projection-idxs)
         result-attrs     (zipmap unique-call-vars (range))]
-    (if (and (= n (count attrs))
-             (zero? (alength const-idxs))
-             (zero? (alength equality-left))
-             (identity-indices? projection-idxs))
-      (r/relation! result-attrs tuples)
-      (r/relation!
-        result-attrs
-        (let [size (.size tuples)
-              acc  (FastList. size)
-              seen (HashSet. size)
-              key  (r/array-lookup)]
-          (dotimes [i size]
-            (let [^objects tuple (.get tuples i)]
-              (when (and (const-check const-idxs const-values tuple)
-                         (equality-check equality-left equality-right tuple))
-                (let [to (object-array n)]
-                  (dotimes [j n]
-                    (aset to j (aget tuple (aget projection-idxs j))))
-                  (when-not (.contains seen (r/reset-array-lookup! key to))
-                    (.add seen (r/wrap-array to))
-                    (.add acc to))))))
-          acc)))))
+    (r/with-unique-key
+      (if (and (= n (count attrs))
+               (zero? (alength const-idxs))
+               (zero? (alength equality-left))
+               (identity-indices? projection-idxs))
+        (r/relation! result-attrs tuples)
+        (r/relation!
+          result-attrs
+          (let [size (.size tuples)
+                acc  (FastList. size)
+                seen (HashSet. size)
+                key  (r/array-lookup)]
+            (dotimes [i size]
+              (let [^objects tuple (.get tuples i)]
+                (when (and (const-check const-idxs const-values tuple)
+                           (equality-check equality-left equality-right tuple))
+                  (let [to (object-array n)]
+                    (dotimes [j n]
+                      (aset to j (aget tuple (aget projection-idxs j))))
+                    (when-not (.contains seen (r/reset-array-lookup! key to))
+                      (.add seen (r/wrap-array to))
+                      (.add acc to))))))
+            acc)))
+      unique-call-vars)))
 
 (defn- rename-rule
   [branches]
@@ -1209,7 +1211,11 @@
 (def ^:dynamic *magic-rewrite?* true)
 (def ^:dynamic *bound-transitive-eav?* true)
 (def ^:dynamic *bound-transitive-full-scan?* true)
+(def ^:dynamic *full-transitive-eav?* true)
+(def ^:dynamic *bound-linear-eav?* true)
+(def ^:dynamic *full-linear-eav?* true)
 (def ^:dynamic *bound-synchronized-eav?* true)
+(def ^:dynamic *full-synchronized-eav?* true)
 
 ;; magic set rewrite
 
@@ -1680,6 +1686,120 @@
         {:value (first values)}))
     {:value arg}))
 
+(defn- reverse-linear-eav-links
+  [links]
+  (mapv (fn [link]
+          (update link :bound-side #(case % :e :v :v :e)))
+        (rseq (vec links))))
+
+(defn- linear-eav-rule-path
+  "Return the ref-EAV path from the first head argument to the second for a
+   single-branch, nonrecursive binary rule. Nested eligible rules are flattened
+   without crossing unions, predicates, or other semantic boundaries."
+  ([context rule-name]
+   (linear-eav-rule-path context rule-name #{}))
+  ([context rule-name seen]
+   (when-not (contains? seen rule-name)
+     (let [branches (get-in context [:rules rule-name])]
+       (when (= 1 (count branches))
+         (let [branch    (first branches)
+               head      (first branch)
+               head-vars (vec (rule-args head))
+               seen      (conj seen rule-name)]
+           (when (and (= rule-name (rule-head head))
+                      (nil? (source head))
+                      (= 2 (count head-vars))
+                      (every? qu/binding-var? head-vars)
+                      (distinct-vars? head-vars))
+             (letfn [(clause-segment [clause]
+                       (cond
+                         (simple-eav-clause? clause)
+                         (let [[from attr to] clause]
+                           (when (not= from to)
+                             {:from from
+                              :to to
+                              :links [{:attr attr :bound-side :e}]}))
+
+                         (and (sequential? clause)
+                              (rule-call? context clause)
+                              (nil? (source clause)))
+                         (let [nested-name (rule-head clause)
+                               nested-args (vec (rule-args clause))]
+                           (when (and (= 2 (count nested-args))
+                                      (every? qu/binding-var? nested-args)
+                                      (distinct-vars? nested-args))
+                             (when-let [links
+                                        (linear-eav-rule-path
+                                          context nested-name seen)]
+                               {:from (nth nested-args 0)
+                                :to (nth nested-args 1)
+                                :links links})))))]
+               (let [segments (mapv clause-segment (rest branch))]
+                 (when (and (seq segments) (every? some? segments))
+                   (loop [current   (nth head-vars 0)
+                          remaining segments
+                          links     []]
+                     (if (empty? remaining)
+                       (when (= current (nth head-vars 1)) links)
+                       (when-not (= current (nth head-vars 1))
+                         (let [matches
+                               (into []
+                                     (keep-indexed
+                                       (fn [idx {:keys [from to]}]
+                                         (when (or (= current from)
+                                                   (= current to))
+                                           idx)))
+                                     remaining)]
+                           (when (= 1 (count matches))
+                             (let [idx     (long (first matches))
+                                   segment (nth remaining idx)
+                                   forward? (= current (:from segment))
+                                   next-node (if forward?
+                                               (:to segment)
+                                               (:from segment))
+                                   next-links (if forward?
+                                                (:links segment)
+                                                (reverse-linear-eav-links
+                                                  (:links segment)))]
+                               (recur next-node
+                                      (concatv (take idx remaining)
+                                               (drop (inc idx) remaining))
+                                      (into links next-links))))))))))))))))))
+
+(defn- bound-linear-eav-plan
+  [context rule-name args]
+  (when (and *bound-linear-eav?*
+             (= 2 (count args))
+             (nil? (get-in context [:rule-rels rule-name])))
+    (let [pattern    (binding-pattern args (context-bound-vars context))
+          bound-idxs (vec (bound-indices pattern))]
+      (when (= 1 (count bound-idxs))
+        (let [bound-idx (long (first bound-idxs))]
+          (when-let [links (linear-eav-rule-path context rule-name)]
+            (let [database (get-in context [:sources '$])]
+              (when (and database
+                         (db/-searchable? database)
+                         (every?
+                           #(identical? :db.type/ref
+                                        (get-in (db/-schema database)
+                                                [(:attr %) :db/valueType]))
+                           links))
+                (when-let [bound
+                           (singleton-bound-argument
+                             context (nth args bound-idx))]
+                  (when-let [traversal-value
+                             (db/entid database (:value bound))]
+                    (assoc
+                      {:db database
+                       :head-vars
+                       (vec (rest (ffirst
+                                    (get-in context [:rules rule-name]))))
+                       :links links}
+                      :bound-idx bound-idx
+                      :bound-value (:value bound)
+                      :pending-tx? (db/pending-tx-cache? database)
+                      :traversal-value traversal-value)))))))))))
+
 (defn- bound-transitive-eav-plan
   [context rule-name args]
   (when (and *bound-transitive-eav?*
@@ -1845,6 +1965,71 @@
       (r/relation! (zipmap head-vars (range)) tuples)
       head-vars args)))
 
+(def ^:private ^:const bound-linear-full-scan-threshold 128)
+
+(defn- cached-long-eav-adjacency
+  [^HashMap cache ^DB db attr bound-side]
+  (let [k [attr bound-side]]
+    (or (.get cache k)
+        (let [adjacency (build-long-eav-adjacency db attr bound-side)]
+          (.put cache k adjacency)
+          adjacency))))
+
+(defn- advance-bound-linear-frontier
+  [^DB db ^HashMap adjacency-cache ^longs frontier
+   {:keys [attr bound-side]} pending-tx?]
+  (let [next       (LongHashSet.)
+        full-scan? (and (not pending-tx?)
+                        (db/local-ref-attr-adjacency? db)
+                        (>= (alength frontier)
+                            bound-linear-full-scan-threshold))]
+    (if full-scan?
+      (let [adjacency ^LongObjectHashMap
+            (cached-long-eav-adjacency adjacency-cache db attr bound-side)]
+        (dotimes [i (alength frontier)]
+          (when-let [values ^LongArrayList
+                     (.get adjacency (aget frontier i))]
+            (dotimes [j (.size values)]
+              (.add next (.get values j))))))
+      (dotimes [i (alength frontier)]
+        (let [node      (aget frontier i)
+              pattern   (if (= bound-side :e)
+                          [node attr nil]
+                          [nil attr node])
+              neighbors ^List (db/-search-tuples db pattern)]
+          (when neighbors
+            (dotimes [j (.size neighbors)]
+              (.add next
+                    (long (aget ^objects (.get neighbors j) 0))))))))
+    (.toArray next)))
+
+(defn- eval-bound-linear-eav
+  [{:keys [^DB db head-vars links ^long bound-idx bound-value
+           traversal-value pending-tx?]}
+   args]
+  (let [links       (if (zero? bound-idx)
+                      links
+                      (reverse-linear-eav-links links))
+        cache       (HashMap.)
+        ^longs final-frontier
+        (loop [^longs frontier (long-array [(long traversal-value)])
+               remaining       (seq links)]
+          (if (or (nil? remaining) (zero? (alength frontier)))
+            frontier
+            (recur (advance-bound-linear-frontier
+                     db cache frontier (first remaining) pending-tx?)
+                   (next remaining))))
+        tuples      (FastList. (alength final-frontier))]
+    (dotimes [i (alength final-frontier)]
+      (let [output (Long/valueOf (aget final-frontier i))]
+        (.add tuples
+              (if (zero? bound-idx)
+                (object-array [bound-value output])
+                (object-array [output bound-value])))))
+    (map-rule-result
+      (r/relation! (zipmap head-vars (range)) tuples)
+      head-vars args)))
+
 (defn- synchronized-eav-recursive-plan
   "Recognize p(X,Y) :- left(X,Z), p(Z,Z1), right(Y,Z1), including
    physically reversed EAV links. Each head position must connect to the same
@@ -1901,6 +2086,397 @@
                 {:base      base
                  :head-vars (vec (rest (ffirst branches)))
                  :links     (:links recursive)}))))))))
+
+(def ^:private ^:const full-synchronized-max-bitmap-bytes
+  (* 64 1024 1024))
+
+(def ^:private ^:const full-transitive-max-bitmap-bytes
+  (* 64 1024 1024))
+
+(defn- full-synchronized-eav-plan
+  [context rule-name args]
+  (when (and *full-synchronized-eav?*
+             (= 2 (count args))
+             (nil? (get-in context [:rule-rels rule-name]))
+             (every? #{:f}
+                     (binding-pattern args (context-bound-vars context))))
+    (when-let [{:keys [base links] :as plan}
+               (synchronized-eav-rule-plan context rule-name)]
+      (let [database (get-in context [:sources '$])
+            attrs    (into [(:attr base)] (map :attr) links)]
+        (when (and database
+                   (db/-searchable? database)
+                   (every?
+                     #(identical? :db.type/ref
+                                  (get-in (db/-schema database)
+                                          [% :db/valueType]))
+                     attrs))
+          (assoc plan :db database))))))
+
+(defn- full-transitive-eav-plan
+  [context rule-name args]
+  (when (and *full-transitive-eav?*
+             (= 2 (count args))
+             (nil? (get-in context [:rule-rels rule-name]))
+             (every? #{:f}
+                     (binding-pattern args (context-bound-vars context))))
+    (when-let [{:keys [attr] :as plan}
+               (transitive-eav-rule-plan context rule-name)]
+      (let [database (get-in context [:sources '$])]
+        (when (and database
+                   (db/-searchable? database)
+                   (identical? :db.type/ref
+                               (get-in (db/-schema database)
+                                       [attr :db/valueType])))
+          (assoc plan :db database))))))
+
+(defn- full-linear-eav-plan
+  [context rule-name args]
+  (when (and *full-linear-eav?*
+             (= 2 (count args))
+             (nil? (get-in context [:rule-rels rule-name]))
+             (every? #{:f}
+                     (binding-pattern args (context-bound-vars context))))
+    (when-let [links (linear-eav-rule-path context rule-name)]
+      (let [database (get-in context [:sources '$])]
+        (when (and (< 1 (count links))
+                   database
+                   (db/-searchable? database)
+                   (db/local-ref-attr-adjacency? database)
+                   (not (db/pending-tx-cache? database))
+                   (every?
+                     #(identical? :db.type/ref
+                                  (get-in (db/-schema database)
+                                          [(:attr %) :db/valueType]))
+                     links))
+          {:db        database
+           :head-vars (vec (rest (ffirst
+                                   (get-in context [:rules rule-name]))))
+           :links     links})))))
+
+(defn- add-ordinal!
+  ^long [^HashMap ordinals ^FastList values value]
+  (if-let [^Number ordinal (.get ordinals value)]
+    (.longValue ordinal)
+    (let [ordinal (.size values)]
+      (.put ordinals value (Integer/valueOf ordinal))
+      (.add values value)
+      ordinal)))
+
+(defn- collect-eav-domain!
+  [^HashMap ordinals ^FastList values ^List tuples]
+  (when tuples
+    (dotimes [i (.size tuples)]
+      (let [^objects tuple (.get tuples i)]
+        (add-ordinal! ordinals values (aget tuple 0))
+        (add-ordinal! ordinals values (aget tuple 1))))))
+
+(defn- dense-synchronized-domain?
+  [^long domain-size]
+  (let [words (quot (+ domain-size 63) 64)
+        ;; Result, current delta, next delta, and the two recursive-link
+        ;; adjacencies are the maximum simultaneously live dense matrices.
+        bytes (* words 8 domain-size 5)]
+    (and (pos? domain-size)
+         (<= bytes full-synchronized-max-bitmap-bytes))))
+
+(defn- dense-transitive-domain?
+  [^long domain-size]
+  (let [words         (quot (+ domain-size 63) 64)
+        bytes-per-row (* words 8)]
+    (and (pos? domain-size)
+         (pos? bytes-per-row)
+         (<= domain-size
+             (quot full-transitive-max-bitmap-bytes bytes-per-row)))))
+
+(defn- bitset-row!
+  ^BitSet [^objects rows ^long row-idx ^long domain-size]
+  (or (aget rows row-idx)
+      (let [row (BitSet. (int domain-size))]
+        (aset rows row-idx row)
+        row)))
+
+(defn- build-base-bitset-rows
+  [^List tuples ^HashMap ordinals ^long entity-pos ^long domain-size]
+  (let [rows (object-array domain-size)]
+    (when tuples
+      (dotimes [i (.size tuples)]
+        (let [^objects tuple (.get tuples i)
+              x              (if (zero? entity-pos)
+                               (aget tuple 0) (aget tuple 1))
+              y              (if (zero? entity-pos)
+                               (aget tuple 1) (aget tuple 0))
+              ^Number x-idx  (.get ordinals x)
+              ^Number y-idx  (.get ordinals y)]
+          (.set (bitset-row! rows (.longValue x-idx) domain-size)
+                (.intValue y-idx)))))
+    rows))
+
+(defn- transitive-bitset-closure!
+  [^objects rows ^long domain-size]
+  ;; BitSet Warshall retains set semantics while turning each dense row update
+  ;; into a word-wise union instead of producing one tuple per path proof.
+  (dotimes [k domain-size]
+    (when-let [^BitSet via (aget rows k)]
+      (dotimes [i domain-size]
+        (when-let [^BitSet row (aget rows i)]
+          (when (.get row k)
+            (.or row via))))))
+  rows)
+
+(defn- build-link-bitset-rows
+  [^List tuples ^HashMap ordinals bound-side ^long domain-size]
+  (let [rows      (object-array domain-size)
+        bound-idx (if (= bound-side :e) 0 1)
+        out-idx   (bit-xor bound-idx 1)]
+    (when tuples
+      (dotimes [i (.size tuples)]
+        (let [^objects tuple   (.get tuples i)
+              ^Number row-idx (.get ordinals (aget tuple bound-idx))
+              ^Number out     (.get ordinals (aget tuple out-idx))]
+          (.set (bitset-row! rows (.longValue row-idx) domain-size)
+                (.intValue out)))))
+    rows))
+
+(defn- synchronized-bitset-fixed-point!
+  [^objects results ^objects left-rows ^objects right-rows
+   ^long domain-size]
+  ;; The current delta may share its rows with `results`: all propagation for
+  ;; a round finishes before results are mutated with the next delta.
+  (loop [^objects delta (aclone results)]
+    (let [next-rows (object-array domain-size)]
+      (dotimes [z domain-size]
+        (when-let [^BitSet delta-row (aget delta z)]
+          (when-not (.isEmpty delta-row)
+            (let [expanded (BitSet. (int domain-size))]
+              ;; Lift all new right-hand recursive values through the second
+              ;; EAV link once for this row.
+              (loop [z1 (.nextSetBit delta-row 0)]
+                (when-not (neg? z1)
+                  (when-let [^BitSet outputs (aget right-rows z1)]
+                    (.or expanded outputs))
+                  (recur (.nextSetBit delta-row
+                                      (unchecked-inc-int z1)))))
+              ;; Every caller of z receives that complete lifted row. This is
+              ;; a word-wise union instead of one hash insertion per proof.
+              (when-not (.isEmpty expanded)
+                (when-let [^BitSet callers (aget left-rows z)]
+                  (loop [x (.nextSetBit callers 0)]
+                    (when-not (neg? x)
+                      (.or (bitset-row! next-rows x domain-size) expanded)
+                      (recur (.nextSetBit callers
+                                          (unchecked-inc-int x)))))))))))
+      (let [changed? (boolean-array 1)]
+        (dotimes [x domain-size]
+          (when-let [^BitSet candidates (aget next-rows x)]
+            (when-let [^BitSet known (aget results x)]
+              (.andNot candidates known))
+            (if (.isEmpty candidates)
+              (aset next-rows x nil)
+              (do
+                (aset changed? 0 true)
+                (if-let [^BitSet known (aget results x)]
+                  (.or known candidates)
+                  (aset results x candidates))))))
+        (when (aget changed? 0)
+          (recur next-rows)))))
+  results)
+
+(defn- emit-synchronized-bitset-relation
+  [^objects rows ^FastList values head-vars]
+  (let [domain-size (.size values)
+        ^long output-size
+        (loop [x 0, total 0]
+          (if (< x domain-size)
+            (let [^BitSet row (aget rows x)]
+              (recur (unchecked-inc-int x)
+                     (+ total (long (if row (.cardinality row) 0)))))
+            total))
+        tuples (FastList. (int (min output-size Integer/MAX_VALUE)))]
+    (dotimes [x domain-size]
+      (when-let [^BitSet row (aget rows x)]
+        (loop [y (.nextSetBit row 0)]
+          (when-not (neg? y)
+            (.add tuples
+                  (object-array [(.get values x) (.get values y)]))
+            (recur (.nextSetBit row (unchecked-inc-int y)))))))
+    (r/relation! (zipmap head-vars (range)) tuples)))
+
+(def ^:private ^:const full-linear-max-bitmap-bytes
+  (* 64 1024 1024))
+
+(defn- add-long-ordinal!
+  ^long [^HashMap ordinals ^LongArrayList values ^long value]
+  (let [boxed (Long/valueOf value)]
+    (if-let [^Number ordinal (.get ordinals boxed)]
+      (.longValue ordinal)
+      (let [ordinal (.size values)]
+        (.put ordinals boxed (Integer/valueOf ordinal))
+        (.add values value)
+        ordinal))))
+
+(defn- collect-long-adjacency-values!
+  [^LongObjectHashMap adjacency ^HashMap ordinals
+   ^LongArrayList values]
+  (let [^longs keys (.toArray (.keySet adjacency))]
+    (dotimes [i (alength keys)]
+      (let [neighbors ^LongArrayList (.get adjacency (aget keys i))]
+        (dotimes [j (.size neighbors)]
+          (add-long-ordinal! ordinals values (.get neighbors j)))))))
+
+(defn- dense-full-linear-domain?
+  [^long domain-size adjacencies]
+  (let [words      (long (quot (+ domain-size 63) 64))
+        row-bytes  (long (* words 8))
+        row-counts (mapv #(.size ^LongObjectHashMap %) adjacencies)
+        peak-rows
+        (loop [i 0, peak (long 0)]
+          (if (< i (dec (count row-counts)))
+            (let [rows (+ (long (nth row-counts i))
+                          (long (nth row-counts (inc i))))]
+              (recur (unchecked-inc-int i) (max peak rows)))
+            peak))]
+    (and (pos? domain-size)
+         (pos? row-bytes)
+         (<= (long peak-rows)
+             (quot full-linear-max-bitmap-bytes row-bytes)))))
+
+(defn- terminal-linear-bitset-rows
+  [^LongObjectHashMap adjacency ^HashMap ordinals ^long domain-size]
+  (let [rows        (LongObjectHashMap. (.size adjacency))
+        ^longs keys (.toArray (.keySet adjacency))]
+    (dotimes [i (alength keys)]
+      (let [key       (aget keys i)
+            neighbors ^LongArrayList (.get adjacency key)
+            row       (BitSet. (int domain-size))]
+        (dotimes [j (.size neighbors)]
+          (let [^Number ordinal
+                (.get ordinals (Long/valueOf (.get neighbors j)))]
+            (.set row (.intValue ordinal))))
+        (when-not (.isEmpty row)
+          (.put rows key row))))
+    rows))
+
+(defn- prepend-linear-bitset-rows
+  [^LongObjectHashMap adjacency ^LongObjectHashMap suffix
+   ^long domain-size]
+  (let [rows        (LongObjectHashMap. (.size adjacency))
+        ^longs keys (.toArray (.keySet adjacency))]
+    (dotimes [i (alength keys)]
+      (let [key       (aget keys i)
+            neighbors ^LongArrayList (.get adjacency key)
+            row       (BitSet. (int domain-size))]
+        (dotimes [j (.size neighbors)]
+          (when-let [reachable ^BitSet (.get suffix (.get neighbors j))]
+            (.or row reachable)))
+        (when-not (.isEmpty row)
+          (.put rows key row))))
+    rows))
+
+(defn- emit-full-linear-relation
+  [^LongObjectHashMap rows ^LongArrayList endpoint-values head-vars]
+  (let [^longs starts (.toArray (.keySet rows))
+        output-size
+        (loop [i 0, total (long 0)]
+          (if (< i (alength starts))
+            (recur (unchecked-inc-int i)
+                   (+ total
+                      (long (.cardinality
+                              ^BitSet (.get rows (aget starts i))))))
+            total))
+        tuples (FastList. (int (min (long output-size)
+                                    (long Integer/MAX_VALUE))))]
+    (dotimes [i (alength starts)]
+      (let [start (Long/valueOf (aget starts i))
+            row   ^BitSet (.get rows (aget starts i))]
+        (loop [ordinal (.nextSetBit row 0)]
+          (when-not (neg? ordinal)
+            (.add tuples
+                  (object-array
+                    [start (Long/valueOf (.get endpoint-values ordinal))]))
+            (recur (.nextSetBit row (unchecked-inc-int ordinal)))))))
+    (r/relation! (zipmap head-vars (range)) tuples)))
+
+(defn- eval-full-linear-eav
+  [{:keys [^DB db head-vars links]} args]
+  (let [adjacencies
+        (mapv #(build-long-eav-adjacency db (:attr %) (:bound-side %)) links)
+        terminal   ^LongObjectHashMap (peek adjacencies)
+        ordinals   (HashMap.)
+        endpoints  (LongArrayList.)]
+    (collect-long-adjacency-values! terminal ordinals endpoints)
+    (let [domain-size (.size endpoints)]
+      (cond
+        (zero? domain-size)
+        (map-rule-result
+          (r/relation! (zipmap head-vars (range)) (FastList.))
+          head-vars args)
+
+        (dense-full-linear-domain? domain-size adjacencies)
+        (let [terminal-rows
+              (terminal-linear-bitset-rows terminal ordinals domain-size)
+              rows
+              (loop [idx    (- (count adjacencies) 2)
+                     suffix terminal-rows]
+                (if (neg? idx)
+                  suffix
+                  (recur (dec idx)
+                         (prepend-linear-bitset-rows
+                           (nth adjacencies idx) suffix domain-size))))]
+          (map-rule-result
+            (emit-full-linear-relation rows endpoints head-vars)
+            head-vars args))
+
+        :else nil))))
+
+(defn- eval-full-transitive-eav
+  [{:keys [^DB db attr ^long entity-pos head-vars]} args]
+  (let [tuples   ^List (or (db/-search-tuples db [nil attr nil])
+                           (FastList.))
+        ordinals (HashMap.)
+        values   (FastList.)]
+    (collect-eav-domain! ordinals values tuples)
+    (let [domain-size (.size values)]
+      (when (dense-transitive-domain? domain-size)
+        (let [rows (build-base-bitset-rows
+                     tuples ordinals entity-pos domain-size)]
+          (transitive-bitset-closure! rows domain-size)
+          (map-rule-result
+            (emit-synchronized-bitset-relation rows values head-vars)
+            head-vars args))))))
+
+(defn- eval-full-synchronized-eav
+  [{:keys [^DB db base links head-vars]} args]
+  (let [tuple-cache (HashMap.)
+        tuples-for  (fn [attr]
+                      (or (.get tuple-cache attr)
+                          (let [tuples (or (db/-search-tuples
+                                            db [nil attr nil])
+                                           (FastList.))]
+                            (.put tuple-cache attr tuples)
+                            tuples)))
+        ^List base-tuples (tuples-for (:attr base))
+        ^List left-tuples (tuples-for (:attr (nth links 0)))
+        ^List right-tuples (tuples-for (:attr (nth links 1)))
+        ordinals (HashMap.)
+        values   (FastList.)]
+    (collect-eav-domain! ordinals values base-tuples)
+    (collect-eav-domain! ordinals values left-tuples)
+    (collect-eav-domain! ordinals values right-tuples)
+    (let [domain-size (.size values)]
+      (when (dense-synchronized-domain? domain-size)
+        (let [results (build-base-bitset-rows
+                        base-tuples ordinals (:entity-pos base) domain-size)
+              left    (build-link-bitset-rows
+                        left-tuples ordinals (:bound-side (nth links 0))
+                        domain-size)
+              right   (build-link-bitset-rows
+                        right-tuples ordinals (:bound-side (nth links 1))
+                        domain-size)]
+          (synchronized-bitset-fixed-point! results left right domain-size)
+          (map-rule-result
+            (emit-synchronized-bitset-relation results values head-vars)
+            head-vars args))))))
 
 (defn- bound-synchronized-eav-plan
   [context rule-name args]
@@ -2467,37 +3043,41 @@
                 ;; This is critical for cyclic graphs where the same tuple can be
                 ;; reached through paths of different lengths.
                 seen-sets
-                (reduce
-                  (fn [m rname]
-                    (let [init-rel  (start-totals rname)
-                          init-size (if-let [^List ts (:tuples init-rel)]
-                                      (.size ts)
-                                      0)
-                          capacity  (max 16 (* 4 ^long init-size))
-                          seen      (HashSet. (int capacity))]
-                      (r/add-to-seen! init-rel seen)
-                      (assoc m rname seen)))
-                  {} stratum)
+                (when stratum-recursive?
+                  (reduce
+                    (fn [m rname]
+                      (let [init-rel  (start-totals rname)
+                            init-size (if-let [^List ts (:tuples init-rel)]
+                                        (.size ts)
+                                        0)
+                            capacity  (max 16 (* 4 ^long init-size))
+                            seen      (HashSet. (int capacity))]
+                        (r/add-to-seen! init-rel seen)
+                        (assoc m rname seen)))
+                    {} stratum))
 
                 final-totals
-                (loop [totals      start-totals
-                       deltas      start-totals
-                       has-deltas? (some r/rel-not-empty (vals start-totals))
-                       iter        0]
-                  (if (not has-deltas?)
-                    totals
-                    (let [iter-context
-                          (assoc clean-context
-                                 :rules full-renamed-rules
-                                 :rels seed-rels
-                                 :rule-rels (merge base-rule-rels
-                                                   empty-stratum-rels
-                                                   deltas)
-                                 ;; Only use base-rule-rels for size estimation
-                                 ;; (pre-computed non-recursive rules), not the
-                                 ;; stratum's iterative totals which can affect
-                                 ;; clause ordering in ways that break correctness
-                                 :rule-totals base-rule-rels)
+                (if-not stratum-recursive?
+                  start-totals
+                  (loop [totals      start-totals
+                         deltas      start-totals
+                         has-deltas? (some r/rel-not-empty
+                                           (vals start-totals))
+                         iter        0]
+                    (if (not has-deltas?)
+                      totals
+                      (let [iter-context
+                            (assoc clean-context
+                                   :rules full-renamed-rules
+                                   :rels seed-rels
+                                   :rule-rels (merge base-rule-rels
+                                                     empty-stratum-rels
+                                                     deltas)
+                                   ;; Only use base-rule-rels for size estimation
+                                   ;; (pre-computed non-recursive rules), not the
+                                   ;; stratum's iterative totals which can affect
+                                   ;; clause ordering in ways that break correctness
+                                   :rule-totals base-rule-rels)
 
                           ;; Fused tuple production with deduplication.
                           eval-one
@@ -2548,19 +3128,39 @@
                                                    :current-size cur-size
                                                    :threshold    magic-threshold})))))]
 
-                      (recur new-totals new-deltas
-                             (seq new-deltas) (inc iter)))))]
+                        (recur new-totals new-deltas
+                               (seq new-deltas) (inc iter))))))]
 
             (map-rule-result (final-totals rule-name)
                              entry-renamed-head args)))))))
 
-(defn solve-stratified
-  [context rule-name args resolve-clause-fn]
+(def ^:private no-specialized-rule-result (Object.))
+
+(defn- specialized-rule-result
+  [context rule-name args]
   (if-let [plan (bound-transitive-eav-plan context rule-name args)]
     (eval-bound-transitive-eav plan args)
     (if-let [plan (bound-synchronized-eav-plan context rule-name args)]
       (eval-bound-synchronized-eav plan args)
-      (let [rules         (:rules context)
+      (if-let [plan (bound-linear-eav-plan context rule-name args)]
+        (eval-bound-linear-eav plan args)
+        (if-let [plan (full-linear-eav-plan context rule-name args)]
+          (or (eval-full-linear-eav plan args)
+              no-specialized-rule-result)
+          (if-let [plan (full-transitive-eav-plan context rule-name args)]
+            (or (eval-full-transitive-eav plan args)
+                no-specialized-rule-result)
+            (if-let [plan (full-synchronized-eav-plan context rule-name args)]
+              (or (eval-full-synchronized-eav plan args)
+                  no-specialized-rule-result)
+              no-specialized-rule-result)))))))
+
+(defn solve-stratified
+  [context rule-name args resolve-clause-fn]
+  (let [specialized (specialized-rule-result context rule-name args)]
+    (if-not (identical? specialized no-specialized-rule-result)
+      specialized
+        (let [rules         (:rules context)
             deps          (or (:rules-deps context) (dependency-graph rules))
             sccs          (dependency-sccs deps)
             stratum       (some #(when (% rule-name) %) sccs)
@@ -2625,7 +3225,8 @@
                   ;; Re-throw other exceptions
                   (throw e)))))
           (binding [*magic-rewrite?* false]
-            (solve-stratified* context rule-name args resolve-clause-fn)))))))
+            (solve-stratified* context rule-name args
+                               resolve-clause-fn)))))))
 
 ;; rewrite
 

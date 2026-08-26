@@ -86,6 +86,118 @@
       (is (= 'b1 (ffirst (:late-clauses
                            (d/explain {:run? false} b1-q facts rules))))))))
 
+(deftest nonrecursive-stratum-set-union-test
+  (let [facts  [[1 :edge 2]
+                [1 :edge 3]]
+        rules  '[[(derived ?x ?y)
+                  [?x :edge ?y]]
+                 [(derived ?x ?y)
+                  [?x :edge ?y]]
+                 [(outer ?x ?y)
+                  (derived ?x ?y)]]
+        query  '[:find ?y :in $ % :where (outer 1 ?y)]
+        count-query '[:find (count ?y) .
+                      :in $ %
+                      :where (derived 1 ?y)]]
+    (testing "base branches remain a set without fixed-point bookkeeping"
+      (is (= #{[2] [3]} (d/q query facts rules)))
+      (is (= 2 (d/q count-query facts rules))))))
+
+(deftest bound-linear-eav-rule-chain-test
+  (let [schema   (into {}
+                       (map (fn [attr]
+                              [attr {:db/valueType   :db.type/ref
+                                     :db/cardinality :db.cardinality/many}]))
+                       [:d1 :d2 :c2 :c3 :c4])
+        pairs    {:d1 [[1 10] [1 11] [2 11]]
+                  :d2 [[10 20] [10 21] [11 21] [11 22]]
+                  :c2 [[20 30] [21 30] [21 31] [22 32]]
+                  :c3 [[30 40] [31 40] [31 41] [32 42]]
+                  :c4 [[40 50] [41 51] [42 50] [42 52]]}
+        facts    (into [{:db/id 1 :db/ident :node/one}]
+                       (mapcat (fn [[attr tuples]]
+                                 (map (fn [[x y]] {:db/id x attr y}) tuples)))
+                       pairs)
+        ruleset  '[[(c1 ?x ?y)
+                    [?x :d1 ?z]
+                    [?z :d2 ?y]]
+                   [(b2 ?x ?y)
+                    [?x :c3 ?z]
+                    [?z :c4 ?y]]
+                   [(b1 ?x ?y)
+                    (c1 ?x ?z)
+                    [?z :c2 ?y]]
+                   [(a ?x ?y)
+                    (b1 ?x ?z)
+                    (b2 ?z ?y)]]
+        reverse-rules '[[(reverse-b2 ?y ?x)
+                         [?x :c3 ?z]
+                         [?z :c4 ?y]]]
+        ff-query '[:find ?x ?y :in $ % :where (a ?x ?y)]
+        b2-query '[:find ?x ?y :in $ % :where (b2 ?x ?y)]
+        reverse-query '[:find ?y ?x :in $ % :where (reverse-b2 ?y ?x)]
+        bf-query '[:find ?y :in $ % ?x :where (a ?x ?y)]
+        fb-query '[:find ?x :in $ % ?y :where (a ?x ?y)]
+        conn     (d/create-conn nil schema {:kv-opts {:inmemory? true}})
+        fallback (d/create-conn nil schema {:kv-opts {:inmemory? true}})]
+    (try
+      (d/transact! conn facts)
+      (d/transact! fallback facts)
+      (let [database          (d/db conn)
+            fallback-database (d/db fallback)
+            bf                (d/q bf-query database ruleset 1)
+            fb                (d/q fb-query database ruleset 50)]
+        (testing "nested binary predicates flatten to one guarded EAV path"
+          (let [path-fn @(ns-resolve 'datalevin.rules
+                                     'linear-eav-rule-path)
+                path    (path-fn {:rules (rules/parse-rules ruleset)} 'a)]
+            (is (= [:d1 :d2 :c2 :c3 :c4] (mapv :attr path)))
+            (is (= [:e :e :e :e :e] (mapv :bound-side path)))))
+
+        (testing "both singleton-bound directions match general evaluation"
+          (is (= #{[50] [51] [52]} bf))
+          (is (= #{[1] [2]} fb))
+          (is (= bf
+                 (binding [rules/*bound-linear-eav?* false]
+                   (d/q bf-query fallback-database ruleset 1))))
+          (is (= fb
+                 (binding [rules/*bound-linear-eav?* false]
+                   (d/q fb-query fallback-database ruleset 50))))
+          (is (= bf (d/q bf-query database ruleset :node/one))))
+
+        (testing "free endpoints use the exact fixed-length path"
+          (let [full (d/q ff-query database ruleset)
+                b2   (d/q b2-query database ruleset)
+                reverse-b2 (d/q reverse-query database reverse-rules)]
+            (is (= #{[1 50] [1 51] [1 52]
+                     [2 50] [2 51] [2 52]}
+                   full))
+            (is (= full
+                   (binding [rules/*full-linear-eav?* false]
+                     (d/q ff-query fallback-database ruleset))))
+            (is (= (set (map (fn [[x y]] [y x]) b2)) reverse-b2))
+            (is (= reverse-b2
+                   (binding [rules/*full-linear-eav?* false]
+                     (d/q reverse-query fallback-database reverse-rules))))))
+
+        (testing "pending transaction overlays retain chain semantics"
+          (let [tx-data          [[:db/add 1 :d1 12]
+                                  [:db/add 12 :d2 23]
+                                  [:db/add 23 :c2 33]
+                                  [:db/add 33 :c3 43]
+                                  [:db/add 43 :c4 53]]
+                overlay          (d/db-with database tx-data)
+                fallback-overlay (d/db-with fallback-database tx-data)]
+            (is (= (d/q bf-query overlay ruleset 1)
+                   (binding [rules/*bound-linear-eav?* false]
+                     (d/q bf-query fallback-overlay ruleset 1))))
+            (is (= (d/q ff-query overlay ruleset)
+                   (binding [rules/*full-linear-eav?* false]
+                     (d/q ff-query fallback-overlay ruleset)))))))
+      (finally
+        (d/close conn)
+        (d/close fallback)))))
+
 (deftest terminal-projected-distinct-collection-test
   (let [schema {:c3 {:db/valueType   :db.type/ref
                      :db/cardinality :db.cardinality/many}
@@ -224,6 +336,9 @@
           [(tc-constrained ?a ?b)
            [?a :edge ?a]
            (tc-constrained ?a ?b)]]
+        ff-query     '[:find ?a ?b
+                       :in $ %
+                       :where (tc ?a ?b)]
         bf-query     '[:find [?b ...]
                        :in $ % ?start
                        :where (tc ?start ?b)]
@@ -245,6 +360,18 @@
                          (d/db conn) left-rules))))
         (is (= #{1 2 3 4}
                (set (d/q bf-query (d/db conn) left-rules :node/one)))))
+
+      (testing "the full closure uses the dense set-valued specialization"
+        (let [full (set (d/q ff-query (d/db conn) left-rules))]
+          (is (= 12 (count full)))
+          (is (= full
+                 (binding [rules/*full-transitive-eav?* false]
+                   (set (d/q ff-query (d/db fallback) left-rules)))))
+          (is (= (set (map (fn [[a b]] [b a]) full))
+                 (set (d/q '[:find ?a ?b
+                             :in $ %
+                             :where (tc-reverse ?a ?b)]
+                           (d/db conn) reverse-rules))))))
 
       (testing "right-linear and physically reversed forms retain semantics"
         (is (= #{1 2 3 4}
@@ -279,7 +406,9 @@
                  (set (d/q fb-query (d/db fallback) left-rules 4))))))
 
       (testing "a pending transaction overlay uses transaction-aware probes"
-        (let [overlay (d/db-with (d/db conn) [[:db/add 4 :edge 5]])]
+        (let [overlay          (d/db-with (d/db conn) [[:db/add 4 :edge 5]])
+              fallback-overlay (d/db-with (d/db fallback)
+                                           [[:db/add 4 :edge 5]])]
           (is (= #{1 2 3 4 5}
                  (set (d/q '[:find [?b ...]
                              :in $ % ?start
@@ -290,7 +419,10 @@
                              [(tc-overlay ?a ?b)
                               [?a :edge ?mid]
                               (tc-overlay ?mid ?b)]]
-                           1))))))
+                           1))))
+          (is (= (set (d/q ff-query overlay left-rules))
+                 (binding [rules/*full-transitive-eav?* false]
+                   (set (d/q ff-query fallback-overlay left-rules)))))))
       (finally
         (d/close conn)
         (d/close fallback)))))
@@ -374,14 +506,18 @@
                         :where (sg ?start ?y)]
         fb-query      '[:find [?x ...]
                         :in $ % ?end
-                        :where (sg ?x ?end)]]
+                        :where (sg ?x ?end)]
+        ff-query      '[:find ?x ?y
+                        :in $ %
+                        :where (sg ?x ?y)]]
     (try
       (d/transact! conn facts)
       (d/transact! fallback facts)
       (let [database          (d/db conn)
             fallback-database (d/db fallback)
             bf                (set (d/q bf-query database sg-rules 1))
-            fb                (set (d/q fb-query database sg-rules 1))]
+            fb                (set (d/q fb-query database sg-rules 1))
+            ff                (set (d/q ff-query database sg-rules))]
         (testing "both singleton-bound directions match the general fixed point"
           (is (seq bf))
           (is (seq fb))
@@ -392,7 +528,17 @@
                  (binding [rules/*bound-synchronized-eav?* false]
                    (set (d/q fb-query fallback-database sg-rules 1))))))
 
+        (testing "the full closure agrees with the general fixed point"
+          (is (= ff
+                 (binding [rules/*full-synchronized-eav?* false]
+                   (set (d/q ff-query fallback-database sg-rules))))))
+
         (testing "physical EAV reversal leaves the logical closure unchanged"
+          (is (= ff
+                 (set (d/q '[:find ?x ?y
+                             :in $ %
+                             :where (sg-reverse ?x ?y)]
+                           database reverse-rules))))
           (is (= bf
                  (set (d/q '[:find [?y ...]
                              :in $ % ?start
@@ -416,12 +562,28 @@
                                              [:db/add 7 :sib 2]])]
             (is (= (set (d/q bf-query overlay sg-rules 1))
                    (binding [rules/*bound-synchronized-eav?* false]
-                     (set (d/q bf-query fallback-overlay sg-rules 1))))))))
+                     (set (d/q bf-query fallback-overlay sg-rules 1)))))))
+
+        (testing "pending overlays are included in the full closure"
+          (let [overlay          (d/db-with database
+                                           [[:db/add 6 :par 7]
+                                            [:db/add 7 :sib 2]])
+                fallback-overlay (d/db-with fallback-database
+                                            [[:db/add 6 :par 7]
+                                             [:db/add 7 :sib 2]])]
+            (is (= (set (d/q ff-query overlay sg-rules))
+                   (binding [rules/*full-synchronized-eav?* false]
+                     (set (d/q ff-query fallback-overlay sg-rules))))))))
 
       (testing "the exact synchronized shape is recognized"
-        (let [plan-rule @(ns-resolve 'datalevin.rules
-                                     'synchronized-eav-rule-plan)]
-          (is (some? (plan-rule {:rules (rules/parse-rules sg-rules)} 'sg)))))
+        (let [context   {:rules (rules/parse-rules sg-rules)}
+              plan-rule @(ns-resolve 'datalevin.rules
+                                      'synchronized-eav-rule-plan)
+              dense?    @(ns-resolve 'datalevin.rules
+                                      'dense-synchronized-domain?)]
+          (is (some? (plan-rule context 'sg)))
+          (is (true? (dense? 1000)))
+          (is (false? (dense? 12000)))))
       (finally
         (d/close conn)
         (d/close fallback)))))
@@ -450,17 +612,25 @@
                    [?x :par ?z]
                    (sg ?z ?z1)
                    [?y :par ?z1]]]
-        queries {:bf '[:find ?y :in $ % ?bound :where (sg ?bound ?y)]
+        queries {:ff '[:find ?x ?y :in $ % :where (sg ?x ?y)]
+                 :bf '[:find ?y :in $ % ?bound :where (sg ?bound ?y)]
                  :fb '[:find ?x :in $ % ?bound :where (sg ?x ?bound)]}
         conn     (d/create-conn nil schema {:kv-opts {:inmemory? true}})
         fallback (d/create-conn nil schema {:kv-opts {:inmemory? true}})]
     (try
       (d/transact! conn facts)
       (d/transact! fallback facts)
-      (doseq [[_ query] queries, bound (range n)]
-        (is (= (d/q query (d/db conn) ruleset bound)
-               (binding [rules/*bound-synchronized-eav?* false]
-                 (d/q query (d/db fallback) ruleset bound)))))
+      (doseq [[binding query] queries
+              bound (if (= binding :ff) [nil] (range n))]
+        (let [specialized (if (= binding :ff)
+                            (d/q query (d/db conn) ruleset)
+                            (d/q query (d/db conn) ruleset bound))
+              general     (binding [rules/*bound-synchronized-eav?* false
+                                    rules/*full-synchronized-eav?* false]
+                            (if (= binding :ff)
+                              (d/q query (d/db fallback) ruleset)
+                              (d/q query (d/db fallback) ruleset bound)))]
+          (is (= specialized general))))
       (finally
         (d/close conn)
         (d/close fallback)))))

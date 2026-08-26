@@ -1,6 +1,6 @@
 (ns openrulebench.data
   "Deterministic set-valued data generators for the portable OpenRuleBench
-   tasks. Each sample is generated in Clojure and handed unchanged to its
+   tasks. Each task run is generated in Clojure and handed unchanged to its
    backend."
   (:import [java.util Random]))
 

@@ -39,7 +39,7 @@
    [datalevin.timeout :as timeout]
    [datalevin.util :as u :refer [cond+ concatv map+]])
   (:import
-   [clojure.lang IPersistentCollection]
+   [clojure.lang IPersistentCollection PersistentVector]
    [java.util Collection Comparator HashSet List PriorityQueue]
    [datalevin.parser BindTuple Constant FindColl FindRel FindScalar FindTuple
     Pattern Variable]
@@ -109,7 +109,7 @@
       (set! lookup nil)
       (dotimes [i size]
         (.cons ^IPersistentCollection result-set
-               (vec ^objects (.get tuples i))))
+               (PersistentVector/adopt ^objects (.get tuples i))))
       (.clear tuples)
       (set! projected nil)
       result-set))
@@ -1814,13 +1814,36 @@
      (recur (-collect-tuples acc rel dst-idxs src-idxs)
             (next rels) symbols))))
 
+(defn- collect-exact-unique-relation
+  [rels symbols]
+  (when (= 1 (count rels))
+    (let [rel          (first rels)
+          symbols      (vec symbols)
+          expected     (zipmap symbols (range))
+          tuples ^List (:tuples rel)]
+      (when (and (= expected (:attrs rel))
+                 (r/unique-on? rel symbols)
+                 tuples)
+        (let [size       (.size tuples)
+              result-set (sp/new-spillable-set
+                           nil {:initial-capacity size})]
+          ;; The rule engine already proved both physical projection and
+          ;; distinctness. Convert its tuples directly to the public query
+          ;; representation instead of cloning and deduplicating them again.
+          (dotimes [i size]
+            (.cons ^IPersistentCollection result-set
+                   (PersistentVector/adopt ^objects (.get tuples i))))
+          result-set)))))
+
 (defn collect
-  [{:keys [result-set] :as context} symbols]
+  [{:keys [result-set rels] :as context} symbols]
   (if (or (= result-set #{})
           (= (vec symbols) (:terminal-collected-symbols context)))
     context
-    (assoc context :result-set (into (sp/new-spillable-set) (map vec)
-                                     (-collect context symbols)))))
+    (assoc context :result-set
+           (or (collect-exact-unique-relation rels symbols)
+               (into (sp/new-spillable-set) (map vec)
+                     (-collect context symbols))))))
 
 (defn- typed-aget [a i]
   (aget ^objects a ^Long i))
@@ -2800,43 +2823,43 @@
                                  (:qtimeout parsed-q))]
     (let [plans (discover-access-plans parsed-q inputs)]
       (if (seq plans)
-        (let [planned-context (access-query-plan parsed-q inputs plans)]
-          (let [alternative (qo/selected-alternative planned-context)]
-            (if qplan/*explain*
-              (if (= :access (:kind alternative))
-                (let [execution (volatile! {:batches [] :subqueries []})
-                      result
-                      (binding [qplan/*explain*  nil
-                                *access-execution* execution]
-                        (execute-alternative
-                          parsed-q inputs (:access-plans planned-context)
-                          alternative))
-                      actual-size (query-result-size parsed-q result)
-                      explained-context
-                      (assoc planned-context
-                             :run? true
-                             :explain-actual-result-size actual-size
-                             :access-path-execution
-                             (access-execution-plan
-                               planned-context alternative @execution
-                               actual-size))]
-                  (result-explain explained-context result)
+        (let [planned-context (access-query-plan parsed-q inputs plans)
+              alternative     (qo/selected-alternative planned-context)]
+          (if qplan/*explain*
+            (if (= :access (:kind alternative))
+              (let [execution   (volatile! {:batches [] :subqueries []})
+                    result
+                    (binding [qplan/*explain*    nil
+                              *access-execution* execution]
+                      (execute-alternative
+                        parsed-q inputs (:access-plans planned-context)
+                        alternative))
+                    actual-size (query-result-size parsed-q result)
+                    explained-context
+                    (assoc planned-context
+                           :run? true
+                           :explain-actual-result-size actual-size
+                           :access-path-execution
+                           (access-execution-plan
+                             planned-context alternative @execution
+                             actual-size))]
+                (result-explain explained-context result)
+                result)
+              (let [deferred         (volatile! nil)
+                    result
+                    (binding [*deferred-result-explain* deferred]
+                      (execute-alternative
+                        parsed-q inputs (:access-plans planned-context)
+                        alternative))
+                    executed-context (:context @deferred)]
+                (result-explain
+                  (assoc executed-context
+                         :property-memo (:property-memo planned-context))
                   result)
-                (let [deferred (volatile! nil)
-                      result
-                      (binding [*deferred-result-explain* deferred]
-                        (execute-alternative
-                          parsed-q inputs (:access-plans planned-context)
-                          alternative))
-                      executed-context (:context @deferred)]
-                  (result-explain
-                    (assoc executed-context
-                           :property-memo (:property-memo planned-context))
-                    result)
-                  result))
-              (execute-alternative
-                parsed-q inputs (:access-plans planned-context)
-                alternative))))
+                result))
+            (execute-alternative
+              parsed-q inputs (:access-plans planned-context)
+              alternative)))
         (execute-query parsed-q inputs plans)))))
 
 (defn mark-parsing-finished!

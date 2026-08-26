@@ -1,6 +1,6 @@
 (ns openrulebench.core
   "Core benchmarking utilities for OpenRuleBench.
-   Repeated wall-clock measurement, correctness oracles, and result artifacts."
+   Warmup/measurement pass execution, correctness oracles, and result artifacts."
   (:require
    [clojure.java.io :as io]
    [clojure.pprint :as pprint]
@@ -494,97 +494,141 @@
                      (name status)))))
 
 ;; ============================================================
-;; Repeated benchmark contract and child-runner CLI
+;; Benchmark pass contract and child-runner CLI
 ;; ============================================================
 
 (def default-run-options
-  {:warmup 1 :iterations 5 :verify? true :quiet? false :output nil})
+  {:warmup 1 :iterations 1 :verify? true :quiet? false :output nil})
 
-(defn- first-failure
-  [results]
-  (first (remove #(= :ok (:status %)) results)))
+(defn- finish-runs
+  [system spec runs verify?]
+  (let [task          (benchmark-task spec)
+        counts        (mapv :result-count runs)
+        consistent?   (apply = counts)
+        input-digests (mapv :input-digest runs)
+        inputs-consistent? (apply = input-digests)
+        expected      (when verify? (expected-result-count spec))
+        oracle-ok?    (or (nil? expected)
+                          (every? #(= expected %) counts))
+        times         (mapv :time-ms runs)
+        summary       (latency-summary times)
+        single-pass?  (= 1 (count times))
+        run-metadata  (select-keys (first runs)
+                                   [:timing-scope :base-fact-count
+                                    :engine-version :input-digest])
+        correctness   (assoc
+                        (cond
+                          (not verify?)
+                          {:status :skipped}
 
-(defn- run-until-failure
-  [run-once spec n]
-  (loop [i 0
-         results []]
-    (if (= i n)
-      results
-      (let [result (run-once spec)
-            results' (conj results result)]
-        (if (= :ok (:status result))
-          (recur (inc i) results')
-          results')))))
+                          (some? expected)
+                          {:status (if (and consistent?
+                                            inputs-consistent?
+                                            oracle-ok?)
+                                     :passed :failed)
+                           :oracle :independent-reference
+                           :expected-count expected}
 
-(defn run-repeated
-  [system spec run-once {:keys [warmup iterations verify?]}]
-  (let [task           (benchmark-task spec)
-        warmup-results (run-until-failure run-once spec warmup)]
-    (if-let [failure (first-failure warmup-results)]
-      (assoc failure
-             :system system
-             :benchmark spec
-             :phase :warmup
-             :samples-ms [])
-      (let [runs (run-until-failure run-once spec iterations)]
-        (if-let [failure (first-failure runs)]
+                          :else
+                          {:status (if consistent? :consistent :failed)
+                           :oracle :none})
+                        :input-status (if inputs-consistent?
+                                        :consistent :failed))]
+    (if (and consistent? inputs-consistent? oracle-ok?)
+      (merge
+        {:system system
+         :benchmark spec
+         :task (dissoc task :spec)
+         :status :ok
+         :result-count (first counts)
+         :time-ms (if single-pass? (first times) (:median summary))
+         :reported-statistic (if single-pass? :single-measurement :median)
+         :latency-ms summary
+         :samples-ms times
+         :correctness correctness}
+        run-metadata)
+      {:system system
+       :benchmark spec
+       :task (dissoc task :spec)
+       :status :incorrect
+       :result-counts counts
+       :input-digests input-digests
+       :expected-count expected
+       :samples-ms times
+       :correctness correctness})))
+
+(defn- warmup-failures
+  [benchmarks run-once passes]
+  (loop [pass 0
+         failures {}]
+    (if (= pass passes)
+      failures
+      (recur
+        (inc pass)
+        (reduce
+          (fn [current spec]
+            (if (contains? current spec)
+              current
+              (let [result (run-once spec)]
+                (if (= :ok (:status result))
+                  current
+                  (assoc current spec result)))))
+          failures
+          benchmarks)))))
+
+(defn- measurement-runs
+  [benchmarks run-once passes excluded]
+  (loop [pass 0
+         runs {}
+         failures {}]
+    (if (= pass passes)
+      {:runs runs :failures failures}
+      (let [[next-runs next-failures]
+            (reduce
+              (fn [[current-runs current-failures] spec]
+                (if (or (contains? excluded spec)
+                        (contains? current-failures spec))
+                  [current-runs current-failures]
+                  (let [result (run-once spec)]
+                    (if (= :ok (:status result))
+                      [(update current-runs spec (fnil conj []) result)
+                       current-failures]
+                      [current-runs (assoc current-failures spec result)]))))
+              [runs failures]
+              benchmarks)]
+        (recur (inc pass) next-runs next-failures)))))
+
+(defn run-benchmark-passes
+  "Run complete warmup passes before complete measurement passes.
+
+   The default protocol executes every selected task once as warmup and once as
+   the retained measurement. More than one measurement pass is supported for
+   diagnostic use and reports the median for compatibility with older data."
+  [system benchmarks run-once {:keys [warmup iterations verify?]}]
+  (let [warmup-errors (warmup-failures benchmarks run-once warmup)
+        {:keys [runs failures]}
+        (measurement-runs benchmarks run-once iterations warmup-errors)]
+    (mapv
+      (fn [spec]
+        (if-let [failure (get warmup-errors spec)]
           (assoc failure
                  :system system
                  :benchmark spec
-                 :phase :measurement
-                 :samples-ms (mapv :time-ms (take-while #(= :ok (:status %))
-                                                        runs)))
-          (let [counts       (mapv :result-count runs)
-                consistent?  (apply = counts)
-                input-digests (mapv :input-digest runs)
-                inputs-consistent? (apply = input-digests)
-                expected     (when verify? (expected-result-count spec))
-                oracle-ok?   (or (nil? expected)
-                                 (every? #(= expected %) counts))
-                times        (mapv :time-ms runs)
-                summary      (latency-summary times)
-                run-metadata (select-keys (first runs)
-                                          [:timing-scope :base-fact-count
-                                           :engine-version :input-digest])
-                correctness  (assoc
-                               (cond
-                                 (not verify?)
-                                 {:status :skipped}
+                 :phase :warmup
+                 :samples-ms [])
+          (if-let [failure (get failures spec)]
+            (assoc failure
+                   :system system
+                   :benchmark spec
+                   :phase :measurement
+                   :samples-ms (mapv :time-ms (get runs spec)))
+            (finish-runs system spec (get runs spec) verify?))))
+      benchmarks)))
 
-                                 (some? expected)
-                                 {:status (if (and consistent?
-                                                   inputs-consistent?
-                                                   oracle-ok?)
-                                            :passed :failed)
-                                  :oracle :independent-reference
-                                  :expected-count expected}
-
-                                 :else
-                                 {:status (if consistent? :consistent :failed)
-                                  :oracle :none})
-                               :input-status (if inputs-consistent?
-                                               :consistent :failed))]
-            (if (and consistent? inputs-consistent? oracle-ok?)
-              (merge
-                {:system system
-                 :benchmark spec
-                 :task (dissoc task :spec)
-                 :status :ok
-                 :result-count (first counts)
-                 :time-ms (:median summary)
-                 :latency-ms summary
-                 :samples-ms times
-                 :correctness correctness}
-                run-metadata)
-              {:system system
-               :benchmark spec
-               :task (dissoc task :spec)
-               :status :incorrect
-               :result-counts counts
-               :input-digests input-digests
-               :expected-count expected
-               :samples-ms times
-               :correctness correctness})))))))
+(defn run-repeated
+  "Compatibility wrapper for running the pass protocol on one task."
+  [system spec run-once opts]
+  (first (run-benchmark-passes system [spec] run-once opts)))
 
 (defn- parse-positive-long
   [option value allow-zero?]
@@ -664,9 +708,9 @@
   [system]
   (str "OpenRuleBench " system " runner\n\n"
        "Options:\n"
-       "  --warmup N       Fresh-database warmup runs (default 1)\n"
-       "  --iterations N   Measured fresh-database runs (default 5)\n"
-       "  --output PATH    Write an EDN report with raw samples\n"
+       "  --warmup N       Complete warmup passes (default 1)\n"
+       "  --iterations N   Complete measured passes (default 1)\n"
+       "  --output PATH    Write an EDN report with raw measurements\n"
        "  --no-verify      Skip the independent answer-count oracle\n"
        "  --quiet          Suppress the console result row\n"
        "  --help           Show this help\n"))
@@ -693,10 +737,15 @@
       (do
         (println (child-usage system))
         {:exit-code 0 :help? true})
-      (let [results (mapv #(run-repeated system % run-once opts) benchmarks)
+      (let [results (run-benchmark-passes system benchmarks run-once opts)
             report  {:format-version 2
                      :benchmark-suite :openrulebench
                      :contract :portable-tc-sg-join1-v1
+                     :measurement-protocol
+                     {:order :warmup-passes-then-measurement-passes
+                      :reported-statistic
+                      (if (= 1 (:iterations opts))
+                        :single-measurement :median)}
                      :system system
                      :host (host-info)
                      :configuration (select-keys opts

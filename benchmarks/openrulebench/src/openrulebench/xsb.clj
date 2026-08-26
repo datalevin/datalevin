@@ -113,24 +113,30 @@ a(X, Y) :- b1(X, Z), b2(Z, Y).
     (when (zero? (:exit result))
       (str/trim (:out result)))))
 
-(defn run-xsb-timed
-  "Run XSB benchmark and return count."
-  [prog-file count-goal]
-  (let [result (sh/sh "xsb" "--nobanner" "--quietload" "--noprompt"
-                      "-e" (str "['" prog-file "'], "
-                                count-goal "(N), "
-                                "write(N), nl, halt."))]
-    (when (zero? (:exit result))
-      (parse-long (str/trim (:out result))))))
+(defn run-xsb-materialization-timed
+  "Run a goal that materializes its answers in L.
 
-(defn run-xsb-count-goal
-  "Run a complete XSB goal that binds N to the answer cardinality."
-  [prog-file goal]
-  (let [result (sh/sh "xsb" "--nobanner" "--quietload" "--noprompt"
-                      "-e" (str "['" prog-file "'], " goal ", "
-                                "write(N), nl, halt."))]
-    (when (zero? (:exit result))
-      (parse-long (str/trim (:out result))))))
+  Program consultation and fact loading happen before XSB's internal wall
+  clock starts.  The measured interval includes query evaluation and creation
+  of the complete answer list, but excludes counting that list and process
+  startup/shutdown."
+  [prog-file materialization-goal]
+  (let [{:keys [exit out err]}
+        (sh/sh "xsb" "--nobanner" "--quietload" "--noprompt"
+               "-e" (str "['" prog-file "'], "
+                         "walltime(T0), " materialization-goal ", "
+                         "walltime(T1), basics:length(L,N), "
+                         "MS is (T1-T0)*1000, "
+                         "write(N), put(9), write(MS), nl, halt."))]
+    (when-not (zero? exit)
+      (throw (ex-info "XSB query harness failed"
+                      {:exit exit :stdout out :stderr err})))
+    (let [[count-str time-str] (str/split (str/trim out) #"\s+")]
+      (when-not (and count-str time-str)
+        (throw (ex-info "XSB query harness returned malformed output"
+                        {:stdout out :stderr err})))
+      {:result-count (parse-long count-str)
+       :time-ms     (Double/parseDouble time-str)})))
 
 (def ^:private xsb-version
   (delay
@@ -140,14 +146,14 @@ a(X, Y) :- b1(X, Z), b2(Z, Y).
           (str/trim (if (str/blank? out) err out))))
       (catch Exception _ nil))))
 
-(defn- answer-count-goal
+(defn- answer-materialization-goal
   [{:keys [family query binding bound-value]}]
   (let [predicate (name (if (= family :join1) query family))]
     (case binding
-      :ff (format "findall([X,Y], %s(X,Y), L), basics:length(L,N)" predicate)
-      :bf (format "findall(Y, %s(%d,Y), L), basics:length(L,N)"
+      :ff (format "findall([X,Y], %s(X,Y), L)" predicate)
+      :bf (format "findall(Y, %s(%d,Y), L)"
                   predicate bound-value)
-      :fb (format "findall(X, %s(X,%d), L), basics:length(L,N)"
+      :fb (format "findall(X, %s(X,%d), L)"
                   predicate bound-value))))
 
 ;; =============================================================================
@@ -165,10 +171,9 @@ a(X, Y) :- b1(X, Z), b2(Z, Y).
                     :sg (write-sg-files task-data dir)
                     :join1 (write-join1-files task-data dir))]
     (try
-      (let [start        (core/now-ms)
-            result-count (run-xsb-count-goal prog-file
-                                             (answer-count-goal task))
-            time-ms      (- (core/now-ms) start)]
+      (let [{:keys [result-count time-ms]}
+            (run-xsb-materialization-timed
+              prog-file (answer-materialization-goal task))]
         {:system "xsb"
          :benchmark spec
          :time-ms time-ms
@@ -176,7 +181,7 @@ a(X, Y) :- b1(X, Z), b2(Z, Y).
          :base-fact-count (core/task-base-fact-count task task-data)
          :input-digest (core/task-data-digest task task-data)
          :engine-version (or @xsb-version "unknown")
-         :timing-scope :external-process-load-evaluate-materialize
+         :timing-scope :query-and-materialization
          :status (if result-count :ok :error)})
       (finally
         (doseq [f (or (seq (.listFiles (io/file dir))) [])]
@@ -192,11 +197,9 @@ a(X, Y) :- b1(X, Z), b2(Z, Y).
         prog-file (write-tc-files edges dir)]
     (try
       (System/gc)
-      (let [start        (core/now-ms)
-            ;; The count goal materializes the table and consumes all answers
-            ;; in one XSB process; a separate pre-run would not warm this process.
-            result-count (run-xsb-timed prog-file "count_tc")
-            time-ms      (- (core/now-ms) start)]
+      (let [{:keys [result-count time-ms]}
+            (run-xsb-materialization-timed
+              prog-file "findall([X,Y], tc(X,Y), L)")]
         {:system "xsb"
          :benchmark (str "tc:" instance-name)
          :time-ms time-ms
@@ -216,9 +219,9 @@ a(X, Y) :- b1(X, Z), b2(Z, Y).
         prog-file (write-sg-files relations dir)]
     (try
       (System/gc)
-      (let [start        (core/now-ms)
-            result-count (run-xsb-timed prog-file "count_sg")
-            time-ms      (- (core/now-ms) start)]
+      (let [{:keys [result-count time-ms]}
+            (run-xsb-materialization-timed
+              prog-file "findall([X,Y], sg(X,Y), L)")]
         {:system "xsb"
          :benchmark (str "sg:" instance-name)
          :time-ms time-ms

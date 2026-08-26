@@ -28,7 +28,28 @@
 
 (deftest external-program-bindings-test
   (let [task (core/require-benchmark-task "join1:50k-b1-fb")]
-    (is (= "findall(X, b1(X,1), L), basics:length(L,N)"
-           (#'xsb/answer-count-goal task)))
+    (is (= "findall(X, b1(X,1), L)"
+           (#'xsb/answer-materialization-goal task)))
     (is (str/includes? (souffle/program-for-task task)
-                       "result(x) :- b1(x, 1)."))))
+                       "result(x) :- b1(x, 1)."))
+    (is (= ["souffle" "-m" "result" "-g" "task.cpp" "task.dl"]
+           (#'souffle/souffle-generation-args
+             task "task.cpp" "task.dl"))))
+  (let [task (core/require-benchmark-task "tc:50k-cyclic-ff")]
+    (is (= ["souffle" "-g" "task.cpp" "task.dl"]
+           (#'souffle/souffle-generation-args
+             task "task.cpp" "task.dl")))))
+
+(deftest external-engine-timing-boundary-test
+  (let [source @#'souffle/embedded-harness-source]
+    (is (< (str/index-of source "program->loadAll")
+           (str/index-of source "const auto start")))
+    (is (< (str/index-of source "const auto start")
+           (str/index-of source "program->runAll")))
+    (is (< (str/index-of source "program->getRelationSize")
+           (str/index-of source "const auto finish"))))
+  (is (= ["/sdk/lib" "/sdk/lib" "/other/lib"]
+         (#'souffle/mach-o-rpaths
+           (str "         path /sdk/lib (offset 12)\n"
+                "         path /sdk/lib (offset 12)\n"
+                "         path /other/lib (offset 12)\n")))))

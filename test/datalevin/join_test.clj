@@ -33,6 +33,17 @@
       (r/project-distinct vars)
       (row-set)))
 
+(deftest uniqueness-proof-keeps-physical-projection-test
+  (let [source    (-> (relation {'?x 0 '?y 1}
+                                [[1 :a :hidden-a]
+                                 [2 :a :hidden-b]])
+                      (r/with-unique-key ['?x]))
+        projected (r/project-distinct source ['?x '?y])]
+    (is (r/unique-on? source ['?x '?y]))
+    (is (not (identical? source projected)))
+    (is (= #{[1 :a] [2 :a]} (row-set projected)))
+    (is (every? #(= 2 (alength ^objects %)) (:tuples projected)))))
+
 (deftest hash-join-project-distinct-test
   (let [left  (relation {'?x 0 '?z 1}
                         [[1 10] [1 11] [2 10] [2 10]])
@@ -40,8 +51,10 @@
                         [[10 :a] [10 :b] [11 :a] [11 :a]])]
     (testing "relation composition is exact in either input orientation"
       (doseq [[a b] [[left right] [right left]]]
-        (is (= (expected-projected-join a b ['?x '?y])
-               (row-set (j/hash-join-project-distinct a b ['?x '?y]))))))
+        (let [actual (j/hash-join-project-distinct a b ['?x '?y])]
+          (is (= (expected-projected-join a b ['?x '?y])
+                 (row-set actual)))
+          (is (r/unique-on? actual ['?x '?y])))))
 
     (testing "one-sided projections remain distinct"
       (doseq [vars [['?x] ['?y] ['?z] ['?x '?z '?y]]]
@@ -97,6 +110,10 @@
         actual   (j/hash-join-project-distinct left right ['?x '?y])]
     (is (some? selected))
     (is (= (* n n) (.size ^java.util.List (:tuples selected))))
+    (is (r/unique-on? selected ['?x '?y]))
+    (is (identical? selected
+                    (r/project-distinct selected ['?x '?y])))
+    (is (not (r/unique-on? selected ['?x])))
     (is (= (set (for [x (range n), y (range n)] [x y]))
            (row-set actual)))
     (is (= (row-set actual)

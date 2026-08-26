@@ -632,6 +632,11 @@
 (defn put-homo-tuple
   "x-type is a single raw value type"
   [^ByteBuffer bf x x-type]
+  (when (empty? x)
+    (u/raise "Cannot store an empty homogeneous tuple"
+             {:error      :data/validation
+              :value      x
+              :tuple-type x-type}))
   (let [c   (count x)
         f   (nth x 0)
         hdr (raw-header f x-type)]
@@ -1137,7 +1142,8 @@
          (not (some #(= % :data) t))
          (let [ct (count t)]
            (if (= 1 ct)
-             (let [t' (first t)] (every? #(valid-data* % t') x))
+             (and (seq x)
+                  (let [t' (first t)] (every? #(valid-data* % t') x)))
              (and (= ct (count x))
                   (every? true?
                           (map #(or (nil? %1) (valid-data* %1 %2)) x t))))))

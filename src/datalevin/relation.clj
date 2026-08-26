@@ -83,6 +83,29 @@
   (timeout/assert-time-left)
   (Relation. attrs tuples))
 
+(defn ^:no-doc with-unique-key
+  "Record that `rel` contains at most one tuple for each value of `vars`."
+  [rel vars]
+  (vary-meta rel update ::unique-keys (fnil conj #{}) (set vars)))
+
+(defn ^:no-doc unique-on?
+  "Return true when relation metadata proves uniqueness on `vars`. A unique
+   key also proves uniqueness for every superset of that key."
+  [rel vars]
+  (boolean
+    (when-let [unique-keys (::unique-keys (meta rel))]
+      (let [vars (set vars)]
+        (some #(every? vars %) unique-keys)))))
+
+(defn- exact-tuple-layout?
+  [rel attrs]
+  (and (= (:attrs rel) attrs)
+       (let [^List tuples (:tuples rel)]
+         (or (nil? tuples)
+             (zero? (.size tuples))
+             (= (count attrs)
+                (alength ^objects (.get tuples 0)))))))
+
 ;; Relation algebra
 
 (defn join-tuples
@@ -236,44 +259,49 @@
                        (raise "Cannot project missing relation attributes"
                               {:missing missing
                                :available (keys attrs)}))
-        output-attrs (zipmap vars (range))
-        ^List tuples (:tuples rel)
-        size         (long (if tuples (.size tuples) 0))
-        ^ints idxs   (int-array (map attrs vars))
-        width        (alength idxs)
-        output       (FastList. (int size))]
-    (cond
-      (zero? size)
-      (relation! output-attrs output)
+        output-attrs (zipmap vars (range))]
+    (if (and (exact-tuple-layout? rel output-attrs)
+             (unique-on? rel vars))
+      rel
+      (let [^List tuples (:tuples rel)
+            size         (long (if tuples (.size tuples) 0))
+            ^ints idxs   (int-array (map attrs vars))
+            width        (alength idxs)
+            output       (FastList. (int size))]
+        (with-unique-key
+          (cond
+            (zero? size)
+            (relation! output-attrs output)
 
-      (zero? width)
-      (do
-        (.add output (object-array 0))
-        (relation! output-attrs output))
+            (zero? width)
+            (do
+              (.add output (object-array 0))
+              (relation! output-attrs output))
 
-      (= 1 width)
-      (let [idx  (aget idxs 0)
-            seen (HashSet. (int size))]
-        (dotimes [i size]
-          (let [value (aget ^objects (.get tuples i) idx)]
-            (when (.add seen value)
-              (.add output (object-array [value])))))
-        (relation! output-attrs output))
+            (= 1 width)
+            (let [idx  (aget idxs 0)
+                  seen (HashSet. (int size))]
+              (dotimes [i size]
+                (let [value (aget ^objects (.get tuples i) idx)]
+                  (when (.add seen value)
+                    (.add output (object-array [value])))))
+              (relation! output-attrs output))
 
-      :else
-      (let [seen    (HashSet. (int size))
-            scratch (object-array width)
-            lookup  (array-lookup)]
-        (dotimes [i size]
-          (let [^objects tuple (.get tuples i)]
-            (dotimes [j width]
-              (aset scratch j (aget tuple (aget idxs j))))
-            (reset-array-lookup! lookup scratch)
-            (when-not (.contains seen lookup)
-              (let [key (aclone scratch)]
-                (.add seen (wrap-array key))
-                (.add output key)))))
-        (relation! output-attrs output)))))
+            :else
+            (let [seen    (HashSet. (int size))
+                  scratch (object-array width)
+                  lookup  (array-lookup)]
+              (dotimes [i size]
+                (let [^objects tuple (.get tuples i)]
+                  (dotimes [j width]
+                    (aset scratch j (aget tuple (aget idxs j))))
+                  (reset-array-lookup! lookup scratch)
+                  (when-not (.contains seen lookup)
+                    (let [key (aclone scratch)]
+                      (.add seen (wrap-array key))
+                      (.add output key)))))
+              (relation! output-attrs output)))
+          vars)))))
 
 (defn sum-rel-dedupe
   ([] (relation! {} (FastList.)))

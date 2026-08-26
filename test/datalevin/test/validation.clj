@@ -61,6 +61,28 @@
     (d/close-db db)
     (u/delete-files dir)))
 
+(deftest empty-homogeneous-tuple-error-test
+  (let [dir  (u/tmp-dir (str "empty-homogeneous-tuple-" (UUID/randomUUID)))
+        conn (d/create-conn
+               dir
+               {:sf/emails {:db/valueType :db.type/tuple
+                            :db/tupleType :db.type/string}})]
+    (try
+      (let [error (try
+                    (d/transact! conn [{:sf/foo "hi" :sf/emails []}])
+                    nil
+                    (catch clojure.lang.ExceptionInfo e e))]
+        (is (= "Cannot store an empty homogeneous tuple for attribute :sf/emails"
+               (.getMessage error)))
+        (is (= {:error      :transact/syntax
+                :attribute  :sf/emails
+                :value      []
+                :tuple-type :db.type/string}
+               (ex-data error))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
 
 (deftest coerce-inst-test
   (is (instance? Date (prepare/coerce-inst 1000)))

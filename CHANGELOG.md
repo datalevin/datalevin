@@ -16,6 +16,7 @@
 - [Datalog] late or-join branch planner.
 - [Datalog] segmented morsel-driven execution.
 - [Datalog] cheaper final result collection.
+- [Datalog] better error report for missing tuple elements.
 
 ## 1.0.2 (2026-08-11)
 
