@@ -69,6 +69,8 @@ are not accepted by the comparison runner:
 
 ## Systems and timing classes
 
+The following systems are tested:
+
 | System | TC/SG FF | TC/SG bound | Join1 | Timing class |
 |---|---:|---:|---:|---|
 | [Datalevin](https://datalevin.org/) | yes | yes | yes | query + full result materialization |
@@ -78,27 +80,6 @@ are not accepted by the comparison runner:
 | [Souffle](https://souffle-lang.github.io/cav-paper) | yes | yes | yes | compiled evaluation + in-memory result relation |
 | [Clara Rules](https://www.clara-rules.org/) | yes | no | no | forward-chain + query materialization |
 | [O'Doyle Rules](https://github.com/oakes/odoyle-rules) | yes | no | no | forward-chain + query materialization |
-
-Timing for every backend excludes data generation, database/session
-construction, fact loading, index construction, and statistics collection from
-the timed region. Each timed region evaluates the rules/query and fully
-materializes its answer.
-
-XSB consults its generated program and facts before reading XSB's internal wall
-clock. The interval ends after `findall` has materialized every projected
-answer; list counting and process startup/shutdown are outside it. In each pass
-process, Souffle generates and compiles C++ once per distinct query program.
-Each task pass creates a fresh embedded program instance and calls `loadAll()`
-before the clock, then times `runAll()` with I/O disabled through completion of
-its in-memory `result` relation. Program compilation, process startup, input
-loading, and CSV output are therefore excluded. Bound Souffle programs enable
-its magic-set transform for `result`. All five portable backends consequently
-report `:timing-scope :query-and-materialization` and may be compared under
-this boundary.
-
-Clara and O'Doyle are materialize-all production-rule systems. Bound queries
-would execute the same full closure and filter it afterward, so the runner marks
-those task/system pairs `N/A` instead of implying bound-query optimization.
 
 ### System references
 
@@ -116,6 +97,38 @@ those task/system pairs `N/A` instead of implying bound-query optimization.
 6. [Clara Rules documentation](https://www.clara-rules.org/) and
    [source repository](https://github.com/oracle-samples/clara-rules).
 7. [O'Doyle Rules documentation and source](https://github.com/oakes/odoyle-rules).
+
+### Timing
+
+Timing for every backend excludes data generation, database/session
+construction, fact loading, index construction, and statistics collection from
+the timed region. Each timed region evaluates the rules/query and fully
+materializes its answer.
+
+SQLite and PostgreSQL use the same end-to-end JDBC consumption contract. Their
+timers include statement creation, query execution, reading every projected
+column through JDBC, and constructing the complete in-memory result. The
+PostgreSQL values therefore include localhost client/server communication,
+result transfer, and JDBC decoding; no estimated loopback cost is subtracted.
+The SQLite values include its embedded JDBC/native boundary and the same column
+decoding and row materialization.
+
+XSB and Souffle generate Datalog query programs and compile them into native
+code. XSB consults its generated program and facts before reading XSB's internal
+wall clock. The interval ends after `findall` has materialized every projected
+answer; list counting and process startup/shutdown are outside it. In each pass
+process, Souffle generates and compiles C++ once per distinct query program.
+Each task pass creates a fresh embedded program instance and calls `loadAll()`
+before the clock, then times `runAll()` with I/O disabled through completion of
+its in-memory `result` relation. Program compilation, process startup, input
+loading, and CSV output are therefore excluded. Bound Souffle programs enable
+its magic-set transform for `result`. All five portable backends consequently
+report `:timing-scope :query-and-materialization` and may be compared under this
+boundary.
+
+Clara and O'Doyle are materialize-all production-rule systems. Bound queries
+would execute the same full closure and filter it afterward, so the runner marks
+those task/system pairs `N/A` instead of implying bound-query optimization.
 
 ## Correctness and measurement contract
 
@@ -170,19 +183,21 @@ heap limit for each Clojure wrapper process. Engine versions were Datalevin
 1.0.2, SQLite 3.51.1, PostgreSQL 18.4 (Homebrew), XSB 5.0.0, Souffle 2.5, Clara
 Rules 0.24.0, and O'Doyle Rules 1.3.1 (configured dependency).
 
-Under the suite's JOB-style protocol, the harness ran one complete warmup pass
-and then one complete measurement pass in the same child JVM. Each displayed
-number is that single measured latency in milliseconds; no repeated samples or
-median are involved. All 53 completed measurements passed their independent
-count oracle, and the cross-system input-digest check passed. Clara completed
-three of its four supported tasks; cyclic TC exhausted its 8 GiB wrapper heap
-during warmup. O'Doyle's four supported tasks exceeded the 60-second
-rule-firing timeout during warmup. A warmup failure has no retained measurement,
-so those cells report `OOM` or `T/O`; unsupported system/task pairs report
-`N/A`. The command exits nonzero when any selected task fails, while preserving
-the diagnostic artifact. The
-[raw EDN artifact](results/2026-08-26-representative.edn) contains every result
-and the full environment metadata.
+All 53 completed measurements passed their independent count oracle, and the
+cross-system input-digest check passed.
+
+The harness ran one complete warmup pass and then one complete measurement pass
+in the same child JVM. Each displayed number is that single measured latency in
+milliseconds.
+
+Clara completed three of its four supported tasks; cyclic TC exhausted its 8 GiB
+wrapper heap during warmup. O'Doyle's four supported tasks exceeded the
+60-second rule-firing timeout during warmup. A warmup failure has no retained
+measurement, so those cells report `OOM` or `T/O`; unsupported system/task pairs
+report `N/A`. The command exits nonzero when any selected task fails, while
+preserving the diagnostic artifact. The [raw EDN
+artifact](results/2026-08-26-representative.edn) contains every result and the
+full environment metadata.
 
 ### Query evaluation and result materialization
 
@@ -270,23 +285,3 @@ Do not combine results with different `:timing-scope` values into a single
 speedup. In particular, do not substitute an external process wall time for the
 internal query-and-materialization interval. Do not compare `tiny` results with
 published scales or silently drop failed or unsupported cells.
-
-## Layout
-
-```text
-openrulebench/
-├── bench.clj
-├── deps.edn
-├── src/openrulebench/
-│   ├── core.clj          # task contract, references, statistics, artifacts
-│   ├── data.clj          # deterministic set-valued generators
-│   ├── runner.clj        # capability-aware process orchestrator
-│   ├── datalevin.clj
-│   ├── sqlite.clj
-│   ├── postgresql.clj
-│   ├── xsb.clj
-│   ├── souffle.clj
-│   ├── clara.clj
-│   └── odoyle.clj
-└── test/openrulebench/
-```
