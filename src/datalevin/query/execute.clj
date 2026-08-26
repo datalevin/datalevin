@@ -92,6 +92,15 @@
 (definterface IProjectedDistinctSink
   (^Object finishResult []))
 
+(defn- tuple->persistent-vector
+  [^objects tuple]
+  ;; PersistentVector/adopt avoids copying the query engine's immutable tuple
+  ;; array, but its adopted array is the vector tail and therefore must not
+  ;; exceed the 32-element branching width.
+  (if (<= (alength tuple) 32)
+    (PersistentVector/adopt tuple)
+    (vec tuple)))
+
 (deftype ProjectedDistinctSink [^ints idxs
                                 ^:unsynchronized-mutable ^HashSet seen
                                 ^:unsynchronized-mutable ^FastList projected
@@ -109,7 +118,7 @@
       (set! lookup nil)
       (dotimes [i size]
         (.cons ^IPersistentCollection result-set
-               (PersistentVector/adopt ^objects (.get tuples i))))
+               (tuple->persistent-vector ^objects (.get tuples i))))
       (.clear tuples)
       (set! projected nil)
       result-set))
@@ -1816,24 +1825,32 @@
 
 (defn- collect-exact-unique-relation
   [rels symbols]
-  (when (= 1 (count rels))
-    (let [rel          (first rels)
-          symbols      (vec symbols)
-          expected     (zipmap symbols (range))
-          tuples ^List (:tuples rel)]
-      (when (and (= expected (:attrs rel))
-                 (r/unique-on? rel symbols)
-                 tuples)
-        (let [size       (.size tuples)
-              result-set (sp/new-spillable-set
-                           nil {:initial-capacity size})]
-          ;; The rule engine already proved both physical projection and
-          ;; distinctness. Convert its tuples directly to the public query
-          ;; representation instead of cloning and deduplicating them again.
-          (dotimes [i size]
-            (.cons ^IPersistentCollection result-set
-                   (PersistentVector/adopt ^objects (.get tuples i))))
-          result-set)))))
+  (let [symbols  (vec symbols)
+        relevant (filterv
+                   (fn [rel]
+                     (some #(contains? (:attrs rel) %) symbols))
+                   rels)]
+    (when (= 1 (count relevant))
+      (let [rel          (first relevant)
+            expected     (zipmap symbols (range))
+            tuples ^List (:tuples rel)]
+        (when (and (= expected (:attrs rel))
+                   (r/unique-on? rel symbols)
+                   tuples
+                   ;; Symbol-disjoint relations only affect a set-valued
+                   ;; projection through emptiness. Nonempty ones may be
+                   ;; ignored without changing the public result.
+                   (every? r/rel-not-empty rels))
+          (let [size       (.size tuples)
+                result-set (sp/new-spillable-set
+                             nil {:initial-capacity size})]
+            ;; The rule engine already proved both physical projection and
+            ;; distinctness. Convert its tuples directly to the public query
+            ;; representation instead of cloning and deduplicating them again.
+            (dotimes [i size]
+              (.cons ^IPersistentCollection result-set
+                     (tuple->persistent-vector ^objects (.get tuples i))))
+            result-set))))))
 
 (defn collect
   [{:keys [result-set rels] :as context} symbols]

@@ -51,6 +51,15 @@
                 (fn [^long id]
                   (when (odd? id) [:ignored (* id 10)])))))))
 
+(deftest immutable-tuple-vector-conversion-test
+  (let [convert @(ns-resolve 'datalevin.query.execute
+                             'tuple->persistent-vector)]
+    (doseq [width [0 2 32 33 64]
+            :let [values (vec (range width))
+                  result (convert (object-array values))]]
+      (is (vector? result))
+      (is (= values result)))))
+
 (deftest nested-rule-set-boundary-test
   (let [domain (range 12)
         facts  (vec
@@ -342,6 +351,9 @@
         bf-query     '[:find [?b ...]
                        :in $ % ?start
                        :where (tc ?start ?b)]
+        bf-pair-query '[:find ?start ?b
+                        :in $ % ?start
+                        :where (tc ?start ?b)]
         fb-query     '[:find [?a ...]
                        :in $ % ?end
                        :where (tc ?a ?end)]]
@@ -360,6 +372,9 @@
                          (d/db conn) left-rules))))
         (is (= #{1 2 3 4}
                (set (d/q bf-query (d/db conn) left-rules :node/one)))))
+      (testing "the existing singleton binding remains available to projection"
+        (is (= #{[1 1] [1 2] [1 3] [1 4]}
+               (d/q bf-pair-query (d/db conn) left-rules 1))))
 
       (testing "the full closure uses the dense set-valued specialization"
         (let [full (set (d/q ff-query (d/db conn) left-rules))]
@@ -398,9 +413,13 @@
                          (d/db conn) constrained-rules 1)))))
 
       (testing "the specialized result agrees with the general fixed point"
-        (is (= (set (d/q bf-query (d/db conn) left-rules 1))
-               (binding [rules/*bound-transitive-eav?* false]
-                 (set (d/q bf-query (d/db fallback) left-rules 1)))))
+        (let [specialized (set (d/q bf-query (d/db conn) left-rules 1))]
+          (is (= specialized
+                 (binding [rules/*bound-transitive-saturation?* false]
+                   (set (d/q bf-query (d/db conn) left-rules 1)))))
+          (is (= specialized
+                 (binding [rules/*bound-transitive-eav?* false]
+                   (set (d/q bf-query (d/db fallback) left-rules 1))))))
         (is (= (set (d/q fb-query (d/db conn) left-rules 4))
                (binding [rules/*bound-transitive-eav?* false]
                  (set (d/q fb-query (d/db fallback) left-rules 4))))))

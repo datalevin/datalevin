@@ -163,6 +163,49 @@ map, and finishes the existing work queue from that map. A minimum observation
 and frontier size keeps sparse or short traversals on point probes; pending
 transaction overlays always remain on the transaction-aware indexed path.
 
+#### Exact output-domain saturation
+
+Forward traversal on a committed database has an additional exact stopping
+condition. For a rule whose recursive edge is `[?from :edge ?to]`, every answer
+for the free `?to` argument must be one of the distinct stored values of
+`:edge`. Datalevin obtains that value-domain size from the AVE index. The work
+queue already emits each reachable value at most once, so when the number of
+emitted answers equals the complete value-domain size, the two sets must be
+equal. Expanding the remaining queue cannot add another answer and evaluation
+stops immediately.
+
+The test uses the number of emitted answers, not the traversal's seen set. The
+bound start node is placed in the seen set to terminate cycles, but ordinary
+transitive closure may return it only after a non-empty path reaches it again.
+Consequently the saturation check preserves the distinction between transitive
+and reflexive-transitive closure.
+
+The optimization is deliberately limited to committed, forward EAV traversal:
+
+- In reverse traversal the answers are entities, while AVE cardinality counts
+  distinct attribute values, so it is not an answer-domain bound.
+- A pending `db-with` overlay may contain values not reflected in the stored
+  AVE cardinality, so transaction-aware traversal runs to queue exhaustion.
+- Other recursive shapes and non-ref attributes continue through their existing
+  specialized or general evaluators.
+
+This is an exact completion proof rather than a selectivity estimate. It is
+most effective for a dense strongly connected component that reaches the whole
+attribute value domain; sparse traversals normally finish before saturation and
+retain their indexed-probe behavior.
+
+#### Singleton-bound result elision
+
+The bound endpoint is already represented by a literal or by a singleton input
+relation. The specialized traversal therefore materializes only the newly
+reached free value instead of repeating the bound value in every two-column
+tuple. It marks that one-column relation as unique, allowing terminal result
+collection to consume it directly. If the query projects the bound variable as
+well, its existing singleton input relation still supplies the value. A
+symbol-disjoint input relation may be skipped during set-valued projection only
+after it is known to be nonempty, since an empty input must still make the
+result empty.
+
 ### Demand-driven synchronized closure
 
 A singleton-bound binary predicate can also avoid whole-relation evaluation for

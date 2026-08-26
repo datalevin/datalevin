@@ -170,7 +170,7 @@ heap limit for each Clojure wrapper process. Engine versions were Datalevin
 1.0.2, SQLite 3.51.1, PostgreSQL 18.4 (Homebrew), XSB 5.0.0, Souffle 2.5, Clara
 Rules 0.24.0, and O'Doyle Rules 1.3.1 (configured dependency).
 
-Following the JOB benchmark protocol, the harness ran one complete warmup pass
+Under the suite's JOB-style protocol, the harness ran one complete warmup pass
 and then one complete measurement pass in the same child JVM. Each displayed
 number is that single measured latency in milliseconds; no repeated samples or
 median are involved. All 53 completed measurements passed their independent
@@ -189,21 +189,24 @@ and the full environment metadata.
 Data generation, loading, index construction, and statistics collection are
 outside these timed regions. XSB program consultation and Souffle C++
 generation/compilation are outside as described above. Among completed results,
-Datalevin has the lowest latency in five cells, Souffle in three, PostgreSQL in
-one, and XSB in one.
+Datalevin has the lowest latency in nine cells and Souffle in one. Datalevin
+leads all three selected TC comparisons, including cyclic TC bound-first at
+4.76 ms versus 6.62 ms for the fastest alternative, PostgreSQL. Across the six
+selected TC and Join1 comparisons, Datalevin leads five; the remaining Join1
+`b2` free/free cell is 211.71 ms for Datalevin versus 168.56 ms for Souffle.
 
 | Task | Result rows | Datalevin (ms) | SQLite (ms) | PostgreSQL (ms) | XSB (ms) | Souffle (ms) | Clara Rules (ms) | O'Doyle Rules (ms) |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| TC 50K cyclic FF | 1,000,000 | 1,088.08 | 41,139.60 | 6,754.27 | 3,923.00 | 1,063.83 | OOM | T/O |
-| TC 50K acyclic FF | 473,807 | 467.09 | 9,006.51 | 1,956.23 | 953.00 | 374.91 | 50,353.55 | T/O |
-| TC 50K cyclic BF | 1,000 | 20.60 | 7.27 | 6.83 | 1,733.00 | 1,032.41 | N/A | N/A |
-| SG 6K cyclic FF | 869,923 | 374.34 | 4,714.67 | 1,871.00 | 119,938.00 | 820.24 | 41,712.99 | T/O |
-| SG 6K acyclic FF | 215,263 | 70.64 | 473.35 | 190.88 | 14,564.00 | 90.52 | 3,125.44 | T/O |
-| SG 6K acyclic BF | 533 | 6.07 | 23.32 | 7.72 | 264.00 | 89.41 | N/A | N/A |
-| SG 6K acyclic FB | 541 | 4.79 | 20.78 | 7.04 | 5,863.00 | 123.71 | N/A | N/A |
-| Join1 50K b1 FF | 1,000,000 | 499.43 | 20,320.87 | 9,683.01 | 1,800.00 | 2,443.55 | N/A | N/A |
-| Join1 50K b2 FF | 917,680 | 234.55 | 668.85 | 760.13 | 172.00 | 171.78 | N/A | N/A |
-| Join1 50K a BF | 1,000 | 134.30 | 879.86 | 416.03 | 126.00 | 39,664.07 | N/A | N/A |
+| TC 50K cyclic FF | 1,000,000 | 501.13 | 41,827.70 | 6,423.95 | 3,634.00 | 1,035.65 | OOM | T/O |
+| TC 50K acyclic FF | 473,807 | 64.65 | 8,899.15 | 1,703.13 | 950.00 | 373.22 | 50,461.65 | T/O |
+| TC 50K cyclic BF | 1,000 | 4.76 | 7.28 | 6.62 | 1,805.00 | 1,008.25 | N/A | N/A |
+| SG 6K cyclic FF | 869,923 | 347.51 | 4,678.69 | 1,807.57 | 122,323.00 | 811.48 | 41,489.81 | T/O |
+| SG 6K acyclic FF | 215,263 | 33.82 | 471.29 | 184.53 | 14,559.00 | 88.44 | 3,132.56 | T/O |
+| SG 6K acyclic BF | 533 | 6.03 | 23.75 | 7.31 | 264.00 | 83.83 | N/A | N/A |
+| SG 6K acyclic FB | 541 | 4.63 | 21.23 | 6.73 | 5,627.00 | 117.15 | N/A | N/A |
+| Join1 50K b1 FF | 1,000,000 | 183.21 | 20,288.17 | 9,449.25 | 1,856.00 | 2,350.56 | N/A | N/A |
+| Join1 50K b2 FF | 917,680 | 211.71 | 663.79 | 788.52 | 173.00 | 168.56 | N/A | N/A |
+| Join1 50K a BF | 1,000 | 12.36 | 875.29 | 399.79 | 125.00 | 36,869.99 | N/A | N/A |
 
 ## Running the suite
 

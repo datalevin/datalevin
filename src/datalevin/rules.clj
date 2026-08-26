@@ -1211,6 +1211,7 @@
 (def ^:dynamic *magic-rewrite?* true)
 (def ^:dynamic *bound-transitive-eav?* true)
 (def ^:dynamic *bound-transitive-full-scan?* true)
+(def ^:dynamic *bound-transitive-saturation?* true)
 (def ^:dynamic *full-transitive-eav?* true)
 (def ^:dynamic *bound-linear-eav?* true)
 (def ^:dynamic *full-linear-eav?* true)
@@ -1837,11 +1838,19 @@
   (db/ref-attr-adjacency database attr bound-side))
 
 (defn- add-bound-transitive-tuple!
-  [^FastList tuples ^long bound-idx bound-value ^long neighbor]
-  (.add tuples
-        (if (zero? bound-idx)
-          (object-array [bound-value (Long/valueOf neighbor)])
-          (object-array [(Long/valueOf neighbor) bound-value]))))
+  [^FastList tuples ^long neighbor]
+  (.add tuples (object-array [(Long/valueOf neighbor)])))
+
+(defn- singleton-bound-binary-result
+  [^FastList tuples args ^long bound-idx]
+  (let [free-var (nth args (bit-xor (int bound-idx) 1))]
+    ;; The specialized plan is admitted only when the other argument is free
+    ;; and the bound argument has exactly one value in the surrounding
+    ;; context. Keep that singleton in its existing input relation and expose
+    ;; only the genuinely new column, avoiding a redundant one-key join.
+    (r/with-unique-key
+      (r/relation! {free-var 0} tuples)
+      [free-var])))
 
 (defn- dense-transitive-frontier?
   [^long pending ^long observations ^long observed-edges ^long scan-count]
@@ -1855,9 +1864,14 @@
            (* bound-transitive-full-scan-work-ratio
               (double scan-count)))))
 
+(defn- transitive-output-saturated?
+  [^FastList tuples output-domain-size]
+  (and output-domain-size
+       (= (.size tuples) (long output-domain-size))))
+
 (defn- eval-bound-transitive-eav
-  [{:keys [^DB db attr ^long entity-pos head-vars
-           ^long bound-idx bound-value traversal-value pending-tx?]}
+  [{:keys [^DB db attr ^long entity-pos
+           ^long bound-idx traversal-value pending-tx?]}
    args]
   (let [bound-side     (if (= bound-idx entity-pos) :e :v)
         traversal-node (long traversal-value)
@@ -1866,6 +1880,14 @@
         cycle?         (boolean-array 1)
         full-scan?     (and *bound-transitive-full-scan?*
                             (db/local-ref-attr-adjacency? db))
+        output-domain-size
+        (when (and *bound-transitive-saturation?*
+                   (not pending-tx?)
+                   (= bound-side :e))
+          ;; In the forward EAV direction every possible answer is a distinct
+          ;; value of this attribute. Once all such values have been reached,
+          ;; expanding the remaining queue cannot add an answer.
+          (long (db/-cardinality db attr)))
         tuples         (FastList.)]
     (.add seen traversal-node)
     (.add queue traversal-node)
@@ -1888,12 +1910,10 @@
                   (if (== neighbor traversal-node)
                     (when-not (aget cycle? 0)
                       (aset cycle? 0 true)
-                      (add-bound-transitive-tuple!
-                        tuples bound-idx bound-value neighbor))
+                      (add-bound-transitive-tuple! tuples neighbor))
                     (when (.add seen neighbor)
                       (.add queue neighbor)
-                      (add-bound-transitive-tuple!
-                        tuples bound-idx bound-value neighbor))))))
+                      (add-bound-transitive-tuple! tuples neighbor))))))
             (recur (inc cursor)))))
       (let [switch-cursor
             ;; Indexed probes are optimal while the reachable subgraph is
@@ -1903,7 +1923,9 @@
             (loop [cursor        0
                    observed-edges 0
                    scan-count    -1]
-              (if (>= cursor (.size queue))
+              (if (or (>= cursor (.size queue))
+                      (transitive-output-saturated?
+                        tuples output-domain-size))
                 -1
                 (let [node      (.get queue (int cursor))
                       pattern   (if (= bound-side :e)
@@ -1918,12 +1940,10 @@
                         (if (== neighbor traversal-node)
                           (when-not (aget cycle? 0)
                             (aset cycle? 0 true)
-                            (add-bound-transitive-tuple!
-                              tuples bound-idx bound-value neighbor))
+                            (add-bound-transitive-tuple! tuples neighbor))
                           (when (.add seen neighbor)
                             (.add queue neighbor)
-                            (add-bound-transitive-tuple!
-                              tuples bound-idx bound-value neighbor))))))
+                            (add-bound-transitive-tuple! tuples neighbor))))))
                   (let [next-cursor   (inc cursor)
                         observations  next-cursor
                         observed      (+ observed-edges n)
@@ -1936,16 +1956,25 @@
                         scan-count'   (if (and eligible? (neg? scan-count))
                                         (long (db/-count db [nil attr nil]))
                                         scan-count)]
-                    (if (and eligible?
-                             (dense-transitive-frontier?
-                               pending observations observed scan-count'))
+                    (cond
+                      (transitive-output-saturated?
+                        tuples output-domain-size)
+                      -1
+
+                      (and eligible?
+                           (dense-transitive-frontier?
+                             pending observations observed scan-count'))
                       next-cursor
+
+                      :else
                       (recur next-cursor observed scan-count'))))))]
         (when-not (neg? (long switch-cursor))
           (let [adjacency ^LongObjectHashMap
                 (build-long-eav-adjacency db attr bound-side)]
             (loop [cursor (long switch-cursor)]
-              (when (< cursor (.size queue))
+              (when (and (< cursor (.size queue))
+                         (not (transitive-output-saturated?
+                                tuples output-domain-size)))
                 (let [node   (.get queue (int cursor))
                       values ^LongArrayList (.get adjacency node)]
                   (when values
@@ -1954,16 +1983,12 @@
                         (if (== neighbor traversal-node)
                           (when-not (aget cycle? 0)
                             (aset cycle? 0 true)
-                            (add-bound-transitive-tuple!
-                              tuples bound-idx bound-value neighbor))
+                            (add-bound-transitive-tuple! tuples neighbor))
                           (when (.add seen neighbor)
                             (.add queue neighbor)
-                            (add-bound-transitive-tuple!
-                              tuples bound-idx bound-value neighbor))))))
+                            (add-bound-transitive-tuple! tuples neighbor))))))
                   (recur (inc cursor)))))))))
-    (map-rule-result
-      (r/relation! (zipmap head-vars (range)) tuples)
-      head-vars args)))
+    (singleton-bound-binary-result tuples args bound-idx)))
 
 (def ^:private ^:const bound-linear-full-scan-threshold 128)
 
