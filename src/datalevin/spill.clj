@@ -27,6 +27,7 @@
    [com.sun.management GarbageCollectionNotificationInfo]
    [org.eclipse.collections.impl.map.mutable UnifiedMap]
    [org.eclipse.collections.impl.list.mutable FastList]
+   [datalevin.utl UniqueVectorSet]
    [clojure.lang ISeq IPersistentVector MapEntry Util Sequential
     IPersistentMap MapEquivalence IObj IFn IPersistentSet]))
 
@@ -70,8 +71,8 @@
 
 (defonce cleaner (delay (Cleaner/create)))
 
-(defn- ^Cleaner spill-cleaner
-  []
+(defn- spill-cleaner
+  ^Cleaner []
   @cleaner)
 
 (defn- close-spill-resources!
@@ -547,7 +548,7 @@
                              (volatile! nil)
                              (volatile! nil)
                              nil)]
-     (doseq [[k v] m] (assoc smap k v))
+     (doseq [[k v] m] (.put smap k v))
      smap)))
 
 (nippy/extend-freeze
@@ -661,3 +662,8 @@
   :spillable-set
   [^DataInput in]
   (new-spillable-set (nippy/thaw-from-in! in)))
+
+(nippy/extend-freeze
+  UniqueVectorSet :spillable-set
+  [^UniqueVectorSet x ^DataOutput out]
+  (nippy/freeze-to-out! out (into #{} x)))

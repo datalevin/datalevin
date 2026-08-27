@@ -101,9 +101,9 @@ The following systems are tested:
 ### Timing
 
 Timing for every backend excludes data generation, database/session
-construction, fact loading, index construction, and statistics collection from
-the timed region. Each timed region evaluates the rules/query and fully
-materializes its answer.
+construction, fact loading, base-relation index construction, and statistics
+collection from the timed region. Each timed region evaluates the rules/query
+and fully materializes its answer.
 
 SQLite and PostgreSQL use the same end-to-end JDBC consumption contract. Their
 timers include statement creation, query execution, reading every projected
@@ -183,8 +183,12 @@ heap limit for each Clojure wrapper process. Engine versions were Datalevin
 1.0.2, SQLite 3.51.1, PostgreSQL 18.4 (Homebrew), XSB 5.0.0, Souffle 2.5, Clara
 Rules 0.24.0, and O'Doyle Rules 1.3.1 (configured dependency).
 
-All 53 completed measurements passed their independent count oracle, and the
-cross-system input-digest check passed.
+All 53 completed measurements in the seven-system comparison artifact passed
+their independent count oracle, and its cross-system input-digest check passed.
+After the terminal unique-result materialization optimization, Datalevin alone
+was rerun over the same ordered ten tasks. All ten refreshed measurements passed
+their oracle, and their input digests and result counts exactly match the
+original comparison run.
 
 The harness ran one complete warmup pass and then one complete measurement pass
 in the same child JVM. Each displayed number is that single measured latency in
@@ -195,33 +199,42 @@ wrapper heap during warmup. O'Doyle's four supported tasks exceeded the
 60-second rule-firing timeout during warmup. A warmup failure has no retained
 measurement, so those cells report `OOM` or `T/O`; unsupported system/task pairs
 report `N/A`. The command exits nonzero when any selected task fails, while
-preserving the diagnostic artifact. The [raw EDN
-artifact](results/2026-08-26-representative.edn) contains every result and the
-full environment metadata.
+preserving the diagnostic artifact. The [seven-system raw EDN
+artifact](results/2026-08-26-representative.edn) contains every original result
+and the full environment metadata.
+
+The table below retains the six unchanged alternative-system columns from that
+artifact. Its Datalevin column comes from the [raw Datalevin refresh
+artifact](results/2026-08-26-datalevin-optimized.edn), run on the same machine
+with the same JVM and Clojure versions, task order, 8 GiB heap, timing boundary,
+and one complete warmup pass followed by one complete measurement pass. The
+alternatives were not rerun because neither their implementations nor the
+inputs or protocol changed; keeping their measurements also avoids presenting
+ordinary run-to-run variation as an alternative-system change.
 
 ### Query evaluation and result materialization
 
-Data generation, loading, index construction, and statistics collection are
-outside these timed regions. XSB program consultation and Souffle C++
-generation/compilation are outside as described above. Among completed results,
-Datalevin has the lowest latency in nine cells and Souffle in one. Datalevin
-leads all three selected TC comparisons, including cyclic TC bound-first at
-4.76 ms versus 6.62 ms for the fastest alternative, PostgreSQL. Across the six
-selected TC and Join1 comparisons, Datalevin leads five; the remaining Join1
-`b2` free/free cell is 211.71 ms for Datalevin versus 168.56 ms for Souffle.
+Data generation, loading, base-relation index construction, and statistics
+collection are outside these timed regions. XSB program consultation and
+Souffle C++ generation/compilation are outside as described above. Datalevin has
+the lowest latency in all ten displayed cells. It leads all three selected TC
+comparisons, including cyclic TC bound-first at 4.95 ms versus 6.62 ms for the
+fastest alternative, PostgreSQL. Join1 `b2` free/free is 117.70 ms versus
+168.56 ms for Souffle: Datalevin's latency is 30.2% lower. Its 917,680 result
+vectors and membership index are fully materialized inside the timed region.
 
 | Task | Result rows | Datalevin (ms) | SQLite (ms) | PostgreSQL (ms) | XSB (ms) | Souffle (ms) | Clara Rules (ms) | O'Doyle Rules (ms) |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| TC 50K cyclic FF | 1,000,000 | 501.13 | 41,827.70 | 6,423.95 | 3,634.00 | 1,035.65 | OOM | T/O |
-| TC 50K acyclic FF | 473,807 | 64.65 | 8,899.15 | 1,703.13 | 950.00 | 373.22 | 50,461.65 | T/O |
-| TC 50K cyclic BF | 1,000 | 4.76 | 7.28 | 6.62 | 1,805.00 | 1,008.25 | N/A | N/A |
-| SG 6K cyclic FF | 869,923 | 347.51 | 4,678.69 | 1,807.57 | 122,323.00 | 811.48 | 41,489.81 | T/O |
-| SG 6K acyclic FF | 215,263 | 33.82 | 471.29 | 184.53 | 14,559.00 | 88.44 | 3,132.56 | T/O |
-| SG 6K acyclic BF | 533 | 6.03 | 23.75 | 7.31 | 264.00 | 83.83 | N/A | N/A |
-| SG 6K acyclic FB | 541 | 4.63 | 21.23 | 6.73 | 5,627.00 | 117.15 | N/A | N/A |
-| Join1 50K b1 FF | 1,000,000 | 183.21 | 20,288.17 | 9,449.25 | 1,856.00 | 2,350.56 | N/A | N/A |
-| Join1 50K b2 FF | 917,680 | 211.71 | 663.79 | 788.52 | 173.00 | 168.56 | N/A | N/A |
-| Join1 50K a BF | 1,000 | 12.36 | 875.29 | 399.79 | 125.00 | 36,869.99 | N/A | N/A |
+| TC 50K cyclic FF | 1,000,000 | 70.73 | 41,827.70 | 6,423.95 | 3,634.00 | 1,035.65 | OOM | T/O |
+| TC 50K acyclic FF | 473,807 | 46.27 | 8,899.15 | 1,703.13 | 950.00 | 373.22 | 50,461.65 | T/O |
+| TC 50K cyclic BF | 1,000 | 4.95 | 7.28 | 6.62 | 1,805.00 | 1,008.25 | N/A | N/A |
+| SG 6K cyclic FF | 869,923 | 70.96 | 4,678.69 | 1,807.57 | 122,323.00 | 811.48 | 41,489.81 | T/O |
+| SG 6K acyclic FF | 215,263 | 19.69 | 471.29 | 184.53 | 14,559.00 | 88.44 | 3,132.56 | T/O |
+| SG 6K acyclic BF | 533 | 6.09 | 23.75 | 7.31 | 264.00 | 83.83 | N/A | N/A |
+| SG 6K acyclic FB | 541 | 4.74 | 21.23 | 6.73 | 5,627.00 | 117.15 | N/A | N/A |
+| Join1 50K b1 FF | 1,000,000 | 87.86 | 20,288.17 | 9,449.25 | 1,856.00 | 2,350.56 | N/A | N/A |
+| Join1 50K b2 FF | 917,680 | 117.70 | 663.79 | 788.52 | 173.00 | 168.56 | N/A | N/A |
+| Join1 50K a BF | 1,000 | 12.42 | 875.29 | 399.79 | 125.00 | 36,869.99 | N/A | N/A |
 
 ## Running the suite
 

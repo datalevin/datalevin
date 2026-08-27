@@ -43,6 +43,7 @@
    [java.util Collection Comparator HashSet List PriorityQueue]
    [datalevin.parser BindTuple Constant FindColl FindRel FindScalar FindTuple
     Pattern Variable]
+   [datalevin.utl UniqueVectorSet]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
 (def ^:private plugin-inputs qo/plugin-inputs)
@@ -101,24 +102,52 @@
     (PersistentVector/adopt tuple)
     (vec tuple)))
 
+(def ^:private ^:const unique-vector-set-max-size 2000000)
+
+(defn- spillable-result-set
+  [^List tuples]
+  (let [size       (.size tuples)
+        result-set (sp/new-spillable-set nil {:initial-capacity size})]
+    (dotimes [i size]
+      (.cons ^IPersistentCollection result-set
+             (tuple->persistent-vector ^objects (.get tuples i))))
+    result-set))
+
+(defn- indexed-unique-result-set
+  [^List tuples]
+  (let [size (.size tuples)
+        runtime (Runtime/getRuntime)
+        used (- (.totalMemory runtime) (.freeMemory runtime))
+        headroom (- (.maxMemory runtime) used)
+        index-bytes (when (UniqueVectorSet/supportsSize size)
+                      (UniqueVectorSet/estimatedIndexBytes size))
+        materialization-bytes
+        (when index-bytes
+          (+ (long index-bytes) (* 32 (long size))))
+        direct? (and (<= size unique-vector-set-max-size)
+                     materialization-bytes
+                     (>= headroom (* 2 (long materialization-bytes))))]
+    (if direct?
+      (UniqueVectorSet/fromUniqueTuples tuples)
+      (spillable-result-set tuples))))
+
 (deftype ProjectedDistinctSink [^ints idxs
                                 ^:unsynchronized-mutable ^HashSet seen
                                 ^:unsynchronized-mutable ^FastList projected
                                 ^:unsynchronized-mutable ^objects scratch
                                 ^:unsynchronized-mutable lookup
+                                ^:unsynchronized-mutable ^boolean distinct-batch
+                                ^:unsynchronized-mutable ^boolean proven-unique
                                 ^longs input-count]
   IProjectedDistinctSink
   (finishResult [_]
     (let [^FastList tuples projected
-          size             (.size tuples)
-          result-set       (sp/new-spillable-set
-                             nil {:initial-capacity size})]
+          result-set       (if proven-unique
+                             (indexed-unique-result-set tuples)
+                             (spillable-result-set tuples))]
       (set! seen nil)
       (set! scratch nil)
       (set! lookup nil)
-      (dotimes [i size]
-        (.cons ^IPersistentCollection result-set
-               (tuple->persistent-vector ^objects (.get tuples i))))
       (.clear tuples)
       (set! projected nil)
       result-set))
@@ -126,9 +155,15 @@
   qplan/ITerminalDistinctSink
   (-add-distinct-batch! [_ tuples]
     (let [^List tuples tuples
-          n            (.size tuples)]
+          n            (.size tuples)
+          previous     (aget input-count 0)]
       (aset-long input-count 0
-                 (unchecked-add (aget input-count 0) (long n)))
+                 (unchecked-add previous (long n)))
+      (when (or distinct-batch (pos? previous))
+        ;; Each batch is internally distinct, but separate batches are not
+        ;; guaranteed disjoint. The spillable fallback performs the union.
+        (set! proven-unique (boolean false)))
+      (set! distinct-batch (boolean true))
       (if (zero? (.size projected))
         (if (instance? FastList tuples)
           (set! projected tuples)
@@ -140,6 +175,8 @@
   (add [_ tuple]
     (let [^objects tuple tuple
           width          (alength idxs)]
+      (when distinct-batch
+        (set! proven-unique (boolean false)))
       (aset-long input-count 0 (unchecked-inc (aget input-count 0)))
       (if (= 1 width)
         (let [value (aget tuple (aget idxs 0))]
@@ -173,7 +210,8 @@
     {:sink        (ProjectedDistinctSink.
                     idxs (HashSet.) (FastList.)
                     (when (< 1 width) (object-array width))
-                    (when (< 1 width) (r/array-lookup)) input-count)
+                    (when (< 1 width) (r/array-lookup))
+                    (boolean false) (boolean true) input-count)
      :input-count input-count}))
 
 (defn- terminal-collection-symbols
@@ -1841,15 +1879,11 @@
                    ;; projection through emptiness. Nonempty ones may be
                    ;; ignored without changing the public result.
                    (every? r/rel-not-empty rels))
-          (let [size       (.size tuples)
-                result-set (sp/new-spillable-set
-                             nil {:initial-capacity size})]
+          (let [result-set (indexed-unique-result-set tuples)]
             ;; The rule engine already proved both physical projection and
             ;; distinctness. Convert its tuples directly to the public query
-            ;; representation instead of cloning and deduplicating them again.
-            (dotimes [i size]
-              (.cons ^IPersistentCollection result-set
-                     (tuple->persistent-vector ^objects (.get tuples i))))
+            ;; representation and build its lookup index without rechecking
+            ;; duplicate keys.
             result-set))))))
 
 (defn collect

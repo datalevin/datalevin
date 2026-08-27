@@ -102,6 +102,39 @@ tables, and final result rather than by the potentially much larger number of
 proof paths. The optimization does not imply constant memory: a genuinely large
 distinct result must still be represented.
 
+### Eager materialization of proven-unique results
+
+Some terminal rule operators produce a relation that is already exactly
+projected to the query's find variables and proven unique. Re-inserting every
+tuple into a general-purpose set would repeat duplicate detection after that
+proof. This is especially expensive for large binary results because it adds a
+hash-table probe and possible vector equality checks for every public result
+row.
+
+For one proven-unique terminal batch, the collector adopts each immutable tuple
+array as a persistent vector and builds a Clojure-`hasheq`-based open-addressed
+membership index without comparing tuples for duplicates again. Both the
+vectors and the entire index are built before the query returns, so this remains
+full result materialization rather than a lazy result or benchmark-only counting
+path. The returned value retains normal Clojure set equality, lookup, sequence, metadata,
+and serialization behavior; operations that change it fall back to a regular
+persistent set.
+
+The shortcut is disabled as soon as ordinary sink input is mixed with a direct
+batch or more than one batch is received, because independently distinct
+batches need not be disjoint. Results above two million rows, results whose
+index estimate exceeds available heap headroom, and paths without an exact
+uniqueness proof use the existing spillable set collector.
+
+In the 2026-08-26 OpenRuleBench representative protocol (one complete warmup
+pass followed by one complete measurement pass), Join1 `b2` free/free produced
+917,680 verified rows in 117.70 ms, down from the previously retained 211.71 ms.
+The unchanged Soufflé result is 168.56 ms, so the refreshed Datalevin latency is
+30.2% lower while retaining the same query-and-full-materialization timing
+scope. The [full comparison artifact](../benchmarks/openrulebench/results/2026-08-26-representative.edn)
+and [Datalevin refresh artifact](../benchmarks/openrulebench/results/2026-08-26-datalevin-optimized.edn)
+record the two protocol runs.
+
 Bound rule calls benefit as well. If a lookup proves and elides a bound head
 variable, the evaluator safely reattaches a singleton seed before projecting
 the rule result. When several rule clauses are otherwise ready, the late-clause
@@ -267,7 +300,9 @@ that leverage rules. Datalevin is compared favorably with neo4j
 
 The portable [OpenRuleBench suite](../benchmarks/openrulebench) includes
 recursive rule task TC and SG, as well as Join1, a non-recursive rule DAG
-designed to expose intermediate-result growth.
+designed to expose intermediate-result growth. Its published timing boundary
+includes construction of the complete public result set, including the eager
+membership index described above.
 
 ## References
 

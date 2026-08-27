@@ -14,7 +14,9 @@
    [datalevin.core :as d]
    [datalevin.query.execute]
    [datalevin.query.plan :as qplan]
-   [datalevin.rules :as rules]))
+   [datalevin.rules :as rules])
+  (:import
+   [datalevin.utl UniqueVectorSet]))
 
 (deftest flat-function-tuple-binding-test
   (testing "ignored elements and new variables bind directly"
@@ -223,6 +225,11 @@
                          {:db/id 11 :c4 [20]}])
       (let [explain (d/explain {:run? true} query (d/db conn) rules)]
         (is (= #{[1 20] [1 21]} (:result explain)))
+        (is (instance? UniqueVectorSet (:result explain)))
+        (is (= [1 20] (get (:result explain) [1 20])))
+        (is (= #{[1 20] [1 21] [2 22]}
+               (conj (:result explain) [2 22])))
+        (is (= #{[1 21]} (disj (:result explain) [1 20])))
         (is (= {:mode          :projected-distinct
                 :symbols       '[?x ?y]
                 :input-tuples  3
