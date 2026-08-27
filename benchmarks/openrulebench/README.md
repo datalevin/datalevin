@@ -1,8 +1,8 @@
 # Portable OpenRuleBench tasks
 
-This directory contains subset of benchmark tasks derived from
+This directory contains a subset of benchmark tasks derived from
 [OpenRuleBench](https://www3.cs.stonybrook.edu/~kifer/TechReports/OpenRuleBench09.pdf),
-testing rule resolution performance.
+testing logic rule resolution performance.
 
 ## Task set
 
@@ -109,22 +109,21 @@ SQLite and PostgreSQL use the same end-to-end JDBC consumption contract. Their
 timers include statement creation, query execution, reading every projected
 column through JDBC, and constructing the complete in-memory result. The
 PostgreSQL values therefore include localhost client/server communication,
-result transfer, and JDBC decoding; no estimated loopback cost is subtracted.
-The SQLite values include its embedded JDBC/native boundary and the same column
-decoding and row materialization.
+result transfer, and JDBC decoding. The SQLite values include its embedded
+JDBC/native boundary and the same column decoding and row materialization.
 
-XSB and Souffle generate Datalog query programs and compile them into native
-code. XSB consults its generated program and facts before reading XSB's internal
-wall clock. The interval ends after `findall` has materialized every projected
-answer; list counting and process startup/shutdown are outside it. In each pass
-process, Souffle generates and compiles C++ once per distinct query program.
-Each task pass creates a fresh embedded program instance and calls `loadAll()`
-before the clock, then times `runAll()` with I/O disabled through completion of
-its in-memory `result` relation. Program compilation, process startup, input
-loading, and CSV output are therefore excluded. Bound Souffle programs enable
-its magic-set transform for `result`. All five portable backends consequently
-report `:timing-scope :query-and-materialization` and may be compared under this
-boundary.
+XSB and Souffle generate Datalog query programs and compile them into SLG-WAM
+bytecode and native code, respectively. XSB consults its generated program and
+facts before reading XSB's internal wall clock. The interval ends after
+`findall` has materialized every projected answer; list counting and process
+startup/shutdown are outside it. In each pass process, Souffle generates and
+compiles C++ once per distinct query program. Each task pass creates a fresh
+embedded program instance and calls `loadAll()` before the clock, then times
+`runAll()` with I/O disabled through completion of its in-memory `result`
+relation. Program compilation, process startup, input loading, and CSV output
+are therefore excluded. Bound Souffle programs enable its magic-set transform
+for `result`. All five portable backends consequently report `:timing-scope
+:query-and-materialization` and may be compared under this boundary.
 
 Clara and O'Doyle are materialize-all production-rule systems. Bound queries
 would execute the same full closure and filter it afterward, so the runner marks
@@ -140,10 +139,9 @@ those task/system pairs `N/A` instead of implying bound-query optimization.
   Generation is deterministic.
 - Base relations and derived answers have set semantics in every backend. SQL
   plans use duplicate elimination at relation boundaries.
-- Each displayed value is the single retained measurement, not a median or
-  average of repeated executions. The EDN artifact records it as `:time-ms`, as
-  the sole value in `:samples-ms`, and with `:reported-statistic
-  :single-measurement`.
+- Each displayed value is the single retained measurement. The EDN artifact
+  records it as `:time-ms`, as the sole value in `:samples-ms`, and with
+  `:reported-statistic :single-measurement`.
 - Every measured answer count must equal an independent reference: BitSet
   transitive closure for TC, a delta work queue for SG, and BitSet relation
   composition for Join1.
@@ -166,7 +164,8 @@ The orchestrator requests an 8 GiB maximum heap for every Clojure wrapper.
 Every child records its effective maximum heap. PostgreSQL-server, XSB, and
 Souffle resource limits are external and are reported separately.
 
-Setup is excluded because the benchmark is about inference/query execution.
+All 53 completed measurements passed their independent count oracle, and the
+cross-system input-digest check passed.
 
 ## Representative results (2026-08-26)
 
@@ -174,8 +173,7 @@ This published-scale matrix covers all three portable families without the
 explicitly designated Join1 `a` free/free stress cell. It contains the four
 canonical free/free recursive tasks, cyclic TC bound-first, both bound
 orientations of acyclic SG, free/free Join1 `b1` and `b2`, and the top-level
-Join1 `a` bound-first query. It is not a substitute for the complete 42-task
-matrix.
+Join1 `a` bound-first query.
 
 The run used a 12-core Apple M3 Pro MacBook Pro (6 performance and 6 efficiency
 cores), 36 GiB RAM, macOS 26.6.2, OpenJDK 21.0.11, Clojure 1.12.5, and an 8 GiB
@@ -183,58 +181,40 @@ heap limit for each Clojure wrapper process. Engine versions were Datalevin
 1.0.2, SQLite 3.51.1, PostgreSQL 18.4 (Homebrew), XSB 5.0.0, Souffle 2.5, Clara
 Rules 0.24.0, and O'Doyle Rules 1.3.1 (configured dependency).
 
-All 53 completed measurements in the seven-system comparison artifact passed
-their independent count oracle, and its cross-system input-digest check passed.
-After the terminal unique-result materialization optimization, Datalevin alone
-was rerun over the same ordered ten tasks. All ten refreshed measurements passed
-their oracle, and their input digests and result counts exactly match the
-original comparison run.
-
 The harness ran one complete warmup pass and then one complete measurement pass
 in the same child JVM. Each displayed number is that single measured latency in
 milliseconds.
 
 Clara completed three of its four supported tasks; cyclic TC exhausted its 8 GiB
-wrapper heap during warmup. O'Doyle's four supported tasks exceeded the
-60-second rule-firing timeout during warmup. A warmup failure has no retained
-measurement, so those cells report `OOM` or `T/O`; unsupported system/task pairs
-report `N/A`. The command exits nonzero when any selected task fails, while
-preserving the diagnostic artifact. The [seven-system raw EDN
-artifact](results/2026-08-26-representative.edn) contains every original result
-and the full environment metadata.
+wrapper heap during warmup.
 
-The table below retains the six unchanged alternative-system columns from that
-artifact. Its Datalevin column comes from the [raw Datalevin refresh
-artifact](results/2026-08-26-datalevin-optimized.edn), run on the same machine
-with the same JVM and Clojure versions, task order, 8 GiB heap, timing boundary,
-and one complete warmup pass followed by one complete measurement pass. The
-alternatives were not rerun because neither their implementations nor the
-inputs or protocol changed; keeping their measurements also avoids presenting
-ordinary run-to-run variation as an alternative-system change.
+O'Doyle's four supported tasks exceeded the 60-second rule-firing timeout during
+warmup. A warmup failure has no retained measurement, so those cells report
+`OOM` or `T/O`; unsupported system/task pairs report `N/A`. The command exits
+nonzero when any selected task fails, while preserving the diagnostic artifact.
+The [raw seven-system EDN artifact](results/2026-08-26-representative.edn)
+contains all measurements, environment metadata, and rerun provenance.
 
 ### Query evaluation and result materialization
 
-Data generation, loading, base-relation index construction, and statistics
-collection are outside these timed regions. XSB program consultation and
-Souffle C++ generation/compilation are outside as described above. Datalevin has
-the lowest latency in all ten displayed cells. It leads all three selected TC
-comparisons, including cyclic TC bound-first at 4.95 ms versus 6.62 ms for the
-fastest alternative, PostgreSQL. Join1 `b2` free/free is 117.70 ms versus
-168.56 ms for Souffle: Datalevin's latency is 30.2% lower. Its 917,680 result
-vectors and membership index are fully materialized inside the timed region.
+Datalevin has the lowest latency in all ten displayed cells. It leads all three
+selected TC comparisons, including cyclic TC bound-first at 4.71 ms versus 7.04
+ms for the fastest alternative, SQLite. Join1 `b2` free/free is 124.85 ms versus
+174.95 ms for Souffle and 174.00 ms for XSB: Datalevin's latency is 28.6% lower
+than Souffle's.
 
 | Task | Result rows | Datalevin (ms) | SQLite (ms) | PostgreSQL (ms) | XSB (ms) | Souffle (ms) | Clara Rules (ms) | O'Doyle Rules (ms) |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| TC 50K cyclic FF | 1,000,000 | 70.73 | 41,827.70 | 6,423.95 | 3,634.00 | 1,035.65 | OOM | T/O |
-| TC 50K acyclic FF | 473,807 | 46.27 | 8,899.15 | 1,703.13 | 950.00 | 373.22 | 50,461.65 | T/O |
-| TC 50K cyclic BF | 1,000 | 4.95 | 7.28 | 6.62 | 1,805.00 | 1,008.25 | N/A | N/A |
-| SG 6K cyclic FF | 869,923 | 70.96 | 4,678.69 | 1,807.57 | 122,323.00 | 811.48 | 41,489.81 | T/O |
-| SG 6K acyclic FF | 215,263 | 19.69 | 471.29 | 184.53 | 14,559.00 | 88.44 | 3,132.56 | T/O |
-| SG 6K acyclic BF | 533 | 6.09 | 23.75 | 7.31 | 264.00 | 83.83 | N/A | N/A |
-| SG 6K acyclic FB | 541 | 4.74 | 21.23 | 6.73 | 5,627.00 | 117.15 | N/A | N/A |
-| Join1 50K b1 FF | 1,000,000 | 87.86 | 20,288.17 | 9,449.25 | 1,856.00 | 2,350.56 | N/A | N/A |
-| Join1 50K b2 FF | 917,680 | 117.70 | 663.79 | 788.52 | 173.00 | 168.56 | N/A | N/A |
-| Join1 50K a BF | 1,000 | 12.42 | 875.29 | 399.79 | 125.00 | 36,869.99 | N/A | N/A |
+| TC 50K cyclic FF | 1,000,000 | 67.88 | 42,093.77 | 6,518.89 | 3,607.00 | 1,030.36 | OOM | T/O |
+| TC 50K acyclic FF | 473,807 | 45.20 | 8,906.87 | 2,380.37 | 961.00 | 371.93 | 51,376.65 | T/O |
+| TC 50K cyclic BF | 1,000 | 4.71 | 7.04 | 7.48 | 1,699.00 | 1,046.78 | N/A | N/A |
+| SG 6K cyclic FF | 869,923 | 70.23 | 4,621.70 | 2,223.42 | 118,252.00 | 865.82 | 42,834.25 | T/O |
+| SG 6K acyclic FF | 215,263 | 18.91 | 459.55 | 192.21 | 14,438.00 | 89.43 | 3,391.57 | T/O |
+| SG 6K acyclic BF | 533 | 6.09 | 23.92 | 7.28 | 262.00 | 86.09 | N/A | N/A |
+| SG 6K acyclic FB | 541 | 4.66 | 20.31 | 6.81 | 5,606.00 | 121.00 | N/A | N/A |
+| Join1 50K b1 FF | 1,000,000 | 86.65 | 20,282.64 | 10,249.66 | 1,795.00 | 2,367.18 | N/A | N/A |
+| Join1 50K b2 FF | 917,680 | 124.85 | 670.34 | 835.83 | 174.00 | 174.95 | N/A | N/A |
+| Join1 50K a BF | 1,000 | 12.01 | 911.26 | 395.24 | 120.00 | 36,721.96 | N/A | N/A |
 
 ## Running the suite
 

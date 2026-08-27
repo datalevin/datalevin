@@ -116,9 +116,9 @@ array as a persistent vector and builds a Clojure-`hasheq`-based open-addressed
 membership index without comparing tuples for duplicates again. Both the
 vectors and the entire index are built before the query returns, so this remains
 full result materialization rather than a lazy result or benchmark-only counting
-path. The returned value retains normal Clojure set equality, lookup, sequence, metadata,
-and serialization behavior; operations that change it fall back to a regular
-persistent set.
+path. The returned value retains normal Clojure set equality, lookup, sequence,
+metadata, and serialization behavior; operations that change it fall back to a
+regular persistent set.
 
 The shortcut is disabled as soon as ordinary sink input is mixed with a direct
 batch or more than one batch is received, because independently distinct
@@ -128,12 +128,11 @@ uniqueness proof use the existing spillable set collector.
 
 In the 2026-08-26 OpenRuleBench representative protocol (one complete warmup
 pass followed by one complete measurement pass), Join1 `b2` free/free produced
-917,680 verified rows in 117.70 ms, down from the previously retained 211.71 ms.
-The unchanged Soufflé result is 168.56 ms, so the refreshed Datalevin latency is
-30.2% lower while retaining the same query-and-full-materialization timing
-scope. The [full comparison artifact](../benchmarks/openrulebench/results/2026-08-26-representative.edn)
-and [Datalevin refresh artifact](../benchmarks/openrulebench/results/2026-08-26-datalevin-optimized.edn)
-record the two protocol runs.
+917,680 verified rows in 124.85 ms, down from the previously retained 211.71 ms.
+In the same fresh seven-system comparison, Soufflé took 174.95 ms, so
+Datalevin's latency is 28.6% lower while retaining the same
+query-and-full-materialization timing scope. The [comparison artifact](../benchmarks/openrulebench/results/2026-08-26-representative.edn)
+records the protocol run and XSB launcher repair provenance.
 
 Bound rule calls benefit as well. If a lookup proves and elides a bound head
 variable, the evaluator safely reattaches a singleton seed before projecting
