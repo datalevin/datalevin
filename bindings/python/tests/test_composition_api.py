@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datalevin import (
     Keyword,
+    LookupRef,
+    PatchOp,
     PullAttr,
     PullNested,
     PullSelector,
@@ -49,6 +51,9 @@ def test_query_builder_is_pure_typed_and_composable() -> None:
 
 def test_query_strings_are_literals_unless_explicitly_typed() -> None:
     entity = q.var("e")
+    presence = q.pattern(entity, "user/id")
+    assert presence.to_form() == (entity, q.kw("user/id"))
+
     clause = q.datom(entity, "label", "?literal")
     form = clause.to_form()
 
@@ -178,4 +183,54 @@ def test_transaction_builder_produces_typed_immutable_forms() -> None:
         [":db.fn/cas", -1, ":person/age", 42, 43],
         [":db.fn/retractAttribute", -1, ":person/nickname"],
         [":db/ensure", ":person/valid?", -1],
+    ]
+
+
+def test_transaction_context_specific_forms_are_explicit_and_composable() -> None:
+    eve = tx.lookup_ref("user/handle", "eve")
+    patches = [
+        tx.patch_set(["profile", "status"], ":literal"),
+        tx.patch_unset(q.kw("obsolete")),
+        tx.patch_update(["tags"], "conj", ":literal"),
+        tx.patch_update(q.kw("profile"), q.kw("assoc"), "role", "admin"),
+    ]
+    transaction = tx.data(
+        tx.entity(
+            -1,
+            {
+                "user/handle": "alice",
+                "user/friend": eve,
+                "user/child": tx.entity(-2, {"user/handle": "child"}),
+                "user/data": {"set": ":literal"},
+            },
+        ),
+        tx.patch_idoc(eve, "user/profile", patches),
+        tx.invoke("people/inc-age", eve),
+    )
+
+    assert isinstance(eve, LookupRef)
+    assert eve.as_data() == [":user/handle", "eve"]
+    assert all(isinstance(patch, PatchOp) for patch in patches)
+    assert patches[0].to_form()[2] == ":literal"
+    assert patches[2].to_form()[3] == ":literal"
+    assert transaction.as_data() == [
+        {
+            ":user/handle": "alice",
+            ":user/friend": [":user/handle", "eve"],
+            ":user/child": {":user/handle": "child", ":db/id": -2},
+            ":user/data": {"set": ":literal"},
+            ":db/id": -1,
+        },
+        [
+            ":db.fn/patchIdoc",
+            [":user/handle", "eve"],
+            ":user/profile",
+            [
+                [":set", ["profile", "status"], ":literal"],
+                [":unset", ":obsolete"],
+                [":update", ["tags"], ":conj", ":literal"],
+                [":update", ":profile", ":assoc", "role", "admin"],
+            ],
+        ],
+        [":people/inc-age", [":user/handle", "eve"]],
     ]

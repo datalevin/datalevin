@@ -6,12 +6,15 @@ import { test } from "node:test";
 
 import {
   Keyword,
+  LookupRef,
+  PatchOp,
   PullAttr,
   PullNested,
   PullSelector,
   Query,
   TxData,
   connect,
+  idocAttr,
   q,
   schemaAttr,
   tx
@@ -70,6 +73,12 @@ test("query forms are pure, typed, and composable", () => {
 
 test("plain strings stay literals unless explicitly typed", () => {
   const entity = q.var("e");
+  const presence = q.pattern(entity, "user/id").toForm();
+  assert.equal(presence.length, 2);
+  assert.equal(presence[0], entity);
+  assert.equal(presence[1] instanceof Keyword, true);
+  assert.equal(presence[1].toString(), ":user/id");
+
   const clause = q.datom(entity, "label", "?literal").toForm();
   assert.equal(clause[1] instanceof Keyword, true);
   assert.equal(clause[2], "?literal");
@@ -153,6 +162,56 @@ test("transaction forms use explicit operation and attribute keywords", () => {
   ]);
 });
 
+test("transaction context-specific forms are explicit and composable", () => {
+  const eve = tx.lookupRef("user/handle", "eve");
+  const patches = [
+    tx.patchSet(["profile", "status"], ":literal"),
+    tx.patchUnset(q.kw("obsolete")),
+    tx.patchUpdate(["tags"], "conj", ":literal"),
+    tx.patchUpdate(q.kw("profile"), q.kw("assoc"), "role", "admin")
+  ];
+  const transaction = tx.data(
+    tx.entity(-1, {
+      "user/handle": "alice",
+      "user/friend": eve,
+      "user/child": tx.entity(-2, { "user/handle": "child" }),
+      "user/data": { set: ":literal" }
+    }),
+    tx.patchIdoc(eve, "user/profile", patches),
+    tx.invoke("people/inc-age", eve)
+  );
+
+  assert.equal(eve instanceof LookupRef, true);
+  assert.deepEqual(eve.asData(), [":user/handle", "eve"]);
+  assert.equal(patches.every((patch) => patch instanceof PatchOp), true);
+  assert.equal(patches[0].toForm()[2], ":literal");
+  assert.equal(patches[2].toForm()[3], ":literal");
+  assert.deepEqual(transaction.asData(), [
+    new Map([
+      [":user/handle", "alice"],
+      [":user/friend", [":user/handle", "eve"]],
+      [":user/child", new Map([
+        [":user/handle", "child"],
+        [":db/id", -2]
+      ])],
+      [":user/data", { set: ":literal" }],
+      [":db/id", -1]
+    ]),
+    [
+      ":db.fn/patchIdoc",
+      [":user/handle", "eve"],
+      ":user/profile",
+      [
+        [":set", ["profile", "status"], ":literal"],
+        [":unset", ":obsolete"],
+        [":update", ["tags"], ":conj", ":literal"],
+        [":update", ":profile", ":assoc", "role", "admin"]
+      ]
+    ],
+    [":people/inc-age", [":user/handle", "eve"]]
+  ]);
+});
+
 test(
   "composed queries and transactions execute through the JVM bridge",
   { skip: !runtimeAvailable, timeout: 30000 },
@@ -165,7 +224,14 @@ test(
         ":person/label": schemaAttr({ valueType: ":db.type/string" }),
         ":person/nickname": schemaAttr({ valueType: ":db.type/string" }),
         ":person/status": schemaAttr({ valueType: ":db.type/keyword" }),
-        ":person/friend": schemaAttr({ valueType: ":db.type/ref" })
+        ":person/friend": schemaAttr({ valueType: ":db.type/ref" }),
+        ":user/handle": schemaAttr({
+          valueType: ":db.type/string",
+          unique: ":db.unique/identity"
+        }),
+        ":user/name": schemaAttr({ valueType: ":db.type/string" }),
+        ":user/friend": schemaAttr({ valueType: ":db.type/ref" }),
+        ":user/profile": idocAttr({ format: "edn" })
       }
     });
 
@@ -333,6 +399,86 @@ test(
         where: [q.rule("adult", entity, name, minimum)]
       });
       assert.deepEqual(await conn.query(byRule, q.rules(adultRule), 30), ["Ada"]);
+
+      const eve = tx.lookupRef("user/handle", "eve");
+      await conn.transact(tx.data(
+        tx.entity(-10, {
+          "user/handle": "eve",
+          "user/name": "Eve",
+          "user/profile": {
+            status: "active",
+            profile: { age: 30 },
+            tags: ["a"],
+            obsolete: true
+          }
+        })
+      ));
+      await conn.transact(tx.data(
+        tx.entity(-11, {
+          "user/handle": "alice",
+          "user/friend": eve
+        }),
+        tx.entity(-12, {
+          "user/handle": "parent",
+          "user/friend": tx.entity(-13, {
+            "user/handle": "child",
+            "user/name": "Child"
+          })
+        }),
+        tx.add(eve, "user/name", "Evelyn")
+      ));
+      await conn.transact(tx.data(
+        tx.patchIdoc(eve, "user/profile", [
+          tx.patchSet(["status"], ":literal"),
+          tx.patchUpdate(["profile"], "assoc", "role", "admin"),
+          tx.patchUpdate(["profile", "age"], "inc"),
+          tx.patchUpdate(["tags"], "conj", ":literal"),
+          tx.patchUnset(["obsolete"])
+        ])
+      ));
+
+      const user = q.var("user");
+      const handle = q.var("handle");
+      const friend = q.var("friend");
+      const friendHandle = q.var("friend_handle");
+      const owner = q.var("owner");
+      const friendByOwner = q.query({
+        find: q.scalar(friendHandle),
+        inputs: [q.DB, owner],
+        where: [
+          q.datom(user, "user/handle", owner),
+          q.datom(user, "user/friend", friend),
+          q.datom(friend, "user/handle", friendHandle)
+        ]
+      });
+      assert.equal(await conn.query(friendByOwner, "alice"), "eve");
+      assert.equal(await conn.query(friendByOwner, "parent"), "child");
+
+      const userName = q.var("user_name");
+      const nameByHandle = q.query({
+        find: q.scalar(userName),
+        inputs: [q.DB, handle],
+        where: [
+          q.datom(user, "user/handle", handle),
+          q.datom(user, "user/name", userName)
+        ]
+      });
+      assert.equal(await conn.query(nameByHandle, "eve"), "Evelyn");
+
+      const profile = q.var("profile");
+      const profileByHandle = q.query({
+        find: q.scalar(profile),
+        inputs: [q.DB, handle],
+        where: [
+          q.datom(user, "user/handle", handle),
+          q.datom(user, "user/profile", profile)
+        ]
+      });
+      assert.deepEqual(await conn.query(profileByHandle, "eve"), {
+        status: ":literal",
+        profile: { age: 31n, role: "admin" },
+        tags: ["a", ":literal"]
+      });
     } finally {
       await conn.close();
     }

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from datalevin import connect, q, schema_attr, tx
+from datalevin import connect, idoc_attr, q, schema_attr, tx
 
 
 pytestmark = pytest.mark.usefixtures("require_runtime")
@@ -16,6 +16,12 @@ def test_composed_queries_and_transactions_use_the_current_jvm_bridge(tmp_path) 
         ":person/nickname": schema_attr(value_type=":db.type/string"),
         ":person/status": schema_attr(value_type=":db.type/keyword"),
         ":person/friend": schema_attr(value_type=":db.type/ref"),
+        ":user/handle": schema_attr(
+            value_type=":db.type/string", unique=":db.unique/identity"
+        ),
+        ":user/name": schema_attr(value_type=":db.type/string"),
+        ":user/friend": schema_attr(value_type=":db.type/ref"),
+        ":user/profile": idoc_attr(format="edn"),
     }
     with connect(str(tmp_path / "composition"), schema=schema) as conn:
         conn.transact(
@@ -194,3 +200,99 @@ def test_composed_queries_and_transactions_use_the_current_jvm_bridge(tmp_path) 
             where=[q.rule("adult", entity, name, minimum)],
         )
         assert conn.query(by_rule, q.rules(adult_rule), 30) == ["Ada"]
+
+        eve = tx.lookup_ref("user/handle", "eve")
+        conn.transact(
+            tx.data(
+                tx.entity(
+                    -10,
+                    {
+                        "user/handle": "eve",
+                        "user/name": "Eve",
+                        "user/profile": {
+                            "status": "active",
+                            "profile": {"age": 30},
+                            "tags": ["a"],
+                            "obsolete": True,
+                        },
+                    },
+                )
+            )
+        )
+        conn.transact(
+            tx.data(
+                tx.entity(
+                    -11,
+                    {"user/handle": "alice", "user/friend": eve},
+                ),
+                tx.entity(
+                    -12,
+                    {
+                        "user/handle": "parent",
+                        "user/friend": tx.entity(
+                            -13,
+                            {"user/handle": "child", "user/name": "Child"},
+                        ),
+                    },
+                ),
+                tx.add(eve, "user/name", "Evelyn"),
+            )
+        )
+        conn.transact(
+            tx.data(
+                tx.patch_idoc(
+                    eve,
+                    "user/profile",
+                    [
+                        tx.patch_set(["status"], ":literal"),
+                        tx.patch_update(["profile"], "assoc", "role", "admin"),
+                        tx.patch_update(["profile", "age"], "inc"),
+                        tx.patch_update(["tags"], "conj", ":literal"),
+                        tx.patch_unset(["obsolete"]),
+                    ],
+                )
+            )
+        )
+
+        user = q.var("user")
+        handle = q.var("handle")
+        friend = q.var("friend")
+        friend_handle = q.var("friend_handle")
+        owner = q.var("owner")
+        friend_by_owner = q.query(
+            find=q.scalar(friend_handle),
+            inputs=[q.DB, owner],
+            where=[
+                q.datom(user, "user/handle", owner),
+                q.datom(user, "user/friend", friend),
+                q.datom(friend, "user/handle", friend_handle),
+            ],
+        )
+        assert conn.query(friend_by_owner, "alice") == "eve"
+        assert conn.query(friend_by_owner, "parent") == "child"
+
+        user_name = q.var("user_name")
+        name_by_handle = q.query(
+            find=q.scalar(user_name),
+            inputs=[q.DB, handle],
+            where=[
+                q.datom(user, "user/handle", handle),
+                q.datom(user, "user/name", user_name),
+            ],
+        )
+        assert conn.query(name_by_handle, "eve") == "Evelyn"
+
+        profile = q.var("profile")
+        profile_by_handle = q.query(
+            find=q.scalar(profile),
+            inputs=[q.DB, handle],
+            where=[
+                q.datom(user, "user/handle", handle),
+                q.datom(user, "user/profile", profile),
+            ],
+        )
+        assert conn.query(profile_by_handle, "eve") == {
+            "status": ":literal",
+            "profile": {"age": 31, "role": "admin"},
+            "tags": ["a", ":literal"],
+        }

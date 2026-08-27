@@ -1,7 +1,15 @@
-import { Form, RawForm, formData } from "./form.js";
+import { Form, Keyword, RawForm, formData } from "./form.js";
 import { kw } from "./query.js";
 
 const MISSING = Symbol("missing");
+const PATCH_UPDATE_OPERATIONS = new Set([
+  "conj",
+  "merge",
+  "assoc",
+  "dissoc",
+  "inc",
+  "dec"
+]);
 
 function attribute(value) {
   return typeof value === "string" ? kw(value) : value;
@@ -9,6 +17,60 @@ function attribute(value) {
 
 function callable(value) {
   return typeof value === "string" ? kw(value) : value;
+}
+
+function patchPath(path) {
+  const vectorPath = Array.isArray(path);
+  if (!vectorPath && typeof path !== "string" && !(path instanceof Keyword)) {
+    throw new TypeError(
+      "An idoc patch path must be a string, keyword, or array."
+    );
+  }
+  const segments = vectorPath ? path : [path];
+  if (segments.length === 0) {
+    throw new TypeError("An idoc patch path must not be empty.");
+  }
+  for (const segment of segments) {
+    const integer = (
+      (typeof segment === "number" && Number.isSafeInteger(segment))
+      || typeof segment === "bigint"
+    );
+    if (integer) {
+      if (segment < 0) {
+        throw new TypeError("An idoc patch path index must be non-negative.");
+      }
+      continue;
+    }
+    if (segment instanceof Keyword) {
+      if (segment.name === "?" || segment.name === "*") {
+        throw new TypeError("An idoc patch path does not allow keyword wildcards.");
+      }
+      continue;
+    }
+    if (typeof segment !== "string") {
+      throw new TypeError(
+        "Idoc patch path segments must be strings, keywords, or integers."
+      );
+    }
+  }
+  return vectorPath ? Object.freeze([...path]) : path;
+}
+
+function patchUpdateOperation(operation) {
+  const result = typeof operation === "string" ? kw(operation) : operation;
+  if (!(result instanceof Keyword)) {
+    throw new TypeError(
+      "An idoc patch update operation must be a keyword or keyword name."
+    );
+  }
+  if (!PATCH_UPDATE_OPERATIONS.has(result.name)) {
+    throw new TypeError(
+      `Unknown idoc patch update operation ${result}; expected one of ${
+        [...PATCH_UPDATE_OPERATIONS].sort().join(", ")
+      }.`
+    );
+  }
+  return result;
 }
 
 export class TxItem extends Form {
@@ -20,6 +82,39 @@ export class TxItem extends Form {
 
   toForm() {
     return this.form;
+  }
+}
+
+export class LookupRef extends Form {
+  constructor(attributeName, value) {
+    super();
+    this.attribute = attribute(attributeName);
+    this.value = value;
+    Object.freeze(this);
+  }
+
+  toForm() {
+    return [this.attribute, this.value];
+  }
+
+  asData() {
+    return formData(this);
+  }
+}
+
+export class PatchOp extends Form {
+  constructor(form) {
+    super();
+    this.form = Object.freeze([...form]);
+    Object.freeze(this);
+  }
+
+  toForm() {
+    return this.form;
+  }
+
+  asData() {
+    return formData(this);
   }
 }
 
@@ -70,6 +165,10 @@ export function entity(dbId = null, attrs = {}) {
   return new TxItem(result);
 }
 
+export function lookupRef(attributeName, value) {
+  return new LookupRef(attributeName, value);
+}
+
 export function add(entityId, attributeName, value) {
   return new TxItem([kw("db/add"), entityId, attribute(attributeName), value]);
 }
@@ -102,8 +201,29 @@ export function call(functionValue, ...args) {
   return new TxItem([kw("db.fn/call"), callable(functionValue), ...args]);
 }
 
+export function invoke(functionValue, ...args) {
+  return new TxItem([callable(functionValue), ...args]);
+}
+
 export function ensure(predicateValue, ...args) {
   return new TxItem([kw("db/ensure"), callable(predicateValue), ...args]);
+}
+
+export function patchSet(path, value) {
+  return new PatchOp([kw("set"), patchPath(path), value]);
+}
+
+export function patchUnset(path) {
+  return new PatchOp([kw("unset"), patchPath(path)]);
+}
+
+export function patchUpdate(path, operation, ...args) {
+  return new PatchOp([
+    kw("update"),
+    patchPath(path),
+    patchUpdateOperation(operation),
+    ...args
+  ]);
 }
 
 export function patchIdoc(
@@ -112,6 +232,9 @@ export function patchIdoc(
   patch,
   { oldValue = MISSING } = {}
 ) {
+  if (patch instanceof PatchOp) {
+    patch = [patch];
+  }
   const result = [kw("db.fn/patchIdoc"), entityId, attribute(attributeName)];
   if (oldValue !== MISSING) {
     result.push(oldValue);
@@ -132,7 +255,12 @@ export const tx = Object.freeze({
   data,
   ensure,
   entity,
+  invoke,
+  lookupRef,
   patchIdoc,
+  patchSet,
+  patchUnset,
+  patchUpdate,
   raw,
   retract,
   retractAttribute,

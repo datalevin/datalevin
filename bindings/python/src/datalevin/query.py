@@ -543,10 +543,21 @@ def pull(variable, pattern, *, from_source=None) -> Expression:
     return Expression(tuple(items))
 
 
-def datom(entity, attribute, value, *, from_source=None) -> Clause:
+def pattern(*terms, from_source=None) -> Clause:
+    """Build a variable-arity database pattern with a typed attribute term."""
+
+    if not terms:
+        raise ValueError("A database pattern requires at least one term.")
     items = [] if from_source is None else [from_source]
-    items.extend((entity, _attribute(attribute), value))
+    normalized = list(terms)
+    if len(normalized) >= 2:
+        normalized[1] = _attribute(normalized[1])
+    items.extend(normalized)
     return Clause(tuple(items))
+
+
+def datom(entity, attribute, value, *, from_source=None) -> Clause:
+    return pattern(entity, attribute, value, from_source=from_source)
 
 
 def predicate(function, *args) -> Clause:
@@ -692,6 +703,7 @@ __all__ = [
     "not_join",
     "or_",
     "or_join",
+    "pattern",
     "predicate",
     "pull",
     "pull_attr",

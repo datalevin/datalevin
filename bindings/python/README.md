@@ -88,10 +88,12 @@ names = conn.query(people, 18) if adults_only else conn.query(people)
 ```
 
 Available helpers cover relation, collection, tuple, and scalar finds;
-aggregates and pull expressions; datom, predicate, function-binding, rule, and
-logical clauses; input bindings, joins, rules, ordering, limits, offsets, and
-timeouts. `q.raw()` is the structured escape hatch for new syntax; its tokens
-must use `q.kw()` and `q.sym()` explicitly.
+aggregates and pull expressions; database patterns, predicate,
+function-binding, rule, and logical clauses; input bindings, joins, rules,
+ordering, limits, offsets, and timeouts. `q.datom(e, a, v)` is the common
+three-term form; use variable-arity `q.pattern(e, a)` for a presence pattern or
+other supported database-pattern arity. `q.raw()` remains the structured escape
+hatch for new syntax; its tokens must use `q.kw()` and `q.sym()` explicitly.
 
 ### Composing pull selectors
 
@@ -130,8 +132,38 @@ report = conn.transact(tx.data(items))
 
 In addition to entity maps, `tx` provides `add`, `retract`,
 `retract_attribute`, `retract_entity`, `compare_and_swap`/`cas`, `call`,
-`ensure`, and `patch_idoc` operations. Values remain ordinary Python data;
-`q.kw()` and `q.sym()` add explicit Datalevin tokens where needed.
+`ensure`, and `patch_idoc` operations. Context-sensitive transaction values
+also have explicit builders:
+
+```python
+eve = tx.lookup_ref("user/handle", "eve")
+
+report = conn.transact(tx.data(
+    tx.entity(-1, {
+        "user/handle": "alice",
+        "user/friend": eve,
+        "user/child": tx.entity(-2, {"user/handle": "child"}),
+    }),
+    tx.patch_idoc(eve, "user/profile", [
+        tx.patch_set(["status"], "active"),
+        tx.patch_update(["visits"], "inc"),
+        tx.patch_unset(["obsolete"]),
+    ]),
+    tx.invoke("people/audit", eve),
+))
+```
+
+`lookup_ref` turns only its attribute into a keyword, so its lookup value stays
+literal. The patch builders similarly type only `set`, `unset`, `update`, and
+the update operation; paths, assigned values, and update arguments stay
+ordinary Python values. `invoke` emits the direct form for a transaction
+function installed under a database ident, while `call` emits
+`:db.fn/call`.
+
+Wrap a nested entity map in `tx.entity(...)`, as above. A plain nested
+dictionary with ordinary string keys remains data; the builder does not
+recursively convert it into an entity. More generally, values remain ordinary
+Python data; `q.kw()` and `q.sym()` add explicit Datalevin tokens where needed.
 
 ## Data Style
 
@@ -605,6 +637,13 @@ python -m venv .venv
 pip install -e '.[dev]'
 pytest
 ```
+
+The test suite also executes every case selected by the active release in the
+sibling `dtlvtest` golden spec. It discovers `../dtlvtest` automatically; set
+`DTLVTEST_ROOT=/path/to/dtlvtest` for a checkout elsewhere. The conformance
+adapter reads `spec/manifest.edn`, preserves EDN keyword and symbol types, and
+lowers each dataset, transaction, and query through the typed Python builders.
+The test is skipped only when no `dtlvtest` checkout is available.
 
 `vendor-jar` builds a platform-specific runtime jar for the current build host
 by default. To keep the cross-platform native payloads, pass

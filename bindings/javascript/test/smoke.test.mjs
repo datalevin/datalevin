@@ -38,11 +38,13 @@ import {
   newSearchEngine,
   newVectorIndex,
   openKv,
+  q,
   reIndex,
   schemaAttr,
   searchDomain,
   searchIndexWriter,
   transactAsync,
+  tx,
   txEntity,
   txRetract,
   unaccentTokenFilter,
@@ -128,6 +130,13 @@ test(
 
     try {
       await conn.transact([[":db.fn/call", txDescriptor, "Ada"]]);
+      await conn.transact(tx.data(
+        tx.entity(-100, {
+          "db/ident": q.kw("person/bootstrap"),
+          "db/udf": txDescriptor
+        })
+      ));
+      await conn.transact(tx.data(tx.invoke("person/bootstrap", "Ada")));
       await conn.transact([{ ":db/id": -1, ":name": "Bob", ":score": 3 }]);
       await conn.transact([{ ":db/id": -2, ":guarded-score": 11 }]);
       await assert.rejects(

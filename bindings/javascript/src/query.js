@@ -575,10 +575,29 @@ export function pull(variableValue, pattern, { source: sourceValue = null } = {}
   return new Expression(items);
 }
 
-export function datom(entity, attributeName, value, { source: sourceValue = null } = {}) {
+function databasePattern(sourceValue, terms) {
+  if (terms.length === 0) {
+    throw new TypeError("A database pattern requires at least one term.");
+  }
   const items = sourceValue === null || sourceValue === undefined ? [] : [sourceValue];
-  items.push(entity, attribute(attributeName), value);
+  const normalized = [...terms];
+  if (normalized.length >= 2) {
+    normalized[1] = attribute(normalized[1]);
+  }
+  items.push(...normalized);
   return new Clause(items);
+}
+
+export function pattern(...terms) {
+  return databasePattern(null, terms);
+}
+
+export function patternFrom(sourceValue, ...terms) {
+  return databasePattern(sourceValue, terms);
+}
+
+export function datom(entity, attributeName, value, { source: sourceValue = null } = {}) {
+  return databasePattern(sourceValue, [entity, attributeName, value]);
 }
 
 export function predicate(functionName, ...args) {
@@ -738,6 +757,8 @@ export const q = Object.freeze({
   orFrom,
   orJoin,
   orJoinFrom,
+  pattern,
+  patternFrom,
   predicate,
   pull,
   pullAttr,

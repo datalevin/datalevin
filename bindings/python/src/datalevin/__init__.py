@@ -85,7 +85,7 @@ from .search import (
     unaccent_token_filter,
 )
 from .udf import UdfRegistry, create_udf_registry, udf_descriptor
-from .transaction import TxData
+from .transaction import LookupRef, PatchOp, TxData
 from .vector import VectorIndex
 
 __all__ = [
@@ -100,6 +100,7 @@ __all__ = [
     "KV",
     "KVTransaction",
     "Keyword",
+    "LookupRef",
     "LlamaEmbedder",
     "LlamaGenerator",
     "SearchEngine",
@@ -110,6 +111,7 @@ __all__ = [
     "PullAttr",
     "PullNested",
     "PullSelector",
+    "PatchOp",
     "UdfRegistry",
     "Symbol",
     "TxData",

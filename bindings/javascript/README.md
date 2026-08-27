@@ -93,10 +93,12 @@ const names = adultsOnly
 ```
 
 Available helpers cover relation, collection, tuple, and scalar finds;
-aggregates and pull expressions; datom, predicate, function-binding, rule, and
-logical clauses; input bindings, joins, rules, ordering, limits, offsets, and
-timeouts. `q.raw()` is the structured escape hatch for new syntax; its tokens
-must use `q.kw()` and `q.sym()` explicitly.
+aggregates and pull expressions; database patterns, predicate,
+function-binding, rule, and logical clauses; input bindings, joins, rules,
+ordering, limits, offsets, and timeouts. `q.datom(e, a, v)` is the common
+three-term form; use variable-arity `q.pattern(e, a)` for a presence pattern or
+other supported database-pattern arity. `q.raw()` remains the structured escape
+hatch for new syntax; its tokens must use `q.kw()` and `q.sym()` explicitly.
 
 ### Composing pull selectors
 
@@ -136,8 +138,38 @@ const report = await conn.transact(tx.data(items));
 
 In addition to entity maps, `tx` provides `add`, `retract`,
 `retractAttribute`, `retractEntity`, `compareAndSwap`/`cas`, `call`, `ensure`,
-and `patchIdoc` operations. Values remain ordinary JavaScript data; `q.kw()`
-and `q.sym()` add explicit Datalevin tokens where needed.
+and `patchIdoc` operations. Context-sensitive transaction values also have
+explicit builders:
+
+```js
+const eve = tx.lookupRef("user/handle", "eve");
+
+const report = await conn.transact(tx.data(
+  tx.entity(-1, {
+    "user/handle": "alice",
+    "user/friend": eve,
+    "user/child": tx.entity(-2, { "user/handle": "child" })
+  }),
+  tx.patchIdoc(eve, "user/profile", [
+    tx.patchSet(["status"], "active"),
+    tx.patchUpdate(["visits"], "inc"),
+    tx.patchUnset(["obsolete"])
+  ]),
+  tx.invoke("people/audit", eve)
+));
+```
+
+`lookupRef` turns only its attribute into a keyword, so its lookup value stays
+literal. The patch builders similarly type only `set`, `unset`, `update`, and
+the update operation; paths, assigned values, and update arguments stay
+ordinary JavaScript values. `invoke` emits the direct form for a transaction
+function installed under a database ident, while `call` emits
+`:db.fn/call`.
+
+Wrap a nested entity object in `tx.entity(...)`, as above. A plain nested
+object with ordinary string keys remains data; the builder does not recursively
+convert it into an entity. More generally, values remain ordinary JavaScript
+data; `q.kw()` and `q.sym()` add explicit Datalevin tokens where needed.
 
 ## Data Style
 
@@ -670,6 +702,13 @@ cd bindings/javascript
 npm install
 npm test
 ```
+
+The test suite also executes every case selected by the active release in the
+sibling `dtlvtest` golden spec. It discovers `../dtlvtest` automatically; set
+`DTLVTEST_ROOT=/path/to/dtlvtest` for a checkout elsewhere. The conformance
+adapter reads `spec/manifest.edn`, preserves EDN keyword and symbol types, and
+lowers each dataset, transaction, and query through the typed JavaScript
+builders. The test is skipped only when no `dtlvtest` checkout is available.
 
 `vendor-jar` builds a platform-specific runtime jar for the current build host
 by default. To keep the cross-platform native payloads, pass:

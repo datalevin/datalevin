@@ -11,8 +11,10 @@ from datalevin import (
     exec_json,
     interop,
     keyword,
+    q,
     schema_attr,
     search_domain,
+    tx,
     udf_descriptor,
 )
 from datalevin._convert import to_python
@@ -151,6 +153,15 @@ def test_udf_registry_supports_inline_query_and_tx_functions(tmp_path) -> None:
         opts={":runtime-opts": {":udf-registry": registry}},
     ) as conn:
         conn.transact([[":db.fn/call", tx_descriptor, "Ada"]])
+        conn.transact(
+            tx.data(
+                tx.entity(
+                    -100,
+                    {"db/ident": q.kw("person/bootstrap"), "db/udf": tx_descriptor},
+                )
+            )
+        )
+        conn.transact(tx.data(tx.invoke("person/bootstrap", "Ada")))
         conn.transact([{":db/id": -1, ":name": "Bob", ":score": 3}])
         conn.transact([{":db/id": -2, ":guarded-score": 11}])
         with pytest.raises(Exception, match="failed pred"):
