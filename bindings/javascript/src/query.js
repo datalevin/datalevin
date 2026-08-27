@@ -1,4 +1,11 @@
-import { DatalogSymbol, Form, Keyword, RawForm, formData } from "./form.js";
+import {
+  DatalogSymbol,
+  Form,
+  Keyword,
+  RawForm,
+  formData,
+  immutableSnapshot
+} from "./form.js";
 
 export function kw(name) {
   return name instanceof Keyword ? name : new Keyword(name);
@@ -61,7 +68,7 @@ function plainObject(value) {
 export class Expression extends Form {
   constructor(form) {
     super();
-    this.form = Object.freeze([...form]);
+    this.form = immutableSnapshot([...form]);
     Object.freeze(this);
   }
 
@@ -73,7 +80,7 @@ export class Expression extends Form {
 export class Clause extends Form {
   constructor(form) {
     super();
-    this.form = Object.freeze([...form]);
+    this.form = immutableSnapshot([...form]);
     Object.freeze(this);
   }
 
@@ -85,7 +92,7 @@ export class Clause extends Form {
 export class Binding extends Form {
   constructor(form) {
     super();
-    this.form = form;
+    this.form = immutableSnapshot(form);
     Object.freeze(this);
   }
 
@@ -97,7 +104,7 @@ export class Binding extends Form {
 export class FindSpec extends Form {
   constructor(form) {
     super();
-    this.form = Object.freeze([...form]);
+    this.form = immutableSnapshot([...form]);
     Object.freeze(this);
   }
 
@@ -108,7 +115,7 @@ export class FindSpec extends Form {
 
 export class Order {
   constructor(term, direction) {
-    this.term = term;
+    this.term = immutableSnapshot(term);
     this.direction = direction;
     Object.freeze(this);
   }
@@ -129,20 +136,20 @@ export class PullAttr extends Form {
 
     const entries = [];
     if (Object.hasOwn(options, "as")) {
-      entries.push(Object.freeze([kw("as"), options.as]));
+      entries.push([kw("as"), options.as]);
     }
     if (Object.hasOwn(options, "limit")) {
-      entries.push(Object.freeze([kw("limit"), pullLimit(options.limit)]));
+      entries.push([kw("limit"), pullLimit(options.limit)]);
     }
     if (Object.hasOwn(options, "default")) {
-      entries.push(Object.freeze([kw("default"), options.default]));
+      entries.push([kw("default"), options.default]);
     }
     if (Object.hasOwn(options, "xform")) {
-      entries.push(Object.freeze([kw("xform"), pullXform(options.xform)]));
+      entries.push([kw("xform"), pullXform(options.xform)]);
     }
 
-    this.attribute = attribute(attributeName);
-    this.options = Object.freeze(entries);
+    this.attribute = immutableSnapshot(attribute(attributeName));
+    this.options = immutableSnapshot(entries);
     Object.freeze(this);
   }
 
@@ -151,7 +158,7 @@ export class PullAttr extends Form {
     for (const [key, value] of this.options) {
       result.push(key, value);
     }
-    return result;
+    return immutableSnapshot(result);
   }
 
   asData() {
@@ -162,13 +169,13 @@ export class PullAttr extends Form {
 export class PullNested extends Form {
   constructor(attributeSpec, pattern) {
     super();
-    this.attribute = pullAttrSpec(attributeSpec);
-    this.pattern = pullNestedPattern(pattern);
+    this.attribute = immutableSnapshot(pullAttrSpec(attributeSpec));
+    this.pattern = immutableSnapshot(pullNestedPattern(pattern));
     Object.freeze(this);
   }
 
   toForm() {
-    return new Map([[this.attribute, this.pattern]]);
+    return immutableSnapshot(new Map([[this.attribute, this.pattern]]));
   }
 
   asData() {
@@ -179,7 +186,7 @@ export class PullNested extends Form {
 export class PullSelector extends Form {
   constructor(items = []) {
     super();
-    this.items = Object.freeze(Array.from(items, pullSelectorItem));
+    this.items = immutableSnapshot(Array.from(items, pullSelectorItem));
     Object.freeze(this);
   }
 
@@ -196,7 +203,7 @@ export class PullSelector extends Form {
   }
 
   toForm() {
-    return [...this.items];
+    return this.items;
   }
 
   asData() {
@@ -207,15 +214,15 @@ export class PullSelector extends Form {
 export class JoinVars extends Form {
   constructor(free = [], { required = [] } = {}) {
     super();
-    this.required = Object.freeze([...required]);
-    this.free = Object.freeze([...free]);
+    this.required = immutableSnapshot([...required]);
+    this.free = immutableSnapshot([...free]);
     Object.freeze(this);
   }
 
   toForm() {
-    return this.required.length > 0
+    return immutableSnapshot(this.required.length > 0
       ? [this.required, ...this.free]
-      : [...this.free];
+      : [...this.free]);
   }
 }
 
@@ -224,7 +231,7 @@ export class RuleBranch extends Form {
     super();
     this.name = sym(name);
     this.variables = normalizeJoinVars(variables);
-    this.clauses = Object.freeze([...clauses]);
+    this.clauses = immutableSnapshot([...clauses]);
     if (this.clauses.length === 0) {
       throw new TypeError("A rule branch requires at least one clause.");
     }
@@ -232,17 +239,17 @@ export class RuleBranch extends Form {
   }
 
   toForm() {
-    return [
+    return immutableSnapshot([
       [this.name, ...this.variables.toForm()],
       ...this.clauses.map(asForm)
-    ];
+    ]);
   }
 }
 
 export class RuleSet extends Form {
   constructor(branches) {
     super();
-    this.branches = Object.freeze([...branches]);
+    this.branches = immutableSnapshot([...branches]);
     if (this.branches.length === 0) {
       throw new TypeError("A rule set requires at least one branch.");
     }
@@ -250,7 +257,7 @@ export class RuleSet extends Form {
   }
 
   toForm() {
-    return this.branches.map((branch) => branch.toForm());
+    return immutableSnapshot(this.branches.map((branch) => branch.toForm()));
   }
 }
 
@@ -274,11 +281,13 @@ export class Query extends Form {
       throw new TypeError("query() requires a find specification.");
     }
     this.find = find instanceof FindSpec ? find : relation(...findValues(find));
-    this.where = Object.freeze([...where]);
-    this.inputs = Object.freeze([...inputs]);
-    this.withVars = Object.freeze([...withVars]);
-    this.having = Object.freeze([...having]);
-    this.orderBy = Object.freeze(orderBy.map((item) => item instanceof Order ? item : asc(item)));
+    this.where = immutableSnapshot([...where]);
+    this.inputs = immutableSnapshot([...inputs]);
+    this.withVars = immutableSnapshot([...withVars]);
+    this.having = immutableSnapshot([...having]);
+    this.orderBy = immutableSnapshot(
+      orderBy.map((item) => item instanceof Order ? item : asc(item))
+    );
     this.limit = limit;
     this.offset = offset;
     this.timeout = timeout;
@@ -292,9 +301,9 @@ export class Query extends Form {
       if (names.length === 0) {
         throw new TypeError(`${mode} requires at least one field name.`);
       }
-      this.returnMap = Object.freeze([
+      this.returnMap = immutableSnapshot([
         kw(mode),
-        Object.freeze(Array.from(names, (name) => typeof name === "string" ? sym(name) : name))
+        Array.from(names, (name) => typeof name === "string" ? sym(name) : name)
       ]);
     } else {
       this.returnMap = null;
@@ -335,7 +344,7 @@ export class Query extends Form {
     if (this.limit !== null && this.limit !== undefined) {
       result.push(kw("limit"), this.limit);
     }
-    return result;
+    return immutableSnapshot(result);
   }
 
   asData() {

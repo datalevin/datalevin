@@ -57,6 +57,18 @@ The `q` and `tx` builders are synchronous, pure JavaScript values. Composing
 them does not start the JVM; a connection lowers them to the active backend only
 when `query()` or `transact()` is called.
 
+Their contract is an immutable snapshot, not a mutable builder. Construction
+recursively detaches arrays, plain objects, `Map`, `Set`, `Date`, and byte-array
+values. Arrays and objects are frozen; collection and mutable scalar snapshots
+reject mutation, including through values returned by `toForm()`. Mutating an
+input container later therefore cannot change an existing form. Keyword and
+Datalog-symbol tokens are interned by normalized type and name, so
+`q.kw("user/id") === q.kw(":user/id")` and repeated tokens occupy one `Map`
+key. JavaScript compound objects still use the language's normal identity
+comparison; the immutable snapshot, rather than structural `===`, is their
+composition contract. Non-structural objects such as backend handles are
+treated as atomic values.
+
 ## Composing Queries
 
 Use normal JavaScript control flow to assemble clauses. Variables, attributes,

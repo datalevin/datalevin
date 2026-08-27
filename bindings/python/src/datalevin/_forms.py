@@ -7,6 +7,79 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 
+class FrozenMap(Mapping):
+    """A small insertion-ordered, immutable mapping used inside forms."""
+
+    __slots__ = ("_items",)
+
+    def __init__(self, items=()) -> None:
+        # Build through a temporary dict so normal mapping last-value and
+        # insertion-order behavior is preserved without retaining mutable
+        # storage on the resulting value.
+        object.__setattr__(self, "_items", tuple(dict(items).items()))
+
+    def __setattr__(self, name, value) -> None:
+        raise AttributeError("FrozenMap values are immutable.")
+
+    def __delattr__(self, name) -> None:
+        raise AttributeError("FrozenMap values are immutable.")
+
+    def __getitem__(self, key):
+        for current_key, value in self._items:
+            if current_key == key:
+                return value
+        raise KeyError(key)
+
+    def __iter__(self):
+        return (key for key, _ in self._items)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __hash__(self) -> int:
+        return hash(frozenset(self._items))
+
+    def __repr__(self) -> str:
+        return f"FrozenMap({dict(self._items)!r})"
+
+
+def immutable_snapshot(value, _active=None):
+    """Recursively detach and freeze host containers used in typed forms.
+
+    Builder forms deliberately recognize Python's ordinary structural value
+    containers. Other objects (for example backend handles) are treated as
+    atomic values and retained by reference.
+    """
+
+    if isinstance(value, (Form, Keyword, Symbol, FrozenMap)):
+        return value
+    if isinstance(value, (str, bytes, int, float, complex, bool, type(None))):
+        return value
+    if isinstance(value, (bytearray, memoryview)):
+        return bytes(value)
+
+    structural = isinstance(value, (Mapping, list, tuple, set, frozenset))
+    if not structural:
+        return value
+
+    active = set() if _active is None else _active
+    identity = id(value)
+    if identity in active:
+        raise ValueError("Datalevin forms cannot contain cyclic containers.")
+    active.add(identity)
+    try:
+        if isinstance(value, Mapping):
+            return FrozenMap(
+                (immutable_snapshot(key, active), immutable_snapshot(item, active))
+                for key, item in value.items()
+            )
+        if isinstance(value, (list, tuple)):
+            return tuple(immutable_snapshot(item, active) for item in value)
+        return frozenset(immutable_snapshot(item, active) for item in value)
+    finally:
+        active.remove(identity)
+
+
 def _token_text(value: str, prefix: str) -> str:
     if not isinstance(value, str):
         raise TypeError(f"Datalevin token names must be strings, got {type(value).__name__}.")
@@ -57,6 +130,9 @@ class RawForm(Form):
     """A structured escape hatch; strings remain literal values."""
 
     value: object
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "value", immutable_snapshot(self.value))
 
     def to_form(self):
         return self.value

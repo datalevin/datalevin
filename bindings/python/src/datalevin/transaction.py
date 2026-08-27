@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
-from ._forms import Form, Keyword, RawForm, form_data
+from ._forms import Form, Keyword, RawForm, form_data, immutable_snapshot
 from .query import kw
 
 _MISSING = object()
@@ -68,6 +68,9 @@ class TxItem(Form):
 
     form: object
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "form", immutable_snapshot(self.form))
+
     def to_form(self):
         return self.form
 
@@ -80,8 +83,8 @@ class LookupRef(Form):
     value: object
 
     def __init__(self, attribute, value):
-        object.__setattr__(self, "attribute", _attribute(attribute))
-        object.__setattr__(self, "value", value)
+        object.__setattr__(self, "attribute", immutable_snapshot(_attribute(attribute)))
+        object.__setattr__(self, "value", immutable_snapshot(value))
 
     def to_form(self):
         return (self.attribute, self.value)
@@ -96,6 +99,9 @@ class PatchOp(Form):
 
     form: tuple[object, ...]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "form", immutable_snapshot(self.form))
+
     def to_form(self):
         return self.form
 
@@ -109,8 +115,13 @@ class TxData(Form, Sequence):
 
     items: tuple[Form, ...]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "items", immutable_snapshot(self.items))
+
     def to_form(self):
-        return tuple(item.to_form() if isinstance(item, Form) else item for item in self.items)
+        return immutable_snapshot(
+            tuple(item.to_form() if isinstance(item, Form) else item for item in self.items)
+        )
 
     def __getitem__(self, index):
         return self.items[index]

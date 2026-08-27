@@ -1,4 +1,4 @@
-import { Form, Keyword, RawForm, formData } from "./form.js";
+import { Form, Keyword, RawForm, formData, immutableSnapshot } from "./form.js";
 import { kw } from "./query.js";
 
 const MISSING = Symbol("missing");
@@ -53,7 +53,7 @@ function patchPath(path) {
       );
     }
   }
-  return vectorPath ? Object.freeze([...path]) : path;
+  return vectorPath ? immutableSnapshot(path) : path;
 }
 
 function patchUpdateOperation(operation) {
@@ -76,7 +76,7 @@ function patchUpdateOperation(operation) {
 export class TxItem extends Form {
   constructor(form) {
     super();
-    this.form = form;
+    this.form = immutableSnapshot(form);
     Object.freeze(this);
   }
 
@@ -88,13 +88,13 @@ export class TxItem extends Form {
 export class LookupRef extends Form {
   constructor(attributeName, value) {
     super();
-    this.attribute = attribute(attributeName);
-    this.value = value;
+    this.attribute = immutableSnapshot(attribute(attributeName));
+    this.value = immutableSnapshot(value);
     Object.freeze(this);
   }
 
   toForm() {
-    return [this.attribute, this.value];
+    return immutableSnapshot([this.attribute, this.value]);
   }
 
   asData() {
@@ -105,7 +105,7 @@ export class LookupRef extends Form {
 export class PatchOp extends Form {
   constructor(form) {
     super();
-    this.form = Object.freeze([...form]);
+    this.form = immutableSnapshot([...form]);
     Object.freeze(this);
   }
 
@@ -121,7 +121,7 @@ export class PatchOp extends Form {
 export class TxData extends Form {
   constructor(items = []) {
     super();
-    this.items = Object.freeze([...items]);
+    this.items = immutableSnapshot([...items]);
     Object.freeze(this);
   }
 
@@ -138,7 +138,9 @@ export class TxData extends Form {
   }
 
   toForm() {
-    return this.items.map((item) => item instanceof Form ? item.toForm() : item);
+    return immutableSnapshot(
+      this.items.map((item) => item instanceof Form ? item.toForm() : item)
+    );
   }
 
   asData() {

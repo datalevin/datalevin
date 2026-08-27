@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from datalevin import (
     Keyword,
     LookupRef,
@@ -184,6 +186,50 @@ def test_transaction_builder_produces_typed_immutable_forms() -> None:
         [":db.fn/retractAttribute", -1, ":person/nickname"],
         [":db/ensure", ":person/valid?", -1],
     ]
+
+
+def test_builder_forms_take_recursive_immutable_snapshots() -> None:
+    entity = q.var("entity")
+    literal = {"labels": ["before"]}
+    clause = q.datom(entity, "user/data", literal)
+    attrs = {"user/data": {"tags": ["before"]}}
+    item = tx.entity(-1, attrs)
+    transaction = tx.data(item)
+    source_bytes = bytearray([1, 2])
+    raw_value = q.raw({"bytes": source_bytes})
+
+    literal["labels"].append("after")
+    attrs["user/data"]["tags"].append("after")
+    attrs["user/data"] = {"tags": ["replacement"]}
+    source_bytes[0] = 9
+
+    clause_form = clause.to_form()
+    entity_form = item.to_form()
+    tx_form = transaction.to_form()
+    stored_data = entity_form[q.kw("user/data")]
+
+    assert clause_form[2] == {"labels": ("before",)}
+    assert stored_data == {"tags": ("before",)}
+    assert tx_form[0] is entity_form
+    assert raw_value.to_form()["bytes"] == b"\x01\x02"
+
+    with pytest.raises(TypeError):
+        clause_form[2]["labels"] = ("changed",)
+    with pytest.raises(TypeError):
+        entity_form[q.kw("user/data")] = {"tags": ()}
+    with pytest.raises(AttributeError):
+        stored_data["tags"].append("changed")
+
+
+def test_python_tokens_and_forms_have_value_equality() -> None:
+    first = q.kw("user/id")
+    second = q.kw(":user/id")
+
+    assert first == second
+    assert len({first: 1, second: 2}) == 1
+    assert q.datom(q.var("e"), "user/id", 1) == q.datom(
+        q.var("e"), "user/id", 1
+    )
 
 
 def test_transaction_context_specific_forms_are_explicit_and_composable() -> None:

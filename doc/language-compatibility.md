@@ -64,6 +64,14 @@ tokens. Runtime inputs to typed queries follow the same explicit conversion
 rules recursively. Existing EDN-string and native list/array query APIs remain
 supported with their legacy colon-prefixed keyword shorthand.
 
+Typed builder values use an immutable-snapshot contract. Recognized host
+containers are recursively detached at construction, so later input mutation
+cannot change a query or transaction and lowering does not expose mutable form
+containers. Python tokens have structural equality and hashing. JavaScript
+keyword and symbol tokens are interned by normalized type and name, making
+equal live tokens identical keys in native `Map` instances; compound
+JavaScript forms retain the language's ordinary identity comparison.
+
 Typed pull selectors use `q.selector`, `q.pull_attr`/`q.pullAttr`, nested pull
 helpers, and bounded or unbounded recursion helpers. Attribute names, option
 keys, xform symbols, wildcards, and recursion markers are typed by their grammar

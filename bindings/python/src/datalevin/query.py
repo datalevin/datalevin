@@ -9,7 +9,15 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-from ._forms import Form, Keyword, RawForm, Symbol, form_data
+from ._forms import (
+    Form,
+    FrozenMap,
+    Keyword,
+    RawForm,
+    Symbol,
+    form_data,
+    immutable_snapshot,
+)
 
 
 def kw(name: str) -> Keyword:
@@ -75,6 +83,9 @@ class Expression(Form):
 
     form: tuple[object, ...]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "form", immutable_snapshot(self.form))
+
     def to_form(self):
         return self.form
 
@@ -84,6 +95,9 @@ class Clause(Form):
     """A Datalog ``:where`` or ``:having`` clause."""
 
     form: tuple[object, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "form", immutable_snapshot(self.form))
 
     def to_form(self):
         return self.form
@@ -95,6 +109,9 @@ class Binding(Form):
 
     form: object
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "form", immutable_snapshot(self.form))
+
     def to_form(self):
         return self.form
 
@@ -105,6 +122,9 @@ class FindSpec(Form):
 
     form: tuple[object, ...]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "form", immutable_snapshot(self.form))
+
     def to_form(self):
         return self.form
 
@@ -113,6 +133,9 @@ class FindSpec(Form):
 class Order:
     term: object
     direction: Keyword
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "term", immutable_snapshot(self.term))
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -140,19 +163,22 @@ class PullAttr(Form):
             options.append((kw("default"), default))
         if xform is not _MISSING:
             options.append((kw("xform"), _pull_xform(xform)))
-        object.__setattr__(self, "attribute", _attribute(attribute))
-        object.__setattr__(self, "options", tuple(options))
+        object.__setattr__(self, "attribute", immutable_snapshot(_attribute(attribute)))
+        object.__setattr__(self, "options", immutable_snapshot(options))
 
     def __hash__(self) -> int:
         # Pull attributes are valid map keys even when an arbitrary option
         # value is itself an unhashable Python container.
-        return hash(PullAttr)
+        try:
+            return hash((self.attribute, self.options))
+        except TypeError:
+            return hash(PullAttr)
 
     def to_form(self):
         result = [self.attribute]
         for key, value in self.options:
             result.extend((key, value))
-        return tuple(result)
+        return immutable_snapshot(tuple(result))
 
     def as_data(self):
         return form_data(self)
@@ -166,11 +192,19 @@ class PullNested(Form):
     pattern: object
 
     def __init__(self, attribute, pattern) -> None:
-        object.__setattr__(self, "attribute", _pull_attr_spec(attribute))
-        object.__setattr__(self, "pattern", _pull_nested_pattern(pattern))
+        object.__setattr__(
+            self,
+            "attribute",
+            immutable_snapshot(_pull_attr_spec(attribute)),
+        )
+        object.__setattr__(
+            self,
+            "pattern",
+            immutable_snapshot(_pull_nested_pattern(pattern)),
+        )
 
     def to_form(self):
-        return {self.attribute: self.pattern}
+        return FrozenMap(((self.attribute, self.pattern),))
 
     def as_data(self):
         return form_data(self)
@@ -186,7 +220,7 @@ class PullSelector(Form):
         object.__setattr__(
             self,
             "items",
-            tuple(_pull_selector_item(item) for item in items),
+            immutable_snapshot(tuple(_pull_selector_item(item) for item in items)),
         )
 
     def __iter__(self):
@@ -210,6 +244,10 @@ class JoinVars(Form):
     required: tuple[object, ...]
     free: tuple[object, ...]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "required", immutable_snapshot(self.required))
+        object.__setattr__(self, "free", immutable_snapshot(self.free))
+
     def to_form(self):
         if self.required:
             return (self.required, *self.free)
@@ -222,6 +260,9 @@ class RuleBranch(Form):
     variables: JoinVars
     clauses: tuple[Form, ...]
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "clauses", immutable_snapshot(self.clauses))
+
     def to_form(self):
         head = (self.name, *self.variables.to_form())
         return (head, *(_as_form(clause) for clause in self.clauses))
@@ -230,6 +271,9 @@ class RuleBranch(Form):
 @dataclass(frozen=True, slots=True)
 class RuleSet(Form):
     branches: tuple[RuleBranch, ...]
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "branches", immutable_snapshot(self.branches))
 
     def to_form(self):
         return tuple(branch.to_form() for branch in self.branches)
@@ -287,15 +331,15 @@ class Query(Form):
             normalized_order.append(item if isinstance(item, Order) else asc(item))
 
         object.__setattr__(self, "find", find_spec)
-        object.__setattr__(self, "where", tuple(where))
-        object.__setattr__(self, "inputs", tuple(inputs))
-        object.__setattr__(self, "with_vars", tuple(with_))
-        object.__setattr__(self, "having", tuple(having))
-        object.__setattr__(self, "order_by", tuple(normalized_order))
+        object.__setattr__(self, "where", immutable_snapshot(tuple(where)))
+        object.__setattr__(self, "inputs", immutable_snapshot(tuple(inputs)))
+        object.__setattr__(self, "with_vars", immutable_snapshot(tuple(with_)))
+        object.__setattr__(self, "having", immutable_snapshot(tuple(having)))
+        object.__setattr__(self, "order_by", immutable_snapshot(tuple(normalized_order)))
         object.__setattr__(self, "limit", limit)
         object.__setattr__(self, "offset", offset)
         object.__setattr__(self, "timeout", timeout)
-        object.__setattr__(self, "return_map", return_map)
+        object.__setattr__(self, "return_map", immutable_snapshot(return_map))
 
     def to_form(self):
         result = [kw("find"), *self.find.to_form()]
@@ -323,7 +367,7 @@ class Query(Form):
             result.extend((kw("offset"), self.offset))
         if self.limit is not None:
             result.extend((kw("limit"), self.limit))
-        return tuple(result)
+        return immutable_snapshot(tuple(result))
 
     def as_data(self):
         """Return a debug-friendly nested form without starting a backend."""
@@ -414,7 +458,7 @@ def _pull_attr_expression(values):
     legacy_op = _pull_token_name(values[0])
     if legacy_op in {"default", "limit"} and len(values) == 3:
         value = _pull_limit(values[2]) if legacy_op == "limit" else values[2]
-        return (sym(legacy_op), _pull_attr_spec(values[1]), value)
+        return immutable_snapshot((sym(legacy_op), _pull_attr_spec(values[1]), value))
 
     if len(values) % 2 == 0:
         raise ValueError("A pull attribute expression requires option/value pairs.")
@@ -431,7 +475,7 @@ def _pull_attr_expression(values):
         elif option_name == "xform":
             value = _pull_xform(value)
         result.extend((option, value))
-    return tuple(result)
+    return immutable_snapshot(tuple(result))
 
 
 def _pull_attr_spec(value):

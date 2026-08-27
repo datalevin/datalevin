@@ -162,6 +162,67 @@ test("transaction forms use explicit operation and attribute keywords", () => {
   ]);
 });
 
+test("builder forms take recursive immutable snapshots", () => {
+  const firstKeyword = q.kw("user/id");
+  const secondKeyword = q.kw(":user/id");
+  const firstSymbol = q.sym("status");
+  const secondSymbol = q.sym("status");
+  const tokenMap = new Map([
+    [firstKeyword, 1],
+    [secondKeyword, 2]
+  ]);
+
+  assert.equal(firstKeyword, secondKeyword);
+  assert.equal(firstSymbol, secondSymbol);
+  assert.equal(tokenMap.size, 1);
+  assert.equal(tokenMap.get(q.kw("user/id")), 2);
+
+  const literal = { labels: ["before"] };
+  const clause = q.datom(q.var("entity"), "user/data", literal);
+  const attrs = { "user/data": { tags: ["before"] } };
+  const item = tx.entity(-1, attrs);
+  const transaction = tx.data(item);
+  const sourceDate = new Date("2026-08-27T00:00:00.000Z");
+  const sourceBytes = new Uint8Array([1, 2]);
+  const rawValue = q.raw([sourceDate, sourceBytes]);
+
+  literal.labels.push("after");
+  attrs["user/data"].tags.push("after");
+  attrs["user/data"] = { tags: ["replacement"] };
+  sourceDate.setUTCFullYear(2030);
+  sourceBytes[0] = 9;
+
+  const clauseForm = clause.toForm();
+  const entityForm = item.toForm();
+  const txForm = transaction.toForm();
+  const storedData = entityForm.get(q.kw("user/data"));
+
+  assert.deepEqual(clauseForm[2], { labels: ["before"] });
+  assert.deepEqual(storedData, { tags: ["before"] });
+  assert.equal(txForm[0], entityForm);
+  assert.equal(Object.isFrozen(clauseForm), true);
+  assert.equal(Object.isFrozen(clauseForm[2]), true);
+  assert.equal(Object.isFrozen(storedData.tags), true);
+  assert.equal(Object.isFrozen(txForm), true);
+  assert.equal(rawValue.toForm()[0].toISOString(), "2026-08-27T00:00:00.000Z");
+  assert.deepEqual(Array.from(rawValue.toForm()[1]), [1, 2]);
+
+  assert.throws(() => clauseForm.push("changed"), TypeError);
+  assert.throws(() => clauseForm[2].labels.push("changed"), TypeError);
+  assert.throws(
+    () => entityForm.set(q.kw("user/data"), { tags: [] }),
+    /immutable/
+  );
+  assert.throws(
+    () => Map.prototype.set.call(entityForm, q.kw("changed"), true),
+    TypeError
+  );
+  assert.throws(() => rawValue.toForm()[0].setTime(0), /immutable/);
+  assert.throws(() => {
+    rawValue.toForm()[1][0] = 9;
+  }, /immutable/);
+});
+
 test("transaction context-specific forms are explicit and composable", () => {
   const eve = tx.lookupRef("user/handle", "eve");
   const patches = [

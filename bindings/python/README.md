@@ -55,6 +55,15 @@ The `q` and `tx` builders are pure Python values: composing them does not start
 the JVM. The connection lowers them to the active backend only when `query()` or
 `transact()` is called.
 
+Their contract is an immutable snapshot, not a mutable builder. Construction
+recursively detaches Python dictionaries, lists, sets, `bytearray`, and
+`memoryview` values; mappings become read-only mappings, sequences become
+tuples, and sets become `frozenset` values. Mutating an input container later
+therefore cannot change an existing form, and `to_form()` does not expose a
+mutable structural container. `q.kw()` and `q.sym()` tokens use Python value
+equality and hashing. Non-structural objects such as backend handles are treated
+as atomic values.
+
 ## Composing Queries
 
 Use normal Python control flow to assemble clauses. Variables, attributes,
