@@ -72,6 +72,13 @@ keyword and symbol tokens are interned by normalized type and name, making
 equal live tokens identical keys in native `Map` instances; compound
 JavaScript forms retain the language's ordinary identity comparison.
 
+Both bindings reject structurally invalid typed forms before backend lowering,
+including incompatible or mis-sized return maps, empty or repeated join
+variables, invalid or repeated ordering terms, top-level `and` branch groups,
+and rule branches with inconsistent required/free arity. Raw forms remain the
+explicit unchecked escape hatch. Python `RuleSet.as_data()` and JavaScript
+`RuleSet.asData()` provide equivalent debug projections.
+
 Typed pull selectors use `q.selector`, `q.pull_attr`/`q.pullAttr`, nested pull
 helpers, and bounded or unbounded recursion helpers. Attribute names, option
 keys, xform symbols, wildcards, and recursion markers are typed by their grammar

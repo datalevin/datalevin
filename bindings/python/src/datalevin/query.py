@@ -77,6 +77,14 @@ def _callable(value):
     return sym(value) if isinstance(value, str) else value
 
 
+def _is_variable_symbol(value) -> bool:
+    return isinstance(value, Symbol) and value.name.startswith("?")
+
+
+def _is_order_index(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
 @dataclass(frozen=True, slots=True)
 class Expression(Form):
     """A query call or find expression."""
@@ -95,12 +103,24 @@ class Clause(Form):
     """A Datalog ``:where`` or ``:having`` clause."""
 
     form: tuple[object, ...]
+    kind: str = "clause"
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "form", immutable_snapshot(self.form))
 
     def to_form(self):
         return self.form
+
+
+def _clause_operator(value):
+    return value.kind if isinstance(value, Clause) else None
+
+
+def _reject_and_clauses(clauses, context: str) -> None:
+    if any(_clause_operator(clause) == "and" for clause in clauses):
+        raise ValueError(
+            f"q.and_ is only valid as a branch of q.or_ or q.or_join, not {context}."
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,13 +149,73 @@ class FindSpec(Form):
         return self.form
 
 
+def _find_spec_details(find: FindSpec):
+    form = find.form
+    if len(form) == 2 and form[-1] == _DOT:
+        return "scalar", (form[0],)
+    if len(form) > 2 and form[-1] == _DOT:
+        return "tuple", form[:-1]
+    if len(form) == 1 and isinstance(form[0], tuple):
+        nested = form[0]
+        if len(nested) == 2 and nested[-1] == _ELLIPSIS:
+            return "collection", (nested[0],)
+        return "tuple", nested
+    return "relation", form
+
+
+def _find_element_variables(value):
+    if _is_variable_symbol(value):
+        return (value,)
+    if not isinstance(value, Expression) or not value.form:
+        return ()
+
+    operator = value.form[0]
+    name = operator.name if isinstance(operator, Symbol) else None
+    if name == "pull":
+        variable_index = 2 if len(value.form) == 4 else 1
+        if variable_index < len(value.form):
+            variable = value.form[variable_index]
+            return (variable,) if _is_variable_symbol(variable) else ()
+        return ()
+    if name in {"+", "-", "*", "/", "mod", "rem", "quot"}:
+        return tuple(
+            variable
+            for argument in value.form[1:]
+            for variable in _find_element_variables(argument)
+        )
+
+    arguments = value.form[2:] if name == "aggregate" else value.form[1:]
+    if arguments and _is_variable_symbol(arguments[-1]):
+        return (arguments[-1],)
+    return ()
+
+
+def _find_variables(find: FindSpec):
+    _, elements = _find_spec_details(find)
+    return {
+        variable
+        for element in elements
+        for variable in _find_element_variables(element)
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class Order:
     term: object
     direction: Keyword
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "term", immutable_snapshot(self.term))
+        term = immutable_snapshot(self.term)
+        if not (_is_variable_symbol(term) or _is_order_index(term)):
+            raise TypeError(
+                "An order term must be a query variable or non-negative index."
+            )
+        if not isinstance(self.direction, Keyword) or self.direction.name not in {
+            "asc",
+            "desc",
+        }:
+            raise ValueError("An order direction must be :asc or :desc.")
+        object.__setattr__(self, "term", term)
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -245,8 +325,19 @@ class JoinVars(Form):
     free: tuple[object, ...]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "required", immutable_snapshot(self.required))
-        object.__setattr__(self, "free", immutable_snapshot(self.free))
+        required = immutable_snapshot(self.required)
+        free = immutable_snapshot(self.free)
+        if not isinstance(required, tuple) or not isinstance(free, tuple):
+            raise TypeError("Required and free join variables must be sequences.")
+        variables = (*required, *free)
+        if not variables:
+            raise ValueError("Join variables must not be empty.")
+        if not all(_is_variable_symbol(variable) for variable in variables):
+            raise TypeError("Join variables must be values created by q.var().")
+        if len(set(variables)) != len(variables):
+            raise ValueError("Join variables must be distinct.")
+        object.__setattr__(self, "required", required)
+        object.__setattr__(self, "free", free)
 
     def to_form(self):
         if self.required:
@@ -261,7 +352,17 @@ class RuleBranch(Form):
     clauses: tuple[Form, ...]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "clauses", immutable_snapshot(self.clauses))
+        if not isinstance(self.name, Symbol) or self.name.name.startswith(("?", "$")):
+            raise TypeError("A rule name must be a plain Datalog symbol.")
+        if self.name.name in {"%", "_"}:
+            raise TypeError("A rule name must be a plain Datalog symbol.")
+        if not isinstance(self.variables, JoinVars):
+            raise TypeError("Rule variables must be a q.join_vars() value.")
+        clauses = immutable_snapshot(self.clauses)
+        if not clauses:
+            raise ValueError("A rule branch requires at least one clause.")
+        _reject_and_clauses(clauses, "at the top level of a rule branch")
+        object.__setattr__(self, "clauses", clauses)
 
     def to_form(self):
         head = (self.name, *self.variables.to_form())
@@ -273,13 +374,72 @@ class RuleSet(Form):
     branches: tuple[RuleBranch, ...]
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "branches", immutable_snapshot(self.branches))
+        branches = immutable_snapshot(self.branches)
+        if not branches:
+            raise ValueError("A rule set requires at least one branch.")
+        if not all(isinstance(branch, RuleBranch) for branch in branches):
+            raise TypeError("A rule set accepts only q.rule_branch() values.")
+
+        arities = {}
+        for branch in branches:
+            arity = (
+                len(branch.variables.required),
+                len(branch.variables.free),
+            )
+            previous = arities.setdefault(branch.name, arity)
+            if previous != arity:
+                raise ValueError(
+                    f"Rule branches named {branch.name} must have matching "
+                    "required/free arity."
+                )
+        object.__setattr__(self, "branches", branches)
 
     def to_form(self):
         return tuple(branch.to_form() for branch in self.branches)
 
     def as_data(self):
         return form_data(self)
+
+
+def _normalize_return_map(find: FindSpec, mode: str, values):
+    if isinstance(values, (str, bytes)):
+        raise TypeError(f"{mode} must be a sequence of field names.")
+    try:
+        names = tuple(sym(name) if isinstance(name, str) else name for name in values)
+    except TypeError as error:
+        raise TypeError(f"{mode} must be a sequence of field names.") from error
+    if not names:
+        raise ValueError(f"{mode} requires at least one field name.")
+    if not all(isinstance(name, Symbol) for name in names):
+        raise TypeError(f"{mode} field names must be symbols or strings.")
+
+    shape, elements = _find_spec_details(find)
+    if shape in {"scalar", "collection"}:
+        raise ValueError(f"{mode} does not work with a {shape} find specification.")
+    if len(names) != len(elements):
+        raise ValueError(
+            f"{mode} field count must match the {len(elements)} find elements."
+        )
+    return (kw(mode), names)
+
+
+def _validate_query_order(find: FindSpec, ordering) -> None:
+    find_variables = _find_variables(find)
+    _, elements = _find_spec_details(find)
+    seen = set()
+    for item in ordering:
+        term = item.term
+        key = ("index", term) if _is_order_index(term) else ("variable", term)
+        if key in seen:
+            raise ValueError("Order terms must be distinct.")
+        seen.add(key)
+        if _is_order_index(term):
+            if term >= len(elements):
+                raise ValueError(
+                    "Order column index is outside the find specification."
+                )
+        elif term not in find_variables:
+            raise ValueError("An order variable must occur in the find specification.")
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -321,20 +481,23 @@ class Query(Form):
         return_map = None
         if selected:
             mode, names = selected[0]
-            names = tuple(sym(name) if isinstance(name, str) else name for name in names)
-            if not names:
-                raise ValueError(f"{mode} requires at least one field name.")
-            return_map = (kw(mode), names)
+            return_map = _normalize_return_map(find_spec, mode, names)
 
         normalized_order = []
         for item in order_by:
             normalized_order.append(item if isinstance(item, Order) else asc(item))
+        _validate_query_order(find_spec, normalized_order)
+
+        where_snapshot = immutable_snapshot(tuple(where))
+        having_snapshot = immutable_snapshot(tuple(having))
+        _reject_and_clauses(where_snapshot, "at the top level of :where")
+        _reject_and_clauses(having_snapshot, "at the top level of :having")
 
         object.__setattr__(self, "find", find_spec)
-        object.__setattr__(self, "where", immutable_snapshot(tuple(where)))
+        object.__setattr__(self, "where", where_snapshot)
         object.__setattr__(self, "inputs", immutable_snapshot(tuple(inputs)))
         object.__setattr__(self, "with_vars", immutable_snapshot(tuple(with_)))
-        object.__setattr__(self, "having", immutable_snapshot(tuple(having)))
+        object.__setattr__(self, "having", having_snapshot)
         object.__setattr__(self, "order_by", immutable_snapshot(tuple(normalized_order)))
         object.__setattr__(self, "limit", limit)
         object.__setattr__(self, "offset", offset)
@@ -621,10 +784,12 @@ def rule(name, *args, from_source=None) -> Clause:
 def _clauses(operator, clauses, source_value=None) -> Clause:
     if not clauses:
         raise ValueError(f"{operator} requires at least one clause.")
+    if operator in {"and", "not"}:
+        _reject_and_clauses(clauses, f"inside q.{operator}_")
     items = [] if source_value is None else [source_value]
     items.append(sym(operator))
     items.extend(_as_form(clause) for clause in clauses)
-    return Clause(tuple(items))
+    return Clause(tuple(items), kind=operator)
 
 
 def and_(*clauses) -> Clause:
@@ -648,6 +813,8 @@ def _join_clause(operator, variables, clauses, source_value=None) -> Clause:
         raise ValueError(f"{operator} requires at least one clause.")
     if not isinstance(variables, JoinVars):
         variables = join_vars(*variables)
+    if operator == "not-join":
+        _reject_and_clauses(clauses, "inside q.not_join")
     items = [] if source_value is None else [source_value]
     items.extend((sym(operator), variables.to_form()))
     items.extend(_as_form(clause) for clause in clauses)

@@ -112,6 +112,15 @@ three-term form; use variable-arity `q.pattern(e, a)` for a presence pattern or
 other supported database-pattern arity. `q.raw()` remains the structured escape
 hatch for new syntax; its tokens must use `q.kw()` and `q.sym()` explicitly.
 
+Typed forms validate structural grammar when they are composed: keyed result
+names must match a relation/tuple find, join variables must be non-empty and
+distinct, ordering must reference distinct projected variables or valid column
+indexes, and branches of one rule name must have matching required/free arity.
+`q.and()` is a branch group for `q.or()` or `q.orJoin()` and is rejected as a
+top-level `:where`, `not`, `not-join`, or rule-body clause. `q.rules(...)` exposes
+the same `asData()` inspection helper as the other typed forms. `q.raw()`
+deliberately bypasses these typed checks.
+
 ### Composing pull selectors
 
 Pull selectors use position-aware forms so option values remain ordinary

@@ -57,6 +57,17 @@ function callable(value) {
   return typeof value === "string" ? sym(value) : value;
 }
 
+function isVariableSymbol(value) {
+  return value instanceof DatalogSymbol && value.name.startsWith("?");
+}
+
+function isOrderIndex(value) {
+  return (
+    (typeof value === "number" && Number.isSafeInteger(value) && value >= 0)
+    || (typeof value === "bigint" && value >= 0n)
+  );
+}
+
 function plainObject(value) {
   if (value === null || typeof value !== "object") {
     return false;
@@ -78,14 +89,27 @@ export class Expression extends Form {
 }
 
 export class Clause extends Form {
-  constructor(form) {
+  constructor(form, kind = "clause") {
     super();
     this.form = immutableSnapshot([...form]);
+    this.kind = kind;
     Object.freeze(this);
   }
 
   toForm() {
     return this.form;
+  }
+}
+
+function clauseOperator(value) {
+  return value instanceof Clause ? value.kind : null;
+}
+
+function rejectAndClauses(values, context) {
+  if (values.some((value) => clauseOperator(value) === "and")) {
+    throw new TypeError(
+      `q.and() is only valid as a branch of q.or() or q.orJoin(), not ${context}.`
+    );
   }
 }
 
@@ -113,9 +137,60 @@ export class FindSpec extends Form {
   }
 }
 
+function findSpecDetails(find) {
+  const form = find.form;
+  if (form.length === 2 && form.at(-1) === DOT) {
+    return { shape: "scalar", elements: [form[0]] };
+  }
+  if (form.length > 2 && form.at(-1) === DOT) {
+    return { shape: "tuple", elements: form.slice(0, -1) };
+  }
+  if (form.length === 1 && Array.isArray(form[0])) {
+    const nested = form[0];
+    if (nested.length === 2 && nested.at(-1) === ELLIPSIS) {
+      return { shape: "collection", elements: [nested[0]] };
+    }
+    return { shape: "tuple", elements: nested };
+  }
+  return { shape: "relation", elements: form };
+}
+
+function findElementVariables(value) {
+  if (isVariableSymbol(value)) {
+    return [value];
+  }
+  if (!(value instanceof Expression) || value.form.length === 0) {
+    return [];
+  }
+
+  const operator = value.form[0];
+  const name = operator instanceof DatalogSymbol ? operator.name : null;
+  if (name === "pull") {
+    const variableIndex = value.form.length === 4 ? 2 : 1;
+    const variableValue = value.form[variableIndex];
+    return isVariableSymbol(variableValue) ? [variableValue] : [];
+  }
+  if (["+", "-", "*", "/", "mod", "rem", "quot"].includes(name)) {
+    return value.form.slice(1).flatMap(findElementVariables);
+  }
+
+  const args = name === "aggregate" ? value.form.slice(2) : value.form.slice(1);
+  return args.length > 0 && isVariableSymbol(args.at(-1)) ? [args.at(-1)] : [];
+}
+
+function findVariables(find) {
+  return new Set(findSpecDetails(find).elements.flatMap(findElementVariables));
+}
+
 export class Order {
   constructor(term, direction) {
     this.term = immutableSnapshot(term);
+    if (!isVariableSymbol(this.term) && !isOrderIndex(this.term)) {
+      throw new TypeError("An order term must be a query variable or non-negative index.");
+    }
+    if (!(direction instanceof Keyword) || !["asc", "desc"].includes(direction.name)) {
+      throw new TypeError("An order direction must be :asc or :desc.");
+    }
     this.direction = direction;
     Object.freeze(this);
   }
@@ -214,8 +289,21 @@ export class PullSelector extends Form {
 export class JoinVars extends Form {
   constructor(free = [], { required = [] } = {}) {
     super();
+    if (!Array.isArray(free) || !Array.isArray(required)) {
+      throw new TypeError("Required and free join variables must be arrays.");
+    }
     this.required = immutableSnapshot([...required]);
     this.free = immutableSnapshot([...free]);
+    const variables = [...this.required, ...this.free];
+    if (variables.length === 0) {
+      throw new TypeError("Join variables must not be empty.");
+    }
+    if (!variables.every(isVariableSymbol)) {
+      throw new TypeError("Join variables must be values created by q.var().");
+    }
+    if (new Set(variables.map((variableValue) => variableValue.name)).size !== variables.length) {
+      throw new TypeError("Join variables must be distinct.");
+    }
     Object.freeze(this);
   }
 
@@ -232,9 +320,18 @@ export class RuleBranch extends Form {
     this.name = sym(name);
     this.variables = normalizeJoinVars(variables);
     this.clauses = immutableSnapshot([...clauses]);
+    if (
+      this.name.name.startsWith("?")
+      || this.name.name.startsWith("$")
+      || this.name.name === "%"
+      || this.name.name === "_"
+    ) {
+      throw new TypeError("A rule name must be a plain Datalog symbol.");
+    }
     if (this.clauses.length === 0) {
       throw new TypeError("A rule branch requires at least one clause.");
     }
+    rejectAndClauses(this.clauses, "at the top level of a rule branch");
     Object.freeze(this);
   }
 
@@ -253,11 +350,81 @@ export class RuleSet extends Form {
     if (this.branches.length === 0) {
       throw new TypeError("A rule set requires at least one branch.");
     }
+    if (!this.branches.every((branch) => branch instanceof RuleBranch)) {
+      throw new TypeError("A rule set accepts only q.ruleBranch() values.");
+    }
+
+    const arities = new Map();
+    for (const branch of this.branches) {
+      const arity = [branch.variables.required.length, branch.variables.free.length];
+      const previous = arities.get(branch.name.name);
+      if (previous !== undefined && (previous[0] !== arity[0] || previous[1] !== arity[1])) {
+        throw new TypeError(
+          `Rule branches named ${branch.name} must have matching required/free arity.`
+        );
+      }
+      arities.set(branch.name.name, arity);
+    }
     Object.freeze(this);
   }
 
   toForm() {
     return immutableSnapshot(this.branches.map((branch) => branch.toForm()));
+  }
+
+  asData() {
+    return formData(this);
+  }
+}
+
+function normalizeReturnMap(find, mode, values) {
+  if (typeof values === "string" || values?.[Symbol.iterator] === undefined) {
+    throw new TypeError(`${mode} must be an iterable of field names.`);
+  }
+  const names = Array.from(
+    values,
+    (name) => typeof name === "string" ? sym(name) : name
+  );
+  if (names.length === 0) {
+    throw new TypeError(`${mode} requires at least one field name.`);
+  }
+  if (!names.every((name) => name instanceof DatalogSymbol)) {
+    throw new TypeError(`${mode} field names must be symbols or strings.`);
+  }
+
+  const { shape, elements } = findSpecDetails(find);
+  if (shape === "scalar" || shape === "collection") {
+    throw new TypeError(`${mode} does not work with a ${shape} find specification.`);
+  }
+  if (names.length !== elements.length) {
+    throw new TypeError(
+      `${mode} field count must match the ${elements.length} find elements.`
+    );
+  }
+  return immutableSnapshot([kw(mode), names]);
+}
+
+function validateQueryOrder(find, ordering) {
+  const variables = findVariables(find);
+  const { elements } = findSpecDetails(find);
+  const seen = new Set();
+  for (const item of ordering) {
+    const term = item.term;
+    const key = isOrderIndex(term) ? `index:${term}` : `variable:${term.name}`;
+    if (seen.has(key)) {
+      throw new TypeError("Order terms must be distinct.");
+    }
+    seen.add(key);
+    if (isOrderIndex(term)) {
+      if (
+        (typeof term === "bigint" && term >= BigInt(elements.length))
+        || (typeof term === "number" && term >= elements.length)
+      ) {
+        throw new TypeError("Order column index is outside the find specification.");
+      }
+    } else if (!variables.has(term)) {
+      throw new TypeError("An order variable must occur in the find specification.");
+    }
   }
 }
 
@@ -288,6 +455,9 @@ export class Query extends Form {
     this.orderBy = immutableSnapshot(
       orderBy.map((item) => item instanceof Order ? item : asc(item))
     );
+    rejectAndClauses(this.where, "at the top level of :where");
+    rejectAndClauses(this.having, "at the top level of :having");
+    validateQueryOrder(this.find, this.orderBy);
     this.limit = limit;
     this.offset = offset;
     this.timeout = timeout;
@@ -298,13 +468,7 @@ export class Query extends Form {
     }
     if (selected.length === 1) {
       const [mode, names] = selected[0];
-      if (names.length === 0) {
-        throw new TypeError(`${mode} requires at least one field name.`);
-      }
-      this.returnMap = immutableSnapshot([
-        kw(mode),
-        Array.from(names, (name) => typeof name === "string" ? sym(name) : name)
-      ]);
+      this.returnMap = normalizeReturnMap(this.find, mode, names);
     } else {
       this.returnMap = null;
     }
@@ -629,9 +793,12 @@ function clauses(operator, values, sourceValue = null) {
   if (values.length === 0) {
     throw new TypeError(`${operator} requires at least one clause.`);
   }
+  if (operator === "and" || operator === "not") {
+    rejectAndClauses(values, `inside q.${operator}()`);
+  }
   const result = sourceValue === null || sourceValue === undefined ? [] : [sourceValue];
   result.push(sym(operator), ...values.map(asForm));
-  return new Clause(result);
+  return new Clause(result, operator);
 }
 
 export function andClause(...values) {
@@ -677,6 +844,9 @@ function joinClause(operator, variables, values, sourceValue = null) {
     throw new TypeError(`${operator} requires at least one clause.`);
   }
   const normalized = normalizeJoinVars(variables);
+  if (operator === "not-join") {
+    rejectAndClauses(values, "inside q.notJoin()");
+  }
   if (operator === "not-join" && normalized.required.length > 0) {
     throw new TypeError("not-join does not support required join variables.");
   }

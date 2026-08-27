@@ -165,6 +165,95 @@ def test_query_supports_inputs_bindings_joins_rules_and_return_maps() -> None:
     assert relation_binding.to_form() == ((entity, name),)
 
 
+def test_query_builder_rejects_invalid_structural_combinations() -> None:
+    entity = q.var("entity")
+    name = q.var("name")
+    other = q.var("other")
+    clause = q.datom(entity, "person/name", name)
+
+    with pytest.raises(ValueError, match="scalar find"):
+        q.query(find=q.scalar(entity), keys=["id"])
+    with pytest.raises(ValueError, match="collection find"):
+        q.query(find=q.collection(entity), keys=["id"])
+    with pytest.raises(ValueError, match="field count"):
+        q.query(find=q.relation(entity, name), keys=["id"])
+    with pytest.raises(TypeError, match="field names"):
+        q.query(find=q.relation(entity), keys=[q.kw("id")])
+
+    with pytest.raises(ValueError, match="must not be empty"):
+        q.join_vars()
+    with pytest.raises(ValueError, match="distinct"):
+        q.join_vars(entity, required=[entity])
+    with pytest.raises(TypeError, match="q.var"):
+        q.join_vars("entity")
+
+    with pytest.raises(TypeError, match="order term"):
+        q.asc("entity")
+    with pytest.raises(TypeError, match="order term"):
+        q.desc(-1)
+    with pytest.raises(ValueError, match="occur in the find"):
+        q.query(find=q.relation(entity), order_by=[q.asc(other)])
+    with pytest.raises(ValueError, match="outside the find"):
+        q.query(find=q.relation(entity), order_by=[q.asc(1)])
+    with pytest.raises(ValueError, match="distinct"):
+        q.query(
+            find=q.relation(entity),
+            order_by=[q.asc(entity), q.desc(entity)],
+        )
+    with pytest.raises(ValueError, match="direction"):
+        q.Order(entity, q.kw("sideways"))
+
+    branch_group = q.and_(clause, q.predicate("some?", name))
+    with pytest.raises(ValueError, match="only valid as a branch"):
+        q.query(find=q.relation(entity), where=[branch_group])
+    with pytest.raises(ValueError, match="only valid as a branch"):
+        q.not_(branch_group)
+
+    valid = q.query(
+        find=q.relation(entity, name),
+        keys=["id", "name"],
+        order_by=[q.asc(entity), q.desc(1)],
+        where=[q.or_(branch_group, clause)],
+    )
+    assert isinstance(valid, Query)
+    assert isinstance(
+        q.query(find=q.tuple_find(entity, name), keys=["id", "name"]),
+        Query,
+    )
+    assert isinstance(
+        q.query(
+            find=q.relation(entity),
+            inputs=[q.RULES],
+            where=[q.rule("and", entity)],
+        ),
+        Query,
+    )
+
+
+def test_rule_sets_validate_required_and_free_branch_arity() -> None:
+    entity = q.var("entity")
+    child = q.var("child")
+    clause = q.datom(entity, "person/child", child)
+    required_branch = q.rule_branch(
+        "ancestor",
+        q.join_vars(child, required=[entity]),
+        clause,
+    )
+    free_branch = q.rule_branch("ancestor", [entity, child], clause)
+
+    with pytest.raises(ValueError, match="matching required/free arity"):
+        q.rules(required_branch, free_branch)
+    with pytest.raises(ValueError, match="top level of a rule branch"):
+        q.rule_branch("ancestor", [entity], q.and_(clause))
+
+    assert q.rules(required_branch).as_data() == [
+        [
+            ["ancestor", ["?entity"], "?child"],
+            ["?entity", ":person/child", "?child"],
+        ]
+    ]
+
+
 def test_transaction_builder_produces_typed_immutable_forms() -> None:
     transaction = tx.data(
         tx.entity(-1, {"person/name": "?Ada", "person/status": q.kw("active")}),

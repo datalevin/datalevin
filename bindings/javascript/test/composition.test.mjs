@@ -273,6 +273,107 @@ test("transaction context-specific forms are explicit and composable", () => {
   ]);
 });
 
+test("query builders reject invalid structural combinations", () => {
+  const entity = q.var("entity");
+  const name = q.var("name");
+  const other = q.var("other");
+  const clause = q.datom(entity, "person/name", name);
+
+  assert.throws(
+    () => q.query({ find: q.scalar(entity), keys: ["id"] }),
+    /scalar find/
+  );
+  assert.throws(
+    () => q.query({ find: q.collection(entity), keys: ["id"] }),
+    /collection find/
+  );
+  assert.throws(
+    () => q.query({ find: q.relation(entity, name), keys: ["id"] }),
+    /field count/
+  );
+  assert.throws(
+    () => q.query({ find: q.relation(entity), keys: [q.kw("id")] }),
+    /field names/
+  );
+
+  assert.throws(() => q.joinVars(), /must not be empty/);
+  assert.throws(
+    () => q.joinVars(entity, { required: [entity] }),
+    /distinct/
+  );
+  assert.throws(() => q.joinVars("entity"), /q.var/);
+
+  assert.throws(() => q.asc("entity"), /order term/);
+  assert.throws(() => q.desc(-1), /order term/);
+  assert.throws(
+    () => q.query({ find: q.relation(entity), orderBy: [q.asc(other)] }),
+    /occur in the find/
+  );
+  assert.throws(
+    () => q.query({ find: q.relation(entity), orderBy: [q.asc(1)] }),
+    /outside the find/
+  );
+  assert.throws(
+    () => q.query({
+      find: q.relation(entity),
+      orderBy: [q.asc(entity), q.desc(entity)]
+    }),
+    /distinct/
+  );
+
+  const branchGroup = q.and(clause, q.predicate("some?", name));
+  assert.throws(
+    () => q.query({ find: q.relation(entity), where: [branchGroup] }),
+    /only valid as a branch/
+  );
+  assert.throws(() => q.not(branchGroup), /only valid as a branch/);
+
+  const valid = q.query({
+    find: q.relation(entity, name),
+    keys: ["id", "name"],
+    orderBy: [q.asc(entity), q.desc(1)],
+    where: [q.or(branchGroup, clause)]
+  });
+  assert.equal(valid instanceof Query, true);
+  assert.equal(q.query({
+    find: q.tuple(entity, name),
+    keys: ["id", "name"]
+  }) instanceof Query, true);
+  assert.equal(q.query({
+    find: q.relation(entity),
+    inputs: [q.RULES],
+    where: [q.rule("and", entity)]
+  }) instanceof Query, true);
+});
+
+test("rule sets validate branch arity and expose asData", () => {
+  const entity = q.var("entity");
+  const child = q.var("child");
+  const clause = q.datom(entity, "person/child", child);
+  const requiredBranch = q.ruleBranch(
+    "ancestor",
+    q.joinVars(child, { required: [entity] }),
+    clause
+  );
+  const freeBranch = q.ruleBranch("ancestor", [entity, child], clause);
+
+  assert.throws(
+    () => q.rules(requiredBranch, freeBranch),
+    /matching required\/free arity/
+  );
+  assert.throws(
+    () => q.ruleBranch("ancestor", [entity], q.and(clause)),
+    /top level of a rule branch/
+  );
+
+  assert.deepEqual(q.rules(requiredBranch).asData(), [
+    [
+      ["ancestor", ["?entity"], "?child"],
+      ["?entity", ":person/child", "?child"]
+    ]
+  ]);
+});
+
 test(
   "composed queries and transactions execute through the JVM bridge",
   { skip: !runtimeAvailable, timeout: 30000 },
