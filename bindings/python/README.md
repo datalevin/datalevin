@@ -19,7 +19,14 @@ not require building Datalevin from source.
 ## Quick Start
 
 ```python
-from datalevin import connect
+from datalevin import connect, q, tx
+
+entity = q.var("entity")
+name = q.var("name")
+all_names = q.query(
+    find=q.collection(name),
+    where=[q.datom(entity, "name", name)],
+)
 
 with connect(
     "/tmp/dtlv-py",
@@ -31,32 +38,112 @@ with connect(
     },
 ) as conn:
     conn.transact(
-        [
-            {":db/id": -1, ":name": "Ada"},
-            {":db/id": -2, ":name": "Bob"},
-        ]
+        tx.data(
+            tx.entity(-1, {"name": "Ada"}),
+            tx.entity(-2, {"name": "Bob"}),
+        )
     )
 
-    names = conn.query("[:find [?name ...] :where [?e :name ?name]]")
+    names = conn.query(all_names)
     ada = conn.pull([":name"], 1)
 
     print(names)
     print(ada)
 ```
 
-Structured query forms and inputs can also be passed as normal Python lists and
-dictionaries when that is more convenient than EDN strings.
+The `q` and `tx` builders are pure Python values: composing them does not start
+the JVM. The connection lowers them to the active backend only when `query()` or
+`transact()` is called.
+
+## Composing Queries
+
+Use normal Python control flow to assemble clauses. Variables, attributes,
+symbols, and keyword values are explicit, so strings beginning with `?` or `:`
+remain literal strings.
+
+The same rule applies recursively to runtime inputs passed to a typed query.
+Use `q.kw("active")` when an input is a keyword. EDN-string and native-list
+queries keep the legacy `":active"` keyword shorthand for compatibility.
+
+```python
+entity = q.var("entity")
+name = q.var("name")
+age = q.var("age")
+minimum = q.var("minimum")
+
+where = [
+    q.datom(entity, "person/name", name),
+    q.datom(entity, "person/age", age),
+]
+if adults_only:
+    where.append(q.predicate(">=", age, minimum))
+
+people = q.query(
+    find=q.collection(name),
+    inputs=[q.DB, minimum] if adults_only else [],
+    where=where,
+)
+
+names = conn.query(people, 18) if adults_only else conn.query(people)
+```
+
+Available helpers cover relation, collection, tuple, and scalar finds;
+aggregates and pull expressions; datom, predicate, function-binding, rule, and
+logical clauses; input bindings, joins, rules, ordering, limits, offsets, and
+timeouts. `q.raw()` is the structured escape hatch for new syntax; its tokens
+must use `q.kw()` and `q.sym()` explicitly.
+
+### Composing pull selectors
+
+Pull selectors use position-aware forms so option values remain ordinary
+Python data:
+
+```python
+person = q.selector(
+    "person/name",
+    q.pull_attr("person/nickname", default="none", as_="display"),
+    q.pull_attr("person/age", xform="str"),
+    q.pull_nested("person/friend", q.selector("person/name")),
+    q.pull_recursive("person/manager", depth=2),
+)
+
+result = conn.pull(person, entity_id)
+```
+
+`default` and `as_` accept arbitrary values and preserve strings recursively.
+A string `xform` is a symbol name; an explicit `q.sym()` is also accepted.
+Omit `depth` from `pull_recursive` for unbounded `...` recursion. Existing
+native-list selectors remain supported and are normalized by pull grammar
+position rather than by their string contents.
+
+## Composing Transactions
+
+Transaction items compose the same way:
+
+```python
+items = [tx.entity(-1, {"person/name": "Ada"})]
+if nickname is not None:
+    items.append(tx.add(-1, "person/nickname", nickname))
+
+report = conn.transact(tx.data(items))
+```
+
+In addition to entity maps, `tx` provides `add`, `retract`,
+`retract_attribute`, `retract_entity`, `compare_and_swap`/`cas`, `call`,
+`ensure`, and `patch_idoc` operations. Values remain ordinary Python data;
+`q.kw()` and `q.sym()` add explicit Datalevin tokens where needed.
 
 ## Data Style
 
-Use ordinary Python data as the canonical style:
+The existing EDN and native-form APIs remain supported alongside the builders:
 
 - schemas are dictionaries keyed by colon-prefixed attribute strings
-- transaction entity maps are dictionaries, and transaction forms are lists
-- query and pull forms may be EDN strings or Python lists
+- transaction data may use `tx`, dictionaries/lists, or existing `tx_*` helpers
+- query and pull forms may be builder values, EDN strings, or Python lists
 - colon-prefixed strings are converted to keywords in schema/query/form
-  positions
-- use `keyword()` when the stored value itself must be a keyword
+  positions for the legacy native-form API
+- use pure `q.kw()` in builder values, or `keyword()` with the legacy API, when
+  the stored value itself is a keyword
 
 ```python
 from datalevin import keyword, read_edn, schema_attr, tx_add, tx_entity, write_edn

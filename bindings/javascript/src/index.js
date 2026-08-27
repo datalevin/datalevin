@@ -64,6 +64,9 @@ export {
   writeEdn
 } from "./interop.js";
 export { interop } from "./raw.js";
+export { DatalogSymbol, Keyword } from "./form.js";
+export { PullAttr, PullNested, PullSelector, Query, q } from "./query.js";
+export { TxData, tx } from "./transaction.js";
 export { KV, KVTransaction, RawBuffer, RawKV } from "./kv.js";
 export { LlamaEmbedder, LlamaGenerator } from "./llm.js";
 export {

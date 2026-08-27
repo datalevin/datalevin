@@ -1,5 +1,8 @@
 """Datalevin Python bindings over the JVM interop bridge."""
 
+from . import query as q
+from . import transaction as tx
+from ._forms import Keyword, Symbol
 from ._interop import (
     abort_transact,
     analyze,
@@ -65,6 +68,7 @@ from .errors import (
 )
 from .kv import KV, KVTransaction, RawBuffer, RawKV
 from .llm import LlamaEmbedder, LlamaGenerator, new_llama_embedder, new_llama_generator
+from .query import PullAttr, PullNested, PullSelector, Query
 from .search import (
     SearchEngine,
     SearchIndexWriter,
@@ -81,6 +85,7 @@ from .search import (
     unaccent_token_filter,
 )
 from .udf import UdfRegistry, create_udf_registry, udf_descriptor
+from .transaction import TxData
 from .vector import VectorIndex
 
 __all__ = [
@@ -94,13 +99,20 @@ __all__ = [
     "DatalevinJvmError",
     "KV",
     "KVTransaction",
+    "Keyword",
     "LlamaEmbedder",
     "LlamaGenerator",
     "SearchEngine",
     "SearchIndexWriter",
     "RawBuffer",
     "RawKV",
+    "Query",
+    "PullAttr",
+    "PullNested",
+    "PullSelector",
     "UdfRegistry",
+    "Symbol",
+    "TxData",
     "VectorIndex",
     "abort_transact",
     "analyze",
@@ -146,6 +158,7 @@ __all__ = [
     "new_vector_index",
     "open_kv",
     "prefix_token_filter",
+    "q",
     "read_edn",
     "re_index",
     "schema_attr",
@@ -157,6 +170,7 @@ __all__ = [
     "symbol",
     "transact",
     "transact_async",
+    "tx",
     "tx_add",
     "tx_data_to_simulated_report",
     "tx_entity",

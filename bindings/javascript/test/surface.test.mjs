@@ -2,7 +2,22 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import * as datalevin from "../src/index.js";
+import { RawForm } from "../src/form.js";
 import { _BINDINGS } from "../src/interop.js";
+
+test("typed system query inputs preserve literal strings", async () => {
+  const originalClientInvoke = _BINDINGS.clientInvoke;
+  _BINDINGS.clientInvoke = async (functionName, args) => ({ functionName, args });
+  try {
+    const client = new datalevin.Client("HANDLE");
+    assert.deepEqual(await client.querySystem(new RawForm("typed-query"), ":literal"), {
+      functionName: "query-system",
+      args: ["HANDLE", "typed-query", ":literal"]
+    });
+  } finally {
+    _BINDINGS.clientInvoke = originalClientInvoke;
+  }
+});
 
 test("public surface stays importable without starting the JVM", () => {
   assert.equal(typeof datalevin.abortTransact, "function");

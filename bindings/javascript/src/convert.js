@@ -1,4 +1,5 @@
 import { classes } from "./jvm.js";
+import { DatalogSymbol, Form, Keyword } from "./form.js";
 
 const INT64_MIN = -(2n ** 63n);
 const INT64_MAX = 2n ** 63n - 1n;
@@ -112,6 +113,20 @@ export async function toJava(value) {
 
   if (isJavaObject(value)) {
     return value;
+  }
+
+  if (value instanceof Keyword) {
+    const cls = await classes();
+    return cls.interop.keywordSync(value.toString());
+  }
+
+  if (value instanceof DatalogSymbol) {
+    const cls = await classes();
+    return cls.interop.symbolSync(value.toString());
+  }
+
+  if (value instanceof Form) {
+    return toJava(value.toForm());
   }
 
   if (typeof value?.rawHandle === "function") {
@@ -251,6 +266,22 @@ export async function toEdnForm(value) {
     return value;
   }
 
+  if (value instanceof Keyword) {
+    const cls = await classes();
+    return cls.interop.keywordSync(value.toString());
+  }
+
+  if (value instanceof DatalogSymbol) {
+    const cls = await classes();
+    return cls.interop.symbolSync(value.toString());
+  }
+
+  if (value instanceof Form) {
+    // Builder forms carry explicit Keyword/DatalogSymbol nodes. Lower through
+    // toJava so strings such as "?literal" remain ordinary string constants.
+    return toJava(value);
+  }
+
   if (typeof value?.rawHandle === "function") {
     return value.rawHandle();
   }
@@ -288,6 +319,20 @@ export async function toEdnForm(value) {
 export async function toQueryInput(value) {
   if (value === null || isJavaObject(value)) {
     return value;
+  }
+
+  if (value instanceof Keyword) {
+    const cls = await classes();
+    return cls.interop.keywordSync(value.toString());
+  }
+
+  if (value instanceof DatalogSymbol) {
+    const cls = await classes();
+    return cls.interop.symbolSync(value.toString());
+  }
+
+  if (value instanceof Form) {
+    return toJava(value);
   }
 
   if (typeof value?.rawHandle === "function") {

@@ -10,6 +10,7 @@ import uuid as py_uuid
 import jpype
 from jpype.types import JBoolean, JByte, JLong
 
+from ._forms import Form, Keyword, Symbol
 from ._java import call_java, classes, is_java_object
 
 INT64_MIN = -(2**63)
@@ -26,6 +27,15 @@ def to_java(value):
         return classes().boolean_type.TRUE if value else classes().boolean_type.FALSE
     if is_java_object(value):
         return value
+
+    if isinstance(value, Keyword):
+        return call_java(classes().interop.keyword, str(value))
+
+    if isinstance(value, Symbol):
+        return call_java(classes().interop.symbol, str(value))
+
+    if isinstance(value, Form):
+        return to_java(value.to_form())
 
     raw_handle = getattr(value, "raw_handle", None)
     if callable(raw_handle):
@@ -118,7 +128,12 @@ def to_python(value):
     if isinstance(value, cls.map_type) or hasattr(value, "entrySet"):
         result = {}
         for entry in value.entrySet():
-            result[to_python(entry.getKey())] = to_python(entry.getValue())
+            key = to_python(entry.getKey())
+            try:
+                hash(key)
+            except TypeError:
+                key = _hashable_python_value(key)
+            result[key] = to_python(entry.getValue())
         return result
 
     if isinstance(value, cls.set_type):
@@ -130,11 +145,36 @@ def to_python(value):
     return value
 
 
+def _hashable_python_value(value):
+    if isinstance(value, Mapping):
+        return frozenset(
+            (_hashable_python_value(key), _hashable_python_value(item))
+            for key, item in value.items()
+        )
+    if isinstance(value, (list, tuple)):
+        return tuple(_hashable_python_value(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_hashable_python_value(item) for item in value)
+    return value
+
+
 def to_edn_form(value):
     """Convert Python form structures into EDN-friendly JVM values."""
 
     if value is None or is_java_object(value):
         return value
+
+    if isinstance(value, Keyword):
+        return call_java(classes().interop.keyword, str(value))
+
+    if isinstance(value, Symbol):
+        return call_java(classes().interop.symbol, str(value))
+
+    if isinstance(value, Form):
+        # Typed builder forms use explicit Keyword/Symbol nodes.  Lower through
+        # to_java so ordinary strings such as "?literal" and ":literal" are
+        # never reinterpreted by the legacy form heuristic below.
+        return to_java(value)
 
     raw_handle = getattr(value, "raw_handle", None)
     if callable(raw_handle):
@@ -173,6 +213,15 @@ def to_query_input(value):
 
     if value is None or is_java_object(value):
         return value
+
+    if isinstance(value, Keyword):
+        return call_java(classes().interop.keyword, str(value))
+
+    if isinstance(value, Symbol):
+        return call_java(classes().interop.symbol, str(value))
+
+    if isinstance(value, Form):
+        return to_java(value)
 
     raw_handle = getattr(value, "raw_handle", None)
     if callable(raw_handle):

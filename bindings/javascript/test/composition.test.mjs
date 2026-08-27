@@ -1,0 +1,340 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { test } from "node:test";
+
+import {
+  Keyword,
+  PullAttr,
+  PullNested,
+  PullSelector,
+  Query,
+  TxData,
+  connect,
+  q,
+  schemaAttr,
+  tx
+} from "../src/index.js";
+import { resolveClasspath } from "../src/jvm.js";
+
+const runtimeAvailable = (() => {
+  try {
+    resolveClasspath();
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
+function intValue(value) {
+  return typeof value === "bigint" ? Number(value) : value;
+}
+
+test("query forms are pure, typed, and composable", () => {
+  const entity = q.var("e");
+  const name = q.var("name");
+  const age = q.var("age");
+  const clauses = [
+    q.datom(entity, "person/name", name),
+    q.datom(entity, "person/age", age)
+  ];
+  const minimumAge = 30;
+  if (minimumAge !== null) {
+    clauses.push(q.predicate(">=", age, minimumAge));
+  }
+
+  const adults = q.query({
+    find: q.relation(name),
+    where: clauses,
+    orderBy: [q.asc(name)],
+    limit: 10
+  });
+
+  assert.equal(adults instanceof Query, true);
+  assert.deepEqual(adults.asData(), [
+    ":find",
+    "?name",
+    ":where",
+    ["?e", ":person/name", "?name"],
+    ["?e", ":person/age", "?age"],
+    [[">=", "?age", 30]],
+    ":order-by",
+    ["?name", ":asc"],
+    ":limit",
+    10
+  ]);
+  assert.equal(Object.isFrozen(adults), true);
+  assert.equal(Object.isFrozen(q), true);
+});
+
+test("plain strings stay literals unless explicitly typed", () => {
+  const entity = q.var("e");
+  const clause = q.datom(entity, "label", "?literal").toForm();
+  assert.equal(clause[1] instanceof Keyword, true);
+  assert.equal(clause[2], "?literal");
+
+  const keywordLiteral = q.datom(entity, q.var("attribute"), ":literal").toForm();
+  assert.equal(keywordLiteral[1].toString(), "?attribute");
+  assert.equal(keywordLiteral[2], ":literal");
+});
+
+test("pull selectors type grammar tokens without changing values", () => {
+  const attribute = q.pullAttr("person/nickname", {
+    as: "display",
+    limit: null,
+    default: { text: ":none" },
+    xform: "str"
+  });
+  const form = attribute.toForm();
+
+  assert.equal(attribute instanceof PullAttr, true);
+  assert.equal(form[0] instanceof Keyword, true);
+  assert.equal(form[2], "display");
+  assert.equal(form[4], null);
+  assert.deepEqual(form[6], { text: ":none" });
+  assert.equal(form[8].toString(), "str");
+
+  const nested = q.pullNested("person/friend", q.selector("person/name"));
+  const recursive = q.pullRecursive("person/manager");
+  const bounded = q.pullRecursive(q.pullAttr("person/reports", { limit: 2 }), 3);
+  const selector = q.selector(attribute, nested, recursive, bounded);
+
+  assert.equal(nested instanceof PullNested, true);
+  assert.equal(selector instanceof PullSelector, true);
+  assert.deepEqual(selector.asData(), [
+    [
+      ":person/nickname",
+      ":as",
+      "display",
+      ":limit",
+      null,
+      ":default",
+      { text: ":none" },
+      ":xform",
+      "str"
+    ],
+    new Map([[":person/friend", [":person/name"]]]),
+    new Map([[":person/manager", "..."]]),
+    new Map([[[":person/reports", ":limit", 2], 3]])
+  ]);
+
+  const legacyExpression = q.selector([
+    ["person/nickname", ":default", "none", ":as", "display"]
+  ]);
+  assert.deepEqual(legacyExpression.asData(), [
+    [":person/nickname", ":default", "none", ":as", "display"]
+  ]);
+});
+
+test("transaction forms use explicit operation and attribute keywords", () => {
+  const transaction = tx.data(
+    tx.entity(-1, { "person/name": "?Ada", "person/status": q.kw("active") }),
+    tx.add(-1, "person/age", 42),
+    tx.compareAndSwap(-1, "person/age", 42, 43),
+    tx.retractAttribute(-1, "person/nickname"),
+    tx.ensure("person/valid?", -1)
+  );
+
+  assert.equal(transaction instanceof TxData, true);
+  const entityForm = transaction.at(0).toForm();
+  assert.equal(entityForm instanceof Map, true);
+  assert.equal(Array.from(entityForm.keys()).every((key) => key instanceof Keyword), true);
+  assert.deepEqual(transaction.asData(), [
+    new Map([
+      [":person/name", "?Ada"],
+      [":person/status", ":active"],
+      [":db/id", -1]
+    ]),
+    [":db/add", -1, ":person/age", 42],
+    [":db.fn/cas", -1, ":person/age", 42, 43],
+    [":db.fn/retractAttribute", -1, ":person/nickname"],
+    [":db/ensure", ":person/valid?", -1]
+  ]);
+});
+
+test(
+  "composed queries and transactions execute through the JVM bridge",
+  { skip: !runtimeAvailable, timeout: 30000 },
+  async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dtlv-js-composition-"));
+    const conn = await connect(dir, {
+      schema: {
+        ":person/name": schemaAttr({ valueType: ":db.type/string" }),
+        ":person/age": schemaAttr({ valueType: ":db.type/long" }),
+        ":person/label": schemaAttr({ valueType: ":db.type/string" }),
+        ":person/nickname": schemaAttr({ valueType: ":db.type/string" }),
+        ":person/status": schemaAttr({ valueType: ":db.type/keyword" }),
+        ":person/friend": schemaAttr({ valueType: ":db.type/ref" })
+      }
+    });
+
+    try {
+      await conn.transact(tx.data(
+        tx.entity(-1, {
+          "person/name": "Ada",
+          "person/age": 42,
+          "person/label": "?literal",
+          "person/nickname": "Ace",
+          "person/status": q.kw("active"),
+          "person/friend": -2
+        }),
+        tx.entity(-2, {
+          "person/name": "Bob",
+          "person/age": 21,
+          "person/label": ":literal",
+          "person/status": q.kw("draft")
+        })
+      ));
+
+      const entity = q.var("entity");
+      const name = q.var("name");
+      const age = q.var("age");
+      const minimum = q.var("minimum");
+      const adults = q.query({
+        find: q.collection(name),
+        inputs: [q.DB, minimum],
+        where: [
+          q.datom(entity, "person/name", name),
+          q.datom(entity, "person/age", age),
+          q.predicate(">=", age, minimum)
+        ]
+      });
+      assert.deepEqual(await conn.query(adults, 30), ["Ada"]);
+
+      const ordered = q.query({
+        find: q.relation(name, age),
+        where: [
+          q.datom(entity, "person/name", name),
+          q.datom(entity, "person/age", age)
+        ],
+        orderBy: [q.desc(age)]
+      });
+      assert.deepEqual(
+        (await conn.query(ordered)).map(([personName, personAge]) => [personName, intValue(personAge)]),
+        [["Ada", 42], ["Bob", 21]]
+      );
+
+      const leadingQuestion = q.query({
+        find: q.collection(entity),
+        where: [q.datom(entity, "person/label", "?literal")]
+      });
+      const leadingColon = q.query({
+        find: q.collection(entity),
+        where: [q.datom(entity, "person/label", ":literal")]
+      });
+      assert.deepEqual((await conn.query(leadingQuestion)).map(intValue), [1]);
+      assert.deepEqual((await conn.query(leadingColon)).map(intValue), [2]);
+
+      const label = q.var("label");
+      const byLabel = q.query({
+        find: q.collection(entity),
+        inputs: [q.DB, label],
+        where: [q.datom(entity, "person/label", label)]
+      });
+      assert.deepEqual((await conn.query(byLabel, ":literal")).map(intValue), [2]);
+      assert.equal(":plan" in await conn.explain(byLabel, { inputs: [":literal"] }), true);
+
+      const byLabels = q.query({
+        find: q.collection(entity),
+        inputs: [q.DB, q.collectionBinding(label)],
+        where: [q.datom(entity, "person/label", label)]
+      });
+      assert.deepEqual((await conn.query(byLabels, [":literal"])).map(intValue), [2]);
+
+      const active = q.query({
+        find: q.collection(name),
+        where: [
+          q.datom(entity, "person/name", name),
+          q.datom(entity, "person/status", q.kw("active"))
+        ]
+      });
+      assert.deepEqual(await conn.query(active), ["Ada"]);
+
+      const status = q.var("status");
+      const byStatus = q.query({
+        find: q.collection(name),
+        inputs: [q.DB, status],
+        where: [
+          q.datom(entity, "person/name", name),
+          q.datom(entity, "person/status", status)
+        ]
+      });
+      assert.deepEqual(await conn.query(byStatus, q.kw("active")), ["Ada"]);
+
+      const fallbackSelector = q.selector(
+        q.pullAttr("person/nickname", { default: "none", as: "nickname" })
+      );
+      assert.deepEqual(await conn.pull(fallbackSelector, 2), { nickname: "none" });
+
+      const structuredFallback = q.selector(
+        q.pullAttr("person/nickname", {
+          default: { text: ":none" },
+          as: "fallback"
+        })
+      );
+      assert.deepEqual(await conn.pull(structuredFallback, 2), {
+        fallback: { text: ":none" }
+      });
+
+      const tupleAlias = q.selector(
+        q.pullAttr("person/nickname", {
+          default: "none",
+          as: ["label", ":literal"]
+        })
+      );
+      const tupleAliasResult = await conn.pull(tupleAlias, 2);
+      assert.equal(tupleAliasResult instanceof Map, true);
+      assert.deepEqual(Array.from(tupleAliasResult), [
+        [["label", ":literal"], "none"]
+      ]);
+
+      const legacyFallback = q.selector([
+        ["person/nickname", ":default", "none", ":as", "nickname"]
+      ]);
+      assert.deepEqual(await conn.pull(legacyFallback, 2), { nickname: "none" });
+
+      const pulledBob = q.query({
+        find: q.scalar(q.pull(entity, fallbackSelector)),
+        where: [q.datom(entity, "person/name", "Bob")]
+      });
+      assert.deepEqual(await conn.query(pulledBob), { nickname: "none" });
+
+      const ageText = q.selector(
+        q.pullAttr("person/age", { as: "age-text", xform: "str" })
+      );
+      assert.deepEqual(await conn.pull(ageText, 1), { "age-text": "42" });
+
+      const friendName = q.selector(
+        q.pullNested("person/friend", q.selector("person/name"))
+      );
+      assert.deepEqual(await conn.pull(friendName, 1), {
+        ":person/friend": { ":person/name": "Bob" }
+      });
+
+      const recursiveFriend = q.selector(
+        "db/id",
+        q.pullRecursive(q.pullAttr("person/friend", { as: "friend" }), 1)
+      );
+      const recursiveResult = await conn.pull(recursiveFriend, 1);
+      assert.equal(intValue(recursiveResult[":db/id"]), 1);
+      assert.equal(intValue(recursiveResult.friend[":db/id"]), 2);
+
+      const adultRule = q.ruleBranch(
+        "adult",
+        [entity, name, minimum],
+        q.datom(entity, "person/name", name),
+        q.datom(entity, "person/age", age),
+        q.predicate(">=", age, minimum)
+      );
+      const byRule = q.query({
+        find: q.collection(name),
+        inputs: [q.DB, q.RULES, minimum],
+        where: [q.rule("adult", entity, name, minimum)]
+      });
+      assert.deepEqual(await conn.query(byRule, q.rules(adultRule), 30), ["Ada"]);
+    } finally {
+      await conn.close();
+    }
+  }
+);

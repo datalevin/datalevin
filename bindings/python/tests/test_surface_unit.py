@@ -434,6 +434,7 @@ def test_client_wrapper_delegates_to_bindings(monkeypatch) -> None:
     fake = FakeClientBindings()
     monkeypatch.setattr(client_module, "_BINDINGS", fake)
     monkeypatch.setattr(client_module, "to_python", lambda value: value)
+    monkeypatch.setattr(client_module, "to_java", lambda value: ("typed-input", value))
     monkeypatch.setattr(client_module, "to_query_input", lambda value: ("query-input", value))
 
     client = client_module.Client("HANDLE")
@@ -487,6 +488,16 @@ def test_client_wrapper_delegates_to_bindings(monkeypatch) -> None:
     assert client.query_system("[:find ?e :where [?e :db/ident _]]", ":db/ident") == {
         "function": "query-system",
         "args": ["HANDLE", ("edn", "[:find ?e :where [?e :db/ident _]]"), ("query-input", ":db/ident")],
+    }
+
+    typed_query = datalevin.q.query(
+        find=datalevin.q.collection(datalevin.q.var("entity")),
+        where=[datalevin.q.datom(datalevin.q.var("entity"), "db/ident", datalevin.q.var("ident"))],
+    )
+    monkeypatch.setattr(client_module, "to_edn_form", lambda value: ("typed-form", value))
+    assert client.query_system(typed_query, ":literal") == {
+        "function": "query-system",
+        "args": ["HANDLE", ("typed-form", typed_query), ("typed-input", ":literal")],
     }
 
     assert client.disconnected() is False

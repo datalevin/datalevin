@@ -1,4 +1,5 @@
-import { toEdnForm, toQueryInput } from "./convert.js";
+import { toEdnForm, toJava, toQueryInput } from "./convert.js";
+import { Form } from "./form.js";
 import { _BINDINGS } from "./interop.js";
 import { classes } from "./jvm.js";
 import { ResourceWrapper } from "./resource.js";
@@ -164,9 +165,10 @@ export class Client extends ResourceWrapper {
   }
 
   async querySystem(query, ...args) {
+    const convertInput = query instanceof Form ? toJava : toQueryInput;
     const normalizedInputs = [];
     for (const value of args) {
-      normalizedInputs.push(await toQueryInput(value));
+      normalizedInputs.push(await convertInput(value));
     }
     return toJsResult(
       await _BINDINGS.clientInvoke("query-system", [

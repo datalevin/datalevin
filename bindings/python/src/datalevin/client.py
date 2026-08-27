@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from weakref import WeakSet
 
-from ._convert import to_edn_form, to_python, to_query_input
+from ._convert import to_edn_form, to_java, to_python, to_query_input
+from ._forms import Form
 from ._interop import _BINDINGS
 from ._resource import ResourceWrapper
 
@@ -146,10 +147,11 @@ class Client(ResourceWrapper):
         return to_python(_BINDINGS.client_invoke("list-user-permissions", [self.raw_handle(), username]))
 
     def query_system(self, query, *args):
+        convert_input = to_java if isinstance(query, Form) else to_query_input
         return to_python(
             _BINDINGS.client_invoke(
                 "query-system",
-                [self.raw_handle(), _query_form(query), *(to_query_input(arg) for arg in args)],
+                [self.raw_handle(), _query_form(query), *(convert_input(arg) for arg in args)],
             )
         )
 

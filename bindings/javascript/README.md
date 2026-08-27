@@ -19,7 +19,14 @@ normal usage does not require building Datalevin from source.
 ## Quick Start
 
 ```js
-import { connect } from "datalevin-node";
+import { connect, q, tx } from "datalevin-node";
+
+const entity = q.var("entity");
+const name = q.var("name");
+const allNames = q.query({
+  find: q.collection(name),
+  where: [q.datom(entity, "name", name)]
+});
 
 const conn = await connect("/tmp/dtlv-js", {
   schema: {
@@ -31,12 +38,12 @@ const conn = await connect("/tmp/dtlv-js", {
 });
 
 try {
-  await conn.transact([
-    { ":db/id": -1, ":name": "Ada" },
-    { ":db/id": -2, ":name": "Bob" }
-  ]);
+  await conn.transact(tx.data(
+    tx.entity(-1, { name: "Ada" }),
+    tx.entity(-2, { name: "Bob" })
+  ));
 
-  const names = await conn.query("[:find [?name ...] :where [?e :name ?name]]");
+  const names = await conn.query(allNames);
   const ada = await conn.pull([":name"], 1);
 
   console.log(names);
@@ -46,16 +53,103 @@ try {
 }
 ```
 
+The `q` and `tx` builders are synchronous, pure JavaScript values. Composing
+them does not start the JVM; a connection lowers them to the active backend only
+when `query()` or `transact()` is called.
+
+## Composing Queries
+
+Use normal JavaScript control flow to assemble clauses. Variables, attributes,
+symbols, and keyword values are explicit, so strings beginning with `?` or `:`
+remain literal strings.
+
+The same rule applies recursively to runtime inputs passed to a typed query.
+Use `q.kw("active")` when an input is a keyword. EDN-string and native-array
+queries keep the legacy `":active"` keyword shorthand for compatibility.
+
+```js
+const entity = q.var("entity");
+const name = q.var("name");
+const age = q.var("age");
+const minimum = q.var("minimum");
+
+const where = [
+  q.datom(entity, "person/name", name),
+  q.datom(entity, "person/age", age)
+];
+if (adultsOnly) {
+  where.push(q.predicate(">=", age, minimum));
+}
+
+const people = q.query({
+  find: q.collection(name),
+  inputs: adultsOnly ? [q.DB, minimum] : [],
+  where
+});
+
+const names = adultsOnly
+  ? await conn.query(people, 18)
+  : await conn.query(people);
+```
+
+Available helpers cover relation, collection, tuple, and scalar finds;
+aggregates and pull expressions; datom, predicate, function-binding, rule, and
+logical clauses; input bindings, joins, rules, ordering, limits, offsets, and
+timeouts. `q.raw()` is the structured escape hatch for new syntax; its tokens
+must use `q.kw()` and `q.sym()` explicitly.
+
+### Composing pull selectors
+
+Pull selectors use position-aware forms so option values remain ordinary
+JavaScript data:
+
+```js
+const person = q.selector(
+  "person/name",
+  q.pullAttr("person/nickname", { default: "none", as: "display" }),
+  q.pullAttr("person/age", { xform: "str" }),
+  q.pullNested("person/friend", q.selector("person/name")),
+  q.pullRecursive("person/manager", 2)
+);
+
+const result = await conn.pull(person, entityId);
+```
+
+`default` and `as` accept arbitrary values and preserve strings recursively.
+A string `xform` is a symbol name; an explicit `q.sym()` is also accepted.
+Omit the second argument to `pullRecursive` for unbounded `...` recursion.
+Existing native-array selectors remain supported and are normalized by pull
+grammar position rather than by their string contents.
+
+## Composing Transactions
+
+Transaction items compose the same way:
+
+```js
+const items = [tx.entity(-1, { "person/name": "Ada" })];
+if (nickname !== null) {
+  items.push(tx.add(-1, "person/nickname", nickname));
+}
+
+const report = await conn.transact(tx.data(items));
+```
+
+In addition to entity maps, `tx` provides `add`, `retract`,
+`retractAttribute`, `retractEntity`, `compareAndSwap`/`cas`, `call`, `ensure`,
+and `patchIdoc` operations. Values remain ordinary JavaScript data; `q.kw()`
+and `q.sym()` add explicit Datalevin tokens where needed.
+
 ## Data Style
 
-Use ordinary JavaScript data as the canonical style:
+The existing EDN and native-form APIs remain supported alongside the builders:
 
 - schemas are objects keyed by colon-prefixed attribute strings
-- transaction entity maps are objects, and transaction forms are arrays
-- query and pull forms may be EDN strings or JavaScript arrays
+- transaction data may use `tx`, objects/arrays, or existing `tx*` helpers
+- query and pull forms may be builder values, EDN strings, or JavaScript arrays
 - colon-prefixed strings are converted to keywords in schema/query/form
-  positions
-- use `keyword()` when the stored value itself must be a keyword
+  positions for the legacy native-form API
+- use synchronous `q.kw()` in builder values, or `keyword()` with the legacy
+  API, when the stored value itself is a keyword
 
 ```js
 import { keyword, readEdn, schemaAttr, txAdd, txEntity, writeEdn } from "datalevin-node";

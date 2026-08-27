@@ -7,7 +7,8 @@ from threading import Thread
 
 import jpype
 
-from ._convert import to_edn_form, to_python, to_query_input
+from ._convert import to_edn_form, to_java, to_python, to_query_input
+from ._forms import Form
 from ._interop import _BINDINGS
 from ._java import call_java, classes
 from ._resource import ResourceWrapper
@@ -106,10 +107,10 @@ class Connection(ResourceWrapper):
         super().close()
 
     @staticmethod
-    def _query_input(value):
+    def _query_input(value, *, typed=False):
         if isinstance(value, Connection):
             return _BINDINGS.connection_db(value.raw_handle())
-        return to_query_input(value)
+        return to_java(value) if typed else to_query_input(value)
 
     def schema(self):
         return to_python(_BINDINGS.core_invoke("schema", [self.raw_handle()]))
@@ -188,13 +189,24 @@ class Connection(ResourceWrapper):
 
     def query(self, query, *inputs):
         db = _BINDINGS.connection_db(self.raw_handle())
-        args = [_edn_form(query), db, *(self._query_input(value) for value in inputs)]
+        typed = isinstance(query, Form)
+        args = [
+            _edn_form(query),
+            db,
+            *(self._query_input(value, typed=typed) for value in inputs),
+        ]
         return to_python(_BINDINGS.core_invoke("q", args))
 
     def explain(self, query, *inputs, opts_edn=None):
         db = _BINDINGS.connection_db(self.raw_handle())
         opts = None if opts_edn is None else _edn_form(opts_edn)
-        args = [opts, _edn_form(query), db, *(self._query_input(value) for value in inputs)]
+        typed = isinstance(query, Form)
+        args = [
+            opts,
+            _edn_form(query),
+            db,
+            *(self._query_input(value, typed=typed) for value in inputs),
+        ]
         return to_python(_BINDINGS.core_invoke("explain", args))
 
     def transact(self, tx_data, tx_meta=None):

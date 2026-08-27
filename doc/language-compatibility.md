@@ -17,6 +17,7 @@ Status key:
 | --- | --- | --- | --- | --- |
 | Open local Datalog connection | Yes | Yes | Yes | Yes |
 | Query, pull, explain | Yes | Yes | Yes | Yes |
+| Idiomatic, composable query forms | N/A, native data | Partial, `DatalogQuery` / `QueryClause` | Yes, pure `q` forms | Yes, pure `q` forms |
 | Multiple source databases in `q` / `explain` | Yes | Yes, pass `Connection` sources | Yes, pass `Connection` sources | Yes, pass `Connection` sources |
 | Synchronous transaction | Yes | Yes | Yes | Yes |
 | Async transaction | Yes | Yes, `CompletableFuture` | Yes, `Future` | Yes, `Promise` |
@@ -24,7 +25,7 @@ Status key:
 | Transaction listeners: `listen!` / `unlisten!` | Yes | Yes | Yes | Yes |
 | Datalog transaction callback | Yes, `with-transaction` | Yes, `withTransaction` | Yes, `with_transaction` | No |
 | Datalog transaction callback timeout | Yes | Yes | Yes | N/A |
-| Transaction entity maps/forms | Yes | Yes, maps and `Tx` builders | Yes, dictionaries/lists and helpers | Yes, objects/arrays and helpers |
+| Transaction entity maps/forms | Yes | Yes, maps and `Tx` builders | Yes, pure `tx` forms plus dictionaries/lists | Yes, pure `tx` forms plus objects/arrays |
 | Transactable existing entity objects | Yes | No | No | No |
 | Lazy entity reads | Yes | Yes | Yes | Yes |
 | Eager entity map/touch | Yes | Yes | Yes | Yes |
@@ -55,6 +56,19 @@ but not staged mutation of entity objects. Use transaction maps/builders instead
 For multiple source database queries in non-Clojure bindings, pass another
 `Connection` object as the source input corresponding to the extra `$` symbol.
 Direct DB snapshot access remains an interop/compatibility detail.
+
+Python and JavaScript `q`/`tx` values are backend-neutral composition objects.
+They do not start the JVM and are lowered only when executed. Plain strings in
+these typed forms remain strings; use `q.var`, `q.kw`, and `q.sym` for Datalog
+tokens. Runtime inputs to typed queries follow the same explicit conversion
+rules recursively. Existing EDN-string and native list/array query APIs remain
+supported with their legacy colon-prefixed keyword shorthand.
+
+Typed pull selectors use `q.selector`, `q.pull_attr`/`q.pullAttr`, nested pull
+helpers, and bounded or unbounded recursion helpers. Attribute names, option
+keys, xform symbols, wildcards, and recursion markers are typed by their grammar
+positions. Arbitrary `:as` and `:default` values remain native data, including
+strings beginning with `:` or `?`.
 
 ## KV
 

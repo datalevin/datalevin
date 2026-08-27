@@ -1,5 +1,6 @@
 import { toEdnForm, toJava, toJs, toQueryInput } from "./convert.js";
 import { txReportToJs } from "./database.js";
+import { Form } from "./form.js";
 import { _BINDINGS } from "./interop.js";
 import { callJavaMethod, javaBridgeModule } from "./jvm.js";
 import { ResourceWrapper } from "./resource.js";
@@ -195,9 +196,10 @@ export class Connection extends ResourceWrapper {
   }
 
   async query(query, ...inputs) {
+    const convertInput = query instanceof Form ? toJava : toQueryInput;
     const normalizedInputs = [];
     for (const input of inputs) {
-      normalizedInputs.push(await toQueryInput(input));
+      normalizedInputs.push(await convertInput(input));
     }
     if (typeof query === "string") {
       return toJsResult(
@@ -212,9 +214,10 @@ export class Connection extends ResourceWrapper {
   }
 
   async explain(query, { inputs = [], optsEdn = null } = {}) {
+    const convertInput = query instanceof Form ? toJava : toQueryInput;
     const normalizedInputs = [];
     for (const input of inputs) {
-      normalizedInputs.push(await toQueryInput(input));
+      normalizedInputs.push(await convertInput(input));
     }
     if (optsEdn !== null && optsEdn !== undefined) {
       if (typeof query === "string") {
