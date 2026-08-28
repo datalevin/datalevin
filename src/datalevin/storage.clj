@@ -2782,56 +2782,59 @@
 
 (defn prepare-embedding-plan
   [^Store store datoms]
-  (let [schema  (schema store)
-        batches (reduce
-                  (fn [m ^Datom datom]
-                    (let [attr  (.-a datom)
-                          props (schema attr)
-                          v     (.-v datom)]
-                      (if (and props
-                               (props :db/embedding)
-                               (d/datom-added datom)
-                               (string? v))
-                        (reduce
-                          (fn [m domain]
-                            (update m domain conj
-                                    {:datom datom
-                                     :text  v
-                                     :attr  attr
-                                     :ref   [(.-e datom) attr v]
-                                     :kind  :document
-                                     :domain domain}))
-                          m
-                          (remove #(async-embedding-domain? store %)
-                                  (embedding-attr-domains attr props)))
-                        m)))
-                  {}
-                  datoms)]
-    (when (seq batches)
-      (let [plan (IdentityHashMap.)]
-        (doseq [[domain items] batches
-                :let [provider    (or (embedding-provider store domain)
-                                      (u/raise "Embedding provider is not initialized"
-                                               {:domain domain}))
-                      dimensions (get-in (embedding-domain-config store domain)
-                                         [:dimensions])
-                      vectors    (emb/embedding provider
-                                                (mapv #(dissoc % :datom) items)
-                                                nil)]]
-          (when-not (= (count items) (count vectors))
-            (u/raise "Embedding provider returned the wrong number of vectors"
-                     {:domain  domain
-                      :items   (count items)
-                      :vectors (count vectors)}))
-          (doseq [[item vec-data] (map vector items vectors)]
-            (let [datom      (:datom item)
-                  domain-map (or (.get plan datom)
-                                 (let [m (HashMap.)]
-                                   (.put plan datom m)
-                                   m))]
-              (.put ^HashMap domain-map domain
-                    (ensure-embedding-vector! domain dimensions vec-data)))))
-        plan))))
+  ;; Most Datalog stores have no embedding domains. Avoid walking every datom
+  ;; in every commit when there cannot be an embedding operation to prepare.
+  (when (seq (.-embedding-indices store))
+    (let [schema  (schema store)
+          batches (reduce
+                    (fn [m ^Datom datom]
+                      (let [attr  (.-a datom)
+                            props (schema attr)
+                            v     (.-v datom)]
+                        (if (and props
+                                 (props :db/embedding)
+                                 (d/datom-added datom)
+                                 (string? v))
+                          (reduce
+                            (fn [m domain]
+                              (update m domain conj
+                                      {:datom datom
+                                       :text  v
+                                       :attr  attr
+                                       :ref   [(.-e datom) attr v]
+                                       :kind  :document
+                                       :domain domain}))
+                            m
+                            (remove #(async-embedding-domain? store %)
+                                    (embedding-attr-domains attr props)))
+                          m)))
+                    {}
+                    datoms)]
+      (when (seq batches)
+        (let [plan (IdentityHashMap.)]
+          (doseq [[domain items] batches
+                  :let [provider    (or (embedding-provider store domain)
+                                        (u/raise "Embedding provider is not initialized"
+                                                 {:domain domain}))
+                        dimensions (get-in (embedding-domain-config store domain)
+                                           [:dimensions])
+                        vectors    (emb/embedding provider
+                                                  (mapv #(dissoc % :datom) items)
+                                                  nil)]]
+            (when-not (= (count items) (count vectors))
+              (u/raise "Embedding provider returned the wrong number of vectors"
+                       {:domain  domain
+                        :items   (count items)
+                        :vectors (count vectors)}))
+            (doseq [[item vec-data] (map vector items vectors)]
+              (let [datom      (:datom item)
+                    domain-map (or (.get plan datom)
+                                   (let [m (HashMap.)]
+                                     (.put plan datom m)
+                                     m))]
+                (.put ^HashMap domain-map domain
+                      (ensure-embedding-vector! domain dimensions vec-data)))))
+          plan)))))
 
 (defn load-datoms-with-plan!
   ([^Store store datoms embedding-plan]

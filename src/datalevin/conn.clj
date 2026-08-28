@@ -405,34 +405,44 @@
         (let [old (db/cache-disabled? store)]
           (db/disable-cache store)
           (try
-            (let [kv            (.-lmdb store)
+            (let [kv             (.-lmdb store)
                   prepared-store (volatile! nil)
-                  [report info]
+                  result
                   (l/with-transaction-kv [kv1 kv]
                     (let [store1 ^Store (s/transfer store kv1)
                           db1    ^DB    (db/transfer db store1)]
-                      (vreset! prepared-store store1)
-                      (let [[report info] (db/stamp-blind-local-tx
-                                            db1 prepared tx-meta)]
-                        (db/commit-prepared-tx-data! db1 (:tx-data report))
-                        [report info])))
-                  new-store      ^Store (s/transfer ^Store @prepared-store kv)
-                  new-info       (assoc info :last-modified
-                                        (long (or (i/last-modified new-store)
-                                                  0)))
-                  new-db         (db/carry-runtime-opts
-                                   (db/new-db new-store new-info)
-                                   db)]
-              (reset! conn new-db)
-              (assoc report :db-after @conn))
+                      (when (db/blind-local-tx-unique-values-absent?
+                              db1 prepared)
+                        (vreset! prepared-store store1)
+                        (let [[report info] (db/stamp-blind-local-tx
+                                              db1 prepared tx-meta)]
+                          (db/commit-prepared-tx-data!
+                            db1 (:tx-data report) report)
+                          [report info]))))]
+              (when result
+                (let [[report info] result
+                      new-store   ^Store (s/transfer
+                                           ^Store @prepared-store kv)
+                      new-info    (assoc info :last-modified
+                                         (long (or (i/last-modified new-store)
+                                                   0)))
+                      new-db      (db/carry-runtime-opts
+                                    (db/new-db new-store new-info)
+                                    db)]
+                  (reset! conn new-db)
+                  (assoc report :db-after @conn))))
             (finally
               (when-not old
                 (db/enable-cache (.-store ^DB @conn))))))))))
 
 (defn- maybe-direct-local-blind-transact!
-  [conn tx-data tx-meta]
-  (when-let [prepared (db/prepare-blind-local-tx ^DB @conn tx-data)]
-    (direct-local-blind-transact! conn prepared tx-meta)))
+  ([conn tx-data tx-meta]
+   (maybe-direct-local-blind-transact! conn tx-data tx-meta false))
+  ([conn tx-data tx-meta require-unique?]
+   (when-let [prepared (db/prepare-blind-local-tx ^DB @conn tx-data)]
+     (when (or (not require-unique?)
+               (seq (:unique-avs prepared)))
+       (direct-local-blind-transact! conn prepared tx-meta)))))
 
 (declare current-thread-holds-store-write-lock?)
 
@@ -471,7 +481,8 @@
     (or (maybe-direct-local-blind-transact! conn tx-data tx-meta)
         (direct-local-transact! conn tx-data tx-meta))
     (if (local-wal-transact-eligible? conn)
-      (prepared-local-wal-transact! conn tx-data tx-meta)
+      (or (maybe-direct-local-blind-transact! conn tx-data tx-meta true)
+          (prepared-local-wal-transact! conn tx-data tx-meta))
       (let [report (with-transaction [c conn]
                      (assert (active-conn-structural? c))
                      (with @c tx-data tx-meta))]

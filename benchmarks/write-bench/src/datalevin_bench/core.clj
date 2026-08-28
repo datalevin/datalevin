@@ -318,7 +318,8 @@
         conn     (when dl?
                    (d/get-conn
                      dir
-                     {:k {:db/valueType :db.type/long}
+                     {:k {:db/valueType :db.type/long
+                          :db/unique    :db.unique/identity}
                       :v {:db/valueType :db.type/string}}
                      (cond-> (assoc {:kv-opts {:mapsize 60000
                                                :flags   (-> c/default-env-flags
@@ -481,7 +482,8 @@
         conn     (when dl?
                    (d/get-conn
                      dir
-                     {:k {:db/valueType :db.type/long}
+                     {:k {:db/valueType :db.type/long
+                          :db/unique    :db.unique/identity}
                       :v {:db/valueType :db.type/string}}
                      (cond-> (assoc {:kv-opts {:mapsize 60000
                                                :flags   (-> c/default-env-flags

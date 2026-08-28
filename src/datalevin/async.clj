@@ -160,9 +160,14 @@
     (assert (or (nil? cb) (ifn? cb)) "callback should be nil or a function")
     (.acquire backlog)
     (try
-      (.putIfAbsent work-queues k (new-workqueue work))
-      (let [item                     (->WorkItem work p cb)
-            ^WorkQueue wq            (.get work-queues k)
+      ;; ConcurrentHashMap.putIfAbsent evaluates its value eagerly. Constructing
+      ;; a WorkQueue here for every submission used to allocate and discard a
+      ;; queue (and combine stage) once the key was established.
+      (let [^WorkQueue wq            (or (.get work-queues k)
+                                         (let [fresh (new-workqueue work)]
+                                           (or (.putIfAbsent work-queues k fresh)
+                                               fresh)))
+            item                     (->WorkItem work p cb)
             ^ConcurrentLinkedQueue q (.-items wq)]
         (.offer q item)
         (.offer event-queue k))

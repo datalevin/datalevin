@@ -46,7 +46,9 @@ reads/writes are individual operations, not batched.
 The read/write integers are random number between 1 and 2 millions. So initally
 write has a 50% chance of being an append and 50% chance of being an
 overwrite. The chance of being an overwrite increases as more items are
-written.
+written. The benchmark schema declares the integer attribute as
+`:db.unique/identity`, matching the SQLite primary key and making the mixed
+phase's repeated keys true upserts rather than additional entities.
 
 ### Metrics
 
@@ -76,6 +78,9 @@ Clojure command line is needed to run the benchmarks.
 Use a disk-backed directory for `:base-dir` / `:dir`. On some Linux systems,
 `/tmp` is mounted as `tmpfs`, which will inflate write throughput and hide real
 fsync costs.
+
+For comparable measurements, run one unrecorded warmup pass followed by one
+recorded measurement pass, using a fresh database directory for each pass.
 
 For example, the command below runs pure write benchmark for `transact-async`
 with batch size 10, and save the results in `dl-async-10.csv`:
@@ -164,6 +169,12 @@ Datalevin has two Datalog transaction functions:
 Both are durable by default. In the case of `transact-async`, the returned
 `future` is only realized after the data are flushed to disk. Both are tested.
 
+Large batches of simple entity maps with new scalar identity values use a
+guarded ingestion fast path: identity values are checked in the same LMDB write
+transaction before entities are stamped. Small writes, duplicate identities,
+existing identities, and unsupported transaction forms fall back to the normal
+upsert resolver.
+
 `transact` is just the blocked version of `transact-async` so it is not tested.
 There are two faster `init-db` and `fill-db` functions that directly load
 prepared datoms to bypass the expensive process of verifying integrity of
@@ -173,6 +184,13 @@ interested in transactions of raw data.
 SQLite has two durable transaction mode: default and WAL in FULL sync mode.
 
 ### Results
+
+> **Schema correction:** the benchmark documentation has always described
+> `:k` as `:db.unique/identity`, but the checked-in Datalog schema previously
+> omitted that declaration. The benchmark now matches the documented SQLite
+> primary-key/upsert semantics. Treat the historical plots below as
+> pre-correction results until the complete matrix is regenerated; they are not
+> directly comparable with current runs.
 
 We will first focus on durable writes. We presents throughput and commit
 latency. The call latencies are close to commit latencies in synchronous writes,

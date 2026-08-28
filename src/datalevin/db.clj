@@ -113,7 +113,8 @@
   [schema-epoch
    opts-epoch
    auto-entity-time?
-   entities])
+   entities
+   unique-avs])
 
 (deftype ^:private PreparedBlindEntity [tempid ^objects attrs])
 
@@ -1414,30 +1415,32 @@
            (carry-runtime-opts
              (transfer ^DB @prepared-db new-store)
              db)))
-       (do
-         (if (instance? Store store)
-           (let [embedding-plan    (s/prepare-embedding-plan ^Store store
-                                                              tx-data)
-                 last-modified-ms  (System/currentTimeMillis)
-                 extra-kv-tx       (some-> report
-                                           (committed-client-op-response
-                                             last-modified-ms))
-                 commit-opts       (cond-> {:last-modified-ms last-modified-ms}
-                                     extra-kv-tx
-                                     (assoc :extra-kv-txs [extra-kv-tx]))]
-             (s/load-datoms-with-plan! ^Store store tx-data embedding-plan
-                                       commit-opts)
-             (when ensures
-               (run-report-ensures! (transfer (:db-after report) store)
-                                    report))
-             (s/mark-state-current! ^Store store last-modified-ms))
-           (do
-             (load-datoms store tx-data)
-             (when ensures
-               (run-report-ensures! (transfer (:db-after report) store)
-                                    report))))
-         (invalidate-cache store tx-data (last-modified store))
-         db)))))
+       (if (instance? Store store)
+         (let [embedding-plan (s/prepare-embedding-plan ^Store store tx-data)
+               commit-ms      (System/currentTimeMillis)
+               extra-kv-tx    (some-> report
+                                      (committed-client-op-response commit-ms))
+               commit-opts    (cond-> {:last-modified-ms commit-ms}
+                                extra-kv-tx
+                                (assoc :extra-kv-txs [extra-kv-tx]))]
+           (s/load-datoms-with-plan! ^Store store tx-data embedding-plan
+                                     commit-opts)
+           (when ensures
+             (run-report-ensures! (transfer (:db-after report) store)
+                                  report))
+           (s/mark-state-current! ^Store store commit-ms)
+           ;; The commit persisted this exact value. Reuse it for cache
+           ;; invalidation instead of opening a post-commit LMDB read txn only
+           ;; to fetch :last-modified again.
+           (invalidate-cache store tx-data commit-ms)
+           db)
+         (do
+           (load-datoms store tx-data)
+           (when ensures
+             (run-report-ensures! (transfer (:db-after report) store)
+                                  report))
+           (invalidate-cache store tx-data (last-modified store))
+           db))))))
 
 (defn- remote-tx-result
   [res]
@@ -1470,15 +1473,33 @@
   [^DB db entities tx-time]
   (txprep/prepare-entities db entities tx-time))
 
+;; The blind path is profitable for ingestion-sized batches, where identity
+;; probes can share one LMDB transaction and full transaction expansion is a
+;; material cost. Small OLTP writes retain the normal upsert resolver; a hit in
+;; a candidate batch also falls back to it without changing semantics.
+(def ^:private ^:const ^long blind-unique-write-threshold 256)
+
+(def ^:private blind-unique-value-types
+  #{:db.type/boolean
+    :db.type/instant
+    :db.type/keyword
+    :db.type/long
+    :db.type/string
+    :db.type/symbol
+    :db.type/uuid})
+
 (defn- blind-write-attr-supported?
-  [attr props tuple-source-attrs]
+  [attr props tuple-source-attrs allow-unique?]
   (and props
        (keyword? attr)
        (not (contains? #{:db/id :db/created-at :db/updated-at} attr))
        (not= "db" (namespace attr))
        (not (reverse-ref? attr))
        (not (identical? (:db/valueType props) :db.type/ref))
-       (nil? (:db/unique props))
+       (or (nil? (:db/unique props))
+           (and allow-unique?
+                (identical? (:db/unique props) :db.unique/identity)
+                (contains? blind-unique-value-types (:db/valueType props))))
        (not (:db.attr/preds props))
        (not (contains? props :db/tupleAttrs))
        (not (contains? props :db/tupleType))
@@ -1494,20 +1515,29 @@
                  (contains? unique-identity-attrs (first value))))))
 
 (defn- append-blind-value!
-  ^Boolean [^FastList attrs store-opts props attr entity value]
+  ^Boolean [^FastList attrs ^FastList unique-avs ^java.util.HashSet seen-avs
+            store-opts props attr entity value]
   (if (or (map? value)
           (datom? value)
           (and (coll? value) (not (bytes? value))))
     false
-    (do
-      (vld/validate-val value entity)
-      (.add attrs attr)
-      (.add attrs
-            (prepare/correct-value-with-props store-opts props attr value))
-      true)))
+    (let [value'  (do
+                    (vld/validate-val value entity)
+                    (prepare/correct-value-with-props
+                      store-opts props attr value))
+          unique? (identical? (:db/unique props) :db.unique/identity)
+          av       (when unique? [attr value'])]
+      (if (and unique? (not (.add seen-avs av)))
+        false
+        (do
+          (when unique? (.add unique-avs av))
+          (.add attrs attr)
+          (.add attrs value')
+          true)))))
 
 (defn- prepare-blind-write-entity
-  [store-schema store-opts tuple-source-attrs unique-identity-attrs entity]
+  [store-schema store-opts tuple-source-attrs unique-identity-attrs
+   allow-unique? ^FastList unique-avs ^java.util.HashSet seen-avs entity]
   (let [old-eid   (:db/id entity)
         entity-id (or old-eid (auto-tempid))]
     (when (or (nil? old-eid) (tempid? old-eid))
@@ -1519,7 +1549,7 @@
                   true
                   (let [props (store-schema attr)]
                     (if-not (blind-write-attr-supported?
-                              attr props tuple-source-attrs)
+                              attr props tuple-source-attrs allow-unique?)
                       (reduced false)
                       (let [supported-values?
                             (if (blind-write-multiple-values?
@@ -1527,12 +1557,14 @@
                               (loop [values (seq raw-value)]
                                 (if-some [value (first values)]
                                   (if (append-blind-value!
-                                        attrs store-opts props attr entity value)
+                                        attrs unique-avs seen-avs store-opts
+                                        props attr entity value)
                                     (recur (next values))
                                     false)
                                   true))
                               (append-blind-value!
-                                attrs store-opts props attr entity raw-value))]
+                                attrs unique-avs seen-avs store-opts props attr
+                                entity raw-value))]
                         (if-not supported-values?
                           (reduced false)
                           true))))))
@@ -1550,6 +1582,12 @@
         tuple-source-attrs (:db/attrTuples store-rschema)
         unique-identity-attrs (:db.unique/identity store-rschema)
         auto-entity-time? (boolean (:auto-entity-time? store-opts))
+        allow-unique?     (>= (long (bounded-count
+                                     blind-unique-write-threshold initial-es))
+                              blind-unique-write-threshold)
+        ^FastList unique-avs (FastList.)
+        seen-avs          (java.util.HashSet.)
+        seen-tempids      (java.util.HashSet.)
         entities
         (reduce
           (fn [^FastList acc entity]
@@ -1557,11 +1595,14 @@
               (if-let [^PreparedBlindEntity prepared
                        (prepare-blind-write-entity
                          store-schema store-opts tuple-source-attrs
-                         unique-identity-attrs entity)]
-                (if (or (pos? (alength ^objects (.-attrs prepared)))
-                        auto-entity-time?)
-                  (doto acc (.add prepared))
-                  acc)
+                         unique-identity-attrs allow-unique? unique-avs
+                         seen-avs entity)]
+                (if-not (.add seen-tempids (.-tempid prepared))
+                  (reduced nil)
+                  (if (or (pos? (alength ^objects (.-attrs prepared)))
+                          auto-entity-time?)
+                    (doto acc (.add prepared))
+                    acc))
                 (reduced nil))
               (reduced nil)))
           (FastList.)
@@ -1570,7 +1611,21 @@
       (->PreparedBlindTx store-schema
                          store-opts
                          auto-entity-time?
-                         entities))))
+                         entities
+                         unique-avs))))
+
+(defn ^:no-doc blind-local-tx-unique-values-absent?
+  "Check a prepared batch's identity values against the current store snapshot.
+   The connection invokes this after opening its LMDB write transaction, so all
+   probes share that transaction and no concurrent insert can race the check."
+  [^DB db ^PreparedBlindTx prepared]
+  (let [^FastList avs (:unique-avs prepared)
+        store         (.-store db)]
+    (loop [i 0]
+      (or (>= i (.size avs))
+          (let [[a v] (.get avs i)]
+            (and (nil? (i/av-first-e store a v))
+                 (recur (unchecked-inc i))))))))
 
 (defn ^:no-doc blind-local-tx-valid?
   [^DB db ^PreparedBlindTx prepared]

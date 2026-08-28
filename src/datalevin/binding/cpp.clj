@@ -955,6 +955,28 @@
           (Long/compare (.-e x) (.-e y))
           c)))))
 
+(def ^:private ordered-datom-write-threshold
+  ;; Two index-ordered passes improve LMDB locality for large Datalog commits,
+  ;; but sorting is a net cost for the small transactions common in OLTP.
+  512)
+
+(defn- large-add-only-datom-batch?
+  ^Boolean [^java.util.List txs]
+  (and (>= (.size txs) (long ordered-datom-write-threshold))
+       (loop [i 0]
+         (if (< i (.size txs))
+           (let [tx (.get txs i)]
+             (cond
+               (instance? DatomKVTxData tx)
+               (if (.-added? ^DatomKVTxData tx)
+                 (recur (unchecked-inc i))
+                 false)
+
+               ;; Datom operations are deliberately placed before generic
+               ;; metadata/index operations in the write plan.
+               :else true))
+           true))))
+
 (defn- transact1*
   [txs ^DBI dbi txn kt vt]
   (let [validate? (.-validate-data? dbi)]
@@ -1026,7 +1048,8 @@
 
 (defn- transact-datom-list*
   [^java.util.List txs ^HashMap dbis txn]
-  (if c/*ordered-datom-writes?*
+  (if (or c/*ordered-datom-writes?*
+          (large-add-only-datom-batch? txs))
     (transact-datom-index-passes* txs dbis txn)
     (let [n (.size txs)]
       (loop [i   0
