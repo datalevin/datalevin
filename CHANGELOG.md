@@ -41,13 +41,15 @@
 - [Datalog] `or` and `or-join` improvements: union optimization and dedupe
   before union.
 - [Datalog] better error report for missing tuple elements.
+- [Datalog] fast path for batched writes.
 
 ### Changed
+- [KV] respect OS durability default, i.e. use default sync on macos.
 - [Datalog] set semantics at rule boundary.
 
 ### Fixed
 - [WAL] avoid replaying an older, already-materialized WAL record; lock for
-  complete LMDB teardown.
+  complete LMDB tear down.
 - [Datalog] CSV reader fix.
 
 ## 1.0.2 (2026-08-11)

@@ -1475,8 +1475,9 @@
 
 ;; The blind path is profitable for ingestion-sized batches, where identity
 ;; probes can share one LMDB transaction and full transaction expansion is a
-;; material cost. Small OLTP writes retain the normal upsert resolver; a hit in
-;; a candidate batch also falls back to it without changing semantics.
+;; material cost. WAL writes may opt into it for small transactions because
+;; avoiding full transaction expansion is measurable there. A unique-value hit
+;; always falls back to the normal resolver without changing upsert semantics.
 (def ^:private ^:const ^long blind-unique-write-threshold 256)
 
 (def ^:private blind-unique-value-types
@@ -1574,45 +1575,49 @@
           (PreparedBlindEntity. entity-id (.toArray attrs)))))))
 
 (defn ^:no-doc prepare-blind-local-tx
-  [^DB db initial-es]
-  (let [store             (.-store db)
-        store-schema      (schema store)
-        store-opts        (opts store)
-        store-rschema     (rschema store)
-        tuple-source-attrs (:db/attrTuples store-rschema)
-        unique-identity-attrs (:db.unique/identity store-rschema)
-        auto-entity-time? (boolean (:auto-entity-time? store-opts))
-        allow-unique?     (>= (long (bounded-count
-                                     blind-unique-write-threshold initial-es))
-                              blind-unique-write-threshold)
-        ^FastList unique-avs (FastList.)
-        seen-avs          (java.util.HashSet.)
-        seen-tempids      (java.util.HashSet.)
-        entities
-        (reduce
-          (fn [^FastList acc entity]
-            (if (map? entity)
-              (if-let [^PreparedBlindEntity prepared
-                       (prepare-blind-write-entity
-                         store-schema store-opts tuple-source-attrs
-                         unique-identity-attrs allow-unique? unique-avs
-                         seen-avs entity)]
-                (if-not (.add seen-tempids (.-tempid prepared))
-                  (reduced nil)
-                  (if (or (pos? (alength ^objects (.-attrs prepared)))
-                          auto-entity-time?)
-                    (doto acc (.add prepared))
-                    acc))
-                (reduced nil))
-              (reduced nil)))
-          (FastList.)
-          initial-es)]
-    (when (and entities (not (.isEmpty ^FastList entities)))
-      (->PreparedBlindTx store-schema
-                         store-opts
-                         auto-entity-time?
-                         entities
-                         unique-avs))))
+  ([^DB db initial-es]
+   (prepare-blind-local-tx db initial-es false))
+  ([^DB db initial-es allow-small-unique?]
+   (let [store             (.-store db)
+         store-schema      (schema store)
+         store-opts        (opts store)
+         store-rschema     (rschema store)
+         tuple-source-attrs (:db/attrTuples store-rschema)
+         unique-identity-attrs (:db.unique/identity store-rschema)
+         auto-entity-time? (boolean (:auto-entity-time? store-opts))
+         allow-unique?     (or allow-small-unique?
+                               (>= (long (bounded-count
+                                          blind-unique-write-threshold
+                                          initial-es))
+                                   blind-unique-write-threshold))
+         ^FastList unique-avs (FastList.)
+         seen-avs          (java.util.HashSet.)
+         seen-tempids      (java.util.HashSet.)
+         entities
+         (reduce
+           (fn [^FastList acc entity]
+             (if (map? entity)
+               (if-let [^PreparedBlindEntity prepared
+                        (prepare-blind-write-entity
+                          store-schema store-opts tuple-source-attrs
+                          unique-identity-attrs allow-unique? unique-avs
+                          seen-avs entity)]
+                 (if-not (.add seen-tempids (.-tempid prepared))
+                   (reduced nil)
+                   (if (or (pos? (alength ^objects (.-attrs prepared)))
+                           auto-entity-time?)
+                     (doto acc (.add prepared))
+                     acc))
+                 (reduced nil))
+               (reduced nil)))
+           (FastList.)
+           initial-es)]
+     (when (and entities (not (.isEmpty ^FastList entities)))
+       (->PreparedBlindTx store-schema
+                          store-opts
+                          auto-entity-time?
+                          entities
+                          unique-avs)))))
 
 (defn ^:no-doc blind-local-tx-unique-values-absent?
   "Check a prepared batch's identity values against the current store snapshot.

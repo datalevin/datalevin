@@ -171,9 +171,10 @@ Both are durable by default. In the case of `transact-async`, the returned
 
 Large batches of simple entity maps with new scalar identity values use a
 guarded ingestion fast path: identity values are checked in the same LMDB write
-transaction before entities are stamped. Small writes, duplicate identities,
-existing identities, and unsupported transaction forms fall back to the normal
-upsert resolver.
+transaction before entities are stamped. WAL mode also uses this path for small
+simple identity inserts, where avoiding full transaction expansion improves
+synchronous OLTP throughput. Existing or duplicate identities and unsupported
+transaction forms fall back to the normal upsert resolver.
 
 `transact` is just the blocked version of `transact-async` so it is not tested.
 There are two faster `init-db` and `fill-db` functions that directly load

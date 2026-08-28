@@ -439,7 +439,8 @@
   ([conn tx-data tx-meta]
    (maybe-direct-local-blind-transact! conn tx-data tx-meta false))
   ([conn tx-data tx-meta require-unique?]
-   (when-let [prepared (db/prepare-blind-local-tx ^DB @conn tx-data)]
+   (when-let [prepared (db/prepare-blind-local-tx
+                         ^DB @conn tx-data require-unique?)]
      (when (or (not require-unique?)
                (seq (:unique-avs prepared)))
        (direct-local-blind-transact! conn prepared tx-meta)))))

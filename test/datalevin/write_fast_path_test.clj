@@ -37,6 +37,12 @@
     (try
       (testing "small unique transactions retain the full upsert path"
         (is (nil? (db/prepare-blind-local-tx @conn (item-batch 0 255)))))
+      (testing "WAL can opt small unique transactions into blind preparation"
+        (let [prepared (db/prepare-blind-local-tx
+                         @conn (item-batch 0 1) true)]
+          (is (some? prepared))
+          (is (= 1 (count (:entities prepared))))
+          (is (= 1 (count (:unique-avs prepared))))))
       (testing "large, distinct scalar identity values use blind preparation"
         (let [prepared (db/prepare-blind-local-tx @conn (item-batch 0 256))]
           (is (some? prepared))
@@ -47,6 +53,22 @@
                          {:db/id "same" :item/id 1 :item/right true}]
                         (item-batch 2 254))]
           (is (nil? (db/prepare-blind-local-tx @conn txs)))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest single-unique-wal-inserts-preserve-upsert-semantics
+  (let [dir  (u/tmp-dir (str "blind-unique-single-wal-" (UUID/randomUUID)))
+        conn (d/get-conn dir schema {:wal? true})]
+    (try
+      (d/transact! conn [{:item/id 1 :item/value "initial"}])
+      (is (= 1 (d/count-datoms @conn nil :item/id nil)))
+      (is (= "initial" (:item/value (d/entity @conn [:item/id 1]))))
+
+      (testing "an existing identity falls back to normal upsert resolution"
+        (d/transact! conn [{:item/id 1 :item/value "updated"}])
+        (is (= 1 (d/count-datoms @conn nil :item/id nil)))
+        (is (= "updated" (:item/value (d/entity @conn [:item/id 1])))))
       (finally
         (d/close conn)
         (u/delete-files dir)))))
