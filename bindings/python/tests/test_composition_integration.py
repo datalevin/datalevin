@@ -10,20 +10,34 @@ pytestmark = pytest.mark.usefixtures("require_runtime")
 
 def test_composed_queries_and_transactions_use_the_current_jvm_bridge(tmp_path) -> None:
     schema = {
-        ":person/name": schema_attr(value_type=":db.type/string"),
+        ":person/name": schema_attr(
+            value_type=":db.type/string",
+            fulltext=True,
+            fulltext_auto_domain=True,
+        ),
         ":person/age": schema_attr(value_type=":db.type/long"),
         ":person/label": schema_attr(value_type=":db.type/string"),
         ":person/nickname": schema_attr(value_type=":db.type/string"),
         ":person/status": schema_attr(value_type=":db.type/keyword"),
         ":person/friend": schema_attr(value_type=":db.type/ref"),
+        ":person/embedding": schema_attr(value_type=":db.type/vec"),
         ":user/handle": schema_attr(
             value_type=":db.type/string", unique=":db.unique/identity"
         ),
         ":user/name": schema_attr(value_type=":db.type/string"),
         ":user/friend": schema_attr(value_type=":db.type/ref"),
-        ":user/profile": idoc_attr(format="edn"),
+        ":user/profile": idoc_attr(format="edn", domain="profiles"),
     }
-    with connect(str(tmp_path / "composition"), schema=schema) as conn:
+    with connect(
+        str(tmp_path / "composition"),
+        schema=schema,
+        opts={
+            ":vector-opts": {
+                ":dimensions": 2,
+                ":metric-type": ":cosine",
+            }
+        },
+    ) as conn:
         conn.transact(
             tx.data(
                 tx.entity(
@@ -35,6 +49,7 @@ def test_composed_queries_and_transactions_use_the_current_jvm_bridge(tmp_path) 
                         "person/nickname": "Ace",
                         "person/status": q.kw("active"),
                         "person/friend": -2,
+                        "person/embedding": [1.0, 0.0],
                     },
                 ),
                 tx.entity(
@@ -44,6 +59,7 @@ def test_composed_queries_and_transactions_use_the_current_jvm_bridge(tmp_path) 
                         "person/age": 21,
                         "person/label": ":literal",
                         "person/status": q.kw("draft"),
+                        "person/embedding": [0.0, 1.0],
                     },
                 ),
             )
@@ -64,6 +80,63 @@ def test_composed_queries_and_transactions_use_the_current_jvm_bridge(tmp_path) 
         )
         assert conn.query(adults, 30) == ["Ada"]
 
+        search_term = q.var("search_term")
+        fulltext_names = q.query(
+            find=q.collection(name),
+            inputs=[q.DB, search_term],
+            where=[
+                q.fulltext(
+                    search_term,
+                    [entity, q.IGNORE, q.IGNORE],
+                    attribute="person/name",
+                    options=q.fulltext_options(top=1),
+                ),
+                q.datom(entity, "person/name", name),
+            ],
+        )
+        assert conn.query(fulltext_names, "Ada") == ["Ada"]
+
+        query_vector = q.var("query_vector")
+        distance = q.var("distance")
+        vector_names = q.query(
+            find=q.collection(name),
+            inputs=[q.DB, query_vector],
+            where=[
+                q.vec_neighbors(
+                    query_vector,
+                    [entity, q.IGNORE, q.IGNORE, distance],
+                    attribute="person/embedding",
+                    options=q.vector_search_options(
+                        top=1,
+                        display="refs+dists",
+                    ),
+                ),
+                q.datom(entity, "person/name", name),
+            ],
+        )
+        assert conn.query(vector_names, [1.0, 0.0]) == ["Ada"]
+
+        inner_age = q.var("inner_age")
+        youngest = q.var("youngest")
+        youngest_entity = q.var("youngest_entity")
+        youngest_age_query = q.query(
+            find=q.relation(q.aggregate("min", inner_age)),
+            where=[q.datom(q.IGNORE, "person/age", inner_age)],
+        )
+        nested_query = q.query(
+            find=q.relation(youngest_entity, youngest),
+            where=[
+                q.bind(
+                    "q",
+                    q.relation_binding(youngest),
+                    q.quote(youngest_age_query),
+                    q.DB,
+                ),
+                q.datom(youngest_entity, "person/age", youngest),
+            ],
+        )
+        assert conn.query(nested_query) == [[2, 21]]
+
         ordered = q.query(
             find=q.relation(name, age),
             where=[
@@ -73,6 +146,20 @@ def test_composed_queries_and_transactions_use_the_current_jvm_bridge(tmp_path) 
             order_by=[q.desc(age)],
         )
         assert conn.query(ordered) == [["Ada", 42], ["Bob", 21]]
+
+        unordered = q.query(
+            find=q.relation(name, age),
+            where=[
+                q.datom(entity, "person/name", name),
+                q.datom(entity, "person/age", age),
+            ],
+        )
+        unordered_rows = conn.query(unordered)
+        assert isinstance(unordered_rows, list)
+        assert {tuple(row) for row in unordered_rows} == {
+            ("Ada", 42),
+            ("Bob", 21),
+        }
 
         leading_question = q.query(
             find=q.collection(entity),
@@ -296,3 +383,24 @@ def test_composed_queries_and_transactions_use_the_current_jvm_bridge(tmp_path) 
             "profile": {"age": 31, "role": "admin"},
             "tags": ["a", ":literal"],
         }
+
+        idoc_entity = q.var("idoc_entity")
+        idoc_attribute = q.var("idoc_attribute")
+        idoc_value = q.var("idoc_value")
+        idoc_predicate = q.var("idoc_predicate")
+        matching_handles = q.query(
+            find=q.collection(handle),
+            inputs=[q.DB, idoc_predicate],
+            where=[
+                q.idoc_match(
+                    idoc_predicate,
+                    [idoc_entity, idoc_attribute, idoc_value],
+                    options=q.idoc_match_options(domains=["profiles"]),
+                ),
+                q.datom(idoc_entity, "user/handle", handle),
+            ],
+        )
+        assert conn.query(
+            matching_handles,
+            {"profile": {"age": q.edn_list(q.sym(">="), 31)}},
+        ) == ["eve"]

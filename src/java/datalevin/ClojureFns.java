@@ -114,7 +114,7 @@ final class ClojureFns {
         final boolean txFn = isTxFnDescriptor(descriptor);
         return new AFn() {
             private Object invokeValues(List<?> values) {
-                Object result = fn.invoke(values);
+                Object result = fn.invoke(bridgeUdfArguments(values));
                 return txFn
                         ? DatalevinForms.txDataInput(result)
                         : ClojureCodec.runtimeInput(result);
@@ -144,6 +144,26 @@ final class ClojureFns {
                 return invokeValues(values);
             }
         };
+    }
+
+    private static List<?> bridgeUdfArguments(List<?> values) {
+        ArrayList<Object> bridged = null;
+        for (int i = 0; i < values.size(); i++) {
+            Object value = values.get(i);
+            Object replacement = rawDatabase(value) ? new DatabaseValue(value) : value;
+            if (bridged != null) {
+                bridged.add(replacement);
+            } else if (replacement != value) {
+                bridged = new ArrayList<>(values.size());
+                bridged.addAll(values.subList(0, i));
+                bridged.add(replacement);
+            }
+        }
+        return bridged == null ? values : bridged;
+    }
+
+    private static boolean rawDatabase(Object value) {
+        return value != null && "datalevin.db.DB".equals(value.getClass().getName());
     }
 
     static AFn pagedFilter(BiPredicate<Object, Object> predicate,

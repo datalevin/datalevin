@@ -920,6 +920,13 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
 
 
 def test_udf_descriptor_helper() -> None:
+    assert datalevin.UdfDescriptor is udf_module.UdfDescriptor
+    assert callable(datalevin.q.udf)
+    assert callable(datalevin.q.bind_udf)
+    assert callable(datalevin.q.udf_predicate)
+    assert callable(datalevin.tx.call_udf)
+    assert callable(datalevin.tx.install_udf)
+    assert callable(datalevin.tx.uninstall_udf)
     assert udf_module.udf_descriptor("math/inc") == {
         ":udf/lang": ":java",
         ":udf/kind": ":query-fn",

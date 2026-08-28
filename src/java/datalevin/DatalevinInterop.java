@@ -44,7 +44,10 @@ public final class DatalevinInterop {
      * runtimes.
      */
     public static Object coreInvokeBridge(String function, List<?> args) {
-        return ClojureCodec.bridgeOutput(coreInvoke(function, args));
+        Object result = coreInvoke(function, args);
+        return "q".equals(function)
+                ? ClojureCodec.bridgeQueryOutput(result)
+                : ClojureCodec.bridgeOutput(result);
     }
 
     /**
@@ -59,7 +62,21 @@ public final class DatalevinInterop {
      * runtimes.
      */
     public static Object clientInvokeBridge(String function, List<?> args) {
-        return ClojureCodec.bridgeOutput(clientInvoke(function, args));
+        Object result = clientInvoke(function, args);
+        return "query-system".equals(function)
+                ? ClojureCodec.bridgeQueryOutput(result)
+                : ClojureCodec.bridgeOutput(result);
+    }
+
+    /**
+     * Builds an EDN list while recursively normalizing its values.
+     *
+     * <p>Foreign-language arrays normally represent EDN vectors. This method
+     * preserves the list distinction needed by quoted forms and predicate
+     * expressions.
+     */
+    public static Object ednList(List<?> items) {
+        return ClojureCodec.ednList(Objects.requireNonNull(items, "items"));
     }
 
     /**
@@ -68,9 +85,6 @@ public final class DatalevinInterop {
     public static Object createConnection(String dir,
                                           Map<?, ?> schema,
                                           Map<?, ?> opts) {
-        if (dir == null) {
-            return ClojureRuntime.core("create-conn");
-        }
         if (opts != null) {
             return ClojureRuntime.core("create-conn",
                                        dir,
@@ -82,7 +96,9 @@ public final class DatalevinInterop {
                                        dir,
                                        DatalevinForms.schemaInput(schema));
         }
-        return ClojureRuntime.core("create-conn", dir);
+        return dir == null
+                ? ClojureRuntime.core("create-conn")
+                : ClojureRuntime.core("create-conn", dir);
     }
 
     /**
@@ -176,6 +192,28 @@ public final class DatalevinInterop {
      */
     public static DatabaseValue connectionDbBridge(Object conn) {
         return new DatabaseValue(connectionDb(conn));
+    }
+
+    /**
+     * Runs a text query and materializes any unordered relation result before
+     * it crosses a foreign-language bridge.
+     */
+    public static Object connectionQueryBridge(Connection conn,
+                                               String query,
+                                               List<?> inputs) {
+        Objects.requireNonNull(conn, "conn");
+        return ClojureCodec.bridgeQueryOutput(conn.query(query, inputs));
+    }
+
+    /**
+     * Runs a structured query and materializes any unordered relation result
+     * before it crosses a foreign-language bridge.
+     */
+    public static Object connectionQueryFormBridge(Connection conn,
+                                                   Object queryForm,
+                                                   List<?> inputs) {
+        Objects.requireNonNull(conn, "conn");
+        return ClojureCodec.bridgeQueryOutput(conn.queryForm(queryForm, inputs));
     }
 
     /**

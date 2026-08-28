@@ -89,11 +89,7 @@ final class ClojureCodec {
         }
 
         if (value instanceof IPersistentList list) {
-            ArrayList<Object> values = new ArrayList<>();
-            for (Object item : (java.util.List<?>) list) {
-                values.add(toClojure(item));
-            }
-            return PersistentList.create(values);
+            return ednList((java.util.List<?>) list);
         }
 
         if (value instanceof Set<?> set) {
@@ -130,6 +126,14 @@ final class ClojureCodec {
         }
 
         return value;
+    }
+
+    static Object ednList(Collection<?> items) {
+        ArrayList<Object> values = new ArrayList<>(items.size());
+        for (Object item : items) {
+            values.add(toClojure(item));
+        }
+        return PersistentList.create(values);
     }
 
     static Object runtimeInput(Object value) {
@@ -228,6 +232,23 @@ final class ClojureCodec {
         }
 
         return String.valueOf(value);
+    }
+
+    /**
+     * Normalizes a query result without exposing a runtime-specific set class
+     * to foreign-language bridges. Relation results remain unordered, but are
+     * represented as ordinary Java lists so their row lists need not be
+     * hashable in the host language.
+     */
+    static Object bridgeQueryOutput(Object value) {
+        if (value instanceof Set<?> set) {
+            ArrayList<Object> result = new ArrayList<>(set.size());
+            for (Object item : set) {
+                result.add(bridgeOutput(item));
+            }
+            return result;
+        }
+        return bridgeOutput(value);
     }
 
     static boolean isRuntimeInput(Object value) {

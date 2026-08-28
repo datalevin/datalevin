@@ -1,4 +1,10 @@
-import { toEdnForm, toJava, toJs, toQueryInput } from "./convert.js";
+import {
+  toEdnForm,
+  toJava,
+  toJs,
+  toJsQueryResult,
+  toQueryInput
+} from "./convert.js";
 import { txReportToJs } from "./database.js";
 import { Form } from "./form.js";
 import { _BINDINGS } from "./interop.js";
@@ -202,14 +208,19 @@ export class Connection extends ResourceWrapper {
       normalizedInputs.push(await convertInput(input));
     }
     if (typeof query === "string") {
-      return toJsResult(
-        await callJavaMethod(this.rawHandle(), "query", query, await toJava(normalizedInputs)),
-        { bridge: true }
+      return toJsQueryResult(
+        await _BINDINGS.connectionQuery(
+          this.rawHandle(), query, await toJava(normalizedInputs)
+        )
       );
     }
-    return toJsResult(
-      await callJavaMethod(this.rawHandle(), "queryForm", await queryForm(query), await toJava(normalizedInputs)),
-      { bridge: true }
+    return toJsQueryResult(
+      await _BINDINGS.connectionQuery(
+        this.rawHandle(),
+        await queryForm(query),
+        await toJava(normalizedInputs),
+        { form: true }
+      )
     );
   }
 

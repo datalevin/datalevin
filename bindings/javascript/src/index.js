@@ -64,8 +64,25 @@ export {
   writeEdn
 } from "./interop.js";
 export { interop } from "./raw.js";
-export { DatalogSymbol, Keyword } from "./form.js";
-export { PullAttr, PullNested, PullSelector, Query, q } from "./query.js";
+export {
+  DatalogSymbol,
+  EdnList,
+  Keyword,
+  Uuid,
+  ednList,
+  quote,
+  uuid
+} from "./form.js";
+export {
+  FulltextOptions,
+  IdocMatchOptions,
+  PullAttr,
+  PullNested,
+  PullSelector,
+  Query,
+  VectorSearchOptions,
+  q
+} from "./query.js";
 export { LookupRef, PatchOp, TxData, tx } from "./transaction.js";
 export { KV, KVTransaction, RawBuffer, RawKV } from "./kv.js";
 export { LlamaEmbedder, LlamaGenerator } from "./llm.js";
@@ -84,5 +101,10 @@ export {
   prefixTokenFilter,
   unaccentTokenFilter
 } from "./search.js";
-export { UdfRegistry, createUdfRegistry, udfDescriptor } from "./udf.js";
+export {
+  UdfDescriptor,
+  UdfRegistry,
+  createUdfRegistry,
+  udfDescriptor
+} from "./udf.js";
 export { VectorIndex } from "./vector.js";

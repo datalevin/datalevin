@@ -1,14 +1,16 @@
 import { toJava, toJs } from "./convert.js";
+import { Database } from "./database.js";
 import { _BINDINGS } from "./interop.js";
 import { javaBridgeModule } from "./jvm.js";
+import { UdfDescriptor, descriptorData } from "./udf-value.js";
 
-function keywordString(value) {
-  const text = String(value);
-  return text.startsWith(":") ? text : `:${text}`;
-}
+const DATABASE_CLASSES = new Set([
+  "datalevin.db.DB",
+  "datalevin.DatabaseValue"
+]);
 
 function descriptorKey(descriptor) {
-  const normalized = udfDescriptor(descriptor);
+  const normalized = descriptorData(descriptor);
   return [
     normalized[":udf/lang"],
     normalized[":udf/kind"],
@@ -38,50 +40,56 @@ function materializeJavaArgs(args) {
   return items;
 }
 
-async function txUdfArgsToJs(args) {
+function materializeUdfArgs(args) {
   if (Array.isArray(args)) {
-    if (args.length === 0) {
-      return args;
-    }
-    const convertedTail = await Promise.all(args.slice(1).map((value) => toJs(value)));
-    return [args[0], ...convertedTail];
+    return args;
   }
-
   if (typeof args?.sizeSync === "function" && typeof args?.getSync === "function") {
+    const values = [];
     const size = Number(args.sizeSync());
-    if (size === 0) {
-      return [];
-    }
-
-    const values = [null];
-    for (let index = 1; index < size; index += 1) {
-      values.push(await toJs(args.getSync(index)));
+    for (let index = 0; index < size; index += 1) {
+      try {
+        values.push(args.getSync(index));
+      } catch (error) {
+        const message = String(error?.message ?? error);
+        if (index === 0 && message.includes("ClassNotFoundException: datalevin.db.DB")) {
+          // Runtime jars before the DatabaseValue UDF bridge could not expose
+          // the generated Clojure DB class to Node. Preserve their historical
+          // null argument while newer runtimes provide an idiomatic Database.
+          values.push(null);
+          continue;
+        }
+        throw error;
+      }
     }
     return values;
   }
-
-  const values = materializeJavaArgs(args);
-  if (values.length === 0) {
-    return values;
-  }
-  const convertedTail = await Promise.all(values.slice(1).map((value) => toJs(value)));
-  return [values[0], ...convertedTail];
+  return materializeJavaArgs(args);
 }
 
-async function udfArgsToJs(args, descriptor) {
-  if (descriptor[":udf/kind"] !== ":tx-fn") {
-    const jsArgs = await toJs(args);
-    return Array.isArray(jsArgs) ? jsArgs : [jsArgs];
+function javaClassName(value) {
+  try {
+    return value.getClassSync().getNameSync();
+  } catch {
+    return null;
   }
-
-  return txUdfArgsToJs(args);
 }
 
-async function createProxy(fn, descriptor) {
+async function udfArgsToJs(args) {
+  const values = materializeUdfArgs(args);
+  return Promise.all(values.map(async (value) => {
+    if (DATABASE_CLASSES.has(javaClassName(value))) {
+      return new Database(value);
+    }
+    return toJs(value);
+  }));
+}
+
+async function createProxy(fn) {
   const { newProxy } = await javaBridgeModule();
   return newProxy("datalevin.UdfFunction", {
     invoke: async (args) => {
-      const values = await udfArgsToJs(args, descriptor);
+      const values = await udfArgsToJs(args);
       const result = await fn(...values);
       return toJava(result === undefined ? null : result);
     }
@@ -93,29 +101,7 @@ export function udfDescriptor(idOrDescriptor, {
   lang = ":java",
   version = null
 } = {}) {
-  if (idOrDescriptor !== null && typeof idOrDescriptor === "object") {
-    const descriptor = idOrDescriptor;
-    const id = descriptor[":udf/id"] ?? descriptor.id ?? descriptor.udfId;
-    return udfDescriptor(id, {
-      kind: descriptor[":udf/kind"] ?? descriptor.kind ?? kind,
-      lang: descriptor[":udf/lang"] ?? descriptor.lang ?? lang,
-      version: descriptor[":udf/version"] ?? descriptor.version ?? version
-    });
-  }
-
-  if (idOrDescriptor === null || idOrDescriptor === undefined) {
-    throw new TypeError("udf id is required");
-  }
-
-  const descriptor = {
-    ":udf/lang": keywordString(lang),
-    ":udf/kind": keywordString(kind),
-    ":udf/id": keywordString(idOrDescriptor)
-  };
-  if (version !== null && version !== undefined) {
-    descriptor[":udf/version"] = version;
-  }
-  return descriptor;
+  return descriptorData(idOrDescriptor, { kind, lang, version });
 }
 
 export class UdfRegistry {
@@ -133,15 +119,15 @@ export class UdfRegistry {
       throw new TypeError("fn must be a function");
     }
 
-    const normalized = udfDescriptor(descriptor);
-    const proxy = await createProxy(fn, normalized);
+    const normalized = UdfDescriptor.from(descriptor, { defaultLang: "javascript" });
+    const proxy = await createProxy(fn);
     await _BINDINGS.registerUdf(this._handle, normalized, proxy);
     this._proxies.set(descriptorKey(normalized), proxy);
     return fn;
   }
 
   async unregister(descriptor) {
-    const normalized = udfDescriptor(descriptor);
+    const normalized = UdfDescriptor.from(descriptor, { defaultLang: "javascript" });
     await _BINDINGS.unregisterUdf(this._handle, normalized);
     const key = descriptorKey(normalized);
     const proxy = this._proxies.get(key);
@@ -152,30 +138,35 @@ export class UdfRegistry {
   }
 
   async registered(descriptor) {
-    return _BINDINGS.registeredUdf(this._handle, udfDescriptor(descriptor));
+    return _BINDINGS.registeredUdf(
+      this._handle,
+      UdfDescriptor.from(descriptor, { defaultLang: "javascript" })
+    );
   }
 
   async queryUdf(id, fn, options = {}) {
-    return this.register(udfDescriptor(id, { ...options, kind: ":query-fn" }), fn);
+    return this.register(UdfDescriptor.queryFn(id, options), fn);
   }
 
   async predicateUdf(id, fn, options = {}) {
-    return this.register(udfDescriptor(id, { ...options, kind: ":predicate" }), fn);
+    return this.register(UdfDescriptor.predicate(id, options), fn);
   }
 
   async txUdf(id, fn, options = {}) {
-    return this.register(udfDescriptor(id, { ...options, kind: ":tx-fn" }), fn);
+    return this.register(UdfDescriptor.txFn(id, options), fn);
   }
 
   async analyzerUdf(id, fn, options = {}) {
-    return this.register(udfDescriptor(id, { ...options, kind: ":analyzer" }), fn);
+    return this.register(UdfDescriptor.analyzer(id, options), fn);
   }
 
   async queryAnalyzerUdf(id, fn, options = {}) {
-    return this.register(udfDescriptor(id, { ...options, kind: ":query-analyzer" }), fn);
+    return this.register(UdfDescriptor.queryAnalyzer(id, options), fn);
   }
 }
 
 export async function createUdfRegistry() {
   return new UdfRegistry(await _BINDINGS.createUdfRegistry());
 }
+
+export { UdfDescriptor };

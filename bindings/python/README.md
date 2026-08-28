@@ -103,6 +103,8 @@ ordering, limits, offsets, and timeouts. `q.datom(e, a, v)` is the common
 three-term form; use variable-arity `q.pattern(e, a)` for a presence pattern or
 other supported database-pattern arity. `q.raw()` remains the structured escape
 hatch for new syntax; its tokens must use `q.kw()` and `q.sym()` explicitly.
+Relation queries return a list of row lists. Without `order_by`, row order is
+unspecified.
 
 Typed forms validate structural grammar when they are composed: keyed result
 names must match a relation/tuple find, join variables must be non-empty and
@@ -111,6 +113,48 @@ indexes, and branches of one rule name must have matching required/free arity.
 `q.and_()` is a branch group for `q.or_()` or `q.or_join()` and is rejected as a
 top-level `:where`, `not`, `not-join`, or rule-body clause. `q.raw()` deliberately
 bypasses these typed checks.
+
+### Composing search clauses
+
+Full-text, vector, and indexed-document searches have dedicated clauses and
+position-aware option builders:
+
+```python
+entity = q.var("entity")
+attribute = q.var("attribute")
+value = q.var("value")
+score = q.var("score")
+distance = q.var("distance")
+
+text_clause = q.fulltext(
+    q.var("term"),
+    [entity, attribute, value, score],
+    attribute="document/text",
+    options=q.fulltext_options(top=5, display="refs+scores"),
+)
+
+vector_clause = q.vec_neighbors(
+    q.var("embedding"),
+    [entity, attribute, value, distance],
+    options=q.vector_search_options(
+        domains=["documents"], top=10, display="refs+dists"
+    ),
+)
+
+idoc_clause = q.idoc_match(
+    q.var("predicate"),
+    [entity, attribute, value],
+    options=q.idoc_match_options(domains=["profiles"]),
+)
+```
+
+Pass either `attribute=` or a domain list, as supported by the corresponding
+index. Result sequences are lowered to relation bindings; an explicit
+`q.relation_binding(...)` is also accepted. Static `display` options validate
+the result width while composing the query: full-text supports `refs`,
+`refs+scores`, `texts`, `offsets`, and `texts+offsets`; vector search supports
+`refs` and `refs+dists`. Use a `q.var()` as `options=` when the option map is a
+runtime query input. `from_source=` selects a non-default source.
 
 ### Composing pull selectors
 
@@ -181,6 +225,29 @@ Wrap a nested entity map in `tx.entity(...)`, as above. A plain nested
 dictionary with ordinary string keys remains data; the builder does not
 recursively convert it into an entity. More generally, values remain ordinary
 Python data; `q.kw()` and `q.sym()` add explicit Datalevin tokens where needed.
+
+### EDN lists and quoting
+
+Python lists and tuples represent EDN vectors. Use `q.edn_list()` when EDN
+syntax requires a list, such as an IDoc predicate, and `q.quote()` for the
+common `(quote value)` form used by nested queries:
+
+```python
+age_filter = {
+    "profile": {"age": q.edn_list(q.sym(">="), 30)},
+}
+
+inner = q.query(
+    find=q.relation(q.aggregate("min", q.var("age"))),
+    where=[q.datom(q.IGNORE, "person/age", q.var("age"))],
+)
+quoted_inner = q.quote(inner)
+```
+
+Both forms are immutable, backend-neutral values and do not start the JVM.
+Their top-level aliases are `edn_list()` and `quote()`. Ordinary strings inside
+an EDN list remain strings; use `q.sym()` for an operator or other symbol. This
+keeps these cases composable without `read_edn()`.
 
 ## Data Style
 
@@ -317,36 +384,53 @@ future = conn.transact_async([{":db/id": -1, ":name": "Cara"}])
 report = future.result(timeout=10)
 ```
 
-## UDF Example
+## Composing UDFs
 
-Use `create_udf_registry()` and `udf_descriptor()` for runtime UDFs. Pass the
-registry in connection runtime options, then call the descriptor from query with
-Datalevin's `udf` function. Fulltext analyzers use the same route with
-`registry.analyzer_udf()` or `registry.query_analyzer_udf()` and descriptors in
-`search_domain(analyzer=..., query_analyzer=...)`. Analyzer functions return
-`[term, position, offset]` triples.
+Use the immutable `UdfDescriptor` value with the typed API. It preserves
+keyword types when nested in query inputs, transactions, schema attributes, or
+search-domain options. `q.bind_udf()` binds a query-function result and
+`q.udf_predicate()` creates a predicate clause. Transaction UDFs have explicit
+`tx.call_udf()`, `tx.install_udf()`, and `tx.uninstall_udf()` helpers; an
+installed descriptor can subsequently be called with `tx.invoke()`. Both
+transaction UDFs and predicate UDFs used by `tx.ensure()` receive a `Database`
+as their first callback argument.
 
 ```python
-from datalevin import connect, create_udf_registry, udf_descriptor
+from datalevin import UdfDescriptor, connect, create_udf_registry, q
 
 registry = create_udf_registry()
+descriptor = UdfDescriptor.query_fn("math/inc")
 
-@registry.query_udf(":math/inc")
+@registry.register(descriptor)
 def inc(value):
     return value + 1
 
-descriptor = udf_descriptor(":math/inc")
+descriptor_input = q.var("descriptor")
+number = q.var("number")
+value = q.var("value")
+increment = q.query(
+    find=q.scalar(value),
+    inputs=[q.DB, descriptor_input, number],
+    where=[q.bind_udf(descriptor_input, value, number)],
+)
 
 with connect(
-    "/tmp/dtlv-py-udf",
-    opts={":runtime-opts": {":udf-registry": registry}},
+    None,
+    opts={
+        ":kv-opts": {":inmemory?": True},
+        ":runtime-opts": {":udf-registry": registry},
+    },
 ) as conn:
-    value = conn.query(
-        "[:find ?v . :in $ ?desc ?n :where [(udf ?desc ?n) ?v]]",
-        descriptor,
-        41,
-    )
+    assert conn.query(increment, descriptor, 41) == 42
 ```
+
+`udf_descriptor()` remains available and returns the original mutable
+colon-string dictionary for EDN-string and native-list compatibility code.
+`UdfDescriptor` factories, bare IDs passed to a registry, and the
+`query_udf()`/`predicate_udf()`/`tx_udf()`/analyzer registration conveniences
+default to `:python`. The legacy helper retains its `:java` default. Both forms
+are accepted by a registry, explicit `lang="java"` remains available, and the
+typed UDF helpers normalize legacy descriptors when they are used explicitly.
 
 ## Fulltext Analyzer UDF Example
 
@@ -362,26 +446,26 @@ from datalevin import (
     create_udf_registry,
     schema_attr,
     search_domain,
-    udf_descriptor,
+    UdfDescriptor,
 )
 
 registry = create_udf_registry()
-analyzer = udf_descriptor(":text/hashtags", kind=":analyzer")
-query_analyzer = udf_descriptor(":text/plain-query", kind=":query-analyzer")
+analyzer = UdfDescriptor.analyzer("text/hashtags")
+query_analyzer = UdfDescriptor.query_analyzer("text/plain-query")
 
-@registry.analyzer_udf(":text/hashtags")
+@registry.register(analyzer)
 def hashtags(text):
     return [
         [match.group(0)[1:], pos, match.start()]
         for pos, match in enumerate(re.finditer(r"#\w+", text))
     ]
 
-@registry.query_analyzer_udf(":text/plain-query")
+@registry.register(query_analyzer)
 def plain_query(text):
     return [[token, pos, pos] for pos, token in enumerate(text.split())]
 
 with connect(
-    "/tmp/dtlv-py-fulltext-udf",
+    None,
     schema={
         ":text": schema_attr(
             value_type=":db.type/string",
@@ -390,6 +474,7 @@ with connect(
         )
     },
     opts={
+        ":kv-opts": {":inmemory?": True},
         ":runtime-opts": {":udf-registry": registry},
         ":search-domains": {
             "text": search_domain(

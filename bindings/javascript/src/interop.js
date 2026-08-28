@@ -161,6 +161,22 @@ class InteropBindings {
     return callJavaMethod(cls.interop, "connectionDbBridge", handle);
   }
 
+  async connectionQuery(handle, query, inputs, { form = false } = {}) {
+    const cls = await classes();
+    const bridgeMethod = form
+      ? "connectionQueryFormBridge"
+      : "connectionQueryBridge";
+    if (typeof cls.interop[bridgeMethod] === "function") {
+      return callJavaMethod(cls.interop, bridgeMethod, handle, query, inputs);
+    }
+
+    // Compatibility for runtimes predating the in-JVM query bridge. Runtime
+    // builds that return SpillableSet require the bridge method above.
+    const method = form ? "queryForm" : "query";
+    const result = await callJavaMethod(handle, method, query, inputs);
+    return callJavaMethod(cls.interop, "bridgeResult", result);
+  }
+
   async connectionEntity(handle, eid) {
     const cls = await classes();
     return callJavaMethod(

@@ -5,6 +5,8 @@ import re
 import pytest
 
 from datalevin import (
+    Database,
+    UdfDescriptor,
     api_info,
     connect,
     create_udf_registry,
@@ -102,23 +104,31 @@ def test_raw_interop_exposes_normalizers_and_kv_calls(tmp_path) -> None:
     assert raw.key_value_closed(kv) is True
 
 
-def test_udf_registry_supports_inline_query_and_tx_functions(tmp_path) -> None:
+def test_udf_registry_supports_inline_query_and_tx_functions() -> None:
     registry = create_udf_registry()
+    query_descriptor = UdfDescriptor.query_fn(":math/inc")
+    predicate_descriptor = UdfDescriptor.predicate(":score/high?")
+    attr_predicate_descriptor = UdfDescriptor.predicate(":score/guarded?")
+    ensure_descriptor = UdfDescriptor.predicate(":score/ensure-guarded?")
+    tx_descriptor = UdfDescriptor.tx_fn(":person/bootstrap")
+    bare_id_descriptor = UdfDescriptor.query_fn(":math/double")
+    convenience_descriptor = UdfDescriptor.query_fn(":math/triple")
 
-    @registry.query_udf(":math/inc")
+    @registry.register(query_descriptor)
     def inc(value):
         return value + 1
 
-    @registry.predicate_udf(":score/high?")
+    @registry.register(":math/double")
+    def double(value):
+        return value * 2
+
+    @registry.query_udf(":math/triple")
+    def triple(value):
+        return value * 3
+
+    @registry.register(predicate_descriptor)
     def high_score(score):
         return score >= 10
-
-    attr_predicate_descriptor = udf_descriptor(
-        ":score/guarded?", kind=":predicate", lang=":python"
-    )
-    ensure_descriptor = udf_descriptor(
-        ":score/ensure-guarded?", kind=":predicate", lang=":python"
-    )
 
     def guarded_score(score):
         return score >= 10
@@ -129,16 +139,13 @@ def test_udf_registry_supports_inline_query_and_tx_functions(tmp_path) -> None:
     registry.register(attr_predicate_descriptor, guarded_score)
     registry.register(ensure_descriptor, ensure_guarded_score)
 
-    @registry.tx_udf(":person/bootstrap")
+    @registry.register(tx_descriptor)
     def bootstrap(db, name):
-        return [{":db/id": -1, ":name": name, ":score": 10}]
-
-    query_descriptor = udf_descriptor(":math/inc")
-    predicate_descriptor = udf_descriptor(":score/high?", kind=":predicate")
-    tx_descriptor = udf_descriptor(":person/bootstrap", kind=":tx-fn")
+        assert isinstance(db, Database)
+        return tx.data(tx.entity(-1, {"name": name, "score": 10}))
 
     with connect(
-        str(tmp_path / "db"),
+        None,
         schema={
             ":name": {
                 ":db/valueType": ":db.type/string",
@@ -150,84 +157,118 @@ def test_udf_registry_supports_inline_query_and_tx_functions(tmp_path) -> None:
                 attr_preds=attr_predicate_descriptor,
             ),
         },
-        opts={":runtime-opts": {":udf-registry": registry}},
+        opts={
+            ":kv-opts": {":inmemory?": True},
+            ":runtime-opts": {":udf-registry": registry},
+        },
     ) as conn:
-        conn.transact([[":db.fn/call", tx_descriptor, "Ada"]])
-        conn.transact(
-            tx.data(
-                tx.entity(
-                    -100,
-                    {"db/ident": q.kw("person/bootstrap"), "db/udf": tx_descriptor},
-                )
-            )
-        )
+        conn.transact(tx.data(tx.call_udf(tx_descriptor, "Ada")))
+        conn.transact(tx.data(tx.install_udf(tx_descriptor)))
         conn.transact(tx.data(tx.invoke("person/bootstrap", "Ada")))
         conn.transact([{":db/id": -1, ":name": "Bob", ":score": 3}])
         conn.transact([{":db/id": -2, ":guarded-score": 11}])
         with pytest.raises(Exception, match="failed pred"):
             conn.transact([{":db/id": -3, ":guarded-score": 3}])
         conn.transact(
-            [
-                {":db/id": -4, ":guarded-score": 11},
-                [keyword(":db/ensure"), ensure_descriptor, -4],
-            ]
+            tx.data(
+                tx.entity(-4, {"guarded-score": 11}),
+                tx.ensure(ensure_descriptor, -4),
+            )
         )
         with pytest.raises(Exception, match=":db/ensure failed"):
             conn.transact(
-                [
-                    {":db/id": -5, ":guarded-score": 12},
-                    [keyword(":db/ensure"), ensure_descriptor, -5],
-                ]
+                tx.data(
+                    tx.entity(-5, {"guarded-score": 12}),
+                    tx.ensure(ensure_descriptor, -5),
+                )
             )
 
+        descriptor = q.var("descriptor")
+        number = q.var("number")
+        value = q.var("value")
+        typed_query = q.query(
+            find=q.scalar(value),
+            inputs=[q.DB, descriptor, number],
+            where=[q.bind_udf(descriptor, value, number)],
+        )
         assert conn.query(
-            "[:find ?v . :in $ ?desc ?n :where [(udf ?desc ?n) ?v]]",
+            typed_query,
             query_descriptor,
             9,
         ) == 10
+        assert conn.query(typed_query, bare_id_descriptor, 9) == 18
+        assert conn.query(typed_query, convenience_descriptor, 9) == 27
+        inline_query = q.query(
+            find=q.scalar(value),
+            inputs=[q.DB, number],
+            where=[q.bind_udf(query_descriptor, value, number)],
+        )
+        assert conn.query(inline_query, 19) == 20
+        entity = q.var("entity")
+        name = q.var("name")
+        score = q.var("score")
+        pred = q.var("pred")
+        typed_predicate_query = q.query(
+            find=q.collection(name),
+            inputs=[q.DB, pred],
+            where=[
+                q.datom(entity, "name", name),
+                q.datom(entity, "score", score),
+                q.udf_predicate(pred, score),
+            ],
+        )
         assert conn.query(
-            "[:find [?name ...] :in $ ?pred "
-            ":where [?e :name ?name] [?e :score ?score] [(udf ?pred ?score)]]",
+            typed_predicate_query,
             predicate_descriptor,
         ) == ["Ada"]
+        assert conn.query(
+            "[:find ?v . :in $ ?n :where [(udf :math/inc ?n) ?v]]",
+            41,
+        ) == 42
         assert sorted(conn.query("[:find [?name ...] :where [?e :name ?name]]")) == ["Ada", "Bob"]
         assert registry.registered(query_descriptor) is True
         assert registry.registered(predicate_descriptor) is True
         assert registry.registered(attr_predicate_descriptor) is True
         assert registry.registered(ensure_descriptor) is True
         assert registry.registered(tx_descriptor) is True
+        assert registry.registered(bare_id_descriptor) is True
+        assert registry.registered(convenience_descriptor) is True
 
         registry.unregister(query_descriptor)
         registry.unregister(predicate_descriptor)
         registry.unregister(attr_predicate_descriptor)
         registry.unregister(ensure_descriptor)
         registry.unregister(tx_descriptor)
+        registry.unregister(":math/double")
+        registry.unregister(":math/triple")
 
         assert registry.registered(query_descriptor) is False
         assert registry.registered(predicate_descriptor) is False
         assert registry.registered(attr_predicate_descriptor) is False
         assert registry.registered(ensure_descriptor) is False
         assert registry.registered(tx_descriptor) is False
+        assert registry.registered(bare_id_descriptor) is False
+        assert registry.registered(convenience_descriptor) is False
 
 
-def test_udf_registry_supports_fulltext_analyzers(tmp_path) -> None:
+def test_udf_registry_supports_fulltext_analyzers() -> None:
     registry = create_udf_registry()
-    analyzer_descriptor = udf_descriptor(":text/hashtags", kind=":analyzer")
-    query_descriptor = udf_descriptor(":text/plain-query", kind=":query-analyzer")
+    analyzer_descriptor = UdfDescriptor.analyzer(":text/hashtags")
+    query_descriptor = UdfDescriptor.query_analyzer(":text/plain-query")
 
-    @registry.analyzer_udf(":text/hashtags")
+    @registry.register(analyzer_descriptor)
     def hashtag_analyzer(text):
         return [
             [match.group(0)[1:], pos, match.start()]
             for pos, match in enumerate(re.finditer(r"#\w+", text))
         ]
 
-    @registry.query_analyzer_udf(":text/plain-query")
+    @registry.register(query_descriptor)
     def plain_query_analyzer(text):
         return [[token, pos, pos] for pos, token in enumerate(text.split())]
 
     with connect(
-        str(tmp_path / "fulltext-udf"),
+        None,
         schema={
             ":text": schema_attr(
                 value_type=":db.type/string",
@@ -236,6 +277,7 @@ def test_udf_registry_supports_fulltext_analyzers(tmp_path) -> None:
             )
         },
         opts={
+            ":kv-opts": {":inmemory?": True},
             ":runtime-opts": {":udf-registry": registry},
             ":search-domains": {
                 "text": search_domain(

@@ -1,5 +1,5 @@
 import { classes } from "./jvm.js";
-import { DatalogSymbol, Form, Keyword } from "./form.js";
+import { DatalogSymbol, EdnList, Form, Keyword, Uuid } from "./form.js";
 
 const INT64_MIN = -(2n ** 63n);
 const INT64_MAX = 2n ** 63n - 1n;
@@ -123,6 +123,20 @@ export async function toJava(value) {
   if (value instanceof DatalogSymbol) {
     const cls = await classes();
     return cls.interop.symbolSync(value.toString());
+  }
+
+  if (value instanceof Uuid) {
+    const cls = await classes();
+    return cls.uuid.fromStringSync(value.toString());
+  }
+
+  if (value instanceof EdnList) {
+    const cls = await classes();
+    const items = new cls.arrayList();
+    for (const item of value) {
+      items.addSync(await toJava(item));
+    }
+    return cls.interop.ednListSync(items);
   }
 
   if (value instanceof Form) {
@@ -250,6 +264,20 @@ export async function toJs(value) {
   }
 
   return value;
+}
+
+export async function toJsQueryResult(value) {
+  if (isJavaObject(value)) {
+    const cls = await classes();
+    if (instanceOf(value, cls.setType)) {
+      const rows = [];
+      for (const item of materializeJavaCollection(value)) {
+        rows.push(await toJs(item));
+      }
+      return rows;
+    }
+  }
+  return toJs(value);
 }
 
 async function toJavaFormMap(entries, converter) {

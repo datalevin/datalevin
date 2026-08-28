@@ -12,6 +12,7 @@ import {
   KVTransaction,
   RawBuffer,
   RawKV,
+  UdfDescriptor,
   analyze,
   apiInfo,
   cardinality,
@@ -49,6 +50,7 @@ import {
   txRetract,
   unaccentTokenFilter,
   udfDescriptor,
+  uuid,
   withTransaction
 } from "../src/index.js";
 import { toJs } from "../src/interop.js";
@@ -93,25 +95,61 @@ test(
 );
 
 test(
+  "pure UUID values and id-less entities lower through the runtime",
+  { skip: !runtimeAvailable, timeout: 30000 },
+  async () => {
+    const id = uuid("550e8400-e29b-41d4-a716-446655440000");
+    const conn = await connect(null, {
+      schema: {
+        ":record/id": schemaAttr({
+          valueType: ":db.type/uuid",
+          unique: ":db.unique/identity"
+        })
+      },
+      opts: { ":kv-opts": { ":inmemory?": true } }
+    });
+
+    try {
+      await conn.transact(tx.data(tx.entity({ "record/id": id })));
+      assert.equal(
+        await conn.query("[:find ?id . :where [_ :record/id ?id]]"),
+        id.toString()
+      );
+    } finally {
+      await conn.close();
+    }
+  }
+);
+
+test(
   "UDF registry supports inline query predicate and transaction functions",
   { skip: !runtimeAvailable, timeout: 30000 },
   async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dtlv-js-udf-"));
     const registry = await createUdfRegistry();
-    const queryDescriptor = udfDescriptor(":math/inc");
-    const predicateDescriptor = udfDescriptor(":score/high?", { kind: ":predicate" });
-    const attrPredicateDescriptor = udfDescriptor(":score/guarded?", {
-      kind: ":predicate",
-      lang: ":javascript"
-    });
-    const txDescriptor = udfDescriptor(":person/bootstrap", { kind: ":tx-fn" });
+    const queryDescriptor = UdfDescriptor.queryFn(":math/inc");
+    const predicateDescriptor = UdfDescriptor.predicate(":score/high?");
+    const attrPredicateDescriptor = UdfDescriptor.predicate(":score/guarded?");
+    const ensureDescriptor = UdfDescriptor.predicate(":score/ensure-guarded?");
+    const txDescriptor = UdfDescriptor.txFn(":person/bootstrap");
+    const bareIdDescriptor = UdfDescriptor.queryFn(":math/double");
+    const convenienceDescriptor = UdfDescriptor.queryFn(":math/triple");
+    let udfDatabaseAvailable = false;
 
-    await registry.queryUdf(":math/inc", (value) => Number(value) + 1);
-    await registry.predicateUdf(":score/high?", (score) => Number(score) >= 10);
+    await registry.register(queryDescriptor, (value) => Number(value) + 1);
+    await registry.register(":math/double", (value) => Number(value) * 2);
+    await registry.queryUdf(":math/triple", (value) => Number(value) * 3);
+    await registry.register(predicateDescriptor, (score) => Number(score) >= 10);
     await registry.register(attrPredicateDescriptor, (score) => Number(score) >= 10);
-    await registry.txUdf(":person/bootstrap", (_db, name) => [
-      { ":db/id": -1, ":name": String(name), ":score": 10 }
-    ]);
+    await registry.register(ensureDescriptor, async (db, eid) => {
+      assert.equal(db instanceof Database, true);
+      const entity = await db.entityMap(eid);
+      return intValue(entity[":guarded-score"]) === 11;
+    });
+    await registry.register(txDescriptor, (db, name) => {
+      udfDatabaseAvailable = db instanceof Database;
+      return tx.data(tx.entity(-1, { name: String(name), score: 10 }));
+    });
 
     const conn = await connect(dir, {
       schema: {
@@ -129,13 +167,8 @@ test(
     });
 
     try {
-      await conn.transact([[":db.fn/call", txDescriptor, "Ada"]]);
-      await conn.transact(tx.data(
-        tx.entity(-100, {
-          "db/ident": q.kw("person/bootstrap"),
-          "db/udf": txDescriptor
-        })
-      ));
+      await conn.transact(tx.data(tx.callUdf(txDescriptor, "Ada")));
+      await conn.transact(tx.data(tx.installUdf(txDescriptor)));
       await conn.transact(tx.data(tx.invoke("person/bootstrap", "Ada")));
       await conn.transact([{ ":db/id": -1, ":name": "Bob", ":score": 3 }]);
       await conn.transact([{ ":db/id": -2, ":guarded-score": 11 }]);
@@ -143,39 +176,104 @@ test(
         () => conn.transact([{ ":db/id": -3, ":guarded-score": 3 }]),
         /failed pred/
       );
+      if (udfDatabaseAvailable) {
+        await conn.transact(tx.data(
+          tx.entity(-4, { "guarded-score": 11 }),
+          tx.ensure(ensureDescriptor, -4)
+        ));
+        await assert.rejects(
+          () => conn.transact(tx.data(
+            tx.entity(-5, { "guarded-score": 12 }),
+            tx.ensure(ensureDescriptor, -5)
+          )),
+          /:db\/ensure failed/
+        );
+      }
 
       assert.equal(await registry.registered(queryDescriptor), true);
       assert.equal(await registry.registered(predicateDescriptor), true);
       assert.equal(await registry.registered(attrPredicateDescriptor), true);
+      assert.equal(await registry.registered(ensureDescriptor), true);
       assert.equal(await registry.registered(txDescriptor), true);
+      const descriptor = q.var("descriptor");
+      const number = q.var("number");
+      const value = q.var("value");
+      const typedQuery = q.query({
+        find: q.scalar(value),
+        inputs: [q.DB, descriptor, number],
+        where: [q.bindUdf(descriptor, value, number)]
+      });
       assert.equal(
         intValue(await conn.query(
-          "[:find ?v . :in $ ?desc ?n :where [(udf ?desc ?n) ?v]]",
+          typedQuery,
           queryDescriptor,
           41
         )),
         42
       );
+      assert.equal(
+        intValue(await conn.query(typedQuery, bareIdDescriptor, 9)),
+        18
+      );
+      assert.equal(
+        intValue(await conn.query(typedQuery, convenienceDescriptor, 9)),
+        27
+      );
+      const inlineQuery = q.query({
+        find: q.scalar(value),
+        inputs: [q.DB, number],
+        where: [q.bindUdf(queryDescriptor, value, number)]
+      });
+      assert.equal(intValue(await conn.query(inlineQuery, 19)), 20);
+      const entity = q.var("entity");
+      const name = q.var("name");
+      const score = q.var("score");
+      const pred = q.var("pred");
+      const typedPredicateQuery = q.query({
+        find: q.collection(name),
+        inputs: [q.DB, pred],
+        where: [
+          q.datom(entity, "name", name),
+          q.datom(entity, "score", score),
+          q.udfPredicate(pred, score)
+        ]
+      });
       assert.deepEqual(
         await conn.query(
-          "[:find [?name ...] :in $ ?pred :where [?e :name ?name] [?e :score ?score] [(udf ?pred ?score)]]",
+          typedPredicateQuery,
           predicateDescriptor
         ),
         ["Ada"]
+      );
+      assert.equal(
+        intValue(await conn.query(
+          "[:find ?v . :in $ ?n :where [(udf :math/inc ?n) ?v]]",
+          41
+        )),
+        42
       );
       assert.deepEqual(
         (await conn.query("[:find [?name ...] :where [?e :name ?name]]")).sort(),
         ["Ada", "Bob"]
       );
 
+      assert.equal(await registry.registered(bareIdDescriptor), true);
+      assert.equal(await registry.registered(convenienceDescriptor), true);
+
       await registry.unregister(queryDescriptor);
       await registry.unregister(predicateDescriptor);
       await registry.unregister(attrPredicateDescriptor);
+      await registry.unregister(ensureDescriptor);
       await registry.unregister(txDescriptor);
+      await registry.unregister(":math/double");
+      await registry.unregister(":math/triple");
       assert.equal(await registry.registered(queryDescriptor), false);
       assert.equal(await registry.registered(predicateDescriptor), false);
       assert.equal(await registry.registered(attrPredicateDescriptor), false);
+      assert.equal(await registry.registered(ensureDescriptor), false);
       assert.equal(await registry.registered(txDescriptor), false);
+      assert.equal(await registry.registered(bareIdDescriptor), false);
+      assert.equal(await registry.registered(convenienceDescriptor), false);
     } finally {
       await conn.close();
     }
@@ -188,10 +286,10 @@ test(
   async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dtlv-js-fulltext-udf-"));
     const registry = await createUdfRegistry();
-    const analyzerDescriptor = udfDescriptor(":text/hashtags", { kind: ":analyzer" });
-    const queryDescriptor = udfDescriptor(":text/plain-query", { kind: ":query-analyzer" });
+    const analyzerDescriptor = UdfDescriptor.analyzer(":text/hashtags");
+    const queryDescriptor = UdfDescriptor.queryAnalyzer(":text/plain-query");
 
-    await registry.analyzerUdf(":text/hashtags", (text) => {
+    await registry.register(analyzerDescriptor, (text) => {
       const tokens = [];
       const pattern = /#\w+/g;
       let match;
@@ -201,7 +299,7 @@ test(
       }
       return tokens;
     });
-    await registry.queryAnalyzerUdf(":text/plain-query", (text) => (
+    await registry.register(queryDescriptor, (text) => (
       String(text).trim().split(/\s+/).filter(Boolean).map((token, position) => [token, position, position])
     ));
 

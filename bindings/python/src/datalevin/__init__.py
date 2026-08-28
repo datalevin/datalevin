@@ -2,7 +2,7 @@
 
 from . import query as q
 from . import transaction as tx
-from ._forms import Keyword, Symbol
+from ._forms import EdnList, Keyword, Symbol, edn_list, quote
 from ._interop import (
     abort_transact,
     analyze,
@@ -68,7 +68,15 @@ from .errors import (
 )
 from .kv import KV, KVTransaction, RawBuffer, RawKV
 from .llm import LlamaEmbedder, LlamaGenerator, new_llama_embedder, new_llama_generator
-from .query import PullAttr, PullNested, PullSelector, Query
+from .query import (
+    FulltextOptions,
+    IdocMatchOptions,
+    PullAttr,
+    PullNested,
+    PullSelector,
+    Query,
+    VectorSearchOptions,
+)
 from .search import (
     SearchEngine,
     SearchIndexWriter,
@@ -84,7 +92,7 @@ from .search import (
     prefix_token_filter,
     unaccent_token_filter,
 )
-from .udf import UdfRegistry, create_udf_registry, udf_descriptor
+from .udf import UdfDescriptor, UdfRegistry, create_udf_registry, udf_descriptor
 from .transaction import LookupRef, PatchOp, TxData
 from .vector import VectorIndex
 
@@ -94,12 +102,15 @@ __all__ = [
     "Database",
     "DatalevinConfigurationError",
     "Entity",
+    "EdnList",
+    "FulltextOptions",
     "DatalevinError",
     "DatalevinJavaError",
     "DatalevinJvmError",
     "KV",
     "KVTransaction",
     "Keyword",
+    "IdocMatchOptions",
     "LookupRef",
     "LlamaEmbedder",
     "LlamaGenerator",
@@ -113,8 +124,10 @@ __all__ = [
     "PullSelector",
     "PatchOp",
     "UdfRegistry",
+    "UdfDescriptor",
     "Symbol",
     "TxData",
+    "VectorSearchOptions",
     "VectorIndex",
     "abort_transact",
     "analyze",
@@ -139,6 +152,7 @@ __all__ = [
     "datalog_kv",
     "embedding_attr",
     "embedding_options",
+    "edn_list",
     "en_stop_words_token_filter",
     "exec_json",
     "explicit_transaction_timeout",
@@ -161,6 +175,7 @@ __all__ = [
     "open_kv",
     "prefix_token_filter",
     "q",
+    "quote",
     "read_edn",
     "re_index",
     "schema_attr",

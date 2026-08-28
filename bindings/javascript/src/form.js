@@ -38,6 +38,8 @@ function tokenPool() {
 
 const KEYWORDS = tokenPool();
 const DATALOG_SYMBOLS = tokenPool();
+const UUIDS = tokenPool();
+const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 export class Keyword {
   constructor(name) {
@@ -73,10 +75,80 @@ export class DatalogSymbol {
   }
 }
 
+export class Uuid {
+  constructor(value) {
+    if (value instanceof Uuid) {
+      return value;
+    }
+    if (typeof value !== "string") {
+      throw new TypeError(`Datalevin UUID values must be strings, got ${typeof value}.`);
+    }
+    const text = value.toLowerCase();
+    if (!UUID_PATTERN.test(text)) {
+      throw new TypeError(`Invalid UUID value: ${JSON.stringify(value)}.`);
+    }
+    const existing = UUIDS.get(text);
+    if (existing !== undefined) {
+      return existing;
+    }
+    this.value = text;
+    Object.freeze(this);
+    UUIDS.set(text, this);
+  }
+
+  toString() {
+    return this.value;
+  }
+
+  toJSON() {
+    return this.value;
+  }
+}
+
+export function uuid(value) {
+  return value instanceof Uuid ? value : new Uuid(value);
+}
+
 export class Form {
   toForm() {
     throw new TypeError(`${this.constructor.name}.toForm() is not implemented.`);
   }
+}
+
+export class EdnList extends Form {
+  constructor(...items) {
+    super();
+    this.items = immutableSnapshot(items);
+    Object.freeze(this);
+  }
+
+  get length() {
+    return this.items.length;
+  }
+
+  at(index) {
+    return this.items.at(index);
+  }
+
+  [Symbol.iterator]() {
+    return this.items[Symbol.iterator]();
+  }
+
+  toForm() {
+    return this;
+  }
+
+  asData() {
+    return formData(this);
+  }
+}
+
+export function ednList(...items) {
+  return new EdnList(...items);
+}
+
+export function quote(value) {
+  return new EdnList(new DatalogSymbol("quote"), value);
 }
 
 const IMMUTABLE_SNAPSHOTS = new WeakSet();
@@ -240,6 +312,7 @@ export function immutableSnapshot(value, active = new Set()) {
     || (typeof value !== "object" && typeof value !== "function")
     || value instanceof Keyword
     || value instanceof DatalogSymbol
+    || value instanceof Uuid
     || value instanceof Form
     || IMMUTABLE_SNAPSHOTS.has(value)
   ) {
@@ -308,6 +381,9 @@ export class RawForm extends Form {
 }
 
 export function formData(value) {
+  if (value instanceof EdnList) {
+    return new EdnList(...Array.from(value, formData));
+  }
   if (value instanceof Form) {
     return formData(value.toForm());
   }

@@ -5,6 +5,9 @@ import path from "node:path";
 import { test } from "node:test";
 
 import {
+  EdnList,
+  FulltextOptions,
+  IdocMatchOptions,
   Keyword,
   LookupRef,
   PatchOp,
@@ -13,13 +16,21 @@ import {
   PullSelector,
   Query,
   TxData,
+  UdfDescriptor,
+  UdfRegistry,
+  Uuid,
+  VectorSearchOptions,
   connect,
+  ednList,
   idocAttr,
   q,
+  quote,
   schemaAttr,
-  tx
+  tx,
+  udfDescriptor,
+  uuid
 } from "../src/index.js";
-import { resolveClasspath } from "../src/jvm.js";
+import { jvmStarted, resolveClasspath } from "../src/jvm.js";
 
 const runtimeAvailable = (() => {
   try {
@@ -71,6 +82,37 @@ test("query forms are pure, typed, and composable", () => {
   assert.equal(Object.isFrozen(q), true);
 });
 
+test("UDF registration conveniences default to JavaScript", async () => {
+  const registry = new UdfRegistry("HANDLE");
+  const captured = [];
+  registry.register = async (descriptor, fn) => {
+    captured.push(descriptor);
+    return fn;
+  };
+  const callback = () => null;
+
+  await registry.queryUdf("host/query", callback);
+  await registry.predicateUdf("host/predicate", callback);
+  await registry.txUdf("host/tx", callback);
+  await registry.analyzerUdf("host/analyzer", callback);
+  await registry.queryAnalyzerUdf("host/query-analyzer", callback);
+
+  assert.deepEqual(
+    captured.map((descriptor) => descriptor.lang),
+    Array(5).fill(":javascript")
+  );
+  assert.deepEqual(captured.map((descriptor) => descriptor.kind), [
+    ":query-fn",
+    ":predicate",
+    ":tx-fn",
+    ":analyzer",
+    ":query-analyzer"
+  ]);
+
+  await registry.queryUdf("host/explicit-java", callback, { lang: "java" });
+  assert.equal(captured.at(-1).lang, ":java");
+});
+
 test("plain strings stay literals unless explicitly typed", () => {
   const entity = q.var("e");
   const presence = q.pattern(entity, "user/id").toForm();
@@ -86,6 +128,60 @@ test("plain strings stay literals unless explicitly typed", () => {
   const keywordLiteral = q.datom(entity, q.var("attribute"), ":literal").toForm();
   assert.equal(keywordLiteral[1].toString(), "?attribute");
   assert.equal(keywordLiteral[2], ":literal");
+});
+
+test("EDN lists and quotes are pure and preserve the vector distinction", () => {
+  const wasStarted = jvmStarted();
+  const pathValue = ["profile", "age"];
+  const predicate = ednList(q.sym(">="), pathValue, 30);
+  const age = q.var("age");
+  const inner = q.query({
+    find: q.scalar(age),
+    where: [q.datom(q.var("entity"), "person/age", age)]
+  });
+  const quoted = quote(inner);
+  pathValue.push("ignored");
+
+  assert.equal(predicate instanceof EdnList, true);
+  assert.equal(predicate.toForm(), predicate);
+  assert.equal(predicate.at(0), q.sym(">="));
+  assert.deepEqual(predicate.at(1), ["profile", "age"]);
+  assert.equal(predicate.asData().at(0), ">=");
+  assert.equal(Object.isFrozen(predicate), true);
+  assert.equal(Object.isFrozen(predicate.items), true);
+
+  assert.equal(quoted instanceof EdnList, true);
+  assert.equal(quoted.at(0), q.sym("quote"));
+  assert.equal(quoted.at(1), inner);
+  assert.equal(quoted.asData().at(0), "quote");
+  assert.deepEqual(quoted.asData().at(1), inner.asData());
+  assert.deepEqual(q.ednList(q.sym("nil?")).asData(), ednList(q.sym("nil?")).asData());
+  assert.deepEqual(q.quote(inner).asData(), quoted.asData());
+  assert.equal(jvmStarted(), wasStarted);
+});
+
+test("UUID values and id-less entities are pure and composable", () => {
+  const wasStarted = jvmStarted();
+  const id = uuid("550E8400-E29B-41D4-A716-446655440000");
+  const equivalent = uuid("550e8400-e29b-41d4-a716-446655440000");
+  const anonymous = tx.entity({
+    "record/id": id,
+    "record/name": "Ada"
+  });
+  const legacy = tx.entity(null, { "record/id": id });
+
+  assert.equal(id instanceof Uuid, true);
+  assert.equal(id, equivalent);
+  assert.equal(id.toString(), "550e8400-e29b-41d4-a716-446655440000");
+  assert.equal(JSON.stringify(id), '"550e8400-e29b-41d4-a716-446655440000"');
+  assert.equal(Object.isFrozen(id), true);
+  assert.equal(jvmStarted(), wasStarted);
+
+  assert.equal(anonymous.toForm().get(q.kw("record/id")), id);
+  assert.equal(anonymous.toForm().has(q.kw("db/id")), false);
+  assert.equal(legacy.toForm().get(q.kw("record/id")), id);
+  assert.throws(() => uuid("not-a-uuid"), /Invalid UUID/);
+  assert.throws(() => tx.entity({ name: "Ada" }, []), /attributes/);
 });
 
 test("pull selectors type grammar tokens without changing values", () => {
@@ -160,6 +256,280 @@ test("transaction forms use explicit operation and attribute keywords", () => {
     [":db.fn/retractAttribute", -1, ":person/nickname"],
     [":db/ensure", ":person/valid?", -1]
   ]);
+});
+
+test("UDF values compose with typed queries and transactions", () => {
+  const descriptor = UdfDescriptor.queryFn("math/inc", { version: "v1" });
+  const equivalent = new UdfDescriptor({
+    id: "math/inc",
+    kind: "query-fn",
+    lang: "javascript",
+    version: "v1"
+  });
+  const legacy = udfDescriptor("math/legacy");
+
+  assert.equal(descriptor, equivalent);
+  assert.deepEqual(descriptor.asData(), {
+    ":udf/lang": ":javascript",
+    ":udf/kind": ":query-fn",
+    ":udf/id": ":math/inc",
+    ":udf/version": "v1"
+  });
+  assert.equal(Object.isFrozen(descriptor), true);
+  assert.equal(Object.isFrozen(descriptor.data), true);
+  assert.equal(descriptor.toForm() instanceof Map, true);
+  assert.equal(
+    Array.from(descriptor.toForm().keys()).every((key) => key instanceof Keyword),
+    true
+  );
+
+  const number = q.var("number");
+  const result = q.var("result");
+  const query = q.query({
+    find: q.scalar(result),
+    inputs: [q.DB, number],
+    where: [q.bindUdf(descriptor, result, number)]
+  });
+  assert.deepEqual(query.asData(), [
+    ":find",
+    "?result",
+    ".",
+    ":in",
+    "$",
+    "?number",
+    ":where",
+    [
+      [
+        "udf",
+        new Map([
+          [":udf/lang", ":javascript"],
+          [":udf/kind", ":query-fn"],
+          [":udf/id", ":math/inc"],
+          [":udf/version", "v1"]
+        ]),
+        "?number"
+      ],
+      "?result"
+    ]
+  ]);
+  assert.equal(
+    q.udfPredicate(UdfDescriptor.predicate("score/high?"), result)
+      .toForm()[0][0],
+    q.sym("udf")
+  );
+  assert.deepEqual(q.udf(legacy, number).toForm()[1].asData(), legacy);
+
+  const txDescriptor = UdfDescriptor.txFn("person/bootstrap");
+  const predicateDescriptor = UdfDescriptor.predicate("person/valid?");
+  const transaction = tx.data(
+    tx.installUdf(txDescriptor),
+    tx.callUdf(txDescriptor, "Ada"),
+    tx.ensure(predicateDescriptor, -1),
+    tx.uninstallUdf("person/bootstrap")
+  );
+  const txData = transaction.asData();
+  assert.deepEqual(txData[0], new Map([
+    [":db/ident", ":person/bootstrap"],
+    [":db/udf", new Map([
+      [":udf/lang", ":javascript"],
+      [":udf/kind", ":tx-fn"],
+      [":udf/id", ":person/bootstrap"]
+    ])]
+  ]));
+  assert.deepEqual(txData[1], [
+    ":db.fn/call",
+    new Map([
+      [":udf/lang", ":javascript"],
+      [":udf/kind", ":tx-fn"],
+      [":udf/id", ":person/bootstrap"]
+    ]),
+    "Ada"
+  ]);
+  assert.deepEqual(txData[2], [
+    ":db/ensure",
+    new Map([
+      [":udf/lang", ":javascript"],
+      [":udf/kind", ":predicate"],
+      [":udf/id", ":person/valid?"]
+    ]),
+    -1
+  ]);
+  assert.deepEqual(txData[3], [
+    ":db.fn/retractAttribute",
+    [":db/ident", ":person/bootstrap"],
+    ":db/udf"
+  ]);
+
+  assert.throws(() => UdfDescriptor.of("unknown", "bad/kind"), /Unsupported UDF kind/);
+  assert.throws(
+    () => UdfDescriptor.queryFn("bad/version", { version: 1.5 }),
+    /version/
+  );
+  assert.throws(
+    () => new UdfDescriptor({ id: "bad/key", extra: true }),
+    /Unsupported UDF descriptor key/
+  );
+});
+
+test("typed search clauses and options preserve search grammar", () => {
+  const entity = q.var("entity");
+  const term = q.var("term");
+  const score = q.var("score");
+  const vector = q.var("vector");
+  const distance = q.var("distance");
+  const predicate = q.var("predicate");
+
+  const fulltextOpts = q.fulltextOptions({
+    top: 5,
+    display: "refs+scores",
+    domains: ["people"]
+  });
+  const vectorOpts = q.vectorSearchOptions({
+    top: 2,
+    display: "refs+dists",
+    domains: ["embeddings"]
+  });
+  const idocOpts = q.idocMatchOptions({ domains: ["profiles"] });
+
+  assert.equal(fulltextOpts instanceof FulltextOptions, true);
+  assert.equal(vectorOpts instanceof VectorSearchOptions, true);
+  assert.equal(idocOpts instanceof IdocMatchOptions, true);
+  assert.deepEqual(fulltextOpts.asData(), new Map([
+    [":top", 5],
+    [":display", ":refs+scores"],
+    [":domains", ["people"]]
+  ]));
+  assert.deepEqual(vectorOpts.asData(), new Map([
+    [":top", 2],
+    [":display", ":refs+dists"],
+    [":domains", ["embeddings"]]
+  ]));
+  assert.deepEqual(idocOpts.asData(), new Map([
+    [":domains", ["profiles"]]
+  ]));
+
+  const search = q.query({
+    find: q.relation(entity, score, distance),
+    inputs: [q.DB, term, vector, predicate],
+    where: [
+      q.fulltext(
+        term,
+        [entity, q.IGNORE, q.IGNORE, score],
+        {
+          attribute: "person/name",
+          options: fulltextOpts
+        }
+      ),
+      q.vecNeighbors(
+        vector,
+        q.relationBinding(entity, q.IGNORE, q.IGNORE, distance),
+        { options: vectorOpts }
+      ),
+      q.idocMatch(
+        predicate,
+        [entity, q.IGNORE, q.IGNORE],
+        { options: idocOpts }
+      )
+    ]
+  });
+  assert.deepEqual(search.asData(), [
+    ":find",
+    "?entity",
+    "?score",
+    "?distance",
+    ":in",
+    "$",
+    "?term",
+    "?vector",
+    "?predicate",
+    ":where",
+    [
+      [
+        "fulltext",
+        "$",
+        ":person/name",
+        "?term",
+        new Map([
+          [":top", 5],
+          [":display", ":refs+scores"],
+          [":domains", ["people"]]
+        ])
+      ],
+      [["?entity", "_", "_", "?score"]]
+    ],
+    [
+      [
+        "vec-neighbors",
+        "$",
+        "?vector",
+        new Map([
+          [":top", 2],
+          [":display", ":refs+dists"],
+          [":domains", ["embeddings"]]
+        ])
+      ],
+      [["?entity", "_", "_", "?distance"]]
+    ],
+    [
+      [
+        "idoc-match",
+        "$",
+        "?predicate",
+        new Map([[":domains", ["profiles"]]])
+      ],
+      [["?entity", "_", "_"]]
+    ]
+  ]);
+});
+
+test("typed search clauses reject invalid static shapes", () => {
+  const entity = q.var("entity");
+
+  assert.throws(
+    () => q.fulltextOptions({ display: "refs+dists" }),
+    /Unsupported search display/
+  );
+  assert.throws(
+    () => q.vectorSearchOptions({ top: -1 }),
+    /non-negative/
+  );
+  assert.throws(
+    () => q.idocMatchOptions({ domains: [] }),
+    /must not be empty/
+  );
+  assert.throws(
+    () => q.fulltext(
+      "Ada",
+      [entity, q.IGNORE, q.IGNORE],
+      { options: q.fulltextOptions({ display: "refs+scores" }) }
+    ),
+    /requires 4 result items/
+  );
+  assert.throws(
+    () => q.vecNeighbors([1, 0], [entity, q.IGNORE, q.IGNORE]),
+    /attribute or vector search domains/
+  );
+  assert.throws(
+    () => q.fulltext(
+      "Ada",
+      [entity, q.IGNORE, q.IGNORE],
+      { options: q.vectorSearchOptions({ domains: ["people"] }) }
+    ),
+    /Expected FulltextOptions/
+  );
+  assert.throws(
+    () => q.idocMatch({}, [entity, q.IGNORE, "value"]),
+    /q.var/
+  );
+
+  assert.equal(
+    q.fulltext(
+      "Ada",
+      [entity, q.IGNORE, q.IGNORE, q.var("score")],
+      { options: q.var("runtime_options") }
+    ).toForm().length,
+    2
+  );
 });
 
 test("builder forms take recursive immutable snapshots", () => {
@@ -381,19 +751,30 @@ test(
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dtlv-js-composition-"));
     const conn = await connect(dir, {
       schema: {
-        ":person/name": schemaAttr({ valueType: ":db.type/string" }),
+        ":person/name": schemaAttr({
+          valueType: ":db.type/string",
+          fulltext: true,
+          fulltextAutoDomain: true
+        }),
         ":person/age": schemaAttr({ valueType: ":db.type/long" }),
         ":person/label": schemaAttr({ valueType: ":db.type/string" }),
         ":person/nickname": schemaAttr({ valueType: ":db.type/string" }),
         ":person/status": schemaAttr({ valueType: ":db.type/keyword" }),
         ":person/friend": schemaAttr({ valueType: ":db.type/ref" }),
+        ":person/embedding": schemaAttr({ valueType: ":db.type/vec" }),
         ":user/handle": schemaAttr({
           valueType: ":db.type/string",
           unique: ":db.unique/identity"
         }),
         ":user/name": schemaAttr({ valueType: ":db.type/string" }),
         ":user/friend": schemaAttr({ valueType: ":db.type/ref" }),
-        ":user/profile": idocAttr({ format: "edn" })
+        ":user/profile": idocAttr({ format: "edn", domain: "profiles" })
+      },
+      opts: {
+        ":vector-opts": {
+          ":dimensions": 2,
+          ":metric-type": ":cosine"
+        }
       }
     });
 
@@ -405,13 +786,15 @@ test(
           "person/label": "?literal",
           "person/nickname": "Ace",
           "person/status": q.kw("active"),
-          "person/friend": -2
+          "person/friend": -2,
+          "person/embedding": [1, 0]
         }),
         tx.entity(-2, {
           "person/name": "Bob",
           "person/age": 21,
           "person/label": ":literal",
-          "person/status": q.kw("draft")
+          "person/status": q.kw("draft"),
+          "person/embedding": [0, 1]
         })
       ));
 
@@ -430,6 +813,70 @@ test(
       });
       assert.deepEqual(await conn.query(adults, 30), ["Ada"]);
 
+      const searchTerm = q.var("search_term");
+      const fulltextNames = q.query({
+        find: q.collection(name),
+        inputs: [q.DB, searchTerm],
+        where: [
+          q.fulltext(
+            searchTerm,
+            [entity, q.IGNORE, q.IGNORE],
+            {
+              attribute: "person/name",
+              options: q.fulltextOptions({ top: 1 })
+            }
+          ),
+          q.datom(entity, "person/name", name)
+        ]
+      });
+      assert.deepEqual(await conn.query(fulltextNames, "Ada"), ["Ada"]);
+
+      const queryVector = q.var("query_vector");
+      const distance = q.var("distance");
+      const vectorNames = q.query({
+        find: q.collection(name),
+        inputs: [q.DB, queryVector],
+        where: [
+          q.vecNeighbors(
+            queryVector,
+            [entity, q.IGNORE, q.IGNORE, distance],
+            {
+              attribute: "person/embedding",
+              options: q.vectorSearchOptions({
+                top: 1,
+                display: "refs+dists"
+              })
+            }
+          ),
+          q.datom(entity, "person/name", name)
+        ]
+      });
+      assert.deepEqual(await conn.query(vectorNames, [1, 0]), ["Ada"]);
+
+      const innerAge = q.var("inner_age");
+      const youngest = q.var("youngest");
+      const youngestEntity = q.var("youngest_entity");
+      const youngestAgeQuery = q.query({
+        find: q.relation(q.aggregate("min", innerAge)),
+        where: [q.datom(q.IGNORE, "person/age", innerAge)]
+      });
+      const nestedQuery = q.query({
+        find: q.relation(youngestEntity, youngest),
+        where: [
+          q.bind(
+            "q",
+            q.relationBinding(youngest),
+            q.quote(youngestAgeQuery),
+            q.DB
+          ),
+          q.datom(youngestEntity, "person/age", youngest)
+        ]
+      });
+      assert.deepEqual(
+        (await conn.query(nestedQuery)).map((row) => row.map(intValue)),
+        [[2, 21]]
+      );
+
       const ordered = q.query({
         find: q.relation(name, age),
         where: [
@@ -440,6 +887,22 @@ test(
       });
       assert.deepEqual(
         (await conn.query(ordered)).map(([personName, personAge]) => [personName, intValue(personAge)]),
+        [["Ada", 42], ["Bob", 21]]
+      );
+
+      const unordered = q.query({
+        find: q.relation(name, age),
+        where: [
+          q.datom(entity, "person/name", name),
+          q.datom(entity, "person/age", age)
+        ]
+      });
+      const unorderedRows = await conn.query(unordered);
+      assert.equal(Array.isArray(unorderedRows), true);
+      assert.deepEqual(
+        unorderedRows
+          .map(([personName, personAge]) => [personName, intValue(personAge)])
+          .sort(([left], [right]) => left.localeCompare(right)),
         [["Ada", 42], ["Bob", 21]]
       );
 
@@ -641,6 +1104,30 @@ test(
         profile: { age: 31n, role: "admin" },
         tags: ["a", ":literal"]
       });
+
+      const idocEntity = q.var("idoc_entity");
+      const idocAttribute = q.var("idoc_attribute");
+      const idocValue = q.var("idoc_value");
+      const idocPredicate = q.var("idoc_predicate");
+      const matchingHandles = q.query({
+        find: q.collection(handle),
+        inputs: [q.DB, idocPredicate],
+        where: [
+          q.idocMatch(
+            idocPredicate,
+            [idocEntity, idocAttribute, idocValue],
+            { options: q.idocMatchOptions({ domains: ["profiles"] }) }
+          ),
+          q.datom(idocEntity, "user/handle", handle)
+        ]
+      });
+      assert.deepEqual(
+        await conn.query(
+          matchingHandles,
+          { profile: { age: q.ednList(q.sym(">="), 31) } }
+        ),
+        ["eve"]
+      );
     } finally {
       await conn.close();
     }

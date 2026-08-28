@@ -3,9 +3,12 @@ import {
   Form,
   Keyword,
   RawForm,
+  ednList,
   formData,
-  immutableSnapshot
+  immutableSnapshot,
+  quote
 } from "./form.js";
+import { udfReference } from "./udf-value.js";
 
 export function kw(name) {
   return name instanceof Keyword ? name : new Keyword(name);
@@ -123,6 +126,209 @@ export class Binding extends Form {
   toForm() {
     return this.form;
   }
+}
+
+class QueryOptions extends Form {
+  constructor(entries) {
+    super();
+    this.data = immutableSnapshot(new Map(entries));
+    Object.freeze(this);
+  }
+
+  get size() {
+    return this.data.size;
+  }
+
+  get(key) {
+    return this.data.get(key);
+  }
+
+  has(key) {
+    return this.data.has(key);
+  }
+
+  entries() {
+    return this.data.entries();
+  }
+
+  [Symbol.iterator]() {
+    return this.data[Symbol.iterator]();
+  }
+
+  toForm() {
+    return this.data;
+  }
+
+  asData() {
+    return formData(this);
+  }
+}
+
+export class FulltextOptions extends QueryOptions {}
+export class VectorSearchOptions extends QueryOptions {}
+export class IdocMatchOptions extends QueryOptions {}
+
+const FULLTEXT_DISPLAYS = new Map([
+  ["refs", 3],
+  ["refs+scores", 4],
+  ["texts", 4],
+  ["offsets", 4],
+  ["texts+offsets", 5]
+]);
+const VECTOR_DISPLAYS = new Map([
+  ["refs", 3],
+  ["refs+dists", 4]
+]);
+
+function optionName(value) {
+  if (value instanceof Keyword) {
+    return value.name;
+  }
+  if (typeof value !== "string") {
+    throw new TypeError("Query option keys must be keywords or strings.");
+  }
+  return kw(value).name;
+}
+
+function nonnegativeOption(name, value) {
+  const valid = (
+    (typeof value === "number" && Number.isSafeInteger(value) && value >= 0)
+    || (typeof value === "bigint" && value >= 0n)
+  );
+  if (!valid) {
+    throw new TypeError(`${name} must be a non-negative integer.`);
+  }
+  return value;
+}
+
+function domainOption(value) {
+  if (typeof value === "string" || value === null || !value?.[Symbol.iterator]) {
+    throw new TypeError("Search domains must be a sequence of strings.");
+  }
+  const domains = [...value];
+  if (domains.length === 0) {
+    throw new TypeError("Search domains must not be empty.");
+  }
+  if (!domains.every((domain) => typeof domain === "string" && domain.length > 0)) {
+    throw new TypeError("Search domains must contain non-empty strings.");
+  }
+  return domains;
+}
+
+function displayOption(value, supported) {
+  const display = typeof value === "string" ? kw(value) : value;
+  if (!(display instanceof Keyword) || !supported.has(display.name)) {
+    const expected = [...supported.keys()].map((name) => `:${name}`).join(", ");
+    throw new TypeError(`Unsupported search display; expected one of ${expected}.`);
+  }
+  return display;
+}
+
+function extraOptionEntries(extra) {
+  if (extra === null || extra === undefined) {
+    return [];
+  }
+  if (extra instanceof Map) {
+    return [...extra.entries()];
+  }
+  if (plainObject(extra)) {
+    return Object.entries(extra);
+  }
+  throw new TypeError("extra query options must be a Map or plain object.");
+}
+
+function queryOptions(
+  OptionType,
+  values,
+  { extra = null, displays = null, nonnegative = new Set() } = {}
+) {
+  const raw = new Map();
+  for (const [name, value] of values) {
+    if (value !== null && value !== undefined) {
+      raw.set(name, value);
+    }
+  }
+  for (const [key, value] of extraOptionEntries(extra)) {
+    raw.set(optionName(key), value);
+  }
+
+  const entries = [];
+  for (const [name, original] of raw) {
+    let value = original;
+    if (name === "domains") {
+      value = domainOption(value);
+    } else if (name === "display" && displays !== null) {
+      value = displayOption(value, displays);
+    } else if (nonnegative.has(name)) {
+      value = nonnegativeOption(name, value);
+    }
+    entries.push([kw(name), immutableSnapshot(value)]);
+  }
+  return new OptionType(entries);
+}
+
+export function fulltextOptions({
+  top = null,
+  limit = null,
+  offset = null,
+  pagingCachePages = null,
+  display = null,
+  domains = null,
+  proximityExpansion = null,
+  proximityMaxDist = null,
+  docFilter = null,
+  extra = null
+} = {}) {
+  return queryOptions(
+    FulltextOptions,
+    [
+      ["top", top],
+      ["limit", limit],
+      ["offset", offset],
+      ["paging-cache-pages", pagingCachePages],
+      ["display", display],
+      ["domains", domains],
+      ["proximity-expansion", proximityExpansion],
+      ["proximity-max-dist", proximityMaxDist],
+      ["doc-filter", docFilter]
+    ],
+    {
+      extra,
+      displays: FULLTEXT_DISPLAYS,
+      nonnegative: new Set(["top", "limit", "offset", "paging-cache-pages"])
+    }
+  );
+}
+
+export function vectorSearchOptions({
+  top = null,
+  display = null,
+  domains = null,
+  vecFilter = null,
+  extra = null
+} = {}) {
+  return queryOptions(
+    VectorSearchOptions,
+    [
+      ["top", top],
+      ["display", display],
+      ["domains", domains],
+      ["vec-filter", vecFilter]
+    ],
+    {
+      extra,
+      displays: VECTOR_DISPLAYS,
+      nonnegative: new Set(["top"])
+    }
+  );
+}
+
+export function idocMatchOptions({ domains = null, extra = null } = {}) {
+  return queryOptions(
+    IdocMatchOptions,
+    [["domains", domains]],
+    { extra }
+  );
 }
 
 export class FindSpec extends Form {
@@ -558,6 +764,10 @@ export function call(functionName, ...args) {
   return new Expression([callable(functionName), ...args]);
 }
 
+export function udf(reference, ...args) {
+  return call("udf", udfReference(reference), ...args);
+}
+
 export function aggregate(functionName, ...args) {
   return call(functionName, ...args);
 }
@@ -774,11 +984,179 @@ export function datom(entity, attributeName, value, { source: sourceValue = null
 }
 
 export function predicate(functionName, ...args) {
+  if (functionName instanceof Expression) {
+    if (args.length > 0) {
+      throw new TypeError("An expression predicate does not accept extra arguments.");
+    }
+    return new Clause([asForm(functionName)]);
+  }
   return new Clause([[callable(functionName), ...args]]);
 }
 
 export function bind(functionName, bindingValue, ...args) {
+  if (functionName instanceof Expression) {
+    if (args.length > 0) {
+      throw new TypeError("An expression binding does not accept extra arguments.");
+    }
+    return new Clause([asForm(functionName), asForm(bindingValue)]);
+  }
   return new Clause([[callable(functionName), ...args], asForm(bindingValue)]);
+}
+
+function searchSource(value) {
+  if (!(value instanceof DatalogSymbol) || !value.name.startsWith("$")) {
+    throw new TypeError("A search source must be a value created by q.source().");
+  }
+  return value;
+}
+
+function searchAttribute(value) {
+  if (value === null || value === undefined) {
+    return null;
+  }
+  const normalized = attribute(value);
+  if (!(normalized instanceof Keyword)) {
+    throw new TypeError("A search attribute must be a keyword or attribute name.");
+  }
+  return normalized;
+}
+
+function searchOptionsValue(value, OptionType, builder) {
+  if (value === null || value === undefined || value instanceof OptionType) {
+    return { value: value ?? null, static: true };
+  }
+  if (value instanceof QueryOptions) {
+    throw new TypeError(`Expected ${OptionType.name}, got ${value.constructor.name}.`);
+  }
+  if (value instanceof Map || plainObject(value)) {
+    return { value: builder({ extra: value }), static: true };
+  }
+  if (isVariableSymbol(value) || value instanceof RawForm) {
+    return { value, static: false };
+  }
+  throw new TypeError(
+    `Search options must be ${OptionType.name}, a Map/object, or a query variable.`
+  );
+}
+
+function relationResultBinding(results, allowedArities, context) {
+  let bindingValue;
+  if (results instanceof Binding) {
+    bindingValue = results;
+  } else {
+    if (typeof results === "string" || !results?.[Symbol.iterator]) {
+      throw new TypeError(`${context} results must be a sequence or relation binding.`);
+    }
+    bindingValue = relationBinding(...results);
+  }
+
+  const form = bindingValue.toForm();
+  if (!(Array.isArray(form) && form.length === 1 && Array.isArray(form[0]))) {
+    throw new TypeError(`${context} requires a relation result binding.`);
+  }
+  const items = form[0];
+  if (!items.every((item) => isVariableSymbol(item) || item === IGNORE)) {
+    throw new TypeError(`${context} result items must be q.var() or q.IGNORE values.`);
+  }
+  if (!allowedArities.has(items.length)) {
+    const expected = [...allowedArities].sort().join(", ");
+    throw new TypeError(`${context} requires ${expected} result items.`);
+  }
+  return bindingValue;
+}
+
+function staticDisplayArity(options, displays, defaultArity = 3) {
+  if (options === null) {
+    return new Set([defaultArity]);
+  }
+  const display = options.get(kw("display"));
+  return new Set([display === undefined ? defaultArity : displays.get(display.name)]);
+}
+
+export function fulltext(
+  queryValue,
+  results,
+  { attribute: attributeValue = null, options = null, source: sourceValue = DB } = {}
+) {
+  const normalizedSource = searchSource(sourceValue);
+  const normalizedAttribute = searchAttribute(attributeValue);
+  const normalizedOptions = searchOptionsValue(options, FulltextOptions, fulltextOptions);
+  const arities = normalizedOptions.static
+    ? staticDisplayArity(normalizedOptions.value, FULLTEXT_DISPLAYS)
+    : new Set(FULLTEXT_DISPLAYS.values());
+  const bindingValue = relationResultBinding(results, arities, "q.fulltext");
+  const args = [normalizedSource];
+  if (normalizedAttribute !== null) {
+    args.push(normalizedAttribute);
+  }
+  args.push(queryValue);
+  if (normalizedOptions.value !== null) {
+    args.push(normalizedOptions.value);
+  }
+  return bind("fulltext", bindingValue, ...args);
+}
+
+export function vecNeighbors(
+  queryVector,
+  results,
+  { attribute: attributeValue = null, options = null, source: sourceValue = DB } = {}
+) {
+  const normalizedSource = searchSource(sourceValue);
+  const normalizedAttribute = searchAttribute(attributeValue);
+  const normalizedOptions = searchOptionsValue(
+    options, VectorSearchOptions, vectorSearchOptions
+  );
+  if (normalizedAttribute === null && normalizedOptions.static) {
+    const domains = normalizedOptions.value?.get(kw("domains"));
+    if (domains === undefined || domains.length === 0) {
+      throw new TypeError(
+        "q.vecNeighbors requires an attribute or vector search domains."
+      );
+    }
+  }
+  const arities = normalizedOptions.static
+    ? staticDisplayArity(normalizedOptions.value, VECTOR_DISPLAYS)
+    : new Set(VECTOR_DISPLAYS.values());
+  const bindingValue = relationResultBinding(results, arities, "q.vecNeighbors");
+  const args = [normalizedSource];
+  if (normalizedAttribute !== null) {
+    args.push(normalizedAttribute);
+  }
+  args.push(queryVector);
+  if (normalizedOptions.value !== null) {
+    args.push(normalizedOptions.value);
+  }
+  return bind("vec-neighbors", bindingValue, ...args);
+}
+
+export function idocMatch(
+  queryValue,
+  results,
+  { attribute: attributeValue = null, options = null, source: sourceValue = DB } = {}
+) {
+  const normalizedSource = searchSource(sourceValue);
+  const normalizedAttribute = searchAttribute(attributeValue);
+  const normalizedOptions = searchOptionsValue(
+    options, IdocMatchOptions, idocMatchOptions
+  );
+  const bindingValue = relationResultBinding(results, new Set([3]), "q.idocMatch");
+  const args = [normalizedSource];
+  if (normalizedAttribute !== null) {
+    args.push(normalizedAttribute);
+  }
+  args.push(queryValue);
+  if (normalizedOptions.value !== null) {
+    args.push(normalizedOptions.value);
+  }
+  return bind("idoc-match", bindingValue, ...args);
+}
+
+export function bindUdf(reference, bindingValue, ...args) {
+  return bind(udf(reference, ...args), bindingValue);
+}
+
+export function udfPredicate(reference, ...args) {
+  return predicate(udf(reference, ...args));
 }
 
 export function rule(name, ...args) {
@@ -918,14 +1296,20 @@ export const q = Object.freeze({
   and: andClause,
   asc,
   bind,
+  bindUdf,
   call,
   collection,
   collectionBinding,
   customAggregate,
   datom,
   desc,
+  ednList,
   expression,
+  fulltext,
+  fulltextOptions,
   ignoreBinding,
+  idocMatch,
+  idocMatchOptions,
   joinVars,
   kw,
   not: notClause,
@@ -944,6 +1328,7 @@ export const q = Object.freeze({
   pullNested,
   pullRecursive,
   query,
+  quote,
   raw,
   relation,
   relationBinding,
@@ -958,6 +1343,10 @@ export const q = Object.freeze({
   tuple: tupleFind,
   tupleBinding,
   tupleScalar,
+  udf,
+  udfPredicate,
   v,
-  var: variable
+  var: variable,
+  vecNeighbors,
+  vectorSearchOptions
 });

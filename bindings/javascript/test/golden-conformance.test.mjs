@@ -319,7 +319,7 @@ function query(form) {
 
 function txItem(value) {
   if (value instanceof Map) {
-    return tx.entity(null, value);
+    return tx.entity(value);
   }
   if (!Array.isArray(value) || value.length === 0 || !(value[0] instanceof Keyword)) {
     throw new TypeError(`Unsupported golden transaction item: ${String(value)}.`);

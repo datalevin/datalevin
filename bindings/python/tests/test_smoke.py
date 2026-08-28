@@ -23,6 +23,16 @@ from datalevin import (
 pytestmark = pytest.mark.usefixtures("require_runtime")
 
 
+def test_anonymous_connection_forwards_schema_and_options() -> None:
+    with connect(
+        None,
+        schema={":name": {":db/valueType": ":db.type/string"}},
+        opts={":kv-opts": {":inmemory?": True}},
+    ) as conn:
+        assert conn.schema()[":name"][":db/valueType"] == ":db.type/string"
+        assert conn.opts()[":kv-opts"][":inmemory?"] is True
+
+
 def test_local_datalog_smoke(tmp_path: Path) -> None:
     info = api_info()
     assert isinstance(info, dict)

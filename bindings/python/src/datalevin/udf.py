@@ -7,6 +7,7 @@ import jpype
 from ._convert import to_java, to_python
 from ._interop import _BINDINGS
 from ._java import classes, is_java_object
+from ._udf_value import UdfDescriptor, descriptor_data
 
 
 class _PythonUdfFunction:
@@ -27,8 +28,11 @@ def _java_class_name(value):
         return None
 
 
-def _udf_arg_to_python(arg, index: int):
-    if index == 0 and _java_class_name(arg) == "datalevin.db.DB":
+def _udf_arg_to_python(arg, _index: int):
+    if _java_class_name(arg) in {
+        "datalevin.db.DB",
+        "datalevin.DatabaseValue",
+    }:
         from .database import Database
 
         return Database(arg)
@@ -40,86 +44,99 @@ class UdfRegistry:
 
     def __init__(self, handle=None) -> None:
         self._handle = _BINDINGS.create_udf_registry() if handle is None else handle
+        self._proxies = {}
 
     def raw_handle(self):
         return self._handle
 
-    def register(self, descriptor, fn):
+    def register(self, descriptor, fn=None):
+        """Register ``fn``; bare descriptors default to the Python language."""
+
+        if fn is None:
+            def decorator(decorated):
+                self.register(descriptor, decorated)
+                return decorated
+
+            return decorator
+        if not callable(fn):
+            raise TypeError("fn must be callable")
+        normalized = UdfDescriptor.from_value(descriptor, default_lang="python")
         proxy = jpype.JProxy(classes().udf_function, inst=_PythonUdfFunction(fn))
-        _BINDINGS.register_udf(self._handle, descriptor, proxy)
+        _BINDINGS.register_udf(self._handle, normalized, proxy)
+        self._proxies[normalized] = proxy
         return fn
 
     def unregister(self, descriptor):
-        _BINDINGS.unregister_udf(self._handle, descriptor)
+        normalized = UdfDescriptor.from_value(descriptor, default_lang="python")
+        _BINDINGS.unregister_udf(self._handle, normalized)
+        self._proxies.pop(normalized, None)
 
     def registered(self, descriptor) -> bool:
-        return _BINDINGS.registered_udf(self._handle, descriptor)
+        normalized = UdfDescriptor.from_value(descriptor, default_lang="python")
+        return _BINDINGS.registered_udf(self._handle, normalized)
 
-    def query_udf(self, udf_id: str):
+    def query_udf(self, udf_id: str, *, lang="python", version=None):
         def decorator(fn):
-            self.register(udf_descriptor(udf_id, kind=":query-fn"), fn)
+            self.register(
+                UdfDescriptor.query_fn(udf_id, lang=lang, version=version), fn
+            )
             return fn
 
         return decorator
 
-    def predicate_udf(self, udf_id: str):
+    def predicate_udf(self, udf_id: str, *, lang="python", version=None):
         def decorator(fn):
-            self.register(udf_descriptor(udf_id, kind=":predicate"), fn)
+            self.register(
+                UdfDescriptor.predicate(udf_id, lang=lang, version=version), fn
+            )
             return fn
 
         return decorator
 
-    def tx_udf(self, udf_id: str):
+    def tx_udf(self, udf_id: str, *, lang="python", version=None):
         def decorator(fn):
-            self.register(udf_descriptor(udf_id, kind=":tx-fn"), fn)
+            self.register(UdfDescriptor.tx_fn(udf_id, lang=lang, version=version), fn)
             return fn
 
         return decorator
 
-    def analyzer_udf(self, udf_id: str):
+    def analyzer_udf(self, udf_id: str, *, lang="python", version=None):
         def decorator(fn):
-            self.register(udf_descriptor(udf_id, kind=":analyzer"), fn)
+            self.register(
+                UdfDescriptor.analyzer(udf_id, lang=lang, version=version), fn
+            )
             return fn
 
         return decorator
 
-    def query_analyzer_udf(self, udf_id: str):
+    def query_analyzer_udf(self, udf_id: str, *, lang="python", version=None):
         def decorator(fn):
-            self.register(udf_descriptor(udf_id, kind=":query-analyzer"), fn)
+            self.register(
+                UdfDescriptor.query_analyzer(
+                    udf_id, lang=lang, version=version
+                ),
+                fn,
+            )
             return fn
 
         return decorator
-
-
-def _keyword_string(value) -> str:
-    text = str(value)
-    return text if text.startswith(":") else f":{text}"
 
 
 def udf_descriptor(udf_id=None, *, kind=":query-fn", lang=":java", version=None):
-    """Create a Datalevin UDF descriptor dictionary."""
+    """Create the legacy colon-string descriptor dictionary.
 
-    if isinstance(udf_id, dict):
-        descriptor = dict(udf_id)
-        udf_id = descriptor.get(":udf/id", descriptor.get("id"))
-        kind = descriptor.get(":udf/kind", descriptor.get("kind", kind))
-        lang = descriptor.get(":udf/lang", descriptor.get("lang", lang))
-        version = descriptor.get(":udf/version", descriptor.get("version", version))
+    Use :class:`UdfDescriptor` when composing with the typed ``q`` and ``tx``
+    APIs.  This function retains its existing dictionary shape for callers of
+    the EDN/list compatibility API.
+    """
 
-    if udf_id is None:
-        raise TypeError("udf_id is required")
-
-    descriptor = {
-        ":udf/lang": _keyword_string(lang),
-        ":udf/kind": _keyword_string(kind),
-        ":udf/id": _keyword_string(udf_id),
-    }
-    if version is not None:
-        descriptor[":udf/version"] = version
-    return descriptor
+    return descriptor_data(udf_id, kind=kind, lang=lang, version=version)
 
 
 def create_udf_registry() -> UdfRegistry:
     """Create a new UDF registry wrapper."""
 
     return UdfRegistry()
+
+
+__all__ = ["UdfDescriptor", "UdfRegistry", "create_udf_registry", "udf_descriptor"]

@@ -17,7 +17,7 @@ async function clientIdInput(value) {
     const cls = await classes();
     return cls.uuid.fromStringSync(value);
   }
-  return value;
+  return toJava(value);
 }
 
 export class Client extends ResourceWrapper {

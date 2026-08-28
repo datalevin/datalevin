@@ -10,14 +10,18 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 
 from ._forms import (
+    EdnList,
     Form,
     FrozenMap,
     Keyword,
     RawForm,
     Symbol,
+    edn_list,
     form_data,
     immutable_snapshot,
+    quote,
 )
+from ._udf_value import udf_reference
 
 
 def kw(name: str) -> Keyword:
@@ -134,6 +138,206 @@ class Binding(Form):
 
     def to_form(self):
         return self.form
+
+
+class _QueryOptions(Form, Mapping):
+    """Immutable keyword-keyed options for a query search function."""
+
+    __slots__ = ("_data",)
+
+    def __init__(self, entries=()) -> None:
+        object.__setattr__(self, "_data", FrozenMap(entries))
+
+    def __setattr__(self, name, value) -> None:
+        raise AttributeError(f"{type(self).__name__} values are immutable.")
+
+    def __delattr__(self, name) -> None:
+        raise AttributeError(f"{type(self).__name__} values are immutable.")
+
+    def __getitem__(self, key):
+        return self._data[key]
+
+    def __iter__(self):
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __hash__(self) -> int:
+        return hash(self._data)
+
+    def __eq__(self, other):
+        if not isinstance(other, Mapping):
+            return NotImplemented
+        return dict(self.items()) == dict(other.items())
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({dict(self._data)!r})"
+
+    def to_form(self):
+        return self._data
+
+    def as_data(self):
+        return form_data(self)
+
+
+class FulltextOptions(_QueryOptions):
+    """Typed options accepted by the Datalog ``fulltext`` function."""
+
+    __slots__ = ()
+
+
+class VectorSearchOptions(_QueryOptions):
+    """Typed options accepted by the Datalog ``vec-neighbors`` function."""
+
+    __slots__ = ()
+
+
+class IdocMatchOptions(_QueryOptions):
+    """Typed options accepted by the Datalog ``idoc-match`` function."""
+
+    __slots__ = ()
+
+
+_FULLTEXT_DISPLAYS = {
+    "refs": 3,
+    "refs+scores": 4,
+    "texts": 4,
+    "offsets": 4,
+    "texts+offsets": 5,
+}
+_VECTOR_DISPLAYS = {"refs": 3, "refs+dists": 4}
+
+
+def _option_name(value) -> str:
+    if isinstance(value, Keyword):
+        return value.name
+    if not isinstance(value, str):
+        raise TypeError("Query option keys must be keywords or strings.")
+    return kw(value).name
+
+
+def _nonnegative_option(name: str, value):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer.")
+    return value
+
+
+def _domain_option(value):
+    if isinstance(value, (str, bytes)):
+        raise TypeError("Search domains must be a sequence of strings.")
+    try:
+        domains = tuple(value)
+    except TypeError as error:
+        raise TypeError("Search domains must be a sequence of strings.") from error
+    if not domains:
+        raise ValueError("Search domains must not be empty.")
+    if not all(isinstance(domain, str) and domain for domain in domains):
+        raise TypeError("Search domains must contain non-empty strings.")
+    return domains
+
+
+def _display_option(value, supported) -> Keyword:
+    display = kw(value) if isinstance(value, str) else value
+    if not isinstance(display, Keyword) or display.name not in supported:
+        expected = ", ".join(f":{name}" for name in supported)
+        raise ValueError(f"Unsupported search display; expected one of {expected}.")
+    return display
+
+
+def _query_options(
+    option_type,
+    values,
+    *,
+    extra,
+    displays=None,
+    nonnegative=(),
+):
+    raw = {name: value for name, value in values if value is not None}
+    if extra is not None:
+        if not isinstance(extra, Mapping):
+            raise TypeError("extra query options must be a mapping.")
+        for key, value in extra.items():
+            raw[_option_name(key)] = value
+
+    entries = []
+    for name, value in raw.items():
+        if name == "domains":
+            value = _domain_option(value)
+        elif name == "display" and displays is not None:
+            value = _display_option(value, displays)
+        elif name in nonnegative:
+            value = _nonnegative_option(name, value)
+        entries.append((kw(name), immutable_snapshot(value)))
+    return option_type(entries)
+
+
+def fulltext_options(
+    *,
+    top=None,
+    limit=None,
+    offset=None,
+    paging_cache_pages=None,
+    display=None,
+    domains=None,
+    proximity_expansion=None,
+    proximity_max_dist=None,
+    doc_filter=None,
+    extra=None,
+) -> FulltextOptions:
+    """Build typed options for :func:`fulltext`."""
+
+    return _query_options(
+        FulltextOptions,
+        (
+            ("top", top),
+            ("limit", limit),
+            ("offset", offset),
+            ("paging-cache-pages", paging_cache_pages),
+            ("display", display),
+            ("domains", domains),
+            ("proximity-expansion", proximity_expansion),
+            ("proximity-max-dist", proximity_max_dist),
+            ("doc-filter", doc_filter),
+        ),
+        extra=extra,
+        displays=_FULLTEXT_DISPLAYS,
+        nonnegative={"top", "limit", "offset", "paging-cache-pages"},
+    )
+
+
+def vector_search_options(
+    *,
+    top=None,
+    display=None,
+    domains=None,
+    vec_filter=None,
+    extra=None,
+) -> VectorSearchOptions:
+    """Build typed options for :func:`vec_neighbors`."""
+
+    return _query_options(
+        VectorSearchOptions,
+        (
+            ("top", top),
+            ("display", display),
+            ("domains", domains),
+            ("vec-filter", vec_filter),
+        ),
+        extra=extra,
+        displays=_VECTOR_DISPLAYS,
+        nonnegative={"top"},
+    )
+
+
+def idoc_match_options(*, domains=None, extra=None) -> IdocMatchOptions:
+    """Build typed options for :func:`idoc_match`."""
+
+    return _query_options(
+        IdocMatchOptions,
+        (("domains", domains),),
+        extra=extra,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -577,6 +781,12 @@ def call(function, *args) -> Expression:
     return Expression((_callable(function), *args))
 
 
+def udf(reference, *args) -> Expression:
+    """Build a typed call to Datalevin's runtime ``udf`` function."""
+
+    return call("udf", udf_reference(reference), *args)
+
+
 def aggregate(function, *args) -> Expression:
     return call(function, *args)
 
@@ -768,11 +978,187 @@ def datom(entity, attribute, value, *, from_source=None) -> Clause:
 
 
 def predicate(function, *args) -> Clause:
+    if isinstance(function, Expression):
+        if args:
+            raise TypeError("An expression predicate does not accept extra arguments.")
+        return Clause((_as_form(function),))
     return Clause(((_callable(function), *args),))
 
 
 def bind(function, binding, *args) -> Clause:
+    if isinstance(function, Expression):
+        if args:
+            raise TypeError("An expression binding does not accept extra arguments.")
+        return Clause((_as_form(function), _as_form(binding)))
     return Clause(((_callable(function), *args), _as_form(binding)))
+
+
+def _search_source(value) -> Symbol:
+    if not isinstance(value, Symbol) or not value.name.startswith("$"):
+        raise TypeError("A search source must be a value created by q.source().")
+    return value
+
+
+def _search_attribute(value):
+    if value is None:
+        return None
+    attribute = _attribute(value)
+    if not isinstance(attribute, Keyword):
+        raise TypeError("A search attribute must be a keyword or attribute name.")
+    return attribute
+
+
+def _search_options_value(value, option_type, builder):
+    if value is None or isinstance(value, option_type):
+        return value, True
+    if isinstance(value, _QueryOptions):
+        raise TypeError(f"Expected {option_type.__name__}, got {type(value).__name__}.")
+    if isinstance(value, Mapping):
+        return builder(extra=value), True
+    if _is_variable_symbol(value) or isinstance(value, RawForm):
+        return value, False
+    raise TypeError(
+        f"Search options must be {option_type.__name__}, a mapping, or a query variable."
+    )
+
+
+def _relation_result_binding(results, allowed_arities, context: str) -> Binding:
+    if isinstance(results, Binding):
+        binding = results
+    else:
+        if isinstance(results, (str, bytes)):
+            raise TypeError(f"{context} results must be a sequence or relation binding.")
+        try:
+            binding = relation_binding(*tuple(results))
+        except TypeError as error:
+            raise TypeError(
+                f"{context} results must be a sequence or relation binding."
+            ) from error
+
+    form = binding.to_form()
+    if not (
+        isinstance(form, tuple)
+        and len(form) == 1
+        and isinstance(form[0], tuple)
+    ):
+        raise TypeError(f"{context} requires a relation result binding.")
+    items = form[0]
+    if not all(_is_variable_symbol(item) or item == IGNORE for item in items):
+        raise TypeError(f"{context} result items must be q.var() or q.IGNORE values.")
+    if len(items) not in allowed_arities:
+        expected = ", ".join(str(arity) for arity in sorted(allowed_arities))
+        raise ValueError(f"{context} requires {expected} result items.")
+    return binding
+
+
+def _static_display_arity(options, displays, default=3):
+    if options is None:
+        return {default}
+    display = options.get(kw("display"))
+    return {default if display is None else displays[display.name]}
+
+
+def fulltext(
+    query_value,
+    results,
+    *,
+    attribute=None,
+    options=None,
+    from_source=DB,
+) -> Clause:
+    """Build a typed ``fulltext`` search clause."""
+
+    source_value = _search_source(from_source)
+    attribute_value = _search_attribute(attribute)
+    options_value, static = _search_options_value(
+        options, FulltextOptions, fulltext_options
+    )
+    arities = (
+        _static_display_arity(options_value, _FULLTEXT_DISPLAYS)
+        if static
+        else set(_FULLTEXT_DISPLAYS.values())
+    )
+    binding = _relation_result_binding(results, arities, "q.fulltext")
+    args = [source_value]
+    if attribute_value is not None:
+        args.append(attribute_value)
+    args.append(query_value)
+    if options_value is not None:
+        args.append(options_value)
+    return bind("fulltext", binding, *args)
+
+
+def vec_neighbors(
+    query_vector,
+    results,
+    *,
+    attribute=None,
+    options=None,
+    from_source=DB,
+) -> Clause:
+    """Build a typed ``vec-neighbors`` similarity-search clause."""
+
+    source_value = _search_source(from_source)
+    attribute_value = _search_attribute(attribute)
+    options_value, static = _search_options_value(
+        options, VectorSearchOptions, vector_search_options
+    )
+    if attribute_value is None and static:
+        domains = None if options_value is None else options_value.get(kw("domains"))
+        if not domains:
+            raise ValueError(
+                "q.vec_neighbors requires an attribute or vector search domains."
+            )
+    arities = (
+        _static_display_arity(options_value, _VECTOR_DISPLAYS)
+        if static
+        else set(_VECTOR_DISPLAYS.values())
+    )
+    binding = _relation_result_binding(results, arities, "q.vec_neighbors")
+    args = [source_value]
+    if attribute_value is not None:
+        args.append(attribute_value)
+    args.append(query_vector)
+    if options_value is not None:
+        args.append(options_value)
+    return bind("vec-neighbors", binding, *args)
+
+
+def idoc_match(
+    query_value,
+    results,
+    *,
+    attribute=None,
+    options=None,
+    from_source=DB,
+) -> Clause:
+    """Build a typed ``idoc-match`` indexed-document clause."""
+
+    source_value = _search_source(from_source)
+    attribute_value = _search_attribute(attribute)
+    options_value, _ = _search_options_value(
+        options, IdocMatchOptions, idoc_match_options
+    )
+    binding = _relation_result_binding(results, {3}, "q.idoc_match")
+    args = [source_value]
+    if attribute_value is not None:
+        args.append(attribute_value)
+    args.append(query_value)
+    if options_value is not None:
+        args.append(options_value)
+    return bind("idoc-match", binding, *args)
+
+
+def bind_udf(reference, binding, *args) -> Clause:
+    """Invoke a query UDF and bind its result."""
+
+    return bind(udf(reference, *args), binding)
+
+
+def udf_predicate(reference, *args) -> Clause:
+    """Invoke a predicate UDF as a where clause."""
+
+    return predicate(udf(reference, *args))
 
 
 def rule(name, *args, from_source=None) -> Clause:
@@ -881,9 +1267,12 @@ __all__ = [
     "Binding",
     "Clause",
     "DB",
+    "EdnList",
     "Expression",
     "FindSpec",
+    "FulltextOptions",
     "IGNORE",
+    "IdocMatchOptions",
     "JoinVars",
     "Keyword",
     "Order",
@@ -896,18 +1285,25 @@ __all__ = [
     "RuleBranch",
     "RuleSet",
     "Symbol",
+    "VectorSearchOptions",
     "aggregate",
     "and_",
     "asc",
     "bind",
+    "bind_udf",
     "call",
     "collection",
     "collection_binding",
     "custom_aggregate",
     "datom",
     "desc",
+    "edn_list",
     "expression",
+    "fulltext",
+    "fulltext_options",
     "ignore_binding",
+    "idoc_match",
+    "idoc_match_options",
     "join_vars",
     "kw",
     "not_",
@@ -921,6 +1317,7 @@ __all__ = [
     "pull_nested",
     "pull_recursive",
     "query",
+    "quote",
     "raw",
     "relation",
     "relation_binding",
@@ -934,6 +1331,10 @@ __all__ = [
     "tuple_binding",
     "tuple_find",
     "tuple_scalar",
+    "udf",
+    "udf_predicate",
     "v",
     "var",
+    "vec_neighbors",
+    "vector_search_options",
 ]

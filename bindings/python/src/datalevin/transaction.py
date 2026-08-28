@@ -6,6 +6,7 @@ from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
 from ._forms import Form, Keyword, RawForm, form_data, immutable_snapshot
+from ._udf_value import UdfDescriptor, udf_reference
 from .query import kw
 
 _MISSING = object()
@@ -188,6 +189,12 @@ def call(function, *args) -> TxItem:
     return TxItem((kw("db.fn/call"), _callable(function), *args))
 
 
+def call_udf(reference, *args) -> TxItem:
+    """Invoke a transaction UDF by descriptor or registered keyword id."""
+
+    return call(udf_reference(reference), *args)
+
+
 def invoke(function, *args) -> TxItem:
     """Invoke a transaction function installed under a database ident."""
 
@@ -195,7 +202,26 @@ def invoke(function, *args) -> TxItem:
 
 
 def ensure(predicate, *args) -> TxItem:
-    return TxItem((kw("db/ensure"), _callable(predicate), *args))
+    return TxItem((kw("db/ensure"), udf_reference(predicate), *args))
+
+
+def install_udf(descriptor) -> TxItem:
+    """Install a descriptor under its ``:udf/id`` database ident."""
+
+    normalized = UdfDescriptor.from_value(descriptor, default_lang="java")
+    return entity(
+        attrs={
+            "db/ident": kw(normalized.udf_id),
+            "db/udf": normalized,
+        }
+    )
+
+
+def uninstall_udf(ident) -> TxItem:
+    """Retract ``:db/udf`` from an installed database ident."""
+
+    ident = kw(ident) if isinstance(ident, str) else ident
+    return retract_attribute(lookup_ref("db/ident", ident), "db/udf")
 
 
 def patch_set(path, value) -> PatchOp:
@@ -241,12 +267,14 @@ __all__ = [
     "TxItem",
     "add",
     "call",
+    "call_udf",
     "cas",
     "compare_and_swap",
     "data",
     "ensure",
     "entity",
     "invoke",
+    "install_udf",
     "lookup_ref",
     "patch_idoc",
     "patch_set",
@@ -256,4 +284,5 @@ __all__ = [
     "retract",
     "retract_attribute",
     "retract_entity",
+    "uninstall_udf",
 ]

@@ -3,6 +3,9 @@ from __future__ import annotations
 import pytest
 
 from datalevin import (
+    EdnList,
+    FulltextOptions,
+    IdocMatchOptions,
     Keyword,
     LookupRef,
     PatchOp,
@@ -12,8 +15,15 @@ from datalevin import (
     Query,
     Symbol,
     TxData,
+    UdfDescriptor,
+    UdfRegistry,
+    VectorSearchOptions,
+    edn_list,
+    jvm_started,
     q,
+    quote,
     tx,
+    udf_descriptor,
 )
 
 
@@ -51,6 +61,38 @@ def test_query_builder_is_pure_typed_and_composable() -> None:
     ]
 
 
+def test_udf_registration_conveniences_default_to_python() -> None:
+    registry = object.__new__(UdfRegistry)
+    captured = []
+
+    def register(descriptor, fn=None):
+        captured.append(descriptor)
+        return fn
+
+    registry.register = register
+
+    def callback(*_args):
+        return None
+
+    registry.query_udf("host/query")(callback)
+    registry.predicate_udf("host/predicate")(callback)
+    registry.tx_udf("host/tx")(callback)
+    registry.analyzer_udf("host/analyzer")(callback)
+    registry.query_analyzer_udf("host/query-analyzer")(callback)
+
+    assert [descriptor.lang for descriptor in captured] == [":python"] * 5
+    assert [descriptor.kind for descriptor in captured] == [
+        ":query-fn",
+        ":predicate",
+        ":tx-fn",
+        ":analyzer",
+        ":query-analyzer",
+    ]
+
+    registry.query_udf("host/explicit-java", lang="java")(callback)
+    assert captured[-1].lang == ":java"
+
+
 def test_query_strings_are_literals_unless_explicitly_typed() -> None:
     entity = q.var("e")
     presence = q.pattern(entity, "user/id")
@@ -67,6 +109,39 @@ def test_query_strings_are_literals_unless_explicitly_typed() -> None:
     keyword_form = keyword_literal.to_form()
     assert isinstance(keyword_form[1], Symbol)
     assert keyword_form[2] == ":literal"
+
+
+def test_edn_lists_and_quotes_are_pure_and_preserve_vector_distinction() -> None:
+    was_started = jvm_started()
+    path = ["profile", "age"]
+    predicate = edn_list(q.sym(">="), path, 30)
+    inner = q.query(
+        find=q.scalar(q.var("age")),
+        where=[q.datom(q.var("entity"), "person/age", q.var("age"))],
+    )
+    quoted = quote(inner)
+    path.append("ignored")
+
+    assert isinstance(predicate, EdnList)
+    assert predicate.to_form() is predicate
+    assert predicate[0] == q.sym(">=")
+    assert predicate[1] == ("profile", "age")
+    assert predicate.as_data()[0] == ">="
+
+    assert isinstance(quoted, EdnList)
+    assert quoted[0] == q.sym("quote")
+    assert quoted[1] is inner
+    assert quoted.as_data()[0] == "quote"
+    assert quoted.as_data()[1] == (
+        ":find",
+        "?age",
+        ".",
+        ":where",
+        ("?entity", ":person/age", "?age"),
+    )
+    assert q.edn_list(q.sym("nil?")) == edn_list(q.sym("nil?"))
+    assert q.quote(inner) == quoted
+    assert jvm_started() is was_started
 
 
 def test_pull_selectors_type_grammar_tokens_without_changing_values() -> None:
@@ -163,6 +238,149 @@ def test_query_supports_inputs_bindings_joins_rules_and_return_maps() -> None:
 
     relation_binding = q.relation_binding(entity, name)
     assert relation_binding.to_form() == ((entity, name),)
+
+
+def test_typed_search_clauses_and_options_preserve_search_grammar() -> None:
+    entity = q.var("entity")
+    term = q.var("term")
+    score = q.var("score")
+    vector = q.var("vector")
+    distance = q.var("distance")
+    predicate = q.var("predicate")
+
+    fulltext_opts = q.fulltext_options(
+        top=5,
+        display="refs+scores",
+        domains=["people"],
+    )
+    vector_opts = q.vector_search_options(
+        top=2,
+        display="refs+dists",
+        domains=["embeddings"],
+    )
+    idoc_opts = q.idoc_match_options(domains=["profiles"])
+
+    assert isinstance(fulltext_opts, FulltextOptions)
+    assert isinstance(vector_opts, VectorSearchOptions)
+    assert isinstance(idoc_opts, IdocMatchOptions)
+    assert fulltext_opts.as_data() == {
+        ":top": 5,
+        ":display": ":refs+scores",
+        ":domains": ["people"],
+    }
+    assert vector_opts.as_data() == {
+        ":top": 2,
+        ":display": ":refs+dists",
+        ":domains": ["embeddings"],
+    }
+    assert idoc_opts.as_data() == {":domains": ["profiles"]}
+
+    search = q.query(
+        find=q.relation(entity, score, distance),
+        inputs=[q.DB, term, vector, predicate],
+        where=[
+            q.fulltext(
+                term,
+                [entity, q.IGNORE, q.IGNORE, score],
+                attribute="person/name",
+                options=fulltext_opts,
+            ),
+            q.vec_neighbors(
+                vector,
+                q.relation_binding(entity, q.IGNORE, q.IGNORE, distance),
+                options=vector_opts,
+            ),
+            q.idoc_match(
+                predicate,
+                [entity, q.IGNORE, q.IGNORE],
+                options=idoc_opts,
+            ),
+        ],
+    )
+    assert search.as_data() == [
+        ":find",
+        "?entity",
+        "?score",
+        "?distance",
+        ":in",
+        "$",
+        "?term",
+        "?vector",
+        "?predicate",
+        ":where",
+        [
+            [
+                "fulltext",
+                "$",
+                ":person/name",
+                "?term",
+                {
+                    ":top": 5,
+                    ":display": ":refs+scores",
+                    ":domains": ["people"],
+                },
+            ],
+            [["?entity", "_", "_", "?score"]],
+        ],
+        [
+            [
+                "vec-neighbors",
+                "$",
+                "?vector",
+                {
+                    ":top": 2,
+                    ":display": ":refs+dists",
+                    ":domains": ["embeddings"],
+                },
+            ],
+            [["?entity", "_", "_", "?distance"]],
+        ],
+        [
+            [
+                "idoc-match",
+                "$",
+                "?predicate",
+                {":domains": ["profiles"]},
+            ],
+            [["?entity", "_", "_"]],
+        ],
+    ]
+
+
+def test_typed_search_clauses_reject_invalid_static_shapes() -> None:
+    entity = q.var("entity")
+
+    with pytest.raises(ValueError, match="Unsupported search display"):
+        q.fulltext_options(display="refs+dists")
+    with pytest.raises(ValueError, match="non-negative"):
+        q.vector_search_options(top=-1)
+    with pytest.raises(ValueError, match="must not be empty"):
+        q.idoc_match_options(domains=[])
+    with pytest.raises(ValueError, match="requires 4 result items"):
+        q.fulltext(
+            "Ada",
+            [entity, q.IGNORE, q.IGNORE],
+            options=q.fulltext_options(display="refs+scores"),
+        )
+    with pytest.raises(ValueError, match="attribute or vector search domains"):
+        q.vec_neighbors([1.0, 0.0], [entity, q.IGNORE, q.IGNORE])
+    with pytest.raises(TypeError, match="Expected FulltextOptions"):
+        q.fulltext(
+            "Ada",
+            [entity, q.IGNORE, q.IGNORE],
+            options=q.vector_search_options(domains=["people"]),
+        )
+    with pytest.raises(TypeError, match="q.var"):
+        q.idoc_match({}, [entity, q.IGNORE, "value"])
+
+    assert isinstance(
+        q.fulltext(
+            "Ada",
+            [entity, q.IGNORE, q.IGNORE, q.var("score")],
+            options=q.var("runtime_options"),
+        ),
+        q.Clause,
+    )
 
 
 def test_query_builder_rejects_invalid_structural_combinations() -> None:
@@ -275,6 +493,118 @@ def test_transaction_builder_produces_typed_immutable_forms() -> None:
         [":db.fn/retractAttribute", -1, ":person/nickname"],
         [":db/ensure", ":person/valid?", -1],
     ]
+
+
+def test_udf_values_compose_with_typed_queries_and_transactions() -> None:
+    descriptor = UdfDescriptor.query_fn("math/inc", version="v1")
+    equivalent = UdfDescriptor(
+        {
+            "id": "math/inc",
+            "kind": "query-fn",
+            "lang": "python",
+            "version": "v1",
+        }
+    )
+    legacy = udf_descriptor("math/legacy")
+
+    assert descriptor == equivalent
+    assert hash(descriptor) == hash(equivalent)
+    assert descriptor.as_data() == {
+        ":udf/lang": ":python",
+        ":udf/kind": ":query-fn",
+        ":udf/id": ":math/inc",
+        ":udf/version": "v1",
+    }
+    assert all(isinstance(key, Keyword) for key in descriptor.to_form())
+    assert all(
+        isinstance(descriptor.to_form()[q.kw(key)], Keyword)
+        for key in ("udf/lang", "udf/kind", "udf/id")
+    )
+    with pytest.raises(AttributeError, match="immutable"):
+        descriptor.lang = ":other"
+
+    number = q.var("number")
+    result = q.var("result")
+    query = q.query(
+        find=q.scalar(result),
+        inputs=[q.DB, number],
+        where=[q.bind_udf(descriptor, result, number)],
+    )
+    assert query.as_data() == [
+        ":find",
+        "?result",
+        ".",
+        ":in",
+        "$",
+        "?number",
+        ":where",
+        [
+            [
+                "udf",
+                {
+                    ":udf/lang": ":python",
+                    ":udf/kind": ":query-fn",
+                    ":udf/id": ":math/inc",
+                    ":udf/version": "v1",
+                },
+                "?number",
+            ],
+            "?result",
+        ],
+    ]
+    assert q.udf_predicate(
+        UdfDescriptor.predicate("score/high?"), result
+    ).to_form()[0][0] == q.sym("udf")
+    assert q.udf(legacy, number).to_form()[1].as_data() == legacy
+
+    tx_descriptor = UdfDescriptor.tx_fn("person/bootstrap")
+    predicate_descriptor = UdfDescriptor.predicate("person/valid?")
+    transaction = tx.data(
+        tx.install_udf(tx_descriptor),
+        tx.call_udf(tx_descriptor, "Ada"),
+        tx.ensure(predicate_descriptor, -1),
+        tx.uninstall_udf("person/bootstrap"),
+    )
+    assert transaction.as_data() == [
+        {
+            ":db/ident": ":person/bootstrap",
+            ":db/udf": {
+                ":udf/lang": ":python",
+                ":udf/kind": ":tx-fn",
+                ":udf/id": ":person/bootstrap",
+            },
+        },
+        [
+            ":db.fn/call",
+            {
+                ":udf/lang": ":python",
+                ":udf/kind": ":tx-fn",
+                ":udf/id": ":person/bootstrap",
+            },
+            "Ada",
+        ],
+        [
+            ":db/ensure",
+            {
+                ":udf/lang": ":python",
+                ":udf/kind": ":predicate",
+                ":udf/id": ":person/valid?",
+            },
+            -1,
+        ],
+        [
+            ":db.fn/retractAttribute",
+            [":db/ident", ":person/bootstrap"],
+            ":db/udf",
+        ],
+    ]
+
+    with pytest.raises(ValueError, match="Unsupported UDF kind"):
+        UdfDescriptor.of("unknown", "bad/kind")
+    with pytest.raises(TypeError, match="version"):
+        UdfDescriptor.query_fn("bad/version", version=1.5)
+    with pytest.raises(ValueError, match="Unsupported UDF descriptor key"):
+        UdfDescriptor({"id": "bad/key", "extra": True})
 
 
 def test_builder_forms_take_recursive_immutable_snapshots() -> None:

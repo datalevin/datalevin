@@ -39,8 +39,8 @@ const conn = await connect("/tmp/dtlv-js", {
 
 try {
   await conn.transact(tx.data(
-    tx.entity(-1, { name: "Ada" }),
-    tx.entity(-2, { name: "Bob" })
+    tx.entity({ name: "Ada" }),
+    tx.entity({ name: "Bob" })
   ));
 
   const names = await conn.query(allNames);
@@ -61,11 +61,11 @@ Their contract is an immutable snapshot, not a mutable builder. Construction
 recursively detaches arrays, plain objects, `Map`, `Set`, `Date`, and byte-array
 values. Arrays and objects are frozen; collection and mutable scalar snapshots
 reject mutation, including through values returned by `toForm()`. Mutating an
-input container later therefore cannot change an existing form. Keyword and
-Datalog-symbol tokens are interned by normalized type and name, so
-`q.kw("user/id") === q.kw(":user/id")` and repeated tokens occupy one `Map`
-key. JavaScript compound objects still use the language's normal identity
-comparison; the immutable snapshot, rather than structural `===`, is their
+input container later therefore cannot change an existing form. Keyword,
+Datalog-symbol, and UUID values are interned by normalized type and value, so
+`q.kw("user/id") === q.kw(":user/id")` and repeated equivalent values occupy
+one `Map` key. JavaScript compound objects still use the language's normal
+identity comparison; the immutable snapshot, rather than structural `===`, is their
 composition contract. Non-structural objects such as backend handles are
 treated as atomic values.
 
@@ -111,6 +111,8 @@ ordering, limits, offsets, and timeouts. `q.datom(e, a, v)` is the common
 three-term form; use variable-arity `q.pattern(e, a)` for a presence pattern or
 other supported database-pattern arity. `q.raw()` remains the structured escape
 hatch for new syntax; its tokens must use `q.kw()` and `q.sym()` explicitly.
+Relation queries return an Array of row Arrays. Without `orderBy`, row order is
+unspecified.
 
 Typed forms validate structural grammar when they are composed: keyed result
 names must match a relation/tuple find, join variables must be non-empty and
@@ -120,6 +122,52 @@ indexes, and branches of one rule name must have matching required/free arity.
 top-level `:where`, `not`, `not-join`, or rule-body clause. `q.rules(...)` exposes
 the same `asData()` inspection helper as the other typed forms. `q.raw()`
 deliberately bypasses these typed checks.
+
+### Composing search clauses
+
+Full-text, vector, and indexed-document searches have dedicated clauses and
+position-aware option builders:
+
+```js
+const entity = q.var("entity");
+const attribute = q.var("attribute");
+const value = q.var("value");
+const score = q.var("score");
+const distance = q.var("distance");
+
+const textClause = q.fulltext(
+  q.var("term"),
+  [entity, attribute, value, score],
+  {
+    attribute: "document/text",
+    options: q.fulltextOptions({ top: 5, display: "refs+scores" })
+  }
+);
+
+const vectorClause = q.vecNeighbors(
+  q.var("embedding"),
+  [entity, attribute, value, distance],
+  {
+    options: q.vectorSearchOptions({
+      domains: ["documents"], top: 10, display: "refs+dists"
+    })
+  }
+);
+
+const idocClause = q.idocMatch(
+  q.var("predicate"),
+  [entity, attribute, value],
+  { options: q.idocMatchOptions({ domains: ["profiles"] }) }
+);
+```
+
+Pass either `attribute` or a domain list, as supported by the corresponding
+index. Result Arrays are lowered to relation bindings; an explicit
+`q.relationBinding(...)` is also accepted. Static `display` options validate
+the result width while composing the query: full-text supports `refs`,
+`refs+scores`, `texts`, `offsets`, and `texts+offsets`; vector search supports
+`refs` and `refs+dists`. Use a `q.var()` as `options` when the option map is a
+runtime query input. `source` selects a non-default source.
 
 ### Composing pull selectors
 
@@ -157,6 +205,10 @@ if (nickname !== null) {
 const report = await conn.transact(tx.data(items));
 ```
 
+Use `tx.entity(attrs)` when Datalevin should allocate the entity id, and
+`tx.entity(id, attrs)` when supplying an explicit id or temporary id.
+`tx.entity(null, attrs)` remains accepted for compatibility but is unnecessary.
+
 In addition to entity maps, `tx` provides `add`, `retract`,
 `retractAttribute`, `retractEntity`, `compareAndSwap`/`cas`, `call`, `ensure`,
 and `patchIdoc` operations. Context-sensitive transaction values also have
@@ -191,6 +243,45 @@ Wrap a nested entity object in `tx.entity(...)`, as above. A plain nested
 object with ordinary string keys remains data; the builder does not recursively
 convert it into an entity. More generally, values remain ordinary JavaScript
 data; `q.kw()` and `q.sym()` add explicit Datalevin tokens where needed.
+
+JavaScript has no built-in UUID scalar. The synchronous `uuid()` helper creates
+an immutable UUID value without starting the JVM; it is validated,
+canonicalized, and lowered only when used by an operation:
+
+```js
+import { tx, uuid } from "datalevin-node";
+
+const id = uuid("550e8400-e29b-41d4-a716-446655440000");
+await conn.transact(tx.data(tx.entity({ "record/id": id })));
+```
+
+Repeated equivalent UUID values are interned. UUID results remain canonical
+strings for compatibility; pass such a result through `uuid()` when using it
+again in a typed input position.
+
+### EDN lists and quoting
+
+JavaScript Arrays represent EDN vectors. Use `q.ednList()` when EDN syntax
+requires a list, such as an IDoc predicate, and `q.quote()` for the common
+`(quote value)` form used by nested queries:
+
+```js
+const ageFilter = {
+  profile: { age: q.ednList(q.sym(">="), 30) }
+};
+
+const age = q.var("age");
+const inner = q.query({
+  find: q.relation(q.aggregate("min", age)),
+  where: [q.datom(q.IGNORE, "person/age", age)]
+});
+const quotedInner = q.quote(inner);
+```
+
+Both forms are immutable, backend-neutral values and do not start the JVM.
+Their top-level aliases are `ednList()` and `quote()`. Ordinary strings inside
+an EDN list remain strings; use `q.sym()` for an operator or other symbol. This
+keeps these cases composable without `readEdn()`.
 
 ## Data Style
 
@@ -341,36 +432,53 @@ const report = await conn.transactAsync([
 ]);
 ```
 
-## UDF Example
+## Composing UDFs
 
-Use `createUdfRegistry()` and `udfDescriptor()` for runtime UDFs. Pass the
-registry in connection runtime options, then call the descriptor from query with
-Datalevin's `udf` function. Fulltext analyzers use the same route with
-`registry.analyzerUdf()` or `registry.queryAnalyzerUdf()` and descriptors in
-`searchDomain({ analyzer, queryAnalyzer })`. Analyzer functions return
-`[term, position, offset]` triples.
+Use the immutable `UdfDescriptor` value with the typed API. It preserves
+keyword types when nested in query inputs, transactions, schema attributes, or
+search-domain options. `q.bindUdf()` binds a query-function result and
+`q.udfPredicate()` creates a predicate clause. Transaction UDFs have explicit
+`tx.callUdf()`, `tx.installUdf()`, and `tx.uninstallUdf()` helpers; an installed
+descriptor can subsequently be called with `tx.invoke()`. Both transaction UDFs
+and predicate UDFs used by `tx.ensure()` receive a `Database` as their first
+callback argument.
 
 ```js
-import { connect, createUdfRegistry, udfDescriptor } from "datalevin-node";
+import { UdfDescriptor, connect, createUdfRegistry, q } from "datalevin-node";
 
 const registry = await createUdfRegistry();
-await registry.queryUdf(":math/inc", (value) => Number(value) + 1);
+const descriptor = UdfDescriptor.queryFn("math/inc");
+await registry.register(descriptor, (value) => Number(value) + 1);
 
-const descriptor = udfDescriptor(":math/inc");
 const conn = await connect("/tmp/dtlv-js-udf", {
   opts: { ":runtime-opts": { ":udf-registry": registry } }
 });
 
 try {
-  const value = await conn.query(
-    "[:find ?v . :in $ ?desc ?n :where [(udf ?desc ?n) ?v]]",
-    descriptor,
-    41
-  );
+  const descriptorInput = q.var("descriptor");
+  const number = q.var("number");
+  const value = q.var("value");
+  const increment = q.query({
+    find: q.scalar(value),
+    inputs: [q.DB, descriptorInput, number],
+    where: [q.bindUdf(descriptorInput, value, number)]
+  });
+  console.log(await conn.query(increment, descriptor, 41));
 } finally {
   await conn.close();
 }
 ```
+
+`udfDescriptor()` remains available and returns the original mutable
+colon-string object for EDN-string and native-array compatibility code.
+`UdfDescriptor` factories, bare IDs passed to a registry, and the
+`queryUdf()`/`predicateUdf()`/`txUdf()`/analyzer registration conveniences
+default to `:javascript`. The legacy helper retains its `:java` default. Both
+forms are accepted by a registry, explicit `{ lang: "java" }` remains
+available, and the typed UDF helpers normalize legacy descriptors when they are
+used explicitly. Typed descriptors are interned by normalized language, kind,
+id, and version, so equivalent descriptors also behave as one key in a
+JavaScript `Map`.
 
 ## Fulltext Analyzer UDF Example
 
@@ -384,14 +492,14 @@ import {
   createUdfRegistry,
   schemaAttr,
   searchDomain,
-  udfDescriptor
+  UdfDescriptor
 } from "datalevin-node";
 
 const registry = await createUdfRegistry();
-const analyzer = udfDescriptor(":text/hashtags", { kind: ":analyzer" });
-const queryAnalyzer = udfDescriptor(":text/plain-query", { kind: ":query-analyzer" });
+const analyzer = UdfDescriptor.analyzer("text/hashtags");
+const queryAnalyzer = UdfDescriptor.queryAnalyzer("text/plain-query");
 
-await registry.analyzerUdf(":text/hashtags", (text) => {
+await registry.register(analyzer, (text) => {
   const tokens = [];
   const pattern = /#\w+/g;
   const source = String(text);
@@ -402,7 +510,7 @@ await registry.analyzerUdf(":text/hashtags", (text) => {
   return tokens;
 });
 
-await registry.queryAnalyzerUdf(":text/plain-query", (text) => (
+await registry.register(queryAnalyzer, (text) => (
   String(text).trim().split(/\s+/).filter(Boolean)
     .map((token, position) => [token, position, position])
 ));

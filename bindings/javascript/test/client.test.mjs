@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { after, before, test } from "node:test";
 
-import { DatalevinJavaError, jvmStarted, newClient } from "../src/index.js";
+import { DatalevinJavaError, jvmStarted, newClient, uuid } from "../src/index.js";
 import { clojureCliAvailable, runtimeAvailable, startLiveServer } from "../test-support/live-server.mjs";
 
 const integrationAvailable = runtimeAvailable() && clojureCliAvailable();
@@ -224,7 +224,7 @@ test(
       assert.equal(typeof clients[clientId][":open-dbs"], "object");
       assert.equal(typeof clients[clientId][":open-dbs"][dbName], "object");
 
-      await client.disconnectClient(otherId);
+      await client.disconnectClient(uuid(otherId));
 
       assert.equal(
         await waitFor(async () => {

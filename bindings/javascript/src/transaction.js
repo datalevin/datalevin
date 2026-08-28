@@ -1,5 +1,6 @@
 import { Form, Keyword, RawForm, formData, immutableSnapshot } from "./form.js";
 import { kw } from "./query.js";
+import { UdfDescriptor, udfReference } from "./udf-value.js";
 
 const MISSING = Symbol("missing");
 const PATCH_UPDATE_OPERATIONS = new Set([
@@ -155,7 +156,28 @@ export function data(...items) {
   return new TxData(items);
 }
 
-export function entity(dbId = null, attrs = {}) {
+export function entity(dbId = null, attrs = MISSING) {
+  if (attrs === MISSING) {
+    if (dbId instanceof Map || (
+      dbId !== null
+      && typeof dbId === "object"
+      && (Object.getPrototypeOf(dbId) === Object.prototype
+          || Object.getPrototypeOf(dbId) === null)
+    )) {
+      attrs = dbId;
+      dbId = null;
+    } else {
+      attrs = {};
+    }
+  }
+  if (!(attrs instanceof Map) && (
+    attrs === null
+    || typeof attrs !== "object"
+    || (Object.getPrototypeOf(attrs) !== Object.prototype
+        && Object.getPrototypeOf(attrs) !== null)
+  )) {
+    throw new TypeError("Transaction entity attributes must be an object or Map.");
+  }
   const entries = attrs instanceof Map ? attrs.entries() : Object.entries(attrs);
   const result = new Map();
   for (const [key, value] of entries) {
@@ -203,12 +225,29 @@ export function call(functionValue, ...args) {
   return new TxItem([kw("db.fn/call"), callable(functionValue), ...args]);
 }
 
+export function callUdf(reference, ...args) {
+  return call(udfReference(reference), ...args);
+}
+
 export function invoke(functionValue, ...args) {
   return new TxItem([callable(functionValue), ...args]);
 }
 
 export function ensure(predicateValue, ...args) {
-  return new TxItem([kw("db/ensure"), callable(predicateValue), ...args]);
+  return new TxItem([kw("db/ensure"), udfReference(predicateValue), ...args]);
+}
+
+export function installUdf(descriptor) {
+  const normalized = UdfDescriptor.from(descriptor, { defaultLang: "java" });
+  return entity({
+    "db/ident": kw(normalized.udfId),
+    "db/udf": normalized
+  });
+}
+
+export function uninstallUdf(ident) {
+  const normalized = typeof ident === "string" ? kw(ident) : ident;
+  return retractAttribute(lookupRef("db/ident", normalized), "db/udf");
 }
 
 export function patchSet(path, value) {
@@ -252,12 +291,14 @@ export function raw(form) {
 export const tx = Object.freeze({
   add,
   call,
+  callUdf,
   cas,
   compareAndSwap,
   data,
   ensure,
   entity,
   invoke,
+  installUdf,
   lookupRef,
   patchIdoc,
   patchSet,
@@ -266,5 +307,6 @@ export const tx = Object.freeze({
   raw,
   retract,
   retractAttribute,
-  retractEntity
+  retractEntity,
+  uninstallUdf
 });

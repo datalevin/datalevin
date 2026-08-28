@@ -125,6 +125,43 @@ class Form(ABC):
         """Return the form in backend-neutral Python containers and tokens."""
 
 
+@dataclass(frozen=True, slots=True, init=False)
+class EdnList(Form):
+    """A backend-neutral EDN list, distinct from a vector-like tuple/list."""
+
+    items: tuple
+
+    def __init__(self, *items) -> None:
+        object.__setattr__(self, "items", tuple(immutable_snapshot(item) for item in items))
+
+    def __len__(self) -> int:
+        return len(self.items)
+
+    def __iter__(self):
+        return iter(self.items)
+
+    def __getitem__(self, index):
+        return self.items[index]
+
+    def to_form(self):
+        return self
+
+    def as_data(self):
+        return form_data(self)
+
+
+def edn_list(*items) -> EdnList:
+    """Create a pure EDN list; use explicit Symbol values for symbolic items."""
+
+    return EdnList(*items)
+
+
+def quote(value) -> EdnList:
+    """Create the pure EDN form ``(quote value)``."""
+
+    return EdnList(Symbol("quote"), value)
+
+
 @dataclass(frozen=True, slots=True)
 class RawForm(Form):
     """A structured escape hatch; strings remain literal values."""
@@ -141,6 +178,8 @@ class RawForm(Form):
 def form_data(value):
     """Return a debug-friendly form using strings for keywords and symbols."""
 
+    if isinstance(value, EdnList):
+        return EdnList(*(form_data(item) for item in value))
     if isinstance(value, Form):
         return form_data(value.to_form())
     if isinstance(value, (Keyword, Symbol)):

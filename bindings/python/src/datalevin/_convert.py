@@ -10,7 +10,7 @@ import uuid as py_uuid
 import jpype
 from jpype.types import JBoolean, JByte, JLong
 
-from ._forms import Form, Keyword, Symbol
+from ._forms import EdnList, Form, Keyword, Symbol
 from ._java import call_java, classes, is_java_object
 
 INT64_MIN = -(2**63)
@@ -33,6 +33,12 @@ def to_java(value):
 
     if isinstance(value, Symbol):
         return call_java(classes().interop.symbol, str(value))
+
+    if isinstance(value, EdnList):
+        items = classes().array_list()
+        for item in value:
+            items.add(to_java(item))
+        return call_java(classes().interop.ednList, items)
 
     if isinstance(value, Form):
         return to_java(value.to_form())
@@ -137,7 +143,14 @@ def to_python(value):
         return result
 
     if isinstance(value, cls.set_type):
-        return {to_python(item) for item in value}
+        items = [to_python(item) for item in value]
+        try:
+            return set(items)
+        except TypeError:
+            # Relation rows lower to mutable lists and therefore cannot be
+            # members of a Python set. Return a list with unspecified order,
+            # while retaining set semantics for other hashable JVM sets.
+            return items
 
     if isinstance(value, (cls.list_type, cls.collection_type)) or hasattr(value, "iterator"):
         return [to_python(item) for item in value]
