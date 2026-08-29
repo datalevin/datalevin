@@ -88,6 +88,13 @@ public class Cursor {
     }
 
     /**
+     * Store the key/value currently held by this cursor's buffers.
+     */
+    public void put(int flags) {
+        Util.checkRc(DTLV.mdb_cursor_put(ptr(), key.ptr(), val.ptr(), flags));
+    }
+
+    /**
      * Close and free memory
      */
     public void close() {

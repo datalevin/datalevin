@@ -83,6 +83,10 @@ public class LRUCache {
         return new HashSet<Object>(map.keySet());
     }
 
+    public synchronized boolean isEmpty() {
+        return map.isEmpty();
+    }
+
     public synchronized List<Object> orderedKeys() {
         return new ArrayList<Object>(map.keySet());
     }

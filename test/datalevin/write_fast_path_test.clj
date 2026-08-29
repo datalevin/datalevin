@@ -10,11 +10,13 @@
 (ns datalevin.write-fast-path-test
   (:require
    [clojure.test :refer [deftest is testing]]
+   [datalevin.binding.cpp]
    [datalevin.core :as d]
    [datalevin.db :as db]
    [datalevin.util :as u])
   (:import
-   [java.util UUID]))
+   [datalevin.lmdb DatomKVTxData]
+   [java.util ArrayList UUID]))
 
 (def ^:private schema
   {:item/id    {:db/valueType :db.type/long
@@ -31,15 +33,47 @@
             {:item/id id :item/value (str "v" id)})
           (range start (+ start n)))))
 
-(deftest large-unique-insert-preparation-is-conservatively-gated
+(defn- repeated-value-batch
+  [start n]
+  (let [start (long start)
+        n     (long n)]
+    (mapv (fn [id]
+            {:item/id    id
+             :item/value "shared"
+             :item/left  true
+             :item/right false})
+          (range start (+ start n)))))
+
+(deftest add-only-datom-writes-always-use-ordered-index-passes
+  (let [add-only? (ns-resolve 'datalevin.binding.cpp
+                              'add-only-datom-batch?)
+        txs       (ArrayList.)]
+    (is (some? add-only?))
+    (testing "metadata-only and empty transactions do not select the path"
+      (is (false? (add-only? txs)))
+      (.add txs (Object.))
+      (is (false? (add-only? txs))))
+    (testing "one added datom is sufficient, with no size threshold"
+      (.add txs (DatomKVTxData. 1 (byte-array 0) true))
+      (is (true? (add-only? txs))))
+    (testing "any retraction retains the general transaction path"
+      (.add txs (DatomKVTxData. 2 (byte-array 0) false))
+      (is (false? (add-only? txs))))))
+
+(deftest supported-unique-inserts-use-small-batch-blind-preparation
   (let [dir  (u/tmp-dir (str "blind-unique-prepare-" (UUID/randomUUID)))
         conn (d/get-conn dir schema)]
     (try
-      (testing "small unique transactions retain the full upsert path"
-        (is (nil? (db/prepare-blind-local-tx @conn (item-batch 0 255)))))
-      (testing "WAL can opt small unique transactions into blind preparation"
+      (testing "single non-WAL unique inserts retain the ordinary resolver"
+        (is (nil? (db/prepare-blind-local-tx @conn (item-batch 0 1)))))
+      (testing "two unique inserts use blind preparation"
+        (let [prepared (db/prepare-blind-local-tx @conn (item-batch 0 2))]
+          (is (some? prepared))
+          (is (= 2 (count (:entities prepared))))
+          (is (= 2 (count (:unique-avs prepared))))))
+      (testing "WAL can opt a single unique insert into blind preparation"
         (let [prepared (db/prepare-blind-local-tx
-                         @conn (item-batch 0 1) true)]
+                         @conn (item-batch 2 1) true)]
           (is (some? prepared))
           (is (= 1 (count (:entities prepared))))
           (is (= 1 (count (:unique-avs prepared))))))
@@ -73,6 +107,32 @@
         (d/close conn)
         (u/delete-files dir)))))
 
+(deftest ordered-ave-duplicate-appends-preserve-data
+  (let [dir   (u/tmp-dir (str "ordered-ave-duplicates-" (UUID/randomUUID)))
+        conn* (atom nil)]
+    (try
+      (let [conn (d/get-conn dir schema)]
+        (reset! conn* conn)
+        ;; The second batch appends to duplicate trees created by the first.
+        (d/transact! conn (repeated-value-batch 0 256))
+        (d/transact! conn (repeated-value-batch 256 256))
+        (doseq [attr [:item/id :item/value :item/left :item/right]]
+          (is (= 512 (d/count-datoms @conn nil attr nil))))
+        (is (= "shared" (:item/value (d/entity @conn [:item/id 511]))))
+        (is (true? (:item/left (d/entity @conn [:item/id 511]))))
+        (is (false? (:item/right (d/entity @conn [:item/id 511]))))
+        (d/close conn)
+        (reset! conn* nil))
+
+      (let [conn (d/get-conn dir schema)]
+        (reset! conn* conn)
+        (doseq [attr [:item/id :item/value :item/left :item/right]]
+          (is (= 512 (d/count-datoms @conn nil attr nil)))))
+      (finally
+        (when-let [conn @conn*]
+          (d/close conn))
+        (u/delete-files dir)))))
+
 (deftest large-unique-inserts-preserve-upsert-and-durability-semantics
   (doseq [wal? [false true]]
     (testing (if wal? "WAL" "default LMDB")
@@ -87,6 +147,17 @@
             (is (= 256 (d/count-datoms @conn nil :item/id nil)))
             (is (= "v42"
                    (:item/value (d/entity @conn [:item/id 42]))))
+
+            (testing "large add-only updates retain ordinary EAV puts"
+              (d/transact!
+                conn
+                (mapv (fn [id]
+                        {:db/id     [:item/id id]
+                         :item/left true
+                         :item/right true})
+                      (range 256)))
+              (is (= 256 (d/count-datoms @conn nil :item/left nil)))
+              (is (= 256 (d/count-datoms @conn nil :item/right nil))))
 
             (testing "an existing identity makes the whole batch fall back"
               (d/transact!

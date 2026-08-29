@@ -98,6 +98,9 @@
   (^void putKeyId [^long id])
   (^void putValId [^long id]))
 
+(definterface ^:private IWriteCursor
+  (^datalevin.cpp.Cursor writeCursor [^datalevin.cpp.Txn txn]))
+
 (deftype Pool [^ThreadLocal que]
   IPool
   (pool-add [_ x] (.add ^ArrayDeque (.get que) x))
@@ -590,6 +593,10 @@
         (raise "Error putting r/w value buffer of "
                (.dbi-name this) ": " e {:value id :type :id}))))
 
+  IWriteCursor
+  (writeCursor [_ txn]
+    (Cursor/create txn db kp vp))
+
   IDB
   (dbi [_] db)
   (dbi-name [_] (.getName db))
@@ -935,6 +942,32 @@
         (.del eav txn false)
         (.reset kp)))))
 
+(defn- put-eav-datom-append-tx
+  [^DBI eav ^Cursor cur ^DatomKVTxData tx ^long flags]
+  (let [e   (.-e tx)
+        avg (.-avg tx)]
+    (.putKeyId eav e)
+    (.put-val eav avg :raw)
+    (.put cur (int flags))))
+
+(defn- last-id-key
+  [^Cursor cur]
+  (when (.seek cur DTLV/MDB_LAST)
+    (long (b/read-buffer (.outBuf ^BufVal (.key cur)) :id))))
+
+(defn- appendable-new-eav-batch?
+  ^Boolean [^objects datoms ^long n ^Cursor cur]
+  (and (pos? n)
+       (loop [i 0]
+         (if (< i n)
+           (if (.-added? ^DatomKVTxData (aget datoms i))
+             (recur (unchecked-inc i))
+             false)
+           true))
+       (let [first-e (.-e ^DatomKVTxData (aget datoms 0))
+             last-e  (last-id-key cur)]
+         (or (nil? last-e) (> first-e (long last-e))))))
+
 (def ^:private datom-eav-comparator
   (reify Comparator
     (compare [_ x y]
@@ -955,27 +988,18 @@
           (Long/compare (.-e x) (.-e y))
           c)))))
 
-(def ^:private ordered-datom-write-threshold
-  ;; Two index-ordered passes improve LMDB locality for large Datalog commits,
-  ;; but sorting is a net cost for the small transactions common in OLTP.
-  512)
-
-(defn- large-add-only-datom-batch?
+(defn- add-only-datom-batch?
   ^Boolean [^java.util.List txs]
-  (and (>= (.size txs) (long ordered-datom-write-threshold))
-       (loop [i 0]
-         (if (< i (.size txs))
-           (let [tx (.get txs i)]
-             (cond
-               (instance? DatomKVTxData tx)
-               (if (.-added? ^DatomKVTxData tx)
-                 (recur (unchecked-inc i))
-                 false)
-
-               ;; Datom operations are deliberately placed before generic
-               ;; metadata/index operations in the write plan.
-               :else true))
-           true))))
+  (loop [i          0
+         saw-datom? false]
+    (if (< i (.size txs))
+      (let [tx (.get txs i)]
+        (if (instance? DatomKVTxData tx)
+          (if (.-added? ^DatomKVTxData tx)
+            (recur (unchecked-inc i) true)
+            false)
+          (recur (unchecked-inc i) saw-datom?)))
+      saw-datom?)))
 
 (defn- transact1*
   [txs ^DBI dbi txn kt vt]
@@ -1030,11 +1054,46 @@
         [^objects datoms n] (datom-txs txs)
         n (int n)]
     (Arrays/sort datoms 0 n datom-eav-comparator)
-    (dotimes [i n]
-      (put-eav-datom-tx eav txn (aget datoms i)))
-    (Arrays/parallelSort datoms 0 n datom-ave-comparator)
-    (dotimes [i n]
-      (put-ave-datom-tx ave txn (aget datoms i)))
+    (let [new-entity-batch?
+          (with-open [^Cursor cur (.writeCursor ^IWriteCursor eav txn)]
+            (let [append? (appendable-new-eav-batch? datoms n cur)]
+              (if append?
+                (loop [i 0
+                       previous-e Long/MIN_VALUE]
+                  (when (< i n)
+                    (let [^DatomKVTxData tx (aget datoms i)
+                          e                 (.-e tx)]
+                      (put-eav-datom-append-tx
+                        eav cur tx
+                        (if (= e previous-e)
+                          DTLV/MDB_APPENDDUP
+                          DTLV/MDB_APPEND))
+                      (recur (unchecked-inc i) e))))
+                (dotimes [i n]
+                  (let [^DatomKVTxData tx (aget datoms i)]
+                    (if (.-added? tx)
+                      (do
+                        (.putKeyId eav (.-e tx))
+                        (.put-val eav (.-avg tx) :raw)
+                        (.put cur (int 0)))
+                      (put-eav-datom-tx eav txn tx)))))
+              append?))]
+      (Arrays/parallelSort datoms 0 n datom-ave-comparator)
+      (with-open [^Cursor cur (.writeCursor ^IWriteCursor ave txn)]
+        (dotimes [i n]
+          (let [^DatomKVTxData tx (aget datoms i)]
+            (if (.-added? tx)
+              (do
+                (.put-key ave (.-avg tx) :raw)
+                (.putValId ave (.-e tx))
+                ;; EAV appendability proves every entity ID is above the
+                ;; previous database maximum. AVE is sorted by key and entity,
+                ;; so each existing duplicate tree can append without a data
+                ;; search. New AVE keys still use the ordinary key insertion.
+                (.put cur (if new-entity-batch?
+                            DTLV/MDB_APPENDDUP
+                            (int 0))))
+              (put-ave-datom-tx ave txn tx))))))
     (dotimes [i (.size txs)]
       (let [tx (.get txs i)]
         (when-not (instance? DatomKVTxData tx)
@@ -1049,7 +1108,7 @@
 (defn- transact-datom-list*
   [^java.util.List txs ^HashMap dbis txn]
   (if (or c/*ordered-datom-writes?*
-          (large-add-only-datom-batch? txs))
+          (add-only-datom-batch? txs))
     (transact-datom-index-passes* txs dbis txn)
     (let [n (.size txs)]
       (loop [i   0

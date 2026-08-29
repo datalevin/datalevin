@@ -1,621 +1,352 @@
 # Write Benchmark
 
-The purpose of this benchmark is to study the write throughput and latency under
-various conditions in Datalevin. Hopefully, this gives users some reference data
-points to help choosing the right transaction function, the right data batch
-size, transaction mode and environment flags for specific use cases.
-
-We also compare Datalevin's Datalog transaction speed with SQLite, as it is the
-most widely deployed embedded database that has a reputation for being fast.
-
-## Setup
-
-The benchmark is conducted on a 2016 Intel Core i7-6850K CPU @ 3.60GHz with 6
-cores, 64GB RAM, Samsung 860 EVO 1TB SSD.
-
-The OS is x86_64 GNU/Linux 6.12.73+deb13-amd64, Debian 13 (trixie), running
-OpenJDK version "21.0.10" 2024-10-15, and Clojure version is 1.12.4. Datalevin
-is version 0.10.7. SQLite is from SQLite JDBC driver 3.48.0.0, using next.jdbc
-Clojure library 1.3.981.
-
-### Tasks
-
-There are two tasks that are done sequentially.
-
-#### Pure Write
-
-The first task writes a 8 bytes integer as key and a 36 bytes random UUID string
-as value. In Datalevin, this means an entitiy of two attributes, one is a long,
-marked as `:db.unique/identity`, and the other a string. In SQLite, this is a
-row of two fields, one is an integer `PRIMARY KEY`, and another a `TEXT`.
-
-The pure write task is to do 1 million such writes to an empty DB. The integers
-are all even numbers between 1 and 2 millions, so the next task can have 50%
-chance of hitting existing data initially.
-
-The writes can be batched to improve throughput as it reduces the number of disk
-flush calls. We vary the batch sizes in this task: 1, 10, 100, and 1000, to
-test the batching speed up effect.
-
-#### Mixed Read/Write
-
-With 1 million entities in DB, we then do 2 million additional operations, with
-1 million reads and 1 million writes. Read and write are interleaved. These
-reads/writes are individual operations, not batched.
-
-The read/write integers are random number between 1 and 2 millions. So initally
-write has a 50% chance of being an append and 50% chance of being an
-overwrite. The chance of being an overwrite increases as more items are
-written. The benchmark schema declares the integer attribute as
-`:db.unique/identity`, matching the SQLite primary key and making the mixed
-phase's repeated keys true upserts rather than additional entities.
-
-### Metrics
-
-For every 10K write requests, a set of metrics are recorded:
-
-* Throughput (writes/second), average throughput at the moment.
-* Call Latency (milliseconds), average latency of write function calls.
-* Commit Latency (milliseconds), average latency of transaction commits.
-
-The results are written into a CSV file.
-
-For asynchronous transactions, the measures are taken in the callback function,
-which is only called after the commit is finished, so its commit latency includes
-the time for flushing to disk, so as to ensure all comparisons are fair.
-
-For consistency and to avoid exhausting system resources, the number of
-asynchronous write requests in flight is capped at 1000 using a Semaphore.
-
-At the end of the benchmark, the total number of data items on disk is also
-queried to verify that all data are written, otherwise the benckmark will report
-an error.
-
-### Run
-
-Clojure command line is needed to run the benchmarks.
-
-Use a disk-backed directory for `:base-dir` / `:dir`. On some Linux systems,
-`/tmp` is mounted as `tmpfs`, which will inflate write throughput and hide real
-fsync costs.
-
-For comparable measurements, run one unrecorded warmup pass followed by one
-recorded measurement pass, using a fresh database directory for each pass.
-
-For example, the command below runs pure write benchmark for `transact-async`
-with batch size 10, and save the results in `dl-async-10.csv`:
-
-```bash
-time clj -Xwrite :base-dir \"/tmp/dl/\" :batch 10 :f dl-async > dl-10-async.csv
-```
-
-WAL mode is available by appending `-wal` to task names
-(for example `kv-sync-wal`, `kv-async-wal`, `dl-sync-wal`, `dl-async-wal`,
-`sql-tx-wal`).
-You can also set `:durability-profile` to `:strict` (default), `:extra`, or
-`:relaxed`.
-
-You can run multiple calling threads to test concurrent write ingress by using `:threads`, e.g.:
-
-```bash
-time clj -Xwrite :base-dir \"/tmp/dl/\" :batch 1 :f kv-sync-wal :durability-profile :strict :threads 8 > kv-sync-wal-strict-1-t8.csv
-```
-
-Async multi-thread example:
-
-```bash
-time clj -Xwrite :base-dir \"/tmp/dl/\" :batch 1 :f kv-async-wal :durability-profile :relaxed :threads 8 > kv-async-wal-relaxed-1-t8.csv
-```
-
-Extra durability example:
-
-```bash
-time clj -Xwrite :base-dir \"/tmp/dl/\" :batch 1 :f kv-sync-wal :durability-profile :extra :threads 8 > kv-sync-wal-extra-1-t8.csv
-```
-
-SQLite multi-thread example (uses WAL mode with `busy_timeout`, each thread
-gets its own connection via ThreadLocal):
-
-```bash
-time clj -Xwrite :base-dir \"/tmp/sql/\" :batch 1 :f sql-tx-wal :threads 8 > sqlite-wal-1-t8.csv
-```
-
-This command runs mixed read/write benchmark following the pure write task
-above:
-
-```bash
-time clj -Xmixed :dir \"/tmp/dl/dl-async-10\" :f dl-async > dl-10-async-mixed.csv
-
-# WAL example:
-time clj -Xmixed :dir \"/tmp/dl/dl-async-wal-10-strict\" :f dl-async-wal > dl-10-async-wal-mixed.csv
-```
-
-The command below runs pure write benchmark for Sqlite `INSERT` with batch size
-1 using SQLite default journal mode (non-WAL), and saves the results in
-`sqlite-1.csv`:
-
-```bash
-time clj -Xwrite :base-dir \"/tmp/sql/\" :batch 1 :f sql-tx > sqlite-1.csv
-```
-
-WAL variant:
-
-```bash
-time clj -Xwrite :base-dir \"/tmp/sql/\" :batch 1 :f sql-tx-wal > sqlite-wal-1.csv
-```
-
-This command runs the read/write mixed task following the pure write above:
-
-```bash
-time clj -Xmixed :dir \"/tmp/sql/sqlite-1\" :f sql-tx > sqlite-1-mixed.csv
-
-# WAL example:
-time clj -Xmixed :dir \"/tmp/sql/sqlite-wal-1\" :f sql-tx-wal > sqlite-wal-1-mixed.csv
-```
-
-The total wall clock time, system time and user time are also recorded.
-
-## Durable Datalog Transaction vs. SQLite
-
-This is the write conditions that matter for an OLTP store.
-
-### Write Conditions
-
-Datalevin has two Datalog transaction functions:
-
-* `transact!`
-* `transact-async`
-
-Both are durable by default. In the case of `transact-async`, the returned
-`future` is only realized after the data are flushed to disk. Both are tested.
-
-Large batches of simple entity maps with new scalar identity values use a
-guarded ingestion fast path: identity values are checked in the same LMDB write
-transaction before entities are stamped. WAL mode also uses this path for small
-simple identity inserts, where avoiding full transaction expansion improves
-synchronous OLTP throughput. Existing or duplicate identities and unsupported
-transaction forms fall back to the normal upsert resolver.
-
-`transact` is just the blocked version of `transact-async` so it is not tested.
-There are two faster `init-db` and `fill-db` functions that directly load
-prepared datoms to bypass the expensive process of verifying integrity of
-everything. These are not formally tested in this benchmark, as we are mainly
-interested in transactions of raw data.
-
-SQLite has two durable transaction mode: default and WAL in FULL sync mode.
-
-### Results
-
-> **Schema correction:** the benchmark documentation has always described
-> `:k` as `:db.unique/identity`, but the checked-in Datalog schema previously
-> omitted that declaration. The benchmark now matches the documented SQLite
-> primary-key/upsert semantics. Treat the historical plots below as
-> pre-correction results until the complete matrix is regenerated; they are not
-> directly comparable with current runs.
-
-We will first focus on durable writes. We presents throughput and commit
-latency. The call latencies are close to commit latencies in synchronous writes,
-while close to zero for asynchronous writes. So call latencies are omitted from
-this presentation.
-
-#### Pure Write Task
-
-We plotted the accumulated throughput for each batch size. The Y axis (writes
-per second) is on the log scale. The X axis is every 10000 writes per tick.
-
-##### Batch size 1 throughput
-
-<p align="center">
-<img src="throughput-1.png" alt="throughput batch size 1" height="300"></img>
-</p>
-
-When data are not batched, Datalevin default writes are much faster than
-SQLite's default, and Datalevin async writes are much faster than SQLite's WAL
-mode.
-
-##### Batch size 10 throughput
-
-<p align="center">
-<img src="throughput-10.png" alt="throughput batch size 10" height="300"></img>
-</p>
-
-When data are batched at size 10, the same relative positions remain, but the
-gaps narrow.
-
-##### Batch size 100 throughput
-
-<p align="center">
-<img src="throughput-100.png" alt="throughput batch size 100" height="300"></img>
-</p>
-
-At batch size 100, SQLite's default mode writes are now faster than Datalevin's
-default writes, and WAL mode is faster than async writes.
-
-Notice that Datalevin's async writes at batch 100 are not faster than
-that of batch size 10.
-
-##### Batch size 1000 throughput
-
-<p align="center">
-<img src="throughput-1000.png" alt="throughput batch size 1000" height="300"></img>
-</p>
-
-At batch size 1000, SQLite's default writes are now faster than Datalevin's
-Async writes in all cases.
-
-##### Average commit latency
-
-The average latency of commits (milliseconds) for all conditions are plotted:
-
-<p align="center">
-<img src="commit-latency.png" alt="Commit Latency" height="300"></img>
-</p>
-
-Datalevin's commit latency goes up as the batch size goes up. The same pattern
-is with WAL mode. On the other hand, SQLite's default has a sweet spot at batch
-size 10.
-
-None of SQLite's commit latency goes under 1 milliseconds, while Datalevin's
-Async transaction can go way below 1 milliseconds at batch size 1 and 10.
-
-#### Mixed Read/Write Task
-
-The wallclock time to finish the 2 millions mixed reads/writes is plotted on
-the left, and the CPU times are plotted at right:
-
-<p align="center">
-<img src="wallclock-time.png" alt="Mixed Read/Write Wallclock Time" height="300"></img>
-<img src="cpu-time.png" alt="Mixed Read/Write CPU Time" height="300"></img>
-</p>
-
-For mixed read/write task, Datalevin default is much faster than SQLite default,
-Datalevn Async is much faster than SQLite WAL, while SQLite WAL is faster than
-Datalevin default.
-
-As to CPU time, the differences among different conditions are not big. We can
-see that Aysnc in Datalevin and WAL mode in SQLite do save CPU time compared
-with respective default conditions.
-
-Notice that most of the time is spent on waiting for I/O in the three
-synchronous conditions, where CPU times are relatively small compared with the
-wallclock time. The exception is Datalevin Async, where the total CPU
-time (227.89 seconds) is actually greater than wallclock time (111.04 seconds),
-indicating an effective utilization of multicore and the apparent hiding of I/O
-wait time.
-
-#### Remark
-
-In general, Datalevin's Datalog transaction speed is more stable and less
-sensitive to batch size variations. Particularly, the throughput of Async
-transaction hovers around 15k to 40k per second regardless the batch sizes.
-SQLite is very good at batch transaction, but individual transaction fails
-short.
-
-It should be mentioned that for bulk loading of large amount of data,  Datalevin
-has the option to use `init-db` and `fill-db` functions. For example, it took 5.3
-seconds to load this data set using `init-db` and `fill-db`, slightly better
-than the fastest SQLite's 6.7 seconds at WAL batch size 1000.
-
-Finally, Datalevin builds index at data load time so it is maintenance free,
-whereas SQLite does not build index at transaction time so users have to manage
-indices.
-
-## Non-durable Datalog Transaction vs. SQLite
-
-These are generally faster than durable writes, and can be used when durability
-is not a top priority.
-
-We are interested in these non-durable write conditions, because there are many
-good use cases for a fast non-durable store, such as caching, session
-management, temporary data storage, real-time analytics, message queues,
-configuration, leaderboards, and so on.
-
-### Write Conditions
-
-Datalevin supports faster, albeit less durable writes, by setting some
-environment flags (either when openning the DB, or call `set-env-flags`).
-These are the conditions:
-
-* dl-sync-nometa: `transact!`, with `:nometasync` flag
-* dl-sync-nosync: `transact!`, with `:nosync` flag
-* dl-sync-wm: `transact!`, with `:writemap` and `:mapasync` flags
-* dl-async-nometa: `transact-async`, with `:nometasync` flag
-* dl-async-nosync: `transact-async`, with `:nosync` flag
-* dl-async-wm: `transact-async`, with `:writemap` and `:mapasync` flags
-
-SQLite also has several non-durable write modes. We test these combinations:
-
-* sql-default-normal: default journal mode, and sync mode normal
-* sql-default-off: default journal mode, and sync mode off
-* sql-wal-normal: WAL journal mode, and sync mode normal
-* sql-wal-off: WAL journal mode, and sync mode off
-
-### Results
-
-We list the throughput and latency for all conditions. Throughput is in writes
-per second and latency in milliseconds.
-
-#### Pure Write Task
-
-Batch size 1:
-
-|Condition |Throughput|Latency|
-|---|---|---|
-| dl-sync-nometa| 291.39| 	3.62|
-| dl-sync-nosync| 15453.56|	0.07|
-| dl-sync-wm| 22460.30|	0.05|
-| dl-async-nometa| 16917.77|	0.07|
-| dl-async-nosync| 37697.74|	0.02|
-| dl-async-wm| 41457.29|	0.02|
-| sql-default-normal|83.62|	12.16|
-| sql-default-off|9163.72	|0.11|
-| sql-wal-normal| 18353.00|	0.05|
-| sql-wal-off| 24986.88|	0.04|
-
-Batch size 10:
-
-|Condition |Throughput|Latency|
-|---|---|---|
-| dl-sync-nometa|1965.79|	5.09|
-| dl-sync-nosync|41523.07|	0.24|
-| dl-sync-wm|52222.05|	0.19|
-| dl-async-nometa|30974.74|	0.41|
-| dl-async-nosync|50495.61|	0.19|
-| dl-async-wm|54961.35|	0.17|
-| sql-default-normal|1040.87|	12.06|
-| sql-default-off|67222.37	|0.14|
-| sql-wal-normal|107158.17|	0.08|
-| sql-wal-off|134934.56|	0.08|
-
-Batch size 100:
-
-|Condition |Throughput|Latency|
-|---|---|---|
-| dl-sync-nometa|9120.43|	17.57|
-| dl-sync-nosync|53256.64	|1.83|
-| dl-sync-wm|61682.7	|1.52|
-| dl-async-nometa|27368.42	|3.82|
-| dl-async-nosync|44844.06	|2.16|
-| dl-async-wm|50626.12	|1.67|
-| sql-default-normal|7865.47|	12.72|
-| sql-default-off|243961.94	|0.4|
-| sql-wal-normal|248942.00|	0.31|
-| sql-wal-off|294724.43|	0.28|
-
-Batch size 1000:
-
-|Condition |Throughput|Latency|
-|---|---|---|
-| dl-sync-nometa|15622.31|	|69.30|
-| dl-sync-nosync|55242.51	|18.10|
-| dl-sync-wm|61774.15	|15.80|
-| dl-async-nometa|39931.57|	71.00|
-| dl-async-nosync|41811.15	|25.00|
-| dl-async-wm|44209.15	|21.69|
-| sql-default-normal|65044.88|	15.20|
-| sql-default-off|371747.21	|2.4|
-| sql-wal-normal|338409.48|	2.30|
-| sql-wal-off|376364.32|	2.30|
-
-#### Mixed Read/Write Task
-
-|Condition |Throughput|Latency|
-|---|---|---|
-| dl-sync-nometa|269.14|	3.85|
-| dl-sync-nosync|5968.12|	0.17|
-| dl-sync-wm|6955.55|	0.14|
-| dl-async-nometa|8545.21|	0.13|
-| dl-async-nosync|11424.13|	0.09|
-| dl-async-wm|11339.99|	0.09|
-| sql-default-normal|82.48|	12.15|
-| sql-default-off|7715.45	|0.13|
-| sql-wal-normal|8290.71|0.16|
-| sql-wal-off|19112.05|	0.05|
-
-### Remark
-
-Patterns similar to durable writes seems to apply to non-durable writes:
-Datalevin is less sensitive to batching and is better at individual
-transactions, whereas SQLite is better at batch transactions.
-
-For mixed read/write task, Datalevin is slightly better overall, except that
-sql-wal-off performs the best. The most commonly used SQLite write mode,
-sql-wal-normal, performs slightly worse than the equivalent Datalevin write
-mode, dl-async-nometa, where both behave similarly: the last transaction may
-be lost at an untimely system crash but the database is saved from corruption.
-
-## Key Value Transaction
-
-Datalevin wraps LMDB to offer KV store feature. Here we do not compare Datalevin
-with other KV stores, as there are plenty of such comparison between LMDB and
-others KV stores already.
-
-We study the throughput and latency of KV writes under different combination of
-transact function and env flags, using the same tasks as above. For pure write
-task, we write 1 million pairs of key and value; 2 millions of reads/writes for
-mixed read/write task, the same as Datalog transaction.
-
-### Write Conditions
-
-All combinations of batch size, transaction function and environment flags are
-tested:
-
-* sync-default: `transact-kv`, with default flags
-* sync-nometa: `transact-kv`, with `:nometasync` flag
-* sync-nosync: `transact-kv`, with `:nosync` flag
-* sync-wm: `transact-kv`, with `:writemap` and `:mapasync` flags
-* async-default: `transact-kv-async`, with default flags
-* async-nometa: `transact-kv-async`, with `:nometasync` flag
-* async-nosync: `transact-kv-async`, with `:nosync` flag
-* async-wm: `transact-kv-async`, with `:writemap` and `:mapasync` flags
-
-### Results
-
-Throughput is in writes per second and latency in milliseconds.
-
-#### Pure Write Task
-
-Batch size 1:
-
-| |sync-default|sync-nometa|sync-nosync|sync-wm|async-default|async-nometa|async-nosync|async-wm|
-|---|---|---|---|---|---|---|---|---|
-|Throughput|232.27	|1013.77	|109134.56	|230149.6	|109973.73	|173688.4	|179371.47	|174347.78|
-|Latency	|5.8	|0.99	|0.01	|0	|0.01	|0.01	|0.01	|0.01|
-
-Batch size 10:
-
-| |sync-default|sync-nometa|sync-nosync|sync-wm|async-default|async-nometa|async-nosync|async-wm|
-|---|---|---|---|---|---|---|---|---|
-|Throughput| 5147.9	| 6738.41	| 520833.33	| 743494.42	| 390767.41	| 570534.48	| 759197.86	| 767131.84|
-|Latency|1.96	|3.45	|0.02	|0.01	|0.02	|0.02	|0.01	|0.01|
-
-Batch size 100:
-
-| |sync-default|sync-nometa|sync-nosync|sync-wm|async-default|async-nometa|async-nosync|async-wm|
-|---|---|---|---|---|---|---|---|---|
-|Throughput|32795.49|	45132.46|	913242.01|	1012145.75|	400225.73|	462968.75|	1246203.35|	1256516.13|
-|Latency|2.95|	2.16|	0.1|	0.08|	0.21|	0.19|	0.05|	0.06|
-
-Batch size 1000:
-
-| |sync-default|sync-nometa|sync-nosync|sync-wm|async-default|async-nometa|async-nosync|async-wm|
-|---|---|---|---|---|---|---|---|---|
-|Throughput|223914.02|	251762.34|	1109877.91|	1131221.72|	366345.71|	467817.9|	619602.47|	652868.55|
-|Latency|5.2|	3.7|	0.8|	0.8|	2.33|	1.78|	1|	1.86|
-
-#### Mixed Read/Write Task
-
-| |sync-default|sync-nometa|sync-nosync|sync-wm|async-default|async-nometa|async-nosync|async-wm|
-|---|---|---|---|---|---|---|---|---|
-|Throughput|216.01|	991.07|	67078.08|	106112.05|	25952.69|	27631.68|	80696.16|	84061.15|
-|Latency|5.83|	1|	0.01|	0.01|	0.05|	0.04|	0.01|	0.01|
-
-### Remark
-
-It is interesting to see that for durable writes, asynchronous writes can
-usually perform about half as fast as the fastest non-durable writes.
-
-For non-durable writes, synchronous transaction with `:writemap` and `:mapasync`
-flags is the best performing method, while asynchronous writes can actually
-be little behind sometimes, perhaps due to the overhead of asynchronous processing.
-
-Unlike Datalog store, batching in KV store has more impact, and the growth seem
-to be linear with batch size increases.
-
-## WAL Mode Transaction
-
-Datalevin 0.10.7 introduced WAL (Write-Ahead Log) mode, enabled by passing
-`:wal? true` when opening a KV or Datalog store. WAL mode allows concurrent
-reads from multiple threads while writes proceed, and supports configurable
-durability profiles.
-
-### Durability Profiles
-
-WAL mode exposes three durability profiles via `:wal-durability-profile`:
-
-* `:strict` (default) — `fsync` per commit; strong durability guarantee
-* `:extra` — this only matters for macOS, as its `fsync` is not durable, so
-  this option calls `fcntl(F_FULLSYNC)` instad.
-* `:relaxed` — group flushing; fastest, with a risk of small window of losing a
-  tail of transactions (by default 10ms) in untimely system crash.
-
-### Write Conditions
-
-All WAL benchmarks below use batch size 1 and vary the thread count from 1 to 8:
-
-* **kv-sync-wal**: `transact-kv` in WAL mode; each call blocks until the WAL
-  commit is durable
-* **kv-async-wal**: `transact-kv-async` in WAL mode
-* **dl-sync-wal**: `transact!` in WAL mode
-* **dl-async-wal**: `transact-async` in WAL mode
-* **sql-tx-wal**: SQLite WAL journal mode; each thread uses its own connection
-  via `ThreadLocal`
-
-### Results
-
-In the interest of space, we only report results of batch size 1 in the WAL
-benchmarks. Throughput is in writes per second and latency in milliseconds.
-
-#### KV WAL: Durability Profile Comparison (Single Thread)
-
-| Durability | kv-sync throughput | kv-sync commit latency | kv-async throughput | kv-async commit latency |
-|---|---|---|---|---|
-| strict  | 19,346  | 0.07 | 207,426 | 0.01 |
-| relaxed | 36,535  | 0.03  | 250,878 | 0.00 |
-
-Note: `:extra` is only meaningful on macOS, where it forces `fcntl(F_FULLFSYNC)`
-instead of the standard `fsync`. On Linux, `:extra` and `:strict` call the same
-underlying syscall and have identical performance.
-
-For single-threaded use, `kv-async-wal` is roughly 10× faster than `kv-sync-wal`
-because the asynchronous path decouples the caller from the WAL fsync. Relaxed
-durability gives about a 2× throughput gain over strict for sync writes.
-
-#### KV WAL: Multi-Thread Scalability
-
-Strict durability:
-
-| Threads | kv-sync-wal-strict | kv-async-wal-strict |
-|---|---|---|
-| 1 | 19,346      | 207,426 |
-| 2 | 22,628      | 268,384 |
-| 4 | 6,527     | 270,270 |
-| 8 | 6,027     | 259,538 |
-
-Relaxed durability:
-
-| Threads | kv-sync-wal-relaxed | kv-async-wal-relaxed |
-|---|---|---|
-| 1 | 36,535      | 250,878 |
-| 2 | 39,216      | 286,862 |
-| 4 | 14,274    | 274,725 |
-| 8 | 5,804     | 364,431 |
-
-**Key observations:**
-
-- `kv-sync-wal` does not scale beyond 2 threads, due to the limited amount of
-  overlapping work in KV sync writes. With 4+ threads the WAL serializes fsyncs
-  across competing callers, causing severe contention (2–4× slowdown).
-- `kv-async-wal` scales well through 8 threads for relaxed durability. The
-  system batches commits from multiple callers, amortizing the
-  fsync cost. With 8 threads and relaxed durability it reaches 364k writes/sec.
-
-#### Datalog WAL Performance
-
-| Condition    | 1 thread throughput | 4 threads throughput | 8 threads throughput | commit latency (t=1) |
-|---|---|---|---|---|
-| dl-sync-wal  | 1,511  | 2,716 | 2,449        | 0.66 |
-| dl-async-wal | 31,757         | 33,458         | 31,572         | 0.03 |
-
-WAL batching reduces the per-transaction disk overhead, accounting for the
-large speedup in the sync case. `dl-async-wal` throughput does not improve
-significantly with more threads, as the WAL writer serializes commits; with
-relaxed durability the throughput is similar across all tested thread counts.
-
-#### SQLite WAL: Multi-Thread Comparison
-
-| Threads | sql-tx-wal throughput |
+This benchmark measures end-to-end write throughput and request latency for
+Datalevin's Datalog and key-value APIs. It also compares Datalog writes with
+SQLite through JDBC. The comparison intentionally includes transaction parsing,
+value encoding, and result decoding on both sides; it is an embedded API
+benchmark, not a raw storage-engine microbenchmark.
+
+The current person-record matrix covers Datalevin Datalog and SQLite in default
+and relaxed-WAL modes. KV is intentionally a separate workload: it has no
+equivalent row-store task in this benchmark and should be compared only across
+its own durability conditions. The PNG files in this directory are legacy
+results from an older implementation and are not evidence for the current code.
+
+## Pure-write workload
+
+Each write inserts a deterministic small person record: a 36-byte UUID string
+identity, first name, last name, and age from 18 through 90.
+
+- Datalevin Datalog stores `:person/id`, `:person/first-name`,
+  `:person/last-name`, and `:person/age`. The string ID is declared
+  `:db.unique/identity`, and age uses `:db.type/long`.
+- Datalevin KV stores the UUID string as the key and a data map containing first
+  name, last name, and age as the value.
+- SQLite stores `person_id TEXT PRIMARY KEY NOT NULL`, two `TEXT` name columns,
+  and `age INTEGER`. This is an ordinary rowid table, so SQLite auto-assigns a
+  signed 64-bit rowid and maintains a separate unique index for the string
+  primary key. It deliberately does not use the `AUTOINCREMENT` keyword, whose
+  extra sequence bookkeeping is not needed for this equivalence.
+
+SQLite uses one connection-scoped, single-row prepared `INSERT`. Each benchmark
+request binds its records with JDBC `addBatch`, calls `executeBatch`, and then
+commits once. Auto-commit is disabled. The SQL statement shape and preparation
+count are therefore constant across batch sizes; a batch of N differs only in
+the number of bound parameter sets executed in its transaction.
+
+The record semantics are now aligned, but the physical index work is still
+native to each data model. Datalevin materializes EAV and AVE entries for all
+four attributes. SQLite writes the row table and the string-primary-key index;
+the three non-identity fields have no secondary indexes. The comparison is
+therefore an end-to-end API workload, not a storage-engine test with matched
+index counts.
+
+The initial records use even logical key slots; each slot is mapped
+deterministically to a UUID string. A batch is one API transaction containing 1,
+10, 100, or 1000 records. A final partial batch is supported, so the requested
+total need not be divisible by the batch size.
+
+Data generation is included in end-to-end throughput but excluded from the API
+call-latency sample. UUIDs, person fields, and mixed-workload key streams are
+deterministic for the configured `:seed`, which defaults to 42.
+
+### Person-record results
+
+One million records were written per result on the macOS arm64 benchmark host
+with one thread, a fresh database, one measurement pass, and no warmup pass.
+All rows were measured on 2026-08-29. The blocking Datalog and SQLite columns
+use one API request at a time. Datalog async is reported as an additional API
+condition with at most 1000 outstanding requests; it is not treated as a
+blocking-API storage-engine ratio.
+
+#### Default
+
+| Batch | Datalog sync | SQLite | Blocking result | Datalog async |
+|---:|---:|---:|---:|---:|
+| 1 | 432.751 s / 2,311/s | 469.463 s / 2,130/s | Datalog 1.085X | 29.053 s / 34,420/s |
+| 10 | 203.496 s / 4,914/s | 82.695 s / 12,093/s | SQLite 2.461X | 10.589 s / 94,438/s |
+| 100 | 87.096 s / 11,482/s | 37.204 s / 26,879/s | SQLite 2.341X | 5.112 s / 195,600/s |
+| 1000 | 22.343 s / 44,757/s | 23.606 s / 42,361/s | Datalog 1.057X | 5.065 s / 197,414/s |
+
+The blocking throughput scaling between adjacent batch sizes makes the two
+crossovers easier to see:
+
+| Batch transition | Datalog sync scaling | SQLite scaling |
+|---:|---:|---:|
+| 1 to 10 | 2.13X | 5.68X |
+| 10 to 100 | 2.34X | 2.22X |
+| 100 to 1000 | 3.90X | 1.58X |
+
+Across these adjacent tenfold batch increases, Datalevin's throughput speedup
+rises from 2.13X to 2.34X to 3.90X, while SQLite's falls from 5.68X to 2.22X to
+1.58X. The measurements do not establish the cause of either progression.
+
+This is a crossover result, not a single overall ranking. For independent
+durable writes at batch 1, Datalevin led by 8.5%. SQLite led at the intermediate
+batch sizes of 10 and 100 by 2.46X and 2.34X. For large bulk transactions at
+batch 1000, Datalevin led by 5.7%. The relevant row is therefore the one closest
+to an application's transaction size; averaging the four ratios would not be
+meaningful.
+
+#### Relaxed WAL
+
+Datalevin uses its `:relaxed` WAL profile. SQLite uses WAL with
+`synchronous=NORMAL`; neither side requests the separately labeled extra macOS
+full-sync policy.
+
+| Batch | Datalog sync | SQLite | Blocking result | Datalog async |
+|---:|---:|---:|---:|---:|
+| 1 | 106.587 s / 9,382/s | 31.900 s / 31,348/s | SQLite 3.341X | 11.003 s / 90,886/s |
+| 10 | 36.046 s / 27,742/s | 23.337 s / 42,850/s | SQLite 1.545X | 6.437 s / 155,345/s |
+| 100 | 19.339 s / 51,709/s | 21.211 s / 47,146/s | Datalog 1.097X | 5.323 s / 187,874/s |
+| 1000 | 9.590 s / 104,273/s | 21.874 s / 45,716/s | Datalog 2.281X | 5.809 s / 172,146/s |
+
+For the blocking APIs, SQLite led at batches 1 and 10, while Datalog led at
+batches 100 and 1000. The Datalog async condition had the highest measured
+throughput at every batch size. These rows report the observed outcomes and do
+not assign a cause to their batch-size progressions.
+
+The crossover should not be interpreted as a general storage-engine ranking.
+This is an end-to-end API workload, and the physical index work differs:
+Datalevin materializes all four attributes in EAV and AVE, while SQLite writes
+a row and its string-primary-key index. The measurements show the outcome at
+each batch size, but do not isolate every component of the crossover.
+
+SQLite 3.48.0 reported rollback journal mode with `synchronous=FULL` for the
+default rows and WAL with `synchronous=NORMAL` for relaxed WAL. Both reported
+`fullfsync=OFF`, `checkpoint_fullfsync=OFF`, and a 4 KiB page size. Its schema
+inspection showed one million distinct string IDs, an auto-assigned rowid, and
+the separate `sqlite_autoindex_person_1` primary-key index. At default batch
+1000, the final Datalevin database was 321.1 MiB and SQLite database was 112.0
+MiB. Datalevin still writes substantially more physical index data because all
+four attributes are present in both EAV and AVE.
+
+All 24 manifests use the same one-pass protocol and recorded environment. The
+current Datalog/SQLite matrix is complete for default and relaxed-WAL modes.
+Strict and extra WAL are different durability experiments, not missing rows in
+these tables.
+
+### Person-record comparison tasks
+
+| Task | API |
 |---|---|
-| 1 | 23,412 |
-| 2 | 14,464 |
-| 4 |  9,404 |
-| 8 |  9,251 |
+| `dl-sync` | Datalog `transact!` |
+| `dl-async` | Datalog `transact-async` with bounded outstanding requests |
+| `sql-tx` | SQLite reusable prepared `INSERT`, JDBC batch, one commit/request |
 
-SQLite WAL does not scale with multiple writers at all. Throughput decreases as thread
-count increases because SQLite serializes write transactions through a single
-write lock, and per-thread connection overhead and `busy_timeout` coordination
-add latency. At 4 and 8 threads the throughput converges near 9,400 writes/sec,
-suggesting the write lock is the bottleneck.
+Append `-wal` to any task to enable WAL mode, for example `dl-sync-wal` or
+`sql-tx-wal`.
 
-### Remark
+### Separate KV workload
 
-For concurrent write workloads with WAL mode:
+| Task | API |
+|---|---|
+| `kv-sync` | KV `transact-kv` |
+| `kv-async` | KV `transact-kv-async` with bounded outstanding requests |
 
-- Use `kv-async-wal` (not `kv-sync-wal`) for multi-thread KV writes.
-  Async WAL batches WAL entries, providing much better multi-thread scalability.
-- Choose the durability profile based on your data loss tolerance:
-  `:relaxed` is about 2× faster than `:strict` for sync writes.
-- Use `dl-async-wal` for multi-thread Datalog writes. It maintains stable
-  throughput (~31–33k writes/sec) across all tested thread counts.
-- SQLite WAL degrades significantly under multi-thread write pressure;
-  Datalevin WAL is a better choice for concurrent write workloads.
+KV tasks also accept the `-wal` suffix. Report KV independently across its
+durability conditions; do not place its results in the Datalog/SQLite ranking.
+
+Datalevin's async APIs adaptively combine queued API requests into physical
+transactions. The reported request count is therefore not a count of physical
+commits. The default cap is 1000 outstanding API requests, independently of the
+number of writes in each request.
+
+## Durability conditions
+
+The publishable default comparison respects the operating system's ordinary
+sync policy. It does not request an additional macOS full sync:
+
+| Condition | Datalevin | SQLite |
+|---|---|---|
+| Default | LMDB default sync | rollback journal, `synchronous=FULL` |
+| WAL `:strict` | WAL `fsync` acknowledgment | WAL, `synchronous=FULL` |
+| WAL `:relaxed` | bounded group flushing | WAL, `synchronous=NORMAL` |
+| WAL `:extra` | extra full sync on supported platforms | WAL, `synchronous=EXTRA`, `fullfsync=ON` |
+
+WAL tasks default to `:relaxed`, matching explicit local WAL use in the
+Datalevin API; the paired SQLite setting is WAL with `synchronous=NORMAL`. Set
+`:durability-profile` explicitly to `:strict`, `:relaxed`, or `:extra` when a
+named profile is important. Use explicit `:strict` for a durability-matched
+comparison in which each transaction waits for WAL `fsync` acknowledgment.
+Durability profiles are rejected for non-WAL tasks.
+
+The benchmark queries SQLite after configuration and fails unless the requested
+journal, synchronous, and full-sync settings took effect. On macOS,
+`:extra` is a separately labeled stronger-durability experiment; it is not part
+of the ordinary-fsync default comparison. SQLite documents `synchronous=EXTRA`
+and [`fullfsync`](https://sqlite.org/pragma.html#pragma_fullfsync) as separate
+settings; the benchmark configures both for this profile.
+
+## Metrics
+
+The measurement CSV contains one final row with:
+
+- `Writes` and `Requests`: successfully completed writes and API transactions.
+- `Time`: elapsed time from the start of workload generation through the last
+  completion callback.
+- `Throughput`: completed writes divided by that elapsed time.
+- `Call Mean`: mean time spent in the transaction API call. For async APIs this
+  is primarily submission time.
+- `Completion Mean/P50/P95/P99`: time from submission until that particular API
+  request's success callback runs after its configured commit acknowledgment.
+
+Completion latency is per API request. It is not derived by dividing a grouped
+commit by the number of callbacks.
+
+Progress is written to stderr every 10,000 completed writes by default, keeping
+stdout valid CSV. Use `:report 0` to disable progress output.
+
+Every async request is accounted for with a completion barrier. Both successful
+and failed async operations release their benchmark permits. Any transaction
+error, timeout, missing callback, SQLite configuration mismatch, or final count
+mismatch fails the process instead of producing a usable result row.
+
+## Required protocol
+
+Publishable write results use one measurement pass against a fresh database.
+There is no discarded warmup pass: database growth, page allocation, and sync
+costs are part of the workload rather than JVM steady-state effects to warm
+away. Use the same one-million-write dataset, seed, thread count, and durability
+settings for every system and batch size. Run on an otherwise idle machine and
+a disk-backed benchmark directory.
+
+The `write` entry point rejects existing database targets rather than silently
+measuring overwrites. When `:base-dir` is supplied it also writes `results.edn`,
+recording the one-pass protocol, exact database path, effective durability,
+storage configuration, software versions, platform information, and metrics.
+
+Do not use a memory-backed `/tmp` filesystem. On macOS, `/private/tmp` is
+normally disk-backed; verify the mount on the machine being measured.
+
+## Running a measurement
+
+Run from this directory. Give each task/batch combination a new base directory:
+
+```bash
+clj -X:write \
+  :base-dir '"/private/tmp/dtlv-write-20260828/dl-sync-b1"' \
+  :batch 1 \
+  :f dl-sync \
+  > dl-sync-b1.csv
+```
+
+An explicit strict async WAL example:
+
+```bash
+clj -X:write \
+  :base-dir '"/private/tmp/dtlv-write-20260828/dl-async-wal-b10"' \
+  :batch 10 \
+  :f dl-async-wal \
+  :durability-profile :strict \
+  > dl-async-wal-b10.csv
+```
+
+SQLite WAL uses the same protocol:
+
+```bash
+clj -X:write \
+  :base-dir '"/private/tmp/dtlv-write-20260828/sqlite-wal-b10"' \
+  :batch 10 \
+  :f sql-tx-wal \
+  :durability-profile :strict \
+  > sqlite-wal-b10.csv
+```
+
+Progress and the manifest location go to stderr; the measurement row goes to
+stdout. Smaller write counts are useful only for smoke testing:
+
+```bash
+clj -X:write \
+  :base-dir '"/private/tmp/dtlv-write-smoke"' \
+  :batch 5 \
+  :f dl-async \
+  :total 20 \
+  :report 0
+```
+
+`clj -X:suite` remains as a compatibility alias for the same one-pass protocol
+and accepts legacy `:measurement-writes` as an alias for `:total`. It rejects
+`:warmup-writes` so a two-pass run cannot be mistaken for the reported method.
+
+## Multi-thread write ingress
+
+Set `:threads` to use multiple callers. Datalog multi-thread runs require WAL;
+KV and SQLite permit default or WAL modes. SQLite gives each caller its own JDBC
+connection with a 10-second busy timeout.
+
+```bash
+clj -X:write \
+  :base-dir '"/private/tmp/dtlv-write-20260828/dl-sync-wal-b1-t8"' \
+  :batch 1 \
+  :f dl-sync-wal \
+  :durability-profile :strict \
+  :threads 8
+```
+
+Strict-mode commit timeouts are not skipped. A timeout invalidates the run.
+
+## Mixed read/write workload
+
+Mixed mode starts with a pure-write database containing one million people,
+then performs one million read/write pairs. Read and write logical key slots are
+in the range 1 through two million and are deterministically mapped to UUID
+strings, giving an initial 50% hit/upsert probability. The exact key streams are
+seeded. An upsert replaces first name, last name, and age.
+
+Mixed mode is deliberately closed-loop: every read/write pair commits before
+the next pair begins. Selecting an async Datalevin API still awaits its returned
+future. This preserves the same read-your-writes semantics as SQLite instead of
+letting Datalevin reads race ahead of queued writes.
+
+SQLite uses `INSERT ... ON CONFLICT DO UPDATE`, matching Datalevin identity
+upsert semantics rather than SQLite's delete-and-reinsert `OR REPLACE` behavior.
+The initial and final exact entity counts are verified.
+
+Run mixed mode against the measurement database recorded in `results.edn`:
+
+```bash
+clj -X:mixed \
+  :dir '"/private/tmp/dtlv-write-20260828/dl-sync-wal-b1/dl-sync-wal-1-strict"' \
+  :f dl-sync-wal \
+  :durability-profile :strict
+```
+
+A mixed run mutates its input database. Prepare an independent identical
+database for every reported measurement; never reuse a database from an earlier
+mixed run.
+
+## Bulk initialization
+
+`dl-init` loads the same deterministic person dataset through
+`init-db`/`fill-db`. It uses the same string unique-identity schema and rejects
+an existing target:
+
+```bash
+clj -X:dl-init :dir '"/private/tmp/dtlv-init"'
+```
+
+Bulk initialization is a separate workload and must not be placed in the same
+table as transactional API throughput.
+
+## Tests
+
+Run the benchmark's correctness suite from this directory:
+
+```bash
+clj -M:test
+```
+
+The suite includes generated batch-accounting cases; timeout, callback, metric,
+CSV, and validation checks; SQLite PRAGMA verification; and small temporary
+database runs through every KV, Datalog, SQLite, async, default-relaxed-WAL, and
+explicit-strict-WAL adapter. It also exercises multi-caller SQLite, mixed mode,
+bulk initialization, fresh target rejection, and the one-pass manifest. These
+are correctness probes with only a few writes, not performance measurements.
+Temporary databases are removed after each test.
+
+The shared asynchronous executor contract is tested with the main project:
+
+```bash
+lein test datalevin.async-test
+```

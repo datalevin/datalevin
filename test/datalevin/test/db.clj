@@ -57,6 +57,24 @@
     (is (not= (cache-key 42 1000) (cache-key 43 1000)))
     (is (not= (cache-key 42 1000) (cache-key 42 4000)))))
 
+(deftest empty-query-cache-skips-datom-touch-summary
+  (let [dir  (u/tmp-dir (str "empty-query-cache-" (UUID/randomUUID)))
+        conn (d/create-conn dir {:item/value {}})]
+    (try
+      (let [[cache generation] (db/cache-token (:store @conn))
+            summary-var        (ns-resolve 'datalevin.db 'tx-touch-summary)]
+        (.clear ^datalevin.utl.LRUCache cache)
+        (with-redefs-fn
+          {summary-var
+           (fn [_]
+             (throw (ex-info "empty cache should not summarize datoms" {})))}
+          #(d/transact! conn [{:db/id 1 :item/value 100}]))
+        (is (> (.generation ^datalevin.utl.LRUCache cache)
+               (long generation))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
 (deftest stale-query-result-cannot-repopulate-cache-after-commit
   (let [dir          (u/tmp-dir
                       (str "stale-query-cache-" (UUID/randomUUID)))

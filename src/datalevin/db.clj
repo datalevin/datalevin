@@ -463,16 +463,29 @@
    (if-some [^LRUCache cache (.get ^ConcurrentHashMap caches (dir store))]
      (do
        (when (seq tx-data)
-         (let [touches (tx-touch-summary tx-data)]
-           ;; Prevent a reader that started before this commit from publishing
-           ;; its old snapshot after the affected entries have been removed.
-           ;; LRUCache methods synchronize on the cache monitor, so this also
-           ;; keeps cache hits out of the invalidation window.
+         ;; Pure ingestion normally has no cached reads. Avoid constructing
+         ;; four touch sets and a values-by-attribute map from every datom in
+         ;; that common case, while still advancing the cache generation.
+         (if (.isEmpty cache)
            (locking cache
              (.beginInvalidation cache (long (or target 0)))
-             (doseq [k (.keys cache)
-                     :when (tx-affects-cache-key? touches k)]
-               (.remove cache k)))))
+             ;; A cache entry may have appeared between the optimistic empty
+             ;; check and acquiring the monitor. Handle that race normally.
+             (when-not (.isEmpty cache)
+               (let [touches (tx-touch-summary tx-data)]
+                 (doseq [k (.keys cache)
+                         :when (tx-affects-cache-key? touches k)]
+                   (.remove cache k)))))
+           (let [touches (tx-touch-summary tx-data)]
+             ;; Prevent a reader that started before this commit from publishing
+             ;; its old snapshot after the affected entries have been removed.
+             ;; LRUCache methods synchronize on the cache monitor, so this also
+             ;; keeps cache hits out of the invalidation window.
+             (locking cache
+               (.beginInvalidation cache (long (or target 0)))
+               (doseq [k (.keys cache)
+                       :when (tx-affects-cache-key? touches k)]
+                 (.remove cache k))))))
        (when-not (seq tx-data)
          (.setTarget cache (long (or target 0))))
        (mark-remote-cache-max-tx! store remote-max-tx))
@@ -1473,12 +1486,13 @@
   [^DB db entities tx-time]
   (txprep/prepare-entities db entities tx-time))
 
-;; The blind path is profitable for ingestion-sized batches, where identity
-;; probes can share one LMDB transaction and full transaction expansion is a
-;; material cost. WAL writes may opt into it for small transactions because
-;; avoiding full transaction expansion is measurable there. A unique-value hit
-;; always falls back to the normal resolver without changing upsert semantics.
-(def ^:private ^:const ^long blind-unique-write-threshold 256)
+;; Identity probes in the blind path share the LMDB write transaction, and a
+;; unique-value hit falls back to the normal resolver without changing upsert
+;; semantics. For a single non-WAL entity, preparing and probing first costs
+;; more than the ordinary resolver. Enable it from two entities onward so small
+;; batches avoid the old ingestion-sized discontinuity without regressing the
+;; single-record OLTP path. WAL may still opt a single entity into this path.
+(def ^:private ^:const ^long blind-unique-write-threshold 2)
 
 (def ^:private blind-unique-value-types
   #{:db.type/boolean

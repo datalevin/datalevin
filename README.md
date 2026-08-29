@@ -328,18 +328,17 @@ execution per query after an independent-process warmup and is not an official
 LDBC result; the [LDBC README](benchmarks/LDBC-SNB-bench) documents the full
 methodology and per-query results.
 
-For durable transaction performance, we compared Datalevin with
-SQLite using [this write benchmark](benchmark/write-bench) on a 2016 Ubuntu
-Linux server with an Intel i7 3.6GHz CPU and a 1TB SSD drive.
-
-<p align="center">
-<img src="benchmarks/write-bench/throughput-1.png" alt="Throughput at 1" height="300"></img>
-</p>
-
-When transacting one entity (equivalently, one row in SQLite) at a time,
-Datalevin's default transaction function is over 5X faster than SQLite's
-default; while Datlevin's asynchronous transaction mode is over 20X faster than
-SQLite's WAL mode.
+The [write benchmark](benchmarks/write-bench) compares Datalevin Datalog and KV
+transactions with SQLite under explicitly verified durability settings. SQLite
+uses one reusable prepared statement, JDBC batching, and one explicit commit
+per request. The one-million-person-record matrix covers batches 1, 10, 100,
+and 1000 in default and relaxed-WAL modes. For blocking calls, Datalevin led at
+default batches 1 and 1000 and relaxed-WAL batches 100 and 1000; SQLite led the
+other rows. Datalog async is reported separately with bounded outstanding
+requests. KV is a separate workload to compare across its own durability
+conditions, not part of the Datalog/SQLite ranking. Write runs intentionally
+have no warmup pass, and the older charts in that directory are retained only
+as historical artifacts.
 
 For performance comparison with [Datomic](https://www.datomic.com) and
 [Datascript](https://github.com/tonsky/datascript), see the [DataScript

@@ -47,9 +47,13 @@
 
 (deftest test-keys-and-target
   (let [l (LRUCache. 4 1)]
+    (is (.isEmpty l))
     (.put l :a 1)
     (.put l :b 2)
+    (is (not (.isEmpty l)))
     (is (= #{:a :b} (set (.keys l))))
+    (.clear l)
+    (is (.isEmpty l))
     (.setTarget l 42)
     (is (= 42 (.target l)))))
 

@@ -109,11 +109,13 @@
     (when (.peek items)
       (let [^WorkItem item (.poll items)
             res            (do-work* (.-work item))
-            [status payload] res
+            [_ payload]    res
             cb             (.-cb item)]
         (finalize-work-item! item res backlog)
-        (when (identical? status :ok)
-          (run-callback! cb payload)))
+        ;; The public async APIs document that callbacks receive either the
+        ;; successful result or the exception. Keep promise delivery first so
+        ;; user callbacks cannot delay realization of the returned future.
+        (run-callback! cb payload))
       (recur))))
 
 (defn- combined-work
@@ -124,13 +126,12 @@
       (let [^WorkItem item (.poll items)]
         (.add stage item))
       (recur)))
-  (let [res              (do-work* (cmb (mapv #(.-work ^WorkItem %) stage)))
-        [status payload] res]
+  (let [res         (do-work* (cmb (mapv #(.-work ^WorkItem %) stage)))
+        [_ payload] res]
     (dotimes [i (.size stage)]
       (finalize-work-item! ^WorkItem (.get stage i) res backlog))
-    (when (identical? status :ok)
-      (dotimes [i (.size stage)]
-        (run-callback! (.-cb ^WorkItem (.get stage i)) payload)))))
+    (dotimes [i (.size stage)]
+      (run-callback! (.-cb ^WorkItem (.get stage i)) payload))))
 
 (defn- event-handler
   [^ConcurrentHashMap work-queues k ^Semaphore backlog]

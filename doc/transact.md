@@ -52,9 +52,11 @@ Details of the WAL mode are documented [here](wal.md).
 
 Asynchronous transaction functions automatically batch transactions together to
 reduce the number of expensive commit calls: `transact-kv-async` for KV
-store, `transact-async` for Datalog store. Both return a `future`, that is only
-realized after the data is flushed to disk, and they optionally take a callback
-function, that will only be called after the data is flushed to disk.
+store, `transact-async` for Datalog store. Both return a future. On success, it
+is realized after the data is flushed according to the configured durability
+policy. On failure, dereferencing it throws the transaction exception. The
+optional callback runs after the future is realized and receives the successful
+transaction result or that exception.
 
 `transact` function is a blocked version of `transact-async`, that will block
 until the future is realized. One can call a sequence of `transact-async`,
