@@ -56,17 +56,17 @@ One million records were written per result on the macOS arm64 benchmark host
 with one thread, a fresh database, one measurement pass, and no warmup pass.
 All rows were measured on 2026-08-29. The blocking Datalog and SQLite columns
 use one API request at a time. Datalog async is reported as an additional API
-condition with at most 1000 outstanding requests; it is not treated as a
-blocking-API storage-engine ratio.
+condition with bounded outstanding work; it is not treated as a blocking-API
+storage-engine ratio.
 
 #### Default
 
-| Batch | Datalog sync | SQLite | Blocking result | Datalog async |
+| Batch | Datalog sync | SQLite | Sync comparison | Datalog async |
 |---:|---:|---:|---:|---:|
-| 1 | 432.751 s / 2,311/s | 469.463 s / 2,130/s | Datalog 1.085X | 29.053 s / 34,420/s |
-| 10 | 203.496 s / 4,914/s | 82.695 s / 12,093/s | SQLite 2.461X | 10.589 s / 94,438/s |
-| 100 | 87.096 s / 11,482/s | 37.204 s / 26,879/s | SQLite 2.341X | 5.112 s / 195,600/s |
-| 1000 | 22.343 s / 44,757/s | 23.606 s / 42,361/s | Datalog 1.057X | 5.065 s / 197,414/s |
+| 1 | 2,311/s | 2,130/s | Datalog 1.085X | 34,483/s |
+| 10 | 4,914/s | 12,093/s | SQLite 2.461X | 97,763/s |
+| 100 | 11,482/s | 26,879/s | SQLite 2.341X | 192,474/s |
+| 1000 | 44,757/s | 42,361/s | Datalog 1.057X | 190,214/s |
 
 The blocking throughput scaling between adjacent batch sizes makes the two
 crossovers easier to see:
@@ -94,12 +94,12 @@ Datalevin uses its `:relaxed` WAL profile. SQLite uses WAL with
 `synchronous=NORMAL`; neither side requests the separately labeled extra macOS
 full-sync policy.
 
-| Batch | Datalog sync | SQLite | Blocking result | Datalog async |
+| Batch | Datalog sync | SQLite | Sync comparison | Datalog async |
 |---:|---:|---:|---:|---:|
-| 1 | 106.587 s / 9,382/s | 31.900 s / 31,348/s | SQLite 3.341X | 11.003 s / 90,886/s |
-| 10 | 36.046 s / 27,742/s | 23.337 s / 42,850/s | SQLite 1.545X | 6.437 s / 155,345/s |
-| 100 | 19.339 s / 51,709/s | 21.211 s / 47,146/s | Datalog 1.097X | 5.323 s / 187,874/s |
-| 1000 | 9.590 s / 104,273/s | 21.874 s / 45,716/s | Datalog 2.281X | 5.809 s / 172,146/s |
+| 1 | 10,415/s | 31,348/s | SQLite 3.010X | 91,729/s |
+| 10 | 30,650/s | 42,850/s | SQLite 1.398X | 158,650/s |
+| 100 | 52,354/s | 47,146/s | Datalog 1.110X | 185,677/s |
+| 1000 | 103,386/s | 45,716/s | Datalog 2.261X | 183,090/s |
 
 For the blocking APIs, SQLite led at batches 1 and 10, while Datalog led at
 batches 100 and 1000. The Datalog async condition had the highest measured
@@ -131,7 +131,7 @@ these tables.
 | Task | API |
 |---|---|
 | `dl-sync` | Datalog `transact!` |
-| `dl-async` | Datalog `transact-async` with bounded outstanding requests |
+| `dl-async` | Datalog `transact-async` with bounded outstanding requests and writes |
 | `sql-tx` | SQLite reusable prepared `INSERT`, JDBC batch, one commit/request |
 
 Append `-wal` to any task to enable WAL mode, for example `dl-sync-wal` or
@@ -149,8 +149,11 @@ durability conditions; do not place its results in the Datalog/SQLite ranking.
 
 Datalevin's async APIs adaptively combine queued API requests into physical
 transactions. The reported request count is therefore not a count of physical
-commits. The default cap is 1000 outstanding API requests, independently of the
-number of writes in each request.
+commits. The benchmark caps outstanding work at both 1000 API requests and
+100,000 writes. The effective request cap is the smaller of those limits: it is
+1000 for batches 1, 10, and 100, and 100 for batch 1000. Override the limits
+with `:in-flight` and `:in-flight-writes`; `results.edn` records both configured
+limits and the effective request cap.
 
 ## Durability conditions
 

@@ -713,6 +713,10 @@
   *ordered-datom-writes?* false)
 
 (def ^{:dynamic true
+       :doc     "Maximum number of top-level transaction forms combined into one Datalog async transaction."}
+  *datalog-async-batch-max-forms* 100000)
+
+(def ^{:dynamic true
        :doc     "Datalog DB starts background sampling or not"}
   *db-background-sampling?* true)
 

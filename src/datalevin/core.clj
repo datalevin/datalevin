@@ -208,8 +208,9 @@ Only usable for debug output.
  semantics; `:relaxed` improves throughput by batching durability and may lose
  a small tail of recent transactions on a crash; `:extra` is stricter than
  `:strict` (SQLite-style extra durability, e.g. fullsync on macOS). For local
- single-thread idle writes, `:strict` and `:extra` may take a direct fast path;
- `:relaxed` always uses the sync queue so batching remains effective.
+ single-thread idle writes, all three profiles may take a direct fast path;
+ concurrent pressure falls back to queue combining. Relaxed WAL durability is
+ still grouped by the txn-log thresholds below.
 
    * `:wal-group-commit`, maximum transactions per durability batch in
  `:relaxed` mode. Default comes from
@@ -299,8 +300,9 @@ Only usable for debug output.
    * `:wal?`, a boolean, enabling WAL mode for the underlying KV store.
 
    * `:wal-durability-profile`, one of `:strict`, `:relaxed`, or `:extra`.
- `:strict` and `:extra` may take an idle local direct fast path; `:relaxed`
- always uses the sync queue so durability batching remains effective.
+ local idle writes may take a direct fast path; concurrent pressure falls back
+ to queue combining. Relaxed WAL durability remains grouped independently by
+ the txn-log thresholds below.
 
    * `:wal-group-commit`, maximum transactions per durability batch in
  `:relaxed` mode. Default comes from
@@ -762,8 +764,9 @@ Only usable for debug output.
    * `:wal?`, a boolean, enabling WAL mode for the underlying KV store.
 
    * `:wal-durability-profile`, one of `:strict`, `:relaxed`, or `:extra`.
- `:strict` and `:extra` may take an idle local direct fast path; `:relaxed`
- always uses the sync queue so durability batching remains effective.
+ local idle writes may take a direct fast path; concurrent pressure falls back
+ to queue combining. Relaxed WAL durability remains grouped independently by
+ the txn-log thresholds below.
 
    * `:wal-group-commit`, maximum transactions per durability batch in
  `:relaxed` mode. Default comes from
@@ -810,7 +813,9 @@ Only usable for debug output.
  `:strict` maximizes durability with fsync semantics; `:relaxed` improves write
  throughput with a small risk of losing the latest transactions on a crash;
  `:extra` is stricter than `:strict` (SQLite-style extra durability, e.g.
- fullsync on macOS).
+ fullsync on macOS). Local idle calls to [[transact!]] may take a direct fast
+ path; concurrent pressure falls back to queue combining. Relaxed WAL
+ durability remains grouped independently by the txn-log thresholds below.
 
    * `:wal-group-commit`, maximum transactions per durability batch in
  `:relaxed` mode. Default comes from
@@ -1095,7 +1100,10 @@ Only usable for debug output.
   is deref'ed.
 
   Use an adaptive batch transaction algorithm that adjusts batch size
-  according to workload: the higher the load, the larger the batch size.
+  according to workload: the higher the load, the larger the batch size. One
+  physical auto-combined transaction is capped at
+  `datalevin.constants/*datalog-async-batch-max-forms*` top-level transaction
+  forms so caller-side batches cannot grow it without bound.
 
   The 4-arity version of the function takes a `callback` function that will
   be called when the transaction commits, which takes the transaction result
@@ -1189,10 +1197,9 @@ Only usable for debug output.
    `:strict` waits for durable WAL acknowledgement per write transaction with
    fsync semantics; `:relaxed` batches durability for higher throughput with a
    small crash window; `:extra` is stricter than `:strict` (SQLite-style extra
-   durability, e.g. fullsync on macOS). For local single-thread idle writes,
-   `:strict` and `:extra` may take a direct fast path; `:relaxed` always uses
-   the sync queue so batching remains effective. When WAL is enabled and this
-   option is omitted, the default is `:relaxed`.
+   durability, e.g. fullsync on macOS). Relaxed WAL durability remains grouped
+   by the txn-log thresholds below. When WAL is enabled and this option is
+   omitted, the default is `:relaxed`.
   * `:wal-group-commit` sets the max transactions per durability batch in
    `:relaxed` mode. Default comes from
    `datalevin.constants/*wal-group-commit*`.

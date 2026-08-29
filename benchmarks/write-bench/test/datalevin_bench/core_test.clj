@@ -88,6 +88,16 @@
     (is (= 10 (count (:allowed (ex-data error)))))
     (is (some #{"dl-async-wal"} (:allowed (ex-data error))))))
 
+(deftest async-in-flight-window-caps-requests-and-write-volume
+  (let [effective (ns-resolve 'datalevin-bench.core
+                              'effective-in-flight-limit)]
+    (is (= 1000 (effective 1 1000 100000)))
+    (is (= 1000 (effective 10 1000 100000)))
+    (is (= 1000 (effective 100 1000 100000)))
+    (is (= 100 (effective 1000 1000 100000)))
+    (is (= 7 (effective 1000 7 100000)))
+    (is (= 1 (effective 200000 1000 100000)))))
+
 (deftest durability-profiles-are-context-sensitive
   (doseq [profile [:strict :relaxed :extra]]
     (is (nil? (invoke-private 'validate-durability-profile! true profile)))
@@ -295,6 +305,7 @@
              (assoc valid :total 0)
              (assoc valid :report -1)
              (assoc valid :in-flight 0)
+             (assoc valid :in-flight-writes 0)
              (assoc valid :completion-timeout-ms 0)
              (assoc valid :seed 1.5)
              (assoc valid :durability-profile :unknown)
@@ -322,6 +333,15 @@
             (is (= 3 (:requests result)))
             (is (= (name task) (:task result)))
             (is (= async? (:async? result)))
+            (if async?
+              (do
+                (is (= 2 (:in-flight result)))
+                (is (= 2 (:in-flight-request-limit result)))
+                (is (= 100000 (:in-flight-write-limit result))))
+              (do
+                (is (nil? (:in-flight result)))
+                (is (nil? (:in-flight-request-limit result)))
+                (is (nil? (:in-flight-write-limit result)))))
             (is (nil? (:durability-profile result)))
             (is (= engine (get-in result [:storage :engine])))
             (when (= :sqlite engine)

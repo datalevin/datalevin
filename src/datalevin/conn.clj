@@ -23,7 +23,7 @@
    [datalevin.db DB TxReport]
    [datalevin.storage Store]
    [datalevin.remote DatalogStore]
-   [datalevin.async IAsyncWork AsyncExecutor]
+   [datalevin.async IAsyncWork IBoundedAsyncWork AsyncExecutor]
    [org.eclipse.collections.impl.list.mutable FastList]
    [java.util.concurrent Executors LinkedBlockingQueue ConcurrentHashMap
     ThreadPoolExecutor ArrayBlockingQueue ThreadPoolExecutor$CallerRunsPolicy
@@ -594,10 +594,6 @@
 
               :else nil)))))))
 
-(defn- strict-txlog-sync-queue?
-  [conn]
-  (= :strict (txlog-sync-queue-profile conn)))
-
 (declare queued-transact!)
 
 (def ^:private wal-idle-direct-cooldown-ms
@@ -643,12 +639,18 @@
              (queued-transact! conn tx-data tx-meta))))
 
        (= :relaxed profile)
-       ;; Relaxed durability relies on the sync queue to batch fsync work.
-       ;; Allowing an idle direct fast path defeats the expected batching
-       ;; semantics and makes the behavior diverge from the documented model.
-       (do
-         (observe-txlog-sync-path! :queued-relaxed)
-         (queued-transact! conn tx-data tx-meta))
+       ;; Txn-log group commit batches relaxed durability independently of the
+       ;; Datalog request queue. Avoid the queue handoff while idle, but retain
+       ;; its transaction combining once concurrent requests create pressure.
+       (let [[direct? report]
+             (try-direct-wal-transact-when-idle! conn tx-data tx-meta)]
+         (if direct?
+           (do
+             (observe-txlog-sync-path! :direct-wal-idle-relaxed)
+             report)
+           (do
+             (observe-txlog-sync-path! :queued-relaxed)
+             (queued-transact! conn tx-data tx-meta))))
 
        (= :extra profile)
        ;; Extra durability follows the same adaptive dispatch as strict, with a
@@ -888,13 +890,22 @@
 (deftype ^:no-doc SyncQueuedReq [tx-data tx-meta result-promise])
 (deftype ^:no-doc SyncQueuedResult [report error])
 
+(defn- tx-data-size
+  ^long [tx-data]
+  (if (instance? java.util.Collection tx-data)
+    (.size ^java.util.Collection tx-data)
+    (count tx-data)))
+
 (deftype ^:no-doc AsyncDLTx [conn tx-data tx-meta cb]
   IAsyncWork
   (work-key [_] (->> (.-store ^DB @conn) i/db-name dl-work-key))
   ;; Async transact stays at the API layer and delegates execution to transact!.
   (do-work [_] (transact! conn tx-data tx-meta))
   (combine [_] dl-tx-combine)
-  (callback [_] cb))
+  (callback [_] cb)
+  IBoundedAsyncWork
+  (batch-weight [_] (tx-data-size tx-data))
+  (max-batch-weight [_] c/*datalog-async-batch-max-forms*))
 
 (deftype ^:no-doc SyncQueuedDLTx [conn requests]
   IAsyncWork
@@ -916,7 +927,11 @@
   (let [^AsyncDLTx fw (first coll)]
     (if (nil? (next coll))
       fw
-      (let [^FastList out (FastList.)]
+      (let [capacity (reduce (fn [^long n ^AsyncDLTx work]
+                               (+ n (tx-data-size (.-tx-data work))))
+                             0
+                             coll)
+            ^FastList out (FastList. (int capacity))]
         (doseq [^AsyncDLTx work coll]
           (add-combined-tx-data! out (.-tx-data work)))
         (->AsyncDLTx (.-conn fw)
@@ -929,7 +944,12 @@
   (let [^SyncQueuedDLTx fw (first coll)]
     (if (nil? (next coll))
       fw
-      (let [^FastList out (FastList.)]
+      (let [capacity (reduce (fn [^long n ^SyncQueuedDLTx work]
+                               (+ n (.size ^java.util.Collection
+                                           (.-requests work))))
+                             0
+                             coll)
+            ^FastList out (FastList. (int capacity))]
         (doseq [^SyncQueuedDLTx work coll]
           (.addAll out ^java.util.Collection (.-requests work)))
         (->SyncQueuedDLTx (.-conn fw) out)))))

@@ -36,6 +36,13 @@
     "Return a callback for when a work is done. This callback takes as
      input the result of do-work. This could be nil."))
 
+(defprotocol IBoundedAsyncWork
+  "Optional weighted cap for one auto-combined physical work batch."
+  (batch-weight [_]
+    "Return this work item's positive batch weight.")
+  (max-batch-weight [_]
+    "Return the maximum total weight of one combined batch."))
+
 (deftype WorkItem [work promise cb])
 
 (deftype WorkQueue [^ConcurrentLinkedQueue items  ; [WorkItem ...]
@@ -118,14 +125,45 @@
         (run-callback! cb payload))
       (recur))))
 
-(defn- combined-work
-  [cmb ^ConcurrentLinkedQueue items ^FastList stage ^Semaphore backlog]
+(defn- bounded-batch-weight
+  ^long [work]
+  (max 1 (long (batch-weight work))))
+
+(defn- bounded-max-batch-weight
+  ^long [work]
+  (max 1 (long (max-batch-weight work))))
+
+(defn- stage-combined-work!
+  [^ConcurrentLinkedQueue items ^FastList stage first-work]
   (.clear stage)
-  (loop []
-    (when (.peek items)
-      (let [^WorkItem item (.poll items)]
-        (.add stage item))
-      (recur)))
+  (if (satisfies? IBoundedAsyncWork first-work)
+    (let [limit (bounded-max-batch-weight first-work)]
+      (loop [weight 0]
+        (if-let [^WorkItem item (.peek items)]
+          (let [work        (.-work item)
+                item-weight (if (satisfies? IBoundedAsyncWork work)
+                              (bounded-batch-weight work)
+                              1)
+                full?       (and (pos? (.size stage))
+                                 (> item-weight (- limit weight)))]
+            (if full?
+              weight
+              (do
+                (.poll items)
+                (.add stage item)
+                (recur (+ weight item-weight)))))
+          weight)))
+    (loop []
+      (when (.peek items)
+        (let [^WorkItem item (.poll items)]
+          (.add stage item))
+        (recur))))
+  stage)
+
+(defn- combined-work
+  [cmb ^ConcurrentLinkedQueue items ^FastList stage ^Semaphore backlog
+   first-work]
+  (stage-combined-work! items stage first-work)
   (let [res         (do-work* (cmb (mapv #(.-work ^WorkItem %) stage)))
         [_ payload] res]
     (dotimes [i (.size stage)]
@@ -134,14 +172,24 @@
       (run-callback! (.-cb ^WorkItem (.get stage i)) payload))))
 
 (defn- event-handler
-  [^ConcurrentHashMap work-queues k ^Semaphore backlog]
+  [^ConcurrentHashMap work-queues ^LinkedBlockingQueue event-queue k
+   ^Semaphore backlog]
   (let [^WorkQueue wq                (.get work-queues k)
         ^ConcurrentLinkedQueue items (.-items wq)
         first-work                   (.-fw wq)]
     (locking items
-      (if-let [cmb (combine first-work)]
-        (combined-work cmb items (.-stage wq) backlog)
-        (individual-work items backlog)))))
+      ;; Duplicate event keys can schedule adjacent handlers. A prior handler
+      ;; may consume an item that arrived while it was draining, leaving the
+      ;; next handler with an empty queue.
+      (when (.peek items)
+        (if-let [cmb (combine first-work)]
+          (combined-work cmb items (.-stage wq) backlog first-work)
+          (individual-work items backlog)))
+      ;; A weighted batch can intentionally leave work queued. Producers may
+      ;; also add work while the handler runs, so make the residual explicit
+      ;; instead of relying on a duplicate key already being present.
+      (when (.peek items)
+        (.offer event-queue k)))))
 
 (defn- new-workqueue
   [work]
@@ -196,7 +244,10 @@
                   (when-not (.contains event-queue k) ; do nothing when busy
                     (when (.get running)
                       (.submit workers
-                               ^Callable #(event-handler work-queues k backlog)))))
+                               ^Callable #(event-handler work-queues
+                                                         event-queue
+                                                         k
+                                                         backlog)))))
                 (recur)))
             (init []
               (try (event-loop)

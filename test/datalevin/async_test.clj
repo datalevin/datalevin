@@ -40,6 +40,27 @@
         nil)))
   (callback [_] callback))
 
+(declare ->BoundedCombiningWork)
+
+(deftype BoundedCombiningWork [values weight limit batches callback]
+  async/IAsyncWork
+  (work-key [_] :async-test/bounded-combined-success)
+  (do-work [_]
+    (swap! batches conj {:values values :weight weight})
+    values)
+  (combine [_]
+    (fn [works]
+      (->BoundedCombiningWork
+        (vec (mapcat #(.-values ^BoundedCombiningWork %) works))
+        (reduce + (map #(.-weight ^BoundedCombiningWork %) works))
+        limit
+        batches
+        nil)))
+  (callback [_] callback)
+  async/IBoundedAsyncWork
+  (batch-weight [_] weight)
+  (max-batch-weight [_] limit))
+
 (defn- thrown-value
   [f]
   (try
@@ -156,5 +177,40 @@
         (is (= values (deref result 1000 ::timeout))))
       (doseq [callback-result callbacks]
         (is (= values (deref callback-result 1000 ::timeout))))
+      (finally
+        (async/stop executor)))))
+
+(deftest bounded-combined-work-reschedules-residual-items
+  (let [new-executor (ns-resolve 'datalevin.async 'new-async-executor)
+        executor     (new-executor)
+        batches      (atom [])
+        values       (vec (range 10))
+        callbacks    (mapv (fn [_] (promise)) values)
+        results      (mapv (fn [value callback-result]
+                             (async/exec
+                               executor
+                               (->BoundedCombiningWork
+                                 [value]
+                                 1
+                                 3
+                                 batches
+                                 #(deliver callback-result %))))
+                           values
+                           callbacks)]
+    (try
+      ;; Queue all work before starting so the weighted cap, rather than
+      ;; producer timing, determines the physical batch boundaries.
+      (async/start executor)
+      (let [resolved (mapv #(deref % 2000 ::timeout) results)
+            callback-values
+            (mapv #(deref % 2000 ::timeout) callbacks)]
+        (is (not-any? #{::timeout} resolved))
+        (is (not-any? #{::timeout} callback-values))
+        (doseq [[value result callback-value]
+                (map vector values resolved callback-values)]
+          (is (some #{value} result))
+          (is (= result callback-value)))
+        (is (= [3 3 3 1] (mapv :weight @batches)))
+        (is (= values (vec (mapcat :values @batches)))))
       (finally
         (async/stop executor)))))

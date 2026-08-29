@@ -11,12 +11,14 @@
   (:require
    [clojure.test :refer [deftest is testing]]
    [datalevin.binding.cpp]
+   [datalevin.conn :as conn]
    [datalevin.core :as d]
    [datalevin.db :as db]
    [datalevin.util :as u])
   (:import
    [datalevin.lmdb DatomKVTxData]
-   [java.util ArrayList UUID]))
+   [java.util ArrayList UUID]
+   [java.util.concurrent.atomic AtomicLong]))
 
 (def ^:private schema
   {:item/id    {:db/valueType :db.type/long
@@ -43,6 +45,35 @@
              :item/left  true
              :item/right false})
           (range start (+ start n)))))
+
+(deftest relaxed-wal-idle-writes-retain-txlog-grouping-on-direct-path
+  (let [conn* (d/create-conn nil
+                             schema
+                             {:wal? true
+                              :wal-durability-profile :relaxed
+                              :kv-opts {:inmemory? true}})
+        paths (atom [])]
+    (try
+      (binding [conn/*txlog-sync-path-observer*
+                #(swap! paths conj %)]
+        (dotimes [i 16]
+          (d/transact! conn* [{:item/id i :item/value (str "v" i)}])))
+      (is (= 16 (count @paths)))
+      (is (every? #{:direct-wal-idle-relaxed} @paths))
+      (is (= 16 (d/count-datoms @conn* nil :item/id nil)))
+      (testing "pending pressure retains the combining queue fallback"
+        (let [^AtomicLong pending (:sync-queue-pending (meta conn*))]
+          (.set pending 1)
+          (try
+            (binding [conn/*txlog-sync-path-observer*
+                      #(swap! paths conj %)]
+              (d/transact! conn* [{:item/id 16 :item/value "v16"}]))
+            (finally
+              (.set pending 0))))
+        (is (= :queued-relaxed (peek @paths)))
+        (is (= 17 (d/count-datoms @conn* nil :item/id nil))))
+      (finally
+        (d/close conn*)))))
 
 (deftest add-only-datom-writes-always-use-ordered-index-passes
   (let [add-only? (ns-resolve 'datalevin.binding.cpp

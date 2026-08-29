@@ -23,6 +23,7 @@
 (def total 1000000)
 (def report 10000)
 (def in-flight 1000)
+(def in-flight-writes 100000)
 (def completion-timeout-ms 600000)
 (def default-seed 42)
 
@@ -88,6 +89,11 @@
     (throw (ex-info (str label " must be a non-negative integer")
                     {:option label :value value})))
   (long value))
+
+(defn- effective-in-flight-limit
+  [batch request-limit write-limit]
+  (int (min (long request-limit)
+            (max 1 (quot (long write-limit) (long batch))))))
 
 (defn- positive-int!
   [label value]
@@ -179,12 +185,14 @@
 
 (defn- validate-common!
   [{:keys [batch threads total-writes report-every in-flight-limit
+           in-flight-write-limit
            completion-timeout]} info durability-profile]
   (positive-int! :batch batch)
   (positive-int! :threads threads)
   (positive-long! :total total-writes)
   (non-negative-long! :report report-every)
   (positive-int! :in-flight in-flight-limit)
+  (positive-long! :in-flight-writes in-flight-write-limit)
   (positive-long! :completion-timeout-ms completion-timeout)
   (validate-durability-profile! (:wal? info) durability-profile)
   (when (and (> (long threads) 1)
@@ -656,11 +664,12 @@
 
 (defn- run-write-pass
   [{:keys [base-dir batch f threads durability-profile total report
-           in-flight completion-timeout-ms seed]
+           in-flight in-flight-writes completion-timeout-ms seed]
     :or   {threads               1
            total                 1000000
            report                10000
            in-flight             1000
+           in-flight-writes      100000
            completion-timeout-ms 600000
            seed                  42}}]
   (let [base-dir           (when (some? base-dir)
@@ -671,6 +680,12 @@
         total-writes       (positive-long! :total total)
         report-every       (non-negative-long! :report report)
         in-flight-limit    (positive-int! :in-flight in-flight)
+        in-flight-write-limit
+        (positive-long! :in-flight-writes in-flight-writes)
+        effective-in-flight
+        (effective-in-flight-limit batch
+                                   in-flight-limit
+                                   in-flight-write-limit)
         seed               (integer-long! :seed seed)
         completion-timeout (positive-long! :completion-timeout-ms
                                            completion-timeout-ms)
@@ -681,6 +696,7 @@
                             :total-writes total-writes
                             :report-every report-every
                             :in-flight-limit in-flight-limit
+                            :in-flight-write-limit in-flight-write-limit
                             :completion-timeout completion-timeout}
         _                  (validate-common! config info durability-profile)
         target             (benchmark-target base-dir info batch threads
@@ -696,7 +712,7 @@
                        :batch-size batch
                        :threads threads
                        :async? (:async? info)
-                       :in-flight in-flight-limit
+                       :in-flight effective-in-flight
                        :completion-timeout-ms completion-timeout
                        :report-every report-every
                        :tx-fn (:tx-fn context)
@@ -712,7 +728,11 @@
                :async? (:async? info)
                :durability-profile effective-profile
                :seed seed
-               :in-flight (when (:async? info) in-flight-limit)
+               :in-flight (when (:async? info) effective-in-flight)
+               :in-flight-request-limit
+               (when (:async? info) in-flight-limit)
+               :in-flight-write-limit
+               (when (:async? info) in-flight-write-limit)
                :completion-timeout-ms completion-timeout
                :report-every report-every
                :workload workload-description

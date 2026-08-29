@@ -44,7 +44,7 @@
 - [Datalog] fast path for batched writes.
 
 ### Changed
-- [KV] respect OS durability default, i.e. use default sync on macos.
+- [KV] respect OS durability default, i.e. use default fsync on macos.
 - [Datalog] set semantics at rule boundary.
 
 ### Fixed
