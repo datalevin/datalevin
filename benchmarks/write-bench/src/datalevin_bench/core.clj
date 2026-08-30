@@ -46,6 +46,17 @@
        "(person_id, first_name, last_name, age) "
        "VALUES (?, ?, ?, ?)"))
 
+(def ^:private sqlite-person-select-sql
+  (str "SELECT first_name, last_name, age "
+       "FROM person WHERE person_id = ?"))
+
+(def ^:private sqlite-person-upsert-sql
+  (str sqlite-person-insert-sql " "
+       "ON CONFLICT(person_id) DO UPDATE SET "
+       "first_name=excluded.first_name, "
+       "last_name=excluded.last_name, "
+       "age=excluded.age"))
+
 (def ^:private sqlite-person-secondary-indexes
   [{:name "person_first_name_idx" :column "first_name"}
    {:name "person_last_name_idx" :column "last_name"}
@@ -53,6 +64,11 @@
 
 (deftype ^:private SQLiteBatchWriter
   [^Connection conn ^PreparedStatement statement])
+
+(deftype ^:private SQLiteMixedWriter
+  [^Connection conn
+   ^PreparedStatement read-statement
+   ^PreparedStatement upsert-statement])
 
 (def ^:private workload-description
   {:name :small-person-record
@@ -77,8 +93,7 @@
    "White" "Williams" "Wilson" "Wong" "Wood" "Wright" "Young"])
 
 (def ^:private valid-base-tasks
-  #{"kv-async" "kv-sync" "dl-async" "dl-sync" "sql-tx"
-    "sql-tx-indexed"})
+  #{"kv-async" "kv-sync" "dl-async" "dl-sync" "sql-tx"})
 
 (def ^:private valid-durability-profiles #{:strict :extra :relaxed})
 
@@ -153,15 +168,14 @@
                        :allowed (sort
                                   (mapcat #(vector % (str % "-wal"))
                                           valid-base-tasks))})))
-    {:name                      task-name
-     :base                      base-name
-     :wal?                      wal?
-     :async?                    (s/ends-with? base-name "async")
-     :sqlite-secondary-indexes? (= base-name "sql-tx-indexed")
-     :kind                      (cond
-                                  (s/starts-with? base-name "kv-") :kv
-                                  (s/starts-with? base-name "dl-") :datalog
-                                  :else :sqlite)}))
+    {:name   task-name
+     :base   base-name
+     :wal?   wal?
+     :async? (s/ends-with? base-name "async")
+     :kind   (cond
+               (s/starts-with? base-name "kv-") :kv
+               (s/starts-with? base-name "dl-") :datalog
+               :else :sqlite)}))
 
 (defn- validate-durability-profile!
   [wal? durability-profile]
@@ -223,16 +237,11 @@
       dir-name)))
 
 (defn- benchmark-target
-  [base-dir {:keys [name kind wal? sqlite-secondary-indexes?]}
+  [base-dir {:keys [name kind wal?]}
    batch threads durability-profile]
   (run-dir base-dir
            (if (= kind :sqlite)
-             (cond
-               sqlite-secondary-indexes?
-               (if wal? "sqlite-indexed-wal" "sqlite-indexed")
-
-               wal? "sqlite-wal"
-               :else "sqlite")
+             (if wal? "sqlite-wal" "sqlite")
              name)
            batch
            threads
@@ -465,6 +474,47 @@
       (finally
         (.close conn)))))
 
+(defn- open-sqlite-mixed-writer
+  ^SQLiteMixedWriter [^Connection conn]
+  (SQLiteMixedWriter. conn
+                      (.prepareStatement conn sqlite-person-select-sql)
+                      (.prepareStatement conn sqlite-person-upsert-sql)))
+
+(defn- close-sqlite-mixed-writer!
+  [^SQLiteMixedWriter writer]
+  (let [^PreparedStatement read-statement   (.-read-statement writer)
+        ^PreparedStatement upsert-statement (.-upsert-statement writer)
+        ^Connection conn                    (.-conn writer)]
+    (try
+      (.close read-statement)
+      (finally
+        (try
+          (.close upsert-statement)
+          (finally
+            (.close conn)))))))
+
+(defn- read-sqlite-person!
+  [^SQLiteMixedWriter writer ^String person-id]
+  (let [^PreparedStatement statement (.-read-statement writer)]
+    (.clearParameters statement)
+    (.setString statement 1 person-id)
+    (with-open [result (.executeQuery statement)]
+      (when (.next result)
+        {:first_name (.getString result 1)
+         :last_name  (.getString result 2)
+         :age        (.getLong result 3)}))))
+
+(defn- upsert-sqlite-person!
+  [^SQLiteMixedWriter writer
+   [^String person-id ^String first-name ^String last-name age]]
+  (let [^PreparedStatement statement (.-upsert-statement writer)]
+    (.clearParameters statement)
+    (.setString statement 1 person-id)
+    (.setString statement 2 first-name)
+    (.setString statement 3 last-name)
+    (.setLong statement 4 (long age))
+    (.executeUpdate statement)))
+
 (defn- rollback-sqlite-batch!
   [^Connection conn ^Throwable primary]
   (try
@@ -497,13 +547,11 @@
         (throw t)))))
 
 (defn- sqlite-batch-configuration
-  [config ^SQLiteBatchWriter writer secondary-indexes?]
+  [config ^SQLiteBatchWriter writer]
   (assoc config
          :auto-commit (.getAutoCommit ^Connection (.-conn writer))
          :insert-mode :prepared-jdbc-batch
-         :secondary-indexes (if secondary-indexes?
-                              sqlite-person-secondary-indexes
-                              [])))
+         :secondary-indexes sqlite-person-secondary-indexes))
 
 (defn- verify-count!
   [label expected actual]
@@ -543,7 +591,7 @@
                  expected (d/q datalog-age-count-query db)))
 
 (defn- open-write-context
-  [{:keys [kind wal? sqlite-secondary-indexes?] :as info}
+  [{:keys [kind wal?] :as info}
    target threads durability-profile seed]
   (let [next-person (pure-person-generator seed)]
     (case kind
@@ -604,13 +652,11 @@
                                         durability-profile)]
             (try
               (create-sqlite-person-table! conn)
-              (when sqlite-secondary-indexes?
-                (create-sqlite-person-secondary-indexes! conn))
+              (create-sqlite-person-secondary-indexes! conn)
               (let [sqlite-ver (sqlite-version conn)
                     driver-ver (.getDriverVersion (.getMetaData conn))
                     writer     (open-sqlite-batch-writer conn)
-                    config     (sqlite-batch-configuration
-                                 config writer sqlite-secondary-indexes?)]
+                    config     (sqlite-batch-configuration config writer)]
                 {:tx-fn   (fn [txs callback]
                             (callback
                               (transact-sqlite-person-batch! writer txs)))
@@ -630,8 +676,7 @@
                 opened  (atom [(:conn initial)])]
             (try
               (create-sqlite-person-table! (:conn initial))
-              (when sqlite-secondary-indexes?
-                (create-sqlite-person-secondary-indexes! (:conn initial)))
+              (create-sqlite-person-secondary-indexes! (:conn initial))
               (let [busy-ms    (configure-sqlite-busy-timeout!
                                  (:conn initial) 10000)
                     base-config (assoc (:config initial)
@@ -654,8 +699,7 @@
                     conns      @opened
                     writers    (mapv open-sqlite-batch-writer conns)
                     config     (sqlite-batch-configuration
-                                 base-config (first writers)
-                                 sqlite-secondary-indexes?)
+                                 base-config (first writers))
                     next-writer (AtomicLong. 0)
                     thread-writer
                     (ThreadLocal/withInitial
@@ -854,7 +898,7 @@
   (inc (.nextInt random (int keyspace))))
 
 (defn- open-mixed-context
-  [{:keys [kind wal? async? sqlite-secondary-indexes?]}
+  [{:keys [kind wal? async?]}
    target durability-profile initial-total seed]
   (let [keyspace     (* 2 (long initial-total))
         _            (when (> keyspace Integer/MAX_VALUE)
@@ -940,43 +984,34 @@
             spec         {:dbtype "sqlite" :dbname target}
             {:keys [conn config]}
             (open-sqlite-connection spec journal-mode sync-mode
-                                    durability-profile)
-            upsert-sql   (str "INSERT INTO person "
-                              "(person_id, first_name, last_name, age) "
-                              "VALUES (?, ?, ?, ?) "
-                              "ON CONFLICT(person_id) DO UPDATE SET "
-                              "first_name=excluded.first_name, "
-                              "last_name=excluded.last_name, "
-                              "age=excluded.age")]
+                                    durability-profile)]
         (try
           (verify-count! :sqlite-initial initial-total (sqlite-count conn))
-          {:tx-fn   (fn [txs callback]
-                      (jdbc/execute-one!
-                        conn [(str "SELECT first_name, last_name, age "
-                                   "FROM person WHERE person_id = ?")
-                              (read-id)])
-                      (let [values (first txs)]
+          (let [writer (open-sqlite-mixed-writer conn)]
+            {:tx-fn   (fn [^FastList txs callback]
+                        (read-sqlite-person! writer (read-id))
                         (callback
-                          (jdbc/execute! conn (into [upsert-sql] values)))))
-           :add-fn  (fn [^FastList txs]
-                      (let [slot (write-slot)
-                            {:keys [person-id first-name last-name age]}
-                            (next-person slot)]
-                        (.set expected (int slot))
-                        (.add txs [person-id first-name last-name age])))
-           :verify! #(verify-count! :sqlite-mixed (.cardinality expected)
-                                    (sqlite-count conn))
-           :close!  #(.close conn)
-           :storage {:engine :sqlite
-                     :sqlite-version (sqlite-version conn)
-                     :jdbc-driver-version
-                     (.getDriverVersion (.getMetaData conn))
-                     :configuration
-                     (assoc config
-                            :secondary-indexes
-                            (if sqlite-secondary-indexes?
-                              sqlite-person-secondary-indexes
-                              []))}}
+                          (upsert-sqlite-person! writer (.get txs 0))))
+             :add-fn  (fn [^FastList txs]
+                        (let [slot (write-slot)
+                              {:keys [person-id first-name last-name age]}
+                              (next-person slot)]
+                          (.set expected (int slot))
+                          (.add txs [person-id first-name last-name age])))
+             :verify! #(verify-count! :sqlite-mixed (.cardinality expected)
+                                      (sqlite-count conn))
+             :close!  #(close-sqlite-mixed-writer! writer)
+             :storage {:engine :sqlite
+                       :sqlite-version (sqlite-version conn)
+                       :jdbc-driver-version
+                       (.getDriverVersion (.getMetaData conn))
+                       :configuration
+                       (assoc config
+                              :auto-commit (.getAutoCommit conn)
+                              :read-mode :prepared-jdbc-query
+                              :upsert-mode :prepared-jdbc-upsert
+                              :secondary-indexes
+                              sqlite-person-secondary-indexes)}})
           (catch Throwable t
             (.close conn)
             (throw t)))))))

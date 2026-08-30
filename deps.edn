@@ -1,4 +1,4 @@
-{:paths ["src" "target/classes"]
+{:paths ["src" "resources" "target/classes"]
  :deps  {
          org.clojure/clojure                           {:mvn/version "1.12.5"}
          babashka/babashka.pods                        {:mvn/version "0.2.0"}

@@ -1981,7 +1981,8 @@ To access store on a server, [[interpret.inter-fn]] should be used to define the
   These values (the list) will be stored together in a sorted set.
   They should be of the same type. Each list item cannot be
   larger than 511 bytes. Point and range queries on these values are
-  supported.
+  supported. When `:dupfixed` is set, list values bypass the environment-wide
+  `:val-compress` option so their encoded width remains fixed.
 
   See [[put-list-items]], [[get-list]], [[list-range]], and so on."}
   open-list-dbi i/open-list-dbi)

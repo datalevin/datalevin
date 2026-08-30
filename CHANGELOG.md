@@ -6,16 +6,18 @@
 - [Datalog] `get-some-else` built-in function. Similar to `get-some` but always
   return a tuple.
 - [Lib] Idiomatic, composable query and transaction APIs for Python and
-  JavaScriptExisting EDN-string and native list/array APIs remain supported.
-- [Lib] Typed Python/JavaScript builder forms use an immutable snapshot
-  contract. Python `q.kw`/`q.sym` tokens have structural equality and hashing;
-  JavaScript tokens are interned by normalized type and name.
-- [Lib] Typed Python/JavaScript forms validate their structural grammar when
-  composedRaw forms (`q.raw()`/`q.raw`) remain the explicit unchecked escape
-  hatch.
-- [Lib] Pull selector builders in the Python and JavaScript bindings:
-  position-aware `q.selector` with typed attribute options (`default`, `as`),
-  xform symbols, nested pulls, and bounded or unbounded recursive pulls.
+  JavaScript. Existing EDN-string and native list/array APIs remain supported.
+
+### Changed
+- [KV] respect OS durability default, i.e. use default fsync on macos.
+- [Datalog] set semantics at rule boundary.
+- [Storage] AVE now uses `DUPFIXED` format. Existing 1.0.x databases upgrade
+  automatically through the existing dump/load migration.
+
+### Fixed
+- [WAL] avoid replaying an older, already-materialized WAL record; lock for
+  complete LMDB tear down.
+- [Datalog] CSV reader fix.
 
 ### Improved
 - [Datalog] planner accounts for late clauses cost and better hash join cost
@@ -42,15 +44,6 @@
   before union.
 - [Datalog] better error report for missing tuple elements.
 - [Datalog] fast path for batched writes.
-
-### Changed
-- [KV] respect OS durability default, i.e. use default fsync on macos.
-- [Datalog] set semantics at rule boundary.
-
-### Fixed
-- [WAL] avoid replaying an older, already-materialized WAL record; lock for
-  complete LMDB tear down.
-- [Datalog] CSV reader fix.
 
 ## 1.0.2 (2026-08-11)
 

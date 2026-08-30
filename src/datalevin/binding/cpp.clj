@@ -281,6 +281,8 @@
     adjacent keys reuse their encoding and equal adjacent pairs are probed
     once."))
 
+(declare list-range-info*)
+
 (deftype Rtx [^:unsynchronized-mutable lmdb
               ^Txn txn
               depth
@@ -337,7 +339,7 @@
       (put-bufval start-kp
                   (b/indexable nil (long aid) value value-type nil)
                   :avg (key-compressor lmdb) k-comp-bf)
-      (put-id-bufval start-vp (long id) (val-compressor lmdb) v-comp-bf)
+      (put-id-bufval start-vp (long id) nil v-comp-bf)
       (boolean
         (.get cur ^BufVal start-kp ^BufVal start-vp DTLV/MDB_GET_BOTH))))
 
@@ -351,7 +353,7 @@
           bound-id         (long bound-id)
           nt               (.size in)
           key-compressor   (key-compressor lmdb)
-          value-compressor (val-compressor lmdb)]
+          value-compressor nil]
       (put-id-bufval start-vp bound-id value-compressor v-comp-bf)
       (loop [i           (long 0)
              last-value  nil
@@ -394,7 +396,7 @@
           aid              (long aid)
           nt               (.size in)
           key-compressor   (key-compressor lmdb)
-          value-compressor (val-compressor lmdb)]
+          value-compressor nil]
       (loop [i           (long 0)
              last-value  nil
              last-id     (long 0)
@@ -445,13 +447,9 @@
     (put-bufval stop-kp k2 kt (key-compressor lmdb) k-comp-bf)
     (l/range-table range-type start-kp stop-kp))
 
-  (list-range-info [_ k-range-type k1 k2 kt v-range-type v1 v2 vt]
-    (put-bufval start-kp k1 kt (key-compressor lmdb) k-comp-bf)
-    (put-bufval stop-kp k2 kt (key-compressor lmdb) k-comp-bf)
-    (put-bufval start-vp v1 vt (val-compressor lmdb) v-comp-bf)
-    (put-bufval stop-vp v2 vt (val-compressor lmdb) v-comp-bf)
-    [(l/range-table k-range-type start-kp stop-kp)
-     (l/range-table v-range-type start-vp stop-vp)])
+  (list-range-info [this k-range-type k1 k2 kt v-range-type v1 v2 vt]
+    (list-range-info* lmdb this k-range-type k1 k2 kt
+                      v-range-type v1 v2 vt (val-compressor lmdb)))
 
   IRtx
   (read-only? [_] (.isReadOnly txn))
@@ -494,16 +492,32 @@
           (clean-buffer-quiet! v-comp-bf*))))
     nil))
 
+(defn- list-range-info*
+  [lmdb ^Rtx rtx k-range-type k1 k2 kt v-range-type v1 v2 vt
+   value-compressor]
+  (let [^BufVal start-kp      (.-start-kp rtx)
+        ^BufVal stop-kp       (.-stop-kp rtx)
+        ^BufVal start-vp      (.-start-vp rtx)
+        ^BufVal stop-vp       (.-stop-vp rtx)
+        ^ByteBuffer k-comp-bf (l/key-bf rtx)
+        ^ByteBuffer v-comp-bf (l/val-bf rtx)]
+    (put-bufval start-kp k1 kt (key-compressor lmdb) k-comp-bf)
+    (put-bufval stop-kp k2 kt (key-compressor lmdb) k-comp-bf)
+    (put-bufval start-vp v1 vt value-compressor v-comp-bf)
+    (put-bufval stop-vp v2 vt value-compressor v-comp-bf)
+    [(l/range-table k-range-type start-kp stop-kp)
+     (l/range-table v-range-type start-vp stop-vp)]))
+
 (defn- v-bf
-  [^BufVal vp lmdb rtx]
+  [^BufVal vp value-compressor rtx]
   (let [bf (.outBuf vp)]
-    (if-let [compressor (val-compressor lmdb)]
+    (if-let [compressor value-compressor]
       (let [^ByteBuffer cbf (l/val-bf rtx)]
         (bf-uncompress compressor bf cbf)
         (.flip cbf))
       bf)))
 
-(deftype KV [^BufVal kp ^BufVal vp lmdb rtx]
+(deftype KV [^BufVal kp ^BufVal vp lmdb value-compressor rtx]
   IKV
   (k [_]
     (let [bf (.outBuf kp)]
@@ -513,7 +527,7 @@
           (.flip cbf))
         bf)))
 
-  (v [_] (v-bf vp lmdb rtx)))
+  (v [_] (v-bf vp value-compressor rtx)))
 
 (defn- stat-map [^Stat stat]
   (let [^DTLV$MDB_stat s (.get stat)]
@@ -546,6 +560,7 @@
               ^ByteBuffer k-comp-bf
               ^:volatile-mutable ^ByteBuffer v-comp-bf
               ^boolean dupsort?
+              ^boolean dupfixed?
               ^boolean counted?
               ^boolean validate-data?]
   IBuffer
@@ -559,7 +574,7 @@
                (.dbi-name this) ": " e {:value x :type t}))))
   (put-val [this x t]
     (try
-      (put-bufval vp x t (val-compressor lmdb) v-comp-bf)
+      (put-bufval vp x t (when-not dupfixed? (val-compressor lmdb)) v-comp-bf)
       (catch BufferOverflowException _
         (let [size          (val-size x)
               old-vp        vp
@@ -569,7 +584,9 @@
           (close-bufval-quiet! old-vp)
           (clean-buffer-quiet! old-v-comp-bf)
           (set-max-val-size lmdb size)
-          (put-bufval vp x t (val-compressor lmdb) v-comp-bf)))
+          (put-bufval vp x t
+                      (when-not dupfixed? (val-compressor lmdb))
+                      v-comp-bf)))
       (catch Exception e
         (raise "Error putting r/w value buffer of "
                (.dbi-name this) ": " e {:value x :type t}))))
@@ -585,7 +602,7 @@
                (.dbi-name this) ": " e {:value id :type :id}))))
   (putValId [this id]
     (try
-      (put-id-bufval vp id (val-compressor lmdb) v-comp-bf)
+      (put-id-bufval vp id (when-not dupfixed? (val-compressor lmdb)) v-comp-bf)
       (catch BufferOverflowException _
         ;; Preserve the generic buffer-growth behavior on the exceptional path.
         (.put-val this (Long/valueOf id) :id))
@@ -611,7 +628,7 @@
                            (.get db) (.ptr kp) (.ptr vp))]
       (Util/checkRc ^int rc)
       (when-not (= rc DTLV/MDB_NOTFOUND)
-        (.outBuf vp))))
+        (v-bf vp (when-not dupfixed? (val-compressor lmdb)) rtx))))
   (get-key-rank [_ rtx]
     (let [^BufVal kp (.-kp ^Rtx rtx)
           ^LongPointer rp (LongPointer. 1)
@@ -627,7 +644,8 @@
                                 (.get db) (long rank) (.ptr kp) (.ptr vp))]
       (Util/checkRc ^int rc)
       (when-not (= rc DTLV/MDB_NOTFOUND)
-        [(.outBuf kp) (.outBuf vp)])))
+        [(.outBuf kp)
+         (v-bf vp (when-not dupfixed? (val-compressor lmdb)) rtx)])))
   (iterate-key [this rtx cur [range-type k1 k2] k-type]
     (let [ctx (l/range-info rtx range-type k1 k2 k-type)]
       (->KeyIterable lmdb this cur rtx ctx)))
@@ -636,8 +654,9 @@
       (->KeySampleIterable lmdb this indices cur rtx ctx)))
   (iterate-list [this rtx cur [k-range-type k1 k2] k-type
                  [v-range-type v1 v2] v-type]
-    (let [ctx (l/list-range-info rtx k-range-type k1 k2 k-type
-                                 v-range-type v1 v2 v-type)]
+    (let [ctx (list-range-info*
+                lmdb rtx k-range-type k1 k2 k-type v-range-type v1 v2 v-type
+                (when-not dupfixed? (val-compressor lmdb)))]
       (->ListIterable lmdb this cur rtx ctx)))
   (iterate-list-sample [this rtx cur indices [k-range-type k1 k2] k-type]
     (let [ctx (l/range-info rtx k-range-type k1 k2 k-type)]
@@ -683,6 +702,13 @@
       (close-resource! dbi)
       (catch Throwable _))))
 
+(defn- dbi-val-compressor
+  "DUPFIXED values must keep their encoded width, so they are never passed
+  through the environment-wide value compressor."
+  [^DBI dbi]
+  (when-not (.-dupfixed? dbi)
+    (val-compressor (.-lmdb dbi))))
+
 (defn- dtlv-bool [x] (if x DTLV/DTLV_TRUE DTLV/DTLV_FALSE))
 
 (defn- dtlv-val ^DTLV$MDB_val [x] (when x (.ptr ^BufVal x)))
@@ -712,6 +738,8 @@
           ek (dtlv-val (.-stop-bf ctx))
           k (.key cur)
           v (.val cur)
+          value-compressor (when-not (.-dupfixed? db)
+                             (val-compressor lmdb))
           iter (DTLV$dtlv_key_iter.)]
       (Util/checkRc
        (DTLV/dtlv_key_iter_create
@@ -720,7 +748,7 @@
       (reify
         Iterator
         (hasNext [_] (dtlv-rc (DTLV/dtlv_key_iter_has_next iter)))
-        (next [_] (KV. k v lmdb rtx))
+        (next [_] (KV. k v lmdb value-compressor rtx))
 
         AutoCloseable
         (close [_] (DTLV/dtlv_key_iter_destroy iter))))))
@@ -737,6 +765,8 @@
           ek (dtlv-val (.-stop-bf ctx))
           k (.key cur)
           v (.val cur)
+          value-compressor (when-not (.-dupfixed? db)
+                             (val-compressor lmdb))
           iter (DTLV$dtlv_key_rank_sample_iter.)
           samples (alength indices)
           sizets (SizeTPointer. samples)]
@@ -748,7 +778,7 @@
       (reify
         Iterator
         (hasNext [_] (dtlv-rc (DTLV/dtlv_key_rank_sample_iter_has_next iter)))
-        (next [_] (KV. k v lmdb rtx))
+        (next [_] (KV. k v lmdb value-compressor rtx))
 
         AutoCloseable
         (close [_] (DTLV/dtlv_key_rank_sample_iter_destroy iter))))))
@@ -774,6 +804,8 @@
           ev (dtlv-val (.-stop-bf vctx))
           k (.key cur)
           v (.val cur)
+          value-compressor (when-not (.-dupfixed? db)
+                             (val-compressor lmdb))
           iter (DTLV$dtlv_list_iter.)]
       (Util/checkRc
        (DTLV/dtlv_list_iter_create
@@ -784,7 +816,7 @@
       (reify
         Iterator
         (hasNext [_] (dtlv-rc (DTLV/dtlv_list_iter_has_next iter)))
-        (next [_] (KV. k v lmdb rtx))
+        (next [_] (KV. k v lmdb value-compressor rtx))
 
         AutoCloseable
         (close [_] (DTLV/dtlv_list_iter_destroy iter))))))
@@ -801,6 +833,8 @@
           ek      (dtlv-val (.-stop-bf ctx))
           k       (.key cur)
           v       (.val cur)
+          value-compressor (when-not (.-dupfixed? db)
+                             (val-compressor lmdb))
           iter    (DTLV$dtlv_list_rank_sample_iter.)
           samples (alength indices)
           sizets  (SizeTPointer. samples)]
@@ -812,7 +846,7 @@
       (reify
         Iterator
         (hasNext [_] (dtlv-rc (DTLV/dtlv_list_rank_sample_iter_has_next iter)))
-        (next [_] (KV. k v lmdb rtx))
+        (next [_] (KV. k v lmdb value-compressor rtx))
 
         AutoCloseable
         (close [_] (DTLV/dtlv_list_rank_sample_iter_destroy iter))))))
@@ -830,6 +864,8 @@
           ek             (dtlv-val (.-stop-bf ctx))
           k              (.key cur)
           v              (.val cur)
+          value-compressor (when-not (.-dupfixed? db)
+                             (val-compressor lmdb))
           iter           (DTLV$dtlv_list_key_range_full_val_iter.)]
       (Util/checkRc
        (DTLV/dtlv_list_key_range_full_val_iter_create
@@ -839,7 +875,7 @@
         Iterator
         (hasNext [_]
           (dtlv-rc (DTLV/dtlv_list_key_range_full_val_iter_has_next iter)))
-        (next [_] (KV. k v lmdb rtx))
+        (next [_] (KV. k v lmdb value-compressor rtx))
 
         AutoCloseable
         (close [_] (DTLV/dtlv_list_key_range_full_val_iter_destroy iter))))))
@@ -852,6 +888,8 @@
   (val-iterator [_]
     (let [^BufVal k (.key cur)
           ^BufVal v (.val cur)
+          value-compressor (when-not (.-dupfixed? db)
+                             (val-compressor lmdb))
           iter (DTLV$dtlv_list_val_full_iter.)]
       (Util/checkRc
        (DTLV/dtlv_list_val_full_iter_create iter (.ptr cur) (.ptr k) (.ptr v)))
@@ -863,7 +901,7 @@
            (DTLV/dtlv_list_val_full_iter_seek iter (.ptr ^BufVal (.-kp rtx)))))
         (has-next-val [_]
           (dtlv-rc (DTLV/dtlv_list_val_full_iter_has_next iter)))
-        (next-val [_] (v-bf v lmdb rtx))
+        (next-val [_] (v-bf v value-compressor rtx))
 
         AutoCloseable
         (close [_] (DTLV/dtlv_list_val_full_iter_destroy iter))))))
@@ -1322,17 +1360,20 @@
            (.ptr cur) (.ptr ^BufVal (.-kp rtx)) (.ptr ^BufVal (.-vp rtx)))))
 
 (defn- in-list?*
-  [^Rtx rtx ^Cursor cur k kt v vt]
-  (l/list-range-info rtx :at-least k nil kt :at-least v nil vt)
+  [^DBI dbi ^Rtx rtx ^Cursor cur k kt v vt]
+  (list-range-info* (.-lmdb dbi) rtx :at-least k nil kt :at-least v nil vt
+                    (dbi-val-compressor dbi))
   (.get cur ^BufVal (.-start-kp rtx) ^BufVal (.-start-vp rtx)
         DTLV/MDB_GET_BOTH))
 
 (defn- near-list*
-  [^Rtx rtx ^Cursor cur k kt v vt]
-  (l/list-range-info rtx :at-least k nil kt :at-least v nil vt)
-  (when (.get cur ^BufVal (.-start-kp rtx) ^BufVal (.-start-vp rtx)
-              DTLV/MDB_GET_BOTH_RANGE)
-    (.outBuf (.val cur))))
+  [^DBI dbi ^Rtx rtx ^Cursor cur k kt v vt]
+  (let [value-compressor (dbi-val-compressor dbi)]
+    (list-range-info* (.-lmdb dbi) rtx
+                      :at-least k nil kt :at-least v nil vt value-compressor)
+    (when (.get cur ^BufVal (.-start-kp rtx) ^BufVal (.-start-vp rtx)
+                DTLV/MDB_GET_BOTH_RANGE)
+      (v-bf (.val cur) value-compressor rtx))))
 
 (declare ->CppLMDB)
 
@@ -1736,6 +1777,7 @@
                         :validate-data? validate-data?}
               flags    (set flags)
               dupsort? (if (:dupsort flags) true false)
+              dupfixed? (if (:dupfixed flags) true false)
               counted? (if (:counted flags) true false)
               kp       (new-bufval key-size)
               vp       (new-bufval val-size)
@@ -1743,7 +1785,7 @@
               vc       (bf/allocate-buffer val-size)
               dbi      (Dbi/create env dbi-name (kv-flags flags))
               db       (DBI. this dbi (new-pools) kp vp kc vc
-                             dupsort? counted? validate-data?)]
+                             dupsort? dupfixed? counted? validate-data?)]
           (when (not= dbi-name c/kv-info)
             (when (not= existing-opts opts)
               (vswap! info assoc-in [:dbis dbi-name] opts)
@@ -2186,7 +2228,7 @@
   (near-list [lmdb dbi-name k v kt vt]
     (.check-ready lmdb)
     (scan/scan
-      (near-list* rtx cur k kt v vt)
+      (near-list* dbi rtx cur k kt v vt)
       (raise "Fail to get an item that is near in a list: "
              e {:dbi dbi-name :k k :v v})))
 
@@ -2194,7 +2236,7 @@
     (.check-ready lmdb)
     (if (and k v)
       (scan/scan
-        (in-list?* rtx cur k kt v vt)
+        (in-list?* dbi rtx cur k kt v vt)
         (raise "Fail to test if an item is in list: "
                e {:dbi dbi-name :k k :v v}))
       false))

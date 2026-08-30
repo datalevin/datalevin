@@ -3447,8 +3447,11 @@
 
 (defn- open-dbis
   [lmdb]
+  ;; AVE duplicate values are fixed-width entity IDs. The binding keeps
+  ;; DUPFIXED DBI values raw even when the environment compresses values.
   (open-list-dbi lmdb c/ave {:key-size c/+max-key-size+
-                             :val-size c/+id-bytes+})
+                             :val-size c/+id-bytes+
+                             :flags (conj c/default-dbi-flags :dupfixed)})
   (open-list-dbi lmdb c/eav {:key-size c/+id-bytes+
                              :val-size c/+max-key-size+})
   (open-dbi lmdb c/giants {:key-size c/+id-bytes+})
