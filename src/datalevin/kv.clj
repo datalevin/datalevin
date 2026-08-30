@@ -2394,7 +2394,11 @@
       txs
       (let [^FastList out
             (if (instance? java.util.Collection txs)
-              (FastList. (.size ^java.util.Collection txs))
+              ;; An internal datom becomes one canonical AVE row and one EAV
+              ;; row in the transaction log. Size for that representation so
+              ;; ingestion batches do not repeatedly grow the backing array.
+              (let [n (.size ^java.util.Collection txs)]
+                (FastList. (int (if (l/datom-kv-txs? txs) (* 2 n) n))))
               (FastList.))]
         (if (instance? java.util.List txs)
           (let [^java.util.List tx-list txs

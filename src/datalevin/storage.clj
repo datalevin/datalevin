@@ -67,6 +67,8 @@
 (declare with-open-opts close-store-resources! release-shared-local-store!)
 (declare enqueue-secondary-index-work! enqueue-secondary-index-work-if-needed!)
 
+(def ^:dynamic ^:no-doc *enforce-blind-unique-inserts?* false)
+
 (def ^:private async-secondary-index-option-keys
   #{:async-secondary-index-worker-max-jobs
     :async-secondary-index-worker-lease-ms
@@ -730,6 +732,7 @@
 
 (defprotocol IStateSync
   (mark-state-current! [this last-modified-ms])
+  (observed-state-sync-ms [this])
   (ensure-current! [this]))
 
 (defn maybe-ensure-current!
@@ -796,6 +799,8 @@
   (mark-state-current! [this last-modified-ms]
     (set! state-sync-ms (long (or last-modified-ms 0)))
     this)
+
+  (observed-state-sync-ms [_] state-sync-ms)
 
   (ensure-current! [this]
     (when-not (closed? this)
@@ -1223,10 +1228,26 @@
             :avg :id)))
 
   (av-first-e [_ a v]
-    (get-value
-      lmdb c/ave
-      (datom->indexable schema (d/datom c/e0 a v) false)
-      :avg :id true))
+    (let [^Indexable i
+          (datom->indexable schema (d/datom c/e0 a v) false)]
+      (if (b/giant? i)
+        ;; Giant AVE keys contain an allocated giant ID. Search the keys that
+        ;; share the logical value's truncated prefix, then compare the value
+        ;; loaded from the giants DB instead of assuming the first giant ID.
+        (list-range-some
+          lmdb c/ave
+          (fn [kv]
+            (let [^Retrieved r (b/read-buffer (lmdb/k kv) :avg)]
+              (when (= v (retrieved->v lmdb r))
+                (b/read-buffer (lmdb/v kv) :id))))
+          [:closed
+           i
+           (Indexable. nil (.-a i) v (.-f i) (.-b i) c/gmax)]
+          :avg
+          [:all]
+          :id
+          true)
+        (get-value lmdb c/ave i :avg :id true))))
 
   (av-first-datom [this a v]
     (when-let [e (.av-first-e this a v)] (d/datom e a v)))
@@ -2896,7 +2917,14 @@
         max-gt     (max-gt store)
         i          (b/indexable nil aid v vt max-gt)
         giant?     (b/giant? i)]
-    (.add txs (DatomKVTxData. e (b/indexable-bytes i avg-bf) true))
+    (.add txs (DatomKVTxData.
+                e
+                (b/indexable-bytes i avg-bf)
+                true
+                (boolean
+                  (and *enforce-blind-unique-inserts?*
+                       (identical? (:db/unique props)
+                                   :db.unique/identity)))))
     (when giant?
       (.advance-max-gt store)
       (let [gd [e attr v]
@@ -3007,7 +3035,7 @@
                        [:r [e aid gt v]]
                        [:d [e aid v]])])))
     (let [ii (Indexable. nil aid v (.-f i) (.-b i) (or gt c/normal))]
-      (.add txs (DatomKVTxData. e (b/indexable-bytes ii avg-bf) false))
+      (.add txs (DatomKVTxData. e (b/indexable-bytes ii avg-bf) false false))
       (when gt
         (when gt-cur (.remove giants d-eav))
         (.add txs (lmdb/kv-tx :del c/giants gt :id)))
@@ -4061,18 +4089,24 @@
 
 (defn- transfer-engines
   [engines lmdb]
-  (zipmap (keys engines) (map #(s/transfer % lmdb) (vals engines))))
+  (if (empty? engines)
+    engines
+    (zipmap (keys engines) (map #(s/transfer % lmdb) (vals engines)))))
 
 (defn- transfer-indices
   [indices lmdb]
-  (zipmap (keys indices) (map #(v/transfer % lmdb) (vals indices))))
+  (if (empty? indices)
+    indices
+    (zipmap (keys indices) (map #(v/transfer % lmdb) (vals indices)))))
 
 (defn- transfer-idoc-indices
   [indices lmdb]
-  (zipmap (keys indices) (map #(idoc/transfer % lmdb) (vals indices))))
+  (if (empty? indices)
+    indices
+    (zipmap (keys indices) (map #(idoc/transfer % lmdb) (vals indices)))))
 
 (defn- transfer-with-schema
-  [^Store old lmdb schema*]
+  [^Store old lmdb schema* reuse-derived-schema-state?]
   (let [opts*         (opts old)
         idoc-indices (transfer-idoc-indices (store-idoc-indices old) lmdb)
         idoc-indices (if (lmdb/writing? lmdb)
@@ -4088,12 +4122,20 @@
              (.-counts old)
              opts*
              schema*
-             (schema->rschema schema*)
-             (init-attrs schema*)
-             (init-max-aid schema*)
+             (if reuse-derived-schema-state?
+               (rschema old)
+               (schema->rschema schema*))
+             (if reuse-derived-schema-state?
+               (attrs old)
+               (init-attrs schema*))
+             (if reuse-derived-schema-state?
+               (max-aid old)
+               (init-max-aid schema*))
              (max-gt old)
              (max-tx old)
-             (init-state-sync-ms lmdb)
+             (if reuse-derived-schema-state?
+               (observed-state-sync-ms old)
+               (init-state-sync-ms lmdb))
              (.-scheduled-sampling old)
              (.-write-txn old)
              ;; Sampling work may still be queued against an older Store wrapper.
@@ -4107,14 +4149,18 @@
   "transfer state of an existing store to a new store that has a different
   LMDB instance"
   [^Store old lmdb]
-  (transfer-with-schema old lmdb (schema old)))
+  ;; Ordinary transaction transfers preserve the exact in-memory schema.
+  ;; Reuse its immutable reverse/aid maps and the already observed state
+  ;; timestamp instead of rebuilding them (and rereading :last-modified) on
+  ;; both sides of every write transaction.
+  (transfer-with-schema old lmdb (schema old) true))
 
 (defn- transfer-current
   "Transfer a Store while taking its schema from the LMDB transaction. The
   caller must hold the write lock so planning cannot race another schema
   mutation."
   [^Store old lmdb]
-  (transfer-with-schema old lmdb (load-schema lmdb)))
+  (transfer-with-schema old lmdb (load-schema lmdb) false))
 
 (defn with-open-opts
   "Return a Store wrapper over the same open LMDB state but with different

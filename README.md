@@ -329,16 +329,10 @@ LDBC result; the [LDBC README](benchmarks/LDBC-SNB-bench) documents the full
 methodology and per-query results.
 
 The [write benchmark](benchmarks/write-bench) compares Datalevin Datalog and KV
-transactions with SQLite under explicitly verified durability settings. SQLite
-uses one reusable prepared statement, JDBC batching, and one explicit commit
-per request. The one-million-person-record matrix covers batches 1, 10, 100,
-and 1000 in default and relaxed-WAL modes. For blocking calls, Datalevin led at
-default batches 1 and 1000 and relaxed-WAL batches 100 and 1000; SQLite led the
-other rows. Datalog async is reported separately with bounded outstanding
-requests. KV is a separate workload to compare across its own durability
-conditions, not part of the Datalog/SQLite ranking. Write runs intentionally
-have no warmup pass, and the older charts in that directory are retained only
-as historical artifacts.
+transactions with SQLite under explicitly verified durability settings. The
+one-million-person-record matrix covers batches 1, 10, 100, and 1000 in default
+and relaxed-WAL modes. For blocking calls, Datalevin led at default batches 1
+and 1000 and relaxed-WAL batches 100 and 1000; SQLite led the other rows.
 
 For performance comparison with [Datomic](https://www.datomic.com) and
 [Datascript](https://github.com/tonsky/datascript), see the [DataScript

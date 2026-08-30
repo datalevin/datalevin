@@ -46,6 +46,11 @@
        "(person_id, first_name, last_name, age) "
        "VALUES (?, ?, ?, ?)"))
 
+(def ^:private sqlite-person-secondary-indexes
+  [{:name "person_first_name_idx" :column "first_name"}
+   {:name "person_last_name_idx" :column "last_name"}
+   {:name "person_age_idx" :column "age"}])
+
 (deftype ^:private SQLiteBatchWriter
   [^Connection conn ^PreparedStatement statement])
 
@@ -72,7 +77,8 @@
    "White" "Williams" "Wilson" "Wong" "Wood" "Wright" "Young"])
 
 (def ^:private valid-base-tasks
-  #{"kv-async" "kv-sync" "dl-async" "dl-sync" "sql-tx"})
+  #{"kv-async" "kv-sync" "dl-async" "dl-sync" "sql-tx"
+    "sql-tx-indexed"})
 
 (def ^:private valid-durability-profiles #{:strict :extra :relaxed})
 
@@ -147,14 +153,15 @@
                        :allowed (sort
                                   (mapcat #(vector % (str % "-wal"))
                                           valid-base-tasks))})))
-    {:name    task-name
-     :base    base-name
-     :wal?    wal?
-     :async?  (s/ends-with? base-name "async")
-     :kind    (cond
-                (s/starts-with? base-name "kv-") :kv
-                (s/starts-with? base-name "dl-") :datalog
-                :else :sqlite)}))
+    {:name                      task-name
+     :base                      base-name
+     :wal?                      wal?
+     :async?                    (s/ends-with? base-name "async")
+     :sqlite-secondary-indexes? (= base-name "sql-tx-indexed")
+     :kind                      (cond
+                                  (s/starts-with? base-name "kv-") :kv
+                                  (s/starts-with? base-name "dl-") :datalog
+                                  :else :sqlite)}))
 
 (defn- validate-durability-profile!
   [wal? durability-profile]
@@ -216,10 +223,16 @@
       dir-name)))
 
 (defn- benchmark-target
-  [base-dir {:keys [name kind wal?]} batch threads durability-profile]
+  [base-dir {:keys [name kind wal? sqlite-secondary-indexes?]}
+   batch threads durability-profile]
   (run-dir base-dir
            (if (= kind :sqlite)
-             (if wal? "sqlite-wal" "sqlite")
+             (cond
+               sqlite-secondary-indexes?
+               (if wal? "sqlite-indexed-wal" "sqlite-indexed")
+
+               wal? "sqlite-wal"
+               :else "sqlite")
              name)
            batch
            threads
@@ -432,6 +445,12 @@
   [conn]
   (jdbc/execute! conn [sqlite-person-table-ddl]))
 
+(defn- create-sqlite-person-secondary-indexes!
+  [conn]
+  (doseq [{:keys [name column]} sqlite-person-secondary-indexes]
+    (jdbc/execute! conn
+                   [(str "CREATE INDEX " name " ON person (" column ")")])))
+
 (defn- open-sqlite-batch-writer
   ^SQLiteBatchWriter [^Connection conn]
   (.setAutoCommit conn false)
@@ -478,10 +497,13 @@
         (throw t)))))
 
 (defn- sqlite-batch-configuration
-  [config ^SQLiteBatchWriter writer]
+  [config ^SQLiteBatchWriter writer secondary-indexes?]
   (assoc config
          :auto-commit (.getAutoCommit ^Connection (.-conn writer))
-         :insert-mode :prepared-jdbc-batch))
+         :insert-mode :prepared-jdbc-batch
+         :secondary-indexes (if secondary-indexes?
+                              sqlite-person-secondary-indexes
+                              [])))
 
 (defn- verify-count!
   [label expected actual]
@@ -521,7 +543,7 @@
                  expected (d/q datalog-age-count-query db)))
 
 (defn- open-write-context
-  [{:keys [kind wal?] :as info}
+  [{:keys [kind wal? sqlite-secondary-indexes?] :as info}
    target threads durability-profile seed]
   (let [next-person (pure-person-generator seed)]
     (case kind
@@ -582,10 +604,13 @@
                                         durability-profile)]
             (try
               (create-sqlite-person-table! conn)
+              (when sqlite-secondary-indexes?
+                (create-sqlite-person-secondary-indexes! conn))
               (let [sqlite-ver (sqlite-version conn)
                     driver-ver (.getDriverVersion (.getMetaData conn))
                     writer     (open-sqlite-batch-writer conn)
-                    config     (sqlite-batch-configuration config writer)]
+                    config     (sqlite-batch-configuration
+                                 config writer sqlite-secondary-indexes?)]
                 {:tx-fn   (fn [txs callback]
                             (callback
                               (transact-sqlite-person-batch! writer txs)))
@@ -605,6 +630,8 @@
                 opened  (atom [(:conn initial)])]
             (try
               (create-sqlite-person-table! (:conn initial))
+              (when sqlite-secondary-indexes?
+                (create-sqlite-person-secondary-indexes! (:conn initial)))
               (let [busy-ms    (configure-sqlite-busy-timeout!
                                  (:conn initial) 10000)
                     base-config (assoc (:config initial)
@@ -627,7 +654,8 @@
                     conns      @opened
                     writers    (mapv open-sqlite-batch-writer conns)
                     config     (sqlite-batch-configuration
-                                 base-config (first writers))
+                                 base-config (first writers)
+                                 sqlite-secondary-indexes?)
                     next-writer (AtomicLong. 0)
                     thread-writer
                     (ThreadLocal/withInitial
@@ -826,7 +854,7 @@
   (inc (.nextInt random (int keyspace))))
 
 (defn- open-mixed-context
-  [{:keys [kind wal? async?]}
+  [{:keys [kind wal? async? sqlite-secondary-indexes?]}
    target durability-profile initial-total seed]
   (let [keyspace     (* 2 (long initial-total))
         _            (when (> keyspace Integer/MAX_VALUE)
@@ -943,7 +971,12 @@
                      :sqlite-version (sqlite-version conn)
                      :jdbc-driver-version
                      (.getDriverVersion (.getMetaData conn))
-                     :configuration config}}
+                     :configuration
+                     (assoc config
+                            :secondary-indexes
+                            (if sqlite-secondary-indexes?
+                              sqlite-person-secondary-indexes
+                              []))}}
           (catch Throwable t
             (.close conn)
             (throw t)))))))

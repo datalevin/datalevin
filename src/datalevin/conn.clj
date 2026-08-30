@@ -25,6 +25,7 @@
    [datalevin.remote DatalogStore]
    [datalevin.async IAsyncWork IBoundedAsyncWork AsyncExecutor]
    [org.eclipse.collections.impl.list.mutable FastList]
+   [java.util HashSet]
    [java.util.concurrent Executors LinkedBlockingQueue ConcurrentHashMap
     ThreadPoolExecutor ArrayBlockingQueue ThreadPoolExecutor$CallerRunsPolicy
     TimeUnit]
@@ -410,27 +411,33 @@
                   result
                   (l/with-transaction-kv [kv1 kv]
                     (let [store1 ^Store (s/transfer store kv1)
-                          db1    ^DB    (db/transfer db store1)]
-                      (when (db/blind-local-tx-unique-values-absent?
-                              db1 prepared)
+                          db1    ^DB    (db/transfer db store1)
+                          fused? (boolean (:fuse-unique-inserts? prepared))]
+                      (when (or fused?
+                                (db/blind-local-tx-unique-values-absent?
+                                  db1 prepared))
                         (vreset! prepared-store store1)
-                        (let [[report info] (db/stamp-blind-local-tx
-                                              db1 prepared tx-meta)]
-                          (db/commit-prepared-tx-data!
-                            db1 (:tx-data report) report)
-                          [report info]))))]
+                        (let [report (db/stamp-blind-local-tx
+                                       db1 prepared tx-meta)]
+                          (binding [s/*enforce-blind-unique-inserts?* fused?
+                                    c/*ordered-datom-writes?* true]
+                            (db/commit-prepared-tx-data!
+                              db1 (:tx-data report) report))
+                          report))))]
               (when result
-                (let [[report info] result
+                (let [report result
                       new-store   ^Store (s/transfer
                                            ^Store @prepared-store kv)
-                      new-info    (assoc info :last-modified
-                                         (long (or (i/last-modified new-store)
-                                                   0)))
-                      new-db      (db/carry-runtime-opts
-                                    (db/new-db new-store new-info)
-                                    db)]
+                      new-db      (-> (:db-after report)
+                                      (db/transfer new-store)
+                                      (db/carry-runtime-opts db)
+                                      (db/adopt-current-db!))]
                   (reset! conn new-db)
                   (assoc report :db-after @conn))))
+            (catch clojure.lang.ExceptionInfo e
+              (if (l/blind-unique-collision? e)
+                nil
+                (throw e)))
             (finally
               (when-not old
                 (db/enable-cache (.-store ^DB @conn))))))))))
@@ -440,9 +447,9 @@
    (maybe-direct-local-blind-transact! conn tx-data tx-meta false))
   ([conn tx-data tx-meta require-unique?]
    (when-let [prepared (db/prepare-blind-local-tx
-                         ^DB @conn tx-data require-unique?)]
+                         ^DB @conn tx-data require-unique? false)]
      (when (or (not require-unique?)
-               (seq (:unique-avs prepared)))
+               (:has-unique? prepared))
        (direct-local-blind-transact! conn prepared tx-meta)))))
 
 (declare current-thread-holds-store-write-lock?)
@@ -982,6 +989,120 @@
           (aset reports i report)
           (recur (inc i) (:db-after report)))))))
 
+(defn- add-distinct-blind-unique-values!
+  [^HashSet seen prepared]
+  (let [^FastList avs (:unique-avs prepared)]
+    (loop [i 0]
+      (if (< i (.size avs))
+        (if (.add seen (.get avs i))
+          (recur (unchecked-inc i))
+          false)
+        true))))
+
+(defn- prepare-sync-queued-blind-batch
+  [conn ^FastList requests]
+  (let [db    ^DB @conn
+        store (.-store db)]
+    (when (and (instance? Store store)
+               (true? (:wal? (i/env-opts (.-lmdb ^Store store)))))
+      (let [n                 (int (.size requests))
+            ^objects prepared (object-array n)
+            seen              (HashSet.)]
+        (loop [i 0]
+          (if (< i n)
+            (let [^SyncQueuedReq req (.get requests i)
+                  tx (db/prepare-blind-local-tx
+                       db (.-tx-data req) true)]
+              (if (and tx (add-distinct-blind-unique-values! seen tx))
+                (do
+                  (aset prepared i tx)
+                  (recur (unchecked-inc i)))
+                nil))
+            prepared))))))
+
+(def ^:private sync-queued-blind-fallback-type
+  ::sync-queued-blind-fallback)
+
+(defn- sync-queued-blind-fallback!
+  []
+  (throw (ex-info "Queued blind transaction requires full resolution"
+                  {:type sync-queued-blind-fallback-type})))
+
+(defn- prepared-blind-batch-valid?
+  [^DB db ^objects prepared]
+  (let [n (alength prepared)]
+    (loop [i 0]
+      (or (>= i n)
+          (and (db/blind-local-tx-valid? db (aget prepared i))
+               (recur (unchecked-inc i)))))))
+
+(defn- try-commit-sync-queued-blind-batch!
+  [conn ^FastList requests ^objects prepared ^objects reports]
+  (locking conn
+    (let [db    ^DB @conn
+          store (.-store db)
+          n     (alength prepared)]
+      (when (and (instance? Store store)
+                 (= n (alength reports))
+                 (= n (.size requests))
+                 (not (l/writing? (.-lmdb ^Store store)))
+                 (prepared-blind-batch-valid? db prepared))
+        (let [old (db/cache-disabled? store)]
+          (db/disable-cache store)
+          (try
+            (let [kv       (.-lmdb ^Store store)
+                  final-db (volatile! nil)]
+              (try
+                (l/with-transaction-kv [kv1 kv]
+                  (let [store1 ^Store (s/transfer ^Store store kv1)
+                        db1    ^DB    (db/transfer db store1)]
+                    ;; Side-effect-free prepared requests enforce identity
+                    ;; uniqueness in the eventual AVE put. Other requests keep
+                    ;; the preflight probe because a late collision must not
+                    ;; occur after updating a secondary engine.
+                    (dotimes [i n]
+                      (let [tx (aget prepared i)]
+                        (when (and (not (:fuse-unique-inserts? tx))
+                                   (not
+                                     (db/blind-local-tx-unique-values-absent?
+                                       db1 tx)))
+                          (sync-queued-blind-fallback!))))
+                    (loop [i 0
+                           current db1]
+                      (if (< i n)
+                        (let [^SyncQueuedReq req (.get requests i)
+                              prepared-tx (aget prepared i)
+                              ^TxReport report
+                              (db/stamp-blind-local-tx
+                                current prepared-tx (.-tx-meta req))]
+                          (binding [s/*enforce-blind-unique-inserts?*
+                                    (boolean
+                                      (:fuse-unique-inserts? prepared-tx))
+                                    c/*ordered-datom-writes?* true]
+                            (db/commit-prepared-tx-data!
+                              current (:tx-data report) report))
+                          (aset reports i report)
+                          (recur (unchecked-inc i) (:db-after report)))
+                        (vreset! final-db current)))))
+                (let [final-db ^DB @final-db
+                      new-store ^Store
+                      (s/transfer ^Store (.-store final-db) kv)
+                      new-db   (-> final-db
+                                   (db/transfer new-store)
+                                   (db/carry-runtime-opts db)
+                                   (db/adopt-current-db!))]
+                  (reset! conn new-db)
+                  true)
+                (catch clojure.lang.ExceptionInfo e
+                  (if (or (= sync-queued-blind-fallback-type
+                             (:type (ex-data e)))
+                          (l/blind-unique-collision? e))
+                    false
+                    (throw e)))))
+            (finally
+              (when-not old
+                (db/enable-cache (.-store ^DB @conn))))))))))
+
 (defn- commit-sync-queued-batch-reports!
   [conn ^objects reports]
   (let [n (alength ^objects reports)]
@@ -1008,16 +1129,22 @@
             (catch Throwable e
               (deliver-sync-queued-error! req e)))
           nil)
-        ;; Batch queued strict requests in a single write txn for throughput.
+        ;; Batch queued requests in a single write txn for throughput.
         (let [^objects reports (object-array n)]
           (try
             (binding [*sync-queue-worker?* true]
-              ;; Batch preparation allocates concrete entids/tx ids. Keep it
-              ;; under the same connection lock as commit so concurrent direct
-              ;; writes cannot advance the shared snapshot mid-batch.
-              (locking conn
-                (prepare-sync-queued-batch-reports! conn requests reports)
-                (commit-sync-queued-batch-reports! conn reports)))
+              (let [prepared (prepare-sync-queued-blind-batch conn requests)]
+                (when-not
+                  (and prepared
+                       (try-commit-sync-queued-blind-batch!
+                         conn requests prepared reports))
+                  ;; General preparation allocates concrete entids/tx ids. Keep
+                  ;; it under the same connection lock as commit so concurrent
+                  ;; direct writes cannot advance the shared snapshot mid-batch.
+                  (locking conn
+                    (prepare-sync-queued-batch-reports!
+                      conn requests reports)
+                    (commit-sync-queued-batch-reports! conn reports)))))
             (let [db-after @conn]
               (dotimes [i n]
                 (deliver-sync-queued-success!

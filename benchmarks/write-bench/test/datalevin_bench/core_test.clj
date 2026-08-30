@@ -63,12 +63,13 @@
            overrides)))
 
 (deftest task-classification-covers-every-supported-spelling
-  (doseq [[base kind async?]
-          [["kv-sync" :kv false]
-           ["kv-async" :kv true]
-           ["dl-sync" :datalog false]
-           ["dl-async" :datalog true]
-           ["sql-tx" :sqlite false]]
+  (doseq [[base kind async? sqlite-secondary-indexes?]
+          [["kv-sync" :kv false false]
+           ["kv-async" :kv true false]
+           ["dl-sync" :datalog false false]
+           ["dl-async" :datalog true false]
+           ["sql-tx" :sqlite false false]
+           ["sql-tx-indexed" :sqlite false true]]
           wal? [false true]]
     (let [task (str base (when wal? "-wal"))
           info (invoke-private 'task-info task)]
@@ -76,6 +77,8 @@
       (is (= base (:base info)))
       (is (= kind (:kind info)))
       (is (= async? (:async? info)))
+      (is (= sqlite-secondary-indexes?
+             (:sqlite-secondary-indexes? info)))
       (is (= wal? (:wal? info)))))
   (is (= "dl-sync" (:name (invoke-private 'task-info 'dl-sync))))
   (is (= "dl-sync" (:name (invoke-private 'task-info :dl-sync)))))
@@ -85,7 +88,7 @@
          (ex-message (thrown-info #(invoke-private 'task-info nil)))))
   (let [error (thrown-info #(invoke-private 'task-info 'unknown))]
     (is (= "Unsupported write benchmark task" (ex-message error)))
-    (is (= 10 (count (:allowed (ex-data error)))))
+    (is (= 12 (count (:allowed (ex-data error)))))
     (is (some #{"dl-async-wal"} (:allowed (ex-data error))))))
 
 (deftest async-in-flight-window-caps-requests-and-write-volume
@@ -135,12 +138,16 @@
 (deftest benchmark-targets-encode-relevant-run-settings
   (let [root       (.getPath (io/file "root"))
         dl-info    (invoke-private 'task-info 'dl-async-wal)
-        sqlite-info (invoke-private 'task-info 'sql-tx-wal)]
+        sqlite-info (invoke-private 'task-info 'sql-tx-wal)
+        indexed-info (invoke-private 'task-info 'sql-tx-indexed-wal)]
     (is (= (.getPath (io/file root "dl-async-wal-10-t4-strict"))
            (invoke-private 'benchmark-target root dl-info 10 4 :strict)))
     (is (= (.getPath (io/file root "sqlite-wal-100-relaxed"))
            (invoke-private 'benchmark-target
                            root sqlite-info 100 1 :relaxed)))
+    (is (= (.getPath (io/file root "sqlite-indexed-wal-100-relaxed"))
+           (invoke-private 'benchmark-target
+                           root indexed-info 100 1 :relaxed)))
     (is (= "kv-sync-1"
            (invoke-private 'benchmark-target
                            nil (invoke-private 'task-info 'kv-sync)
@@ -239,6 +246,30 @@
     (let [indexes (jdbc/execute! conn ["PRAGMA index_list('person')"])]
       (is (some #{"sqlite_autoindex_person_1"} (mapcat vals indexes))))))
 
+(deftest indexed-sqlite-adapter-maintains-each-value-lookup-index
+  (with-temp-root
+    "write-bench-sqlite-indexed-"
+    (fn [root]
+      (let [result   (run-pass root 'sql-tx-indexed)
+            expected [{:name "person_first_name_idx" :column "first_name"}
+                      {:name "person_last_name_idx" :column "last_name"}
+                      {:name "person_age_idx" :column "age"}]]
+        (is (= expected
+               (get-in result [:storage :configuration :secondary-indexes])))
+        (with-open [conn (jdbc/get-connection
+                           {:dbtype "sqlite" :dbname (:target result)})]
+          (let [indexes (jdbc/execute!
+                          conn ["PRAGMA index_list('person')"]
+                          {:builder-fn rs/as-unqualified-lower-maps})]
+            (is (= (set (map :name expected))
+                   (set (keep :name
+                              (filter #(= "c" (:origin %)) indexes))))))
+          (doseq [{:keys [name column]} expected]
+            (let [columns (jdbc/execute!
+                            conn [(str "PRAGMA index_info('" name "')")]
+                            {:builder-fn rs/as-unqualified-lower-maps})]
+              (is (= [column] (mapv :name columns))))))))))
+
 (deftest sqlite-prepared-batches-are-atomic-and-reusable
   (let [conn (jdbc/get-connection {:dbtype "sqlite" :dbname ":memory:"})]
     (invoke-private 'create-sqlite-person-table! conn)
@@ -326,7 +357,8 @@
                ['kv-async :datalevin-kv true]
                ['dl-sync :datalevin-datalog false]
                ['dl-async :datalevin-datalog true]
-               ['sql-tx :sqlite false]]]
+               ['sql-tx :sqlite false]
+               ['sql-tx-indexed :sqlite false]]]
         (testing (name task)
           (let [result (run-pass root task)]
             (is (= 7 (:writes result)))
@@ -349,7 +381,12 @@
                                   [:storage :configuration :auto-commit])))
               (is (= :prepared-jdbc-batch
                      (get-in result
-                             [:storage :configuration :insert-mode]))))
+                             [:storage :configuration :insert-mode])))
+              (is (= (if (str/includes? (name task) "indexed") 3 0)
+                     (count
+                       (get-in result
+                               [:storage :configuration
+                                :secondary-indexes])))))
             (is (.exists (io/file (:target result))))))))))
 
 (deftest every-sync-adapter-persists-the-same-person-record
@@ -438,7 +475,8 @@
                ['kv-async-wal :datalevin-kv true]
                ['dl-sync-wal :datalevin-datalog false]
                ['dl-async-wal :datalevin-datalog true]
-               ['sql-tx-wal :sqlite false]]]
+               ['sql-tx-wal :sqlite false]
+               ['sql-tx-indexed-wal :sqlite false]]]
         (testing (name task)
           (let [result (run-pass root task {:durability-profile :strict})]
             (is (= 7 (:writes result)))
@@ -450,7 +488,12 @@
               (is (= "wal" (get-in result
                                     [:storage :configuration :journal-mode])))
               (is (= "full" (get-in result
-                                     [:storage :configuration :synchronous]))))))))))
+                                     [:storage :configuration :synchronous])))
+              (let [indexes (get-in result
+                                    [:storage :configuration
+                                     :secondary-indexes])]
+                (is (= (if (str/includes? (name task) "indexed") 3 0)
+                       (count indexes)))))))))))
 
 (deftest default-wal-storage-adapters-use-relaxed-profile
   (with-temp-root
@@ -461,7 +504,8 @@
                ['kv-async-wal :datalevin-kv true]
                ['dl-sync-wal :datalevin-datalog false]
                ['dl-async-wal :datalevin-datalog true]
-               ['sql-tx-wal :sqlite false]]]
+               ['sql-tx-wal :sqlite false]
+               ['sql-tx-indexed-wal :sqlite false]]]
         (testing (name task)
           (let [result (run-pass root task)]
             (is (= 7 (:writes result)))
@@ -473,7 +517,12 @@
               (is (= "wal" (get-in result
                                     [:storage :configuration :journal-mode])))
               (is (= "normal" (get-in result
-                                       [:storage :configuration :synchronous]))))))))))
+                                       [:storage :configuration :synchronous])))
+              (let [indexes (get-in result
+                                    [:storage :configuration
+                                     :secondary-indexes])]
+                (is (= (if (str/includes? (name task) "indexed") 3 0)
+                       (count indexes)))))))))))
 
 (deftest sqlite-multi-caller-run-uses-uniform-busy-timeouts
   (with-temp-root

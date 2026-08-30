@@ -160,7 +160,15 @@
   IKVTxable
   (kv-txable? [_] true))
 
-(deftype ^:no-doc DatomKVTxData [^long e ^bytes avg ^boolean added?])
+(deftype ^:no-doc DatomKVTxData
+  [^long e ^bytes avg ^boolean added? ^boolean no-overwrite?])
+
+(def ^:const ^:no-doc blind-unique-collision-type
+  ::blind-unique-collision)
+
+(defn ^:no-doc blind-unique-collision?
+  [e]
+  (= blind-unique-collision-type (:type (ex-data e))))
 
 (defmethod print-method KVTxData
   [^KVTxData d, ^Writer w]

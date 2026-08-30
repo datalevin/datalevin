@@ -114,9 +114,11 @@
    opts-epoch
    auto-entity-time?
    entities
-   unique-avs])
+   unique-avs
+   has-unique?
+   fuse-unique-inserts?])
 
-(deftype ^:private PreparedBlindEntity [tempid ^objects attrs])
+(deftype ^:private PreparedBlindEntity [tempid ^FastList attrs])
 
 ;; (defmethod print-method TxReport [^TxReport rp, ^java.io.Writer w]
 ;;   (binding [*out* w]
@@ -1030,6 +1032,13 @@
          (.-pull-patterns old))
     old))
 
+(defn ^:no-doc adopt-current-db!
+  "Register an already constructed current DB value without repeating the
+  store-open lifecycle work performed by `new-db`."
+  [^DB db]
+  (swap! dbs assoc (db-name (.-store db)) db)
+  db)
+
 (defn ^DB empty-db
   ([] (empty-db nil nil))
   ([dir] (empty-db dir nil))
@@ -1271,8 +1280,6 @@
 
 (declare commit-prepared-tx-data!)
 
-(defn- auto-tempid [] (txprep/auto-tempid))
-
 (defn- auto-tempid? ^Boolean [x] (txprep/auto-tempid? x))
 
 (defn- tempid?
@@ -1503,6 +1510,19 @@
     :db.type/symbol
     :db.type/uuid})
 
+(defn- blind-unique-inline-value?
+  "Conservatively reject values that can spill into the giants DB. Giant
+  values include an allocated giant ID in their AVE key, so LMDB key equality
+  cannot enforce their logical uniqueness."
+  [value-type value]
+  (case value-type
+    (:db.type/string :db.type/keyword :db.type/symbol)
+    ;; UTF-8 needs at most four bytes per UTF-16 code unit. This leaves ample
+    ;; room below LMDB's 511-byte key limit for the AVG type/attribute prefix.
+    (<= (count (str value)) 100)
+
+    true))
+
 (defn- blind-write-attr-supported?
   [attr props tuple-source-attrs allow-unique?]
   (and props
@@ -1530,7 +1550,8 @@
                  (contains? unique-identity-attrs (first value))))))
 
 (defn- append-blind-value!
-  ^Boolean [^FastList attrs ^FastList unique-avs ^java.util.HashSet seen-avs
+  ^Boolean [^FastList attrs ^FastList unique-avs
+            ^java.util.HashSet seen-avs collect-unique-avs? has-unique?
             store-opts props attr entity value]
   (if (or (map? value)
           (datom? value)
@@ -1541,22 +1562,32 @@
                     (prepare/correct-value-with-props
                       store-opts props attr value))
           unique? (identical? (:db/unique props) :db.unique/identity)
-          av       (when unique? [attr value'])]
-      (if (and unique? (not (.add seen-avs av)))
+          _        (when unique? (vreset! has-unique? true))
+          av       (when (and unique? collect-unique-avs?) [attr value'])]
+      (if (and unique?
+               (or (not (blind-unique-inline-value?
+                          (:db/valueType props) value'))
+                   (and collect-unique-avs?
+                        (not (.add seen-avs av)))))
         false
         (do
-          (when unique? (.add unique-avs av))
+          (when av (.add unique-avs av))
           (.add attrs attr)
           (.add attrs value')
           true)))))
 
 (defn- prepare-blind-write-entity
   [store-schema store-opts tuple-source-attrs unique-identity-attrs
-   allow-unique? ^FastList unique-avs ^java.util.HashSet seen-avs entity]
+   allow-unique? ^FastList unique-avs ^java.util.HashSet seen-avs
+   collect-unique-avs? has-unique? fuse-unique-inserts? entity]
   (let [old-eid   (:db/id entity)
-        entity-id (or old-eid (auto-tempid))]
+        ;; An implicit entity does not need a transaction-scoped tempid: the
+        ;; blind stamper assigns its final EID directly and never exposes an
+        ;; implicit mapping in the report. Retain explicit tempids so repeated
+        ;; user IDs still fall back to the resolver and merge correctly.
+        entity-id old-eid]
     (when (or (nil? old-eid) (tempid? old-eid))
-      (let [^FastList attrs (FastList.)
+      (let [^FastList attrs (FastList. (int (* 2 (count entity))))
             supported?
             (reduce-kv
               (fn [_ attr raw-value]
@@ -1566,32 +1597,65 @@
                     (if-not (blind-write-attr-supported?
                               attr props tuple-source-attrs allow-unique?)
                       (reduced false)
-                      (let [supported-values?
+                      (let [_ (when (or (:db/fulltext props)
+                                        (:db/embedding props))
+                                (vreset! fuse-unique-inserts? false))
+                            supported-values?
                             (if (blind-write-multiple-values?
                                   props unique-identity-attrs raw-value)
                               (loop [values (seq raw-value)]
                                 (if-some [value (first values)]
                                   (if (append-blind-value!
-                                        attrs unique-avs seen-avs store-opts
-                                        props attr entity value)
+                                        attrs unique-avs seen-avs
+                                        collect-unique-avs? has-unique?
+                                        store-opts props attr entity value)
                                     (recur (next values))
                                     false)
                                   true))
                               (append-blind-value!
-                                attrs unique-avs seen-avs store-opts props attr
-                                entity raw-value))]
+                                attrs unique-avs seen-avs collect-unique-avs?
+                                has-unique? store-opts props attr entity
+                                raw-value))]
                         (if-not supported-values?
                           (reduced false)
                           true))))))
               true
               entity)]
         (when supported?
-          (PreparedBlindEntity. entity-id (.toArray attrs)))))))
+          (PreparedBlindEntity. entity-id attrs))))))
+
+(defn- collect-prepared-blind-unique-avs
+  [store-schema ^FastList entities ^long initial-capacity]
+  (let [^FastList avs (FastList. (int initial-capacity))
+        seen          (java.util.HashSet.
+                        (int (max 1 (inc (quot (* 4 initial-capacity) 3)))))]
+    (loop [i 0]
+      (if (< i (.size entities))
+        (let [^PreparedBlindEntity entity (.get entities i)
+              ^FastList attrs (.-attrs entity)
+              distinct?
+              (loop [j 0]
+                (if (< j (.size attrs))
+                  (let [attr (.get attrs j)
+                        value (.get attrs (unchecked-inc j))]
+                    (if (identical? (:db/unique (store-schema attr))
+                                    :db.unique/identity)
+                      (let [av [attr value]]
+                        (if (.add seen av)
+                          (do (.add avs av) (recur (+ j 2)))
+                          false))
+                      (recur (+ j 2))))
+                  true))]
+          (when distinct?
+            (recur (unchecked-inc i))))
+        avs))))
 
 (defn ^:no-doc prepare-blind-local-tx
   ([^DB db initial-es]
-   (prepare-blind-local-tx db initial-es false))
+   (prepare-blind-local-tx db initial-es false true))
   ([^DB db initial-es allow-small-unique?]
+   (prepare-blind-local-tx db initial-es allow-small-unique? true))
+  ([^DB db initial-es allow-small-unique? collect-unique-avs?]
    (let [store             (.-store db)
          store-schema      (schema store)
          store-opts        (opts store)
@@ -1604,9 +1668,18 @@
                                           blind-unique-write-threshold
                                           initial-es))
                                    blind-unique-write-threshold))
-         ^FastList unique-avs (FastList.)
-         seen-avs          (java.util.HashSet.)
-         seen-tempids      (java.util.HashSet.)
+         initial-count     (int
+                             (if (instance? java.util.Collection initial-es)
+                               (.size ^java.util.Collection initial-es)
+                               0))
+         set-capacity      (int (max 1 (inc (quot (* 4 (long initial-count))
+                                                  3))))
+         ^FastList unique-avs (FastList. initial-count)
+         seen-avs          (when collect-unique-avs?
+                              (java.util.HashSet. set-capacity))
+         seen-tempids      (java.util.HashSet. set-capacity)
+         has-unique?       (volatile! false)
+         fuse-unique-inserts? (volatile! true)
          entities
          (reduce
            (fn [^FastList acc entity]
@@ -1615,23 +1688,37 @@
                         (prepare-blind-write-entity
                           store-schema store-opts tuple-source-attrs
                           unique-identity-attrs allow-unique? unique-avs
-                          seen-avs entity)]
-                 (if-not (.add seen-tempids (.-tempid prepared))
+                          seen-avs collect-unique-avs? has-unique?
+                          fuse-unique-inserts? entity)]
+                 (if (and (.-tempid prepared)
+                          (not (.add seen-tempids (.-tempid prepared))))
                    (reduced nil)
-                   (if (or (pos? (alength ^objects (.-attrs prepared)))
+                   (if (or (not (.isEmpty ^FastList (.-attrs prepared)))
                            auto-entity-time?)
                      (doto acc (.add prepared))
                      acc))
                  (reduced nil))
                (reduced nil)))
-           (FastList.)
-           initial-es)]
-     (when (and entities (not (.isEmpty ^FastList entities)))
+           (FastList. initial-count)
+           initial-es)
+         fuse-unique-inserts?
+         (and @has-unique? @fuse-unique-inserts?)
+         unique-avs
+         (if (and entities
+                  @has-unique?
+                  (not collect-unique-avs?)
+                  (not fuse-unique-inserts?))
+           (collect-prepared-blind-unique-avs
+             store-schema entities initial-count)
+           unique-avs)]
+     (when (and entities unique-avs (not (.isEmpty ^FastList entities)))
        (->PreparedBlindTx store-schema
                           store-opts
                           auto-entity-time?
                           entities
-                          unique-avs)))))
+                          unique-avs
+                          @has-unique?
+                          fuse-unique-inserts?)))))
 
 (defn ^:no-doc blind-local-tx-unique-values-absent?
   "Check a prepared batch's identity values against the current store snapshot.
@@ -1668,24 +1755,26 @@
             (let [^PreparedBlindEntity entity (.get entities i)
                   eid      (unchecked-inc next-eid)
                   tempid   (.-tempid entity)
-                  ^objects attrs (.-attrs entity)
-                  attr-count (alength attrs)
+                  ^FastList attrs (.-attrs entity)
+                  attr-count (.size attrs)
                   tx-data (cond-> tx-data
                             auto-entity-time?
-                            (conj! (datom eid :db/created-at tx-time tx-id))
+                            (conj! (Datom. eid :db/created-at tx-time
+                                           tx-id 0 nil))
 
                             auto-entity-time?
-                            (conj! (datom eid :db/updated-at tx-time tx-id)))
+                            (conj! (Datom. eid :db/updated-at tx-time
+                                           tx-id 0 nil)))
                   tx-data
                   (loop [j 0
                          tx-data tx-data]
                     (if (< j attr-count)
                       (recur (+ j 2)
                              (conj! tx-data
-                                    (datom eid
-                                           (aget attrs j)
-                                           (aget attrs (unchecked-inc j))
-                                           tx-id)))
+                                    (Datom. eid
+                                            (.get attrs j)
+                                            (.get attrs (unchecked-inc j))
+                                            tx-id 0 nil)))
                       tx-data))
                   tempids (if (and tempid (not (auto-tempid? tempid)))
                             (assoc! tempids tempid eid)
@@ -1693,13 +1782,11 @@
               (recur (unchecked-inc i) tx-data tempids eid))
             [(persistent! tx-data) (persistent! tempids) next-eid]))
         tempids            (assoc tempids :db/current-tx tx-id)
-        info               {:max-eid max-eid
-                            :max-tx  tx-id}
         db-after           (-> db
                                (assoc :max-eid max-eid)
                                (assoc :max-tx tx-id))
         report             (->TxReport db db-after tx-data tempids tx-meta)]
-    [report info]))
+    report))
 
 (defn transact-tx-data
   [initial-report initial-es simulated?]

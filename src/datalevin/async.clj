@@ -48,6 +48,7 @@
 (deftype WorkQueue [^ConcurrentLinkedQueue items  ; [WorkItem ...]
                     fw ; first work
                     ^FastList stage ; for combining work
+                    ^AtomicBoolean active
                     ])
 
 (def ^:private async-backlog-factor
@@ -176,26 +177,32 @@
    ^Semaphore backlog]
   (let [^WorkQueue wq                (.get work-queues k)
         ^ConcurrentLinkedQueue items (.-items wq)
-        first-work                   (.-fw wq)]
-    (locking items
-      ;; Duplicate event keys can schedule adjacent handlers. A prior handler
-      ;; may consume an item that arrived while it was draining, leaving the
-      ;; next handler with an empty queue.
+        first-work                   (.-fw wq)
+        ^AtomicBoolean active        (.-active wq)]
+    (try
       (when (.peek items)
         (if-let [cmb (combine first-work)]
           (combined-work cmb items (.-stage wq) backlog first-work)
           (individual-work items backlog)))
-      ;; A weighted batch can intentionally leave work queued. Producers may
-      ;; also add work while the handler runs, so make the residual explicit
-      ;; instead of relying on a duplicate key already being present.
-      (when (.peek items)
-        (.offer event-queue k)))))
+      (finally
+        (if (.peek items)
+          ;; Keep ownership while handing a weighted residual or newly arrived
+          ;; work back to the dispatcher.
+          (.offer event-queue k)
+          (do
+            (.set active false)
+            ;; Close the enqueue-vs-release race: a producer that observed the
+            ;; old active=true did not schedule an event.
+            (when (and (.peek items)
+                       (.compareAndSet active false true))
+              (.offer event-queue k))))))))
 
 (defn- new-workqueue
   [work]
   (let [cmb (combine work)]
     (assert (or (nil? cmb) (ifn? cmb)) "combine should be nil or a function")
-    (->WorkQueue (ConcurrentLinkedQueue.) work (when cmb (FastList.)))))
+    (->WorkQueue (ConcurrentLinkedQueue.) work (when cmb (FastList.))
+                 (AtomicBoolean. false))))
 
 (defn- enqueue-work!
   [^ConcurrentHashMap work-queues
@@ -219,7 +226,10 @@
             item                     (->WorkItem work p cb)
             ^ConcurrentLinkedQueue q (.-items wq)]
         (.offer q item)
-        (.offer event-queue k))
+        ;; Exactly one event/handler may own a work key at a time. The handler
+        ;; reschedules itself if work arrives while it is active.
+        (when (.compareAndSet ^AtomicBoolean (.-active wq) false true)
+          (.offer event-queue k)))
       (catch Throwable e
         (.release backlog)
         (throw e)))))
@@ -241,13 +251,12 @@
     (letfn [(event-loop []
               (when (.get running)
                 (let [k (.take event-queue)]
-                  (when-not (.contains event-queue k) ; do nothing when busy
-                    (when (.get running)
-                      (.submit workers
-                               ^Callable #(event-handler work-queues
-                                                         event-queue
-                                                         k
-                                                         backlog)))))
+                  (when (.get running)
+                    (.submit workers
+                             ^Callable #(event-handler work-queues
+                                                       event-queue
+                                                       k
+                                                       backlog))))
                 (recur)))
             (init []
               (try (event-loop)

@@ -1083,16 +1083,24 @@
         (dotimes [i n]
           (let [^DatomKVTxData tx (aget datoms i)]
             (if (.-added? tx)
-              (do
+              (let [base-flags (if new-entity-batch?
+                                 DTLV/MDB_APPENDDUP
+                                 (int 0))
+                    flags      (if (.-no-overwrite? tx)
+                                 (bit-or base-flags DTLV/MDB_NOOVERWRITE)
+                                 base-flags)]
                 (.put-key ave (.-avg tx) :raw)
                 (.putValId ave (.-e tx))
                 ;; EAV appendability proves every entity ID is above the
                 ;; previous database maximum. AVE is sorted by key and entity,
                 ;; so each existing duplicate tree can append without a data
                 ;; search. New AVE keys still use the ordinary key insertion.
-                (.put cur (if new-entity-batch?
-                            DTLV/MDB_APPENDDUP
-                            (int 0))))
+                (if (.-no-overwrite? tx)
+                  (when-not (.tryPut cur (int flags))
+                    (throw
+                      (ex-info "Blind unique value already exists"
+                               {:type l/blind-unique-collision-type})))
+                  (.put cur (int flags))))
               (put-ave-datom-tx ave txn tx))))))
     (dotimes [i (.size txs)]
       (let [tx (.get txs i)]
@@ -1939,7 +1947,8 @@
                           (raise "DB resized" {:resized true}))))
                   (catch Exception e
                     (when one-shot? (.close txn))
-                    (if (= :ha/write-rejected (:error (ex-data e)))
+                    (if (or (= :ha/write-rejected (:error (ex-data e)))
+                            (l/blind-unique-collision? e))
                       (throw e)
                       (raise "Fail to transact to LMDB: " e {}))))))]
         (if (Thread/holdsLock write-txn)

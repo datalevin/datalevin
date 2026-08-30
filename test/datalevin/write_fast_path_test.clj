@@ -18,7 +18,8 @@
   (:import
    [datalevin.lmdb DatomKVTxData]
    [java.util ArrayList UUID]
-   [java.util.concurrent.atomic AtomicLong]))
+   [java.util.concurrent.atomic AtomicLong]
+   [org.eclipse.collections.impl.list.mutable FastList]))
 
 (def ^:private schema
   {:item/id    {:db/valueType :db.type/long
@@ -45,6 +46,10 @@
              :item/left  true
              :item/right false})
           (range start (+ start n)))))
+
+(defn- invoke-conn-private
+  [sym & args]
+  (apply (ns-resolve 'datalevin.conn sym) args))
 
 (deftest relaxed-wal-idle-writes-retain-txlog-grouping-on-direct-path
   (let [conn* (d/create-conn nil
@@ -85,10 +90,10 @@
       (.add txs (Object.))
       (is (false? (add-only? txs))))
     (testing "one added datom is sufficient, with no size threshold"
-      (.add txs (DatomKVTxData. 1 (byte-array 0) true))
+      (.add txs (DatomKVTxData. 1 (byte-array 0) true false))
       (is (true? (add-only? txs))))
     (testing "any retraction retains the general transaction path"
-      (.add txs (DatomKVTxData. 2 (byte-array 0) false))
+      (.add txs (DatomKVTxData. 2 (byte-array 0) false false))
       (is (false? (add-only? txs))))))
 
 (deftest supported-unique-inserts-use-small-batch-blind-preparation
@@ -101,13 +106,15 @@
         (let [prepared (db/prepare-blind-local-tx @conn (item-batch 0 2))]
           (is (some? prepared))
           (is (= 2 (count (:entities prepared))))
-          (is (= 2 (count (:unique-avs prepared))))))
+          (is (= 2 (count (:unique-avs prepared))))
+          (is (true? (:fuse-unique-inserts? prepared)))))
       (testing "WAL can opt a single unique insert into blind preparation"
         (let [prepared (db/prepare-blind-local-tx
                          @conn (item-batch 2 1) true)]
           (is (some? prepared))
           (is (= 1 (count (:entities prepared))))
-          (is (= 1 (count (:unique-avs prepared))))))
+          (is (= 1 (count (:unique-avs prepared))))
+          (is (true? (:fuse-unique-inserts? prepared)))))
       (testing "large, distinct scalar identity values use blind preparation"
         (let [prepared (db/prepare-blind-local-tx @conn (item-batch 0 256))]
           (is (some? prepared))
@@ -118,6 +125,77 @@
                          {:db/id "same" :item/id 1 :item/right true}]
                         (item-batch 2 254))]
           (is (nil? (db/prepare-blind-local-tx @conn txs)))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest combined-queued-wal-inserts-use-blind-preparation
+  (let [dir  (u/tmp-dir (str "blind-queued-wal-" (UUID/randomUUID)))
+        conn (d/get-conn dir schema {:wal? true
+                                     :wal-durability-profile :relaxed})]
+    (try
+      (let [requests (doto (FastList. 2)
+                       (.add (conn/->SyncQueuedReq
+                               (item-batch 0 10) {:request 0} (promise)))
+                       (.add (conn/->SyncQueuedReq
+                               (item-batch 10 10) {:request 1} (promise))))
+            ^objects prepared
+            (invoke-conn-private
+              'prepare-sync-queued-blind-batch conn requests)
+            ^objects reports (object-array 2)]
+        (is (some? prepared))
+        (is (true?
+              (invoke-conn-private
+                'try-commit-sync-queued-blind-batch!
+                conn requests prepared reports)))
+        (let [report-0 (aget reports 0)
+              report-1 (aget reports 1)]
+          (is (= {:request 0} (:tx-meta report-0)))
+          (is (= {:request 1} (:tx-meta report-1)))
+          (is (not= (:db/current-tx (:tempids report-0))
+                    (:db/current-tx (:tempids report-1))))
+          (is (= 20 (d/count-datoms @conn nil :item/id nil)))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest combined-queued-blind-preparation-falls-back-safely
+  (let [dir  (u/tmp-dir (str "blind-queued-fallback-" (UUID/randomUUID)))
+        conn (d/get-conn dir schema {:wal? true
+                                     :wal-durability-profile :relaxed})]
+    (try
+      (testing "identities duplicated across requests require full resolution"
+        (let [requests (doto (FastList. 2)
+                         (.add (conn/->SyncQueuedReq
+                                 [{:item/id 1 :item/value "first"}]
+                                 nil (promise)))
+                         (.add (conn/->SyncQueuedReq
+                                 [{:item/id 1 :item/value "second"}]
+                                 nil (promise))))]
+          (is (nil?
+                (invoke-conn-private
+                  'prepare-sync-queued-blind-batch conn requests)))))
+      (testing "an existing identity aborts before any queued write is made"
+        (d/transact! conn [{:item/id 1 :item/value "existing"}])
+        (let [requests (doto (FastList. 2)
+                         (.add (conn/->SyncQueuedReq
+                                 [{:item/id 1 :item/value "updated"}]
+                                 nil (promise)))
+                         (.add (conn/->SyncQueuedReq
+                                 [{:item/id 2 :item/value "new"}]
+                                 nil (promise))))
+              ^objects prepared
+              (invoke-conn-private
+                'prepare-sync-queued-blind-batch conn requests)
+              ^objects reports (object-array 2)]
+          (is (some? prepared))
+          (is (false?
+                (invoke-conn-private
+                  'try-commit-sync-queued-blind-batch!
+                  conn requests prepared reports)))
+          (is (= "existing" (:item/value
+                               (d/entity @conn [:item/id 1]))))
+          (is (nil? (d/entity @conn [:item/id 2])))))
       (finally
         (d/close conn)
         (u/delete-files dir)))))
@@ -137,6 +215,31 @@
       (finally
         (d/close conn)
         (u/delete-files dir)))))
+
+(deftest giant-identity-values-use-logical-unique-lookups
+  (let [giant-schema {:item/id    {:db/valueType :db.type/string
+                                    :db/unique    :db.unique/identity}
+                      :item/value {:db/valueType :db.type/string}}
+        a            (apply str (repeat 600 \a))
+        b            (apply str (repeat 600 \b))]
+    (doseq [wal? [false true]]
+      (testing (if wal? "WAL" "default LMDB")
+        (let [dir  (u/tmp-dir (str "giant-identity-" wal? "-"
+                                   (UUID/randomUUID)))
+              conn (d/get-conn dir giant-schema {:wal? wal?})]
+          (try
+            (testing "giant identities stay out of the physical-key fast path"
+              (is (nil? (db/prepare-blind-local-tx
+                          @conn [{:item/id a} {:item/id b}]))))
+            (d/transact! conn [{:item/id a :item/value "a"}
+                               {:item/id b :item/value "b"}])
+            (d/transact! conn [{:item/id b :item/value "updated"}])
+            (is (= 2 (d/count-datoms @conn nil :item/id nil)))
+            (is (= "updated"
+                   (:item/value (d/entity @conn [:item/id b]))))
+            (finally
+              (d/close conn)
+              (u/delete-files dir))))))))
 
 (deftest ordered-ave-duplicate-appends-preserve-data
   (let [dir   (u/tmp-dir (str "ordered-ave-duplicates-" (UUID/randomUUID)))

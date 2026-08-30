@@ -658,17 +658,23 @@
 
 (defn- bb-write-flags!
   ^ByteBuffer [^ByteBuffer bf ^ThreadLocal tl flags]
-  (let [fs (normalize-flags flags)
-        cnt (count fs)]
-    (when (> cnt 255)
-      (raise "Too many txn-log flags"
-             {:type :txlog/corrupt
-              :count cnt}))
-    (let [bf (bb-put-byte! bf tl cnt)]
-      (reduce (fn [^ByteBuffer bf f]
-                (bb-put-byte! bf tl (int (flag->byte f))))
-              bf
-              fs))))
+  (if (nil? flags)
+    ;; Datom rows, metadata rows, and most general KV writes carry no flags.
+    ;; Avoid normalizing a collection and constructing a reducing closure for
+    ;; every canonical WAL row in that common case.
+    (bb-put-byte! bf tl 0)
+    (let [fs  (normalize-flags flags)
+          cnt (count fs)]
+      (when (> cnt 255)
+        (raise "Too many txn-log flags"
+               {:type :txlog/corrupt
+                :count cnt}))
+      (loop [^ByteBuffer out (bb-put-byte! bf tl cnt)
+             i               0]
+        (if (< i cnt)
+          (recur (bb-put-byte! out tl (int (flag->byte (nth fs i))))
+                 (unchecked-inc i))
+          out)))))
 
 (defn- bb-read-flags
   [^ByteBuffer bf]

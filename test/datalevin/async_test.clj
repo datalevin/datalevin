@@ -1,7 +1,10 @@
 (ns datalevin.async-test
   (:require
    [clojure.test :refer [deftest is]]
-   [datalevin.async :as async]))
+   [datalevin.async :as async])
+  (:import
+   [datalevin.async AsyncExecutor]
+   [java.util.concurrent LinkedBlockingQueue]))
 
 (deftype FailingWork [callback]
   async/IAsyncWork
@@ -177,6 +180,27 @@
         (is (= values (deref result 1000 ::timeout))))
       (doseq [callback-result callbacks]
         (is (= values (deref callback-result 1000 ::timeout))))
+      (finally
+        (async/stop executor)))))
+
+(deftest one-event-owns-each-work-key
+  (let [new-executor (ns-resolve 'datalevin.async 'new-async-executor)
+        executor     (new-executor)
+        values       (vec (range 100))
+        results      (mapv (fn [value]
+                             (async/exec
+                               executor
+                               (->CombiningWork value nil)))
+                           values)
+        ^LinkedBlockingQueue event-queue
+        (.-event-queue ^AsyncExecutor executor)]
+    (try
+      ;; Producers append directly to the per-key queue. Only its owner should
+      ;; place a dispatcher event, regardless of how many requests accumulate.
+      (is (= 1 (.size event-queue)))
+      (async/start executor)
+      (doseq [result results]
+        (is (= values (deref result 2000 ::timeout))))
       (finally
         (async/stop executor)))))
 
