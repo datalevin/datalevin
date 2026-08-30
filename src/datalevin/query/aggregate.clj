@@ -16,8 +16,9 @@
    [datalevin.relation :as r]
    [datalevin.util :as u])
   (:import
-   [java.util HashMap HashSet List]
    [datalevin.parser Constant PlainSymbol SrcVar Variable]
+   [datalevin.utl NumberOps]
+   [java.util HashMap HashSet List]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
 (def ^:dynamic *keyed-group-reduction?*
@@ -47,7 +48,7 @@
 
 (defn- add-sum-values
   [a b]
-  (clojure.lang.Numbers/add a b))
+  (NumberOps/add a b))
 
 (defn- sums-relation
   [group-vars value-var ^HashMap sums]

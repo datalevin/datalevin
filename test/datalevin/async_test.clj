@@ -1,10 +1,24 @@
 (ns datalevin.async-test
   (:require
-   [clojure.test :refer [deftest is]]
-   [datalevin.async :as async])
+   [clojure.test :refer [deftest is use-fixtures]]
+   [datalevin.async :as async]
+   [taoensso.timbre :as log])
   (:import
    [datalevin.async AsyncExecutor]
    [java.util.concurrent LinkedBlockingQueue]))
+
+(defn- suppress-logs
+  [f]
+  (let [config log/*config*]
+    (try
+      ;; Async work runs on raw executor threads, so change Timbre's root
+      ;; configuration rather than relying on a dynamic binding.
+      (log/set-config! (log/set-min-level config :report))
+      (f)
+      (finally
+        (log/set-config! config)))))
+
+(use-fixtures :once suppress-logs)
 
 (deftype FailingWork [callback]
   async/IAsyncWork
