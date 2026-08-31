@@ -575,6 +575,15 @@
   '[:find (count ?e) .
     :where [?e :person/age _]])
 
+(def ^:private datalog-mixed-person-query
+  '[:find ?first-name ?last-name ?age
+    :in $ ?person-id
+    :where
+    [?e :person/id ?person-id]
+    [?e :person/first-name ?first-name]
+    [?e :person/last-name ?last-name]
+    [?e :person/age ?age]])
+
 (defn- verify-datalog-counts!
   [db expected label]
   ;; Use exact query scans here. Native key-range counts are intended to be
@@ -921,8 +930,8 @@
           {:tx-fn   (if async?
                       (fn [txs callback]
                         (d/get-value db max-write-dbi (read-id) :string :data)
-                        @(d/transact-kv-async db max-write-dbi txs
-                                              :string :data callback))
+                        (d/transact-kv-async db max-write-dbi txs
+                                             :string :data callback))
                       (fn [txs callback]
                         (d/get-value db max-write-dbi (read-id) :string :data)
                         (callback
@@ -944,23 +953,20 @@
             (throw t))))
 
       :datalog
-      (let [conn  (d/get-conn
-                    target
-                    person-schema
-                    (datalog-opts wal? durability-profile))
-            query '[:find (pull ?e [:person/first-name
-                                    :person/last-name
-                                    :person/age])
-                    :in $ ?person-id
-                    :where [?e :person/id ?person-id]]]
+      (let [conn (d/get-conn
+                   target
+                   person-schema
+                   (datalog-opts wal? durability-profile))]
         (try
           (verify-datalog-counts! (d/db conn) initial-total :datalog-initial)
           {:tx-fn   (if async?
                       (fn [txs callback]
-                        (d/q query (d/db conn) (read-id))
-                        @(d/transact-async conn txs nil callback))
+                        (d/q datalog-mixed-person-query
+                             (d/db conn) (read-id))
+                        (d/transact-async conn txs nil callback))
                       (fn [txs callback]
-                        (d/q query (d/db conn) (read-id))
+                        (d/q datalog-mixed-person-query
+                             (d/db conn) (read-id))
                         (callback (d/transact! conn txs nil))))
            :add-fn  (fn [^FastList txs]
                       (let [slot (write-slot)]
@@ -1017,10 +1023,9 @@
             (throw t)))))))
 
 (defn mixed
-  "Run a closed-loop mixed workload against a database produced by `write`.
-  Every read/write pair completes before the next pair starts, including when
-  an async API is selected, so all stores provide the same read-your-writes
-  semantics."
+  "Run a mixed workload against a database produced by `write`. Each request
+  performs an indexed read followed by an upsert submission. Sync tasks complete
+  each write before continuing; async tasks keep a bounded write pipeline."
   [{:keys [dir f durability-profile total initial-total report
            completion-timeout-ms seed]
     :or   {total                 1000000
@@ -1050,8 +1055,8 @@
                       {:total-writes total-operations
                        :batch-size 1
                        :threads 1
-                       ;; Async APIs are deliberately awaited inside tx-fn.
-                       :async? false
+                       :async? (:async? info)
+                       :in-flight in-flight
                        :completion-timeout-ms completion-timeout
                        :report-every report-every
                        :tx-fn (:tx-fn context)
@@ -1067,7 +1072,8 @@
                  :batch 1
                  :threads 1
                  :async? (:async? info)
-                 :closed-loop? true
+                 :closed-loop? (not (:async? info))
+                 :in-flight (when (:async? info) in-flight)
                  :durability-profile effective-profile
                  :seed seed
                  :workload workload-description

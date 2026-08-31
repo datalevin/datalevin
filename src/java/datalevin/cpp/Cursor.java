@@ -1,5 +1,7 @@
 package datalevin.cpp;
 
+import static datalevin.cpp.UnsafeAccess.UNSAFE;
+
 import org.bytedeco.javacpp.*;
 import datalevin.dtlvnative.DTLV;
 import java.nio.ByteBuffer;
@@ -9,16 +11,31 @@ import java.nio.ByteBuffer;
  */
 public class Cursor {
 
+    private static final int MDB_VAL_STRUCT_SIZE
+        = Pointer.sizeof(DTLV.MDB_val.class);
+    private static final int MDB_VAL_SIZE_OFFSET
+        = Pointer.offsetof(DTLV.MDB_val.class, "mv_size");
+    private static final int MDB_VAL_DATA_OFFSET
+        = Pointer.offsetof(DTLV.MDB_val.class, "mv_data");
+
     private DTLV.MDB_cursor ptr;
 
     private BufVal key;
     private BufVal val;
     private DTLV.MDB_val multipleVals;
+    private boolean ownsMultipleVals;
 
     public Cursor(DTLV.MDB_cursor ptr, BufVal key, BufVal val) {
+        this(ptr, key, val, null, true);
+    }
+
+    private Cursor(DTLV.MDB_cursor ptr, BufVal key, BufVal val,
+                   DTLV.MDB_val multipleVals, boolean ownsMultipleVals) {
         this.ptr = ptr;
         this.key = key;
         this.val = val;
+        this.multipleVals = multipleVals;
+        this.ownsMultipleVals = ownsMultipleVals;
     }
 
     /**
@@ -31,6 +48,24 @@ public class Cursor {
         Util.checkRc(DTLV.mdb_cursor_open(txn.get(), dbi.get(), ptr));
 
         return new Cursor(ptr, key, val);
+    }
+
+    /**
+     * Create a cursor that borrows reusable MDB_MULTIPLE descriptors.
+     */
+    public static Cursor create(Txn txn, Dbi dbi, BufVal key, BufVal val,
+                                DTLV.MDB_val multipleVals) {
+
+        if (multipleVals == null) {
+            throw new IllegalArgumentException(
+                "Reusable multiple values cannot be null");
+        }
+
+        DTLV.MDB_cursor ptr = new DTLV.MDB_cursor();
+
+        Util.checkRc(DTLV.mdb_cursor_open(txn.get(), dbi.get(), ptr));
+
+        return new Cursor(ptr, key, val, multipleVals, false);
     }
 
     /**
@@ -144,30 +179,36 @@ public class Cursor {
             multipleVals = new DTLV.MDB_val(2);
         }
 
-        final long firstAddress = multipleVals.position(0).address();
-        final long secondAddress = multipleVals.position(1).address();
-        if (BufVal.UNSAFE_AVAILABLE) {
-            values.unsafeIn(firstAddress, values.inAddr(), itemSize);
-            UnsafeAccess.UNSAFE.putLong(
-                secondAddress + BufVal.STRUCT_FIELD_OFFSET_SIZE, itemCount);
-            UnsafeAccess.UNSAFE.putLong(
-                secondAddress + BufVal.STRUCT_FIELD_OFFSET_DATA, 0L);
+        multipleVals.position(0);
+        final boolean useUnsafe = UnsafeAccess.isAvailable();
+        final long secondValAddress = useUnsafe
+            ? multipleVals.address() + MDB_VAL_STRUCT_SIZE
+            : 0L;
+        if (useUnsafe) {
+            final long firstValAddress = multipleVals.address();
+            /* JavaCPP Pointer.address() is the allocation base, independent
+             * of logical position. Advance by the native struct size so the
+             * count lands in the second MDB_val rather than overwriting the
+             * first one's size. */
+            UNSAFE.putLong(firstValAddress + MDB_VAL_SIZE_OFFSET, itemSize);
+            UNSAFE.putLong(firstValAddress + MDB_VAL_DATA_OFFSET,
+                           values.inAddr());
+            UNSAFE.putLong(secondValAddress + MDB_VAL_SIZE_OFFSET, itemCount);
         } else {
-            multipleVals.position(0).mv_size(itemSize).mv_data(values.data());
+            multipleVals.mv_size(itemSize).mv_data(values.data());
             multipleVals.position(1).mv_size(itemCount);
+            multipleVals.position(0);
         }
 
-        multipleVals.position(0);
         final int rc = DTLV.mdb_cursor_put(
             ptr(), key.ptr(), multipleVals, flags | DTLV.MDB_MULTIPLE);
         final long processed;
-        if (BufVal.UNSAFE_AVAILABLE) {
-            processed = UnsafeAccess.UNSAFE.getLong(
-                secondAddress + BufVal.STRUCT_FIELD_OFFSET_SIZE);
+        if (useUnsafe) {
+            processed = UNSAFE.getLong(secondValAddress + MDB_VAL_SIZE_OFFSET);
         } else {
             processed = multipleVals.position(1).mv_size();
+            multipleVals.position(0);
         }
-        multipleVals.position(0);
         Util.checkRc(rc);
         return processed;
     }
@@ -179,7 +220,9 @@ public class Cursor {
         DTLV.mdb_cursor_close(ptr);
         ptr.close();
         if (multipleVals != null) {
-            multipleVals.position(0).close();
+            if (ownsMultipleVals) {
+                multipleVals.position(0).close();
+            }
             multipleVals = null;
         }
     }

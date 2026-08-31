@@ -165,6 +165,14 @@
     (is (not= second-id (invoke-private 'person-id 43 2)))
     (is (= second-id (str (UUID/fromString second-id))))))
 
+(deftest mixed-datalog-read-uses-a-relation-find-spec
+  (let [query (var-get
+                (ns-resolve 'datalevin-bench.core
+                            'datalog-mixed-person-query))]
+    (is (= '[:find ?first-name ?last-name ?age]
+           (subvec query 0 4)))
+    (is (= :in (nth query 4)))))
+
 (deftest fresh-target-validation-covers-files-directories-and-sidecars
   (with-temp-root
     "write-bench-target-"

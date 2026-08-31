@@ -38,15 +38,20 @@ connection with a 10-second busy timeout.
 
 ### Mixed
 
-Mixed mode starts with one million people and performs one million closed-loop
-read/write pairs. Each pair reads a person by UUID and then upserts a complete
-person record containing first name, last name, and age.
+Mixed mode starts with one million people and performs one million read/write
+pairs. Each pair reads a person by UUID and then upserts a complete person
+record containing first name, last name, and age.
 
 Read and write slots are selected independently from 1 through two million,
-giving an initial 50% hit/upsert probability. Every pair completes before the
-next begins, including when an async Datalevin API is selected. SQLite uses
-`INSERT ... ON CONFLICT DO UPDATE`, matching Datalevin identity upsert
-semantics.
+giving an initial 50% hit/upsert probability. Sync tasks complete each write
+before starting the next read. Async Datalevin tasks keep up to 1000 submitted
+writes outstanding; subsequent reads use the latest available connection
+snapshot without a read-your-write barrier. SQLite uses connection-scoped
+prepared lookup and `INSERT ... ON CONFLICT DO UPDATE` statements, matching
+Datalevin identity upsert semantics.
+
+The Datalog lookup uses a relation find specification for first name, last
+name, and age; it does not use the single-tuple find form.
 
 ### KV
 
@@ -111,13 +116,14 @@ measurement:
 
 ```bash
 clj -X:mixed \
-  :dir '"/private/tmp/dtlv-write/dl-sync-wal-b1/dl-sync-wal-1-relaxed"' \
+  :dir '"/private/tmp/dtlv-write/dl-sync-wal-b1000/dl-sync-wal-1000-relaxed"' \
   :f dl-sync-wal \
   :durability-profile :relaxed
 ```
 
 A mixed run mutates its input database. Prepare an independent identical
-database for each measurement.
+database for each measurement. Published mixed results use clones of the
+batch-1000 initial targets.
 
 ### KV
 
@@ -152,11 +158,12 @@ accepts `:measurement-writes` as an alias for `:total` and rejects the old
 
 ### Measurement protocol
 
-Publishable results use one measurement pass against a fresh database. There
-is no discarded warmup pass: database growth, page allocation, and sync costs
-are part of the workload. Use the same one-million-record dataset, seed, caller
-count, and durability settings for every comparison. Run on an otherwise idle
-machine.
+Publishable results use one measurement pass. Pure write starts with a fresh
+empty database; mixed starts with an independent clone of its defined
+preloaded image. There is no discarded warmup pass: database growth, page
+allocation, and sync costs are part of the workload. Use the same dataset,
+seed, caller count, and durability settings for every comparison. Run on an
+otherwise idle machine.
 
 Data generation is included in end-to-end throughput but excluded from the API
 call-latency sample. The default seed is 42. Initial and final record counts are
@@ -211,7 +218,8 @@ boundaries, not byte-for-byte physical index work.
 
 The measurement CSV reports:
 
-- `Writes` and `Requests`: completed records and API transactions.
+- `Writes` and `Requests`: completed records or mixed pairs, and API
+  transactions.
 - `Time`: elapsed time through the last completion callback.
 - `Throughput`: completed records divided by elapsed time.
 - `Call Mean`: time spent in the transaction API call; for async tasks this is
@@ -239,9 +247,9 @@ lein test datalevin.async-test
 
 Results show throughput: records written per second.
 
-Datalevin results were measured on 2026-08-30 with Datalevin 1.1.0. SQLite
-results were measured on 2026-08-29. Every SQLite run includes the three
-explicit value indexes described above.
+Datalevin rows were rerun on 2026-08-30 with Datalevin 1.1.0 and native
+library 0.19.4. SQLite comparator rows are the existing matching runs measured
+on 2026-08-29; every SQLite run includes the three explicit value indexes.
 
 `Datalog sync` and SQLite are blocking APIs and are compared in the
 `Sync comparison` column. Datalog async is reported in the last column.
@@ -250,45 +258,27 @@ explicit value indexes described above.
 
 | Batch | Datalog sync | SQLite | Sync comparison | Datalog async |
 |---:|---:|---:|---:|---:|
-| 1 | 2,382/s | 1,814/s | Datalog 1.313X | 37,939/s |
-| 10 | 5,217/s | 6,233/s | SQLite 1.195X | 109,314/s |
-| 100 | 12,397/s | 14,171/s | SQLite 1.143X | 263,231/s |
-| 1000 | 48,518/s | 30,722/s | Datalog 1.579X | 252,984/s |
+| 1 | 2,380/s | 1,814/s | Datalog 1.312X | 37,357/s |
+| 10 | 5,157/s | 6,233/s | SQLite 1.209X | 114,960/s |
+| 100 | 12,546/s | 14,171/s | SQLite 1.129X | 282,470/s |
+| 1000 | 49,436/s | 30,722/s | Datalog 1.609X | 284,146/s |
 
 ### Relaxed WAL
 
 Datalevin uses its `:relaxed` WAL profile. SQLite uses WAL with
-`synchronous=NORMAL`. Neither requests the separately labeled extra macOS
-full-sync policy.
+`synchronous=NORMAL`.
 
 | Batch | Datalog sync | SQLite | Sync comparison | Datalog async |
 |---:|---:|---:|---:|---:|
-| 1 | 13,278/s | 15,574/s | SQLite 1.173X | 110,012/s |
-| 10 | 35,436/s | 19,083/s | Datalog 1.857X | 197,452/s |
-| 100 | 66,010/s | 25,757/s | Datalog 2.563X | 243,797/s |
-| 1000 | 125,693/s | 33,146/s | Datalog 3.792X | 239,262/s |
-
-Both synchronous APIs commit once per request. Datalog materializes four datoms
-per person in both EAV and AVE. SQLite writes a table row, its string-primary-key
-index, and the three explicit secondary indexes. AVE is the automatically
-maintained attribute-value index that lets Datalevin query every attribute by
-value without separate index declarations; SQLite requires developers to
-declare and maintain the corresponding indexes themselves.
-
-The difference is therefore partly an ergonomics/performance tradeoff: Datalevin
-places greater priority on query ergonomics and pays the associated write cost
-automatically. This benchmark includes the corresponding SQLite indexes so the
-comparison does not reward omitting that lookup support. With larger batches,
-Datalevin sorts the EAV and AVE writes into their respective index orders and
-benefits increasingly from ordered cursor writes. It leads SQLite at batches 1
-and 1000 under default durability, and from batch 10 onward under relaxed WAL.
+| 1 | 13,094/s | 15,574/s | SQLite 1.189X | 110,755/s |
+| 10 | 35,889/s | 19,083/s | Datalog 1.881X | 211,238/s |
+| 100 | 63,440/s | 25,757/s | Datalog 2.463X | 275,859/s |
+| 1000 | 129,227/s | 33,146/s | Datalog 3.899X | 276,797/s |
 
 ## Concurrent
 
-This experiment uses batches 1, 10, 100, and 1000 with relaxed WAL. Each row
-writes one million people through `dl-sync-wal` and `sql-tx-wal` on a fresh
-database with no warmup pass. SQLite maintains the three explicit value indexes
-in every case. Results were measured on 2026-08-30.
+Each row writes one million people through `dl-sync-wal` and `sql-tx-wal` on a
+fresh database with no warmup pass, with either 2 or 4 concurrent threads.
 
 | Batch | Threads | Datalog sync | SQLite | Sync comparison |
 |---:|---:|---:|---:|---:|
@@ -303,7 +293,24 @@ in every case. Results were measured on 2026-08-30.
 
 ## Mixed
 
-Publishable mixed read/write results have not yet been collected.
+Results show completed read/write pairs per second. Each engine was populated
+once through its batch-1000 pure-write path. Every condition starts from an
+independent clone of that engine's one-million-person image, then runs one
+million pairs with seed 42, no warmup pass, and one measurement pass. Sync and
+SQLite runs are closed-loop; Datalog async keeps its bounded pipeline without a
+read-your-write barrier. SQLite maintains the three explicit value indexes.
+Corrected Datalevin runs were measured on 2026-08-30; SQLite comparator rows
+are retained from the existing matching runs.
+
+`Datalog sync` and SQLite are blocking APIs and are compared in the
+`Sync comparison` column. Datalog async is reported separately and keeps a
+bounded pipeline of outstanding writes, allowing cross-request adaptive
+batching while reads continue against the latest available snapshot.
+
+| Durability | Datalog sync | SQLite | Sync comparison | Datalog async |
+|---|---:|---:|---:|---:|
+| Default | 1,552/s | 1,515/s | Datalog 1.025X | 7,791/s |
+| Relaxed WAL | 5,398/s | 6,731/s | SQLite 1.247X | 20,437/s |
 
 ## KV
 

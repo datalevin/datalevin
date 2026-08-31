@@ -984,6 +984,162 @@
         (d/close-db db)
         (u/delete-files dir)))))
 
+(deftest input-bound-eav-projection-group-test
+  (let [dir    (u/tmp-dir (str "input-bound-eav-projection-group-"
+                               (UUID/randomUUID)))
+        schema {:person/id         {:db/valueType :db.type/string
+                                    :db/unique :db.unique/identity}
+                :person/first-name {:db/valueType :db.type/string}
+                :person/last-name  {:db/valueType :db.type/string}
+                :person/age        {:db/valueType :db.type/long}
+                :person/group      {:db/valueType :db.type/keyword}
+                :person/tag        {:db/valueType :db.type/keyword
+                                    :db/cardinality :db.cardinality/many}
+                :person/role       {:db/valueType :db.type/keyword
+                                    :db/cardinality :db.cardinality/many}}
+        conn   (d/get-conn dir schema)
+        person-query
+        '[:find [?first-name ?last-name ?age]
+          :in $ ?person-id
+          :where
+          [?e :person/id ?person-id]
+          [?e :person/first-name ?first-name]
+          [?e :person/last-name ?last-name]
+          [?e :person/age ?age]]
+        return-map-query
+        '[:find ?first-name ?last-name ?age
+          :keys first-name last-name age
+          :in $ ?person-id
+          :where
+          [?e :person/id ?person-id]
+          [?e :person/first-name ?first-name]
+          [?e :person/last-name ?last-name]
+          [?e :person/age ?age]]
+        reordered-query
+        '[:find [?age ?first-name ?last-name]
+          :in $ ?person-id
+          :where
+          [?e :person/last-name ?last-name]
+          [?e :person/id ?person-id]
+          [?e :person/age ?age]
+          [?e :person/first-name ?first-name]]
+        many-query
+        '[:find ?tag ?role
+          :in $ [?e ...]
+          :where
+          [?e :person/tag ?tag]
+          [?e :person/role ?role]]
+        many-point-query
+        '[:find ?tag ?role
+          :in $ ?person-id
+          :where
+          [?e :person/id ?person-id]
+          [?e :person/tag ?tag]
+          [?e :person/role ?role]]
+        nonunique-query
+        '[:find ?first-name ?age
+          :in $ ?group
+          :where
+          [?e :person/group ?group]
+          [?e :person/first-name ?first-name]
+          [?e :person/age ?age]]]
+    (try
+      (d/transact! conn
+                   [{:db/id 1
+                     :person/id "complete"
+                     :person/first-name "Ada"
+                     :person/last-name "Lovelace"
+                     :person/age 36}
+                    {:db/id 2
+                     :person/id "incomplete"
+                     :person/first-name "Grace"
+                     :person/last-name "Hopper"}
+                    {:db/id 3
+                     :person/id "many"
+                     :person/tag [:logic :math]
+                     :person/role [:author :programmer]}
+                    {:db/id 4
+                     :person/id "group-a"
+                     :person/group :shared
+                     :person/first-name "Edsger"
+                     :person/age 72}
+                    {:db/id 5
+                     :person/id "group-b"
+                     :person/group :shared
+                     :person/first-name "Frances"
+                     :person/age 85}])
+      (let [db-value (d/db conn)]
+        (testing "a unique scalar anchor gathers projections in one EAV scan"
+          (is (= ["Ada" "Lovelace" 36]
+                 (d/q person-query db-value "complete")))
+          (is (= [36 "Ada" "Lovelace"]
+                 (d/q reordered-query db-value "complete"))))
+        (testing "all grouped projection clauses retain conjunctive semantics"
+          (is (nil? (d/q person-query db-value "incomplete"))))
+        (testing "cardinality-many projections retain their Cartesian product"
+          (let [expected #{[:logic :author]
+                           [:logic :programmer]
+                           [:math :author]
+                           [:math :programmer]}]
+            (is (= expected (d/q many-query db-value [3])))
+            (is (= expected (d/q many-point-query db-value "many")))
+            (is (= :point-lookup-projection
+                   (get-in (d/explain {:run? true}
+                                      many-point-query db-value "many")
+                           [:executed-plan-alternative :kind]))))
+          (let [plan  (d/explain {:run? false} many-query db-value [3])
+                stage (first (:input-bound-eav-groups plan))]
+            (is (= [:person/tag :person/role] (:attributes stage)))
+            (is (= 4 (:output-tuples stage)))))
+        (testing "explain exposes both direct and planned fused projections"
+          (let [direct (d/explain {:run? true}
+                                  person-query db-value "complete")
+                direct-plan (d/explain {:run? false}
+                                       person-query db-value "complete")
+                plan   (d/explain {:run? false}
+                                  return-map-query db-value "complete")
+                stages (mapcat :materialization-stages
+                               (:pre-materialization-decisions plan))
+                stage  (some #(when (= :grouped-bound-eav (:strategy %)) %)
+                             stages)]
+            (is (= {:identity :person/id
+                    :attributes [:person/first-name
+                                 :person/last-name
+                                 :person/age]
+                    :find-type :tuple
+                    :output-tuples 1}
+                   (:point-lookup-projection direct)))
+            (is (= {:identity :person/id
+                    :attributes [:person/first-name
+                                 :person/last-name
+                                 :person/age]
+                    :find-type :tuple}
+                   (:point-lookup-projection direct-plan)))
+            (is (= '?e (:entity stage)))
+            (is (= [:person/first-name :person/last-name :person/age]
+                   (:attributes stage)))
+            (is (= 1 (:input-tuples stage)))
+            (is (= 1 (:output-tuples stage)))))
+        (testing "non-unique anchors stay on the general query path"
+          (is (= #{["Edsger" 72] ["Frances" 85]}
+                 (d/q nonunique-query db-value :shared)))
+          (is (nil? (:point-lookup-projection
+                      (d/explain {:run? true}
+                                 nonunique-query db-value :shared)))))
+        (testing "db-with snapshots preserve point-projection results"
+          (let [pending (d/db-with
+                          db-value
+                          [{:db/id 6
+                            :person/id "pending"
+                            :person/first-name "Barbara"
+                            :person/last-name "Liskov"
+                            :person/age 86}])]
+            (is (= ["Barbara" "Liskov" 86]
+                   (d/q person-query pending "pending"))))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
 (deftest hash-join-output-materialization-cost-test
   (let [estimate-cost @(ns-resolve 'datalevin.query-optimizer
                                    'estimate-hash-join-cost)]

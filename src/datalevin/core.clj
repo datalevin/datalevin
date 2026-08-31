@@ -1361,7 +1361,7 @@ Only usable for debug output.
   of `txs` and passed in as `dbi-name` argument. Similarly, `k-type` and `v-type` can be
   pulled out and passed in as arguments if the whole `txs` have the same data types.
 
-  `:flags` is a set of LMDB Write flag keywords, may include `:nooverwrite`, `:nodupdata`, `:current`, `:reserve`, `:append`, `:appenddup`, `:multiple`, see [LMDB documentation](http://www.lmdb.tech/doc/group__mdb__put.html).
+  `:flags` is a set of LMDB Write flag keywords, may include `:nooverwrite`, `:nodupdata`, `:current`, `:reserve`, `:append`, `:appenddup`, see [LMDB documentation](http://www.lmdb.tech/doc/group__mdb__put.html).
        Pass in `:append` when the data is already sorted to gain better write performance.
 
   Example:

@@ -37,7 +37,7 @@
 (defn parsed-q
   [q]
   (or (.get ^LRUCache *query-cache* q)
-      (let [res (dp/parse-query q)]
+      (let [res (qexec/prepare-query (dp/parse-query q))]
         (.put ^LRUCache *query-cache* q res)
         res)))
 

@@ -369,6 +369,14 @@
   [db tx-data]
   (:db-after (with db tx-data)))
 
+(defn- with-isolated-tx-cache
+  "Prepare against fresh mutable EAV/AVE overlays so readers of the currently
+  published DB value cannot observe transaction-local mutations."
+  [^DB db tx-data tx-meta simulated?]
+  (db/transact-tx-data
+    (db/->TxReport db (db/transfer db (.-store db)) [] {} tx-meta)
+    tx-data simulated?))
+
 (defn- local-direct-transact-eligible?
   [conn]
   (let [store (.-store ^DB @conn)]
@@ -390,7 +398,7 @@
         (let [report (u/repeat-try-catch
                        c/+in-tx-overflow-times+
                        l/resized?
-                       (with db tx-data tx-meta))]
+                       (with-isolated-tx-cache db tx-data tx-meta false))]
           (reset! conn (db/carry-runtime-opts (:db-after report) db))
           (assoc report :db-after @conn))
           (finally
@@ -475,7 +483,7 @@
         (let [report (u/repeat-try-catch
                        c/+in-tx-overflow-times+
                        l/resized?
-                       (with db tx-data tx-meta true))]
+                       (with-isolated-tx-cache db tx-data tx-meta true))]
           (with-transaction [c conn]
             (assert (active-conn-structural? c))
             (db/commit-prepared-tx-data! @c (:tx-data report) report))

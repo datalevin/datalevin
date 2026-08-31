@@ -114,10 +114,10 @@ For embedded usage, [Java](examples/java/README.md),
 and [Clojure](https://cljdoc.org/d/datalevin/datalevin) are currently supported.
 
 More information about our vision and design decisions can be found in these
-resources:
+resources in chronicle order:
 
 * Interview [Clojure Corner Interview with Huahai Yang](https://www.youtube.com/watch?v=1XMU5mdDj7I)
-* Book [Datalevin: the Definite Guide to Logical and Intelligent Databases](https://datalevin.org/docs)
+* **Book [Datalevin: the Definite Guide to Logical and Intelligent Databases](https://datalevin.org/docs)**
 * Post [Triple Store, Triple Progress: Datalevin Posited for the Future](https://yyhh.org/blog/2026/01/triple-store-triple-progress-datalevin-posited-for-the-future/)
 * Post [Achieving High Throughput and Low Latency through Adaptive Asynchronous Transaction](https://yyhh.org/blog/2025/02/achieving-high-throughput-and-low-latency-through-adaptive-asynchronous-transaction/)
 * Post [Competing for the JOB with a Triplestore](https://yyhh.org/blog/2024/09/competing-for-the-job-with-a-triplestore/)
@@ -384,8 +384,9 @@ reach as soon as we can. We may adjust the priorities based on feedback.
 * 1.0.0 ~~As a document database with automatic path indexing; WAL mode;
   transaction log access API;  read-only replicas; high availability; JSON API;
   library for Java, Python, and JavaScript; Book.~~[Done 2027/07/20]
-* 1.1.0 data compression; KV TTL;
-* 1.2.0 extensible storage/query for arbitrary data; entity-level security.
+* 1.1.0 AVE storage optimization; transaction and query performance enhancement.
+* 1.2.0 data compression; KV TTL;
+* 1.3.0 extensible storage/query for arbitrary data; entity-level security.
 * 2.0.0 direct analytics and virtual relationships.
 * 2.1.0 incremental view maintenance core.
 * 3.0.0 aggregation in rule heads.

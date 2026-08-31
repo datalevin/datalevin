@@ -10,12 +10,13 @@
 (ns datalevin.write-fast-path-test
   (:require
    [clojure.test :refer [deftest is testing]]
-   [datalevin.binding.cpp]
+   [datalevin.binding.cpp :as cpp]
    [datalevin.conn :as conn]
    [datalevin.core :as d]
    [datalevin.db :as db]
    [datalevin.util :as u])
   (:import
+   [datalevin.dtlvnative DTLV]
    [datalevin.lmdb DatomKVTxData]
    [java.util ArrayList UUID]
    [java.util.concurrent.atomic AtomicLong]
@@ -216,6 +217,28 @@
         (d/close conn)
         (u/delete-files dir)))))
 
+(deftest direct-transactions-do-not-mutate-published-db-overlays
+  (doseq [wal? [false true]]
+    (testing (if wal? "WAL" "default LMDB")
+      (let [dir  (u/tmp-dir (str "isolated-tx-cache-" wal? "-"
+                                 (UUID/randomUUID)))
+            conn (d/get-conn dir schema {:wal? wal?})]
+        (try
+          (d/transact! conn [{:item/id 1 :item/value "initial"}])
+          (let [published   @conn
+                eavt-before (vec (:eavt published))
+                avet-before (vec (:avet published))]
+            ;; An existing identity forces the ordinary resolver after the
+            ;; optimistic blind probe, exercising transaction-local overlays.
+            (d/transact! conn [{:item/id 1 :item/value "updated"}])
+            (is (= eavt-before (vec (:eavt published))))
+            (is (= avet-before (vec (:avet published))))
+            (is (= "updated"
+                   (:item/value (d/entity @conn [:item/id 1])))))
+          (finally
+            (d/close conn)
+            (u/delete-files dir)))))))
+
 (deftest giant-identity-values-use-logical-unique-lookups
   (let [giant-schema {:item/id    {:db/valueType :db.type/string
                                     :db/unique    :db.unique/identity}
@@ -242,14 +265,23 @@
               (u/delete-files dir))))))))
 
 (deftest ordered-ave-duplicate-appends-preserve-data
-  (let [dir   (u/tmp-dir (str "ordered-ave-duplicates-" (UUID/randomUUID)))
-        conn* (atom nil)]
+  (let [dir             (u/tmp-dir (str "ordered-ave-duplicates-"
+                                        (UUID/randomUUID)))
+        conn*           (atom nil)
+        multiple-counts (atom [])
+        buffer-sizes    (atom [])]
     (try
       (let [conn (d/get-conn dir schema)]
         (reset! conn* conn)
         ;; The second batch appends to duplicate trees created by the first.
-        (d/transact! conn (repeated-value-batch 0 256))
-        (d/transact! conn (repeated-value-batch 256 256))
+        (binding [cpp/*ave-multiple-write-observer*
+                  #(swap! multiple-counts conj %)
+                  cpp/*ave-multiple-buffer-allocation-observer*
+                  #(swap! buffer-sizes conj %)]
+          (d/transact! conn (repeated-value-batch 0 256))
+          (d/transact! conn (repeated-value-batch 256 256)))
+        (is (= (repeat 6 256) (sort @multiple-counts)))
+        (is (= [(* 256 Long/BYTES)] @buffer-sizes))
         (doseq [attr [:item/id :item/value :item/left :item/right]]
           (is (= 512 (d/count-datoms @conn nil attr nil))))
         (is (= "shared" (:item/value (d/entity @conn [:item/id 511]))))
@@ -265,6 +297,155 @@
       (finally
         (when-let [conn @conn*]
           (d/close conn))
+        (u/delete-files dir)))))
+
+(deftest ave-multiple-write-starts-at-two-duplicates
+  (let [dir             (u/tmp-dir (str "ave-multiple-threshold-"
+                                        (UUID/randomUUID)))
+        conn*           (atom nil)
+        multiple-counts (atom [])
+        buffer-sizes    (atom [])]
+    (try
+      (let [conn (d/get-conn dir schema)]
+        (reset! conn* conn)
+        (binding [cpp/*ave-multiple-write-observer*
+                  #(swap! multiple-counts conj %)
+                  cpp/*ave-multiple-buffer-allocation-observer*
+                  #(swap! buffer-sizes conj %)]
+          (testing "one duplicate stays on the scalar write path"
+            (d/transact! conn (repeated-value-batch 0 1))
+            (is (empty? @multiple-counts))
+            (is (empty? @buffer-sizes)))
+          (testing "two duplicates use one multiple write per shared value"
+            (d/transact! conn (repeated-value-batch 1 2))
+            (is (= (repeat 3 2) @multiple-counts))
+            (is (= [(* 2 Long/BYTES)] @buffer-sizes)))
+          (testing "the reusable buffer grows geometrically"
+            (d/transact! conn (repeated-value-batch 3 3))
+            (is (= (concat (repeat 3 2) (repeat 3 3))
+                   @multiple-counts))
+            (is (= [(* 2 Long/BYTES) (* 4 Long/BYTES)]
+                   @buffer-sizes))))
+        (doseq [attr [:item/id :item/value :item/left :item/right]]
+          (is (= 6 (d/count-datoms @conn nil attr nil)))))
+      (finally
+        (when-let [conn @conn*]
+          (d/close conn))
+        (u/delete-files dir)))))
+
+(deftest mixed-ave-run-sizes-apply-the-threshold-per-run
+  (let [dir             (u/tmp-dir (str "ave-multiple-mixed-runs-"
+                                        (UUID/randomUUID)))
+        conn*           (atom nil)
+        multiple-counts (atom [])
+        buffer-sizes    (atom [])]
+    (try
+      (let [conn (d/get-conn dir schema)]
+        (reset! conn* conn)
+        (binding [cpp/*ave-multiple-write-observer*
+                  #(swap! multiple-counts conj %)
+                  cpp/*ave-multiple-buffer-allocation-observer*
+                  #(swap! buffer-sizes conj %)]
+          (d/transact!
+            conn
+            (mapv (fn [id]
+                    {:item/id    id
+                     :item/value (if (zero? (long id)) "one" "two")})
+                  (range 3))))
+        (is (= [2] @multiple-counts))
+        (is (= [(* 2 Long/BYTES)] @buffer-sizes))
+        (is (= 1 (d/count-datoms @conn nil :item/value "one")))
+        (is (= 2 (d/count-datoms @conn nil :item/value "two"))))
+      (finally
+        (when-let [conn @conn*]
+          (d/close conn))
+        (u/delete-files dir)))))
+
+(deftest appenddup-eligibility-can-split-one-ave-run
+  (let [dir         (u/tmp-dir (str "ave-multiple-split-run-"
+                                    (UUID/randomUUID)))
+        conn*       (atom nil)
+        write-flags (atom [])]
+    (try
+      (let [conn (d/get-conn dir schema)]
+        (reset! conn* conn)
+        (d/transact!
+          conn
+          (mapv (fn [id]
+                  (cond-> {:item/id id}
+                    (= id 4) (assoc :item/left true)))
+                (range 9)))
+        (binding [cpp/*ave-multiple-write-flags-observer*
+                  #(swap! write-flags conj [%1 %2])]
+          (d/transact!
+            conn
+            (mapv (fn [id]
+                    {:db/id [:item/id id] :item/left true})
+                  [0 1 2 3 5 6 7 8])))
+        (is (= [[4 0] [4 DTLV/MDB_APPENDDUP]] @write-flags))
+        (is (= 9 (d/count-datoms @conn nil :item/left true))))
+      (finally
+        (when-let [conn @conn*]
+          (d/close conn))
+        (u/delete-files dir)))))
+
+(deftest one-shot-prepared-ave-writes-select-appenddup-per-run
+  (let [dir          (u/tmp-dir (str "ave-multiple-per-run-appenddup-"
+                                     (UUID/randomUUID)))
+        conn*        (atom nil)
+        write-flags  (atom [])]
+    (try
+      (let [conn (d/get-conn dir schema)]
+        (reset! conn* conn)
+        ;; Establish a high existing tail for :item/left and a low one for
+        ;; :item/right. The next one-shot transaction is add-only, but not a
+        ;; globally appendable entity batch.
+        (d/transact!
+          conn
+          (mapv (fn [id]
+                  (cond-> {:item/id id}
+                    (= id 0) (assoc :item/right true)
+                    (= id 7) (assoc :item/left true)))
+                (range 8)))
+        (binding [cpp/*ave-multiple-write-flags-observer*
+                  #(swap! write-flags conj [%1 %2])]
+          (d/transact!
+            conn
+            (into
+              (mapv (fn [id]
+                      {:db/id [:item/id id] :item/left true})
+                    (range 4))
+              (mapv (fn [id]
+                      {:db/id [:item/id id] :item/right true})
+                    (range 4 8)))))
+        (is (= #{[4 0] [4 DTLV/MDB_APPENDDUP]}
+               (set @write-flags)))
+        (is (= 5 (d/count-datoms @conn nil :item/left true)))
+        (is (= 5 (d/count-datoms @conn nil :item/right true))))
+      (finally
+        (when-let [conn @conn*]
+          (d/close conn))
+        (u/delete-files dir)))))
+
+(deftest public-kv-writes-reject-the-internal-multiple-flag
+  (let [dir (u/tmp-dir (str "reject-public-multiple-"
+                            (UUID/randomUUID)))
+        kv* (atom nil)]
+    (try
+      (let [kv (d/open-kv dir)]
+        (reset! kv* kv)
+        (d/open-dbi kv "values")
+        (let [error (try
+                      (d/transact-kv
+                        kv "values" [[:put 1 2 #{:multiple}]] :long :long)
+                      nil
+                      (catch Exception e e))]
+          (is (some? error))
+          (is (re-find #":multiple" (ex-message error)))
+          (is (nil? (d/get-value kv "values" 1 :long :long)))))
+      (finally
+        (when-let [kv @kv*]
+          (d/close-kv kv))
         (u/delete-files dir)))))
 
 (deftest large-unique-inserts-preserve-upsert-and-durability-semantics

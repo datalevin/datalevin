@@ -646,46 +646,53 @@
             (update-in [:parsed-q :qorig-where]
                        #(u/remove-idxs idxs %)))))))
 
-(defn- materializable-bound-pattern
+(defn- materializable-bound-patterns
   [context bound?]
   (let [{:keys [parsed-q sources]} context
         qwhere (:qwhere parsed-q)]
-    (first
-      (keep-indexed
-        (fn [clause-idx [parsed-clause orig-clause]]
-          (when (and (instance? Pattern parsed-clause)
-                     (vector? orig-clause))
-            (let [pattern (:pattern parsed-clause)
-                  e-sym   (pattern-var-symbol (first pattern))
-                  v-sym   (when (<= 3 (count pattern))
+    (keep-indexed
+      (fn [clause-idx [parsed-clause orig-clause]]
+        (when (and (instance? Pattern parsed-clause)
+                   (vector? orig-clause))
+          (let [pattern    (:pattern parsed-clause)
+                e-sym     (pattern-var-symbol (first pattern))
+                v-sym     (when (<= 3 (count pattern))
                             (pattern-var-symbol (nth pattern 2)))
-                  attr    (second pattern)
-                  e-bound? (bound? context e-sym)
-                  v-bound? (bound? context v-sym)]
-              (when (and (instance? Constant attr)
-                         (keyword? (:value attr)))
-                (when-let [source (get sources
-                                       (clause-source-symbol
-                                         (:source parsed-clause)))]
-                  (let [attr-value (:value attr)
-                        input-bound?
-                        (and (or e-bound? v-bound?)
-                             (not (and e-bound? v-bound?)))
-                        unresolved-ref?
-                        (or (and e-bound?
-                                 (relation-has-unresolved-ref?
-                                   context source attr-value true e-sym))
-                            (and v-bound?
-                                 (relation-has-unresolved-ref?
-                                   context source attr-value false v-sym)))]
-                    (when (and (db/-searchable? source)
-                               input-bound?
-                               (not unresolved-ref?))
-                      {:clause-idx clause-idx
-                       :source     source
-                       :pattern    (pattern-form orig-clause)})))))))
-        (map vector qwhere
-             (:qorig-where parsed-q))))))
+                attr      (second pattern)
+                e-bound?  (bound? context e-sym)
+                v-bound?  (bound? context v-sym)
+                source-sym (clause-source-symbol (:source parsed-clause))]
+            (when (and (instance? Constant attr)
+                       (keyword? (:value attr)))
+              (when-let [source (get sources source-sym)]
+                (let [attr-value (:value attr)
+                      input-bound?
+                      (and (or e-bound? v-bound?)
+                           (not (and e-bound? v-bound?)))
+                      unresolved-ref?
+                      (or (and e-bound?
+                               (relation-has-unresolved-ref?
+                                 context source attr-value true e-sym))
+                          (and v-bound?
+                               (relation-has-unresolved-ref?
+                                 context source attr-value false v-sym)))]
+                  (when (and (db/-searchable? source)
+                             input-bound?
+                             (not unresolved-ref?))
+                    {:clause-idx   clause-idx
+                     :source       source
+                     :source-sym   source-sym
+                     :pattern      (pattern-form orig-clause)
+                     :attr         attr-value
+                     :entity-sym   e-sym
+                     :value-sym    v-sym
+                     :entity-bound? (boolean e-bound?)
+                     :value-bound?  (boolean v-bound?)})))))))
+      (map vector qwhere (:qorig-where parsed-q)))))
+
+(defn- materializable-bound-pattern
+  [context bound?]
+  (first (materializable-bound-patterns context bound?)))
 
 (defn- materializable-input-bound-pattern
   [context]
@@ -695,6 +702,106 @@
   [context]
   (materializable-bound-pattern context bound-relation?))
 
+(defn- integer-entity-relation?
+  [rel entity-sym]
+  (when-let [idx (get (:attrs rel) entity-sym)]
+    (let [^List tuples (:tuples rel)
+          ^long n      (if tuples (.size tuples) 0)]
+      (when (pos? n)
+        (loop [i (long 0)]
+          (if (< i n)
+            (let [entity (aget ^objects (.get tuples (int i)) (int idx))]
+              (and (integer? entity)
+                   (not (neg? (long entity)))
+                   (recur (unchecked-inc i))))
+            true))))))
+
+(defn- distinct-value-candidates
+  [candidates]
+  (second
+    (reduce
+      (fn [[seen result] {:keys [value-sym] :as candidate}]
+        (if (contains? seen value-sym)
+          [seen result]
+          [(conj seen value-sym) (conj result candidate)]))
+      [#{} []]
+      candidates)))
+
+(defn- input-bound-eav-group
+  [context]
+  (let [candidates
+        (->> (materializable-bound-patterns
+               context small-bound-relation?)
+             (filter
+               (fn [{:keys [source attr entity-sym value-sym
+                            entity-bound? value-bound?]}]
+                 (and entity-bound?
+                      (not value-bound?)
+                      (qu/binding-var? entity-sym)
+                      (qu/binding-var? value-sym)
+                      (not= entity-sym value-sym)
+                      (not (bound-relation? context value-sym))
+                      (some? (get-in (db/-schema source) [attr :db/aid])))))
+             vec)]
+    (some
+      (fn [{:keys [source-sym entity-sym]}]
+        (let [group (->> candidates
+                         (filter #(and (= source-sym (:source-sym %))
+                                       (= entity-sym (:entity-sym %))))
+                         distinct-value-candidates)]
+          (when (<= 2 (count group))
+            (let [rel (rel-for-var context entity-sym)]
+              (when (integer-entity-relation? rel entity-sym)
+                group)))))
+      candidates)))
+
+(defn- materialize-input-bound-eav-group
+  [context candidates]
+  (let [{:keys [source source-sym entity-sym]} (first candidates)
+        schema       (db/-schema source)
+        candidates   (vec
+                       (sort-by #(get-in schema [(:attr %) :db/aid])
+                                candidates))
+        rel          (rel-for-var context entity-sym)
+        ^List input  (:tuples rel)
+        eid-idx      (long (get (:attrs rel) entity-sym))
+        attrs-v      (mapv (fn [{:keys [attr]}]
+                             [attr {:skip? false}])
+                           candidates)
+        tuples       (or (db/-eav-scan-v-list source input eid-idx attrs-v)
+                         (FastList.))
+        base-idx     (long (count (:attrs rel)))
+        attrs        (reduce-kv
+                       (fn [attrs idx {:keys [value-sym]}]
+                         (assoc attrs value-sym
+                                (unchecked-add base-idx (long idx))))
+                       (:attrs rel) candidates)
+        enriched     (assoc rel :attrs attrs :tuples tuples)
+        clause-idxs  (into #{} (map :clause-idx) candidates)
+        stage        {:strategy      :grouped-bound-eav
+                      :source        source-sym
+                      :entity        entity-sym
+                      :attributes    (mapv :attr candidates)
+                      :patterns      (mapv :pattern candidates)
+                      :input-tuples  (.size input)
+                      :output-tuples (.size ^List tuples)}]
+    {:context
+     (-> context
+         (update :rels
+                 (fn [rels]
+                   (mapv #(if (identical? % rel) enriched %) rels)))
+         (update-in [:parsed-q :qwhere]
+                    #(u/remove-idxs clause-idxs %))
+         (update-in [:parsed-q :qorig-where]
+                    #(u/remove-idxs clause-idxs %)))
+     :stage stage}))
+
+(defn- record-input-bound-eav-group!
+  [stage]
+  (when qplan/*explain*
+    (vswap! qplan/*explain* update :input-bound-eav-groups
+            (fnil conj []) stage)))
+
 (defn materialize-input-bound-patterns
   "Materialize patterns constrained by small input-bound relations before
    planning. When a query has multiple unique constant anchors whose entity
@@ -702,18 +809,23 @@
    same join component instead of leaving one as a late filter."
   [context]
   (loop [context (materialize-protected-unique-anchors context)]
-    (if-let [{:keys [^long clause-idx source pattern]}
-             (materializable-input-bound-pattern context)]
-      (let [rel (qresolve/lookup-pattern
-                  (assoc context :rels-bound-cache (volatile! {}))
-                  source pattern)]
-        (recur (-> context
-                   (update :rels qresolve/collapse-rels rel)
-                   (update-in [:parsed-q :qwhere]
-                              #(u/remove-idxs #{clause-idx} %))
-                   (update-in [:parsed-q :qorig-where]
-                              #(u/remove-idxs #{clause-idx} %)))))
-      context)))
+    (if-let [group (input-bound-eav-group context)]
+      (let [{:keys [context stage]}
+            (materialize-input-bound-eav-group context group)]
+        (record-input-bound-eav-group! stage)
+        (recur context))
+      (if-let [{:keys [^long clause-idx source pattern]}
+               (materializable-input-bound-pattern context)]
+        (let [rel (qresolve/lookup-pattern
+                    (assoc context :rels-bound-cache (volatile! {}))
+                    source pattern)]
+          (recur (-> context
+                     (update :rels qresolve/collapse-rels rel)
+                     (update-in [:parsed-q :qwhere]
+                                #(u/remove-idxs #{clause-idx} %))
+                     (update-in [:parsed-q :qorig-where]
+                                #(u/remove-idxs #{clause-idx} %)))))
+        context))))
 
 (defn- materialized-output-cost
   ^double [^long tuple-count ^long width]
@@ -1040,48 +1152,100 @@
                    (conj stages stage)))))
       {:eligible? true :cost cost :stages stages})))
 
+(defn- grouped-bound-eav-projected-cost
+  ^double [context candidates ^double budget]
+  (loop [candidates candidates
+         cost       0.0]
+    (if-let [{:keys [source attr pattern]} (first candidates)]
+      (let [remaining    (max 0.0 (- budget cost))
+            output-count (bounded-pattern-output-count
+                           context source pattern
+                           (affordable-output-cap remaining))
+            probe-count  (bound-pattern-probe-count context pattern)
+            stage-cost   (projected-pattern-materialization-cost
+                           source attr probe-count output-count)]
+        (recur (next candidates) (+ cost stage-cost)))
+      cost)))
+
 (defn- materialize-bound-patterns-with-cost
   [context ^double budget]
   (loop [context context
          cost    0.0
          stages  []]
-    (if-let [{:keys [^long clause-idx source pattern]}
-             (cost-materializable-bound-pattern context)]
-      (let [remaining-cost (max 0.0 (- budget cost))
-            output-count (bounded-pattern-output-count
-                           context source pattern
-                           (affordable-output-cap remaining-cost))
-            probe-count (bound-pattern-probe-count context pattern)
-            projected-cost (projected-pattern-materialization-cost
-                             source (second pattern)
-                             probe-count output-count)]
+    (if-let [group (input-bound-eav-group context)]
+      (let [remaining-cost (double (max 0.0 (- budget cost)))
+            projected-cost (double
+                             (grouped-bound-eav-projected-cost
+                               context group remaining-cost))]
         (if (<= budget (+ cost projected-cost))
           {:context context
            :cost cost
            :stages stages
            :eligible? false
-           :guardrail {:pattern pattern
-                       :projected-rows output-count
+           :guardrail {:strategy :grouped-bound-eav
+                       :patterns (mapv :pattern group)
                        :projected-cost projected-cost
                        :accumulated-cost cost
                        :budget budget}}
-          (let [result   (materialize-pattern-with-cost
-                           context source pattern probe-count)
-                charged-cost (max projected-cost (double (:cost result)))
-                new-cost (+ cost charged-cost)]
+          (let [{:keys [context stage]}
+                (materialize-input-bound-eav-group context group)
+                output-cost (double
+                              (materialized-output-cost
+                                (long (:output-tuples stage))
+                                (count group)))
+                charged-cost (double (max projected-cost output-cost))
+                new-cost (double (+ cost charged-cost))
+                stage (assoc stage
+                             :projected-cost projected-cost
+                             :output-cost output-cost
+                             :charged-cost charged-cost)]
             (if (<= budget new-cost)
-              {:context (:context result)
+              {:context context
                :cost new-cost
-               :stages (conj stages (:stage result))
+               :stages (conj stages stage)
                :eligible? false
-               :guardrail {:pattern pattern
+               :guardrail {:strategy :grouped-bound-eav
+                           :patterns (:patterns stage)
                            :actual-cost new-cost
                            :budget budget}}
-              (recur (remove-materialized-clause
-                       (:context result) clause-idx)
-                     new-cost
-                     (conj stages (:stage result)))))))
-      {:context context :cost cost :stages stages :eligible? true})))
+              (recur context new-cost (conj stages stage))))))
+      (if-let [{:keys [^long clause-idx source pattern]}
+               (cost-materializable-bound-pattern context)]
+        (let [remaining-cost (max 0.0 (- budget cost))
+              output-count (bounded-pattern-output-count
+                             context source pattern
+                             (affordable-output-cap remaining-cost))
+              probe-count (bound-pattern-probe-count context pattern)
+              projected-cost (projected-pattern-materialization-cost
+                               source (second pattern)
+                               probe-count output-count)]
+          (if (<= budget (+ cost projected-cost))
+            {:context context
+             :cost cost
+             :stages stages
+             :eligible? false
+             :guardrail {:pattern pattern
+                         :projected-rows output-count
+                         :projected-cost projected-cost
+                         :accumulated-cost cost
+                         :budget budget}}
+            (let [result   (materialize-pattern-with-cost
+                             context source pattern probe-count)
+                  charged-cost (max projected-cost (double (:cost result)))
+                  new-cost (+ cost charged-cost)]
+              (if (<= budget new-cost)
+                {:context (:context result)
+                 :cost new-cost
+                 :stages (conj stages (:stage result))
+                 :eligible? false
+                 :guardrail {:pattern pattern
+                             :actual-cost new-cost
+                             :budget budget}}
+                (recur (remove-materialized-clause
+                         (:context result) clause-idx)
+                       new-cost
+                       (conj stages (:stage result)))))))
+        {:context context :cost cost :stages stages :eligible? true}))))
 
 (defn- var-symbol
   [v]
@@ -3043,6 +3207,8 @@
                                  :delayed-cost (:delayed-cost candidate)
                                  :materialization-cost
                                  (:materialization-cost trial)
+                                 :materialization-stages
+                                 (:materialization-stages trial)
                                  :residual-cost residual-cost
                                  :guardrail (:guardrail trial)
                                  :baseline-cost base-cost

@@ -76,6 +76,19 @@
 (def ^:dynamic *before-write-commit-fn*
   nil)
 
+(def ^:dynamic *ave-multiple-write-observer*
+  nil)
+
+(def ^:dynamic *ave-multiple-buffer-allocation-observer*
+  nil)
+
+(def ^:dynamic *ave-multiple-write-flags-observer*
+  nil)
+
+(def ^:private ^:const ave-multiple-min-items 2)
+(def ^:private ^:const ave-multiple-max-items 65536)
+(def ^:private ^:const ave-multiple-max-buffer-bytes 524288)
+
 (def ^:private duplicate-local-open-msg
   "Please do not open multiple LMDB connections to the same DB
            in the same process. Instead, a LMDB connection should be held onto
@@ -100,6 +113,10 @@
 
 (definterface ^:private IWriteCursor
   (^datalevin.cpp.Cursor writeCursor [^datalevin.cpp.Txn txn]))
+
+(definterface ^:private IMultipleBuffer
+  (^datalevin.cpp.BufVal multipleValBuffer [^long size])
+  (^datalevin.cpp.Cursor multipleWriteCursor [^datalevin.cpp.Txn txn]))
 
 (deftype Pool [^ThreadLocal que]
   IPool
@@ -126,6 +143,13 @@
   (when bufval
     (try
       (.close bufval)
+      (catch Throwable _))))
+
+(defn- close-mdb-val-quiet!
+  [^DTLV$MDB_val value]
+  (when value
+    (try
+      (.close (.position value 0))
       (catch Throwable _))))
 
 (defn- clean-buffer-quiet!
@@ -206,7 +230,6 @@
     :reserve DTLV/MDB_RESERVE
     :append DTLV/MDB_APPEND
     :appenddup DTLV/MDB_APPENDDUP
-    :multiple DTLV/MDB_MULTIPLE
 
     :rdonly-txn DTLV/MDB_RDONLY))
 
@@ -562,7 +585,36 @@
               ^boolean dupsort?
               ^boolean dupfixed?
               ^boolean counted?
-              ^boolean validate-data?]
+              ^boolean validate-data?
+              ^:volatile-mutable ^BufVal multiple-vp
+              ^:volatile-mutable ^DTLV$MDB_val multiple-vals]
+  IMultipleBuffer
+  (multipleValBuffer [_ size]
+    (let [size             (long size)
+          ^BufVal current  multiple-vp
+          ^long current-capacity (if current
+                                   (.capacity ^ByteBuffer (.inBuf current))
+                                   0)]
+      (when (or (neg? size)
+                (> size (long ave-multiple-max-buffer-bytes)))
+        (raise "Invalid AVE multiple-value buffer size" {:size size}))
+      (when (< current-capacity size)
+        (let [doubled-capacity (if (pos? current-capacity)
+                                 (min (long ave-multiple-max-buffer-bytes)
+                                      (* 2 current-capacity))
+                                 size)
+              new-capacity     (long (max size doubled-capacity))
+              ^BufVal replacement (new-bufval new-capacity)]
+          (set! multiple-vp replacement)
+          (close-bufval-quiet! current)
+          (when-let [observer *ave-multiple-buffer-allocation-observer*]
+            (observer new-capacity))))
+      multiple-vp))
+  (multipleWriteCursor [_ txn]
+    (when-not multiple-vals
+      (set! multiple-vals (DTLV$MDB_val. 2)))
+    (Cursor/create txn db kp vp multiple-vals))
+
   IBuffer
   (put-key [this x t]
     (try
@@ -688,6 +740,8 @@
   (close-resource! [_]
     (close-bufval-quiet! kp)
     (close-bufval-quiet! vp)
+    (close-bufval-quiet! multiple-vp)
+    (close-mdb-val-quiet! multiple-vals)
     (clean-buffer-quiet! k-comp-bf)
     (clean-buffer-quiet! v-comp-bf)
     (try
@@ -994,14 +1048,9 @@
     (long (b/read-buffer (.outBuf ^BufVal (.key cur)) :id))))
 
 (defn- appendable-new-eav-batch?
-  ^Boolean [^objects datoms ^long n ^Cursor cur]
-  (and (pos? n)
-       (loop [i 0]
-         (if (< i n)
-           (if (.-added? ^DatomKVTxData (aget datoms i))
-             (recur (unchecked-inc i))
-             false)
-           true))
+  ^Boolean [^objects datoms ^long n ^Cursor cur ^Boolean add-only?]
+  (and add-only?
+       (pos? n)
        (let [first-e (.-e ^DatomKVTxData (aget datoms 0))
              last-e  (last-id-key cur)]
          (or (nil? last-e) (> first-e (long last-e))))))
@@ -1025,6 +1074,144 @@
         (if (zero? c)
           (Long/compare (.-e x) (.-e y))
           c)))))
+
+(defn- ave-multiple-run-end
+  ^long [^objects datoms ^long start ^long n]
+  (let [^DatomKVTxData first-tx (aget datoms (int start))]
+    (if (.-no-overwrite? first-tx)
+      (unchecked-inc start)
+      (let [^bytes avg (.-avg first-tx)]
+        (loop [i (unchecked-inc start)]
+          (if (< i n)
+            (let [^DatomKVTxData tx (aget datoms (int i))]
+              (if (and (not (.-no-overwrite? tx))
+                       (zero? (BitOps/compareBytes avg (.-avg tx))))
+                (recur (unchecked-inc i))
+                i))
+            i))))))
+
+(defn- put-ave-multiple-chunk!
+  [^DBI ave ^Cursor cur ^objects datoms start item-count flags ^BufVal values]
+  (let [start          (long start)
+        item-count     (long item-count)
+        flags          (long flags)
+        end            (+ start item-count)
+        ^DatomKVTxData first-tx (aget datoms (int start))
+        ^ByteBuffer bf (.inBuf values)]
+    (.put-key ave (.-avg first-tx) :raw)
+    (.clear bf)
+    (loop [i start]
+      (when (< i end)
+        (.putLong bf (.-e ^DatomKVTxData (aget datoms (int i))))
+        (recur (unchecked-inc i))))
+    (.flip bf)
+    (.reset values)
+    (let [written (.putMultiple cur values (long c/+id-bytes+) item-count
+                                (int flags))]
+      (when-not (= item-count written)
+        (raise "LMDB wrote only part of an AVE MDB_MULTIPLE batch"
+               {:expected item-count :written written})))
+    (when-let [observer *ave-multiple-write-observer*]
+      (observer item-count))
+    (when-let [observer *ave-multiple-write-flags-observer*]
+      (observer item-count flags))))
+
+(defn- put-ave-multiple-run!
+  [^DBI ave ^Cursor cur ^objects datoms start end flags ^BufVal values]
+  (let [start (long start)
+        end   (long end)
+        flags (long flags)]
+    (loop [i start]
+      (when (< i end)
+        (let [item-count (long
+                           (min (long ave-multiple-max-items) (- end i)))]
+          (put-ave-multiple-chunk! ave cur datoms i item-count flags values)
+          (recur (+ i item-count)))))))
+
+(defn- put-ave-added-datom!
+  [^DBI ave ^Cursor cur ^DatomKVTxData tx flags]
+  (let [flags (long flags)
+        flags (if (.-no-overwrite? tx)
+                (bit-or flags DTLV/MDB_NOOVERWRITE)
+                flags)]
+    (.put-key ave (.-avg tx) :raw)
+    (.putValId ave (.-e tx))
+    (if (.-no-overwrite? tx)
+      (when-not (.tryPut cur (int flags))
+        (throw
+          (ex-info "Blind unique value already exists"
+                   {:type l/blind-unique-collision-type})))
+      (.put cur (int flags)))))
+
+(defn- put-ave-added-segment!
+  [^DBI ave ^Cursor cur ^objects datoms start end flags]
+  (let [start      (long start)
+        end        (long end)
+        item-count (- end start)
+        flags      (long flags)]
+    (when (pos? item-count)
+      (if (>= item-count (long ave-multiple-min-items))
+        (let [buffer-size (* (long c/+id-bytes+)
+                             (min (long ave-multiple-max-items) item-count))
+              ^BufVal values (.multipleValBuffer
+                               ^IMultipleBuffer ave buffer-size)]
+          ;; AVE values are fixed-width entity IDs, so one sorted
+          ;; (attribute, value) segment crosses JNI in one MDB_MULTIPLE call.
+          (put-ave-multiple-run! ave cur datoms start end flags values))
+        (loop [i start]
+          (when (< i end)
+            (put-ave-added-datom!
+              ave cur ^DatomKVTxData (aget datoms (int i)) flags)
+            (recur (unchecked-inc i))))))))
+
+(defn- ave-last-existing-eid
+  [^DBI ave ^Cursor cur ^DatomKVTxData first-tx]
+  (.put-key ave (.-avg first-tx) :raw)
+  (when (.seek cur DTLV/MDB_SET)
+    (when-not (.seek cur DTLV/MDB_LAST_DUP)
+      (raise "Unable to read the last AVE duplicate" {}))
+    (.getLong ^ByteBuffer (.outBuf ^BufVal (.val cur)))))
+
+(defn- ave-appenddup-start
+  [^DBI ave ^Cursor cur ^objects datoms start end
+   ^Boolean all-new-entities?]
+  (let [start (long start)
+        end   (long end)]
+    (if all-new-entities?
+      start
+      (if-let [last-e (ave-last-existing-eid
+                        ave cur ^DatomKVTxData (aget datoms (int start)))]
+        (let [last-e (long last-e)]
+          (loop [i start]
+            (if (and (< i end)
+                     (<= (.-e ^DatomKVTxData (aget datoms (int i))) last-e))
+              (recur (unchecked-inc i))
+              i)))
+        start))))
+
+(defn- put-ave-add-only-runs!
+  [^DBI ave ^Cursor cur ^objects datoms n
+   ^Boolean all-new-entities?]
+  (let [n (long n)]
+    (loop [i 0]
+      (when (< i n)
+        (let [^DatomKVTxData tx (aget datoms (int i))]
+          (if (.-no-overwrite? tx)
+            (do
+              (put-ave-added-datom! ave cur tx (int 0))
+              (recur (unchecked-inc i)))
+            (let [end          (ave-multiple-run-end datoms i n)
+                  item-count   (- end i)
+                  append-start (if (or all-new-entities?
+                                       (>= item-count
+                                           (long ave-multiple-min-items)))
+                                 (ave-appenddup-start
+                                   ave cur datoms i end all-new-entities?)
+                                 end)]
+              (put-ave-added-segment! ave cur datoms i append-start (int 0))
+              (put-ave-added-segment!
+                ave cur datoms append-start end DTLV/MDB_APPENDDUP)
+              (recur end))))))))
 
 (defn- add-only-datom-batch?
   ^Boolean [^java.util.List txs]
@@ -1086,15 +1273,15 @@
         [out j]))))
 
 (defn- transact-datom-index-passes*
-  [^List txs ^HashMap dbis txn]
+  [^objects datoms n ^HashMap dbis txn ^Boolean add-only?]
   (let [^DBI ave (or (.get dbis c/ave) (raise c/ave " is not open" {}))
         ^DBI eav (or (.get dbis c/eav) (raise c/eav " is not open" {}))
-        [^objects datoms n] (datom-txs txs)
-        n (int n)]
+        n         (int n)]
     (Arrays/sort datoms 0 n datom-eav-comparator)
-    (let [new-entity-batch?
+    (let [all-new-entities?
           (with-open [^Cursor cur (.writeCursor ^IWriteCursor eav txn)]
-            (let [append? (appendable-new-eav-batch? datoms n cur)]
+            (let [append? (appendable-new-eav-batch?
+                            datoms n cur add-only?)]
               (if append?
                 (loop [i 0
                        previous-e Long/MIN_VALUE]
@@ -1117,66 +1304,55 @@
                       (put-eav-datom-tx eav txn tx)))))
               append?))]
       (Arrays/parallelSort datoms 0 n datom-ave-comparator)
-      (with-open [^Cursor cur (.writeCursor ^IWriteCursor ave txn)]
-        (dotimes [i n]
-          (let [^DatomKVTxData tx (aget datoms i)]
-            (if (.-added? tx)
-              (let [base-flags (if new-entity-batch?
-                                 DTLV/MDB_APPENDDUP
-                                 (int 0))
-                    flags      (if (.-no-overwrite? tx)
-                                 (bit-or base-flags DTLV/MDB_NOOVERWRITE)
-                                 base-flags)]
-                (.put-key ave (.-avg tx) :raw)
-                (.putValId ave (.-e tx))
-                ;; EAV appendability proves every entity ID is above the
-                ;; previous database maximum. AVE is sorted by key and entity,
-                ;; so each existing duplicate tree can append without a data
-                ;; search. New AVE keys still use the ordinary key insertion.
-                (if (.-no-overwrite? tx)
-                  (when-not (.tryPut cur (int flags))
-                    (throw
-                      (ex-info "Blind unique value already exists"
-                               {:type l/blind-unique-collision-type})))
-                  (.put cur (int flags))))
-              (put-ave-datom-tx ave txn tx))))))
-    (dotimes [i (.size txs)]
-      (let [tx (.get txs i)]
-        (when-not (instance? DatomKVTxData tx)
-          (let [^KVTxData tx (l/->kv-tx-data tx)
-                dbi-name (.-dbi-name tx)
-                ^DBI dbi (or (.get dbis dbi-name)
-                             (raise dbi-name " is not open" {}))
-                validate? (.-validate-data? dbi)]
-            (vld/validate-kv-tx-data tx validate?)
-            (put-tx dbi txn tx)))))))
+      (with-open [^Cursor cur (if add-only?
+                               (.multipleWriteCursor ^IMultipleBuffer ave txn)
+                               (.writeCursor ^IWriteCursor ave txn))]
+        (if add-only?
+          (put-ave-add-only-runs!
+            ave cur datoms n all-new-entities?)
+          (dotimes [i n]
+            (let [^DatomKVTxData tx (aget datoms i)]
+              (if (.-added? tx)
+                (put-ave-added-datom! ave cur tx (int 0))
+                (put-ave-datom-tx ave txn tx)))))))))
 
 (defn- transact-datom-list*
   [^java.util.List txs ^HashMap dbis txn]
-  (if (or c/*ordered-datom-writes?*
-          (add-only-datom-batch? txs))
-    (transact-datom-index-passes* txs dbis txn)
-    (let [n (.size txs)]
-      (loop [i   0
-             ave nil
-             eav nil]
-        (when (< i n)
-          (let [t (.get txs i)]
-            (if (instance? DatomKVTxData t)
-              (let [^DBI ave* (or ave (.get dbis c/ave)
-                                  (raise c/ave " is not open" {}))
-                    ^DBI eav* (or eav (.get dbis c/eav)
-                                  (raise c/eav " is not open" {}))]
-                (put-datom-tx ave* eav* txn t)
-                (recur (unchecked-inc i) ave* eav*))
-              (let [^KVTxData tx (l/->kv-tx-data t)
+  (let [add-only? (add-only-datom-batch? txs)]
+    (if (or c/*ordered-datom-writes?* add-only?)
+      (let [[^objects datoms n] (datom-txs txs)]
+        (transact-datom-index-passes* datoms n dbis txn add-only?)
+        (dotimes [i (.size txs)]
+          (let [tx (.get txs i)]
+            (when-not (instance? DatomKVTxData tx)
+              (let [^KVTxData tx (l/->kv-tx-data tx)
                     dbi-name (.-dbi-name tx)
                     ^DBI dbi (or (.get dbis dbi-name)
                                  (raise dbi-name " is not open" {}))
                     validate? (.-validate-data? dbi)]
                 (vld/validate-kv-tx-data tx validate?)
-                (put-tx dbi txn tx)
-                (recur (unchecked-inc i) ave eav)))))))))
+                (put-tx dbi txn tx))))))
+      (let [n (.size txs)]
+        (loop [i   0
+               ave nil
+               eav nil]
+          (when (< i n)
+            (let [t (.get txs i)]
+              (if (instance? DatomKVTxData t)
+                (let [^DBI ave* (or ave (.get dbis c/ave)
+                                    (raise c/ave " is not open" {}))
+                      ^DBI eav* (or eav (.get dbis c/eav)
+                                    (raise c/eav " is not open" {}))]
+                  (put-datom-tx ave* eav* txn t)
+                  (recur (unchecked-inc i) ave* eav*))
+                (let [^KVTxData tx (l/->kv-tx-data t)
+                      dbi-name (.-dbi-name tx)
+                      ^DBI dbi (or (.get dbis dbi-name)
+                                   (raise dbi-name " is not open" {}))
+                      validate? (.-validate-data? dbi)]
+                  (vld/validate-kv-tx-data tx validate?)
+                  (put-tx dbi txn tx)
+                  (recur (unchecked-inc i) ave eav))))))))))
 
 (defn- transact*
   [txs ^HashMap dbis txn]
@@ -1205,7 +1381,24 @@
             (vld/validate-kv-tx-data tx validate?)
             (put-tx dbi txn tx)))))))
 
-(defn- transact-prepared-datom-ops*
+(defn- prepared-datom-txs
+  [^objects ops]
+  (let [n            (alength ops)
+        ^objects out (object-array (quot n 2))]
+    (loop [i          0
+           j          0
+           add-only?  true]
+      (if (< i n)
+        (let [tx (aget ops (unchecked-inc i))]
+          (if (instance? DatomKVTxData tx)
+            (do
+              (aset out j tx)
+              (recur (+ i 2) (unchecked-inc j)
+                     (and add-only? (.-added? ^DatomKVTxData tx))))
+            (recur (+ i 2) j add-only?)))
+        [out j add-only?]))))
+
+(defn- transact-prepared-datom-ops-scalar!*
   [^objects ops ^HashMap dbis txn]
   (let [n (alength ops)]
     (loop [i   0
@@ -1224,6 +1417,20 @@
             (do
               (put-tx dbi txn ^KVTxData tx)
               (recur (+ i 2) ave eav))))))))
+
+(defn- transact-prepared-datom-ops*
+  [^objects ops ^HashMap dbis txn]
+  (let [[^objects datoms n add-only?] (prepared-datom-txs ops)]
+    (if (or c/*ordered-datom-writes?* add-only?)
+      (do
+        (transact-datom-index-passes* datoms n dbis txn add-only?)
+        (loop [i 0]
+          (when (< i (alength ops))
+            (let [tx (aget ops (unchecked-inc i))]
+              (when-not (instance? DatomKVTxData tx)
+                (put-tx ^DBI (aget ops i) txn ^KVTxData tx))
+              (recur (+ i 2))))))
+      (transact-prepared-datom-ops-scalar!* ops dbis txn))))
 
 (defn- transact-prepared-ops*
   [^objects ops ^HashMap dbis txn]
@@ -1785,7 +1992,8 @@
               vc       (bf/allocate-buffer val-size)
               dbi      (Dbi/create env dbi-name (kv-flags flags))
               db       (DBI. this dbi (new-pools) kp vp kc vc
-                             dupsort? dupfixed? counted? validate-data?)]
+                             dupsort? dupfixed? counted? validate-data?
+                             nil nil)]
           (when (not= dbi-name c/kv-info)
             (when (not= existing-opts opts)
               (vswap! info assoc-in [:dbis dbi-name] opts)
