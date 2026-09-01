@@ -103,7 +103,7 @@
     (is (nil? (invoke-private 'validate-durability-profile! true profile)))
     (is (= profile
            (invoke-private 'effective-durability-profile true profile))))
-  (is (= :relaxed (invoke-private 'effective-durability-profile true nil)))
+  (is (= :strict (invoke-private 'effective-durability-profile true nil)))
   (is (nil? (invoke-private 'effective-durability-profile false nil)))
   (is (= ":durability-profile is only valid for WAL tasks"
          (ex-message
@@ -114,6 +114,26 @@
           (thrown-info
             #(invoke-private 'validate-durability-profile! true :unknown)))
         "must be one of")))
+
+(deftest kv-non-durable-profiles-are-restricted-to-non-wal-sync
+  (let [kv-sync     (invoke-private 'task-info 'kv-sync)
+        invalid-tasks (mapv #(invoke-private 'task-info %)
+                            ['kv-async 'kv-sync-wal 'dl-sync])]
+    (doseq [profile [:nometasync :nosync :writemap-mapasync]]
+      (is (nil? (invoke-private 'validate-kv-non-durable-profile!
+                                kv-sync profile))))
+    (is (str/includes?
+          (ex-message
+            (thrown-info
+              #(invoke-private 'validate-kv-non-durable-profile!
+                               kv-sync :unknown)))
+          "must be one of"))
+    (doseq [task invalid-tasks]
+      (is (= ":kv-non-durable-profile is only valid for non-WAL kv-sync"
+             (ex-message
+               (thrown-info
+                 #(invoke-private 'validate-kv-non-durable-profile!
+                                  task :nosync))))))))
 
 (deftest storage-options-preserve-the-selected-durability
   (let [kv-default (invoke-private 'store-opts false nil)
@@ -127,6 +147,13 @@
     (is (not (contains? dl-default :wal-durability-profile)))
     (is (= :relaxed (:wal-durability-profile dl-wal)))
     (is (= (:flags kv-default) (get-in dl-default [:kv-opts :flags]))))
+  (is (= #{:nordahead :notls :nometasync}
+         (:flags (invoke-private 'store-opts false nil :nometasync))))
+  (is (= #{:nordahead :notls :nosync}
+         (:flags (invoke-private 'store-opts false nil :nosync))))
+  (is (= #{:nordahead :notls :writemap :mapasync}
+         (:flags
+           (invoke-private 'store-opts false nil :writemap-mapasync))))
   (is (= "FULL" (invoke-private 'sql-sync-mode-for nil)))
   (is (= "FULL" (invoke-private 'sql-sync-mode-for :strict)))
   (is (= "NORMAL" (invoke-private 'sql-sync-mode-for :relaxed)))
@@ -144,7 +171,11 @@
     (is (= "kv-sync-1"
            (invoke-private 'benchmark-target
                            nil (invoke-private 'task-info 'kv-sync)
-                           1 1 nil)))))
+                           1 1 nil)))
+    (is (= (.getPath (io/file root "kv-sync-100-nosync"))
+           (invoke-private 'benchmark-target
+                           root (invoke-private 'task-info 'kv-sync)
+                           100 1 nil :nosync)))))
 
 (deftest deterministic-person-records-have-a-stable-shape
   (let [first-id    (invoke-private 'deterministic-uuid 42 1)
@@ -366,6 +397,13 @@
              (assoc valid :seed 1.5)
              (assoc valid :durability-profile :unknown)
              (assoc valid :durability-profile :strict)
+             (assoc valid :kv-non-durable-profile :unknown)
+             (assoc valid :f 'kv-async
+                    :kv-non-durable-profile :nosync)
+             (assoc valid :f 'kv-sync-wal
+                    :kv-non-durable-profile :nosync)
+             (assoc valid :f 'dl-sync
+                    :kv-non-durable-profile :nosync)
              (assoc valid :f 'dl-sync :threads 2)]]
         (doseq [opts invalid-options]
           (is (instance? clojure.lang.ExceptionInfo
@@ -412,6 +450,30 @@
                                [:storage :configuration
                                 :secondary-indexes])))))
             (is (.exists (io/file (:target result))))))))))
+
+(deftest non-durable-kv-sync-adapters-record-effective-env-flags
+  (with-temp-root
+    "write-bench-kv-non-durable-"
+    (fn [root]
+      (doseq [[profile expected]
+              [[:nometasync #{:nordahead :notls :nometasync}]
+               [:nosync #{:nordahead :notls :nosync}]
+               [:writemap-mapasync
+                #{:nordahead :notls :writemap :mapasync}]]]
+        (testing (name profile)
+          (let [result (run-pass root 'kv-sync
+                                 {:kv-non-durable-profile profile})]
+            (is (= 7 (:writes result)))
+            (is (= profile (:kv-non-durable-profile result)))
+            (is (nil? (:durability-profile result)))
+            (is (false? (get-in result [:storage :configuration :wal?])))
+            (is (= expected
+                   (set (get-in result
+                                [:storage :configuration :env-flags]))))
+            (is (= profile
+                   (get-in result
+                           [:storage :configuration
+                            :kv-non-durable-profile])))))))))
 
 (deftest every-sync-adapter-persists-the-same-person-record
   (with-temp-root
@@ -517,7 +579,7 @@
                                      :secondary-indexes])]
                 (is (= 3 (count indexes)))))))))))
 
-(deftest default-wal-storage-adapters-use-relaxed-profile
+(deftest default-wal-storage-adapters-use-strict-profile
   (with-temp-root
     "write-bench-default-wal-"
     (fn [root]
@@ -531,14 +593,14 @@
           (let [result (run-pass root task)]
             (is (= 7 (:writes result)))
             (is (= 3 (:requests result)))
-            (is (= :relaxed (:durability-profile result)))
+            (is (= :strict (:durability-profile result)))
             (is (= async? (:async? result)))
             (is (= engine (get-in result [:storage :engine])))
             (when (= :sqlite engine)
               (is (= "wal" (get-in result
                                     [:storage :configuration :journal-mode])))
-              (is (= "normal" (get-in result
-                                       [:storage :configuration :synchronous])))
+              (is (= "full" (get-in result
+                                     [:storage :configuration :synchronous])))
               (let [indexes (get-in result
                                     [:storage :configuration
                                      :secondary-indexes])]

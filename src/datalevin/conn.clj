@@ -450,6 +450,45 @@
               (when-not old
                 (db/enable-cache (.-store ^DB @conn))))))))))
 
+(defn- direct-local-identity-transact!
+  [conn prepared tx-meta]
+  (locking conn
+    (let [db    ^DB @conn
+          store ^Store (.-store db)]
+      (when (db/blind-local-tx-valid? db prepared)
+        (let [old (db/cache-disabled? store)]
+          (db/disable-cache store)
+          (try
+            (let [kv             (.-lmdb store)
+                  prepared-store (volatile! nil)
+                  result
+                  (l/with-transaction-kv [kv1 kv]
+                    (let [store1 ^Store (s/transfer store kv1)
+                          db1    ^DB    (db/transfer db store1)]
+                      (when-let [[report upsert? :as result]
+                                 (db/stamp-blind-local-identity-tx
+                                   db1 prepared tx-meta)]
+                        (vreset! prepared-store store1)
+                        (binding [s/*enforce-blind-unique-inserts?* false
+                                  c/*ordered-datom-writes?* (not upsert?)]
+                          (db/commit-prepared-tx-data!
+                            db1 (:tx-data report) report))
+                        result)))]
+              (when result
+                (let [[report upsert?] result
+                      new-store ^Store (s/transfer
+                                         ^Store @prepared-store kv)
+                      new-db    (-> (:db-after report)
+                                    (db/transfer new-store)
+                                    (db/carry-runtime-opts db)
+                                    (db/adopt-current-db!))
+                      report    (assoc report :db-after new-db)]
+                  (reset! conn new-db)
+                  [report upsert?])))
+            (finally
+              (when-not old
+                (db/enable-cache (.-store ^DB @conn))))))))))
+
 (defn- maybe-direct-local-blind-transact!
   ([conn tx-data tx-meta]
    (maybe-direct-local-blind-transact! conn tx-data tx-meta false))
@@ -459,6 +498,32 @@
      (when (or (not require-unique?)
                (:has-unique? prepared))
        (direct-local-blind-transact! conn prepared tx-meta)))))
+
+(def ^:dynamic *local-wal-tx-path-observer* nil)
+(def ^:dynamic *local-wal-identity-upsert?* true)
+
+(defn- observe-local-wal-tx-path!
+  [path]
+  (when (fn? *local-wal-tx-path-observer*)
+    (*local-wal-tx-path-observer* path)))
+
+(defn- maybe-direct-local-wal-transact!
+  [conn tx-data tx-meta]
+  (when-let [prepared (db/prepare-blind-local-tx
+                        ^DB @conn tx-data true false)]
+    (when (:has-unique? prepared)
+      (if (and *local-wal-identity-upsert?*
+               (:identity-upsert-av prepared))
+        (when-let [[report upsert?]
+                   (direct-local-identity-transact!
+                     conn prepared tx-meta)]
+          (observe-local-wal-tx-path!
+            (if upsert? :identity-upsert :blind-insert))
+          report)
+        (when-let [report (direct-local-blind-transact!
+                            conn prepared tx-meta)]
+          (observe-local-wal-tx-path! :blind-insert)
+          report)))))
 
 (declare current-thread-holds-store-write-lock?)
 
@@ -487,6 +552,7 @@
           (with-transaction [c conn]
             (assert (active-conn-structural? c))
             (db/commit-prepared-tx-data! @c (:tx-data report) report))
+          (observe-local-wal-tx-path! :general)
           (assoc report :db-after @conn))
         (finally
           (when-not old
@@ -497,7 +563,7 @@
     (or (maybe-direct-local-blind-transact! conn tx-data tx-meta)
         (direct-local-transact! conn tx-data tx-meta))
     (if (local-wal-transact-eligible? conn)
-      (or (maybe-direct-local-blind-transact! conn tx-data tx-meta true)
+      (or (maybe-direct-local-wal-transact! conn tx-data tx-meta)
           (prepared-local-wal-transact! conn tx-data tx-meta))
       (let [report (with-transaction [c conn]
                      (assert (active-conn-structural? c))

@@ -531,8 +531,8 @@
   *wal-rollback?* false)
 
 (def ^{:dynamic true
-       :doc     "WAL durability profile. `:relaxed` enables batched durability. `:strict` waits for durable log ack per txn using fsync semantics. `:extra` is stricter (SQLite-style extra durability, e.g. fullsync on macOS)."}
-  *wal-durability-profile* :relaxed)
+       :doc     "WAL durability profile. `:strict` is the default and waits for durable log ack per txn using fsync semantics. `:relaxed` enables batched durability. `:extra` is stricter (SQLite-style extra durability, e.g. fullsync on macOS)."}
+  *wal-durability-profile* :strict)
 
 (def ^{:dynamic true
        :doc     "Enable LMDB dual-slot commit marker in WAL mode."}
@@ -699,7 +699,7 @@
 
 (def ^{:dynamic true
        :doc     "Default WAL durability profile for Datalog stores when WAL is enabled explicitly."}
-  *datalog-wal-durability-profile* :relaxed)
+  *datalog-wal-durability-profile* :strict)
 
 (def ^{:dynamic true :no-doc true
        :doc     "When true, use the prepare/apply transaction path"}

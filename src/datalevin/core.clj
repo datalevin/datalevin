@@ -210,7 +210,8 @@ Only usable for debug output.
  `:strict` (SQLite-style extra durability, e.g. fullsync on macOS). For local
  single-thread idle writes, all three profiles may take a direct fast path;
  concurrent pressure falls back to queue combining. Relaxed WAL durability is
- still grouped by the txn-log thresholds below.
+ still grouped by the txn-log thresholds below. When omitted, the default is
+ `:strict`.
 
    * `:wal-group-commit`, maximum transactions per durability batch in
  `:relaxed` mode. Default comes from
@@ -225,9 +226,9 @@ Only usable for debug output.
 
   For Datalog stores opened through this API, the default for a new local
   store is `:wal? false`. When WAL is enabled explicitly, the default
-  durability profile is `:relaxed`; specify `:strict` or `:extra` for
-  stronger crash durability. Consensus-lease HA stores require WAL and use
-  `:strict` by default.
+  durability profile is `:strict`; specify `:relaxed` only when accepting its
+  bounded crash-loss window for higher throughput. Consensus-lease HA stores
+  require WAL and also use `:strict` by default.
 
 
   Usage:
@@ -302,7 +303,7 @@ Only usable for debug output.
    * `:wal-durability-profile`, one of `:strict`, `:relaxed`, or `:extra`.
  local idle writes may take a direct fast path; concurrent pressure falls back
  to queue combining. Relaxed WAL durability remains grouped independently by
- the txn-log thresholds below.
+ the txn-log thresholds below. When omitted, the default is `:strict`.
 
    * `:wal-group-commit`, maximum transactions per durability batch in
  `:relaxed` mode. Default comes from
@@ -766,7 +767,7 @@ Only usable for debug output.
    * `:wal-durability-profile`, one of `:strict`, `:relaxed`, or `:extra`.
  local idle writes may take a direct fast path; concurrent pressure falls back
  to queue combining. Relaxed WAL durability remains grouped independently by
- the txn-log thresholds below.
+ the txn-log thresholds below. When omitted, the default is `:strict`.
 
    * `:wal-group-commit`, maximum transactions per durability batch in
  `:relaxed` mode. Default comes from
@@ -816,6 +817,7 @@ Only usable for debug output.
  fullsync on macOS). Local idle calls to [[transact!]] may take a direct fast
  path; concurrent pressure falls back to queue combining. Relaxed WAL
  durability remains grouped independently by the txn-log thresholds below.
+ When omitted, the default is `:strict`.
 
    * `:wal-group-commit`, maximum transactions per durability batch in
  `:relaxed` mode. Default comes from
@@ -874,9 +876,9 @@ Only usable for debug output.
 
   For Datalog stores opened through this API, the default for a new local
   store is `:wal? false`. When WAL is enabled explicitly, the default
-  durability profile is `:relaxed`; specify `:strict` or `:extra` for
-  stronger crash durability. Consensus-lease HA stores require WAL and use
-  `:strict` by default.
+  durability profile is `:strict`; specify `:relaxed` only when accepting its
+  bounded crash-loss window for higher throughput. Consensus-lease HA stores
+  require WAL and also use `:strict` by default.
 
   Please note that the connection should be managed like a stateful resource.
   Application should hold on to the same connection rather than opening
@@ -1199,7 +1201,7 @@ Only usable for debug output.
    small crash window; `:extra` is stricter than `:strict` (SQLite-style extra
    durability, e.g. fullsync on macOS). Relaxed WAL durability remains grouped
    by the txn-log thresholds below. When WAL is enabled and this option is
-   omitted, the default is `:relaxed`.
+   omitted, the default is `:strict`.
   * `:wal-group-commit` sets the max transactions per durability batch in
    `:relaxed` mode. Default comes from
    `datalevin.constants/*wal-group-commit*`.

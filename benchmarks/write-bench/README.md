@@ -17,8 +17,8 @@ string identity, first name, last name, and age from 18 through 90.
 | Datalevin KV | UUID string key and a data map containing first name, last name, and age |
 
 SQLite uses an ordinary rowid table. It assigns a signed 64-bit rowid and
-maintains a separate unique index for the string primary key; it does not use
-the `AUTOINCREMENT` keyword.
+maintains a separate unique index for the string primary key, and main index for
+other three columns.
 
 ### Pure write
 
@@ -40,7 +40,8 @@ connection with a 10-second busy timeout.
 
 Mixed mode starts with one million people and performs one million read/write
 pairs. Each pair reads a person by UUID and then upserts a complete person
-record containing first name, last name, and age.
+record containing first name, last name, and age. Read/write operations are 50/50
+proportion.
 
 Read and write slots are selected independently from 1 through two million,
 giving an initial 50% hit/upsert probability. Sync tasks complete each write
@@ -50,14 +51,11 @@ snapshot without a read-your-write barrier. SQLite uses connection-scoped
 prepared lookup and `INSERT ... ON CONFLICT DO UPDATE` statements, matching
 Datalevin identity upsert semantics.
 
-The Datalog lookup uses a relation find specification for first name, last
-name, and age; it does not use the single-tuple find form.
-
 ### KV
 
 KV uses the same generated person identities and values. It has no equivalent
 row-store task in this benchmark, so it is compared only across its own
-durability conditions and is not part of the Datalog/SQLite ranking.
+durability conditions and is not part of the Datalog/SQLite comparison.
 
 ## Running
 
@@ -136,6 +134,21 @@ clj -X:write \
   :f kv-sync
 ```
 
+The cache-oriented non-durable study uses only non-WAL `kv-sync`. Select one
+of the three named LMDB flag policies with `:kv-non-durable-profile`:
+
+```bash
+clj -X:write \
+  :base-dir '"/private/tmp/dtlv-kv-nosync-b100"' \
+  :batch 100 \
+  :f kv-sync \
+  :kv-non-durable-profile :nosync
+```
+
+Accepted values are `:nometasync`, `:nosync`, and `:writemap-mapasync`.
+The benchmark rejects this option for WAL, async, Datalog, and SQLite tasks and
+records both the selected profile and effective LMDB flags in `results.edn`.
+
 ### Smoke tests and output
 
 Use a smaller total only for smoke testing:
@@ -185,9 +198,21 @@ normally disk-backed; verify the mount on the benchmark host.
 | WAL `:relaxed` | bounded group flushing | WAL, `synchronous=NORMAL` |
 | WAL `:extra` | extra full sync on supported platforms | WAL, `synchronous=EXTRA`, `fullfsync=ON` |
 
-WAL tasks default to `:relaxed`. Set `:durability-profile` to `:strict`,
-`:relaxed`, or `:extra` when a named profile is required. Durability profiles
-are rejected for non-WAL tasks.
+WAL tasks default to `:strict`. Set `:durability-profile` to `:relaxed` for
+batched durability or `:extra` for stronger-than-default OS sync behavior.
+Durability profiles are rejected for non-WAL tasks.
+
+The separate non-durable KV study uses the documented non-WAL LMDB policies:
+
+- `:nometasync` omits synchronous metadata-page flushing; the last transaction
+  can be lost after a system crash while database integrity is retained.
+- `:nosync` leaves data-page flushing to the operating system and can corrupt
+  the database after an untimely system crash.
+- `:writemap-mapasync` enables a writable memory map with asynchronous map
+  flushing and has the additional writable-map safety and allocation caveats.
+
+These profiles are intended to represent cache-like uses, so the benchmark
+deliberately measures them only through synchronous, non-WAL KV writes.
 
 The benchmark verifies SQLite's journal, synchronous, and full-sync settings
 before measuring. On macOS, `:extra` is a separately labeled stronger
@@ -247,40 +272,91 @@ lein test datalevin.async-test
 
 Results show throughput: records written per second.
 
-Datalevin rows were rerun on 2026-08-30 with Datalevin 1.1.0 and native
-library 0.19.4. SQLite comparator rows are the existing matching runs measured
-on 2026-08-29; every SQLite run includes the three explicit value indexes.
+### Default sync
 
-`Datalog sync` and SQLite are blocking APIs and are compared in the
-`Sync comparison` column. Datalog async is reported in the last column.
+`Datalog ` and `SQLite `use the default blocking APIs of respective systems and
+are compared in the `Sync comparison` column.
 
-### Default durability
+Datalog async condition is reported in the last column.
 
-| Batch | Datalog sync | SQLite | Sync comparison | Datalog async |
+These are all fully durable writes.
+
+| Batch | Datalog | SQLite | Sync comparison | Datalog async |
 |---:|---:|---:|---:|---:|
 | 1 | 2,380/s | 1,814/s | Datalog 1.312X | 37,357/s |
 | 10 | 5,157/s | 6,233/s | SQLite 1.209X | 114,960/s |
 | 100 | 12,546/s | 14,171/s | SQLite 1.129X | 282,470/s |
 | 1000 | 49,436/s | 30,722/s | Datalog 1.609X | 284,146/s |
 
-### Relaxed WAL
+### WAL
 
-Datalevin uses its `:relaxed` WAL profile. SQLite uses WAL with
+These are write ahead log (WAL) write modes.
+
+#### Strict durability
+
+Datalevin uses its `:strict` WAL profile and SQLite uses WAL with
+`synchronous=FULL`.
+
+Datalog WAL strict async condition is reported in the last column.
+
+These are fully durable write.
+
+| Batch | Datalog strict WAL | SQLite FULL WAL | Strict WAL comparison | Datalog WAL strict async |
+|---:|---:|---:|---:|---:|
+| 1 | 8,186/s | 8,822/s | SQLite 1.078X | 102,133/s |
+| 10 | 26,519/s | 17,609/s | Datalog 1.506X | 195,976/s |
+| 100 | 44,747/s | 22,840/s | Datalog 1.959X | 245,485/s |
+| 1000 | 114,739/s | 32,105/s | Datalog 3.574X | 238,974/s |
+
+#### Relaxed durability
+
+Datalevin uses its `:relaxed` WAL profile and SQLite uses WAL with
 `synchronous=NORMAL`.
 
-| Batch | Datalog sync | SQLite | Sync comparison | Datalog async |
+Datalog WAL relaxed async condition is reported in the last column.
+
+These modes can lose recently acknowledged transactions after an OS crash or
+power loss, so they are kept separate from the strict durability comparison.
+
+| Batch | Datalog relaxed sync | SQLite NORMAL WAL | Relaxed sync comparison | Datalog relaxed async |
 |---:|---:|---:|---:|---:|
 | 1 | 13,094/s | 15,574/s | SQLite 1.189X | 110,755/s |
 | 10 | 35,889/s | 19,083/s | Datalog 1.881X | 211,238/s |
 | 100 | 63,440/s | 25,757/s | Datalog 2.463X | 275,859/s |
 | 1000 | 129,227/s | 33,146/s | Datalog 3.899X | 276,797/s |
 
+Relative to relaxed WAL, strict synchronous acknowledgment costs most at small
+batches. The async pipeline combines queued API requests into physical
+transactions, reducing the strict penalty to 7.2% through 13.7%.
+
 ## Concurrent
 
-Each row writes one million people through `dl-sync-wal` and `sql-tx-wal` on a
-fresh database with no warmup pass, with either 2 or 4 concurrent threads.
+Both Datalevin and SQLite are single writer in the default synchronous mode, so
+only WAL mode has any benefit in concurrent writes. The measurements use either
+2 or 4 concurrent caller threads.
 
-| Batch | Threads | Datalog sync | SQLite | Sync comparison |
+### Strict durability
+
+Datalevin uses its `:strict` WAL profile and SQLite uses WAL with
+`synchronous=FULL`.
+
+| Batch | Threads | Datalog strict WAL | SQLite FULL WAL | Strict WAL comparison |
+|---:|---:|---:|---:|---:|
+| 1 | 2 | 13,317/s | 8,175/s | Datalog 1.629X |
+| 1 | 4 | 19,003/s | 7,557/s | Datalog 2.514X |
+| 10 | 2 | 35,168/s | 23,314/s | Datalog 1.508X |
+| 10 | 4 | 42,827/s | 25,003/s | Datalog 1.713X |
+| 100 | 2 | 71,594/s | 39,689/s | Datalog 1.804X |
+| 100 | 4 | 81,618/s | 43,305/s | Datalog 1.885X |
+| 1000 | 2 | 127,638/s | 45,996/s | Datalog 2.775X |
+| 1000 | 4 | 151,622/s | 50,735/s | Datalog 2.988X |
+
+### Relaxed durability (not strictly durable)
+
+Datalevin uses its `:relaxed` WAL profile and SQLite uses WAL with
+`synchronous=NORMAL`.
+
+| Batch | Threads | Datalog relaxed WAL | SQLite NORMAL WAL | Relaxed WAL comparison |
 |---:|---:|---:|---:|---:|
 | 1 | 2 | 15,660/s | 22,056/s | SQLite 1.408X |
 | 1 | 4 | 22,834/s | 21,997/s | Datalog 1.038X |
@@ -299,20 +375,106 @@ independent clone of that engine's one-million-person image, then runs one
 million pairs with seed 42, no warmup pass, and one measurement pass. Sync and
 SQLite runs are closed-loop; Datalog async keeps its bounded pipeline without a
 read-your-write barrier. SQLite maintains the three explicit value indexes.
-Corrected Datalevin runs were measured on 2026-08-30; SQLite comparator rows
-are retained from the existing matching runs.
 
 `Datalog sync` and SQLite are blocking APIs and are compared in the
 `Sync comparison` column. Datalog async is reported separately and keeps a
 bounded pipeline of outstanding writes, allowing cross-request adaptive
 batching while reads continue against the latest available snapshot.
 
-| Durability | Datalog sync | SQLite | Sync comparison | Datalog async |
+### Strictly durable paths
+
+The default row compares Datalevin's default LMDB path with SQLite's rollback
+journal and `synchronous=FULL`. The strict-WAL row compares Datalevin `:strict`
+with SQLite WAL and `synchronous=FULL`.
+
+| Durability | Datalog sync | SQLite sync | Sync comparison | Datalog async |
 |---|---:|---:|---:|---:|
 | Default | 1,552/s | 1,515/s | Datalog 1.025X | 7,791/s |
-| Relaxed WAL | 5,398/s | 6,731/s | SQLite 1.247X | 20,437/s |
+| Strict WAL | 5,616/s | 5,041/s | Datalog 1.114X | 16,996/s |
+
+### Relaxed durability (not strictly durable)
+
+| Durability | Datalog sync | SQLite sync | Sync comparison | Datalog async |
+|---|---:|---:|---:|---:|
+| Relaxed WAL | 6,965/s | 6,731/s | Datalog 1.035X | 20,437/s |
 
 ## KV
 
-Publishable KV results have not yet been collected. KV will be reported only
-across its own durability conditions.
+Results show throughput: records written per second. Every row writes one
+million records to a fresh database with seed 42, no warmup pass, and one
+measurement pass. Measurements were collected on 2026-08-31 with Datalevin
+1.1.0, Java 21.0.11, and a 12-core Apple Silicon macOS host. Most original rows
+use native artifact 0.19.4 (DLMDB 1.0.0). The corrected `writemap` + `mapasync`
+rows and the new strict-WAL rows use 0.19.5, whose only listed change is the
+Darwin `MS_ASYNC` fix; the WAL paths do not use that flag combination.
+Background media analysis was paused during each measurement phase and resumed
+immediately afterward to keep host load stable. The complete throughput,
+latency, environment, effective-storage, and per-condition native-version
+metadata is preserved in the [KV result artifact](results/2026-08-31-kv.edn)
+and [strict-WAL result artifact](results/2026-08-31-strict-wal.edn). The KV
+mixed rows are included in the
+[strict mixed-WAL result artifact](results/2026-08-31-strict-wal-mixed.edn).
+
+KV has no equivalent SQLite task in this benchmark, so these tables compare
+only Datalevin KV API and durability conditions.
+
+### Strictly durable paths
+
+The default LMDB path and the `:strict` WAL profile both preserve acknowledged
+commits across an OS crash or power loss. Async tasks use the bounded pipeline
+described in [Async batching](#async-batching).
+
+| Batch | Default sync | Strict WAL sync | Default async | Strict WAL async |
+|---:|---:|---:|---:|---:|
+| 1 | 8,204/s | 16,289/s | 53,705/s | 148,167/s |
+| 10 | 18,684/s | 79,044/s | 110,259/s | 215,406/s |
+| 100 | 40,043/s | 143,404/s | 359,055/s | 294,525/s |
+| 1000 | 57,990/s | 171,421/s | 336,221/s | 300,193/s |
+
+Strict WAL is still 1.99X through 4.23X faster than default synchronous LMDB
+durability.
+
+### Relaxed WAL (not strictly durable)
+
+| Batch | Relaxed WAL sync | Relaxed WAL async |
+|---:|---:|---:|
+| 1 | 30,719/s | 166,730/s |
+| 10 | 106,721/s | 233,724/s |
+| 100 | 164,165/s | 330,084/s |
+| 1000 | 184,117/s | 334,558/s |
+
+Relaxed WAL improves synchronous throughput by 3.18X through 5.71X over
+default LMDB durability. For async writes, its advantage is concentrated at
+batches 1 and 10; the default and relaxed-WAL paths converge at batches 100
+and 1000 as encoding and storage work dominate. Its synchronous gap to strict
+WAL falls sharply as the batch amortizes each acknowledgment. Async grouping
+keeps the strict penalty between 7.8% and 11.1% across all tested batch sizes.
+
+### Mixed strict WAL
+
+| Durability | KV sync | KV async | Async speedup |
+|---|---:|---:|---:|
+| Strict WAL | 12,690/s | 112,114/s | 8.835X |
+
+The synchronous path completes each lookup and strictly acknowledged upsert
+before starting the next pair. The async path uses the same bounded
+1,000-request pipeline as the Datalog mixed study.
+
+### Cache-oriented non-durable paths
+
+These are synchronous, non-WAL `kv-sync` measurements. Default durability is
+repeated as the baseline. The safety tradeoffs of the other columns are
+described in [Durability](#durability); these conditions are not durability
+equivalents.
+
+| Batch | Default | `nometasync` | `nosync` | `writemap` + `mapasync` |
+|---:|---:|---:|---:|---:|
+| 1 | 8,204/s | 8,400/s | 56,771/s | 93,938/s |
+| 10 | 18,684/s | 16,279/s | 147,563/s | 209,732/s |
+| 100 | 40,043/s | 40,095/s | 202,438/s | 254,537/s |
+| 1000 | 57,990/s | 58,079/s | 223,205/s | 271,192/s |
+
+`nometasync` provides no consistent throughput improvement in this one-pass
+study. With the 0.19.5 Darwin fix, `writemap` + `mapasync` is the fastest
+synchronous condition at every batch size, reaching 271,192 writes/s at batch
+1000 and exceeding `nosync` by 1.22X through 1.65X.

@@ -116,7 +116,8 @@
    entities
    unique-avs
    has-unique?
-   fuse-unique-inserts?])
+   fuse-unique-inserts?
+   identity-upsert-av])
 
 (deftype ^:private PreparedBlindEntity [tempid ^FastList attrs])
 
@@ -1493,12 +1494,12 @@
   [^DB db entities tx-time]
   (txprep/prepare-entities db entities tx-time))
 
-;; Identity probes in the blind path share the LMDB write transaction, and a
-;; unique-value hit falls back to the normal resolver without changing upsert
-;; semantics. For a single non-WAL entity, preparing and probing first costs
-;; more than the ordinary resolver. Enable it from two entities onward so small
-;; batches avoid the old ingestion-sized discontinuity without regressing the
-;; single-record OLTP path. WAL may still opt a single entity into this path.
+;; Identity probes in the blind path share the LMDB write transaction. For a
+;; single non-WAL entity, preparing and probing first costs more than the
+;; ordinary resolver. Enable it from two entities onward so small batches avoid
+;; the old ingestion-sized discontinuity without regressing the single-record
+;; OLTP path. WAL may still opt a single entity into this path and specialize a
+;; simple cardinality-one identity upsert.
 (def ^:private ^:const ^long blind-unique-write-threshold 2)
 
 (def ^:private blind-unique-value-types
@@ -1650,6 +1651,8 @@
             (recur (unchecked-inc i))))
         avs))))
 
+(declare blind-identity-upsert-av)
+
 (defn ^:no-doc prepare-blind-local-tx
   ([^DB db initial-es]
    (prepare-blind-local-tx db initial-es false true))
@@ -1710,7 +1713,13 @@
                   (not fuse-unique-inserts?))
            (collect-prepared-blind-unique-avs
              store-schema entities initial-count)
-           unique-avs)]
+           unique-avs)
+         identity-upsert-av
+         (when (and entities
+                    (not auto-entity-time?)
+                    (= 1 (.size ^FastList entities)))
+           (blind-identity-upsert-av
+             store-schema (.get ^FastList entities 0)))]
      (when (and entities unique-avs (not (.isEmpty ^FastList entities)))
        (->PreparedBlindTx store-schema
                           store-opts
@@ -1718,7 +1727,8 @@
                           entities
                           unique-avs
                           @has-unique?
-                          fuse-unique-inserts?)))))
+                          fuse-unique-inserts?
+                          identity-upsert-av)))))
 
 (defn ^:no-doc blind-local-tx-unique-values-absent?
   "Check a prepared batch's identity values against the current store snapshot.
@@ -1738,6 +1748,71 @@
   (let [store (.-store db)]
     (and (identical? (:schema-epoch prepared) (schema store))
          (identical? (:opts-epoch prepared) (opts store)))))
+
+(defn- blind-identity-upsert-av
+  [store-schema ^PreparedBlindEntity entity]
+  (let [^FastList attrs (.-attrs entity)]
+    (loop [i           0
+           identity-av nil]
+      (if (< i (.size attrs))
+        (let [attr  (.get attrs i)
+              value (.get attrs (unchecked-inc i))
+              props (store-schema attr)]
+          ;; Cardinality-many map values are additive and need exact EAV
+          ;; membership checks. Leave those, and entities with ambiguous
+          ;; identities, to the general transaction engine.
+          (cond
+            (identical? (:db/cardinality props) :db.cardinality/many)
+            nil
+
+            (identical? (:db/unique props) :db.unique/identity)
+            (when-not identity-av
+              (recur (+ i 2) [attr value]))
+
+            :else
+            (recur (+ i 2) identity-av)))
+        identity-av))))
+
+(defn- stamp-existing-blind-local-identity-upsert
+  [^DB db ^PreparedBlindTx prepared tx-meta identity-attr eid]
+  (let [^FastList entities (:entities prepared)
+        ^PreparedBlindEntity entity (.get entities 0)
+        tx-id           (inc (long (:max-tx db)))
+        ^FastList attrs (.-attrs entity)
+        tx-data
+        (loop [i       0
+               tx-data (transient [])]
+          (if (< i (.size attrs))
+            (let [attr  (.get attrs i)
+                  value (.get attrs (unchecked-inc i))]
+              (if (= attr identity-attr)
+                (recur (+ i 2) tx-data)
+                (let [^Datom old-datom
+                      (ea-first-datom (.-store db) eid attr)]
+                  (cond
+                    (nil? old-datom)
+                    (recur (+ i 2)
+                           (conj! tx-data
+                                  (d/datom eid attr value tx-id)))
+
+                    (= (.-v old-datom) value)
+                    (recur (+ i 2) tx-data)
+
+                    :else
+                    (recur (+ i 2)
+                           (-> tx-data
+                               (conj! (d/datom eid attr (.-v old-datom)
+                                               tx-id false))
+                               (conj! (d/datom eid attr value tx-id))))))))
+            (persistent! tx-data)))
+        tempid          (.-tempid entity)
+        tempids         (cond-> {:db/current-tx tx-id}
+                          (and tempid (not (auto-tempid? tempid)))
+                          (assoc tempid eid))
+        db-after        (cond-> (assoc db :max-tx tx-id)
+                          (> (long eid) (long (:max-eid db)))
+                          (assoc :max-eid eid))]
+    (->TxReport db db-after tx-data tempids tx-meta)))
 
 (defn ^:no-doc stamp-blind-local-tx
   [^DB db ^PreparedBlindTx prepared tx-meta]
@@ -1787,6 +1862,20 @@
                                (assoc :max-tx tx-id))
         report             (->TxReport db db-after tx-data tempids tx-meta)]
     report))
+
+(defn ^:no-doc stamp-blind-local-identity-tx
+  "Stamp one eligible simple identity transaction, resolving insert versus
+   upsert inside the caller's LMDB write transaction. Returns
+   [report upsert?], or nil when the prepared shape is not eligible."
+  [^DB db ^PreparedBlindTx prepared tx-meta]
+  (when-let [[identity-attr identity-value]
+             (:identity-upsert-av prepared)]
+    (if-some [eid (i/av-first-e (.-store db)
+                                identity-attr identity-value)]
+      [(stamp-existing-blind-local-identity-upsert
+         db prepared tx-meta identity-attr eid)
+       true]
+      [(stamp-blind-local-tx db prepared tx-meta) false])))
 
 (defn transact-tx-data
   [initial-report initial-es simulated?]

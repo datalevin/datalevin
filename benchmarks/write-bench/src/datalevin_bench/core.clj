@@ -97,6 +97,11 @@
 
 (def ^:private valid-durability-profiles #{:strict :extra :relaxed})
 
+(def ^:private kv-non-durable-profile-flags
+  {:nometasync       #{:nometasync}
+   :nosync           #{:nosync}
+   :writemap-mapasync #{:writemap :mapasync}})
+
 (defn- positive-long!
   [label value]
   (when-not (and (integer? value) (pos? (long value)))
@@ -190,7 +195,24 @@
 
 (defn- effective-durability-profile
   [wal? durability-profile]
-  (when wal? (or durability-profile :relaxed)))
+  (when wal? (or durability-profile :strict)))
+
+(defn- validate-kv-non-durable-profile!
+  [{:keys [kind wal? async? name]} kv-non-durable-profile]
+  (when kv-non-durable-profile
+    (when-not (contains? kv-non-durable-profile-flags
+                         kv-non-durable-profile)
+      (throw
+        (ex-info
+          ":kv-non-durable-profile must be one of :nometasync, :nosync, or :writemap-mapasync"
+          {:kv-non-durable-profile kv-non-durable-profile
+           :allowed (set (keys kv-non-durable-profile-flags))})))
+    (when-not (and (= :kv kind) (not wal?) (not async?))
+      (throw
+        (ex-info
+          ":kv-non-durable-profile is only valid for non-WAL kv-sync"
+          {:kv-non-durable-profile kv-non-durable-profile
+           :task name})))))
 
 (defn- ensure-native-wal-sync-path!
   [{:keys [name wal? kind]}]
@@ -207,7 +229,8 @@
 (defn- validate-common!
   [{:keys [batch threads total-writes report-every in-flight-limit
            in-flight-write-limit
-           completion-timeout]} info durability-profile]
+           completion-timeout]} info durability-profile
+   kv-non-durable-profile]
   (positive-int! :batch batch)
   (positive-int! :threads threads)
   (positive-long! :total total-writes)
@@ -216,6 +239,7 @@
   (positive-long! :in-flight-writes in-flight-write-limit)
   (positive-long! :completion-timeout-ms completion-timeout)
   (validate-durability-profile! (:wal? info) durability-profile)
+  (validate-kv-non-durable-profile! info kv-non-durable-profile)
   (when (and (> (long threads) 1)
              (= :datalog (:kind info))
              (not (:wal? info)))
@@ -225,10 +249,11 @@
   (ensure-native-wal-sync-path! info))
 
 (defn- run-dir
-  [base-dir f batch threads durability-profile]
+  [base-dir f batch threads durability-profile kv-non-durable-profile]
   (let [thread-suffix  (if (> (long threads) 1) (str "-t" threads) "")
-        profile-suffix (if durability-profile
-                         (str "-" (name durability-profile))
+        profile        (or durability-profile kv-non-durable-profile)
+        profile-suffix (if profile
+                         (str "-" (name profile))
                          "")
         dir-name       (str (name f) "-" batch
                             thread-suffix profile-suffix)]
@@ -237,15 +262,18 @@
       dir-name)))
 
 (defn- benchmark-target
-  [base-dir {:keys [name kind wal?]}
-   batch threads durability-profile]
-  (run-dir base-dir
-           (if (= kind :sqlite)
-             (if wal? "sqlite-wal" "sqlite")
-             name)
-           batch
-           threads
-           durability-profile))
+  ([base-dir info batch threads durability-profile]
+   (benchmark-target base-dir info batch threads durability-profile nil))
+  ([base-dir {:keys [name kind wal?]}
+    batch threads durability-profile kv-non-durable-profile]
+   (run-dir base-dir
+            (if (= kind :sqlite)
+              (if wal? "sqlite-wal" "sqlite")
+              name)
+            batch
+            threads
+            durability-profile
+            kv-non-durable-profile)))
 
 (defn- ensure-parent-directory!
   [path]
@@ -347,12 +375,16 @@
    :age age})
 
 (defn- store-opts
-  [wal? durability-profile]
-  (cond-> {:mapsize 60000
-           :flags   c/default-env-flags
-           :wal?    wal?}
-    (and wal? durability-profile)
-    (assoc :wal-durability-profile durability-profile)))
+  ([wal? durability-profile]
+   (store-opts wal? durability-profile nil))
+  ([wal? durability-profile kv-non-durable-profile]
+   (cond-> {:mapsize 60000
+            :flags   (into c/default-env-flags
+                           (get kv-non-durable-profile-flags
+                                kv-non-durable-profile #{}))
+            :wal?    wal?}
+     (and wal? durability-profile)
+     (assoc :wal-durability-profile durability-profile))))
 
 (defn- datalog-opts
   [wal? durability-profile]
@@ -601,11 +633,13 @@
 
 (defn- open-write-context
   [{:keys [kind wal?] :as info}
-   target threads durability-profile seed]
+   target threads durability-profile kv-non-durable-profile seed]
   (let [next-person (pure-person-generator seed)]
     (case kind
       :kv
-      (let [db (d/open-kv target (store-opts wal? durability-profile))]
+      (let [db (d/open-kv target
+                          (store-opts wal? durability-profile
+                                      kv-non-durable-profile))]
         (try
           (d/open-dbi db max-write-dbi)
           {:tx-fn   (if (:async? info)
@@ -624,7 +658,16 @@
                                      (d/entries db max-write-dbi)))
            :close!  #(d/close-kv db)
            :storage {:engine :datalevin-kv
-                     :native-version (Util/version)}}
+                     :native-version (Util/version)
+                     :configuration
+                     (cond-> {:wal? wal?
+                              :env-flags
+                              (vec (sort (d/get-env-flags db)))}
+                       durability-profile
+                       (assoc :wal-durability-profile durability-profile)
+                       kv-non-durable-profile
+                       (assoc :kv-non-durable-profile
+                              kv-non-durable-profile))}}
           (catch Throwable t
             (d/close-kv db)
             (throw t))))
@@ -745,7 +788,8 @@
 
 (defn- run-write-pass
   [{:keys [base-dir batch f threads durability-profile total report
-           in-flight in-flight-writes completion-timeout-ms seed]
+           kv-non-durable-profile in-flight in-flight-writes
+           completion-timeout-ms seed]
     :or   {threads               1
            total                 1000000
            report                10000
@@ -779,13 +823,16 @@
                             :in-flight-limit in-flight-limit
                             :in-flight-write-limit in-flight-write-limit
                             :completion-timeout completion-timeout}
-        _                  (validate-common! config info durability-profile)
+        _                  (validate-common! config info durability-profile
+                                             kv-non-durable-profile)
         target             (benchmark-target base-dir info batch threads
-                                             effective-profile)
+                                             effective-profile
+                                             kv-non-durable-profile)
         _                  (ensure-fresh-target!
                              target (= :sqlite (:kind info)))
         context            (open-write-context info target threads
-                                               effective-profile seed)
+                                               effective-profile
+                                               kv-non-durable-profile seed)
         started-at         (str (Instant/now))]
     (try
       (let [metrics (h/run-benchmark!
@@ -808,6 +855,7 @@
                :threads threads
                :async? (:async? info)
                :durability-profile effective-profile
+               :kv-non-durable-profile kv-non-durable-profile
                :seed seed
                :in-flight (when (:async? info) effective-in-flight)
                :in-flight-request-limit

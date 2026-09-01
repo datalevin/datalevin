@@ -12,6 +12,7 @@
    [clojure.test :refer [deftest is testing]]
    [datalevin.binding.cpp :as cpp]
    [datalevin.conn :as conn]
+   [datalevin.constants :as c]
    [datalevin.core :as d]
    [datalevin.db :as db]
    [datalevin.util :as u])
@@ -51,6 +52,39 @@
 (defn- invoke-conn-private
   [sym & args]
   (apply (ns-resolve 'datalevin.conn sym) args))
+
+(defn- report-datom-tuples
+  [report]
+  (mapv (fn [datom]
+          [(:e datom) (:a datom) (:v datom) (:tx datom) (:added datom)])
+        (:tx-data report)))
+
+(deftest wal-default-profile-is-strict
+  (is (= :strict c/*wal-durability-profile*))
+  (is (= :strict c/*datalog-wal-durability-profile*))
+  (testing "Datalog WAL uses the strict dispatch path when omitted"
+    (let [conn* (d/create-conn nil
+                               schema
+                               {:wal? true
+                                :kv-opts {:inmemory? true}})
+          paths (atom [])]
+      (try
+        (binding [conn/*txlog-sync-path-observer*
+                  #(swap! paths conj %)]
+          (d/transact! conn* [{:item/id 1 :item/value "v1"}]))
+        (is (= [:direct-wal-idle-strict] @paths))
+        (finally
+          (d/close conn*)))))
+  (testing "direct KV WAL reports the strict default"
+    (let [dir      (u/tmp-dir (str "strict-wal-default-"
+                                   (UUID/randomUUID)))
+          kv-store (d/open-kv dir {:wal? true})]
+      (try
+        (is (= :strict
+               (:durability-profile (d/txlog-watermarks kv-store))))
+        (finally
+          (d/close-kv kv-store)
+          (u/delete-files dir))))))
 
 (deftest relaxed-wal-idle-writes-retain-txlog-grouping-on-direct-path
   (let [conn* (d/create-conn nil
@@ -115,7 +149,8 @@
           (is (some? prepared))
           (is (= 1 (count (:entities prepared))))
           (is (= 1 (count (:unique-avs prepared))))
-          (is (true? (:fuse-unique-inserts? prepared)))))
+          (is (true? (:fuse-unique-inserts? prepared)))
+          (is (= [:item/id 2] (:identity-upsert-av prepared)))))
       (testing "large, distinct scalar identity values use blind preparation"
         (let [prepared (db/prepare-blind-local-tx @conn (item-batch 0 256))]
           (is (some? prepared))
@@ -209,10 +244,96 @@
       (is (= 1 (d/count-datoms @conn nil :item/id nil)))
       (is (= "initial" (:item/value (d/entity @conn [:item/id 1]))))
 
-      (testing "an existing identity falls back to normal upsert resolution"
+      (testing "an existing identity retains normal upsert semantics"
         (d/transact! conn [{:item/id 1 :item/value "updated"}])
         (is (= 1 (d/count-datoms @conn nil :item/id nil)))
         (is (= "updated" (:item/value (d/entity @conn [:item/id 1])))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest simple-existing-identity-wal-upserts-use-specialized-stamping
+  (let [specialized-dir (u/tmp-dir
+                          (str "identity-upsert-specialized-"
+                               (UUID/randomUUID)))
+        fallback-dir    (u/tmp-dir
+                          (str "identity-upsert-fallback-"
+                               (UUID/randomUUID)))
+        specialized     (d/get-conn specialized-dir schema {:wal? true})
+        fallback        (d/get-conn fallback-dir schema {:wal? true})
+        initial         {:item/id    1
+                         :item/value "initial"
+                         :item/left  true}
+        update          {:db/id      "upsert-tempid"
+                         :item/id    1
+                         :item/value "updated"
+                         :item/left  true
+                         :item/right false}
+        tx-meta         {:source :identity-upsert-test}
+        paths           (atom [])]
+    (try
+      (d/transact! specialized [initial])
+      (d/transact! fallback [initial])
+      (let [specialized-report
+            (binding [conn/*local-wal-tx-path-observer*
+                      #(swap! paths conj %)]
+              (d/transact! specialized [update] tx-meta))
+            fallback-report
+            (binding [conn/*local-wal-identity-upsert?* false]
+              (d/transact! fallback [update] tx-meta))
+            eid (get (:tempids specialized-report) "upsert-tempid")]
+        (is (= [:identity-upsert] @paths))
+        (is (= (:tempids fallback-report)
+               (:tempids specialized-report)))
+        (is (= tx-meta (:tx-meta specialized-report)))
+        (is (= (report-datom-tuples fallback-report)
+               (report-datom-tuples specialized-report)))
+        (is (= #{[:item/value "initial" false]
+                 [:item/value "updated" true]
+                 [:item/right false true]}
+               (into #{}
+                     (map (fn [datom]
+                            [(:a datom) (:v datom) (:added datom)]))
+                     (:tx-data specialized-report))))
+        (is (= eid (:db/id (d/touch (d/entity @specialized
+                                               [:item/id 1])))))
+        (is (= (into {} (d/touch (d/entity @fallback [:item/id 1])))
+               (into {} (d/touch
+                          (d/entity @specialized [:item/id 1])))))
+
+        (testing "a redundant identity upsert still advances the transaction"
+          (let [before (:max-tx @specialized)
+                report (d/transact! specialized
+                                    [{:item/id    1
+                                      :item/value "updated"
+                                      :item/left  true
+                                      :item/right false}])]
+            (is (empty? (:tx-data report)))
+            (is (= (inc (long before)) (:max-tx @specialized)))
+            (is (= (:max-tx @specialized)
+                   (:db/current-tx (:tempids report)))))))
+      (finally
+        (d/close specialized)
+        (d/close fallback)
+        (u/delete-files specialized-dir)
+        (u/delete-files fallback-dir)))))
+
+(deftest complex-identity-wal-upserts-retain-general-fallback
+  (let [dir   (u/tmp-dir (str "identity-upsert-general-fallback-"
+                              (UUID/randomUUID)))
+        schema' (assoc schema
+                       :item/tags {:db/valueType   :db.type/string
+                                   :db/cardinality :db.cardinality/many})
+        conn  (d/get-conn dir schema' {:wal? true})
+        paths (atom [])]
+    (try
+      (d/transact! conn [{:item/id 1 :item/tags ["one"]}])
+      (binding [conn/*local-wal-tx-path-observer*
+                #(swap! paths conj %)]
+        (d/transact! conn [{:item/id 1 :item/tags ["two"]}]))
+      (is (= [:general] @paths))
+      (is (= #{"one" "two"}
+             (:item/tags (d/touch (d/entity @conn [:item/id 1])))))
       (finally
         (d/close conn)
         (u/delete-files dir)))))
@@ -228,8 +349,9 @@
           (let [published   @conn
                 eavt-before (vec (:eavt published))
                 avet-before (vec (:avet published))]
-            ;; An existing identity forces the ordinary resolver after the
-            ;; optimistic blind probe, exercising transaction-local overlays.
+            ;; Existing identities use either the ordinary resolver or the
+            ;; WAL identity specialization. Neither may mutate this published
+            ;; DB value's transaction-local overlays.
             (d/transact! conn [{:item/id 1 :item/value "updated"}])
             (is (= eavt-before (vec (:eavt published))))
             (is (= avet-before (vec (:avet published))))

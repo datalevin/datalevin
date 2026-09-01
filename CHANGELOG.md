@@ -9,6 +9,10 @@
   JavaScript. Existing EDN-string and native list/array APIs remain supported.
 
 ### Changed
+- [WAL] default WAL durability to `:strict` when WAL is enabled and no profile
+  is specified. `:relaxed` remains an explicit higher-throughput option with a
+  bounded crash-loss window. Existing databases retain their persisted profile
+  on reopen.
 - [KV] respect OS durability default, i.e. use default fsync on macos.
 - [Datalog] set semantics at rule boundary.
 - [Storage] AVE now uses `DUPFIXED` format. Existing 1.0.x databases upgrade
@@ -44,6 +48,7 @@
   before union.
 - [Datalog] better error report for missing tuple elements.
 - [Datalog] fast path for batched writes.
+- [Datalog] local WAL fast path for simple identity upserts.
 
 ## 1.0.2 (2026-08-11)
 

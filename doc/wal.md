@@ -27,8 +27,10 @@ explicitly when you want WAL write concurrency and throughput behavior:
 ```
 
 When a local Datalog or KV store enables WAL and omits
-`:wal-durability-profile`, the default profile is `:relaxed`. Specify
-`:strict` or `:extra` when the WAL opt-in is primarily for crash durability:
+`:wal-durability-profile`, the default profile is `:strict`. Specify
+`:relaxed` only when accepting its bounded crash-loss window for higher
+throughput, or `:extra` for stronger-than-default OS sync behavior. The default
+can also be written explicitly:
 
 ```clojure
 (d/create-conn
@@ -37,6 +39,10 @@ When a local Datalog or KV store enables WAL and omits
   {:wal? true
    :wal-durability-profile :strict})
 ```
+
+Existing databases retain their persisted WAL durability profile on reopen.
+To move an older `:relaxed` database to the new default, reopen it explicitly
+with `:wal-durability-profile :strict`.
 
 Consensus-lease HA databases require WAL and default to `:strict`.
 
@@ -64,11 +70,11 @@ against the shared files before appending or reporting watermarks.
 WAL supports three durability profiles in WAL:
 
 * `:strict`: each transaction waits for durable WAL acknowledgment, i.e,
-  `fsync` success for the WAL segment file. This is the default for
-  consensus-lease HA.
+  `fsync` success for the WAL segment file. This is the default whenever WAL
+  is enabled, including consensus-lease HA.
 * `:relaxed`: transactions can return before durability is forced for every
-  single write, using batched syncs for a higher throughput. This is the
-  default for explicit non-HA WAL opt-in.
+  single write, using batched syncs for a higher throughput. This is an
+  explicit opt-in.
 * `:extra`: each transaction waits for stricter durability than `:strict`,
   on macOS, that is `fcntl(F_FULLSYNC)`.
 
