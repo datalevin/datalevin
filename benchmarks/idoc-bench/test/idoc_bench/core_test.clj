@@ -50,4 +50,59 @@
                        (assoc bench/default-opts :ops 1 :threads 2))))
   (is (= "--hotset must be greater than 0 and at most 1"
          (call-private 'validate-options
-                       (assoc bench/default-opts :hotset 0.0)))))
+                       (assoc bench/default-opts :hotset 0.0))))
+  (is (= "unsupported durability profile: :unknown"
+         (call-private 'validate-options
+                       (assoc bench/default-opts
+                              :durability-profile :unknown))))
+  (is (= "unsupported run role: :unknown"
+         (call-private 'validate-options
+                       (assoc bench/default-opts :run-role :unknown))))
+  (is (thrown-with-msg?
+        clojure.lang.ExceptionInfo
+        #"--repetitions is not supported"
+        (call-private 'parse-args ["--repetitions" "3"]))))
+
+(deftest benchmark-query-projects-only-ids-test
+  (is (= '[:find ?e
+           :in $ ?q
+           :where [(idoc-match $ :mem/doc ?q nil) [[?e _ _]]]]
+         bench/q-idoc)))
+
+(deftest single-pass-summary-test
+  (let [latency {:operations {:read {:count 10 :mean 1.0}}
+                 :idoc-shapes {}}
+        result  (call-private
+                  'summarize-pass
+                  [{:system :datalevin
+                    :throughput-ops-per-second 20.0
+                    :elapsed-ms 500.0
+                    :latency-ms latency}])]
+    (is (= :single-complete-pass (:aggregation result)))
+    (is (= 20.0
+           (get-in result
+                   [:systems :datalevin :throughput-ops-per-second])))
+    (is (= latency
+           (get-in result [:systems :datalevin :latency-ms])))))
+
+(deftest two-pass-pair-validation-test
+  (let [base {:format-version 3
+              :configuration {:system :datalevin :workload :A}
+              :schedule {:measurement-sha256 "same"}
+              :results [{:system :datalevin
+                         :correctness {:status :passed}}]
+              :host {:jvm-instance-id "warmup-jvm"
+                     :benchmark-host-control "controlled"}}
+        warmup (assoc base :protocol {:run-role :warmup})
+        measurement (-> base
+                        (assoc :protocol {:run-role :measurement})
+                        (assoc-in [:host :jvm-instance-id]
+                                  "measurement-jvm"))]
+    (is (true? (bench/validate-pass-pair warmup measurement)))
+    (is (thrown-with-msg?
+          clojure.lang.ExceptionInfo
+          #"Invalid IDoc benchmark warmup/measurement pair"
+          (bench/validate-pass-pair
+            warmup
+            (assoc-in measurement [:schedule :measurement-sha256]
+                      "different"))))))

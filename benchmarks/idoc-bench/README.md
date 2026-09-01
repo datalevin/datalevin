@@ -18,7 +18,8 @@ Each benchmark run performs the same high-level tasks:
    - MongoDB builds field indexes for the query mix.
 3. **Verify**: compare reads, mutations, and idoc queries with an independent
    Clojure oracle.
-4. **Warmup**: execute `--warmup` operations to stabilize caches.
+4. **Within-pass warmup**: execute `--warmup` operations to stabilize the
+   freshly built database before timing.
 5. **Run**: execute `--ops` operations according to the workload mix.
 
 Verification is mandatory by default. A mismatch or worker failure aborts the
@@ -32,19 +33,27 @@ benchmark result.
 - The report records SHA-256 digests for the dataset and both schedules.
 - Every operation uses client-observed wall-clock time. Query latency includes
   planning, database execution, transfer, and complete realization of result
-  ids for all four systems.
+  ids for all four systems. Every backend projects only record ids for an idoc
+  query; full documents are not fetched merely to discard them.
 - Updates and read-modify-writes use the same per-record critical section on
   every backend. Time waiting on a contended record is included in latency.
+- The default `strict` durability profile uses Datalevin strict WAL,
+  PostgreSQL `synchronous_commit=on`, SQLite WAL `synchronous=FULL`, and
+  MongoDB write concern `{w: 1, j: true}`.
 - Database creation, loading, index creation, correctness checks, and warmup
   are outside the measured interval.
 - The console reports mean, median, p95, and p99 latency by operation. Idoc
   latency is also broken down by query shape.
+- Publishable results use two complete passes in independent JVM processes:
+  one `--run-role warmup` pass followed by one `--run-role measurement` pass.
+  Only the measurement pass is reported. Repeating a workload inside one JVM
+  is deliberately unsupported because it primarily measures progressively
+  warmer code and caches.
+- Each artifact records its run role and JVM-instance ID. Use
+  `idoc-bench.core/validate-pass-pair` to require distinct JVMs plus matching
+  configuration, schedules, systems, host controls, and correctness gates.
 - `--output` writes host/JVM metadata, configuration, correctness results,
   summaries, and every raw latency sample to one EDN artifact.
-
-This contract deliberately does not mix database-reported `EXPLAIN` time with
-client wall-clock time. Explain plans remain useful diagnostics, but they are
-not comparable latency measurements across these systems.
 
 ### Operation Types
 
@@ -122,7 +131,7 @@ The `idoc` operation randomly picks one of these query shapes:
 ## Run Benchmarks
 
 ```bash
-# Datalevin
+# Datalevin smoke run; the default role is measurement
 clojure -M:bench --system datalevin \
   --output results/datalevin-c.edn
 
@@ -136,9 +145,14 @@ clojure -M:bench --system sqlite --sqlite-path /tmp/idoc-bench.sqlite
 # MongoDB
 clojure -M:bench --system mongo --mongo-uri mongodb://localhost:27017
 
-# Run all systems sequentially
+# Publishable two-pass run. These must be separate shell invocations/JVMs.
 clojure -M:bench --system all --records 10000 --ops 10000 \
-  --output results/all-c.edn
+  --durability strict --run-role warmup \
+  --output results/all-c-warmup.edn
+
+clojure -M:bench --system all --records 10000 --ops 10000 \
+  --durability strict --run-role measurement \
+  --output results/all-c-measurement.edn
 ```
 
 ### Options
@@ -166,20 +180,55 @@ clojure -M:bench --system all --records 10000 --ops 10000 \
 - `--mongo-db NAME`   MongoDB database (default idoc_bench)
 - `--mongo-coll NAME` MongoDB collection (default docs)
 - `--seed N`          RNG seed (default 42)
+- `--durability strict|relaxed` Acknowledgment profile (default strict)
+- `--run-role warmup|measurement` Complete-pass role (default measurement)
 - `--keep`            Keep DB artifacts after run
 
 ## Results
 
-Use `--output` for any result intended to guide optimization or be published.
-The raw samples make it possible to recalculate distributions and detect
-outliers without rerunning the workload. A result is comparable only when its
-dataset and measurement schedule hashes match and its correctness status is
-`:passed`.
+The completed study used 10,000 documents, 1,000 within-pass warmup operations,
+10,000 measured operations, seed 42, and idoc weight 30. For each workload and
+thread count, one complete `--system all --run-role warmup` JVM was immediately
+followed by one complete `--system all --run-role measurement` JVM. Only the
+measurement pass is reported below. All six pairs passed
+`validate-pass-pair`: their configurations, schedules, systems, host controls,
+and correctness results match, and every warmup/measurement pair has distinct
+JVM-instance IDs.
 
-For a before/after optimization comparison, keep the full command, seed,
-machine, JVM, database versions, and service configuration fixed. Run each
-configuration multiple times and compare medians from complete artifacts; do
-not treat the tiny smoke commands below as performance baselines.
+The host was a 12-core Apple Silicon Mac running Java 21.0.11. Backend versions
+were Datalevin 1.1.0 / DLMDB 1.0.0, PostgreSQL 18.4, SQLite 3.51.1, and MongoDB
+7.0.35. `mediaanalysisd` was paused for all 12 passes and resumed afterward.
+
+| Workload | Datalevin | PostgreSQL | SQLite | MongoDB | Leader |
+|---|---:|---:|---:|---:|---:|
+| A | 3,358/s | 2,270/s | 438/s | 309/s | Datalevin 1.480X |
+| C | 11,454/s | 2,039/s | 437/s | 2,868/s | Datalevin 3.993X |
+| F | 2,680/s | 1,789/s | 416/s | 192/s | Datalevin 1.497X |
+
+#### Workload C query-shape p50
+
+Each cell is the p50 latency from the retained measurement pass, in
+milliseconds.
+
+| Query shape | Datalevin | PostgreSQL | SQLite | MongoDB |
+|---|---:|---:|---:|---:|
+| Nested equality | 0.057 | 0.802 | 0.155 | 0.510 |
+| Range | 0.328 | 1.552 | 0.789 | 1.814 |
+| Wildcard, one segment | 0.051 | 0.635 | 0.136 | 0.501 |
+| Wildcard, any depth | 0.147 | 2.767 | 22.719 | 1.112 |
+| Array match | 0.207 | 3.615 | 23.924 | 1.459 |
+
+SQLite is competitive on its expression-indexed scalar shapes, but JSON1
+cannot index the nested array elements used by wildcard-depth and array-match;
+those two shapes scan all documents and dominate its mixed throughput.
+MongoDB's explicit journal acknowledgment primarily affects A/F, while C shows
+its indexed read/query performance without write acknowledgment cost.
+
+Use `--output` for any result intended to guide optimization or be published.
+A publishable result is the measurement half of a validated two-process pair.
+For before/after optimization, run one complete pair for each build and keep
+the command, seed, machine, JVM, database versions, schedules, and service
+configuration fixed.
 
 ## Tests and Smoke Checks
 
@@ -191,9 +240,6 @@ clojure -M:test
 clojure -M:bench --system datalevin --records 100 --ops 40 --warmup 5
 clojure -M:bench --system sqlite --records 100 --ops 40 --warmup 5
 ```
-
-
-
 ## Notes
 
 - Postgres uses JSONB, SQLite uses JSON1 functions, and MongoDB stores the

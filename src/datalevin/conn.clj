@@ -489,6 +489,43 @@
               (when-not old
                 (db/enable-cache (.-store ^DB @conn))))))))))
 
+(defn- direct-local-patch-idoc-transact!
+  [conn prepared tx-meta]
+  (locking conn
+    (let [db    ^DB @conn
+          store ^Store (.-store db)]
+      (when (db/local-patch-idoc-tx-valid? db prepared)
+        (let [old (db/cache-disabled? store)]
+          (db/disable-cache store)
+          (try
+            (let [kv             (.-lmdb store)
+                  prepared-store (volatile! nil)
+                  result
+                  (l/with-transaction-kv [kv1 kv]
+                    (let [store1 ^Store (s/transfer store kv1)
+                          db1    ^DB    (db/transfer db store1)]
+                      (when-let [{:keys [report]}
+                                 (db/stamp-local-patch-idoc-tx
+                                   db1 prepared tx-meta)]
+                        (vreset! prepared-store store1)
+                        (db/commit-prepared-tx-data!
+                          db1 (:tx-data report) report)
+                        report)))]
+              (when result
+                (let [report    result
+                      new-store ^Store (s/transfer
+                                         ^Store @prepared-store kv)
+                      new-db    (-> (:db-after report)
+                                    (db/transfer new-store)
+                                    (db/carry-runtime-opts db)
+                                    (db/adopt-current-db!))
+                      report    (assoc report :db-after new-db)]
+                  (reset! conn new-db)
+                  report)))
+            (finally
+              (when-not old
+                (db/enable-cache (.-store ^DB @conn))))))))))
+
 (defn- maybe-direct-local-blind-transact!
   ([conn tx-data tx-meta]
    (maybe-direct-local-blind-transact! conn tx-data tx-meta false))
@@ -501,6 +538,7 @@
 
 (def ^:dynamic *local-wal-tx-path-observer* nil)
 (def ^:dynamic *local-wal-identity-upsert?* true)
+(def ^:dynamic *local-wal-patch-idoc?* true)
 
 (defn- observe-local-wal-tx-path!
   [path]
@@ -509,21 +547,28 @@
 
 (defn- maybe-direct-local-wal-transact!
   [conn tx-data tx-meta]
-  (when-let [prepared (db/prepare-blind-local-tx
-                        ^DB @conn tx-data true false)]
-    (when (:has-unique? prepared)
-      (if (and *local-wal-identity-upsert?*
-               (:identity-upsert-av prepared))
-        (when-let [[report upsert?]
-                   (direct-local-identity-transact!
-                     conn prepared tx-meta)]
-          (observe-local-wal-tx-path!
-            (if upsert? :identity-upsert :blind-insert))
-          report)
-        (when-let [report (direct-local-blind-transact!
+  (or
+    (when *local-wal-patch-idoc?*
+      (when-let [prepared (db/prepare-local-patch-idoc-tx ^DB @conn tx-data)]
+        (when-let [report (direct-local-patch-idoc-transact!
                             conn prepared tx-meta)]
-          (observe-local-wal-tx-path! :blind-insert)
-          report)))))
+          (observe-local-wal-tx-path! :patch-idoc)
+          report)))
+    (when-let [prepared (db/prepare-blind-local-tx
+                          ^DB @conn tx-data true false)]
+      (when (:has-unique? prepared)
+        (if (and *local-wal-identity-upsert?*
+                 (:identity-upsert-av prepared))
+          (when-let [[report upsert?]
+                     (direct-local-identity-transact!
+                       conn prepared tx-meta)]
+            (observe-local-wal-tx-path!
+              (if upsert? :identity-upsert :blind-insert))
+            report)
+          (when-let [report (direct-local-blind-transact!
+                              conn prepared tx-meta)]
+            (observe-local-wal-tx-path! :blind-insert)
+            report))))))
 
 (declare current-thread-holds-store-write-lock?)
 
@@ -1063,6 +1108,104 @@
           (aset reports i report)
           (recur (inc i) (:db-after report)))))))
 
+(defn- prepare-sync-queued-patch-idoc-batch
+  [conn ^FastList requests]
+  (let [db    ^DB @conn
+        store (.-store db)]
+    (when (and (instance? Store store)
+               (true? (:wal? (i/env-opts (.-lmdb ^Store store)))))
+      (let [n                 (int (.size requests))
+            ^objects prepared (object-array n)]
+        (loop [i 0]
+          (if (< i n)
+            (let [^SyncQueuedReq req (.get requests i)
+                  tx (db/prepare-local-patch-idoc-tx db (.-tx-data req))]
+              (if tx
+                (do
+                  (aset prepared i tx)
+                  (recur (unchecked-inc i)))
+                nil))
+            prepared))))))
+
+(defn- prepared-patch-idoc-batch-valid?
+  [^DB db ^objects prepared]
+  (let [n (alength prepared)]
+    (loop [i 0]
+      (or (>= i n)
+          (and (db/local-patch-idoc-tx-valid? db (aget prepared i))
+               (recur (unchecked-inc i)))))))
+
+(defn- prepare-sync-queued-patch-idoc-reports!
+  [^DB db ^FastList requests ^objects prepared ^objects reports]
+  (let [n (alength prepared)]
+    (loop [i       0
+           current db
+           docs    {}]
+      (if (< i n)
+        (let [^SyncQueuedReq req (.get requests i)
+              patch             (aget prepared i)
+              doc-key           [(:e patch) (:attr patch)]
+              stamped           (if (contains? docs doc-key)
+                                  (db/stamp-local-patch-idoc-tx
+                                    current patch (.-tx-meta req)
+                                    (get docs doc-key))
+                                  (db/stamp-local-patch-idoc-tx
+                                    current patch (.-tx-meta req)))
+              _                 (when-not stamped
+                                  (u/raise
+                                    "Prepared patchIdoc batch became stale"
+                                    {:type ::stale-patch-idoc-batch}))
+              ^TxReport report  (:report stamped)]
+          (aset reports i report)
+          (recur (unchecked-inc i)
+                 (:db-after report)
+                 (assoc docs doc-key (:doc stamped))))
+        current))))
+
+(defn- try-commit-sync-queued-patch-idoc-batch!
+  [conn ^FastList requests ^objects prepared ^objects reports]
+  (locking conn
+    (let [db    ^DB @conn
+          store (.-store db)
+          n     (alength prepared)]
+      (when (and (instance? Store store)
+                 (= n (alength reports))
+                 (= n (.size requests))
+                 (not (l/writing? (.-lmdb ^Store store)))
+                 (prepared-patch-idoc-batch-valid? db prepared))
+        (let [old (db/cache-disabled? store)]
+          (db/disable-cache store)
+          (try
+            (let [kv       (.-lmdb ^Store store)
+                  final-db (volatile! nil)]
+              (l/with-transaction-kv [kv1 kv]
+                (let [store1 ^Store (s/transfer ^Store store kv1)
+                      db1    ^DB    (db/transfer db store1)
+                      dbn    ^DB    (prepare-sync-queued-patch-idoc-reports!
+                                      db1 requests prepared reports)]
+                  (loop [i       0
+                         current db1]
+                    (when (< i n)
+                      (let [^TxReport report (aget reports i)]
+                        (db/commit-prepared-tx-data!
+                          current (:tx-data report) report)
+                        (recur (unchecked-inc i) (:db-after report)))))
+                  (vreset! final-db dbn)))
+              (let [final-db ^DB @final-db
+                    new-store ^Store
+                    (s/transfer ^Store (.-store final-db) kv)
+                    new-db (-> final-db
+                               (db/transfer new-store)
+                               (db/carry-runtime-opts db)
+                               (db/adopt-current-db!))]
+                (reset! conn new-db)
+                (dotimes [_ n]
+                  (observe-local-wal-tx-path! :patch-idoc))
+                true))
+            (finally
+              (when-not old
+                (db/enable-cache (.-store ^DB @conn))))))))))
+
 (defn- add-distinct-blind-unique-values!
   [^HashSet seen prepared]
   (let [^FastList avs (:unique-avs prepared)]
@@ -1207,18 +1350,28 @@
         (let [^objects reports (object-array n)]
           (try
             (binding [*sync-queue-worker?* true]
-              (let [prepared (prepare-sync-queued-blind-batch conn requests)]
+              (let [patches (when *local-wal-patch-idoc?*
+                              (prepare-sync-queued-patch-idoc-batch
+                                conn requests))]
                 (when-not
-                  (and prepared
-                       (try-commit-sync-queued-blind-batch!
-                         conn requests prepared reports))
-                  ;; General preparation allocates concrete entids/tx ids. Keep
-                  ;; it under the same connection lock as commit so concurrent
-                  ;; direct writes cannot advance the shared snapshot mid-batch.
-                  (locking conn
-                    (prepare-sync-queued-batch-reports!
-                      conn requests reports)
-                    (commit-sync-queued-batch-reports! conn reports)))))
+                  (and patches
+                       (try-commit-sync-queued-patch-idoc-batch!
+                         conn requests patches reports))
+                  (let [prepared
+                        (prepare-sync-queued-blind-batch conn requests)]
+                    (when-not
+                      (and prepared
+                           (try-commit-sync-queued-blind-batch!
+                             conn requests prepared reports))
+                      ;; General preparation allocates concrete entids/tx ids.
+                      ;; Keep it under the same connection lock as commit so
+                      ;; concurrent direct writes cannot advance the shared
+                      ;; snapshot mid-batch.
+                      (locking conn
+                        (prepare-sync-queued-batch-reports!
+                          conn requests reports)
+                        (commit-sync-queued-batch-reports!
+                          conn reports)))))))
             (let [db-after @conn]
               (dotimes [i n]
                 (deliver-sync-queued-success!

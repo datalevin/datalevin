@@ -21,7 +21,9 @@ The following benchmarks are included:
   vector queries with access paths enabled and disabled, reporting latency and
   residual candidate work.
 * [Idoc](idoc-bench) runs YCSB-style A/C/F workloads plus idoc query mixes
-  (nested paths, ranges, wildcards, arrays) to stress document queries.
+  (nested paths, ranges, wildcards, arrays) to stress document queries. Its
+  publication protocol uses one complete warmup pass and one retained
+  measurement pass in independent JVM processes.
 * [OpenRuleBench](openrulebench) compares a portable TC, SG, and Join1 task
   matrix across Datalevin and compatible rule/SQL engines. Every accepted task
   has deterministic set-valued inputs, an independent answer-count reference,

@@ -30,6 +30,16 @@
    :item/left  {:db/valueType :db.type/boolean}
    :item/right {:db/valueType :db.type/boolean}})
 
+(def ^:private idoc-schema
+  (assoc schema
+         :item/doc {:db/valueType :db.type/idoc
+                    :db/domain    "items"}))
+
+(def ^:private q-idoc-eids
+  '[:find [?e ...]
+    :in $ ?query
+    :where [(idoc-match $ :item/doc ?query nil) [[?e _ _]]]])
+
 (defn- item-batch
   [start n]
   (let [start (long start)
@@ -58,6 +68,10 @@
   (mapv (fn [datom]
           [(:e datom) (:a datom) (:v datom) (:tx datom) (:added datom)])
         (:tx-data report)))
+
+(defn- report-datom-metadata
+  [report]
+  (mapv meta (:tx-data report)))
 
 (deftest wal-default-profile-is-strict
   (is (= :strict c/*wal-durability-profile*))
@@ -317,6 +331,244 @@
         (d/close fallback)
         (u/delete-files specialized-dir)
         (u/delete-files fallback-dir)))))
+
+(deftest simple-local-wal-idoc-patches-use-specialized-stamping
+  (let [specialized-dir (u/tmp-dir
+                          (str "patch-idoc-specialized-"
+                               (UUID/randomUUID)))
+        fallback-dir    (u/tmp-dir
+                          (str "patch-idoc-fallback-"
+                               (UUID/randomUUID)))
+        specialized     (d/get-conn specialized-dir idoc-schema {:wal? true})
+        fallback        (d/get-conn fallback-dir idoc-schema {:wal? true})
+        initial-doc     {:profile {:age 30 :name "Alice"}
+                         :tags    ["a"]
+                         :orders  [{:product "A" :qty 10}
+                                   {:product "B" :qty 20}]
+                         :bio     (apply str (repeat 600 \x))}
+        patches         [[[:set [:profile :age] 31]
+                          [:update [:tags] :conj "b"]]
+                         [[:set [:orders 1 :product] "C"]]
+                         [[:update [:profile] :assoc :title "dev"]
+                          [:update [:profile] :merge {:country "US"}]
+                          [:update [:profile] :dissoc :name]
+                          [:update [:profile :age] :inc]]
+                         [[:unset [:profile :title]]
+                          [:update [:profile :age] :dec]]]
+        tx-meta         {:source :patch-idoc-test}
+        paths           (atom [])]
+    (try
+      (doseq [conn* [specialized fallback]]
+        (d/transact! conn* [{:db/id    1
+                             :item/id  1
+                             :item/doc initial-doc}]))
+      (doseq [ops patches]
+        (reset! paths [])
+        (let [tx-data [[:db.fn/patchIdoc 1 :item/doc ops]]
+              specialized-report
+              (binding [conn/*local-wal-tx-path-observer*
+                        #(swap! paths conj %)]
+                (d/transact! specialized tx-data tx-meta))
+              fallback-report
+              (binding [conn/*local-wal-patch-idoc?* false]
+                (d/transact! fallback tx-data tx-meta))]
+          (is (= [:patch-idoc] @paths))
+          (is (= tx-meta (:tx-meta specialized-report)))
+          (is (= (:tempids fallback-report)
+                 (:tempids specialized-report)))
+          (is (= (report-datom-tuples fallback-report)
+                 (report-datom-tuples specialized-report)))
+          (is (= (report-datom-metadata fallback-report)
+                 (report-datom-metadata specialized-report)))
+          (is (= (:item/doc (d/entity @fallback 1))
+                 (:item/doc (d/entity @specialized 1))))))
+
+      (testing "a redundant patch still advances the logical transaction"
+        (let [before          (:max-tx @specialized)
+              fallback-before (:max-tx @fallback)
+              tx-data         [[:db.fn/patchIdoc 1 :item/doc
+                                [[:set [:profile :age] 31]]]]
+              report          (d/transact! specialized tx-data)
+              fallback-report
+              (binding [conn/*local-wal-patch-idoc?* false]
+                (d/transact! fallback tx-data))]
+          (is (empty? (:tx-data report)))
+          (is (empty? (:tx-data fallback-report)))
+          (is (= (inc (long before)) (:max-tx @specialized)))
+          (is (= (inc (long fallback-before)) (:max-tx @fallback)))
+          (is (= (:max-tx @specialized)
+                 (:db/current-tx (:tempids report))))))
+
+      (testing "a patch can create an explicit numeric entity"
+        (reset! paths [])
+        (let [tx-data [[:db.fn/patchIdoc 1000 :item/doc
+                        [[:set [:status] "new"]]]]
+              specialized-report
+              (binding [conn/*local-wal-tx-path-observer*
+                        #(swap! paths conj %)]
+                (d/transact! specialized tx-data))
+              fallback-report
+              (binding [conn/*local-wal-patch-idoc?* false]
+                (d/transact! fallback tx-data))]
+          (is (= [:patch-idoc] @paths))
+          (is (= (report-datom-tuples fallback-report)
+                 (report-datom-tuples specialized-report)))
+          (is (= (:max-eid (:db-after fallback-report))
+                 (:max-eid (:db-after specialized-report))
+                 1000))
+          (is (= {:status "new"}
+                 (:item/doc (d/entity @specialized 1000))))))
+
+      (is (= [1] (d/q q-idoc-eids @specialized
+                       {:profile {:age 31 :country "US"}})))
+      (is (= [1] (d/q q-idoc-eids @specialized
+                       {:orders {:product "C"}})))
+      (is (empty? (d/q q-idoc-eids @specialized
+                        {:profile {:name "Alice"}})))
+      (finally
+        (d/close specialized)
+        (d/close fallback)
+        (u/delete-files specialized-dir)
+        (u/delete-files fallback-dir)))))
+
+(deftest local-wal-idoc-patch-specialization-is-conservative
+  (let [dir  (u/tmp-dir (str "patch-idoc-conservative-"
+                             (UUID/randomUUID)))
+        conn (d/get-conn dir idoc-schema {:wal? true})
+        paths (atom [])]
+    (try
+      (d/transact! conn [{:db/id 1 :item/id 1}])
+      (testing "an absent idoc attribute can be created"
+        (binding [conn/*local-wal-tx-path-observer*
+                  #(swap! paths conj %)]
+          (d/transact! conn [[:db.fn/patchIdoc 1 :item/doc
+                              [[:set [:status] "active"]]]]))
+        (is (= [:patch-idoc] @paths))
+        (is (= {:status "active"} (:item/doc (d/entity @conn 1)))))
+
+      (testing "lookup refs and multi-form transactions retain full resolution"
+        (reset! paths [])
+        (binding [conn/*local-wal-tx-path-observer*
+                  #(swap! paths conj %)]
+          (d/transact! conn
+                       [[:db.fn/patchIdoc [:item/id 1] :item/doc
+                         [[:set [:status] "lookup"]]]]))
+        (is (= [:general] @paths))
+        (reset! paths [])
+        (binding [conn/*local-wal-tx-path-observer*
+                  #(swap! paths conj %)]
+          (d/transact! conn
+                       [[:db.fn/patchIdoc 1 :item/doc
+                         [[:set [:status] "multi"]]]
+                        [:db/add 1 :item/left true]]))
+        (is (= [:general] @paths))
+        (is (true? (:item/left (d/entity @conn 1)))))
+
+      (testing "unique IDoc attributes retain general uniqueness validation"
+        (let [unique-dir (u/tmp-dir (str "patch-idoc-unique-"
+                                         (UUID/randomUUID)))
+              unique-schema
+              (assoc schema
+                     :item/doc {:db/valueType :db.type/idoc
+                                :db/domain    "unique-items"
+                                :db/unique    :db.unique/value})
+              unique-conn (d/get-conn unique-dir unique-schema {:wal? true})]
+          (try
+            (d/transact! unique-conn
+                         [{:db/id 1 :item/id 1 :item/doc {:status "old"}}])
+            (reset! paths [])
+            (binding [conn/*local-wal-tx-path-observer*
+                      #(swap! paths conj %)]
+              (d/transact! unique-conn
+                           [[:db.fn/patchIdoc 1 :item/doc
+                             [[:set [:status] "new"]]]]))
+            (is (= [:general] @paths))
+            (is (= {:status "new"}
+                   (:item/doc (d/entity @unique-conn 1))))
+            (finally
+              (d/close unique-conn)
+              (u/delete-files unique-dir)))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest combined-queued-wal-idoc-patches-use-specialized-stamping
+  (let [dir  (u/tmp-dir (str "patch-idoc-queued-wal-"
+                             (UUID/randomUUID)))
+        conn (d/get-conn dir idoc-schema {:wal? true})]
+    (try
+      (d/transact! conn [{:db/id 1 :item/id 1 :item/doc {:counter 0}}])
+      (let [requests (doto (FastList. 2)
+                       (.add (conn/->SyncQueuedReq
+                               [[:db.fn/patchIdoc 1 :item/doc
+                                 [[:update [:counter] :inc]]]]
+                               {:request 0} (promise)))
+                       (.add (conn/->SyncQueuedReq
+                               [[:db.fn/patchIdoc 1 :item/doc
+                                 [[:update [:counter] :inc]]]]
+                               {:request 1} (promise))))
+            ^objects prepared
+            (invoke-conn-private
+              'prepare-sync-queued-patch-idoc-batch conn requests)
+            ^objects reports (object-array 2)
+            before (d/txlog-watermarks (d/datalog-kv conn))]
+        (is (some? prepared))
+        (is (true?
+              (invoke-conn-private
+                'try-commit-sync-queued-patch-idoc-batch!
+                conn requests prepared reports)))
+        (let [after    (d/txlog-watermarks (d/datalog-kv conn))
+              report0 (aget reports 0)
+              report1 (aget reports 1)]
+          (is (= {:request 0} (:tx-meta report0)))
+          (is (= {:request 1} (:tx-meta report1)))
+          (is (= (inc (long (:db/current-tx (:tempids report0))))
+                 (:db/current-tx (:tempids report1))))
+          (is (= 1 (- (long (:last-committed-lsn after))
+                      (long (:last-committed-lsn before)))))
+          (is (= 2 (:counter (:item/doc (d/entity @conn 1)))))
+          (is (= [1] (d/q q-idoc-eids @conn {:counter 2})))
+          (is (empty? (d/q q-idoc-eids @conn {:counter 0})))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest queued-wal-idoc-patches-prepare-before-mutating-indexes
+  (let [dir  (u/tmp-dir (str "patch-idoc-queued-rollback-"
+                             (UUID/randomUUID)))
+        conn (d/get-conn dir idoc-schema {:wal? true})]
+    (try
+      (d/transact! conn [{:db/id 1 :item/id 1 :item/doc {:counter 0}}
+                         {:db/id 2 :item/id 2 :item/doc {:counter "bad"}}])
+      (let [requests (doto (FastList. 2)
+                       (.add (conn/->SyncQueuedReq
+                               [[:db.fn/patchIdoc 1 :item/doc
+                                 [[:update [:counter] :inc]]]]
+                               nil (promise)))
+                       (.add (conn/->SyncQueuedReq
+                               [[:db.fn/patchIdoc 2 :item/doc
+                                 [[:update [:counter] :inc]]]]
+                               nil (promise))))
+            ^objects prepared
+            (invoke-conn-private
+              'prepare-sync-queued-patch-idoc-batch conn requests)
+            ^objects reports (object-array 2)
+            before (d/txlog-watermarks (d/datalog-kv conn))]
+        (is (some? prepared))
+        (is (thrown? Exception
+              (invoke-conn-private
+                'try-commit-sync-queued-patch-idoc-batch!
+                conn requests prepared reports)))
+        (let [after (d/txlog-watermarks (d/datalog-kv conn))]
+          (is (= (:last-committed-lsn before)
+                 (:last-committed-lsn after)))
+          (is (= 0 (:counter (:item/doc (d/entity @conn 1)))))
+          (is (= "bad" (:counter (:item/doc (d/entity @conn 2)))))
+          (is (= [1] (d/q q-idoc-eids @conn {:counter 0})))
+          (is (empty? (d/q q-idoc-eids @conn {:counter 1})))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
 
 (deftest complex-identity-wal-upserts-retain-general-fallback
   (let [dir   (u/tmp-dir (str "identity-upsert-general-fallback-"

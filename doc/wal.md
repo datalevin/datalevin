@@ -87,6 +87,15 @@ Dispatch policy differs by profile:
 * `:extra`: follows the same adaptive direct-or-queued dispatch as `:strict`,
   but with stricter durability on the sync side.
 
+Local Datalog WAL specializes common single-form writes before using the
+general transaction planner. A simple cardinality-one `:db.fn/patchIdoc` with
+a numeric entity id can be stamped against the active LMDB write snapshot;
+homogeneous queued patches are prepared in logical order and committed in one
+physical WAL transaction. Each request still receives its own transaction id
+and report. Lookup refs, cardinality-many or unique IDoc attributes, attribute
+predicates, automatic entity timestamps, and mixed transaction forms retain
+the general path and its full validation semantics.
+
 In `:strict`, the durability guarantee follows the OS's `fsync` guidance, which
 is not the same for different OS. On macOS, `fsync` is not full durable. Getting
 full durability on MacOS requires `:extra`. On Linux and Windows, `:strict` and

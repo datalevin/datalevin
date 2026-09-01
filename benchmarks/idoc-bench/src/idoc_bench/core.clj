@@ -13,8 +13,11 @@
    [next.jdbc.result-set :as rs]
    [next.jdbc.sql :as sql])
   (:import
+   [com.mongodb WriteConcern]
    [com.mongodb.client MongoClients]
-   [com.mongodb.client.model Filters]
+   [com.mongodb.client.model Filters Projections]
+   [datalevin.cpp Util]
+   [java.lang.management ManagementFactory]
    [java.nio.charset StandardCharsets]
    [java.security MessageDigest]
    [java.time Instant]
@@ -31,6 +34,12 @@
   {:A {:read 50 :update 50}
    :C {:read 100}
    :F {:rmw 100}})
+
+(def durability-profiles #{:strict :relaxed})
+(def run-roles #{:warmup :measurement})
+
+(defonce ^:private jvm-instance-id
+  (str (UUID/randomUUID)))
 
 (def tags
   ["urgent" "todo" "followup" "meeting" "project" "customer" "issue"
@@ -78,7 +87,7 @@
 (def q-idoc
   '[:find ?e
     :in $ ?q
-    :where [(idoc-match $ :mem/doc ?q) [[?e ?a ?v]]]])
+    :where [(idoc-match $ :mem/doc ?q nil) [[?e _ _]]]])
 
 (def default-opts
   {:system      :datalevin
@@ -93,6 +102,8 @@
    :verify?     true
    :hotset      1.0
    :seed        42
+   :durability-profile :strict
+   :run-role    :measurement
    :output      nil
    :dir         nil
    :dtlv-uri    nil
@@ -416,6 +427,11 @@
     (instance? PGobject v) (.getValue ^PGobject v)
     :else (str v)))
 
+(defn- first-row-value
+  [row]
+  (when (map? row)
+    (first (vals row))))
+
 (defn- sql-query
   [conn sql params]
   (jdbc/execute! conn (into [sql] params)
@@ -424,6 +440,40 @@
 (defn- sql-query-ids
   [conn sql params]
   (into #{} (map :id) (sql-query conn sql params)))
+
+(defn- pg-synchronous-commit
+  [durability-profile]
+  (case durability-profile
+    :relaxed "off"
+    "on"))
+
+(defn- pg-conn
+  [ds durability-profile]
+  (let [conn (jdbc/get-connection ds)
+        mode (pg-synchronous-commit durability-profile)]
+    (try
+      (jdbc/execute! conn [(str "SET synchronous_commit = " mode)])
+      (let [actual (str (first-row-value
+                          (jdbc/execute-one!
+                            conn ["SHOW synchronous_commit"]
+                            {:builder-fn rs/as-unqualified-lower-maps})))]
+        (when-not (= mode actual)
+          (throw (ex-info "PostgreSQL did not enter the requested durability mode"
+                          {:expected mode :actual actual}))))
+      conn
+      (catch Throwable t
+        (.close conn)
+        (throw t)))))
+
+(defn- pg-storage
+  [conn durability-profile]
+  (let [metadata (.getMetaData conn)]
+    {:engine :postgresql
+     :server-version (.getDatabaseProductVersion metadata)
+     :jdbc-driver-version (.getDriverVersion metadata)
+     :configuration
+     {:document-storage :jsonb
+      :synchronous-commit (pg-synchronous-commit durability-profile)}}))
 
 (defn- sql-read-doc
   [conn table id]
@@ -590,7 +640,8 @@
   [coll spec]
   (into #{}
         (map #(long (.get ^Document % "_id")))
-        (.find coll (mongo-filter spec))))
+        (.projection (.find coll (mongo-filter spec))
+                     (Projections/include (into-array String ["_id"])))))
 
 (defn- mongo-update-stats!
   [coll id score last-seen]
@@ -607,18 +658,84 @@
   (.createIndex coll (Document. {"events.entity.name" 1}))
   (.createIndex coll (Document. {"events.tags" 1})))
 
+(defn- sqlite-synchronous-mode
+  [durability-profile]
+  (case durability-profile
+    :relaxed ["NORMAL" 1]
+    ["FULL" 2]))
+
+(defn- sqlite-pragma
+  [conn pragma]
+  (first-row-value
+    (jdbc/execute-one!
+      conn [(str "PRAGMA " pragma ";")]
+      {:builder-fn rs/as-unqualified-lower-maps})))
+
 (defn- sqlite-conn
-  [ds]
-  (let [conn (jdbc/get-connection ds)]
-    (jdbc/execute! conn ["PRAGMA journal_mode=WAL;"])
-    (jdbc/execute! conn ["PRAGMA synchronous=NORMAL;"])
-    (jdbc/execute! conn ["PRAGMA busy_timeout=5000;"])
-    conn))
+  [ds durability-profile]
+  (let [conn                  (jdbc/get-connection ds)
+        [sync-mode sync-code] (sqlite-synchronous-mode durability-profile)]
+    (try
+      (let [journal-mode (-> (jdbc/execute-one!
+                               conn ["PRAGMA journal_mode=WAL;"]
+                               {:builder-fn rs/as-unqualified-lower-maps})
+                             first-row-value
+                             str
+                             str/lower-case)]
+        (when-not (= "wal" journal-mode)
+          (throw (ex-info "SQLite did not enter WAL mode"
+                          {:expected "wal" :actual journal-mode}))))
+      (jdbc/execute! conn [(str "PRAGMA synchronous=" sync-mode ";")])
+      (jdbc/execute! conn ["PRAGMA busy_timeout=5000;"])
+      (let [actual-sync (long (sqlite-pragma conn "synchronous"))]
+        (when-not (= (long sync-code) actual-sync)
+          (throw (ex-info "SQLite did not enter the requested durability mode"
+                          {:expected sync-code :actual actual-sync}))))
+      conn
+      (catch Throwable t
+        (.close conn)
+        (throw t)))))
+
+(defn- sqlite-storage
+  [conn durability-profile]
+  (let [[sync-mode _] (sqlite-synchronous-mode durability-profile)
+        metadata      (.getMetaData conn)]
+    {:engine :sqlite
+     :sqlite-version (str (first-row-value
+                            (jdbc/execute-one!
+                              conn ["SELECT sqlite_version() AS version"]
+                              {:builder-fn rs/as-unqualified-lower-maps})))
+     :jdbc-driver-version (.getDriverVersion metadata)
+     :configuration
+     {:document-storage :json1-text
+      :journal-mode "wal"
+      :synchronous (str/lower-case sync-mode)
+      :busy-timeout-ms (long (sqlite-pragma conn "busy_timeout"))}}))
+
+(defn- mongo-write-concern
+  [durability-profile]
+  (case durability-profile
+    :relaxed (.withJournal WriteConcern/ACKNOWLEDGED false)
+    WriteConcern/JOURNALED))
+
+(defn- mongo-storage
+  [database durability-profile]
+  (let [build-info (.runCommand database (Document. {"buildInfo" 1}))]
+    {:engine :mongodb
+     :server-version (.getString build-info "version")
+     :driver-version (or (some-> MongoClients .getPackage
+                                  .getImplementationVersion)
+                         "4.11.1")
+     :configuration
+     {:document-storage :bson
+      :write-concern (if (= :strict durability-profile)
+                       {:w 1 :journal true}
+                       {:w 1 :journal false})}}))
 
 (defn- datalevin-handlers
   [opts docs]
   (let [{:keys [batch-size env-flags keep-db? idoc-trace?
-                dtlv-uri]} opts
+                dtlv-uri durability-profile]} opts
 
         dir    (when-not dtlv-uri
                  (or (:dir opts)
@@ -635,7 +752,10 @@
                  (d/create-conn
                    dir
                    schema
-                   {:kv-opts {:flags (into c/default-env-flags env-flags)}}))
+                   {:wal? true
+                    :wal-durability-profile durability-profile
+                    :kv-opts
+                    {:flags (into c/default-env-flags env-flags)}}))
         label  (if db-uri "remote Datalevin" dir)
         trace  (when idoc-trace? (atom {}))
         tracer (fn [spec]
@@ -652,6 +772,18 @@
             (into #{} (map first) res)))]
     {:system       :datalevin
      :label        label
+     :storage      {:engine :datalevin-datalog
+                    :datalevin-version c/version
+                    :native-version (Util/version)
+                    :configuration
+                    {:document-storage :db.type/idoc
+                     :wal? (nil? dtlv-uri)
+                     :wal-durability-profile
+                     (when-not dtlv-uri durability-profile)
+                     :env-flags
+                     (when-not dtlv-uri
+                       (vec (sort (d/get-env-flags
+                                    (d/datalog-kv conn)))))}}
      :load!        (fn []
                      (load-docs-datalevin! conn @docs batch-size)
                      (println "Running analyze ...")
@@ -687,12 +819,14 @@
 (defn- postgres-handlers
   [opts docs]
   (let [{:keys [batch-size keep-db? pg-url pg-user
-                pg-password pg-table]} opts
+                pg-password pg-table durability-profile]} opts
 
         ds       (jdbc/get-datasource
                    (cond-> {:jdbcUrl pg-url}
                      pg-user     (assoc :user pg-user)
                      pg-password (assoc :password pg-password)))
+        storage  (with-open [conn (pg-conn ds durability-profile)]
+                   (pg-storage conn durability-profile))
         init!    (fn []
                    (jdbc/execute! ds [(str "DROP TABLE IF EXISTS " pg-table)])
                    (jdbc/execute! ds [(str "CREATE TABLE " pg-table
@@ -720,10 +854,11 @@
           (pg-update-stats! conn pg-table id score last-seen))]
     {:system       :postgres
      :label        (str "PostgreSQL (" pg-table ")")
+     :storage      storage
      :load!        (fn []
                      (init!)
                      (load!))
-     :make-thread  (fn [_] {:conn (jdbc/get-connection ds)})
+     :make-thread  (fn [_] {:conn (pg-conn ds durability-profile)})
      :close-thread (fn [{:keys [conn]}] (.close conn))
      :op-read      (fn [{:keys [conn]} {:keys [id]}]
                      (read-doc conn id))
@@ -753,7 +888,7 @@
 
 (defn- sqlite-handlers
   [opts docs]
-  (let [{:keys [batch-size keep-db? sqlite-path]} opts
+  (let [{:keys [batch-size keep-db? sqlite-path durability-profile]} opts
 
         default-dir  (str (u/tmp-dir
                             (str "idoc-bench-sqlite-" (UUID/randomUUID))))
@@ -763,9 +898,11 @@
                        (u/file parent))
         ds           (jdbc/get-datasource
                        {:jdbcUrl (str "jdbc:sqlite:" db-path)})
+        storage      (with-open [conn (sqlite-conn ds durability-profile)]
+                       (sqlite-storage conn durability-profile))
         init!
         (fn []
-          (let [conn (sqlite-conn ds)]
+          (let [conn (sqlite-conn ds durability-profile)]
             (try
               (jdbc/execute! conn [(str "DROP TABLE IF EXISTS idoc_bench_docs")])
               (jdbc/execute!
@@ -784,7 +921,7 @@
                                  :doc (encode-json doc)})
                               @docs))]
               (sql/insert-multi! tx :idoc_bench_docs batch)))
-          (let [conn (sqlite-conn ds)]
+          (let [conn (sqlite-conn ds durability-profile)]
             (try
               (println "Building indexes ...")
               (sqlite-create-indexes! conn)
@@ -802,10 +939,11 @@
           (sqlite-update-stats! conn id score last-seen))]
     {:system       :sqlite
      :label        db-path
+     :storage      storage
      :load!        (fn []
                      (init!)
                      (load!))
-     :make-thread  (fn [_] {:conn (sqlite-conn ds)})
+     :make-thread  (fn [_] {:conn (sqlite-conn ds durability-profile)})
      :close-thread (fn [{:keys [conn]}] (.close conn))
      :op-read      (fn [{:keys [conn]} {:keys [id]}]
                      (read-doc conn id))
@@ -838,14 +976,18 @@
 
 (defn- mongo-handlers
   [opts docs]
-  (let [{:keys [batch-size keep-db? mongo-uri mongo-db mongo-coll]}
+  (let [{:keys [batch-size keep-db? mongo-uri mongo-db mongo-coll
+                durability-profile]}
         opts
 
         client   (MongoClients/create mongo-uri)
         database (.getDatabase client mongo-db)
-        coll     (.getCollection database mongo-coll)]
+        coll     (.withWriteConcern (.getCollection database mongo-coll)
+                                    (mongo-write-concern durability-profile))
+        storage  (mongo-storage database durability-profile)]
     {:system       :mongo
      :label        (str "MongoDB (" mongo-db "/" mongo-coll ")")
+     :storage      storage
      :load!
      (fn []
        (.drop coll)
@@ -1106,6 +1248,12 @@
         (.shutdownNow executor)
         (.awaitTermination executor 30 TimeUnit/SECONDS)))))
 
+(defn- timed-call
+  [f]
+  (let [start (System/nanoTime)
+        value (f)]
+    [value (/ (- (System/nanoTime) start) 1e6)]))
+
 (defn- run-bench
   [system opts base-docs warmup-schedule schedule]
   (let [docs     (atom (vec base-docs))
@@ -1117,51 +1265,84 @@
     (println "System:" (name system))
     (println "Loading" records "documents into" (:label handlers) "...")
     (try
-      ((:load! handlers))
-      (let [correctness (if (:verify? opts)
-                          (verify-handlers! handlers base-docs)
-                          {:status :skipped})]
+      (let [[_ load-ms]       (timed-call #((:load! handlers)))
+            [correctness verification-ms]
+            (timed-call #(if (:verify? opts)
+                           (verify-handlers! handlers base-docs)
+                           {:status :skipped}))]
         (println "Warmup" warmup-ops "ops ...")
-        (warmup handlers warmup-schedule record-locks)
-        (when-let [reset-trace! (:reset-trace! handlers)]
-          (reset-trace!))
-        (println "Running workload" (:workload opts)
-                 "with idoc weight" (:idoc-ratio opts)
-                 "on" threads "threads ...")
-        (let [start       (System/nanoTime)
-              samples     (run-workers handlers schedule threads record-locks)
-              elapsed-ms  (/ (- (System/nanoTime) start) 1e6)
-              actual-ops  (count samples)
-              summary     (summarize-samples samples)
-              throughput  (if (pos? elapsed-ms)
-                            (/ actual-ops (/ elapsed-ms 1000.0))
-                            0.0)]
-          (when-not (= ops actual-ops)
-            (throw
-              (ex-info "Benchmark did not complete every scheduled operation"
-                       {:system system :expected ops :actual actual-ops})))
-          (print-summary summary actual-ops elapsed-ms)
-          (when-let [report (:trace-report handlers)]
-            (report))
-          {:system system
-           :correctness correctness
-           :elapsed-ms elapsed-ms
-           :throughput-ops-per-second throughput
-           :latency-ms summary
-           :raw-samples samples
-           :idoc-trace (when-let [trace-data (:trace-data handlers)]
-                         (trace-data))}))
+        (let [[_ warmup-ms]
+              (timed-call #(warmup handlers warmup-schedule record-locks))]
+          (when-let [reset-trace! (:reset-trace! handlers)]
+            (reset-trace!))
+          (println "Running workload" (:workload opts)
+                   "with idoc weight" (:idoc-ratio opts)
+                   "on" threads "threads ...")
+          (let [start       (System/nanoTime)
+                samples     (run-workers handlers schedule threads record-locks)
+                elapsed-ms  (/ (- (System/nanoTime) start) 1e6)
+                actual-ops  (count samples)
+                summary     (summarize-samples samples)
+                throughput  (if (pos? elapsed-ms)
+                              (/ actual-ops (/ elapsed-ms 1000.0))
+                              0.0)]
+            (when-not (= ops actual-ops)
+              (throw
+                (ex-info "Benchmark did not complete every scheduled operation"
+                         {:system system :expected ops :actual actual-ops})))
+            (print-summary summary actual-ops elapsed-ms)
+            (when-let [report (:trace-report handlers)]
+              (report))
+            {:system system
+             :storage (:storage handlers)
+             :correctness correctness
+             :setup-ms {:load-and-index load-ms
+                        :verification verification-ms
+                        :warmup warmup-ms}
+             :elapsed-ms elapsed-ms
+             :throughput-ops-per-second throughput
+             :latency-ms summary
+             :raw-samples samples
+             :idoc-trace (when-let [trace-data (:trace-data handlers)]
+                           (trace-data))})))
       (finally
         (try
           ((:close! handlers))
           (finally
             ((:cleanup! handlers))))))))
 
+(defn- summarize-pass
+  [results]
+  {:aggregation :single-complete-pass
+   :systems
+   (into
+     (sorted-map)
+     (map
+        (fn [{:keys [system throughput-ops-per-second elapsed-ms latency-ms]}]
+          [system
+           {:throughput-ops-per-second throughput-ops-per-second
+            :elapsed-ms elapsed-ms
+            :latency-ms latency-ms}])
+        results))})
+
+(defn- print-pass-summary
+  [summary]
+  (println)
+  (println "complete-pass throughput")
+  (println "system\tops/sec\telapsed-ms")
+  (doseq [[system {:keys [throughput-ops-per-second elapsed-ms]}]
+          (get summary :systems)]
+    (println
+      (str (name system)
+           "\t" (format "%.2f" (double throughput-ops-per-second))
+           "\t" (format "%.2f" (double elapsed-ms))))))
+
 (def ^:private value-options
   #{"--system" "--workload" "--records" "--ops" "--warmup" "--threads"
     "--batch" "--idoc" "--hotset" "--output" "--dir" "--dtlv-uri"
     "--sqlite-path" "--pg-url" "--pg-user" "--pg-password" "--pg-table"
-    "--mongo-uri" "--mongo-db" "--mongo-coll" "--seed"})
+    "--mongo-uri" "--mongo-db" "--mongo-coll" "--seed" "--durability"
+    "--run-role" "--repetitions"})
 
 (defn- require-option-values!
   [args]
@@ -1228,6 +1409,17 @@
         "--keep"       (recur (assoc opts :keep-db? true) (next more))
         "--seed"       (recur (assoc opts :seed (Long/parseLong (second more)))
                               (nnext more))
+        "--durability" (recur (assoc opts :durability-profile
+                                     (keyword (str/lower-case (second more))))
+                              (nnext more))
+        "--run-role"   (recur (assoc opts :run-role
+                                     (keyword (str/lower-case (second more))))
+                              (nnext more))
+        "--repetitions"
+        (throw
+          (ex-info
+            "--repetitions is not supported; run one warmup JVM pass and one measurement JVM pass"
+            {:argument arg :value (second more)}))
         "--help"       (recur (assoc opts :help? true) (next more))
         (throw (ex-info (str "Unrecognized argument: " arg)
                         {:argument arg})))
@@ -1258,28 +1450,39 @@
   (println "  --mongo-db NAME    MongoDB database")
   (println "  --mongo-coll NAME  MongoDB collection")
   (println "  --seed N           RNG seed (default 42)")
+  (println "  --durability strict|relaxed  Acknowledgment profile (default strict)")
+  (println "  --run-role warmup|measurement  Complete-pass role (default measurement)")
   (println "  --keep             Keep DB artifacts after run")
   (println "  --help             Show this help"))
 
 (def ^:private report-config-keys
   [:system :workload :records :ops :warmup :threads :batch-size
-   :idoc-ratio :idoc-trace? :verify? :hotset :seed :keep-db?])
+   :idoc-ratio :idoc-trace? :verify? :hotset :seed :durability-profile
+   :keep-db?])
 
 (defn- host-info
   []
   {:timestamp  (str (Instant/now))
+   :jvm-instance-id jvm-instance-id
    :clojure    (clojure-version)
    :datalevin  c/version
+   :datalevin-native (Util/version)
    :java       (System/getProperty "java.version")
    :vm         (System/getProperty "java.vm.name")
+   :jvm-arguments (vec (.getInputArguments
+                         (ManagementFactory/getRuntimeMXBean)))
    :os         (System/getProperty "os.name")
    :os-version (System/getProperty "os.version")
    :arch       (System/getProperty "os.arch")
-   :processors (.availableProcessors (Runtime/getRuntime))})
+   :processors (.availableProcessors (Runtime/getRuntime))
+   :benchmark-host-control
+   (or (some-> (System/getProperty "idoc.bench.host-control") not-empty)
+       (some-> (System/getenv "IDOC_BENCH_HOST_CONTROL") not-empty)
+       "unspecified")})
 
 (defn- validate-options
   [{:keys [system workload records ops warmup threads batch-size idoc-ratio
-           hotset pg-table] :as opts}]
+           hotset pg-table durability-profile run-role] :as opts}]
   (cond
     (not (contains? #{:datalevin :postgres :sqlite :mongo :all} system))
     (str "unsupported system: " system)
@@ -1294,6 +1497,10 @@
     (> threads ops) "--threads must not exceed --ops"
     (not (pos? batch-size)) "--batch must be positive"
     (neg? idoc-ratio) "--idoc must not be negative"
+    (not (contains? durability-profiles durability-profile))
+    (str "unsupported durability profile: " durability-profile)
+    (not (contains? run-roles run-role))
+    (str "unsupported run role: " run-role)
     (not (< 0.0 hotset 1.0000000001)) "--hotset must be greater than 0 and at most 1"
     (not (re-matches #"[A-Za-z_][A-Za-z0-9_]*" pg-table))
     "--pg-table must be an unqualified SQL identifier"
@@ -1308,15 +1515,76 @@
     (println)
     (println "Wrote results to" (.getPath file))))
 
+(def ^:private comparable-host-keys
+  [:clojure :datalevin :datalevin-native :java :vm :jvm-arguments :os
+   :os-version :arch :processors :benchmark-host-control])
+
+(defn validate-pass-pair
+  "Validate an IDoc warmup/measurement artifact pair. Returns true or throws
+   with all protocol mismatches. The two reports must come from distinct JVMs
+   and have identical benchmark configuration, schedules, host controls, and
+   correctness status."
+  [warmup-report measurement-report]
+  (let [warmup-role       (get-in warmup-report [:protocol :run-role])
+        measurement-role  (get-in measurement-report [:protocol :run-role])
+        warmup-jvm        (get-in warmup-report [:host :jvm-instance-id])
+        measurement-jvm   (get-in measurement-report [:host :jvm-instance-id])
+        correctness-ok?   (fn [report]
+                            (every? #(= :passed
+                                        (get-in % [:correctness :status]))
+                                    (:results report)))
+        mismatches
+        (cond-> []
+          (not= :warmup warmup-role)
+          (conj {:field :warmup-role :actual warmup-role})
+
+          (not= :measurement measurement-role)
+          (conj {:field :measurement-role :actual measurement-role})
+
+          (or (nil? warmup-jvm)
+              (nil? measurement-jvm)
+              (= warmup-jvm measurement-jvm))
+          (conj {:field :jvm-instance-id
+                 :warmup warmup-jvm
+                 :measurement measurement-jvm})
+
+          (not= (:configuration warmup-report)
+                (:configuration measurement-report))
+          (conj {:field :configuration})
+
+          (not= (:schedule warmup-report) (:schedule measurement-report))
+          (conj {:field :schedule})
+
+          (not= (mapv :system (:results warmup-report))
+                (mapv :system (:results measurement-report)))
+          (conj {:field :systems})
+
+          (not= (select-keys (:host warmup-report) comparable-host-keys)
+                (select-keys (:host measurement-report) comparable-host-keys))
+          (conj {:field :host})
+
+          (not (correctness-ok? warmup-report))
+          (conj {:field :warmup-correctness})
+
+          (not (correctness-ok? measurement-report))
+          (conj {:field :measurement-correctness}))]
+    (when (seq mismatches)
+      (throw
+        (ex-info "Invalid IDoc benchmark warmup/measurement pair"
+                 {:mismatches mismatches})))
+    true))
+
 (defn run-benchmark
   [opts]
   (let [validated (validate-options opts)]
     (if (string? validated)
       (throw (ex-info validated
                       {:options (select-keys opts report-config-keys)}))
-      (let [systems         (if (= :all (:system opts))
+      (let [all-systems?    (= :all (:system opts))
+            systems         (if all-systems?
                               [:datalevin :postgres :sqlite :mongo]
                               [(:system opts)])
+            host            (host-info)
             base-docs       (generate-docs (:records opts) (:seed opts))
             warmup-schedule (generate-schedule opts (:warmup opts)
                                                (+ (:seed opts) 1000003))
@@ -1325,18 +1593,32 @@
             schedule-info   {:dataset-sha256 (schedule-digest base-docs)
                              :warmup-sha256 (schedule-digest warmup-schedule)
                              :measurement-sha256 (schedule-digest schedule)
-                             :operation-counts (frequencies (map :op schedule))}
+                             :operation-counts (frequencies (map :op schedule))
+                             :idoc-shape-counts
+                             (frequencies
+                               (keep #(get-in % [:spec :type]) schedule))
+                             :thread-partition :contiguous-static}
             _               (println "Schedule SHA-256:"
                                      (:measurement-sha256 schedule-info))
+            _               (println "Run role:" (name (:run-role opts)))
             results         (mapv #(run-bench % opts base-docs
                                               warmup-schedule schedule)
                                   systems)
-            report          {:format-version 1
+            summary         (summarize-pass results)
+            report          {:format-version 3
                              :benchmark :indexed-document
-                             :host (host-info)
+                             :protocol
+                             {:method :two-independent-jvm-passes
+                              :run-role (:run-role opts)
+                              :retained? (= :measurement (:run-role opts))
+                              :same-process-pass-count 1
+                              :jvm-instance-id jvm-instance-id}
+                             :host host
                              :configuration (select-keys opts report-config-keys)
                              :schedule schedule-info
-                             :results results}]
+                             :results results
+                             :summary summary}]
+        (print-pass-summary summary)
         (when-let [output (:output opts)]
           (write-report! output report))
         report))))

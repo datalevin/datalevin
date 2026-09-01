@@ -20,6 +20,7 @@
    [datalevin.db.tx.common :as txcommon]
    [datalevin.db.tx.execute :as txexec]
    [datalevin.db.tx.prepare :as txprep]
+   [datalevin.idoc :as idoc]
    [datalevin.util :as u
     :refer [case-tree defrecord-updatable conjv concatv]]
    [datalevin.lmdb :as l]
@@ -120,6 +121,14 @@
    identity-upsert-av])
 
 (deftype ^:private PreparedBlindEntity [tempid ^FastList attrs])
+
+(defrecord PreparedLocalPatchIdocTx
+  [schema-epoch
+   opts-epoch
+   entity
+   e
+   attr
+   ops])
 
 ;; (defmethod print-method TxReport [^TxReport rp, ^java.io.Writer w]
 ;;   (binding [*out* w]
@@ -1876,6 +1885,91 @@
          db prepared tx-meta identity-attr eid)
        true]
       [(stamp-blind-local-tx db prepared tx-meta) false])))
+
+(defn ^:no-doc prepare-local-patch-idoc-tx
+  "Recognize one simple non-unique cardinality-one patchIdoc request without
+   consulting mutable entity state. The caller must stamp it against the
+   current LMDB write snapshot before committing it. Returns nil for shapes
+   that retain the general transaction path."
+  [^DB db initial-es]
+  (let [store      (.-store db)
+        store-opts (opts store)
+        forms      (seq initial-es)
+        entity     (when (and forms (nil? (next forms))) (first forms))]
+    (when (and (sequential? entity)
+               (= 4 (count entity))
+               (not (:auto-entity-time? store-opts)))
+      (let [[op e attr patch-ops] entity
+            props                 ((schema store) attr)]
+        (when (and (identical? op :db.fn/patchIdoc)
+                   (integer? e)
+                   (<= 1 e Long/MAX_VALUE)
+                   (keyword? attr)
+                   props
+                   (identical? (:db/valueType props) :db.type/idoc)
+                   (not (identical? (:db/cardinality props)
+                                    :db.cardinality/many))
+                   (nil? (:db/unique props))
+                   (not (:db.attr/preds props))
+                   (or (nil? patch-ops) (sequential? patch-ops)))
+          (->PreparedLocalPatchIdocTx
+            (schema store) store-opts entity (long e) attr patch-ops))))))
+
+(defn ^:no-doc local-patch-idoc-tx-valid?
+  [^DB db ^PreparedLocalPatchIdocTx prepared]
+  (let [store (.-store db)]
+    (and (identical? (:schema-epoch prepared) (schema store))
+         (identical? (:opts-epoch prepared) (opts store)))))
+
+(defn- stamp-local-patch-idoc-doc
+  [^DB db ^PreparedLocalPatchIdocTx prepared tx-meta old-doc]
+  (let [{:keys [entity e attr ops]} prepared
+        store       (.-store db)
+        props       ((schema store) attr)
+        tx-id       (inc (long (:max-tx db)))
+        base-report (->TxReport db
+                                (assoc db :max-tx tx-id)
+                                []
+                                {:db/current-tx tx-id}
+                                tx-meta)]
+    (if (empty? ops)
+      {:report base-report :doc old-doc}
+      (let [{raw-doc :doc paths :paths}
+            (idoc/apply-patch (or old-doc {}) ops)
+            _       (vld/validate-val raw-doc entity)
+            new-doc (prepare/correct-value-with-props
+                      (opts store) props attr raw-doc)
+            add     (with-meta (datom e attr new-doc tx-id)
+                      {:idoc/patch {:paths paths}})
+            db-after (cond-> (:db-after base-report)
+                       (nil? old-doc)
+                       (assoc :max-eid
+                              (max (long (:max-eid db)) (long e))))
+            tx-data (cond
+                      (nil? old-doc) [add]
+                      (= old-doc new-doc) []
+                      :else [(datom e attr old-doc tx-id false) add])]
+        {:report (assoc base-report
+                        :db-after db-after
+                        :tx-data tx-data)
+         :doc new-doc}))))
+
+(defn ^:no-doc stamp-local-patch-idoc-tx
+  "Stamp a prepared patchIdoc request against the current store snapshot.
+   Returns {:report TxReport :doc resulting-doc}, or nil when its immutable
+   schema/options epochs are stale. The four-argument arity accepts a virtual
+   current document so queued patches to the same entity can be prepared in
+   order before any side index is mutated."
+  ([^DB db ^PreparedLocalPatchIdocTx prepared tx-meta]
+   (when (local-patch-idoc-tx-valid? db prepared)
+     (let [e         (entid-strict db (:e prepared))
+           old-datom (ea-first-datom (.-store db) e (:attr prepared))
+           old-doc   (when old-datom (.-v ^Datom old-datom))]
+       (stamp-local-patch-idoc-doc db prepared tx-meta old-doc))))
+  ([^DB db ^PreparedLocalPatchIdocTx prepared tx-meta old-doc]
+   (when (local-patch-idoc-tx-valid? db prepared)
+     (entid-strict db (:e prepared))
+     (stamp-local-patch-idoc-doc db prepared tx-meta old-doc))))
 
 (defn transact-tx-data
   [initial-report initial-es simulated?]
