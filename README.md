@@ -349,7 +349,7 @@ query time was 3.890 seconds versus 27.406 seconds for Neo4j. Neo4j's sum was
 
 #### Document
 
-The [iDOC benchmark](benchmarks/idoc-bench) compares Datalevin's indexed
+The [idoc benchmark](benchmarks/idoc-bench) compares Datalevin's indexed
 documents with PostgreSQL JSONB, SQLite JSON1, and MongoDB BSON. It combines
 YCSB-style reads and writes with nested equality, range, wildcard-path, and
 array-match queries.
@@ -359,7 +359,7 @@ Workload A mixes reads and updates, C is read-only, and F uses
 read-modify-write.
 
 | Workload | Datalevin | PostgreSQL | SQLite | MongoDB |
-|---|---:|---:|---:|---:|---:|
+|---|---:|---:|---:|---:|
 | A | 3,358/s | 2,270/s | 438/s | 309/s |
 | C | 11,454/s | 2,039/s | 437/s | 2,868/s  |
 | F | 2,680/s | 1,789/s | 416/s | 192/s |
@@ -418,8 +418,9 @@ reach as soon as we can. We may adjust the priorities based on feedback.
   migration; new rule engine.~~[Done 2026/01/22]
 * 1.0.0 ~~As a document database with automatic path indexing; WAL mode;
   transaction log access API;  read-only replicas; high availability; JSON API;
-  library for Java, Python, and JavaScript; Book.~~[Done 2027/07/20]
-* 1.1.0 AVE storage optimization; transaction and query performance enhancement.
+  library for Java, Python, and JavaScript; Book.~~[Done 2026/07/20]
+* 1.1.0 ~~AVE storage optimization; transaction and query performance
+  enhancement.~~ [Done 2026/09/02]
 * 1.2.0 data compression; KV TTL;
 * 1.3.0 extensible storage/query for arbitrary data; entity-level security.
 * 2.0.0 direct analytics and virtual relationships.
@@ -435,9 +436,8 @@ Datalevin will remain open source for the foreseeable future. We appreciate and
 welcome your contributions or suggestions. Please feel free to file issues or
 pull requests.
 
-You can join the discussions in the `#datalevin`
-channel on [Clojurians Slack](http://clojurians.net/) or use the Github
-Discussions feature above.
+You can join the discussions in the `#datalevin` channel on [Clojurians
+Slack](http://clojurians.net/) or use the Github Discussions feature above.
 
 If commercial support is needed, reach out to https://agenwiz.com
 
