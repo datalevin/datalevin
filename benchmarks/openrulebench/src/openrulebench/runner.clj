@@ -219,7 +219,7 @@
   (let [{:keys [alias namespace]} (system-config system)]
     (vec
       (concat
-        ["clojure" "-J-Xmx8g"]
+        ["clojure" "-J-Xms2g" "-J-Xmx8g"]
         [(str "-M:" alias) "-m" namespace
          "--warmup" (str (:warmup opts))
          "--iterations" (str (:iterations opts))

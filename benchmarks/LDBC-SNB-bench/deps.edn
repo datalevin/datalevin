@@ -5,10 +5,12 @@
  :aliases
  {:load {:jvm-opts ["-Dclojure.compiler.direct-linking=true"]
          :main-opts ["-m" "ldbc-snb-bench.core" "load"]}
-  :bench {:jvm-opts ["-Dclojure.compiler.direct-linking=true"]
+  :bench {:jvm-opts ["-Xms2g"
+                     "-Dclojure.compiler.direct-linking=true"]
           :main-opts ["-m" "ldbc-snb-bench.core" "bench"]}
   :neo4j-bench {:extra-deps {org.neo4j/neo4j {:mvn/version "2026.06.0"}}
-                :jvm-opts ["-Dclojure.compiler.direct-linking=true"]
+                :jvm-opts ["-Xms2g"
+                           "-Dclojure.compiler.direct-linking=true"]
                 :main-opts ["-m" "ldbc-snb-bench.neo4j"]}
   :compare {:main-opts ["-m" "ldbc-snb-bench.comparison"]}
   :repl {:main-opts ["-m" "nrepl.cmdline" "--middleware" "[cider.nrepl/cider-middleware]"]}

@@ -1,5 +1,7 @@
 (ns ldbc-snb-bench.harness-test
   (:require
+   [clojure.edn :as edn]
+   [clojure.java.io :as io]
    [clojure.test :refer [deftest is testing]]
    [ldbc-snb-bench.harness :as harness]))
 
@@ -19,6 +21,13 @@
   (is (= (Boolean/parseBoolean
            (System/getProperty "clojure.compiler.direct-linking" "false"))
          (:clojure-direct-linking (harness/host-info)))))
+
+(deftest benchmark-aliases-pin-initial-heap-test
+  (let [deps (edn/read-string (slurp (io/file "deps.edn")))]
+    (doseq [alias [:bench :neo4j-bench]]
+      (testing (name alias)
+        (is (some #{"-Xms2g"}
+                  (get-in deps [:aliases alias :jvm-opts])))))))
 
 (deftest latency-summary-test
   (is (= {:count 4

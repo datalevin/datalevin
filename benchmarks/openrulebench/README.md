@@ -160,9 +160,12 @@ those task/system pairs `N/A` instead of implying bound-query optimization.
   does not honor thread cancellation. A timed-out worker therefore exits with
   its task process and cannot overlap the next measurement.
 
-The orchestrator requests an 8 GiB maximum heap for every Clojure wrapper.
-Every child records its effective maximum heap. PostgreSQL-server, XSB, and
-Souffle resource limits are external and are reported separately.
+The orchestrator requests a fixed 2 GiB initial heap and an 8 GiB maximum heap
+for every Clojure wrapper. Fixing the initial heap prevents G1 heap expansion
+and concurrent collection from falling unpredictably inside dense result
+materialization. Every child records its effective maximum heap.
+PostgreSQL-server, XSB, and Souffle resource limits are external and are
+reported separately.
 
 All 53 completed measurements passed their independent count oracle, and the
 cross-system input-digest check passed.

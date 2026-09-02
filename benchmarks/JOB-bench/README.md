@@ -183,17 +183,23 @@ interested in the behavior of query optimizer.
 The table below reports the second pass of each benchmark command described
 above and is retained with the raw CSV files for reproducibility.
 
-All three columns were regenerated on 2026-08-23. Each system ran one complete
-warmup pass followed by one complete measurement pass in a separate runner/JVM
-process. The Datalevin and JDBC runners used Clojure 1.12.5; Datalevin used
-direct linking. Before the retained PostgreSQL pair, the macOS filesystem cache
-was purged and PostgreSQL was restarted to clear `shared_buffers`; its first
-pass therefore established the warm state used by the measurement pass. The
-113-query Datalevin correctness suite passed after the runs. Before measurement,
+The PostgreSQL and SQLite columns were regenerated on 2026-08-23. The Datalevin
+column was regenerated on 2026-09-01 at revision `e0152efe` after the query
+engine and DLMDB changes. Each system ran one complete warmup pass followed by
+one complete measurement pass in a separate runner/JVM process. The Datalevin
+and JDBC runners used Clojure 1.12.5; Datalevin used direct linking.
+
+Before the retained PostgreSQL pair, the macOS filesystem cache was purged and
+PostgreSQL was restarted to clear `shared_buffers`; its first pass therefore
+established the warm state used by the measurement pass. Before measurement,
 SQLite was rebuilt from the source CSV files and all 21 table row counts were
-verified to match PostgreSQL exactly. The complete two-pass environment and
+verified to match PostgreSQL exactly. Their complete two-pass environment and
 artifacts are retained in the
 [2026-08-23 run directory](results/baseline-postgres-sqlite-20260823/README.md).
+The current Datalevin [warmup](results/datalevin-warmup-20260901T235851Z.csv)
+and [measurement](results/datalevin-measurement-20260901T235851Z.csv) artifacts
+are also retained. The 113-query Datalevin correctness suite passed before the
+September run.
 
 We look at the timing results. The total query time can be divided into two
 parts: query planning time and plan execution time. SQLite does not report
@@ -213,11 +219,11 @@ The table below sums the database-reported planning and execution times for all
 |---|---|
 |PostgreSQL|128.2|
 |SQLite|281.8 completed-query subtotal (9 timeouts)|
-|Datalevin|40.4|
+|Datalevin|38.1|
 
-PostgreSQL's recorded total is 3.17X Datalevin's. SQLite's non-timeout subtotal
-alone is 6.98X Datalevin's. Counting each timed-out query at only its 60-second
-cutoff gives SQLite a lower bound of 821.8 seconds, or 20.35X Datalevin's; its
+PostgreSQL's recorded total is 3.37X Datalevin's. SQLite's non-timeout subtotal
+alone is 7.40X Datalevin's. Counting each timed-out query at only its 60-second
+cutoff gives SQLite a lower bound of 821.8 seconds, or 21.59X Datalevin's; its
 actual total is higher.
 
 SQLite took extremely long to run some queries, so we had to put in a
@@ -229,128 +235,128 @@ table:
 
 |Query|PostgreSQL (ms)|SQLite (ms)|Datalevin (ms)|
 |---|---|---|---|
-|1a|36.8|138.7|20.7|
-|1b|30.6|134.5|17.1|
-|1c|30.2|125.1|25.3|
-|1d|28.3|141.2|9.4|
-|2a|279.1|91.2|52.8|
-|2b|267.9|89.1|19.3|
-|2c|252.9|86.0|3.7|
-|2d|380.5|113.2|24.3|
-|3a|111.4|143.9|102.4|
-|3b|63.6|116.2|13.5|
-|3c|197.2|196.1|300.7|
-|4a|67.9|232.2|383.3|
-|4b|62.5|57.7|14.0|
-|4c|66.6|392.0|865.0|
-|5a|52.8|77.5|54.1|
-|5b|48.7|76.6|326.8|
-|5c|71.6|89.9|578.8|
-|6a|12.1|277.4|15.1|
-|6b|157.1|387.2|31.4|
-|6c|3.8|274.5|7.4|
-|6d|4733.8|1533.0|326.4|
-|6e|8.2|280.2|10.6|
-|6f|5124.3|2319.5|793.0|
-|7a|646.1|460.9|102.3|
-|7b|157.7|105.8|48.6|
-|7c|2007.6|4482.2|825.6|
-|8a|822.4|2273.5|47.6|
-|8b|66.1|350.1|48.7|
-|8c|1796.0|timeout|3876.4|
-|8d|671.2|timeout|322.9|
-|9a|111.2|6804.3|287.1|
-|9b|106.8|2759.1|346.2|
-|9c|182.7|38617.0|339.4|
-|9d|2121.7|38763.4|735.2|
-|10a|240.9|356.1|300.0|
-|10b|104.3|119.6|77.2|
-|10c|6990.9|timeout|2127.6|
-|11a|33.1|58.3|63.8|
-|11b|12.3|17.1|22.5|
-|11c|588.4|114.7|362.3|
-|11d|85.3|336.9|103.3|
-|12a|117.0|1444.0|170.5|
-|12b|34.6|1863.3|230.9|
-|12c|324.7|1994.0|302.7|
-|13a|554.3|408.0|924.9|
-|13b|233.3|1246.4|315.7|
-|13c|225.9|1216.9|745.7|
-|13d|915.6|2822.2|1204.7|
-|14a|226.8|203.9|311.3|
-|14b|77.8|122.1|56.9|
-|14c|461.0|373.8|214.5|
-|15a|126.4|2616.3|468.9|
-|15b|18.9|16.4|33.9|
-|15c|236.0|timeout|534.3|
-|15d|286.7|timeout|489.7|
-|16a|123.9|47.8|65.9|
-|16b|10838.4|8296.8|2388.1|
-|16c|951.4|525.4|300.5|
-|16d|760.9|409.0|197.7|
-|17a|7460.0|2392.3|587.0|
-|17b|6352.3|4310.4|384.1|
-|17c|6188.4|4287.6|28.8|
-|17d|6176.2|4432.7|246.0|
-|17e|7847.0|4304.8|1985.2|
-|17f|7423.6|5688.9|433.6|
-|18a|2579.6|16852.7|686.0|
-|18b|130.7|540.1|517.5|
-|18c|3322.3|17992.1|532.5|
-|19a|119.2|4472.9|571.5|
-|19b|58.0|745.5|102.8|
-|19c|906.5|19694.4|270.8|
-|19d|2018.8|20813.3|1556.5|
-|20a|2231.1|3596.2|325.2|
-|20b|1794.5|935.9|116.0|
-|20c|965.7|2267.9|107.4|
-|21a|38.2|102.0|65.2|
-|21b|25.8|88.0|38.0|
-|21c|28.1|121.5|87.7|
-|22a|300.8|1286.5|255.2|
-|22b|271.0|1172.3|66.1|
-|22c|983.2|2175.0|336.4|
-|22d|696.2|3077.4|109.1|
-|23a|120.9|timeout|195.2|
-|23b|40.4|timeout|47.6|
-|23c|200.9|timeout|542.5|
-|24a|300.7|6360.2|112.7|
-|24b|43.6|23.8|65.3|
-|25a|1676.4|1791.8|580.6|
-|25b|185.3|806.8|46.3|
-|25c|5964.0|6082.1|214.7|
-|26a|647.1|2335.1|241.5|
-|26b|159.2|1300.0|93.5|
-|26c|1203.2|1417.1|111.6|
-|27a|38.7|318.4|103.8|
-|27b|32.2|209.1|89.6|
-|27c|43.3|252.8|114.0|
-|28a|468.7|1325.6|398.8|
-|28b|272.8|552.5|197.9|
-|28c|331.5|timeout|283.0|
-|29a|56.0|9.3|870.9|
-|29b|48.1|8.0|904.1|
-|29c|113.7|422.2|1104.6|
-|30a|4041.8|2450.7|595.0|
-|30b|812.9|2396.3|109.0|
-|30c|6106.4|2111.3|271.5|
-|31a|803.3|1082.2|105.6|
-|31b|267.6|1001.8|65.4|
-|31c|733.6|1430.0|185.8|
-|32a|4.4|60.6|5.7|
-|32b|59.7|62.8|29.3|
-|33a|53.8|27.7|106.5|
-|33b|55.9|23.7|92.5|
-|33c|81.2|38.8|111.2|
+|1a|36.8|138.7|11.9|
+|1b|30.6|134.5|9.3|
+|1c|30.2|125.1|7.8|
+|1d|28.3|141.2|8.2|
+|2a|279.1|91.2|49.2|
+|2b|267.9|89.1|17.7|
+|2c|252.9|86.0|3.8|
+|2d|380.5|113.2|22.5|
+|3a|111.4|143.9|88.3|
+|3b|63.6|116.2|12.6|
+|3c|197.2|196.1|214.5|
+|4a|67.9|232.2|355.3|
+|4b|62.5|57.7|13.6|
+|4c|66.6|392.0|749.9|
+|5a|52.8|77.5|54.0|
+|5b|48.7|76.6|310.8|
+|5c|71.6|89.9|637.8|
+|6a|12.1|277.4|12.9|
+|6b|157.1|387.2|23.1|
+|6c|3.8|274.5|7.5|
+|6d|4733.8|1533.0|307.1|
+|6e|8.2|280.2|10.5|
+|6f|5124.3|2319.5|826.2|
+|7a|646.1|460.9|86.1|
+|7b|157.7|105.8|36.4|
+|7c|2007.6|4482.2|720.0|
+|8a|822.4|2273.5|45.1|
+|8b|66.1|350.1|48.9|
+|8c|1796.0|timeout|3447.4|
+|8d|671.2|timeout|313.6|
+|9a|111.2|6804.3|371.2|
+|9b|106.8|2759.1|231.0|
+|9c|182.7|38617.0|302.8|
+|9d|2121.7|38763.4|722.3|
+|10a|240.9|356.1|308.0|
+|10b|104.3|119.6|67.9|
+|10c|6990.9|timeout|2006.2|
+|11a|33.1|58.3|61.7|
+|11b|12.3|17.1|23.4|
+|11c|588.4|114.7|300.8|
+|11d|85.3|336.9|138.1|
+|12a|117.0|1444.0|150.9|
+|12b|34.6|1863.3|229.3|
+|12c|324.7|1994.0|310.2|
+|13a|554.3|408.0|918.7|
+|13b|233.3|1246.4|1039.7|
+|13c|225.9|1216.9|579.3|
+|13d|915.6|2822.2|1262.8|
+|14a|226.8|203.9|239.3|
+|14b|77.8|122.1|42.1|
+|14c|461.0|373.8|163.4|
+|15a|126.4|2616.3|525.7|
+|15b|18.9|16.4|29.5|
+|15c|236.0|timeout|484.8|
+|15d|286.7|timeout|475.5|
+|16a|123.9|47.8|55.5|
+|16b|10838.4|8296.8|2328.1|
+|16c|951.4|525.4|301.4|
+|16d|760.9|409.0|184.0|
+|17a|7460.0|2392.3|649.6|
+|17b|6352.3|4310.4|346.4|
+|17c|6188.4|4287.6|27.0|
+|17d|6176.2|4432.7|234.8|
+|17e|7847.0|4304.8|2115.8|
+|17f|7423.6|5688.9|423.6|
+|18a|2579.6|16852.7|474.2|
+|18b|130.7|540.1|416.8|
+|18c|3322.3|17992.1|312.5|
+|19a|119.2|4472.9|406.2|
+|19b|58.0|745.5|82.0|
+|19c|906.5|19694.4|231.2|
+|19d|2018.8|20813.3|1338.2|
+|20a|2231.1|3596.2|247.4|
+|20b|1794.5|935.9|109.9|
+|20c|965.7|2267.9|119.6|
+|21a|38.2|102.0|50.0|
+|21b|25.8|88.0|36.3|
+|21c|28.1|121.5|71.0|
+|22a|300.8|1286.5|293.5|
+|22b|271.0|1172.3|59.0|
+|22c|983.2|2175.0|237.7|
+|22d|696.2|3077.4|204.8|
+|23a|120.9|timeout|197.8|
+|23b|40.4|timeout|47.1|
+|23c|200.9|timeout|464.7|
+|24a|300.7|6360.2|83.0|
+|24b|43.6|23.8|61.5|
+|25a|1676.4|1791.8|508.6|
+|25b|185.3|806.8|41.5|
+|25c|5964.0|6082.1|229.6|
+|26a|647.1|2335.1|274.6|
+|26b|159.2|1300.0|87.4|
+|26c|1203.2|1417.1|111.9|
+|27a|38.7|318.4|90.3|
+|27b|32.2|209.1|80.0|
+|27c|43.3|252.8|104.3|
+|28a|468.7|1325.6|330.9|
+|28b|272.8|552.5|241.9|
+|28c|331.5|timeout|165.5|
+|29a|56.0|9.3|827.6|
+|29b|48.1|8.0|809.4|
+|29c|113.7|422.2|960.9|
+|30a|4041.8|2450.7|506.3|
+|30b|812.9|2396.3|101.8|
+|30c|6106.4|2111.3|234.2|
+|31a|803.3|1082.2|98.3|
+|31b|267.6|1001.8|64.8|
+|31c|733.6|1430.0|236.3|
+|32a|4.4|60.6|5.6|
+|32b|59.7|62.8|27.3|
+|33a|53.8|27.7|97.2|
+|33b|55.9|23.7|87.4|
+|33c|81.2|38.8|102.4|
 
 ### Planning time
 
 |DB|Mean|Min|Median|Max|
 |---|---|---|---|---|
 |PostgreSQL|9.4 |0.3 |2.5 |49.3 |
-|Datalevin|68.7 |2.3 |30.3 |1079.8 |
+|Datalevin|59.2 |2.5 |27.1 |947.9 |
 
-Datalevin spent 7.761 seconds in planning, or 19.2% of its 40.392-second
+Datalevin spent 6.689 seconds in planning, or 17.6% of its 38.073-second
 reported total. Planning remains smaller than execution, but is material in
 this run.
 
@@ -362,17 +368,17 @@ SQLite doesn't report any internal timing.
 |---|---|---|---|---|
 |PostgreSQL|1125.4 |3.3 |224.8 |10836.2 |
 |SQLite|2710.1 |8.0 |493.1 |38763.4 |
-|Datalevin|288.8 |0.2 |86.7 |3865.7 |
+|Datalevin|277.7 |0.2 |91.8 |3437.3 |
 
-PostgreSQL's mean execution time is 3.9X Datalevin's, and SQLite's recorded
-mean is 9.4X Datalevin's. Their medians are 2.6X and 5.7X Datalevin's,
-respectively. The maximum Datalevin execution time is 3.866 seconds, versus
+PostgreSQL's mean execution time is 4.1X Datalevin's, and SQLite's recorded
+mean is 9.8X Datalevin's. Their medians are 2.4X and 5.4X Datalevin's,
+respectively. The maximum Datalevin execution time is 3.437 seconds, versus
 10.836 seconds for PostgreSQL and 38.763 seconds among SQLite's completed
 queries.
 
 ## Remarks
 
-For these complex queries, execution still accounts for 80.8% of Datalevin's
+For these complex queries, execution accounts for 82.4% of Datalevin's
 reported query time. The quality of the plans generated by the planner remains
 the main determinant of the overall query-time differences, while planning
 overhead is now large enough to report separately.

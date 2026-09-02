@@ -273,9 +273,11 @@ than issuing an untimed metadata query. It therefore does not compile Cypher
 before IC1; any lazy query-compiler initialization in the fresh measurement JVM
 is included in that first timed query.
 
-Both benchmark runner aliases enable Clojure direct linking, matching the main
-Datalevin build. The setting is recorded in the host manifest and the comparator
-rejects reports produced with different compiler modes.
+Both benchmark runner aliases request a fixed 2 GiB initial heap and enable
+Clojure direct linking, matching the main Datalevin build. Fixing the initial
+heap reduces run-to-run G1 heap-expansion variability. Direct linking and the
+effective maximum heap are recorded in the host manifest, and the comparator
+rejects reports produced with different compiler modes or maximum heaps.
 
 Storage caching is intentionally retained. Both measurement processes reopen
 their database after the independent warmup process exits, allowing operating-

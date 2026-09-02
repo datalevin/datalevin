@@ -44,6 +44,15 @@
           (is (= [{:child :datalevin}] (:child-hosts report)))
           (is (every? #(= :ok (:status %)) (:results report))))))))
 
+(deftest child-jvm-uses-fixed-initial-heap-test
+  (let [command (#'runner/child-command
+                  :datalevin
+                  {:warmup 1 :iterations 1 :verify? true}
+                  "/tmp/openrulebench-result.edn"
+                  ["tc:50k-cyclic-ff"])]
+    (is (= ["clojure" "-J-Xms2g" "-J-Xmx8g"]
+           (subvec command 0 3)))))
+
 (deftest help-does-not-resolve-to-benchmarks-test
   (is (true? (:help? (runner/parse-args ["--help"])))))
 
