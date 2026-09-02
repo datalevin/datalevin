@@ -57,7 +57,7 @@ any flavor of SQL, once they get to use it. Perhaps it is because Datalog is
 more declarative and composable than SQL, e.g. the automatic implicit joins seem
 to be its killer feature. In addition, the recursive rules feature of Datalog
 makes it suitable for [graph queries](benchmarks/LDBC-SNB-bench) and
-[deductive reasoning](benchmarks/math-bench).
+[deductive reasoning](benchmarks/openrulebench).
 
 The feature set of Datomic® may not be a good fit for some use cases. One thing
 that may [confuse some
@@ -297,12 +297,35 @@ for EDN data.
 ## :bar_chart: Benchmarks
 
 This repository contains several [benchmarks](benchmarks) that compare
-performance of Datalevin with other databases.
+performance of Datalevin with other systems.
 
-We compared Datalevin with PostgreSQL and SQLite in handling complex queries, using
-[Join Order Benchmark](benchmarks/JOB-bench). On a
-MacBook Pro, Apple M3 Pro chip with 12 cores, 36 GB memory and 1TB SSD drive, the
-chart below plots query latency for all 113 queries in the benchmark.
+All these benchmarks were conducted on a 2023 MacBook Pro, Apple M3 Pro chip
+with 12 cores, 36 GB memory and 1TB SSD drive.
+
+### Write
+
+The [write benchmark](benchmarks/write-bench) compares Datalevin Datalog
+transactions with SQLite under explicitly verified durability settings.
+
+In pure write, the one-million-person-record matrix covers batches 1, 10, 100,
+and 1000. Datalevin led at default sync mode in batches 1 and 1000, and default
+WAL mode in batches 10, 100 and 1000; SQLite led the other rows. Datalevin's
+async write modes are much faster, as expected.
+
+For concurrent writes in default WAL mode, Datalevin led in all batches in both
+2 and 4 concurrent threads.
+
+For 50/50 mixed read/write, Datalevin held slight lead.
+
+### Read
+
+Datalevin support multiple database paradigms.
+
+#### Relational
+
+We compared Datalevin with PostgreSQL and SQLite in handling complex relational
+queries, using [Join Order Benchmark](benchmarks/JOB-bench). The chart below
+plots query latency for all 113 queries in the benchmark.
 
 <p align="center">
 <img src="benchmarks/JOB-bench/job_benchmark_log_bars.svg" alt="JOB benchmark" height="300"></img>
@@ -313,53 +336,48 @@ In the current second-pass snapshot, Datalevin completed the 113 queries in
 while SQLite's 281.8-second completed-query subtotal is 7.40X Datalevin's, with
 another nine queries reaching the one-minute timeout. The gain is mainly due to
 shorter query execution time as Datalevin's query optimizer generates better
-plans. Details of the benchmark and its methodology are in the
-[JOB README](benchmarks/JOB-bench); background analysis can be found in [this
-article](https://yyhh.org/blog/2024/09/competing-for-the-job-with-a-triplestore/)
+plans.
 
-We also compare Datalevin with Neo4j Community Embedded using the 21 read
-queries in the [LDBC SNB benchmark](benchmarks/LDBC-SNB-bench). In the current
-SF1 snapshot, captured on 2026-08-23 with both engines embedded and no network
-transport, Datalevin's summed measured query time was 3.890 seconds versus
-27.406 seconds for Neo4j. Neo4j's sum was 7.046X Datalevin's, the equal-query
-Neo4j/Datalevin geometric-mean ratio was 4.996X, and Datalevin had the lower
-time on 20 of 21 queries. This local read-latency harness uses one measured
-execution per query after an independent-process warmup and is not an official
-LDBC result; the [LDBC README](benchmarks/LDBC-SNB-bench) documents the full
-methodology and per-query results.
+#### Graph
 
-The [write benchmark](benchmarks/write-bench) compares Datalevin Datalog and KV
-transactions with SQLite under explicitly verified durability settings. The
-one-million-person-record matrix covers batches 1, 10, 100, and 1000 in default
-and relaxed-WAL modes. For blocking calls, Datalevin led at default batches 1
-and 1000 and relaxed-WAL batches 100 and 1000; SQLite led the other rows.
+We compare Datalevin with Neo4j Community Embedded using the 21 read
+queries in the [LDBC SNB benchmark](benchmarks/LDBC-SNB-bench). Datalevin's
+summed measured query time was 3.890 seconds versus 27.406 seconds for Neo4j.
+Neo4j's sum was 7.046X Datalevin's, the equal-query Neo4j/Datalevin
+geometric-mean ratio was 4.996X, and Datalevin had the lower time on 20 of 21
+queries.
 
-For performance comparison with [Datomic](https://www.datomic.com) and
-[Datascript](https://github.com/tonsky/datascript), see the [DataScript
-benchmark](benchmarks/datascript-bench). Run on an Apple M3 Pro with all three
-databases in in-memory mode, Datalevin is competitive on write operations, and
-significantly outperforms both on complex read queries due to its query
-optimizer. For example, Datalevin is over 13X faster than Datascript on a
-3-way join query and nearly 18X faster on a 4-way join.
+#### Logic
 
-Datalevin also has an advanced [rule engine](doc/rules.md), which is much faster
-than Datomic and Datascript that implement the same rule language. [This
-benchmark](benchmarks/math-bench) shows the running time in milliseconds of
-applying 4 rules to a mathematics genealogy data set on a Macbook Pro 2023.
+Datalevin's [rule engine](doc/rules.md) is evaluated with a portable
+[OpenRuleBench-derived suite](benchmarks/openrulebench). It covers recursive
+transitive closure (TC), nonlinear recursive same-generation fixed points
+(SG), and nonrecursive Join1 rule DAGs. The benchmark compares Datalevin with 6
+alternative systems.
 
-| System    | Q1 | Q2 | Q3 | Q4
-| -------- | ------- | -------- | -------- | -------- |
-| Datomic 1.0.7469   | 1275.1 | 1296.7 | 967.2 | 41192.9 |
-| Datascript 1.7.8  | 109.7 | 707.2 | 584.7 | Out of Memory |
-| Datalevin latest | 14.4 | 330.9 | 269.6 | 2.9 |
+In the current representative comparison, Datalevin had the lowest latency in
+all ten selected cells. `FF` means both query arguments are free, `BF` fixes the
+first argument, and `FB` fixes the second. The last column divides the fastest
+alternative's latency by Datalevin's latency.
 
-For recursive rules like Q4, Datalevin can be orders of magnitude faster,
-while Datomic and Datascript struggle.
+| Task | Result rows | Datalevin (ms) | Fastest alternative (ms) | Alternative / Datalevin |
+|---|---:|---:|---:|---:|
+| TC 50K cyclic FF | 1,000,000 | 67.88 | Soufflé 1,030.36 | 15.18X |
+| TC 50K acyclic FF | 473,807 | 45.20 | Soufflé 371.93 | 8.23X |
+| TC 50K cyclic BF | 1,000 | 4.71 | SQLite 7.04 | 1.49X |
+| SG 6K cyclic FF | 869,923 | 70.23 | Soufflé 865.82 | 12.33X |
+| SG 6K acyclic FF | 215,263 | 18.91 | Soufflé 89.43 | 4.73X |
+| SG 6K acyclic BF | 533 | 6.09 | PostgreSQL 7.28 | 1.20X |
+| SG 6K acyclic FB | 541 | 4.66 | PostgreSQL 6.81 | 1.46X |
+| Join1 50K b1 FF | 1,000,000 | 86.65 | XSB 1,795.00 | 20.72X |
+| Join1 50K b2 FF | 917,680 | 124.85 | XSB 174.00 | 1.39X |
+| Join1 50K a BF | 1,000 | 12.01 | XSB 120.00 | 9.99X |
 
 ## :rocket: Status
 
-Datalevin is extensively tested with property-based testing and is used
-in production at [Juji](https://juji.io), among other companies.
+Datalevin is extensively tested with property-based testing. It was used
+in production at Juji (acquired by Accenture) for several years, among other
+companies.
 
 If your project is using Datalevin in production, drop a comment in [this
 issue](https://github.com/datalevin/datalevin/issues/383).
