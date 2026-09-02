@@ -319,7 +319,7 @@ For 50/50 mixed read/write, Datalevin held slight lead.
 
 ### Read
 
-Datalevin support multiple database paradigms.
+Datalevin supports multiple database paradigms.
 
 #### Relational
 
@@ -346,6 +346,23 @@ summed measured query time was 3.890 seconds versus 27.406 seconds for Neo4j.
 Neo4j's sum was 7.046X Datalevin's, the equal-query Neo4j/Datalevin
 geometric-mean ratio was 4.996X, and Datalevin had the lower time on 20 of 21
 queries.
+
+#### Document
+
+The [iDOC benchmark](benchmarks/idoc-bench) compares Datalevin's indexed
+documents with PostgreSQL JSONB, SQLite JSON1, and MongoDB BSON. It combines
+YCSB-style reads and writes with nested equality, range, wildcard-path, and
+array-match queries.
+
+At one caller, Datalevin had the highest throughput in all three workloads.
+Workload A mixes reads and updates, C is read-only, and F uses
+read-modify-write.
+
+| Workload | Datalevin | PostgreSQL | SQLite | MongoDB |
+|---|---:|---:|---:|---:|---:|
+| A | 3,358/s | 2,270/s | 438/s | 309/s |
+| C | 11,454/s | 2,039/s | 437/s | 2,868/s  |
+| F | 2,680/s | 1,789/s | 416/s | 192/s |
 
 #### Logic
 

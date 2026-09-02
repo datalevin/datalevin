@@ -1,34 +1,33 @@
 # Benchmarks
 
-The following benchmarks are included:
+The current benchmark suite includes:
 
-* [Join Order Benchmark](JOB-bench) compares Datalevin, SQLite and Postgresql on
-  JOB benchmark. This is a standard benchmark for SQL databases that consists of
-  realistic data set (IMDB) and complex queries, and puts a high demand on the
-  quality of query optimizer.
+* [Write](write-bench) compares Datalevin's Datalog and SQLite write paths in
+  pure, concurrent, and mixed read/write workloads. Durability-matched Datalog
+  comparisons pair strict Datalevin WAL with SQLite WAL `FULL`; relaxed modes
+  are reported separately. It also studies Datalevin's KV writes in various
+  settings.
+* [Join Order Benchmark](JOB-bench) compares Datalevin, PostgreSQL, and SQLite
+  on all 113 queries in the standard IMDB workload. Its complex multiway joins
+  stress query optimization; the publication protocol uses one complete warmup
+  pass followed by one retained measurement pass.
 * [LDBC-SNB Benchmark](LDBC-SNB-bench) compares Datalevin and Neo4j on an
-  industry standard graph database workload. It contains some interactive short
-  reads and complex graph queries on a synthetic graph data set.
+  industry-standard graph workload containing interactive short reads and
+  complex graph queries over a synthetic social-network data set.
+* [OpenRuleBench](openrulebench) compares Datalevin with six alternative
+  rule/SQL engines on portable transitive closure, same generation, and Join1
+  tasks, important for recursive rule resolutions.
+* [iDOC](idoc-bench) compares Datalevin, PostgreSQL, SQLite, and MongoDB on
+  YCSB-style A/C/F workloads plus document-query mixes covering nested paths,
+  ranges, wildcards, and arrays.
+* [Wikipedia Full-text Search](search-bench) compares Lucene and Datalevin on
+  full-text search performance using a Wikipedia data set and realistic Web
+  queries.
 * [Math Genealogy](math-bench)  compares Datascript, Datomic and Datalevin on
   Datalog rule processing using a realistic Math Genealogy data set.
 * [Datascript](datascript-bench) is the benchmark inherited from Datascript,
   that compares Datascript, Datomic and Datalevin on Datalog transaction and
   queries, as well as rule processing using a synthetic data set.
-* [Wikipedia Full-text Search](search-bench) compares Lucene and Datalevin on
-  full-text search performance using Wikipedia data set and realistic Web
-  queries.
 * [Access Path](access-path-bench) compares identical fulltext and approximate
   vector queries with access paths enabled and disabled, reporting latency and
   residual candidate work.
-* [Idoc](idoc-bench) runs YCSB-style A/C/F workloads plus idoc query mixes
-  (nested paths, ranges, wildcards, arrays) to stress document queries. Its
-  publication protocol uses one complete warmup pass and one retained
-  measurement pass in independent JVM processes.
-* [OpenRuleBench](openrulebench) compares a portable TC, SG, and Join1 task
-  matrix across Datalevin and compatible rule/SQL engines. Every accepted task
-  has deterministic set-valued inputs, an independent answer-count reference,
-  one warmup pass plus one retained measurement pass, and raw artifacts;
-  unreproducible DBLP/LUBM placeholders are explicitly outside the comparison
-  suite.
-* [Write](write-bench) studies writing synthetic data to measure Datalevin's write
-  performance in various conditions, and compares with SQLite.
