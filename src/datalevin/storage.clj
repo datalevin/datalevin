@@ -2719,28 +2719,36 @@
                            store)]
       (when (and (a/running? exe)
                  (not (closed? store)))
-        (try
-          (let [result (process-secondary-index-jobs!
-                        store
-                        (async-secondary-index-worker-opts store))
-                status (:status result)
-                pending? (pos? (long (or (:pending-count status) 0)))
-                next-retry-ms (:next-retry-ms status)
-                next-lease-ms (:next-lease-ms status)]
-            (cond
-              (and pending? (not (closed? store)))
-              (enqueue-secondary-index-work! store)
+        ;; Fast local transactions enqueue this work while their outer LMDB
+        ;; transaction is still open. Wait for that commit before looking for
+        ;; jobs, otherwise an empty pre-commit read can consume the only wakeup.
+        ;; Do not retain this monitor while processing: job claiming takes the
+        ;; Store lock before writing LMDB, so retaining it would invert locks.
+        (locking (lmdb/write-txn (.-lmdb store)) nil)
+        (when (and (a/running? exe)
+                   (not (closed? store)))
+          (try
+            (let [result (process-secondary-index-jobs!
+                          store
+                          (async-secondary-index-worker-opts store))
+                  status (:status result)
+                  pending? (pos? (long (or (:pending-count status) 0)))
+                  next-retry-ms (:next-retry-ms status)
+                  next-lease-ms (:next-lease-ms status)]
+              (cond
+                (and pending? (not (closed? store)))
+                (enqueue-secondary-index-work! store)
 
-              (and next-retry-ms (not (closed? store)))
-              (do
-                (wait-for-secondary-index-time! store next-retry-ms)
-                (enqueue-secondary-index-work! store))
+                (and next-retry-ms (not (closed? store)))
+                (do
+                  (wait-for-secondary-index-time! store next-retry-ms)
+                  (enqueue-secondary-index-work! store))
 
-              (and next-lease-ms (not (closed? store)))
-              (do
-                (wait-for-secondary-index-time! store next-lease-ms)
-                (enqueue-secondary-index-work! store))))
-          (catch Throwable _)))))
+                (and next-lease-ms (not (closed? store)))
+                (do
+                  (wait-for-secondary-index-time! store next-lease-ms)
+                  (enqueue-secondary-index-work! store))))
+            (catch Throwable _))))))
   (combine [_]
     (fn [works]
       (peek (vec works))))
