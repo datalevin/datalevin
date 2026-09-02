@@ -1429,7 +1429,8 @@ See also: [[open-kv]], [[sync]]"}
 
          * `:writemap`, use writable mmap
 
-         * `:mapasync`, use asynchronous msync when `:writemap` is used
+         * `:mapasync`, defer dirty mapped-page writeback to the operating
+         system when `:writemap` is used
 
          * `:notls`, tie reader locktable slots to txn objects instead of to threads
 

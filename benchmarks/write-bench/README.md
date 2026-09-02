@@ -403,17 +403,9 @@ with SQLite WAL and `synchronous=FULL`.
 Results show throughput: records written per second. Every row writes one
 million records to a fresh database with seed 42, no warmup pass, and one
 measurement pass. Measurements were collected on 2026-08-31 with Datalevin
-1.1.0, Java 21.0.11, and a 12-core Apple Silicon macOS host. Most original rows
-use native artifact 0.19.4 (DLMDB 1.0.0). The corrected `writemap` + `mapasync`
-rows and the new strict-WAL rows use 0.19.5, whose only listed change is the
-Darwin `MS_ASYNC` fix; the WAL paths do not use that flag combination.
-Background media analysis was paused during each measurement phase and resumed
-immediately afterward to keep host load stable. The complete throughput,
-latency, environment, effective-storage, and per-condition native-version
-metadata is preserved in the [KV result artifact](results/2026-08-31-kv.edn)
-and [strict-WAL result artifact](results/2026-08-31-strict-wal.edn). The KV
-mixed rows are included in the
-[strict mixed-WAL result artifact](results/2026-08-31-strict-wal-mixed.edn).
+1.1.0, Java 21.0.11, and a 12-core Apple Silicon macOS host. Background media
+analysis was paused during each measurement phase and resumed immediately
+afterward to keep host load stable.
 
 KV has no equivalent SQLite task in this benchmark, so these tables compare
 only Datalevin KV API and durability conditions.
@@ -475,6 +467,6 @@ equivalents.
 | 1000 | 57,990/s | 58,079/s | 223,205/s | 271,192/s |
 
 `nometasync` provides no consistent throughput improvement in this one-pass
-study. With the 0.19.5 Darwin fix, `writemap` + `mapasync` is the fastest
-synchronous condition at every batch size, reaching 271,192 writes/s at batch
-1000 and exceeding `nosync` by 1.22X through 1.65X.
+study. `writemap` + `mapasync` is the fastest synchronous condition at every
+batch size, reaching 271,192 writes/s at batch 1000 and exceeding `nosync` by
+1.22X through 1.65X.

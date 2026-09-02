@@ -100,6 +100,66 @@
           (d/close-kv kv-store)
           (u/delete-files dir))))))
 
+(deftest direct-kv-retains-wal-durability-profile
+  (let [dir (u/tmp-dir (str "raw-kv-wal-profile-" (UUID/randomUUID)))]
+    (try
+      ;; Exercise enabling WAL on an existing raw KV store, not only creation
+      ;; of a store whose first open already supplies all WAL options.
+      (d/close-kv (d/open-kv dir))
+      (let [kv-store (d/open-kv dir {:wal? true
+                                     :wal-durability-profile :relaxed})]
+        (try
+          (is (= :relaxed
+                 (:durability-profile (d/txlog-watermarks kv-store))))
+          (finally
+            (d/close-kv kv-store))))
+      (binding [c/*wal-durability-profile* :extra]
+        (let [kv-store (d/open-kv dir {:wal? true})]
+          (try
+            (is (= :relaxed
+                   (:durability-profile (d/txlog-watermarks kv-store))))
+            (finally
+              (d/close-kv kv-store)))))
+      (let [kv-store (d/open-kv dir {:wal? true
+                                     :wal-durability-profile :strict})]
+        (try
+          (is (= :strict
+                 (:durability-profile (d/txlog-watermarks kv-store))))
+          (finally
+            (d/close-kv kv-store))))
+      (binding [c/*wal-durability-profile* :relaxed]
+        (let [kv-store (d/open-kv dir {:wal? true})]
+          (try
+            (is (= :strict
+                   (:durability-profile (d/txlog-watermarks kv-store))))
+            (finally
+              (d/close-kv kv-store)))))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest direct-kv-retains-the-effective-default-profile
+  (let [dir (u/tmp-dir (str "raw-kv-default-wal-profile-"
+                            (UUID/randomUUID)))]
+    (try
+      (binding [c/*wal-durability-profile* :strict]
+        (let [kv-store (d/open-kv dir {:wal? true})]
+          (try
+            (is (= :strict
+                   (:durability-profile (d/txlog-watermarks kv-store))))
+            (finally
+              (d/close-kv kv-store)))))
+      ;; A later process default must not reinterpret an existing store whose
+      ;; first WAL open omitted the profile.
+      (binding [c/*wal-durability-profile* :relaxed]
+        (let [kv-store (d/open-kv dir {:wal? true})]
+          (try
+            (is (= :strict
+                   (:durability-profile (d/txlog-watermarks kv-store))))
+            (finally
+              (d/close-kv kv-store)))))
+      (finally
+        (u/delete-files dir)))))
+
 (deftest relaxed-wal-idle-writes-retain-txlog-grouping-on-direct-path
   (let [conn* (d/create-conn nil
                              schema

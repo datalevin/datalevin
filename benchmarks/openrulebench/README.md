@@ -195,8 +195,6 @@ O'Doyle's four supported tasks exceeded the 60-second rule-firing timeout during
 warmup. A warmup failure has no retained measurement, so those cells report
 `OOM` or `T/O`; unsupported system/task pairs report `N/A`. The command exits
 nonzero when any selected task fails, while preserving the diagnostic artifact.
-The [raw seven-system EDN artifact](results/2026-08-26-representative.edn)
-contains all measurements, environment metadata, and rerun provenance.
 
 ### Query evaluation and result materialization
 

@@ -193,13 +193,7 @@ Before the retained PostgreSQL pair, the macOS filesystem cache was purged and
 PostgreSQL was restarted to clear `shared_buffers`; its first pass therefore
 established the warm state used by the measurement pass. Before measurement,
 SQLite was rebuilt from the source CSV files and all 21 table row counts were
-verified to match PostgreSQL exactly. Their complete two-pass environment and
-artifacts are retained in the
-[2026-08-23 run directory](results/baseline-postgres-sqlite-20260823/README.md).
-The current Datalevin [warmup](results/datalevin-warmup-20260901T235851Z.csv)
-and [measurement](results/datalevin-measurement-20260901T235851Z.csv) artifacts
-are also retained. The 113-query Datalevin correctness suite passed before the
-September run.
+verified to match PostgreSQL exactly.
 
 We look at the timing results. The total query time can be divided into two
 parts: query planning time and plan execution time. SQLite does not report

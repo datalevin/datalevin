@@ -299,8 +299,8 @@ for EDN data.
 This repository contains several [benchmarks](benchmarks) that compare
 performance of Datalevin with other systems.
 
-All these benchmarks were conducted on a 2023 MacBook Pro, Apple M3 Pro chip
-with 12 cores, 36 GB memory and 1TB SSD drive.
+The snapshots summarized below were conducted on a 2023 MacBook Pro, Apple M3
+Pro chip with 12 cores, 36 GB memory and 1TB SSD drive.
 
 ### Write
 
@@ -340,12 +340,12 @@ plans.
 
 #### Graph
 
-We compare Datalevin with Neo4j Community Embedded using the 21 read
-queries in the [LDBC SNB benchmark](benchmarks/LDBC-SNB-bench). Datalevin's
-summed measured query time was 3.890 seconds versus 27.406 seconds for Neo4j.
-Neo4j's sum was 7.046X Datalevin's, the equal-query Neo4j/Datalevin
-geometric-mean ratio was 4.996X, and Datalevin had the lower time on 20 of 21
-queries.
+We compare Datalevin with Neo4j Community Embedded using the 21 read queries in
+the [LDBC SNB benchmark](benchmarks/LDBC-SNB-bench), an unofficial,
+single-execution local scale factor 1 snapshot. Datalevin's summed measured
+query time was 3.890 seconds versus 27.406 seconds for Neo4j. Neo4j's sum was
+7.046X Datalevin's, the equal-query Neo4j/Datalevin geometric-mean ratio was
+4.996X, and Datalevin had the lower time on 20 of 21 queries.
 
 #### Document
 

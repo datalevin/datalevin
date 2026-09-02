@@ -2623,6 +2623,21 @@
   (transact-kv lmdb c/kv-info (map (fn [[k v]] [:put k v]) new-info))
   (vreset! (.-info lmdb) (merge new-info (load-info-from-kv lmdb))))
 
+(defn- retain-wal-durability-profile!
+  [^CppLMDB lmdb loaded-info info]
+  (if-not (true? (:wal? info))
+    info
+    (let [profile (or (:wal-durability-profile info)
+                      c/*wal-durability-profile*)]
+      (vld/validate-option-mutation :wal-durability-profile profile)
+      (when-not (= profile (:wal-durability-profile loaded-info))
+        ;; Raw KV stores do not have the Datalog options DBI. Retain the
+        ;; effective profile in kv-info before the WAL runtime starts so an
+        ;; omitted profile on the next open cannot silently change durability.
+        (transact-kv lmdb c/kv-info
+                     [[:put :wal-durability-profile profile]]))
+      (assoc info :wal-durability-profile profile))))
+
 (defn- open-kv*
   [dir dir-file db-file {:keys [mapsize max-readers flags max-dbs temp?
                                 key-compress val-compress]
@@ -2690,12 +2705,16 @@
                                   (.exists (io/file dir c/valcode-file-name)))
                          (cp/load-val-compressor
                           (str dir u/+separator+ c/valcode-file-name)))
-                loaded-info (load-info-from-kv lmdb)]
+                loaded-info (load-info-from-kv lmdb)
+                merged-info (if (empty? loaded-info)
+                              info
+                              (assoc (merge loaded-info info)
+                                     :dbis (:dbis loaded-info)))
+                merged-info (retain-wal-durability-profile!
+                              lmdb loaded-info merged-info)]
             (if (empty? loaded-info)
-              (init-info lmdb info)
-              (vreset! (.-info lmdb)
-                       (assoc (merge loaded-info info)
-                              :dbis (:dbis loaded-info))))
+              (init-info lmdb merged-info)
+              (vreset! (.-info lmdb) merged-info))
             (set-max-val-size lmdb (max-val-size lmdb))
             (set-key-compressor lmdb k-comp)
             (set-val-compressor lmdb v-comp)
