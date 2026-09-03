@@ -22,7 +22,7 @@ Environment:
   SONATYPE_CENTRAL_PASSWORD      Portal token password.
   SONATYPE_CENTRAL_URL           Defaults to https://central.sonatype.com
   SONATYPE_CENTRAL_POLL_INTERVAL Defaults to 10 seconds.
-  SONATYPE_CENTRAL_MAX_POLLS     Defaults to 90 attempts.
+  SONATYPE_CENTRAL_MAX_POLLS     Defaults to 180 attempts (30 minutes).
   JAVA_GPG_HOME                  Optional GPG home for signing.
   JAVA_GPG_KEY_ID                Optional GPG key id for signing.
 
@@ -99,6 +99,8 @@ poll_status() {
   done
 
   echo "Timed out waiting for Sonatype Central deployment ${deployment_id}." >&2
+  echo "The deployment may still finish in Central; do not upload the bundle again." >&2
+  echo "Check https://central.sonatype.com/publishing/deployments before retrying." >&2
   return 1
 }
 
@@ -110,7 +112,7 @@ sign_bundle=true
 dry_run=false
 central_base=${SONATYPE_CENTRAL_URL:-https://central.sonatype.com}
 poll_interval=${SONATYPE_CENTRAL_POLL_INTERVAL:-10}
-max_polls=${SONATYPE_CENTRAL_MAX_POLLS:-90}
+max_polls=${SONATYPE_CENTRAL_MAX_POLLS:-180}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in

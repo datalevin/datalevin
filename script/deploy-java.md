@@ -93,7 +93,11 @@ Useful environment variables:
 - `SONATYPE_CENTRAL_POLL_INTERVAL`
   Defaults to `10`
 - `SONATYPE_CENTRAL_MAX_POLLS`
-  Defaults to `90`
+  Defaults to `180`, giving Central 30 minutes at the default polling interval.
+
+If status polling times out, the upload may still be validating or publishing
+in Central. Check the deployment in the Portal before uploading the same
+version again.
 
 ## Browse The Javadoc
 
