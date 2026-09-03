@@ -21,6 +21,7 @@
    [java.nio.channels SocketChannel Selector SelectionKey]
    [java.util UUID WeakHashMap Collections]
    [java.util.concurrent ConcurrentLinkedQueue ConcurrentHashMap]
+   [java.util.concurrent.atomic AtomicBoolean]
    [java.net InetSocketAddress StandardSocketOptions URI]))
 
 (defprotocol ^:no-doc IConnection
@@ -206,41 +207,77 @@
 
 (deftype ^:no-doc ConnectionPool [host port client-id pool-size time-out
                                   ^ConcurrentLinkedQueue available
-                                  ^ConcurrentLinkedQueue used]
+                                  ^ConcurrentLinkedQueue used
+                                  ^AtomicBoolean closed?]
   IConnectionPool
   (get-connection [this]
-    (if (closed-pool? this)
-      (u/raise "This client is closed" {:client-id client-id})
-      (let [start (System/currentTimeMillis)]
-        (loop []
-          (if (.isEmpty available)
+    (let [start (System/currentTimeMillis)
+          closed-error #(u/raise "This client is closed"
+                                 {:client-id client-id})]
+      (loop []
+        (when (.get closed?)
+          (closed-error))
+        ;; Poll once instead of checking isEmpty before polling: concurrent
+        ;; borrowers can otherwise both observe a singleton queue and one gets
+        ;; nil after the other wins the poll.
+        (if-some [^Connection conn
+                  (locking this
+                    (when-not (.get closed?)
+                      (.poll available)))]
+          (if (.isOpen ^SocketChannel (.-ch conn))
+            (locking this
+              (if (.get closed?)
+                (do
+                  (close conn)
+                  (closed-error))
+                (do
+                  (.add used conn)
+                  conn)))
+            (try
+              (let [new-conn (new-connection host port time-out)]
+                (set-client-id new-conn client-id)
+                (locking this
+                  (if (.get closed?)
+                    (do
+                      (close new-conn)
+                      (closed-error))
+                    (do
+                      (.add used new-conn)
+                      new-conn))))
+              (catch Throwable t
+                (locking this
+                  ;; Keep a dead connection as a replacement placeholder.
+                  ;; Without it, another call cannot retry replacement after a
+                  ;; one-connection pool sees a temporary server outage.
+                  (when-not (.get closed?)
+                    (.add available conn)))
+                (throw t))))
+          (if (.get closed?)
+            (closed-error)
             (if (>= (- (System/currentTimeMillis) start) ^long time-out)
               (u/raise "Timeout in obtaining a connection" {})
-              (do (Thread/sleep 1000)
-                  (recur)))
-            (let [^Connection conn (.poll available)]
-              (if (.isOpen ^SocketChannel (.-ch conn))
-                (do (.add used conn)
-                    conn)
-                (let [conn (new-connection host port time-out)]
-                  (set-client-id conn client-id)
-                  (.add used conn)
-                  conn))))))))
+              (do
+                (Thread/sleep 1000)
+                (recur))))))))
 
   (release-connection [this conn]
     (locking this
       (when (.contains used conn)
         (.remove used conn)
-        (.add available conn))))
+        (if (.get closed?)
+          (close ^Connection conn)
+          (.add available conn)))))
 
   (close-pool [this]
-    (dotimes [_ (.size used)] (close ^Connection (.poll used)))
-    (.clear used)
-    (dotimes [_ (.size available)] (close ^Connection (.poll available)))
-    (.clear available))
+    (locking this
+      (when (.compareAndSet closed? false true)
+        (dotimes [_ (.size used)] (close ^Connection (.poll used)))
+        (.clear used)
+        (dotimes [_ (.size available)] (close ^Connection (.poll available)))
+        (.clear available))))
 
-  (closed-pool? [this]
-    (and (.isEmpty used) (.isEmpty available))))
+  (closed-pool? [_]
+    (.get closed?)))
 
 (defn- authenticate
   "Send an authenticate message to server, and wait to receive the response.
@@ -270,13 +307,20 @@
                                            host port client-id
                                            pool-size time-out
                                            (ConcurrentLinkedQueue.)
-                                           (ConcurrentLinkedQueue.))
+                                           (ConcurrentLinkedQueue.)
+                                           (AtomicBoolean. false))
         ^ConcurrentLinkedQueue available (.-available pool)]
-    (dotimes [_ pool-size]
-      (let [conn (new-connection host port time-out)]
-        (set-client-id conn client-id)
-        (.add available conn)))
-    pool))
+    (try
+      (dotimes [_ pool-size]
+        (let [conn (new-connection host port time-out)]
+          (set-client-id conn client-id)
+          (.add available conn)))
+      pool
+      (catch Throwable t
+        ;; A server can disappear while the initial pool is being populated.
+        ;; Do not leak connections that were established earlier in the loop.
+        (close-pool pool)
+        (throw t)))))
 
 (defprotocol ^:no-doc IClient
   (request [client req]
@@ -403,23 +447,35 @@
                                             :db-name        db-name
                                             :db-type        db-type})
                                          :reconnect
-                                         (let [client-id
-                                               (authenticate host port username
-                                                             password
-                                                             time-out)]
+                                         (do
                                            (close conn)
                                            (vreset! success? false)
-                                           {:request-status :reconnect
-                                            :client-id      client-id})))
+                                           {:request-status :reconnect})))
                                      (finally
                                        (release-connection pool' conn)))
               res'                 (case (:request-status res)
                                      :reconnect
-                                     (let [client-id (:client-id res)]
-                                       (set! id client-id)
-                                       (set! pool (new-connectionpool
-                                                    host port client-id
-                                                    pool-size time-out))
+                                     (do
+                                       ;; Several in-flight requests can learn
+                                       ;; that the same server session is stale.
+                                       ;; Only the request that still owns the
+                                       ;; observed pool should replace it.
+                                       (locking client
+                                         (when (identical? pool pool')
+                                           (let [client-id
+                                                 (authenticate
+                                                   host port username password
+                                                   time-out)
+                                                 new-pool
+                                                 (new-connectionpool
+                                                   host port client-id
+                                                   pool-size time-out)]
+                                             ;; Explicit field access is needed
+                                             ;; for mutable deftype fields inside
+                                             ;; the locking form.
+                                             (set! (.-id ^Client client) client-id)
+                                             (set! (.-pool ^Client client) new-pool)
+                                             (close-pool pool'))))
                                        nil)
 
                                      :reopen
@@ -450,13 +506,17 @@
         (send-only conn {:type :disconnect})
         (release-connection pool conn))
       (finally
-        (.remove ha-write-retry-settings client)
-        (.remove ha-retry-disabled-clients client)
-        (.remove ha-preferred-endpoints client)
-        (.remove ha-preferred-read-endpoints client)
-        (.remove ha-known-db-endpoints client)
-        (disconnect-retry-clients! client disconnect)))
-    (close-pool pool))
+        (try
+          (.remove ha-write-retry-settings client)
+          (.remove ha-retry-disabled-clients client)
+          (.remove ha-preferred-endpoints client)
+          (.remove ha-preferred-read-endpoints client)
+          (.remove ha-known-db-endpoints client)
+          (disconnect-retry-clients! client disconnect)
+          (finally
+            ;; A failed best-effort disconnect must still make the local
+            ;; lifecycle transition final and release every socket.
+            (close-pool pool))))))
 
   (disconnected? [client]
     (closed-pool? pool))

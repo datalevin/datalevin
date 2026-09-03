@@ -194,6 +194,26 @@
           (d/close-kv lmdb))
         (u/delete-files dir)))))
 
+(deftest persisted-dbi-is-lazily-restored-after-reopen
+  (let [dir (u/tmp-dir (str "lazy-dbi-reopen-" (UUID/randomUUID)))]
+    (try
+      (let [kv-store (d/open-kv dir)]
+        (d/open-dbi kv-store "values"
+                    {:key-size 64 :val-size 512})
+        (d/transact-kv kv-store [[:put "values" :key {:value 42}]])
+        (d/close-kv kv-store))
+      ;; A named DBI's metadata is durable, but its native handle is not. Reads
+      ;; should lazily restore the known handle rather than require another
+      ;; explicit open call after an environment/server restart.
+      (let [reopened (d/open-kv dir)]
+        (try
+          (is (= [[:key {:value 42}]]
+                 (d/get-range reopened "values" [:all])))
+          (finally
+            (d/close-kv reopened))))
+      (finally
+        (u/delete-files dir)))))
+
 (deftest stale-ha-replay-does-not-regress-materialized-payload
   (let [dir (u/tmp-dir (str "stale-ha-replay-" (UUID/randomUUID)))]
     (try

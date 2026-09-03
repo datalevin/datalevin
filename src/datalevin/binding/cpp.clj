@@ -1975,41 +1975,52 @@
                                         false)}}]
     (.check-ready this)
     (assert (< ^long key-size 512) "Key size cannot be greater than 511 bytes")
-    (let [{info-dbis :dbis max-dbis :max-dbs} @info]
-      (if (< (count info-dbis) ^long max-dbis)
-        (let [existing-opts (get info-dbis dbi-name)
-              opts     {:key-size       key-size
-                        :val-size       val-size
-                        :flags          flags
-                        :validate-data? validate-data?}
-              flags    (set flags)
-              dupsort? (if (:dupsort flags) true false)
-              dupfixed? (if (:dupfixed flags) true false)
-              counted? (if (:counted flags) true false)
-              kp       (new-bufval key-size)
-              vp       (new-bufval val-size)
-              kc       (bf/allocate-buffer key-size)
-              vc       (bf/allocate-buffer val-size)
-              dbi      (Dbi/create env dbi-name (kv-flags flags))
-              db       (DBI. this dbi (new-pools) kp vp kc vc
-                             dupsort? dupfixed? counted? validate-data?
-                             nil nil)]
-          (when (not= dbi-name c/kv-info)
-            (when (not= existing-opts opts)
-              (vswap! info assoc-in [:dbis dbi-name] opts)
-              (transact-kv this [(l/kv-tx :put c/kv-info [:dbis dbi-name] opts
-                                          [:keyword :string])])))
-          (.put dbis dbi-name db)
-          db)
-        (u/raise (str "Reached maximal number of DBI: " max-dbis) {}))))
+    (locking dbis
+      (let [{info-dbis :dbis max-dbis :max-dbs} @info]
+        ;; A known DBI can always be reopened: it does not consume another LMDB
+        ;; named-database slot. This matters when an environment already has
+        ;; max-dbs persisted DBIs and is opened by a fresh process.
+        (if (or (contains? info-dbis dbi-name)
+                (< (count info-dbis) ^long max-dbis))
+          (let [existing-opts (get info-dbis dbi-name)
+                opts     {:key-size       key-size
+                          :val-size       val-size
+                          :flags          flags
+                          :validate-data? validate-data?}
+                flags    (set flags)
+                dupsort? (if (:dupsort flags) true false)
+                dupfixed? (if (:dupfixed flags) true false)
+                counted? (if (:counted flags) true false)
+                kp       (new-bufval key-size)
+                vp       (new-bufval val-size)
+                kc       (bf/allocate-buffer key-size)
+                vc       (bf/allocate-buffer val-size)
+                dbi      (Dbi/create env dbi-name (kv-flags flags))
+                db       (DBI. this dbi (new-pools) kp vp kc vc
+                               dupsort? dupfixed? counted? validate-data?
+                               nil nil)]
+            (when (not= dbi-name c/kv-info)
+              (when (not= existing-opts opts)
+                (vswap! info assoc-in [:dbis dbi-name] opts)
+                (transact-kv
+                  this [(l/kv-tx :put c/kv-info [:dbis dbi-name] opts
+                                 [:keyword :string])])))
+            (.put dbis dbi-name db)
+            db)
+          (u/raise (str "Reached maximal number of DBI: " max-dbis) {})))))
 
   (get-dbi [this dbi-name]
     (.get-dbi this dbi-name true))
   (get-dbi [this dbi-name create?]
     (or (.get dbis dbi-name)
-        (if create?
-          (.open-dbi this dbi-name)
-          (u/raise (str "DBI " dbi-name " is not open") {}))))
+        (locking dbis
+          (or (.get dbis dbi-name)
+              ;; DBI metadata is durable, while an opened native DBI handle is
+              ;; process-local. Lazily restore a known handle after a server or
+              ;; environment reopen without creating an unknown database.
+              (if (or create? (contains? (:dbis @info) dbi-name))
+                (.open-dbi this dbi-name)
+                (u/raise (str "DBI " dbi-name " is not open") {}))))))
 
   (clear-dbi [this dbi-name]
     (.check-ready this)
