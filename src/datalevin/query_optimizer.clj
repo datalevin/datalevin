@@ -29,6 +29,7 @@
    [datalevin.query.resolve :as qresolve]
    [datalevin.query-util :as qu]
    [datalevin.relation :as r]
+   [datalevin.rules :as rules]
    [datalevin.util :as u :refer [cond+ raise conjv concatv map+]])
   (:import
    [java.util HashMap HashSet IdentityHashMap List]
@@ -50,6 +51,21 @@
 
 (def ^:private ^:const ^double selective-anchor-dominance-margin
   2.0)
+
+(def ^:private ^:const ^long selective-rule-anchor-min-plan-size
+  1000000)
+
+(def ^:private ^:const ^long selective-rule-anchor-max-inline-size
+  1000000)
+
+(def ^:private ^:const ^long selective-rule-anchor-max-rule-size
+  1000000)
+
+(def ^:private ^:const ^long selective-rule-anchor-max-output-size
+  2000000)
+
+(def ^:private ^:const ^double selective-rule-anchor-dominance-margin
+  4.0)
 
 (def ^:private ^:const ^long max-deferred-attribute-groups
   4)
@@ -3159,6 +3175,253 @@
   (when qplan/*explain*
     (vswap! qplan/*explain* update :pre-materialization-decisions
             (fnil conj []) decision)))
+
+(defn- reset-cost-planning
+  [context]
+  (-> context
+      (assoc :opt-clauses nil
+             :late-clauses nil
+             :optimizable-or-joins nil
+             :graph nil
+             :plan nil
+             :result-set nil)
+      (dissoc :optimizable-not-joins
+              :deferred-base-samples
+              :attribute-group-planning
+              ::selective-preplanned?)))
+
+(defn- splice-rule-expansion
+  [context ^long clause-idx expansion]
+  (let [parsed-q (get context :parsed-q)
+        clauses  (:qorig-where parsed-q)
+        before   (subvec clauses 0 clause-idx)
+        after    (subvec clauses (unchecked-inc clause-idx))
+        clauses  (into before (concat expansion after))]
+    (-> context
+        (assoc :parsed-q
+               (assoc parsed-q
+                      :qorig-where clauses
+                      :qwhere (dp/parse-where clauses)))
+        (reset-cost-planning))))
+
+(defn- isolate-rule-expansion
+  [context {:keys [rule-vars expansion]}]
+  (let [parsed-q (:parsed-q context)
+        parsed-q (assoc parsed-q
+                        :qfind (dp/parse-find rule-vars)
+                        :qorig-find rule-vars
+                        :qwith nil
+                        :qreturn-map nil
+                        :qwhere (dp/parse-where expansion)
+                        :qorig-where expansion
+                        :qhaving nil
+                        :qorder nil
+                        :qlimit nil
+                        :qoffset nil)]
+    (-> context
+        (assoc :parsed-q parsed-q :rels [])
+        (reset-cost-planning))))
+
+(defn- variable-rule-args
+  [^RuleExpr clause]
+  (let [args (:args clause)
+        vars (mapv #(when (instance? Variable %) (:symbol ^Variable %)) args)]
+    (when (and (every? some? vars)
+               (<= 2 (count (set vars))))
+      vars)))
+
+(defn- selective-rule-anchor-candidates
+  [{:keys [parsed-q rels late-clauses] :as context}]
+  (let [clauses    (:qorig-where parsed-q)
+        late       (set late-clauses)
+        bound-vars (into #{} (mapcat (comp keys :attrs)) rels)]
+    (into
+      []
+      (keep-indexed
+        (fn [clause-idx [parsed-clause orig-clause]]
+          (when (and (instance? RuleExpr parsed-clause)
+                     (or (nil? late-clauses)
+                         (contains? late orig-clause)))
+            (when-let [rule-vars (variable-rule-args parsed-clause)]
+              (let [rule-var-set (set rule-vars)
+                    outside-vars
+                    (into #{}
+                          (mapcat qu/collect-vars)
+                          (u/remove-idxs #{clause-idx} clauses))]
+                (when (and (not-any? bound-vars rule-vars)
+                           (<= 2 (count (set/intersection
+                                         rule-var-set outside-vars))))
+                  (when-let [expansion
+                             (rules/expand-nonrecursive-rule-call-for-planning
+                               context orig-clause)]
+                    {:clause-idx clause-idx
+                     :clause     orig-clause
+                     :rule       (get-in parsed-clause [:name :symbol])
+                     :rule-vars  rule-vars
+                     :expansion  expansion}))))))
+      (map vector (:qwhere parsed-q) clauses)))))
+
+(defn- cost-selective-rule-anchor
+  [planned ^long baseline-size ^double baseline-cost candidate]
+  (let [inline-planned
+        (-> planned
+            (splice-rule-expansion
+              (:clause-idx candidate) (:expansion candidate))
+            (planned-context-for-cost))
+        rule-planned   (-> planned
+                           (isolate-rule-expansion candidate)
+                           (planned-context-for-cost))
+        inline-size    (long (estimated-plan-size inline-planned))
+        inline-cost    (double (estimated-context-work inline-planned))
+        rule-plan-size (long (estimated-plan-size rule-planned))
+        rule-plan-cost (double (estimated-context-work rule-planned))
+        inline-late-expansion?
+        (some (comp late-expansion-operation? late-operation)
+              (:late-clauses inline-planned))
+        rule-late-expansion?
+        (some (comp late-expansion-operation? late-operation)
+              (:late-clauses rule-planned))]
+    (when (and (pos? inline-size)
+               (pos? rule-plan-size)
+               (<= inline-size selective-rule-anchor-max-inline-size)
+               (<= rule-plan-size selective-rule-anchor-max-rule-size)
+               (not inline-late-expansion?)
+               (not rule-late-expansion?)
+               (< (* selective-rule-anchor-dominance-margin
+                     (double inline-size))
+                  (double baseline-size))
+               (< (* selective-rule-anchor-dominance-margin inline-cost)
+                  baseline-cost))
+      (assoc candidate
+             :inline-size inline-size
+             :inline-cost inline-cost
+             :rule-plan-size rule-plan-size
+             :rule-plan-cost rule-plan-cost
+             :saving (- baseline-cost (+ inline-cost rule-plan-cost))))))
+
+(defn- relation-covering-vars
+  [rels vars]
+  (some
+    (fn [rel]
+      (when (every? #(contains? (:attrs rel) %) vars) rel))
+    rels))
+
+(defn- try-selective-rule-anchor
+  [{:keys [sources] :as planned} candidate ^double baseline-cost]
+  (let [{:keys [^long clause-idx clause rule-vars]
+         rule-plan-cost-value :rule-plan-cost} candidate
+        rule-plan-cost (double rule-plan-cost-value)
+        resolved
+        (binding [qu/*implicit-source* (get sources '$)]
+          (qresolve/resolve-clause planned clause))
+        seed      (remove-materialized-clause resolved clause-idx)
+        rule-rel  (relation-covering-vars (:rels seed) rule-vars)
+        rule-rows (when rule-rel (relation-size rule-rel))]
+    (cond
+      (nil? rule-rows)
+      (assoc candidate
+             :context planned
+             :eligible? false
+             :guardrail {:reason :missing-rule-relation})
+
+      (> (long rule-rows) selective-rule-anchor-max-output-size)
+      (assoc candidate
+             :context planned
+             :rule-rows rule-rows
+             :eligible? false
+             :guardrail {:reason :rule-output-too-large
+                         :limit selective-rule-anchor-max-output-size
+                         :actual rule-rows})
+
+      (zero? (long rule-rows))
+      (assoc candidate
+             :context (-> seed
+                          (reset-cost-planning)
+                          (assoc :result-set #{}))
+             :rule-rows 0
+             :materialization-cost rule-plan-cost
+             :residual-cost 0.0
+             :candidate-cost rule-plan-cost
+             :materialization-stages []
+             :eligible? true)
+
+      :else
+      (let [output-cost
+            (materialized-output-cost
+              (long rule-rows) (count (:attrs rule-rel)))
+            rule-cost   (+ rule-plan-cost output-cost)
+            budget      (max 0.0 (- baseline-cost rule-cost))
+            propagated  (materialize-bound-patterns-with-cost seed budget)
+            propagation-cost (double (:cost propagated))
+            residual    (when (:eligible? propagated)
+                          (-> (:context propagated)
+                              (reset-cost-planning)
+                              (planned-context-for-cost)))
+            residual-cost (when residual (estimated-context-work residual))
+            candidate-cost
+            (when residual-cost
+              (+ rule-cost propagation-cost (double residual-cost)))]
+        (assoc candidate
+               :context (or residual planned)
+               :rule-rows rule-rows
+               :materialization-cost
+               (+ rule-cost propagation-cost)
+               :materialization-stages (:stages propagated)
+               :residual-cost residual-cost
+               :candidate-cost candidate-cost
+               :eligible? (and candidate-cost
+                               (< (double candidate-cost) baseline-cost))
+               :guardrail (:guardrail propagated))))))
+
+(defn materialize-selective-rule-anchors
+  "Materialize an exact non-recursive rule relation before planning when the
+   late rule would otherwise permit a much larger physical intermediate. A
+   forced inline expansion is used only to cost the alternative; execution
+   retains the rule's set-valued boundary."
+  [context]
+  (let [raw-candidates (selective-rule-anchor-candidates context)]
+    (if (empty? raw-candidates)
+      context
+      (let [planned       (if (some? (:late-clauses context))
+                            context
+                            (planned-context-for-cost context))
+            baseline-size (long (estimated-plan-size planned))
+            baseline-cost (double (estimated-context-work planned))]
+        (if (< baseline-size selective-rule-anchor-min-plan-size)
+          (assoc planned ::selective-preplanned? true)
+          (let [candidates
+                (into []
+                      (keep #(cost-selective-rule-anchor
+                               planned baseline-size baseline-cost %))
+                      (selective-rule-anchor-candidates planned))]
+            (if (empty? candidates)
+              (assoc planned ::selective-preplanned? true)
+              (let [candidate (apply max-key :saving candidates)
+                    trial     (try-selective-rule-anchor
+                                planned candidate baseline-cost)
+                    selected? (:eligible? trial)
+                    decision
+                    {:strategy (if selected?
+                                 :pre-materialized-rule-anchor
+                                 :planner-late-rule)
+                     :rule (:rule candidate)
+                     :clause (:clause candidate)
+                     :baseline-size baseline-size
+                     :baseline-cost baseline-cost
+                     :inline-size (:inline-size candidate)
+                     :inline-cost (:inline-cost candidate)
+                     :rule-plan-size (:rule-plan-size candidate)
+                     :rule-plan-cost (:rule-plan-cost candidate)
+                     :rule-rows (:rule-rows trial)
+                     :materialization-cost (:materialization-cost trial)
+                     :materialization-stages (:materialization-stages trial)
+                     :residual-cost (:residual-cost trial)
+                     :candidate-cost (:candidate-cost trial)
+                     :guardrail (:guardrail trial)}]
+                (record-selective-value-decision! decision)
+                (if selected?
+                  (assoc (:context trial) ::selective-preplanned? true)
+                  (assoc planned ::selective-preplanned? true))))))))))
 
 (defn materialize-selective-value-lookups
   "Cost non-unique constant AVE lookups as possible pre-planning entity

@@ -69,6 +69,9 @@
 (def ^:private materialize-selective-value-lookups
   qo/materialize-selective-value-lookups)
 
+(def ^:private materialize-selective-rule-anchors
+  qo/materialize-selective-rule-anchors)
+
 (def ^:private push-down-equality-disjunctions
   qo/push-down-equality-disjunctions)
 
@@ -2839,6 +2842,7 @@
                (push-down-equality-disjunctions)
                (rewrite-unused-vars)
                (materialize-selective-value-lookups)
+               (materialize-selective-rule-anchors)
                (-q true)))]
      (binding [built-ins/*udf-db* udf-db]
        (finish-query parsed-q context)))))
@@ -2857,6 +2861,7 @@
           (push-down-equality-disjunctions)
           (rewrite-unused-vars)
           (materialize-selective-value-lookups)
+          (materialize-selective-rule-anchors)
           (-q false)))))
 
 (defmulti ^:private execute-alternative
@@ -3137,6 +3142,7 @@
           (push-down-equality-disjunctions)
           (rewrite-unused-vars)
           (materialize-selective-value-lookups)
+          (materialize-selective-rule-anchors)
           (-q false)))))
 
 (defn plan*

@@ -3323,6 +3323,20 @@
                           (cons 'and ex)))
                       expanded))]))))
 
+(defn expand-nonrecursive-rule-call-for-planning
+  "Expand one non-recursive rule call for cardinality planning. The expansion
+   deliberately crosses the outer rule's set boundary and must therefore
+   never be executed as a replacement for the rule relation. Nested rule
+   boundaries remain intact."
+  [{:keys [rules rules-deps] :as context} clause]
+  (when (and (seq rules) (rule-call? context clause))
+    (let [deps (or rules-deps (dependency-graph rules))
+          src  (source clause)
+          head (rule-head clause)
+          args (rule-args clause)]
+      (when-not (recursive? deps head)
+        (expand-rule context (volatile! #{}) rules deps src head args)))))
+
 (defn- expand-clauses
   "Expand non-recursive rules, preserving set-valued boundaries below the
    outermost expansion when a rule can have multiple proofs per head tuple."

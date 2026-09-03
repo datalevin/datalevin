@@ -118,6 +118,15 @@
   (println "\n\n[ Running LDBC-SNB tests ]\n")
   (sh "./ldbc-snb-test" :dir "script")
 
+  (println "\n\n[ Running idoc tests ]\n")
+  (sh "clojure" "-M:test" :dir "benchmarks/idoc-bench")
+
+  (println "\n\n[ Running OpenRuleBench tests ]\n")
+  (sh "clojure" "-M:test" :dir "benchmarks/openrulebench")
+
+  (println "\n\n[ Running write benchmark tests ]\n")
+  (sh "clojure" "-M:test" :dir "benchmarks/write-bench")
+
   (println "\n\n[ Testing jar ]\n")
   (sh "./jar" :dir "script")
   (sh "test-jar/test.sh")

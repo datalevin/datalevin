@@ -1941,3 +1941,69 @@
       (finally
         (d/close conn)
         (u/delete-files dir)))))
+
+(deftest selective-rule-anchor-pre-materialization-test
+  (let [dir    (u/tmp-dir (str "selective-rule-anchor-"
+                               (UUID/randomUUID)))
+        n      1500
+        schema {:person/advised    {:db/valueType   :db.type/ref
+                                    :db/cardinality :db.cardinality/many}
+                :person/name       {:db/valueType :db.type/string}
+                :dissertation/cid  {:db/valueType :db.type/ref}
+                :dissertation/univ {:db/valueType :db.type/string}}
+        rules  '[[(author ?d ?c)
+                  [?d :dissertation/cid ?c]]
+                 [(adv ?x ?y)
+                  [?x :person/advised ?d]
+                  (author ?d ?y)]
+                 [(univ ?c ?u)
+                  [?d :dissertation/cid ?c]
+                  [?d :dissertation/univ ?u]]]
+        query  '[:find [?name ...]
+                 :in $ %
+                 :where
+                 (adv ?x ?y)
+                 (univ ?x ?u)
+                 (univ ?y ?u)
+                 [?y :person/name ?name]]
+        conn   (d/get-conn dir schema)]
+    (try
+      (let [extra-did (+ 20000 n)
+            tx-data
+            (into
+              [{:db/id             extra-did
+                :dissertation/cid  2
+                :dissertation/univ "shared"}]
+              (mapcat
+                (fn [^long i]
+                  (let [person-id (unchecked-inc i)
+                        did       (+ 10000 i)
+                        next-did  (+ 10000
+                                     (long
+                                       (mod (unchecked-inc i) (long n))))]
+                    [{:db/id person-id
+                      :person/name (str "person-" person-id)
+                      :person/advised
+                      (if (zero? i) [next-did extra-did] next-did)}
+                     {:db/id             did
+                      :dissertation/cid  person-id
+                      :dissertation/univ "shared"}]))
+              (range n)))]
+        (d/transact! conn tx-data))
+      (let [db-value (d/db conn)
+            explain  (d/explain {:run? false} query db-value rules)
+            decision (some #(when (= :pre-materialized-rule-anchor
+                                      (:strategy %))
+                              %)
+                           (:pre-materialization-decisions explain))
+            result   (d/q query db-value rules)]
+        (testing "an exact rule relation anchors a dominating outer join"
+          (is (= 'adv (:rule decision)))
+          (is (= n (:rule-rows decision)))
+          (is (< (:inline-size decision) (:baseline-size decision)))
+          (is (< (:candidate-cost decision) (:baseline-cost decision)))
+          (is (not-any? #(= 'adv (first %)) (:late-clauses explain)))
+          (is (= n (count result)))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
