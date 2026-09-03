@@ -1,6 +1,6 @@
 # Change Log
 
-## WIP
+## 1.1.0 (2026-09-02)
 
 ### Added
 - [Datalog] `get-some-else` built-in function. Similar to `get-some` but always
