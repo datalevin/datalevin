@@ -509,7 +509,42 @@
         ((:with-db-runtime-store-swap-fn deps)
          server
          db-name
-         f)
+         (fn []
+           (let [result        (f)
+                 result-state  (cond
+                                 (and (map? result)
+                                      (map? (:state result)))
+                                 (:state result)
+
+                                 (and (map? result)
+                                      (contains? result :store))
+                                 result
+
+                                 :else nil)
+                 local-patch   (when result-state
+                                 (ha-follower-local-side-effect-patch
+                                  expected-state
+                                  result-state))]
+             ;; Closing and reopening the physical store is not atomic for
+             ;; readers unless the replacement is published before the
+             ;; runtime write lock is released. The follower loop publishes
+             ;; the remaining sync state after the step completes; publish
+             ;; just the local side effects here so no reader can acquire the
+             ;; matching read lock and observe the closed old store.
+             (when local-patch
+               ((:transform-db-state-when-fn deps)
+                server
+                db-name
+                #(and (= :follower (:ha-role %))
+                      (same-ha-runtime-state?
+                       %
+                       expected-state
+                       :ha-follower-loop-running?))
+                #(merge-ha-follower-local-side-effect-patch
+                  %
+                  expected-state
+                  local-patch)))
+             result)))
         (u/raise "HA follower store swap aborted because follower state changed"
                  {:error :ha/follower-stale-state
                   :db-name db-name
