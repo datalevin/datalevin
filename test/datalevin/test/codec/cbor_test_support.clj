@@ -9,11 +9,46 @@
 ;;
 (ns datalevin.test.codec.cbor-test-support
   (:require
-   [clojure.test.check.generators :as gen])
+   [clojure.java.io :as io]
+   [clojure.string :as str]
+   [clojure.test.check.generators :as gen]
+   [datalevin.codec.cbor :as cbor])
   (:import
+   [datalevin.codec DLCbor DLCbor$Limits]
    [java.math BigDecimal BigInteger]
    [java.net URI]
+   [java.nio ByteBuffer]
    [java.util Arrays UUID]))
+
+(defn malformed-rows
+  "Returns the shared malformed DL-CBOR corpus as five-column rows."
+  []
+  (with-open [reader (io/reader
+                      (io/resource
+                       "datalevin/cbor/v1/malformed-vectors.tsv"))]
+    (->> (line-seq reader)
+         (remove #(or (str/blank? %) (str/starts-with? % "#")))
+         (mapv #(str/split % #"\t" -1)))))
+
+(defn- malformed-limits [operation]
+  (case operation
+    "limit-input"      (DLCbor$Limits. 4 256 1000000 (* 16 1024 1024) 4096)
+    "limit-depth"      (DLCbor$Limits. (* 64 1024 1024) 2 1000000
+                                        (* 16 1024 1024) 4096)
+    "limit-collection" (DLCbor$Limits. (* 64 1024 1024) 256 2
+                                        (* 16 1024 1024) 4096)
+    "limit-string"     (DLCbor$Limits. (* 64 1024 1024) 256 1000000 2 4096)
+    "limit-bignum"     (DLCbor$Limits. (* 64 1024 1024) 256 1000000 64 8)))
+
+(defn decode-malformed
+  "Decodes a malformed-corpus input under its named operation and limits."
+  [operation ^bytes input]
+  (case operation
+    "canonical" (cbor/decode input)
+    "fast"      (cbor/decode input false)
+    "storage"   (cbor/decode-storage input)
+    (DLCbor/decode (ByteBuffer/wrap input) true
+                   (malformed-limits operation))))
 
 (def ^:private long-gen
   (gen/frequency

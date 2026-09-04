@@ -10,13 +10,15 @@
 (ns datalevin.test.codec.cbor-cross-language-test
   (:require
    [clojure.java.io :as io]
-   [clojure.test :refer [use-fixtures]]
+   [clojure.string :as str]
+   [clojure.test :refer [deftest is testing use-fixtures]]
    [clojure.test.check.clojure-test :refer [defspec]]
    [clojure.test.check.generators :as gen]
    [clojure.test.check.properties :as prop]
    [datalevin.codec.cbor :as cbor]
    [datalevin.test.codec.cbor-test-support :as support])
   (:import
+   [datalevin.codec DLCbor$CodecException DLCbor$ErrorCode]
    [java.io BufferedReader BufferedWriter InputStreamReader OutputStreamWriter]
    [java.lang ProcessBuilder ProcessBuilder$Redirect]
    [java.nio.charset StandardCharsets]
@@ -113,7 +115,7 @@
                    (unchecked-byte (bit-or (bit-shift-left high 4) low)))))
     result))
 
-(defn- rust-request ^bytes [operation ^String payload]
+(defn- rust-response ^String [operation ^String payload]
   (let [{:keys [process reader writer] :as peer} *rust-peer*]
     (when-not peer
       (throw (IllegalStateException. "Rust test peer is not running")))
@@ -123,16 +125,35 @@
       (.write ^BufferedWriter writer payload)
       (.write ^BufferedWriter writer "\n")
       (.flush ^BufferedWriter writer)
-      (let [response (.readLine ^BufferedReader reader)]
-        (when-not response
+      (or (.readLine ^BufferedReader reader)
           (throw (ex-info "Rust DL-CBOR test peer terminated"
                           {:operation operation
                            :exit-code (when-not (.isAlive ^Process process)
-                                        (.exitValue ^Process process))})))
-        (if (.startsWith ^String response "ok\t")
-          (hex->bytes (.substring ^String response 3))
-          (throw (ex-info "Rust DL-CBOR test peer rejected a JVM value"
-                          {:operation operation :response response})))))))
+                                        (.exitValue ^Process process))}))))))
+
+(defn- rust-request ^bytes [operation ^String payload]
+  (let [response (rust-response operation payload)]
+    (if (.startsWith ^String response "ok\t")
+      (hex->bytes (.substring ^String response 3))
+      (throw (ex-info "Rust DL-CBOR test peer rejected a request"
+                      {:operation operation :response response})))))
+
+(defn- rust-error [operation ^String hex]
+  (let [response (rust-response operation hex)
+        [status code offset & details] (str/split response #"\t" -1)]
+    (when (or (not= "error" status) (seq details))
+      (throw (ex-info "Rust DL-CBOR peer did not return a codec error"
+                      {:operation operation :response response})))
+    {:code code :offset (Long/parseLong offset)}))
+
+(defn- jvm-error [operation ^bytes input]
+  (try
+    (support/decode-malformed operation input)
+    (throw (ex-info "JVM accepted malformed DL-CBOR"
+                    {:operation operation :hex (bytes->hex input)}))
+    (catch DLCbor$CodecException exception
+      {:code   (.name ^DLCbor$ErrorCode (.code exception))
+       :offset (long (.offset exception))})))
 
 (defn- rust-roundtrip ^bytes [operation ^bytes encoded]
   (rust-request operation (bytes->hex encoded)))
@@ -149,6 +170,16 @@
      (bit-or (bit-shift-left (long high) 32)
              (bit-and (long low) 0xffffffff)))
    (gen/tuple int32-gen int32-gen)))
+
+(deftest malformed-jvm-rust-error-agreement-test
+  (let [rows (support/malformed-rows)]
+    (is (= 53 (count rows)))
+    (doseq [[id operation hex expected _note] rows]
+      (testing id
+        (let [jvm-error  (jvm-error operation (hex->bytes hex))
+              rust-error (rust-error operation hex)]
+          (is (= expected (:code jvm-error)))
+          (is (= jvm-error rust-error)))))))
 
 (defspec canonical-jvm-rust-jvm-roundtrip-property 500
   (prop/for-all [value support/value-gen]

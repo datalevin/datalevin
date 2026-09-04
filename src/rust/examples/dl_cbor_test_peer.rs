@@ -1,6 +1,9 @@
 //! Line-oriented peer used by the JVM/Rust interoperability property tests.
 
-use datalevin_codec::cbor::{Integer, Mode, Value, decode, decode_storage, encode, encode_storage};
+use datalevin_codec::cbor::{
+    Error, Integer, Limits, Mode, Value, decode, decode_storage, decode_with_limits, encode,
+    encode_storage,
+};
 use std::collections::HashSet;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 
@@ -30,31 +33,60 @@ fn main() -> io::Result<()> {
 fn process(line: &str) -> Result<Vec<u8>, String> {
     let (operation, payload) = line
         .split_once('\t')
-        .ok_or_else(|| "request must contain an operation and hex payload".to_owned())?;
+        .ok_or_else(|| protocol_failure("request must contain an operation and payload"))?;
     if operation == "generate" || operation == "generate-fast" {
         let seed = u64::from_str_radix(payload, 16)
-            .map_err(|error| format!("invalid generation seed: {error}"))?;
+            .map_err(|error| protocol_failure(&format!("invalid generation seed: {error}")))?;
         let mode = if operation == "generate" {
             Mode::Canonical
         } else {
             Mode::Fast
         };
-        return encode(&generated_value(seed), mode).map_err(|error| error.to_string());
+        return encode(&generated_value(seed), mode).map_err(codec_failure);
     }
 
-    let bytes = hex_decode(payload)?;
+    let bytes = hex_decode(payload).map_err(|error| protocol_failure(&error))?;
     match operation {
         "canonical" => decode(&bytes, true)
             .and_then(|value| encode(&value, Mode::Canonical))
-            .map_err(|error| error.to_string()),
+            .map_err(codec_failure),
         "fast" => decode(&bytes, false)
             .and_then(|value| encode(&value, Mode::Canonical))
-            .map_err(|error| error.to_string()),
+            .map_err(codec_failure),
         "storage" => decode_storage(&bytes, true)
             .and_then(|value| encode_storage(&value, Mode::Canonical))
-            .map_err(|error| error.to_string()),
-        _ => Err(format!("unknown operation: {operation}")),
+            .map_err(codec_failure),
+        "limit-input" | "limit-depth" | "limit-collection" | "limit-string" | "limit-bignum" => {
+            decode_with_limits(&bytes, true, limits_for(operation))
+                .and_then(|value| encode(&value, Mode::Canonical))
+                .map_err(codec_failure)
+        }
+        _ => Err(protocol_failure(&format!("unknown operation: {operation}"))),
     }
+}
+
+fn codec_failure(error: Error) -> String {
+    format!("{}\t{}", error.kind.code(), error.offset)
+}
+
+fn protocol_failure(message: &str) -> String {
+    format!("PROTOCOL\t0\t{}", message.replace(['\t', '\n'], " "))
+}
+
+fn limits_for(operation: &str) -> Limits {
+    let mut limits = Limits::default();
+    match operation {
+        "limit-input" => limits.max_input_bytes = 4,
+        "limit-depth" => limits.max_depth = 2,
+        "limit-collection" => limits.max_collection_len = 2,
+        "limit-string" => limits.max_string_bytes = 2,
+        "limit-bignum" => {
+            limits.max_string_bytes = 64;
+            limits.max_bignum_bytes = 8;
+        }
+        _ => unreachable!(),
+    }
+    limits
 }
 
 struct DeterministicRng {
@@ -330,5 +362,6 @@ mod tests {
         assert!(process("canonical\t0").is_err());
         assert!(process("canonical\tzz").is_err());
         assert!(process("unknown\t00").is_err());
+        assert_eq!("NON_SHORTEST\t0", process("canonical\t1817").unwrap_err());
     }
 }

@@ -3,7 +3,8 @@
    [clojure.java.io :as io]
    [clojure.string :as str]
    [clojure.test :refer [deftest is testing]]
-  [datalevin.codec.cbor :as cbor])
+  [datalevin.codec.cbor :as cbor]
+   [datalevin.test.codec.cbor-test-support :as support])
   (:import
    [datalevin.codec DLCbor$CodecException DLCbor$ErrorCode]
    [java.math BigDecimal]
@@ -172,23 +173,16 @@
     (is (Arrays/equals (hex->bytes "a261620162616102")
                        (cbor/encode (cbor/decode encoded false))))))
 
-(deftest malformed-input-test
-  (is (= DLCbor$ErrorCode/NON_SHORTEST
-         (error-code #(cbor/decode (hex->bytes "1817")))))
-  (is (= DLCbor$ErrorCode/TRAILING_BYTES
-         (error-code #(cbor/decode (hex->bytes "0000")))))
-  (is (= DLCbor$ErrorCode/INDEFINITE_LENGTH
-         (error-code #(cbor/decode (hex->bytes "9fff")))))
-  (is (= DLCbor$ErrorCode/INVALID_UTF8
-         (error-code #(cbor/decode (hex->bytes "61ff")))))
-  (is (= DLCbor$ErrorCode/NON_CANONICAL
-         (error-code #(cbor/decode
-                       (hex->bytes "a262616101616202")))))
-  (is (= DLCbor$ErrorCode/DUPLICATE_KEY
-         (error-code #(cbor/decode (hex->bytes "a201000101")))))
-  (is (= DLCbor$ErrorCode/UNESCAPED_TYPED_HEADER
-         (error-code #(cbor/decode-storage (hex->bytes "f6")))))
-  (is (= DLCbor$ErrorCode/UNNECESSARY_STORAGE_ESCAPE
-         (error-code #(cbor/decode-storage (hex->bytes "ff00")))))
+(deftest shared-malformed-corpus-test
+  (let [rows (support/malformed-rows)]
+    (is (= 53 (count rows)))
+    (doseq [[id operation hex expected _note :as row] rows]
+      (testing id
+        (is (= 5 (count row)))
+        (is (= (DLCbor$ErrorCode/valueOf expected)
+               (error-code #(support/decode-malformed operation
+                                                      (hex->bytes hex)))))))))
+
+(deftest invalid-host-unicode-test
   (is (= DLCbor$ErrorCode/INVALID_UNICODE
          (error-code #(cbor/encode (String. (char-array [(char 0xd800)])))))))

@@ -126,10 +126,45 @@ pub enum ErrorKind {
     InvalidUuid,
     DuplicateKey,
     DuplicateSetMember,
-    NonCanonicalOrder,
+    NonCanonical,
     UnescapedTypedHeader,
     UnnecessaryStorageEscape,
     UnsupportedValue,
+}
+
+impl ErrorKind {
+    /// Stable cross-language identifier shared with the JVM codec.
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::InputTooLarge => "INPUT_TOO_LARGE",
+            Self::OutputTooSmall => "OUTPUT_TOO_SMALL",
+            Self::Truncated => "TRUNCATED",
+            Self::TrailingBytes => "TRAILING_BYTES",
+            Self::InvalidAdditionalInfo => "INVALID_ADDITIONAL_INFO",
+            Self::IndefiniteLength => "INDEFINITE_LENGTH",
+            Self::NonShortest => "NON_SHORTEST",
+            Self::UnsupportedSimpleValue => "UNSUPPORTED_SIMPLE_VALUE",
+            Self::IntegerOutOfRange => "INTEGER_OUT_OF_RANGE",
+            Self::LengthOutOfRange => "LENGTH_OUT_OF_RANGE",
+            Self::InvalidUtf8 => "INVALID_UTF8",
+            Self::InvalidUnicode => "INVALID_UNICODE",
+            Self::DepthLimit => "DEPTH_LIMIT",
+            Self::CollectionLimit => "COLLECTION_LIMIT",
+            Self::StringLimit => "STRING_LIMIT",
+            Self::BignumLimit => "BIGNUM_LIMIT",
+            Self::InvalidBignum => "INVALID_BIGNUM",
+            Self::InvalidDecimal => "INVALID_DECIMAL",
+            Self::InvalidRatio => "INVALID_RATIO",
+            Self::InvalidUri => "INVALID_URI",
+            Self::InvalidUuid => "INVALID_UUID",
+            Self::DuplicateKey => "DUPLICATE_KEY",
+            Self::DuplicateSetMember => "DUPLICATE_SET_MEMBER",
+            Self::NonCanonical => "NON_CANONICAL",
+            Self::UnescapedTypedHeader => "UNESCAPED_TYPED_HEADER",
+            Self::UnnecessaryStorageEscape => "UNNECESSARY_STORAGE_ESCAPE",
+            Self::UnsupportedValue => "UNSUPPORTED_VALUE",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -146,7 +181,7 @@ impl Error {
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "DL-CBOR {:?} at byte {}", self.kind, self.offset)
+        write!(f, "DL-CBOR {} at byte {}", self.kind.code(), self.offset)
     }
 }
 
@@ -743,6 +778,9 @@ impl Decoder<'_> {
             5 => self.map(additional, head_offset, depth),
             6 => {
                 let tag = self.argument(additional, head_offset)?;
+                if tag == TAG_SET {
+                    return self.set(head_offset, depth + 1);
+                }
                 let value = self.value(depth + 1)?;
                 self.tagged(tag, value, head_offset)
             }
@@ -772,7 +810,7 @@ impl Decoder<'_> {
                 if let Some(previous) = &previous
                     && canonical_cmp(previous, &canonical_key) != Ordering::Less
                 {
-                    return Err(Error::new(ErrorKind::NonCanonicalOrder, key_start));
+                    return Err(Error::new(ErrorKind::NonCanonical, key_start));
                 }
                 previous = Some(canonical_key);
             }
@@ -780,6 +818,43 @@ impl Decoder<'_> {
             entries.push((key, value));
         }
         Ok(Value::Map(entries))
+    }
+
+    fn set(&mut self, tag_offset: usize, depth: usize) -> Result<Value> {
+        if depth > self.limits.max_depth {
+            return Err(Error::new(ErrorKind::DepthLimit, self.position));
+        }
+        let array_offset = self.position;
+        let array_head = self.read_u8()?;
+        if array_head >> 5 != 4 {
+            return Err(Error::new(ErrorKind::UnsupportedValue, tag_offset));
+        }
+        let length = self.length(
+            array_head & 0x1f,
+            array_offset,
+            self.limits.max_collection_len,
+        )?;
+        let mut values = Vec::with_capacity(length);
+        let mut seen = HashSet::with_capacity(length.min(1024));
+        let mut previous: Option<Vec<u8>> = None;
+        for _ in 0..length {
+            let value_offset = self.position;
+            let value = self.value(depth + 1)?;
+            let canonical = encode(&value, Mode::Canonical)?;
+            if !seen.insert(canonical.clone()) {
+                return Err(Error::new(ErrorKind::DuplicateSetMember, value_offset));
+            }
+            if self.canonical {
+                if let Some(previous) = &previous
+                    && canonical_cmp(previous, &canonical) != Ordering::Less
+                {
+                    return Err(Error::new(ErrorKind::NonCanonical, value_offset));
+                }
+                previous = Some(canonical);
+            }
+            values.push(value);
+        }
+        Ok(Value::Set(values))
     }
 
     fn tagged(&mut self, tag: u64, value: Value, offset: usize) -> Result<Value> {
@@ -839,37 +914,11 @@ impl Decoder<'_> {
                     .map_err(|_| Error::new(ErrorKind::InvalidUuid, offset))?;
                 Ok(Value::Uuid(bytes))
             }
-            TAG_SET => {
-                let Value::Array(values) = value else {
-                    return Err(Error::new(ErrorKind::UnsupportedValue, offset));
-                };
-                self.validate_set(values, offset)
-            }
             _ => Ok(Value::Tagged {
                 tag,
                 value: Box::new(value),
             }),
         }
-    }
-
-    fn validate_set(&self, values: Vec<Value>, offset: usize) -> Result<Value> {
-        let mut previous: Option<Vec<u8>> = None;
-        let mut seen = HashSet::with_capacity(values.len().min(1024));
-        for value in &values {
-            let canonical = encode(value, Mode::Canonical)?;
-            if !seen.insert(canonical.clone()) {
-                return Err(Error::new(ErrorKind::DuplicateSetMember, offset));
-            }
-            if self.canonical {
-                if let Some(previous) = &previous
-                    && canonical_cmp(previous, &canonical) != Ordering::Less
-                {
-                    return Err(Error::new(ErrorKind::NonCanonicalOrder, offset));
-                }
-                previous = Some(canonical);
-            }
-        }
-        Ok(Value::Set(values))
     }
 
     fn simple(&mut self, additional: u8, offset: usize) -> Result<Value> {
@@ -882,7 +931,7 @@ impl Decoder<'_> {
                 let bits = u32::from_be_bytes(self.read_array()?);
                 if self.canonical && f32::from_bits(bits).is_nan() && bits != CANONICAL_FLOAT32_NAN
                 {
-                    return Err(Error::new(ErrorKind::NonCanonicalOrder, offset));
+                    return Err(Error::new(ErrorKind::NonCanonical, offset));
                 }
                 Ok(Value::Float32(f32::from_bits(bits)))
             }
@@ -890,7 +939,7 @@ impl Decoder<'_> {
                 let bits = u64::from_be_bytes(self.read_array()?);
                 if self.canonical && f64::from_bits(bits).is_nan() && bits != CANONICAL_FLOAT64_NAN
                 {
-                    return Err(Error::new(ErrorKind::NonCanonicalOrder, offset));
+                    return Err(Error::new(ErrorKind::NonCanonical, offset));
                 }
                 Ok(Value::Float64(f64::from_bits(bits)))
             }
@@ -989,6 +1038,10 @@ mod tests {
     const GOLDEN: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../resources/datalevin/cbor/v1/golden-vectors.tsv"
+    ));
+    const MALFORMED: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../resources/datalevin/cbor/v1/malformed-vectors.tsv"
     ));
 
     fn arbitrary_big_magnitude() -> BoxedStrategy<Vec<u8>> {
@@ -1308,6 +1361,48 @@ mod tests {
     }
 
     #[test]
+    fn shared_malformed_corpus_has_exact_error_agreement() {
+        let mut count = 0;
+        for line in MALFORMED
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+        {
+            let columns: Vec<_> = line.split('\t').collect();
+            assert_eq!(5, columns.len(), "invalid malformed fixture row: {line}");
+            let [id, operation, hex, expected, _note]: [&str; 5] = columns.try_into().unwrap();
+            let input = hex_decode(hex);
+            let error = match operation {
+                "canonical" => decode(&input, true),
+                "fast" => decode(&input, false),
+                "storage" => decode_storage(&input, true),
+                "limit-input" | "limit-depth" | "limit-collection" | "limit-string"
+                | "limit-bignum" => decode_with_limits(&input, true, malformed_limits(operation)),
+                _ => panic!("unknown malformed fixture operation {operation}: {id}"),
+            }
+            .expect_err(id);
+            assert_eq!(expected, error.kind.code(), "{id}");
+            count += 1;
+        }
+        assert_eq!(53, count);
+    }
+
+    fn malformed_limits(operation: &str) -> Limits {
+        let mut limits = Limits::default();
+        match operation {
+            "limit-input" => limits.max_input_bytes = 4,
+            "limit-depth" => limits.max_depth = 2,
+            "limit-collection" => limits.max_collection_len = 2,
+            "limit-string" => limits.max_string_bytes = 2,
+            "limit-bignum" => {
+                limits.max_string_bytes = 64;
+                limits.max_bignum_bytes = 8;
+            }
+            _ => unreachable!(),
+        }
+        limits
+    }
+
+    #[test]
     fn rejects_noncanonical_and_malformed_input() {
         assert_eq!(
             ErrorKind::NonShortest,
@@ -1326,7 +1421,7 @@ mod tests {
             decode(&[0x61, 0xff], true).unwrap_err().kind
         );
         assert_eq!(
-            ErrorKind::NonCanonicalOrder,
+            ErrorKind::NonCanonical,
             decode(&hex_decode("a262616101616202"), true)
                 .unwrap_err()
                 .kind

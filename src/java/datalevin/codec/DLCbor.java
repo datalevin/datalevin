@@ -1380,7 +1380,7 @@ public final class DLCbor {
                                 ErrorCode.STRING_LIMIT);
             require(length);
             int start = input.position();
-            validateUtf8(input, start, length, headOffset);
+            validateUtf8(input, start, length, offset());
             if (input.hasArray()) {
                 String result = new String(input.array(),
                                            input.arrayOffset() + start,
@@ -1478,7 +1478,11 @@ public final class DLCbor {
                     throw error(ErrorCode.INVALID_URI, headOffset);
                 }
                 try {
-                    return URI.create(text);
+                    URI uri = URI.create(text);
+                    if (!uri.toASCIIString().equals(text)) {
+                        throw error(ErrorCode.INVALID_URI, headOffset);
+                    }
+                    return uri;
                 } catch (IllegalArgumentException exception) {
                     throw error(ErrorCode.INVALID_URI, headOffset);
                 }

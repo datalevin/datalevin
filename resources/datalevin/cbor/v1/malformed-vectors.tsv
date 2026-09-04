@@ -1,0 +1,54 @@
+# id	operation	hex	error	note
+empty	canonical		TRUNCATED	empty input
+truncated-uint8	canonical	18	TRUNCATED	missing one-byte integer argument
+truncated-uint16	canonical	1901	TRUNCATED	short two-byte integer argument
+truncated-bytes	canonical	430102	TRUNCATED	byte string shorter than declared length
+truncated-array	canonical	8200	TRUNCATED	array missing its second item
+truncated-map	canonical	a100	TRUNCATED	map key without a value
+declared-string-past-input	canonical	50	TRUNCATED	declared byte-string length exceeds input
+trailing-item	canonical	0000	TRAILING_BYTES	second item follows complete first item
+reserved-additional-info	canonical	1c	INVALID_ADDITIONAL_INFO	reserved integer additional information
+indefinite-array	canonical	9fff	INDEFINITE_LENGTH	indefinite collections are forbidden
+indefinite-map	canonical	bfff	INDEFINITE_LENGTH	indefinite maps are forbidden
+non-shortest-integer	canonical	1817	NON_SHORTEST	23 encoded with an argument byte
+non-shortest-length	canonical	5800	NON_SHORTEST	empty byte string with an argument byte
+unsupported-half-float	canonical	f90000	UNSUPPORTED_SIMPLE_VALUE	float16 is outside the semantic model
+unsupported-simple	canonical	f0	UNSUPPORTED_SIMPLE_VALUE	unassigned simple value
+positive-integer-overflow	canonical	1b8000000000000000	INTEGER_OUT_OF_RANGE	unsigned integer exceeds signed 64-bit range
+negative-integer-overflow	canonical	3b8000000000000000	INTEGER_OUT_OF_RANGE	negative integer exceeds signed 64-bit range
+invalid-utf8-byte	canonical	61ff	INVALID_UTF8	invalid leading UTF-8 byte
+invalid-utf8-continuation	canonical	62c2ff	INVALID_UTF8	invalid UTF-8 continuation byte
+non-canonical-map-order	canonical	a262616101616202	NON_CANONICAL	longer encoded key precedes shorter key
+duplicate-map-key	canonical	a201000101	DUPLICATE_KEY	duplicate canonical map key
+duplicate-map-key-fast	fast	a201000101	DUPLICATE_KEY	fast readers still reject duplicate keys
+set-wrong-container	canonical	d9010200	UNSUPPORTED_VALUE	set tag must contain an array
+non-canonical-set-order	canonical	d9010282181800	NON_CANONICAL	longer encoded member precedes shorter member
+duplicate-set-member	canonical	d90102820101	DUPLICATE_SET_MEMBER	duplicate canonical set member
+duplicate-set-member-fast	fast	d90102820101	DUPLICATE_SET_MEMBER	fast readers still reject duplicate members
+non-canonical-float32-nan	canonical	fa7fc00001	NON_CANONICAL	non-canonical float32 NaN payload
+non-canonical-float64-nan	canonical	fb7ff8000000000001	NON_CANONICAL	non-canonical float64 NaN payload
+bignum-wrong-inner-type	canonical	c200	INVALID_BIGNUM	bignum tag must contain bytes
+bignum-leading-zero	canonical	c24100	INVALID_BIGNUM	bignum magnitude is not minimal
+bignum-fits-i64	canonical	c24118	INVALID_BIGNUM	bignum must be outside signed 64-bit range
+decimal-wrong-shape	canonical	c400	INVALID_DECIMAL	decimal tag must contain a pair
+decimal-exponent-overflow	canonical	c4821a8000000001	INVALID_DECIMAL	decimal exponent exceeds signed 32-bit range
+decimal-redundant-mantissa	canonical	c482000a	INVALID_DECIMAL	decimal mantissa has a removable factor of ten
+decimal-noncanonical-zero	canonical	c4820100	INVALID_DECIMAL	zero decimal must have exponent zero
+ratio-wrong-shape	canonical	d81e00	INVALID_RATIO	ratio tag must contain a pair
+ratio-zero-denominator	canonical	d81e820100	INVALID_RATIO	ratio denominator must be positive
+ratio-not-reduced	canonical	d81e820204	INVALID_RATIO	ratio numerator and denominator are not coprime
+ratio-negative-denominator	canonical	d81e820121	INVALID_RATIO	ratio denominator is negative
+uri-empty	canonical	d82060	INVALID_URI	URI must be non-empty
+uri-non-ascii	canonical	d82062cebb	INVALID_URI	URI payload must already be ASCII-normalized
+uuid-wrong-inner-type	canonical	d82500	INVALID_UUID	UUID tag must contain bytes
+uuid-wrong-length	canonical	d8254100	INVALID_UUID	UUID payload must contain exactly 16 bytes
+storage-empty	storage		TRUNCATED	empty storage field
+storage-lone-escape	storage	ff	TRUNCATED	storage escape without an item
+storage-unescaped-header	storage	f6	UNESCAPED_TYPED_HEADER	typed-header collision was not escaped
+storage-unnecessary-escape	storage	ff00	UNNECESSARY_STORAGE_ESCAPE	non-colliding item was escaped
+input-limit	limit-input	1a00000000	INPUT_TOO_LARGE	input exceeds the four-byte test limit
+depth-limit	limit-depth	81818100	DEPTH_LIMIT	nesting exceeds the depth-two test limit
+collection-limit	limit-collection	83000000	COLLECTION_LIMIT	array exceeds the two-item test limit
+byte-string-limit	limit-string	43000000	STRING_LIMIT	byte string exceeds the two-byte test limit
+text-string-limit	limit-string	63616263	STRING_LIMIT	text string exceeds the two-byte test limit
+bignum-limit	limit-bignum	c249010000000000000000	BIGNUM_LIMIT	magnitude exceeds the eight-byte test limit
