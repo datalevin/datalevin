@@ -1,0 +1,16 @@
+[package]
+name = "datalevin-codec"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Platform-neutral codecs shared by Datalevin runtimes"
+license = "EPL-2.0"
+
+[lib]
+name = "datalevin_codec"
+path = "src/lib.rs"
+
+[dependencies]
+
+[dev-dependencies]
+proptest = "1.11.0"

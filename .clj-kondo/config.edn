@@ -23,7 +23,8 @@
 
  :lint-as
  {datalevin.parser/deftrecord clojure.core/defrecord
-  datalevin.util/defrecord-updatable clojure.core/defrecord}
+  datalevin.util/defrecord-updatable clojure.core/defrecord
+  clojure.test.check.clojure-test/defspec clojure.test/deftest}
 
  :skip-comments true
 

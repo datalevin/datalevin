@@ -72,7 +72,8 @@
                     [#"_test" #"\/test\/" #"test\d" #"\/data\.json" #"all\.json"
                      #"\.csv" #"\.edn" #"\.txt"]
                     :uberjar-name "test0.uberjar.jar"}
-   :dev            {:main datalevin.test0}}
+   :dev            {:main         datalevin.test0
+                    :dependencies [[org.clojure/test.check]]}}
   :global-vars {*print-namespace-maps* false
                 *unchecked-math*       :warn-on-boxed
                 *warn-on-reflection*   true}

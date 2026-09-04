@@ -1,11 +1,15 @@
 # Change Log
 
+## WIP
+### Improved
+- [Server] harden client/server lifecycle
+
 ## 1.1.0 (2026-09-02)
 
 ### Added
 - [Datalog] `get-some-else` built-in function. Similar to `get-some` but always
   return a tuple.
-- [Lib] Idiomatic, composable query and transaction APIs for Python and
+- [Lib] idiomatic, composable query and transaction APIs for Python and
   JavaScript. Existing EDN-string and native list/array APIs remain supported.
 
 ### Changed
