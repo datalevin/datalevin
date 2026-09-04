@@ -322,6 +322,12 @@ pub fn decode_with_limits(input: &[u8], canonical: bool, limits: Limits) -> Resu
 
 /// Decode a complete storage-wrapped untyped item.
 pub fn decode_storage(input: &[u8], canonical: bool) -> Result<Value> {
+    decode_storage_with_limits(input, canonical, Limits::default())
+}
+
+/// Decode a complete storage-wrapped untyped item with explicit allocation
+/// and nesting limits.
+pub fn decode_storage_with_limits(input: &[u8], canonical: bool, limits: Limits) -> Result<Value> {
     let Some(first) = input.first().copied() else {
         return Err(Error::new(ErrorKind::Truncated, 0));
     };
@@ -332,11 +338,11 @@ pub fn decode_storage(input: &[u8], canonical: bool) -> Result<Value> {
         if !is_typed_header(bare_first) {
             return Err(Error::new(ErrorKind::UnnecessaryStorageEscape, 0));
         }
-        decode(&input[1..], canonical)
+        decode_with_limits(&input[1..], canonical, limits)
     } else if is_typed_header(first) {
         Err(Error::new(ErrorKind::UnescapedTypedHeader, 0))
     } else {
-        decode(input, canonical)
+        decode_with_limits(input, canonical, limits)
     }
 }
 
@@ -1437,6 +1443,14 @@ mod tests {
         assert_eq!(
             ErrorKind::UnnecessaryStorageEscape,
             decode_storage(&[0xff, 0x00], true).unwrap_err().kind
+        );
+        let mut limits = Limits::default();
+        limits.max_string_bytes = 2;
+        assert_eq!(
+            ErrorKind::StringLimit,
+            decode_storage_with_limits(&[0x63, b'a', b'b', b'c'], true, limits)
+                .unwrap_err()
+                .kind
         );
     }
 

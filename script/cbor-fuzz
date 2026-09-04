@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+rust_root="$repo_root/src/rust"
+fuzz_root="$repo_root/target/cbor-fuzz"
+corpus_root="$fuzz_root/corpus"
+artifact_root="$fuzz_root/artifacts"
+dictionary="$rust_root/fuzz/dl-cbor.dict"
+
+usage() {
+    echo "usage: script/cbor-fuzz {corpus|smoke|rust} [runs-or-seconds]"
+    echo "  corpus          refresh seeds from the shared vector files"
+    echo "  smoke [runs]    run both targets for a fixed input count (default: 1000)"
+    echo "  rust [seconds]  fuzz both Rust targets (default: 60 each)"
+}
+
+positive_integer() {
+    if [[ ! "$1" =~ ^[1-9][0-9]*$ ]]; then
+        echo "expected a positive integer, got: $1" >&2
+        exit 2
+    fi
+}
+
+prepare_corpus() {
+    mkdir -p "$corpus_root" "$artifact_root"
+    cargo run --quiet \
+        --manifest-path "$rust_root/Cargo.toml" \
+        --example dl_cbor_seed_corpus \
+        -- \
+        "$repo_root/resources/datalevin/cbor/v1/golden-vectors.tsv" \
+        "$repo_root/resources/datalevin/cbor/v1/malformed-vectors.tsv" \
+        "$corpus_root"
+}
+
+require_rust_fuzz() {
+    if ! command -v cargo-fuzz >/dev/null 2>&1; then
+        echo "cargo-fuzz is required: cargo install cargo-fuzz" >&2
+        exit 2
+    fi
+    if ! rustup run nightly rustc --version >/dev/null 2>&1; then
+        echo "the Rust nightly toolchain is required: rustup toolchain install nightly" >&2
+        exit 2
+    fi
+}
+
+run_rust_target() {
+    local target="$1"
+    local corpus="$2"
+    local stop_flag="$3"
+    mkdir -p "$artifact_root/rust-$target"
+    (
+        cd "$rust_root"
+        cargo +nightly fuzz run "$target" "$corpus" -- \
+            "$stop_flag" \
+            -max_len=65536 \
+            -rss_limit_mb=2048 \
+            -timeout=10 \
+            "-dict=$dictionary" \
+            "-artifact_prefix=$artifact_root/rust-$target/"
+    )
+}
+
+run_rust() {
+    local stop_flag="$1"
+    require_rust_fuzz
+    run_rust_target decode-bare "$corpus_root/bare" "$stop_flag"
+    run_rust_target decode-storage "$corpus_root/storage" "$stop_flag"
+}
+
+command="${1:-}"
+amount="${2:-}"
+case "$command" in
+    corpus)
+        [[ -z "$amount" ]] || { usage >&2; exit 2; }
+        prepare_corpus
+        ;;
+    smoke)
+        amount="${amount:-1000}"
+        positive_integer "$amount"
+        prepare_corpus
+        run_rust "-runs=$amount"
+        ;;
+    rust)
+        amount="${amount:-60}"
+        positive_integer "$amount"
+        prepare_corpus
+        run_rust "-max_total_time=$amount"
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac

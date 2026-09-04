@@ -1,0 +1,29 @@
+[package]
+name = "datalevin-codec-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+datalevin-codec = { path = ".." }
+libfuzzer-sys = "0.4"
+
+[[bin]]
+name = "decode-bare"
+path = "fuzz_targets/decode_bare.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode-storage"
+path = "fuzz_targets/decode_storage.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
