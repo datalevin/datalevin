@@ -1,0 +1,52 @@
+# Phase 0 draft: compact scalar byte strings; remaining extensions use stand-in tag 17484.
+# id	profiles	type	diagnostic	canonical_hex	storage_hex	clojure_value	rust_value
+keyword-unqualified	draft-data	keyword	:a	42fb61	42fb61	:a	Value::Keyword{namespace:None,name:"a"}
+keyword-qualified	draft-data	keyword	:ns/a	45e0026e7361	45e0026e7361	:ns/a	Value::Keyword{namespace:Some("ns"),name:"a"}
+keyword-empty-namespace	draft-data	keyword	:/a	43e00061	43e00061	(Keyword/intern "" "a")	Value::Keyword{namespace:Some(""),name:"a"}
+symbol-unqualified	draft-data	symbol	a	42fc61	42fc61	(symbol "a")	Value::Symbol{namespace:None,name:"a"}
+symbol-qualified	draft-data	symbol	ns/a	45e1026e7361	45e1026e7361	(symbol "ns" "a")	Value::Symbol{namespace:Some("ns"),name:"a"}
+character-ascii	draft-data	character	U+0061	42e261	42e261	(char 0x0061)	Value::Character(0x0061)
+character-surrogate	draft-data	character	UTF-16-D800	43e2d800	43e2d800	(char 0xd800)	Value::Character(0xd800)
+list-empty	draft-data	list	()	d9444c8104	d9444c8104	()	Value::List([])
+list-mixed	draft-data	list	(1 "a")	d9444c8304016161	d9444c8304016161	(list 1 "a")	Value::List([1,"a"])
+queue-mixed	draft-data	queue	queue(1,"a")	d9444c8305016161	d9444c8305016161	(into PersistentQueue/EMPTY [1 "a"])	Value::Queue([1,"a"])
+regex-no-flags	draft-data	regex	/a+/	44e300612b	44e300612b	(Pattern/compile "a+")	Value::Regex{source:"a+",flags:0}
+regex-unix-lines	draft-data	regex	/a/ UNIX_LINES	43e30161	43e30161	(Pattern/compile "a" Pattern/UNIX_LINES)	Value::Regex{source:"a",flags:1}
+regex-case-insensitive	draft-data	regex	/a/ CASE_INSENSITIVE	43e30261	43e30261	(Pattern/compile "a" Pattern/CASE_INSENSITIVE)	Value::Regex{source:"a",flags:2}
+regex-comments	draft-data	regex	/a/ COMMENTS	43e30461	43e30461	(Pattern/compile "a" Pattern/COMMENTS)	Value::Regex{source:"a",flags:4}
+regex-multiline	draft-data	regex	/a/ MULTILINE	43e30861	43e30861	(Pattern/compile "a" Pattern/MULTILINE)	Value::Regex{source:"a",flags:8}
+regex-literal	draft-data	regex	/a/ LITERAL	43e31061	43e31061	(Pattern/compile "a" Pattern/LITERAL)	Value::Regex{source:"a",flags:16}
+regex-dotall	draft-data	regex	/a/ DOTALL	43e32061	43e32061	(Pattern/compile "a" Pattern/DOTALL)	Value::Regex{source:"a",flags:32}
+regex-unicode-case	draft-data	regex	/a/ UNICODE_CASE	43e34061	43e34061	(Pattern/compile "a" Pattern/UNICODE_CASE)	Value::Regex{source:"a",flags:64}
+regex-unicode-character-class	draft-data	regex	/\w+/ UNICODE_CHARACTER_CLASS|UNICODE_CASE	46e3c0025c772b	46e3c0025c772b	(Pattern/compile "\\w+" Pattern/UNICODE_CHARACTER_CLASS)	Value::Regex{source:"\\w+",flags:320}
+regex-all-supported-flags	draft-data	regex	/a/ all supported flags	44e3ff0261	44e3ff0261	(Pattern/compile "a" 383)	Value::Regex{source:"a",flags:383}
+extension-unknown-integer	draft-forwarding	extension	42(1,null)	d9444c83182a01f6	d9444c83182a01f6	(ExtensionValue. 42 [1 nil])	Value::Extension{type_id:Integer(42),arguments:[1,null]}
+extension-unknown-name	draft-forwarding	extension	org.example/x(1,null)	d9444c836d6f72672e6578616d706c652f7801f6	d9444c836d6f72672e6578616d706c652f7801f6	(ExtensionValue. "org.example/x" [1 nil])	Value::Extension{type_id:Name("org.example/x"),arguments:[1,null]}
+keyword-qualified-example	draft-data	keyword	:user/id	48e004757365726964	48e004757365726964	:user/id	Value::Keyword{namespace:Some("user"),name:"id"}
+keyword-empty-name	draft-data	keyword	absent namespace, empty name	41fb	41fb	(Keyword/intern nil "")	Value::Keyword{namespace:None,name:""}
+keyword-qualified-empty-name	draft-data	keyword	namespace ns, empty name	44e0026e73	44e0026e73	(Keyword/intern "ns" "")	Value::Keyword{namespace:Some("ns"),name:""}
+keyword-empty-parts	draft-data	keyword	empty namespace and name	42e000	42e000	(Keyword/intern "" "")	Value::Keyword{namespace:Some(""),name:""}
+keyword-unqualified-slash	draft-data	keyword	unqualified name user/id	48fb757365722f6964	48fb757365722f6964	(Keyword/intern nil "user/id")	Value::Keyword{namespace:None,name:"user/id"}
+keyword-embedded-nul	draft-data	keyword	namespace n NUL s, name a NUL b	48e0036e0073610062	48e0036e0073610062	(Keyword/intern "n\u0000s" "a\u0000b")	Value::Keyword{namespace:Some("n\0s"),name:"a\0b"}
+keyword-unqualified-nul	draft-data	keyword	unqualified name a NUL b	44fb610062	44fb610062	(Keyword/intern nil "a\u0000b")	Value::Keyword{namespace:None,name:"a\0b"}
+keyword-unicode	draft-data	keyword	:λ/😀	48e002cebbf09f9880	48e002cebbf09f9880	(Keyword/intern "λ" "😀")	Value::Keyword{namespace:Some("λ"),name:"😀"}
+keyword-namespace-127	draft-data	keyword	127-byte namespace, name a	5882e07f7878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787861	5882e07f7878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787861	(Keyword/intern (apply str (repeat 127 "x")) "a")	Value::Keyword{namespace:Some("x".repeat(127)),name:"a"}
+keyword-namespace-128	draft-data	keyword	128-byte namespace, name a	5884e08001787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787861	5884e08001787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787861	(Keyword/intern (apply str (repeat 128 "x")) "a")	Value::Keyword{namespace:Some("x".repeat(128)),name:"a"}
+symbol-empty-name	draft-data	symbol	absent namespace, empty name	41fc	41fc	(symbol nil "")	Value::Symbol{namespace:None,name:""}
+symbol-empty-namespace	draft-data	symbol	empty namespace, name a	43e10061	43e10061	(symbol "" "a")	Value::Symbol{namespace:Some(""),name:"a"}
+symbol-embedded-nul	draft-data	symbol	namespace n NUL s, name a NUL b	48e1036e0073610062	48e1036e0073610062	(symbol "n\u0000s" "a\u0000b")	Value::Symbol{namespace:Some("n\0s"),name:"a\0b"}
+symbol-unqualified-slash	draft-data	symbol	unqualified name user/id	48fc757365722f6964	48fc757365722f6964	(symbol nil "user/id")	Value::Symbol{namespace:None,name:"user/id"}
+symbol-unicode	draft-data	symbol	λ/😀	48e102cebbf09f9880	48e102cebbf09f9880	(symbol "λ" "😀")	Value::Symbol{namespace:Some("λ"),name:"😀"}
+symbol-namespace-128	draft-data	symbol	128-byte namespace, name a	5884e18001787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787861	5884e18001787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787878787861	(symbol (apply str (repeat 128 "x")) "a")	Value::Symbol{namespace:Some("x".repeat(128)),name:"a"}
+keyword-name-22	draft-data	keyword	22-byte unqualified name	57fb61616161616161616161616161616161616161616161	57fb61616161616161616161616161616161616161616161	(Keyword/intern nil (apply str (repeat 22 "a")))	Value::Keyword{namespace:None,name:"a".repeat(22)}
+keyword-name-23	draft-data	keyword	23-byte unqualified name	5818fb6161616161616161616161616161616161616161616161	5818fb6161616161616161616161616161616161616161616161	(Keyword/intern nil (apply str (repeat 23 "a")))	Value::Keyword{namespace:None,name:"a".repeat(23)}
+character-zero	draft-data	character	UTF-16-0000	42e200	42e200	(char 0x0000)	Value::Character(0x0000)
+character-byte-max	draft-data	character	UTF-16-00FF	42e2ff	42e2ff	(char 0x00ff)	Value::Character(0x00ff)
+character-two-byte-min	draft-data	character	UTF-16-0100	43e20100	43e20100	(char 0x0100)	Value::Character(0x0100)
+character-max	draft-data	character	UTF-16-FFFF	43e2ffff	43e2ffff	(char 0xffff)	Value::Character(0xffff)
+character-low-surrogate	draft-data	character	UTF-16-DC00	43e2dc00	43e2dc00	(char 0xdc00)	Value::Character(0xdc00)
+regex-empty	draft-data	regex	Java regex with flags 0	42e300	42e300	(Pattern/compile "")	Value::Regex{source:"",flags:0}
+regex-unicode	draft-data	regex	Java regex with flags 2	48e302cebbf09f9880	48e302cebbf09f9880	(Pattern/compile "λ😀" Pattern/CASE_INSENSITIVE)	Value::Regex{source:"λ😀",flags:2}
+regex-embedded-nul	draft-data	regex	Java regex with flags 0	45e300610062	45e300610062	(Pattern/compile "a\u0000b")	Value::Regex{source:"a\0b",flags:0}
+regex-source-21	draft-data	regex	Java regex with flags 0	57e300616161616161616161616161616161616161616161	57e300616161616161616161616161616161616161616161	(Pattern/compile (apply str (repeat 21 "a")))	Value::Regex{source:"a".repeat(21),flags:0}
+regex-source-22	draft-data	regex	Java regex with flags 0	5818e30061616161616161616161616161616161616161616161	5818e30061616161616161616161616161616161616161616161	(Pattern/compile (apply str (repeat 22 "a")))	Value::Regex{source:"a".repeat(22),flags:0}

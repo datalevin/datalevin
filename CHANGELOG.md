@@ -2,7 +2,8 @@
 
 ## WIP
 ### Improved
-- [Server] harden client/server lifecycle
+- [Server] harden client/server lifecycle.
+- [Datalog] refresh giant id floor in transaction.
 
 ## 1.1.0 (2026-09-02)
 

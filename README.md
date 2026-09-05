@@ -421,14 +421,17 @@ reach as soon as we can. We may adjust the priorities based on feedback.
   library for Java, Python, and JavaScript; Book.~~[Done 2026/07/20]
 * 1.1.0 ~~AVE storage optimization; transaction and query performance
   enhancement.~~ [Done 2026/09/02]
-* 1.2.0 data compression; KV TTL;
-* 1.3.0 extensible storage/query for arbitrary data; entity-level security.
-* 2.0.0 direct analytics and virtual relationships.
-* 2.1.0 incremental view maintenance core.
-* 3.0.0 aggregation in rule heads.
-* 3.1.0 provenance annotation.
-* 4.0.0 local sharding.
-* 4.1.0 data distribution.
+* 1.2.0 portable DL-CBOR encoding; direct analytics, virtual relationships, and
+  semantic data federation with persistent main-schema mappings and
+  query-conditioned planning evidence through a separate companion library.
+* 1.3.0 reusable virtual relations and aggregation in rule heads.
+* 1.4.0 incremental view maintenance and initial maintained aggregates.
+* 1.5.0 extensible storage/query for analytical types and arbitrary data.
+* 2.0.0 data compression; KV TTL.
+* 2.1.0 entity-level security.
+* 2.2.0 provenance annotation.
+* 3.0.0 local sharding.
+* 3.1.0 data distribution.
 
 ## :arrows_clockwise: Contact
 

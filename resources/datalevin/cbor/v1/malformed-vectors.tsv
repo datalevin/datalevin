@@ -42,6 +42,19 @@ uri-empty	canonical	d82060	INVALID_URI	URI must be non-empty
 uri-non-ascii	canonical	d82062cebb	INVALID_URI	URI payload must already be ASCII-normalized
 uuid-wrong-inner-type	canonical	d82500	INVALID_UUID	UUID tag must contain bytes
 uuid-wrong-length	canonical	d8254100	INVALID_UUID	UUID payload must contain exactly 16 bytes
+instant-wrong-inner-type	canonical	d903e900	INVALID_INSTANT	extended-time tag must contain a map
+instant-missing-seconds	canonical	d903e9a12201	INVALID_INSTANT	extended-time map must contain POSIX seconds at key 1
+instant-zero-remainder	canonical	d903e9a201002200	INVALID_INSTANT	millisecond remainder must be omitted when zero
+instant-large-remainder	canonical	d903e9a20100221903e8	INVALID_INSTANT	millisecond remainder must be below 1000
+instant-unknown-key	canonical	d903e9a201000200	INVALID_INSTANT	restricted millisecond profile rejects other extended-time keys
+instant-overflow	canonical	d903e9a1011b7fffffffffffffff	INVALID_INSTANT	resulting epoch milliseconds exceed signed 64-bit range
+instant-duplicate-key	canonical	d903e9a201000100	DUPLICATE_KEY	extended-time map repeats the seconds key
+instant-duplicate-key-fast	fast	d903e9a201000100	DUPLICATE_KEY	fast mode still rejects duplicate extended-time keys
+instant-noncanonical-key-order	canonical	d903e9a2221903e70100	NON_CANONICAL	extended-time map keys must use deterministic order
+typed-array-wrong-inner-type	canonical	d84580	INVALID_TYPED_ARRAY	typed array tag must contain a byte string
+typed-array-misaligned	canonical	d84e43000000	INVALID_TYPED_ARRAY	byte length must be a multiple of element width
+typed-array-noncanonical-float32-nan	canonical	d855440100c07f	NON_CANONICAL	float32 array NaN payload is not normalized
+typed-array-noncanonical-float64-nan	canonical	d85648010000000000f87f	NON_CANONICAL	float64 array NaN payload is not normalized
 storage-empty	storage		TRUNCATED	empty storage field
 storage-lone-escape	storage	ff	TRUNCATED	storage escape without an item
 storage-unescaped-header	storage	f6	UNESCAPED_TYPED_HEADER	typed-header collision was not escaped
@@ -51,4 +64,6 @@ depth-limit	limit-depth	81818100	DEPTH_LIMIT	nesting exceeds the depth-two test 
 collection-limit	limit-collection	83000000	COLLECTION_LIMIT	array exceeds the two-item test limit
 byte-string-limit	limit-string	43000000	STRING_LIMIT	byte string exceeds the two-byte test limit
 text-string-limit	limit-string	63616263	STRING_LIMIT	text string exceeds the two-byte test limit
+typed-array-string-limit	limit-string	d84543000000	STRING_LIMIT	typed-array payload exceeds the two-byte string limit
+typed-array-collection-limit	limit-collection	d84546000000000000	COLLECTION_LIMIT	typed array exceeds the two-item collection limit
 bignum-limit	limit-bignum	c249010000000000000000	BIGNUM_LIMIT	magnitude exceeds the eight-byte test limit

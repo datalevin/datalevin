@@ -31,6 +31,8 @@ prepare_corpus() {
         -- \
         "$repo_root/resources/datalevin/cbor/v1/golden-vectors.tsv" \
         "$repo_root/resources/datalevin/cbor/v1/malformed-vectors.tsv" \
+        "$repo_root/resources/datalevin/cbor/v1/draft-extension-vectors.tsv" \
+        "$repo_root/resources/datalevin/cbor/v1/draft-extension-malformed-vectors.tsv" \
         "$corpus_root"
 }
 
@@ -57,6 +59,8 @@ run_rust_target() {
             -max_len=65536 \
             -rss_limit_mb=2048 \
             -timeout=10 \
+            -verbosity=0 \
+            -print_final_stats=1 \
             "-dict=$dictionary" \
             "-artifact_prefix=$artifact_root/rust-$target/"
     )

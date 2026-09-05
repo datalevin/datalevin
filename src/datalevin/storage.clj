@@ -289,7 +289,7 @@
 (defn- init-attrs [schema]
   (into {} (map (fn [[k v]] [(v :db/aid) k])) schema))
 
-(defn- init-max-gt
+(defn- ^:redef init-max-gt
   [lmdb]
   (or (when-let [gt (-> (get-first lmdb c/giants [:all-back] :id :ignore)
                         first)]
@@ -733,7 +733,9 @@
 (defprotocol IStateSync
   (mark-state-current! [this last-modified-ms])
   (observed-state-sync-ms [this])
-  (ensure-current! [this]))
+  (ensure-current! [this])
+  (sync-giant-id! [this]
+    "Refresh the giant ID floor while holding the shared LMDB write lock."))
 
 (defn maybe-ensure-current!
   [this]
@@ -801,6 +803,9 @@
     this)
 
   (observed-state-sync-ms [_] state-sync-ms)
+
+  (sync-giant-id! [_]
+    (set! max-gt (max (long max-gt) (long (init-max-gt lmdb)))))
 
   (ensure-current! [this]
     (when-not (closed? this)
@@ -2135,11 +2140,7 @@
                   :actual   result}))
       result)))
 
-(defn migrate-attr-values
-  "Re-encode all datoms for `attr` from :data (untyped) to `new-vt`.
-   Validates every value can be coerced first. Deletes old datoms with
-   the old :data encoding, then inserts new datoms with the new typed
-   encoding, all in a single atomic `transact-kv` call."
+(defn- migrate-attr-values*
   [^Store store attr new-vt]
   (let [lmdb   (.-lmdb store)
         s      (schema store)
@@ -2206,8 +2207,18 @@
                   (.add txs (lmdb/kv-tx :put c/giants cur-gt value
                                         :id vtype [:append]))))))
           ;; 3) single atomic write
-          (locking (lmdb/write-txn lmdb)
-            (transact-kv lmdb txs)))))))
+          (transact-kv lmdb txs))))))
+
+(defn migrate-attr-values
+  "Re-encode all datoms for `attr` from :data (untyped) to `new-vt`.
+   Validates every value can be coerced first. Deletes old datoms with
+   the old :data encoding, then inserts new datoms with the new typed
+   encoding, all in a single atomic `transact-kv` call."
+  [^Store store attr new-vt]
+  (locking (.-write-txn store)
+    (when-not (lmdb/writing? (.-lmdb store))
+      (sync-giant-id! store))
+    (migrate-attr-values* store attr new-vt)))
 
 (defn- collect-fulltext
   [^Store store ^FastList ft-ds ^FastList ft-jobs attr props text ref job-op op]
@@ -2871,6 +2882,10 @@
   ([^Store store datoms embedding-plan {:keys [extra-kv-txs last-modified-ms]}]
    (let [[res secondary-index-job-count]
          (locking (.-write-txn store)
+           ;; Transaction stores refresh when the write lock is acquired.
+           ;; Direct writes acquire it here, before allocating any giant IDs.
+           (when-not (lmdb/writing? (.-lmdb store))
+             (sync-giant-id! store))
            (let [plan (prepare-datoms-kv-plan store
                                               datoms
                                               embedding-plan
@@ -4082,7 +4097,11 @@
                                 (init-max-tx lmdb)
                                 (init-state-sync-ms lmdb)
                                 (volatile! nil)
-                                (volatile! :storage-mutex)
+                                ;; Keep allocation and commit under the same
+                                ;; lock as explicit transactions and KV writes.
+                                ;; A separate store mutex would invert the lock
+                                ;; order when direct and explicit writes race.
+                                (lmdb/write-txn lmdb)
                                 (ReentrantReadWriteLock.)
                                 false
                                 dir-key)]
@@ -4118,9 +4137,16 @@
 
 (defn- transfer-with-schema
   [^Store old lmdb schema* reuse-derived-schema-state?]
-  (let [opts*         (opts old)
+  (let [writing?     (lmdb/writing? lmdb)
+        ;; Refresh under the shared write lock on transaction entry.
+        ;; Nested transfers carry the allocator forward.
+        max-gt*      (if (and writing? (not (lmdb/writing? (.-lmdb old))))
+                       (locking (lmdb/write-txn lmdb)
+                         (max (long (max-gt old)) (long (init-max-gt lmdb))))
+                       (max-gt old))
+        opts*        (opts old)
         idoc-indices (transfer-idoc-indices (store-idoc-indices old) lmdb)
-        idoc-indices (if (lmdb/writing? lmdb)
+        idoc-indices (if writing?
                        idoc-indices
                        (merge-missing-idoc-indices
                          lmdb idoc-indices schema* opts*))]
@@ -4142,7 +4168,7 @@
              (if reuse-derived-schema-state?
                (max-aid old)
                (init-max-aid schema*))
-             (max-gt old)
+             max-gt*
              (max-tx old)
              (if reuse-derived-schema-state?
                (observed-state-sync-ms old)

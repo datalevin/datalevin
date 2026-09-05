@@ -1,8 +1,8 @@
 //! Line-oriented peer used by the JVM/Rust interoperability property tests.
 
 use datalevin_codec::cbor::{
-    Error, Integer, Limits, Mode, Value, decode, decode_storage, decode_with_limits, encode,
-    encode_storage,
+    Error, ExtensionId, Integer, Limits, Mode, Value, decode, decode_storage, decode_with_limits,
+    encode, encode_storage,
 };
 use std::collections::HashSet;
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
@@ -56,11 +56,10 @@ fn process(line: &str) -> Result<Vec<u8>, String> {
         "storage" => decode_storage(&bytes, true)
             .and_then(|value| encode_storage(&value, Mode::Canonical))
             .map_err(codec_failure),
-        "limit-input" | "limit-depth" | "limit-collection" | "limit-string" | "limit-bignum" => {
-            decode_with_limits(&bytes, true, limits_for(operation))
-                .and_then(|value| encode(&value, Mode::Canonical))
-                .map_err(codec_failure)
-        }
+        "limit-input" | "limit-depth" | "limit-collection" | "limit-string" | "limit-bignum"
+        | "limit-extension" => decode_with_limits(&bytes, true, limits_for(operation))
+            .and_then(|value| encode(&value, Mode::Canonical))
+            .map_err(codec_failure),
         _ => Err(protocol_failure(&format!("unknown operation: {operation}"))),
     }
 }
@@ -84,6 +83,7 @@ fn limits_for(operation: &str) -> Limits {
             limits.max_string_bytes = 64;
             limits.max_bignum_bytes = 8;
         }
+        "limit-extension" => limits.max_extension_bytes = 4,
         _ => unreachable!(),
     }
     limits
@@ -123,7 +123,7 @@ fn generated_value(seed: u64) -> Value {
 }
 
 fn generated_value_at(random: &mut DeterministicRng, depth: usize) -> Value {
-    let alternatives = if depth >= 4 { 13 } else { 16 };
+    let alternatives = if depth >= 4 { 24 } else { 30 };
     match random.bounded(alternatives) {
         0 => Value::Null,
         1 => Value::Bool(random.next_u64() & 1 != 0),
@@ -138,13 +138,70 @@ fn generated_value_at(random: &mut DeterministicRng, depth: usize) -> Value {
         10 => random_ratio(random),
         11 => Value::Uri(random_uri(random)),
         12 => Value::Uuid(random_uuid(random)),
-        13 => Value::Array(
+        13 => Value::InstantMillis(random_i64(random)),
+        14 => Value::Uint16Array(
+            (0..random.bounded(33))
+                .map(|_| random.next_u64() as u16)
+                .collect(),
+        ),
+        15 => Value::Int16Array(
+            (0..random.bounded(33))
+                .map(|_| random.next_u64() as i16)
+                .collect(),
+        ),
+        16 => Value::Int32Array(
+            (0..random.bounded(33))
+                .map(|_| random.next_u64() as i32)
+                .collect(),
+        ),
+        17 => Value::Int64Array(
+            (0..random.bounded(33))
+                .map(|_| random.next_u64() as i64)
+                .collect(),
+        ),
+        18 => Value::Float32Array(
+            (0..random.bounded(33))
+                .map(|_| f32::from_bits(random.next_u64() as u32))
+                .collect(),
+        ),
+        19 => Value::Float64Array(
+            (0..random.bounded(33))
+                .map(|_| f64::from_bits(random.next_u64()))
+                .collect(),
+        ),
+        20 => Value::Keyword {
+            namespace: (random.next_u64() & 1 != 0).then(|| random_text(random)),
+            name: random_text(random),
+        },
+        21 => Value::Symbol {
+            namespace: (random.next_u64() & 1 != 0).then(|| random_text(random)),
+            name: random_text(random),
+        },
+        22 => Value::Character(random.next_u64() as u16),
+        23 => random_regex(random),
+        24 => Value::Array(
             (0..random.bounded(7))
                 .map(|_| generated_value_at(random, depth + 1))
                 .collect(),
         ),
-        14 => random_map(random, depth),
-        15 => random_set(random, depth),
+        25 => random_map(random, depth),
+        26 => random_set(random, depth),
+        27 => Value::List(
+            (0..random.bounded(7))
+                .map(|_| generated_value_at(random, depth + 1))
+                .collect(),
+        ),
+        28 => Value::Queue(
+            (0..random.bounded(7))
+                .map(|_| generated_value_at(random, depth + 1))
+                .collect(),
+        ),
+        29 => Value::Extension {
+            type_id: ExtensionId::Name("org.example/generated".into()),
+            arguments: (0..random.bounded(5))
+                .map(|_| generated_value_at(random, depth + 1))
+                .collect(),
+        },
         _ => unreachable!(),
     }
 }
@@ -258,8 +315,23 @@ fn random_uuid(random: &mut DeterministicRng) -> [u8; 16] {
     bytes
 }
 
+fn random_regex(random: &mut DeterministicRng) -> Value {
+    const FLAGS: &[u16] = &[0, 1, 2, 4, 8, 16, 32, 64, 320, 383];
+    let source: String = (0..random.bounded(33))
+        .map(|_| match random.bounded(62) as u8 {
+            value @ 0..=9 => char::from(b'0' + value),
+            value @ 10..=35 => char::from(b'a' + value - 10),
+            value => char::from(b'A' + value - 36),
+        })
+        .collect();
+    Value::Regex {
+        source,
+        flags: FLAGS[random.bounded(FLAGS.len())],
+    }
+}
+
 fn random_map_key(random: &mut DeterministicRng) -> Value {
-    match random.bounded(9) {
+    match random.bounded(12) {
         0 => Value::Null,
         1 => Value::Bool(random.next_u64() & 1 != 0),
         2 => Value::Integer(random_i64(random).into()),
@@ -269,6 +341,15 @@ fn random_map_key(random: &mut DeterministicRng) -> Value {
         6 => Value::Bytes(random.bytes(32)),
         7 => Value::Uri(random_uri(random)),
         8 => Value::Uuid(random_uuid(random)),
+        9 => Value::Keyword {
+            namespace: None,
+            name: random_text(random),
+        },
+        10 => Value::Symbol {
+            namespace: None,
+            name: random_text(random),
+        },
+        11 => Value::Character(random.next_u64() as u16),
         _ => unreachable!(),
     }
 }
@@ -292,13 +373,25 @@ fn random_set(random: &mut DeterministicRng, depth: usize) -> Value {
     let mut values = Vec::with_capacity(length);
     let mut seen = HashSet::new();
     while values.len() < length {
-        let value = generated_value_at(random, depth + 1);
+        let value = random_set_element(random, depth);
         let canonical_value = encode(&value, Mode::Canonical).expect("generated set value");
         if seen.insert(canonical_value) {
             values.push(value);
         }
     }
     Value::Set(values)
+}
+
+fn random_set_element(random: &mut DeterministicRng, depth: usize) -> Value {
+    if depth < 4 && random.bounded(4) == 0 {
+        Value::Array(
+            (0..random.bounded(5))
+                .map(|_| random_map_key(random))
+                .collect(),
+        )
+    } else {
+        random_map_key(random)
+    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {

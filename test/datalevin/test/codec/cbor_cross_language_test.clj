@@ -19,7 +19,7 @@
    [datalevin.test.codec.cbor-test-support :as support])
   (:import
    [datalevin.codec DLCbor$CodecException DLCbor$ErrorCode]
-   [java.io BufferedReader BufferedWriter InputStreamReader OutputStreamWriter]
+   [java.io BufferedReader BufferedWriter File InputStreamReader OutputStreamWriter]
    [java.lang ProcessBuilder ProcessBuilder$Redirect]
    [java.nio.charset StandardCharsets]
    [java.util Arrays]
@@ -30,6 +30,32 @@
                                ^BufferedWriter writer])
 
 (def ^:dynamic *rust-peer* nil)
+
+(defn- cargo-executable
+  "Find Cargo on PATH or in the Rust installation, with a CARGO path override."
+  ^String []
+  (let [executable (if (= File/separator "\\") "cargo.exe" "cargo")
+        override   (not-empty (System/getenv "CARGO"))
+        path       (not-empty (System/getenv "PATH"))
+        cargo-home (or (not-empty (System/getenv "CARGO_HOME"))
+                       (io/file (System/getProperty "user.home") ".cargo"))
+        candidates (if override
+                     [(io/file override)]
+                     (concat
+                      (when path
+                        (map #(io/file % executable)
+                             (str/split path (re-pattern File/pathSeparator))))
+                      [(io/file cargo-home "bin" executable)]))]
+    (or (some (fn [^File candidate]
+                (when (and (.isFile candidate) (.canExecute candidate))
+                  ;; Keep the cargo filename: rustup may dispatch by symlink name.
+                  (.getAbsolutePath candidate)))
+              candidates)
+        (throw (ex-info
+                (str "Cannot find Cargo for the DL-CBOR cross-language tests. "
+                     "Install Rust, add Cargo to PATH, or set CARGO to its "
+                     "executable path.")
+                {:searched (mapv str candidates)})))))
 
 (defn- repository-root []
   (let [root     (.getCanonicalFile
@@ -44,7 +70,7 @@
 (defn- start-rust-peer []
   (let [root     (repository-root)
         manifest (io/file root "src/rust/Cargo.toml")
-        command  ["cargo" "run" "--quiet" "--manifest-path"
+        command  [(cargo-executable) "run" "--quiet" "--manifest-path"
                   (.getPath manifest) "--example" "dl_cbor_test_peer"]
         builder  (doto (ProcessBuilder. ^java.util.List command)
                    (.directory root)
@@ -173,7 +199,17 @@
 
 (deftest malformed-jvm-rust-error-agreement-test
   (let [rows (support/malformed-rows)]
-    (is (= 53 (count rows)))
+    (is (= 68 (count rows)))
+    (doseq [[id operation hex expected _note] rows]
+      (testing id
+        (let [jvm-error  (jvm-error operation (hex->bytes hex))
+              rust-error (rust-error operation hex)]
+          (is (= expected (:code jvm-error)))
+          (is (= jvm-error rust-error)))))))
+
+(deftest draft-extension-malformed-jvm-rust-error-agreement-test
+  (let [rows (support/draft-extension-malformed-rows)]
+    (is (= 64 (count rows)))
     (doseq [[id operation hex expected _note] rows]
       (testing id
         (let [jvm-error  (jvm-error operation (hex->bytes hex))

@@ -1,0 +1,66 @@
+# Phase 0 draft: compact scalar validation and the remaining stand-in-tag envelope.
+# id	operation	hex	error	note
+extension-wrong-inner-type	canonical	d9444c00	INVALID_EXTENSION	extension tag must contain an array
+extension-empty	canonical	d9444c80	INVALID_EXTENSION	extension array must contain a type ID
+extension-negative-id	canonical	d9444c8120	INVALID_EXTENSION	integer type ID must be non-negative
+extension-empty-name-id	canonical	d9444c8160	INVALID_EXTENSION	string type ID must be non-empty
+extension-boolean-id	canonical	d9444c81f4	INVALID_EXTENSION	type ID must be an unsigned integer or string
+extension-keyword-missing-name	canonical	d9444c8101	INVALID_EXTENSION	keyword requires a name
+extension-keyword-wrong-name	canonical	d9444c820100	INVALID_EXTENSION	keyword name must be text
+extension-keyword-extra-field	canonical	d9444c8401616e6178656578747261	INVALID_EXTENSION	keyword permits only namespace and name fields
+extension-nonshortest-id	canonical	d9444c8218016161	NON_SHORTEST	built-in type ID must use shortest integer encoding
+extension-collection-limit	limit-collection	d9444c83182a01f6	COLLECTION_LIMIT	envelope item count exceeds the two-item test limit
+extension-byte-limit	limit-extension	d9444c83182a01f6	EXTENSION_LIMIT	tag content exceeds the four-byte extension limit
+compact-empty	canonical	40	INVALID_EXTENSION	a DL byte string must contain a subtype
+compact-unknown-subtype	canonical	4100	INVALID_EXTENSION	undefined byte-string subtype
+compact-unknown-subtype-fast	fast	4100	INVALID_EXTENSION	fast readers reject undefined byte-string subtypes
+compact-legacy-bare-bytes	canonical	4200ff	INVALID_EXTENSION	ordinary bytes require subtype FE
+keyword-missing-length	canonical	41e0	INVALID_EXTENSION	qualified keyword requires a namespace byte length
+symbol-missing-length	canonical	41e1	INVALID_EXTENSION	qualified symbol requires a namespace byte length
+keyword-truncated-varint	canonical	42e080	INVALID_EXTENSION	namespace varint must terminate inside the byte string
+keyword-truncated-body	canonical	43e004	TRUNCATED	outer byte string is shorter than its declared length
+keyword-namespace-overrun	canonical	43e00261	INVALID_EXTENSION	namespace length exceeds the remaining payload
+keyword-namespace-crosses-item	canonical	8242e0026161	INVALID_EXTENSION	namespace length cannot consume the following CBOR item
+keyword-nonshortest-varint	canonical	44e0800061	NON_SHORTEST	namespace byte length must use shortest unsigned LEB128
+keyword-nonshortest-varint-fast	fast	44e0800061	NON_SHORTEST	shortest namespace lengths are required in both modes
+keyword-varint-overflow	canonical	46e08080808008	LENGTH_OUT_OF_RANGE	namespace byte length is at most 2147483647
+keyword-varint-too-long	canonical	46e08080808080	LENGTH_OUT_OF_RANGE	namespace byte length uses at most five bytes
+keyword-large-namespace-overrun	canonical	46e0ffffffff07	INVALID_EXTENSION	large in-range namespace length is bounded before allocation
+keyword-namespace-surrogate	canonical	46e003eda08061	INVALID_UTF8	namespace must contain only Unicode scalar values
+keyword-namespace-splits-utf8	canonical	45e001cebb61	INVALID_UTF8	namespace length cannot split a UTF-8 code point
+keyword-invalid-name	canonical	44e00161ff	INVALID_UTF8	qualified name has independently validated UTF-8
+keyword-invalid-unqualified-name	canonical	42fbff	INVALID_UTF8	unqualified keyword name must be valid UTF-8
+symbol-invalid-unqualified-name	canonical	42fcff	INVALID_UTF8	unqualified symbol name must be valid UTF-8
+symbol-invalid-namespace	canonical	44e101ff61	INVALID_UTF8	qualified symbol namespace must be valid UTF-8
+keyword-extension-limit	limit-extension	45fb61626364	EXTENSION_LIMIT	extension budget includes subtype and name
+qualified-keyword-extension-limit	limit-extension	45e001616263	EXTENSION_LIMIT	extension budget includes subtype, namespace length, namespace and name
+keyword-string-limit	limit-string	43fb6162	STRING_LIMIT	byte-string budget includes subtype and text
+keyword-nonshortest-outer-length	canonical	5802fb61	NON_SHORTEST	CBOR byte-string head must use its shortest length
+keyword-retired-tagged-layout	canonical	d9444c82016161	INVALID_EXTENSION	retired tagged keyword ID 1 is rejected
+symbol-retired-tagged-layout	canonical	d9444c8302626e736161	INVALID_EXTENSION	retired tagged symbol ID 2 is rejected
+character-missing-value	canonical	41e2	INVALID_EXTENSION	character requires one or two code-unit bytes
+character-too-wide	canonical	44e2010000	INVALID_EXTENSION	character code unit must fit unsigned 16 bits
+character-leading-zero	canonical	43e20061	NON_SHORTEST	code units below 256 use one byte
+character-leading-zero-fast	fast	43e20061	NON_SHORTEST	shortest character payloads are required in both modes
+character-truncated-body	canonical	43e201	TRUNCATED	outer byte string is shorter than declared
+character-string-limit	limit-string	43e20100	STRING_LIMIT	string budget includes subtype and code unit
+character-retired-tagged-layout	canonical	d9444c82031861	INVALID_EXTENSION	retired tagged character ID 3 is rejected
+regex-missing-flags	canonical	41e3	INVALID_REGEX	regex requires a flags varint
+regex-unterminated-flags	canonical	42e380	INVALID_REGEX	flags must terminate inside the byte string
+regex-flags-cross-item	canonical	8241e301	INVALID_REGEX	flags cannot consume the following CBOR item
+regex-nonshortest-flags	canonical	44e3800061	NON_SHORTEST	flags require shortest unsigned LEB128
+regex-nonshortest-flags-fast	fast	44e3800061	NON_SHORTEST	shortest regex flags are required in both modes
+regex-flags-overflow	canonical	46e38080808008	INVALID_REGEX	overflowing flags are rejected before source decoding
+regex-flags-too-long	canonical	46e38080808080	INVALID_REGEX	flags varint exceeds the bounded reader width
+regex-flags-outside-u16	canonical	44e3808004	INVALID_REGEX	regex flags must fit the defined flag vocabulary
+regex-unknown-flags	canonical	44e3800461	INVALID_REGEX	undefined flag bit 512 is rejected
+regex-canon-eq	canonical	44e3800161	INVALID_REGEX	CANON_EQ remains excluded
+regex-unnormalized-unicode-class	canonical	44e3800261	INVALID_REGEX	UNICODE_CHARACTER_CLASS must include UNICODE_CASE
+regex-invalid-utf8	canonical	43e300ff	INVALID_UTF8	regex source must be valid UTF-8
+regex-surrogate-source	canonical	45e300eda080	INVALID_UTF8	regex source must contain Unicode scalar values
+regex-invalid-flags-and-source	canonical	44e38001ff	INVALID_REGEX	validate flags before decoding source text
+regex-truncated-body	canonical	44e30061	TRUNCATED	outer regex byte string is shorter than declared
+regex-extension-limit	limit-extension	45e300616263	EXTENSION_LIMIT	extension budget includes subtype, flags and source
+regex-string-limit	limit-string	43e30061	STRING_LIMIT	string budget includes subtype, flags and source
+regex-retired-tagged-layout	canonical	d9444c84060162612b00	INVALID_EXTENSION	retired tagged regex ID 6 is rejected
+regex-retired-tagged-layout-fast	fast	d9444c84060162612b00	INVALID_EXTENSION	retired regex layout is also rejected in fast mode

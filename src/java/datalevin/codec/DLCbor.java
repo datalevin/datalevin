@@ -3,14 +3,19 @@ package datalevin.codec;
 import clojure.lang.BigInt;
 import clojure.lang.IPersistentList;
 import clojure.lang.IPersistentMap;
-import clojure.lang.ITransientCollection;
 import clojure.lang.ITransientMap;
+import clojure.lang.ITransientSet;
+import clojure.lang.Keyword;
 import clojure.lang.Numbers;
 import clojure.lang.PersistentArrayMap;
 import clojure.lang.PersistentHashSet;
+import clojure.lang.PersistentList;
+import clojure.lang.PersistentQueue;
 import clojure.lang.PersistentVector;
 import clojure.lang.Ratio;
 import clojure.lang.Sorted;
+import clojure.lang.Symbol;
+import clojure.lang.Util;
 
 import java.math.BigDecimal;
 import java.math.BigInteger;
@@ -19,10 +24,13 @@ import java.nio.BufferOverflowException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Comparator;
+import java.util.Date;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -31,6 +39,7 @@ import java.util.Set;
 import java.util.SortedMap;
 import java.util.SortedSet;
 import java.util.UUID;
+import java.util.regex.Pattern;
 
 /**
  * Purpose-built DL-CBOR v1 Phase 0 codec.
@@ -46,7 +55,49 @@ public final class DLCbor {
     private static final long TAG_RATIO = 30;
     private static final long TAG_URI = 32;
     private static final long TAG_UUID = 37;
+    private static final long TAG_UINT16_LE_ARRAY = 69;
+    private static final long TAG_SINT16_LE_ARRAY = 77;
+    private static final long TAG_SINT32_LE_ARRAY = 78;
+    private static final long TAG_SINT64_LE_ARRAY = 79;
+    private static final long TAG_FLOAT32_LE_ARRAY = 85;
+    private static final long TAG_FLOAT64_LE_ARRAY = 86;
     private static final long TAG_SET = 258;
+    private static final long TAG_EXTENDED_TIME = 1001;
+
+    /**
+     * Non-durable Phase 0 stand-in for the not-yet-assigned Datalevin
+     * extension tag. It is deliberately public so draft fixtures and the
+     * independent Rust implementation cannot acquire a hidden second value.
+     */
+    public static final long DRAFT_EXTENSION_TAG = 0x444c;
+
+    private static final long EXT_KEYWORD = 1;
+    private static final long EXT_SYMBOL = 2;
+    private static final long EXT_CHARACTER = 3;
+    private static final long EXT_LIST = 4;
+    private static final long EXT_QUEUE = 5;
+    private static final long EXT_REGEX = 6;
+
+    // Subtypes inside DL-CBOR byte strings. FB, FC and FE reuse typed-data
+    // headers; E0/E1 distinguish qualified names without a separator scan.
+    private static final int SUBTYPE_QUALIFIED_KEYWORD = 0xe0;
+    private static final int SUBTYPE_QUALIFIED_SYMBOL = 0xe1;
+    private static final int SUBTYPE_CHARACTER = 0xe2;
+    private static final int SUBTYPE_JAVA_REGEX = 0xe3;
+    private static final int SUBTYPE_KEYWORD = 0xfb;
+    private static final int SUBTYPE_SYMBOL = 0xfc;
+    private static final int SUBTYPE_BYTES = 0xfe;
+
+    private static final int REGEX_FLAGS = Pattern.UNIX_LINES
+        | Pattern.CASE_INSENSITIVE
+        | Pattern.COMMENTS
+        | Pattern.MULTILINE
+        | Pattern.LITERAL
+        | Pattern.DOTALL
+        | Pattern.UNICODE_CASE
+        | Pattern.UNICODE_CHARACTER_CLASS;
+
+    private static final Object NOT_FOUND = new Object();
 
     private static final int CANONICAL_FLOAT_NAN = 0x7fc00000;
     private static final long CANONICAL_DOUBLE_NAN = 0x7ff8000000000000L;
@@ -92,7 +143,12 @@ public final class DLCbor {
         INVALID_DECIMAL,
         INVALID_RATIO,
         INVALID_URI,
+        INVALID_REGEX,
         INVALID_UUID,
+        INVALID_INSTANT,
+        INVALID_TYPED_ARRAY,
+        INVALID_EXTENSION,
+        EXTENSION_LIMIT,
         DUPLICATE_KEY,
         DUPLICATE_SET_MEMBER,
         UNESCAPED_TYPED_HEADER,
@@ -124,25 +180,39 @@ public final class DLCbor {
                                                         256,
                                                         1_000_000,
                                                         16 * 1024 * 1024,
-                                                        4 * 1024);
+                                                        4 * 1024,
+                                                        16 * 1024 * 1024);
 
         public final int maxInputBytes;
         public final int maxDepth;
         public final int maxCollectionLength;
         public final int maxStringBytes;
         public final int maxBignumBytes;
+        public final int maxExtensionBytes;
 
         public Limits(int maxInputBytes,
                       int maxDepth,
                       int maxCollectionLength,
                       int maxStringBytes,
                       int maxBignumBytes) {
+            this(maxInputBytes, maxDepth, maxCollectionLength, maxStringBytes,
+                 maxBignumBytes, 16 * 1024 * 1024);
+        }
+
+        public Limits(int maxInputBytes,
+                      int maxDepth,
+                      int maxCollectionLength,
+                      int maxStringBytes,
+                      int maxBignumBytes,
+                      int maxExtensionBytes) {
             this.maxInputBytes = positive(maxInputBytes, "maxInputBytes");
             this.maxDepth = positive(maxDepth, "maxDepth");
             this.maxCollectionLength = positive(maxCollectionLength,
                                                 "maxCollectionLength");
             this.maxStringBytes = positive(maxStringBytes, "maxStringBytes");
             this.maxBignumBytes = positive(maxBignumBytes, "maxBignumBytes");
+            this.maxExtensionBytes = positive(maxExtensionBytes,
+                                              "maxExtensionBytes");
         }
 
         private static int positive(int value, String name) {
@@ -150,6 +220,73 @@ public final class DLCbor {
                 throw new IllegalArgumentException(name + " must be positive");
             }
             return value;
+        }
+    }
+
+    /**
+     * A neutral, non-executable Datalevin extension. Integer identifiers are
+     * reserved for built-ins; user identifiers are globally unique non-empty
+     * strings. Arguments are DL-CBOR values and may be empty.
+     */
+    public static final class ExtensionValue {
+        private final Object typeId;
+        private final List<?> arguments;
+
+        public ExtensionValue(long typeId, List<?> arguments) {
+            this((Object) extensionTypeId(typeId), arguments);
+        }
+
+        public ExtensionValue(String typeId, List<?> arguments) {
+            this((Object) extensionTypeId(typeId), arguments);
+        }
+
+        private ExtensionValue(Object typeId, List<?> arguments) {
+            this.typeId = typeId;
+            Objects.requireNonNull(arguments, "arguments");
+            this.arguments = Collections.unmodifiableList(
+                new ArrayList<>(arguments));
+        }
+
+        private static Long extensionTypeId(long typeId) {
+            if (typeId < 0) {
+                throw new IllegalArgumentException(
+                    "extension integer type ID must be non-negative");
+            }
+            return Long.valueOf(typeId);
+        }
+
+        private static String extensionTypeId(String typeId) {
+            Objects.requireNonNull(typeId, "typeId");
+            if (typeId.isEmpty()) {
+                throw new IllegalArgumentException(
+                    "extension string type ID must be non-empty");
+            }
+            return typeId;
+        }
+
+        public Object typeId() {
+            return typeId;
+        }
+
+        public List<?> arguments() {
+            return arguments;
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            return other instanceof ExtensionValue that
+                && Objects.equals(typeId, that.typeId)
+                && Objects.equals(arguments, that.arguments);
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(typeId, arguments);
+        }
+
+        @Override
+        public String toString() {
+            return "ExtensionValue[" + typeId + ", " + arguments + "]";
         }
     }
 
@@ -256,9 +393,8 @@ public final class DLCbor {
 
     /** Decode one complete bare item from a byte array. */
     public static Object decode(byte[] input, boolean canonical) {
-        return decode(ByteBuffer.wrap(Objects.requireNonNull(input, "input")),
-                      canonical,
-                      Limits.DEFAULT);
+        Objects.requireNonNull(input, "input");
+        return decodeArray(input, 0, input.length, canonical, Limits.DEFAULT);
     }
 
     /** Decode one complete bare item, consuming the input buffer. */
@@ -297,14 +433,34 @@ public final class DLCbor {
             if (!isTypedHeader(input[1] & 0xff)) {
                 throw error(ErrorCode.UNNECESSARY_STORAGE_ESCAPE, 0);
             }
-            return decode(ByteBuffer.wrap(input, 1, input.length - 1).slice(),
-                          canonical,
-                          Limits.DEFAULT);
+            return decodeArray(input, 1, input.length - 1,
+                               canonical, Limits.DEFAULT);
         }
         if (isTypedHeader(first)) {
             throw error(ErrorCode.UNESCAPED_TYPED_HEADER, 0);
         }
         return decode(input, canonical);
+    }
+
+    private static Object decodeArray(byte[] input,
+                                      int start,
+                                      int length,
+                                      boolean canonical,
+                                      Limits limits) {
+        if (length > limits.maxInputBytes) {
+            throw error(ErrorCode.INPUT_TOO_LARGE, 0);
+        }
+        Decoder decoder = DECODER.get();
+        decoder.reset(input, start, length, canonical, limits);
+        try {
+            Object result = decoder.readValue(0);
+            if (decoder.hasRemaining()) {
+                throw error(ErrorCode.TRAILING_BYTES, decoder.offset());
+            }
+            return result;
+        } finally {
+            decoder.clear();
+        }
     }
 
     public static boolean isTypedHeader(int value) {
@@ -330,6 +486,54 @@ public final class DLCbor {
         void putBytes(byte[] bytes);
 
         void putText(String value, int utf8Length);
+
+        void putShortLittleEndian(int value);
+
+        void putIntLittleEndian(int value);
+
+        void putLongLittleEndian(long value);
+
+        default void putCharsLittleEndian(char[] values) {
+            for (char value : values) {
+                putShortLittleEndian(value);
+            }
+        }
+
+        default void putShortsLittleEndian(short[] values) {
+            for (short value : values) {
+                putShortLittleEndian(value);
+            }
+        }
+
+        default void putIntsLittleEndian(int[] values) {
+            for (int value : values) {
+                putIntLittleEndian(value);
+            }
+        }
+
+        default void putLongsLittleEndian(long[] values) {
+            for (long value : values) {
+                putLongLittleEndian(value);
+            }
+        }
+
+        default void putFloatsLittleEndian(float[] values) {
+            for (float value : values) {
+                int bits = Float.isNaN(value)
+                    ? CANONICAL_FLOAT_NAN
+                    : Float.floatToRawIntBits(value);
+                putIntLittleEndian(bits);
+            }
+        }
+
+        default void putDoublesLittleEndian(double[] values) {
+            for (double value : values) {
+                long bits = Double.isNaN(value)
+                    ? CANONICAL_DOUBLE_NAN
+                    : Double.doubleToRawLongBits(value);
+                putLongLittleEndian(bits);
+            }
+        }
     }
 
     private static final class ArraySink implements Sink {
@@ -375,6 +579,47 @@ public final class DLCbor {
                 throw error(ErrorCode.OUTPUT_TOO_SMALL, position);
             }
             encodeUtf8(value, output, position);
+            position = end;
+        }
+
+        @Override
+        public void putShortLittleEndian(int value) {
+            int end = checkedEnd(position, 2);
+            if (end > output.length) {
+                throw error(ErrorCode.OUTPUT_TOO_SMALL, position);
+            }
+            output[position] = (byte) value;
+            output[position + 1] = (byte) (value >>> 8);
+            position = end;
+        }
+
+        @Override
+        public void putIntLittleEndian(int value) {
+            int end = checkedEnd(position, 4);
+            if (end > output.length) {
+                throw error(ErrorCode.OUTPUT_TOO_SMALL, position);
+            }
+            output[position] = (byte) value;
+            output[position + 1] = (byte) (value >>> 8);
+            output[position + 2] = (byte) (value >>> 16);
+            output[position + 3] = (byte) (value >>> 24);
+            position = end;
+        }
+
+        @Override
+        public void putLongLittleEndian(long value) {
+            int end = checkedEnd(position, 8);
+            if (end > output.length) {
+                throw error(ErrorCode.OUTPUT_TOO_SMALL, position);
+            }
+            output[position] = (byte) value;
+            output[position + 1] = (byte) (value >>> 8);
+            output[position + 2] = (byte) (value >>> 16);
+            output[position + 3] = (byte) (value >>> 24);
+            output[position + 4] = (byte) (value >>> 32);
+            output[position + 5] = (byte) (value >>> 40);
+            output[position + 6] = (byte) (value >>> 48);
+            output[position + 7] = (byte) (value >>> 56);
             position = end;
         }
     }
@@ -439,6 +684,38 @@ public final class DLCbor {
             encodeUtf8(value, output, position);
             position += utf8Length;
         }
+
+        @Override
+        public void putShortLittleEndian(int value) {
+            require(2);
+            output[position] = (byte) value;
+            output[position + 1] = (byte) (value >>> 8);
+            position += 2;
+        }
+
+        @Override
+        public void putIntLittleEndian(int value) {
+            require(4);
+            output[position] = (byte) value;
+            output[position + 1] = (byte) (value >>> 8);
+            output[position + 2] = (byte) (value >>> 16);
+            output[position + 3] = (byte) (value >>> 24);
+            position += 4;
+        }
+
+        @Override
+        public void putLongLittleEndian(long value) {
+            require(8);
+            output[position] = (byte) value;
+            output[position + 1] = (byte) (value >>> 8);
+            output[position + 2] = (byte) (value >>> 16);
+            output[position + 3] = (byte) (value >>> 24);
+            output[position + 4] = (byte) (value >>> 32);
+            output[position + 5] = (byte) (value >>> 40);
+            output[position + 6] = (byte) (value >>> 48);
+            output[position + 7] = (byte) (value >>> 56);
+            position += 8;
+        }
     }
 
     private static final class BufferSink implements Sink {
@@ -447,6 +724,7 @@ public final class DLCbor {
         private long textWord;
         private int textWidth;
         private boolean textBigEndian;
+        private boolean littleEndian;
 
         private BufferSink() {
         }
@@ -454,11 +732,13 @@ public final class DLCbor {
         private void reset(ByteBuffer output) {
             this.output = output;
             this.origin = output.position();
+            this.littleEndian = output.order() == ByteOrder.LITTLE_ENDIAN;
         }
 
         private void clear() {
             output = null;
             origin = 0;
+            littleEndian = false;
         }
 
         @Override
@@ -509,6 +789,130 @@ public final class DLCbor {
             }
             textWord = 0;
             textWidth = 0;
+        }
+
+        @Override
+        public void putShortLittleEndian(int value) {
+            short item = (short) value;
+            output.putShort(littleEndian ? item : Short.reverseBytes(item));
+        }
+
+        @Override
+        public void putIntLittleEndian(int value) {
+            output.putInt(littleEndian ? value : Integer.reverseBytes(value));
+        }
+
+        @Override
+        public void putLongLittleEndian(long value) {
+            output.putLong(littleEndian ? value : Long.reverseBytes(value));
+        }
+
+        @Override
+        public void putCharsLittleEndian(char[] values) {
+            int byteLength = Math.multiplyExact(values.length, 2);
+            requireBuffer(byteLength);
+            int start = output.position();
+            ByteOrder original = output.order();
+            try {
+                output.order(ByteOrder.LITTLE_ENDIAN);
+                output.asCharBuffer().put(values);
+                output.position(start + byteLength);
+            } finally {
+                output.order(original);
+            }
+        }
+
+        @Override
+        public void putShortsLittleEndian(short[] values) {
+            int byteLength = Math.multiplyExact(values.length, 2);
+            requireBuffer(byteLength);
+            int start = output.position();
+            ByteOrder original = output.order();
+            try {
+                output.order(ByteOrder.LITTLE_ENDIAN);
+                output.asShortBuffer().put(values);
+                output.position(start + byteLength);
+            } finally {
+                output.order(original);
+            }
+        }
+
+        @Override
+        public void putIntsLittleEndian(int[] values) {
+            int byteLength = Math.multiplyExact(values.length, 4);
+            requireBuffer(byteLength);
+            int start = output.position();
+            ByteOrder original = output.order();
+            try {
+                output.order(ByteOrder.LITTLE_ENDIAN);
+                output.asIntBuffer().put(values);
+                output.position(start + byteLength);
+            } finally {
+                output.order(original);
+            }
+        }
+
+        @Override
+        public void putLongsLittleEndian(long[] values) {
+            int byteLength = Math.multiplyExact(values.length, 8);
+            requireBuffer(byteLength);
+            int start = output.position();
+            ByteOrder original = output.order();
+            try {
+                output.order(ByteOrder.LITTLE_ENDIAN);
+                output.asLongBuffer().put(values);
+                output.position(start + byteLength);
+            } finally {
+                output.order(original);
+            }
+        }
+
+        @Override
+        public void putFloatsLittleEndian(float[] values) {
+            for (float value : values) {
+                if (Float.isNaN(value)) {
+                    Sink.super.putFloatsLittleEndian(values);
+                    return;
+                }
+            }
+            int byteLength = Math.multiplyExact(values.length, 4);
+            requireBuffer(byteLength);
+            int start = output.position();
+            ByteOrder original = output.order();
+            try {
+                output.order(ByteOrder.LITTLE_ENDIAN);
+                output.asFloatBuffer().put(values);
+                output.position(start + byteLength);
+            } finally {
+                output.order(original);
+            }
+        }
+
+        @Override
+        public void putDoublesLittleEndian(double[] values) {
+            for (double value : values) {
+                if (Double.isNaN(value)) {
+                    Sink.super.putDoublesLittleEndian(values);
+                    return;
+                }
+            }
+            int byteLength = Math.multiplyExact(values.length, 8);
+            requireBuffer(byteLength);
+            int start = output.position();
+            ByteOrder original = output.order();
+            try {
+                output.order(ByteOrder.LITTLE_ENDIAN);
+                output.asDoubleBuffer().put(values);
+                output.position(start + byteLength);
+            } finally {
+                output.order(original);
+            }
+        }
+
+        private void requireBuffer(int length) {
+            if (output.remaining() < length) {
+                throw new BufferOverflowException();
+            }
         }
 
         private void appendTextByte(int value) {
@@ -569,8 +973,55 @@ public final class DLCbor {
                                bigIntegerSize(ratio.numerator),
                                bigIntegerSize(ratio.denominator));
         }
+        if (value instanceof Date date) {
+            return instantSize(date.getTime());
+        }
+        if (value instanceof Instant instant) {
+            return instantSize(instantMillis(instant, 0));
+        }
         if (value instanceof byte[] bytes) {
-            return checkedSize(headSize(bytes.length), bytes.length);
+            int length = checkedSize(1, bytes.length);
+            return checkedSize(headSize(length), length);
+        }
+        if (value instanceof char[] values) {
+            return typedArraySize(TAG_UINT16_LE_ARRAY, values.length, 2);
+        }
+        if (value instanceof short[] values) {
+            return typedArraySize(TAG_SINT16_LE_ARRAY, values.length, 2);
+        }
+        if (value instanceof int[] values) {
+            return typedArraySize(TAG_SINT32_LE_ARRAY, values.length, 4);
+        }
+        if (value instanceof long[] values) {
+            return typedArraySize(TAG_SINT64_LE_ARRAY, values.length, 8);
+        }
+        if (value instanceof float[] values) {
+            return typedArraySize(TAG_FLOAT32_LE_ARRAY, values.length, 4);
+        }
+        if (value instanceof double[] values) {
+            return typedArraySize(TAG_FLOAT64_LE_ARRAY, values.length, 8);
+        }
+        if (value instanceof Keyword keyword) {
+            return namedValueSize(keyword.getNamespace(), keyword.getName());
+        }
+        if (value instanceof Symbol symbol) {
+            return namedValueSize(symbol.getNamespace(), symbol.getName());
+        }
+        if (value instanceof Character character) {
+            return character <= 0xff ? 3 : 4;
+        }
+        if (value instanceof PersistentQueue queue) {
+            return collectionExtensionSize(EXT_QUEUE, queue);
+        }
+        if (value instanceof IPersistentList list) {
+            return collectionExtensionSize(EXT_LIST,
+                                           (Collection<?>) list);
+        }
+        if (value instanceof Pattern pattern) {
+            int flags = validatedRegexFlags(pattern.flags(), 0);
+            int length = checkedSize(1, unsignedVarintSize(flags),
+                                     utf8Length(pattern.pattern(), 0));
+            return checkedSize(headSize(length), length);
         }
         if (value instanceof String text) {
             int length = utf8Length(text, 0);
@@ -584,13 +1035,30 @@ public final class DLCbor {
         if (value instanceof UUID) {
             return checkedSize(headSize(TAG_UUID), headSize(16), 16);
         }
+        if (value instanceof ExtensionValue extension) {
+            validateExtensionId(extension.typeId, 0);
+            int size = checkedSize(extensionHeadSize(
+                                       extensionItemCount(
+                                           extension.arguments.size())),
+                                   sizeOf(extension.typeId));
+            for (Object argument : extension.arguments) {
+                size = checkedSize(size, sizeOf(argument));
+            }
+            return size;
+        }
         if (value instanceof TaggedValue tagged) {
+            if (tagged.tag == DRAFT_EXTENSION_TAG) {
+                throw error(ErrorCode.INVALID_EXTENSION, 0);
+            }
+            if (rawByteStringTag(tagged.tag) && tagged.value instanceof byte[] bytes) {
+                return checkedSize(headSize(tagged.tag), headSize(bytes.length),
+                                   bytes.length);
+            }
             return checkedSize(headSize(tagged.tag), sizeOf(tagged.value));
         }
         if (value instanceof Sorted
             || value instanceof SortedMap<?, ?>
             || value instanceof SortedSet<?>
-            || value instanceof IPersistentList
             || value instanceof Collection<?>
                && !(value instanceof List<?>)
                && !(value instanceof Set<?>)) {
@@ -623,6 +1091,90 @@ public final class DLCbor {
 
     private static int integerSize(long value) {
         return headSize(value >= 0 ? value : ~value);
+    }
+
+    private static int instantSize(long milliseconds) {
+        long seconds = Math.floorDiv(milliseconds, 1000);
+        int remainder = Math.floorMod(milliseconds, 1000);
+        int result = checkedSize(headSize(TAG_EXTENDED_TIME),
+                                 headSize(remainder == 0 ? 1 : 2),
+                                 integerSize(1),
+                                 integerSize(seconds));
+        return remainder == 0
+            ? result
+            : checkedSize(result, integerSize(-3), integerSize(remainder));
+    }
+
+    private static int typedArraySize(long tag, int length, int width) {
+        final int byteLength;
+        try {
+            byteLength = Math.multiplyExact(length, width);
+        } catch (ArithmeticException exception) {
+            throw error(ErrorCode.LENGTH_OUT_OF_RANGE, 0);
+        }
+        return checkedSize(headSize(tag), headSize(byteLength), byteLength);
+    }
+
+    private static int extensionHeadSize(int itemCount) {
+        return checkedSize(headSize(DRAFT_EXTENSION_TAG),
+                           headSize(itemCount));
+    }
+
+    private static int extensionItemCount(int argumentCount) {
+        if (argumentCount == Integer.MAX_VALUE) {
+            throw error(ErrorCode.LENGTH_OUT_OF_RANGE, 0);
+        }
+        return argumentCount + 1;
+    }
+
+    private static int namedValueSize(String namespace, String name) {
+        int length = checkedSize(1, utf8Length(name, 0));
+        if (namespace != null) {
+            int namespaceLength = utf8Length(namespace, 0);
+            length = checkedSize(length, unsignedVarintSize(namespaceLength),
+                                 namespaceLength);
+        }
+        return checkedSize(headSize(length), length);
+    }
+
+    private static int unsignedVarintSize(int value) {
+        int length = 1;
+        while ((value >>>= 7) != 0) {
+            length++;
+        }
+        return length;
+    }
+
+    private static void validateExtensionId(Object typeId, int offset) {
+        if (typeId instanceof Long id
+            && (id == EXT_KEYWORD || id == EXT_SYMBOL
+                || id == EXT_CHARACTER || id == EXT_REGEX)) {
+            throw error(ErrorCode.INVALID_EXTENSION, offset);
+        }
+    }
+
+    private static int collectionExtensionSize(long typeId,
+                                               Collection<?> values) {
+        int size = checkedSize(extensionHeadSize(
+                                   extensionItemCount(values.size())),
+                               integerSize(typeId));
+        for (Object value : values) {
+            size = checkedSize(size, sizeOf(value));
+        }
+        return size;
+    }
+
+    private static int validatedRegexFlags(long rawFlags, int offset) {
+        if (rawFlags < 0 || rawFlags > Integer.MAX_VALUE) {
+            throw error(ErrorCode.INVALID_REGEX, offset);
+        }
+        int flags = (int) rawFlags;
+        if ((flags & ~REGEX_FLAGS) != 0
+            || (flags & Pattern.UNICODE_CHARACTER_CLASS) != 0
+               && (flags & Pattern.UNICODE_CASE) == 0) {
+            throw error(ErrorCode.INVALID_REGEX, offset);
+        }
+        return flags;
     }
 
     private static int bigIntegerSize(BigInteger value) {
@@ -701,9 +1253,58 @@ public final class DLCbor {
             writeDecimal(sink, decimal);
         } else if (value instanceof Ratio ratio) {
             writeRatio(sink, ratio.numerator, ratio.denominator);
+        } else if (value instanceof Date date) {
+            writeInstant(sink, date.getTime());
+        } else if (value instanceof Instant instant) {
+            writeInstant(sink, instantMillis(instant, sink.position()));
         } else if (value instanceof byte[] bytes) {
-            writeHead(sink, 2, bytes.length);
+            writeHead(sink, 2, checkedSize(1, bytes.length));
+            sink.putByte(SUBTYPE_BYTES);
             sink.putBytes(bytes);
+        } else if (value instanceof char[] values) {
+            writeTypedArrayHead(sink, TAG_UINT16_LE_ARRAY, values.length, 2);
+            sink.putCharsLittleEndian(values);
+        } else if (value instanceof short[] values) {
+            writeTypedArrayHead(sink, TAG_SINT16_LE_ARRAY, values.length, 2);
+            sink.putShortsLittleEndian(values);
+        } else if (value instanceof int[] values) {
+            writeTypedArrayHead(sink, TAG_SINT32_LE_ARRAY, values.length, 4);
+            sink.putIntsLittleEndian(values);
+        } else if (value instanceof long[] values) {
+            writeTypedArrayHead(sink, TAG_SINT64_LE_ARRAY, values.length, 8);
+            sink.putLongsLittleEndian(values);
+        } else if (value instanceof float[] values) {
+            writeTypedArrayHead(sink, TAG_FLOAT32_LE_ARRAY, values.length, 4);
+            sink.putFloatsLittleEndian(values);
+        } else if (value instanceof double[] values) {
+            writeTypedArrayHead(sink, TAG_FLOAT64_LE_ARRAY, values.length, 8);
+            sink.putDoublesLittleEndian(values);
+        } else if (value instanceof Keyword keyword) {
+            writeNamedValue(sink, SUBTYPE_KEYWORD, SUBTYPE_QUALIFIED_KEYWORD,
+                            keyword.getNamespace(), keyword.getName());
+        } else if (value instanceof Symbol symbol) {
+            writeNamedValue(sink, SUBTYPE_SYMBOL, SUBTYPE_QUALIFIED_SYMBOL,
+                            symbol.getNamespace(), symbol.getName());
+        } else if (value instanceof Character character) {
+            writeHead(sink, 2, character <= 0xff ? 2 : 3);
+            sink.putByte(SUBTYPE_CHARACTER);
+            if (character > 0xff) {
+                sink.putByte(character >>> 8);
+            }
+            sink.putByte(character);
+        } else if (value instanceof PersistentQueue queue) {
+            writeCollectionExtension(sink, EXT_QUEUE, queue, mode);
+        } else if (value instanceof IPersistentList list) {
+            writeCollectionExtension(sink, EXT_LIST,
+                                     (Collection<?>) list, mode);
+        } else if (value instanceof Pattern pattern) {
+            int flags = validatedRegexFlags(pattern.flags(), sink.position());
+            int sourceLength = utf8Length(pattern.pattern(), sink.position());
+            writeHead(sink, 2, checkedSize(1, unsignedVarintSize(flags),
+                                         sourceLength));
+            sink.putByte(SUBTYPE_JAVA_REGEX);
+            writeUnsignedVarint(sink, flags);
+            sink.putText(pattern.pattern(), sourceLength);
         } else if (value instanceof String text) {
             writeText(sink, text);
         } else if (value instanceof URI uri) {
@@ -714,14 +1315,28 @@ public final class DLCbor {
             writeHead(sink, 2, 16);
             putLong(sink, uuid.getMostSignificantBits());
             putLong(sink, uuid.getLeastSignificantBits());
+        } else if (value instanceof ExtensionValue extension) {
+            validateExtensionId(extension.typeId, sink.position());
+            writeExtensionHead(sink,
+                               extensionItemCount(extension.arguments.size()));
+            writeValue(sink, extension.typeId, mode);
+            for (Object argument : extension.arguments) {
+                writeValue(sink, argument, mode);
+            }
         } else if (value instanceof TaggedValue tagged) {
+            if (tagged.tag == DRAFT_EXTENSION_TAG) {
+                throw error(ErrorCode.INVALID_EXTENSION, sink.position());
+            }
             writeHead(sink, 6, tagged.tag);
-            writeValue(sink, tagged.value, mode);
+            if (rawByteStringTag(tagged.tag) && tagged.value instanceof byte[] bytes) {
+                writeHead(sink, 2, bytes.length);
+                sink.putBytes(bytes);
+            } else {
+                writeValue(sink, tagged.value, mode);
+            }
         } else if (value instanceof Sorted
                    || value instanceof SortedMap<?, ?>
                    || value instanceof SortedSet<?>) {
-            throw error(ErrorCode.UNSUPPORTED_VALUE, sink.position());
-        } else if (value instanceof IPersistentList) {
             throw error(ErrorCode.UNSUPPORTED_VALUE, sink.position());
         } else if (value instanceof Map<?, ?> map) {
             writeMap(sink, map, mode);
@@ -786,6 +1401,87 @@ public final class DLCbor {
         writeHead(sink, 4, 2);
         writeBigInteger(sink, numerator);
         writeBigInteger(sink, denominator);
+    }
+
+    private static void writeInstant(Sink sink, long milliseconds) {
+        long seconds = Math.floorDiv(milliseconds, 1000);
+        int remainder = Math.floorMod(milliseconds, 1000);
+        writeHead(sink, 6, TAG_EXTENDED_TIME);
+        writeHead(sink, 5, remainder == 0 ? 1 : 2);
+        writeLong(sink, 1);
+        writeLong(sink, seconds);
+        if (remainder != 0) {
+            writeLong(sink, -3);
+            writeLong(sink, remainder);
+        }
+    }
+
+    private static void writeExtensionHead(Sink sink, int itemCount) {
+        writeHead(sink, 6, DRAFT_EXTENSION_TAG);
+        writeHead(sink, 4, itemCount);
+    }
+
+    private static void writeNamedValue(Sink sink,
+                                        int subtype,
+                                        int qualifiedSubtype,
+                                        String namespace,
+                                        String name) {
+        int nameLength = utf8Length(name, sink.position());
+        int namespaceLength = namespace == null
+            ? 0 : utf8Length(namespace, sink.position());
+        int length = checkedSize(1, nameLength);
+        if (namespace != null) {
+            length = checkedSize(length, unsignedVarintSize(namespaceLength),
+                                 namespaceLength);
+        }
+        writeHead(sink, 2, length);
+        sink.putByte(namespace == null ? subtype : qualifiedSubtype);
+        if (namespace != null) {
+            writeUnsignedVarint(sink, namespaceLength);
+            sink.putText(namespace, namespaceLength);
+        }
+        sink.putText(name, nameLength);
+    }
+
+    private static void writeUnsignedVarint(Sink sink, int value) {
+        while (value >= 128) {
+            sink.putByte((value & 0x7f) | 0x80);
+            value >>>= 7;
+        }
+        sink.putByte(value);
+    }
+
+    private static void writeCollectionExtension(Sink sink,
+                                                 long typeId,
+                                                 Collection<?> values,
+                                                 Mode mode) {
+        writeExtensionHead(sink, extensionItemCount(values.size()));
+        writeLong(sink, typeId);
+        for (Object value : values) {
+            writeValue(sink, value, mode);
+        }
+    }
+
+    private static long instantMillis(Instant instant, int offset) {
+        try {
+            return instant.toEpochMilli();
+        } catch (ArithmeticException exception) {
+            throw error(ErrorCode.INVALID_INSTANT, offset);
+        }
+    }
+
+    private static void writeTypedArrayHead(Sink sink,
+                                            long tag,
+                                            int length,
+                                            int width) {
+        final int byteLength;
+        try {
+            byteLength = Math.multiplyExact(length, width);
+        } catch (ArithmeticException exception) {
+            throw error(ErrorCode.LENGTH_OUT_OF_RANGE, sink.position());
+        }
+        writeHead(sink, 6, tag);
+        writeHead(sink, 2, byteLength);
     }
 
     private static BigDecimal normalizedDecimal(BigDecimal input) {
@@ -922,6 +1618,62 @@ public final class DLCbor {
         }
     }
 
+    private static void validateUtf8(byte[] input,
+                                     int start,
+                                     int length,
+                                     int errorOffset) {
+        int index = start;
+        int end = start + length;
+        while (index < end) {
+            int first = input[index] & 0xff;
+            if (first <= 0x7f) {
+                index++;
+                continue;
+            }
+            if (first >= 0xc2 && first <= 0xdf) {
+                if (index + 1 >= end
+                    || !isUtf8Continuation(input[index + 1] & 0xff)) {
+                    throw error(ErrorCode.INVALID_UTF8, errorOffset);
+                }
+                index += 2;
+                continue;
+            }
+            if (first >= 0xe0 && first <= 0xef) {
+                if (index + 2 >= end) {
+                    throw error(ErrorCode.INVALID_UTF8, errorOffset);
+                }
+                int second = input[index + 1] & 0xff;
+                int third = input[index + 2] & 0xff;
+                if (!isUtf8Continuation(second)
+                    || !isUtf8Continuation(third)
+                    || first == 0xe0 && second < 0xa0
+                    || first == 0xed && second >= 0xa0) {
+                    throw error(ErrorCode.INVALID_UTF8, errorOffset);
+                }
+                index += 3;
+                continue;
+            }
+            if (first >= 0xf0 && first <= 0xf4) {
+                if (index + 3 >= end) {
+                    throw error(ErrorCode.INVALID_UTF8, errorOffset);
+                }
+                int second = input[index + 1] & 0xff;
+                int third = input[index + 2] & 0xff;
+                int fourth = input[index + 3] & 0xff;
+                if (!isUtf8Continuation(second)
+                    || !isUtf8Continuation(third)
+                    || !isUtf8Continuation(fourth)
+                    || first == 0xf0 && second < 0x90
+                    || first == 0xf4 && second > 0x8f) {
+                    throw error(ErrorCode.INVALID_UTF8, errorOffset);
+                }
+                index += 4;
+                continue;
+            }
+            throw error(ErrorCode.INVALID_UTF8, errorOffset);
+        }
+    }
+
     private static boolean isUtf8Continuation(int value) {
         return value >= 0x80 && value <= 0xbf;
     }
@@ -984,6 +1736,7 @@ public final class DLCbor {
             rejectDuplicateEntries(entries, ErrorCode.DUPLICATE_KEY,
                                    sink.position());
         }
+        rejectHostEquivalentEntryKeys(entries, sink.position());
 
         writeHead(sink, 5, entries.size());
         for (PreparedEntry entry : entries) {
@@ -1039,6 +1792,8 @@ public final class DLCbor {
                 }
             }
         }
+        rejectHostEquivalentValues(values, ErrorCode.DUPLICATE_SET_MEMBER,
+                                   sink.position());
 
         writeHead(sink, 4, values.size());
         for (PreparedValue value : values) {
@@ -1068,6 +1823,37 @@ public final class DLCbor {
                               entries.get(index).keyBytes)) {
                 throw error(ErrorCode.DUPLICATE_KEY, offset);
             }
+        }
+    }
+
+    private static void rejectHostEquivalentEntryKeys(
+        List<PreparedEntry> entries, int offset) {
+        if (entries.size() < 2) {
+            return;
+        }
+        ITransientSet seen = (ITransientSet)
+            PersistentHashSet.EMPTY.asTransient();
+        for (PreparedEntry entry : entries) {
+            if (seen.contains(entry.key)) {
+                throw error(ErrorCode.DUPLICATE_KEY, offset);
+            }
+            seen = (ITransientSet) seen.conj(entry.key);
+        }
+    }
+
+    private static void rejectHostEquivalentValues(List<PreparedValue> values,
+                                                   ErrorCode code,
+                                                   int offset) {
+        if (values.size() < 2) {
+            return;
+        }
+        ITransientSet seen = (ITransientSet)
+            PersistentHashSet.EMPTY.asTransient();
+        for (PreparedValue value : values) {
+            if (seen.contains(value.value)) {
+                throw error(code, offset);
+            }
+            seen = (ITransientSet) seen.conj(value.value);
         }
     }
 
@@ -1208,9 +1994,14 @@ public final class DLCbor {
             || valueClass == Long.class
             || valueClass == BigInt.class
             || valueClass == BigInteger.class
-            || valueClass == Float.class
-            || valueClass == Double.class
+            || valueClass == Character.class
+            || valueClass == Keyword.class
+            || valueClass == Symbol.class
             || valueClass == UUID.class;
+    }
+
+    private static boolean safeDecodedSetMemberEquality(Object value) {
+        return value == null || safeHostEqualityClass(value.getClass());
     }
 
     private static int compareCanonical(byte[] left, byte[] right) {
@@ -1308,28 +2099,61 @@ public final class DLCbor {
 
     private static final class Decoder {
         private ByteBuffer input;
+        private byte[] arrayInput;
+        private int arrayPosition;
+        private int arrayLimit;
         private boolean canonical;
         private Limits limits;
         private int origin;
+        private boolean littleEndian;
+        private int activeLimit;
+        private ErrorCode activeLimitCode;
 
         private Decoder() {
         }
 
         private void reset(ByteBuffer input, boolean canonical, Limits limits) {
             this.input = input;
+            this.arrayInput = null;
             this.canonical = canonical;
             this.limits = limits;
             this.origin = input.position();
+            this.littleEndian = input.order() == ByteOrder.LITTLE_ENDIAN;
+            this.activeLimit = -1;
+            this.activeLimitCode = null;
+        }
+
+        private void reset(byte[] input,
+                           int start,
+                           int length,
+                           boolean canonical,
+                           Limits limits) {
+            this.input = null;
+            this.arrayInput = input;
+            this.arrayPosition = start;
+            this.arrayLimit = start + length;
+            this.canonical = canonical;
+            this.limits = limits;
+            this.origin = start;
+            this.littleEndian = true;
+            this.activeLimit = -1;
+            this.activeLimitCode = null;
         }
 
         private void clear() {
             input = null;
+            arrayInput = null;
+            arrayPosition = 0;
+            arrayLimit = 0;
             limits = null;
             origin = 0;
+            littleEndian = false;
+            activeLimit = -1;
+            activeLimitCode = null;
         }
 
         private int offset() {
-            return input.position() - origin;
+            return inputPosition() - origin;
         }
 
         private Object readValue(int depth) {
@@ -1343,9 +2167,7 @@ public final class DLCbor {
             return switch (major) {
                 case 0 -> readPositiveInteger(additional, headOffset);
                 case 1 -> readNegativeInteger(additional, headOffset);
-                case 2 -> readByteString(additional, headOffset,
-                                         limits.maxStringBytes,
-                                         ErrorCode.STRING_LIMIT);
+                case 2 -> readByteStringValue(additional, headOffset);
                 case 3 -> readText(additional, headOffset);
                 case 4 -> readArray(additional, headOffset, depth);
                 case 5 -> readMap(additional, headOffset, depth);
@@ -1368,19 +2190,113 @@ public final class DLCbor {
                                       int limit,
                                       ErrorCode limitCode) {
             int length = length(additional, headOffset, limit, limitCode);
-            byte[] bytes = new byte[length];
             require(length);
-            input.get(bytes);
+            byte[] bytes = new byte[length];
+            getBytes(bytes, 0, length);
             return bytes;
+        }
+
+        private Object readByteStringValue(int additional, int headOffset) {
+            int length = length(additional, headOffset, limits.maxStringBytes,
+                                ErrorCode.STRING_LIMIT);
+            require(length);
+            if (length == 0) {
+                throw error(ErrorCode.INVALID_EXTENSION, headOffset);
+            }
+            int end = inputPosition() + length;
+            int subtype = readUnsignedByte();
+            if (subtype == SUBTYPE_BYTES) {
+                byte[] bytes = new byte[length - 1];
+                getBytes(bytes, 0, bytes.length);
+                return bytes;
+            }
+            if (subtype != SUBTYPE_KEYWORD && subtype != SUBTYPE_SYMBOL
+                && subtype != SUBTYPE_QUALIFIED_KEYWORD
+                && subtype != SUBTYPE_QUALIFIED_SYMBOL
+                && subtype != SUBTYPE_CHARACTER && subtype != SUBTYPE_JAVA_REGEX) {
+                throw error(ErrorCode.INVALID_EXTENSION, headOffset);
+            }
+            if (length > limits.maxExtensionBytes) {
+                throw error(ErrorCode.EXTENSION_LIMIT, headOffset);
+            }
+            if (subtype == SUBTYPE_CHARACTER) {
+                if (length != 2 && length != 3) {
+                    throw error(ErrorCode.INVALID_EXTENSION, headOffset);
+                }
+                int codeUnit = readUnsignedByte();
+                if (length == 3) {
+                    if (codeUnit == 0) {
+                        throw error(ErrorCode.NON_SHORTEST, headOffset);
+                    }
+                    codeUnit = (codeUnit << 8) | readUnsignedByte();
+                }
+                return Character.valueOf((char) codeUnit);
+            }
+            if (subtype == SUBTYPE_JAVA_REGEX) {
+                int flags = validatedRegexFlags(
+                    readUnsignedVarint(end, headOffset, ErrorCode.INVALID_REGEX,
+                                       ErrorCode.INVALID_REGEX), headOffset);
+                String source = readTextBytes(end - inputPosition());
+                return compileRegex(source, flags, headOffset);
+            }
+            String namespace = null;
+            if (subtype == SUBTYPE_QUALIFIED_KEYWORD
+                || subtype == SUBTYPE_QUALIFIED_SYMBOL) {
+                int namespaceLength = readUnsignedVarint(
+                    end, headOffset, ErrorCode.INVALID_EXTENSION,
+                    ErrorCode.LENGTH_OUT_OF_RANGE);
+                if (namespaceLength > end - inputPosition()) {
+                    throw error(ErrorCode.INVALID_EXTENSION, headOffset);
+                }
+                namespace = readTextBytes(namespaceLength);
+            }
+            String name = readTextBytes(end - inputPosition());
+            return subtype == SUBTYPE_KEYWORD
+                || subtype == SUBTYPE_QUALIFIED_KEYWORD
+                ? Keyword.intern(namespace, name)
+                : Symbol.intern(namespace, name);
+        }
+
+        private int readUnsignedVarint(int end, int headOffset,
+                                       ErrorCode missingCode,
+                                       ErrorCode overflowCode) {
+            int value = 0;
+            for (int shift = 0; shift <= 28; shift += 7) {
+                if (inputPosition() == end) {
+                    throw error(missingCode, headOffset);
+                }
+                int next = readUnsignedByte();
+                if (shift == 28 && next > 7) {
+                    throw error(overflowCode, headOffset);
+                }
+                value |= (next & 0x7f) << shift;
+                if ((next & 0x80) == 0) {
+                    if (shift != 0 && next == 0) {
+                        throw error(ErrorCode.NON_SHORTEST, headOffset);
+                    }
+                    return value;
+                }
+            }
+            throw new AssertionError("unreachable unsigned varint");
         }
 
         private String readText(int additional, int headOffset) {
             int length = length(additional, headOffset,
                                 limits.maxStringBytes,
                                 ErrorCode.STRING_LIMIT);
+            return readTextBytes(length);
+        }
+
+        private String readTextBytes(int length) {
             require(length);
-            int start = input.position();
-            validateUtf8(input, start, length, offset());
+            int start = inputPosition();
+            validateInputUtf8(start, length, offset());
+            if (arrayInput != null) {
+                String result = new String(arrayInput, start, length,
+                                           StandardCharsets.UTF_8);
+                arrayPosition = start + length;
+                return result;
+            }
             if (input.hasArray()) {
                 String result = new String(input.array(),
                                            input.arrayOffset() + start,
@@ -1390,7 +2306,7 @@ public final class DLCbor {
                 return result;
             }
             byte[] bytes = decodeBytes(length);
-            input.get(bytes, 0, length);
+            getBytes(bytes, 0, length);
             return new String(bytes, 0, length, StandardCharsets.UTF_8);
         }
 
@@ -1420,17 +2336,16 @@ public final class DLCbor {
                 ? null
                 : PersistentArrayMap.EMPTY.asTransient();
             for (int index = 0; index < length; index++) {
-                int keyStart = input.position();
+                int keyStart = inputPosition();
                 int keyOffset = offset();
                 Object key = readValue(depth + 1);
-                int keyEnd = input.position();
+                int keyEnd = inputPosition();
                 byte[] canonicalKey = canonical ? null : encode(key, Mode.CANONICAL);
                 if (canonical && previousStart >= 0) {
-                    int comparison = compareCanonicalRanges(input,
-                                                              previousStart,
-                                                              previousEnd,
-                                                              keyStart,
-                                                              keyEnd);
+                    int comparison = compareInputRanges(previousStart,
+                                                        previousEnd,
+                                                        keyStart,
+                                                        keyEnd);
                     if (comparison == 0) {
                         throw error(ErrorCode.DUPLICATE_KEY, keyOffset);
                     }
@@ -1443,6 +2358,15 @@ public final class DLCbor {
                 }
                 previousStart = keyStart;
                 previousEnd = keyEnd;
+                if (small) {
+                    for (int prior = 0; prior < index; prior++) {
+                        if (Util.equiv(keyValues[prior * 2], key)) {
+                            throw error(ErrorCode.DUPLICATE_KEY, keyOffset);
+                        }
+                    }
+                } else if (largeResult.valAt(key, NOT_FOUND) != NOT_FOUND) {
+                    throw error(ErrorCode.DUPLICATE_KEY, keyOffset);
+                }
                 Object value = readValue(depth + 1);
                 if (small) {
                     keyValues[index * 2] = key;
@@ -1463,8 +2387,34 @@ public final class DLCbor {
             if (tag == TAG_POSITIVE_BIGNUM || tag == TAG_NEGATIVE_BIGNUM) {
                 return readBignum(tag == TAG_NEGATIVE_BIGNUM, headOffset);
             }
+            if (tag == TAG_UUID) {
+                if (depth + 1 > limits.maxDepth) {
+                    throw error(ErrorCode.DEPTH_LIMIT, offset());
+                }
+                int payloadOffset = offset();
+                int payloadHead = readUnsignedByte();
+                if ((payloadHead >>> 5) != 2) {
+                    throw error(ErrorCode.INVALID_UUID, headOffset);
+                }
+                int length = length(payloadHead & 0x1f, payloadOffset,
+                                    limits.maxStringBytes, ErrorCode.STRING_LIMIT);
+                require(length);
+                if (length != 16) {
+                    throw error(ErrorCode.INVALID_UUID, headOffset);
+                }
+                return new UUID(readLong(), readLong());
+            }
             if (tag == TAG_SET) {
                 return readSet(headOffset, depth + 1);
+            }
+            if (typedArrayWidth(tag) != 0) {
+                return readTypedArray(tag, headOffset);
+            }
+            if (tag == TAG_EXTENDED_TIME) {
+                return readInstant(headOffset, depth + 1);
+            }
+            if (tag == DRAFT_EXTENSION_TAG) {
+                return readExtension(headOffset, depth + 1);
             }
             Object value = readValue(depth + 1);
             if (tag == TAG_DECIMAL) {
@@ -1487,14 +2437,309 @@ public final class DLCbor {
                     throw error(ErrorCode.INVALID_URI, headOffset);
                 }
             }
-            if (tag == TAG_UUID) {
-                if (!(value instanceof byte[] bytes) || bytes.length != 16) {
-                    throw error(ErrorCode.INVALID_UUID, headOffset);
-                }
-                ByteBuffer buffer = ByteBuffer.wrap(bytes);
-                return new UUID(buffer.getLong(), buffer.getLong());
-            }
             return new TaggedValue(tag, value);
+        }
+
+        private Object readExtension(int tagOffset, int depth) {
+            int previousLimit = activeLimit;
+            ErrorCode previousLimitCode = activeLimitCode;
+            long candidate = (long) inputPosition() + limits.maxExtensionBytes;
+            int candidateLimit = candidate > Integer.MAX_VALUE
+                ? Integer.MAX_VALUE
+                : (int) candidate;
+            if (activeLimit < 0 || candidateLimit < activeLimit) {
+                activeLimit = candidateLimit;
+                activeLimitCode = ErrorCode.EXTENSION_LIMIT;
+            }
+            try {
+                return readExtensionWithinLimit(tagOffset, depth);
+            } finally {
+                activeLimit = previousLimit;
+                activeLimitCode = previousLimitCode;
+            }
+        }
+
+        private Object readExtensionWithinLimit(int tagOffset, int depth) {
+            if (depth > limits.maxDepth) {
+                throw error(ErrorCode.DEPTH_LIMIT, offset());
+            }
+            int arrayOffset = offset();
+            int arrayHead = readUnsignedByte();
+            if ((arrayHead >>> 5) != 4) {
+                throw error(ErrorCode.INVALID_EXTENSION, tagOffset);
+            }
+            int length = collectionLength(arrayHead & 0x1f, arrayOffset);
+            if (length == 0) {
+                throw error(ErrorCode.INVALID_EXTENSION, tagOffset);
+            }
+            Object typeId = readValue(depth + 1);
+            if (typeId instanceof Long integerId) {
+                if (integerId < 0) {
+                    throw error(ErrorCode.INVALID_EXTENSION, tagOffset);
+                }
+                if (integerId > Integer.MAX_VALUE) {
+                    return readUnknownExtension(typeId, length, depth);
+                }
+                return switch (integerId.intValue()) {
+                    case (int) EXT_KEYWORD, (int) EXT_SYMBOL,
+                         (int) EXT_CHARACTER, (int) EXT_REGEX ->
+                        throw error(ErrorCode.INVALID_EXTENSION, tagOffset);
+                    case (int) EXT_LIST ->
+                        readListExtension(length, depth);
+                    case (int) EXT_QUEUE ->
+                        readQueueExtension(length, depth);
+                    default -> readUnknownExtension(typeId, length, depth);
+                };
+            }
+            if (typeId instanceof String name && !name.isEmpty()) {
+                return readUnknownExtension(name, length, depth);
+            }
+            throw error(ErrorCode.INVALID_EXTENSION, tagOffset);
+        }
+
+        private IPersistentList readListExtension(int length, int depth) {
+            Object[] values = readExtensionArguments(length, depth);
+            return PersistentList.create(Arrays.asList(values));
+        }
+
+        private PersistentQueue readQueueExtension(int length, int depth) {
+            PersistentQueue result = PersistentQueue.EMPTY;
+            for (int index = 1; index < length; index++) {
+                result = result.cons(readValue(depth + 1));
+            }
+            return result;
+        }
+
+        private Pattern compileRegex(String source, int flags, int headOffset) {
+            try {
+                Pattern result = Pattern.compile(source, flags);
+                if (result.flags() != flags) {
+                    throw error(ErrorCode.INVALID_REGEX, headOffset);
+                }
+                return result;
+            } catch (IllegalArgumentException | StackOverflowError exception) {
+                throw error(ErrorCode.INVALID_REGEX, headOffset);
+            }
+        }
+
+        private ExtensionValue readUnknownExtension(Object typeId,
+                                                    int length,
+                                                    int depth) {
+            List<?> arguments = PersistentVector.adopt(
+                readExtensionArguments(length, depth));
+            return typeId instanceof Long integerId
+                ? new ExtensionValue(integerId, arguments)
+                : new ExtensionValue((String) typeId, arguments);
+        }
+
+        private Object[] readExtensionArguments(int length, int depth) {
+            int argumentCount = length - 1;
+            if (activeLimit >= 0
+                && argumentCount > activeLimit - inputPosition()) {
+                throw error(activeLimitCode, offset());
+            }
+            Object[] arguments = new Object[argumentCount];
+            for (int index = 0; index < arguments.length; index++) {
+                arguments[index] = readValue(depth + 1);
+            }
+            return arguments;
+        }
+
+        private Date readInstant(int tagOffset, int depth) {
+            if (depth > limits.maxDepth) {
+                throw error(ErrorCode.DEPTH_LIMIT, offset());
+            }
+            int mapHeadOffset = offset();
+            int mapHead = readUnsignedByte();
+            if ((mapHead >>> 5) != 5) {
+                throw error(ErrorCode.INVALID_INSTANT, tagOffset);
+            }
+            int length = collectionLength(mapHead & 0x1f, mapHeadOffset);
+            int previousStart = -1;
+            int previousEnd = -1;
+            HashSet<ByteArrayKey> seen = canonical || length <= 2
+                ? null
+                : new HashSet<>(Math.min(length, 4));
+            Object previousFastKey = null;
+            boolean previousFastKeyPresent = false;
+            long seconds = 0;
+            long remainder = 0;
+            boolean secondsPresent = false;
+            boolean remainderPresent = false;
+            boolean invalid = length < 1 || length > 2;
+            for (int index = 0; index < length; index++) {
+                int keyStart = inputPosition();
+                int keyOffset = offset();
+                Object key = readValue(depth + 1);
+                int keyEnd = inputPosition();
+                if (canonical && previousStart >= 0) {
+                    int comparison = compareInputRanges(previousStart,
+                                                        previousEnd,
+                                                        keyStart,
+                                                        keyEnd);
+                    if (comparison == 0) {
+                        throw error(ErrorCode.DUPLICATE_KEY, keyOffset);
+                    }
+                    if (comparison > 0) {
+                        throw error(ErrorCode.NON_CANONICAL, keyOffset);
+                    }
+                } else if (!canonical && seen != null) {
+                    byte[] canonicalKey = encode(key, Mode.CANONICAL);
+                    if (!seen.add(new ByteArrayKey(canonicalKey))) {
+                        throw error(ErrorCode.DUPLICATE_KEY, keyOffset);
+                    }
+                } else if (!canonical) {
+                    if (previousFastKeyPresent) {
+                        boolean duplicate = previousFastKey instanceof Long
+                            && key instanceof Long
+                            ? previousFastKey.equals(key)
+                            : Arrays.equals(encode(previousFastKey,
+                                                  Mode.CANONICAL),
+                                            encode(key, Mode.CANONICAL));
+                        if (duplicate) {
+                            throw error(ErrorCode.DUPLICATE_KEY, keyOffset);
+                        }
+                    }
+                    previousFastKey = key;
+                    previousFastKeyPresent = true;
+                }
+                previousStart = keyStart;
+                previousEnd = keyEnd;
+                int componentHead = hasRemaining()
+                    ? inputByteAt(inputPosition())
+                    : -1;
+                int componentMajor = componentHead >>> 5;
+                if (Long.valueOf(1).equals(key)
+                    && (componentMajor == 0 || componentMajor == 1)) {
+                    seconds = readSignedInteger(depth + 1);
+                    secondsPresent = true;
+                } else if (Long.valueOf(-3).equals(key)
+                           && (componentMajor == 0 || componentMajor == 1)) {
+                    remainder = readSignedInteger(depth + 1);
+                    remainderPresent = true;
+                    if (remainder < 1 || remainder > 999) {
+                        invalid = true;
+                    }
+                } else {
+                    readValue(depth + 1);
+                    invalid = true;
+                }
+            }
+            if (invalid
+                || !secondsPresent
+                || length != 1 + (remainderPresent ? 1 : 0)) {
+                throw error(ErrorCode.INVALID_INSTANT, tagOffset);
+            }
+            long fraction = remainderPresent ? remainder : 0;
+            long minimumSeconds = Math.floorDiv(Long.MIN_VALUE, 1000);
+            long maximumSeconds = Math.floorDiv(Long.MAX_VALUE, 1000);
+            if (seconds < minimumSeconds
+                || seconds > maximumSeconds
+                || seconds == minimumSeconds
+                   && fraction < Math.floorMod(Long.MIN_VALUE, 1000)
+                || seconds == maximumSeconds
+                   && fraction > Math.floorMod(Long.MAX_VALUE, 1000)) {
+                throw error(ErrorCode.INVALID_INSTANT, tagOffset);
+            }
+            if (seconds == minimumSeconds) {
+                return new Date(Long.MIN_VALUE
+                                + fraction
+                                - Math.floorMod(Long.MIN_VALUE, 1000));
+            }
+            return new Date(seconds * 1000 + fraction);
+        }
+
+        private long readSignedInteger(int depth) {
+            if (depth > limits.maxDepth) {
+                throw error(ErrorCode.DEPTH_LIMIT, offset());
+            }
+            int headOffset = offset();
+            int head = readUnsignedByte();
+            int major = head >>> 5;
+            long value = argument(head & 0x1f, headOffset);
+            if (value > Long.MAX_VALUE) {
+                throw error(ErrorCode.INTEGER_OUT_OF_RANGE, headOffset);
+            }
+            return major == 0 ? value : ~value;
+        }
+
+        private Object readTypedArray(long tag, int tagOffset) {
+            int payloadHeadOffset = offset();
+            int payloadHead = readUnsignedByte();
+            if ((payloadHead >>> 5) != 2) {
+                throw error(ErrorCode.INVALID_TYPED_ARRAY, tagOffset);
+            }
+            int byteLength = length(payloadHead & 0x1f,
+                                    payloadHeadOffset,
+                                    limits.maxStringBytes,
+                                    ErrorCode.STRING_LIMIT);
+            int width = typedArrayWidth(tag);
+            if (byteLength % width != 0) {
+                throw error(ErrorCode.INVALID_TYPED_ARRAY, tagOffset);
+            }
+            int elementCount = byteLength / width;
+            if (elementCount > limits.maxCollectionLength) {
+                throw error(ErrorCode.COLLECTION_LIMIT, tagOffset);
+            }
+            require(byteLength);
+            int valueOffset = offset();
+            if (tag == TAG_UINT16_LE_ARRAY) {
+                char[] values = new char[elementCount];
+                for (int index = 0; index < elementCount; index++) {
+                    values[index] = (char) readLittleEndianUnsignedShort();
+                }
+                return values;
+            }
+            if (tag == TAG_SINT16_LE_ARRAY) {
+                short[] values = new short[elementCount];
+                for (int index = 0; index < elementCount; index++) {
+                    values[index] = (short) readLittleEndianUnsignedShort();
+                }
+                return values;
+            }
+            if (tag == TAG_SINT32_LE_ARRAY) {
+                int[] values = new int[elementCount];
+                for (int index = 0; index < elementCount; index++) {
+                    values[index] = readLittleEndianInt();
+                }
+                return values;
+            }
+            if (tag == TAG_SINT64_LE_ARRAY) {
+                long[] values = new long[elementCount];
+                for (int index = 0; index < elementCount; index++) {
+                    values[index] = readLittleEndianLong();
+                }
+                return values;
+            }
+            if (tag == TAG_FLOAT32_LE_ARRAY) {
+                float[] values = new float[elementCount];
+                for (int index = 0; index < elementCount; index++) {
+                    int bits = readLittleEndianInt();
+                    if (canonical
+                        && Float.isNaN(Float.intBitsToFloat(bits))
+                        && bits != CANONICAL_FLOAT_NAN) {
+                        throw error(ErrorCode.NON_CANONICAL,
+                                    valueOffset + index * width);
+                    }
+                    values[index] = Float.intBitsToFloat(bits);
+                }
+                return values;
+            }
+            if (tag == TAG_FLOAT64_LE_ARRAY) {
+                double[] values = new double[elementCount];
+                for (int index = 0; index < elementCount; index++) {
+                    long bits = readLittleEndianLong();
+                    if (canonical
+                        && Double.isNaN(Double.longBitsToDouble(bits))
+                        && bits != CANONICAL_DOUBLE_NAN) {
+                        throw error(ErrorCode.NON_CANONICAL,
+                                    valueOffset + index * width);
+                    }
+                    values[index] = Double.longBitsToDouble(bits);
+                }
+                return values;
+            }
+            throw new AssertionError("unreachable typed-array tag");
         }
 
         private Object readSet(int headOffset, int depth) {
@@ -1504,38 +2749,44 @@ public final class DLCbor {
                 throw error(ErrorCode.UNSUPPORTED_VALUE, headOffset);
             }
             int length = collectionLength(arrayHead & 0x1f, arrayHeadOffset);
-            ITransientCollection values = PersistentHashSet.EMPTY.asTransient();
-            HashSet<ByteArrayKey> seen = canonical
-                ? null
-                : new HashSet<>(Math.min(length, 1024));
+            ITransientSet values = (ITransientSet)
+                PersistentHashSet.EMPTY.asTransient();
+            HashSet<ByteArrayKey> seen = null;
             int previousStart = -1;
             int previousEnd = -1;
             for (int index = 0; index < length; index++) {
-                int valueStart = input.position();
+                int valueStart = inputPosition();
                 int valueOffset = offset();
                 Object value = readValue(depth + 1);
-                int valueEnd = input.position();
+                int valueEnd = inputPosition();
                 if (canonical && previousStart >= 0) {
-                    int comparison = compareCanonicalRanges(input,
-                                                              previousStart,
-                                                              previousEnd,
-                                                              valueStart,
-                                                              valueEnd);
+                    int comparison = compareInputRanges(previousStart,
+                                                        previousEnd,
+                                                        valueStart,
+                                                        valueEnd);
                     if (comparison == 0) {
                         throw error(ErrorCode.DUPLICATE_SET_MEMBER, valueOffset);
                     }
                     if (comparison > 0) {
                         throw error(ErrorCode.NON_CANONICAL, valueOffset);
                     }
-                } else if (!canonical) {
+                } else if (!canonical
+                           && !safeDecodedSetMemberEquality(value)) {
                     byte[] encoded = encode(value, Mode.CANONICAL);
+                    if (seen == null) {
+                        seen = new HashSet<>(Math.min(length, 1024));
+                    }
                     if (!seen.add(new ByteArrayKey(encoded))) {
                         throw error(ErrorCode.DUPLICATE_SET_MEMBER, valueOffset);
                     }
                 }
                 previousStart = valueStart;
                 previousEnd = valueEnd;
-                values = values.conj(value);
+                int previousCount = values.count();
+                values = (ITransientSet) values.conj(value);
+                if (values.count() == previousCount) {
+                    throw error(ErrorCode.DUPLICATE_SET_MEMBER, valueOffset);
+                }
             }
             return values.persistent();
         }
@@ -1679,12 +2930,12 @@ public final class DLCbor {
 
         private int readUnsignedByte() {
             require(1);
-            return input.get() & 0xff;
+            return nextUnsignedByte();
         }
 
         private int readUnsignedShort() {
             require(2);
-            return (readUnsignedByte() << 8) | readUnsignedByte();
+            return (nextUnsignedByte() << 8) | nextUnsignedByte();
         }
 
         private long readUnsignedInt() {
@@ -1693,29 +2944,143 @@ public final class DLCbor {
 
         private int readInt() {
             require(4);
-            return (readUnsignedByte() << 24)
-                | (readUnsignedByte() << 16)
-                | (readUnsignedByte() << 8)
-                | readUnsignedByte();
+            return (nextUnsignedByte() << 24)
+                | (nextUnsignedByte() << 16)
+                | (nextUnsignedByte() << 8)
+                | nextUnsignedByte();
         }
 
         private long readLong() {
             require(8);
-            return ((long) readUnsignedByte() << 56)
-                | ((long) readUnsignedByte() << 48)
-                | ((long) readUnsignedByte() << 40)
-                | ((long) readUnsignedByte() << 32)
-                | ((long) readUnsignedByte() << 24)
-                | ((long) readUnsignedByte() << 16)
-                | ((long) readUnsignedByte() << 8)
-                | readUnsignedByte();
+            return ((long) nextUnsignedByte() << 56)
+                | ((long) nextUnsignedByte() << 48)
+                | ((long) nextUnsignedByte() << 40)
+                | ((long) nextUnsignedByte() << 32)
+                | ((long) nextUnsignedByte() << 24)
+                | ((long) nextUnsignedByte() << 16)
+                | ((long) nextUnsignedByte() << 8)
+                | nextUnsignedByte();
+        }
+
+        private int readLittleEndianUnsignedShort() {
+            if (arrayInput != null) {
+                return nextUnsignedByte() | (nextUnsignedByte() << 8);
+            }
+            short value = input.getShort();
+            return Short.toUnsignedInt(littleEndian
+                                       ? value
+                                       : Short.reverseBytes(value));
+        }
+
+        private int readLittleEndianInt() {
+            if (arrayInput != null) {
+                return nextUnsignedByte()
+                    | (nextUnsignedByte() << 8)
+                    | (nextUnsignedByte() << 16)
+                    | (nextUnsignedByte() << 24);
+            }
+            int value = input.getInt();
+            return littleEndian ? value : Integer.reverseBytes(value);
+        }
+
+        private long readLittleEndianLong() {
+            if (arrayInput != null) {
+                return nextUnsignedByte()
+                    | ((long) nextUnsignedByte() << 8)
+                    | ((long) nextUnsignedByte() << 16)
+                    | ((long) nextUnsignedByte() << 24)
+                    | ((long) nextUnsignedByte() << 32)
+                    | ((long) nextUnsignedByte() << 40)
+                    | ((long) nextUnsignedByte() << 48)
+                    | ((long) nextUnsignedByte() << 56);
+            }
+            long value = input.getLong();
+            return littleEndian ? value : Long.reverseBytes(value);
         }
 
         private void require(int length) {
-            if (length < 0 || input.remaining() < length) {
+            int position = inputPosition();
+            if (length < 0) {
+                throw error(ErrorCode.TRUNCATED, offset());
+            }
+            if (activeLimit >= 0 && length > activeLimit - position) {
+                throw error(activeLimitCode, offset());
+            }
+            if (remaining() < length) {
                 throw error(ErrorCode.TRUNCATED, offset());
             }
         }
+
+        private int inputPosition() {
+            return arrayInput == null ? input.position() : arrayPosition;
+        }
+
+        private int remaining() {
+            return arrayInput == null
+                ? input.remaining()
+                : arrayLimit - arrayPosition;
+        }
+
+        private boolean hasRemaining() {
+            return remaining() != 0;
+        }
+
+        private int inputByteAt(int index) {
+            return (arrayInput == null ? input.get(index) : arrayInput[index])
+                & 0xff;
+        }
+
+        private int nextUnsignedByte() {
+            return (arrayInput == null ? input.get() : arrayInput[arrayPosition++])
+                & 0xff;
+        }
+
+        private void getBytes(byte[] output, int start, int length) {
+            if (arrayInput == null) {
+                input.get(output, start, length);
+            } else {
+                System.arraycopy(arrayInput, arrayPosition,
+                                 output, start, length);
+                arrayPosition += length;
+            }
+        }
+
+        private void validateInputUtf8(int start, int length, int errorOffset) {
+            if (arrayInput == null) {
+                validateUtf8(input, start, length, errorOffset);
+            } else {
+                validateUtf8(arrayInput, start, length, errorOffset);
+            }
+        }
+
+        private int compareInputRanges(int leftStart,
+                                       int leftEnd,
+                                       int rightStart,
+                                       int rightEnd) {
+            return arrayInput == null
+                ? compareCanonicalRanges(input, leftStart, leftEnd,
+                                         rightStart, rightEnd)
+                : compareCanonicalRanges(arrayInput, leftStart, leftEnd,
+                                         rightStart, rightEnd);
+        }
+    }
+
+    private static boolean rawByteStringTag(long tag) {
+        return tag == TAG_POSITIVE_BIGNUM || tag == TAG_NEGATIVE_BIGNUM
+            || tag == TAG_UUID || typedArrayWidth(tag) != 0;
+    }
+
+    private static int typedArrayWidth(long tag) {
+        if (tag == TAG_UINT16_LE_ARRAY || tag == TAG_SINT16_LE_ARRAY) {
+            return 2;
+        }
+        if (tag == TAG_SINT32_LE_ARRAY || tag == TAG_FLOAT32_LE_ARRAY) {
+            return 4;
+        }
+        if (tag == TAG_SINT64_LE_ARRAY || tag == TAG_FLOAT64_LE_ARRAY) {
+            return 8;
+        }
+        return 0;
     }
 
     private static List<?> pair(Object value,
@@ -1766,6 +3131,27 @@ public final class DLCbor {
         for (int index = 0; index < leftLength; index++) {
             int left = source.get(leftStart + index) & 0xff;
             int right = source.get(rightStart + index) & 0xff;
+            if (left != right) {
+                return Integer.compare(left, right);
+            }
+        }
+        return 0;
+    }
+
+    private static int compareCanonicalRanges(byte[] source,
+                                              int leftStart,
+                                              int leftEnd,
+                                              int rightStart,
+                                              int rightEnd) {
+        int leftLength = leftEnd - leftStart;
+        int rightLength = rightEnd - rightStart;
+        int length = Integer.compare(leftLength, rightLength);
+        if (length != 0) {
+            return length;
+        }
+        for (int index = 0; index < leftLength; index++) {
+            int left = source[leftStart + index] & 0xff;
+            int right = source[rightStart + index] & 0xff;
             if (left != right) {
                 return Integer.compare(left, right);
             }

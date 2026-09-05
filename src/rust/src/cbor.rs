@@ -15,7 +15,38 @@ const TAG_DECIMAL: u64 = 4;
 const TAG_RATIO: u64 = 30;
 const TAG_URI: u64 = 32;
 const TAG_UUID: u64 = 37;
+const TAG_UINT16_LE_ARRAY: u64 = 69;
+const TAG_SINT16_LE_ARRAY: u64 = 77;
+const TAG_SINT32_LE_ARRAY: u64 = 78;
+const TAG_SINT64_LE_ARRAY: u64 = 79;
+const TAG_FLOAT32_LE_ARRAY: u64 = 85;
+const TAG_FLOAT64_LE_ARRAY: u64 = 86;
 const TAG_SET: u64 = 258;
+const TAG_EXTENDED_TIME: u64 = 1001;
+
+/// Non-durable Phase 0 stand-in for the not-yet-assigned Datalevin extension
+/// tag. Draft fixtures use the same mnemonic `0x444c` value as the JVM codec.
+pub const DRAFT_EXTENSION_TAG: u64 = 0x444c;
+
+const EXT_KEYWORD: u64 = 1;
+const EXT_SYMBOL: u64 = 2;
+const EXT_CHARACTER: u64 = 3;
+const EXT_LIST: u64 = 4;
+const EXT_QUEUE: u64 = 5;
+const EXT_REGEX: u64 = 6;
+
+// Byte-string subtypes. FB/FC/FE reuse Datalevin's typed-data headers.
+const SUBTYPE_QUALIFIED_KEYWORD: u8 = 0xe0;
+const SUBTYPE_QUALIFIED_SYMBOL: u8 = 0xe1;
+const SUBTYPE_CHARACTER: u8 = 0xe2;
+const SUBTYPE_JAVA_REGEX: u8 = 0xe3;
+const SUBTYPE_KEYWORD: u8 = 0xfb;
+const SUBTYPE_SYMBOL: u8 = 0xfc;
+const SUBTYPE_BYTES: u8 = 0xfe;
+
+const REGEX_UNICODE_CASE: u16 = 0x0040;
+const REGEX_UNICODE_CHARACTER_CLASS: u16 = 0x0100;
+const REGEX_FLAGS: u16 = 0x017f;
 
 const CANONICAL_FLOAT32_NAN: u32 = 0x7fc0_0000;
 const CANONICAL_FLOAT64_NAN: u64 = 0x7ff8_0000_0000_0000;
@@ -44,6 +75,13 @@ impl From<i64> for Integer {
     }
 }
 
+/// Identifier for a neutral, non-executable Datalevin extension.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ExtensionId {
+    Integer(u64),
+    Name(String),
+}
+
 /// Neutral values covered by the initial shared corpus.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
@@ -67,6 +105,32 @@ pub enum Value {
     },
     Uri(String),
     Uuid([u8; 16]),
+    InstantMillis(i64),
+    Uint16Array(Vec<u16>),
+    Int16Array(Vec<i16>),
+    Int32Array(Vec<i32>),
+    Int64Array(Vec<i64>),
+    Float32Array(Vec<f32>),
+    Float64Array(Vec<f64>),
+    Keyword {
+        namespace: Option<String>,
+        name: String,
+    },
+    Symbol {
+        namespace: Option<String>,
+        name: String,
+    },
+    Character(u16),
+    List(Vec<Value>),
+    Queue(Vec<Value>),
+    Regex {
+        source: String,
+        flags: u16,
+    },
+    Extension {
+        type_id: ExtensionId,
+        arguments: Vec<Value>,
+    },
     Tagged {
         tag: u64,
         value: Box<Value>,
@@ -87,6 +151,7 @@ pub struct Limits {
     pub max_collection_len: usize,
     pub max_string_bytes: usize,
     pub max_bignum_bytes: usize,
+    pub max_extension_bytes: usize,
 }
 
 impl Default for Limits {
@@ -97,6 +162,7 @@ impl Default for Limits {
             max_collection_len: 1_000_000,
             max_string_bytes: 16 * 1024 * 1024,
             max_bignum_bytes: 4 * 1024,
+            max_extension_bytes: 16 * 1024 * 1024,
         }
     }
 }
@@ -123,7 +189,12 @@ pub enum ErrorKind {
     InvalidDecimal,
     InvalidRatio,
     InvalidUri,
+    InvalidRegex,
     InvalidUuid,
+    InvalidInstant,
+    InvalidTypedArray,
+    InvalidExtension,
+    ExtensionLimit,
     DuplicateKey,
     DuplicateSetMember,
     NonCanonical,
@@ -156,7 +227,12 @@ impl ErrorKind {
             Self::InvalidDecimal => "INVALID_DECIMAL",
             Self::InvalidRatio => "INVALID_RATIO",
             Self::InvalidUri => "INVALID_URI",
+            Self::InvalidRegex => "INVALID_REGEX",
             Self::InvalidUuid => "INVALID_UUID",
+            Self::InvalidInstant => "INVALID_INSTANT",
+            Self::InvalidTypedArray => "INVALID_TYPED_ARRAY",
+            Self::InvalidExtension => "INVALID_EXTENSION",
+            Self::ExtensionLimit => "EXTENSION_LIMIT",
             Self::DuplicateKey => "DUPLICATE_KEY",
             Self::DuplicateSetMember => "DUPLICATE_SET_MEMBER",
             Self::NonCanonical => "NON_CANONICAL",
@@ -312,6 +388,7 @@ pub fn decode_with_limits(input: &[u8], canonical: bool, limits: Limits) -> Resu
         position: 0,
         canonical,
         limits,
+        active_limit: None,
     };
     let value = decoder.value(0)?;
     if decoder.position != input.len() {
@@ -375,7 +452,8 @@ fn encode_value<W: Writer>(writer: &mut W, value: &Value, mode: Mode) -> Result<
             writer.put(&bits.to_be_bytes())
         }
         Value::Bytes(bytes) => {
-            encode_head(writer, 2, bytes.len() as u64)?;
+            encode_head(writer, 2, bytes.len() as u64 + 1)?;
+            writer.put_u8(SUBTYPE_BYTES)?;
             writer.put(bytes)
         }
         Value::Text(text) => {
@@ -424,11 +502,277 @@ fn encode_value<W: Writer>(writer: &mut W, value: &Value, mode: Mode) -> Result<
             encode_head(writer, 2, 16)?;
             writer.put(bytes)
         }
+        Value::InstantMillis(milliseconds) => encode_instant(writer, *milliseconds),
+        Value::Uint16Array(values) => {
+            encode_typed_array_head(writer, TAG_UINT16_LE_ARRAY, values.len(), 2)?;
+            for value in values {
+                writer.put(&value.to_le_bytes())?;
+            }
+            Ok(())
+        }
+        Value::Int16Array(values) => {
+            encode_typed_array_head(writer, TAG_SINT16_LE_ARRAY, values.len(), 2)?;
+            for value in values {
+                writer.put(&value.to_le_bytes())?;
+            }
+            Ok(())
+        }
+        Value::Int32Array(values) => {
+            encode_typed_array_head(writer, TAG_SINT32_LE_ARRAY, values.len(), 4)?;
+            for value in values {
+                writer.put(&value.to_le_bytes())?;
+            }
+            Ok(())
+        }
+        Value::Int64Array(values) => {
+            encode_typed_array_head(writer, TAG_SINT64_LE_ARRAY, values.len(), 8)?;
+            for value in values {
+                writer.put(&value.to_le_bytes())?;
+            }
+            Ok(())
+        }
+        Value::Float32Array(values) => {
+            encode_typed_array_head(writer, TAG_FLOAT32_LE_ARRAY, values.len(), 4)?;
+            for value in values {
+                let bits = if value.is_nan() {
+                    CANONICAL_FLOAT32_NAN
+                } else {
+                    value.to_bits()
+                };
+                writer.put(&bits.to_le_bytes())?;
+            }
+            Ok(())
+        }
+        Value::Float64Array(values) => {
+            encode_typed_array_head(writer, TAG_FLOAT64_LE_ARRAY, values.len(), 8)?;
+            for value in values {
+                let bits = if value.is_nan() {
+                    CANONICAL_FLOAT64_NAN
+                } else {
+                    value.to_bits()
+                };
+                writer.put(&bits.to_le_bytes())?;
+            }
+            Ok(())
+        }
+        Value::Keyword { namespace, name } => encode_named_value(
+            writer,
+            SUBTYPE_KEYWORD,
+            SUBTYPE_QUALIFIED_KEYWORD,
+            namespace.as_deref(),
+            name,
+        ),
+        Value::Symbol { namespace, name } => encode_named_value(
+            writer,
+            SUBTYPE_SYMBOL,
+            SUBTYPE_QUALIFIED_SYMBOL,
+            namespace.as_deref(),
+            name,
+        ),
+        Value::Character(value) => {
+            encode_head(writer, 2, if *value <= 0xff { 2 } else { 3 })?;
+            writer.put_u8(SUBTYPE_CHARACTER)?;
+            if *value > 0xff {
+                writer.put_u8((value >> 8) as u8)?;
+            }
+            writer.put_u8(*value as u8)
+        }
+        Value::List(values) => encode_sequence_extension(writer, EXT_LIST, values, mode),
+        Value::Queue(values) => encode_sequence_extension(writer, EXT_QUEUE, values, mode),
+        Value::Regex { source, flags } => {
+            validate_regex(source, *flags, writer.position())?;
+            let length = 1 + unsigned_varint_size(usize::from(*flags)) + source.len() as u64;
+            encode_head(writer, 2, length)?;
+            writer.put_u8(SUBTYPE_JAVA_REGEX)?;
+            encode_unsigned_varint(writer, usize::from(*flags))?;
+            writer.put(source.as_bytes())
+        }
+        Value::Extension { type_id, arguments } => {
+            let item_count = arguments
+                .len()
+                .checked_add(1)
+                .ok_or_else(|| Error::new(ErrorKind::LengthOutOfRange, writer.position()))?;
+            encode_extension_head(writer, item_count)?;
+            encode_extension_id(writer, type_id)?;
+            for argument in arguments {
+                encode_value(writer, argument, mode)?;
+            }
+            Ok(())
+        }
         Value::Tagged { tag, value } => {
+            if *tag == DRAFT_EXTENSION_TAG {
+                return Err(Error::new(ErrorKind::InvalidExtension, writer.position()));
+            }
             encode_head(writer, 6, *tag)?;
+            if (matches!(*tag, TAG_POSITIVE_BIGNUM | TAG_NEGATIVE_BIGNUM | TAG_UUID)
+                || typed_array_width(*tag).is_some())
+                && let Value::Bytes(bytes) = value.as_ref()
+            {
+                encode_head(writer, 2, bytes.len() as u64)?;
+                return writer.put(bytes);
+            }
             encode_value(writer, value, mode)
         }
     }
+}
+
+fn encode_instant<W: Writer>(writer: &mut W, milliseconds: i64) -> Result<()> {
+    let seconds = milliseconds.div_euclid(1000);
+    let remainder = milliseconds.rem_euclid(1000);
+    encode_head(writer, 6, TAG_EXTENDED_TIME)?;
+    encode_head(writer, 5, if remainder == 0 { 1 } else { 2 })?;
+    encode_i64(writer, 1)?;
+    encode_i64(writer, seconds)?;
+    if remainder != 0 {
+        encode_i64(writer, -3)?;
+        encode_i64(writer, remainder)?;
+    }
+    Ok(())
+}
+
+fn encode_extension_head<W: Writer>(writer: &mut W, item_count: usize) -> Result<()> {
+    encode_head(writer, 6, DRAFT_EXTENSION_TAG)?;
+    encode_head(writer, 4, item_count as u64)
+}
+
+fn encode_extension_id<W: Writer>(writer: &mut W, type_id: &ExtensionId) -> Result<()> {
+    match type_id {
+        ExtensionId::Integer(type_id) => {
+            if *type_id > i64::MAX as u64
+                || matches!(
+                    *type_id,
+                    EXT_KEYWORD | EXT_SYMBOL | EXT_CHARACTER | EXT_REGEX
+                )
+            {
+                return Err(Error::new(ErrorKind::InvalidExtension, writer.position()));
+            }
+            encode_head(writer, 0, *type_id)
+        }
+        ExtensionId::Name(type_id) => {
+            if type_id.is_empty() {
+                return Err(Error::new(ErrorKind::InvalidExtension, writer.position()));
+            }
+            validate_unicode(type_id)?;
+            encode_head(writer, 3, type_id.len() as u64)?;
+            writer.put(type_id.as_bytes())
+        }
+    }
+}
+
+fn encode_named_value<W: Writer>(
+    writer: &mut W,
+    subtype: u8,
+    qualified_subtype: u8,
+    namespace: Option<&str>,
+    name: &str,
+) -> Result<()> {
+    validate_unicode(name)?;
+    let mut length = 1 + name.len() as u64;
+    if let Some(namespace) = namespace {
+        validate_unicode(namespace)?;
+        if namespace.len() > i32::MAX as usize {
+            return Err(Error::new(ErrorKind::LengthOutOfRange, writer.position()));
+        }
+        length += namespace.len() as u64 + unsigned_varint_size(namespace.len());
+    }
+    encode_head(writer, 2, length)?;
+    writer.put_u8(if namespace.is_some() {
+        qualified_subtype
+    } else {
+        subtype
+    })?;
+    if let Some(namespace) = namespace {
+        encode_unsigned_varint(writer, namespace.len())?;
+        writer.put(namespace.as_bytes())?;
+    }
+    writer.put(name.as_bytes())
+}
+
+fn unsigned_varint_size(mut value: usize) -> u64 {
+    let mut length = 1;
+    while value >= 128 {
+        length += 1;
+        value >>= 7;
+    }
+    length
+}
+
+fn encode_unsigned_varint<W: Writer>(writer: &mut W, mut value: usize) -> Result<()> {
+    while value >= 128 {
+        writer.put_u8((value as u8 & 0x7f) | 0x80)?;
+        value >>= 7;
+    }
+    writer.put_u8(value as u8)
+}
+
+fn decode_unsigned_varint(
+    input: &[u8],
+    offset: usize,
+    missing_kind: ErrorKind,
+    overflow_kind: ErrorKind,
+) -> Result<(usize, usize)> {
+    let mut value = 0;
+    for (index, shift) in (0..=28).step_by(7).enumerate() {
+        let Some(&next) = input.get(index) else {
+            return Err(Error::new(missing_kind, offset));
+        };
+        if shift == 28 && next > 7 {
+            return Err(Error::new(overflow_kind, offset));
+        }
+        value |= usize::from(next & 0x7f) << shift;
+        if next & 0x80 == 0 {
+            if shift != 0 && next == 0 {
+                return Err(Error::new(ErrorKind::NonShortest, offset));
+            }
+            return Ok((value, index + 1));
+        }
+    }
+    unreachable!("bounded unsigned varint")
+}
+
+fn encode_sequence_extension<W: Writer>(
+    writer: &mut W,
+    type_id: u64,
+    values: &[Value],
+    mode: Mode,
+) -> Result<()> {
+    let item_count = values
+        .len()
+        .checked_add(1)
+        .ok_or_else(|| Error::new(ErrorKind::LengthOutOfRange, writer.position()))?;
+    encode_extension_head(writer, item_count)?;
+    encode_head(writer, 0, type_id)?;
+    for value in values {
+        encode_value(writer, value, mode)?;
+    }
+    Ok(())
+}
+
+fn validate_regex(source: &str, flags: u16, offset: usize) -> Result<()> {
+    validate_unicode(source)?;
+    validate_regex_flags(flags, offset)
+}
+
+fn validate_regex_flags(flags: u16, offset: usize) -> Result<()> {
+    if flags & !REGEX_FLAGS != 0
+        || flags & REGEX_UNICODE_CHARACTER_CLASS != 0 && flags & REGEX_UNICODE_CASE == 0
+    {
+        return Err(Error::new(ErrorKind::InvalidRegex, offset));
+    }
+    Ok(())
+}
+
+fn encode_typed_array_head<W: Writer>(
+    writer: &mut W,
+    tag: u64,
+    element_count: usize,
+    width: usize,
+) -> Result<()> {
+    let byte_length = element_count
+        .checked_mul(width)
+        .ok_or_else(|| Error::new(ErrorKind::LengthOutOfRange, writer.position()))?;
+    encode_head(writer, 6, tag)?;
+    encode_head(writer, 2, byte_length as u64)
 }
 
 fn encode_integer<W: Writer>(writer: &mut W, integer: &Integer) -> Result<()> {
@@ -733,6 +1077,7 @@ struct Decoder<'a> {
     position: usize,
     canonical: bool,
     limits: Limits,
+    active_limit: Option<(usize, ErrorKind)>,
 }
 
 impl Decoder<'_> {
@@ -760,10 +1105,7 @@ impl Decoder<'_> {
                 }
                 Ok(Value::int(!(argument as i64)))
             }
-            2 => {
-                let length = self.length(additional, head_offset, self.limits.max_string_bytes)?;
-                Ok(Value::Bytes(self.read(length)?.to_vec()))
-            }
+            2 => self.byte_string_value(additional, head_offset),
             3 => {
                 let length = self.length(additional, head_offset, self.limits.max_string_bytes)?;
                 let offset = self.position;
@@ -784,8 +1126,17 @@ impl Decoder<'_> {
             5 => self.map(additional, head_offset, depth),
             6 => {
                 let tag = self.argument(additional, head_offset)?;
+                if matches!(tag, TAG_POSITIVE_BIGNUM | TAG_NEGATIVE_BIGNUM | TAG_UUID) {
+                    return self.raw_byte_tag(tag, head_offset, depth + 1);
+                }
                 if tag == TAG_SET {
                     return self.set(head_offset, depth + 1);
+                }
+                if typed_array_width(tag).is_some() {
+                    return self.typed_array(tag, head_offset);
+                }
+                if tag == DRAFT_EXTENSION_TAG {
+                    return self.extension_with_limit(head_offset, depth + 1);
                 }
                 let value = self.value(depth + 1)?;
                 self.tagged(tag, value, head_offset)
@@ -793,6 +1144,127 @@ impl Decoder<'_> {
             7 => self.simple(additional, head_offset),
             _ => unreachable!(),
         }
+    }
+
+    fn byte_string_value(&mut self, additional: u8, head_offset: usize) -> Result<Value> {
+        let length = self.length(additional, head_offset, self.limits.max_string_bytes)?;
+        let payload_offset = self.position;
+        let extension_limit = self.limits.max_extension_bytes;
+        let payload = self.read(length)?;
+        let Some((&subtype, body)) = payload.split_first() else {
+            return Err(Error::new(ErrorKind::InvalidExtension, head_offset));
+        };
+        if subtype == SUBTYPE_BYTES {
+            return Ok(Value::Bytes(body.to_vec()));
+        }
+        if !matches!(
+            subtype,
+            SUBTYPE_KEYWORD
+                | SUBTYPE_SYMBOL
+                | SUBTYPE_QUALIFIED_KEYWORD
+                | SUBTYPE_QUALIFIED_SYMBOL
+                | SUBTYPE_CHARACTER
+                | SUBTYPE_JAVA_REGEX
+        ) {
+            return Err(Error::new(ErrorKind::InvalidExtension, head_offset));
+        }
+        if length > extension_limit {
+            return Err(Error::new(ErrorKind::ExtensionLimit, head_offset));
+        }
+        if subtype == SUBTYPE_CHARACTER {
+            let code_unit = match *body {
+                [value] => u16::from(value),
+                [0, _] => return Err(Error::new(ErrorKind::NonShortest, head_offset)),
+                [high, low] => u16::from_be_bytes([high, low]),
+                _ => return Err(Error::new(ErrorKind::InvalidExtension, head_offset)),
+            };
+            return Ok(Value::Character(code_unit));
+        }
+        if subtype == SUBTYPE_JAVA_REGEX {
+            let (flags, width) = decode_unsigned_varint(
+                body,
+                head_offset,
+                ErrorKind::InvalidRegex,
+                ErrorKind::InvalidRegex,
+            )?;
+            let flags = u16::try_from(flags)
+                .map_err(|_| Error::new(ErrorKind::InvalidRegex, head_offset))?;
+            validate_regex_flags(flags, head_offset)?;
+            let source = std::str::from_utf8(&body[width..])
+                .map_err(|_| Error::new(ErrorKind::InvalidUtf8, payload_offset + 1 + width))?;
+            return Ok(Value::Regex {
+                source: source.to_owned(),
+                flags,
+            });
+        }
+        let mut position = 1;
+        let namespace = if matches!(
+            subtype,
+            SUBTYPE_QUALIFIED_KEYWORD | SUBTYPE_QUALIFIED_SYMBOL
+        ) {
+            let (namespace_length, width) = decode_unsigned_varint(
+                body,
+                head_offset,
+                ErrorKind::InvalidExtension,
+                ErrorKind::LengthOutOfRange,
+            )?;
+            position += width;
+            if namespace_length > payload.len() - position {
+                return Err(Error::new(ErrorKind::InvalidExtension, head_offset));
+            }
+            let namespace = std::str::from_utf8(&payload[position..position + namespace_length])
+                .map_err(|_| Error::new(ErrorKind::InvalidUtf8, payload_offset + position))?;
+            position += namespace_length;
+            Some(namespace.to_owned())
+        } else {
+            None
+        };
+        let name = std::str::from_utf8(&payload[position..])
+            .map_err(|_| Error::new(ErrorKind::InvalidUtf8, payload_offset + position))?
+            .to_owned();
+        if matches!(subtype, SUBTYPE_KEYWORD | SUBTYPE_QUALIFIED_KEYWORD) {
+            Ok(Value::Keyword { namespace, name })
+        } else {
+            Ok(Value::Symbol { namespace, name })
+        }
+    }
+
+    // Standard tags own their byte-string contents: they carry no DL subtype.
+    fn raw_byte_tag(&mut self, tag: u64, tag_offset: usize, depth: usize) -> Result<Value> {
+        if depth > self.limits.max_depth {
+            return Err(Error::new(ErrorKind::DepthLimit, self.position));
+        }
+        let payload_offset = self.position;
+        let head = self.read_u8()?;
+        let kind = if tag == TAG_UUID {
+            ErrorKind::InvalidUuid
+        } else {
+            ErrorKind::InvalidBignum
+        };
+        if head >> 5 != 2 {
+            return Err(Error::new(kind, tag_offset));
+        }
+        let length = if tag == TAG_UUID {
+            self.length(head & 0x1f, payload_offset, self.limits.max_string_bytes)?
+        } else {
+            let length = self.argument(head & 0x1f, tag_offset)?;
+            if length > self.limits.max_bignum_bytes as u64 {
+                return Err(Error::new(ErrorKind::BignumLimit, tag_offset));
+            }
+            length as usize
+        };
+        let bytes = self.read(length)?;
+        if tag == TAG_UUID {
+            let bytes = bytes.try_into().map_err(|_| Error::new(kind, tag_offset))?;
+            return Ok(Value::Uuid(bytes));
+        }
+        validate_big_magnitude(bytes, tag_offset)?;
+        let magnitude = bytes.to_vec();
+        Ok(Value::Integer(if tag == TAG_POSITIVE_BIGNUM {
+            Integer::PositiveBig(magnitude)
+        } else {
+            Integer::NegativeBig(magnitude)
+        }))
     }
 
     fn map(&mut self, additional: u8, head_offset: usize, depth: usize) -> Result<Value> {
@@ -863,22 +1335,81 @@ impl Decoder<'_> {
         Ok(Value::Set(values))
     }
 
+    fn extension_with_limit(&mut self, tag_offset: usize, depth: usize) -> Result<Value> {
+        let previous_limit = self.active_limit;
+        let candidate = self
+            .position
+            .saturating_add(self.limits.max_extension_bytes);
+        if previous_limit.is_none_or(|(limit, _)| candidate < limit) {
+            self.active_limit = Some((candidate, ErrorKind::ExtensionLimit));
+        }
+        let result = self.extension(tag_offset, depth);
+        self.active_limit = previous_limit;
+        result
+    }
+
+    fn extension(&mut self, tag_offset: usize, depth: usize) -> Result<Value> {
+        if depth > self.limits.max_depth {
+            return Err(Error::new(ErrorKind::DepthLimit, self.position));
+        }
+        let array_offset = self.position;
+        let array_head = self.read_u8()?;
+        if array_head >> 5 != 4 {
+            return Err(Error::new(ErrorKind::InvalidExtension, tag_offset));
+        }
+        let length = self.length(
+            array_head & 0x1f,
+            array_offset,
+            self.limits.max_collection_len,
+        )?;
+        if length == 0 {
+            return Err(Error::new(ErrorKind::InvalidExtension, tag_offset));
+        }
+        self.ensure_extension_slots(length)?;
+        let raw_type_id = self.value(depth + 1)?;
+        let type_id = match raw_type_id {
+            Value::Integer(Integer::I64(value)) if value >= 0 => ExtensionId::Integer(value as u64),
+            Value::Text(value) if !value.is_empty() => ExtensionId::Name(value),
+            _ => return Err(Error::new(ErrorKind::InvalidExtension, tag_offset)),
+        };
+        let argument_count = length - 1;
+        match type_id {
+            ExtensionId::Integer(EXT_KEYWORD | EXT_SYMBOL | EXT_CHARACTER | EXT_REGEX) => {
+                Err(Error::new(ErrorKind::InvalidExtension, tag_offset))
+            }
+            ExtensionId::Integer(EXT_LIST) => Ok(Value::List(
+                self.extension_arguments(argument_count, depth)?,
+            )),
+            ExtensionId::Integer(EXT_QUEUE) => Ok(Value::Queue(
+                self.extension_arguments(argument_count, depth)?,
+            )),
+            type_id => Ok(Value::Extension {
+                type_id,
+                arguments: self.extension_arguments(argument_count, depth)?,
+            }),
+        }
+    }
+
+    fn extension_arguments(&mut self, count: usize, depth: usize) -> Result<Vec<Value>> {
+        self.ensure_extension_slots(count)?;
+        let mut arguments = Vec::with_capacity(count);
+        for _ in 0..count {
+            arguments.push(self.value(depth + 1)?);
+        }
+        Ok(arguments)
+    }
+
+    fn ensure_extension_slots(&self, count: usize) -> Result<()> {
+        if let Some((limit, kind)) = self.active_limit
+            && count > limit.saturating_sub(self.position)
+        {
+            return Err(Error::new(kind, self.position));
+        }
+        Ok(())
+    }
+
     fn tagged(&mut self, tag: u64, value: Value, offset: usize) -> Result<Value> {
         match tag {
-            TAG_POSITIVE_BIGNUM | TAG_NEGATIVE_BIGNUM => {
-                let Value::Bytes(magnitude) = value else {
-                    return Err(Error::new(ErrorKind::InvalidBignum, offset));
-                };
-                if magnitude.len() > self.limits.max_bignum_bytes {
-                    return Err(Error::new(ErrorKind::BignumLimit, offset));
-                }
-                validate_big_magnitude(&magnitude, offset)?;
-                if tag == TAG_POSITIVE_BIGNUM {
-                    Ok(Value::Integer(Integer::PositiveBig(magnitude)))
-                } else {
-                    Ok(Value::Integer(Integer::NegativeBig(magnitude)))
-                }
-            }
             TAG_DECIMAL => {
                 let [exponent, mantissa] = expect_pair(value, ErrorKind::InvalidDecimal, offset)?;
                 let Integer::I64(exponent) =
@@ -911,19 +1442,94 @@ impl Decoder<'_> {
                 }
                 Ok(Value::Uri(uri))
             }
-            TAG_UUID => {
-                let Value::Bytes(bytes) = value else {
-                    return Err(Error::new(ErrorKind::InvalidUuid, offset));
-                };
-                let bytes: [u8; 16] = bytes
-                    .try_into()
-                    .map_err(|_| Error::new(ErrorKind::InvalidUuid, offset))?;
-                Ok(Value::Uuid(bytes))
-            }
+            TAG_EXTENDED_TIME => decode_instant(value, offset),
             _ => Ok(Value::Tagged {
                 tag,
                 value: Box::new(value),
             }),
+        }
+    }
+
+    fn typed_array(&mut self, tag: u64, tag_offset: usize) -> Result<Value> {
+        let payload_offset = self.position;
+        let head = self.read_u8()?;
+        if head >> 5 != 2 {
+            return Err(Error::new(ErrorKind::InvalidTypedArray, tag_offset));
+        }
+        let byte_length = self.length(head & 0x1f, payload_offset, self.limits.max_string_bytes)?;
+        let width = typed_array_width(tag).expect("typed-array tag checked by caller");
+        if byte_length % width != 0 {
+            return Err(Error::new(ErrorKind::InvalidTypedArray, tag_offset));
+        }
+        let element_count = byte_length / width;
+        if element_count > self.limits.max_collection_len {
+            return Err(Error::new(ErrorKind::CollectionLimit, tag_offset));
+        }
+        let value_offset = self.position;
+        let canonical = self.canonical;
+        let bytes = self.read(byte_length)?;
+        match tag {
+            TAG_UINT16_LE_ARRAY => {
+                let (chunks, remainder) = bytes.as_chunks::<2>();
+                debug_assert!(remainder.is_empty());
+                Ok(Value::Uint16Array(
+                    chunks.iter().copied().map(u16::from_le_bytes).collect(),
+                ))
+            }
+            TAG_SINT16_LE_ARRAY => {
+                let (chunks, remainder) = bytes.as_chunks::<2>();
+                debug_assert!(remainder.is_empty());
+                Ok(Value::Int16Array(
+                    chunks.iter().copied().map(i16::from_le_bytes).collect(),
+                ))
+            }
+            TAG_SINT32_LE_ARRAY => {
+                let (chunks, remainder) = bytes.as_chunks::<4>();
+                debug_assert!(remainder.is_empty());
+                Ok(Value::Int32Array(
+                    chunks.iter().copied().map(i32::from_le_bytes).collect(),
+                ))
+            }
+            TAG_SINT64_LE_ARRAY => {
+                let (chunks, remainder) = bytes.as_chunks::<8>();
+                debug_assert!(remainder.is_empty());
+                Ok(Value::Int64Array(
+                    chunks.iter().copied().map(i64::from_le_bytes).collect(),
+                ))
+            }
+            TAG_FLOAT32_LE_ARRAY => {
+                let mut values = Vec::with_capacity(element_count);
+                let (chunks, remainder) = bytes.as_chunks::<4>();
+                debug_assert!(remainder.is_empty());
+                for (index, chunk) in chunks.iter().copied().enumerate() {
+                    let bits = u32::from_le_bytes(chunk);
+                    if canonical && f32::from_bits(bits).is_nan() && bits != CANONICAL_FLOAT32_NAN {
+                        return Err(Error::new(
+                            ErrorKind::NonCanonical,
+                            value_offset + index * 4,
+                        ));
+                    }
+                    values.push(f32::from_bits(bits));
+                }
+                Ok(Value::Float32Array(values))
+            }
+            TAG_FLOAT64_LE_ARRAY => {
+                let mut values = Vec::with_capacity(element_count);
+                let (chunks, remainder) = bytes.as_chunks::<8>();
+                debug_assert!(remainder.is_empty());
+                for (index, chunk) in chunks.iter().copied().enumerate() {
+                    let bits = u64::from_le_bytes(chunk);
+                    if canonical && f64::from_bits(bits).is_nan() && bits != CANONICAL_FLOAT64_NAN {
+                        return Err(Error::new(
+                            ErrorKind::NonCanonical,
+                            value_offset + index * 8,
+                        ));
+                    }
+                    values.push(f64::from_bits(bits));
+                }
+                Ok(Value::Float64Array(values))
+            }
+            _ => unreachable!(),
         }
     }
 
@@ -995,11 +1601,7 @@ impl Decoder<'_> {
     }
 
     fn read_u8(&mut self) -> Result<u8> {
-        let Some(value) = self.input.get(self.position).copied() else {
-            return Err(Error::new(ErrorKind::Truncated, self.position));
-        };
-        self.position += 1;
-        Ok(value)
+        Ok(self.read(1)?[0])
     }
 
     fn read(&mut self, length: usize) -> Result<&[u8]> {
@@ -1007,6 +1609,11 @@ impl Decoder<'_> {
             .position
             .checked_add(length)
             .ok_or_else(|| Error::new(ErrorKind::LengthOutOfRange, self.position))?;
+        if let Some((limit, kind)) = self.active_limit
+            && end > limit
+        {
+            return Err(Error::new(kind, self.position));
+        }
         let Some(bytes) = self.input.get(self.position..end) else {
             return Err(Error::new(ErrorKind::Truncated, self.position));
         };
@@ -1019,6 +1626,54 @@ impl Decoder<'_> {
             .try_into()
             .map_err(|_| Error::new(ErrorKind::Truncated, self.position))
     }
+}
+
+fn typed_array_width(tag: u64) -> Option<usize> {
+    match tag {
+        TAG_UINT16_LE_ARRAY | TAG_SINT16_LE_ARRAY => Some(2),
+        TAG_SINT32_LE_ARRAY | TAG_FLOAT32_LE_ARRAY => Some(4),
+        TAG_SINT64_LE_ARRAY | TAG_FLOAT64_LE_ARRAY => Some(8),
+        _ => None,
+    }
+}
+
+fn decode_instant(value: Value, offset: usize) -> Result<Value> {
+    let Value::Map(entries) = value else {
+        return Err(Error::new(ErrorKind::InvalidInstant, offset));
+    };
+    let entry_count = entries.len();
+    if !(1..=2).contains(&entry_count) {
+        return Err(Error::new(ErrorKind::InvalidInstant, offset));
+    }
+    let mut seconds = None;
+    let mut remainder = None;
+    for (key, value) in entries {
+        match key {
+            Value::Integer(Integer::I64(1)) => {
+                let Value::Integer(Integer::I64(value)) = value else {
+                    return Err(Error::new(ErrorKind::InvalidInstant, offset));
+                };
+                seconds = Some(value);
+            }
+            Value::Integer(Integer::I64(-3)) => {
+                let Value::Integer(Integer::I64(value @ 1..=999)) = value else {
+                    return Err(Error::new(ErrorKind::InvalidInstant, offset));
+                };
+                remainder = Some(value);
+            }
+            _ => return Err(Error::new(ErrorKind::InvalidInstant, offset)),
+        }
+    }
+    let Some(seconds) = seconds else {
+        return Err(Error::new(ErrorKind::InvalidInstant, offset));
+    };
+    if entry_count != 1 + usize::from(remainder.is_some()) {
+        return Err(Error::new(ErrorKind::InvalidInstant, offset));
+    }
+    let milliseconds = i128::from(seconds) * 1000 + i128::from(remainder.unwrap_or(0));
+    let milliseconds =
+        i64::try_from(milliseconds).map_err(|_| Error::new(ErrorKind::InvalidInstant, offset))?;
+    Ok(Value::InstantMillis(milliseconds))
 }
 
 fn expect_pair(value: Value, kind: ErrorKind, offset: usize) -> Result<[Value; 2]> {
@@ -1048,6 +1703,14 @@ mod tests {
     const MALFORMED: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../resources/datalevin/cbor/v1/malformed-vectors.tsv"
+    ));
+    const DRAFT_EXTENSIONS: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../resources/datalevin/cbor/v1/draft-extension-vectors.tsv"
+    ));
+    const DRAFT_EXTENSION_MALFORMED: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../resources/datalevin/cbor/v1/draft-extension-malformed-vectors.tsv"
     ));
 
     fn arbitrary_big_magnitude() -> BoxedStrategy<Vec<u8>> {
@@ -1152,15 +1815,64 @@ mod tests {
             .boxed()
     }
 
+    fn arbitrary_keyword() -> BoxedStrategy<Value> {
+        (any::<bool>(), arbitrary_text(), arbitrary_text())
+            .prop_map(|(qualified, namespace, name)| Value::Keyword {
+                namespace: qualified.then_some(namespace),
+                name,
+            })
+            .boxed()
+    }
+
+    fn arbitrary_symbol() -> BoxedStrategy<Value> {
+        (any::<bool>(), arbitrary_text(), arbitrary_text())
+            .prop_map(|(qualified, namespace, name)| Value::Symbol {
+                namespace: qualified.then_some(namespace),
+                name,
+            })
+            .boxed()
+    }
+
+    fn arbitrary_regex() -> BoxedStrategy<Value> {
+        let source = prop::collection::vec(0_u8..62, 0..32).prop_map(|values| {
+            values
+                .into_iter()
+                .map(|value| match value {
+                    0..=9 => char::from(b'0' + value),
+                    10..=35 => char::from(b'a' + value - 10),
+                    _ => char::from(b'A' + value - 36),
+                })
+                .collect()
+        });
+        (
+            source,
+            prop::sample::select(vec![0_u16, 1, 2, 4, 8, 16, 32, 64, 320, 383]),
+        )
+            .prop_map(|(source, flags)| Value::Regex { source, flags })
+            .boxed()
+    }
+
     fn arbitrary_map_key() -> BoxedStrategy<Value> {
         prop_oneof![
             Just(Value::Null),
             any::<bool>().prop_map(Value::Bool),
             arbitrary_integer().prop_map(Value::Integer),
             arbitrary_text().prop_map(Value::Text),
+            arbitrary_keyword(),
+            arbitrary_symbol(),
+            any::<u16>().prop_map(Value::Character),
             prop::collection::vec(any::<u8>(), 0..32).prop_map(Value::Bytes),
             any::<[u8; 16]>().prop_map(Value::Uuid),
             arbitrary_uri().prop_map(Value::Uri),
+        ]
+        .boxed()
+    }
+
+    fn arbitrary_extension_id() -> BoxedStrategy<ExtensionId> {
+        prop_oneof![
+            Just(ExtensionId::Integer(0)),
+            (7_u64..=i64::MAX as u64).prop_map(ExtensionId::Integer),
+            Just(ExtensionId::Name("org.example/generated".into())),
         ]
         .boxed()
     }
@@ -1190,21 +1902,40 @@ mod tests {
             any::<u64>().prop_map(|bits| Value::Float64(f64::from_bits(bits))),
             prop::collection::vec(any::<u8>(), 0..64).prop_map(Value::Bytes),
             arbitrary_text().prop_map(Value::Text),
+            arbitrary_keyword(),
+            arbitrary_symbol(),
+            any::<u16>().prop_map(Value::Character),
+            arbitrary_regex(),
             arbitrary_decimal(),
             arbitrary_ratio(),
             arbitrary_uri().prop_map(Value::Uri),
             any::<[u8; 16]>().prop_map(Value::Uuid),
+            any::<i64>().prop_map(Value::InstantMillis),
+            prop::collection::vec(any::<u16>(), 0..32).prop_map(Value::Uint16Array),
+            prop::collection::vec(any::<i16>(), 0..32).prop_map(Value::Int16Array),
+            prop::collection::vec(any::<i32>(), 0..32).prop_map(Value::Int32Array),
+            prop::collection::vec(any::<i64>(), 0..32).prop_map(Value::Int64Array),
+            prop::collection::vec(any::<u32>(), 0..32).prop_map(|bits| Value::Float32Array(
+                bits.into_iter().map(f32::from_bits).collect()
+            )),
+            prop::collection::vec(any::<u64>(), 0..32).prop_map(|bits| Value::Float64Array(
+                bits.into_iter().map(f64::from_bits).collect()
+            )),
         ];
 
         leaf.prop_recursive(4, 64, 8, |inner| {
             prop_oneof![
                 prop::collection::vec(inner.clone(), 0..6).prop_map(Value::Array),
+                prop::collection::vec(inner.clone(), 0..6).prop_map(Value::List),
+                prop::collection::vec(inner.clone(), 0..6).prop_map(Value::Queue),
                 prop::collection::vec((arbitrary_map_key(), inner.clone()), 0..6)
                     .prop_map(deduplicate_entries)
                     .prop_map(Value::Map),
-                prop::collection::vec(inner, 0..8)
+                prop::collection::vec(inner.clone(), 0..8)
                     .prop_map(deduplicate_values)
                     .prop_map(Value::Set),
+                (arbitrary_extension_id(), prop::collection::vec(inner, 0..4))
+                    .prop_map(|(type_id, arguments)| Value::Extension { type_id, arguments }),
             ]
         })
         .boxed()
@@ -1315,6 +2046,7 @@ mod tests {
                 max_collection_len: 64,
                 max_string_bytes: 128,
                 max_bignum_bytes: 128,
+                max_extension_bytes: 128,
             };
             let result = std::panic::catch_unwind(|| decode_with_limits(&input, true, limits));
             prop_assert!(result.is_ok(), "decoder panicked for input {input:02x?}");
@@ -1363,7 +2095,151 @@ mod tests {
             assert_value_eq(&value, &decoded_storage, id);
             count += 1;
         }
-        assert_eq!(45, count);
+        assert_eq!(59, count);
+    }
+
+    #[test]
+    fn draft_extension_corpus_round_trips() {
+        let mut count = 0;
+        for line in DRAFT_EXTENSIONS
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+        {
+            let columns: Vec<_> = line.split('\t').collect();
+            assert_eq!(8, columns.len(), "invalid draft fixture row: {line}");
+            let id = columns[0];
+            let expected = hex_decode(columns[4]);
+            let expected_storage = hex_decode(columns[5]);
+            let value = fixture_value(id);
+
+            assert_eq!(expected, encode(&value, Mode::Canonical).unwrap(), "{id}");
+            assert_eq!(
+                expected.len(),
+                encoded_len(&value, Mode::Canonical).unwrap(),
+                "{id}"
+            );
+            let mut output = vec![0; expected.len()];
+            assert_eq!(
+                expected.len(),
+                encode_into(&value, Mode::Canonical, &mut output).unwrap(),
+                "{id}"
+            );
+            assert_eq!(expected, output, "{id}");
+
+            let decoded = decode(&expected, true).unwrap();
+            assert_value_eq(&value, &decoded, id);
+            assert_eq!(expected, encode(&decoded, Mode::Canonical).unwrap(), "{id}");
+            assert_eq!(
+                expected_storage,
+                encode_storage(&value, Mode::Canonical).unwrap(),
+                "{id}"
+            );
+            assert_value_eq(
+                &value,
+                &decode_storage(&expected_storage, true).unwrap(),
+                id,
+            );
+            count += 1;
+        }
+        assert_eq!(50, count);
+    }
+
+    #[test]
+    fn extension_writer_rejects_unportable_identifiers() {
+        for id in [EXT_KEYWORD, EXT_SYMBOL, EXT_CHARACTER, EXT_REGEX] {
+            let retired = Value::Extension {
+                type_id: ExtensionId::Integer(id),
+                arguments: vec![Value::Text("a".into())],
+            };
+            for mode in [Mode::Canonical, Mode::Fast] {
+                assert_eq!(
+                    ErrorKind::InvalidExtension,
+                    encode(&retired, mode).unwrap_err().kind
+                );
+            }
+        }
+        let too_large = Value::Extension {
+            type_id: ExtensionId::Integer(i64::MAX as u64 + 1),
+            arguments: vec![],
+        };
+        assert_eq!(
+            ErrorKind::InvalidExtension,
+            encode(&too_large, Mode::Canonical).unwrap_err().kind
+        );
+
+        let empty_name = Value::Extension {
+            type_id: ExtensionId::Name(String::new()),
+            arguments: vec![],
+        };
+        assert_eq!(
+            ErrorKind::InvalidExtension,
+            encode(&empty_name, Mode::Canonical).unwrap_err().kind
+        );
+
+        let canon_eq_regex = Value::Regex {
+            source: "a".into(),
+            flags: 0x80,
+        };
+        assert_eq!(
+            ErrorKind::InvalidRegex,
+            encode(&canon_eq_regex, Mode::Canonical).unwrap_err().kind
+        );
+    }
+
+    #[test]
+    fn named_value_varint_boundaries() {
+        for length in [127, 128, 16383, 16384] {
+            for value in [
+                Value::Keyword {
+                    namespace: Some("x".repeat(length)),
+                    name: "λ\0/😀".into(),
+                },
+                Value::Symbol {
+                    namespace: Some("x".repeat(length)),
+                    name: "λ\0/😀".into(),
+                },
+            ] {
+                for mode in [Mode::Canonical, Mode::Fast] {
+                    let encoded = encode(&value, mode).unwrap();
+                    assert_value_eq(&value, &decode(&encoded, true).unwrap(), "varint boundary");
+                    let mut buffer = vec![0; encoded_len(&value, mode).unwrap()];
+                    assert_eq!(
+                        buffer.len(),
+                        encode_into(&value, mode, &mut buffer).unwrap()
+                    );
+                    assert_eq!(encoded, buffer);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tagged_byte_payload_context() {
+        for (tag, payload, expected) in [
+            (2, "8000000000000000", "c2488000000000000000"),
+            (3, "8000000000000000", "c3488000000000000000"),
+            (
+                37,
+                "fbfcfee0e1000102030405060708090a",
+                "d82550fbfcfee0e1000102030405060708090a",
+            ),
+            (69, "fbfc", "d84542fbfc"),
+            (10000, "fb61", "d9271043fefb61"),
+        ] {
+            let value = Value::Tagged {
+                tag,
+                value: Box::new(Value::Bytes(hex_decode(payload))),
+            };
+            for mode in [Mode::Canonical, Mode::Fast] {
+                let encoded = encode(&value, mode).unwrap();
+                assert_eq!(hex_decode(expected), encoded);
+                assert_eq!(encoded.len(), encoded_len(&value, mode).unwrap());
+                assert_eq!(
+                    encoded,
+                    encode(&decode(&encoded, true).unwrap(), mode).unwrap()
+                );
+            }
+        }
     }
 
     #[test]
@@ -1389,7 +2265,35 @@ mod tests {
             assert_eq!(expected, error.kind.code(), "{id}");
             count += 1;
         }
-        assert_eq!(53, count);
+        assert_eq!(68, count);
+    }
+
+    #[test]
+    fn draft_extension_malformed_corpus_has_exact_error_agreement() {
+        let mut count = 0;
+        for line in DRAFT_EXTENSION_MALFORMED
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+        {
+            let columns: Vec<_> = line.split('\t').collect();
+            assert_eq!(5, columns.len(), "invalid draft malformed row: {line}");
+            let [id, operation, hex, expected, _note]: [&str; 5] = columns.try_into().unwrap();
+            let input = hex_decode(hex);
+            let error = match operation {
+                "canonical" => decode(&input, true),
+                "fast" => decode(&input, false),
+                "storage" => decode_storage(&input, true),
+                "limit-input" | "limit-depth" | "limit-collection" | "limit-string"
+                | "limit-bignum" | "limit-extension" => {
+                    decode_with_limits(&input, true, malformed_limits(operation))
+                }
+                _ => panic!("unknown malformed fixture operation {operation}: {id}"),
+            }
+            .expect_err(id);
+            assert_eq!(expected, error.kind.code(), "{id}");
+            count += 1;
+        }
+        assert_eq!(64, count);
     }
 
     fn malformed_limits(operation: &str) -> Limits {
@@ -1403,6 +2307,7 @@ mod tests {
                 limits.max_string_bytes = 64;
                 limits.max_bignum_bytes = 8;
             }
+            "limit-extension" => limits.max_extension_bytes = 4,
             _ => unreachable!(),
         }
         limits
@@ -1444,8 +2349,23 @@ mod tests {
             ErrorKind::UnnecessaryStorageEscape,
             decode_storage(&[0xff, 0x00], true).unwrap_err().kind
         );
-        let mut limits = Limits::default();
-        limits.max_string_bytes = 2;
+        let noncanonical_array_nan = hex_decode("d855440100c07f");
+        assert_eq!(
+            ErrorKind::NonCanonical,
+            decode(&noncanonical_array_nan, true).unwrap_err().kind
+        );
+        assert_eq!(
+            hex_decode("d855440000c07f"),
+            encode(
+                &decode(&noncanonical_array_nan, false).unwrap(),
+                Mode::Canonical
+            )
+            .unwrap()
+        );
+        let limits = Limits {
+            max_string_bytes: 2,
+            ..Limits::default()
+        };
         assert_eq!(
             ErrorKind::StringLimit,
             decode_storage_with_limits(&[0x63, b'a', b'b', b'c'], true, limits)
@@ -1595,6 +2515,197 @@ mod tests {
             },
             "uri-https" => Value::Uri("https://example.com".into()),
             "uuid-sequence" => Value::Uuid([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]),
+            "instant-epoch" => Value::InstantMillis(0),
+            "instant-positive-millis" => Value::InstantMillis(1234),
+            "instant-negative-millis" => Value::InstantMillis(-1),
+            "instant-int64-min" => Value::InstantMillis(i64::MIN),
+            "instant-int64-max" => Value::InstantMillis(i64::MAX),
+            "uint16-array" => Value::Uint16Array(vec![0, 0x03bb, 0xd800, 0xffff]),
+            "int16-array" => Value::Int16Array(vec![i16::MIN, -1, 0, i16::MAX]),
+            "int32-array" => Value::Int32Array(vec![i32::MIN, -1, 0, i32::MAX]),
+            "int64-array" => Value::Int64Array(vec![i64::MIN, -1, 0, i64::MAX]),
+            "float32-array" => {
+                Value::Float32Array(vec![1.5, -0.0, f32::INFINITY, f32::from_bits(0x7fc0_0001)])
+            }
+            "float64-array" => Value::Float64Array(vec![
+                1.5,
+                -0.0,
+                f64::NEG_INFINITY,
+                f64::from_bits(0x7ff8_0000_0000_0001),
+            ]),
+            "bytes-subtype-collisions" => Value::Bytes(vec![0xfb, 0xfc, 0xfe, 0xe0, 0xe1, 0]),
+            "bytes-length-22" => Value::Bytes(vec![97; 22]),
+            "bytes-length-23" => Value::Bytes(vec![97; 23]),
+            "keyword-qualified-example" => Value::Keyword {
+                namespace: Some("user".into()),
+                name: "id".into(),
+            },
+            "keyword-empty-name" => Value::Keyword {
+                namespace: None,
+                name: "".into(),
+            },
+            "keyword-qualified-empty-name" => Value::Keyword {
+                namespace: Some("ns".into()),
+                name: "".into(),
+            },
+            "keyword-empty-parts" => Value::Keyword {
+                namespace: Some("".into()),
+                name: "".into(),
+            },
+            "keyword-unqualified-slash" => Value::Keyword {
+                namespace: None,
+                name: "user/id".into(),
+            },
+            "keyword-embedded-nul" => Value::Keyword {
+                namespace: Some("n\0s".into()),
+                name: "a\0b".into(),
+            },
+            "keyword-unqualified-nul" => Value::Keyword {
+                namespace: None,
+                name: "a\0b".into(),
+            },
+            "keyword-unicode" => Value::Keyword {
+                namespace: Some("λ".into()),
+                name: "😀".into(),
+            },
+            "keyword-namespace-127" => Value::Keyword {
+                namespace: Some("x".repeat(127)),
+                name: "a".into(),
+            },
+            "keyword-namespace-128" => Value::Keyword {
+                namespace: Some("x".repeat(128)),
+                name: "a".into(),
+            },
+            "symbol-empty-name" => Value::Symbol {
+                namespace: None,
+                name: "".into(),
+            },
+            "symbol-empty-namespace" => Value::Symbol {
+                namespace: Some("".into()),
+                name: "a".into(),
+            },
+            "symbol-embedded-nul" => Value::Symbol {
+                namespace: Some("n\0s".into()),
+                name: "a\0b".into(),
+            },
+            "symbol-unqualified-slash" => Value::Symbol {
+                namespace: None,
+                name: "user/id".into(),
+            },
+            "symbol-unicode" => Value::Symbol {
+                namespace: Some("λ".into()),
+                name: "😀".into(),
+            },
+            "symbol-namespace-128" => Value::Symbol {
+                namespace: Some("x".repeat(128)),
+                name: "a".into(),
+            },
+            "keyword-name-22" => Value::Keyword {
+                namespace: None,
+                name: "a".repeat(22),
+            },
+            "keyword-name-23" => Value::Keyword {
+                namespace: None,
+                name: "a".repeat(23),
+            },
+            "keyword-unqualified" => Value::Keyword {
+                namespace: None,
+                name: "a".into(),
+            },
+            "keyword-qualified" => Value::Keyword {
+                namespace: Some("ns".into()),
+                name: "a".into(),
+            },
+            "keyword-empty-namespace" => Value::Keyword {
+                namespace: Some(String::new()),
+                name: "a".into(),
+            },
+            "symbol-unqualified" => Value::Symbol {
+                namespace: None,
+                name: "a".into(),
+            },
+            "symbol-qualified" => Value::Symbol {
+                namespace: Some("ns".into()),
+                name: "a".into(),
+            },
+            "character-zero" => Value::Character(0),
+            "character-byte-max" => Value::Character(0x00ff),
+            "character-two-byte-min" => Value::Character(0x0100),
+            "character-max" => Value::Character(0xffff),
+            "character-low-surrogate" => Value::Character(0xdc00),
+            "character-ascii" => Value::Character(0x0061),
+            "character-surrogate" => Value::Character(0xd800),
+            "list-empty" => Value::List(vec![]),
+            "list-mixed" => Value::List(vec![Value::int(1), Value::Text("a".into())]),
+            "queue-mixed" => Value::Queue(vec![Value::int(1), Value::Text("a".into())]),
+            "regex-empty" => Value::Regex {
+                source: "".into(),
+                flags: 0,
+            },
+            "regex-unicode" => Value::Regex {
+                source: "λ😀".into(),
+                flags: 2,
+            },
+            "regex-embedded-nul" => Value::Regex {
+                source: "a\0b".into(),
+                flags: 0,
+            },
+            "regex-source-21" => Value::Regex {
+                source: "a".repeat(21),
+                flags: 0,
+            },
+            "regex-source-22" => Value::Regex {
+                source: "a".repeat(22),
+                flags: 0,
+            },
+            "regex-no-flags" => Value::Regex {
+                source: "a+".into(),
+                flags: 0,
+            },
+            "regex-unix-lines" => Value::Regex {
+                source: "a".into(),
+                flags: 1,
+            },
+            "regex-case-insensitive" => Value::Regex {
+                source: "a".into(),
+                flags: 2,
+            },
+            "regex-comments" => Value::Regex {
+                source: "a".into(),
+                flags: 4,
+            },
+            "regex-multiline" => Value::Regex {
+                source: "a".into(),
+                flags: 8,
+            },
+            "regex-literal" => Value::Regex {
+                source: "a".into(),
+                flags: 16,
+            },
+            "regex-dotall" => Value::Regex {
+                source: "a".into(),
+                flags: 32,
+            },
+            "regex-unicode-case" => Value::Regex {
+                source: "a".into(),
+                flags: 64,
+            },
+            "regex-unicode-character-class" => Value::Regex {
+                source: "\\w+".into(),
+                flags: 320,
+            },
+            "regex-all-supported-flags" => Value::Regex {
+                source: "a".into(),
+                flags: 383,
+            },
+            "extension-unknown-integer" => Value::Extension {
+                type_id: ExtensionId::Integer(42),
+                arguments: vec![Value::int(1), Value::Null],
+            },
+            "extension-unknown-name" => Value::Extension {
+                type_id: ExtensionId::Name("org.example/x".into()),
+                arguments: vec![Value::int(1), Value::Null],
+            },
             _ => panic!("fixture has no Rust value: {id}"),
         }
     }
@@ -1603,7 +2714,10 @@ mod tests {
         match (expected, actual) {
             (Value::Float32(left), Value::Float32(right)) if left.is_nan() && right.is_nan() => {}
             (Value::Float64(left), Value::Float64(right)) if left.is_nan() && right.is_nan() => {}
-            (Value::Map(_), Value::Map(_)) | (Value::Set(_), Value::Set(_)) => assert_eq!(
+            (Value::Float32Array(_), Value::Float32Array(_))
+            | (Value::Float64Array(_), Value::Float64Array(_))
+            | (Value::Map(_), Value::Map(_))
+            | (Value::Set(_), Value::Set(_)) => assert_eq!(
                 encode(expected, Mode::Canonical).unwrap(),
                 encode(actual, Mode::Canonical).unwrap(),
                 "{id}"

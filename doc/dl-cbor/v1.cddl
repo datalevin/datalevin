@@ -1,0 +1,100 @@
+; DL-CBOR v1, Phase 0 draft.
+; Deterministic ordering, shortest forms, duplicate rejection, and resource
+; limits are normative prose constraints in v1.md and cannot be expressed by
+; this grammar alone.
+
+dl-value =
+    null
+  / bool
+  / dl-int
+  / dl-bigint
+  / float32
+  / float64
+  / dl-byte-string
+  / tstr
+  / dl-vector
+  / dl-map
+  / dl-decimal
+  / dl-ratio
+  / dl-set
+  / dl-uri
+  / dl-uuid
+  / dl-instant
+  / dl-uint16-array
+  / dl-sint16-array
+  / dl-sint32-array
+  / dl-sint64-array
+  / dl-float32-array
+  / dl-float64-array
+  / draft-dl-extension
+
+dl-int = -9223372036854775808..9223372036854775807
+
+; At a DL value position, every byte string has a subtype. The payload byte
+; grammar is defined in v1.md section 2.1 (not nested CBOR):
+;   FB / FC: UTF-8 unqualified keyword / symbol name
+;   E0 / E1: shortest unsigned LEB128 namespace byte length, UTF-8 namespace,
+;            UTF-8 name (qualified keyword / symbol)
+;   E2: one or two big-endian bytes holding an unsigned UTF-16 code unit,
+;       with shortest width (zero occupies one byte)
+;   E3: shortest unsigned LEB128 Java Pattern flags, UTF-8 source. Legal flags
+;       are bits 0 through 6 and bit 8, with bit 8 implying bit 6.
+;   FE: arbitrary raw bytes
+; Empty byte strings and other subtypes are invalid. Standard-tag payload
+; bstr below is raw and does not carry a DL subtype.
+dl-byte-string = bstr .size (1..)
+
+; Magnitudes are minimally encoded big-endian unsigned integers, have no
+; leading zero, and represent a value outside the signed 64-bit range.
+dl-bigint = #6.2(bstr) / #6.3(bstr)
+
+; Decimal inputs are normalized: no redundant trailing decimal zero and one
+; representation for zero. Exponent is constrained to signed 32-bit range.
+dl-decimal = #6.4([exponent: int, mantissa: int / dl-bigint])
+
+; Denominator is positive and numerator/denominator are reduced.
+dl-ratio = #6.30([
+  numerator: int / dl-bigint,
+  denominator: uint / #6.2(bstr)
+])
+
+dl-vector = [* dl-value]
+dl-map = {* dl-value => dl-value}
+dl-set = #6.258([* dl-value])
+dl-uri = #6.32(tstr)
+dl-uuid = #6.37(bstr .size 16)
+
+; Restricted RFC 9581 extended time: integer POSIX seconds plus an optional
+; positive millisecond remainder. Other tag-1001 map keys are not in v1.
+dl-instant = #6.1001({
+  1: int,
+  ? -3: 1..999
+})
+
+; RFC 8746 little-endian typed arrays. Payload lengths are multiples of the
+; element width and element counts are subject to the collection limit.
+dl-uint16-array = #6.69(bstr)
+dl-sint16-array = #6.77(bstr)
+dl-sint32-array = #6.78(bstr)
+dl-sint64-array = #6.79(bstr)
+dl-float32-array = #6.85(bstr)
+dl-float64-array = #6.86(bstr)
+
+; Phase 0 only. Tag 17484 (0x444c) is an unassigned, non-durable stand-in.
+; Replace it with the assigned tag and regenerate every tagged vector before
+; this branch becomes normative.
+draft-dl-extension = #6.17484(
+    draft-list
+  / draft-queue
+  / draft-open-extension
+)
+
+draft-list = [4, * dl-value]
+draft-queue = [5, * dl-value]
+
+; Integer IDs 1, 2, 3 and 6 are retired and rejected; IDs 4 and 5 are above.
+; Open integer IDs are kept within
+; signed 64-bit range for exact JVM/Rust agreement. Text IDs are non-empty,
+; globally unique names selected by their defining specification.
+draft-open-extension = [draft-open-extension-id, * dl-value]
+draft-open-extension-id = 0 / 7..9223372036854775807 / (tstr .size (1..))

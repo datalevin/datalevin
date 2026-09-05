@@ -8,6 +8,7 @@ pub const FUZZ_LIMITS: Limits = Limits {
     max_collection_len: 4 * 1024,
     max_string_bytes: 64 * 1024,
     max_bignum_bytes: 4 * 1024,
+    max_extension_bytes: 64 * 1024,
 };
 
 pub fn verify_value(value: &Value) -> Vec<u8> {

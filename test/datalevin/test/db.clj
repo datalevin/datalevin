@@ -10,6 +10,7 @@
    [datalevin.kv :as kv]
    [datalevin.lmdb :as l]
    [datalevin.query.plan :as qplan]
+   [datalevin.storage :as s]
    [datalevin.util :as u :refer [defrecord-updatable]])
   (:import
    [java.lang Thread$State]
@@ -36,6 +37,186 @@
 
 (deftest test-defrecord-updatable
   (is (= 0xBEEF (-> (map->HashBeef {:x :ignored}) hash))))
+
+(deftest giant-id-refreshes-once-after-acquiring-write-lock
+  (binding [c/*db-background-sampling?* false]
+    (doseq [wal? [false true]]
+      (testing (str "wal=" wal?)
+        (let [dir       (u/tmp-dir (str "giant-id-boundary-" (UUID/randomUUID)))
+              conn-a    (d/create-conn dir {:item/data {} :item/text {}}
+                                       {:wal? wal?})
+              conn-b    (d/create-conn dir)
+              value     (fn [n] {:body (.repeat "x" 1000) :revision n})
+              refresh   @#'s/init-max-gt
+              refreshes (atom [])]
+          (try
+            (d/with-transaction [cn conn-a]
+              (d/transact! cn [{:db/id 1 :item/data (value 0)
+                               :item/text (.repeat "y" 1000)}]))
+            (is (< (i/max-gt (:store @conn-b)) (i/max-gt (:store @conn-a))))
+            (with-redefs-fn
+              {#'s/init-max-gt
+               (fn [lmdb]
+                 (swap! refreshes conj [(Thread/holdsLock (l/write-txn lmdb))
+                                       (l/writing? lmdb)])
+                 (refresh lmdb))}
+              (fn []
+                (d/with-transaction [cn conn-b]
+                  ;; The stale allocator is refreshed before the user body runs.
+                  (is (= [[true true]] @refreshes))
+                  (is (= (i/max-gt (:store @conn-a))
+                         (i/max-gt (:store @cn))))
+                  (d/transact! cn [{:db/id 1 :item/data (value 1)}])
+                  (d/with-transaction [nested cn]
+                    (d/transact! nested [{:db/id 1 :item/data (value 2)}]))
+                  (d/update-schema cn {:item/text {:db/valueType :db.type/string}})
+                  (is (= [[true true]] @refreshes)))
+                (is (= [[true true]] @refreshes))
+                (reset! refreshes [])
+                (d/transact! conn-b [{:db/id 1 :item/data (value 3)}])
+                (is (= 1 (count @refreshes)))
+                (is (true? (ffirst @refreshes)))
+                (reset! refreshes [])
+                (d/with-transaction [cn conn-b]
+                  (is (= [[true true]] @refreshes))
+                  (d/transact! cn [{:db/id 1 :item/data (value 4)}]))
+                (is (= [[true true]] @refreshes))
+                ;; Server transactions open the KV transaction separately.
+                (reset! refreshes [])
+                (let [store (:store @conn-b)
+                      lmdb  (d/datalog-kv conn-b)
+                      wlmdb (locking (l/write-txn lmdb)
+                              (i/open-transact-kv lmdb))]
+                  (try
+                    (let [wstore (s/transfer store wlmdb)]
+                      (is (= [[true true]] @refreshes))
+                      (s/transfer wstore wlmdb)
+                      (is (= [[true true]] @refreshes)))
+                    (finally
+                      (i/abort-transact-kv lmdb)
+                      (i/close-transact-kv lmdb))))))
+            (is (= (value 4) (:item/data (d/entity @conn-b 1))))
+            (is (= (.repeat "y" 1000) (:item/text (d/entity @conn-b 1))))
+            (finally
+              (d/close conn-b)
+              (d/close conn-a)
+              (u/delete-files dir))))))))
+
+(deftest large-map-updates-through-multiple-connections
+  (binding [c/*db-background-sampling?* false]
+    (doseq [wal? [false true]
+            explicit? [false true]]
+      (testing (str "wal=" wal? ", explicit=" explicit?)
+        (let [dir     (u/tmp-dir (str "shared-giants-" (UUID/randomUUID)))
+              schema  {:item/name {:db/valueType :db.type/string}
+                       :item/data {}}
+              value   (fn [n] {:body (.repeat "x" 1000) :revision n})
+              conn-a  (d/create-conn dir schema {:wal? wal?})
+              conn-b  (d/create-conn dir)
+              conn-c  (volatile! nil)
+              write!  (fn [conn n]
+                        (let [tx [{:db/id 1 :item/data (value n)}]]
+                          (if explicit?
+                            (d/with-transaction [cn conn]
+                              (d/transact! cn tx))
+                            (d/transact! conn tx))))]
+          (try
+            (try
+              (d/transact! conn-a [{:db/id 1 :item/name "one"}
+                                  {:db/id 2 :item/name "two"}])
+              (d/with-transaction [cn conn-a]
+                (d/transact! cn [{:db/id 1 :item/data (value 0)}
+                                {:db/id 2 :item/data (value -1)}]))
+              (write! conn-b 1)
+              (write! conn-a 2)
+              ;; Opening another connection must not revive an old allocator.
+              (vreset! conn-c (d/create-conn dir))
+              (write! @conn-c 3)
+              (testing "aborted allocations cannot cause a later collision"
+                (d/with-transaction [cn conn-a]
+                  (d/transact! cn [{:db/id 1 :item/data (value 100)}])
+                  (d/abort-transact cn))
+                (is (= (value 3) (:item/data (d/entity @conn-b 1))))
+                (write! conn-b 4))
+              (testing "failed transactions preserve the committed values"
+                (is (thrown-with-msg?
+                      clojure.lang.ExceptionInfo #"rollback giant update"
+                      (d/with-transaction [cn conn-a]
+                        (d/transact! cn [{:db/id 1 :item/data (value 101)}])
+                        (throw (ex-info "rollback giant update" {})))))
+                (is (= (value 4) (:item/data (d/entity @conn-b 1))))
+                (write! @conn-c 5))
+              (doseq [conn [conn-a conn-b @conn-c]]
+                (is (= (value 5) (:item/data (d/entity @conn 1))))
+                (is (= (value -1) (:item/data (d/entity @conn 2))))
+                (is (= 1 (count (d/datoms @conn :eav 1 :item/data)))))
+              (finally
+                (when @conn-c (d/close @conn-c))
+                (d/close conn-b)
+                (d/close conn-a)))
+            (with-open [^java.io.Closeable conn (d/create-conn dir)]
+              (is (= (value 5) (:item/data (d/entity @conn 1))))
+              (is (= (value -1) (:item/data (d/entity @conn 2)))))
+            (finally
+              (u/delete-files dir))))))))
+
+(deftest concurrent-large-map-transactions-use-distinct-ids
+  (binding [c/*db-background-sampling?* false]
+    (doseq [wal? [false true]]
+      (let [dir    (u/tmp-dir (str "concurrent-giants-" (UUID/randomUUID)))
+            conn-a (d/create-conn dir {:item/data {}} {:wal? wal?})
+            conn-b (d/create-conn dir)
+            value  (fn [e n] {:body (.repeat "x" 1000) :entity e :revision n})
+            start  (CountDownLatch. 1)
+            run!   (fn [conn e]
+                     (future
+                       (.await start)
+                       (dotimes [n 10]
+                         (d/with-transaction [cn conn]
+                           (d/transact! cn [{:db/id e :item/data (value e n)}])
+                           (d/transact! cn [{:db/id e :item/data (value e (inc n))}])))
+                       :done))]
+        (try
+          (d/transact! conn-a [{:db/id 1 :item/data (value 1 -1)}
+                              {:db/id 2 :item/data (value 2 -1)}])
+          (let [a (run! conn-a 1)
+                b (run! conn-b 2)]
+            (.countDown start)
+            (try
+              (is (= :done (deref a 10000 ::timeout)))
+              (is (= :done (deref b 10000 ::timeout)))
+              (finally
+                (future-cancel a)
+                (future-cancel b))))
+          (is (= (value 1 10) (:item/data (d/entity @conn-a 1))))
+          (is (= (value 2 10) (:item/data (d/entity @conn-a 2))))
+          (is (= 2 (d/entries (d/datalog-kv conn-a) c/giants)))
+          (finally
+            (.countDown start)
+            (d/close conn-b)
+            (d/close conn-a)
+            (u/delete-files dir)))))))
+
+(deftest schema-migration-refreshes-large-value-ids
+  (binding [c/*db-background-sampling?* false]
+    (let [dir    (u/tmp-dir (str "migrate-shared-giants-" (UUID/randomUUID)))
+          conn-a (d/create-conn dir {:item/data {}})
+          conn-b (d/create-conn dir)
+          value  (.repeat "x" 1000)]
+      (try
+        (d/with-transaction [cn conn-a]
+          (d/transact! cn [{:db/id 1 :item/data value}
+                          {:db/id 2 :item/data (str value "2")}]))
+        (d/update-schema conn-b {:item/data {:db/valueType :db.type/string}})
+        (is (= value (:item/data (d/entity @conn-b 1))))
+        (is (= (str value "2") (:item/data (d/entity @conn-b 2))))
+        (d/transact! conn-b [{:db/id 1 :item/data (str value "3")}])
+        (is (= (str value "3") (:item/data (d/entity @conn-b 1))))
+        (is (= 2 (d/entries (d/datalog-kv conn-b) c/giants)))
+        (finally
+          (d/close conn-b)
+          (d/close conn-a)
+          (u/delete-files dir))))))
 
 (deftest deterministic-sample-cache-key-includes-seed
   (let [cache-key

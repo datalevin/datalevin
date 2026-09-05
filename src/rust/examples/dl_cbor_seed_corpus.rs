@@ -7,9 +7,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut arguments = env::args_os().skip(1);
     let golden = required_path(&mut arguments, "golden vectors")?;
     let malformed = required_path(&mut arguments, "malformed vectors")?;
+    let draft_extensions = required_path(&mut arguments, "draft extension vectors")?;
+    let draft_extension_malformed =
+        required_path(&mut arguments, "draft extension malformed vectors")?;
     let output = required_path(&mut arguments, "output directory")?;
     if arguments.next().is_some() {
-        return Err("usage: dl_cbor_seed_corpus GOLDEN MALFORMED OUTPUT".into());
+        return Err(usage().into());
     }
 
     let bare = output.join("bare");
@@ -19,24 +22,28 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut bare_count = 0;
     let mut storage_count = 0;
-    for columns in rows(&golden, 8)? {
-        let id = safe_id(&columns[0])?;
-        write_seed(&bare, &format!("valid-{id}"), &columns[4])?;
-        write_seed(&storage, &format!("valid-{id}"), &columns[5])?;
-        bare_count += 1;
-        storage_count += 1;
-    }
-    for columns in rows(&malformed, 5)? {
-        let id = safe_id(&columns[0])?;
-        let operation = &columns[1];
-        let directory = if operation == "storage" {
-            storage_count += 1;
-            &storage
-        } else {
+    for path in [&golden, &draft_extensions] {
+        for columns in rows(path, 8)? {
+            let id = safe_id(&columns[0])?;
+            write_seed(&bare, &format!("valid-{id}"), &columns[4])?;
+            write_seed(&storage, &format!("valid-{id}"), &columns[5])?;
             bare_count += 1;
-            &bare
-        };
-        write_seed(directory, &format!("invalid-{id}"), &columns[2])?;
+            storage_count += 1;
+        }
+    }
+    for path in [&malformed, &draft_extension_malformed] {
+        for columns in rows(path, 5)? {
+            let id = safe_id(&columns[0])?;
+            let operation = &columns[1];
+            let directory = if operation == "storage" {
+                storage_count += 1;
+                &storage
+            } else {
+                bare_count += 1;
+                &bare
+            };
+            write_seed(directory, &format!("invalid-{id}"), &columns[2])?;
+        }
     }
 
     println!(
@@ -50,9 +57,15 @@ fn required_path(
     arguments: &mut impl Iterator<Item = std::ffi::OsString>,
     name: &str,
 ) -> Result<PathBuf, Box<dyn Error>> {
-    arguments.next().map(PathBuf::from).ok_or_else(|| {
-        format!("missing {name}; usage: dl_cbor_seed_corpus GOLDEN MALFORMED OUTPUT").into()
-    })
+    arguments
+        .next()
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("missing {name}; {}", usage()).into())
+}
+
+fn usage() -> &'static str {
+    "usage: dl_cbor_seed_corpus GOLDEN MALFORMED DRAFT_EXTENSIONS \
+DRAFT_EXTENSION_MALFORMED OUTPUT"
 }
 
 fn rows(path: &Path, width: usize) -> Result<Vec<Vec<String>>, Box<dyn Error>> {
@@ -99,8 +112,10 @@ fn decode_hex(hex: &str) -> Result<Vec<u8>, Box<dyn Error>> {
     if !hex.len().is_multiple_of(2) {
         return Err(format!("odd hex length: {hex}").into());
     }
-    hex.as_bytes()
-        .chunks_exact(2)
+    let (pairs, remainder) = hex.as_bytes().as_chunks::<2>();
+    debug_assert!(remainder.is_empty());
+    pairs
+        .iter()
         .map(|pair| {
             let high = hex_nibble(pair[0])?;
             let low = hex_nibble(pair[1])?;
