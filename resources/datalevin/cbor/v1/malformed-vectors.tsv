@@ -67,3 +67,28 @@ text-string-limit	limit-string	63616263	STRING_LIMIT	text string exceeds the two
 typed-array-string-limit	limit-string	d84543000000	STRING_LIMIT	typed-array payload exceeds the two-byte string limit
 typed-array-collection-limit	limit-collection	d84546000000000000	COLLECTION_LIMIT	typed array exceeds the two-item collection limit
 bignum-limit	limit-bignum	c249010000000000000000	BIGNUM_LIMIT	magnitude exceeds the eight-byte test limit
+boolean-array-missing-padding-canonical	canonical	41fd	INVALID_TYPED_ARRAY	Packed boolean arrays require a padding-count byte.
+boolean-array-missing-padding-fast	fast	41fd	INVALID_TYPED_ARRAY	Packed boolean arrays require a padding-count byte.
+boolean-array-padding-range-canonical	canonical	43fd0800	INVALID_TYPED_ARRAY	Padding count must be in 0..7.
+boolean-array-padding-range-fast	fast	43fd0800	INVALID_TYPED_ARRAY	Padding count must be in 0..7.
+boolean-array-padding-unsigned-canonical	canonical	43fdff00	INVALID_TYPED_ARRAY	Padding is an unsigned byte, not a signed sentinel.
+boolean-array-padding-unsigned-fast	fast	43fdff00	INVALID_TYPED_ARRAY	Padding is an unsigned byte, not a signed sentinel.
+boolean-array-empty-padding-canonical	canonical	42fd01	INVALID_TYPED_ARRAY	Empty boolean arrays have zero padding.
+boolean-array-empty-padding-fast	fast	42fd01	INVALID_TYPED_ARRAY	Empty boolean arrays have zero padding.
+boolean-array-nonzero-padding-canonical	canonical	43fd0702	INVALID_TYPED_ARRAY	Unused high bits must be zero.
+boolean-array-nonzero-padding-fast	fast	43fd0702	INVALID_TYPED_ARRAY	Unused high bits must be zero.
+boolean-array-high-bit-padding-canonical	canonical	43fd0180	INVALID_TYPED_ARRAY	Bit 7 is padding in a seven-element array.
+boolean-array-high-bit-padding-fast	fast	43fd0180	INVALID_TYPED_ARRAY	Bit 7 is padding in a seven-element array.
+boolean-array-truncated-canonical	canonical	43fd07	TRUNCATED	Declared byte-string payload is incomplete.
+boolean-array-truncated-fast	fast	43fd07	TRUNCATED	Declared byte-string payload is incomplete.
+boolean-array-trailing-canonical	canonical	42fd0000	TRAILING_BYTES	Trailing item after an empty boolean array.
+boolean-array-trailing-fast	fast	42fd0000	TRAILING_BYTES	Trailing item after an empty boolean array.
+boolean-array-duplicate-set-canonical	canonical	d901028242fd0042fd00	DUPLICATE_SET_MEMBER	Distinct host arrays with identical bits are duplicate members.
+boolean-array-duplicate-set-fast	fast	d901028242fd0042fd00	DUPLICATE_SET_MEMBER	Distinct host arrays with identical bits are duplicate members.
+boolean-array-duplicate-map-canonical	canonical	a242fd000042fd0001	DUPLICATE_KEY	Distinct host arrays with identical bits are duplicate keys.
+boolean-array-duplicate-map-fast	fast	a242fd000042fd0001	DUPLICATE_KEY	Distinct host arrays with identical bits are duplicate keys.
+boolean-array-nonshortest	canonical	5802fd00	NON_SHORTEST	Use the shortest outer byte-string length.
+boolean-array-set-order	canonical	d901028243fd070143fd0700	NON_CANONICAL	False array precedes true array in canonical order.
+boolean-array-count-limit	limit-collection	43fd0500	COLLECTION_LIMIT	Three unpacked elements exceed the two-element limit.
+boolean-array-string-limit	limit-string	43fd0700	STRING_LIMIT	The byte-string payload exceeds the two-byte limit.
+boolean-array-extension-limit	limit-extension	45fd00000000	EXTENSION_LIMIT	The subtype plus padding and packed payload exceed the four-byte limit.

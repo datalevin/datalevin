@@ -123,7 +123,7 @@ fn generated_value(seed: u64) -> Value {
 }
 
 fn generated_value_at(random: &mut DeterministicRng, depth: usize) -> Value {
-    let alternatives = if depth >= 4 { 24 } else { 30 };
+    let alternatives = if depth >= 4 { 25 } else { 31 };
     match random.bounded(alternatives) {
         0 => Value::Null,
         1 => Value::Bool(random.next_u64() & 1 != 0),
@@ -179,24 +179,29 @@ fn generated_value_at(random: &mut DeterministicRng, depth: usize) -> Value {
         },
         22 => Value::Character(random.next_u64() as u16),
         23 => random_regex(random),
-        24 => Value::Array(
+        24 => Value::BooleanArray(
+            (0..random.bounded(257))
+                .map(|_| random.next_u64() & 1 != 0)
+                .collect(),
+        ),
+        25 => Value::Array(
             (0..random.bounded(7))
                 .map(|_| generated_value_at(random, depth + 1))
                 .collect(),
         ),
-        25 => random_map(random, depth),
-        26 => random_set(random, depth),
-        27 => Value::List(
+        26 => random_map(random, depth),
+        27 => random_set(random, depth),
+        28 => Value::List(
             (0..random.bounded(7))
                 .map(|_| generated_value_at(random, depth + 1))
                 .collect(),
         ),
-        28 => Value::Queue(
+        29 => Value::Queue(
             (0..random.bounded(7))
                 .map(|_| generated_value_at(random, depth + 1))
                 .collect(),
         ),
-        29 => Value::Extension {
+        30 => Value::Extension {
             type_id: ExtensionId::Name("org.example/generated".into()),
             arguments: (0..random.bounded(5))
                 .map(|_| generated_value_at(random, depth + 1))

@@ -81,7 +81,7 @@ public final class DLCbor {
     private static final long EXT_QUEUE = 5;
     private static final long EXT_REGEX = 6;
 
-    // Subtypes inside DL-CBOR byte strings. FB, FC and FE reuse typed-data
+    // Subtypes inside DL-CBOR byte strings. FB, FC, FD and FE reuse typed-data
     // headers; E0/E1 distinguish qualified names without a separator scan.
     private static final int SUBTYPE_QUALIFIED_KEYWORD = 0xe0;
     private static final int SUBTYPE_QUALIFIED_SYMBOL = 0xe1;
@@ -89,6 +89,7 @@ public final class DLCbor {
     private static final int SUBTYPE_JAVA_REGEX = 0xe3;
     private static final int SUBTYPE_KEYWORD = 0xfb;
     private static final int SUBTYPE_SYMBOL = 0xfc;
+    private static final int SUBTYPE_BOOLEANS = 0xfd;
     private static final int SUBTYPE_BYTES = 0xfe;
 
     private static final int REGEX_FLAGS = Pattern.UNIX_LINES
@@ -1061,6 +1062,10 @@ public final class DLCbor {
             int length = checkedSize(1, bytes.length);
             return checkedSize(headSize(length), length);
         }
+        if (value instanceof boolean[] values) {
+            int length = booleanPayloadSize(values.length);
+            return checkedSize(headSize(length), length);
+        }
         if (value instanceof char[] values) {
             return typedArraySize(TAG_UINT16_LE_ARRAY, values.length, 2);
         }
@@ -1353,6 +1358,8 @@ public final class DLCbor {
             writeHead(sink, 2, checkedSize(1, bytes.length));
             sink.putByte(SUBTYPE_BYTES);
             sink.putBytes(bytes);
+        } else if (value instanceof boolean[] values) {
+            writeBooleans(sink, values);
         } else if (value instanceof char[] values) {
             writeTypedArrayHead(sink, TAG_UINT16_LE_ARRAY, values.length, 2);
             sink.putCharsLittleEndian(values);
@@ -1446,6 +1453,38 @@ public final class DLCbor {
             throw error(ErrorCode.UNSUPPORTED_VALUE, sink.position());
         } else {
             throw error(ErrorCode.UNSUPPORTED_VALUE, sink.position());
+        }
+    }
+
+    private static int booleanPayloadSize(int length) {
+        return checkedSize(2, length / 8, length % 8 == 0 ? 0 : 1);
+    }
+
+    private static void writeBooleans(Sink sink, boolean[] values) {
+        int padding = (8 - values.length % 8) % 8;
+        writeHead(sink, 2, booleanPayloadSize(values.length));
+        sink.putByte(SUBTYPE_BOOLEANS);
+        sink.putByte(padding);
+        int index = 0;
+        int complete = values.length & ~7;
+        while (index < complete) {
+            int bits = (values[index] ? 1 : 0)
+                | (values[index + 1] ? 2 : 0)
+                | (values[index + 2] ? 4 : 0)
+                | (values[index + 3] ? 8 : 0)
+                | (values[index + 4] ? 16 : 0)
+                | (values[index + 5] ? 32 : 0)
+                | (values[index + 6] ? 64 : 0)
+                | (values[index + 7] ? 128 : 0);
+            sink.putByte(bits);
+            index += 8;
+        }
+        if (padding != 0) {
+            int bits = 0;
+            for (int bit = 0; index < values.length; bit++, index++) {
+                bits |= (values[index] ? 1 : 0) << bit;
+            }
+            sink.putByte(bits);
         }
     }
 
@@ -2301,11 +2340,15 @@ public final class DLCbor {
             if (subtype != SUBTYPE_KEYWORD && subtype != SUBTYPE_SYMBOL
                 && subtype != SUBTYPE_QUALIFIED_KEYWORD
                 && subtype != SUBTYPE_QUALIFIED_SYMBOL
-                && subtype != SUBTYPE_CHARACTER && subtype != SUBTYPE_JAVA_REGEX) {
+                && subtype != SUBTYPE_CHARACTER && subtype != SUBTYPE_JAVA_REGEX
+                && subtype != SUBTYPE_BOOLEANS) {
                 throw error(ErrorCode.INVALID_EXTENSION, headOffset);
             }
             if (length > limits.maxExtensionBytes) {
                 throw error(ErrorCode.EXTENSION_LIMIT, headOffset);
+            }
+            if (subtype == SUBTYPE_BOOLEANS) {
+                return readBooleans(length, headOffset);
             }
             if (subtype == SUBTYPE_CHARACTER) {
                 if (length != 2 && length != 3) {
@@ -2396,6 +2439,48 @@ public final class DLCbor {
             byte[] bytes = decodeBytes(length);
             getBytes(bytes, 0, length);
             return new String(bytes, 0, length, StandardCharsets.UTF_8);
+        }
+
+        private boolean[] readBooleans(int length, int headOffset) {
+            // The byte-string dispatcher has already bounded the full payload.
+            if (length < 2) {
+                throw error(ErrorCode.INVALID_TYPED_ARRAY, headOffset);
+            }
+            int padding = nextUnsignedByte();
+            int payload = length - 2;
+            if (padding > 7 || payload == 0 && padding != 0) {
+                throw error(ErrorCode.INVALID_TYPED_ARRAY, headOffset);
+            }
+            long count = (long) payload * 8 - padding;
+            if (count > limits.maxCollectionLength) {
+                throw error(ErrorCode.COLLECTION_LIMIT, headOffset);
+            }
+            if (padding != 0
+                && (inputByteAt(inputPosition() + payload - 1) >>> (8 - padding)) != 0) {
+                throw error(ErrorCode.INVALID_TYPED_ARRAY, headOffset);
+            }
+            boolean[] values = new boolean[(int) count];
+            int index = 0;
+            int complete = values.length & ~7;
+            while (index < complete) {
+                int bits = nextUnsignedByte();
+                values[index] = (bits & 1) != 0;
+                values[index + 1] = (bits & 2) != 0;
+                values[index + 2] = (bits & 4) != 0;
+                values[index + 3] = (bits & 8) != 0;
+                values[index + 4] = (bits & 16) != 0;
+                values[index + 5] = (bits & 32) != 0;
+                values[index + 6] = (bits & 64) != 0;
+                values[index + 7] = (bits & 128) != 0;
+                index += 8;
+            }
+            if (padding != 0) {
+                int bits = nextUnsignedByte();
+                for (int bit = 0; index < values.length; bit++, index++) {
+                    values[index] = (bits & (1 << bit)) != 0;
+                }
+            }
+            return values;
         }
 
         private PersistentVector readArray(int additional,

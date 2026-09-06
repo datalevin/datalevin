@@ -33,6 +33,9 @@ dl-int = -9223372036854775808..9223372036854775807
 ; At a DL value position, every byte string has a subtype. The payload byte
 ; grammar is defined in v1.md section 2.1 (not nested CBOR):
 ;   FB / FC: UTF-8 unqualified keyword / symbol name
+;   FD: padding-count byte (0..7), then LSB-first packed boolean bits.
+;       Unused high bits are zero; empty arrays have zero padding. The count
+;       is 8 * packed-byte-count - padding-count (v1.md section 2.5).
 ;   E0 / E1: shortest unsigned LEB128 namespace byte length, UTF-8 namespace,
 ;            UTF-8 name (qualified keyword / symbol)
 ;   E2: one or two big-endian bytes holding an unsigned UTF-16 code unit,

@@ -11,7 +11,7 @@
     DLCbor$ExtensionValue DLCbor$MapValue DLCbor$SetValue DLCbor$TaggedValue]
    [java.math BigDecimal]
    [java.net URI]
-   [java.nio ByteBuffer]
+   [java.nio ByteBuffer ByteOrder]
    [java.time Instant]
    [java.util ArrayList Arrays Collections Date IdentityHashMap LinkedHashSet
     Map$Entry Objects UUID]
@@ -83,6 +83,24 @@
                                                 [251 252 254 224 225 0]))
    "bytes-length-22"           (byte-array (repeat 22 97))
    "bytes-length-23"           (byte-array (repeat 23 97))
+   "boolean-array-empty"       (boolean-array 0)
+   "boolean-array-false"       (boolean-array [false])
+   "boolean-array-true"        (boolean-array [true])
+   "boolean-array-mixed"       (boolean-array [true false true])
+   "boolean-array-7"           (boolean-array (repeat 7 true))
+   "boolean-array-8"           (boolean-array (repeat 8 true))
+   "boolean-array-9"           (boolean-array (concat (repeat 8 false) [true]))
+   "boolean-array-16"          (boolean-array (take 16 (cycle [true false])))
+   "boolean-array-17"          (boolean-array (concat [true] (repeat 15 false)
+                                                    [true]))
+   "boolean-array-168"         (boolean-array 168)
+   "boolean-array-169"         (boolean-array (repeat 169 true))
+   "boolean-array-2032"        (boolean-array 2032)
+   "boolean-array-2033"        (boolean-array (concat (repeat 2032 false) [true]))
+   "boolean-array-nested"      [(boolean-array [true false true]) []]
+   "boolean-array-map-keys"    (array-map [] 0 (boolean-array 0) 1
+                                         (byte-array [-3 0]) 2)
+   "boolean-array-set-members" #{[] (boolean-array 0)}
    "text-empty"                ""
    "text-ascii"                "hello"
    "text-lambda"               "λ"
@@ -201,12 +219,9 @@
     (and (= (.pattern ^Pattern left) (.pattern ^Pattern right))
          (= (.flags ^Pattern left) (.flags ^Pattern right)))
 
-    (and (map? left) (map? right))
-    (and (= (count left) (count right))
-         (every? (fn [[key value]]
-                   (and (contains? right key)
-                        (value= value (get right key))))
-                 left))
+    (or (and (map? left) (map? right))
+        (and (set? left) (set? right)))
+    (support/value= left right)
 
     (and (sequential? left) (sequential? right))
     (and (= (count left) (count right))
@@ -222,9 +237,75 @@
     (catch DLCbor$CodecException exception
       (.code exception))))
 
+(deftest packed-boolean-bit-pattern-test
+  (doseq [length (range 13)
+          mode [cbor/canonical cbor/fast]]
+    (testing (str length " booleans, " mode)
+      (is (every?
+           (fn [mask]
+             (let [value (boolean-array
+                          (map #(bit-test mask %) (range length)))
+                   width (quot (+ length 7) 8)
+                   expected (byte-array
+                             (map unchecked-byte
+                                  (concat [(+ 0x42 width) 0xfd
+                                           (mod (- 8 (mod length 8)) 8)]
+                                          (take width [mask
+                                                       (bit-shift-right mask 8)]))))
+                   encoded (cbor/encode value mode)]
+               (and (Arrays/equals expected encoded)
+                    (= (alength expected) (cbor/encoded-size value mode))
+                    (value= value (cbor/decode expected (= mode cbor/canonical))))))
+           (range (bit-shift-left 1 length))))))
+  (is (value= (boolean-array 0) (cbor/decode (hex->bytes "5802fd00") false))))
+
+(deftest packed-boolean-buffer-test
+  (doseq [length [0 1 7 8 9 16 17 63 64 65 168 169 2032 2033 65536]
+          mode [cbor/canonical cbor/fast]
+          direct? [false true]
+          order [ByteOrder/BIG_ENDIAN ByteOrder/LITTLE_ENDIAN]]
+    (testing (str length " " mode " direct=" direct? " " order)
+      (let [value (boolean-array (map #(zero? (mod % 3)) (range length)))
+            encoded (cbor/encode value mode)
+            size (alength encoded)
+            buffer (if direct?
+                     (ByteBuffer/allocateDirect (+ size 6))
+                     (ByteBuffer/allocate (+ size 6)))
+            canonical? (= mode cbor/canonical)]
+        (.order buffer order)
+        (.position buffer 3)
+        (.limit buffer (+ 3 size))
+        (is (= size (cbor/write-item! buffer value mode)))
+        (is (= (+ 3 size) (.position buffer)))
+        (.position buffer 3)
+        (let [input (.asReadOnlyBuffer (.slice buffer))
+              bytes (byte-array size)]
+          (.get (.duplicate input) bytes)
+          (is (Arrays/equals encoded bytes))
+          (is (value= value (cbor/decode input canonical?)))
+          (is (value= value (cbor/decode buffer canonical?))))))))
+
+(deftest packed-boolean-identity-test
+  (doseq [mode [cbor/canonical cbor/fast]]
+    (let [left (boolean-array [true])
+          right (boolean-array [true])
+          duplicate-map (support/map-value [[left 0] [right 1]])
+          duplicate-set (DLCbor$SetValue. [left right])
+          distinct-values [true [true] left (byte-array [-3 7 1])]
+          distinct-set (DLCbor$SetValue. distinct-values)
+          encoded (cbor/encode distinct-set mode)]
+      (is (= DLCbor$ErrorCode/DUPLICATE_KEY
+             (error-code #(cbor/encode duplicate-map mode))))
+      (is (= DLCbor$ErrorCode/DUPLICATE_SET_MEMBER
+             (error-code #(cbor/encode duplicate-set mode))))
+      (is (= 4 (count (cbor/decode encoded (= mode cbor/canonical))))))
+    (let [value (boolean-array [true false true])]
+      (is (value= value (cbor/decode-storage (cbor/encode-storage value mode)
+                                            (= mode cbor/canonical)))))))
+
 (deftest shared-golden-corpus-test
   (let [rows (golden-rows)]
-    (is (= 59 (count rows)))
+    (is (= 75 (count rows)))
     (doseq [[id _profiles _type _diagnostic canonical-hex storage-hex
              _clojure _rust :as row] rows]
       (testing id
@@ -315,7 +396,7 @@
 
 (deftest shared-malformed-corpus-test
   (let [rows (support/malformed-rows)]
-    (is (= 68 (count rows)))
+    (is (= 93 (count rows)))
     (doseq [[id operation hex expected _note :as row] rows]
       (testing id
         (is (= 5 (count row)))

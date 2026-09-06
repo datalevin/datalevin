@@ -35,13 +35,14 @@ const EXT_LIST: u64 = 4;
 const EXT_QUEUE: u64 = 5;
 const EXT_REGEX: u64 = 6;
 
-// Byte-string subtypes. FB/FC/FE reuse Datalevin's typed-data headers.
+// Byte-string subtypes. FB/FC/FD/FE reuse Datalevin's typed-data headers.
 const SUBTYPE_QUALIFIED_KEYWORD: u8 = 0xe0;
 const SUBTYPE_QUALIFIED_SYMBOL: u8 = 0xe1;
 const SUBTYPE_CHARACTER: u8 = 0xe2;
 const SUBTYPE_JAVA_REGEX: u8 = 0xe3;
 const SUBTYPE_KEYWORD: u8 = 0xfb;
 const SUBTYPE_SYMBOL: u8 = 0xfc;
+const SUBTYPE_BOOLEANS: u8 = 0xfd;
 const SUBTYPE_BYTES: u8 = 0xfe;
 
 const REGEX_UNICODE_CASE: u16 = 0x0040;
@@ -106,6 +107,7 @@ pub enum Value {
     Uri(String),
     Uuid([u8; 16]),
     InstantMillis(i64),
+    BooleanArray(Vec<bool>),
     Uint16Array(Vec<u16>),
     Int16Array(Vec<i16>),
     Int32Array(Vec<i32>),
@@ -503,6 +505,21 @@ fn encode_value<W: Writer>(writer: &mut W, value: &Value, mode: Mode) -> Result<
             writer.put(bytes)
         }
         Value::InstantMillis(milliseconds) => encode_instant(writer, *milliseconds),
+        Value::BooleanArray(values) => {
+            let padding = (8 - values.len() % 8) % 8;
+            let payload = values.len().div_ceil(8) + 2;
+            encode_head(writer, 2, payload as u64)?;
+            writer.put_u8(SUBTYPE_BOOLEANS)?;
+            writer.put_u8(padding as u8)?;
+            for chunk in values.chunks(8) {
+                let mut bits = 0;
+                for (bit, &value) in chunk.iter().enumerate() {
+                    bits |= u8::from(value) << bit;
+                }
+                writer.put_u8(bits)?;
+            }
+            Ok(())
+        }
         Value::Uint16Array(values) => {
             encode_typed_array_head(writer, TAG_UINT16_LE_ARRAY, values.len(), 2)?;
             for value in values {
@@ -1150,6 +1167,7 @@ impl Decoder<'_> {
         let length = self.length(additional, head_offset, self.limits.max_string_bytes)?;
         let payload_offset = self.position;
         let extension_limit = self.limits.max_extension_bytes;
+        let collection_limit = self.limits.max_collection_len;
         let payload = self.read(length)?;
         let Some((&subtype, body)) = payload.split_first() else {
             return Err(Error::new(ErrorKind::InvalidExtension, head_offset));
@@ -1165,11 +1183,39 @@ impl Decoder<'_> {
                 | SUBTYPE_QUALIFIED_SYMBOL
                 | SUBTYPE_CHARACTER
                 | SUBTYPE_JAVA_REGEX
+                | SUBTYPE_BOOLEANS
         ) {
             return Err(Error::new(ErrorKind::InvalidExtension, head_offset));
         }
         if length > extension_limit {
             return Err(Error::new(ErrorKind::ExtensionLimit, head_offset));
+        }
+        if subtype == SUBTYPE_BOOLEANS {
+            let Some((&padding, bits)) = body.split_first() else {
+                return Err(Error::new(ErrorKind::InvalidTypedArray, head_offset));
+            };
+            if padding > 7 || bits.is_empty() && padding != 0 {
+                return Err(Error::new(ErrorKind::InvalidTypedArray, head_offset));
+            }
+            let count = bits
+                .len()
+                .checked_mul(8)
+                .and_then(|count| count.checked_sub(usize::from(padding)))
+                .ok_or_else(|| Error::new(ErrorKind::CollectionLimit, head_offset))?;
+            if count > collection_limit {
+                return Err(Error::new(ErrorKind::CollectionLimit, head_offset));
+            }
+            if padding != 0 && bits[bits.len() - 1] >> (8 - padding) != 0 {
+                return Err(Error::new(ErrorKind::InvalidTypedArray, head_offset));
+            }
+            let mut values = Vec::with_capacity(count);
+            for (index, &byte) in bits.iter().enumerate() {
+                let width = (count - index * 8).min(8);
+                for bit in 0..width {
+                    values.push(byte & (1 << bit) != 0);
+                }
+            }
+            return Ok(Value::BooleanArray(values));
         }
         if subtype == SUBTYPE_CHARACTER {
             let code_unit = match *body {
@@ -1919,6 +1965,7 @@ mod tests {
             arbitrary_uri().prop_map(Value::Uri),
             any::<[u8; 16]>().prop_map(Value::Uuid),
             any::<i64>().prop_map(Value::InstantMillis),
+            prop::collection::vec(any::<bool>(), 0..256).prop_map(Value::BooleanArray),
             prop::collection::vec(any::<u16>(), 0..32).prop_map(Value::Uint16Array),
             prop::collection::vec(any::<i16>(), 0..32).prop_map(Value::Int16Array),
             prop::collection::vec(any::<i32>(), 0..32).prop_map(Value::Int32Array),
@@ -2115,6 +2162,64 @@ mod tests {
     }
 
     #[test]
+    fn packed_boolean_bit_patterns() {
+        for length in 0..=12 {
+            for mask in 0u16..(1 << length) {
+                let value =
+                    Value::BooleanArray((0..length).map(|bit| mask & (1 << bit) != 0).collect());
+                let bytes = (length + 7) / 8;
+                let mut expected = vec![0x42 + bytes as u8, 0xfd, ((8 - length % 8) % 8) as u8];
+                expected.extend_from_slice(&mask.to_le_bytes()[..bytes]);
+                for mode in [Mode::Canonical, Mode::Fast] {
+                    assert_eq!(expected, encode(&value, mode).unwrap());
+                    assert_eq!(expected.len(), encoded_len(&value, mode).unwrap());
+                    assert_eq!(value, decode(&expected, mode == Mode::Canonical).unwrap());
+                }
+            }
+        }
+        assert_eq!(
+            Value::BooleanArray(vec![]),
+            decode(&hex_decode("5802fd00"), false).unwrap()
+        );
+    }
+
+    #[test]
+    fn packed_boolean_limits_and_duplicates() {
+        let input = hex_decode("43fd0505");
+        for canonical in [true, false] {
+            let mut limits = Limits::default();
+            limits.max_collection_len = 3;
+            assert_eq!(
+                Value::BooleanArray(vec![true, false, true]),
+                decode_with_limits(&input, canonical, limits).unwrap()
+            );
+            limits.max_collection_len = 2;
+            assert_eq!(
+                ErrorKind::CollectionLimit,
+                decode_with_limits(&input, canonical, limits)
+                    .unwrap_err()
+                    .kind
+            );
+        }
+        for mode in [Mode::Canonical, Mode::Fast] {
+            let array = Value::BooleanArray(vec![true]);
+            let map = Value::Map(vec![
+                (array.clone(), Value::Null),
+                (array.clone(), Value::Null),
+            ]);
+            let set = Value::Set(vec![array.clone(), array]);
+            assert_eq!(
+                ErrorKind::DuplicateKey,
+                encode(&map, mode).unwrap_err().kind
+            );
+            assert_eq!(
+                ErrorKind::DuplicateSetMember,
+                encode(&set, mode).unwrap_err().kind
+            );
+        }
+    }
+
+    #[test]
     fn shared_golden_corpus_round_trips() {
         let mut count = 0;
         for line in GOLDEN
@@ -2156,7 +2261,7 @@ mod tests {
             assert_value_eq(&value, &decoded_storage, id);
             count += 1;
         }
-        assert_eq!(59, count);
+        assert_eq!(75, count);
     }
 
     #[test]
@@ -2319,14 +2424,16 @@ mod tests {
                 "fast" => decode(&input, false),
                 "storage" => decode_storage(&input, true),
                 "limit-input" | "limit-depth" | "limit-collection" | "limit-string"
-                | "limit-bignum" => decode_with_limits(&input, true, malformed_limits(operation)),
+                | "limit-bignum" | "limit-extension" => {
+                    decode_with_limits(&input, true, malformed_limits(operation))
+                }
                 _ => panic!("unknown malformed fixture operation {operation}: {id}"),
             }
             .expect_err(id);
             assert_eq!(expected, error.kind.code(), "{id}");
             count += 1;
         }
-        assert_eq!(68, count);
+        assert_eq!(93, count);
     }
 
     #[test]
@@ -2536,6 +2643,44 @@ mod tests {
             "float64-nan" => Value::Float64(f64::NAN),
             "bytes-empty" => Value::Bytes(vec![]),
             "bytes-two" => Value::Bytes(vec![0x00, 0xff]),
+            "boolean-array-empty" => Value::BooleanArray(vec![]),
+            "boolean-array-false" => Value::BooleanArray(vec![false]),
+            "boolean-array-true" => Value::BooleanArray(vec![true]),
+            "boolean-array-mixed" => Value::BooleanArray(vec![true, false, true]),
+            "boolean-array-7" => Value::BooleanArray(vec![true; 7]),
+            "boolean-array-8" => Value::BooleanArray(vec![true; 8]),
+            "boolean-array-9" => {
+                let mut values = vec![false; 9];
+                values[8] = true;
+                Value::BooleanArray(values)
+            }
+            "boolean-array-16" => Value::BooleanArray((0..16).map(|i| i % 2 == 0).collect()),
+            "boolean-array-17" => {
+                let mut values = vec![false; 17];
+                values[0] = true;
+                values[16] = true;
+                Value::BooleanArray(values)
+            }
+            "boolean-array-168" => Value::BooleanArray(vec![false; 168]),
+            "boolean-array-169" => Value::BooleanArray(vec![true; 169]),
+            "boolean-array-2032" => Value::BooleanArray(vec![false; 2032]),
+            "boolean-array-2033" => {
+                let mut values = vec![false; 2033];
+                values[2032] = true;
+                Value::BooleanArray(values)
+            }
+            "boolean-array-nested" => Value::Array(vec![
+                Value::BooleanArray(vec![true, false, true]),
+                Value::Array(vec![]),
+            ]),
+            "boolean-array-map-keys" => Value::Map(vec![
+                (Value::Array(vec![]), Value::int(0)),
+                (Value::BooleanArray(vec![]), Value::int(1)),
+                (Value::Bytes(vec![0xfd, 0]), Value::int(2)),
+            ]),
+            "boolean-array-set-members" => {
+                Value::Set(vec![Value::Array(vec![]), Value::BooleanArray(vec![])])
+            }
             "text-empty" => Value::Text(String::new()),
             "text-ascii" => Value::Text("hello".into()),
             "text-lambda" => Value::Text("λ".into()),

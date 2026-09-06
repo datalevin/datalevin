@@ -197,9 +197,26 @@
              (bit-and (long low) 0xffffffff)))
    (gen/tuple int32-gen int32-gen)))
 
+(deftest packed-boolean-jvm-rust-roundtrip-test
+  (with-open [reader (io/reader (io/resource "datalevin/cbor/v1/golden-vectors.tsv"))]
+    (doseq [line (line-seq reader)
+            :when (str/starts-with? line "boolean-array-")
+            :let [[id _profiles _type _diagnostic hex] (str/split line #"\t")]
+            [operation mode] [["canonical" cbor/canonical] ["fast" cbor/fast]]]
+      (testing (str id " " operation)
+        (let [expected (hex->bytes hex)
+              value (cbor/decode expected)
+              encoded (cbor/encode value mode)
+              rust-encoded (rust-roundtrip operation encoded)
+              storage (cbor/encode-storage value mode)]
+          (is (Arrays/equals expected encoded))
+          (is (support/value= value (cbor/decode rust-encoded)))
+          (is (Arrays/equals expected rust-encoded))
+          (is (Arrays/equals storage (rust-roundtrip "storage" storage))))))))
+
 (deftest malformed-jvm-rust-error-agreement-test
   (let [rows (support/malformed-rows)]
-    (is (= 68 (count rows)))
+    (is (= 93 (count rows)))
     (doseq [[id operation hex expected _note] rows]
       (testing id
         (let [jvm-error  (jvm-error operation (hex->bytes hex))

@@ -152,6 +152,9 @@
 (def ^:private instant-gen
   (gen/fmap #(Date. (long %)) long-gen))
 
+(def ^:private boolean-array-gen
+  (gen/fmap boolean-array (gen/vector gen/boolean 0 256)))
+
 (def ^:private char-array-gen
   (gen/fmap #(char-array (map char %))
             (gen/vector (gen/choose 0 0xffff) 0 32)))
@@ -255,6 +258,7 @@
     [1 uuid-gen]
     [1 uri-gen]
     [2 instant-gen]
+    [1 boolean-array-gen]
     [1 char-array-gen]
     [1 short-array-gen]
     [1 int-array-gen]
