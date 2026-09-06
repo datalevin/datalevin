@@ -359,7 +359,7 @@ fn random_map(random: &mut DeterministicRng, depth: usize) -> Value {
     let mut entries = Vec::with_capacity(length);
     let mut seen = HashSet::new();
     while entries.len() < length {
-        let key = random_map_key(random);
+        let key = random_collection_member(random, depth);
         let canonical_key = encode(&key, Mode::Canonical).expect("generated map key");
         if seen.insert(canonical_key) {
             entries.push((key, generated_value_at(random, depth + 1)));
@@ -373,7 +373,7 @@ fn random_set(random: &mut DeterministicRng, depth: usize) -> Value {
     let mut values = Vec::with_capacity(length);
     let mut seen = HashSet::new();
     while values.len() < length {
-        let value = random_set_element(random, depth);
+        let value = random_collection_member(random, depth);
         let canonical_value = encode(&value, Mode::Canonical).expect("generated set value");
         if seen.insert(canonical_value) {
             values.push(value);
@@ -382,15 +382,20 @@ fn random_set(random: &mut DeterministicRng, depth: usize) -> Value {
     Value::Set(values)
 }
 
-fn random_set_element(random: &mut DeterministicRng, depth: usize) -> Value {
-    if depth < 4 && random.bounded(4) == 0 {
-        Value::Array(
-            (0..random.bounded(5))
-                .map(|_| random_map_key(random))
-                .collect(),
-        )
-    } else {
-        random_map_key(random)
+fn random_collection_member(random: &mut DeterministicRng, depth: usize) -> Value {
+    match random.bounded(16) {
+        // Exercise identities that ordinary Clojure maps and sets merge.
+        0 => Value::Array(vec![]),
+        1 => Value::List(vec![]),
+        2 => Value::Queue(vec![]),
+        3 => Value::Float32(0.0),
+        4 => Value::Float32(-0.0),
+        5 => Value::Float64(0.0),
+        6 => Value::Float64(-0.0),
+        7 => Value::Float32(1.0),
+        8 => Value::Float64(1.0),
+        9..=12 => generated_value_at(random, depth + 1),
+        _ => random_map_key(random),
     }
 }
 

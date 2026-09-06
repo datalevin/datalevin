@@ -14,13 +14,45 @@
    [clojure.test.check.generators :as gen]
    [datalevin.codec.cbor :as cbor])
   (:import
-   [clojure.lang Keyword PersistentQueue Symbol]
-   [datalevin.codec DLCbor DLCbor$ExtensionValue DLCbor$Limits]
+   [clojure.lang Keyword MapEntry PersistentQueue Symbol]
+   [datalevin.codec DLCbor DLCbor$ExtensionValue DLCbor$Limits
+    DLCbor$MapValue DLCbor$SetValue]
    [java.math BigDecimal BigInteger]
    [java.net URI]
    [java.nio ByteBuffer]
-   [java.util Date List Objects UUID]
+   [java.util Arrays Date List Map Objects Set UUID]
    [java.util.regex Pattern]))
+
+(defn collection-identity-rows
+  "Returns shared valid collections, including values host equality merges."
+  []
+  (with-open [reader (io/reader
+                      (io/resource
+                       "datalevin/cbor/v1/collection-identity-vectors.tsv"))]
+    (->> (line-seq reader)
+         (remove #(or (str/blank? %) (str/starts-with? % "#")))
+         (mapv #(str/split % #"\t" -1)))))
+
+(defn map-value
+  "Builds a lossless DL-CBOR map from pairs without applying host equality."
+  ^DLCbor$MapValue [entries]
+  (DLCbor$MapValue.
+   (mapv (fn [[key value]] (MapEntry/create key value)) entries)))
+
+(defn collection-identity-malformed-rows
+  "Returns shared duplicate cases that exercise lossless collection decoding."
+  []
+  (with-open [reader (io/reader
+                      (io/resource
+                       (str "datalevin/cbor/v1/"
+                            "collection-identity-malformed-vectors.tsv")))]
+    (->> (line-seq reader)
+         (remove #(or (str/blank? %) (str/starts-with? % "#")))
+         (mapv #(str/split % #"\t" -1)))))
+
+(defn- unique-by-bytes [key-fn values]
+  (vec (vals (into {} (map (fn [value]
+                            [(vec (cbor/encode (key-fn value))) value])) values))))
 
 (defn malformed-rows
   "Returns the shared malformed DL-CBOR corpus as five-column rows."
@@ -231,8 +263,13 @@
     [1 double-array-gen]]))
 
 (def set-element-gen
-  "Generated values whose host equality is stable inside Clojure sets."
+  "Generated values for ordinary Clojure sets; value-gen also uses holders."
   (gen/one-of [map-key-gen (gen/vector map-key-gen 0 4)]))
+
+(def ^:private identity-boundary-gen
+  (gen/elements [[] (list) PersistentQueue/EMPTY
+                 (float 0.0) (float -0.0) 0.0 -0.0
+                 (float 1.0) 1.0]))
 
 (def value-gen
   "Generated recursive values in the portable DL-CBOR v1 domain."
@@ -245,6 +282,13 @@
                     (gen/vector inner 0 6))]
        [3 (gen/map map-key-gen inner {:max-elements 6})]
        [2 (gen/set set-element-gen {:max-elements 8})]
+       [2 (gen/fmap #(map-value (unique-by-bytes first %))
+                    (gen/vector (gen/tuple
+                                 (gen/one-of [inner identity-boundary-gen])
+                                 inner) 0 10))]
+       [2 (gen/fmap #(DLCbor$SetValue. (unique-by-bytes identity %))
+                    (gen/vector (gen/one-of [inner identity-boundary-gen])
+                                0 10))]
        [1 (gen/fmap (fn [[named? integer-id arguments]]
                       (let [^java.util.List arguments arguments]
                         (if named?
@@ -261,6 +305,14 @@
   "Compares portable values while preserving array and float semantics."
   [left right]
   (cond
+    (and (or (instance? Map left) (instance? DLCbor$MapValue left))
+         (or (instance? Map right) (instance? DLCbor$MapValue right)))
+    (Arrays/equals (cbor/encode left) (cbor/encode right))
+
+    (and (or (instance? Set left) (instance? DLCbor$SetValue left))
+         (or (instance? Set right) (instance? DLCbor$SetValue right)))
+    (Arrays/equals (cbor/encode left) (cbor/encode right))
+
     (and (instance? DLCbor$ExtensionValue left)
          (instance? DLCbor$ExtensionValue right))
     (let [^DLCbor$ExtensionValue left  left
@@ -287,16 +339,6 @@
     (and (instance? Pattern left) (instance? Pattern right))
     (and (= (.pattern ^Pattern left) (.pattern ^Pattern right))
          (= (.flags ^Pattern left) (.flags ^Pattern right)))
-
-    (and (map? left) (map? right))
-    (and (= (count left) (count right))
-         (every? (fn [[key value]]
-                   (and (contains? right key)
-                        (value= value (get right key))))
-                 left))
-
-    (and (set? left) (set? right))
-    (= left right)
 
     (and (instance? List left) (instance? List right))
     (and (= (count left) (count right))

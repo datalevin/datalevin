@@ -1712,6 +1712,14 @@ mod tests {
         env!("CARGO_MANIFEST_DIR"),
         "/../../resources/datalevin/cbor/v1/draft-extension-malformed-vectors.tsv"
     ));
+    const COLLECTION_IDENTITY: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../resources/datalevin/cbor/v1/collection-identity-vectors.tsv"
+    ));
+    const COLLECTION_IDENTITY_MALFORMED: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../resources/datalevin/cbor/v1/collection-identity-malformed-vectors.tsv"
+    ));
 
     fn arbitrary_big_magnitude() -> BoxedStrategy<Vec<u8>> {
         (1_u8..=u8::MAX, prop::collection::vec(any::<u8>(), 8..32))
@@ -1928,7 +1936,7 @@ mod tests {
                 prop::collection::vec(inner.clone(), 0..6).prop_map(Value::Array),
                 prop::collection::vec(inner.clone(), 0..6).prop_map(Value::List),
                 prop::collection::vec(inner.clone(), 0..6).prop_map(Value::Queue),
-                prop::collection::vec((arbitrary_map_key(), inner.clone()), 0..6)
+                prop::collection::vec((inner.clone(), inner.clone()), 0..6)
                     .prop_map(deduplicate_entries)
                     .prop_map(Value::Map),
                 prop::collection::vec(inner.clone(), 0..8)
@@ -2051,6 +2059,59 @@ mod tests {
             let result = std::panic::catch_unwind(|| decode_with_limits(&input, true, limits));
             prop_assert!(result.is_ok(), "decoder panicked for input {input:02x?}");
         }
+    }
+
+    #[test]
+    fn collection_identity_corpus_round_trips() {
+        let mut count = 0;
+        for line in COLLECTION_IDENTITY
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+        {
+            let columns: Vec<_> = line.split('\t').collect();
+            let [id, kind, size, canonical_hex, fast_hex, _note]: [&str; 6] =
+                columns.try_into().unwrap();
+            let expected = hex_decode(canonical_hex);
+            for (canonical, hex) in [(true, canonical_hex), (false, fast_hex)] {
+                let decoded = decode(&hex_decode(hex), canonical).expect(id);
+                let length = match (kind, &decoded) {
+                    ("map", Value::Map(entries)) => entries.len(),
+                    ("set", Value::Set(members)) => members.len(),
+                    _ => panic!("wrong collection kind: {id}"),
+                };
+                assert_eq!(size.parse::<usize>().unwrap(), length, "{id}");
+                assert_eq!(expected, encode(&decoded, Mode::Canonical).unwrap(), "{id}");
+                let fast = encode(&decoded, Mode::Fast).unwrap();
+                assert_eq!(
+                    expected,
+                    encode(&decode(&fast, false).unwrap(), Mode::Canonical).unwrap(),
+                    "{id}"
+                );
+            }
+            count += 1;
+        }
+        assert_eq!(15, count);
+    }
+
+    #[test]
+    fn collection_identity_duplicate_corpus() {
+        let mut count = 0;
+        for line in COLLECTION_IDENTITY_MALFORMED
+            .lines()
+            .filter(|line| !line.starts_with('#') && !line.is_empty())
+        {
+            let columns: Vec<_> = line.split('\t').collect();
+            let [id, operation, hex, expected, _note]: [&str; 5] = columns.try_into().unwrap();
+            let canonical = match operation {
+                "canonical" => true,
+                "fast" => false,
+                _ => panic!("unknown collection identity operation: {operation}"),
+            };
+            let error = decode(&hex_decode(hex), canonical).expect_err(id);
+            assert_eq!(expected, error.kind.code(), "{id}");
+            count += 1;
+        }
+        assert_eq!(8, count);
     }
 
     #[test]

@@ -38,13 +38,19 @@ character, and regex IDs 1, 2, 3, and 6 are retired: those values now use local
 byte-string subtypes and do not need an IANA tag assignment. Incompatible
 revisions receive a new type ID; an existing ID is never redefined.
 
+The selected collection framing retains lists and queues in this flattened
+tagged array. Sets retain their standard tag 258, while vectors and maps use
+native CBOR containers. The measured compact collection byte-string alternative
+was not selected.
+
 ## Checks before submission
 
 - Recheck the live [IANA CBOR tag registry](https://www.iana.org/assignments/cbor-tags).
 - Complete the controlled extension-rich throughput, allocation, and small-key
   encoded-size gates against Nippy.
-- Decide whether the unified envelope remains acceptable after the small-key
-  size result, including the effect of a 24-through-255 assignment.
+- Validate the remaining extension payloads against the small-key size gate,
+  including the effect of a 24-through-255 assignment; collection framing is
+  settled as described above.
 - Reconfirm the regex contract and initial built-in registry during format
   review.
 - Replace the stand-in tag in both implementations and the CDDL.

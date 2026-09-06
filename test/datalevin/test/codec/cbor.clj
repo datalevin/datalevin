@@ -8,13 +8,13 @@
   (:import
    [clojure.lang Keyword PersistentQueue]
    [datalevin.codec DLCbor$CodecException DLCbor$ErrorCode
-    DLCbor$ExtensionValue DLCbor$TaggedValue]
+    DLCbor$ExtensionValue DLCbor$MapValue DLCbor$SetValue DLCbor$TaggedValue]
    [java.math BigDecimal]
    [java.net URI]
    [java.nio ByteBuffer]
    [java.time Instant]
-   [java.util Arrays Collections Date IdentityHashMap LinkedHashSet Objects
-    UUID]
+   [java.util ArrayList Arrays Collections Date IdentityHashMap LinkedHashSet
+    Map$Entry Objects UUID]
    [java.util.regex Pattern]))
 
 (defn- hex->bytes ^bytes [^String value]
@@ -406,29 +406,120 @@
       (is (= DLCbor$ErrorCode/INVALID_REGEX
              (error-code #(cbor/encode pattern)))))))
 
-(deftest host-collection-equality-collision-test
-  (testing "distinct wire identities cannot collapse into one Clojure set member"
-    (let [encoded (hex->bytes "d901028280d9444c8104")]
-      (doseq [canonical? [true false]]
-        (is (= DLCbor$ErrorCode/DUPLICATE_SET_MEMBER
-               (error-code #(cbor/decode encoded canonical?)))))))
-  (testing "distinct wire identities cannot collapse into one Clojure map key"
-    (let [encoded (hex->bytes "a28000d9444c810401")]
-      (doseq [canonical? [true false]]
-        (is (= DLCbor$ErrorCode/DUPLICATE_KEY
-               (error-code #(cbor/decode encoded canonical?)))))))
-  (testing "float width and signed-zero identity cannot collapse in a set"
-    (doseq [encoded [(hex->bytes "d9010282fa00000000fa80000000")
-                     (hex->bytes
-                      "d9010282fa3f800000fb3ff0000000000000")]
-            canonical? [true false]]
-      (is (= DLCbor$ErrorCode/DUPLICATE_SET_MEMBER
-             (error-code #(cbor/decode encoded canonical?))))))
+(deftest collection-identity-corpus-test
+  (let [rows (support/collection-identity-rows)]
+    (is (= 15 (count rows)))
+    (doseq [[id kind size canonical-hex fast-hex _note] rows
+            [canonical? hex] [[true canonical-hex] [false fast-hex]]
+            input-kind [:array :heap :direct :read-only]]
+      (testing (str id " " canonical? " " input-kind)
+        (let [encoded (hex->bytes hex)
+              expected (hex->bytes canonical-hex)
+              input (if (= input-kind :array)
+                      encoded
+                      (let [buffer (if (= input-kind :heap)
+                                     (ByteBuffer/allocate (+ 6 (alength encoded)))
+                                     (ByteBuffer/allocateDirect
+                                      (+ 6 (alength encoded))))]
+                        (.position buffer 3)
+                        (.put buffer encoded)
+                        (.limit buffer (.position buffer))
+                        (.position buffer 3)
+                        (if (= input-kind :read-only)
+                          (.asReadOnlyBuffer (.slice buffer))
+                          buffer)))
+              decoded (cbor/decode input canonical?)
+              items (if (= kind "map")
+                      (.entries ^DLCbor$MapValue decoded)
+                      (.members ^DLCbor$SetValue decoded))
+              mode (if canonical? cbor/canonical cbor/fast)
+              output (ByteBuffer/allocateDirect (cbor/encoded-size decoded mode))]
+          (is (= (Long/parseLong size) (count items)))
+          (is (Arrays/equals expected (cbor/encode decoded)))
+          (is (= (alength expected) (cbor/write-item! output decoded mode)))
+          (.flip output)
+          (is (Arrays/equals expected
+                             (cbor/encode (cbor/decode output canonical?))))
+          (is (Arrays/equals
+               expected
+               (cbor/encode (cbor/decode-storage
+                             (cbor/encode-storage decoded mode) canonical?)))))))))
+
+(deftest collection-identity-duplicate-test
+  (let [rows (support/collection-identity-malformed-rows)]
+    (is (= 8 (count rows)))
+    (doseq [[id operation hex expected _note] rows]
+      (testing id
+        (is (= (DLCbor$ErrorCode/valueOf expected)
+               (error-code #(support/decode-malformed
+                             operation (hex->bytes hex))))))))
   (testing "fast decoding still detects duplicate identity-equality values"
     (is (= DLCbor$ErrorCode/DUPLICATE_SET_MEMBER
            (error-code #(cbor/decode
                          (hex->bytes "d901028242fe0142fe01") false)))))
-  (testing "writers reject collections that cannot round-trip through Clojure"
+  (testing "writers reject canonical duplicates regardless of host equality"
+    (let [duplicate-map (doto (IdentityHashMap.)
+                          (.put (String. "a") 0)
+                          (.put (String. "a") 1))
+          duplicate-set (doto (Collections/newSetFromMap (IdentityHashMap.))
+                          (.add (Long/valueOf "1000"))
+                          (.add (Long/valueOf "1000")))]
+      (is (= 2 (.size duplicate-map)))
+      (is (= 2 (.size duplicate-set)))
+      (doseq [mode [cbor/canonical cbor/fast]]
+        (doseq [value [duplicate-map (support/map-value [[[] 0] [[] 1]])]]
+          (is (= DLCbor$ErrorCode/DUPLICATE_KEY
+                 (error-code #(cbor/encode value mode)))))
+        (doseq [value [duplicate-set (DLCbor$SetValue. [[] []])]]
+          (is (= DLCbor$ErrorCode/DUPLICATE_SET_MEMBER
+                 (error-code #(cbor/encode value mode)))))))))
+
+(deftest lossless-collection-value-test
+  (testing "ordinary decoded collections keep their Clojure representation"
+    (is (map? (cbor/decode (cbor/encode {:a 1 :b 2}))))
+    (is (set? (cbor/decode (cbor/encode #{1 2 3}))))
+    (is (map? (cbor/decode (cbor/encode (zipmap (range 16) (range 16)))))))
+  (testing "entries and members are available without a host map/set conversion"
+    (let [decoded-map (cbor/decode (hex->bytes "a28000d9444c810401"))
+          decoded-set (cbor/decode (hex->bytes "d901028280d9444c8104"))
+          entries (.entries ^DLCbor$MapValue decoded-map)
+          members (.members ^DLCbor$SetValue decoded-set)]
+      (is (vector? (.getKey ^Map$Entry (first entries))))
+      (is (list? (.getKey ^Map$Entry (second entries))))
+      (is (= [0 1] (mapv #(.getValue ^Map$Entry %) entries)))
+      (is (vector? (first members)))
+      (is (list? (second members)))
+      (is (thrown? UnsupportedOperationException (.clear entries)))
+      (is (thrown? UnsupportedOperationException (.clear members)))
+      (is (thrown? UnsupportedOperationException
+                   (.setValue ^Map$Entry (first entries) 42)))))
+  (testing "holder equality and hashing use canonical identity and ignore order"
+    (let [entries [[[] 0] [(list) 1]]
+          map-a (support/map-value entries)
+          map-b (support/map-value (reverse entries))
+          set-a (DLCbor$SetValue. [[] (list)])
+          set-b (DLCbor$SetValue. [(list) []])]
+      (is (= map-a map-b))
+      (is (= (hash map-a) (hash map-b)))
+      (is (= set-a set-b))
+      (is (= (hash set-a) (hash set-b)))
+      (is (not= (DLCbor$SetValue. [[]]) (DLCbor$SetValue. [(list)])))
+      (is (not= (support/map-value [[0 []]])
+                (support/map-value [[0 (list)]])))
+      (doseq [value [[map-a set-a]
+                     (support/map-value [[map-a set-a] [set-a map-a]])
+                     (DLCbor$SetValue. [map-a set-a])]
+              mode [cbor/canonical cbor/fast]]
+        (is (Arrays/equals
+             (cbor/encode value)
+             (cbor/encode (cbor/decode (cbor/encode value mode)
+                                       (= mode cbor/canonical))))))))
+  (testing "holders copy their input containers"
+    (let [members (ArrayList. [nil [] (list)])
+          holder (DLCbor$SetValue. members)]
+      (.clear members)
+      (is (= 3 (count (.members holder))))))
+  (testing "writers accept wire-distinct values from other JVM collections"
     (let [identity-map (doto (IdentityHashMap.)
                          (.put [] 0)
                          (.put (list) 1))
@@ -441,10 +532,9 @@
       (is (= 2 (.size identity-map)))
       (is (= 2 (.size identity-set)))
       (is (= 2 (.size signed-zero-set)))
-      (doseq [mode [cbor/canonical cbor/fast]]
-        (is (= DLCbor$ErrorCode/DUPLICATE_KEY
-               (error-code #(cbor/encode identity-map mode))))
-        (is (= DLCbor$ErrorCode/DUPLICATE_SET_MEMBER
-               (error-code #(cbor/encode identity-set mode))))
-        (is (= DLCbor$ErrorCode/DUPLICATE_SET_MEMBER
-               (error-code #(cbor/encode signed-zero-set mode))))))))
+      (doseq [mode [cbor/canonical cbor/fast]
+              value [identity-map identity-set signed-zero-set]]
+        (is (Arrays/equals
+             (cbor/encode value)
+             (cbor/encode (cbor/decode (cbor/encode value mode)
+                                       (= mode cbor/canonical)))))))))

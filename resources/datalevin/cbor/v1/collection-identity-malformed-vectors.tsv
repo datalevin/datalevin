@@ -1,0 +1,10 @@
+# DL-CBOR canonical identity duplicates, including lossless JVM holders.
+# id	operation	hex	error_code	note
+set-duplicate-after-collision	fast	d90102840080d9444c810400	DUPLICATE_SET_MEMBER	Duplicate scalar after vector/list collision.
+set-duplicate-list-after-collision	fast	d9010283d9444c810480d9444c8104	DUPLICATE_SET_MEMBER	Duplicate list after switching representation.
+map-duplicate-after-collision	fast	a38000d9444c8104018002	DUPLICATE_KEY	Duplicate vector key after switching representation.
+set-duplicate-map-with-colliding-keys	fast	d9010282a28000d9444c810401a2d9444c8104018000	DUPLICATE_SET_MEMBER	Nested maps have identical canonical bytes despite entry order.
+map-duplicate-map-with-colliding-keys	fast	a2a28000d9444c81040100a2d9444c810401800001	DUPLICATE_KEY	Nested map keys have identical canonical bytes despite entry order.
+set-duplicate-bytes-after-collision	fast	d901028480d9444c810442fe0142fe01	DUPLICATE_SET_MEMBER	Content-equal byte arrays remain duplicates after switching representation.
+set-canonical-duplicate-after-collision	canonical	d901028380d9444c8104d9444c8104	DUPLICATE_SET_MEMBER	Canonical duplicate remains invalid after vector/list collision.
+map-canonical-duplicate-after-collision	canonical	a38000d9444c810401d9444c810402	DUPLICATE_KEY	Canonical duplicate remains invalid after vector/list collision.

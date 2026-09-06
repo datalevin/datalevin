@@ -58,6 +58,8 @@ dl-ratio = #6.30([
   denominator: uint / #6.2(bstr)
 ])
 
+; Selected collection framing: native vector/map containers and tagged arrays
+; for sets, lists, and queues. The list/queue definitions below include type IDs.
 dl-vector = [* dl-value]
 dl-map = {* dl-value => dl-value}
 dl-set = #6.258([* dl-value])

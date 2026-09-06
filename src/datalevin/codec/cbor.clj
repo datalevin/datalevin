@@ -35,6 +35,8 @@
    (DLCbor/encode value mode)))
 
 (defn decode
+  "Decodes one item. Maps/sets that need lossless holders return
+  DLCbor$MapValue/DLCbor$SetValue; use their entries()/members() lists."
   ([input]
    (if (bytes? input)
      (DLCbor/decode ^bytes input true)
@@ -52,6 +54,7 @@
    (DLCbor/encodeStorage value mode)))
 
 (defn decode-storage
+  "Decodes a storage item, with the same collection representations as decode."
   ([^bytes input]
    (DLCbor/decodeStorage input true))
   ([^bytes input canonical?]

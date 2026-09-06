@@ -3,6 +3,7 @@ package datalevin.codec;
 import clojure.lang.BigInt;
 import clojure.lang.IPersistentList;
 import clojure.lang.IPersistentMap;
+import clojure.lang.IPersistentSet;
 import clojure.lang.ITransientMap;
 import clojure.lang.ITransientSet;
 import clojure.lang.Keyword;
@@ -25,12 +26,14 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.AbstractMap.SimpleImmutableEntry;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -326,6 +329,81 @@ public final class DLCbor {
         @Override
         public String toString() {
             return "TaggedValue[" + tag + ", " + value + "]";
+        }
+    }
+
+    /**
+     * A lossless map value for keys that a host map would merge. Entries are
+     * exposed as a list so no host equality rule can discard a key. The list
+     * and entries are immutable; contained values have their usual mutability.
+     * This holder encodes as an ordinary CBOR map, with no extra wire wrapper.
+     */
+    public static final class MapValue {
+        private final List<Map.Entry<?, ?>> entries;
+
+        public MapValue(Collection<? extends Map.Entry<?, ?>> entries) {
+            Objects.requireNonNull(entries, "entries");
+            List<Map.Entry<?, ?>> copy = new ArrayList<>(entries.size());
+            for (Map.Entry<?, ?> entry : entries) {
+                copy.add(new SimpleImmutableEntry<>(entry));
+            }
+            this.entries = Collections.unmodifiableList(copy);
+        }
+
+        public List<Map.Entry<?, ?>> entries() {
+            return entries;
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            return this == other || other instanceof MapValue that
+                && Arrays.equals(encode(this, Mode.CANONICAL),
+                                 encode(that, Mode.CANONICAL));
+        }
+
+        @Override
+        public int hashCode() {
+            return Arrays.hashCode(encode(this, Mode.CANONICAL));
+        }
+
+        @Override
+        public String toString() {
+            return "MapValue" + entries;
+        }
+    }
+
+    /**
+     * A lossless set value for members that a host set would merge. Members
+     * are exposed as an immutable list, and encode with the normal set tag
+     * and array. Equality of these holders uses canonical DL-CBOR bytes.
+     */
+    public static final class SetValue {
+        private final List<?> members;
+
+        public SetValue(Collection<?> members) {
+            Objects.requireNonNull(members, "members");
+            this.members = Collections.unmodifiableList(new ArrayList<>(members));
+        }
+
+        public List<?> members() {
+            return members;
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            return this == other || other instanceof SetValue that
+                && Arrays.equals(encode(this, Mode.CANONICAL),
+                                 encode(that, Mode.CANONICAL));
+        }
+
+        @Override
+        public int hashCode() {
+            return Arrays.hashCode(encode(this, Mode.CANONICAL));
+        }
+
+        @Override
+        public String toString() {
+            return "SetValue" + members;
         }
     }
 
@@ -1056,6 +1134,12 @@ public final class DLCbor {
             }
             return checkedSize(headSize(tagged.tag), sizeOf(tagged.value));
         }
+        if (value instanceof MapValue map) {
+            return mapSize(map.entries);
+        }
+        if (value instanceof SetValue set) {
+            return setSize(set.members);
+        }
         if (value instanceof Sorted
             || value instanceof SortedMap<?, ?>
             || value instanceof SortedSet<?>
@@ -1065,19 +1149,10 @@ public final class DLCbor {
             throw error(ErrorCode.UNSUPPORTED_VALUE, 0);
         }
         if (value instanceof Map<?, ?> map) {
-            int size = headSize(map.size());
-            for (Map.Entry<?, ?> entry : map.entrySet()) {
-                size = checkedSize(size, sizeOf(entry.getKey()),
-                                   sizeOf(entry.getValue()));
-            }
-            return size;
+            return mapSize(map.entrySet());
         }
         if (value instanceof Set<?> set) {
-            int size = checkedSize(headSize(TAG_SET), headSize(set.size()));
-            for (Object item : set) {
-                size = checkedSize(size, sizeOf(item));
-            }
-            return size;
+            return setSize(set);
         }
         if (value instanceof List<?> list) {
             int size = headSize(list.size());
@@ -1087,6 +1162,23 @@ public final class DLCbor {
             return size;
         }
         throw error(ErrorCode.UNSUPPORTED_VALUE, 0);
+    }
+
+    private static int mapSize(Collection<? extends Map.Entry<?, ?>> entries) {
+        int size = headSize(entries.size());
+        for (Map.Entry<?, ?> entry : entries) {
+            size = checkedSize(size, sizeOf(entry.getKey()),
+                               sizeOf(entry.getValue()));
+        }
+        return size;
+    }
+
+    private static int setSize(Collection<?> members) {
+        int size = checkedSize(headSize(TAG_SET), headSize(members.size()));
+        for (Object member : members) {
+            size = checkedSize(size, sizeOf(member));
+        }
+        return size;
     }
 
     private static int integerSize(long value) {
@@ -1334,6 +1426,11 @@ public final class DLCbor {
             } else {
                 writeValue(sink, tagged.value, mode);
             }
+        } else if (value instanceof MapValue map) {
+            writeMapEntries(sink, map.entries, mode);
+        } else if (value instanceof SetValue set) {
+            writeHead(sink, 6, TAG_SET);
+            writeSetMembers(sink, set.members, mode);
         } else if (value instanceof Sorted
                    || value instanceof SortedMap<?, ?>
                    || value instanceof SortedSet<?>) {
@@ -1705,9 +1802,15 @@ public final class DLCbor {
                 return length != 0 ? length : leftKey.compareTo(rightKey);
             });
             writeHead(sink, 5, entries.length);
+            String previous = null;
             for (Object item : entries) {
                 Map.Entry<?, ?> entry = (Map.Entry<?, ?>) item;
-                writeText(sink, (String) entry.getKey());
+                String key = (String) entry.getKey();
+                if (key.equals(previous)) {
+                    throw error(ErrorCode.DUPLICATE_KEY, sink.position());
+                }
+                previous = key;
+                writeText(sink, key);
                 writeValue(sink, entry.getValue(), mode);
             }
             return;
@@ -1722,8 +1825,13 @@ public final class DLCbor {
             return;
         }
 
-        List<PreparedEntry> entries = new ArrayList<>(map.size());
-        for (Map.Entry<?, ?> entry : map.entrySet()) {
+        writeMapEntries(sink, map.entrySet(), mode);
+    }
+
+    private static void writeMapEntries(
+        Sink sink, Collection<? extends Map.Entry<?, ?>> input, Mode mode) {
+        List<PreparedEntry> entries = new ArrayList<>(input.size());
+        for (Map.Entry<?, ?> entry : input) {
             entries.add(new PreparedEntry(encode(entry.getKey(), Mode.CANONICAL),
                                           entry.getKey(),
                                           entry.getValue()));
@@ -1736,8 +1844,6 @@ public final class DLCbor {
             rejectDuplicateEntries(entries, ErrorCode.DUPLICATE_KEY,
                                    sink.position());
         }
-        rejectHostEquivalentEntryKeys(entries, sink.position());
-
         writeHead(sink, 5, entries.size());
         for (PreparedEntry entry : entries) {
             if (mode == Mode.CANONICAL) {
@@ -1756,7 +1862,11 @@ public final class DLCbor {
         if (integerValues != null) {
             insertionSortCanonicalLongs(integerValues);
             writeHead(sink, 4, integerValues.length);
-            for (long value : integerValues) {
+            for (int index = 0; index < integerValues.length; index++) {
+                long value = integerValues[index];
+                if (index > 0 && value == integerValues[index - 1]) {
+                    throw error(ErrorCode.DUPLICATE_SET_MEMBER, sink.position());
+                }
                 writeLong(sink, value);
             }
             return;
@@ -1770,8 +1880,12 @@ public final class DLCbor {
             return;
         }
 
-        List<PreparedValue> values = new ArrayList<>(set.size());
-        for (Object value : set) {
+        writeSetMembers(sink, set, mode);
+    }
+
+    private static void writeSetMembers(Sink sink, Collection<?> input, Mode mode) {
+        List<PreparedValue> values = new ArrayList<>(input.size());
+        for (Object value : input) {
             values.add(new PreparedValue(encode(value, Mode.CANONICAL), value));
         }
         if (mode == Mode.CANONICAL) {
@@ -1792,9 +1906,6 @@ public final class DLCbor {
                 }
             }
         }
-        rejectHostEquivalentValues(values, ErrorCode.DUPLICATE_SET_MEMBER,
-                                   sink.position());
-
         writeHead(sink, 4, values.size());
         for (PreparedValue value : values) {
             if (mode == Mode.CANONICAL) {
@@ -1826,38 +1937,12 @@ public final class DLCbor {
         }
     }
 
-    private static void rejectHostEquivalentEntryKeys(
-        List<PreparedEntry> entries, int offset) {
-        if (entries.size() < 2) {
-            return;
-        }
-        ITransientSet seen = (ITransientSet)
-            PersistentHashSet.EMPTY.asTransient();
-        for (PreparedEntry entry : entries) {
-            if (seen.contains(entry.key)) {
-                throw error(ErrorCode.DUPLICATE_KEY, offset);
-            }
-            seen = (ITransientSet) seen.conj(entry.key);
-        }
-    }
-
-    private static void rejectHostEquivalentValues(List<PreparedValue> values,
-                                                   ErrorCode code,
-                                                   int offset) {
-        if (values.size() < 2) {
-            return;
-        }
-        ITransientSet seen = (ITransientSet)
-            PersistentHashSet.EMPTY.asTransient();
-        for (PreparedValue value : values) {
-            if (seen.contains(value.value)) {
-                throw error(code, offset);
-            }
-            seen = (ITransientSet) seen.conj(value.value);
-        }
-    }
-
     private static boolean hostMapKeysGuaranteeUniqueness(Map<?, ?> map) {
+        // Identity maps and arbitrary comparators cannot guarantee wire
+        // uniqueness even for otherwise safe scalar classes.
+        if (!(map instanceof IPersistentMap || map instanceof HashMap<?, ?>)) {
+            return false;
+        }
         Class<?> valueClass = null;
         boolean sawNull = false;
         for (Object key : map.keySet()) {
@@ -1963,6 +2048,9 @@ public final class DLCbor {
     }
 
     private static boolean hostSetValuesGuaranteeUniqueness(Set<?> set) {
+        if (!(set instanceof IPersistentSet || set instanceof HashSet<?>)) {
+            return false;
+        }
         Class<?> valueClass = null;
         boolean sawNull = false;
         for (Object value : set) {
@@ -2321,9 +2409,9 @@ public final class DLCbor {
             return PersistentVector.adopt(values);
         }
 
-        private IPersistentMap readMap(int additional,
-                                       int headOffset,
-                                       int depth) {
+        private Object readMap(int additional,
+                               int headOffset,
+                               int depth) {
             int length = collectionLength(additional, headOffset);
             HashSet<ByteArrayKey> seen = canonical
                 ? null
@@ -2335,6 +2423,8 @@ public final class DLCbor {
             ITransientMap largeResult = small
                 ? null
                 : PersistentArrayMap.EMPTY.asTransient();
+            boolean lossless = false;
+            List<Map.Entry<?, ?>> entries = null;
             for (int index = 0; index < length; index++) {
                 int keyStart = inputPosition();
                 int keyOffset = offset();
@@ -2358,22 +2448,42 @@ public final class DLCbor {
                 }
                 previousStart = keyStart;
                 previousEnd = keyEnd;
-                if (small) {
+                if (small && !lossless) {
                     for (int prior = 0; prior < index; prior++) {
                         if (Util.equiv(keyValues[prior * 2], key)) {
-                            throw error(ErrorCode.DUPLICATE_KEY, keyOffset);
+                            lossless = true;
+                            break;
                         }
                     }
-                } else if (largeResult.valAt(key, NOT_FOUND) != NOT_FOUND) {
-                    throw error(ErrorCode.DUPLICATE_KEY, keyOffset);
+                } else if (!small && !lossless
+                           && largeResult.valAt(key, NOT_FOUND) != NOT_FOUND) {
+                    // Preserve all prior entries before an assoc could merge
+                    // this wire-distinct key with a host-equivalent key.
+                    Map<?, ?> prior = (Map<?, ?>) largeResult.persistent();
+                    entries = new ArrayList<>(length);
+                    entries.addAll(prior.entrySet());
+                    largeResult = null;
+                    lossless = true;
                 }
                 Object value = readValue(depth + 1);
                 if (small) {
                     keyValues[index * 2] = key;
                     keyValues[index * 2 + 1] = value;
+                } else if (lossless) {
+                    entries.add(new SimpleImmutableEntry<>(key, value));
                 } else {
                     largeResult = largeResult.assoc(key, value);
                 }
+            }
+            if (lossless) {
+                if (small) {
+                    entries = new ArrayList<>(length);
+                    for (int index = 0; index < length; index++) {
+                        entries.add(new SimpleImmutableEntry<>(
+                            keyValues[index * 2], keyValues[index * 2 + 1]));
+                    }
+                }
+                return new MapValue(entries);
             }
             return small
                 ? PersistentArrayMap.createAsIfByAssoc(keyValues)
@@ -2751,6 +2861,7 @@ public final class DLCbor {
             int length = collectionLength(arrayHead & 0x1f, arrayHeadOffset);
             ITransientSet values = (ITransientSet)
                 PersistentHashSet.EMPTY.asTransient();
+            List<Object> members = null;
             HashSet<ByteArrayKey> seen = null;
             int previousStart = -1;
             int previousEnd = -1;
@@ -2771,7 +2882,8 @@ public final class DLCbor {
                         throw error(ErrorCode.NON_CANONICAL, valueOffset);
                     }
                 } else if (!canonical
-                           && !safeDecodedSetMemberEquality(value)) {
+                           && (members != null
+                               || !safeDecodedSetMemberEquality(value))) {
                     byte[] encoded = encode(value, Mode.CANONICAL);
                     if (seen == null) {
                         seen = new HashSet<>(Math.min(length, 1024));
@@ -2782,13 +2894,33 @@ public final class DLCbor {
                 }
                 previousStart = valueStart;
                 previousEnd = valueEnd;
-                int previousCount = values.count();
-                values = (ITransientSet) values.conj(value);
-                if (values.count() == previousCount) {
-                    throw error(ErrorCode.DUPLICATE_SET_MEMBER, valueOffset);
+                if (members == null && values.contains(value)) {
+                    Set<?> prior = (Set<?>) values.persistent();
+                    members = new ArrayList<>(length);
+                    members.addAll(prior);
+                    values = null;
+                    if (!canonical) {
+                        // Once host equality collides, canonical bytes must
+                        // track every member, including the safe scalars.
+                        seen = new HashSet<>(Math.min(length, 1024));
+                        for (Object member : members) {
+                            seen.add(new ByteArrayKey(
+                                encode(member, Mode.CANONICAL)));
+                        }
+                        if (!seen.add(new ByteArrayKey(
+                                encode(value, Mode.CANONICAL)))) {
+                            throw error(ErrorCode.DUPLICATE_SET_MEMBER,
+                                        valueOffset);
+                        }
+                    }
+                }
+                if (members != null) {
+                    members.add(value);
+                } else {
+                    values = (ITransientSet) values.conj(value);
                 }
             }
-            return values.persistent();
+            return members == null ? values.persistent() : new SetValue(members);
         }
 
         private BigInt readBignum(boolean negative, int headOffset) {

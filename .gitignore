@@ -93,3 +93,5 @@ bindings/javascript/*.tgz
 bindings/python/src/*.dist-info/
 bindings/python/**/__pycache__/
 bindings/python/**/*.py[cod]
+/doc/access-planning.md
+/doc/cidr2027.md

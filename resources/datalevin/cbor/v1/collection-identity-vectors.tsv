@@ -1,0 +1,17 @@
+# DL-CBOR collection identity: valid in every host binding.
+# id	kind	count	canonical_hex	fast_hex	note
+set-vector-list	set	2	d901028280d9444c8104	d9010282d9444c810480	Empty vector and list are distinct members.
+map-vector-list	map	2	a28000d9444c810401	a2d9444c8104018000	Empty vector and list retain both values.
+set-sequence-kinds	set	3	d901028380d9444c8104d9444c8105	d9010283d9444c8105d9444c810480	Vector, list and queue remain distinct.
+map-sequence-kinds	map	3	a38000d9444c810401d9444c810502	a3d9444c810502d9444c8104018000	Every sequence kind retains its entry.
+set-signed-zero-widths	set	4	d9010284fa00000000fa80000000fb0000000000000000fb8000000000000000	d9010284fb8000000000000000fb0000000000000000fa80000000fa00000000	Both signs and both float widths are distinct.
+map-signed-zero-widths	map	4	a4fa0000000000fa8000000001fb000000000000000002fb800000000000000003	a4fb800000000000000003fb000000000000000002fa8000000001fa0000000000	Each signed zero and float width retains its value.
+set-float-width	set	2	d9010282fa3f800000fb3ff0000000000000	d9010282fb3ff0000000000000fa3f800000	Float32 one and float64 one are distinct.
+map-float-width	map	2	a2fa3f80000000fb3ff000000000000001	a2fb3ff000000000000001fa3f80000000	Float32 and float64 keys retain both values.
+set-nested-sequence-kinds	set	2	d9010282818081d9444c8104	d901028281d9444c81048180	Type identity remains distinct inside vectors.
+map-nested-sequence-kinds	map	2	a2a1008000a100d9444c810401	a2a100d9444c810401a1008000	Maps containing vector/list values remain distinct keys.
+map-size-8	map	8	a800f601f602f603f604f605f68000d9444c810401	a88000d9444c81040100f601f602f603f604f605f6	Retain entries across the small/transient map boundary.
+map-size-9	map	9	a900f601f602f603f604f605f606f68000d9444c810401	a98000d9444c81040100f601f602f603f604f605f606f6	Retain entries across the small/transient map boundary.
+map-size-10	map	10	aa00f601f602f603f604f605f606f607f68000d9444c810401	aa8000d9444c81040100f601f602f603f604f605f606f607f6	Retain entries across the small/transient map boundary.
+set-after-collision	set	6	d901028600806161d9444c8104fa00000000fa80000000	d901028680d9444c8104006161fa80000000fa00000000	Keep members before and after switching representation.
+map-after-collision	map	10	aa00f601f602f603f604f605f606f68000d9444c81040168616263646566676802	aa8000d9444c8104016861626364656667680200f601f602f603f604f605f606f6	Keep entries added after switching representation.

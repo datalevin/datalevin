@@ -217,6 +217,29 @@
           (is (= expected (:code jvm-error)))
           (is (= jvm-error rust-error)))))))
 
+(deftest collection-identity-jvm-rust-roundtrip-test
+  (doseq [[id _kind _size canonical-hex fast-hex _note]
+          (support/collection-identity-rows)
+          [operation hex] [["canonical" canonical-hex] ["fast" fast-hex]]]
+    (testing (str id " " operation)
+      (let [expected (hex->bytes canonical-hex)
+            jvm-decoded (cbor/decode (hex->bytes hex) (= operation "canonical"))
+            jvm-encoded (cbor/encode jvm-decoded)
+            rust-encoded (rust-roundtrip operation (hex->bytes hex))]
+        (is (Arrays/equals expected jvm-encoded))
+        (is (Arrays/equals expected rust-encoded))
+        (is (Arrays/equals expected (rust-roundtrip "canonical" jvm-encoded)))
+        (is (Arrays/equals expected (cbor/encode (cbor/decode rust-encoded))))))))
+
+(deftest collection-identity-duplicate-error-agreement-test
+  (doseq [[id operation hex expected _note]
+          (support/collection-identity-malformed-rows)]
+    (testing id
+      (let [jvm-error (jvm-error operation (hex->bytes hex))
+            rust-error (rust-error operation hex)]
+        (is (= expected (:code jvm-error)))
+        (is (= jvm-error rust-error))))))
+
 (defspec canonical-jvm-rust-jvm-roundtrip-property 500
   (prop/for-all [value support/value-gen]
     (let [jvm-encoded  (cbor/encode value)
