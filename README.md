@@ -392,9 +392,9 @@ alternative's latency by Datalevin's latency.
 
 ## :rocket: Status
 
-Datalevin is extensively tested with property-based testing. It was used
-in production at Juji (acquired by Accenture) for several years, among other
-companies.
+Datalevin is extensively tested with property-based testing. It is used
+in production at Juji (acquired by Accenture), Roam Research, Toka, among many
+other companies.
 
 If your project is using Datalevin in production, drop a comment in [this
 issue](https://github.com/datalevin/datalevin/issues/383).
@@ -421,7 +421,7 @@ reach as soon as we can. We may adjust the priorities based on feedback.
   library for Java, Python, and JavaScript; Book.~~[Done 2026/07/20]
 * 1.1.0 ~~AVE storage optimization; transaction and query performance
   enhancement.~~ [Done 2026/09/02]
-* 1.2.0 portable `:data` encoding; extensible storage/query for arbitrary data.
+* 1.2.0 extensible storage/query for arbitrary data.
 * 1.3.0 direct analytics, virtual relationships, and semantic data federation.
 * 1.4.0 aggregation in rule heads; incremental view maintenance and initial
   maintained aggregates.

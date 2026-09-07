@@ -1,6 +1,28 @@
 use super::*;
 use std::{collections::HashMap, io::Write};
 
+/// Keep the scratch buffer outside the recursive value writer's stack frame.
+/// Fixed-width conversion into contiguous bytes lets LLVM vectorize byte swaps;
+/// each block reaches the destination with one write_all, without a heap buffer.
+#[inline(never)]
+fn write_numeric_blocks<W: Write, T, const N: usize>(
+    output: &mut W,
+    position: &mut usize,
+    values: &[T],
+    to_be_bytes: impl Fn(&T) -> [u8; N],
+) -> std::io::Result<()> {
+    let mut buffer = [0u8; 4096];
+    for block in values.chunks(buffer.len() / N) {
+        let bytes = &mut buffer[..block.len() * N];
+        for (value, dest) in block.iter().zip(bytes.as_chunks_mut::<N>().0) {
+            *dest = to_be_bytes(value);
+        }
+        output.write_all(bytes)?;
+        *position += bytes.len();
+    }
+    Ok(())
+}
+
 /// Writes directly to a Vec, a caller-owned slice, or another std::io::Write.
 /// An Encoder is a Nippy cache session. Discard it after a write failure.
 pub struct Encoder<W> {
@@ -47,6 +69,29 @@ impl<W: Write> Encoder<W> {
             .write_all(bytes)
             .map_err(|_| self.err(ErrorKind::Io))?;
         self.pos += bytes.len();
+        Ok(())
+    }
+    fn numeric_words<T, const N: usize>(
+        &mut self,
+        values: &[T],
+        to_be_bytes: impl Fn(&T) -> [u8; N],
+    ) -> Result<()> {
+        let size = values
+            .len()
+            .checked_mul(N)
+            .ok_or_else(|| self.err(ErrorKind::LimitExceeded))?;
+        if size > self.limits.max_bytes.saturating_sub(self.pos) {
+            return Err(self.err(ErrorKind::LimitExceeded));
+        }
+        if values.len() <= 8 {
+            // Tiny arrays cost less than setting up a scratch block.
+            for value in values {
+                self.put(&to_be_bytes(value))?;
+            }
+        } else {
+            write_numeric_blocks(&mut self.output, &mut self.pos, values, to_be_bytes)
+                .map_err(|_| self.err(ErrorKind::Io))?;
+        }
         Ok(())
     }
     fn tag(&mut self, tag: u8) -> Result<()> {
@@ -205,9 +250,7 @@ impl<W: Write> Encoder<W> {
             let words = integers::compress(items);
             let n = i32::try_from(words.len()).map_err(|_| self.err(ErrorKind::InvalidLength))?;
             self.put(&(-n).to_be_bytes())?;
-            for word in words {
-                self.put(&word.to_be_bytes())?;
-            }
+            self.numeric_words(&words, |n| n.to_be_bytes())?;
         } else {
             self.count(items.len(), 4)?;
             for word in items {
@@ -389,10 +432,7 @@ impl<W: Write> Encoder<W> {
                 self.collection(v.len())?;
                 self.tag(118)?;
                 self.count(v.len(), 4)?;
-                for n in v {
-                    self.put(&n.to_be_bytes())?;
-                }
-                Ok(())
+                self.numeric_words(v, |n| n.to_be_bytes())
             }
             Value::BooleanArray(_) | Value::ShortArray(_) | Value::CharArray(_) => {
                 let n = match value {
@@ -413,28 +453,19 @@ impl<W: Write> Encoder<W> {
                 self.collection(v.len())?;
                 self.tag(119)?;
                 self.count(v.len(), 4)?;
-                for n in v {
-                    self.put(&n.to_be_bytes())?;
-                }
-                Ok(())
+                self.numeric_words(v, |n| n.to_be_bytes())
             }
             Value::FloatArray(v) => {
                 self.collection(v.len())?;
                 self.tag(120)?;
                 self.count(v.len(), 4)?;
-                for n in v {
-                    self.put(&n.to_be_bytes())?;
-                }
-                Ok(())
+                self.numeric_words(v, |n| n.to_be_bytes())
             }
             Value::DoubleArray(v) => {
                 self.collection(v.len())?;
                 self.tag(121)?;
                 self.count(v.len(), 4)?;
-                for n in v {
-                    self.put(&n.to_be_bytes())?;
-                }
-                Ok(())
+                self.numeric_words(v, |n| n.to_be_bytes())
             }
             Value::StringArray(v) | Value::ObjectArray(v) => {
                 if matches!(value, Value::StringArray(_))

@@ -249,11 +249,21 @@
 (def value-gen
   (gen/recursive-gen
    (fn [inner]
-     (gen/one-of [(gen/vector inner 0 16)
-                  (gen/fmap #(apply list %) (gen/vector inner 0 16))
-                  (gen/set inner {:max-elements 16})
-                  (gen/map scalar-gen inner {:max-elements 16})]))
+     ;; Respect recursive-gen's size budget at each level. Explicit collection
+     ;; lengths bypass it and let nested values and shrink trees grow exponentially.
+     (gen/scale #(min 16 (long %))
+                (gen/one-of [(gen/vector inner)
+                            (gen/list inner)
+                            (gen/set inner)
+                            (gen/map scalar-gen inner)])))
    scalar-gen))
+
+(deftest generated-values-respect-small-sizes
+  (doseq [size [0 1]
+          seed (range 32)]
+    (let [value (gen/generate value-gen size seed)]
+      (is (or (not (coll? value)) (<= (count value) (long size)))
+          (str "size " size ", seed " seed)))))
 
 (defspec generated-jvm-rust-jvm 300
   (prop/for-all [value value-gen]
