@@ -19,3 +19,7 @@ xz2 = "0.1"
 
 [dev-dependencies]
 proptest = "1.11.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

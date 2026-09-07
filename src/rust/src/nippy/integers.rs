@@ -4,8 +4,112 @@
 //! VariableByte, four little-endian bytes per int. No alternative wire format.
 use super::ErrorKind;
 
+// The wire is JavaFastPFOR BinaryPacking. Specialize each legal bit width so
+// element offsets and cross-word shifts are constants, as in its Java kernels.
+macro_rules! each_element {
+    ($emit:ident) => {
+        $emit!(
+            0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+            24, 25, 26, 27, 28, 29, 30, 31
+        );
+    };
+}
+
+macro_rules! by_width {
+    ($width:expr, $kernel:ident, $input:expr, $output:expr) => {
+        match $width {
+            0 => $kernel::<0>($input, $output),
+            1 => $kernel::<1>($input, $output),
+            2 => $kernel::<2>($input, $output),
+            3 => $kernel::<3>($input, $output),
+            4 => $kernel::<4>($input, $output),
+            5 => $kernel::<5>($input, $output),
+            6 => $kernel::<6>($input, $output),
+            7 => $kernel::<7>($input, $output),
+            8 => $kernel::<8>($input, $output),
+            9 => $kernel::<9>($input, $output),
+            10 => $kernel::<10>($input, $output),
+            11 => $kernel::<11>($input, $output),
+            12 => $kernel::<12>($input, $output),
+            13 => $kernel::<13>($input, $output),
+            14 => $kernel::<14>($input, $output),
+            15 => $kernel::<15>($input, $output),
+            16 => $kernel::<16>($input, $output),
+            17 => $kernel::<17>($input, $output),
+            18 => $kernel::<18>($input, $output),
+            19 => $kernel::<19>($input, $output),
+            20 => $kernel::<20>($input, $output),
+            21 => $kernel::<21>($input, $output),
+            22 => $kernel::<22>($input, $output),
+            23 => $kernel::<23>($input, $output),
+            24 => $kernel::<24>($input, $output),
+            25 => $kernel::<25>($input, $output),
+            26 => $kernel::<26>($input, $output),
+            27 => $kernel::<27>($input, $output),
+            28 => $kernel::<28>($input, $output),
+            29 => $kernel::<29>($input, $output),
+            30 => $kernel::<30>($input, $output),
+            31 => $kernel::<31>($input, $output),
+            32 => $kernel::<32>($input, $output),
+            _ => unreachable!("validated bit width"),
+        }
+    };
+}
+
+#[inline]
+fn pack<const WIDTH: usize>(values: &[i32], output: &mut [i32]) {
+    let values: &[i32; 32] = values.try_into().unwrap();
+    let output: &mut [i32; WIDTH] = output.try_into().unwrap();
+    if WIDTH == 0 {
+        return;
+    }
+    if WIDTH == 32 {
+        output.copy_from_slice(values);
+        return;
+    }
+    macro_rules! put {
+        ($($i:expr),*) => { $(
+            let bit = $i * WIDTH;
+            let shift = bit % 32;
+            let value = values[$i] as u32;
+            output[bit / 32] |= (value << shift) as i32;
+            if shift + WIDTH > 32 {
+                output[bit / 32 + 1] |= (value >> (32 - shift)) as i32;
+            }
+        )* };
+    }
+    each_element!(put);
+}
+
+#[inline]
+fn unpack<const WIDTH: usize>(words: &[i32], output: &mut [i32]) {
+    let words: &[i32; WIDTH] = words.try_into().unwrap();
+    let output: &mut [i32; 32] = output.try_into().unwrap();
+    if WIDTH == 0 {
+        output.fill(0);
+        return;
+    }
+    if WIDTH == 32 {
+        output.copy_from_slice(words);
+        return;
+    }
+    macro_rules! get {
+        ($($i:expr),*) => { $(
+            let bit = $i * WIDTH;
+            let shift = bit % 32;
+            let mut value = words[bit / 32] as u32 >> shift;
+            if shift + WIDTH > 32 {
+                value |= (words[bit / 32 + 1] as u32) << (32 - shift);
+            }
+            output[$i] = (value & (u32::MAX >> (32 - WIDTH))) as i32;
+        )* };
+    }
+    each_element!(get);
+}
+
 pub(super) fn compress(input: &[i32]) -> Vec<i32> {
-    let mut out = vec![input.len() as i32];
+    let mut out = Vec::with_capacity(input.len() + input.len() / 32 + 12);
+    out.push(input.len() as i32);
     let packed = input.len() / 32 * 32;
     let mut pos = 0;
     while pos < packed {
@@ -26,18 +130,7 @@ pub(super) fn compress(input: &[i32]) -> Vec<i32> {
         for &width in widths.iter().take(groups) {
             let start = out.len();
             out.resize(start + width as usize, 0);
-            if width != 0 {
-                for i in 0..32 {
-                    let bit = i * width as usize;
-                    let word = start + bit / 32;
-                    let shift = bit % 32;
-                    let value = input[pos + i] as u32;
-                    out[word] |= (value << shift) as i32;
-                    if shift + width as usize > 32 {
-                        out[word + 1] |= (value >> (32 - shift)) as i32;
-                    }
-                }
-            }
+            by_width!(width, pack, &input[pos..pos + 32], &mut out[start..]);
             pos += 32;
         }
     }
@@ -91,21 +184,9 @@ pub(super) fn decompress(input: &[i32]) -> std::result::Result<Vec<i32>, ErrorKi
                 return Err(ErrorKind::InvalidValue);
             }
             let words = input.get(pos..pos + width).ok_or(ErrorKind::Truncated)?;
-            for i in 0..32 {
-                let bit = i * width;
-                let value = if width == 0 {
-                    0
-                } else {
-                    let word = bit / 32;
-                    let shift = bit % 32;
-                    let mut value = words[word] as u32 as u64 >> shift;
-                    if shift + width > 32 {
-                        value |= (words[word + 1] as u32 as u64) << (32 - shift);
-                    }
-                    (value & ((1u64 << width) - 1)) as u32
-                };
-                out.push(value as i32);
-            }
+            let start = out.len();
+            out.resize(start + 32, 0);
+            by_width!(width, unpack, words, &mut out[start..]);
             pos += width;
         }
     }
@@ -144,4 +225,42 @@ pub(super) fn decompress(input: &[i32]) -> std::result::Result<Vec<i32>, ErrorKi
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_bit_width_matches_independent_bit_stream() {
+        for width in 0..=32 {
+            let mask = u32::MAX.checked_shr(32 - width).unwrap_or(0);
+            let values = std::array::from_fn::<_, 32, _>(|i| {
+                (if i == 0 {
+                    mask
+                } else {
+                    (i as u32).wrapping_mul(0x9e3779b9) & mask
+                }) as i32
+            });
+            // Build the expected stream bit by bit, independently of word
+            // shifts or the optimized constant-width packing expressions.
+            let mut expected = vec![0i32; width as usize];
+            for (index, value) in values.iter().enumerate() {
+                for bit in 0..width as usize {
+                    let position = index * width as usize + bit;
+                    if (*value as u32 >> bit) & 1 != 0 {
+                        expected[position / 32] |= (1u32 << (position % 32)) as i32;
+                    }
+                }
+            }
+            let mut actual = vec![0; width as usize];
+            by_width!(width, pack, &values, &mut actual);
+            assert_eq!(actual, expected, "width {width}");
+            let mut decoded = [i32::MIN; 32];
+            by_width!(width, unpack, &expected, &mut decoded);
+            assert_eq!(decoded, values, "width {width}");
+        }
+        assert_eq!(decompress(&[32, 33]), Err(ErrorKind::InvalidValue));
+        assert_eq!(decompress(&[32, 32, 0]), Err(ErrorKind::Truncated));
+    }
 }

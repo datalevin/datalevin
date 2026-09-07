@@ -62,7 +62,7 @@ fn direct_caller_owned_buffers_and_rollback() {
         );
     }
     let mut out = vec![123];
-    assert!(fast_freeze_into(&mut out, &Value::Keyword("k".repeat(32768))).is_err());
+    assert!(fast_freeze_into(&mut out, &Value::Keyword("k".repeat(32768).into())).is_err());
     assert_eq!(out, [123]);
 }
 
@@ -244,7 +244,7 @@ fn arb_value() -> impl Strategy<Value = Value> {
         any::<i64>().prop_map(Value::Long),
         any::<u64>().prop_map(Value::Double),
         ".{0,64}".prop_map(Value::Text),
-        "[a-z/]{0,20}".prop_map(Value::Keyword),
+        "[a-z/]{0,20}".prop_map(|s: String| Value::Keyword(s.into())),
         prop::collection::vec(any::<i32>(), 0..260).prop_map(Value::GrowingIntArray)
     ];
     leaf.prop_recursive(8, 256, 16, |inner| {

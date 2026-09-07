@@ -211,11 +211,15 @@
 
 (deftest integer-compression-and-roaring-containers
   (doseq [n [0 1 3 4 31 32 33 127 128 129 255 256 257]
-          width [0 1 7 8 15 16 31 32]]
+          width (range 33)]
     (let [mask (dec (bit-shift-left 1 width))
           values (map #(unchecked-int (bit-and mask (* % 123456789))) (range n))
-          value (support/growing values)]
-      (is (= value (roundtrip value)) (str "length " n ", width " width))))
+          value (support/growing values)
+          wire  (nippy/fast-freeze value)
+          rust  (request "roundtrip" (bytes->hex wire))]
+      (is (Arrays/equals ^bytes wire ^bytes rust)
+          (str "exact JavaFastPFOR bytes: length " n ", width " width))
+      (is (= value (nippy/fast-thaw rust)) (str "length " n ", width " width))))
   (doseq [run? [false true]]
     (let [value (support/bitmap (concat (range 100000) [4294967295]))]
       (when run? (.runOptimize ^org.roaringbitmap.RoaringBitmap value))

@@ -11,6 +11,87 @@ mod java_array;
 mod read;
 mod write;
 
+use std::{
+    fmt,
+    hash::{BuildHasher, Hash, Hasher},
+    ops::Deref,
+    sync::{
+        Arc, LazyLock,
+        atomic::{AtomicU64, Ordering},
+    },
+};
+
+/// Immutable keyword name with shared storage and a cached, randomized hash.
+/// Cached wire references can clone a keyword without copying or rehashing UTF-8.
+#[derive(Debug)]
+pub struct Keyword {
+    name: Arc<str>,
+    hash: AtomicU64,
+}
+
+impl From<&str> for Keyword {
+    fn from(name: &str) -> Self {
+        Self {
+            name: Arc::from(name),
+            hash: AtomicU64::new(0),
+        }
+    }
+}
+impl From<String> for Keyword {
+    fn from(name: String) -> Self {
+        Self::from(name.as_str())
+    }
+}
+impl Deref for Keyword {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.name
+    }
+}
+impl AsRef<str> for Keyword {
+    fn as_ref(&self) -> &str {
+        &self.name
+    }
+}
+impl fmt::Display for Keyword {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.name.fmt(f)
+    }
+}
+impl Clone for Keyword {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            hash: AtomicU64::new(self.hash.load(Ordering::Relaxed)),
+        }
+    }
+}
+impl PartialEq for Keyword {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+    }
+}
+impl Eq for Keyword {}
+impl Keyword {
+    fn cached_hash(&self) -> u64 {
+        let mut hash = self.hash.load(Ordering::Relaxed);
+        if hash == 0 {
+            static HASHER: LazyLock<std::collections::hash_map::RandomState> =
+                LazyLock::new(std::collections::hash_map::RandomState::new);
+            hash = HASHER.hash_one(&self.name).max(1);
+            // The hash is deterministic within the process, so racing readers
+            // can calculate the same value without synchronization or a lock.
+            self.hash.store(hash, Ordering::Relaxed);
+        }
+        hash
+    }
+}
+impl Hash for Keyword {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.cached_hash());
+    }
+}
+
 pub use compression::{Compression, freeze, thaw, thaw_with_limits};
 pub use read::Decoder;
 pub use write::{Encoder, fast_freeze, fast_freeze_into};
@@ -49,7 +130,7 @@ pub enum Value {
     },
     Text(String),
     /// Nippy stores the printable name without the leading colon.
-    Keyword(String),
+    Keyword(Keyword),
     Symbol(String),
     Bytes(Vec<u8>),
     Vector(Vec<Value>),

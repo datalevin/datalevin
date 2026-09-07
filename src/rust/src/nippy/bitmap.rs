@@ -1,6 +1,5 @@
 //! Bound the portable Roaring record before handing it to the standard library.
 use super::ErrorKind;
-use std::io::Cursor;
 
 pub(super) fn read(
     bytes: &[u8],
@@ -43,20 +42,18 @@ pub(super) fn read(
         return Err(ErrorKind::Truncated);
     }
     let mut cardinality = 0usize;
-    for i in 0..count {
-        cardinality += u16_at(keys + i * 4 + 2)? + 1;
-        if i != 0 && u16_at(keys + (i - 1) * 4)? >= u16_at(keys + i * 4)? {
-            return Err(ErrorKind::InvalidValue);
+    let descriptions = bytes[keys..offsets].as_chunks::<4>().0;
+    for (i, description) in descriptions.iter().enumerate() {
+        let cardinal = u16::from_le_bytes([description[2], description[3]]) as usize + 1;
+        cardinality += cardinal;
+        if cardinality > max_members {
+            return Err(ErrorKind::LimitExceeded);
         }
-    }
-    if cardinality > max_members {
-        return Err(ErrorKind::LimitExceeded);
-    }
-    for i in 0..count {
+        // The checked library reader validates key ordering and container data.
+        // Offsets are ignored by that reader, so validate them here.
         if has_offsets && u32_at(offsets + i * 4)? != position {
             return Err(ErrorKind::InvalidValue);
         }
-        let cardinal = u16_at(keys + i * 4 + 2)? + 1;
         let run = runs && bytes[flags + i / 8] & (1 << (i % 8)) != 0;
         position += if run {
             2 + u16_at(position)? * 4
@@ -75,10 +72,10 @@ pub(super) fn read(
     if allocation > allocation_budget {
         return Err(ErrorKind::LimitExceeded);
     }
-    let mut input = Cursor::new(&bytes[..position]);
+    let mut input = &bytes[..position];
     let bitmap = roaring::RoaringBitmap::deserialize_from(&mut input)
         .map_err(|_| ErrorKind::InvalidValue)?;
-    if input.position() as usize != position || bitmap.len() as usize != cardinality {
+    if !input.is_empty() || bitmap.len() as usize != cardinality {
         return Err(ErrorKind::InvalidValue);
     }
     Ok((bitmap, position, allocation))

@@ -7,7 +7,7 @@ use std::io::{self, Read, Write};
 const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
 fn keyword(name: &str) -> Value {
-    Value::Keyword(name.to_owned())
+    Value::Keyword(name.into())
 }
 
 fn text(value: &str) -> Value {
@@ -54,7 +54,7 @@ fn dispatch(request: &Value) -> Value {
         return protocol_error("Request requires a vector of argument descriptors");
     };
     // Echo tests the lossless transport only. It is not a database capability.
-    if operation == "echo" {
+    if operation.as_ref() == "echo" {
         if let [argument] = arguments.as_slice()
             && field(argument, "kind") == Some(&keyword("value"))
             && let Some(value) = field(argument, "value")

@@ -99,6 +99,24 @@ impl<'a> Decoder<'a> {
     fn i64(&mut self) -> Result<i64> {
         Ok(i64::from_be_bytes(self.take(8)?.try_into().unwrap()))
     }
+    fn numeric_words<T, const N: usize>(
+        &mut self,
+        n: usize,
+        from_be_bytes: impl Fn([u8; N]) -> T,
+    ) -> Result<Vec<T>> {
+        // Validate and charge the whole span before allocating. An exact-size
+        // iterator lets the compiler convert contiguous words in bulk.
+        self.collection(n, N)?;
+        self.charge(0, n * N)?;
+        Ok(self
+            .take(n * N)?
+            .as_chunks::<N>()
+            .0
+            .iter()
+            .copied()
+            .map(from_be_bytes)
+            .collect())
+    }
     fn count(&mut self, width: u8) -> Result<usize> {
         let n = match width {
             0 => (self.u8()? ^ 0x80) as i64,
@@ -129,6 +147,12 @@ impl<'a> Decoder<'a> {
         self.charge(0, n)?;
         let s = std::str::from_utf8(self.take(n)?).map_err(|_| self.err(ErrorKind::InvalidUtf8))?;
         Ok(s.to_owned())
+    }
+    fn keyword(&mut self, width: u8) -> Result<Keyword> {
+        let n = self.count(width)?;
+        self.charge(0, n.saturating_add(2 * std::mem::size_of::<usize>()))?;
+        let s = std::str::from_utf8(self.take(n)?).map_err(|_| self.err(ErrorKind::InvalidUtf8))?;
+        Ok(s.into())
     }
     fn big(&mut self) -> Result<Vec<u8>> {
         let n = self.blob(4)?;
@@ -163,7 +187,8 @@ impl<'a> Decoder<'a> {
         if index < self.dict_count {
             let entry = &self.dictionary.unwrap().entries[index];
             let len = match entry {
-                Value::Text(s) | Value::Keyword(s) => s.len(),
+                Value::Text(s) => s.len(),
+                Value::Keyword(s) => s.len(),
                 _ => unreachable!(),
             };
             self.charge(1, std::mem::size_of::<Value>() + len)?;
@@ -236,12 +261,7 @@ impl<'a> Decoder<'a> {
                     .checked_abs()
                     .ok_or_else(|| self.err(ErrorKind::InvalidLength))?
                     as usize;
-                self.collection(n, 4)?;
-                self.charge(0, n * 4)?;
-                let mut words = Vec::with_capacity(n);
-                for _ in 0..n {
-                    words.push(self.i32()?);
-                }
+                let mut words = self.numeric_words(n, i32::from_be_bytes)?;
                 if size < 0 {
                     let count = words.first().copied().unwrap_or(-1);
                     if count < 0 {
@@ -272,6 +292,7 @@ impl<'a> Decoder<'a> {
             _ => return Err(self.err(ErrorKind::UnsupportedType(id))),
         })
     }
+    #[inline]
     fn value(&mut self, depth: usize) -> Result<Value> {
         if depth > self.limits.max_depth {
             return Err(self.err(ErrorKind::LimitExceeded));
@@ -279,7 +300,6 @@ impl<'a> Decoder<'a> {
         self.height = self.height.max(depth);
         self.charge(1, std::mem::size_of::<Value>())?;
         let tag = self.u8()?;
-        let d = depth + 1;
         Ok(match tag {
             3 => Value::Null,
             8 => Value::Bool(true),
@@ -310,6 +330,11 @@ impl<'a> Decoder<'a> {
             55 => Value::Double(0),
             60 => Value::Float(self.i32()? as u32),
             61 => Value::Double(self.i64()? as u64),
+            _ => return self.compound_value(tag, depth + 1),
+        })
+    }
+    fn compound_value(&mut self, tag: u8, d: usize) -> Result<Value> {
+        Ok(match tag {
             44 => Value::BigInt(self.big()?),
             45 => Value::BigInteger(self.big()?),
             62 => Value::BigDecimal {
@@ -325,9 +350,9 @@ impl<'a> Decoder<'a> {
             105 => Value::Text(self.string(1)?),
             16 => Value::Text(self.string(2)?),
             13 => Value::Text(self.string(4)?),
-            106 => Value::Keyword(self.string(1)?),
-            85 => Value::Keyword(self.string(2)?),
-            77 | 14 => Value::Keyword(self.string(4)?),
+            106 => Value::Keyword(self.keyword(1)?),
+            85 => Value::Keyword(self.keyword(2)?),
+            77 | 14 => Value::Keyword(self.keyword(4)?),
             56 => Value::Symbol(self.string(1)?),
             86 => Value::Symbol(self.string(2)?),
             78 | 57 => Value::Symbol(self.string(4)?),
@@ -442,38 +467,11 @@ impl<'a> Decoder<'a> {
             }
             118..=121 => {
                 let n = self.count(4)?;
-                let width = if tag == 118 || tag == 120 { 4 } else { 8 };
-                self.collection(n, width)?;
-                self.charge(0, n * width)?;
                 match tag {
-                    118 => {
-                        let mut v = Vec::with_capacity(n);
-                        for _ in 0..n {
-                            v.push(self.i32()?);
-                        }
-                        Value::IntArray(v)
-                    }
-                    119 => {
-                        let mut v = Vec::with_capacity(n);
-                        for _ in 0..n {
-                            v.push(self.i64()?);
-                        }
-                        Value::LongArray(v)
-                    }
-                    120 => {
-                        let mut v = Vec::with_capacity(n);
-                        for _ in 0..n {
-                            v.push(self.i32()? as u32);
-                        }
-                        Value::FloatArray(v)
-                    }
-                    _ => {
-                        let mut v = Vec::with_capacity(n);
-                        for _ in 0..n {
-                            v.push(self.i64()? as u64);
-                        }
-                        Value::DoubleArray(v)
-                    }
+                    118 => Value::IntArray(self.numeric_words(n, i32::from_be_bytes)?),
+                    119 => Value::LongArray(self.numeric_words(n, i64::from_be_bytes)?),
+                    120 => Value::FloatArray(self.numeric_words(n, u32::from_be_bytes)?),
+                    _ => Value::DoubleArray(self.numeric_words(n, u64::from_be_bytes)?),
                 }
             }
             108 | 109 | 116 | 117 => {

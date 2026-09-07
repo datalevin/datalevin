@@ -1,5 +1,5 @@
 use datalevin_codec::nippy::{
-    Encoder, ErrorKind, Limits, Value, fast_freeze, fast_freeze_into, fast_thaw,
+    Decoder, Encoder, ErrorKind, Limits, Value, fast_freeze, fast_freeze_into, fast_thaw,
 };
 use std::io::{self, Write};
 
@@ -172,9 +172,98 @@ fn bulk_arrays_respect_limits_and_stream_failures() {
         assert_eq!(encoder.position(), 5 + 4096);
         assert_eq!(writer.bytes, expected[..5 + 4096 + 3]);
 
-        let nested = Value::Vector(vec![value, Value::Keyword("k".repeat(32768))]);
+        let nested = Value::Vector(vec![value, Value::Keyword("k".repeat(32768).into())]);
         let mut out = vec![0xcc; 3];
         assert!(fast_freeze_into(&mut out, &nested).is_err());
         assert_eq!(out, [0xcc; 3]);
+    }
+}
+
+#[test]
+fn bulk_decoding_checks_the_entire_span_and_allocation_budget() {
+    for (value, wire) in arrays(4097) {
+        let required = std::mem::size_of::<Value>() + wire.len() - 5;
+        let limits = Limits {
+            max_allocation_bytes: required,
+            ..Limits::default()
+        };
+        let mut unaligned = vec![0xcc; 3];
+        unaligned.extend_from_slice(&wire);
+        let mut decoder = Decoder::new(&unaligned[3..], limits).unwrap();
+        assert_eq!(decoder.read_value().unwrap(), value);
+        assert_eq!(decoder.position(), wire.len());
+        let mut decoder = Decoder::new(
+            &wire,
+            Limits {
+                max_allocation_bytes: required - 1,
+                ..limits
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            decoder.read_value().unwrap_err().kind,
+            ErrorKind::LimitExceeded
+        );
+        for length in [0, 1, 4, 5, 6, 8, 4096, wire.len() - 1] {
+            assert_eq!(
+                fast_thaw(&wire[..length]).unwrap_err().kind,
+                ErrorKind::Truncated
+            );
+        }
+    }
+}
+
+#[test]
+fn large_bitmaps_keep_portable_bytes_and_stream_contracts() {
+    for mut bitmap in [
+        (0..100000).collect::<roaring::RoaringBitmap>(),
+        (0..4096).map(|i| i * 1009).collect(),
+    ] {
+        for optimize in [false, true] {
+            if optimize {
+                bitmap.optimize();
+            }
+            let mut expected = vec![82];
+            expected.extend_from_slice(&25371i16.to_be_bytes());
+            bitmap.serialize_into(&mut expected).unwrap();
+            let value = Value::Bitmap(bitmap.clone());
+            assert_eq!(fast_freeze(&value).unwrap(), expected);
+            assert_eq!(fast_thaw(&expected).unwrap(), value);
+            let mut writer = ShortWrites {
+                bytes: Vec::new(),
+                remaining: usize::MAX,
+                interrupt: true,
+            };
+            let mut encoder = Encoder::new(&mut writer, Limits::default());
+            encoder.write_value(&value).unwrap();
+            assert_eq!(encoder.position(), expected.len());
+            assert_eq!(writer.bytes, expected);
+            let mut writer = ShortWrites {
+                bytes: Vec::new(),
+                remaining: expected.len() - 1,
+                interrupt: false,
+            };
+            assert_eq!(
+                Encoder::new(&mut writer, Limits::default())
+                    .write_value(&value)
+                    .unwrap_err()
+                    .kind,
+                ErrorKind::Io
+            );
+            let mut out = Vec::new();
+            assert_eq!(
+                Encoder::new(
+                    &mut out,
+                    Limits {
+                        max_bytes: expected.len() - 1,
+                        ..Limits::default()
+                    }
+                )
+                .write_value(&value)
+                .unwrap_err()
+                .kind,
+                ErrorKind::LimitExceeded
+            );
+        }
     }
 }
