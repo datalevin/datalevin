@@ -19,7 +19,7 @@
    [taoensso.nippy :as nippy]
    [clojure.set :as set])
   (:import
-   [java.util Iterator List UUID NoSuchElementException Map Set Collection]
+   [java.util Iterator List UUID NoSuchElementException Map Set Collection AbstractSet]
    [java.io DataInput DataOutput]
    [java.lang.ref Cleaner Cleaner$Cleanable]
    [java.lang.management ManagementFactory]
@@ -471,6 +471,12 @@
       (map #(MapEntry. % (.get this %)) (.keySet this))))
 
   Map
+
+  (entrySet [this]
+    (let [owner this]
+      (proxy [AbstractSet] []
+        (size [] (count owner))
+        (iterator [] (.iterator owner)))))
 
   (size [this] (count this))
 

@@ -19,8 +19,8 @@ doc = false
 bench = false
 
 [[bin]]
-name = "decode-storage"
-path = "fuzz_targets/decode_storage.rs"
+name = "decode-header"
+path = "fuzz_targets/decode_header.rs"
 test = false
 doc = false
 bench = false

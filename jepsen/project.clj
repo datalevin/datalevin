@@ -10,7 +10,7 @@
                  [com.cognitect/transit-clj "1.0.333"]
                  [com.github.clj-easy/graal-build-time "1.0.5"]
                  [com.github.luben/zstd-jni "1.5.7-11"]
-                 [com.taoensso/nippy "3.7.0-beta1"]
+                 [com.taoensso/nippy "3.9.0"]
                  [com.taoensso/timbre "6.5.0"]
                  [io.github.nextjournal/markdown "0.7.222"]
                  [metosin/jsonista "0.3.13"]

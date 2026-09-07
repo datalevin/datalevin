@@ -10,7 +10,7 @@
    [com.alipay.sofa/jraft-core "1.4.1"]
    [com.cognitect/transit-clj "1.1.357"]
    [com.github.clj-easy/graal-build-time "1.0.6"]
-   [com.taoensso/nippy "3.7.0-beta1"]
+   [com.taoensso/nippy "3.9.0"]
    [com.taoensso/timbre "6.5.0"]
    [joda-time/joda-time "2.14.2"]
    [me.lemire.integercompression/JavaFastPFOR "0.3.14"]

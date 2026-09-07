@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+set -euo pipefail
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+rust_root="$repo_root/src/rust"
+fuzz_root="$repo_root/target/nippy-fuzz"
+if [[ -z "${CARGO:-}" ]]; then
+    CARGO="$(command -v cargo || true)"
+    CARGO="${CARGO:-${CARGO_HOME:-$HOME/.cargo}/bin/cargo}"
+fi
+export PATH="$(dirname "$CARGO"):$PATH"
+action="${1:-smoke}"
+amount="${2:-1000}"
+if [[ ! "$amount" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Expected a positive run count or time limit" >&2; exit 2
+fi
+case "$action" in
+    smoke) stop_flag="-runs=$amount" ;;
+    rust) stop_flag="-max_total_time=${2:-60}" ;;
+    *) echo "usage: script/nippy-fuzz {smoke|rust} [runs-or-seconds]" >&2; exit 2 ;;
+esac
+"$CARGO" run --quiet --manifest-path "$rust_root/Cargo.toml" \
+    --example nippy_seed_corpus -- "$fuzz_root/corpus"
+for target in bare header; do
+    mkdir -p "$fuzz_root/artifacts/$target"
+    (
+        cd "$rust_root"
+        "$CARGO" +nightly fuzz run "decode-$target" "$fuzz_root/corpus/$target" -- \
+            "$stop_flag" -max_len=65536 -rss_limit_mb=2048 -timeout=10 \
+            -verbosity=0 -print_final_stats=1 \
+            "-artifact_prefix=$fuzz_root/artifacts/$target/"
+    )
+done

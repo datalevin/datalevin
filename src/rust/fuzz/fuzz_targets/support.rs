@@ -1,50 +1,37 @@
-use datalevin_codec::cbor::{
-    Error, ErrorKind, Limits, Mode, Value, decode_with_limits, encode, encode_into, encoded_len,
-};
+use datalevin_codec::nippy::*;
 
-pub const FUZZ_LIMITS: Limits = Limits {
-    max_input_bytes: 64 * 1024,
-    max_depth: 64,
-    max_collection_len: 4 * 1024,
-    max_string_bytes: 64 * 1024,
-    max_bignum_bytes: 4 * 1024,
-    max_extension_bytes: 64 * 1024,
-};
-
-pub fn verify_value(value: &Value) -> Vec<u8> {
-    let canonical = encode(value, Mode::Canonical).expect("a decoded value must re-encode");
-    assert_eq!(
-        canonical.len(),
-        encoded_len(value, Mode::Canonical).expect("a decoded value must have an encoded length"),
-        "encoded_len disagrees with encode"
-    );
-
-    let mut output = vec![0; canonical.len()];
-    let written = encode_into(value, Mode::Canonical, &mut output)
-        .expect("an exactly sized output must be sufficient");
-    assert_eq!(canonical.len(), written, "encode_into wrote the wrong size");
-    assert_eq!(canonical, output, "encode and encode_into disagree");
-
-    let mut short = vec![0; canonical.len() - 1];
-    let error = encode_into(value, Mode::Canonical, &mut short)
-        .expect_err("a short output must be rejected");
-    assert_eq!(ErrorKind::OutputTooSmall, error.kind);
-
-    let decoded = decode_with_limits(&canonical, true, FUZZ_LIMITS)
-        .expect("canonical encoder output must decode");
-    let reencoded =
-        encode(&decoded, Mode::Canonical).expect("a decoded canonical value must re-encode");
-    assert_eq!(
-        canonical, reencoded,
-        "canonical bytes are not a fixed point"
-    );
-    canonical
+pub fn limits() -> Limits {
+    Limits {
+        max_bytes: 65536,
+        max_depth: 32,
+        max_collection_len: 4096,
+        max_values: 16384,
+        max_allocation_bytes: 1024 * 1024,
+    }
 }
 
-pub fn verify_error_offset(error: &Error, input_len: usize) {
-    assert!(
-        error.offset <= input_len,
-        "error offset {} is outside an input of length {input_len}",
-        error.offset
-    );
+pub fn check(result: Result<Value>, input_len: usize) {
+    match result {
+        Ok(value) => {
+            let mut bytes = Vec::new();
+            Encoder::new(&mut bytes, Limits::default())
+                .with_version(WireVersion::V3_9)
+                .write_value(&value)
+                .expect("decoded value must encode");
+            let decoded = fast_thaw(&bytes).expect("encoded value must decode");
+            let mut repeated = Vec::new();
+            Encoder::new(&mut repeated, Limits::default())
+                .with_version(WireVersion::V3_9)
+                .write_value(&decoded)
+                .unwrap();
+            assert_eq!(repeated, bytes);
+            let mut caller_owned = vec![0; bytes.len()];
+            Encoder::new(&mut caller_owned[..], Limits::default())
+                .with_version(WireVersion::V3_9)
+                .write_value(&value)
+                .unwrap();
+            assert_eq!(caller_owned, bytes);
+        }
+        Err(error) => assert!(error.offset <= input_len),
+    }
 }

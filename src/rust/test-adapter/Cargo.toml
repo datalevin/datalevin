@@ -1,0 +1,10 @@
+[package]
+name = "datalevin-test-adapter"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "Process boundary for running the original Clojure tests against Rust"
+license = "EPL-2.0"
+
+[dependencies]
+datalevin-codec = { path = ".." }
