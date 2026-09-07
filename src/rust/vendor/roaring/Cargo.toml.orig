@@ -1,0 +1,33 @@
+[package]
+name = "roaring"
+version = "0.11.5"
+# When changing this value don't forget to change the MSRV test in `.github/workflows/test.yml`!!
+rust-version = "1.90.0"
+authors = ["Wim Looman <wim@nemo157.com>", "Kerollmops <kero@meilisearch.com>"]
+description = "A better compressed bitset - pure Rust implementation"
+
+documentation = "https://docs.rs/roaring"
+repository = "https://github.com/RoaringBitmap/roaring-rs"
+
+readme = "../README.md"
+keywords = ["roaring", "data-structure", "bitmap"]
+categories = ["data-structures"]
+edition = "2021"
+
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+bytemuck = { workspace = true, optional = true }
+byteorder = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+
+[features]
+default = ["std"]
+serde = ["dep:serde", "std"]
+simd = []
+std = ["dep:bytemuck", "dep:byteorder"]
+
+[dev-dependencies]
+proptest = { workspace = true }
+serde_json = { workspace = true }
+postcard = { workspace = true }

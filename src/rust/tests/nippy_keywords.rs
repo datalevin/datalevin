@@ -40,6 +40,7 @@ fn keywords_follow_nippy_39_second_occurrence_policy() {
     assert_eq!(fast_freeze(&value).unwrap(), expected);
     let decoded = fast_thaw(&expected).unwrap();
     assert_eq!(decoded, value);
+    assert_eq!(fast_freeze(&decoded).unwrap(), expected);
     let Value::Vector(items) = decoded else {
         panic!()
     };
@@ -48,6 +49,7 @@ fn keywords_follow_nippy_39_second_occurrence_policy() {
         _ => panic!(),
     };
     assert_eq!(keyword(2).as_ptr(), keyword(3).as_ptr());
+    assert_ne!(keyword(0).as_ptr(), keyword(2).as_ptr());
     assert_eq!(keyword(4).as_ptr(), keyword(5).as_ptr());
     // The returned names own their storage after both input and decoder drop.
     let standalone = {

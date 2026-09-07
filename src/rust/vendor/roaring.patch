@@ -1,0 +1,37 @@
+--- a/src/bitmap/serialization.rs
++++ b/src/bitmap/serialization.rs
+@@ -129,11 +129,17 @@
+         for container in &self.containers {
+             match container.store {
+                 Store::Array(ref values) => {
++                    #[cfg(target_endian = "little")]
++                    writer.write_all(bytemuck::cast_slice(values.as_slice()))?;
++                    #[cfg(target_endian = "big")]
+                     for &value in values.iter() {
+                         writer.write_u16::<LittleEndian>(value)?;
+                     }
+                 }
+                 Store::Bitmap(ref bits) => {
++                    #[cfg(target_endian = "little")]
++                    writer.write_all(bytemuck::cast_slice(bits.as_array()))?;
++                    #[cfg(target_endian = "big")]
+                     for &value in bits.as_array() {
+                         writer.write_u64::<LittleEndian>(value)?;
+                     }
+--- a/src/bitmap/store/array_store/mod.rs
++++ b/src/bitmap/store/array_store/mod.rs
+@@ -395,6 +395,14 @@
+     type Error = Error;
+ 
+     fn try_from(value: Vec<u16>) -> Result<Self, Self::Error> {
++        // Vectorize the common valid case; retain the original first-error
++        // index and error kind on malformed input.
++        let invalid = value.windows(2).fold(0u16, |invalid, pair| {
++            invalid | u16::from(pair[0] >= pair[1])
++        });
++        if invalid == 0 {
++            return Ok(ArrayStore { vec: value });
++        }
+         let mut iter = value.iter().enumerate();
+         if let Some((_, mut prev)) = iter.next() {
+             for (i, cur) in iter {

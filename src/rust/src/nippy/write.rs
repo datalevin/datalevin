@@ -1,5 +1,6 @@
 use super::*;
-use std::{collections::HashMap, hash::BuildHasherDefault, io::Write};
+use hashbrown::{HashMap, hash_map::RawEntryMut};
+use std::{hash::BuildHasherDefault, io::Write};
 
 // Keyword::hash already supplies a randomized, cached hash. Hashing that hash
 // again adds work to every cache hit without improving collision resistance.
@@ -47,7 +48,7 @@ pub struct Encoder<W> {
     pos: usize,
     limits: Limits,
     nodes: usize,
-    keywords: HashMap<Keyword, Option<usize>, BuildHasherDefault<KeywordHasher>>,
+    keywords: HashMap<Keyword, Option<u16>, BuildHasherDefault<KeywordHasher>>,
     cached_keywords: usize,
     version: WireVersion,
 }
@@ -183,18 +184,30 @@ impl<W: Write> Encoder<W> {
         if text.len() > 32767 {
             return Err(self.err(ErrorKind::InvalidLength));
         }
-        text.cached_hash();
-        if let Some(index) = self.keywords.get_mut(text) {
-            if let Some(index) = *index {
-                return self.cache_ref(index);
+        let hash = text.cached_hash();
+        let can_insert = self.keywords.len() < 32768;
+        match self
+            .keywords
+            .raw_entry_mut()
+            .from_hash(hash, |key| key == text)
+        {
+            RawEntryMut::Occupied(mut entry) => {
+                if let Some(index) = *entry.get() {
+                    return self.cache_ref(index as usize);
+                }
+                let next = self.cached_keywords;
+                // Promote this occurrence's shared name into the cache. Wire
+                // references share it; the first plain name may be a different
+                // allocation. Equal keys retain exactly the same cached hash.
+                *entry.key_mut() = text.clone();
+                *entry.get_mut() = Some(next as u16);
+                self.cached_keywords += 1;
+                self.cache_ref(next)?;
             }
-            let next = self.cached_keywords;
-            *index = Some(next);
-            self.cached_keywords += 1;
-            self.cache_ref(next)?;
-        } else if self.keywords.len() < 32768 {
-            // Nippy 3.9 writes the first occurrence plainly and caches the second.
-            self.keywords.insert(text.clone(), None);
+            RawEntryMut::Vacant(entry) if can_insert => {
+                entry.insert_hashed_nocheck(hash, text.clone(), None);
+            }
+            RawEntryMut::Vacant(_) => {}
         }
         self.named(text, 106, 85)
     }
@@ -203,11 +216,9 @@ impl<W: Write> Encoder<W> {
         if index < 8 {
             self.tag(SMALL[index])
         } else if index <= 127 {
-            self.tag(67)?;
-            self.count(index, 1)
+            self.tagged(67, [index as u8])
         } else {
-            self.tag(68)?;
-            self.count(index, 2)
+            self.tagged(68, (index as i16).to_be_bytes())
         }
     }
     fn long(&mut self, n: i64) -> Result<()> {
@@ -335,6 +346,7 @@ impl<W: Write> Encoder<W> {
                     self.tagged(61, v.to_be_bytes())
                 }
             }
+            Value::Keyword(v) => self.keyword(v),
             _ => self.compound_value(value, depth + 1),
         }
     }
@@ -362,7 +374,6 @@ impl<W: Write> Encoder<W> {
                 self.big(denominator)
             }
             Value::Text(v) => self.string(v),
-            Value::Keyword(v) => self.keyword(v),
             Value::Symbol(v) => self.named(v, 56, 86),
             Value::Bytes(v) => self.bytes(v),
             Value::Vector(v) => {

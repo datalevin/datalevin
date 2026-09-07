@@ -14,8 +14,8 @@ pub struct Decoder<'a> {
     input: &'a [u8],
     pos: usize,
     limits: Limits,
-    nodes: usize,
-    allocated: usize,
+    nodes_remaining: usize,
+    bytes_remaining: usize,
     cache: Vec<Option<Cached>>,
     dictionary: Option<&'a SharedDictionary>,
     dict_count: usize,
@@ -32,8 +32,8 @@ impl<'a> Decoder<'a> {
             input,
             pos: 0,
             limits,
-            nodes: 0,
-            allocated: 0,
+            nodes_remaining: limits.max_values,
+            bytes_remaining: limits.max_allocation_bytes,
             cache: Vec::new(),
             dictionary: None,
             dict_count: 0,
@@ -61,18 +61,14 @@ impl<'a> Decoder<'a> {
         Error::new(kind, self.pos)
     }
     fn charge(&mut self, nodes: usize, bytes: usize) -> Result<()> {
-        self.nodes = self
-            .nodes
-            .checked_add(nodes)
+        self.nodes_remaining = self
+            .nodes_remaining
+            .checked_sub(nodes)
             .ok_or_else(|| self.err(ErrorKind::LimitExceeded))?;
-        self.allocated = self
-            .allocated
-            .checked_add(bytes)
+        self.bytes_remaining = self
+            .bytes_remaining
+            .checked_sub(bytes)
             .ok_or_else(|| self.err(ErrorKind::LimitExceeded))?;
-        if self.nodes > self.limits.max_values || self.allocated > self.limits.max_allocation_bytes
-        {
-            return Err(self.err(ErrorKind::LimitExceeded));
-        }
         Ok(())
     }
     fn take(&mut self, n: usize) -> Result<&'a [u8]> {
@@ -169,6 +165,20 @@ impl<'a> Decoder<'a> {
     }
     fn values(&mut self, n: usize, depth: usize) -> Result<Vec<Value>> {
         self.collection(n, 1)?;
+        // Avoid a push loop and repeated moves of Value for tiny collections.
+        match n {
+            0 => return Ok(Vec::new()),
+            1 => return Ok(vec![self.value(depth)?]),
+            2 => return Ok(vec![self.value(depth)?, self.value(depth)?]),
+            3 => {
+                return Ok(vec![
+                    self.value(depth)?,
+                    self.value(depth)?,
+                    self.value(depth)?,
+                ]);
+            }
+            _ => {}
+        }
         let mut result = Vec::with_capacity(n.min(256));
         for _ in 0..n {
             result.push(self.value(depth)?);
@@ -211,12 +221,13 @@ impl<'a> Decoder<'a> {
             return Err(self.err(ErrorKind::InvalidCache));
         }
         self.cache.push(None); // Reserve before nested definitions; cycles fail.
-        let (nodes, bytes, previous_height) = (self.nodes, self.allocated, self.height);
+        let (nodes, bytes, previous_height) =
+            (self.nodes_remaining, self.bytes_remaining, self.height);
         self.height = depth;
         let value = self.value(depth)?;
         let height = self.height - depth;
         self.height = self.height.max(previous_height);
-        let (nodes, bytes) = (self.nodes - nodes, self.allocated - bytes);
+        let (nodes, bytes) = (nodes - self.nodes_remaining, bytes - self.bytes_remaining);
         self.charge(nodes, bytes)?;
         self.cache[index] = Some(Cached {
             value: value.clone(),
@@ -246,9 +257,7 @@ impl<'a> Decoder<'a> {
                 let (bitmap, used, allocation) = bitmap::read(
                     &self.input[self.pos..],
                     self.limits.max_collection_len,
-                    self.limits
-                        .max_allocation_bytes
-                        .saturating_sub(self.allocated),
+                    self.bytes_remaining,
                 )
                 .map_err(|kind| self.err(kind))?;
                 self.charge(0, allocation)?;
@@ -292,7 +301,7 @@ impl<'a> Decoder<'a> {
             _ => return Err(self.err(ErrorKind::UnsupportedType(id))),
         })
     }
-    #[inline]
+    #[inline(always)]
     fn value(&mut self, depth: usize) -> Result<Value> {
         if depth > self.limits.max_depth {
             return Err(self.err(ErrorKind::LimitExceeded));
@@ -330,6 +339,13 @@ impl<'a> Decoder<'a> {
             55 => Value::Double(0),
             60 => Value::Float(self.i32()? as u32),
             61 => Value::Double(self.i64()? as u64),
+            17 => Value::Vector(Vec::new()),
+            97 => {
+                let n = (self.u8()? ^ 0x80) as usize;
+                Value::Vector(self.values(n, depth + 1)?)
+            }
+            113 => Value::Vector(self.values(2, depth + 1)?),
+            114 => Value::Vector(self.values(3, depth + 1)?),
             _ => return self.compound_value(tag, depth + 1),
         })
     }
@@ -363,12 +379,8 @@ impl<'a> Decoder<'a> {
             7 => Value::Bytes(self.blob(1)?),
             15 => Value::Bytes(self.blob(2)?),
             2 => Value::Bytes(self.blob(4)?),
-            17 => Value::Vector(Vec::new()),
-            113 => Value::Vector(self.values(2, d)?),
-            114 => Value::Vector(self.values(3, d)?),
-            97 | 110 | 69 | 21 => {
+            110 | 69 | 21 => {
                 let n = self.count(match tag {
-                    97 => 0,
                     110 => 1,
                     69 => 2,
                     _ => 4,

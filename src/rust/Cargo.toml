@@ -11,13 +11,15 @@ name = "datalevin_codec"
 path = "src/lib.rs"
 
 [dependencies]
-roaring = "0.11.5"
+hashbrown = { version = "0.17.1", default-features = false, features = ["raw-entry", "inline-more"] }
+roaring = { version = "0.11.5", path = "vendor/roaring" }
 lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-encode", "safe-decode"] }
 snap = "1.1"
 zstd = { version = "0.13", default-features = false }
 xz2 = "0.1"
 
 [dev-dependencies]
+roaring-upstream = { package = "roaring", version = "=0.11.5" }
 proptest = "1.11.0"
 
 [profile.release]
