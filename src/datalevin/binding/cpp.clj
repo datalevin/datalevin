@@ -1948,7 +1948,8 @@
   (env-dir [_] (@info :dir))
   (kv-info [_] info)
 
-  (env-opts [_] (dissoc @info :dbis))
+  (env-opts [_] (dissoc @info :dbis :types :custom-types-revision
+                       :custom-type-cache :runtime-opts))
 
   (dbi-opts [_ dbi-name] (get-in @info [:dbis dbi-name]))
 
@@ -2623,11 +2624,16 @@
                                [:dbis :db.value/sysMin]
                                [:dbis :db.value/sysMax]]
                               [:keyword :string]))
+        types (into {}
+                    (map (fn [[[_ type-name] definition]] [type-name definition]))
+                    (get-range lmdb c/kv-info
+                               [:closed [:types c/v0] [:types c/vmax]]
+                               [:keyword :keyword]))
         info (into {}
                    (i/range-keep lmdb c/kv-info decode-kv-info-entry
                                  [:all] :raw :raw true))]
     (c/canonicalize-wal-opts
-     (assoc info :dbis dbis))))
+     (assoc info :dbis dbis :types types))))
 
 (defn- init-info
   [^CppLMDB lmdb new-info]
@@ -2658,7 +2664,9 @@
                               flags c/default-env-flags
                               temp? false}
                          :as opts}]
-  (let [flags            (cond-> flags
+  (let [runtime-opts      (:runtime-opts opts)
+        opts             (dissoc opts :runtime-opts)
+        flags            (cond-> flags
                            temp? (conj :nosync))
         local-handle-key (reserve-local-kv-handle! dir-file flags)]
     (try
@@ -2732,6 +2740,11 @@
             (register-shutdown-hook!
               dir (Thread. #(run-shutdown-close! dir lmdb)))
             (start-scheduled-sync (.-scheduled-sync lmdb) dir env)))
+        ;; Runtime state is installed after persistence/loading and before the
+        ;; handle is published. It is shared by marked-write views and omitted
+        ;; from env-opts and stored metadata.
+        (vswap! (.-info lmdb) assoc :custom-type-cache (atom {})
+                :runtime-opts runtime-opts)
         (register-local-kv-handle! local-handle-key (l/wrap-open-kv lmdb)))
       (catch Exception e
         (release-local-kv-handle! local-handle-key)

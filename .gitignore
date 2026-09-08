@@ -21,6 +21,7 @@ benchmarks/openrulebench/data/downloaded/
 /test-jar/tmp
 /test-jar/target
 /target
+/src/rust/test-adapter/target
 /jepsen/target
 /bench/target
 /classes

@@ -13,6 +13,7 @@
   (:require
    [datalevin.util :as u]
    [datalevin.conn :as conn]
+   [datalevin.custom-data :as custom]
    [datalevin.dump :as dump]
    [datalevin.csv :as csv]
    [datalevin.search :as sc]
@@ -1234,6 +1235,8 @@ Only usable for debug output.
    steps and is skipped for leaders.
   * `:ha-control-plane`, consensus control-plane configuration map required
    when `:ha-mode` is `:consensus-lease`.
+  * `:runtime-opts` supplies local runtime bindings, including `:udf-registry`
+    for registered custom type functions. These options are not persisted.
   * `:spill-opts` is the option map that controls the spill-to-disk behavior
    for `get-range` and `range-filter` functions, which may have the following
    keys:
@@ -1289,6 +1292,30 @@ Only usable for debug output.
   The returned handle is owned by the Datalog connection. Do not close it
   separately; close the Datalog connection instead."}
   datalog-kv conn/datalog-kv)
+
+(defn register-type
+  "Register a database-wide custom type through a local KV handle or Datalog
+  connection. Return `type-name`, a namespaced keyword.
+
+  The definition contains `:index {:type backing-type :order-fn f}`, an
+  optional positive integer `:version` (default 1), and optional `:payload`
+  (default `:nippy`). A backing type is an ordered KV scalar type or a vector
+  of tuple component types. A payload map requires both `:serialize` and
+  `:deserialize`, producing and consuming byte arrays respectively.
+
+  Functions must be `datalevin.interpret/inter-fn` functions or UDF descriptors
+  of kind `:order-fn`, `:serializer`, or `:deserializer`. Registrations persist
+  in kv-info. Re-registering the same definition is idempotent; conflicting
+  definitions require an explicit migration. Registration participates in an
+  enclosing KV write transaction when passed its transaction handle.
+
+  This establishes the registry; custom key and attribute storage is planned
+  separately. Remote registration is not yet supported."
+  [kv-or-conn type-name definition]
+  (custom/register-type (if (conn/conn? kv-or-conn)
+                          (conn/datalog-kv kv-or-conn)
+                          kv-or-conn)
+                        type-name definition))
 
 (def ^{:arglists '([db dbi-name]
                    [db dbi-name opts])

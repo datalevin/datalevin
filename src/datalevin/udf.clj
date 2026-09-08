@@ -195,33 +195,38 @@
            {:error :udf/descriptor :value value :allowed allowed})))
 
 (defn materialize
-  [registry context udf-desc]
-  (let [udf-desc (descriptor udf-desc)]
-    (if-not registry
-      (raise "No UDF registry is configured for descriptor " udf-desc
-             {:error :udf/not-found :descriptor udf-desc :context context})
-      (let [registry  (ensure-registry registry)
-            cache-key udf-desc
-            bind-key  (binding-key udf-desc)]
-        (if-some [callable (or (get-in @registry [:cache cache-key])
-                               (get-in @registry [:bindings bind-key]))]
-          (do
-            (swap! registry assoc-in [:cache cache-key] callable)
-            callable)
-          (let [resolver (get-in @registry [:resolvers (:udf/lang udf-desc)])]
-            (if-not resolver
-              (raise "No UDF resolver found for descriptor " udf-desc
-                     {:error :udf/not-found
-                      :descriptor udf-desc
-                      :context context})
-              (if-some [callable (resolver context udf-desc)]
-                (do
-                  (swap! registry assoc-in [:cache cache-key] callable)
-                  callable)
-                (raise "UDF descriptor could not be resolved " udf-desc
-                       {:error :udf/not-found
-                        :descriptor udf-desc
-                        :context context})))))))))
+  "Resolve a callable. Set cache? to false when the caller caches by a more
+  specific runtime context, such as a custom type's KV environment."
+  ([registry context udf-desc]
+   (materialize registry context udf-desc true))
+  ([registry context udf-desc cache?]
+   (let [udf-desc (descriptor udf-desc)]
+     (if-not registry
+       (raise "No UDF registry is configured for descriptor " udf-desc
+              {:error :udf/not-found :descriptor udf-desc :context context})
+       (let [registry  (ensure-registry registry)
+             cache-key udf-desc
+             bind-key  (binding-key udf-desc)]
+         (if-some [callable (or (when cache? (get-in @registry [:cache cache-key]))
+                                (get-in @registry [:bindings bind-key]))]
+           (do
+             (when cache? (swap! registry assoc-in [:cache cache-key] callable))
+             callable)
+           (let [resolver (get-in @registry [:resolvers (:udf/lang udf-desc)])]
+             (if-not resolver
+               (raise "No UDF resolver found for descriptor " udf-desc
+                      {:error :udf/not-found
+                       :descriptor udf-desc
+                       :context context})
+               (if-some [callable (resolver context udf-desc)]
+                 (do
+                   (when cache?
+                     (swap! registry assoc-in [:cache cache-key] callable))
+                   callable)
+                 (raise "UDF descriptor could not be resolved " udf-desc
+                        {:error :udf/not-found
+                         :descriptor udf-desc
+                         :context context}))))))))))
 
 (defn resolve
   [registry udf-desc]
