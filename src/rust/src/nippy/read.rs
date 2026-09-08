@@ -1,4 +1,5 @@
 use super::*;
+use std::mem::MaybeUninit;
 
 struct Cached {
     value: Value,
@@ -113,6 +114,7 @@ impl<'a> Decoder<'a> {
             .map(from_be_bytes)
             .collect())
     }
+    #[inline]
     fn count(&mut self, width: u8) -> Result<usize> {
         let n = match width {
             0 => (self.u8()? ^ 0x80) as i64,
@@ -138,10 +140,19 @@ impl<'a> Decoder<'a> {
         self.charge(0, n)?;
         Ok(self.take(n)?.to_vec())
     }
+    #[inline]
     fn string(&mut self, width: u8) -> Result<String> {
         let n = self.count(width)?;
         self.charge(0, n)?;
-        let s = std::str::from_utf8(self.take(n)?).map_err(|_| self.err(ErrorKind::InvalidUtf8))?;
+        let bytes = self.take(n)?;
+        // The standard validator already has an efficient long-string loop.
+        // Avoid its setup only for short ASCII payloads.
+        let s = if n < 32 && bytes.is_ascii() {
+            // SAFETY: Every ASCII byte is a complete, valid UTF-8 code point.
+            unsafe { std::str::from_utf8_unchecked(bytes) }
+        } else {
+            std::str::from_utf8(bytes).map_err(|_| self.err(ErrorKind::InvalidUtf8))?
+        };
         Ok(s.to_owned())
     }
     fn keyword(&mut self, width: u8) -> Result<Keyword> {
@@ -163,25 +174,36 @@ impl<'a> Decoder<'a> {
             _ => Err(self.err(ErrorKind::InvalidValue)),
         }
     }
+    #[inline]
     fn values(&mut self, n: usize, depth: usize) -> Result<Vec<Value>> {
         self.collection(n, 1)?;
-        // Avoid a push loop and repeated moves of Value for tiny collections.
         match n {
-            0 => return Ok(Vec::new()),
-            1 => return Ok(vec![self.value(depth)?]),
-            2 => return Ok(vec![self.value(depth)?, self.value(depth)?]),
-            3 => {
-                return Ok(vec![
-                    self.value(depth)?,
-                    self.value(depth)?,
-                    self.value(depth)?,
-                ]);
-            }
-            _ => {}
+            0 => Ok(Vec::new()),
+            1 => self.fixed_values::<1>(depth),
+            2 => self.fixed_values::<2>(depth),
+            3 => self.fixed_values::<3>(depth),
+            _ => self.many_values(n, depth),
         }
-        let mut result = Vec::with_capacity(n.min(256));
+    }
+    // Keep tiny collections in a separate frame from the growing-vector loop.
+    #[inline(never)]
+    fn fixed_values<const N: usize>(&mut self, depth: usize) -> Result<Vec<Value>> {
+        let mut result = Vec::with_capacity(N);
+        for _ in 0..N {
+            self.append_value(&mut result, depth)?;
+        }
+        Ok(result)
+    }
+    #[inline(never)]
+    fn many_values(&mut self, n: usize, depth: usize) -> Result<Vec<Value>> {
+        // Reserve medium collections once, bounded by both the remaining
+        // decoder budget and a 64 KiB initial allocation cap.
+        let capacity = n
+            .min(self.nodes_remaining)
+            .min(self.bytes_remaining.min(64 * 1024) / std::mem::size_of::<Value>());
+        let mut result = Vec::with_capacity(capacity);
         for _ in 0..n {
-            result.push(self.value(depth)?);
+            self.append_value(&mut result, depth)?;
         }
         Ok(result)
     }
@@ -301,53 +323,118 @@ impl<'a> Decoder<'a> {
             _ => return Err(self.err(ErrorKind::UnsupportedType(id))),
         })
     }
+    // Inline into each collection loop to construct values in their final slots
+    // without adding a helper call for every element.
+    #[inline(always)]
+    fn append_value(&mut self, result: &mut Vec<Value>, depth: usize) -> Result<()> {
+        if result.len() == result.capacity() {
+            result.reserve(1);
+        }
+        self.value_into(depth, &mut result.spare_capacity_mut()[0])?;
+        // SAFETY: value_into initializes the spare slot only on success. Until
+        // then len excludes it, so errors and unwinding drop only the prefix.
+        unsafe { result.set_len(result.len() + 1) };
+        Ok(())
+    }
     #[inline(always)]
     fn value(&mut self, depth: usize) -> Result<Value> {
+        let mut result = MaybeUninit::uninit();
+        self.value_into(depth, &mut result)?;
+        // SAFETY: Successful value_into initializes exactly one Value.
+        Ok(unsafe { result.assume_init() })
+    }
+    // Write exactly once, after all fallible work for the value is complete.
+    // On error or unwind the destination remains uninitialized.
+    #[inline(always)]
+    fn value_into(&mut self, depth: usize, out: &mut MaybeUninit<Value>) -> Result<()> {
         if depth > self.limits.max_depth {
             return Err(self.err(ErrorKind::LimitExceeded));
         }
         self.height = self.height.max(depth);
         self.charge(1, std::mem::size_of::<Value>())?;
         let tag = self.u8()?;
-        Ok(match tag {
-            3 => Value::Null,
-            8 => Value::Bool(true),
-            9 => Value::Bool(false),
-            4 => Value::Bool(self.u8()? != 0),
-            104 => Value::MetaProtocolKey,
-            10 => Value::Char(self.i16()? as u16),
-            40 => Value::Byte(self.u8()? as i8),
-            41 => Value::Short(self.i16()?),
-            42 => Value::Integer(self.i32()?),
-            0 => Value::Long(0),
-            43 => Value::Long(self.i64()?),
-            100 => Value::Long(self.u8()? as i8 as i64),
-            101 => Value::Long(self.i16()? as i64),
-            102 => Value::Long(self.i32()? as i64),
+        match tag {
+            3 => {
+                out.write(Value::Null);
+            }
+            8 => {
+                out.write(Value::Bool(true));
+            }
+            9 => {
+                out.write(Value::Bool(false));
+            }
+            4 => {
+                out.write(Value::Bool(self.u8()? != 0));
+            }
+            104 => {
+                out.write(Value::MetaProtocolKey);
+            }
+            10 => {
+                out.write(Value::Char(self.i16()? as u16));
+            }
+            40 => {
+                out.write(Value::Byte(self.u8()? as i8));
+            }
+            41 => {
+                out.write(Value::Short(self.i16()?));
+            }
+            42 => {
+                out.write(Value::Integer(self.i32()?));
+            }
+            0 => {
+                out.write(Value::Long(0));
+            }
+            43 => {
+                out.write(Value::Long(self.i64()?));
+            }
+            100 => {
+                out.write(Value::Long(self.u8()? as i8 as i64));
+            }
+            101 => {
+                out.write(Value::Long(self.i16()? as i64));
+            }
+            102 => {
+                out.write(Value::Long(self.i32()? as i64));
+            }
             87 | 93 => {
                 let n = (self.u8()? ^ 0x80) as i64;
-                Value::Long(if tag == 93 { -n } else { n })
+                out.write(Value::Long(if tag == 93 { -n } else { n }));
             }
             88 | 94 => {
                 let n = (self.i16()? as u16 ^ 0x8000) as i64;
-                Value::Long(if tag == 94 { -n } else { n })
+                out.write(Value::Long(if tag == 94 { -n } else { n }));
             }
             89 | 95 => {
                 let n = (self.i32()? as u32 ^ 0x80000000) as i64;
-                Value::Long(if tag == 95 { -n } else { n })
+                out.write(Value::Long(if tag == 95 { -n } else { n }));
             }
-            55 => Value::Double(0),
-            60 => Value::Float(self.i32()? as u32),
-            61 => Value::Double(self.i64()? as u64),
-            17 => Value::Vector(Vec::new()),
+            55 => {
+                out.write(Value::Double(0));
+            }
+            60 => {
+                out.write(Value::Float(self.i32()? as u32));
+            }
+            61 => {
+                out.write(Value::Double(self.i64()? as u64));
+            }
+            17 => {
+                out.write(Value::Vector(Vec::new()));
+            }
             97 => {
                 let n = (self.u8()? ^ 0x80) as usize;
-                Value::Vector(self.values(n, depth + 1)?)
+                out.write(Value::Vector(self.values(n, depth + 1)?));
             }
-            113 => Value::Vector(self.values(2, depth + 1)?),
-            114 => Value::Vector(self.values(3, depth + 1)?),
-            _ => return self.compound_value(tag, depth + 1),
-        })
+            113 => {
+                out.write(Value::Vector(self.values(2, depth + 1)?));
+            }
+            114 => {
+                out.write(Value::Vector(self.values(3, depth + 1)?));
+            }
+            _ => {
+                out.write(self.compound_value(tag, depth + 1)?);
+            }
+        }
+        Ok(())
     }
     fn compound_value(&mut self, tag: u8, d: usize) -> Result<Value> {
         Ok(match tag {
@@ -590,5 +677,66 @@ impl<'a> Decoder<'a> {
             // require JVM class information; never guess where a payload ends.
             _ => return Err(self.err(ErrorKind::UnsupportedType(tag as i16))),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_failed_value_releases_references(suffix: &[u8]) {
+        // Define a cached keyword, then fail while a later value owns clones.
+        let mut wire = vec![59, 106, 1, b'k'];
+        wire.extend_from_slice(suffix);
+        let mut decoder = Decoder::new(&wire, Limits::default()).unwrap();
+        let Value::Keyword(keyword) = decoder.read_value().unwrap() else {
+            panic!("expected the cache definition");
+        };
+        let weak = Arc::downgrade(&keyword.name);
+        drop(keyword);
+        assert_eq!(weak.strong_count(), 1);
+        assert!(decoder.read_value().is_err());
+        // Only the decoder's cache still owns the name. Every partially
+        // initialized collection and temporary must have released its clones.
+        assert_eq!(weak.strong_count(), 1, "wire suffix: {suffix:?}");
+        drop(decoder);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn failed_collection_slots_release_the_initialized_prefix() {
+        for count in [1usize, 2, 3, 4, 32, 257, 2048] {
+            for fault in [
+                &[126][..],           // Unsupported tag.
+                &[42, 0][..],         // Truncated integer.
+                &[96, 131, b'x'][..], // Truncated string.
+                &[96, 129, 0xff][..], // Invalid UTF-8.
+                &[97, 129][..],       // Truncated singleton vector.
+                &[82, 0, 0][..],      // Unknown custom codec.
+            ] {
+                for object_array in [false, true] {
+                    let mut suffix = if object_array {
+                        let mut header = vec![115];
+                        header.extend_from_slice(&(count as i32).to_be_bytes());
+                        header
+                    } else if count <= 255 {
+                        vec![97, count as u8 ^ 0x80]
+                    } else {
+                        let mut header = vec![69];
+                        header.extend_from_slice(&(count as i16).to_be_bytes());
+                        header
+                    };
+                    suffix.extend(std::iter::repeat_n(59, count - 1));
+                    // The failing final element also has an initialized prefix.
+                    suffix.extend_from_slice(&[113, 59]);
+                    suffix.extend_from_slice(fault);
+                    assert_failed_value_releases_references(&suffix);
+                }
+            }
+        }
+        // Failure after a map key is decoded, and after a string-array payload
+        // is decoded but fails its element-type validation.
+        assert_failed_value_releases_references(&[99, 130, 59, 3, 59, 126]);
+        assert_failed_value_releases_references(&[107, 0, 0, 0, 2, 59, 59]);
     }
 }
