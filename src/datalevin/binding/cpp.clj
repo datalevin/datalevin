@@ -1948,8 +1948,8 @@
   (env-dir [_] (@info :dir))
   (kv-info [_] info)
 
-  (env-opts [_] (dissoc @info :dbis :types :custom-types-revision
-                       :custom-type-cache :runtime-opts))
+  (env-opts [_] (dissoc @info :dbis :types :custom-types-revision :custom-value-id
+                       :custom-type-cache :custom-payload-dbi-open? :runtime-opts))
 
   (dbi-opts [_ dbi-name] (get-in @info [:dbis dbi-name]))
 

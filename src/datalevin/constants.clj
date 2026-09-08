@@ -165,6 +165,7 @@
 ;; value headers
 (def ^:no-doc ^:const type-long-neg   (unchecked-byte 0xC0))
 (def ^:no-doc ^:const type-long-pos   (unchecked-byte 0xC1))
+(def ^:no-doc ^:const type-custom     (unchecked-byte 0xF0))
 (def ^:no-doc ^:const type-bigint     (unchecked-byte 0xF1))
 (def ^:no-doc ^:const type-bigdec     (unchecked-byte 0xF2))
 (def ^:no-doc ^:const type-homo-tuple (unchecked-byte 0xF3))
@@ -246,6 +247,9 @@
 (def ^:const kv-info
   "dbi name for kv store system information is `datalevin/kv-info`"
   "datalevin/kv-info")
+(def ^:const custom-values
+  "DB-wide custom value ID to raw payload mapping."
+  "datalevin/custom-values")
 
 ;; dl
 (def ^:const eav

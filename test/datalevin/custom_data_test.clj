@@ -5,13 +5,14 @@
    [datalevin.constants :as c]
    [datalevin.core :as d]
    [datalevin.custom-data :as custom]
+   [datalevin.custom-value :as cv]
    [datalevin.interface :as i]
    [datalevin.interpret :as inter]
    [datalevin.lmdb :as l]
    [datalevin.udf :as udf]
    [datalevin.util :as u])
   (:import
-   [java.util UUID]
+   [java.util Arrays Date Random UUID]
    [java.util.concurrent TimeUnit]))
 
 (def ^:dynamic *dir* nil)
@@ -23,6 +24,7 @@
     (binding [*dir* (u/tmp-dir (str "custom-types-" (UUID/randomUUID)))
               *handles* (atom [])
               c/*db-background-sampling?* false]
+      (u/file *dir*)
       (try (f)
            (finally
              (doseq [[handle close] (reverse @*handles*)] (close handle))
@@ -288,3 +290,428 @@
           (when finished? (is (zero? (.exitValue process)) (slurp log-file))))
         (finally
           (when (.isAlive process) (.destroyForcibly process)))))))
+
+(defn- unsigned-compare ^long [^bytes a ^bytes b] (Arrays/compareUnsigned a b))
+
+(defn- stored-type [kv backing]
+  (d/register-type kv :app/value
+                   {:index {:type backing
+                            :order-fn (inter/inter-fn [v] (:order v))}})
+  (cv/open-store! kv)
+  (custom/resolve-type kv :app/value))
+
+(defn- key-index [kv name]
+  (d/open-dbi kv name)
+  {:dbi name :position :key})
+
+(defn- item-index [kv name key]
+  (d/open-list-dbi kv name)
+  {:dbi name :position :item :key (cv/encode-order :string key)})
+
+(defn- all-ids [kv index]
+  (mapv cv/reference-id
+        (if (= :key (:position index))
+          (map first (d/get-range kv (:dbi index) [:all] :raw :raw))
+          (d/get-list kv (:dbi index) (:key index) :raw :raw))))
+
+(deftest reference-framing-preserves-native-byte-order
+  (let [random (Random. 234)
+        values (into (mapv byte-array [[] [0] [0 0] [0 -1] [1] [-1] [-1 0]])
+                     (repeatedly 200
+                                 #(let [bs (byte-array (.nextInt random 80))]
+                                    (.nextBytes random bs) bs)))
+        refs (mapv #(cv/reference (cv/reference-prefix %) 123) values)]
+    (doseq [[value ref] (map vector values refs)]
+      (let [{:keys [id truncated? order-bytes]} (cv/decode-reference ref)]
+        (is (= 123 id))
+        (is (false? truncated?))
+        (is (Arrays/equals ^bytes value ^bytes order-bytes))))
+    (is (= (mapv vec (sort unsigned-compare values))
+           (mapv #(vec (:order-bytes (cv/decode-reference %)))
+                 (sort unsigned-compare refs))))
+    (doseq [budget [11 12 13 20 507 511]
+            value values]
+      (is (<= (alength (cv/reference (cv/reference-prefix value budget) 1))
+              budget)))
+    (doseq [budget [11 12 13 20 507 511]]
+      (let [refs (mapv #(cv/reference (cv/reference-prefix % budget) 1)
+                       (sort unsigned-compare values))]
+        (is (every? (fn [[a b]] (<= (unsigned-compare a b) 0))
+                     (partition 2 1 refs))
+            "Truncation can merge order buckets but cannot reverse them")))
+    (doseq [bad [(byte-array []) (byte-array (repeat 11 0))
+                 (byte-array [-16 0 2 0 0 0 0 0 0 0 1])
+                 (byte-array [-16 0 -1 0 0 0 0 0 0 0 1])]]
+      (is (thrown? Exception (cv/decode-reference bad))))
+    (doseq [sentinel [cv/min-id cv/max-id]]
+      (is (thrown? Exception
+                   (cv/reference-id (cv/reference (cv/reference-prefix
+                                                   (byte-array [1])) sentinel)))))))
+
+(deftest references-retain-each-backing-codecs-order
+  (let [cases [[:long [Long/MIN_VALUE -10 -1 0 1 10 Long/MAX_VALUE]]
+               [:id [0 1 Long/MAX_VALUE Long/MIN_VALUE -1]]
+               [:boolean [false true]]
+               [:float [-5.5 -0.0 0.0 5.5]]
+               [:double [-50.5 -0.0 0.0 50.5]]
+               [:instant [(Date. Long/MIN_VALUE) (Date. -1) (Date. 0)
+                          (Date. Long/MAX_VALUE)]]
+               [:uuid [(UUID. 0 0) (UUID. 0 1) (UUID. -1 -1)]]
+               [:bigint (mapv biginteger [-123456789012345678901234567890N
+                                          -1N 0N 1N
+                                          123456789012345678901234567890N])]
+               [:bigdec [-1234567890.123456789M -1M 0M 1M 1.00001M]]
+               [:string ["" "a" "a\u0000" "a\u0000b" "ab" "é" "猫"]]
+               [:keyword [:a :ab :a/b :a/bc :ab/c]]
+               [:symbol ['a 'ab 'a/b 'a/bc 'ab/c]]
+               [:bytes (mapv byte-array [[] [0] [0 0] [0 -1] [1] [-1]])]
+               [[:long] [[Long/MIN_VALUE] [-1] [0] [Long/MAX_VALUE]]]
+               [[:string] [[""] ["a"] ["ab"] ["猫"]]]
+               [[:long :string] [[nil nil] [-1 "a"] [0 nil] [0 ""]
+                                 [0 "a"] [0 "ab"] [1 "a"]]]]]
+    (doseq [[backing values] cases]
+      (let [kv (open-kv (str "backing-" (hash backing)))
+            type (stored-type kv backing)
+            index (key-index kv "index")
+            encoded (mapv #(cv/encode-order backing %) values)
+            ;; Insert backwards so an accidentally dominant ID would reverse it.
+            ids (into {}
+                      (for [n (reverse (range (count values)))]
+                        [n (cv/reference-id
+                            (cv/put-value! kv index type
+                                           {:order (nth values n) :n n}
+                                           (byte-array [n])))]))
+            expected (sort (fn [a b]
+                             (let [c (unsigned-compare (nth encoded a)
+                                                       (nth encoded b))]
+                               ;; Native codecs may normalize values (e.g. -0.0).
+                               (if (zero? c) (compare (ids a) (ids b)) c)))
+                           (range (count values)))]
+        (is (= (mapv ids expected) (all-ids kv index)) (str backing))))))
+
+(deftest collision-matching-replacement-and-ownership
+  (let [kv (open-kv "collisions")
+        type (stored-type kv :long)
+        a (key-index kv "a")
+        b (key-index kv "b")
+        items (item-index kv "items" "first")
+        other-items (assoc items :key (cv/encode-order :string "second"))
+        x {:order 3 :name "x"}
+        y {:order 3 :name "y"}
+        rx (cv/put-value! kv a type x (byte-array [1]))
+        ry (cv/put-value! kv a type y (byte-array [2]))]
+    (is (not= (cv/reference-id rx) (cv/reference-id ry)))
+    (is (= y (:value (cv/find-value kv a type y))))
+    (is (= [2] (vec (:associated (cv/find-value kv a type y)))))
+    (is (= (vec rx) (vec (cv/put-value! kv a type x (byte-array [9])))))
+    (is (= [9] (vec (:associated (cv/find-value kv a type x)))))
+    (is (= 2 (d/entries kv c/custom-values)))
+    (let [refs [(cv/put-value! kv b type x (byte-array [0]))
+                (cv/put-value! kv items type x nil)
+                (cv/put-value! kv other-items type x nil)]]
+      (is (= 5 (count (set (map cv/reference-id (concat [rx ry] refs)))))))
+    (cv/put-value! kv items type y nil)
+    (is (= y (:value (cv/delete-value! kv items type y))))
+    (is (= x (:value (cv/find-value kv items type x))))
+    (is (nil? (cv/find-value kv items type y)))
+    (is (nil? (cv/delete-value! kv a type {:order 3 :name "missing"})))
+    (is (= y (:value (cv/delete-value! kv a type y))))
+    (is (= x (cv/read-value kv type rx)))
+    (is (nil? (d/get-value kv c/custom-values (cv/reference-id ry) :id :raw)))
+    (is (= 1 (cv/clear-values! kv items)))
+    (is (= 1 (cv/clear-values! kv a)))
+    (is (= 2 (d/entries kv c/custom-values)))
+    (is (= x (:value (cv/find-value kv other-items type x))))
+    (is (= x (:value (cv/find-value kv b type x))))))
+
+(deftest range-boundaries-include-or-exclude-the-whole-id-group
+  (let [kv (open-kv "bounds")
+        type (stored-type kv :string)
+        key-idx (key-index kv "keys")
+        item-idx (item-index kv "items" "list")]
+    (doseq [index [key-idx item-idx]]
+      (doseq [name ["a" "b"] order ["" "a" "ab" "b"]]
+        (cv/put-value! kv index type {:order order :name name} (byte-array [1])))
+      (let [scan (fn [range]
+                   (mapv #(cv/read-value kv type %)
+                         (if (= :key (:position index))
+                           (map first (d/get-range kv (:dbi index) range :raw :raw))
+                           (map second (d/list-range
+                                        kv (:dbi index)
+                                        [:closed (:key index) (:key index)] :raw
+                                        range :raw)))))
+            a (cv/order-prefix type {:order "a"})
+            b (cv/order-prefix type {:order "b"})]
+        (doseq [include-a? [false true] include-b? [false true]]
+          (let [lower (cv/boundary a :lower include-a?)
+                upper (cv/boundary b :upper include-b?)
+                values (scan [:closed lower upper])]
+            (is (= (concat (when include-a? ["a" "a"]) ["ab" "ab"]
+                           (when include-b? ["b" "b"]))
+                   (map :order values)))
+            (is (= (reverse values) (scan [:closed-back upper lower])))))))))
+
+(deftest truncated-order-keys-still-match-complete-values
+  (let [kv (open-kv "truncated")
+        type (stored-type kv :string)
+        index (key-index kv "index")
+        stem (apply str (repeat 600 "x"))
+        a {:order (str stem "a") :name "first"}
+        b {:order (str stem "b") :name "second"}
+        ra (cv/put-value! kv index type a (byte-array [1]))
+        rb (cv/put-value! kv index type b (byte-array [2]))]
+    (is (= 511 (alength ^bytes ra)))
+    (is (:truncated? (cv/decode-reference ra)))
+    (is (= (vec (:order-bytes (cv/decode-reference ra)))
+           (vec (:order-bytes (cv/decode-reference rb)))))
+    (is (= b (:value (cv/find-value kv index type b))))
+    (cv/delete-value! kv index type b)
+    (is (nil? (cv/find-value kv index type b)))
+    (is (= a (:value (cv/find-value kv index type a))))))
+
+(deftest payload-and-index-rollback-with-and-without-wal
+  (doseq [wal? [false true]]
+    (let [kv (open-kv (str "rollback-" wal?) {:wal? wal?})
+          type (stored-type kv :long)
+          index (key-index kv "index")
+          a {:order 1 :name "a"}
+          b {:order 1 :name "b"}
+          ra (cv/put-value! kv index type a (byte-array [1]))]
+      (is (thrown-with-msg?
+           Exception #"rollback"
+           (l/with-transaction-kv [tx kv]
+             (cv/put-value! tx index type a (byte-array [9]))
+             (let [rb (cv/put-value! tx index type b (byte-array [2]))]
+               (is (= b (:value (cv/find-value tx index type b))))
+               (is (= (vec rb) (vec (cv/put-value! tx index type b
+                                                  (byte-array [3]))))))
+             (cv/delete-value! tx index type a)
+             (is (nil? (cv/find-value tx index type a)))
+             (throw (ex-info "rollback" {})))))
+      (is (= [1] (vec (:associated (cv/find-value kv index type a)))))
+      (is (nil? (cv/find-value kv index type b)))
+      (is (= 1 (d/entries kv c/custom-values)))
+      (is (= (cv/reference-id ra) (d/get-value kv c/kv-info cv/id-key :keyword)))
+      (l/with-transaction-kv [tx kv]
+        (cv/put-value! tx index type b (byte-array [2]))
+        (cv/delete-value! tx index type b))
+      (is (= 1 (d/entries kv c/custom-values)))
+      ;; Fail after allocation/payload rows have been applied. Catching this
+      ;; exception must not let a containing transaction commit those rows.
+      (d/open-dbi kv "too-small" {:key-size 11})
+      (l/with-transaction-kv [tx kv]
+        (cv/put-value! tx index type b (byte-array [2]))
+        (is (thrown? Exception
+                     (cv/put-value! tx {:dbi "too-small" :position :key}
+                                    type a (byte-array [0])))))
+      (is (nil? (cv/find-value kv index type b)))
+      (is (= 1 (d/entries kv c/custom-values)))
+      (is (zero? (d/entries kv "too-small"))))))
+
+(deftest raw-serde-matches-values-instead-of-payload-bytes
+  (let [runtime (udf/create-registry)
+        kv (open-kv "raw-serde" {:runtime-opts {:udf-registry runtime}})
+        serial (atom 0)
+        order-calls (atom [])
+        serde-calls (atom [])]
+    (udf/register! runtime (udf-desc :order-fn)
+                   (fn [v] (swap! order-calls conj v) (:order v)))
+    (udf/register! runtime (udf-desc :serializer)
+                   (fn [v] (swap! serde-calls conj v)
+                     (b/serialize [(swap! serial inc) v])))
+    (udf/register! runtime (udf-desc :deserializer) #(second (b/deserialize %)))
+    (d/register-type kv :app/value
+                     {:index {:type :long :order-fn (udf-desc :order-fn)}
+                      :payload {:serialize (udf-desc :serializer)
+                                :deserialize (udf-desc :deserializer)}})
+    (cv/open-store! kv)
+    (let [type (custom/resolve-type kv :app/value)
+          index (key-index kv "index")
+          value {:order 1 :name "same"}
+          ref (cv/put-value! kv index type value (byte-array [1]))
+          id (cv/reference-id ref)]
+      (is (= [1 value] (b/deserialize (d/get-value kv c/custom-values id :id :raw))))
+      (is (= (vec ref) (vec (cv/put-value! kv index type value (byte-array [2])))))
+      (is (= [2 value] (b/deserialize (d/get-value kv c/custom-values id :id :raw))))
+      (is (= @order-calls @serde-calls))
+      (is (= 1 (d/entries kv c/custom-values)))
+      (is (= value (:value (cv/find-value kv index type value))))
+      (udf/unregister! runtime (udf-desc :serializer))
+      (is (thrown? Exception
+                   (cv/put-value! kv index (custom/resolve-type kv :app/value)
+                                  value (byte-array [3]))))
+      (is (= [2] (vec (:associated (cv/find-value kv index type value)))))
+      ;; Clearing ownership does not run any application function.
+      (is (= 1 (cv/clear-values! kv index)))
+      (is (zero? (d/entries kv c/custom-values))))))
+
+(deftest payload-read-and-candidate-scan-share-a-snapshot
+  (let [runtime (udf/create-registry)
+        kv (open-kv "snapshot" {:runtime-opts {:udf-registry runtime}})
+        entered (promise)
+        release (promise)
+        reader-thread (atom nil)]
+    (udf/register! runtime (udf-desc :serializer) b/serialize)
+    (udf/register! runtime (udf-desc :deserializer)
+                   (fn [bs]
+                     (when (= @reader-thread (.threadId (Thread/currentThread)))
+                       (reset! reader-thread nil)
+                       (deliver entered true)
+                       (when (= ::timeout (deref release 10000 ::timeout))
+                         (throw (ex-info "snapshot test timed out" {}))))
+                     (b/deserialize bs)))
+    (d/register-type kv :app/value
+                     {:index {:type :long :order-fn (inter/inter-fn [v] (:order v))}
+                      :payload {:serialize (udf-desc :serializer)
+                                :deserialize (udf-desc :deserializer)}})
+    (cv/open-store! kv)
+    (let [type (custom/resolve-type kv :app/value)
+          index (key-index kv "index")
+          a {:order 1 :name "a"}
+          b {:order 1 :name "b"}]
+      (cv/put-value! kv index type a (byte-array [1]))
+      (cv/put-value! kv index type b (byte-array [2]))
+      (let [reader (future
+                     (reset! reader-thread (.threadId (Thread/currentThread)))
+                     (cv/find-value kv index type b))]
+        (try
+          (is (= true (deref entered 10000 ::timeout)))
+          (cv/delete-value! kv index type b)
+          (deliver release true)
+          (is (= b (:value (deref reader 10000 ::timeout))))
+          (is (nil? (cv/find-value kv index type b)))
+          (finally (deliver release true) (future-cancel reader)))))))
+
+(deftest allocation-survives-reopen-copy-and-deletion
+  (let [kv (open-kv "allocation")
+        type (stored-type kv :long)
+        index (key-index kv "index")
+        value {:order 1}
+        id (cv/reference-id (cv/put-value! kv index type value (byte-array [0])))]
+    (cv/delete-value! kv index type value)
+    (d/copy kv (str *dir* "/allocation-copy"))
+    (d/close-kv kv)
+    (doseq [name ["allocation" "allocation-copy"]]
+      (let [kv (open-kv name)
+            type (custom/resolve-type kv :app/value)
+            index (key-index kv "index")]
+        (cv/open-store! kv)
+        (is (= (inc id) (cv/reference-id
+                         (cv/put-value! kv index type value (byte-array [0])))))
+        (is (nil? (:custom-value-id (i/env-opts kv))))
+        (d/transact-kv kv [(l/kv-tx :put c/kv-info cv/id-key 0 :keyword :data)])
+        ;; ID 1 is no longer occupied; create it, then reset the counter to
+        ;; simulate conflicting restored metadata. Never overwrite that payload.
+        (cv/put-value! kv index type {:order 2} (byte-array [0]))
+        (d/transact-kv kv [(l/kv-tx :put c/kv-info cv/id-key 0 :keyword :data)])
+        (is (thrown? Exception
+                     (cv/put-value! kv index type {:order 3} (byte-array [0]))))
+        (is (= 2 (d/entries kv c/custom-values)))
+        (d/transact-kv kv [(l/kv-tx :put c/kv-info cv/id-key
+                                  (dec cv/max-id) :keyword :data)])
+        (is (thrown? Exception
+                     (cv/put-value! kv index type {:order 3} (byte-array [0]))))))))
+
+(deftest concurrent-allocation-and-repeated-insertion
+  (let [kv (open-kv "concurrent-values")
+        type (stored-type kv :long)
+        index (key-index kv "index")
+        start (promise)
+        writers (mapv (fn [n]
+                        (future @start
+                                (cv/put-value! kv index type {:order 1 :n n}
+                                               (byte-array [n]))))
+                      (range 12))]
+    (deliver start true)
+    (is (= 12 (count (set (mapv #(cv/reference-id @%) writers)))))
+    (is (= 12 (d/get-value kv c/kv-info cv/id-key :keyword)))
+    (let [writers (mapv (fn [_]
+                          (future (cv/put-value! kv index type {:order 1 :n 0}
+                                                 (byte-array [0]))))
+                        (range 8))]
+      (is (= 1 (count (set (mapv #(cv/reference-id @%) writers)))))
+      (is (= 12 (d/entries kv c/custom-values))))))
+
+(deftest function-and-encoding-failures-do-not-write
+  (let [runtime (udf/create-registry)
+        kv (open-kv "function-failures" {:runtime-opts {:udf-registry runtime}})
+        index (key-index kv "index")]
+    (udf/register! runtime (udf-desc :order-fn) :order)
+    (udf/register! runtime (udf-desc :serializer)
+                   (fn [v] (when-not (:bad-serde? v) (b/serialize v))))
+    (udf/register! runtime (udf-desc :deserializer) b/deserialize)
+    (d/register-type kv :app/value
+                     {:index {:type :long :order-fn (udf-desc :order-fn)}
+                      :payload {:serialize (udf-desc :serializer)
+                                :deserialize (udf-desc :deserializer)}})
+    (cv/open-store! kv)
+    (let [type (custom/resolve-type kv :app/value)]
+      (l/with-transaction-kv [tx kv]
+        (cv/put-value! tx index type {:order 1} (byte-array [0]))
+        (doseq [value [{:order "bad"} {:order 2 :bad-serde? true}]]
+          (is (thrown? Exception (cv/put-value! tx index type value (byte-array [0]))))))
+      (is (= 1 (d/entries kv c/custom-values)))
+      (is (= 1 (d/get-value kv c/kv-info cv/id-key :keyword))))
+    (d/register-type kv :app/tuple
+                     {:index {:type [:string :long]
+                              :order-fn (inter/inter-fn [v] v)}})
+    (is (thrown-with-msg?
+         Exception #"Cannot encode custom order key"
+         (cv/put-value! kv index (custom/resolve-type kv :app/tuple)
+                        [(apply str (repeat 300 "x")) 1] (byte-array [0]))))
+    (is (= 1 (d/entries kv c/custom-values)))
+    (is (= 1 (d/entries kv "index")))))
+
+(deftest multiple-indexes-share-one-owned-payload
+  (let [kv (open-kv "shared-reference")
+        type (stored-type kv :long)
+        value {:order 1 :name "one fact"}]
+    (d/open-list-dbi kv "primary")
+    (d/open-list-dbi kv "secondary")
+    (let [ref (l/with-transaction-kv [tx kv]
+                (let [{:keys [id txs]} (cv/allocate-payload tx ((:serialize type) value))
+                      ref (cv/reference (cv/order-prefix type value) id)]
+                  (cv/transact! tx (into txs [(l/kv-tx :put "primary" 42 ref :id :raw)
+                                              (l/kv-tx :put "secondary" ref 42 :raw :id)]))
+                  ref))]
+      (is (= 1 (d/entries kv c/custom-values)))
+      (is (= value (cv/read-value kv type ref)))
+      (is (= [42] (vec (d/get-list kv "secondary" ref :raw :id))))
+      (is (thrown? Exception
+                   (l/with-transaction-kv [tx kv]
+                     (cv/transact! tx [(l/kv-tx :del "primary" 42 :id)
+                                       (l/kv-tx :del "secondary" ref :raw)
+                                       (cv/delete-payload-tx ref)])
+                     (throw (ex-info "rollback" {})))))
+      (is (= 1 (d/entries kv c/custom-values)))
+      (is (= 1 (d/entries kv "primary")))
+      (is (= 1 (d/entries kv "secondary")))
+      (l/with-transaction-kv [tx kv]
+        (cv/transact! tx [(l/kv-tx :del "primary" 42 :id)
+                          (l/kv-tx :del "secondary" ref :raw)
+                          (cv/delete-payload-tx ref)]))
+      (is (every? zero? (map #(d/entries kv %)
+                             [c/custom-values "primary" "secondary"]))))))
+
+(deftest storage-initialization-and-index-preconditions
+  (let [kv (open-kv "initialization")]
+    (l/with-transaction-kv [tx kv]
+      (is (thrown-with-msg? Exception #"before starting a transaction"
+                           (cv/open-store! tx))))
+    (cv/open-store! kv)
+    (let [type (stored-type kv :long)
+          index (key-index kv "index")]
+      (l/with-transaction-kv [tx kv]
+        (is (identical? tx (cv/open-store! tx)))
+        (cv/put-value! tx index type {:order 1} (byte-array [0])))
+      (is (nil? (:custom-payload-dbi-open? (i/env-opts kv))))
+      (is (nil? (d/get-value kv c/kv-info :custom-payload-dbi-open?)))
+      (d/open-dbi kv "reversed" {:flags (conj c/default-dbi-flags :reversekey)})
+      (is (thrown-with-msg?
+           Exception #"ordinary byte ordering"
+           (cv/put-value! kv {:dbi "reversed" :position :key}
+                          type {:order 1} (byte-array [0]))))
+      (is (thrown? Exception
+                   (cv/put-value! kv {:dbi "missing" :position :key}
+                                  type {:order 1} (byte-array [0]))))
+      (is (= 1 (d/entries kv c/custom-values))))))
