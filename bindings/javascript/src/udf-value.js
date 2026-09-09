@@ -11,7 +11,10 @@ export const UDF_KINDS = Object.freeze(new Set([
   "predicate",
   "tx-fn",
   "analyzer",
-  "query-analyzer"
+  "query-analyzer",
+  "order-fn",
+  "serializer",
+  "deserializer"
 ]));
 
 const ALIASES = new Map([
@@ -221,6 +224,18 @@ export class UdfDescriptor extends Form {
 
   static queryAnalyzer(udfId, options = {}) {
     return UdfDescriptor.of("query-analyzer", udfId, options);
+  }
+
+  static orderFn(udfId, options = {}) {
+    return UdfDescriptor.of("order-fn", udfId, options);
+  }
+
+  static serializer(udfId, options = {}) {
+    return UdfDescriptor.of("serializer", udfId, options);
+  }
+
+  static deserializer(udfId, options = {}) {
+    return UdfDescriptor.of("deserializer", udfId, options);
   }
 
   static from(value, { defaultLang = "javascript" } = {}) {

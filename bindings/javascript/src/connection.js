@@ -98,6 +98,11 @@ async function createConsumerProxy(fn) {
 }
 
 export class Connection extends ResourceWrapper {
+  /** Register a database-wide type for use as an attribute's :db/valueType. */
+  async registerType(typeName, definition) {
+    return toJs(await _BINDINGS.registerType(this.rawHandle(), typeName, definition));
+  }
+
   constructor(handle, { owned = true } = {}) {
     super(
       handle,

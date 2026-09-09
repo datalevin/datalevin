@@ -79,14 +79,20 @@ def test_udf_registration_conveniences_default_to_python() -> None:
     registry.tx_udf("host/tx")(callback)
     registry.analyzer_udf("host/analyzer")(callback)
     registry.query_analyzer_udf("host/query-analyzer")(callback)
+    registry.order_udf("host/order")(callback)
+    registry.serializer_udf("host/serialize")(callback)
+    registry.deserializer_udf("host/deserialize")(callback)
 
-    assert [descriptor.lang for descriptor in captured] == [":python"] * 5
+    assert [descriptor.lang for descriptor in captured] == [":python"] * 8
     assert [descriptor.kind for descriptor in captured] == [
         ":query-fn",
         ":predicate",
         ":tx-fn",
         ":analyzer",
         ":query-analyzer",
+        ":order-fn",
+        ":serializer",
+        ":deserializer",
     ]
 
     registry.query_udf("host/explicit-java", lang="java")(callback)

@@ -115,6 +115,14 @@ class Connection(ResourceWrapper):
     def schema(self):
         return to_python(_BINDINGS.core_invoke("schema", [self.raw_handle()]))
 
+    def register_type(self, type_name, definition):
+        """Register a database-wide type for use as an attribute's ``:db/valueType``.
+
+        Functions are UDF descriptors with runtime bindings installed locally
+        or on the server. The registration is shared with the KV API.
+        """
+        return to_python(_BINDINGS.register_type(self.raw_handle(), type_name, definition))
+
     def opts(self):
         return to_python(_BINDINGS.core_invoke("opts", [self.raw_handle()]))
 

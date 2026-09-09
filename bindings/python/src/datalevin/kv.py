@@ -219,6 +219,14 @@ class KV(ResourceWrapper):
     def dir(self):
         return to_python(_BINDINGS.core_invoke("dir", [self.raw_handle()]))
 
+    def register_type(self, type_name, definition):
+        """Register an ordered custom type shared by this database's KV and Datalog APIs.
+
+        Order/serde functions are UDF descriptors; bind their implementations in
+        the environment's runtime registry, or on the server for remote stores.
+        """
+        return to_python(_BINDINGS.register_type(self.raw_handle(), type_name, definition))
+
     def open_dbi(self, name, opts=None) -> None:
         args = [self.raw_handle(), name]
         if opts is not None:

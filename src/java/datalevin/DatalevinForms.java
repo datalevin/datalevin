@@ -135,6 +135,20 @@ final class DatalevinForms {
         return optionsMap(opts);
     }
 
+    static Object customTypeInput(Map<?, ?> definition) {
+        Objects.requireNonNull(definition, "definition");
+        // Definition fields and colon-prefixed enum values are keywords, like
+        // schema properties. UdfDescriptor instances retain their typed form.
+        IPersistentMap normalized = keywordMap(definition, true);
+        Object indexKey = ClojureCodec.keyword(":index");
+        Object typeKey = ClojureCodec.keyword(":type");
+        if (normalized.valAt(indexKey) instanceof IPersistentMap index) {
+            normalized = normalized.assoc(indexKey,
+                    index.assoc(typeKey, typeInput(index.valAt(typeKey))));
+        }
+        return normalized;
+    }
+
     static Object envFlagsInput(Collection<?> flags) {
         Objects.requireNonNull(flags, "flags");
         ArrayList<Object> converted = new ArrayList<>(flags.size());

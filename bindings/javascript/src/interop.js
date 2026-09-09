@@ -69,6 +69,12 @@ async function withInterfaceProxyEventLoop(fn) {
 }
 
 class InteropBindings {
+  async registerType(handle, typeName, definition) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "registerType",
+      await unwrapInteropHandle(handle), String(typeName), await toJava(definition));
+  }
+
   async apiInfoRaw() {
     const cls = await classes();
     return callJavaMethod(cls.datalevin, "apiInfo");

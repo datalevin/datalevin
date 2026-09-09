@@ -33,6 +33,18 @@ public final class DatalevinInterop {
     }
 
     /**
+     * Registers a database-wide custom type through a KV or connection handle.
+     * Definitions accept keyword-like map keys and colon-prefixed type values.
+     * Remote operations use UDF bindings installed on the server.
+     */
+    public static Object registerType(Object handle, String typeName, Map<?, ?> definition) {
+        return ClojureRuntime.core("register-type",
+                                  rawResource(handle),
+                                  ClojureCodec.keyword(typeName),
+                                  DatalevinForms.customTypeInput(definition));
+    }
+
+    /**
      * Invokes a Datalevin core function and returns the raw Clojure result.
      */
     public static Object coreInvoke(String function, List<?> args) {

@@ -23,6 +23,11 @@ def _timeout_arg(timeout_ms):
 class InteropBindings:
     """Thin wrapper around the Datalevin JVM bridge."""
 
+    def register_type(self, handle, type_name, definition):
+        return call_java(
+            classes().interop.registerType, handle, str(type_name), to_java(definition)
+        )
+
     def api_info_raw(self):
         return call_java(classes().datalevin.apiInfo)
 

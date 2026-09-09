@@ -73,6 +73,21 @@ public final class UdfRegistry {
         return register(UdfDescriptor.queryAnalyzer(id), fn);
     }
 
+    /** Registers a custom-type order function. */
+    public UdfRegistry orderFn(String id, UdfFunction fn) {
+        return register(UdfDescriptor.orderFn(id), fn);
+    }
+
+    /** Registers a custom-type serializer returning a byte array. */
+    public UdfRegistry serializer(String id, UdfFunction fn) {
+        return register(UdfDescriptor.serializer(id), fn);
+    }
+
+    /** Registers a custom-type deserializer accepting a byte array. */
+    public UdfRegistry deserializer(String id, UdfFunction fn) {
+        return register(UdfDescriptor.deserializer(id), fn);
+    }
+
     /**
      * Unregisters a UDF implementation.
      */

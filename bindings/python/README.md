@@ -432,6 +432,57 @@ default to `:python`. The legacy helper retains its `:java` default. Both forms
 are accepted by a registry, explicit `lang="java"` remains available, and the
 typed UDF helpers normalize legacy descriptors when they are used explicitly.
 
+## Ordered Custom Types
+
+Register a database-wide type through `KV.register_type()` or
+`Connection.register_type()`. Supply an order function returning an existing
+backing type, plus optional payload serde functions. Nippy is the default payload
+codec; a custom serializer returns bytes and its deserializer receives bytes.
+
+```python
+import json
+from datalevin import UdfDescriptor, create_udf_registry, open_kv
+
+registry = create_udf_registry()
+
+@registry.order_udf("task/order")
+def task_order(task):
+    return task["rank"]
+
+@registry.serializer_udf("task/encode")
+def task_encode(task):
+    return json.dumps(task).encode("utf-8")
+
+@registry.deserializer_udf("task/decode")
+def task_decode(payload):
+    return json.loads(payload.decode("utf-8"))
+
+definition = {
+    "index": {"type": ":long", "order-fn": UdfDescriptor.order_fn("task/order")},
+    "payload": {
+        "serialize": UdfDescriptor.serializer("task/encode"),
+        "deserialize": UdfDescriptor.deserializer("task/decode"),
+    },
+}
+with open_kv("/tmp/datalevin-custom-example",
+             opts={":runtime-opts": {":udf-registry": registry}}) as kv:
+    kv.register_type("app/task", definition)
+    kv.open_dbi("tasks", {":key-type": ":app/task"})
+    task = {"rank": 2, "name": "Compile"}
+    kv.transact([(":put", task, "queued")], dbi_name="tasks")
+    assert kv.get_value("tasks", task) == "queued"
+```
+
+For Datalog, register through the connection and set an attribute's
+`:db/valueType` to `:app/task`. Ordered list items use the DBI option
+`{":value-type": ":app/task"}`. Registrations persist and are shared by both
+APIs. Supply runtime bindings again when reopening. Remote stores execute
+functions using bindings installed on the server.
+
+Current values must work with ordinary Python/JVM bridge conversion, such as
+the dictionary above. Automatic serde transport for arbitrary native Python
+objects is still pending. See the [custom-data plan](../../doc/custom-data.md).
+
 ## Fulltext Analyzer UDF Example
 
 Use analyzer UDFs when a Datalog fulltext domain needs host-language tokenizing.

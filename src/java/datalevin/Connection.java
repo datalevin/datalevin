@@ -46,6 +46,15 @@ public final class Connection extends HandleResource {
     }
 
     /**
+     * Registers a database-wide custom type and returns its keyword name.
+     * Attribute schemas select it with {@code :db/valueType}. The registration
+     * is shared with this connection's KV environment.
+     */
+    public Object registerType(String typeName, Map<?, ?> definition) {
+        return DatalevinInterop.registerType(resource(), typeName, definition);
+    }
+
+    /**
      * Applies a raw schema property patch and returns the updated schema.
      * Omitted properties are preserved; a {@code :db/retract} value removes a
      * property. Any supplied {@code :db/aid} is ignored.

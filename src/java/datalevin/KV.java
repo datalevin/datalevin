@@ -49,6 +49,15 @@ public class KV extends HandleResource {
     }
 
     /**
+     * Registers a custom type and returns its namespaced keyword name.
+     * Use the registered name in DBI {@code :key-type}/{@code :value-type}
+     * options and {@link KVType#of(String)} operation arguments.
+     */
+    public Object registerType(String typeName, Map<?, ?> definition) {
+        return DatalevinInterop.registerType(resource(), typeName, definition);
+    }
+
+    /**
      * Opens a regular DBI with default options.
      */
     public void openDbi(String dbiName) {

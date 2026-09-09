@@ -112,9 +112,15 @@ final class ClojureFns {
     static AFn udfFunction(UdfFunction fn, Object descriptor) {
         Objects.requireNonNull(fn, "fn");
         final boolean txFn = isTxFnDescriptor(descriptor);
+        final boolean javascriptSerializer = isJavascriptSerializer(descriptor);
         return new AFn() {
             private Object invokeValues(List<?> values) {
                 Object result = fn.invoke(bridgeUdfArguments(values));
+                if (javascriptSerializer) {
+                    // Node's Object-returning proxy represents Buffer results
+                    // as numeric arrays. Restore their byte-oriented contract.
+                    return DatalevinForms.kvInput(result, KVType.BYTES);
+                }
                 return txFn
                         ? DatalevinForms.txDataInput(result)
                         : ClojureCodec.runtimeInput(result);
@@ -245,5 +251,11 @@ final class ClojureFns {
         }
         Object kind = map.get(ClojureCodec.keyword(":udf/kind"));
         return ":tx-fn".equals(String.valueOf(kind));
+    }
+
+    private static boolean isJavascriptSerializer(Object descriptor) {
+        return descriptor instanceof Map<?, ?> map
+                && ClojureCodec.keyword(":serializer").equals(map.get(ClojureCodec.keyword(":udf/kind")))
+                && ClojureCodec.keyword(":javascript").equals(map.get(ClojureCodec.keyword(":udf/lang")));
     }
 }

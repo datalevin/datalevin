@@ -85,12 +85,16 @@ async function udfArgsToJs(args) {
   }));
 }
 
-async function createProxy(fn) {
+async function createProxy(fn, descriptor) {
   const { newProxy } = await javaBridgeModule();
   return newProxy("datalevin.UdfFunction", {
     invoke: async (args) => {
       const values = await udfArgsToJs(args);
       const result = await fn(...values);
+      if (descriptor.kind === ":serializer"
+          && !Buffer.isBuffer(result) && !(result instanceof Uint8Array)) {
+        throw new TypeError("Custom serializer must return a byte array (Buffer or Uint8Array).");
+      }
       return toJava(result === undefined ? null : result);
     }
   });
@@ -120,7 +124,7 @@ export class UdfRegistry {
     }
 
     const normalized = UdfDescriptor.from(descriptor, { defaultLang: "javascript" });
-    const proxy = await createProxy(fn);
+    const proxy = await createProxy(fn, normalized);
     await _BINDINGS.registerUdf(this._handle, normalized, proxy);
     this._proxies.set(descriptorKey(normalized), proxy);
     return fn;
@@ -162,6 +166,18 @@ export class UdfRegistry {
 
   async queryAnalyzerUdf(id, fn, options = {}) {
     return this.register(UdfDescriptor.queryAnalyzer(id, options), fn);
+  }
+
+  async orderUdf(id, fn, options = {}) {
+    return this.register(UdfDescriptor.orderFn(id, options), fn);
+  }
+
+  async serializerUdf(id, fn, options = {}) {
+    return this.register(UdfDescriptor.serializer(id, options), fn);
+  }
+
+  async deserializerUdf(id, fn, options = {}) {
+    return this.register(UdfDescriptor.deserializer(id, options), fn);
   }
 }
 

@@ -4,8 +4,8 @@ Status: Phases 1–4 are implemented locally: type registration, function
 contracts, ordered references, transactional payload storage, public KV custom
 keys and ordered list items, and Datalog custom attributes. Phase 5 now supports
 remote registration and server execution for values supported by the existing
-wire codec. Native-value transport adapters, language APIs, and performance
-work remain planned.
+wire codec, plus Java, Python, and JavaScript registration and UDF APIs.
+Native-value transport adapters and performance work remain planned.
 
 Tracking issue: [Allow indexing of arbitrary data, #234](https://github.com/datalevin/datalevin/issues/234).
 
@@ -556,6 +556,46 @@ rewrite; the automatic migration from untyped data to built-in types does not
 apply. Custom attributes do not currently support fulltext indexing or custom
 types as components of Datalog composite tuples.
 
+### Language APIs
+
+KV handles and Datalog connections expose the same registration operation:
+
+| Language | Registration | UDF descriptor factories |
+| --- | --- | --- |
+| Java | `kv.registerType(name, definition)`, `conn.registerType(name, definition)` | `UdfDescriptor.orderFn`, `.serializer`, `.deserializer` |
+| Python | `kv.register_type(name, definition)`, `conn.register_type(name, definition)` | `UdfDescriptor.order_fn`, `.serializer`, `.deserializer` |
+| JavaScript | `await kv.registerType(name, definition)`, `await conn.registerType(name, definition)` | `UdfDescriptor.orderFn`, `.serializer`, `.deserializer` |
+
+Definition maps use the Clojure field names (`index`, `type`, `order-fn`,
+`payload`, `serialize`, `deserialize`, `version`). Keys accept a leading colon
+or omit it. Backing types accept the existing keyword/type descriptors; Java
+also accepts `KVType` scalar and tuple specifications. Attribute schemas select
+the registered name as `:db/valueType`, and KV DBIs use `:key-type` or
+`:value-type`. Operation type arguments accept the same registered name.
+
+Java's `UdfRegistry` has `orderFn`, `serializer`, and `deserializer` registration
+helpers. Python has `order_udf`, `serializer_udf`, and `deserializer_udf`
+decorators; JavaScript has `orderUdf`, `serializerUdf`, and `deserializerUdf`.
+The Python and JavaScript descriptor helpers default to their respective host
+languages. All descriptors support the existing version and language options.
+
+Payload callbacks return `byte[]` in Java, bytes-like values in Python, and
+`Buffer` or `Uint8Array` in JavaScript. Deserializers receive the corresponding
+byte representation. The JavaScript serializer adapter restores `byte[]` after
+the interface proxy converts its `Buffer` result into an array. Invalid payload
+results fail before committing. Host callback errors retain their message even
+when a Java interface proxy wraps them in an exception without a message.
+
+These APIs currently accept values supported by their ordinary bridge
+conversion. The payload serde functions control storage bytes; they do not yet
+automatically transport arbitrary native Python/JavaScript objects. Local Java
+KV calls can already pass JVM objects directly to order and serde functions.
+Native-value adapters for all query inputs/results and remote messages remain
+the final Phase 5 work item.
+
+Examples are in the [Python binding README](../bindings/python/README.md#ordered-custom-types)
+and [JavaScript binding README](../bindings/javascript/README.md#ordered-custom-types).
+
 ## Implementation phases
 
 Phases 1–4 are implemented locally. Phase 5 is in progress; Phase 6 is planned.
@@ -645,8 +685,10 @@ Remote registration and server execution are implemented for existing wire
 values. Tests cover KV and Datalog operations, order-key collisions, captured
 interpreted functions, shared registrations, transaction commit/abort,
 permissions, read-only replicas, UDF rebinding, failed writes, and session
-reopen after server restart. The remaining work is the language API and native
-value serde transport below.
+reopen after server restart. Language registration APIs, custom UDF descriptor
+kinds, and byte-oriented serializer adapters are also implemented. Binding tests
+cover scalar/tuple orders, collisions, shared KV/Datalog registrations, payload
+round trips, rollback, and reopen/rebind. Native-value serde transport remains.
 
 - Expose registration and custom-type references through the applicable Java,
   Python, and JavaScript surfaces.

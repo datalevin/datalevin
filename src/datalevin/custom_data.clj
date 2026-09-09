@@ -250,9 +250,14 @@
       (let [data (ex-data e)
             ;; Resolvers receive the live handle; error responses must not.
             data (cond-> data
-                   (map? (:context data)) (update :context dissoc :kv))]
+                   (map? (:context data)) (update :context dissoc :kv))
+            ;; Java interface proxies can wrap host exceptions in an exception
+            ;; without a message. Preserve the host error in the public error.
+            message (or (some #(not-empty (ex-message %))
+                              (take-while some? (iterate ex-cause e)))
+                        (.getName (class e)))]
         (throw (ex-info (str "Custom type " type-name " " (name kind)
-                             " failed: " (ex-message e))
+                             " failed: " message)
                         (merge {:error :custom-type/function}
                                data
                                {:type-name type-name :kind kind})

@@ -480,6 +480,56 @@ used explicitly. Typed descriptors are interned by normalized language, kind,
 id, and version, so equivalent descriptors also behave as one key in a
 JavaScript `Map`.
 
+## Ordered Custom Types
+
+Register a database-wide type through `KV.registerType()` or
+`Connection.registerType()`. Its order function returns an existing backing
+type. Optional payload serializers return `Buffer` or `Uint8Array`, and
+deserializers receive a `Buffer`. Nippy is the default payload codec.
+
+```javascript
+import { UdfDescriptor, createUdfRegistry, openKv } from "datalevin-node";
+
+const registry = await createUdfRegistry();
+await registry.orderUdf("task/order", task => task.rank);
+await registry.serializerUdf("task/encode", task =>
+  Buffer.from(JSON.stringify(task, (_key, value) =>
+    typeof value === "bigint" ? Number(value) : value)));
+await registry.deserializerUdf("task/decode", payload => {
+  const task = JSON.parse(payload.toString("utf8"));
+  return { ...task, rank: BigInt(task.rank) };
+});
+const definition = {
+  index: { type: ":long", "order-fn": UdfDescriptor.orderFn("task/order") },
+  payload: {
+    serialize: UdfDescriptor.serializer("task/encode"),
+    deserialize: UdfDescriptor.deserializer("task/decode")
+  }
+};
+const kv = await openKv("/tmp/datalevin-custom-example", {
+  ":runtime-opts": { ":udf-registry": registry }
+});
+try {
+  await kv.registerType("app/task", definition);
+  await kv.openDbi("tasks", { ":key-type": ":app/task" });
+  const task = { rank: 2n, name: "Compile" };
+  await kv.transact([[":put", task, "queued"]], { dbiName: "tasks" });
+  console.log(await kv.getValue("tasks", task)); // queued
+} finally {
+  await kv.close();
+}
+```
+
+For Datalog, register through the connection and set an attribute's
+`:db/valueType` to `:app/task`. Ordered list items use the DBI option
+`{ ":value-type": ":app/task" }`. Registrations persist and are shared by both
+APIs. Supply runtime bindings again when reopening. Remote stores execute
+functions using bindings installed on the server.
+
+Current values must work with ordinary JavaScript/JVM bridge conversion, such
+as the object above. Automatic serde transport for arbitrary native objects is
+still pending. See the [custom-data plan](../../doc/custom-data.md).
+
 ## Fulltext Analyzer UDF Example
 
 Use analyzer UDFs when a Datalog fulltext domain needs host-language tokenizing.

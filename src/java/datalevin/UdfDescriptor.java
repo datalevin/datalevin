@@ -50,6 +50,21 @@ public final class UdfDescriptor {
         return of("query-analyzer", id);
     }
 
+    /** Creates a custom-type order function descriptor. */
+    public static UdfDescriptor orderFn(String id) {
+        return of("order-fn", id);
+    }
+
+    /** Creates a custom-type serializer descriptor (value to byte array). */
+    public static UdfDescriptor serializer(String id) {
+        return of("serializer", id);
+    }
+
+    /** Creates a custom-type deserializer descriptor (byte array to value). */
+    public static UdfDescriptor deserializer(String id) {
+        return of("deserializer", id);
+    }
+
     /**
      * Creates a Java-backed descriptor with the given UDF kind and id.
      */

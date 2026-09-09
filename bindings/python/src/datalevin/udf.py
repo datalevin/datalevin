@@ -121,6 +121,30 @@ class UdfRegistry:
 
         return decorator
 
+    def order_udf(self, udf_id: str, *, lang="python", version=None):
+        """Register a function producing a custom type's ordered backing value."""
+        def decorator(fn):
+            self.register(UdfDescriptor.order_fn(udf_id, lang=lang, version=version), fn)
+            return fn
+
+        return decorator
+
+    def serializer_udf(self, udf_id: str, *, lang="python", version=None):
+        """Register a custom payload function returning bytes."""
+        def decorator(fn):
+            self.register(UdfDescriptor.serializer(udf_id, lang=lang, version=version), fn)
+            return fn
+
+        return decorator
+
+    def deserializer_udf(self, udf_id: str, *, lang="python", version=None):
+        """Register a custom payload function accepting bytes."""
+        def decorator(fn):
+            self.register(UdfDescriptor.deserializer(udf_id, lang=lang, version=version), fn)
+            return fn
+
+        return decorator
+
 
 def udf_descriptor(udf_id=None, *, kind=":query-fn", lang=":java", version=None):
     """Create the legacy colon-string descriptor dictionary.

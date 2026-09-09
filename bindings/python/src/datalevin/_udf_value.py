@@ -8,7 +8,8 @@ from ._forms import Form, FrozenMap, Keyword, Symbol, form_data, immutable_snaps
 
 
 UDF_KINDS = frozenset(
-    {"query-fn", "predicate", "tx-fn", "analyzer", "query-analyzer"}
+    {"query-fn", "predicate", "tx-fn", "analyzer", "query-analyzer",
+     "order-fn", "serializer", "deserializer"}
 )
 
 _ALIASES = {
@@ -213,6 +214,18 @@ class UdfDescriptor(Form, Mapping):
     @classmethod
     def query_analyzer(cls, udf_id, *, lang="python", version=_MISSING):
         return cls.of("query-analyzer", udf_id, lang=lang, version=version)
+
+    @classmethod
+    def order_fn(cls, udf_id, *, lang="python", version=_MISSING):
+        return cls.of("order-fn", udf_id, lang=lang, version=version)
+
+    @classmethod
+    def serializer(cls, udf_id, *, lang="python", version=_MISSING):
+        return cls.of("serializer", udf_id, lang=lang, version=version)
+
+    @classmethod
+    def deserializer(cls, udf_id, *, lang="python", version=_MISSING):
+        return cls.of("deserializer", udf_id, lang=lang, version=version)
 
     @classmethod
     def from_value(cls, value, *, default_lang="python"):

@@ -96,17 +96,23 @@ test("UDF registration conveniences default to JavaScript", async () => {
   await registry.txUdf("host/tx", callback);
   await registry.analyzerUdf("host/analyzer", callback);
   await registry.queryAnalyzerUdf("host/query-analyzer", callback);
+  await registry.orderUdf("host/order", callback);
+  await registry.serializerUdf("host/serialize", callback);
+  await registry.deserializerUdf("host/deserialize", callback);
 
   assert.deepEqual(
     captured.map((descriptor) => descriptor.lang),
-    Array(5).fill(":javascript")
+    Array(8).fill(":javascript")
   );
   assert.deepEqual(captured.map((descriptor) => descriptor.kind), [
     ":query-fn",
     ":predicate",
     ":tx-fn",
     ":analyzer",
-    ":query-analyzer"
+    ":query-analyzer",
+    ":order-fn",
+    ":serializer",
+    ":deserializer"
   ]);
 
   await registry.queryUdf("host/explicit-java", callback, { lang: "java" });

@@ -261,6 +261,13 @@ export class KV extends ResourceWrapper {
     return toJsResult(await _BINDINGS.coreInvoke("dir", [this.rawHandle()]));
   }
 
+  /** Register an ordered type shared by this database's KV and Datalog APIs.
+   * Supply UDF descriptors and install bindings locally or on the server.
+   */
+  async registerType(typeName, definition) {
+    return toJs(await _BINDINGS.registerType(this.rawHandle(), typeName, definition));
+  }
+
   async openDbi(name, opts = null) {
     const args = [this.rawHandle(), name];
     if (opts !== null && opts !== undefined) {
