@@ -239,6 +239,77 @@
         (is (= [a b] (deref reader 10000 :timeout)))
         (finally (deliver resume true) (future-cancel reader))))))
 
+(deftest custom-reader-keeps-schema-snapshot-across-rename
+  (let [runtime (udf/create-registry)
+        conn (d/create-conn (str *dir* "/schema-snapshot") nil
+                            {:wal? false :cache-limit 0
+                             :runtime-opts {:udf-registry runtime}})
+        desc (fn [kind] {:udf/lang :test :udf/id :app/schema-snapshot :udf/kind kind})
+        entered (promise)
+        resume (promise)
+        armed? (atom false)]
+    (swap! *handles* conj conn)
+    (udf/register! runtime (desc :serializer) bits/serialize)
+    (udf/register! runtime (desc :deserializer)
+                   (fn [payload]
+                     (when (compare-and-set! armed? true false)
+                       (deliver entered true)
+                       (deref resume 10000 nil))
+                     (bits/deserialize payload)))
+    (d/register-type conn :app/task
+                     (assoc task-type :payload {:serialize (desc :serializer)
+                                                :deserialize (desc :deserializer)}))
+    (d/update-schema conn {:task/one {:db/valueType :app/task}})
+    (d/transact! conn [[:db/add 1 :task/one a] [:db/add 2 :task/one b]])
+    (reset! armed? true)
+    (let [reader (future (mapv :v (d/datoms @conn :ave :task/one)))]
+      (try
+        (is (= true (deref entered 10000 :timeout)))
+        (d/update-schema conn nil nil {:task/one :task/renamed})
+        (deliver resume true)
+        (is (= [a b] (deref reader 10000 :timeout)))
+        (is (= [a b] (mapv :v (d/datoms @conn :ave :task/renamed))))
+        (finally (deliver resume true) (future-cancel reader))))))
+
+(deftest custom-readers-follow-udf-rebinding-and-nested-environments
+  (let [runtime (udf/create-registry)
+        conn (d/create-conn (str *dir* "/read-bindings") nil
+                            {:wal? false :cache-limit 0
+                             :runtime-opts {:udf-registry runtime}})
+        other (tasks "nested-reader" false)
+        desc (fn [kind] {:udf/lang :test :udf/id :app/read-bindings :udf/kind kind})
+        armed? (atom false)
+        nested (atom [])
+        decode (fn [marker payload]
+                 (swap! nested conj (mapv :v (d/datoms @other :ave :task/one)))
+                 (with-meta (bits/deserialize payload) {:decoder marker}))]
+    (swap! *handles* conj conn)
+    (d/transact! other [[:db/add 1 :task/one c]])
+    (udf/register! runtime (desc :serializer) bits/serialize)
+    (udf/register! runtime (desc :deserializer)
+                   (fn [payload]
+                     (when (compare-and-set! armed? true false)
+                       (udf/register! runtime (desc :deserializer) #(decode :new %)))
+                     (decode :old payload)))
+    (d/register-type conn :app/task
+                     (assoc task-type :payload {:serialize (desc :serializer)
+                                                :deserialize (desc :deserializer)}))
+    (d/update-schema conn {:task/one {:db/valueType :app/task}})
+    (d/transact! conn [[:db/add 1 :task/one a] [:db/add 2 :task/one b]])
+    (reset! armed? true)
+    (let [values (mapv :v (d/datoms @conn :ave :task/one))]
+      (is (= [a b] values))
+      (is (= [:old :new] (mapv (comp :decoder meta) values))))
+    (is (= [:new :new]
+           (mapv (comp :decoder meta :v) (d/datoms @conn :ave :task/one))))
+    (is (seq @nested))
+    (is (every? #{[c]} @nested))
+    (udf/unregister! runtime (desc :deserializer))
+    (is (thrown? Exception (doall (d/datoms @conn :ave :task/one))))
+    (udf/register! runtime (desc :deserializer) #(decode :restored %))
+    (is (= [:restored :restored]
+           (mapv (comp :decoder meta :v) (d/datoms @conn :ave :task/one))))))
+
 (deftest datalog-custom-schema-validation
   (let [conn (connect "schema")]
     (is (thrown-with-msg? Exception #"not registered"

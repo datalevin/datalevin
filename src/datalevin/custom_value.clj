@@ -204,6 +204,15 @@
   ((:deserialize type)
    (read-payload (i/get-dbi kv c/custom-values false) rtx (reference-id ref))))
 
+(defn value-reader
+  "Prepare a payload decoder for a caller-owned snapshot. The returned function
+  must be consumed on that snapshot's thread before the snapshot is released."
+  [kv type rtx]
+  (require-store! kv)
+  (let [dbi (i/get-dbi kv c/custom-values false)
+        deserialize (:deserialize type)]
+    (fn [ref] (deserialize (read-payload dbi rtx (reference-id ref))))))
+
 (defn- check-index! [kv {:keys [dbi position key]}]
   (when (or (not (string? dbi)) (= dbi c/custom-values) (= dbi c/kv-info)
             (not (#{:key :item} position))
@@ -219,39 +228,41 @@
     (raise "Custom index position disagrees with DBI duplicate flags"
            {:error :custom-type/index :dbi dbi :position position})))
 
-(defn- reduce-index
-  "Keep index and payload reads in one snapshot. Never retain cursor buffers."
-  [kv {:keys [dbi position key] :as index} ref-range f init]
+(defn- reduce-index-at
+  "Keep index and payload reads in the caller's snapshot. Never retain buffers."
+  [kv {:keys [dbi position key] :as index} ref-range f init payload-dbi rtx]
   (check-index! kv index)
-  (let [index-dbi (i/get-dbi kv dbi false)]
-    (with-snapshot kv
-      (fn [payload-dbi rtx]
-        (let [cur (l/get-cursor index-dbi rtx)]
-          (try
-            (let [iterable (if (= position :key)
-                             (l/iterate-kv index-dbi rtx cur ref-range :raw :raw)
-                             (l/iterate-list index-dbi rtx cur
-                                             [:closed key key] :raw
-                                             ref-range :raw))]
-              (with-open [^AutoCloseable iter (.iterator ^Iterable iterable)]
-                (loop [acc init]
-                  (if (.hasNext ^Iterator iter)
-                    (let [row (.next ^Iterator iter)
-                          k (b/read-buffer (l/k row) :raw)
-                          v (b/read-buffer (l/v row) :raw)
-                          entry (if (= position :key)
-                                  {:reference k :associated v}
-                                  {:reference v})
-                          res (f acc entry payload-dbi rtx)]
-                      (if (reduced? res) @res (recur res)))
-                    acc))))
-            (finally
-              (if (l/read-only? rtx)
-                (l/return-cursor index-dbi cur)
-                (l/close-cursor index-dbi cur)))))))))
+  (let [index-dbi (i/get-dbi kv dbi false)
+        cur (l/get-cursor index-dbi rtx)]
+    (try
+      (let [iterable (if (= position :key)
+                       (l/iterate-kv index-dbi rtx cur ref-range :raw :raw)
+                       (l/iterate-list index-dbi rtx cur
+                                       [:closed key key] :raw ref-range :raw))]
+        (with-open [^AutoCloseable iter (.iterator ^Iterable iterable)]
+          (loop [acc init]
+            (if (.hasNext ^Iterator iter)
+              (let [row (.next ^Iterator iter)
+                    k (b/read-buffer (l/k row) :raw)
+                    v (b/read-buffer (l/v row) :raw)
+                    entry (if (= position :key)
+                            {:reference k :associated v}
+                            {:reference v})
+                    res (f acc entry payload-dbi rtx)]
+                (if (reduced? res) @res (recur res)))
+              acc))))
+      (finally
+        (if (l/read-only? rtx)
+          (l/return-cursor index-dbi cur)
+          (l/close-cursor index-dbi cur))))))
 
-(defn- find-prefix [kv index type value prefix]
-  (reduce-index
+(defn- reduce-index [kv index ref-range f init]
+  (with-snapshot kv
+    (fn [payload-dbi rtx]
+      (reduce-index-at kv index ref-range f init payload-dbi rtx))))
+
+(defn- find-prefix-at [kv index type value prefix payload-dbi rtx]
+  (reduce-index-at
    kv index [:closed (reference prefix min-id) (reference prefix max-id)]
    (fn [_ entry payload-dbi rtx]
      (let [candidate ((:deserialize type)
@@ -259,7 +270,20 @@
                                     (reference-id (:reference entry))))]
        (when (= value candidate)
          (reduced (assoc entry :value candidate)))))
-   nil))
+   nil payload-dbi rtx))
+
+(defn find-value-at
+  "Find an exact match and its associated bytes in a caller-owned snapshot."
+  [kv index type value rtx]
+  (require-store! kv)
+  (find-prefix-at kv index type value
+                  (order-prefix type value (or (:max-size index) c/+max-key-size+))
+                  (i/get-dbi kv c/custom-values false) rtx))
+
+(defn- find-prefix [kv index type value prefix]
+  (with-snapshot kv
+    (fn [payload-dbi rtx]
+      (find-prefix-at kv index type value prefix payload-dbi rtx))))
 
 (defn find-value
   "Find the complete value within its order bucket, including staged writes.

@@ -838,7 +838,7 @@
 
 (defn- get-custom-reference [^ByteBuffer bf post-v]
   (let [ref (byte-array (inc (- (.remaining bf) (long post-v))))]
-    (aset-byte ref 0 (byte c/type-custom))
+    (aset ^bytes ref 0 (byte c/type-custom))
     (.get bf ref 1 (dec (alength ref)))
     (CustomReference. ref)))
 

@@ -18,8 +18,9 @@
    [datalevin.util :refer [raise]])
   (:import
    [datalevin NativeValue]
+   [java.lang AutoCloseable]
    [java.lang.ref WeakReference]
-   [java.util Arrays]
+   [java.util Arrays Iterator]
    [java.util.regex Pattern]))
 
 (def ^:private scalar-types (disj c/kv-value-types :data))
@@ -181,6 +182,52 @@
             local)))
       cache)))
 
+(defn metadata-value-at
+  "Read internal metadata using a caller-owned transaction."
+  [kv rtx dbi key key-type]
+  (let [dbi (i/get-dbi kv dbi false)]
+    (l/put-key rtx key key-type)
+    (when-let [buffer (l/get-kv dbi rtx)]
+      (b/read-buffer buffer :data))))
+
+(defn metadata-range-at
+  "Detach internal metadata rows from a caller-owned transaction."
+  [kv rtx dbi key-range key-type]
+  (let [dbi (i/get-dbi kv dbi false)
+        cur (l/get-cursor dbi rtx)]
+    (try
+      (let [rows (l/iterate-kv dbi rtx cur key-range key-type :data)]
+        (with-open [^AutoCloseable iter (.iterator ^Iterable rows)]
+          (loop [result (transient [])]
+            (if (.hasNext ^Iterator iter)
+              (let [row (.next ^Iterator iter)
+                    key (b/read-buffer (l/k row) key-type)
+                    value (b/read-buffer (l/v row) :data)]
+                (recur (conj! result [key value])))
+              (persistent! result)))))
+      (finally
+        (if (l/read-only? rtx)
+          (l/return-cursor dbi cur)
+          (l/close-cursor dbi cur))))))
+
+(defn- registry-at [kv rtx]
+  (let [cache (type-cache kv)
+        revision (long (or (metadata-value-at kv rtx c/kv-info revision-key :keyword) 0))
+        cached (:registry @cache)]
+    (if (= revision (:revision cached))
+      cached
+      (let [snapshot
+            {:revision revision
+             :types (into {} (map (fn [[[_ name] definition]] [name definition]))
+                          (metadata-range-at kv rtx c/kv-info
+                                             [:closed [:types c/v0] [:types c/vmax]]
+                                             registry-key-type))}]
+        (swap! cache (fn [state]
+                       (if (<= (long (get-in state [:registry :revision] -1)) revision)
+                         {:registry snapshot}
+                         state)))
+        snapshot))))
+
 (defn- persisted-revision ^long [kv]
   (long (or (i/get-value kv c/kv-info revision-key :keyword :data) 0)))
 
@@ -332,6 +379,22 @@
                       (check-native-type! type-name value)
                       value))}))
 
+(defn- resolve-cached-type [kv type-name runtime-opts registry]
+  (let [{:keys [revision types]} registry
+        definition (or (get types type-name)
+                       (raise "Custom type is not registered " type-name
+                              {:error :custom-type/not-found :type-name type-name}))
+        udf-registry (:udf-registry runtime-opts)
+        token [revision udf-registry (udf/generation udf-registry)]
+        cache (type-cache kv)
+        cached (get-in @cache [:compiled type-name])]
+    (if (= token (:token cached))
+      (:type cached)
+      (let [compiled (compile-type kv type-name definition runtime-opts)]
+        (swap! cache assoc-in [:compiled type-name]
+               {:token token :type compiled})
+        compiled))))
+
 (defn resolve-type
   "Resolve a type for an operation. Optional runtime opts supply its UDF registry.
   Functions materialize on first use and are cached per registry revision and
@@ -340,17 +403,10 @@
   ([kv type-name]
    (resolve-type kv type-name (:runtime-opts @(local-info kv))))
   ([kv type-name runtime-opts]
-   (let [{:keys [revision types]} (registry kv)
-         definition (or (get types type-name)
-                        (raise "Custom type is not registered " type-name
-                               {:error :custom-type/not-found :type-name type-name}))
-         udf-registry (:udf-registry runtime-opts)
-         token [revision udf-registry (udf/generation udf-registry)]
-         cache (type-cache kv)
-         cached (get-in @cache [:compiled type-name])]
-     (if (= token (:token cached))
-       (:type cached)
-       (let [compiled (compile-type kv type-name definition runtime-opts)]
-         (swap! cache assoc-in [:compiled type-name]
-                {:token token :type compiled})
-         compiled)))))
+   (resolve-cached-type kv type-name runtime-opts (registry kv))))
+
+(defn resolve-type-at
+  "Resolve a type against the caller's metadata and payload snapshot."
+  [kv type-name rtx]
+  (resolve-cached-type kv type-name (:runtime-opts @(local-info kv))
+                       (registry-at kv rtx)))

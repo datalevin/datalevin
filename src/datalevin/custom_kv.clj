@@ -239,8 +239,7 @@
   (let [t (field-type opts field supplied)]
     (cond
       (= supplied :ignore) (constantly nil)
-      (get opts field) (let [type (custom/resolve-type kv t)]
-                         #(cv/read-value-at kv type % rtx))
+      (get opts field) (cv/value-reader kv (custom/resolve-type-at kv t rtx) rtx)
       :else #(b/read-buffer (ByteBuffer/wrap ^bytes %) t))))
 
 (defn- pair-decoder [kv opts kt vt ignore-key? rtx]
@@ -339,11 +338,23 @@
           (case op
             :get-value
             (let [[key kt vt ignore?] (defaults args [nil :data :data true])
-                  kt (field-type opts :key-type kt)
-                  decode (pair-decoder kv opts kt vt ignore? rtx)]
-              (when-let [ref (key-ref kv raw dbi opts key kt)]
-                (when-let [pair (i/get-value raw dbi ref :raw :raw false)]
-                  (decode pair))))
+                  kt (field-type opts :key-type kt)]
+              (if-let [name (:key-type opts)]
+                (do
+                  (when (and ignore? (= vt :ignore))
+                    (raise "Cannot ignore both key and value" {}))
+                  (let [decode (decode-field kv opts :value-type vt rtx)
+                        type (custom/resolve-type-at kv name rtx)]
+                    (when-let [match (cv/find-value-at kv (index raw dbi :key nil)
+                                                      type key rtx)]
+                      ;; Matching already copied the associated index bytes and
+                      ;; reconstructed the stored key in this snapshot.
+                      (let [value (decode (:associated match))]
+                        (if ignore? value [(:value match) value])))))
+                (let [decode (pair-decoder kv opts kt vt ignore? rtx)
+                      ref (cv/encode-order kt key)]
+                  (when-let [pair (i/get-value raw dbi ref :raw :raw false)]
+                    (decode pair)))))
 
             (:get-range :get-first :get-first-n)
             (let [[n args] (if (= op :get-first-n) [(first args) (subvec args 1)] [nil args])

@@ -822,6 +822,43 @@
         (d/open-dbi kv "tasks")
         (is (= :app/task (:key-type (i/dbi-opts kv "tasks"))))))))
 
+(deftest exact-custom-key-reuses-the-stored-match
+  (let [runtime (udf/create-registry)
+        kv (open-kv "stored-match" {:runtime-opts {:udf-registry runtime}})
+        desc (fn [kind] {:udf/lang :test :udf/id :app/stored-key :udf/kind kind})
+        reads (atom 0)
+        key {:rank 1 :name "key"}]
+    (udf/register! runtime (desc :serializer) b/serialize)
+    (udf/register! runtime (desc :deserializer)
+                   (fn [payload]
+                     (swap! reads inc)
+                     (with-meta (b/deserialize payload) {:source :stored})))
+    (d/register-type kv :app/task
+                     (assoc (task-type 0)
+                            :payload {:serialize (desc :serializer)
+                                      :deserialize (desc :deserializer)}))
+    (d/open-dbi kv "keys" {:key-type :app/task})
+    (doseq [value [false "value"]]
+      (d/transact-kv kv "keys" [[:put key value]])
+      (reset! reads 0)
+      (let [[stored found] (d/get-value kv "keys" (with-meta key {:source :caller})
+                                      :app/task :data false)]
+        (is (= key stored))
+        (is (= {:source :stored} (meta stored)))
+        (is (= value found))
+        ;; Exact matching must reconstruct the key, but returning that same key
+        ;; must not invoke the deserializer a second time.
+        (is (= 1 @reads))))
+    (is (= [key nil] (d/get-value kv "keys" key :app/task :ignore false)))
+    (is (nil? (d/get-value kv "keys" {:rank 1 :name "missing"})))
+    (d/open-list-dbi kv "duplicates" {:key-type :app/task})
+    (d/put-list-items kv "duplicates" key [3 1 2] :app/task :long)
+    (is (= [key 1] (d/get-value kv "duplicates" key :app/task :long false)))
+    (d/open-list-dbi kv "custom-items" {:key-type :app/task :value-type :app/task})
+    (d/put-list-items kv "custom-items" key [{:rank 3} {:rank 2}] :app/task :app/task)
+    (is (= [key {:rank 2}]
+           (d/get-value kv "custom-items" key :app/task :app/task false)))))
+
 (deftest public-custom-items-and-custom-list-keys
   (doseq [custom-key? [false true]]
     (let [kv (open-kv (str "public-items-" custom-key?))

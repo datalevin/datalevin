@@ -392,6 +392,14 @@ Candidate scans and payload reads use one LMDB snapshot. This is necessary for
 a reader to resolve its index entries while another transaction deletes their
 payloads. Write-transaction scans use that transaction's staged state.
 
+Eager JVM Datalog reads reuse resolved types and payload readers within that
+snapshot. Range bounds share type resolution with value decoding; each
+attribute's declaration is checked once per read scope. Metadata lookups use
+the caller's transaction. UDF rebinding invalidates cached functions, and
+nested reads restore the enclosing context. Native reader contexts remain on
+their owning thread and end with the operation. Writers continue to resolve
+staged metadata without this read cache.
+
 Transaction-local indexes must use the registered order function and backing
 ordering too. Their current datom comparators compare the original objects,
 which can treat distinct non-Comparable objects of the same class as equal.
@@ -537,6 +545,10 @@ callback modes retain their low-level buffer contract. Counts avoid payload
 decoding, and lazy range sequences retain one snapshot for their index and
 payload reads until closed. Consume them within `with-open`, including when
 reading the entire sequence.
+
+Exact JVM KV lookups reuse the matched index row and reconstructed key instead
+of fetching that row and decoding its key again. Matching still compares the
+complete deserialized value, including when order keys collide.
 
 Clear removes owning entries and their payloads in the same transaction and
 can participate in an explicit writer transaction. Dropping a custom DBI runs
@@ -787,9 +799,10 @@ bindings/python/.venv/bin/python script/custom_data_python_bench.py --output /tm
 The scripts create and remove temporary databases. Python uses
 `DATALEVIN_CLASSPATH`, or obtains it with `clojure -Spath` when unset.
 [Raw samples and environment details](custom-data-performance.edn) accompany
-the tables: `:jvm` contains the optimized run and `:jvm-before` retains the
-initial baseline. Both used an Apple M3 Pro with 36 GiB RAM, macOS 26.6.2,
-JDK 21.0.12.1, and Nippy 3.9.0.
+the tables: `:jvm` contains the latest read optimization run,
+`:jvm-before-reads` retains the preceding write optimization run, and
+`:jvm-before` retains the initial baseline. All used an Apple M3 Pro with
+36 GiB RAM, macOS 26.6.2, JDK 21.0.12.1, and Nippy 3.9.0.
 
 Each JVM case stores 2,048 entries. Results are medians of five rounds after
 three warmup rounds, alternating case order. Each round uses a fresh database;
@@ -817,7 +830,8 @@ inside transaction sorting. The implementation now:
   invalidate the cached functions and keys.
 
 Write times below are µs per row, measured with the same unprofiled harness and
-settings before and after the changes. The full tables below show the new run.
+settings before and after the write changes (`:jvm-before` versus
+`:jvm-before-reads`). The full tables below show the latest read optimization run.
 
 | Custom storage | Before | After | Speedup |
 | --- | ---: | ---: | ---: |
@@ -828,13 +842,40 @@ settings before and after the changes. The full tables below show the new run.
 | KV scalar, 64 values / order key | 55.85 | 29.74 | 1.9× |
 | Datalog scalar, small payload | 31.66 | 13.63 | 2.3× |
 
-Scalar KV deletion also falls from 31.67 to 18.76 µs per row. Exact reads and
-full scans remain broadly similar; collision matching still decodes candidate
-payloads. These changes preserve the storage format and full-value matching.
-Validation passed 78 focused JVM tests (2,591 assertions) and 66 core smoke
-tests (432 assertions). New checks cover aborted registrations reaching the
-same revision, writer-specific resolver context, map-resize retries, and UDF
-and schema changes after comparator keys have been cached.
+Scalar KV deletion also fell from 31.67 to 18.76 µs per row in that run.
+
+Read profiling then identified repeated metadata lookups and payload-reader
+setup in Datalog scans, and a reflective byte-array write in custom-reference
+decoding. Read scopes now reuse resolved types for range bounds and decoding,
+check attribute declarations once per scope, and reuse the payload DBI and
+transaction. Custom-reference decoding uses a primitive byte-array write.
+Exact KV reads reuse the matching row and its decoded key.
+
+The read comparison below uses `:jvm-before-reads` and `:jvm`. Scan times are
+µs per returned row; exact and entity times are µs per call.
+
+| Custom read | Before | After | Speedup |
+| --- | ---: | ---: | ---: |
+| Datalog full scan | 2.471 | 1.022 | 2.4× |
+| Datalog exact hit | 7.18 | 6.03 | 1.2× |
+| Datalog entity read | 5.96 | 4.96 | 1.2× |
+| KV scalar exact hit, small payload | 4.18 | 3.99 | 1.05× |
+| KV tuple exact hit, small payload | 4.91 | 4.77 | 1.03× |
+| KV exact hit, 64 values / order key | 29.35 | 28.17 | 1.04× |
+
+KV scan changes are small, and exact matching still decodes candidate payloads.
+The KV gains are modest relative to run-to-run variation; the larger Datalog
+scan gain is the main result. The host also ran unrelated applications, so these
+are local diagnostics, not controlled hardware benchmarks. Write timings vary,
+particularly for large payloads, and this read comparison establishes no further
+write speedup. The storage format and full-value matching remain unchanged.
+
+Validation passed 81 focused JVM tests (2,613 assertions) and 66 core smoke
+tests (432 assertions). Read checks cover concurrent schema renames and
+payload deletion, UDF rebinding between rows, nested reads in another
+environment, and returning the stored key without deserializing it twice.
+Earlier write checks cover aborted registrations reaching the same revision,
+writer-specific resolver context, map-resize retries, and comparator invalidation.
 
 ### JVM KV
 
@@ -854,16 +895,16 @@ serialized sizes or total database file sizes.
 
 | Storage | Write / row | Exact hit | Scan / row | Delete / row | Live bytes / row |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Built-in long → long | 0.34 | 0.34 | 0.048 | 11.26 | 32 |
-| Built-in long → small payload | 0.76 | 0.80 | 0.477 | 3.70 | 96 |
-| Custom scalar, small payload | 5.39 | 4.18 | 0.764 | 18.76 | 144 |
-| Built-in tuple → long | 0.76 | 0.47 | 0.302 | 10.16 | 48 |
-| Built-in tuple → small payload | 1.16 | 0.92 | 0.745 | 4.01 | 104 |
-| Custom tuple, small payload | 6.13 | 4.91 | 0.786 | 18.35 | 152 |
-| Built-in long → large payload | 3.58 | 1.83 | 0.841 | 0.83 | 8,216 |
-| Custom scalar, large payload | 8.77 | 5.93 | 1.240 | 16.62 | 8,264 |
-| Custom scalar, 8 values / order key | 8.51 | 7.36 | 0.769 | 19.68 | 136 |
-| Custom scalar, 64 values / order key | 29.74 | 29.35 | 0.788 | 19.34 | 136 |
+| Built-in long → long | 0.36 | 0.33 | 0.049 | 11.67 | 32 |
+| Built-in long → small payload | 0.79 | 0.80 | 0.479 | 3.81 | 96 |
+| Custom scalar, small payload | 5.62 | 3.99 | 0.759 | 19.03 | 144 |
+| Built-in tuple → long | 0.86 | 0.47 | 0.315 | 10.35 | 48 |
+| Built-in tuple → small payload | 1.30 | 0.96 | 0.780 | 4.18 | 104 |
+| Custom tuple, small payload | 6.27 | 4.77 | 0.753 | 18.42 | 152 |
+| Built-in long → large payload | 5.52 | 2.07 | 0.897 | 0.84 | 8,216 |
+| Custom scalar, large payload | 10.62 | 5.72 | 1.232 | 17.06 | 8,264 |
+| Custom scalar, 8 values / order key | 8.73 | 6.92 | 0.761 | 19.69 | 136 |
+| Custom scalar, 64 values / order key | 30.36 | 28.17 | 0.774 | 19.30 | 136 |
 
 Collision cases use small payloads and `rank = floor(id / bucket-size)`.
 Exact-hit times average over all members, not just the first or last member.
@@ -875,7 +916,7 @@ rebalancing; the unusually cheaper large-value baseline is specific to this
 ascending batch and should not be generalized to random deletions.
 
 Against the built-in scalar key with the same small payload, custom scalar
-writes cost about 7.1×, exact hits 5.2×, and full scans 1.6×. Tuple full scans are
+writes cost about 7.2×, exact hits 5.0×, and full scans 1.6×. Tuple full scans are
 close in this sample, but their writes and exact hits retain substantial
 overhead. Custom storage is functionally implemented; these numbers do not
 establish performance parity with built-in types.
@@ -888,10 +929,10 @@ scans are per returned row. Each count or lazy-first sample repeats 100 times.
 
 | Storage | Count all, µs | Values only, µs / row | Lazy first, µs |
 | --- | ---: | ---: | ---: |
-| Built-in long → long | 1.36 | 0.038 | 0.79 |
-| Custom scalar, small payload | 2.54 | 0.103 | 4.30 |
-| Custom scalar, large payload | 2.44 | 0.098 | 5.24 |
-| Custom scalar, 64 values / order key | 2.51 | 0.101 | 4.47 |
+| Built-in long → long | 1.45 | 0.039 | 1.02 |
+| Custom scalar, small payload | 2.70 | 0.104 | 4.48 |
+| Custom scalar, large payload | 2.54 | 0.098 | 5.45 |
+| Custom scalar, 64 values / order key | 2.65 | 0.104 | 4.69 |
 
 A separate instrumented deserializer verifies the work performed in a
 64-member bucket: the first exact hit decodes 1 payload, the last hit and a
@@ -901,11 +942,11 @@ decodes 2: the current shared iterator fetches `batch-size + 1` entries.
 Closing the lazy range releases its cursor and snapshot.
 
 The standalone component diagnostic measures about 0.009 µs for direct rank
-access, 0.075 µs for the resolved and validated `inter-fn` order callback, and
-0.033 µs for a resolved JVM-local UDF callback. These include loop and result
+access, 0.071 µs for the resolved and validated `inter-fn` order callback, and
+0.037 µs for a resolved JVM-local UDF callback. These include loop and result
 consumption overhead, with function resolution outside timing. Small-payload
-Nippy serialization/deserialization cost 0.364/0.409 µs; loading and decoding a
-payload by an already-known reference costs 0.820 µs, including acquiring a
+Nippy serialization/deserialization cost 0.359/0.458 µs; loading and decoding a
+payload by an already-known reference costs 0.874 µs, including acquiring a
 read snapshot. This last operation excludes order calculation and candidate
 matching. Simple order callbacks and raw serialization account for only a
 small fraction of current custom write time. Remaining JVM work includes
@@ -923,8 +964,8 @@ payload work in the custom case, without query/result-cache effects.
 
 | Attribute | Write / row, µs | Exact hit, µs | Scan / row, µs | Entity read, µs | Retract / row, µs |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Built-in long | 3.25 | 2.08 | 0.255 | 1.87 | 26.87 |
-| Custom scalar | 13.63 | 7.18 | 2.471 | 5.96 | 35.75 |
+| Built-in long | 3.34 | 2.02 | 0.256 | 1.85 | 27.66 |
+| Custom scalar | 13.30 | 6.03 | 1.022 | 4.96 | 35.39 |
 
 ### Brief Python adapter measurement
 
