@@ -5,8 +5,8 @@ contracts, ordered references, transactional payload storage, public KV custom
 keys and ordered list items, and Datalog custom attributes. Phase 5 now supports
 remote registration and server execution for values supported by the existing
 wire codec, plus Java, Python, and JavaScript registration and UDF APIs.
-Local Python native-value adapters are implemented. JavaScript native-value
-adapters, remote/spill serde transport, and performance work remain planned.
+Local Python and JavaScript native-value adapters are implemented.
+Remote/spill serde transport and performance work remain planned.
 
 Tracking issue: [Allow indexing of arbitrary data, #234](https://github.com/datalevin/datalevin/issues/234).
 
@@ -588,9 +588,8 @@ results fail before committing. Host callback errors retain their message even
 when a Java interface proxy wraps them in an exception without a message.
 
 Local Java KV calls can already pass JVM objects directly to order and serde
-functions. Local Python handles additionally support native class bindings as
-described below. JavaScript currently accepts ordinary bridge values; native
-JavaScript and remote value adapters remain Phase 5 work.
+functions. Local Python and JavaScript handles additionally support native class
+bindings as described below. Remote value adapters remain Phase 5 work.
 
 Examples are in the [Python binding README](../bindings/python/README.md#ordered-custom-types)
 and [JavaScript binding README](../bindings/javascript/README.md#ordered-custom-types).
@@ -646,7 +645,65 @@ convert values without a database handle still need a transport binding
 context. Opening a remote handle with native Python bindings is rejected.
 The carrier has no persistent Nippy encoding; runtime IDs must not become part
 of durable custom payloads. Remote and spill support are the next transport
-work items, along with the JavaScript native adapter.
+work items.
+
+### Native JavaScript values
+
+Bind a native class before opening a local KV environment or Datalog connection:
+
+```javascript
+await registry.bindNativeType("app/task", Task, taskTypeDefinition);
+const opts = { ":runtime-opts": { ":udf-registry": registry } };
+```
+
+This mirrors Python's runtime class binding and is separate from persisted
+`registerType`. It uses the definition's serializer/deserializer UDF descriptors.
+Match exact class prototypes, reject conflicting bindings, and recreate the
+binding on reopen. Built-in JavaScript classes keep their existing bridge
+conversion. The same native class can have different codecs in separate
+registries; concurrent operations retain their own conversion context.
+
+Native instances work as custom KV keys and ordered list items, Datalog
+attribute values, typed query/transaction values, query inputs, and lookup refs.
+Reads, pull/entity results, decoded KV callbacks, and query UDF results reconstruct
+the native instances. Borrowed handles, explicit KV transactions, simulated
+database values, and async transactions retain the runtime bindings. This does
+not change the binding's existing limitation on Datalog `withTransaction`.
+
+Serde uses `Buffer` or `Uint8Array` snapshots and may return promises.
+Deserializers receive a `Buffer` and must return an instance with the bound
+class's exact prototype. A read needs only its deserializer. Missing bindings,
+invalid return values, and callback failures return errors; failed writes roll
+back index and payload changes together. The existing JVM `NativeValue` carrier
+is shared with Python; custom storage payloads have no additional wrapper.
+
+Equality defaults to `node:util.isDeepStrictEqual` on reconstructed values.
+It compares complete values rather than serializer output bytes or JavaScript
+object identity. For classes with private state or other equality requirements,
+provide a runtime equality function:
+
+```javascript
+await registry.bindNativeType("app/task", Task, taskTypeDefinition, {
+  equals: (left, right) => left.rank === right.rank && left.label === right.label
+});
+```
+
+The equality function may be async and must return a boolean. It must define
+a stable equivalence relation and agree across codecs used together. Deep
+equality does not inspect private fields; such classes need an explicit function.
+Each value is decoded using its own codec before comparison. The carrier uses
+the same constant hash and has the same pending hash-performance work as Python.
+
+Map/set construction and EDN-list normalization that can invoke native equality
+run asynchronously to let Java call back into JavaScript. Callback conversion
+retains its owning registry across awaits. Equality proxies are retained by the
+live registry; codec lookup and proxy back-references are weak, and no process-wide
+native class mapping or daemon proxy is installed.
+
+As with Python, native values in untyped `:data`, remote messages, query spilling
+to disk, and eager helpers without a database handle remain unsupported.
+Opening a remote handle with native bindings is rejected before connecting.
+Remote/spill transport needs a runtime binding context before Phase 5 is complete.
 
 ## Implementation phases
 
@@ -740,10 +797,12 @@ permissions, read-only replicas, UDF rebinding, failed writes, and session
 reopen after server restart. Language registration APIs, custom UDF descriptor
 kinds, and byte-oriented serializer adapters are also implemented. Binding tests
 cover scalar/tuple orders, collisions, shared KV/Datalog registrations, payload
-round trips, rollback, and reopen/rebind. Local Python native class adapters also
+round trips, rollback, and reopen/rebind. Local Python and JavaScript native
+class adapters also
 cover noncanonical payloads, unhashable values, exact queries, upserts, decoded
-callbacks, async/simulated transactions, and codec isolation. JavaScript native
-adapters and remote/spill serde transport remain.
+callbacks, async/simulated transactions, and codec isolation. JavaScript additionally
+covers private-state equality, async serde/equality, concurrent codec contexts,
+and native map/set input conversion. Remote/spill serde transport remains.
 
 - Expose registration and custom-type references through the applicable Java,
   Python, and JavaScript surfaces.

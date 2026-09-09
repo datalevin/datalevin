@@ -526,9 +526,56 @@ For Datalog, register through the connection and set an attribute's
 APIs. Supply runtime bindings again when reopening. Remote stores execute
 functions using bindings installed on the server.
 
-Current values must work with ordinary JavaScript/JVM bridge conversion, such
-as the object above. Automatic serde transport for arbitrary native objects is
-still pending. See the [custom-data plan](../../doc/custom-data.md).
+For native JavaScript classes, bind the class before opening the local
+environment. Ordinary KV and Datalog operations then accept and return instances:
+
+```javascript
+import { UdfDescriptor, createUdfRegistry, openKv } from "datalevin-node";
+
+class Task {
+  constructor(rank, label) { this.rank = rank; this.label = label; }
+}
+
+const registry = await createUdfRegistry();
+await registry.orderUdf("native/order", task => task.rank);
+await registry.serializerUdf("native/encode", task =>
+  Buffer.from(JSON.stringify([task.rank.toString(), task.label])));
+await registry.deserializerUdf("native/decode", payload => {
+  const [rank, label] = JSON.parse(payload.toString("utf8"));
+  return new Task(BigInt(rank), label);
+});
+const definition = {
+  index: { type: ":long", "order-fn": UdfDescriptor.orderFn("native/order") },
+  payload: { serialize: UdfDescriptor.serializer("native/encode"),
+    deserialize: UdfDescriptor.deserializer("native/decode") }
+};
+await registry.bindNativeType("app/task", Task, definition);
+const kv = await openKv("/tmp/datalevin-js-native", {
+  ":runtime-opts": { ":udf-registry": registry }
+});
+try {
+  await kv.registerType("app/task", definition);
+  await kv.openDbi("tasks", { ":key-type": ":app/task" });
+  await kv.transact([[":put", new Task(1n, "Compile"), "queued"]], { dbiName: "tasks" });
+  console.log(await kv.getValue("tasks", new Task(1n, "Compile"))); // queued
+  console.log(await kv.getRange("tasks", [":all"])); // [[Task { ... }, "queued"]]
+} finally {
+  await kv.close();
+}
+```
+
+Recreate the runtime class binding and UDF implementations on reopen. Serde
+functions may be async. Exact matching defaults to `node:util.isDeepStrictEqual`
+on decoded values, so equal instances may serialize to different bytes. For
+classes with private fields, or a different value-equality rule, pass
+`{ equals: (left, right) => /* boolean */ }` as the fourth argument to
+`bindNativeType`. Equality may also be async and must remain stable and symmetric.
+
+Native support currently covers local operations without query spilling to
+disk. Remote transport, untyped `:data`, and eager helpers without a database
+handle remain unsupported. Native values currently share a constant JVM hash,
+so large hash joins and deduplication still need performance work. See the
+[native-value plan](../../doc/custom-data.md#native-javascript-values).
 
 ## Fulltext Analyzer UDF Example
 

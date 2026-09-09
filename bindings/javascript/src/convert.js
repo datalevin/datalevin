@@ -1,5 +1,10 @@
 import { classes } from "./jvm.js";
 import { DatalogSymbol, EdnList, Form, Keyword, Uuid } from "./form.js";
+import { currentNativeBindings, nativeCodecFor, nativeToJs } from "./native.js";
+
+function nativeBindingsActive() {
+  return Boolean(currentNativeBindings()?.types.size);
+}
 
 const INT64_MIN = -(2n ** 63n);
 const INT64_MAX = 2n ** 63n - 1n;
@@ -58,7 +63,9 @@ async function toJavaMap(entries, converter) {
   const cls = await classes();
   const jmap = new cls.linkedHashMap();
   for (const [key, item] of entries) {
-    jmap.putSync(await converter(key), await converter(item));
+    const k = await converter(key), v = await converter(item);
+    if (nativeBindingsActive()) await jmap.put(k, v);
+    else jmap.putSync(k, v);
   }
   return jmap;
 }
@@ -67,7 +74,9 @@ async function toJavaSet(items, converter) {
   const cls = await classes();
   const jset = new cls.linkedHashSet();
   for (const item of items) {
-    jset.addSync(await converter(item));
+    const value = await converter(item);
+    if (nativeBindingsActive()) await jset.add(value);
+    else jset.addSync(value);
   }
   return jset;
 }
@@ -88,6 +97,8 @@ export function isJavaObject(value) {
 }
 
 export async function toJava(value) {
+  const native = nativeCodecFor(value);
+  if (native) return native.wrap(value);
   if (value === null || typeof value === "boolean" || typeof value === "string") {
     return value;
   }
@@ -136,7 +147,7 @@ export async function toJava(value) {
     for (const item of value) {
       items.addSync(await toJava(item));
     }
-    return cls.interop.ednListSync(items);
+    return nativeBindingsActive() ? cls.interop.ednList(items) : cls.interop.ednListSync(items);
   }
 
   if (value instanceof Form) {
@@ -206,6 +217,11 @@ export async function toJs(value) {
   }
 
   const cls = await classes();
+
+  if (typeof value.getClassSync === "function"
+      && value.getClassSync().getNameSync() === "datalevin.NativeValue") {
+    return nativeToJs(value);
+  }
 
   if (instanceOf(value, cls.uuid)) {
     return value.toStringSync();
@@ -284,12 +300,16 @@ async function toJavaFormMap(entries, converter) {
   const cls = await classes();
   const jmap = new cls.linkedHashMap();
   for (const [key, item] of entries) {
-    jmap.putSync(await converter(key), await converter(item));
+    const k = await converter(key), v = await converter(item);
+    if (nativeBindingsActive()) await jmap.put(k, v);
+    else jmap.putSync(k, v);
   }
   return jmap;
 }
 
 export async function toEdnForm(value) {
+  const native = nativeCodecFor(value);
+  if (native) return native.wrap(value);
   if (value === null || isJavaObject(value)) {
     return value;
   }
@@ -345,6 +365,8 @@ export async function toEdnForm(value) {
 }
 
 export async function toQueryInput(value) {
+  const native = nativeCodecFor(value);
+  if (native) return native.wrap(value);
   if (value === null || isJavaObject(value)) {
     return value;
   }

@@ -2,6 +2,7 @@ import { toEdnForm, toJava } from "./convert.js";
 import { _BINDINGS } from "./interop.js";
 import { callJavaMethod } from "./jvm.js";
 import { toJsResult } from "./result.js";
+import { currentNativeRegistry, nativeMethods } from "./native.js";
 
 async function pullSelector(value) {
   if (typeof value === "string") {
@@ -20,6 +21,7 @@ async function mapGet(map, key) {
 
 export class Database {
   constructor(handle) {
+    this._nativeRegistry = currentNativeRegistry();
     this._handle = handle;
   }
 
@@ -83,3 +85,5 @@ export async function txReportToJs(report) {
   }
   return result;
 }
+
+nativeMethods(Database);

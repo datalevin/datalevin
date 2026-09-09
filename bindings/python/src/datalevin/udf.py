@@ -31,12 +31,16 @@ class _PythonUdfFunction:
                 python_args = [_udf_arg_to_python(arg, index) for index, arg in enumerate(args)]
                 result = self._fn(*python_args)
                 if self._descriptor.kind == ":deserializer":
+                    expected = None
                     for codec in self._registry._native_types.values():
                         if codec.deserialize == self._descriptor:
-                            codec.check_value(result)
+                            expected = expected or codec
                             # Retain the supplied snapshot; a read needs only
                             # the deserializer, and payloads need not be canonical.
-                            return codec.wrap_payload(python_args[0])
+                            if type(result) is codec.native_type:
+                                return codec.wrap_payload(python_args[0])
+                    if expected is not None:
+                        expected.check_value(result)
                 return to_java(result)
         except jpype.JException:
             raise

@@ -1,7 +1,9 @@
 import util from "node:util";
+import { currentNativeRegistry } from "./native.js";
 
 export class ResourceWrapper {
   constructor(handle, closeFn, closedFn, label) {
+    this._nativeRegistry = currentNativeRegistry();
     this._handle = handle;
     this._closeFn = closeFn;
     this._closedFn = closedFn;

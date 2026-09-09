@@ -1,6 +1,7 @@
 import { isJavaObject, toJs } from "./convert.js";
 import { _BINDINGS } from "./interop.js";
 import { classes } from "./jvm.js";
+import { currentNativeRegistry, nativeMethods } from "./native.js";
 
 function materializeJavaCollection(collection) {
   if (typeof collection?.toArraySync === "function") {
@@ -123,6 +124,7 @@ async function entityValue(value) {
 
 export class Entity {
   constructor(handle) {
+    this._nativeRegistry = currentNativeRegistry();
     this.handle = handle;
   }
 
@@ -169,3 +171,5 @@ export class Entity {
     return "<Entity lazy>";
   }
 }
+
+nativeMethods(Entity);

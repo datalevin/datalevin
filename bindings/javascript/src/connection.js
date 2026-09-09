@@ -11,6 +11,7 @@ import { _BINDINGS } from "./interop.js";
 import { callJavaMethod, javaBridgeModule } from "./jvm.js";
 import { ResourceWrapper } from "./resource.js";
 import { toJsResult } from "./result.js";
+import { bindNativeCallback, nativeMethods } from "./native.js";
 
 async function pullSelector(value) {
   if (typeof value === "string") {
@@ -91,9 +92,9 @@ async function createConsumerProxy(fn) {
   }
   const { newProxy } = await javaBridgeModule();
   return newProxy("java.util.function.Consumer", {
-    accept: async (value) => {
+    accept: bindNativeCallback(async (value) => {
       await fn(await toJs(value));
-    }
+    })
   });
 }
 
@@ -462,3 +463,5 @@ export class Connection extends ResourceWrapper {
     return toJsResult(await callJavaMethod(this.rawHandle(), "gcTxLogSegments"), { bridge: true });
   }
 }
+
+nativeMethods(Connection);

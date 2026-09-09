@@ -1,6 +1,7 @@
 import { toEdnForm, toJava, toJs, toQueryInput } from "./convert.js";
 import { DatalevinError } from "./errors.js";
 import { callJavaMethod, classes, javaBridgeModule, jvmStarted, startJvm } from "./jvm.js";
+import { bindNativeCallback, registryFromOpts, withNativeScope } from "./native.js";
 
 export const CONNECTION_WITH_TRANSACTION_UNSUPPORTED =
   "Connection withTransaction is not exposed by the JavaScript binding because Java interface callbacks deadlock when the callback calls back into Datalevin. Use transact() for a single Datalog transaction, or KV withTransaction for explicit KV transactions.";
@@ -41,10 +42,10 @@ async function normalizeInteropArgs(args = []) {
 async function createFunctionProxy(fn) {
   const { newProxy } = await javaBridgeModule();
   return newProxy("java.util.function.Function", {
-    apply: async (value) => {
+    apply: bindNativeCallback(async (value) => {
       const result = await fn(value);
       return toJava(result === undefined ? null : result);
-    }
+    })
   });
 }
 
@@ -1508,16 +1509,18 @@ export async function execJson(op, args = null) {
 
 export async function connect(dir = null, { schema = null, opts = null, shared = false } = {}) {
   const { Connection } = await import("./connection.js");
-  return new Connection(await _BINDINGS.createConnection(dir, schema, opts, { shared }));
+  return withNativeScope(registryFromOpts(opts, dir), async () =>
+    new Connection(await _BINDINGS.createConnection(dir, schema, opts, { shared })));
 }
 
 export async function initDb(datoms, { dir = null, schema = null, opts = null } = {}) {
   const { Connection } = await import("./connection.js");
-  return new Connection(await _BINDINGS.initDb(datoms, dir, schema, opts));
+  return withNativeScope(registryFromOpts(opts, dir), async () =>
+    new Connection(await _BINDINGS.initDb(datoms, dir, schema, opts)));
 }
 
 export async function fillDb(conn, datoms) {
-  await _BINDINGS.fillDb(conn, datoms);
+  await withNativeScope(conn?._nativeRegistry ?? null, () => _BINDINGS.fillDb(conn, datoms));
   return conn;
 }
 
@@ -2072,7 +2075,8 @@ export function datomAdded(value) {
 
 export async function openKv(dir, opts = null) {
   const { KV } = await import("./kv.js");
-  return new KV(await _BINDINGS.openKeyValue(dir, opts));
+  return withNativeScope(registryFromOpts(opts, dir), async () =>
+    new KV(await _BINDINGS.openKeyValue(dir, opts)));
 }
 
 export async function newSearchEngine(kv, opts = null) {

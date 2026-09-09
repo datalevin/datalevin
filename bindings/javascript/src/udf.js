@@ -3,21 +3,12 @@ import { Database } from "./database.js";
 import { _BINDINGS } from "./interop.js";
 import { javaBridgeModule } from "./jvm.js";
 import { UdfDescriptor, descriptorData } from "./udf-value.js";
+import { NativeCodec, createNativeEqualityProxy, descriptorKey, withNativeScope } from "./native.js";
 
 const DATABASE_CLASSES = new Set([
   "datalevin.db.DB",
   "datalevin.DatabaseValue"
 ]);
-
-function descriptorKey(descriptor) {
-  const normalized = descriptorData(descriptor);
-  return [
-    normalized[":udf/lang"],
-    normalized[":udf/kind"],
-    normalized[":udf/id"],
-    normalized[":udf/version"] ?? ""
-  ].join("\u0000");
-}
 
 function materializeJavaArgs(args) {
   if (Array.isArray(args)) {
@@ -85,18 +76,28 @@ async function udfArgsToJs(args) {
   }));
 }
 
-async function createProxy(fn, descriptor) {
+async function createProxy(fn, descriptor, bindings) {
   const { newProxy } = await javaBridgeModule();
   return newProxy("datalevin.UdfFunction", {
-    invoke: async (args) => {
+    invoke: (args) => withNativeScope(bindings, async () => {
       const values = await udfArgsToJs(args);
       const result = await fn(...values);
       if (descriptor.kind === ":serializer"
           && !Buffer.isBuffer(result) && !(result instanceof Uint8Array)) {
         throw new TypeError("Custom serializer must return a byte array (Buffer or Uint8Array).");
       }
+      if (descriptor.kind === ":deserializer") {
+        let expected;
+        for (const codec of bindings.types.values()) {
+          if (descriptorKey(codec.deserialize) === descriptorKey(descriptor)) {
+            expected ??= codec;
+            if (codec.accepts(result)) return codec.wrapPayload(values[0]);
+          }
+        }
+        expected?.checkValue(result);
+      }
       return toJava(result === undefined ? null : result);
-    }
+    })
   });
 }
 
@@ -112,6 +113,8 @@ export class UdfRegistry {
   constructor(handle) {
     this._handle = handle;
     this._proxies = new Map();
+    this._nativeBindings = { types: new Map(), functions: new Map(), ownerRef: new WeakRef(this) };
+    this._nativeEqualityProxyPromise = null;
   }
 
   rawHandle() {
@@ -124,9 +127,10 @@ export class UdfRegistry {
     }
 
     const normalized = UdfDescriptor.from(descriptor, { defaultLang: "javascript" });
-    const proxy = await createProxy(fn, normalized);
+    const proxy = await createProxy(fn, normalized, this._nativeBindings);
     await _BINDINGS.registerUdf(this._handle, normalized, proxy);
     this._proxies.set(descriptorKey(normalized), proxy);
+    this._nativeBindings.functions.set(descriptorKey(normalized), fn);
     return fn;
   }
 
@@ -134,6 +138,7 @@ export class UdfRegistry {
     const normalized = UdfDescriptor.from(descriptor, { defaultLang: "javascript" });
     await _BINDINGS.unregisterUdf(this._handle, normalized);
     const key = descriptorKey(normalized);
+    this._nativeBindings.functions.delete(key);
     const proxy = this._proxies.get(key);
     if (proxy !== undefined) {
       proxy.reset();
@@ -146,6 +151,37 @@ export class UdfRegistry {
       this._handle,
       UdfDescriptor.from(descriptor, { defaultLang: "javascript" })
     );
+  }
+
+  /** Bind an exact native class to payload UDFs before opening a local database.
+   * Equality defaults to node:util.isDeepStrictEqual; classes with private state
+   * can supply { equals: (left, right) => boolean }. This binding is not persisted.
+   */
+  async bindNativeType(typeName, nativeType, definition, options = {}) {
+    const codec = new NativeCodec(this._nativeBindings, typeName, nativeType, definition, options);
+    const existing = this._nativeBindings.types.get(nativeType.prototype);
+    if (existing) {
+      if (!existing.sameBinding(codec)) throw new TypeError("JavaScript class already has a different native type binding");
+      return this;
+    }
+    if ([...this._nativeBindings.types.values()].some((c) => c.typeName === codec.typeName)) {
+      throw new TypeError("Custom type already has a different JavaScript class binding");
+    }
+    this._nativeEqualityProxyPromise ??= createNativeEqualityProxy();
+    this._nativeBindings.equalityProxyRef = new WeakRef(await this._nativeEqualityProxyPromise);
+    // Recheck after the asynchronous proxy creation: concurrent conflicting
+    // bindings must not overwrite a class installed by another call.
+    const installed = this._nativeBindings.types.get(nativeType.prototype);
+    if (installed) {
+      if (!installed.sameBinding(codec)) throw new TypeError("JavaScript class already has a different native type binding");
+      return this;
+    }
+    if ([...this._nativeBindings.types.values()].some((c) => c.typeName === codec.typeName)) {
+      throw new TypeError("Custom type already has a different JavaScript class binding");
+    }
+    this._nativeBindings.types.set(nativeType.prototype, codec);
+    codec.install();
+    return this;
   }
 
   async queryUdf(id, fn, options = {}) {

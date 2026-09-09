@@ -4,6 +4,7 @@ import { _BINDINGS } from "./interop.js";
 import { callJavaMethod, javaBridgeModule } from "./jvm.js";
 import { ResourceWrapper } from "./resource.js";
 import { toJsResult } from "./result.js";
+import { bindNativeCallback, nativeMethods } from "./native.js";
 
 const NO_TIMEOUT_OPTION = Symbol("no-timeout-option");
 
@@ -141,7 +142,9 @@ async function withInterfaceProxyEventLoop(fn) {
 
 async function withJavaProxy(interfaceName, implementation, fn) {
   const { newProxy } = await javaBridgeModule();
-  const proxy = newProxy(interfaceName, implementation);
+  const methods = Object.fromEntries(Object.entries(implementation)
+    .map(([name, fn]) => [name, bindNativeCallback(fn)]));
+  const proxy = newProxy(interfaceName, methods);
   try {
     return await withInterfaceProxyEventLoop(() => fn(proxy));
   } finally {
@@ -1236,3 +1239,6 @@ export class KVTransaction extends KV {
     }
   }
 }
+
+nativeMethods(KV);
+nativeMethods(KVTransaction);
