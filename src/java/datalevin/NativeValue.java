@@ -39,6 +39,11 @@ public final class NativeValue implements IHashEq {
         return payload.clone();
     }
 
+    /** Restore a spill snapshot using this value's live runtime binding. */
+    public NativeValue withPayload(byte[] bytes) {
+        return new NativeValue(codecId, typeName, bytes, equality);
+    }
+
     @Override
     public boolean equals(Object other) {
         if (this == other) {

@@ -16,10 +16,11 @@
    [datalevin.util :as u]
    [datalevin.lmdb :as l]
    [datalevin.interface :as i]
+   [datalevin.native-value :as nv]
    [taoensso.nippy :as nippy]
    [clojure.set :as set])
   (:import
-   [java.util Iterator List UUID NoSuchElementException Map Set Collection AbstractSet]
+   [java.util Iterator List UUID NoSuchElementException Map Set Collection AbstractSet HashMap]
    [java.io DataInput DataOutput]
    [java.lang.ref Cleaner Cleaner$Cleanable]
    [java.lang.management ManagementFactory]
@@ -112,12 +113,21 @@
 
 (declare ->SVecSeq ->RSVecSeq)
 
+(defn- spill-tx [db bindings txs]
+  (binding [nv/*spill-bindings* bindings]
+    (i/transact-kv db txs)))
+
+(defn- spill-value [db bindings k kt]
+  (binding [nv/*spill-bindings* bindings]
+    (i/get-value db c/tmp-dbi k kt)))
+
 (deftype SpillableVector [^long spill-threshold
                           ^String spill-root
                           spill-dir
                           ^FastList memory
                           disk
                           cleanable
+                          ^HashMap native-bindings
                           total
                           ^:unsynchronized-mutable meta]
   ISpillable
@@ -130,7 +140,7 @@
   (spill [this]
     (when-not @disk
       (let [dir (str spill-root "dtlv-spill-vec-" (UUID/randomUUID))
-            db  (l/open-kv dir {:temp? true})]
+            db  (l/open-kv dir {:temp? true :spill? true})]
         (vreset! spill-dir dir)
         (vreset! disk db)
         (register-spill-cleanup! this cleanable disk spill-dir)
@@ -162,8 +172,9 @@
           ^long tc @total]
       (cond
         (= i tc) (.cons this v)
-        (< i mc) (.add memory i v)
-        (< i tc) (i/transact-kv @disk [(l/kv-tx :put c/tmp-dbi i v :id)])
+        (< i mc) (.set memory i v)
+        (< i tc) (spill-tx @disk native-bindings
+                          [(l/kv-tx :put c/tmp-dbi i [v] :id)])
         :else    (throw (IndexOutOfBoundsException.))))
     this)
 
@@ -172,7 +183,8 @@
       (if (and (< ^long @memory-pressure spill-threshold) mem?)
         (.add memory v)
         (do (when mem? (.spill this))
-            (i/transact-kv @disk [(l/kv-tx :put c/tmp-dbi @total v :id)]))))
+            (spill-tx @disk native-bindings
+                      [(l/kv-tx :put c/tmp-dbi @total [v] :id)]))))
     (vswap! total u/long-inc)
     this)
 
@@ -183,27 +195,18 @@
       (.assocN this k v)
       (throw (IllegalArgumentException. "Key must be integer"))))
 
-  (containsKey [this k]
-    (if (integer? k)
-      (if (some? (get this k))
-        true
-        (if @disk
-          (some? (i/get-value @disk c/tmp-dbi k :id))
-          false))
-      false))
+  (containsKey [_ k]
+    (and (integer? k) (<= 0 ^long k) (< ^long k ^long @total)))
 
-  (entryAt [_ k]
-    (when (integer? k)
-      (if-some [v (.get memory k)]
-        (MapEntry. k v)
-        (when-some [v (i/get-value @disk c/tmp-dbi k :id)]
-          (MapEntry. k v)))))
+  (entryAt [this k]
+    (when (.containsKey this k)
+      (MapEntry. k (.valAt this k))))
 
   (valAt [_ k nf]
-    (if (integer? k)
+    (if (and (integer? k) (<= 0 ^long k) (< ^long k ^long @total))
       (cond
         (< ^long k (.size memory)) (.get memory k)
-        @disk                      (i/get-value @disk c/tmp-dbi k :id)
+        @disk                      (first (spill-value @disk native-bindings k :id))
         :else                      nf)
       nf))
   (valAt [this k]
@@ -212,7 +215,8 @@
   (peek [this]
     (if (zero? ^long (disk-count this))
       (.getLast memory)
-      (i/get-first @disk c/tmp-dbi [:all-back] :id :data true)))
+      (first (binding [nv/*spill-bindings* native-bindings]
+               (i/get-first @disk c/tmp-dbi [:all-back] :id :data true)))))
 
   (pop [this]
     (cond
@@ -234,6 +238,8 @@
     (.clear memory)
     (when @disk
       (clean-spill! cleanable disk spill-dir))
+    (.clear native-bindings)
+    (vreset! total 0)
     this)
 
   (equiv [this other]
@@ -355,6 +361,7 @@
                                                  (FastList. (count vs))
                                                  (volatile! nil)
                                                  (volatile! nil)
+                                                 (nv/spill-bindings)
                                                  (volatile! 0)
                                                  nil)]
      (doseq [v vs] (.cons svec v))
@@ -382,23 +389,72 @@
     (dotimes [_ n] (.cons vs (nippy/thaw-from-in! in)))
     vs))
 
+(defn- map-bucket [db bindings k]
+  (or (spill-value db bindings (hash k) :int) []))
+
+(defn- bucket-index [bucket k]
+  (first (keep-indexed (fn [idx [stored-key]]
+                         (when (Util/equiv k stored-key) idx))
+                       bucket)))
+
+(defn- disk-map-entry [db bindings k]
+  (when db
+    (let [bucket (map-bucket db bindings k)]
+      (when-some [idx (bucket-index bucket k)]
+        (let [[stored-key value] (nth bucket idx)]
+          (MapEntry. stored-key value))))))
+
+(defn- disk-map-put! [db bindings disk-total k v]
+  (let [bucket (map-bucket db bindings k)
+        idx    (bucket-index bucket k)
+        entry  (when (some? idx) (nth bucket idx))]
+    (spill-tx db bindings
+              [(l/kv-tx :put c/tmp-dbi (hash k)
+                        (if entry
+                          (assoc bucket idx [(first entry) v])
+                          (conj bucket [k v]))
+                        :int)])
+    (when-not entry (vswap! disk-total u/long-inc))
+    (second entry)))
+
+(defn- disk-map-remove! [db bindings disk-total k]
+  (when db
+    (let [bucket (map-bucket db bindings k)]
+      (when-some [idx (bucket-index bucket k)]
+        (let [entry (nth bucket idx)
+              rest  (into (subvec bucket 0 idx) (subvec bucket (inc ^long idx)))]
+          (spill-tx db bindings
+                    [(if (seq rest)
+                       (l/kv-tx :put c/tmp-dbi (hash k) rest :int)
+                       (l/kv-tx :del c/tmp-dbi (hash k) :int))])
+          (vswap! disk-total dec)
+          (second entry))))))
+
+(defn- disk-map-entries [db bindings]
+  (when db
+    (let [buckets (binding [nv/*spill-bindings* bindings]
+                    (i/get-range db c/tmp-dbi [:all] :int :data true))]
+      (mapcat identity buckets))))
+
 (deftype SpillableMap [^long spill-threshold
                        ^String spill-root
                        spill-dir
                        ^UnifiedMap memory
                        disk
                        cleanable
+                       ^HashMap native-bindings
+                       disk-total
                        ^:unsynchronized-mutable meta]
   ISpillable
 
   (memory-count ^long [_] (.size memory))
 
-  (disk-count ^long [_] (if @disk (i/entries @disk c/tmp-dbi) 0))
+  (disk-count ^long [_] @disk-total)
 
   (spill [this]
     (when-not @disk
       (let [dir (str spill-root "dtlv-spill-map-" (UUID/randomUUID))
-            db  (l/open-kv dir {:temp? true})]
+            db  (l/open-kv dir {:temp? true :spill? true})]
         (vreset! spill-dir dir)
         (vreset! disk db)
         (register-spill-cleanup! this cleanable disk spill-dir)
@@ -411,29 +467,23 @@
 
   (without [this k] (.remove this k) this)
 
-  (count [_]
-    (cond-> (.size memory) @disk (+ ^long (i/entries @disk c/tmp-dbi))))
+  (count [_] (+ (.size memory) ^long @disk-total))
 
   (containsKey [_ k]
     (if (.containsKey memory k)
       true
-      (if @disk
-        (some? (i/get-value @disk c/tmp-dbi k))
-        false)))
+      (some? (disk-map-entry @disk native-bindings k))))
 
   (entryAt [_ k]
-    (if-some [v (.get memory k)]
-      (MapEntry. k v)
-      (when-some [v (i/get-value @disk c/tmp-dbi k)]
-        (MapEntry. k v))))
+    (if (.containsKey memory k)
+      (MapEntry. k (.get memory k))
+      (disk-map-entry @disk native-bindings k)))
 
   (valAt [_ k nf]
-    (if-some [v (.get memory k)]
-      v
-      (if @disk
-        (if-some [v (i/get-value @disk c/tmp-dbi k)]
-          v
-          nf)
+    (if (.containsKey memory k)
+      (.get memory k)
+      (if-some [entry (disk-map-entry @disk native-bindings k)]
+        (val entry)
         nf)))
   (valAt [this k]
     (.valAt this k nil))
@@ -446,13 +496,15 @@
     (.clear memory)
     (when @disk
       (clean-spill! cleanable disk spill-dir))
+    (.clear native-bindings)
+    (vreset! disk-total 0)
     this)
 
   MapEquivalence
 
   (keySet [_]
     (set/union (set (.keySet memory))
-               (when @disk (set (i/key-range @disk c/tmp-dbi [:all])))))
+               (set (map first (disk-map-entries @disk native-bindings)))))
 
   (equiv [this other]
     (cond
@@ -481,19 +533,22 @@
   (size [this] (count this))
 
   (put [this k v]
-    (if (< ^long @memory-pressure spill-threshold)
+    ;; Keep existing in-memory keys in memory. Once a disk portion exists,
+    ;; new keys stay there even when pressure falls, so equal keys cannot
+    ;; acquire separate entries in the two portions.
+    (if (or (.containsKey memory k)
+            (and (nil? @disk) (< ^long @memory-pressure spill-threshold)))
       (.put memory k v)
-      (when-not (= (.get memory k) v)
+      (do
         (when (nil? @disk) (.spill this))
-        (i/transact-kv @disk [(l/kv-tx :put c/tmp-dbi k v)]))))
+        (disk-map-put! @disk native-bindings disk-total k v))))
 
   (get [this k] (.valAt this k))
 
   (remove [_ k]
     (if (.containsKey memory k)
       (.remove memory k)
-      (when (and @disk (i/get-value @disk c/tmp-dbi k))
-        (i/transact-kv @disk [(l/kv-tx :del c/tmp-dbi k)]))))
+      (disk-map-remove! @disk native-bindings disk-total k)))
 
   (isEmpty [this] (= 0 (count this)))
 
@@ -515,22 +570,19 @@
             kl       (FastList. (.keySet memory))
             mn       (.size kl)
             db       @disk
-            ^long dn (if db (i/entries db c/tmp-dbi) 0)
-            dl       (when-not (zero? dn)
-                       (i/get-range db c/tmp-dbi [:all]))]
+            di       (clojure.lang.RT/iter
+                       (disk-map-entries db native-bindings))]
         (reify
           Iterator
           (hasNext [_]
-            (let [^long di @i]
-              (or (< di mn)
-                  (if db (< di (+ mn dn)) false))))
+            (or (< ^long @i mn) (.hasNext di)))
           (next [iter]
             (if (.hasNext iter)
-              (let [^long di @i
-                    res      (if (< di mn)
-                               (let [k (.get kl di)]
+              (let [^long idx @i
+                    res      (if (< idx mn)
+                               (let [k (.get kl idx)]
                                  (MapEntry. k (.get memory k)))
-                               (let [[k v] (nth dl (- di mn))]
+                               (let [[k v] (.next di)]
                                  (MapEntry. k v)))]
                 (vswap! i u/long-inc)
                 res)
@@ -553,6 +605,8 @@
                              (UnifiedMap.)
                              (volatile! nil)
                              (volatile! nil)
+                             (nv/spill-bindings)
+                             (volatile! 0)
                              nil)]
      (doseq [[k v] m] (.put smap k v))
      smap)))
@@ -655,6 +709,8 @@
                                (UnifiedMap.))
                              (volatile! nil)
                              (volatile! nil)
+                             (nv/spill-bindings)
+                             (volatile! 0)
                              nil)]
      (doseq [e s] (.put impl e c/slash))
      (SpillableSet. impl nil))))

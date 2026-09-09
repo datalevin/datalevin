@@ -571,10 +571,10 @@ classes with private fields, or a different value-equality rule, pass
 `{ equals: (left, right) => /* boolean */ }` as the fourth argument to
 `bindNativeType`. Equality may also be async and must remain stable and symmetric.
 
-Native support currently covers local operations without query spilling to
-disk. Remote transport, untyped `:data`, and eager helpers without a database
+Native support covers local operations, including query spilling to disk.
+Remote transport, untyped `:data`, and eager helpers without a database
 handle remain unsupported. Native values currently share a constant JVM hash,
-so large hash joins and deduplication still need performance work. See the
+so large hash joins and deduplication can be expensive. See the
 [native-value plan](../../doc/custom-data.md#native-javascript-values).
 
 ## Fulltext Analyzer UDF Example

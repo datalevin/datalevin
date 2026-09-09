@@ -520,8 +520,8 @@ registry and must be recreated on reopen. Exact matching uses Python `==` on
 complete values; equal objects do not need identical serialized bytes or a
 Python hash function.
 
-Native class support currently covers local operations without query spilling
-to disk. Remote transport, native values in untyped `:data`, and helpers that
+Native class support covers local operations, including query spilling to disk.
+Remote transport, native values in untyped `:data`, and helpers that
 convert values before a database handle is available remain unsupported. The
 current constant JVM hash can make large hash joins/deduplication expensive.
 See the [native-value plan](../../doc/custom-data.md#native-python-values).

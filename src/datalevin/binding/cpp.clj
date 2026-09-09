@@ -1933,7 +1933,7 @@
       (when (.isClosed env)
         (release-local-kv-handle! dir-key)
         (swap! l/lmdb-dirs disj dir)
-        (when (zero? (count @l/lmdb-dirs))
+        (when (and (not (@info :spill?)) (zero? (count @l/lmdb-dirs)))
           (l/shutdown-last-lmdb-executors!)))
       (when-let [e @close-error]
         (throw e))
@@ -2728,7 +2728,11 @@
                                    nil
                                    nil
                                    nil)]
-        (swap! l/lmdb-dirs conj dir)
+        ;; Spill collections may outlive the application database until GC.
+        ;; Their synchronous temporary stores must not keep global executors
+        ;; alive after the last application database closes.
+        (when-not (:spill? opts)
+          (swap! l/lmdb-dirs conj dir))
         (open-dbi lmdb c/kv-info) ;; never compressed
         (cond
           inmemory? nil

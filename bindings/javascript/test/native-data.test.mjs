@@ -4,11 +4,48 @@ import os from "node:os";
 import path from "node:path";
 import { test } from "node:test";
 import { UdfDescriptor, connect, createUdfRegistry, datalogKv, openKv, q, tx } from "../src/index.js";
-import { resolveClasspath } from "../src/jvm.js";
+import { javaBridgeModule, resolveClasspath } from "../src/jvm.js";
 
 const available = (() => { try { return resolveClasspath().length > 0; } catch { return false; } })();
 const options = { skip: !available, timeout: 60000 };
 const tempDir = () => fs.mkdtempSync(path.join(os.tmpdir(), "datalevin-js-native-"));
+
+test("native values survive query spilling and asynchronous collection reads", options, async () => {
+  const { registry, definition, opts } = await taskType();
+  const { importClass } = await javaBridgeModule();
+  const Clojure = importClass("clojure.java.api.Clojure");
+  const dir = tempDir();
+  const conn = await connect(dir, { opts });
+  const a = new Task(1n, "a"), b = new Task(1n, "b");
+  const deref = Clojure.varSync("clojure.core", "deref");
+  const reset = Clojure.varSync("clojure.core", "vreset!");
+  const pressure = deref.invokeSync(Clojure.varSync("datalevin.spill", "memory-pressure"));
+  const previous = deref.invokeSync(pressure);
+  try {
+    await conn.registerType("app/task", definition);
+    await conn.updateSchema({ "task/value": { ":db/valueType": ":app/task" } });
+    await conn.transact([{ "db/id": 1, "task/value": a }, { "db/id": 2, "task/value": b },
+      { "db/id": 3, "task/value": new Task(1n, "a") }]);
+    const kv = await datalogKv(conn);
+    await kv.openListDbi("owners", { ":value-type": ":app/task" });
+    await kv.putListItems("owners", "alice", [a, b], { kType: ":string", vType: ":app/task" });
+    reset.invokeSync(pressure, 99n);
+    // Reading each spilled map invokes native equality on colliding keys.
+    assert.deepEqual(await kv.listRangeKeep("owners", () => new Map([[a, "a"], [b, "b"]]),
+      [":all"], { kType: ":string", vRange: [":all"], vType: ":app/task" }),
+      [new Map([[a, "a"], [b, "b"]]), new Map([[a, "a"], [b, "b"]])]);
+    assert.deepEqual((await conn.query("[:find ?v :where [?e :task/value ?v]]"))
+      .map(row => row[0].label).sort(), ["a", "b"]);
+    assert.deepEqual((await conn.query("[:find ?e :in $ ?v :where [?e :task/value ?v]]",
+      new Task(1n, "a"))).sort(), [[1n], [3n]]);
+    assert.deepEqual((await conn.query("[:find ?v :where [?e :task/value ?v] [?other :task/value ?v]]"))
+      .map(row => row[0].label).sort(), ["a", "b"]);
+  } finally {
+    reset.invokeSync(pressure, previous);
+    await conn.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 class Task {
   constructor(rank, label) { this.rank = rank; this.label = label; }

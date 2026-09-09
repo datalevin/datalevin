@@ -5,8 +5,8 @@ contracts, ordered references, transactional payload storage, public KV custom
 keys and ordered list items, and Datalog custom attributes. Phase 5 now supports
 remote registration and server execution for values supported by the existing
 wire codec, plus Java, Python, and JavaScript registration and UDF APIs.
-Local Python and JavaScript native-value adapters are implemented.
-Remote/spill serde transport and performance work remain planned.
+Local Python and JavaScript native-value adapters, including query spilling,
+are implemented. Remote native-value transport and performance work remain planned.
 
 Tracking issue: [Allow indexing of arbitrary data, #234](https://github.com/datalevin/datalevin/issues/234).
 
@@ -234,8 +234,8 @@ errors without exporting runtime handles or committing partial writes.
 
 The current remote path accepts logical values supported by the existing Nippy
 wire codec. Custom payload serde controls their stored bytes; it does not yet
-replace serialization of logical values in requests and responses. The native
-value adapters described below remain Phase 5 work.
+replace serialization of logical values in requests and responses. Remote native
+value transport remains Phase 5 work.
 
 The order and serialization functions receive the logical value in their
 registered runtime. Use the payload serde functions at language and
@@ -634,18 +634,17 @@ including when payload bytes differ for equal values. Each side uses its own
 codec, so values from separate runtime registries can compare correctly.
 Unhashable Python classes are supported: the JVM adapter currently uses a
 constant hash to preserve equality for arbitrary classes. This can make hash
-joins and deduplication expensive; native equality/hash costs need measurement
-in Phase 6. The application's equality must behave as a stable equivalence
+joins and deduplication expensive; Phase 6 includes a brief check of native
+equality/hash costs, with deeper tuning deferred to the future Rust core.
+The application's equality must behave as a stable equivalence
 relation, and serde must reconstruct values under that equality.
 
-This adapter currently supports embedded operations that do not serialize the
-runtime carrier through Nippy. Native values in untyped `:data` payloads, query
-results spilling to disk, remote requests/responses, and helpers that eagerly
-convert values without a database handle still need a transport binding
-context. Opening a remote handle with native Python bindings is rejected.
-The carrier has no persistent Nippy encoding; runtime IDs must not become part
-of durable custom payloads. Remote and spill support are the next transport
-work items.
+This adapter supports embedded operations, including query results spilling to
+disk using the temporary binding context described below. Native values in
+untyped `:data` payloads, remote requests/responses, and helpers that eagerly
+convert values without a database handle remain unsupported. Opening a remote
+handle with native Python bindings is rejected. The carrier has no durable or
+wire encoding; remote transport is the next work item.
 
 ### Native JavaScript values
 
@@ -692,7 +691,7 @@ The equality function may be async and must return a boolean. It must define
 a stable equivalence relation and agree across codecs used together. Deep
 equality does not inspect private fields; such classes need an explicit function.
 Each value is decoded using its own codec before comparison. The carrier uses
-the same constant hash and has the same pending hash-performance work as Python.
+the same constant hash and follows the same limited performance scope as Python.
 
 Map/set construction and EDN-list normalization that can invoke native equality
 run asynchronously to let Java call back into JavaScript. Callback conversion
@@ -700,10 +699,39 @@ retains its owning registry across awaits. Equality proxies are retained by the
 live registry; codec lookup and proxy back-references are weak, and no process-wide
 native class mapping or daemon proxy is installed.
 
-As with Python, native values in untyped `:data`, remote messages, query spilling
-to disk, and eager helpers without a database handle remain unsupported.
+As with Python, local query spilling is supported. Native values in untyped
+`:data`, remote messages, and eager helpers without a database handle remain unsupported.
 Opening a remote handle with native bindings is rejected before connecting.
-Remote/spill transport needs a runtime binding context before Phase 5 is complete.
+Remote transport needs receiving-runtime bindings before Phase 5 is complete.
+
+### Local native-value spilling
+
+Each spillable vector, map, or set owns a runtime binding table. Its temporary
+Nippy records carry a codec ID and payload bytes. Reads restore the native
+carrier using that collection's binding table, so values from different codecs
+retain their own deserializers and equality callbacks. The table retains one
+binding per codec with an empty payload, rather than keeping spilled values in
+memory. Emptying a collection releases the table and its temporary database.
+Internal spill stores do not keep global executors alive after the last
+application database closes.
+
+This encoding is restricted to the owning spill context. Ordinary Nippy
+serialization of the carrier and reads without a matching binding fail.
+Runtime IDs occur only in disposable spill files; durable custom payloads and
+the client/server protocol are unchanged.
+
+Spilled maps and sets store hash buckets of complete keys and values. Lookups,
+updates, and removals compare decoded keys using logical equality, including
+nested native values whose payload bytes differ. Hash collisions retain distinct
+keys. Existing in-memory keys stay in memory; after spilling begins, new keys
+go to disk even if memory pressure falls, avoiding duplicate entries across the
+two portions. Counts track entries rather than hash buckets.
+
+JavaScript reads of collections that may invoke native equality are asynchronous
+so the JVM can call back into JavaScript during reconstruction. Tests force
+spilling for native result conversion, queries, joins, deduplication, failure
+handling, and collection reuse. Large native collision buckets retain the known
+constant-hash cost; deeper tuning remains deferred to the Rust core.
 
 ## Implementation phases
 
@@ -798,11 +826,12 @@ reopen after server restart. Language registration APIs, custom UDF descriptor
 kinds, and byte-oriented serializer adapters are also implemented. Binding tests
 cover scalar/tuple orders, collisions, shared KV/Datalog registrations, payload
 round trips, rollback, and reopen/rebind. Local Python and JavaScript native
-class adapters also
-cover noncanonical payloads, unhashable values, exact queries, upserts, decoded
+class adapters also cover noncanonical payloads, unhashable values, exact queries,
+upserts, decoded
 callbacks, async/simulated transactions, and codec isolation. JavaScript additionally
 covers private-state equality, async serde/equality, concurrent codec contexts,
-and native map/set input conversion. Remote/spill serde transport remains.
+and native map/set input conversion. Local spill transport and forced-spill
+binding tests are implemented; remote native-value transport remains.
 
 - Expose registration and custom-type references through the applicable Java,
   Python, and JavaScript surfaces.
@@ -818,6 +847,13 @@ Completion: non-Clojure applications can register order and payload functions
 and use custom values through KV and Datalog APIs.
 
 ### Phase 6: Validation, performance, and documentation
+
+Keep performance work on the interim Python/JavaScript JVM adapters brief:
+take a small representative measurement and fix obvious, low-cost issues.
+Record remaining costs, including constant-hash behavior, and defer substantial
+bridge or hashing redesign to the planned Rust core. Such tuning is not a
+completion requirement; prioritize correctness and remaining functional gaps.
+The storage comparisons below remain useful independently of the bindings.
 
 - Add focused core tests and broad regression/property coverage in the sibling
   `../dtlvtest` project where appropriate.

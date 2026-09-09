@@ -329,3 +329,39 @@ def test_native_classes_can_share_a_deserializer(tmp_path):
         kv.transact([(":put", Work(1, "work:a"), "work:a")], dbi_name="work")
         assert kv.get_range("tasks", [":all"]) == [[Task(1, "a"), "a"]]
         assert kv.get_range("work", [":all"]) == [[Work(1, "work:a"), "work:a"]]
+
+
+def test_native_values_survive_query_and_collection_spilling(tmp_path):
+    import jpype
+    from datalevin._convert import to_java, to_python
+    from datalevin._native import native_scope
+
+    registry, definition = native_task_type()
+    clojure = jpype.JClass("clojure.java.api.Clojure")
+    a, b = Task(1, "a"), Task(1, "b")
+    with connect(str(tmp_path / "native-spill"),
+                 opts={":runtime-opts": {":udf-registry": registry}}) as conn:
+        conn.register_type("app/native-task", definition)
+        conn.update_schema({"task/value": {":db/valueType": ":app/native-task"}})
+        conn.transact([{"db/id": 1, "task/value": a},
+                       {"db/id": 2, "task/value": b},
+                       {"db/id": 3, "task/value": Task(1, "a")}])
+        pressure = clojure.var("datalevin.spill", "memory-pressure").deref()
+        previous = pressure.deref()
+        vector = clojure.var("datalevin.spill", "new-spillable-vector").invoke(
+            None, clojure.read("{:spill-threshold -1}"))
+        try:
+            with native_scope(registry):
+                vector.cons(clojure.var("clojure.core", "vec").invoke(to_java([a, b])))
+            assert clojure.var("datalevin.spill", "disk-count").invoke(vector) == 1
+            assert to_python(vector) == [[a, b]]
+            pressure.reset(jpype.JLong(99))
+            assert sorted(row[0].label for row in conn.query(
+                "[:find ?v :where [?e :task/value ?v]]")) == ["a", "b"]
+            assert sorted(conn.query(
+                "[:find ?e :in $ ?v :where [?e :task/value ?v]]", Task(1, "a"))) == [[1], [3]]
+            assert sorted(row[0].label for row in conn.query(
+                "[:find ?v :where [?e :task/value ?v] [?other :task/value ?v]]")) == ["a", "b"]
+        finally:
+            pressure.reset(previous)
+            vector.empty()

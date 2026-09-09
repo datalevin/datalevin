@@ -29,7 +29,15 @@ function toBufferView(value) {
   return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
 }
 
-function materializeJavaCollection(collection) {
+async function materializeJavaCollection(collection) {
+  if (nativeBindingsActive()) {
+    // Reading spilled collections can reconstruct maps/sets and call native
+    // equality. Leave the event loop available for those JVM callbacks.
+    const items = [];
+    const iterator = await collection.iterator();
+    while (await iterator.hasNext()) items.push(await iterator.next());
+    return items;
+  }
   if (typeof collection?.toArraySync === "function") {
     try {
       const items = collection.toArraySync();
@@ -249,7 +257,8 @@ export async function toJs(value) {
 
   if (instanceOf(value, cls.mapType) || typeof value.entrySetSync === "function") {
     const entries = [];
-    for (const entry of materializeJavaCollection(value.entrySetSync())) {
+    const entrySet = nativeBindingsActive() ? await value.entrySet() : value.entrySetSync();
+    for (const entry of await materializeJavaCollection(entrySet)) {
       entries.push([await toJs(entry.getKeySync()), await toJs(entry.getValueSync())]);
     }
 
@@ -261,7 +270,7 @@ export async function toJs(value) {
 
   if (instanceOf(value, cls.setType)) {
     const items = [];
-    for (const item of materializeJavaCollection(value)) {
+    for (const item of await materializeJavaCollection(value)) {
       items.push(await toJs(item));
     }
     return new Set(items);
@@ -273,7 +282,7 @@ export async function toJs(value) {
     || typeof value.iteratorSync === "function"
   ) {
     const items = [];
-    for (const item of materializeJavaCollection(value)) {
+    for (const item of await materializeJavaCollection(value)) {
       items.push(await toJs(item));
     }
     return items;
@@ -287,7 +296,7 @@ export async function toJsQueryResult(value) {
     const cls = await classes();
     if (instanceOf(value, cls.setType)) {
       const rows = [];
-      for (const item of materializeJavaCollection(value)) {
+      for (const item of await materializeJavaCollection(value)) {
         rows.push(await toJs(item));
       }
       return rows;
