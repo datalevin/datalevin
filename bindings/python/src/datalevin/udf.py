@@ -113,7 +113,7 @@ class UdfRegistry:
     def bind_native_type(self, type_name, native_type, definition):
         """Bind a Python class to a registered type's payload UDFs.
 
-        Call before opening a local database with this registry in runtime
+        Call before opening a database with this registry in runtime
         options. This runtime-only binding is separate from ``register_type``;
         recreate it on reopen. Ordinary KV/query calls then accept instances
         of the class and return reconstructed instances automatically.
@@ -129,6 +129,7 @@ class UdfRegistry:
             raise ValueError("Custom type already has a different Python class binding")
         if native_type.__module__ == "builtins":
             raise ValueError("Bind a custom Python class, not a built-in type")
+        _BINDINGS.bind_native_type(self._handle, codec.type_name, codec.deserialize)
         self._native_types[native_type] = codec
         return self
 

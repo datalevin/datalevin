@@ -1082,6 +1082,14 @@ public final class DatalevinInterop {
         return ClojureRuntime.invoke("datalevin.udf", "create-registry");
     }
 
+    /** Associates a runtime native type with its wire deserializer. */
+    public static Object bindNativeType(Object registry, String typeName,
+                                        Map<?, ?> deserializer) {
+        return ClojureRuntime.invoke("datalevin.udf", "bind-native-type!",
+                rawResource(registry), ClojureCodec.keyword(typeName),
+                DatalevinForms.udfDescriptorInput(deserializer));
+    }
+
     /**
      * Registers a Java-backed UDF in a registry.
      */

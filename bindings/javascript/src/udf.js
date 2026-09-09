@@ -153,7 +153,7 @@ export class UdfRegistry {
     );
   }
 
-  /** Bind an exact native class to payload UDFs before opening a local database.
+  /** Bind an exact native class to payload UDFs before opening a database.
    * Equality defaults to node:util.isDeepStrictEqual; classes with private state
    * can supply { equals: (left, right) => boolean }. This binding is not persisted.
    */
@@ -174,6 +174,15 @@ export class UdfRegistry {
     const installed = this._nativeBindings.types.get(nativeType.prototype);
     if (installed) {
       if (!installed.sameBinding(codec)) throw new TypeError("JavaScript class already has a different native type binding");
+      return this;
+    }
+    if ([...this._nativeBindings.types.values()].some((c) => c.typeName === codec.typeName)) {
+      throw new TypeError("Custom type already has a different JavaScript class binding");
+    }
+    await _BINDINGS.bindNativeType(this._handle, codec.typeName, codec.deserialize);
+    const concurrent = this._nativeBindings.types.get(nativeType.prototype);
+    if (concurrent) {
+      if (!concurrent.sameBinding(codec)) throw new TypeError("JavaScript class already has a different native type binding");
       return this;
     }
     if ([...this._nativeBindings.types.values()].some((c) => c.typeName === codec.typeName)) {

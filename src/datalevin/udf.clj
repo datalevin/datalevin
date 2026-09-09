@@ -228,6 +228,35 @@
                          :descriptor udf-desc
                          :context context}))))))))))
 
+(defn bind-native-type!
+  "Bind a native type name to its receiver deserializer in this runtime only."
+  [registry type-name deserialize]
+  (let [registry (ensure-registry registry)
+        deserialize (ensure-kind deserialize :deserializer)]
+    (when-not (qualified-keyword? type-name)
+      (raise "Native type name must be a namespaced keyword" {:type-name type-name}))
+    (swap! registry
+           (fn [state]
+             (when-let [existing (get-in state [:native-types type-name])]
+               (when-not (= existing deserialize)
+                 (raise "Native type already has a different deserializer"
+                        {:type-name type-name})))
+             (assoc-in state [:native-types type-name] deserialize)))
+    registry))
+
+(defn native-value-reader
+  "Build a receiver using the live caller registry, including later rebindings."
+  [registry]
+  (when registry
+    (fn [type-name payload]
+      (let [type-name (keyword (subs type-name 1))
+            descriptor (get-in (registry-state registry) [:native-types type-name])]
+        (when-not descriptor
+          (raise "Missing receiver native type binding" {:type-name type-name}))
+        ((materialize registry {:type-name type-name :kind :deserializer
+                                :embedded? true} descriptor false)
+         payload)))))
+
 (defn resolve
   [registry udf-desc]
   (materialize registry nil udf-desc))

@@ -56,8 +56,6 @@ def registry_from_opts(opts, dir=None):
     registry = runtime.get(":udf-registry", runtime.get("udf-registry"))
     if not hasattr(registry, "_native_types"):
         return None
-    if registry._native_types and str(dir).startswith("dtlv://"):
-        raise ValueError("Native Python value transport currently requires a local database")
     return registry
 
 

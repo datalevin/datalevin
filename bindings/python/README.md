@@ -520,8 +520,12 @@ registry and must be recreated on reopen. Exact matching uses Python `==` on
 complete values; equal objects do not need identical serialized bytes or a
 Python hash function.
 
-Native class support covers local operations, including query spilling to disk.
-Remote transport, native values in untyped `:data`, and helpers that
+Native class support covers local and remote operations, including query
+spilling to disk. For remote handles, use the same caller registry in
+`:runtime-opts` and install matching order/serde UDFs on the server through
+`datalevin.server/*server-runtime-opts-fn*`. Only type names and payload bytes
+cross the network; results are reconstructed by the caller's deserializer.
+Native values in untyped `:data` and helpers that
 convert values before a database handle is available remain unsupported. The
 current constant JVM hash can make large hash joins/deduplication expensive.
 See the [native-value plan](../../doc/custom-data.md#native-python-values).

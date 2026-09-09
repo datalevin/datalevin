@@ -125,9 +125,10 @@ async function waitForServer(proc, getPort, readOutput, getStartupError) {
   );
 }
 
-export async function startLiveServer() {
+export async function startLiveServer({ nativeValues = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "dtlv-js-server-"));
-  const proc = spawn(clojureBin, ["-M", "-e", serverExpr(root)], {
+  const setup = nativeValues ? '(load-file "test/data/native_wire_server.clj")\n' : "";
+  const proc = spawn(clojureBin, ["-M", "-e", setup + serverExpr(root)], {
     cwd: repoRoot,
     stdio: ["ignore", "pipe", "pipe"]
   });

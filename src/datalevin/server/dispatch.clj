@@ -396,7 +396,7 @@
           (locking message-lock
             (let [wire-opts (:wire-opts @state)
                   {:keys [type] :as message}
-                  (p/read-value fmt msg wire-opts)]
+                  (p/read-request fmt msg wire-opts)]
               (if (= type :set-client-id)
                 (do
                   (log/debug "Message received:" (dissoc message :password :args))
@@ -419,7 +419,7 @@
                  dispatch!)
                 (dispatch!)))))))
     (catch Exception e
-      (log/error "Error Handling message:" e))))
+      (handle-message-error! deps skey e))))
 
 (defn handle-read
   [deps server ^SelectionKey skey]

@@ -2,20 +2,55 @@
   (:require [clojure.test :refer [deftest is use-fixtures]]
             [datalevin.bits :as b]
             [datalevin.client :as client]
+            [datalevin.client-op :as cop]
             [datalevin.constants :as c]
             [datalevin.core :as d]
             [datalevin.custom-data :as custom]
             [datalevin.interface :as i]
             [datalevin.interpret :as inter]
+            [datalevin.native-value :as nv]
             [datalevin.server :as server]
             [datalevin.test.core :refer [allocate-port]]
             [datalevin.udf :as udf]
             [datalevin.util :as u]
             [taoensso.timbre :as log])
-  (:import [datalevin.server Server]
+  (:import [datalevin NativeValue]
+           [datalevin.server Server]
            [datalevin.storage Store]
            [java.lang AutoCloseable]
-           [java.util UUID]))
+           [java.util UUID]
+           [java.util.function BiPredicate]))
+
+(defn- native-logical [^NativeValue v]
+  (subvec (b/deserialize (.payload v)) 0 2))
+
+(defn- native-snapshot [codec type-name payload]
+  (NativeValue. codec type-name payload
+                (reify BiPredicate
+                  (test [_ left right]
+                    (= (native-logical left) (native-logical right))))))
+
+(defn- native-task [rank label]
+  (native-snapshot "caller" ":app/native-task"
+                   (b/serialize [rank label (str (UUID/randomUUID))])))
+
+(defn- native-descriptor [kind]
+  {:udf/lang :java :udf/kind kind :udf/id :app/native-task})
+
+(def native-definition
+  {:index {:type :long :order-fn (native-descriptor :order-fn)}
+   :payload {:serialize (native-descriptor :serializer)
+             :deserialize (native-descriptor :deserializer)}})
+
+(defn- native-registry [registry codec]
+  (udf/register! registry (native-descriptor :order-fn)
+                 #(first (native-logical %)))
+  (udf/register! registry (native-descriptor :serializer)
+                 #(.payload ^NativeValue %))
+  (udf/register! registry (native-descriptor :deserializer)
+                 #(native-snapshot codec ":app/native-task" %))
+  (udf/bind-native-type! registry :app/native-task (native-descriptor :deserializer))
+  registry)
 
 (def ^:dynamic *server* nil)
 (def ^:dynamic *registry* nil)
@@ -44,6 +79,118 @@
 (defn- uri [name]
   (str "dtlv://datalevin:datalevin@localhost/" name))
 
+(deftest native-deserialization-follows-write-permissions
+  (let [admin (client/new-client (uri ""))
+        kv (d/open-kv (uri "native-permissions"))
+        decoded (atom 0)
+        a (native-task 1 "a")]
+    (native-registry *registry* "server")
+    (udf/register! *registry* (native-descriptor :deserializer)
+                   (fn [payload]
+                     (swap! decoded inc)
+                     (native-snapshot "server" ":app/native-task" payload)))
+    (try
+      (d/register-type kv :app/native-task native-definition)
+      (d/open-dbi kv "tasks" {:key-type :app/native-task})
+      (d/transact-kv kv "tasks" [[:put a :a]])
+      (client/create-user admin "native-reader" "reader-password")
+      (client/create-role admin :native-reader)
+      (client/assign-role admin :native-reader "native-reader")
+      (client/grant-permission admin :native-reader :datalevin.server/view
+                               :datalevin.server/database "native-permissions")
+      (let [reader (d/open-kv "dtlv://native-reader:reader-password@localhost/native-permissions")]
+        (try
+          (reset! decoded 0)
+          (is (thrown-with-msg? Exception #"permission"
+                                (d/transact-kv reader "tasks" [[:del a]])))
+          (is (zero? @decoded))
+          (is (= :a (d/get-value reader "tasks" a)))
+          (is (pos? @decoded))
+          (finally (d/close-kv reader))))
+      (let [dbs (.-dbs ^Server *server*)
+            state (get dbs "native-permissions")]
+        (try
+          (.put ^java.util.Map dbs "native-permissions" (assoc state :replica/read-only? true))
+          (reset! decoded 0)
+          (is (thrown-with-msg? Exception #"read-only"
+                                (d/transact-kv kv "tasks" [[:del a]])))
+          (is (zero? @decoded))
+          (finally (.put ^java.util.Map dbs "native-permissions" state))))
+      (finally (d/close-kv kv) (client/disconnect admin)))))
+
+(deftest remote-native-kv-readers-and-streams
+  (let [registry (native-registry (udf/create-registry) "receiver")
+        opts {:runtime-opts {:udf-registry registry}
+              :client-opts {:time-out 3000}}
+        kv (d/open-kv (uri "native-kv") opts)
+        a (native-task 1 "a")
+        b (native-task 1 "b")]
+    (native-registry *registry* "server")
+    (try
+      (d/register-type kv :app/native-task native-definition)
+      (d/open-dbi kv "tasks" {:key-type :app/native-task})
+      (d/transact-kv kv "tasks" [[:put a :a] [:put b :b]])
+      (is (= :a (d/get-value kv "tasks" (native-task 1 "a"))))
+      (let [rows (d/get-range kv "tasks" [:all])]
+        (is (= [[a :a] [b :b]] rows))
+        (is (every? #(= "receiver" (.codecId ^NativeValue (first %))) rows)))
+      (d/with-transaction-kv [tx kv]
+        (d/transact-kv tx "tasks" [[:put (native-task 1 "a") :updated]])
+        (is (= [[a :updated] [b :b]] (d/get-range tx "tasks" [:all]))))
+      ;; Exercise the real copy-in/out threshold and multiple batches.
+      (let [txs (mapv (fn [n] [:put (native-task (+ n 2) (str n)) n]) (range 1001))]
+        (d/transact-kv kv "tasks" txs)
+        (let [rows (d/get-range kv "tasks" [:all])]
+          (is (= 1003 (count rows)))
+          (is (= "receiver" (.codecId ^NativeValue (ffirst rows)))))
+        (udf/unregister! *registry* (native-descriptor :deserializer))
+        (is (thrown? Exception (d/transact-kv kv "tasks" txs)))
+        (is (= 1003 (d/entries kv "tasks")))
+        (native-registry *registry* "server-rebound")
+        (is (= :updated (d/get-value kv "tasks" (native-task 1 "a")))))
+      ;; A missing caller binding is reported immediately, without retrying a write.
+      (udf/unregister! registry (native-descriptor :deserializer))
+      (dotimes [_ 4]
+        (is (nv/decoding-error?
+             (try (d/get-range kv "tasks" [:closed a b]) nil
+                  (catch Exception e e)))))
+      (native-registry registry "receiver-rebound")
+      (is (= "receiver-rebound"
+             (.codecId ^NativeValue (ffirst (d/get-range kv "tasks" [:closed a b])))))
+      (finally (d/close-kv kv)))))
+
+(deftest remote-native-datalog-transactions-and-query-equality
+  (let [registry (native-registry (udf/create-registry) "receiver")
+        opts {:runtime-opts {:udf-registry registry}}
+        conn (d/create-conn (uri "native-datalog") {} opts)
+        a (native-task 1 "a")
+        b (native-task 1 "b")]
+    (native-registry *registry* "server")
+    (try
+      (let [store ^datalevin.remote.DatalogStore (:store @conn)]
+        (is (not (identical? (.-client store) (.-tx-client store)))))
+      (d/register-type conn :app/native-task native-definition)
+      (d/update-schema conn {:task/value {:db/valueType :app/native-task}})
+      (d/transact! conn [{:db/id 1 :task/value a}
+                         {:db/id 2 :task/value b}
+                         {:db/id 3 :task/value (native-task 1 "a")}])
+      (is (= #{[a] [b]} (d/q '[:find ?v :where [?e :task/value ?v]] @conn)))
+      (is (= #{[1] [3]}
+             (d/q '[:find ?e :in $ ?v :where [?e :task/value ?v]]
+                  @conn (native-task 1 "a"))))
+      (is (= #{[a] [b]}
+             (d/q '[:find ?v :where [?e :task/value ?v] [?other :task/value ?v]] @conn)))
+      (d/with-transaction [tx conn]
+        (d/transact! tx [[:db/add 2 :task/value (native-task 1 "a")]])
+        (is (= #{[a]} (d/q '[:find ?v :where [?e :task/value ?v]] @tx))))
+      (is (thrown-with-msg? Exception #"abort"
+                            (d/with-transaction [tx conn]
+                              (d/transact! tx [[:db/add 1 :task/value b]])
+                              (throw (ex-info "abort" {})))))
+      (is (= "receiver" (.codecId ^NativeValue (:task/value (d/pull @conn '[*] 1)))))
+      (is (= a (:task/value (d/pull @conn '[*] 1))))
+      (finally (d/close conn)))))
+
 (defn- local-kv [name]
   (let [store (get-in (.-dbs ^Server *server*) [name :store])]
     (if (instance? Store store) (.-lmdb ^Store store) store)))
@@ -53,6 +200,44 @@
     (try
       (client/close-database admin name)
       (finally (client/disconnect admin)))))
+
+(deftest remote-native-response-replay-after-reopen
+  (let [name "native-replay"
+        registry (native-registry (udf/create-registry) "caller")
+        opts {:runtime-opts {:udf-registry registry}}
+        conn (d/create-conn (uri name) {} opts)
+        txs [{:db/id 1 :task/value (native-task 1 "a")}]
+        op-id (cop/new-client-op-id)
+        request {:type :tx-data :mode :request :writing? false
+                 :args [name txs false]
+                 :client-op-id op-id
+                 :client-op-hash (cop/request-hash (cop/tx-request-payload :tx-data name txs false))
+                 :client-op-response-kind :tx-data}]
+    (native-registry *registry* "server")
+    (try
+      (d/register-type conn :app/native-task native-definition)
+      (d/update-schema conn {:task/value {:db/valueType :app/native-task}})
+      (let [client (.-client ^datalevin.remote.DatalogStore (:store @conn))
+            reply (client/request client request)
+            record (i/get-value (local-kv name) c/ha-client-ops
+                                (cop/kv-info-key op-id) :string :data)]
+        (is (= :command-complete (:type reply)))
+        (is (bytes? (:response-wire record)))
+        (is (not (contains? record :response))))
+      (finally (d/close conn)))
+    (close-server-database! name)
+    (native-registry *registry* "server-reopened")
+    (native-registry registry "caller-reopened")
+    (let [conn (d/create-conn (uri name) {} opts)]
+      (try
+        (let [client (.-client ^datalevin.remote.DatalogStore (:store @conn))
+              reply (client/request client request)
+              value (nth (first (get-in reply [:result :tx-data])) 2)]
+          (is (= :command-complete (:type reply)))
+          (is (= "caller-reopened" (.codecId ^NativeValue value)))
+          (is (= [1 "a"] (native-logical value)))
+          (is (= #{[1]} (d/q '[:find ?e :where [?e :task/value _]] @conn))))
+        (finally (d/close conn))))))
 
 (def task-type
   (let [field :rank]

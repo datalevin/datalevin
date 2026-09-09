@@ -1025,8 +1025,7 @@
 (defn- open-store
   [dir schema opts]
   (if (r/dtlv-uri? dir)
-    (let [[store-opts _] (split-runtime-opts opts)]
-      (r/open dir schema store-opts))
+    (r/open dir schema opts)
     (s/open dir schema opts)))
 
 (defn- tx-datom-comparator [store index]

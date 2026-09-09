@@ -104,10 +104,12 @@ def _wait_for_server(proc: subprocess.Popen[str], port: int, log_file) -> None:
 
 
 @pytest.fixture
-def live_server(require_runtime, require_clojure_cli, tmp_path_factory) -> LiveServer:
+def live_server(require_runtime, require_clojure_cli, tmp_path_factory, request) -> LiveServer:
     root = tmp_path_factory.mktemp("datalevin-server")
     port = _find_free_local_port()
     expr = _server_expr(port, root)
+    if getattr(request, "param", None) == "native-values":
+        expr = '(load-file "test/data/native_wire_server.clj")\n' + expr
 
     with (root / "server.log").open("w+", encoding="utf-8") as log_file:
         proc = subprocess.Popen(

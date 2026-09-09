@@ -571,9 +571,13 @@ classes with private fields, or a different value-equality rule, pass
 `{ equals: (left, right) => /* boolean */ }` as the fourth argument to
 `bindNativeType`. Equality may also be async and must remain stable and symmetric.
 
-Native support covers local operations, including query spilling to disk.
-Remote transport, untyped `:data`, and eager helpers without a database
-handle remain unsupported. Native values currently share a constant JVM hash,
+Native support covers local and remote operations, including query spilling to
+disk. Remote handles use the caller registry in `:runtime-opts`; install matching
+order/serde UDFs on the server through `datalevin.server/*server-runtime-opts-fn*`.
+Only type names and payload bytes cross the network. The caller's deserializer
+and equality function reconstruct returned values, including asynchronous hooks.
+Untyped `:data` and eager helpers without a database handle remain unsupported.
+Native values currently share a constant JVM hash,
 so large hash joins and deduplication can be expensive. See the
 [native-value plan](../../doc/custom-data.md#native-javascript-values).
 

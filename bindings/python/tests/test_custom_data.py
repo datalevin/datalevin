@@ -124,6 +124,31 @@ class Task:
     label: str
 
 
+@pytest.mark.parametrize("live_server", ["native-values"], indirect=True)
+def test_native_values_across_server_process(live_server):
+    registry, definition = native_task_type()
+    opts = {":runtime-opts": {":udf-registry": registry},
+            ":client-opts": {":time-out": 5000}}
+    registry.unregister(UdfDescriptor.order_fn("native/order"))
+    a, b = Task(1, "a"), Task(1, "b")
+    with open_kv(live_server.database_uri("python-native-kv"), opts=opts) as kv:
+        kv.register_type("app/native-task", definition)
+        kv.open_dbi("tasks", {":key-type": ":app/native-task"})
+        kv.transact([(":put", a, "a"), (":put", b, "b")], dbi_name="tasks")
+        assert kv.get_value("tasks", Task(1, "a")) == "a"
+        assert kv.get_range("tasks", [":all"]) == [[a, "a"], [b, "b"]]
+        kv.with_transaction(lambda tx: tx.transact([(":put", Task(1, "a"), "updated")], dbi_name="tasks"))
+        assert kv.get_value("tasks", a) == "updated"
+    with connect(live_server.database_uri("python-native-db"), opts=opts) as conn:
+        conn.register_type("app/native-task", definition)
+        conn.update_schema({"task/value": {":db/valueType": ":app/native-task"}})
+        conn.transact([{"db/id": 1, "task/value": a}, {"db/id": 2, "task/value": b},
+                       {"db/id": 3, "task/value": Task(1, "a")}])
+        assert sorted(row[0].label for row in conn.query("[:find ?v :where [?e :task/value ?v]]")) == ["a", "b"]
+        assert sorted(conn.query("[:find ?e :in $ ?v :where [?e :task/value ?v]]", Task(1, "a"))) == [[1], [3]]
+        assert conn.pull("[*]", 1)[":task/value"] == a
+
+
 def native_task_type():
     registry = create_udf_registry()
     nonce = 0
@@ -270,8 +295,6 @@ def test_native_bindings_are_scoped_to_the_runtime(tmp_path):
     assert registry.bind_native_type("app/native-task", Task, definition) is registry
     with pytest.raises(ValueError, match="different native type"):
         registry.bind_native_type("app/other", Task, definition)
-    with pytest.raises(ValueError, match="local database"):
-        open_kv("dtlv://invalid/native", opts={":runtime-opts": {":udf-registry": registry}})
     with open_kv(str(tmp_path / "ordinary")) as kv:
         kv.open_dbi("ordinary")
         with pytest.raises(Exception):

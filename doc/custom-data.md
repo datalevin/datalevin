@@ -6,10 +6,10 @@ keys and ordered list items, and Datalog custom attributes. Phase 5 now supports
 remote registration and server execution for values supported by the existing
 wire codec, plus Java, Python, and JavaScript registration and UDF APIs.
 Local Python and JavaScript native-value adapters, including query spilling,
-are implemented. Native wire encoding and explicit receiver decoding are tested;
-connecting those readers to remote database/runtime contexts remains part of
-Phase 5. Python and JavaScript native class bindings currently require local
-handles.
+are implemented. Phase 5 includes remote native values: database-scoped server
+readers, caller registry readers, streamed batches, transactions, and durable
+response replay. Separate-process Python and JavaScript tests exercise this path.
+Phase 6 validation and storage-overhead measurements remain planned.
 
 Tracking issue: [Allow indexing of arbitrary data, #234](https://github.com/datalevin/datalevin/issues/234).
 
@@ -239,8 +239,24 @@ The remote path accepts logical values through the existing Nippy wire codec.
 Custom payload serde controls their stored bytes. Native values have a separate
 wire form carrying the registered type name and serde-produced bytes. Its reader
 must be supplied by the receiving runtime; sender codec IDs and byte equality
-cannot substitute for the receiver's deserializer and logical equality. Wiring
-that reader into remote operations is still pending.
+cannot substitute for the receiver's deserializer and logical equality. Native
+class bindings install the caller's reader automatically.
+
+The server first reads request routing fields with inert placeholders, then
+decodes the original bytes on the authorized database/transaction context. The
+second read constructs maps and sets using the receiver's logical equality.
+Ordinary messages need only one read. Streamed input stays in the same context;
+after a decode failure the server drains the batch transfer before reporting the
+error, without committing any items. Client readers come from the handle's UDF
+registry and are shared with its transaction and retry clients. Runtime handles
+are removed from open options before transport.
+
+Client write-retry hashes use the native wire form. Saved transaction responses
+containing native values use version-2 client-operation records with
+`:response-wire` bytes, decoded with the server's current registry on replay.
+Ordinary version-1 response records remain unchanged. These records contain no
+process-local codec IDs. Missing caller readers fail without retrying an already
+committed write.
 
 The order and serialization functions receive the logical value in their
 registered runtime. Use the payload serde functions at language and
@@ -555,8 +571,7 @@ First opening a local Datalog environment with `:runtime-opts {:udf-registry reg
 provides the underlying KV environment's default order and serde bindings.
 These runtime bindings are not persisted. Remote environments use server-owned
 bindings as described above. Cross-language invocation and local native-value
-adapters are implemented; automatic remote native-value binding remains Phase 5
-work.
+adapters, including automatic remote native-value binding, are implemented.
 
 Changing a populated attribute to or from a custom type requires an explicit
 rewrite; the automatic migration from untyped data to built-in types does not
@@ -595,8 +610,8 @@ when a Java interface proxy wraps them in an exception without a message.
 
 Local Java KV calls can already pass JVM objects directly to order and serde
 functions. Local Python and JavaScript handles additionally support native class
-bindings as described below. Automatic remote native-value adapters remain
-Phase 5 work.
+bindings as described below, including for remote handles with matching
+server-side order and serde implementations.
 
 Examples are in the [Python binding README](../bindings/python/README.md#ordered-custom-types)
 and [JavaScript binding README](../bindings/javascript/README.md#ordered-custom-types).
@@ -650,12 +665,13 @@ This adapter supports embedded operations, including query results spilling to
 disk using the temporary binding context described below. Native values in
 untyped `:data` payloads and helpers that eagerly convert values without a
 database handle remain unsupported. The carrier has no durable encoding.
-Remote handles with native class bindings remain rejected until automatic
-receiver binding is implemented.
+Remote handles use the caller registry to reconstruct native results. Install
+matching order and serde implementations on the server through its runtime
+options hook; client callbacks and runtime IDs are not sent to the server.
 
 ### Native JavaScript values
 
-Bind a native class before opening a local KV environment or Datalog connection:
+Bind a native class before opening a KV environment or Datalog connection:
 
 ```javascript
 await registry.bindNativeType("app/task", Task, taskTypeDefinition);
@@ -708,8 +724,9 @@ native class mapping or daemon proxy is installed.
 
 As with Python, local query spilling is supported. Native values in untyped
 `:data` and eager helpers without a database handle remain unsupported.
-Remote handles with native class bindings remain rejected until automatic
-receiver binding is implemented.
+Remote handles use the same caller registry, with matching server-side order and
+serde implementations. Asynchronous deserializers and equality callbacks run
+while the receiving JVM reconstructs values and collections.
 
 ### Local native-value spilling
 
@@ -751,8 +768,7 @@ constant-hash cost; deeper tuning remains deferred to the Rust core.
 
 ## Implementation phases
 
-Phases 1–4 are implemented locally. Phase 5 still needs automatic native-value
-reader binding for remote operations. Phase 6 remains planned.
+Phases 1–5 are implemented. Phase 6 remains planned.
 
 ### Phase 1: Registry and function contracts
 
@@ -848,10 +864,11 @@ upserts, decoded
 callbacks, async/simulated transactions, and codec isolation. JavaScript additionally
 covers private-state equality, async serde/equality, concurrent codec contexts,
 and native map/set input conversion. Local spill transport and forced-spill
-binding tests are implemented. Native wire encoding and explicit receiver
-decoding have protocol coverage. Automatic remote native-value transport still
-needs database-scoped readers on the server, caller-scoped readers on the client,
-and end-to-end binding tests, including streamed batches and transaction runners.
+binding tests are implemented. Automatic remote native-value transport has
+protocol and separate-process binding tests. JVM tests cover independent
+readers, collision matching, streamed batches, transaction runners, permissions,
+read-only rejection before decoding, repeated missing bindings, response replay
+after reopen, and spilling during wire decoding.
 
 - Expose registration and custom-type references through the applicable Java,
   Python, and JavaScript surfaces.

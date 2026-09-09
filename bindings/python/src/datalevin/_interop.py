@@ -714,6 +714,10 @@ class InteropBindings:
     def create_udf_registry(self):
         return call_java(classes().interop.createUdfRegistry)
 
+    def bind_native_type(self, registry, type_name, deserialize):
+        return call_java(classes().interop.bindNativeType, registry, type_name,
+                         to_java(deserialize))
+
     def register_udf(self, registry, descriptor, fn):
         return call_java(classes().interop.registerUdf, registry, to_java(descriptor), fn)
 

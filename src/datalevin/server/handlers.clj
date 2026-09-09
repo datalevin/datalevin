@@ -809,7 +809,7 @@
                                (validate-client-op-record! request))]
         {:replay?       true
          :response-kind response-kind
-         :response      (:response record)}
+         :response      (cop/record-response record)}
         (let [result-promise (promise)
               pending-entry  {:request request
                               :result-promise result-promise}

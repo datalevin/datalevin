@@ -16,6 +16,17 @@
   ^HashMap []
   (HashMap.))
 
+(defn decoding-error
+  "Find a native reader error under Nippy's format-level exception wrappers."
+  [e]
+  (some #(when (= :native-value/decode (:error (ex-data %))) %)
+        (take-while some? (iterate ex-cause e))))
+
+(defn decoding-error?
+  "True when a failed wire read must be reported without retrying the request."
+  [e]
+  (boolean (decoding-error e)))
+
 (defn- wire-native-value?
   [x]
   (and (vector? x)
@@ -51,10 +62,15 @@
         (when-not (and *wire-native-value* (wire-native-value? data))
           (throw (ex-info "Malformed native wire value or wrong decoding context"
                           {:codec-id id})))
-        (when-not *wire-reader*
-          (throw (ex-info "Missing receiver native type binding"
-                          {:type-name (first data)})))
-        (*wire-reader* (first data) (second data)))
+        (try
+          (when-not *wire-reader*
+            (throw (ex-info "Missing receiver native type binding"
+                            {:type-name (first data)})))
+          (*wire-reader* (first data) (second data))
+          (catch Exception e
+            (throw (ex-info (str "Native value decoding failed: " (ex-message e))
+                            {:error :native-value/decode :type-name (first data)}
+                            e)))))
       (if-let [^NativeValue binding
                (when (and (not *wire-native-value*) *spill-bindings*)
                  (.get ^HashMap *spill-bindings* id))]

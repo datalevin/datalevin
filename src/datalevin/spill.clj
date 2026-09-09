@@ -114,11 +114,11 @@
 (declare ->SVecSeq ->RSVecSeq)
 
 (defn- spill-tx [db bindings txs]
-  (binding [nv/*spill-bindings* bindings]
+  (binding [nv/*spill-bindings* bindings nv/*wire-native-value* false]
     (i/transact-kv db txs)))
 
 (defn- spill-value [db bindings k kt]
-  (binding [nv/*spill-bindings* bindings]
+  (binding [nv/*spill-bindings* bindings nv/*wire-native-value* false]
     (i/get-value db c/tmp-dbi k kt)))
 
 (deftype SpillableVector [^long spill-threshold
@@ -215,7 +215,7 @@
   (peek [this]
     (if (zero? ^long (disk-count this))
       (.getLast memory)
-      (first (binding [nv/*spill-bindings* native-bindings]
+      (first (binding [nv/*spill-bindings* native-bindings nv/*wire-native-value* false]
                (i/get-first @disk c/tmp-dbi [:all-back] :id :data true)))))
 
   (pop [this]
@@ -432,7 +432,7 @@
 
 (defn- disk-map-entries [db bindings]
   (when db
-    (let [buckets (binding [nv/*spill-bindings* bindings]
+    (let [buckets (binding [nv/*spill-bindings* bindings nv/*wire-native-value* false]
                     (i/get-range db c/tmp-dbi [:all] :int :data true))]
       (mapcat identity buckets))))
 

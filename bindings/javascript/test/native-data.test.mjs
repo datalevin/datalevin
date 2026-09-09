@@ -5,6 +5,7 @@ import path from "node:path";
 import { test } from "node:test";
 import { UdfDescriptor, connect, createUdfRegistry, datalogKv, openKv, q, tx } from "../src/index.js";
 import { javaBridgeModule, resolveClasspath } from "../src/jvm.js";
+import { clojureCliAvailable, startLiveServer } from "../test-support/live-server.mjs";
 
 const available = (() => { try { return resolveClasspath().length > 0; } catch { return false; } })();
 const options = { skip: !available, timeout: 60000 };
@@ -50,6 +51,40 @@ test("native values survive query spilling and asynchronous collection reads", o
 class Task {
   constructor(rank, label) { this.rank = rank; this.label = label; }
 }
+
+test("native values use independent server and caller runtimes", {
+  skip: !available || !clojureCliAvailable(), timeout: 60000
+}, async () => {
+  const server = await startLiveServer({ nativeValues: true });
+  const { registry, definition, opts } = await taskType();
+  await registry.unregister(UdfDescriptor.orderFn("native/order"));
+  const a = new Task(1n, "a"), b = new Task(1n, "b");
+  let kv, conn;
+  try {
+    kv = await openKv(server.databaseUri("javascript-native-kv"), opts);
+    await kv.registerType("app/task", definition);
+    await kv.openDbi("tasks", { ":key-type": ":app/task" });
+    await kv.transact([[":put", a, "a"], [":put", b, "b"]], { dbiName: "tasks" });
+    assert.equal(await kv.getValue("tasks", new Task(1n, "a")), "a");
+    assert.deepEqual(await kv.getRange("tasks", [":all"]), [[a, "a"], [b, "b"]]);
+    await kv.withTransaction(async tx => {
+      await tx.transact([[":put", new Task(1n, "a"), "updated"]], { dbiName: "tasks" });
+      assert.deepEqual(await tx.getRange("tasks", [":all"]), [[a, "updated"], [b, "b"]]);
+    });
+    conn = await connect(server.databaseUri("javascript-native-db"), { opts });
+    await conn.registerType("app/task", definition);
+    await conn.updateSchema({ "task/value": { ":db/valueType": ":app/task" } });
+    await conn.transact([{ "db/id": 1, "task/value": a }, { "db/id": 2, "task/value": b },
+      { "db/id": 3, "task/value": new Task(1n, "a") }]);
+    assert.deepEqual((await conn.query("[:find ?v :where [?e :task/value ?v]]")).map(r => r[0].label).sort(), ["a", "b"]);
+    assert.deepEqual((await conn.query("[:find ?e :in $ ?v :where [?e :task/value ?v]]", new Task(1n, "a"))).sort(), [[1n], [3n]]);
+    assert.deepEqual((await conn.pull("[*]", 1n))[":task/value"], a);
+  } finally {
+    if (conn) await conn.close();
+    if (kv) await kv.close();
+    await server.stop();
+  }
+});
 
 async function taskType({ nativeType = Task, equals, prefix = "task", tupleOrder = false } = {}) {
   const registry = await createUdfRegistry();
@@ -291,7 +326,6 @@ test("concurrent operations retain their own native codec context", options, asy
     assert.equal(await left.equals(right), true);
     assert.equal(await right.equals(left), true);
     assert.equal(left.hashCodeSync(), right.hashCodeSync());
-    await assert.rejects(() => openKv("dtlv://invalid/native", types[0].opts), /local database/);
   } finally {
     await Promise.all(kvs.map(kv => kv.close()));
     for (const dir of dirs) fs.rmSync(dir, { recursive: true, force: true });

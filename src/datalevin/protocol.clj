@@ -21,6 +21,7 @@
   (:import
    [java.io ByteArrayInputStream ByteArrayOutputStream]
    [java.nio ByteBuffer]
+   [java.util UUID]
    [java.nio.channels SocketChannel Selector SelectionKey]
    [datalevin.io ByteBufferInputStream ByteBufferOutputStream]
    [datalevin.spill SpillableVector]
@@ -84,6 +85,13 @@
     (u/raise "Unknown wire message format"
              {:format fmt
               :format-code (fmt-code fmt)})))
+
+(defn- deserialize-nippy
+  [payload]
+  (binding [nv/*wire-native-value* true]
+    (try (b/deserialize payload)
+         (catch Exception e
+           (throw (or (nv/decoding-error e) e))))))
 
 (defn- maybe-pack-zstd
   [fmt ^bytes payload wire-opts]
@@ -151,8 +159,7 @@
   "Read from a ByteBuffer containing nippy encoded bytes, return a Clojure
   value."
   [^ByteBuffer bf]
-  (binding [nv/*wire-native-value* true]
-    (b/deserialize (b/get-bytes bf))))
+  (deserialize-nippy (b/get-bytes bf)))
 
 (defn read-transit-bf
   "Read from a ByteBuffer containing transit+json encoded bytes,
@@ -237,10 +244,35 @@
                      bs)]
      (case (short code)
        1 (read-transit-bytes payload)
-       2 (binding [nv/*wire-native-value* true] (b/deserialize payload))
+       2 (deserialize-nippy payload)
        (u/raise "Unknown wire message format"
                 {:format fmt
                  :format-code code})))))
+
+(defn read-request
+  "Read request routing fields without running native deserializers. Requests
+  containing native values retain their bytes until authorized dispatch."
+  [fmt bs wire-opts]
+  (let [native? (volatile! false)
+        message (binding [nv/*wire-reader* (fn [_ _]
+                                            (vreset! native? true)
+                                            (UUID/randomUUID))]
+                  (read-value fmt bs wire-opts))]
+    (when-not (map? message)
+      (u/raise "Expected a request map" {}))
+    (let [message (vary-meta message dissoc ::native-request)]
+      (if @native?
+        (vary-meta message assoc ::native-request [fmt bs wire-opts])
+        message))))
+
+(defn resolve-native-request
+  "Rebuild native requests with the bound receiver before constructing keys,
+  sets, or query inputs. Ordinary requests require no second decode."
+  [message]
+  (if-let [[fmt bs opts] (::native-request (meta message))]
+    (with-meta (merge message (read-value fmt bs opts))
+      (dissoc (meta message) ::native-request))
+    message))
 
 (defn send-ch
   "Send to socket channel, return the number of bytes sent. return -1 if

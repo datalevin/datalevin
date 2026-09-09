@@ -17,6 +17,8 @@
    [datalevin.buffer :as bf]
    [datalevin.db :as db]
    [datalevin.udf :as udf]
+   [datalevin.custom-data :as custom]
+   [datalevin.native-value :as nv]
    [datalevin.lmdb :as l]
    [datalevin.binding.cpp :as cpp]
    [datalevin.protocol :as p]
@@ -2235,12 +2237,42 @@
    :write-txn-runner write-txn-runner
    :clients (fn [^Server server] (.-clients server))})
 
+(defn- native-request-reader
+  [^Server server ^SelectionKey skey {:keys [args writing?] :as message}]
+  (let [context
+        (delay
+          (let [db-name (first args)
+                {:keys [client-id]} @(.attachment skey)
+                {:keys [permissions]} (get-client server client-id)
+                action (if (dha/ha-write-message? message) ::alter ::view)]
+            (when-not (and (string? db-name)
+                           permissions
+                           (has-permission? action ::database
+                                            (db-eid (.-sys-conn server) db-name)
+                                            permissions))
+              (u/raise "Don't have permission to decode native database values" {}))
+            ;; Resolving on the transaction runner observes pending registrations.
+            (lmdb server skey db-name writing?)))
+        readers (volatile! {})]
+    (fn [type-name payload]
+      (let [type-name (keyword (subs type-name 1))
+            reader (or (get @readers type-name)
+                       (let [r (:deserialize (custom/resolve-type @context type-name))]
+                         (vswap! readers assoc type-name r)
+                         r))]
+        (reader payload)))))
+
 (def ^:private message-handler-map
   (into {}
         (map (fn [[type handler]]
                [type
                 (fn [server skey message]
-                  (handler (handler-deps) server skey message))]))
+                  (try
+                    (binding [nv/*wire-reader* (native-request-reader server skey message)]
+                      (handler (handler-deps) server skey
+                               (p/resolve-native-request message)))
+                    (catch Exception e
+                      (handle-message-error! skey e))))]))
         sh/handler-map))
 
 (defn- dispatch-message

@@ -19,6 +19,7 @@
    [datalevin.bits :as b]
    [datalevin.datom :as d]
    [datalevin.lmdb :as l :refer [IWriting]]
+   [datalevin.native-value :as nv]
    [clojure.string :as str])
   (:import
    [datalevin.client Client]
@@ -122,6 +123,7 @@
 
 (defn- retry-ha-transport-failure
   [client req request-fn known-endpoints throwable]
+  (when (nv/decoding-error? throwable) (throw throwable))
   (when-let [retry-context (#'cl/client-retry-context client)]
     (let [self-endpoint (str (:host retry-context) ":" (:port retry-context))
           retry-endpoints (->> known-endpoints

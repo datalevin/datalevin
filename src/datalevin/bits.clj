@@ -117,7 +117,12 @@
               nippy/*thaw-serializable-allowlist*)]
     (try
       (nippy/fast-thaw bs)
-      (catch Exception _
+      (catch Exception e
+        ;; A native reader failure is not an old Nippy header. Retrying thaw
+        ;; would hide the missing runtime binding behind a format error.
+        (when (some #(= :native-value/decode (:error (ex-data %)))
+                    (take-while some? (iterate ex-cause e)))
+          (throw e))
         (nippy/thaw bs)))))
 
 ;; bitmap

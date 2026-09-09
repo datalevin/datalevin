@@ -4,6 +4,7 @@
             [datalevin.constants :as c]
             [datalevin.native-value :as nv]
             [datalevin.protocol :as p]
+            [datalevin.spill :as sp]
             [taoensso.nippy :as nippy])
   (:import [datalevin NativeValue]
            [java.nio ByteBuffer]
@@ -100,3 +101,41 @@
     (let [[restored _] (binding [nv/*wire-reader* receiver]
                          (p/receive-one-message bf))]
       (is (= [:a] (mapv logical restored))))))
+
+(deftest request-routing-precedes-native-decoding
+  (let [message {:type :q :args ["tasks" {:nested {(value :a 1) :a}}]}
+        bytes (binding [nv/*wire-native-value* true] (b/serialize message))
+        pending (p/read-request c/message-format-nippy bytes nil)]
+    (is (= :q (:type pending)))
+    (is (= "tasks" (first (:args pending))))
+    (is (thrown? Exception (p/resolve-native-request pending)))
+    (let [resolved (binding [nv/*wire-reader* receiver]
+                     (p/resolve-native-request pending))]
+      (is (= message resolved))
+      (is (empty? (meta resolved))))
+    ;; Client metadata must never supply a replacement request body.
+    (let [ordinary (with-meta {:type :q :args ["ordinary"]}
+                     {:datalevin.protocol/native-request
+                      [c/message-format-nippy bytes nil]})
+          read-back (p/read-request c/message-format-nippy (b/serialize ordinary) nil)]
+      (is (= ordinary (p/resolve-native-request read-back))))))
+
+(deftest native-wire-decoding-can-spill
+  (let [old-pressure @sp/memory-pressure
+        source (sp/new-spillable-vector [(value :a 1) (value :b 2)])
+        pending (volatile! nil)
+        decoded (volatile! nil)]
+    (try
+      (vreset! sp/memory-pressure 99)
+      (let [bytes (binding [nv/*wire-native-value* true]
+                    (b/serialize {:type :q :args ["tasks" source]}))]
+        (vreset! pending (p/read-request c/message-format-nippy bytes nil))
+        (vreset! decoded (binding [nv/*wire-reader* receiver]
+                          (p/resolve-native-request @pending)))
+        (let [rows (second (:args @decoded))]
+          (is (= 2 (sp/disk-count rows)))
+          (is (= [:a :b] (mapv logical rows)))))
+      (finally
+        (vreset! sp/memory-pressure old-pressure)
+        (doseq [v [source (second (:args @pending)) (second (:args @decoded))]]
+          (when v (empty v)))))))

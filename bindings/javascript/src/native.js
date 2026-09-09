@@ -52,9 +52,6 @@ function field(map, key) {
 export function registryFromOpts(opts, dir = null) {
   const registry = field(field(opts, "runtime-opts"), "udf-registry");
   if (!registry?._nativeBindings) return null;
-  if (registry._nativeBindings.types.size && String(dir).startsWith("dtlv://")) {
-    throw new TypeError("Native JavaScript value transport currently requires a local database");
-  }
   return registry;
 }
 

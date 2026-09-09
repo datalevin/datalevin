@@ -13,6 +13,7 @@
    [datalevin.constants :as c]
    [datalevin.interface :as i]
    [datalevin.kv :as kv]
+   [datalevin.native-value :as nv]
    [datalevin.protocol :as p]
    [datalevin.storage :as st]
    [datalevin.util :as u]
@@ -22,6 +23,7 @@
    [java.nio.channels SelectionKey SocketChannel]
    [java.nio.file Files OpenOption]
    [java.security MessageDigest]
+   [java.util UUID]
    [java.util.concurrent ConcurrentLinkedQueue]
    [datalevin.storage Store]
    [datalevin.interface ILMDB IStore]))
@@ -56,7 +58,17 @@
         {:keys [read-bf write-bf wire-opts]} @state
         ^java.nio.channels.Selector selector (.selector skey)
         ^SocketChannel ch          (.channel skey)
-        data                       (transient [])]
+        data                       (transient [])
+        decode-error               (volatile! nil)
+        reader                     nv/*wire-reader*
+        read-native                (fn [type-name payload]
+                                     (if @decode-error
+                                       (UUID/randomUUID)
+                                       (try
+                                         (reader type-name payload)
+                                         (catch Exception e
+                                           (vreset! decode-error e)
+                                           (UUID/randomUUID)))))]
     ;; switch this channel to blocking mode for copy-in
     (.cancel skey)
     (.configureBlocking ch true)
@@ -65,7 +77,8 @@
                                 wire-opts)
       (.clear ^ByteBuffer read-bf)
       (loop [bf read-bf]
-        (let [[msg bf'] (p/receive-ch ch bf wire-opts)]
+        (let [[msg bf'] (binding [nv/*wire-reader* read-native]
+                          (p/receive-ch ch bf wire-opts))]
           (when-not (identical? bf bf') (vswap! state assoc :read-bf bf'))
           (if (map? msg)
             (let [{:keys [type]} msg]
@@ -75,8 +88,12 @@
                 (u/raise "Receive unexpected message while loading data"
                          {:msg msg})))
             (do
-              (doseq [d msg] (conj! data d))
+              (when-not @decode-error
+                (doseq [d msg] (conj! data d)))
               (recur bf')))))
+      ;; Drain through :copy-done before reporting a decode failure so the next
+      ;; request starts at a message boundary and no partial transaction runs.
+      (when-let [e @decode-error] (throw e))
       (let [txs (persistent! data)]
         (log/debug "Copied in" (count txs) "data items")
         txs)

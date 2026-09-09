@@ -1357,6 +1357,11 @@ class InteropBindings {
     return callJavaMethod(cls.interop, "registerUdf", registry, await toJava(descriptor), fn);
   }
 
+  async bindNativeType(registry, typeName, deserialize) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "bindNativeType", registry, typeName, await toJava(deserialize));
+  }
+
   async unregisterUdf(registry, descriptor) {
     const cls = await classes();
     return callJavaMethod(cls.interop, "unregisterUdf", registry, await toJava(descriptor));

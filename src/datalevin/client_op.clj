@@ -15,9 +15,12 @@
   (:require
    [datalevin.bits :as b]
    [datalevin.constants :as c]
+   [datalevin.datom :as d]
    [datalevin.lmdb :as l]
+   [datalevin.native-value :as nv]
    [datalevin.util :as u])
   (:import
+   [datalevin NativeValue]
    [java.security MessageDigest]
    [java.util UUID]))
 
@@ -35,7 +38,8 @@
 (defn request-hash
   [payload]
   (let [^MessageDigest md (MessageDigest/getInstance "SHA-256")]
-    (.update md ^bytes (b/serialize payload))
+    (.update md ^bytes (binding [nv/*wire-native-value* true]
+                        (b/serialize payload)))
     (u/hexify (.digest md))))
 
 (defn tx-request-payload
@@ -52,12 +56,27 @@
 
 (defn committed-record
   [request-type request-hash response-kind response]
-  {:version         1
-   :request-type    request-type
-   :request-hash    request-hash
-   :response-kind   response-kind
-   :response        response
-   :completed-at-ms (System/currentTimeMillis)})
+  (cond-> {:version         1
+           :request-type    request-type
+           :request-hash    request-hash
+           :response-kind   response-kind
+           :response        response
+           :completed-at-ms (System/currentTimeMillis)}
+    ;; Native values are complete custom attribute values. Keep their response
+    ;; snapshots as wire bytes; persisted records must not retain runtime IDs.
+    (some #(instance? NativeValue (if (d/datom? %) (d/datom-v %) (nth % 2)))
+          (:tx-data response))
+    (-> (assoc :version 2
+               :response-wire (binding [nv/*wire-native-value* true]
+                                (b/serialize response)))
+        (dissoc :response))))
+
+(defn record-response
+  "Restore a saved native response using the current database's receiver."
+  [record]
+  (if-let [payload (:response-wire record)]
+    (binding [nv/*wire-native-value* true] (b/deserialize payload))
+    (:response record)))
 
 (defn committed-record-tx
   [client-op-id record]
