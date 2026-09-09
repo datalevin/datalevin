@@ -103,11 +103,17 @@
         (try
           ~call
           (catch Throwable ~'e
+            (when ~keep-rtx?
+              (if (l/read-only? ~'rtx)
+                (l/return-cursor ~'dbi ~'cur)
+                (l/close-cursor ~'dbi ~'cur))
+              (when-not (l/writing? ~'lmdb) (i/return-rtx ~'lmdb ~'rtx)))
             ~error)
           (finally
-            (if (l/read-only? ~'rtx)
-              (l/return-cursor ~'dbi ~'cur)
-              (l/close-cursor ~'dbi ~'cur))
+            (when-not ~keep-rtx?
+              (if (l/read-only? ~'rtx)
+                (l/return-cursor ~'dbi ~'cur)
+                (l/close-cursor ~'dbi ~'cur)))
             (when-not (or (l/writing? ~'lmdb) ~keep-rtx?)
               (i/return-rtx ~'lmdb ~'rtx))))))))
 
@@ -213,17 +219,19 @@
 
 (defn- range-seq*
   [lmdb dbi rtx cur k-range k-type v-type ignore-key?
-   {:keys [batch-size] :or {batch-size 100}}]
+   {:keys [batch-size] :or {batch-size 100} :as opts}]
   (assert (not (and (= v-type :ignore) ignore-key?))
           "Cannot ignore both key and value")
   (let [iter  (.iterator
                 ^Iterable (l/iterate-kv dbi rtx cur k-range k-type v-type))
-        item  (fn [kv]
-                (let [v (when (not= v-type :ignore)
-                          (b/read-buffer (l/v kv) v-type))]
-                  (if ignore-key?
-                    (if v v true)
-                    [(b/read-buffer (l/k kv) k-type) v])))
+        item  (if-let [mapper (:datalevin.scan/map-kv opts)]
+                #(mapper % rtx)
+                (fn [kv]
+                  (let [v (when (not= v-type :ignore)
+                            (b/read-buffer (l/v kv) v-type))]
+                    (if ignore-key?
+                      (if v v true)
+                      [(b/read-buffer (l/k kv) k-type) v]))))
         fetch (fn [^long k]
                 (let [holder (transient [])]
                   (loop [i 0]
@@ -263,7 +271,10 @@
       AutoCloseable
       (close [_]
         (.close ^AutoCloseable iter)
-        (i/return-rtx lmdb rtx))
+        (if (l/read-only? rtx)
+          (l/return-cursor dbi cur)
+          (l/close-cursor dbi cur))
+        (when-not (l/writing? lmdb) (i/return-rtx lmdb rtx)))
 
       Object
       (toString [this] (str (apply list this))))))

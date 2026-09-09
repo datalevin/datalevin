@@ -23,7 +23,7 @@
    [datalevin.interface
     :refer [close-kv list-dbis entries get-range open-dbi transact-kv clear-dbi
             env-dir copy open-transact-kv close-transact-kv abort-transact-kv
-            stat env-opts dbi-opts]])
+            stat env-opts dbi-opts kv-info]])
   (:import
    [datalevin.async IAsyncWork]
    [datalevin.cpp Util]
@@ -276,6 +276,10 @@
 
 (defonce ^:private open-kv-wrapper (volatile! identity))
 
+(def ^:dynamic *raw-kv?*
+  "Internal physical-byte operations, including custom storage and restore."
+  false)
+
 (defn set-open-kv-wrapper!
   [f]
   (vreset! open-kv-wrapper (or f identity))
@@ -297,64 +301,92 @@
    (for [[k v] (get-range lmdb dbi [:all] :raw :raw)]
      [(b/encode-base64 k) (b/encode-base64 v)])])
 
+(defn- custom-dump? [lmdb dbi]
+  (when-let [info (kv-info lmdb)]
+    (let [names (:custom-dbis @info)]
+      (if dbi
+        (or (contains? names dbi)
+            (and (#{c/eav c/ave c/schema} dbi) (dbi-opts lmdb c/custom-values)))
+        (or (seq names) (dbi-opts lmdb c/custom-values))))))
+
+(defn- custom-dump-call [operation & args]
+  (apply (requiring-resolve (symbol "datalevin.custom-kv-dump" (name operation))) args))
+
 (defn dump-dbi
   ([lmdb dbi]
-   (p/pprint {:dbi dbi :entries (entries lmdb dbi)})
-   (doseq [[k v] (get-range lmdb dbi [:all] :raw :raw)]
-     (p/pprint [(b/encode-base64 k) (b/encode-base64 v)])))
+   (if (custom-dump? lmdb dbi)
+     (custom-dump-call :dump! lmdb dbi nil false)
+     (do (p/pprint {:dbi dbi :entries (entries lmdb dbi)})
+         (doseq [[k v] (get-range lmdb dbi [:all] :raw :raw)]
+           (p/pprint [(b/encode-base64 k) (b/encode-base64 v)])))))
   ([lmdb dbi data-output]
-   (if data-output
-     (nippy/freeze-to-out! data-output (nippy-dbi lmdb dbi))
-     (dump-dbi lmdb dbi))))
+   (if (custom-dump? lmdb dbi)
+     (custom-dump-call :dump! lmdb dbi data-output false)
+     (if data-output
+       (nippy/freeze-to-out! data-output (nippy-dbi lmdb dbi))
+       (dump-dbi lmdb dbi)))))
 
 (defn dump-dbi-section
   [lmdb dbi]
-  (p/pprint {:datalevin.dump/section :kv
-             :dbi                    dbi
-             :entries                (entries lmdb dbi)
-             :opts                   (dbi-opts lmdb dbi)})
-  (doseq [[k v] (get-range lmdb dbi [:all] :raw :raw)]
-    (p/pprint [(b/encode-base64 k) (b/encode-base64 v)])))
+  (if (custom-dump? lmdb dbi)
+    (custom-dump-call :dump! lmdb dbi nil true)
+    (do (p/pprint {:datalevin.dump/section :kv
+                  :dbi                    dbi
+                  :entries                (entries lmdb dbi)
+                  :opts                   (dbi-opts lmdb dbi)})
+        (doseq [[k v] (get-range lmdb dbi [:all] :raw :raw)]
+          (p/pprint [(b/encode-base64 k) (b/encode-base64 v)])))))
 
 (defn dump-all
   ([lmdb]
-   (dump-dbi lmdb c/kv-info)
-   (doseq [dbi (set (list-dbis lmdb))] (dump-dbi lmdb dbi)))
+   (if (custom-dump? lmdb nil)
+     (custom-dump-call :dump! lmdb nil nil false)
+     (do (dump-dbi lmdb c/kv-info)
+         (doseq [dbi (set (list-dbis lmdb))] (dump-dbi lmdb dbi)))))
   ([lmdb data-output]
-   (if data-output
-     (nippy/freeze-to-out!
-       data-output
-       (conj (for [dbi (set (list-dbis lmdb))] (nippy-dbi lmdb dbi))
-             (nippy-dbi lmdb c/kv-info)))
-     (dump-all lmdb))))
+   (if (custom-dump? lmdb nil)
+     (custom-dump-call :dump! lmdb nil data-output false)
+     (if data-output
+       (nippy/freeze-to-out!
+         data-output
+         (conj (for [dbi (set (list-dbis lmdb))] (nippy-dbi lmdb dbi))
+               (nippy-dbi lmdb c/kv-info)))
+       (dump-all lmdb)))))
 
 (defn- load-kv [dbi [k v]]
   (kv-tx :put dbi (b/decode-base64 k) (b/decode-base64 v) :raw :raw))
 
 (defn load-dbi-section
-  [lmdb {:keys [dbi entries opts]} read-form]
-  (if opts (open-dbi lmdb dbi opts) (open-dbi lmdb dbi))
-  (transact-kv lmdb (->> (repeatedly read-form)
-                         (take entries)
-                         (map #(load-kv dbi %)))))
+  [lmdb {:keys [dbi entries opts] :as header} read-form]
+  (if (:datalevin.dump/custom header)
+    (custom-dump-call :restore! lmdb (custom-dump-call :read-bundle header read-form) nil)
+    (do (if opts (open-dbi lmdb dbi opts) (open-dbi lmdb dbi))
+        (transact-kv lmdb (->> (repeatedly read-form)
+                              (take entries)
+                              (map #(load-kv dbi %)))))))
 
 (defn load-dbi
   ([lmdb dbi in nippy?]
    (if nippy?
-     (let [[_ kvs] (nippy/thaw-from-in! in)]
-       (open-dbi lmdb dbi)
-       (transact-kv lmdb (map #(load-kv dbi %) kvs)))
+     (let [data (nippy/thaw-from-in! in)]
+       (if (:datalevin/custom-kv-dump data)
+         (custom-dump-call :restore! lmdb data dbi)
+         (let [[_ kvs] data]
+           (open-dbi lmdb dbi)
+           (transact-kv lmdb (map #(load-kv dbi %) kvs)))))
      (load-dbi lmdb dbi in)))
   ([lmdb dbi in]
    (try
      (with-open [^PushbackReader r in]
        (let [read-form         #(edn/read {:eof ::EOF} r)
-             {:keys [entries]} (read-form)]
-         (open-dbi lmdb dbi)
-         (transact-kv lmdb (->> (repeatedly read-form)
-                                (take-while #(not= ::EOF %))
-                                (take entries)
-                                (map #(load-kv dbi %))))))
+             {:keys [entries] :as header} (read-form)]
+         (if (:datalevin.dump/custom header)
+           (custom-dump-call :restore! lmdb (custom-dump-call :read-bundle header read-form) dbi)
+           (do (open-dbi lmdb dbi)
+               (transact-kv lmdb (->> (repeatedly read-form)
+                                     (take-while #(not= ::EOF %))
+                                     (take entries)
+                                     (map #(load-kv dbi %))))))))
      (catch IOException e
        (u/raise "IO error while loading raw data: " (ex-message e) {}))
      (catch RuntimeException e
@@ -367,9 +399,12 @@
 (defn load-all
   ([lmdb in nippy?]
    (if nippy?
-     (doseq [[{:keys [dbi]} kvs] (nippy/thaw-from-in! in)]
-       (open-dbi lmdb dbi)
-       (transact-kv lmdb (map #(load-kv dbi %) kvs)))
+     (let [data (nippy/thaw-from-in! in)]
+       (if (:datalevin/custom-kv-dump data)
+         (custom-dump-call :restore! lmdb data nil)
+         (doseq [[{:keys [dbi]} kvs] data]
+           (open-dbi lmdb dbi)
+           (transact-kv lmdb (map #(load-kv dbi %) kvs)))))
      (load-all lmdb in)))
   ([lmdb in]
    (try
@@ -386,18 +421,25 @@
 
 (defn load-all-forms
   [lmdb forms]
-  (let [load-dbi (fn [[ms vs]]
-                   (doseq [{:keys [dbi opts]} (butlast ms)]
-                     (if opts (open-dbi lmdb dbi opts) (open-dbi lmdb dbi)))
-                   (let [{:keys [dbi entries opts]} (last ms)]
-                     (if opts (open-dbi lmdb dbi opts) (open-dbi lmdb dbi))
-                     (->> vs
-                          (take entries)
-                          (map #(load-kv dbi %)))))]
-    (transact-kv lmdb (->> forms
-                           (partition-by map?)
-                           (partition 2 2 nil)
-                           (mapcat load-dbi)))))
+  (if (:datalevin.dump/custom (first forms))
+    (let [remaining (volatile! (rest forms))
+          read-form #(let [form (first @remaining)] (vswap! remaining rest) form)
+          bundle (custom-dump-call :read-bundle (first forms) read-form)]
+      (when (seq @remaining)
+        (u/raise "Trailing forms after custom KV dump" {:error :custom-type/dump}))
+      (custom-dump-call :restore! lmdb bundle nil))
+    (let [load-dbi (fn [[ms vs]]
+                     (doseq [{:keys [dbi opts]} (butlast ms)]
+                       (if opts (open-dbi lmdb dbi opts) (open-dbi lmdb dbi)))
+                     (let [{:keys [dbi entries opts]} (last ms)]
+                       (if opts (open-dbi lmdb dbi opts) (open-dbi lmdb dbi))
+                       (->> vs
+                            (take entries)
+                            (map #(load-kv dbi %)))))]
+      (transact-kv lmdb (->> forms
+                            (partition-by map?)
+                            (partition 2 2 nil)
+                            (mapcat load-dbi))))))
 
 (defn clear [lmdb]
   (doseq [dbi (set (list-dbis lmdb)) ] (clear-dbi lmdb dbi)))

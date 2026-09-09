@@ -181,24 +181,45 @@
              (assoc (vec d) 2 (idoc-dump-value value))
              d))))
 
+(defn- custom-datalog-kv [conn]
+  (when (instance? Store (:store @conn))
+    (let [kv (conn/datalog-kv conn)]
+      (when (i/dbi-opts kv c/custom-values) kv))))
+
+(defn- dump-custom-datalog [kv output]
+  ((requiring-resolve 'datalevin.custom-kv-dump/dump!) kv :datalog output false))
+
+(defn- restore-custom-datalog [dir bundle schema opts]
+  (when (seq schema)
+    (u/raise "Custom Datalog dumps retain their stored schema; apply schema updates after restore"
+             {:error :custom-type/restore-conflict}))
+  (let [kv (l/open-kv dir (merge (select-keys opts [:wal?]) (:kv-opts opts)))]
+    (try
+      ((requiring-resolve 'datalevin.custom-kv-dump/restore!) kv bundle nil)
+      (finally (i/close-kv kv)))))
+
 (defn dump-datalog
   ([conn]
-   (binding [u/*datalevin-print* true]
-     (let [schema (conn/schema conn)]
-       (p/pprint (conn/opts conn))
-       (p/pprint schema)
-       (doseq [^Datom datom (db/-datoms @conn :eav nil nil nil)]
-         (prn (datom-dump-row schema datom))))))
+   (if-let [kv (custom-datalog-kv conn)]
+     (dump-custom-datalog kv nil)
+     (binding [u/*datalevin-print* true]
+       (let [schema (conn/schema conn)]
+         (p/pprint (conn/opts conn))
+         (p/pprint schema)
+         (doseq [^Datom datom (db/-datoms @conn :eav nil nil nil)]
+           (prn (datom-dump-row schema datom)))))))
   ([conn data-output]
-   (if data-output
-     (let [schema (conn/schema conn)]
-       (nippy/freeze-to-out!
-         data-output
-         [(conn/opts conn)
-         schema
-         (map (fn [^Datom datom] (datom-dump-row schema datom))
-               (db/-datoms @conn :eav nil nil nil))]))
-     (dump-datalog conn))))
+   (if-let [kv (custom-datalog-kv conn)]
+     (dump-custom-datalog kv data-output)
+     (if data-output
+       (let [schema (conn/schema conn)]
+         (nippy/freeze-to-out!
+           data-output
+           [(conn/opts conn)
+            schema
+            (map (fn [^Datom datom] (datom-dump-row schema datom))
+                 (db/-datoms @conn :eav nil nil nil))]))
+       (dump-datalog conn)))))
 
 (defn- dump-datalog-section
   [conn]
@@ -221,7 +242,7 @@
                       (finally
                         (i/close-kv lmdb))))
          datalog? (contains? dbis c/eav)]
-     (if datalog?
+     (if (and datalog? (not (contains? dbis c/custom-values)))
        (do
          (when data-output
            (u/raise "Auto dump of mixed Datalog/KV stores is not supported "
@@ -363,36 +384,38 @@
   ([dir in schema opts nippy?]
    (if nippy?
      (try
-       (let [[old-opts old-schema datoms] (nippy/thaw-from-in! in)
-             old-opts                     (normalize-legacy-ha-nil-sentinels
-                                            old-opts)
-             new-opts                     (merge old-opts opts)
-             new-schema                   (merge old-schema schema)
-             db                           (db/init-db
-                                            (for [d datoms]
-                                              (load-datom new-schema d))
-                                            dir new-schema new-opts)]
-         (db/close-db db))
+       (let [data (nippy/thaw-from-in! in)]
+         (if (:datalevin/custom-kv-dump data)
+           (restore-custom-datalog dir data schema opts)
+           (let [[old-opts old-schema datoms] data
+                 old-opts (normalize-legacy-ha-nil-sentinels old-opts)
+                 new-opts (merge old-opts opts)
+                 new-schema (merge old-schema schema)
+                 db (db/init-db (for [d datoms] (load-datom new-schema d))
+                                dir new-schema new-opts)]
+             (db/close-db db))))
        (catch Exception e
          (u/raise "Error loading nippy file into Datalog DB: " e {})))
      (load-datalog dir in schema opts)))
   ([dir in schema opts]
    (try
      (with-open [^PushbackReader r in]
-       (let [read-form             #(edn/read {:eof     ::EOF
-                                               :readers *data-readers*} r)
-             read-maps             #(let [m1 (read-form)]
-                                      (if (:db/ident m1)
-                                        [nil m1]
-                                        [m1 (read-form)]))
-             [old-opts old-schema] (read-maps)
-             new-opts              (merge old-opts opts)
-             new-schema            (merge old-schema schema)
-             datoms                (->> (repeatedly read-form)
-                                        (take-while #(not= ::EOF %))
-                                        (map #(load-datom new-schema %)))
-             db                    (db/init-db datoms dir new-schema new-opts)]
-         (db/close-db db)))
+       (let [read-form #(edn/read {:eof ::EOF :readers *data-readers*} r)
+             first-form (read-form)]
+         (if (:datalevin.dump/custom first-form)
+           (restore-custom-datalog
+            dir ((requiring-resolve 'datalevin.custom-kv-dump/read-bundle) first-form read-form)
+            schema opts)
+           (let [read-maps #(if (:db/ident first-form)
+                             [nil first-form] [first-form (read-form)])
+                 [old-opts old-schema] (read-maps)
+                 new-opts (merge old-opts opts)
+                 new-schema (merge old-schema schema)
+                 datoms (->> (repeatedly read-form)
+                             (take-while #(not= ::EOF %))
+                             (map #(load-datom new-schema %)))
+                 db (db/init-db datoms dir new-schema new-opts)]
+             (db/close-db db)))))
      (catch IOException e
        (u/raise "IO error while loading Datalog data: " e {}))
      (catch RuntimeException e
@@ -409,6 +432,9 @@
 
 (defn re-index-datalog
   [conn schema opts]
+  (when (and (seq schema) (custom-datalog-kv conn))
+    (u/raise "Custom Datalog schema migration requires an explicit rewrite"
+             {:error :custom-type/migration}))
   (let [d (dir (.-store ^DB @conn))]
     (try
       (let [dumpfile (str d u/+separator+ "dl-dump")]

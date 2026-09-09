@@ -829,12 +829,21 @@
     (when (vector? t)
       (if (= 1 (count t)) c/type-homo-tuple c/type-hete-tuple))))
 
+(deftype CustomReference [^bytes reference])
+
+(defn- get-custom-reference [^ByteBuffer bf post-v]
+  (let [ref (byte-array (inc (- (.remaining bf) (long post-v))))]
+    (aset-byte ref 0 (byte c/type-custom))
+    (.get bf ref 1 (dec (alength ref)))
+    (CustomReference. ref)))
+
 (defn- get-value*
   ([bf hdr] (get-value* bf 0 hdr))
   ([^ByteBuffer bf post-v hdr]
    (case (short hdr)
      -64 (get-long bf)
      -63 (get-long bf)
+     -16 (get-custom-reference bf post-v)
      -15 (get-bigint bf)
      -14 (get-bigdec bf)
      -13 (get-homo-tuple bf post-v)
@@ -887,16 +896,18 @@
   where aid is the integer id of an attribute, vt is its :db/valueType
   max-gt is current max giant id"
   [eid aid val vt max-gt]
-  (let [hdr (long (or (val-header val vt) c/type-nil))]
-    (if-let [vb (val-bytes val vt)]
-      (let [bl   (alength ^bytes vb)
-            cut? (> bl c/+val-bytes-wo-hdr+)
-            bas  (if cut?
-                   (Arrays/copyOf ^bytes vb c/+val-bytes-trunc+)
-                   vb)
-            gid  (if cut? max-gt c/normal)]
-        (Indexable. eid aid val hdr bas gid))
-      (Indexable. eid aid val hdr nil c/normal))))
+  (if (map? vt)
+    ((:custom/indexable vt) eid aid val max-gt)
+    (let [hdr (long (or (val-header val vt) c/type-nil))]
+      (if-let [vb (val-bytes val vt)]
+        (let [bl   (alength ^bytes vb)
+              cut? (> bl c/+val-bytes-wo-hdr+)
+              bas  (if cut?
+                     (Arrays/copyOf ^bytes vb c/+val-bytes-trunc+)
+                     vb)
+              gid  (if cut? max-gt c/normal)]
+          (Indexable. eid aid val hdr bas gid))
+        (Indexable. eid aid val hdr nil c/normal)))))
 
 (defn giant? [^Indexable i] (not= (.-g i) c/normal))
 
@@ -949,13 +960,15 @@
 
 (defn avg->r
   [^ByteBuffer bf]
-  (let [limit (.limit bf)]
-    (.position bf (- limit 1))
-    (if (= c/true-value (get-byte bf))
-      (do (.position bf (- limit 9))
-          (Retrieved. nil nil nil (get-long bf)))
-      (do (.position bf 4)
-          (Retrieved. nil nil (get-value bf 2) c/normal)))))
+  (if (= c/type-custom (.get bf 4))
+    (do (.position bf 0) (get-avg bf))
+    (let [limit (.limit bf)]
+      (.position bf (- limit 1))
+      (if (= c/true-value (get-byte bf))
+        (do (.position bf (- limit 9))
+            (Retrieved. nil nil nil (get-long bf)))
+        (do (.position bf 4)
+            (Retrieved. nil nil (get-value bf 2) c/normal))))))
 
 (defn avg->aid
   "Read the attribute ID from an encoded AVG buffer without decoding its value."
@@ -1059,7 +1072,11 @@
              (put-homo-tuple bf x (nth x-type 0)))
          (do (put-byte bf c/type-hete-tuple)
              (put-hete-tuple bf x x-type)))
-       (put-data bf x)))))
+       (do
+         (when (qualified-keyword? x-type)
+           (u/raise "Custom storage types require a declared DBI"
+                    {:error :custom-type/undeclared :type x-type}))
+         (put-data bf x))))))
 
 (defn put-bf
   "clear the buffer, put in the data, and prepare it for reading"
@@ -1109,7 +1126,11 @@
            (if (= 1 (count v-type))
              (get-homo-tuple bf)
              (get-hete-tuple bf)))
-       (get-data bf)))))
+       (do
+         (when (qualified-keyword? v-type)
+           (u/raise "Custom storage types require a declared DBI"
+                    {:error :custom-type/undeclared :type v-type}))
+         (get-data bf))))))
 
 ;; data validation
 

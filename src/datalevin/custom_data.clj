@@ -17,6 +17,7 @@
    [datalevin.udf :as udf]
    [datalevin.util :refer [raise]])
   (:import
+   [java.util Arrays]
    [java.util.regex Pattern]))
 
 (def ^:private scalar-types (disj c/kv-value-types :data))
@@ -132,11 +133,15 @@
 
 (defn- same-callable? [a b]
   (if (and (:inter-fn/source a) (:inter-fn/source b))
-    (same-source? (b/deserialize (:inter-fn/source a))
-                  (b/deserialize (:inter-fn/source b)))
+    (or (Arrays/equals ^bytes (:inter-fn/source a) ^bytes (:inter-fn/source b))
+        (do
+          ;; A restore may compare captures before the interpreter is loaded.
+          (requiring-resolve 'datalevin.interpret/compile-inter-fn-source)
+          (same-source? (b/deserialize (:inter-fn/source a))
+                        (b/deserialize (:inter-fn/source b)))))
     (= a b)))
 
-(defn- same-definition? [a b]
+(defn same-definition? [a b]
   (and (= (:version a) (:version b))
        (= (get-in a [:index :type]) (get-in b [:index :type]))
        (same-callable? (get-in a [:index :order-fn]) (get-in b [:index :order-fn]))

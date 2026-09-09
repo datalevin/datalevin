@@ -1,9 +1,9 @@
 # Custom data: ordered storage and indexing
 
-Status: Phases 1 and 2 are implemented locally: type registration, function
-contracts, ordered references, and transactional payload storage primitives.
-Public KV routing, Datalog custom attributes, and remote/binding APIs remain
-planned. Registering a type does not yet enable it in ordinary storage calls.
+Status: Phases 1–4 are implemented locally: type registration, function
+contracts, ordered references, transactional payload storage, public KV custom
+keys and ordered list items, and Datalog custom attributes. Remote/binding APIs
+and performance work remain planned.
 
 Tracking issue: [Allow indexing of arbitrary data, #234](https://github.com/datalevin/datalevin/issues/234).
 
@@ -59,7 +59,7 @@ components or multiple named order functions are later extensions.
 
 ## Type definition and registration
 
-Proposed public signature:
+Public signature:
 
 ```clojure
 (d/register-type kv-or-conn type-name definition)
@@ -208,8 +208,8 @@ respect the existing UDF registry generation.
 
 Local KV handles accept `{:runtime-opts {:udf-registry registry}}` in `open-kv`
 options. Runtime options and compiled caches are neither persisted nor exposed
-through environment options. Datalog operations can pass their connection's
-runtime options to the shared type resolver. Resolution is lazy per function
+through environment options. Local Datalog environments accept the same runtime
+options when first opened. Resolution is lazy per function
 and cached per KV environment, type, registry revision, and UDF generation.
 Registration validates UDF descriptors without requiring bindings to be loaded.
 
@@ -233,7 +233,9 @@ behavior across runtimes and reopens.
 Assign a database-wide 64-bit value ID to each new stored custom-value
 occurrence. It is an internal storage reference, distinct from a Datalog entity
 ID. The initial design does not share payload ownership across unrelated
-logical entries. EAV and AVE refer to the same payload for one Datalog fact.
+logical entries. A custom key with duplicate values owns one key payload for
+the entire group; each custom duplicate item owns its own payload. EAV and AVE
+refer to the same payload for one Datalog fact.
 
 Use one shared payload DBI per KV environment, `datalevin/custom-values`:
 
@@ -278,6 +280,19 @@ whole escaped prefix that fits and terminate it with `00 01`. Exact lookup then
 matches complete payloads within that truncated bucket, as with giant values.
 Range precision is limited to that bucket; this retains the agreed bounded-key
 tradeoff. Existing tuple component-size restrictions still apply.
+
+Datalog embeds the same reference in the existing AVG layout:
+
+```text
+EAV: entity-id -> attribute-id (4 bytes) | custom reference | 00 01
+AVE: attribute-id (4 bytes) | custom reference | 00 01 -> entity-id
+```
+
+The two trailing bytes retain AVG's separator and inline-value marker. The
+custom reference budget is therefore 505 bytes. Its internal value ID selects
+the shared payload; it is independent of the existing giant-datom ID space.
+Both indexes use exactly the same reference for a fact. Repeated assertions
+reuse it, and retracting the fact removes both index entries and its payload.
 
 Allocated IDs are positive signed 64-bit integers, from 1 through
 `Long/MAX_VALUE - 1`. Reserve 0 and `Long/MAX_VALUE` as lower and upper bucket
@@ -347,8 +362,11 @@ their caller must include every associated index change in that transaction.
 
 Open the shared payload DBI before starting an explicit writer transaction.
 Native DBI opening itself owns a transaction, so the internal `open-store!`
-initializer rejects nested initialization. Public KV/Datalog adapters will
-initialize this facility when they open a custom index or attribute.
+initializer rejects nested initialization. Public KV adapters initialize this
+facility when opening a custom DBI or reopening an environment that has one.
+The Datalog adapter also initializes it when installing custom attributes.
+Install the first custom index or attribute outside an explicit transaction,
+so native DBI creation can complete before a writer starts.
 
 ### Range access and transparent reads
 
@@ -403,6 +421,29 @@ definitions or value IDs in a populated destination before applying changes;
 never overwrite an unrelated payload merely because its ID matches. Importing
 independent environments with ID remapping is a later extension.
 
+Implemented for text and Nippy binary dumps, both full-environment and
+single-DBI bundles. Dumps without custom DBIs retain the existing format.
+A single-DBI restore retains its original DBI name. An existing custom target
+DBI must be empty or byte-identical to the dump; an occupied payload ID is
+accepted only when both its bytes and owning entry match. Restore reconciles
+the destination and source allocation counters with the highest stored ID.
+Restore runs outside an explicit transaction because opening native DBIs owns
+a transaction. Dependency and conflict checks finish before DBIs are created;
+metadata, payloads, and index rows are then committed together.
+
+Datalog dumps containing custom data use the same physical dependency bundle
+in both text and Nippy formats. They include Datalog's internal DBIs, required
+type definitions, and only their owned custom payloads. Full-environment dumps
+also include user KV DBIs and their payloads. Datalog schema records precede
+EAV and AVE; restore verifies that both indexes agree on each payload's owner.
+The complete source allocation counter is retained even when the dump omits
+payloads belonging to other DBIs. Dumping and replaying these bytes requires
+no application function bindings. Rebind functions before reading logical values.
+
+Custom Datalog dumps retain their stored schema. Apply schema changes after
+restore; supplying a schema override to their loader or re-index operation is
+rejected before destructive work begins.
+
 ## KV and Datalog schema use
 
 KV DBIs declare a registered type for custom keys or ordered list items. The
@@ -411,14 +452,44 @@ Extend the existing KV type arguments and DBI options consistently: explicit
 operation types must agree with an installed custom-type declaration. Ordinary
 DBIs retain their existing type-selection behavior.
 
-The option names for Phase 3 are `:key-type` for a custom key and `:value-type`
+The implemented option names are `:key-type` for a custom key and `:value-type`
 for a custom ordered duplicate item. Their value is the registered type name.
 `:value-type` in this custom indexing facility requires a list/dupsort DBI.
-Persist these declarations in the existing DBI metadata and reject subsequent
-conflicts. These public options are reserved by this design; Phase 2's internal
-raw-index descriptors do not install or expose them yet.
+Both options can be used on the same list DBI. Declarations persist in DBI
+metadata, and subsequent conflicts are rejected. Omitting an operation's type,
+or using its default `:data`, selects the installed custom declaration.
+Explicit type arguments must agree with that declaration. A custom type name
+on an undeclared field raises an error.
 The initial custom indexes require ordinary byte ordering; reverse/integer
 comparison flags and fixed-size duplicate flags are rejected before writing.
+An installed custom index's duplicate layout and custom-key size budget cannot
+be changed by reopening it.
+
+```clojure
+(d/register-type kv :app/task task-type)
+(d/open-dbi kv "tasks" {:key-type :app/task})
+(def task {:priority 3 :name "Compile" :options {:debug true}})
+(d/transact-kv kv "tasks" [[:put task :queued]])
+(d/get-range kv "tasks" [:all])
+;; => [[{:priority 3 :name "Compile" :options {:debug true}} :queued]]
+
+(d/open-list-dbi kv "tasks-by-owner" {:value-type :app/task})
+(d/put-list-items kv "tasks-by-owner" :alice [task] :keyword :app/task)
+(d/get-list kv "tasks-by-owner" :alice :keyword :app/task)
+;; => [{:priority 3 :name "Compile" :options {:debug true}}]
+```
+
+Ordinary reads and decoded callbacks return complete values. Explicit raw
+callback modes retain their low-level buffer contract. Counts avoid payload
+decoding, and lazy range sequences retain one snapshot for their index and
+payload reads until closed. Consume them within `with-open`, including when
+reading the entire sequence.
+
+Clear removes owning entries and their payloads in the same transaction and
+can participate in an explicit writer transaction. Dropping a custom DBI runs
+outside an explicit transaction: it commits that cleanup, then drops the empty
+native DBI while retaining the writer lock. Neither operation calls application
+functions, and neither resets the allocation counter.
 
 Datalog attribute schemas reference the same type name, for example:
 
@@ -432,9 +503,38 @@ keys, handling payloads, checking uniqueness, and matching exact values belong
 to the shared storage path. Existing assertion, lookup-ref, retraction, and
 query interfaces continue to operate on logical values.
 
+```clojure
+(d/register-type conn :app/task task-type)
+(d/update-schema conn {:task/data {:db/valueType :app/task
+                                  :db/cardinality :db.cardinality/many}})
+(d/transact! conn [[:db/add 1 :task/data task]])
+(d/q '[:find ?e :in $ ?task :where [?e :task/data ?task]] @conn task)
+;; => #{[1]}
+(d/index-range @conn :task/data
+               {:priority 1 :name ""} {:priority 5 :name ""})
+```
+
+Custom attributes support cardinality one/many, identity upserts, unique-value
+constraints, lookup references, retractions, query joins, pull, and entity and
+datom reads. Exact operations compare complete values, while `index-range`
+includes the entire order group at an inclusive endpoint. Pending transaction
+indexes use native order prefixes and distinguish complete values within a
+group, including non-Comparable objects with identical hashes. Adding uniqueness
+checks all complete values in each group, rather than only adjacent IDs.
+
+First opening a local Datalog environment with `:runtime-opts {:udf-registry registry}`
+provides the underlying KV environment's default order and serde bindings.
+These runtime bindings are not persisted. Cross-language invocation adapters
+and remote execution remain Phase 5 work.
+
+Changing a populated attribute to or from a custom type requires an explicit
+rewrite; the automatic migration from untyped data to built-in types does not
+apply. Custom attributes do not currently support fulltext indexing or custom
+types as components of Datalog composite tuples.
+
 ## Implementation phases
 
-Phases 1 and 2 are implemented locally. Phases 3–6 are planned work.
+Phases 1–4 are implemented locally. Phases 5 and 6 are planned work.
 
 ### Phase 1: Registry and function contracts
 
@@ -453,8 +553,8 @@ handles, remains isolated between environments, and is transactionally visible.
 ### Phase 2: Shared storage primitives
 
 Implemented in `datalevin.custom-value`. The primitives operate on explicitly
-opened internal raw key indexes and duplicate-item indexes; ordinary public KV
-operations do not route to them yet.
+opened internal raw key indexes and duplicate-item indexes. Phase 3 routes
+public KV operations through these primitives.
 
 - Add the payload DBI, ID allocation state, and ownership/cleanup bookkeeping.
 - Finalize DBI option names and the custom-reference discriminator before
@@ -469,6 +569,11 @@ Completion: colliding order keys retain distinct payloads, exact operations
 select the correct entry, and failures leave no committed dangling references.
 
 ### Phase 3: KV APIs
+
+Implemented in `datalevin.custom-kv` and `datalevin.custom-kv-dump`, with routing
+through the KV wrapper and native DBI metadata. Regression coverage includes
+collisions, transactions and rollback, range variants, lazy snapshots, write
+flags, cleanup, reopen/copy, dump conflicts, and physical WAL replay.
 
 - Wire custom key and ordered list-item declarations into DBI metadata and
   existing transaction/read APIs.
@@ -486,6 +591,13 @@ Completion: direct KV clients can use ordered custom data without managing
 value IDs, payload DBIs, or serialization calls around each operation.
 
 ### Phase 4: Datalog storage
+
+Implemented in `datalevin.custom-datalog`, the shared index codec, Datalog
+storage, and transaction-local comparators. Tests cover complete-value
+collisions, custom serde, order boundaries, truncated keys, uniqueness/upserts,
+rollback, pending reads, concurrent payload deletion, reopen, backup, and WAL
+replay. The query engine continues to consume complete logical values through
+the existing storage interfaces.
 
 - Accept registered type names in attribute schemas and resolve their storage
   descriptors through the KV registry.

@@ -1948,7 +1948,7 @@
   (env-dir [_] (@info :dir))
   (kv-info [_] info)
 
-  (env-opts [_] (dissoc @info :dbis :types :custom-types-revision :custom-value-id
+  (env-opts [_] (dissoc @info :dbis :custom-dbis :types :custom-types-revision :custom-value-id
                        :custom-type-cache :custom-payload-dbi-open? :runtime-opts))
 
   (dbi-opts [_ dbi-name] (get-in @info [:dbis dbi-name]))
@@ -1973,7 +1973,7 @@
                                         c/default-dbi-flags)
                      validate-data? (or (get-in @info
                                                 [:dbis dbi-name :validate-data?])
-                                        false)}}]
+                                        false)} :as supplied}]
     (.check-ready this)
     (assert (< ^long key-size 512) "Key size cannot be greater than 511 bytes")
     (locking dbis
@@ -1984,10 +1984,17 @@
         (if (or (contains? info-dbis dbi-name)
                 (< (count info-dbis) ^long max-dbis))
           (let [existing-opts (get info-dbis dbi-name)
-                opts     {:key-size       key-size
+                _ (doseq [k [:key-type :value-type]
+                          :when (and existing-opts (contains? supplied k)
+                                     (not= (get existing-opts k) (get supplied k)))]
+                    (raise "Cannot change a DBI's installed custom type"
+                           {:error :custom-type/dbi-conflict :dbi dbi-name :option k}))
+                opts     (merge {:key-size       key-size
                           :val-size       val-size
                           :flags          flags
                           :validate-data? validate-data?}
+                                (select-keys existing-opts [:key-type :value-type])
+                                (select-keys supplied [:key-type :value-type]))
                 flags    (set flags)
                 dupsort? (if (:dupsort flags) true false)
                 dupfixed? (if (:dupfixed flags) true false)
@@ -1998,7 +2005,11 @@
                 vc       (bf/allocate-buffer val-size)
                 dbi      (Dbi/create env dbi-name (kv-flags flags))
                 db       (DBI. this dbi (new-pools) kp vp kc vc
-                               dupsort? dupfixed? counted? validate-data?
+                               dupsort? dupfixed? counted?
+                               ;; The custom KV adapter validates logical data;
+                               ;; this DBI receives encoded references and bytes.
+                               (and validate-data?
+                                    (not (or (:key-type opts) (:value-type opts))))
                                nil nil)]
             (when (not= dbi-name c/kv-info)
               (when (not= existing-opts opts)
@@ -2006,6 +2017,8 @@
                 (transact-kv
                   this [(l/kv-tx :put c/kv-info [:dbis dbi-name] opts
                                  [:keyword :string])])))
+            (when (or (:key-type opts) (:value-type opts))
+              (vswap! info update :custom-dbis (fnil conj #{}) dbi-name))
             (.put dbis dbi-name db)
             db)
           (u/raise (str "Reached maximal number of DBI: " max-dbis) {})))))
@@ -2047,6 +2060,7 @@
         (Util/checkRc (DTLV/mdb_drop (.get txn) (.get dbi) 1))
         (.commit txn)
         (vswap! info update :dbis dissoc dbi-name)
+        (vswap! info update :custom-dbis disj dbi-name)
         (transact-kv this c/kv-info
                      [[:del [:dbis dbi-name]]] [:keyword :string])
         (.remove dbis dbi-name)
@@ -2405,14 +2419,15 @@
   (open-list-dbi [this dbi-name {:keys [key-size val-size flags]
                                  :or   {key-size c/+max-key-size+
                                         val-size c/+max-key-size+
-                                        flags    c/default-dbi-flags}}]
+                                        flags    c/default-dbi-flags} :as opts}]
     (.check-ready this)
     (assert (and (>= c/+max-key-size+ ^long key-size)
                  (>= c/+max-key-size+ ^long val-size))
             "Data size cannot be larger than 511 bytes")
     (.open-dbi this dbi-name
-               {:key-size key-size :val-size val-size
-                :flags    (conj flags :dupsort)}))
+               (merge (select-keys opts [:key-type :value-type])
+                      {:key-size key-size :val-size val-size
+                       :flags    (conj flags :dupsort)})))
   (open-list-dbi [lmdb dbi-name]
     (.open-list-dbi lmdb dbi-name nil))
 
@@ -2633,7 +2648,10 @@
                    (i/range-keep lmdb c/kv-info decode-kv-info-entry
                                  [:all] :raw :raw true))]
     (c/canonicalize-wal-opts
-     (assoc info :dbis dbis :types types))))
+     (assoc info :dbis dbis :types types
+            :custom-dbis (into #{} (keep (fn [[name opts]]
+                                          (when (or (:key-type opts) (:value-type opts))
+                                            name))) dbis)))))
 
 (defn- init-info
   [^CppLMDB lmdb new-info]

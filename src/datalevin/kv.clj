@@ -15,6 +15,7 @@
    [clojure.string :as str]
    [datalevin.binding.cpp :as cpp]
    [datalevin.constants :as c]
+   [datalevin.custom-kv :as custom-kv]
    [datalevin.interface :as i]
    [datalevin.lmdb :as l]
    [datalevin.txlog :as txlog]
@@ -50,6 +51,8 @@
          persisted-payload-floor-lsn
          persisted-runtime-floor-lsn
          ->KVLMDB)
+
+(declare raw-lmdb)
 
 (def ^:dynamic *after-txlog-append-fn*
   nil)
@@ -2167,14 +2170,17 @@
              (= :dbis (nth k 0))
              (string? (nth k 1))
              (map? v))
-        (vswap! info-v assoc-in [:dbis (nth k 1)] v)
+        (do (vswap! info-v assoc-in [:dbis (nth k 1)] v)
+            (when (or (:key-type v) (:value-type v))
+              (vswap! info-v update :custom-dbis (fnil conj #{}) (nth k 1))))
 
         (and (= op :del)
              (vector? k)
              (= 2 (count k))
              (= :dbis (nth k 0))
              (string? (nth k 1)))
-        (vswap! info-v update :dbis dissoc (nth k 1))
+        (do (vswap! info-v update :dbis dissoc (nth k 1))
+            (vswap! info-v update :custom-dbis disj (nth k 1)))
 
         (and (= op :put) (= k :max-val-size))
         (vswap! info-v assoc :max-val-size v)
@@ -2204,22 +2210,24 @@
   "Apply physical txlog payload rows without consuming a new local txlog LSN."
   [lmdb rows lsn]
   (let [rows (rows-vector rows)
-        record {:lsn (long lsn)
-                :rows rows}]
-    (with-runtime-txlog-rollback
-      lmdb
-      (fn []
-        (txlog-prepare-replay-dbis! lmdb [record] (dec (long lsn)))
-        (when (= "1" (System/getenv "HA_REPLAY_DEBUG"))
-          (binding [*out* *err*]
-            (prn {:ha-replay-debug true
-                  :lsn (long lsn)
-                  :row-count (count rows)
-                  :row-types (mapv class rows)
-                  :rows rows})))
-        (i/transact-kv
-         lmdb
-         (append-monotonic-payload-lsn-row lmdb rows (long lsn)))))))
+        record {:lsn (long lsn) :rows rows}
+        result
+        (binding [l/*raw-kv?* true]
+          (with-runtime-txlog-rollback
+            lmdb
+            (fn []
+              (txlog-prepare-replay-dbis! lmdb [record] (dec (long lsn)))
+              (when (= "1" (System/getenv "HA_REPLAY_DEBUG"))
+                (binding [*out* *err*]
+                  (prn {:ha-replay-debug true
+                        :lsn (long lsn)
+                        :row-count (count rows)
+                        :row-types (mapv class rows)
+                        :rows rows})))
+              (i/transact-kv
+                lmdb (append-monotonic-payload-lsn-row lmdb rows (long lsn))))))]
+    (custom-kv/initialize! lmdb (raw-lmdb lmdb))
+    result))
 
 (defn- txlog-replay-record!
   [lmdb state record]
@@ -3918,35 +3926,38 @@
   (reset-write [_] (wrap-lmdb (l/reset-write db)))
 
   i/IList
-  (del-list-items [this a0 a1 a2] (i/del-list-items db a0 a1 a2))
-  (del-list-items [this a0 a1 a2 a3 a4] (i/del-list-items db a0 a1 a2 a3 a4))
-  (get-list [this a0 a1 a2 a3] (i/get-list db a0 a1 a2 a3))
-  (in-list? [this a0 a1 a2 a3 a4] (i/in-list? db a0 a1 a2 a3 a4))
-  (list-count [this a0 a1 a2] (i/list-count db a0 a1 a2))
+  (del-list-items [this a0 a1 a2]
+    (i/transact-kv this [(l/kv-tx :del a0 a1 a2)]))
+  (del-list-items [this a0 a1 a2 a3 a4]
+    (i/transact-kv this [(l/kv-tx :del-list a0 a1 a2 a3 a4)]))
+  (get-list [this a0 a1 a2 a3] (custom-kv/read-kv :get-list this db a0 a1 a2 a3))
+  (in-list? [this a0 a1 a2 a3 a4] (custom-kv/read-kv :in-list? this db a0 a1 a2 a3 a4))
+  (list-count [this a0 a1 a2] (custom-kv/read-kv :list-count this db a0 a1 a2))
   (list-dbi? [this a0] (i/list-dbi? db a0))
-  (list-range [this a0 a1 a2 a3 a4] (i/list-range db a0 a1 a2 a3 a4))
-  (list-range-count [this a0 a1 a2] (i/list-range-count db a0 a1 a2))
-  (list-range-filter [this a0 a1 a2 a3 a4 a5] (i/list-range-filter db a0 a1 a2 a3 a4 a5))
-  (list-range-filter [this a0 a1 a2 a3 a4 a5 a6] (i/list-range-filter db a0 a1 a2 a3 a4 a5 a6))
-  (list-range-filter-count [this a0 a1 a2 a3 a4 a5] (i/list-range-filter-count db a0 a1 a2 a3 a4 a5))
-  (list-range-filter-count [this a0 a1 a2 a3 a4 a5 a6] (i/list-range-filter-count db a0 a1 a2 a3 a4 a5 a6))
-  (list-range-first [this a0 a1 a2 a3 a4] (i/list-range-first db a0 a1 a2 a3 a4))
-  (list-range-first-n [this a0 a1 a2 a3 a4 a5] (i/list-range-first-n db a0 a1 a2 a3 a4 a5))
-  (list-range-keep [this a0 a1 a2 a3 a4 a5] (i/list-range-keep db a0 a1 a2 a3 a4 a5))
-  (list-range-keep [this a0 a1 a2 a3 a4 a5 a6] (i/list-range-keep db a0 a1 a2 a3 a4 a5 a6))
-  (list-range-some [this a0 a1 a2 a3 a4 a5] (i/list-range-some db a0 a1 a2 a3 a4 a5))
-  (list-range-some [this a0 a1 a2 a3 a4 a5 a6] (i/list-range-some db a0 a1 a2 a3 a4 a5 a6))
-  (near-list [this a0 a1 a2 a3 a4] (i/near-list db a0 a1 a2 a3 a4))
-  (put-list-items [this a0 a1 a2 a3 a4] (i/put-list-items db a0 a1 a2 a3 a4))
-  (visit-list [this a0 a1 a2 a3] (i/visit-list db a0 a1 a2 a3))
-  (visit-list [this a0 a1 a2 a3 a4] (i/visit-list db a0 a1 a2 a3 a4))
-  (visit-list [this a0 a1 a2 a3 a4 a5] (i/visit-list db a0 a1 a2 a3 a4 a5))
-  (visit-list-key-range [this a0 a1 a2 a3 a4] (i/visit-list-key-range db a0 a1 a2 a3 a4))
-  (visit-list-key-range [this a0 a1 a2 a3 a4 a5] (i/visit-list-key-range db a0 a1 a2 a3 a4 a5))
-  (visit-list-range [this a0 a1 a2 a3 a4 a5] (i/visit-list-range db a0 a1 a2 a3 a4 a5))
-  (visit-list-range [this a0 a1 a2 a3 a4 a5 a6] (i/visit-list-range db a0 a1 a2 a3 a4 a5 a6))
-  (visit-list-sample [this a0 a1 a2 a3 a4 a5] (i/visit-list-sample db a0 a1 a2 a3 a4 a5))
-  (visit-list-sample [this a0 a1 a2 a3 a4 a5 a6] (i/visit-list-sample db a0 a1 a2 a3 a4 a5 a6))
+  (list-range [this a0 a1 a2 a3 a4] (custom-kv/read-kv :list-range this db a0 a1 a2 a3 a4))
+  (list-range-count [this a0 a1 a2] (custom-kv/read-kv :list-range-count this db a0 a1 a2))
+  (list-range-filter [this a0 a1 a2 a3 a4 a5] (custom-kv/read-kv :list-range-filter this db a0 a1 a2 a3 a4 a5))
+  (list-range-filter [this a0 a1 a2 a3 a4 a5 a6] (custom-kv/read-kv :list-range-filter this db a0 a1 a2 a3 a4 a5 a6))
+  (list-range-filter-count [this a0 a1 a2 a3 a4 a5] (custom-kv/read-kv :list-range-filter-count this db a0 a1 a2 a3 a4 a5))
+  (list-range-filter-count [this a0 a1 a2 a3 a4 a5 a6] (custom-kv/read-kv :list-range-filter-count this db a0 a1 a2 a3 a4 a5 a6))
+  (list-range-first [this a0 a1 a2 a3 a4] (custom-kv/read-kv :list-range-first this db a0 a1 a2 a3 a4))
+  (list-range-first-n [this a0 a1 a2 a3 a4 a5] (custom-kv/read-kv :list-range-first-n this db a0 a1 a2 a3 a4 a5))
+  (list-range-keep [this a0 a1 a2 a3 a4 a5] (custom-kv/read-kv :list-range-keep this db a0 a1 a2 a3 a4 a5))
+  (list-range-keep [this a0 a1 a2 a3 a4 a5 a6] (custom-kv/read-kv :list-range-keep this db a0 a1 a2 a3 a4 a5 a6))
+  (list-range-some [this a0 a1 a2 a3 a4 a5] (custom-kv/read-kv :list-range-some this db a0 a1 a2 a3 a4 a5))
+  (list-range-some [this a0 a1 a2 a3 a4 a5 a6] (custom-kv/read-kv :list-range-some this db a0 a1 a2 a3 a4 a5 a6))
+  (near-list [this a0 a1 a2 a3 a4] (custom-kv/read-kv :near-list this db a0 a1 a2 a3 a4))
+  (put-list-items [this a0 a1 a2 a3 a4]
+    (i/transact-kv this [(l/kv-tx :put-list a0 a1 a2 a3 a4)]))
+  (visit-list [this a0 a1 a2 a3] (custom-kv/read-kv :visit-list this db a0 a1 a2 a3))
+  (visit-list [this a0 a1 a2 a3 a4] (custom-kv/read-kv :visit-list this db a0 a1 a2 a3 a4))
+  (visit-list [this a0 a1 a2 a3 a4 a5] (custom-kv/read-kv :visit-list this db a0 a1 a2 a3 a4 a5))
+  (visit-list-key-range [this a0 a1 a2 a3 a4] (custom-kv/read-kv :visit-list-key-range this db a0 a1 a2 a3 a4))
+  (visit-list-key-range [this a0 a1 a2 a3 a4 a5] (custom-kv/read-kv :visit-list-key-range this db a0 a1 a2 a3 a4 a5))
+  (visit-list-range [this a0 a1 a2 a3 a4 a5] (custom-kv/read-kv :visit-list-range this db a0 a1 a2 a3 a4 a5))
+  (visit-list-range [this a0 a1 a2 a3 a4 a5 a6] (custom-kv/read-kv :visit-list-range this db a0 a1 a2 a3 a4 a5 a6))
+  (visit-list-sample [this a0 a1 a2 a3 a4 a5] (custom-kv/read-kv :visit-list-sample this db a0 a1 a2 a3 a4 a5))
+  (visit-list-sample [this a0 a1 a2 a3 a4 a5 a6] (custom-kv/read-kv :visit-list-sample this db a0 a1 a2 a3 a4 a5 a6))
 
   i/IAdmin
   (re-index [this a0] (i/re-index db a0))
@@ -4102,7 +4113,11 @@
       (txlog-reset-pending! (i/kv-info db)))
     (i/abort-transact-kv db))
   (check-ready [this] (i/check-ready db))
-  (clear-dbi [this a0] (i/clear-dbi db a0))
+  (clear-dbi [this a0]
+    (custom-kv/guard-internal! db a0)
+    (if (custom-kv/custom-dbi? db a0)
+      (custom-kv/clear! this db a0)
+      (i/clear-dbi db a0)))
   (close-kv [_]
     (try
       (i/close-kv db)
@@ -4122,53 +4137,59 @@
   (copy [this a0 a1] (txlog-copy-with-backup-pin! this db a0 a1))
   (dbi-opts [this a0] (i/dbi-opts db a0))
   (drop-dbi [this a0]
-    (let [before (try
+    (custom-kv/guard-internal! db a0)
+    (locking (l/write-txn db)
+      (when (and (custom-kv/custom-dbi? db a0) (some? @(l/write-txn db)))
+        (raise "Drop a custom DBI outside an explicit transaction"
+               {:error :custom-type/drop-transaction :dbi a0}))
+      (when (custom-kv/custom-dbi? db a0) (custom-kv/clear! this db a0))
+      (let [before (try
                    (i/dbi-opts db a0)
                    (catch Exception _ nil))
           res (i/drop-dbi db a0)]
       (txlog-log-dbi-drop! this db a0 before)
-      res))
+        res)))
   (entries [this a0] (i/entries db a0))
   (env-dir [this] (i/env-dir db))
   (kv-info [this] (i/kv-info db))
   (env-opts [this] (i/env-opts db))
-  (get-by-rank [this a0 a1] (i/get-by-rank db a0 a1))
-  (get-by-rank [this a0 a1 a2] (i/get-by-rank db a0 a1 a2))
-  (get-by-rank [this a0 a1 a2 a3] (i/get-by-rank db a0 a1 a2 a3))
-  (get-by-rank [this a0 a1 a2 a3 a4] (i/get-by-rank db a0 a1 a2 a3 a4))
+  (get-by-rank [this a0 a1] (custom-kv/read-kv :get-by-rank this db a0 a1))
+  (get-by-rank [this a0 a1 a2] (custom-kv/read-kv :get-by-rank this db a0 a1 a2))
+  (get-by-rank [this a0 a1 a2 a3] (custom-kv/read-kv :get-by-rank this db a0 a1 a2 a3))
+  (get-by-rank [this a0 a1 a2 a3 a4] (custom-kv/read-kv :get-by-rank this db a0 a1 a2 a3 a4))
   (get-dbi [this a0] (i/get-dbi db a0))
   (get-dbi [this a0 a1] (i/get-dbi db a0 a1))
   (get-env-flags [this] (i/get-env-flags db))
-  (get-first [this a0 a1] (i/get-first db a0 a1))
-  (get-first [this a0 a1 a2] (i/get-first db a0 a1 a2))
-  (get-first [this a0 a1 a2 a3] (i/get-first db a0 a1 a2 a3))
-  (get-first [this a0 a1 a2 a3 a4] (i/get-first db a0 a1 a2 a3 a4))
-  (get-first-n [this a0 a1 a2] (i/get-first-n db a0 a1 a2))
-  (get-first-n [this a0 a1 a2 a3] (i/get-first-n db a0 a1 a2 a3))
-  (get-first-n [this a0 a1 a2 a3 a4] (i/get-first-n db a0 a1 a2 a3 a4))
-  (get-first-n [this a0 a1 a2 a3 a4 a5] (i/get-first-n db a0 a1 a2 a3 a4 a5))
-  (get-range [this a0 a1] (i/get-range db a0 a1))
-  (get-range [this a0 a1 a2] (i/get-range db a0 a1 a2))
-  (get-range [this a0 a1 a2 a3] (i/get-range db a0 a1 a2 a3))
-  (get-range [this a0 a1 a2 a3 a4] (i/get-range db a0 a1 a2 a3 a4))
-  (get-rank [this a0 a1] (i/get-rank db a0 a1))
-  (get-rank [this a0 a1 a2] (i/get-rank db a0 a1 a2))
+  (get-first [this a0 a1] (custom-kv/read-kv :get-first this db a0 a1))
+  (get-first [this a0 a1 a2] (custom-kv/read-kv :get-first this db a0 a1 a2))
+  (get-first [this a0 a1 a2 a3] (custom-kv/read-kv :get-first this db a0 a1 a2 a3))
+  (get-first [this a0 a1 a2 a3 a4] (custom-kv/read-kv :get-first this db a0 a1 a2 a3 a4))
+  (get-first-n [this a0 a1 a2] (custom-kv/read-kv :get-first-n this db a0 a1 a2))
+  (get-first-n [this a0 a1 a2 a3] (custom-kv/read-kv :get-first-n this db a0 a1 a2 a3))
+  (get-first-n [this a0 a1 a2 a3 a4] (custom-kv/read-kv :get-first-n this db a0 a1 a2 a3 a4))
+  (get-first-n [this a0 a1 a2 a3 a4 a5] (custom-kv/read-kv :get-first-n this db a0 a1 a2 a3 a4 a5))
+  (get-range [this a0 a1] (custom-kv/read-kv :get-range this db a0 a1))
+  (get-range [this a0 a1 a2] (custom-kv/read-kv :get-range this db a0 a1 a2))
+  (get-range [this a0 a1 a2 a3] (custom-kv/read-kv :get-range this db a0 a1 a2 a3))
+  (get-range [this a0 a1 a2 a3 a4] (custom-kv/read-kv :get-range this db a0 a1 a2 a3 a4))
+  (get-rank [this a0 a1] (custom-kv/read-kv :get-rank this db a0 a1))
+  (get-rank [this a0 a1 a2] (custom-kv/read-kv :get-rank this db a0 a1 a2))
   (get-rtx [this] (i/get-rtx db))
-  (get-some [this a0 a1 a2] (i/get-some db a0 a1 a2))
-  (get-some [this a0 a1 a2 a3] (i/get-some db a0 a1 a2 a3))
-  (get-some [this a0 a1 a2 a3 a4] (i/get-some db a0 a1 a2 a3 a4))
-  (get-some [this a0 a1 a2 a3 a4 a5] (i/get-some db a0 a1 a2 a3 a4 a5))
-  (get-some [this a0 a1 a2 a3 a4 a5 a6] (i/get-some db a0 a1 a2 a3 a4 a5 a6))
-  (get-value [this a0 a1] (i/get-value db a0 a1))
-  (get-value [this a0 a1 a2] (i/get-value db a0 a1 a2))
-  (get-value [this a0 a1 a2 a3] (i/get-value db a0 a1 a2 a3))
-  (get-value [this a0 a1 a2 a3 a4] (i/get-value db a0 a1 a2 a3 a4))
+  (get-some [this a0 a1 a2] (custom-kv/read-kv :get-some this db a0 a1 a2))
+  (get-some [this a0 a1 a2 a3] (custom-kv/read-kv :get-some this db a0 a1 a2 a3))
+  (get-some [this a0 a1 a2 a3 a4] (custom-kv/read-kv :get-some this db a0 a1 a2 a3 a4))
+  (get-some [this a0 a1 a2 a3 a4 a5] (custom-kv/read-kv :get-some this db a0 a1 a2 a3 a4 a5))
+  (get-some [this a0 a1 a2 a3 a4 a5 a6] (custom-kv/read-kv :get-some this db a0 a1 a2 a3 a4 a5 a6))
+  (get-value [this a0 a1] (custom-kv/read-kv :get-value this db a0 a1))
+  (get-value [this a0 a1 a2] (custom-kv/read-kv :get-value this db a0 a1 a2))
+  (get-value [this a0 a1 a2 a3] (custom-kv/read-kv :get-value this db a0 a1 a2 a3))
+  (get-value [this a0 a1 a2 a3 a4] (custom-kv/read-kv :get-value this db a0 a1 a2 a3 a4))
   (key-compressor [this] (i/key-compressor db))
-  (key-range [this a0 a1] (i/key-range db a0 a1))
-  (key-range [this a0 a1 a2] (i/key-range db a0 a1 a2))
-  (key-range-count [this a0 a1] (i/key-range-count db a0 a1))
-  (key-range-count [this a0 a1 a2] (i/key-range-count db a0 a1 a2))
-  (key-range-list-count [this a0 a1 a2] (i/key-range-list-count db a0 a1 a2))
+  (key-range [this a0 a1] (custom-kv/read-kv :key-range this db a0 a1))
+  (key-range [this a0 a1 a2] (custom-kv/read-kv :key-range this db a0 a1 a2))
+  (key-range-count [this a0 a1] (custom-kv/read-kv :key-range-count this db a0 a1))
+  (key-range-count [this a0 a1 a2] (custom-kv/read-kv :key-range-count this db a0 a1 a2))
+  (key-range-list-count [this a0 a1 a2] (custom-kv/read-kv :key-range-list-count this db a0 a1 a2))
   (list-dbis [this] (i/list-dbis db))
   (max-val-size [this] (i/max-val-size db))
   (open-dbi [this a0]
@@ -4177,7 +4198,8 @@
     (let [before (try
                    (i/dbi-opts db a0)
                    (catch Exception _ nil))
-          res (i/open-dbi db a0 a1)
+          opts (if l/*raw-kv?* a1 (custom-kv/prepare-dbi! this db a0 a1))
+          res (i/open-dbi db a0 opts)
           after (i/dbi-opts db a0)]
       (txlog-log-dbi-registration! this db a0 before after)
       res))
@@ -4187,39 +4209,43 @@
     (let [before (try
                    (i/dbi-opts db a0)
                    (catch Exception _ nil))
-          res (i/open-list-dbi db a0 a1)
+          supplied (assoc a1 :flags (conj (set (or (:flags a1) (:flags before)
+                                                   c/default-dbi-flags)) :dupsort))
+          opts (if l/*raw-kv?* supplied
+                   (custom-kv/prepare-dbi! this db a0 supplied))
+          res (i/open-list-dbi db a0 opts)
           after (i/dbi-opts db a0)]
       (txlog-log-dbi-registration! this db a0 before after)
       res))
-  (range-count [this a0 a1] (i/range-count db a0 a1))
-  (range-count [this a0 a1 a2] (i/range-count db a0 a1 a2))
-  (range-filter [this a0 a1 a2] (i/range-filter db a0 a1 a2))
-  (range-filter [this a0 a1 a2 a3] (i/range-filter db a0 a1 a2 a3))
-  (range-filter [this a0 a1 a2 a3 a4] (i/range-filter db a0 a1 a2 a3 a4))
-  (range-filter [this a0 a1 a2 a3 a4 a5] (i/range-filter db a0 a1 a2 a3 a4 a5))
-  (range-filter [this a0 a1 a2 a3 a4 a5 a6] (i/range-filter db a0 a1 a2 a3 a4 a5 a6))
-  (range-filter-count [this a0 a1 a2] (i/range-filter-count db a0 a1 a2))
-  (range-filter-count [this a0 a1 a2 a3] (i/range-filter-count db a0 a1 a2 a3))
-  (range-filter-count [this a0 a1 a2 a3 a4] (i/range-filter-count db a0 a1 a2 a3 a4))
-  (range-filter-count [this a0 a1 a2 a3 a4 a5] (i/range-filter-count db a0 a1 a2 a3 a4 a5))
-  (range-keep [this a0 a1 a2] (i/range-keep db a0 a1 a2))
-  (range-keep [this a0 a1 a2 a3] (i/range-keep db a0 a1 a2 a3))
-  (range-keep [this a0 a1 a2 a3 a4] (i/range-keep db a0 a1 a2 a3 a4))
-  (range-keep [this a0 a1 a2 a3 a4 a5] (i/range-keep db a0 a1 a2 a3 a4 a5))
-  (range-seq [this a0 a1] (i/range-seq db a0 a1))
-  (range-seq [this a0 a1 a2] (i/range-seq db a0 a1 a2))
-  (range-seq [this a0 a1 a2 a3] (i/range-seq db a0 a1 a2 a3))
-  (range-seq [this a0 a1 a2 a3 a4] (i/range-seq db a0 a1 a2 a3 a4))
-  (range-seq [this a0 a1 a2 a3 a4 a5] (i/range-seq db a0 a1 a2 a3 a4 a5))
-  (range-some [this a0 a1 a2] (i/range-some db a0 a1 a2))
-  (range-some [this a0 a1 a2 a3] (i/range-some db a0 a1 a2 a3))
-  (range-some [this a0 a1 a2 a3 a4] (i/range-some db a0 a1 a2 a3 a4))
-  (range-some [this a0 a1 a2 a3 a4 a5] (i/range-some db a0 a1 a2 a3 a4 a5))
+  (range-count [this a0 a1] (custom-kv/read-kv :range-count this db a0 a1))
+  (range-count [this a0 a1 a2] (custom-kv/read-kv :range-count this db a0 a1 a2))
+  (range-filter [this a0 a1 a2] (custom-kv/read-kv :range-filter this db a0 a1 a2))
+  (range-filter [this a0 a1 a2 a3] (custom-kv/read-kv :range-filter this db a0 a1 a2 a3))
+  (range-filter [this a0 a1 a2 a3 a4] (custom-kv/read-kv :range-filter this db a0 a1 a2 a3 a4))
+  (range-filter [this a0 a1 a2 a3 a4 a5] (custom-kv/read-kv :range-filter this db a0 a1 a2 a3 a4 a5))
+  (range-filter [this a0 a1 a2 a3 a4 a5 a6] (custom-kv/read-kv :range-filter this db a0 a1 a2 a3 a4 a5 a6))
+  (range-filter-count [this a0 a1 a2] (custom-kv/read-kv :range-filter-count this db a0 a1 a2))
+  (range-filter-count [this a0 a1 a2 a3] (custom-kv/read-kv :range-filter-count this db a0 a1 a2 a3))
+  (range-filter-count [this a0 a1 a2 a3 a4] (custom-kv/read-kv :range-filter-count this db a0 a1 a2 a3 a4))
+  (range-filter-count [this a0 a1 a2 a3 a4 a5] (custom-kv/read-kv :range-filter-count this db a0 a1 a2 a3 a4 a5))
+  (range-keep [this a0 a1 a2] (custom-kv/read-kv :range-keep this db a0 a1 a2))
+  (range-keep [this a0 a1 a2 a3] (custom-kv/read-kv :range-keep this db a0 a1 a2 a3))
+  (range-keep [this a0 a1 a2 a3 a4] (custom-kv/read-kv :range-keep this db a0 a1 a2 a3 a4))
+  (range-keep [this a0 a1 a2 a3 a4 a5] (custom-kv/read-kv :range-keep this db a0 a1 a2 a3 a4 a5))
+  (range-seq [this a0 a1] (custom-kv/read-kv :range-seq this db a0 a1))
+  (range-seq [this a0 a1 a2] (custom-kv/read-kv :range-seq this db a0 a1 a2))
+  (range-seq [this a0 a1 a2 a3] (custom-kv/read-kv :range-seq this db a0 a1 a2 a3))
+  (range-seq [this a0 a1 a2 a3 a4] (custom-kv/read-kv :range-seq this db a0 a1 a2 a3 a4))
+  (range-seq [this a0 a1 a2 a3 a4 a5] (custom-kv/read-kv :range-seq this db a0 a1 a2 a3 a4 a5))
+  (range-some [this a0 a1 a2] (custom-kv/read-kv :range-some this db a0 a1 a2))
+  (range-some [this a0 a1 a2 a3] (custom-kv/read-kv :range-some this db a0 a1 a2 a3))
+  (range-some [this a0 a1 a2 a3 a4] (custom-kv/read-kv :range-some this db a0 a1 a2 a3 a4))
+  (range-some [this a0 a1 a2 a3 a4 a5] (custom-kv/read-kv :range-some this db a0 a1 a2 a3 a4 a5))
   (return-rtx [this a0] (i/return-rtx db a0))
-  (sample-kv [this a0 a1] (i/sample-kv db a0 a1))
-  (sample-kv [this a0 a1 a2] (i/sample-kv db a0 a1 a2))
-  (sample-kv [this a0 a1 a2 a3] (i/sample-kv db a0 a1 a2 a3))
-  (sample-kv [this a0 a1 a2 a3 a4] (i/sample-kv db a0 a1 a2 a3 a4))
+  (sample-kv [this a0 a1] (custom-kv/read-kv :sample-kv this db a0 a1))
+  (sample-kv [this a0 a1 a2] (custom-kv/read-kv :sample-kv this db a0 a1 a2))
+  (sample-kv [this a0 a1 a2 a3] (custom-kv/read-kv :sample-kv this db a0 a1 a2 a3))
+  (sample-kv [this a0 a1 a2 a3 a4] (custom-kv/read-kv :sample-kv this db a0 a1 a2 a3 a4))
   (set-env-flags [this a0 a1] (i/set-env-flags db a0 a1))
   (set-key-compressor [this a0] (i/set-key-compressor db a0))
   (set-max-val-size [this a0] (i/set-max-val-size db a0))
@@ -4231,25 +4257,27 @@
   (transact-kv [this a0] (.transact-kv this nil a0))
   (transact-kv [this a0 a1] (.transact-kv this a0 a1 :data :data))
   (transact-kv [this a0 a1 a2] (.transact-kv this a0 a1 a2 :data))
-  (transact-kv [_ a0 a1 a2 a3]
-    (with-write-txn-lock-before-runtime-txlog-state
+  (transact-kv [this a0 a1 a2 a3]
+    (if (custom-kv/custom-txs? db a0 a1)
+      (custom-kv/transact! this db a0 a1 a2 a3)
+      (with-write-txn-lock-before-runtime-txlog-state
       db
       (fn []
         (if (txlog-write-path-enabled? db)
           (if-let [state (txlog-runtime-state db)]
             (transact-with-txlog! db state a0 a1 a2 a3)
             (i/transact-kv db a0 a1 a2 a3))
-          (i/transact-kv db a0 a1 a2 a3)))))
+          (i/transact-kv db a0 a1 a2 a3))))))
   (val-compressor [this] (i/val-compressor db))
-  (visit [this a0 a1 a2] (i/visit db a0 a1 a2))
-  (visit [this a0 a1 a2 a3] (i/visit db a0 a1 a2 a3))
-  (visit [this a0 a1 a2 a3 a4] (i/visit db a0 a1 a2 a3 a4))
-  (visit [this a0 a1 a2 a3 a4 a5] (i/visit db a0 a1 a2 a3 a4 a5))
-  (visit-key-range [this a0 a1 a2] (i/visit-key-range db a0 a1 a2))
-  (visit-key-range [this a0 a1 a2 a3] (i/visit-key-range db a0 a1 a2 a3))
-  (visit-key-range [this a0 a1 a2 a3 a4] (i/visit-key-range db a0 a1 a2 a3 a4))
-  (visit-key-sample [this a0 a1 a2 a3 a4] (i/visit-key-sample db a0 a1 a2 a3 a4))
-  (visit-key-sample [this a0 a1 a2 a3 a4 a5] (i/visit-key-sample db a0 a1 a2 a3 a4 a5)))
+  (visit [this a0 a1 a2] (custom-kv/read-kv :visit this db a0 a1 a2))
+  (visit [this a0 a1 a2 a3] (custom-kv/read-kv :visit this db a0 a1 a2 a3))
+  (visit [this a0 a1 a2 a3 a4] (custom-kv/read-kv :visit this db a0 a1 a2 a3 a4))
+  (visit [this a0 a1 a2 a3 a4 a5] (custom-kv/read-kv :visit this db a0 a1 a2 a3 a4 a5))
+  (visit-key-range [this a0 a1 a2] (custom-kv/read-kv :visit-key-range this db a0 a1 a2))
+  (visit-key-range [this a0 a1 a2 a3] (custom-kv/read-kv :visit-key-range this db a0 a1 a2 a3))
+  (visit-key-range [this a0 a1 a2 a3 a4] (custom-kv/read-kv :visit-key-range this db a0 a1 a2 a3 a4))
+  (visit-key-sample [this a0 a1 a2 a3 a4] (custom-kv/read-kv :visit-key-sample this db a0 a1 a2 a3 a4))
+  (visit-key-sample [this a0 a1 a2 a3 a4 a5] (custom-kv/read-kv :visit-key-sample this db a0 a1 a2 a3 a4 a5)))
 
 (defn raw-lmdb
   [db]
@@ -4266,7 +4294,9 @@
                   (i/env-opts db)))]
       (try
         (ensure-txlog-ready! db)
-        (->KVLMDB db)
+        (let [wrapped (->KVLMDB db)]
+          (when-not (l/writing? db) (custom-kv/initialize! wrapped db))
+          wrapped)
         (catch Exception e
           (if fallback-attempted?
             (do

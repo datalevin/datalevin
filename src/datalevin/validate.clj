@@ -15,6 +15,7 @@
    [datalevin.interface :as i
     :refer [schema opts populated? visit-list-range]]
    [datalevin.index :as idx]
+   [datalevin.custom-datalog :as cd]
    [datalevin.datom :as d]
    [datalevin.udf :as udf]
    [datalevin.constants :as c]
@@ -25,7 +26,8 @@
   (:import
    [java.nio.charset StandardCharsets]
    [java.security MessageDigest]
-   [datalevin.bits Retrieved]
+   [datalevin.bits Retrieved CustomReference]
+   [java.util Arrays]
    [datalevin.datom Datom]
    [datalevin.lmdb KVTxData]
    [java.nio.charset StandardCharsets]
@@ -58,7 +60,7 @@
   (when (not= old new)
     (when-let [props ((schema store) attr)]
       (let [old-vt (idx/value-type props)]
-        (when-not (identical? old-vt :data)
+        (when (or (not (identical? old-vt :data)) (cd/custom-type? new))
           (let [low-datom  (d/datom c/e0 attr c/v0)
                 high-datom (d/datom c/emax attr c/vmax)]
             (when (populated? store :ave low-datom high-datom)
@@ -69,18 +71,30 @@
   "Check if adding uniqueness to an attribute would violate existing data."
   [lmdb idx-schema low-datom high-datom]
   (let [prev-v   (volatile! nil)
+        bucket   (volatile! nil)
+        seen     (volatile! #{})
         violate? (volatile! false)
         visitor  (fn [kv]
                    (let [avg ^Retrieved (b/read-buffer (lmdb/k kv) :avg)
-                         v   (idx/retrieved->v lmdb avg)]
-                     (if (= @prev-v v)
+                         v   (idx/retrieved->v lmdb avg)
+                         custom? (instance? CustomReference (.-v avg))
+                         duplicate?
+                         (if custom?
+                           (let [^bytes ref (.-reference ^CustomReference (.-v avg))
+                                 prefix (Arrays/copyOf ref (- (alength ref) Long/BYTES))]
+                             (when-not (Arrays/equals ^bytes @bucket ^bytes prefix)
+                               (vreset! bucket prefix)
+                               (vreset! seen #{}))
+                             (contains? @seen v))
+                           (= @prev-v v))]
+                     (if duplicate?
                        (do (vreset! violate? true)
                            :datalevin/terminate-visit)
-                       (vreset! prev-v v))))]
+                       (if custom? (vswap! seen conj v) (vreset! prev-v v)))))]
     (visit-list-range
       lmdb c/ave visitor
-      [:closed (idx/index->k :ave idx-schema low-datom false)
-       (idx/index->k :ave idx-schema high-datom true)] :avg
+      [:closed (idx/index->k :ave lmdb idx-schema low-datom false)
+       (idx/index->k :ave lmdb idx-schema high-datom true)] :avg
       [:closed c/e0 c/emax] :id)
     @violate?))
 
@@ -1207,8 +1221,9 @@
            :key       :db/isComponent})))
     (validate-schema-key a :db/unique (:db/unique kv)
                          #{:db.unique/value :db.unique/identity})
-    (validate-schema-key a :db/valueType (:db/valueType kv)
-                         c/datalog-value-types)
+    (when-not (cd/custom-type? (:db/valueType kv))
+      (validate-schema-key a :db/valueType (:db/valueType kv)
+                           c/datalog-value-types))
     (validate-schema-key a :db/cardinality (:db/cardinality kv)
                          #{:db.cardinality/one :db.cardinality/many})
     (validate-schema-key a :db/fulltext (:db/fulltext kv)
@@ -1375,6 +1390,7 @@
         st-schema (schema store)
         vt        (idx/value-type (st-schema a))]
     (or (not (st-opts :validate-data?))
+        (cd/custom-type? vt)
         (b/valid-data? v vt)
         (u/raise "Invalid data, expecting" vt " got " v {:input v}))
     vt))

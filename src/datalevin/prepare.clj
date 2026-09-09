@@ -13,6 +13,7 @@
    [datalevin.interface :as i
     :refer [schema opts]]
    [datalevin.index :as idx]
+   [datalevin.custom-datalog :as cd]
    [datalevin.datom :as d]
    [datalevin.util :as u]
    [datalevin.bits :as b])
@@ -204,6 +205,7 @@
        a props store-opts v)
       (do
         (or (not (store-opts :validate-data?))
+            (cd/custom-type? vt)
             (b/valid-data? v vt)
             (u/raise "Invalid data, expecting" vt " got " v {:input v}))
         (type-coercion vt v)))))

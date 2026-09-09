@@ -13,6 +13,8 @@
    [clojure.string :as s]
    [datalevin.bits :as b]
    [datalevin.constants :as c]
+   [datalevin.custom-datalog :as cd]
+   [datalevin.custom-value :as cv]
    [datalevin.db :as db]
    [datalevin.ha.client-cache :as cache]
    [datalevin.ha.lease :as lease]
@@ -29,7 +31,7 @@
    [datalevin.validate :as vld]
    [taoensso.timbre :as log])
   (:import
-   [datalevin.bits Indexable Retrieved]
+   [datalevin.bits Indexable Retrieved CustomReference]
    [datalevin.db DB]
    [datalevin.interface IStore ILMDB]
    [datalevin.storage Store]
@@ -1725,14 +1727,17 @@
 
     (instance? Retrieved existing)
     (let [^Retrieved r existing
-          g              (or (.-g r) c/normal)
-          value          (idx/retrieved->v kv-store r)
-          ^Indexable idx (b/indexable (long e)
-                                      aid
-                                      value
-                                      (idx/value-type props)
-                                      (long g))]
-      (Indexable. (long e) aid value (.-f idx) (.-b idx) g))
+          v (.-v r)]
+      (if (instance? CustomReference v)
+        (cd/indexable e aid (.-reference ^CustomReference v))
+        (let [g              (or (.-g r) c/normal)
+              value          (idx/retrieved->v kv-store r)
+              ^Indexable idx (b/indexable (long e)
+                                          aid
+                                          value
+                                          (idx/value-type props)
+                                          (long g))]
+          (Indexable. (long e) aid value (.-f idx) (.-b idx) g))))
 
     :else
     nil))
@@ -1742,7 +1747,10 @@
   (cond-> [[:del-list c/ave idx [(long e)] :avg :id]
            [:del-list c/eav (long e) [idx] :id :avg]]
     (not= c/normal (.-g idx))
-    (conj [:del c/giants (.-g idx) :id])))
+    (conj [:del c/giants (.-g idx) :id])
+    (= c/type-custom (.-f idx))
+    (conj [:del c/custom-values
+           (cv/reference-id (.-reference ^CustomReference (.-v idx))) :id])))
 
 (defn- ha-cardinality-one-eav-cleanup-rows
   [store kv-store replay-rows]

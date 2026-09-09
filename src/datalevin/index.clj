@@ -12,13 +12,14 @@
   (:require
    [datalevin.interface :refer [get-value]]
    [datalevin.bits :as b]
+   [datalevin.custom-datalog :as cd]
    [datalevin.datom :as d]
    [datalevin.constants :as c]
    [datalevin.util :as u])
   (:import
    [com.github.luben.zstd Zstd]
    [java.nio ByteBuffer]
-   [datalevin.bits Retrieved]
+   [datalevin.bits Retrieved CustomReference]
    [datalevin.datom Datom]))
 
 (defn value-type
@@ -31,29 +32,35 @@
       vt)
     :data))
 
+(defn storage-type [lmdb props]
+  (let [vt (value-type props)]
+    (if (cd/custom-type? vt) (cd/descriptor lmdb vt) vt)))
+
 (defn datom->indexable
-  [schema ^Datom d high?]
-  (let [e  (if-some [e (.-e d)] e (if high? c/emax c/e0))
-        vm (if high? c/vmax c/v0)
-        gm (if high? c/gmax c/g0)]
-    (if-let [a (.-a d)]
-      (if-let [p (schema a)]
-        (if-some [v (.-v d)]
-          (b/indexable e (p :db/aid) v (value-type p) gm)
-          (b/indexable e (p :db/aid) vm (value-type p) gm))
-        (b/indexable e c/a0 c/v0 nil gm))
-      (let [am (if high? c/amax c/a0)]
-        (if-some [v (.-v d)]
-          (if (or (integer? v)
-                  (identical? v :db.value/sysMax)
-                  (identical? v :db.value/sysMin))
-            (if e
-              (b/indexable e am v :db.type/ref gm)
-              (b/indexable (if high? c/emax c/e0) am v :db.type/ref gm))
-            (u/raise
-              "When v is known but a is unknown, v must be a :db.type/ref"
-              {:v v}))
-          (b/indexable e am vm :db.type/sysMin gm))))))
+  ([schema d high?] (datom->indexable nil schema d high?))
+  ([lmdb schema ^Datom d high?]
+   (let [e  (if-some [e (.-e d)] e (if high? c/emax c/e0))
+         vm (if high? c/vmax c/v0)
+         gm (if high? c/gmax c/g0)]
+     (if-let [a (.-a d)]
+       (if-let [p (schema a)]
+         (if-some [v (.-v d)]
+           (b/indexable e (p :db/aid) v (storage-type lmdb p)
+                        (if (and (not high?) (cd/custom-type? (value-type p))) 0 gm))
+           (b/indexable e (p :db/aid) vm (storage-type lmdb p) gm))
+         (b/indexable e c/a0 c/v0 nil gm))
+       (let [am (if high? c/amax c/a0)]
+         (if-some [v (.-v d)]
+           (if (or (integer? v)
+                   (identical? v :db.value/sysMax)
+                   (identical? v :db.value/sysMin))
+             (if e
+               (b/indexable e am v :db.type/ref gm)
+               (b/indexable (if high? c/emax c/e0) am v :db.type/ref gm))
+             (u/raise
+               "When v is known but a is unknown, v must be a :db.type/ref"
+               {:v v}))
+           (b/indexable e am vm :db.type/sysMin gm)))))))
 
 (defonce index->dbi {:eav c/eav :ave c/ave})
 
@@ -118,16 +125,18 @@
     (b/read-buffer (ByteBuffer/wrap bs) :data)))
 
 (defn index->k
-  [index schema ^Datom datom high?]
-  (case index
-    :eav (or (.-e datom) (if high? c/emax c/e0))
-    :ave (datom->indexable schema datom high?)))
+  ([index schema datom high?] (index->k index nil schema datom high?))
+  ([index lmdb schema ^Datom datom high?]
+   (case index
+     :eav (or (.-e datom) (if high? c/emax c/e0))
+     :ave (datom->indexable lmdb schema datom high?))))
 
 (defn index->v
-  [index schema ^Datom datom high?]
-  (case index
-    :eav (datom->indexable schema datom high?)
-    :ave (or (.-e datom) (if high? c/emax c/e0))))
+  ([index schema datom high?] (index->v index nil schema datom high?))
+  ([index lmdb schema ^Datom datom high?]
+   (case index
+     :eav (datom->indexable lmdb schema datom high?)
+     :ave (or (.-e datom) (if high? c/emax c/e0)))))
 
 (defn gt->datom
   [lmdb gt]
@@ -138,12 +147,14 @@
   [lmdb ^Retrieved r]
   (let [g (.-g r)]
     (if (= g c/normal)
-      (.-v r)
+      (let [v (.-v r)]
+        (if (instance? CustomReference v) (cd/read-value lmdb (.-a r) v) v))
       (d/datom-v (gt->datom lmdb g)))))
 
 (defn avg-buffer->v
   [lmdb ^ByteBuffer bf]
   (let [g (b/avg->giant-id bf)]
     (if (= g c/normal)
-      (b/avg->inline-value bf)
+      (let [v (b/avg->inline-value bf)]
+        (if (instance? CustomReference v) (cd/read-value lmdb (b/avg->aid bf) v) v))
       (d/datom-v (gt->datom lmdb g)))))

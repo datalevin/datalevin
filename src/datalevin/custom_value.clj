@@ -198,6 +198,12 @@
     (fn [payload-dbi rtx]
       ((:deserialize type) (read-payload payload-dbi rtx (reference-id ref))))))
 
+(defn read-value-at
+  "Resolve a reference using a caller-owned index snapshot."
+  [kv type ref rtx]
+  ((:deserialize type)
+   (read-payload (i/get-dbi kv c/custom-values false) rtx (reference-id ref))))
+
 (defn- check-index! [kv {:keys [dbi position key]}]
   (when (or (not (string? dbi)) (= dbi c/custom-values) (= dbi c/kv-info)
             (not (#{:key :item} position))
@@ -209,7 +215,7 @@
               (some flags [:reversekey :integerkey :reversedup :integerdup :dupfixed]))
       (raise "Custom index requires an opened DBI with ordinary byte ordering"
              {:error :custom-type/index :dbi dbi :flags flags})))
-  (when (not= (= position :item) (boolean (i/list-dbi? kv dbi)))
+  (when (and (= position :item) (not (i/list-dbi? kv dbi)))
     (raise "Custom index position disagrees with DBI duplicate flags"
            {:error :custom-type/index :dbi dbi :position position})))
 
@@ -299,15 +305,15 @@
   owned by with-transaction-kv. Prepare user function results before calling."
   [kv txs]
   (require-writer! kv)
-  (try (i/transact-kv kv txs)
+  (try (binding [l/*raw-kv?* true] (i/transact-kv kv txs))
        (catch Throwable e
          (when-not (l/resized? e) (i/abort-transact-kv kv))
          (throw e))))
 
-(defn- put-index-tx [{:keys [dbi position key]} ref associated]
+(defn- put-index-tx [{:keys [dbi position key flags]} ref associated]
   (if (= position :key)
-    (l/kv-tx :put dbi ref associated :raw :raw)
-    (l/kv-tx :put dbi key ref :raw :raw)))
+    (l/kv-tx :put dbi ref associated :raw :raw flags)
+    (l/kv-tx :put dbi key ref :raw :raw flags)))
 
 (defn- delete-index-tx [{:keys [dbi position key]} ref]
   (if (= position :key)

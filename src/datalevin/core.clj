@@ -1309,8 +1309,10 @@ Only usable for debug output.
   definitions require an explicit migration. Registration participates in an
   enclosing KV write transaction when passed its transaction handle.
 
-  This establishes the registry; custom key and attribute storage is planned
-  separately. Remote registration is not yet supported."
+  Declare custom keys with `open-dbi`'s `:key-type` option, or ordered custom
+  list items with `open-list-dbi`'s `:value-type` option. Datalog attributes
+  declare the registered name as `:db/valueType`. Remote registration is
+  not yet supported."
   [kv-or-conn type-name definition]
   (custom/register-type (if (conn/conn? kv-or-conn)
                           (conn/datalog-kv kv-or-conn)
@@ -1322,6 +1324,13 @@ Only usable for debug output.
        :doc      "Open a named DBI (i.e. sub-db) in the key-value store. `opts` is an option map that may have the following keys:
 
       * `:validate-data?`, a boolean, instructing the system to validate data type during transaction. Default is `false`.
+
+      * `:key-type` names a registered custom type for ordered keys. The default
+        `:data` operation type selects this declaration; explicit types must agree.
+        It is persisted and cannot be changed on an existing DBI.
+
+      * `:value-type` names a registered custom type for ordered duplicate items
+        in a list/dupsort DBI. It can be combined with a custom `:key-type`.
 
       * `:closed-schema?`, a boolean, instructing the system to only allow entity attributes defined in the schema during transaction. Default is `false`.
 
@@ -2009,8 +2018,10 @@ To access store on a server, [[interpret.inter-fn]] should be used to define the
   in [[open-dbi]].
 
   These values (the list) will be stored together in a sorted set.
-  They should be of the same type. Each list item cannot be
-  larger than 511 bytes. Point and range queries on these values are
+  They should be of the same type. Each encoded list item cannot be
+  larger than 511 bytes. With a registered custom `:value-type`, this limit
+  applies to its ordered reference; the complete payload is stored separately.
+  Point and range queries on these values are
   supported. When `:dupfixed` is set, list values bypass the environment-wide
   `:val-compress` option so their encoded width remains fixed.
 

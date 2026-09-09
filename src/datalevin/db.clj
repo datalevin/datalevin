@@ -17,6 +17,7 @@
    [datalevin.client-op :as cop]
    [datalevin.constants :as c :refer [e0 emax v0 vmax]]
    [datalevin.datom :as d :refer [datom datom?]]
+   [datalevin.custom-datalog :as cd]
    [datalevin.db.tx.common :as txcommon]
    [datalevin.db.tx.execute :as txexec]
    [datalevin.db.tx.prepare :as txprep]
@@ -537,39 +538,50 @@
       (d/nil-cmp a b))))
 
 (defn- cmp-datoms-eavt-schema
-  [schema ^Datom d1 ^Datom d2]
+  [schema value-cmp ^Datom d1 ^Datom d2]
   (u/combine-cmp
     (Long/compare (.-e d1) (.-e d2))
     (cmp-attrs-by-aid schema (.-a d1) (.-a d2))
-    (d/nil-cmp-type (.-v d1) (.-v d2))
+    (value-cmp (.-a d1) (.-v d1) (.-v d2))
     (Long/compare (d/datom-tx d1) (d/datom-tx d2))))
 
 (defn- cmp-datoms-avet-schema
-  [schema ^Datom d1 ^Datom d2]
+  [schema value-cmp ^Datom d1 ^Datom d2]
   (u/combine-cmp
     (cmp-attrs-by-aid schema (.-a d1) (.-a d2))
-    (d/nil-cmp-type (.-v d1) (.-v d2))
+    (value-cmp (.-a d1) (.-v d1) (.-v d2))
     (Long/compare (.-e d1) (.-e d2))
     (Long/compare (d/datom-tx d1) (d/datom-tx d2))))
 
+(defn- tx-cache-index-comparator
+  ([db index] (tx-cache-index-comparator db index false))
+  ([db index buckets?]
+   (let [schema (-schema db)
+         store (:store db)
+         kv (when (instance? Store store) (.-lmdb ^Store store))
+         value-cmp ((if buckets? cd/order-comparator cd/value-comparator) kv (constantly schema))]
+     (case index
+       :eav #(cmp-datoms-eavt-schema schema value-cmp %1 %2)
+       :ave #(cmp-datoms-avet-schema schema value-cmp %1 %2)
+       nil))))
+
 (defn- tx-cache-range-datoms
   [db index start-datom end-datom]
-  (case index
-    :eav (let [e (.-e ^Datom start-datom)]
-           (if (and (some? e) (= e (.-e ^Datom end-datom)))
-             (tx-cache-e-datoms db e)
-             (tx-cache-bounded-datoms
-               (:eavt db) d/cmp-datoms-eavt start-datom end-datom)))
-    :ave (tx-cache-bounded-datoms
-           (:avet db) d/cmp-datoms-avet start-datom end-datom)
-    nil))
-
-(defn- tx-cache-index-comparator
-  [db index]
-  (let [schema (-schema db)]
+  (if (cd/custom-schema? (-schema db))
+    (let [cmp (tx-cache-index-comparator db index true)
+          [lo hi] (if (pos? (long (cmp start-datom end-datom)))
+                    [end-datom start-datom] [start-datom end-datom])]
+      (filter #(and (not (neg? (long (cmp % lo))))
+                    (not (pos? (long (cmp % hi)))))
+              (case index :eav (:eavt db) :ave (:avet db))))
     (case index
-      :eav #(cmp-datoms-eavt-schema schema %1 %2)
-      :ave #(cmp-datoms-avet-schema schema %1 %2)
+      :eav (let [e (.-e ^Datom start-datom)]
+             (if (and (some? e) (= e (.-e ^Datom end-datom)))
+               (tx-cache-e-datoms db e)
+               (tx-cache-bounded-datoms
+                (:eavt db) d/cmp-datoms-eavt start-datom end-datom)))
+      :ave (tx-cache-bounded-datoms
+             (:avet db) d/cmp-datoms-avet start-datom end-datom)
       nil)))
 
 (defn- datom-eav-key
@@ -743,7 +755,9 @@
           store [:search-tuples e a v]
         (case-tree
           [e a (some? v)]
-          [(when (populated? store :eav (d/datom e a v) (d/datom e a v))
+          [(when (if (cd/custom-type? (:db/valueType ((schema store) a)))
+                   (seq (fetch store (d/datom e a v)))
+                   (populated? store :eav (d/datom e a v) (d/datom e a v)))
              (rel/single-tuples (object-array [e a v]))) ; e a v
            (s/ea-tuples store e a) ; e a _
            (s/ev-tuples store e v)  ; e _ v
@@ -787,7 +801,9 @@
           store [:count e a v cap]
         (case-tree
           [e a (some? v)]
-          [(size store :eav (datom e a v) (datom e a v)) ; e a v
+          [(if (cd/custom-type? (:db/valueType ((schema store) a)))
+             (count (fetch store (datom e a v)))
+             (size store :eav (datom e a v) (datom e a v))) ; e a v
            (size store :eav (datom e a c/v0) (datom e a c/vmax)) ; e a _
            (size-filter store :eav
                         (fn [^Datom d] ((s/vpred v) (.-v d)))
@@ -820,17 +836,24 @@
     [db index c1 c2 c3]
     (wrap-cache
         store [:datoms index c1 c2 c3]
-      (slice store index
-             (components->pattern db index c1 c2 c3 e0 v0)
-             (components->pattern db index c1 c2 c3 emax vmax))))
+      (let [a (case index :eav c2 :ave c1)
+            v (case index :eav c3 :ave c2)
+            ds (slice store index
+                      (components->pattern db index c1 c2 c3 e0 v0)
+                      (components->pattern db index c1 c2 c3 emax vmax))]
+        (if (and (some? v) (cd/custom-type? (:db/valueType ((schema store) a))))
+          (filterv #(= v (:v %)) ds)
+          ds))))
   (-datoms
     [db index c1 c2 c3 n]
     (wrap-cache
         store [:datoms index c1 c2 c3 n]
-      (slice store index
-             (components->pattern db index c1 c2 c3 e0 v0)
-             (components->pattern db index c1 c2 c3 emax vmax)
-             n)))
+      (if (cd/custom-type? (:db/valueType ((schema store) (case index :eav c2 :ave c1))))
+        (take n (-datoms db index c1 c2 c3))
+        (slice store index
+               (components->pattern db index c1 c2 c3 e0 v0)
+               (components->pattern db index c1 c2 c3 emax vmax)
+               n))))
 
   (-e-datoms
     [db e]
@@ -1006,6 +1029,22 @@
       (r/open dir schema store-opts))
     (s/open dir schema opts)))
 
+(defn- tx-datom-comparator [store index]
+  (let [kv (when (instance? Store store) (.-lmdb ^Store store))
+        value-cmp (cd/value-comparator kv #(schema store))]
+    (fn [^Datom x ^Datom y]
+      (if (= index :eav)
+        (u/combine-cmp
+         (Long/compare (.-e x) (.-e y))
+         (d/nil-cmp (.-a x) (.-a y))
+         (value-cmp (.-a x) (.-v x) (.-v y))
+         (Long/compare (d/datom-tx x) (d/datom-tx y)))
+        (u/combine-cmp
+         (d/nil-cmp (.-a x) (.-a y))
+         (value-cmp (.-a x) (.-v x) (.-v y))
+         (Long/compare (.-e x) (.-e y))
+         (Long/compare (d/datom-tx x) (d/datom-tx y)))))))
+
 (defn new-db
   ([^IStore store] (new-db store nil))
   ([^IStore store info]
@@ -1016,8 +1055,8 @@
                 {:store         store
                  :max-eid       (if info (:max-eid info) (init-max-eid store))
                  :max-tx        (if info (:max-tx info) (max-tx store))
-                 :eavt          (TreeSortedSet. ^Comparator d/cmp-datoms-eavt)
-                 :avet          (TreeSortedSet. ^Comparator d/cmp-datoms-avet)
+                 :eavt          (TreeSortedSet. ^Comparator (tx-datom-comparator store :eav))
+                 :avet          (TreeSortedSet. ^Comparator (tx-datom-comparator store :ave))
                  :pull-patterns (LRUCache. 64)})]
      (swap! dbs assoc (db-name store) db)
      (ensure-cache store
@@ -1037,8 +1076,8 @@
     (DB. store
          (.-max-eid old)
          (.-max-tx old)
-         (TreeSortedSet. ^Comparator d/cmp-datoms-eavt)
-         (TreeSortedSet. ^Comparator d/cmp-datoms-avet)
+         (TreeSortedSet. ^Comparator (tx-datom-comparator store :eav))
+         (TreeSortedSet. ^Comparator (tx-datom-comparator store :ave))
          (.-pull-patterns old))
     old))
 

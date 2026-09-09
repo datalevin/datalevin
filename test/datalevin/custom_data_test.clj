@@ -5,9 +5,11 @@
    [datalevin.constants :as c]
    [datalevin.core :as d]
    [datalevin.custom-data :as custom]
+   [datalevin.custom-kv-dump :as custom-dump]
    [datalevin.custom-value :as cv]
    [datalevin.interface :as i]
    [datalevin.interpret :as inter]
+   [datalevin.kv :as kv]
    [datalevin.lmdb :as l]
    [datalevin.udf :as udf]
    [datalevin.util :as u])
@@ -715,3 +717,288 @@
                    (cv/put-value! kv {:dbi "missing" :position :key}
                                   type {:order 1} (byte-array [0]))))
       (is (= 1 (d/entries kv c/custom-values))))))
+
+(deftest public-custom-keys
+  (doseq [wal? [false true]]
+    (let [kv (open-kv (str "public-keys-" wal?) {:wal? wal?})
+          a {:rank 1 :name "a"}
+          b {:rank 1 :name "b"}
+          c {:rank 2 :name "c"}]
+      (d/register-type kv :app/task (task-type 0))
+      (d/open-dbi kv "tasks" {:key-type :app/task})
+      (d/transact-kv kv "tasks" [[:put b "b"] [:put a "a"] [:put c "c"]])
+      (is (= "a" (d/get-value kv "tasks" a)))
+      (is (= [b "b"] (d/get-value kv "tasks" b :app/task :data false)))
+      (is (= [[b "b"] [a "a"] [c "c"]] (vec (d/get-range kv "tasks" [:all]))))
+      (is (= [[b "b"] [a "a"]] (vec (d/get-range kv "tasks" [:closed a a]))))
+      (is (= [[c "c"]] (vec (d/get-range kv "tasks" [:greater-than a]))))
+      (is (= 2 (d/key-range-count kv "tasks" [:closed a a])))
+      (is (= [b a c] (vec (d/key-range kv "tasks" [:all]))))
+      (is (= 1 (d/get-rank kv "tasks" a)))
+      (is (= [a "a"] (d/get-by-rank kv "tasks" 1 :app/task :data false)))
+      (d/transact-kv kv [[:put "tasks" a "new" :app/task :data]])
+      (is (= 3 (d/entries kv c/custom-values)))
+      (is (= "new" (d/get-value kv "tasks" a)))
+      (is (thrown? Exception (d/get-value kv "tasks" a :long)))
+      (is (thrown? Exception (d/open-dbi kv "tasks" {:key-type :app/missing})))
+      (with-open [^java.lang.AutoCloseable values (d/range-seq kv "tasks" [:all-back] :app/task :data false
+                                      {:batch-size 1})]
+        (is (= [[c "c"] [a "new"] [b "b"]] (vec (seq values)))))
+      (d/transact-kv kv "tasks" [[:del a]])
+      (is (nil? (d/get-value kv "tasks" a)))
+      (is (= "b" (d/get-value kv "tasks" b)))
+      (is (= 2 (d/entries kv c/custom-values)))
+      (d/close-kv kv)
+      (let [kv (open-kv (str "public-keys-" wal?) {:wal? wal?})]
+        (is (= :app/task (:key-type (i/dbi-opts kv "tasks"))))
+        (is (= "b" (d/get-value kv "tasks" b)))
+        (d/open-dbi kv "tasks")
+        (is (= :app/task (:key-type (i/dbi-opts kv "tasks"))))))))
+
+(deftest public-custom-items-and-custom-list-keys
+  (doseq [custom-key? [false true]]
+    (let [kv (open-kv (str "public-items-" custom-key?))
+          a {:rank 1 :name "a"}
+          b {:rank 1 :name "b"}
+          z {:rank 2 :name "z"}
+          key (if custom-key? {:rank 9 :name "key"} "key")
+          kt (if custom-key? :app/task :string)]
+      (d/register-type kv :app/task (task-type 0))
+      (d/open-list-dbi kv "items" (cond-> {:value-type :app/task}
+                                   custom-key? (assoc :key-type :app/task)))
+      (d/put-list-items kv "items" key [a b z] kt :app/task)
+      (is (= [a b z] (vec (d/get-list kv "items" key kt :app/task))))
+      (is (d/in-list? kv "items" key b kt :app/task))
+      (is (not (d/in-list? kv "items" key {:rank 1 :name "missing"} kt :app/task)))
+      (is (= 3 (d/list-count kv "items" key kt)))
+      (is (= [[key b] [key a]]
+             (vec (d/list-range kv "items" [:all] kt [:closed-back a a] :app/task))))
+      (d/put-list-items kv "items" key [a a] kt :app/task)
+      (is (= 3 (d/list-count kv "items" key kt)))
+      (d/del-list-items kv "items" key [b] kt :app/task)
+      (is (= [a z] (vec (d/get-list kv "items" key kt :app/task))))
+      (let [seen (atom [])]
+        (d/visit-list kv "items" #(swap! seen conj %) key kt :app/task false)
+        (is (= [a z] @seen)))
+      (d/del-list-items kv "items" key kt)
+      (is (= 0 (d/list-count kv "items" key kt)))
+      (is (= 0 (d/entries kv c/custom-values))))))
+
+(deftest public-custom-batches-and-callbacks
+  (let [kv (open-kv "public-batches")
+        a {:rank 1 :name "a"}
+        b {:rank 1 :name "b"}]
+    (d/register-type kv :app/task (task-type 0))
+    (d/open-dbi kv "tasks" {:key-type :app/task})
+    (d/open-dbi kv "plain")
+    (is (thrown? Exception
+                 (d/transact-kv kv [[:put "plain" :k :v]
+                                    [:put "tasks" a 1]
+                                    [:put "tasks" {:rank "bad"} 2]])))
+    (is (nil? (d/get-value kv "plain" :k)))
+    (is (zero? (d/entries kv c/custom-values)))
+    (d/with-transaction-kv [tx kv]
+      (d/transact-kv tx [[:put "tasks" a 1] [:put "tasks" b 2]])
+      (is (= 2 (d/get-value tx "tasks" b))))
+    (is (= [[b 2]] (vec (d/range-filter kv "tasks" (fn [k _] (= k b))
+                                       [:all] :app/task :data false false))))
+    (is (= [1 2] (vec (d/range-keep kv "tasks" (fn [_ v] v)
+                                   [:all] :app/task :data false))))
+    (is (= b (d/range-some kv "tasks" (fn [k v] (when (= v 2) k))
+                           [:all] :app/task :data false)))
+    (let [seen (atom [])]
+      (d/visit kv "tasks" (fn [k _] (swap! seen conj k) :datalevin/terminate-visit)
+               [:all] :app/task :data false)
+      (is (= [a] @seen)))))
+
+(defn- dump-reader [s]
+  (java.io.PushbackReader. (java.io.StringReader. s)))
+
+(deftest public-custom-clear-drop-and-abort
+  (doseq [wal? [false true]]
+    (let [kv (open-kv (str "public-cleanup-" wal?) {:wal? wal?})
+          a {:rank 1 :name "a"} b {:rank 1 :name "b"}]
+      (d/register-type kv :app/task (task-type 0))
+      (d/open-dbi kv "keys" {:key-type :app/task})
+      (d/open-list-dbi kv "items" {:key-type :app/task :value-type :app/task})
+      (d/transact-kv kv "keys" [[:put a 1] [:put b 2]])
+      (d/put-list-items kv "items" a [a b] :app/task :app/task)
+      (is (= 5 (d/entries kv c/custom-values)))
+      (is (thrown? Exception
+                   (d/with-transaction-kv [tx kv]
+                     (d/clear-dbi tx "items")
+                     (is (empty? (d/get-list tx "items" a :app/task :app/task)))
+                     (throw (ex-info "abort" {})))))
+      (is (= [a b] (vec (d/get-list kv "items" a :app/task :app/task))))
+      (d/clear-dbi kv "items")
+      (is (= 2 (d/entries kv c/custom-values)))
+      (d/drop-dbi kv "items")
+      (is (not (contains? (set (d/list-dbis kv)) "items")))
+      (is (thrown? Exception (d/drop-dbi kv c/custom-values)))
+      (is (thrown? Exception (d/clear-dbi kv c/kv-info)))
+      (d/drop-dbi kv "keys")
+      (is (zero? (d/entries kv c/custom-values))))))
+
+(deftest custom-dump-dependencies-and-roundtrip
+  (let [kv (open-kv "dump-source")
+        a {:rank 1 :name "a"} b {:rank 1 :name "b"}]
+    (d/register-type kv :app/task (task-type 0))
+    (d/open-dbi kv "tasks" {:key-type :app/task})
+    (d/open-list-dbi kv "items" {:value-type :app/task})
+    (d/transact-kv kv "tasks" [[:put a 1] [:put b 2]])
+    (d/put-list-items kv "items" :list [a b] :data :app/task)
+    (doseq [single? [false true] binary? [false true]]
+      (let [name (str "restored-" single? "-" binary?)
+            dest (open-kv name)
+            bytes (java.io.ByteArrayOutputStream.)
+            text (if binary?
+                   (with-open [out (java.io.DataOutputStream. bytes)]
+                     (if single? (l/dump-dbi kv "tasks" out) (l/dump-all kv out)))
+                   (with-out-str (if single? (l/dump-dbi kv "tasks") (l/dump-all kv))))
+            input #(if binary?
+                     (java.io.DataInputStream. (java.io.ByteArrayInputStream. (.toByteArray bytes)))
+                     (dump-reader text))
+            restore #(if single? (l/load-dbi dest "tasks" (input) binary?)
+                         (l/load-all dest (input) binary?))]
+        (restore)
+        (is (= 1 (d/get-value dest "tasks" a)))
+        (is (= 2 (d/get-value dest "tasks" b)))
+        (is (= (if single? 2 4) (d/entries dest c/custom-values)))
+        (is (= (not single?) (contains? (set (d/list-dbis dest)) "items")))
+        (when-not single?
+          (is (= [a b] (vec (d/get-list dest "items" :list :data :app/task)))))
+        ;; An identical restore is safe and does not allocate replacement IDs.
+        (restore)
+        (d/transact-kv dest "tasks" [[:put {:rank 9} 9]])
+        (is (= 5 (d/get-value dest c/kv-info cv/id-key :keyword)))
+        (d/close-kv dest)
+        (let [dest (open-kv name)]
+          (is (= 1 (d/get-value dest "tasks" a))))))
+    (let [bundle (custom-dump/capture kv "tasks")]
+      (is (= [c/kv-info c/custom-values "tasks"]
+             (mapv (comp :dbi first) (:sections bundle))))
+      (is (= 2 (count (second (second (:sections bundle)))))))
+    (d/copy kv (str *dir* "/public-copy"))
+    (let [copy (open-kv "public-copy")]
+      (is (= 2 (d/get-value copy "tasks" b))))))
+
+(deftest custom-restore-preflights-conflicts-and-dependencies
+  (let [source (open-kv "conflict-source")
+        dest (open-kv "conflict-dest")
+        a {:rank 1 :name "a"}]
+    (doseq [kv [source dest]] (d/register-type kv :app/task (task-type 0)))
+    (d/open-dbi source "tasks" {:key-type :app/task})
+    (d/transact-kv source "tasks" [[:put a 1]])
+    (d/open-dbi dest "unrelated" {:key-type :app/task})
+    (d/transact-kv dest "unrelated" [[:put a 2]])
+    (let [bundle (custom-dump/capture source "tasks")
+          before (set (d/list-dbis dest))]
+      ;; Identical bytes with ID 1 still belong to a different entry.
+      (is (thrown-with-msg? Exception #"Conflicting custom payload ID"
+                           (custom-dump/restore! dest bundle "tasks")))
+      (is (= before (set (d/list-dbis dest))))
+      (is (= 2 (d/get-value dest "unrelated" a)))
+      (is (= 1 (d/entries dest c/custom-values)))
+      (let [empty-dest (open-kv "missing-dependency")
+            missing (-> bundle (assoc-in [:sections 1 1] [])
+                        (assoc-in [:sections 1 0 :entries] 0))]
+        (is (thrown-with-msg? Exception #"Missing referenced"
+                             (custom-dump/restore! empty-dest missing "tasks")))
+        (is (empty? (d/list-dbis empty-dest)))
+        (is (empty? (:types (custom/registry empty-dest)))))
+      (let [different (open-kv "different-definition")]
+        (d/register-type different :app/task (task-type 1))
+        (is (thrown-with-msg? Exception #"Conflicting custom type"
+                             (custom-dump/restore! different bundle "tasks")))
+        (is (empty? (d/list-dbis different)))))))
+
+(deftest custom-lazy-reader-retains-its-cursor-and-snapshot
+  (let [kv (open-kv "lazy-cursor")
+        keys (mapv #(hash-map :rank %) (range 10))]
+    (d/register-type kv :app/task (task-type 0))
+    (d/open-dbi kv "tasks" {:key-type :app/task})
+    (d/transact-kv kv "tasks" (mapv #(vector :put % (:rank %)) keys))
+    (with-open [^java.lang.AutoCloseable rows (d/range-seq kv "tasks" [:all] :app/task
+                                                         :data false {:batch-size 1})]
+      (let [s (seq rows)]
+        (is (= [(first keys) 0] (first s)))
+        (is (= 10 (count (d/get-range kv "tasks" [:all]))))
+        (d/transact-kv kv "tasks" [[:del (last keys)]])
+        (is (= (mapv #(vector % (:rank %)) keys) (vec s)))))
+    (is (= 9 (d/entries kv "tasks")))))
+
+(deftest custom-kv-wal-replays-physical-rows
+  (let [source (open-kv "replay-source" {:wal? true})
+        dest (open-kv "replay-dest")
+        a {:rank 1 :name "a"} b {:rank 1 :name "b"}]
+    (d/register-type source :app/task (task-type 0))
+    (d/open-dbi source "tasks" {:key-type :app/task})
+    (d/open-list-dbi source "items" {:value-type :app/task})
+    (d/transact-kv source "tasks" [[:put a 1] [:put b 2]])
+    (d/put-list-items source "items" :list [a b] :data :app/task)
+    (d/del-list-items source "items" :list [a] :data :app/task)
+    (doseq [{:keys [rows lsn]} (kv/open-tx-log-rows source 0)]
+      (kv/replay-txlog-rows! dest rows lsn))
+    (is (= 1 (d/get-value dest "tasks" a)))
+    (is (= 2 (d/get-value dest "tasks" b)))
+    (is (= [b] (vec (d/get-list dest "items" :list :data :app/task))))
+    (is (= 3 (d/entries dest c/custom-values)))
+    (let [last-lsn (apply max (map :lsn (kv/open-tx-log-rows source 0)))]
+      (d/clear-dbi source "items")
+      (d/drop-dbi source "tasks")
+      (doseq [{:keys [rows lsn]} (kv/open-tx-log-rows source (inc (long last-lsn)))]
+        (kv/replay-txlog-rows! dest rows lsn))
+      (is (zero? (d/entries dest c/custom-values)))
+      (is (zero? (d/list-count dest "items" :list :data)))
+      (is (not (contains? (set (d/list-dbis dest)) "tasks"))))))
+
+(deftest custom-kv-counts-dumps-and-cleanup-do-not-need-user-functions
+  (let [runtime (udf/create-registry)
+        source (open-kv "no-callback-source" {:runtime-opts {:udf-registry runtime}})
+        dest (open-kv "no-callback-dest")]
+    (udf/register! runtime (udf-desc :order-fn) :rank)
+    (udf/register! runtime (udf-desc :serializer) b/serialize)
+    (udf/register! runtime (udf-desc :deserializer) b/deserialize)
+    (d/register-type source :app/task
+                     {:index {:type :long :order-fn (udf-desc :order-fn)}
+                      :payload {:serialize (udf-desc :serializer)
+                                :deserialize (udf-desc :deserializer)}})
+    (d/open-dbi source "tasks" {:key-type :app/task})
+    (d/transact-kv source "tasks" [[:put {:rank 1} "one"]])
+    (doseq [kind [:order-fn :serializer :deserializer]]
+      (udf/unregister! runtime (udf-desc kind)))
+    (is (= 1 (d/range-count source "tasks" [:all])))
+    (l/load-all dest (dump-reader (with-out-str (l/dump-all source))))
+    (is (= 1 (d/key-range-count dest "tasks" [:all])))
+    (is (= ["one"] (vec (d/get-range dest "tasks" [:all] :app/task :data true))))
+    (d/clear-dbi dest "tasks")
+    (is (zero? (d/entries dest c/custom-values)))))
+
+(deftest custom-kv-validation-flags-and-false-results
+  (let [kv (open-kv "public-validation")
+        a {:rank 1}]
+    (d/register-type kv :app/task (task-type 0))
+    (d/open-dbi kv "tasks" {:key-type :app/task :validate-data? true})
+    (d/open-dbi kv "plain")
+    (d/transact-kv kv "tasks" [[:put a false]] :app/task :boolean)
+    (is (= false (d/get-some kv "tasks" (fn [_ _] true) [:all]
+                            :app/task :boolean true false)))
+    (is (= [false] (vec (d/range-filter kv "tasks" (fn [_ _] true) [:all]
+                                       :app/task :boolean true false))))
+    (is (= [false] (vec (d/range-keep kv "tasks" (fn [_ _] false) [:all]
+                                     :app/task :boolean false))))
+    (doseq [row [[:put "tasks" a nil]
+                 [:put "tasks" nil 1]
+                 [:put "tasks" a "bad" :app/task :long]
+                 [:put "tasks" a true :app/task :boolean #{:nooverwrite}]
+                 [:put "plain" a 1 :app/task :long]]]
+      (is (thrown? Exception (d/transact-kv kv [row]))))
+    (is (= false (d/get-value kv "tasks" a :app/task :boolean)))
+    (is (= 1 (d/entries kv c/custom-values)))
+    (is (thrown? Exception (d/open-dbi kv "tasks" {:key-size 128})))
+    (is (thrown? Exception (d/open-list-dbi kv "tasks")))
+    (d/open-list-dbi kv "items" {:value-type :app/task})
+    (d/put-list-items kv "items" :list [a] :data :app/task)
+    (is (thrown? Exception
+                 (d/transact-kv kv [[:put "items" :list a :data :app/task #{:nodupdata}]])))
+    (is (= [a] (vec (d/get-list kv "items" :list :data :app/task))))))
