@@ -579,7 +579,7 @@ and equality function reconstruct returned values, including asynchronous hooks.
 Untyped `:data` and eager helpers without a database handle remain unsupported.
 Native values currently share a constant JVM hash,
 so large hash joins and deduplication can be expensive. See the
-[native-value plan](../../doc/custom-data.md#native-javascript-values).
+[custom data guide](../../doc/custom-data.md#native-javascript-values).
 
 ## Fulltext Analyzer UDF Example
 

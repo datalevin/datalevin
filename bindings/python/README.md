@@ -528,7 +528,7 @@ cross the network; results are reconstructed by the caller's deserializer.
 Native values in untyped `:data` and helpers that
 convert values before a database handle is available remain unsupported. The
 current constant JVM hash can make large hash joins/deduplication expensive.
-See the [native-value plan](../../doc/custom-data.md#native-python-values).
+See the [custom data guide](../../doc/custom-data.md#native-python-values).
 
 ## Fulltext Analyzer UDF Example
 
