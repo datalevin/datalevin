@@ -195,7 +195,7 @@
                   snapshot)
                 (recur)))))))))
 
-(defn register-type
+(defn- register-local-type
   "Atomically register a type in a local KV environment; return its name."
   [kv type-name definition]
   (local-info kv)
@@ -214,6 +214,16 @@
     ;; Registry readers publish only after observing committed metadata. This
     ;; also handles registration nested in a caller-owned write transaction.
     type-name))
+
+(defn register-type
+  "Atomically register a database-wide type; return its name."
+  [kv type-name definition]
+  (if (satisfies? i/ICustomTypes kv)
+    (do
+      ;; Validate before transport; the server validates again after decoding.
+      (normalize-definition type-name definition)
+      (i/register-type kv type-name definition))
+    (register-local-type kv type-name definition)))
 
 (defn- materialize [kv type-name kind descriptor runtime-opts]
   (if-let [source (:inter-fn/source descriptor)]
@@ -237,12 +247,16 @@
   (try
     (@callable value)
     (catch Exception e
-      (throw (ex-info (str "Custom type " type-name " " (name kind)
-                           " failed: " (ex-message e))
-                      (merge {:error :custom-type/function}
-                             (ex-data e)
-                             {:type-name type-name :kind kind})
-                      e)))))
+      (let [data (ex-data e)
+            ;; Resolvers receive the live handle; error responses must not.
+            data (cond-> data
+                   (map? (:context data)) (update :context dissoc :kv))]
+        (throw (ex-info (str "Custom type " type-name " " (name kind)
+                             " failed: " (ex-message e))
+                        (merge {:error :custom-type/function}
+                               data
+                               {:type-name type-name :kind kind})
+                        e))))))
 
 (defn- compile-type [kv type-name definition runtime-opts]
   (let [backing (get-in definition [:index :type])

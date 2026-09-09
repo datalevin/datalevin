@@ -22,7 +22,7 @@
    [clojure.string :as str])
   (:import
    [datalevin.client Client]
-   [datalevin.interface ILMDB ITxLog IList IAdmin IStore ISearchEngine IVectorIndex]
+   [datalevin.interface ICustomTypes ILMDB ITxLog IList IAdmin IStore ISearchEngine IVectorIndex]
    [clojure.lang Seqable IReduceInit]
    [java.lang AutoCloseable]
    [java.util.concurrent ConcurrentHashMap]
@@ -382,6 +382,11 @@
                        ^AtomicBoolean sampling-started?
                        owns-client?
                        ^AtomicBoolean closed?]
+  ICustomTypes
+  (register-type [_ type-name definition]
+    (datalog-request read-floor-tx client :datalog-register-type
+                     [db-name type-name (b/serialize definition)] writing?))
+
   IWriting
   (writing? [_] writing?)
 
@@ -977,6 +982,11 @@
                   open-db-opts
                   owns-client?
                   ^AtomicBoolean closed?]
+  ICustomTypes
+  (register-type [_ type-name definition]
+    (cl/normal-request client :register-type
+                       [db-name type-name (b/serialize definition)] writing?))
+
   IWriting
   (writing? [_] writing?)
 

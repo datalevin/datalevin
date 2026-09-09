@@ -1,9 +1,15 @@
 # Change Log
 
 ## WIP
+### Added
+- [KV] added `register-type` function to allow indexing of custom data types,
+  and this also works on Datalog. Details are in the [custom data
+  documentation](/doc/custom-data.md).
+  [#234](https://github.com/datalevin/datalevin/issues/234)
+
 ### Improved
 - [Server] harden client/server lifecycle.
-- [Datalog] refresh giant id floor in transaction.
+- [Datalog] always refresh giant id floor in transaction.
 
 ## 1.1.0 (2026-09-02)
 

@@ -1714,6 +1714,25 @@
   [deps server skey message]
   ((:open-server-store deps) server skey message c/kv-type))
 
+(defn register-type
+  [deps server skey {:keys [args writing?]}]
+  (with-error
+    deps
+    skey
+    #(let [[db-name type-name definition] args]
+       (db-alter-permission!
+         deps server skey db-name
+         "Don't have permission to register a custom type in the database"
+         (fn []
+           (with-direct-db-transaction-slot
+             deps server db-name writing?
+             (fn []
+               (write-result!
+                 deps skey
+                 (d/register-type
+                   (kv-store deps server skey db-name writing?)
+                   type-name (b/deserialize definition))))))))))
+
 (defn close-kv
   [deps server skey {:keys [args]}]
   (with-error
@@ -2771,6 +2790,7 @@
    :schema (normal-dt-handler i/schema)
    :rschema (normal-dt-handler i/rschema)
    :set-schema set-schema
+   :datalog-register-type register-type
    :init-max-eid (normal-dt-handler i/init-max-eid)
    :max-tx (normal-dt-handler i/max-tx)
    :swap-attr (deserialized-normal-dt-handler 2 i/swap-attr)
@@ -2835,6 +2855,7 @@
    :close-kv close-kv
    :closed-kv? (normal-kv-handler i/closed-kv?)
    :open-dbi open-dbi
+   :register-type register-type
    :clear-dbi (normal-kv-handler i/clear-dbi)
    :drop-dbi drop-dbi
    :list-dbis list-dbis

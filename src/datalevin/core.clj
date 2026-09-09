@@ -1294,7 +1294,7 @@ Only usable for debug output.
   datalog-kv conn/datalog-kv)
 
 (defn register-type
-  "Register a database-wide custom type through a local KV handle or Datalog
+  "Register a database-wide custom type through a KV handle or Datalog
   connection. Return `type-name`, a namespaced keyword.
 
   The definition contains `:index {:type backing-type :order-fn f}`, an
@@ -1311,8 +1311,10 @@ Only usable for debug output.
 
   Declare custom keys with `open-dbi`'s `:key-type` option, or ordered custom
   list items with `open-list-dbi`'s `:value-type` option. Datalog attributes
-  declare the registered name as `:db/valueType`. Remote registration is
-  not yet supported."
+  declare the registered name as `:db/valueType`. Remote registration requires
+  database alter permission. The server executes the registered functions and
+  supplies any UDF bindings; runtime registries are not sent by the client.
+  Remote logical values must currently be supported by the Nippy wire codec."
   [kv-or-conn type-name definition]
   (custom/register-type (if (conn/conn? kv-or-conn)
                           (conn/datalog-kv kv-or-conn)

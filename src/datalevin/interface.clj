@@ -81,6 +81,10 @@
     [db list-name indices visitor k-range k-type v-type raw-pred?]
     "visit a list range, presumably for side effects of vistor call"))
 
+(defprotocol ICustomTypes
+  (register-type [db type-name definition]
+    "Register a database-wide custom type through a remote store."))
+
 (defprotocol ILMDB
   (check-ready [db] "check if db is ready to be operated on")
   (close-kv [db] "Close this LMDB env")

@@ -792,6 +792,8 @@
 
 (def ^:private ha-write-command-types
   #{:set-schema
+    :register-type
+    :datalog-register-type
     :swap-attr
     :del-attr
     :rename-attr

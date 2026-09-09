@@ -2,8 +2,10 @@
 
 Status: Phases 1–4 are implemented locally: type registration, function
 contracts, ordered references, transactional payload storage, public KV custom
-keys and ordered list items, and Datalog custom attributes. Remote/binding APIs
-and performance work remain planned.
+keys and ordered list items, and Datalog custom attributes. Phase 5 now supports
+remote registration and server execution for values supported by the existing
+wire codec. Native-value transport adapters, language APIs, and performance
+work remain planned.
 
 Tracking issue: [Allow indexing of arbitrary data, #234](https://github.com/datalevin/datalevin/issues/234).
 
@@ -65,9 +67,11 @@ Public signature:
 (d/register-type kv-or-conn type-name definition)
 ```
 
-Implemented for local KV handles and Datalog connections; returns `type-name`.
+Implemented for local and remote KV handles and Datalog connections; returns
+`type-name`.
 `:version` defaults to `1` and must be a positive integer. `:payload` defaults
-to `:nippy`. A KV transaction handle makes registration part of that transaction.
+to `:nippy`. A transaction handle makes registration part of that transaction,
+including remote KV and Datalog write transactions.
 
 `type-name` is a namespaced keyword. A KV handle registers directly. A Datalog
 connection resolves its underlying KV handle using `datalog-kv` and delegates
@@ -212,6 +216,25 @@ through environment options. Local Datalog environments accept the same runtime
 options when first opened. Resolution is lazy per function
 and cached per KV environment, type, registry revision, and UDF generation.
 Registration validates UDF descriptors without requiring bindings to be loaded.
+
+Remote registration requires database alter permission and participates in the
+server's write admission and read-only replica checks. Definitions travel as
+Nippy bytes, including interpreted function source and captures. The server
+checks permissions before decoding and validates the definition before storing
+it. Registration retries remain idempotent; conflicting definitions are rejected.
+
+For remote operations, order and payload functions execute on the server.
+Install UDF bindings there through the existing
+`datalevin.server/*server-runtime-opts-fn*` hook. Those bindings are attached to
+the underlying KV environment for both KV and Datalog stores, including stores
+reopened from persisted sessions after server restart. Changing a registry's
+generation refreshes the callable cache. Missing bindings return structured
+errors without exporting runtime handles or committing partial writes.
+
+The current remote path accepts logical values supported by the existing Nippy
+wire codec. Custom payload serde controls their stored bytes; it does not yet
+replace serialization of logical values in requests and responses. The native
+value adapters described below remain Phase 5 work.
 
 The order and serialization functions receive the logical value in their
 registered runtime. Use the payload serde functions at language and
@@ -524,8 +547,9 @@ checks all complete values in each group, rather than only adjacent IDs.
 
 First opening a local Datalog environment with `:runtime-opts {:udf-registry registry}`
 provides the underlying KV environment's default order and serde bindings.
-These runtime bindings are not persisted. Cross-language invocation adapters
-and remote execution remain Phase 5 work.
+These runtime bindings are not persisted. Remote environments use server-owned
+bindings as described above. Cross-language invocation and native-value transport
+adapters remain Phase 5 work.
 
 Changing a populated attribute to or from a custom type requires an explicit
 rewrite; the automatic migration from untyped data to built-in types does not
@@ -534,7 +558,7 @@ types as components of Datalog composite tuples.
 
 ## Implementation phases
 
-Phases 1–4 are implemented locally. Phases 5 and 6 are planned work.
+Phases 1–4 are implemented locally. Phase 5 is in progress; Phase 6 is planned.
 
 ### Phase 1: Registry and function contracts
 
@@ -616,6 +640,13 @@ Completion: Datalog custom attributes work through the existing logical-value
 interfaces and share registrations with direct KV users.
 
 ### Phase 5: Language bindings and remote execution
+
+Remote registration and server execution are implemented for existing wire
+values. Tests cover KV and Datalog operations, order-key collisions, captured
+interpreted functions, shared registrations, transaction commit/abort,
+permissions, read-only replicas, UDF rebinding, failed writes, and session
+reopen after server restart. The remaining work is the language API and native
+value serde transport below.
 
 - Expose registration and custom-type references through the applicable Java,
   Python, and JavaScript surfaces.

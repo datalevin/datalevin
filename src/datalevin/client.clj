@@ -962,6 +962,7 @@
     :close-transact-kv
     :abort-transact-kv
     :open-dbi
+    :register-type
     :clear-dbi
     :drop-dbi
     :kv-re-index})
@@ -975,6 +976,7 @@
     :schema
     :rschema
     :set-schema
+    :datalog-register-type
     :init-max-eid
     :max-tx
     :datom-count

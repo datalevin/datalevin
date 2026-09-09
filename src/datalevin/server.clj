@@ -499,16 +499,19 @@
 (defn- resolved-runtime-opts
   [server db-name store m]
   (let [current  (current-runtime-opts m)
-        resolved (*server-runtime-opts-fn* server db-name store m)]
-    (cond
-      (and (map? current) (map? resolved))
-      (merge current resolved)
-
-      (map? resolved)
-      resolved
-
-      :else
-      current)))
+        resolved (*server-runtime-opts-fn* server db-name store m)
+        opts     (cond
+                   (and (map? current) (map? resolved)) (merge current resolved)
+                   (map? resolved) resolved
+                   :else current)
+        lmdb     (if (instance? Store store) (.-lmdb ^Store store) store)]
+    ;; Custom order/serde functions execute below the Datalog DB wrapper.
+    ;; Attach the same server-owned bindings on open and session restore, for
+    ;; both KV and Datalog stores. These runtime options never enter kv-info DBI.
+    (when (satisfies? i/ILMDB lmdb)
+      (when-let [info (i/kv-info lmdb)]
+        (vswap! info assoc :runtime-opts opts)))
+    opts))
 
 (defn- attach-runtime-opts
   [dt-db runtime-opts]
