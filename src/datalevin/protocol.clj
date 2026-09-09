@@ -14,6 +14,7 @@
    [datalevin.buffer :as bf]
    [datalevin.constants :as c]
    [datalevin.datom :as d]
+   [datalevin.native-value :as nv]
    [datalevin.util :as u]
    [datalevin.spill :as sp]
    [cognitect.transit :as transit])
@@ -78,7 +79,8 @@
   ^bytes [fmt msg]
   (case (short fmt)
     1 (write-transit-bytes msg)
-    2 (b/serialize msg)
+    2 (binding [nv/*wire-native-value* true]
+        (b/serialize msg))
     (u/raise "Unknown wire message format"
              {:format fmt
               :format-code (fmt-code fmt)})))
@@ -149,7 +151,8 @@
   "Read from a ByteBuffer containing nippy encoded bytes, return a Clojure
   value."
   [^ByteBuffer bf]
-  (b/deserialize (b/get-bytes bf)))
+  (binding [nv/*wire-native-value* true]
+    (b/deserialize (b/get-bytes bf))))
 
 (defn read-transit-bf
   "Read from a ByteBuffer containing transit+json encoded bytes,
@@ -162,7 +165,8 @@
 (defn write-nippy-bf
   "Write a Clojure value as nippy encoded bytes into a ByteBuffer"
   [^ByteBuffer bf v]
-  (b/put-bytes bf (b/serialize v)))
+  (b/put-bytes bf (binding [nv/*wire-native-value* true]
+                    (b/serialize v))))
 
 (defn write-transit-bf
   "Write a Clojure value as transit+json encoded bytes into a ByteBuffer"
@@ -233,7 +237,7 @@
                      bs)]
      (case (short code)
        1 (read-transit-bytes payload)
-       2 (b/deserialize payload)
+       2 (binding [nv/*wire-native-value* true] (b/deserialize payload))
        (u/raise "Unknown wire message format"
                 {:format fmt
                  :format-code code})))))
