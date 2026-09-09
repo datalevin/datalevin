@@ -7,16 +7,45 @@ import jpype
 from ._convert import to_java, to_python
 from ._interop import _BINDINGS
 from ._java import classes, is_java_object
+from ._native import NativeCodec, native_scope
 from ._udf_value import UdfDescriptor, descriptor_data
 
 
+class _NativeBindings:
+    """Host callables and codecs with no JVM registry/proxy ownership."""
+
+    def __init__(self):
+        self._functions = {}
+        self._native_types = {}
+
+
 class _PythonUdfFunction:
-    def __init__(self, fn):
+    def __init__(self, fn, registry, descriptor):
         self._fn = fn
+        self._registry = registry
+        self._descriptor = descriptor
 
     def invoke(self, args):
-        python_args = [_udf_arg_to_python(arg, index) for index, arg in enumerate(args)]
-        return to_java(self._fn(*python_args))
+        try:
+            with native_scope(self._registry):
+                python_args = [_udf_arg_to_python(arg, index) for index, arg in enumerate(args)]
+                result = self._fn(*python_args)
+                if self._descriptor.kind == ":deserializer":
+                    for codec in self._registry._native_types.values():
+                        if codec.deserialize == self._descriptor:
+                            codec.check_value(result)
+                            # Retain the supplied snapshot; a read needs only
+                            # the deserializer, and payloads need not be canonical.
+                            return codec.wrap_payload(python_args[0])
+                return to_java(result)
+        except jpype.JException:
+            raise
+        except Exception as exc:
+            # JPype's PyExceptionProxy has no useful message once Clojure wraps
+            # it. Supply a JVM exception so storage retains the Python failure.
+            raise jpype.JClass("java.lang.IllegalArgumentException")(
+                f"Python UDF failed: {type(exc).__name__}: {exc}"
+            ) from exc
 
 
 def _java_class_name(value):
@@ -45,6 +74,9 @@ class UdfRegistry:
     def __init__(self, handle=None) -> None:
         self._handle = _BINDINGS.create_udf_registry() if handle is None else handle
         self._proxies = {}
+        self._native_bindings = _NativeBindings()
+        self._functions = self._native_bindings._functions
+        self._native_types = self._native_bindings._native_types
 
     def raw_handle(self):
         return self._handle
@@ -61,15 +93,40 @@ class UdfRegistry:
         if not callable(fn):
             raise TypeError("fn must be callable")
         normalized = UdfDescriptor.from_value(descriptor, default_lang="python")
-        proxy = jpype.JProxy(classes().udf_function, inst=_PythonUdfFunction(fn))
+        proxy = jpype.JProxy(classes().udf_function,
+                            inst=_PythonUdfFunction(fn, self._native_bindings, normalized))
         _BINDINGS.register_udf(self._handle, normalized, proxy)
         self._proxies[normalized] = proxy
+        self._functions[normalized] = fn
         return fn
 
     def unregister(self, descriptor):
         normalized = UdfDescriptor.from_value(descriptor, default_lang="python")
         _BINDINGS.unregister_udf(self._handle, normalized)
         self._proxies.pop(normalized, None)
+        self._functions.pop(normalized, None)
+
+    def bind_native_type(self, type_name, native_type, definition):
+        """Bind a Python class to a registered type's payload UDFs.
+
+        Call before opening a local database with this registry in runtime
+        options. This runtime-only binding is separate from ``register_type``;
+        recreate it on reopen. Ordinary KV/query calls then accept instances
+        of the class and return reconstructed instances automatically.
+        """
+        codec = NativeCodec(self, type_name, native_type, definition)
+        existing = self._native_types.get(native_type)
+        if existing is not None:
+            if (existing.type_name, existing.serialize, existing.deserialize) != (
+                    codec.type_name, codec.serialize, codec.deserialize):
+                raise ValueError("Python class already has a different native type binding")
+            return self
+        if any(c.type_name == codec.type_name for c in self._native_types.values()):
+            raise ValueError("Custom type already has a different Python class binding")
+        if native_type.__module__ == "builtins":
+            raise ValueError("Bind a custom Python class, not a built-in type")
+        self._native_types[native_type] = codec
+        return self
 
     def registered(self, descriptor) -> bool:
         normalized = UdfDescriptor.from_value(descriptor, default_lang="python")

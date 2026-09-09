@@ -5,7 +5,8 @@ contracts, ordered references, transactional payload storage, public KV custom
 keys and ordered list items, and Datalog custom attributes. Phase 5 now supports
 remote registration and server execution for values supported by the existing
 wire codec, plus Java, Python, and JavaScript registration and UDF APIs.
-Native-value transport adapters and performance work remain planned.
+Local Python native-value adapters are implemented. JavaScript native-value
+adapters, remote/spill serde transport, and performance work remain planned.
 
 Tracking issue: [Allow indexing of arbitrary data, #234](https://github.com/datalevin/datalevin/issues/234).
 
@@ -586,15 +587,66 @@ the interface proxy converts its `Buffer` result into an array. Invalid payload
 results fail before committing. Host callback errors retain their message even
 when a Java interface proxy wraps them in an exception without a message.
 
-These APIs currently accept values supported by their ordinary bridge
-conversion. The payload serde functions control storage bytes; they do not yet
-automatically transport arbitrary native Python/JavaScript objects. Local Java
-KV calls can already pass JVM objects directly to order and serde functions.
-Native-value adapters for all query inputs/results and remote messages remain
-the final Phase 5 work item.
+Local Java KV calls can already pass JVM objects directly to order and serde
+functions. Local Python handles additionally support native class bindings as
+described below. JavaScript currently accepts ordinary bridge values; native
+JavaScript and remote value adapters remain Phase 5 work.
 
 Examples are in the [Python binding README](../bindings/python/README.md#ordered-custom-types)
 and [JavaScript binding README](../bindings/javascript/README.md#ordered-custom-types).
+
+### Native Python values
+
+Associate a Python class with its custom payload descriptors before opening
+the local environment:
+
+```python
+registry.bind_native_type("app/task", Task, task_type_definition)
+opts = {":runtime-opts": {":udf-registry": registry}}
+```
+
+This is a runtime binding, separate from the persisted `register_type`
+operation. The definition must specify serializer and deserializer UDFs.
+Bind one exact Python class per type name within a UDF registry; conflicting
+bindings fail. Repeating the same binding is idempotent. Different registries
+can bind the same class to different payload codecs without changing other
+databases' conversion behavior. Recreate these bindings on reopen, alongside
+the UDF implementations.
+
+The handle scopes argument conversion to its registry. Native objects can be
+passed directly as custom KV keys, ordered list items, Datalog attribute
+values, range endpoints, lookup refs, and query inputs. Typed transaction and
+query builders defer their conversion until execution. Returned custom values,
+including nested results, entity/pull reads, decoded callbacks, and UDF results,
+are reconstructed as Python instances. Borrowed KV handles, write transactions,
+simulated database values, and asynchronous transactions retain these bindings.
+
+The bridge serializes a native value into a defensive byte snapshot before
+entering the JVM. An internal `NativeValue` carries that snapshot and its live
+runtime binding. Storage still writes the registered payload bytes and uses the
+existing custom references. Order and payload callbacks receive reconstructed
+Python objects. Payload reads need only the deserializer. Binding changes use
+the existing UDF generation mechanism, and missing bindings or callback errors
+fail without partial writes. A native value tagged with a different registered
+type is rejected before indexing it.
+
+Exact matching and query joins use Python `==` on decoded complete values,
+including when payload bytes differ for equal values. Each side uses its own
+codec, so values from separate runtime registries can compare correctly.
+Unhashable Python classes are supported: the JVM adapter currently uses a
+constant hash to preserve equality for arbitrary classes. This can make hash
+joins and deduplication expensive; native equality/hash costs need measurement
+in Phase 6. The application's equality must behave as a stable equivalence
+relation, and serde must reconstruct values under that equality.
+
+This adapter currently supports embedded operations that do not serialize the
+runtime carrier through Nippy. Native values in untyped `:data` payloads, query
+results spilling to disk, remote requests/responses, and helpers that eagerly
+convert values without a database handle still need a transport binding
+context. Opening a remote handle with native Python bindings is rejected.
+The carrier has no persistent Nippy encoding; runtime IDs must not become part
+of durable custom payloads. Remote and spill support are the next transport
+work items, along with the JavaScript native adapter.
 
 ## Implementation phases
 
@@ -688,7 +740,10 @@ permissions, read-only replicas, UDF rebinding, failed writes, and session
 reopen after server restart. Language registration APIs, custom UDF descriptor
 kinds, and byte-oriented serializer adapters are also implemented. Binding tests
 cover scalar/tuple orders, collisions, shared KV/Datalog registrations, payload
-round trips, rollback, and reopen/rebind. Native-value serde transport remains.
+round trips, rollback, and reopen/rebind. Local Python native class adapters also
+cover noncanonical payloads, unhashable values, exact queries, upserts, decoded
+callbacks, async/simulated transactions, and codec isolation. JavaScript native
+adapters and remote/spill serde transport remain.
 
 - Expose registration and custom-type references through the applicable Java,
   Python, and JavaScript surfaces.

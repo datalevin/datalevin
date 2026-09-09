@@ -479,9 +479,52 @@ For Datalog, register through the connection and set an attribute's
 APIs. Supply runtime bindings again when reopening. Remote stores execute
 functions using bindings installed on the server.
 
-Current values must work with ordinary Python/JVM bridge conversion, such as
-the dictionary above. Automatic serde transport for arbitrary native Python
-objects is still pending. See the [custom-data plan](../../doc/custom-data.md).
+For native Python classes, bind the class to its payload descriptors before
+opening the local environment. Ordinary operations then accept and return
+instances automatically:
+
+```python
+from dataclasses import dataclass
+import json
+from datalevin import UdfDescriptor, create_udf_registry, open_kv
+
+@dataclass
+class Task:
+    rank: int
+    label: str
+
+registry = create_udf_registry()
+registry.order_udf("native/order")(lambda task: task.rank)
+registry.serializer_udf("native/encode")(
+    lambda task: json.dumps([task.rank, task.label]).encode("utf-8"))
+registry.deserializer_udf("native/decode")(
+    lambda payload: Task(*json.loads(payload)))
+
+definition = {
+    "index": {"type": ":long", "order-fn": UdfDescriptor.order_fn("native/order")},
+    "payload": {"serialize": UdfDescriptor.serializer("native/encode"),
+                "deserialize": UdfDescriptor.deserializer("native/decode")},
+}
+registry.bind_native_type("app/task", Task, definition)
+with open_kv("/tmp/dtlv-python-native", opts={":runtime-opts": {":udf-registry": registry}}) as kv:
+    kv.register_type("app/task", definition)
+    kv.open_dbi("tasks", {":key-type": ":app/task"})
+    kv.transact([(":put", Task(1, "Compile"), "queued")], dbi_name="tasks")
+    assert kv.get_value("tasks", Task(1, "Compile")) == "queued"
+    assert kv.get_range("tasks", [":all"]) == [[Task(1, "Compile"), "queued"]]
+```
+
+The same binding supports custom Datalog attributes, query inputs, pull/entity
+results, and typed transaction builders. It is scoped to the supplied UDF
+registry and must be recreated on reopen. Exact matching uses Python `==` on
+complete values; equal objects do not need identical serialized bytes or a
+Python hash function.
+
+Native class support currently covers local operations without query spilling
+to disk. Remote transport, native values in untyped `:data`, and helpers that
+convert values before a database handle is available remain unsupported. The
+current constant JVM hash can make large hash joins/deduplication expensive.
+See the [native-value plan](../../doc/custom-data.md#native-python-values).
 
 ## Fulltext Analyzer UDF Example
 

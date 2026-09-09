@@ -11,6 +11,7 @@ from ._convert import to_edn_form, to_java, to_python, to_query_input
 from ._forms import Form
 from ._interop import _BINDINGS
 from ._java import call_java, classes
+from ._native import native_methods
 from ._resource import ResourceWrapper
 
 _TIMEOUT_MISSING = object()
@@ -94,6 +95,7 @@ def _consumer_proxy(fn):
     return jpype.JProxy(classes().consumer_type, inst=_PythonConsumer(fn))
 
 
+@native_methods
 class Connection(ResourceWrapper):
     """Thin Python wrapper over a raw Datalevin connection handle."""
 

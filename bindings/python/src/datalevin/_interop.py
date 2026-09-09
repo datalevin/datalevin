@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+from contextvars import copy_context
 
 import jpype
 
 from ._convert import to_java, to_python
 from ._java import call_java, classes
 from ._jvm import jvm_started, start_jvm
+from ._native import native_scope, registry_from_opts
 from .errors import DatalevinError
 
 _TIMEOUT_MISSING = object()
@@ -798,9 +800,10 @@ _MISSING = object()
 class _PythonFunction:
     def __init__(self, fn) -> None:
         self._fn = fn
+        self._context = copy_context()
 
     def apply(self, value):
-        return to_java(self._fn(value))
+        return self._context.copy().run(lambda: to_java(self._fn(value)))
 
 
 def api_info():
@@ -828,7 +831,8 @@ def connect(dir=None, schema=None, opts=None, *, shared: bool = False) -> Connec
 
     from .connection import Connection
 
-    return Connection(_BINDINGS.create_connection(dir, schema, opts, shared=shared))
+    with native_scope(registry_from_opts(opts, dir)):
+        return Connection(_BINDINGS.create_connection(dir, schema, opts, shared=shared))
 
 
 def init_db(datoms, dir=None, schema=None, opts=None) -> Connection:
@@ -836,13 +840,15 @@ def init_db(datoms, dir=None, schema=None, opts=None) -> Connection:
 
     from .connection import Connection
 
-    return Connection(_BINDINGS.init_db(datoms, dir, schema, opts))
+    with native_scope(registry_from_opts(opts, dir)):
+        return Connection(_BINDINGS.init_db(datoms, dir, schema, opts))
 
 
 def fill_db(conn: Connection, datoms) -> Connection:
     """Bulk-load datoms into an existing Datalevin Datalog connection."""
 
-    _BINDINGS.fill_db(conn, datoms)
+    with native_scope(getattr(conn, "_native_registry", None)):
+        _BINDINGS.fill_db(conn, datoms)
     return conn
 
 
@@ -1285,7 +1291,8 @@ def datalog_kv(conn: Connection) -> KV:
     from .kv import KV
 
     handle = conn.raw_handle() if callable(getattr(conn, "raw_handle", None)) else conn
-    return KV(_BINDINGS.connection_datalog_kv(handle), owned=False)
+    with native_scope(getattr(conn, "_native_registry", None)):
+        return KV(_BINDINGS.connection_datalog_kv(handle), owned=False)
 
 
 def max_eid(conn: Connection):
@@ -1398,7 +1405,8 @@ def open_kv(dir, opts=None) -> KV:
 
     from .kv import KV
 
-    return KV(_BINDINGS.open_key_value(dir, opts))
+    with native_scope(registry_from_opts(opts, dir)):
+        return KV(_BINDINGS.open_key_value(dir, opts))
 
 
 def new_search_engine(kv: KV, opts=None):

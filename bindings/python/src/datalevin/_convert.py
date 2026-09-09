@@ -12,6 +12,7 @@ from jpype.types import JBoolean, JByte, JLong
 
 from ._forms import EdnList, Form, Keyword, Symbol
 from ._java import call_java, classes, is_java_object
+from ._native import native_to_java, native_to_python
 
 INT64_MIN = -(2**63)
 INT64_MAX = 2**63 - 1
@@ -20,6 +21,10 @@ FORM_SYMBOL_STRINGS = {"*", "...", ".", "$", "%", "_"}
 
 def to_java(value):
     """Recursively convert Python values into Java/JVM-friendly values."""
+
+    native = native_to_java(value)
+    if native is not None:
+        return native
 
     if value is None or isinstance(value, (float, str)):
         return value
@@ -107,6 +112,9 @@ def to_python(value):
 
     byte_array_type = jpype.JArray(JByte)
 
+    if str(value.getClass().getName()) == "datalevin.NativeValue":
+        return native_to_python(value)
+
     if isinstance(value, byte_array_type):
         return bytes(value)
 
@@ -174,6 +182,10 @@ def _hashable_python_value(value):
 def to_edn_form(value):
     """Convert Python form structures into EDN-friendly JVM values."""
 
+    native = native_to_java(value)
+    if native is not None:
+        return native
+
     if value is None or is_java_object(value):
         return value
 
@@ -223,6 +235,10 @@ def to_edn_form(value):
 
 def to_query_input(value):
     """Convert Python query inputs while preserving ordinary string literals."""
+
+    native = native_to_java(value)
+    if native is not None:
+        return native
 
     if value is None or is_java_object(value):
         return value

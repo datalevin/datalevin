@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from ._native import current_registry
+
 
 class ResourceWrapper:
     """Context-manager wrapper for a live Datalevin handle."""
 
     def __init__(self, handle, close_fn, closed_fn, kind: str) -> None:
+        self._native_registry = current_registry()
         self._handle = handle
         self._close_fn = close_fn
         self._closed_fn = closed_fn

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from ._convert import to_edn_form, to_python
 from ._interop import _BINDINGS
+from ._native import current_registry, native_methods
 
 
 def _edn_form(value):
@@ -12,10 +13,12 @@ def _edn_form(value):
     return to_edn_form(value)
 
 
+@native_methods
 class Database:
     """Database value returned by simulated transaction reports."""
 
     def __init__(self, handle) -> None:
+        self._native_registry = current_registry()
         self._handle = handle
 
     def __repr__(self) -> str:

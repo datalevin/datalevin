@@ -17,6 +17,7 @@
    [datalevin.udf :as udf]
    [datalevin.util :refer [raise]])
   (:import
+   [datalevin NativeValue]
    [java.util Arrays]
    [java.util.regex Pattern]))
 
@@ -263,6 +264,13 @@
                                {:type-name type-name :kind kind})
                         e))))))
 
+(defn- check-native-type! [type-name value]
+  (when (and (instance? NativeValue value)
+             (not= (str type-name) (.typeName ^NativeValue value)))
+    (raise "Native value belongs to a different custom type"
+           {:error :custom-type/native-type :type-name type-name
+            :value-type (.typeName ^NativeValue value)})))
+
 (defn- compile-type [kv type-name definition runtime-opts]
   (let [backing (get-in definition [:index :type])
         order (delay (materialize kv type-name :order-fn
@@ -277,6 +285,7 @@
     {:type-name type-name
      :definition definition
      :order-fn (fn [value]
+                 (check-native-type! type-name value)
                  (let [key (invoke-function order type-name :order-fn value)]
                    (when-not (valid-order-key? key backing)
                      (raise "Custom order function returned an invalid backing value"
@@ -284,6 +293,7 @@
                              :backing-type backing :value key}))
                    key))
      :serialize (fn [value]
+                  (check-native-type! type-name value)
                   (let [payload (invoke-function serialize type-name :serializer value)]
                     (when-not (bytes? payload)
                       (raise "Custom serializer must return a byte array"
@@ -293,7 +303,9 @@
                     (when-not (bytes? payload)
                       (raise "Custom deserializer requires a byte array"
                              {:error :custom-type/payload :type-name type-name}))
-                    (invoke-function deserialize type-name :deserializer payload))}))
+                    (let [value (invoke-function deserialize type-name :deserializer payload)]
+                      (check-native-type! type-name value)
+                      value))}))
 
 (defn resolve-type
   "Resolve a type for an operation. Optional runtime opts supply its UDF registry.

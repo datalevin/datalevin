@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from contextvars import copy_context
+
 import jpype
 
 from ._convert import to_edn_form, to_java, to_python
 from ._interop import _BINDINGS
 from ._java import call_java, classes
+from ._native import native_methods
 from ._resource import ResourceWrapper
 
 _TIMEOUT_MISSING = object()
@@ -140,9 +143,12 @@ class _PythonBiPredicate:
 class _PythonBiFunction:
     def __init__(self, fn) -> None:
         self._fn = fn
+        self._context = copy_context()
 
     def apply(self, key, value):
-        return to_java(self._fn(to_python(key), to_python(value)))
+        return self._context.copy().run(
+            lambda: to_java(self._fn(to_python(key), to_python(value)))
+        )
 
 
 class _PythonRawBufferConsumer:
@@ -172,9 +178,10 @@ class _PythonRawKVPredicate:
 class _PythonRawKVFunction:
     def __init__(self, fn) -> None:
         self._fn = fn
+        self._context = copy_context()
 
     def apply(self, value):
-        return to_java(self._fn(RawKV(value)))
+        return self._context.copy().run(lambda: to_java(self._fn(RawKV(value))))
 
 
 def _consumer_proxy(fn):
@@ -209,6 +216,7 @@ def _raw_kv_function_proxy(fn):
     return jpype.JProxy(classes().function_type, inst=_PythonRawKVFunction(fn))
 
 
+@native_methods
 class KV(ResourceWrapper):
     """Thin Python wrapper over a raw Datalevin KV handle."""
 

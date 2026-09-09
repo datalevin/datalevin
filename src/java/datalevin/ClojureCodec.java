@@ -142,6 +142,7 @@ final class ClojureCodec {
 
     static Object bridgeOutput(Object value) {
         if (value == null
+                || value instanceof NativeValue
                 || value instanceof Keyword
                 || value instanceof Symbol
                 || value instanceof String
