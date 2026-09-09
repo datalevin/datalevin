@@ -98,19 +98,18 @@
                                (custom/resolve-type kv name) key))
     (cv/encode-order kt key)))
 
-(defn- ensure-key! [kv raw dbi opts key kt]
+(defn- prepare-key [kv raw dbi opts key kt]
   (if-let [name (:key-type opts)]
     (let [type (custom/resolve-type kv name)
           prefix (cv/order-prefix type key (:key-size opts))
           payload ((:serialize type) key)]
-      (if-let [ref (key-ref kv raw dbi opts key kt)]
-        (do (cv/transact! kv [(l/kv-tx :put c/custom-values
-                                       (cv/reference-id ref) payload :id :raw)])
-            ref)
+      (if-let [ref (:reference (cv/find-value kv (index raw dbi :key nil)
+                                             type key prefix))]
+        {:reference ref
+         :txs [(l/kv-tx :put c/custom-values (cv/reference-id ref) payload :id :raw)]}
         (let [{:keys [id txs]} (cv/allocate-payload kv payload)]
-          (cv/transact! kv txs)
-          (cv/reference prefix id))))
-    (cv/encode-order kt key)))
+          {:reference (cv/reference prefix id) :txs txs})))
+    {:reference (cv/encode-order kt key) :txs []}))
 
 (defn- delete-key! [kv raw dbi opts ref]
   (let [item-refs (when (:value-type opts) (i/get-list raw dbi ref :raw :raw))
@@ -145,13 +144,17 @@
                     (when-let [ref (key-ref kv raw dbi opts key kt)]
                       (some? (i/get-value raw dbi ref :raw :raw))))
           (raise "Custom key already exists" {:error :custom-type/key-exists}))
-        (let [ref (ensure-key! kv raw dbi opts key kt)]
-          (doseq [value values]
-            (if-let [name (:value-type opts)]
-              (cv/put-value! kv (assoc (index raw dbi :item ref) :flags flags)
-                             (custom/resolve-type kv name) value nil)
-              (cv/transact! kv [(l/kv-tx :put dbi ref (cv/encode-order vt value)
-                                         :raw :raw flags)])))))
+        (let [{ref :reference txs :txs} (prepare-key kv raw dbi opts key kt)]
+          (if-let [name (:value-type opts)]
+            (do
+              ;; Item matching/allocation must see a newly allocated key ID.
+              (when (seq txs) (cv/transact! kv txs))
+              (doseq [value values]
+                (cv/put-value! kv (assoc (index raw dbi :item ref) :flags flags)
+                               (custom/resolve-type kv name) value nil)))
+            (cv/transact! kv
+                          (into txs (map #(l/kv-tx :put dbi ref (cv/encode-order vt %)
+                                                   :raw :raw flags)) values)))))
 
       :del
       (when-let [ref (key-ref kv raw dbi opts key kt)]

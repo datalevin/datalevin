@@ -234,6 +234,73 @@
       (is (= (d/dir kv) (order-key kv :app/context nil))))
     (is (= [[:app/context :order-fn] [:app/context :order-fn]] @calls))))
 
+(deftest writer-functions-retain-their-own-context
+  (let [runtime (udf/create-registry)
+        kv (open-kv "writer-context" {:runtime-opts {:udf-registry runtime}})
+        desc (udf-desc :order-fn)]
+    (d/open-dbi kv "state")
+    (d/transact-kv kv "state" [[:put :offset 1]])
+    (udf/register-resolver! runtime :test
+                           (fn [{:keys [kv]} _]
+                             (fn [v] (+ (long v) (long (d/get-value kv "state" :offset))))))
+    (d/register-type kv :app/context {:index {:type :long :order-fn desc}})
+    (is (= 2 (order-key kv :app/context 1)))
+    (d/with-transaction-kv [tx kv]
+      (d/transact-kv tx "state" [[:put :offset 10]])
+      (is (= 11 (order-key tx :app/context 1)))
+      (is (= 12 (order-key tx :app/context 2)))
+      (is (= 2 (order-key kv :app/context 1)))
+      ;; Rebinding must invalidate a function already used by this writer.
+      (udf/register! runtime desc (constantly 99))
+      (is (= 99 (order-key tx :app/context 1)))
+      (udf/unregister! runtime desc)
+      (is (= 11 (order-key tx :app/context 1)))
+      (d/abort-transact-kv tx))
+    (is (= 2 (order-key kv :app/context 1)))
+    (d/with-transaction-kv [tx kv]
+      (d/transact-kv tx "state" [[:put :offset 20]])
+      (is (= 21 (order-key tx :app/context 1))))
+    (is (= 21 (order-key kv :app/context 1)))))
+
+(deftest aborted-writer-definitions-cannot-be-reused
+  (let [kv (open-kv "writer-registry")]
+    (d/register-type kv :app/base (task-type 0))
+    (d/with-transaction-kv [tx kv]
+      (is (= 1 (order-key tx :app/base {:rank 1})))
+      (d/register-type tx :app/new (task-type 10))
+      (is (= 11 (order-key tx :app/new {:rank 1})))
+      (is (= 1 (:revision (custom/registry kv))))
+      (d/abort-transact-kv tx))
+    ;; This reaches the same registry revision with a different definition.
+    (d/with-transaction-kv [tx kv]
+      (is (thrown? Exception (custom/resolve-type tx :app/new)))
+      (d/register-type tx :app/new (task-type 20))
+      (is (= 21 (order-key tx :app/new {:rank 1}))))
+    (is (= 21 (order-key kv :app/new {:rank 1})))))
+
+(deftest writer-functions-refresh-after-map-resize
+  (let [runtime (udf/create-registry)
+        kv (open-kv "writer-resize" {:mapsize 1 :runtime-opts {:udf-registry runtime}})
+        writers (atom #{})
+        body (apply str (repeat 131072 \x))
+        values (mapv #(hash-map :rank % :body body) (range 32))]
+    (udf/register-resolver!
+     runtime :test
+     (fn [{:keys [kv]} _]
+       (let [txn @(l/write-txn kv)]
+         (when (l/writing? kv) (swap! writers conj txn))
+         (fn [value]
+           (when-not (identical? txn @(l/write-txn kv))
+             (throw (ex-info "Resolver retained an earlier native writer" {})))
+           (:rank value)))))
+    (d/register-type kv :app/large {:index {:type :long :order-fn (udf-desc :order-fn)}})
+    (d/open-dbi kv "items" {:key-type :app/large})
+    (d/transact-kv kv "items" (mapv #(vector :put % (:rank %)) values) :app/large :long)
+    (is (< 1 (count @writers)))
+    (is (= (mapv #(vector % (:rank %)) values)
+           (d/get-range kv "items" [:all] :app/large :long)))
+    (is (= 32 (d/entries kv c/custom-values)))))
+
 (deftest registry-survives-copy-and-kv-dump
   (let [kv (open-kv "backup")
         copied-path (str *dir* "/copy")]

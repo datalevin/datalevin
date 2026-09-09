@@ -9,7 +9,10 @@ Local Python and JavaScript native-value adapters, including query spilling,
 are implemented. Phase 5 includes remote native values: database-scoped server
 readers, caller registry readers, streamed batches, transactions, and durable
 response replay. Separate-process Python and JavaScript tests exercise this path.
-Phase 6 validation and storage-overhead measurements remain planned.
+Phase 6 now includes reproducible JVM storage and brief Python adapter
+measurements, with validation of results, payload cleanup, and lazy decoding.
+The agreed initial implementation scope is complete; the measured costs below
+remain performance work, particularly custom writes and collision matching.
 
 Tracking issue: [Allow indexing of arbitrary data, #234](https://github.com/datalevin/datalevin/issues/234).
 
@@ -144,8 +147,11 @@ The local implementation stores each definition at `[:types type-name]` with
 key type `[:keyword :keyword]`, and increments `:custom-types-revision` in the
 same write transaction. Interpreted functions retain Nippy-encoded source and
 captures under `:inter-fn/source`; opening metadata does not compile functions.
-Revision checks refresh the committed registry cache. Transaction-local reads
-bypass that cache so aborted definitions and callables are never published.
+Revision checks refresh the committed registry cache. Writes use a separate
+cache for the active native transaction, reusing definitions and functions
+across rows. Registry revisions and UDF generations invalidate its contents;
+a new writer, including a map-resize retry, gets a fresh cache. Aborted
+definitions and writer-bound resolver closures never enter the committed cache.
 
 ## Order and payload functions
 
@@ -159,7 +165,9 @@ The output must match the declared scalar type or tuple arity and component
 types. Apply the existing backing types' validation and nil rules. The order
 function must be deterministic for a registered version: insertion, lookup,
 deletion, and preparation of logical range bounds must obtain the same result
-for the same value. Existing backing-type rules determine index order.
+for the same value. Values participating in a transaction's ordered collections
+must remain stable; comparators may reuse their encoded order keys. Existing
+backing-type rules determine index order.
 
 The optional payload function contract is byte-oriented:
 
@@ -766,9 +774,190 @@ spilling for native result conversion, queries, joins, deduplication, failure
 handling, and collection reuse. Large native collision buckets retain the known
 constant-hash cost; deeper tuning remains deferred to the Rust core.
 
+## Storage measurements (2026-09-09)
+
+These are small local storage diagnostics, separate from the Nippy codec
+comparison. Reproduce from the repository root:
+
+```sh
+clojure -M:dev script/custom_data_bench.clj 2048 5 3 /tmp/custom-data-jvm.edn
+bindings/python/.venv/bin/python script/custom_data_python_bench.py --output /tmp/custom-data-python.json
+```
+
+The scripts create and remove temporary databases. Python uses
+`DATALEVIN_CLASSPATH`, or obtains it with `clojure -Spath` when unset.
+[Raw samples and environment details](custom-data-performance.edn) accompany
+the tables: `:jvm` contains the optimized run and `:jvm-before` retains the
+initial baseline. Both used an Apple M3 Pro with 36 GiB RAM, macOS 26.6.2,
+JDK 21.0.12.1, and Nippy 3.9.0.
+
+Each JVM case stores 2,048 entries. Results are medians of five rounds after
+three warmup rounds, alternating case order. Each round uses a fresh database;
+opening, registration, data construction, validation, and closing are outside
+timing. Writes and deletes each use one ascending batch, including commit.
+WAL and background sampling are disabled; default LMDB sync and DBI flags
+remain enabled. Reads run against the just-written database with warm pages.
+Exact lookups traverse all keys in reverse order; scans are fully consumed ten
+times. These measurements cover neither cold disks nor concurrent workloads,
+remote transport, WAL-enabled throughput, or full query execution.
+
+### JVM optimization results
+
+JFR samples of custom KV writes/deletes showed repeated interpreter analysis.
+Every write previously reloaded the type registry and bypassed compiled-function
+caching. A separate Datalog profile showed registry reads and order-key encoding
+inside transaction sorting. The implementation now:
+
+- Reuses registry snapshots and compiled functions within the active native
+  writer, with revision/generation checks and isolation from committed readers.
+- Prepares each KV key's order prefix once and applies its payload and ordinary
+  index rows through one existing WAL-aware transaction call.
+- Reuses resolved types and encoded order keys within Datalog comparators.
+  Type definitions are immutable; UDF rebinding and native-writer replacement
+  invalidate the cached functions and keys.
+
+Write times below are µs per row, measured with the same unprofiled harness and
+settings before and after the changes. The full tables below show the new run.
+
+| Custom storage | Before | After | Speedup |
+| --- | ---: | ---: | ---: |
+| KV scalar, small payload | 31.97 | 5.39 | 5.9× |
+| KV tuple, small payload | 35.74 | 6.13 | 5.8× |
+| KV scalar, large payload | 35.82 | 8.77 | 4.1× |
+| KV scalar, 8 values / order key | 34.49 | 8.51 | 4.1× |
+| KV scalar, 64 values / order key | 55.85 | 29.74 | 1.9× |
+| Datalog scalar, small payload | 31.66 | 13.63 | 2.3× |
+
+Scalar KV deletion also falls from 31.67 to 18.76 µs per row. Exact reads and
+full scans remain broadly similar; collision matching still decodes candidate
+payloads. These changes preserve the storage format and full-value matching.
+Validation passed 78 focused JVM tests (2,591 assertions) and 66 core smoke
+tests (432 assertions). New checks cover aborted registrations reaching the
+same revision, writer-specific resolver context, map-resize retries, and UDF
+and schema changes after comparator keys have been cached.
+
+### JVM KV
+
+Custom values are maps with `:rank`, `:id`, `:label`, and `:body`. The scalar
+order is `:rank`; the tuple order is `[rank label]` backed by `[:long :string]`.
+The default 32-character body produces an average 70.75-byte Nippy payload.
+The 4,096-character body produces an average 4,135.75-byte payload. Custom
+keys map to a separate long value. Built-in baselines use the backing key and
+either a long or the same complete Nippy payload as their value. Keeping a
+payload directly under a built-in key does not implement custom full-value
+matching or retain multiple values with the same order key.
+
+All times below are microseconds. Scan times include returning complete keys
+and values. Live bytes count user-index and custom-payload B-tree pages per
+entry, excluding registry, free pages, and environment metadata; they are not
+serialized sizes or total database file sizes.
+
+| Storage | Write / row | Exact hit | Scan / row | Delete / row | Live bytes / row |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Built-in long → long | 0.34 | 0.34 | 0.048 | 11.26 | 32 |
+| Built-in long → small payload | 0.76 | 0.80 | 0.477 | 3.70 | 96 |
+| Custom scalar, small payload | 5.39 | 4.18 | 0.764 | 18.76 | 144 |
+| Built-in tuple → long | 0.76 | 0.47 | 0.302 | 10.16 | 48 |
+| Built-in tuple → small payload | 1.16 | 0.92 | 0.745 | 4.01 | 104 |
+| Custom tuple, small payload | 6.13 | 4.91 | 0.786 | 18.35 | 152 |
+| Built-in long → large payload | 3.58 | 1.83 | 0.841 | 0.83 | 8,216 |
+| Custom scalar, large payload | 8.77 | 5.93 | 1.240 | 16.62 | 8,264 |
+| Custom scalar, 8 values / order key | 8.51 | 7.36 | 0.769 | 19.68 | 136 |
+| Custom scalar, 64 values / order key | 29.74 | 29.35 | 0.788 | 19.34 | 136 |
+
+Collision cases use small payloads and `rank = floor(id / bucket-size)`.
+Exact-hit times average over all members, not just the first or last member.
+Deletes proceed in insertion order, so each deletion matches the first
+remaining member; they do not measure worst-case collision deletion. The large
+payload crosses the LMDB overflow-page boundary in both representations, which
+explains the jump in live bytes. Delete costs also depend on B-tree layout and
+rebalancing; the unusually cheaper large-value baseline is specific to this
+ascending batch and should not be generalized to random deletions.
+
+Against the built-in scalar key with the same small payload, custom scalar
+writes cost about 7.1×, exact hits 5.2×, and full scans 1.6×. Tuple full scans are
+close in this sample, but their writes and exact hits retain substantial
+overhead. Custom storage is functionally implemented; these numbers do not
+establish performance parity with built-in types.
+
+### Reads that can skip custom payloads
+
+Counts and scans returning only the ordinary long values do not need the
+custom key payload. Counts and lazy-first timings are per call; value-only
+scans are per returned row. Each count or lazy-first sample repeats 100 times.
+
+| Storage | Count all, µs | Values only, µs / row | Lazy first, µs |
+| --- | ---: | ---: | ---: |
+| Built-in long → long | 1.36 | 0.038 | 0.79 |
+| Custom scalar, small payload | 2.54 | 0.103 | 4.30 |
+| Custom scalar, large payload | 2.44 | 0.098 | 5.24 |
+| Custom scalar, 64 values / order key | 2.51 | 0.101 | 4.47 |
+
+A separate instrumented deserializer verifies the work performed in a
+64-member bucket: the first exact hit decodes 1 payload, the last hit and a
+same-order miss each decode 64, and a full scan decodes 64. Counts and
+value-only scans decode 0. Taking the first lazy result with `:batch-size 1`
+decodes 2: the current shared iterator fetches `batch-size + 1` entries.
+Closing the lazy range releases its cursor and snapshot.
+
+The standalone component diagnostic measures about 0.009 µs for direct rank
+access, 0.075 µs for the resolved and validated `inter-fn` order callback, and
+0.033 µs for a resolved JVM-local UDF callback. These include loop and result
+consumption overhead, with function resolution outside timing. Small-payload
+Nippy serialization/deserialization cost 0.364/0.409 µs; loading and decoding a
+payload by an already-known reference costs 0.820 µs, including acquiring a
+read snapshot. This last operation excludes order calculation and candidate
+matching. Simple order callbacks and raw serialization account for only a
+small fraction of current custom write time. Remaining JVM work includes
+candidate scans, payload lookup overhead, and reducing per-row storage calls;
+this diagnostic does not attribute their individual shares.
+
+### JVM Datalog
+
+These cases store one attribute per entity, using a built-in long or a custom
+scalar with the small map payload. Index caching is disabled (`:cache-limit 0`).
+Exact reads use `datoms :ave`; scans use `index-range`; entity reads retrieve
+the attribute through `entity`. Results are consumed within timing. Thus this
+compares storage APIs and complete-value reconstruction, including the extra
+payload work in the custom case, without query/result-cache effects.
+
+| Attribute | Write / row, µs | Exact hit, µs | Scan / row, µs | Entity read, µs | Retract / row, µs |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Built-in long | 3.25 | 2.08 | 0.255 | 1.87 | 26.87 |
+| Custom scalar | 13.63 | 7.18 | 2.471 | 5.96 | 35.75 |
+
+### Brief Python adapter measurement
+
+These figures retain the initial run, before the JVM optimizations above.
+Python adapter tuning and remeasurement are deferred to the Rust core.
+
+Python 3.14.7 and JPype 1.7.1 use the same JVM. This smaller run uses 256 entries,
+three warmup rounds, and five measured rounds, again alternating case order.
+The native value is a Python `Task(rank, label)` class with a 32-character
+label, a scalar order UDF, and JSON byte serde. Its representative payload is
+39 bytes at rank 42. The baseline stores long keys and long values; both paths
+include the normal Python API conversion and JVM bridge. Scans run five times
+and return Python values. JVM startup is outside timing.
+
+| Python KV path | Write / row, µs | Exact hit, µs | Scan / row, µs | Count all, µs | Delete / row, µs |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Built-in long | 10.19 | 22.58 | 20.89 | 23.88 | 10.89 |
+| Native Task | 170.27 | 137.14 | 69.26 | 26.91 | 136.42 |
+
+Pure Python JSON encode/decode cost 1.220/0.928 µs per value. A JVM loop calling
+a minimal numeric Python UDF costs 13.024 µs per invocation, amortizing the
+outer JPype call. This measures a minimal callback crossing, not the full
+native-value adapter. The larger storage costs include wrapping, conversions,
+multiple callbacks, and logical matching. Constant JVM hashes can additionally
+make native-key map/set operations and query deduplication expensive; this KV
+measurement does not quantify that growth. Substantial bridge and hashing
+redesign remains deferred to the Rust core. JavaScript timing is also deferred;
+its separate-process correctness and spill tests are already covered in Phase 5.
+
 ## Implementation phases
 
-Phases 1–5 are implemented. Phase 6 remains planned.
+Phases 1–6 are implemented for the agreed initial scope. The measurements above
+record current overhead and identify further performance work.
 
 ### Phase 1: Registry and function contracts
 
@@ -884,6 +1073,17 @@ Completion: non-Clojure applications can register order and payload functions
 and use custom values through KV and Datalog APIs.
 
 ### Phase 6: Validation, performance, and documentation
+
+Implemented with the existing focused correctness suites and the two diagnostic
+scripts above. The scripts check returned values/counts, empty indexes and
+payload stores after deletion/retraction, and deserializer counts for collisions
+and lazy reads. The JVM run covers scalar and tuple keys, two payload sizes,
+collision buckets, direct payload reads, and Datalog storage. The Python run
+provides the agreed brief adapter sample. All diagnostics completed successfully;
+the Clojure script also passes lint without warnings. Existing core coverage
+includes seeded reference-order checks, snapshots, rollback, WAL replay, dumps,
+UDF rebinding, and local/remote language values. Production-scale workload
+coverage and performance tuning remain follow-up work.
 
 Keep performance work on the interim Python/JavaScript JVM adapters brief:
 take a small representative measurement and fix obvious, low-cost issues.

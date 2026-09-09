@@ -262,10 +262,13 @@
    nil))
 
 (defn find-value
-  "Find the complete value within its order bucket, including staged writes."
-  [kv index type value]
-  (find-prefix kv index type value
+  "Find the complete value within its order bucket, including staged writes.
+  A prepared prefix avoids evaluating and encoding the same order key again."
+  ([kv index type value]
+   (find-value kv index type value
                (order-prefix type value (or (:max-size index) c/+max-key-size+))))
+  ([kv index type value prefix]
+   (find-prefix kv index type value prefix)))
 
 (defn- require-writer! [kv]
   (when-not (and (l/writing? kv) (Thread/holdsLock (l/write-txn kv)))

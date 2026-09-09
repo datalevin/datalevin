@@ -3,6 +3,7 @@
             [datalevin.constants :as c]
             [datalevin.bits :as bits]
             [datalevin.core :as d]
+            [datalevin.custom-datalog :as cd]
             [datalevin.custom-value :as cv]
             [datalevin.db :as db]
             [datalevin.datom :as datom]
@@ -54,6 +55,33 @@
 (def a {:rank 1 :name "a"})
 (def b {:rank 1 :name "b"})
 (def c {:rank 2 :name "c"})
+
+(deftest comparator-keys-follow-runtime-and-schema-changes
+  (let [runtime (udf/create-registry)
+        conn (d/create-conn (str *dir* "/comparator-bindings") nil
+                            {:wal? false :runtime-opts {:udf-registry runtime}})
+        _ (swap! *handles* conj conn)
+        kv (d/datalog-kv conn)
+        desc {:udf/lang :test :udf/kind :order-fn :udf/id :app/rank}
+        schema (atom {:task/value {:db/valueType :app/task}})
+        compare-values (cd/value-comparator kv #(deref schema))]
+    (udf/register! runtime desc :rank)
+    (d/register-type conn :app/task {:index {:type :long :order-fn desc}})
+    (is (neg? (compare-values :task/value a c)))
+    (is (neg? (compare-values :task/value a c)))
+    (udf/register! runtime desc #(- (long (:rank %))))
+    ;; Reuse the exact input objects whose prefixes were cached.
+    (is (pos? (compare-values :task/value a c)))
+    (udf/unregister! runtime desc)
+    (is (thrown? Exception (compare-values :task/value a c)))
+    (udf/register! runtime desc :rank)
+    (is (neg? (compare-values :task/value a c)))
+    (d/register-type conn :app/reverse
+                     {:index {:type :long :order-fn (inter/inter-fn [v] (- (:rank v)))}})
+    (swap! schema assoc-in [:task/value :db/valueType] :app/reverse)
+    (is (pos? (compare-values :task/value a c)))
+    (is (not (zero? (compare-values :task/value a b))))
+    (is (zero? (compare-values :task/value a (into {} a))))))
 
 (deftest datalog-custom-storage-and-queries
   (doseq [wal? [false true]]

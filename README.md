@@ -116,6 +116,7 @@ and [Clojure](https://cljdoc.org/d/datalevin/datalevin) are currently supported.
 More information about our vision and design decisions can be found in these
 resources in chronicle order:
 
+* Post [Datalevin 1.1.0: State-of-the-Art Performance Across Data Models](https://yyhh.org/blog/2026/09/datalevin-1-1-0-performance/)
 * Interview [Clojure Corner Interview with Huahai Yang](https://www.youtube.com/watch?v=1XMU5mdDj7I)
 * **Book [Datalevin: the Definite Guide to Logical and Intelligent Databases](https://datalevin.org/docs)**
 * Post [Triple Store, Triple Progress: Datalevin Posited for the Future](https://yyhh.org/blog/2026/01/triple-store-triple-progress-datalevin-posited-for-the-future/)

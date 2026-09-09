@@ -16,8 +16,9 @@
             [datalevin.datom :as d]
             [datalevin.interface :as i]
             [datalevin.lmdb :as l]
+            [datalevin.udf :as udf]
             [datalevin.util :refer [raise]])
-  (:import [java.util Arrays HashMap]
+  (:import [java.util Arrays HashMap IdentityHashMap]
            [java.nio ByteBuffer]
            [datalevin.bits Indexable Retrieved CustomReference]
            [datalevin.lmdb DatomKVTxData]))
@@ -150,23 +151,44 @@
           (finally (when rtx# (i/return-rtx kv# rtx#))))))
 
 (defn order-comparator
-  "Compare range endpoints by order bucket, without complete-value tie breaks."
+  "Compare range endpoints by order bucket, without complete-value tie breaks.
+  The comparator belongs to a transaction overlay or a single range operation.
+  Immutable type definitions and stable values need resolving/encoding only once;
+  new UDF bindings or a replaced native writer invalidate the cached keys."
   [kv schema-fn]
-  (fn [a x y]
-    (if (or (nil? x) (nil? y))
-      0
-      (if-let [t (let [t (:db/valueType ((schema-fn) a))]
-                   (when (custom-type? t) t))]
-        (cond
-          (= x y) 0
-          (or (identical? x c/v0) (identical? y c/vmax)) -1
-          (or (identical? x c/vmax) (identical? y c/v0)) 1
-          :else
-          (let [type (custom/resolve-type kv t)]
-            (Arrays/compareUnsigned
-             ^bytes (cv/order-prefix type x reference-budget)
-             ^bytes (cv/order-prefix type y reference-budget))))
-        (d/compare-with-type x y)))))
+  (let [types (HashMap.)]
+    (fn [a x y]
+      (if (or (nil? x) (nil? y))
+        0
+        (if-let [t (let [t (:db/valueType ((schema-fn) a))]
+                     (when (custom-type? t) t))]
+          (cond
+            (= x y) 0
+            (or (identical? x c/v0) (identical? y c/vmax)) -1
+            (or (identical? x c/vmax) (identical? y c/v0)) 1
+            :else
+            (let [registry (get-in @(i/kv-info kv) [:runtime-opts :udf-registry])
+                  generation (udf/generation registry)
+                  txn (when (l/writing? kv) @(l/write-txn kv))
+                  cached (.get types t)
+                  entry (if (and cached (identical? registry (:registry cached))
+                                 (= generation (:generation cached))
+                                 (identical? txn (:txn cached)))
+                          cached
+                          (let [entry {:registry registry :generation generation :txn txn
+                                       :type (custom/resolve-type kv t)
+                                       :keys (IdentityHashMap.)}]
+                            (.put types t entry)
+                            entry))
+                  type (:type entry)
+                  ^IdentityHashMap keys (:keys entry)
+                  prefix (fn [v]
+                           (or (.get keys v)
+                               (let [key (cv/order-prefix type v reference-budget)]
+                                 (.put keys v key)
+                                 key)))]
+              (Arrays/compareUnsigned ^bytes (prefix x) ^bytes (prefix y))))
+          (d/compare-with-type x y))))))
 
 (defn value-comparator
   "Order complete values by their native order prefix, then by a stable

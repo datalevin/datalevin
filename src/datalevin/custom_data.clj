@@ -18,6 +18,7 @@
    [datalevin.util :refer [raise]])
   (:import
    [datalevin NativeValue]
+   [java.lang.ref WeakReference]
    [java.util Arrays]
    [java.util.regex Pattern]))
 
@@ -163,6 +164,23 @@
 (defn- runtime-cache [kv]
   (:custom-type-cache @(local-info kv)))
 
+(defn- type-cache
+  "Keep staged definitions and resolver functions in the native writer's cache.
+  A new transaction (including a resize retry) must never reuse aborted state
+  or a resolver closure bound to a previous writer."
+  [kv]
+  (let [cache (runtime-cache kv)]
+    (if (l/writing? kv)
+      (let [txn @(l/write-txn kv)
+            writer (:writer @cache)]
+        (if (and writer (identical? txn (.get ^WeakReference (:txn writer))))
+          (:cache writer)
+          (let [local (atom {:registry (:registry @cache)})]
+            ;; Do not retain a closed native transaction through this cache.
+            (swap! cache assoc :writer {:txn (WeakReference. txn) :cache local})
+            local)))
+      cache)))
+
 (defn- persisted-revision ^long [kv]
   (long (or (i/get-value kv c/kv-info revision-key :keyword :data) 0)))
 
@@ -175,10 +193,17 @@
 (defn registry
   "Read the registry visible to this handle, refreshing committed cache state."
   [kv]
-  (let [cache (runtime-cache kv)]
+  (let [cache (type-cache kv)]
     (if (l/writing? kv)
-      ;; Never publish definitions visible only in an uncommitted transaction.
-      {:revision (persisted-revision kv) :types (read-types kv)}
+      (let [revision (persisted-revision kv)
+            cached (:registry @cache)]
+        (if (= revision (:revision cached))
+          cached
+          (let [snapshot {:revision revision :types (read-types kv)}]
+            ;; This cache belongs only to the active writer. Readers cannot
+            ;; observe staged definitions, even if the transaction aborts.
+            (reset! cache {:registry snapshot})
+            snapshot)))
       (loop []
         (let [revision (persisted-revision kv)
               cached (:registry @cache)]
@@ -309,8 +334,9 @@
 
 (defn resolve-type
   "Resolve a type for an operation. Optional runtime opts supply its UDF registry.
-  Functions materialize on first use; committed descriptors are cached per UDF
-  registry generation. Call again for each operation to observe new bindings."
+  Functions materialize on first use and are cached per registry revision and
+  UDF generation, separately for committed readers and the active native writer.
+  Call again for each operation to observe new bindings."
   ([kv type-name]
    (resolve-type kv type-name (:runtime-opts @(local-info kv))))
   ([kv type-name runtime-opts]
@@ -320,12 +346,11 @@
                                {:error :custom-type/not-found :type-name type-name}))
          udf-registry (:udf-registry runtime-opts)
          token [revision udf-registry (udf/generation udf-registry)]
-         cache (runtime-cache kv)
+         cache (type-cache kv)
          cached (get-in @cache [:compiled type-name])]
-     (if (and (not (l/writing? kv)) (= token (:token cached)))
+     (if (= token (:token cached))
        (:type cached)
        (let [compiled (compile-type kv type-name definition runtime-opts)]
-         (when-not (l/writing? kv)
-           (swap! cache assoc-in [:compiled type-name]
-                  {:token token :type compiled}))
+         (swap! cache assoc-in [:compiled type-name]
+                {:token token :type compiled})
          compiled)))))
