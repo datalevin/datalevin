@@ -2775,7 +2775,8 @@
 (defmethod open-kv :cpp
   ([dir] (open-kv dir {}))
   ([dir opts]
-   (let [opts (c/canonicalize-wal-opts opts)
+   (let [migration-kv-types (:migration-kv-types opts)
+         opts (c/canonicalize-wal-opts (dissoc opts :migration-kv-types))
          inmemory? (or (nil? dir)
                        (:inmemory? opts)
                        (some #{:inmemory} (:flags opts)))
@@ -2808,7 +2809,7 @@
                      (neg? order)
                      (do
                        (when c/require-migration?
-                         (m/perform-migration dir major minor patch))
+                         (m/perform-migration dir major minor patch migration-kv-types))
                        (write-version-file dir-file c/version))
 
                      (pos? order)

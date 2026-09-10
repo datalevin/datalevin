@@ -35,7 +35,17 @@
 (defn validate-schema! [kv schema]
   (doseq [[attr props] schema
           :let [t (:db/valueType props)] :when (custom-type? t)]
-    (custom/resolve-type kv t)
+    (try
+      (custom/resolve-type kv t)
+      (catch clojure.lang.ExceptionInfo e
+        (if (= :custom-type/not-found (:error (ex-data e)))
+          (throw (ex-info
+                   (str "Bad attribute specification for "
+                        (pr-str {attr {:db/valueType t}}) ": " (ex-message e))
+                   {:error :schema/validation :attribute attr
+                    :key :db/valueType :value t}
+                   e))
+          (throw e))))
     (when (:db/fulltext props)
       (raise "Custom attributes do not support fulltext indexing"
              {:error :schema/validation :attribute attr :key :db/fulltext})))

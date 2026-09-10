@@ -312,6 +312,22 @@
 
 (deftest datalog-custom-schema-validation
   (let [conn (connect "schema")]
+    (doseq [type-name [:db.type/bogus :app/missing]]
+      (let [before (d/schema conn)
+            error (try
+                    (d/update-schema conn
+                                     {:good/attr {:db/valueType :db.type/string}
+                                      :bad/attr {:db/valueType type-name}})
+                    nil
+                    (catch clojure.lang.ExceptionInfo e e))]
+        (is (re-find #"Bad attribute specification.*not registered"
+                     (or (some-> error ex-message) "")))
+        (is (= {:error :schema/validation :attribute :bad/attr
+                :key :db/valueType :value type-name}
+               (ex-data error)))
+        (is (= :custom-type/not-found
+               (some-> error ex-cause ex-data :error)))
+        (is (= before (d/schema conn)))))
     (is (thrown-with-msg? Exception #"not registered"
                          (d/update-schema conn task-schema)))
     (is (nil? (:task/one (d/schema conn))))

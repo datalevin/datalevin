@@ -1,6 +1,8 @@
-(require '[datalevin.constants :as c]
+(require '[clojure.edn :as edn]
+         '[datalevin.constants :as c]
          '[datalevin.core :as d]
          '[datalevin.bits :as b]
+         '[datalevin.migration-kv-codec :as codec]
          '[taoensso.nippy :as nippy])
 
 (import '[java.io BufferedOutputStream DataOutputStream])
@@ -30,7 +32,7 @@
   (+ (alength ^bytes k) (alength ^bytes v)))
 
 (defn batch-writer
-  [out]
+  [out encode-entry]
   (let [batch (volatile! (transient []))
         state (long-array 3)
         flush! (fn []
@@ -46,7 +48,7 @@
                                 (> (+ (aget state 0) item-size)
                                    max-batch-bytes)))
                    (flush!))
-                 (vreset! batch (conj! @batch item))
+                 (vreset! batch (conj! @batch (encode-entry item)))
                  (aset state 0 (+ (aget state 0) item-size))
                  (aset state 1 (inc (aget state 1)))
                  (aset state 2 (inc (aget state 2)))))
@@ -60,10 +62,10 @@
   (or dupsort? (contains? flags :dupsort)))
 
 (defn write-dbi
-  [out kv {:keys [dbi entries] :as expected}]
+  [out kv {:keys [dbi entries] :as expected} overrides]
   (nippy/freeze-to-out!
     out (assoc expected :frame :dbi))
-  (let [[add! finish!] (batch-writer out)
+  (let [[add! finish!] (batch-writer out (codec/entry-encoder (:opts expected) overrides))
         opts           (:opts expected)
         dupsort?       (dupsort-dbi? opts)
         _              (if dupsort?
@@ -93,7 +95,8 @@
     written))
 
 (binding [*out* *err*]
-  (let [[dir] *command-line-args*
+  (let [[dir types-edn] *command-line-args*
+        kv-types (when types-edn (edn/read-string types-edn))
         kv    (d/open-kv dir)]
     (try
       (let [dbis (-> (d/list-dbis kv) set (disj c/kv-info) sort vec)
@@ -117,7 +120,7 @@
           (let [dump-count
                 (reduce
                   (fn [total dbi]
-                    (+ total (write-dbi out kv dbi)))
+                    (+ total (write-dbi out kv dbi (get kv-types (:dbi dbi)))))
                   0
                   dbis)]
             (when-not (= source-count dump-count)

@@ -1,7 +1,9 @@
-(require '[clojure.string :as str]
+(require '[clojure.edn :as edn]
+         '[clojure.string :as str]
          '[datalevin.bits :as b]
          '[datalevin.core :as d]
          '[datalevin.db :as db]
+         '[datalevin.migration-kv-codec :as codec]
          '[taoensso.nippy :as nippy])
 
 (import '[datalevin.datom Datom]
@@ -128,7 +130,7 @@
   (+ (alength ^bytes k) (alength ^bytes v)))
 
 (defn batch-writer
-  [out]
+  [out encode-entry]
   (let [batch (volatile! (transient []))
         state (long-array 3)
         flush! (fn []
@@ -144,7 +146,7 @@
                                 (> (+ (aget state 0) item-size)
                                    max-kv-batch-bytes)))
                    (flush!))
-                 (vreset! batch (conj! @batch item))
+                 (vreset! batch (conj! @batch (encode-entry item)))
                  (aset state 0 (+ (aget state 0) item-size))
                  (aset state 1 (inc (aget state 1)))
                  (aset state 2 (inc (aget state 2)))))
@@ -158,9 +160,9 @@
   (or dupsort? (contains? flags :dupsort)))
 
 (defn write-kv-dbi
-  [out kv {:keys [dbi entries] :as expected}]
+  [out kv {:keys [dbi entries] :as expected} overrides]
   (nippy/freeze-to-out! out (assoc expected :frame :dbi))
-  (let [[add! finish!] (batch-writer out)
+  (let [[add! finish!] (batch-writer out (codec/entry-encoder (:opts expected) overrides))
         opts           (:opts expected)
         dupsort?       (dupsort-dbi? opts)
         _              (if dupsort?
@@ -239,7 +241,8 @@
               written)))))))
 
 (binding [*out* *err*]
-  (let [[dir]        *command-line-args*
+  (let [[dir types-edn] *command-line-args*
+        kv-types     (when types-edn (edn/read-string types-edn))
         all-kv-dbis  (read-kv-dbis dir)
         conn         (volatile! (d/get-conn dir))
         datom-count  (volatile! 0)
@@ -276,7 +279,7 @@
           (let [kv (d/open-kv dir)]
             (try
               (doseq [dbi kv-dbis]
-                (vswap! kv-count + (write-kv-dbi out kv dbi)))
+                (vswap! kv-count + (write-kv-dbi out kv dbi (get kv-types (:dbi dbi)))))
               (when-not (= kv-source-count @kv-count)
                 (throw
                   (ex-info "Exported KV entry count does not match source"

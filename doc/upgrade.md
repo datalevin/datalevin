@@ -6,7 +6,8 @@ Upgrading from dtlvnative 0.19.x to 1.1.1 requires rebuilding existing
 databases. dtlvnative 1.0.0 introduced DLMDB data format version 2; databases
 written with 0.19.x use format version 1. The new library rejects the old
 format with `MDB_VERSION_MISMATCH`. This applies to both KV and Datalog
-databases, including custom data. Nippy payloads do not need a new encoding.
+databases, including custom data. Nippy payloads remain readable; automatic
+migration also re-encodes serialized KV index entries for the current runtime.
 
 Datalevin 1.2.0 marks this storage change with a minor version bump, so opening
 a database marked 1.1.x triggers the automatic migration described
@@ -97,6 +98,41 @@ Datalog store, it migrates the schema and datoms together with any user KV DBIs
 in the same environment. Datalog-owned internal and secondary-index DBIs are
 rebuilt by the current version instead of being copied. If `datalevin/eav` is
 absent, all user DBIs are migrated as a key-value store.
+
+### Serialized KV keys and duplicate values
+
+Nippy releases can encode the same value differently. Copying an old `:data`
+key as raw bytes can leave it readable in a range scan but unreachable by a
+point lookup. Automatic migration decodes these keys with the old runtime and
+encodes them with the new runtime. It does the same for `:data` values in
+duplicate-sorted DBIs, so list membership checks and deletes still work.
+Ordinary values remain readable without re-encoding.
+
+Older DBIs did not store the types supplied to individual KV operations. When
+there is no declared type, migration recognizes Nippy only when decoding and
+re-encoding with the old runtime reproduces the complete original bytes.
+Other bytes are copied unchanged. Raw keys or duplicate values that deliberately
+contain a complete Nippy encoding are indistinguishable from `:data`; explicitly
+mark those DBIs as raw when opening the source for migration:
+
+```clojure
+(require '[datalevin.core :as d])
+
+(def kv
+  (d/open-kv "/path/source"
+             {:migration-kv-types
+              {"raw-keys" {:key-type :raw}
+               "raw-lists" {:key-type :raw :val-type :raw}}}))
+```
+
+Each override can be `:raw` (preserve bytes), `:data` (decode as Nippy and
+re-encode), or `:auto` (use the exact-match check). For Datalog connections,
+put `:migration-kv-types` inside `:kv-opts`; the overrides apply to user KV DBIs
+sharing the database. These settings are used during automatic migration.
+
+Raw KV dump/load preserves encoded bytes and does not perform this conversion.
+If a previous migration already left serialized keys unreachable, restore its
+original backup directory and migrate again with the corrected runtime.
 
 ## Manual Data Migration
 

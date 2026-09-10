@@ -76,32 +76,36 @@
         script          (io/file tmp-root target)]
     (when-not script-resource
       (raise "Migration exporter resource is missing" {}))
+    (u/create-dirs (.getParent script))
     (with-open [in  (io/input-stream script-resource)
                 out (io/output-stream script)]
       (io/copy in out))
     script))
 
 (defn- start-export
-  [jar dir ^File tmp-root resource target]
-  (let [^File script (copy-export-script tmp-root resource target)
+  [jar dir ^File tmp-root resource target kv-types]
+  (let [_ (copy-export-script tmp-root "datalevin/migration_kv_codec.clj"
+                              "datalevin/migration_kv_codec.clj")
+        ^File script (copy-export-script tmp-root resource target)
         cmd     (-> ["java"]
                     (into java-opts)
-                    (conj "-cp" jar "clojure.main" (.getAbsolutePath script)
-                          dir))
+                    (conj "-cp" (str jar File/pathSeparator (.getAbsolutePath tmp-root))
+                          "clojure.main" (.getAbsolutePath script)
+                          dir (pr-str kv-types)))
         process (.start (ProcessBuilder. ^java.util.List cmd))]
     {:cmd     cmd
      :process process
      :error   (future (slurp (io/reader (.getErrorStream process))))}))
 
 (defn- start-datalog-export
-  [jar dir tmp-root]
+  [jar dir tmp-root kv-types]
   (start-export jar dir tmp-root
-                "datalevin/migration_export.clj" "export-datalog.clj"))
+                "datalevin/migration_export.clj" "export-datalog.clj" kv-types))
 
 (defn- start-kv-export
-  [jar dir tmp-root]
+  [jar dir tmp-root kv-types]
   (start-export jar dir tmp-root
-                "datalevin/migration_kv_export.clj" "export-kv.clj"))
+                "datalevin/migration_kv_export.clj" "export-kv.clj" kv-types))
 
 (defn- await-export
   [{:keys [cmd process error]}]
@@ -267,7 +271,12 @@
           (do
             (if/transact-kv
               kv
-              (map (fn [[k v]] (l/kv-tx :put dbi k v :raw :raw)) frame))
+              (map (fn [[k v k-type v-type]]
+                     ;; Exporters may decode Nippy index entries with the old
+                     ;; runtime so the destination can encode them consistently
+                     ;; with its own lookups. Older two-element rows stay raw.
+                     (l/kv-tx :put dbi k v (or k-type :raw) (or v-type :raw)))
+                   frame))
             (recur (+ loaded (count frame))))
 
           (= {:frame :dbi-end :dbi dbi :entry-count loaded} frame)
@@ -338,9 +347,9 @@
     backup-path))
 
 (defn- perform-datalog-migration
-  [jar dir ^File tmp-root]
+  [jar dir ^File tmp-root kv-types]
   (let [^File staged (io/file (str dir ".migrating-" (UUID/randomUUID)))
-        export       (start-datalog-export jar dir tmp-root)]
+        export       (start-datalog-export jar dir tmp-root kv-types)]
     (try
       (let [{:keys [source-count dump-count loaded-count
                     kv-source-count kv-dump-count kv-loaded-count]}
@@ -365,9 +374,9 @@
           (u/delete-files staged))))))
 
 (defn- perform-kv-migration
-  [jar dir ^File tmp-root]
+  [jar dir ^File tmp-root kv-types]
   (let [^File staged (io/file (str dir ".migrating-" (UUID/randomUUID)))
-        export       (start-kv-export jar dir tmp-root)]
+        export       (start-kv-export jar dir tmp-root kv-types)]
     (try
       (let [{:keys [source-count dump-count loaded-count]}
             (load-kv-stream (.getAbsolutePath staged)
@@ -387,16 +396,27 @@
           (u/delete-files staged))))))
 
 (defn perform-migration
-  [dir major minor patch]
-  (let [dir       (str (.normalize (.toAbsolutePath ^Path (path dir))))
-        jar       (ensure-jar major minor patch)
-        datalog?  (check-datalog jar dir)
-        ^File tmp-root (io/file (u/tmp-dir
-                                 (str "datalevin-migrate-" (UUID/randomUUID))))]
-    (try
-      (u/create-dirs (.getPath tmp-root))
-      (if datalog?
-        (perform-datalog-migration jar dir tmp-root)
-        (perform-kv-migration jar dir tmp-root))
-      (finally
-        (when (.exists tmp-root) (u/delete-files tmp-root))))))
+  ([dir major minor patch]
+   (perform-migration dir major minor patch nil))
+  ([dir major minor patch kv-types]
+   (when-not (or (nil? kv-types)
+                 (and (map? kv-types)
+                      (every? (fn [[dbi types]]
+                                (and (string? dbi) (map? types)
+                                     (every? #{:key-type :val-type} (keys types))
+                                     (every? #{:raw :data :auto} (vals types))))
+                              kv-types)))
+     (raise "Invalid :migration-kv-types; expected DBI names mapped to :key-type/:val-type overrides (:raw, :data, or :auto)"
+            {:migration-kv-types kv-types}))
+   (let [dir       (str (.normalize (.toAbsolutePath ^Path (path dir))))
+         jar       (ensure-jar major minor patch)
+         datalog?  (check-datalog jar dir)
+         ^File tmp-root (io/file (u/tmp-dir
+                                  (str "datalevin-migrate-" (UUID/randomUUID))))]
+     (try
+       (u/create-dirs (.getPath tmp-root))
+       (if datalog?
+         (perform-datalog-migration jar dir tmp-root kv-types)
+         (perform-kv-migration jar dir tmp-root kv-types))
+       (finally
+         (when (.exists tmp-root) (u/delete-files tmp-root)))))))
