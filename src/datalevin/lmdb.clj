@@ -31,6 +31,7 @@
    [java.io Writer PushbackReader FileOutputStream FileInputStream DataOutputStream
     DataInputStream IOException]
    [java.lang RuntimeException]
+   [java.nio ByteBuffer]
    [java.util.concurrent ScheduledExecutorService ScheduledFuture TimeUnit]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
@@ -297,7 +298,7 @@
   (@open-kv-wrapper db))
 
 (defn- nippy-dbi [lmdb dbi]
-  [{:dbi dbi :entries (entries lmdb dbi)}
+  [{:dbi dbi :entries (entries lmdb dbi) :opts (dbi-opts lmdb dbi)}
    (for [[k v] (get-range lmdb dbi [:all] :raw :raw)]
      [(b/encode-base64 k) (b/encode-base64 v)])])
 
@@ -316,7 +317,8 @@
   ([lmdb dbi]
    (if (custom-dump? lmdb dbi)
      (custom-dump-call :dump! lmdb dbi nil false)
-     (do (p/pprint {:dbi dbi :entries (entries lmdb dbi)})
+     (do (p/pprint {:dbi dbi :entries (entries lmdb dbi)
+                   :opts (dbi-opts lmdb dbi)})
          (doseq [[k v] (get-range lmdb dbi [:all] :raw :raw)]
            (p/pprint [(b/encode-base64 k) (b/encode-base64 v)])))))
   ([lmdb dbi data-output]
@@ -356,6 +358,26 @@
 (defn- load-kv [dbi [k v]]
   (kv-tx :put dbi (b/decode-base64 k) (b/decode-base64 v) :raw :raw))
 
+(defn- dumped-dbi-options
+  "Recover DBI declarations from kv-info in dumps predating per-section opts.
+  Read them before creating the native databases: importing metadata afterward
+  cannot turn an ordinary database into a duplicate-sorted database."
+  [pairs]
+  (into {}
+        (keep (fn [[k v]]
+                (let [raw (b/decode-base64 k)
+                      key (if (= c/type-hete-tuple (aget ^bytes raw 0))
+                            (b/read-buffer (ByteBuffer/wrap raw) [:keyword :string])
+                            ;; Older dumps may use Nippy keys. Ordinary typed
+                            ;; scalar metadata does not contain DBI declarations.
+                            (try (b/read-buffer (ByteBuffer/wrap raw) :data)
+                                 (catch Exception _ nil)))]
+                  (when (and (vector? key) (= 2 (count key))
+                             (= :dbis (first key)))
+                    [(second key)
+                     (b/read-buffer (ByteBuffer/wrap (b/decode-base64 v)) :data)]))))
+        pairs))
+
 (defn load-dbi-section
   [lmdb {:keys [dbi entries opts] :as header} read-form]
   (if (:datalevin.dump/custom header)
@@ -371,18 +393,18 @@
      (let [data (nippy/thaw-from-in! in)]
        (if (:datalevin/custom-kv-dump data)
          (custom-dump-call :restore! lmdb data dbi)
-         (let [[_ kvs] data]
-           (open-dbi lmdb dbi)
+         (let [[{:keys [opts]} kvs] data]
+           (open-dbi lmdb dbi opts)
            (transact-kv lmdb (map #(load-kv dbi %) kvs)))))
      (load-dbi lmdb dbi in)))
   ([lmdb dbi in]
    (try
      (with-open [^PushbackReader r in]
        (let [read-form         #(edn/read {:eof ::EOF} r)
-             {:keys [entries] :as header} (read-form)]
+             {:keys [entries opts] :as header} (read-form)]
          (if (:datalevin.dump/custom header)
            (custom-dump-call :restore! lmdb (custom-dump-call :read-bundle header read-form) dbi)
-           (do (open-dbi lmdb dbi)
+           (do (open-dbi lmdb dbi opts)
                (transact-kv lmdb (->> (repeatedly read-form)
                                      (take-while #(not= ::EOF %))
                                      (take entries)
@@ -402,9 +424,11 @@
      (let [data (nippy/thaw-from-in! in)]
        (if (:datalevin/custom-kv-dump data)
          (custom-dump-call :restore! lmdb data nil)
-         (doseq [[{:keys [dbi]} kvs] data]
-           (open-dbi lmdb dbi)
-           (transact-kv lmdb (map #(load-kv dbi %) kvs)))))
+         (let [saved-opts (dumped-dbi-options
+                           (mapcat second (filter #(= c/kv-info (:dbi (first %))) data)))]
+           (doseq [[{:keys [dbi opts]} kvs] data]
+             (open-dbi lmdb dbi (or opts (get saved-opts dbi)))
+             (transact-kv lmdb (map #(load-kv dbi %) kvs))))))
      (load-all lmdb in)))
   ([lmdb in]
    (try
@@ -428,13 +452,16 @@
       (when (seq @remaining)
         (u/raise "Trailing forms after custom KV dump" {:error :custom-type/dump}))
       (custom-dump-call :restore! lmdb bundle nil))
-    (let [load-dbi (fn [[ms vs]]
+    (let [saved-opts (volatile! {})
+          load-dbi (fn [[ms vs]]
                      (doseq [{:keys [dbi opts]} (butlast ms)]
-                       (if opts (open-dbi lmdb dbi opts) (open-dbi lmdb dbi)))
-                     (let [{:keys [dbi entries opts]} (last ms)]
-                       (if opts (open-dbi lmdb dbi opts) (open-dbi lmdb dbi))
-                       (->> vs
-                            (take entries)
+                       (open-dbi lmdb dbi (or opts (get @saved-opts dbi))))
+                     (let [{:keys [dbi entries opts]} (last ms)
+                           rows (take entries vs)]
+                       (when (= dbi c/kv-info)
+                         (vswap! saved-opts merge (dumped-dbi-options rows)))
+                       (open-dbi lmdb dbi (or opts (get @saved-opts dbi)))
+                       (->> rows
                             (map #(load-kv dbi %)))))]
       (transact-kv lmdb (->> forms
                             (partition-by map?)

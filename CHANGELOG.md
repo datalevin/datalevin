@@ -2,10 +2,17 @@
 
 ## WIP
 ### Added
-- [KV] added `register-type` function to allow indexing of custom data types,
-  and this also works on Datalog. Details are in the [custom data
+- [storage] added `register-type` function to allow indexing of custom data
+  types, and this also works on Datalog. Details are in the [custom data
   documentation](/doc/custom-data.md).
   [#234](https://github.com/datalevin/datalevin/issues/234)
+
+### Changed
+- [Storage] update dtlvnative to 1.1.1, which uses DLMDB data format version 2,
+  and contains rust bindings to dlmdb, usearch and llama.cpp, laying the
+  foundation for a rust core of Datalevin, parallel to the Clojure one. Clojure
+  will still be the source of new feature development and serves JVM, while rust
+  one serves the native platforms.
 
 ### Improved
 - [Server] harden client/server lifecycle.

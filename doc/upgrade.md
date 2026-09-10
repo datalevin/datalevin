@@ -1,5 +1,50 @@
 # Datalevin Database Upgrade
 
+## Datalevin 1.2.0: native storage migration
+
+Upgrading from dtlvnative 0.19.x to 1.1.1 requires rebuilding existing
+databases. dtlvnative 1.0.0 introduced DLMDB data format version 2; databases
+written with 0.19.x use format version 1. The new library rejects the old
+format with `MDB_VERSION_MISMATCH`. This applies to both KV and Datalog
+databases, including custom data. Nippy payloads do not need a new encoding.
+
+Datalevin 1.2.0 marks this storage change with a minor version bump, so opening
+a database marked 1.1.x triggers the automatic migration described
+below. This check uses Datalevin's own major/minor version, not the dtlvnative
+dependency version. Changing the `VERSION` file does not convert the native
+data format.
+
+Automatic migration uses the released runtime matching the source database's
+version. If an unpublished development build stored features that its matching
+release does not understand, dump with that development build before opening
+the database with 1.2.0. Manual dump/load is also needed when changing only the
+native dependency without changing Datalevin's major/minor version.
+
+For manual migration, stop writes and keep the old runtime available. Dump with
+the runtime that can open the source, then load into a new directory with the
+upgraded runtime. For example, using the CLI's text dump format:
+
+```sh
+dtlv-old -d /path/source -f /tmp/datalevin-upgrade.dump dump
+dtlv-new -d /path/destination -f /tmp/datalevin-upgrade.dump load
+```
+
+Here `dtlv-old` and `dtlv-new` are separate installations using the old and new
+native libraries. The default dump mode detects KV versus Datalog and includes
+user KV DBIs alongside Datalog data. For an unpublished development build,
+use that build with its old native dependency to create the dump; a released
+CLI may not understand features added by the development build.
+
+Validate the restored data before switching the application to the destination,
+and retain the original directory as a backup. A filesystem copy or compact
+copy retains the source native format and is not a migration. Custom type
+definitions and payload dependencies must travel with their indexes; use the
+complete dump rather than copying individual internal DBIs. Supply application
+classes and UDF bindings when required by the source or restored values.
+
+Databases already using DLMDB format version 2, including those created with
+dtlvnative 1.0.0 or 1.1.0, do not need this native-format migration for 1.1.1.
+
 Before introducing steps to upgrade Datalevin databases, let us discuss the
 versioning of Datalevin, so we have the right expectations as to when a database
 upgrade is needed.
