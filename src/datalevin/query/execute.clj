@@ -2544,118 +2544,35 @@
       [tuples @candidate-work])
     [(qplan/step-execute source source-db input) nil]))
 
-(defn- top-k-pushdown-query
+(defn- pushdown-query
+  "Shared batch-scanning pipeline for adaptive top-k and limit pushdown.
+
+  `strategy` supplies the mode-specific pieces:
+    `:scanned-by`    `:tuples` or `:work`, the sample scan accounting unit
+    `:done?`         `(fn [rows frontier window-end] ...)`
+    `:finish`        `(fn [rows] ...)`
+    `:retry-empty?`  continue past empty non-exhausted batches with work
+    `:empty-window?` short-circuit to an empty result when window-end is 0"
   [parsed-q inputs
-   {:keys [source residual-query demand work fallback access-plan]}]
-  (let [path        (:path source)
-        source-db   (access-source-db source inputs)
-        batch-query residual-query
-        find-vars   (dp/find-vars (:qfind parsed-q))
-        order       (:ordering demand)
-        limit       (:limit demand)
-        offset      (:offset demand)
-        window-end  (:required-count demand)
-        work-budget (:max-candidates work)
-        budgeted?   (some? work-budget)
-        sample-batch (:sample-batch source)
-        sample-tuples (:tuples sample-batch)
-        sample-count (long (if sample-tuples
-                             (.size ^java.util.List sample-tuples)
-                             0))
-        sample-rows
-        (if (pos? sample-count)
-          (into #{}
-                (execute-access-batch
-                  parsed-q batch-query inputs source-db access-plan
-                  sample-tuples
-                  {:source         :planning-sample
-                   :candidate-work (qaccess/batch-work sample-batch)
-                   :exhausted?     (:exhausted? sample-batch)}))
-          #{})
-        sample-done?
-        (or (:exhausted? sample-batch)
-            (past-top-k-boundary?
-              path demand find-vars order sample-rows
-              (:frontier sample-batch) window-end))
-        attempt-work
-        (cond-> work
-          (and budgeted? (pos? (long work-budget)))
-          (assoc :batch-size
-                 (min (long (or (:batch-size work) work-budget))
-                      (long work-budget)))
-
-          sample-batch
-          (assoc :resume (:frontier sample-batch)
-                 :emitted sample-count))
-        fallback-query #(execute-access-fallback fallback inputs %)]
-    (cond
-      sample-done?
-      (order-result find-vars sample-rows order limit offset)
-
-      (and budgeted?
-           (or (not (pos? (long work-budget)))
-               (>= sample-count (long work-budget))))
-      (fallback-query :candidate-budget)
-
-      :else
-      (let [cursor (qaccess/open-access
-                     path demand (:bounds source) attempt-work source-db nil)]
-        (try
-          (loop [rows sample-rows
-                 batches (if sample-batch 1 0)
-                 scanned sample-count]
-            (if (or (and (not budgeted?)
-                         (>= (long batches) top-k-max-candidate-batches))
-                    (and budgeted?
-                         (>= (long scanned) (long work-budget))))
-              (fallback-query (if budgeted?
-                                :candidate-budget
-                                :batch-limit))
-              (let [{:keys [tuples frontier exhausted?] :as batch}
-                    (qaccess/next-batch cursor)]
-                (if (zero? (.size ^java.util.List tuples))
-                  (if exhausted?
-                    (order-result find-vars rows order limit offset)
-                    (fallback-query :empty-batch))
-                  (let [batch-result
-                        (execute-access-batch
-                          parsed-q batch-query inputs source-db access-plan
-                          tuples
-                          {:source         :access-cursor
-                           :candidate-work (qaccess/batch-work batch)
-                           :exhausted?     exhausted?})
-                        rows (into rows batch-result)]
-                    (if (or exhausted?
-                            (past-top-k-boundary?
-                              path demand find-vars order rows
-                              frontier window-end))
-                      (order-result find-vars rows order limit offset)
-                      (recur rows
-                             (unchecked-inc-int batches)
-                             (+ (long scanned)
-                                (qaccess/batch-work batch)))))))))
-          (finally
-            (qaccess/close-cursor cursor)))))))
-
-(defn- limit-pushdown-query
-  [parsed-q inputs
-   {:keys [source residual-query demand work fallback access-plan]}]
-  (let [path          (:path source)
-        source-db     (access-source-db source inputs)
-        batch-query   residual-query
-        limit         (:limit demand)
-        offset        (:offset demand)
-        window-end    (long (:required-count demand))
-        work-budget   (:max-candidates work)
-        budgeted?     (some? work-budget)
-        sample-batch  (:sample-batch source)
-        sample-tuples (:tuples sample-batch)
-        sample-count  (long (if sample-tuples
-                              (.size ^java.util.List sample-tuples)
-                              0))
-        sample-work   (if sample-batch
-                        (qaccess/batch-work sample-batch)
-                        0)
+   {:keys [source residual-query demand work fallback access-plan]}
+   {:keys [scanned-by done? finish retry-empty? empty-window?]}]
+  (let [path           (:path source)
+        source-db      (access-source-db source inputs)
+        batch-query    residual-query
+        window-end     (long (:required-count demand))
+        work-budget    (:max-candidates work)
+        budgeted?      (some? work-budget)
+        sample-batch   (:sample-batch source)
+        sample-tuples  (:tuples sample-batch)
+        sample-count   (long (if sample-tuples
+                               (.size ^java.util.List sample-tuples)
+                               0))
+        sample-work    (long (if sample-batch
+                               (qaccess/batch-work sample-batch)
+                               0))
+        sample-scanned (case scanned-by
+                         :tuples sample-count
+                         :work   sample-work)
         sample-rows
         (if (pos? sample-count)
           (into #{}
@@ -2666,9 +2583,9 @@
                    :candidate-work sample-work
                    :exhausted?     (:exhausted? sample-batch)}))
           #{})
-        sample-done?
-        (or (:exhausted? sample-batch)
-            (<= window-end (long (count sample-rows))))
+        sample-done?   (or (:exhausted? sample-batch)
+                           (done? sample-rows (:frontier sample-batch)
+                                  window-end))
         attempt-work
         (cond-> work
           (and budgeted? (pos? (long work-budget)))
@@ -2677,12 +2594,11 @@
                       (long work-budget)))
 
           sample-batch
-          (assoc :resume (:frontier sample-batch)
-                 :emitted sample-work))
-        fallback-query #(execute-access-fallback fallback inputs %)
-        finish         #(result-window % limit offset)]
+          (assoc :resume  (:frontier sample-batch)
+                 :emitted sample-scanned))
+        fallback-query #(execute-access-fallback fallback inputs %)]
     (cond
-      (zero? window-end)
+      (and empty-window? (zero? window-end))
       []
 
       sample-done?
@@ -2690,7 +2606,7 @@
 
       (and budgeted?
            (or (not (pos? (long work-budget)))
-               (>= sample-work (long work-budget))))
+               (>= sample-scanned (long work-budget))))
       (fallback-query :candidate-budget)
 
       :else
@@ -2699,7 +2615,7 @@
         (try
           (loop [rows    sample-rows
                  batches (if sample-batch 1 0)
-                 scanned sample-work]
+                 scanned sample-scanned]
             (if (or (and (not budgeted?)
                          (>= (long batches) top-k-max-candidate-batches))
                     (and budgeted?
@@ -2707,20 +2623,16 @@
               (fallback-query (if budgeted?
                                 :candidate-budget
                                 :batch-limit))
-              (let [{:keys [tuples exhausted?] :as batch}
+              (let [{:keys [tuples frontier exhausted?] :as batch}
                     (qaccess/next-batch cursor)
-                    batch-work (qaccess/batch-work batch)
+                    batch-work (long (qaccess/batch-work batch))
                     scanned    (+ (long scanned) batch-work)]
                 (if (zero? (.size ^java.util.List tuples))
-                  (cond
-                    exhausted?
+                  (if exhausted?
                     (finish rows)
-
-                    (zero? batch-work)
-                    (fallback-query :empty-batch)
-
-                    :else
-                    (recur rows (unchecked-inc-int batches) scanned))
+                    (if (and retry-empty? (pos? batch-work))
+                      (recur rows (unchecked-inc-int batches) scanned)
+                      (fallback-query :empty-batch)))
                   (let [batch-result
                         (execute-access-batch
                           parsed-q batch-query inputs source-db access-plan
@@ -2730,13 +2642,46 @@
                            :exhausted?     exhausted?})
                         rows (into rows batch-result)]
                     (if (or exhausted?
-                            (<= window-end (long (count rows))))
+                            (done? rows frontier window-end))
                       (finish rows)
                       (recur rows
                              (unchecked-inc-int batches)
                              scanned)))))))
           (finally
             (qaccess/close-cursor cursor)))))))
+
+(defn- top-k-pushdown-query
+  [parsed-q inputs plan]
+  (let [find-vars (dp/find-vars (:qfind parsed-q))
+        demand    (:demand plan)
+        order     (:ordering demand)
+        limit     (:limit demand)
+        offset    (:offset demand)
+        path      (:path (:source plan))]
+    (pushdown-query
+      parsed-q inputs plan
+      {:scanned-by    :tuples
+       :done?         (fn [rows frontier window-end]
+                        (past-top-k-boundary?
+                          path demand find-vars order rows frontier window-end))
+       :finish        (fn [rows]
+                        (order-result find-vars rows order limit offset))
+       :retry-empty?  false
+       :empty-window? false})))
+
+(defn- limit-pushdown-query
+  [parsed-q inputs plan]
+  (let [demand (:demand plan)
+        limit  (:limit demand)
+        offset (:offset demand)]
+    (pushdown-query
+      parsed-q inputs plan
+      {:scanned-by    :work
+       :done?         (fn [rows _frontier window-end]
+                        (<= window-end (long (count rows))))
+       :finish        (fn [rows] (result-window rows limit offset))
+       :retry-empty?  true
+       :empty-window? true})))
 
 (defn- candidate-relation
   [candidate-vars rows]
@@ -2820,6 +2765,22 @@
     (binding [built-ins/*udf-db* udf-db]
       (finish-query parsed-q (run-planned-context context)))))
 
+(defn- prepare-context
+  "Run the shared context preparation pipeline. `execute?` selects execution
+   vs planning mode for `make-context` and `-q`."
+  [parsed-q inputs access-plans execute?]
+  (-> (qplan/make-context parsed-q execute?)
+      (attach-access-plans access-plans)
+      (qresolve/resolve-ins inputs)
+      (materialize-input-bound-patterns)
+      (resolve-redudants)
+      (rules/rewrite)
+      (push-down-equality-disjunctions)
+      (rewrite-unused-vars)
+      (materialize-selective-value-lookups)
+      (materialize-selective-rule-anchors)
+      (-q execute?)))
+
 (defn- execute-query
   ([parsed-q inputs]
    (execute-query parsed-q inputs []))
@@ -2828,17 +2789,7 @@
          udf-db            (first (filter db/-searchable? inputs))
          context
          (binding [built-ins/*udf-db* udf-db]
-           (-> (qplan/make-context parsed-q true)
-               (attach-access-plans access-plans)
-               (qresolve/resolve-ins inputs)
-               (materialize-input-bound-patterns)
-               (resolve-redudants)
-               (rules/rewrite)
-               (push-down-equality-disjunctions)
-               (rewrite-unused-vars)
-               (materialize-selective-value-lookups)
-               (materialize-selective-rule-anchors)
-               (-q true)))]
+           (prepare-context parsed-q inputs access-plans true))]
      (binding [built-ins/*udf-db* udf-db]
        (finish-query parsed-q context)))))
 
@@ -2847,17 +2798,7 @@
   (let [[parsed-q inputs] (plugin-inputs parsed-q inputs)
         udf-db            (first (filter db/-searchable? inputs))]
     (binding [built-ins/*udf-db* udf-db]
-      (-> (qplan/make-context parsed-q false)
-          (attach-access-plans access-plans)
-          (qresolve/resolve-ins inputs)
-          (materialize-input-bound-patterns)
-          (resolve-redudants)
-          (rules/rewrite)
-          (push-down-equality-disjunctions)
-          (rewrite-unused-vars)
-          (materialize-selective-value-lookups)
-          (materialize-selective-rule-anchors)
-          (-q false)))))
+      (prepare-context parsed-q inputs access-plans false))))
 
 (defmulti ^:private execute-alternative
   (fn [_parsed-q _inputs _access-plans alternative]
@@ -3128,17 +3069,7 @@
                                  (:qtimeout parsed-q))]
     (let [plans             (discover-access-plans parsed-q inputs)
           [parsed-q inputs] (plugin-inputs parsed-q inputs)]
-      (-> (qplan/make-context parsed-q false)
-          (attach-access-plans plans)
-          (qresolve/resolve-ins inputs)
-          (materialize-input-bound-patterns)
-          (resolve-redudants)
-          (rules/rewrite)
-          (push-down-equality-disjunctions)
-          (rewrite-unused-vars)
-          (materialize-selective-value-lookups)
-          (materialize-selective-rule-anchors)
-          (-q false)))))
+      (prepare-context parsed-q inputs plans false))))
 
 (defn plan*
   [parsed-q inputs]

@@ -2811,17 +2811,30 @@
 
 (declare recursive?)
 
+(defn- context-stratum
+  "Return the rules, dependency graph, containing SCC (stratum), and whether
+   the stratum is recursive for `rule-name` in `context`."
+  [context rule-name]
+  (let [rules   (:rules context)
+        deps    (or (:rules-deps context) (dependency-graph rules))
+        sccs    (dependency-sccs deps)
+        stratum (some #(when (% rule-name) %) sccs)]
+    {:rules      rules
+     :deps       deps
+     :stratum    stratum
+     :recursive? (when stratum
+                   (recursive-stratum? stratum deps rule-name))}))
+
 (defn- solve-stratified*
   [context rule-name args resolve-clause-fn]
-  (let [rules      (:rules context)
-        deps       (or (:rules-deps context) (dependency-graph rules))
+  (let [{:keys [rules deps] :as info}
+        (context-stratum context rule-name)
         cached-rel (get-in context [:rule-rels rule-name])
         head-vars  (rest (ffirst (rules rule-name)))]
     (if cached-rel
       (map-rule-result cached-rel head-vars args)
-      (let [sccs               (dependency-sccs deps)
-            stratum            (some #(when (% rule-name) %) sccs)
-            stratum-recursive? (recursive-stratum? stratum deps rule-name)]
+      (let [stratum            (:stratum info)
+            stratum-recursive? (:recursive? info)]
         (if-not stratum
           (raise "Rule not found in strata" {:rule rule-name})
           (let [stratum-set    (set stratum)
@@ -3185,12 +3198,8 @@
   (let [specialized (specialized-rule-result context rule-name args)]
     (if-not (identical? specialized no-specialized-rule-result)
       specialized
-        (let [rules         (:rules context)
-            deps          (or (:rules-deps context) (dependency-graph rules))
-            sccs          (dependency-sccs deps)
-            stratum       (some #(when (% rule-name) %) sccs)
-            recursive?    (when stratum
-                            (recursive-stratum? stratum deps rule-name))
+        (let [{:keys [rules stratum recursive?]}
+              (context-stratum context rule-name)
             bound-vars    (context-bound-vars context)
             base-pattern  (binding-pattern args bound-vars)
             base-bound?   (some #{:b} base-pattern)
