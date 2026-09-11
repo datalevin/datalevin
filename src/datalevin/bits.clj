@@ -696,7 +696,9 @@
       (put-byte bf c/truncator)
       (doseq [s sizes] (put-byte bf (unchecked-byte s))))))
 
-(defn- header->type
+(defn header->type
+  "Return the logical type of a serialized value header. Throws when the
+   header does not name a recognized scalar type."
   [header]
   (case (short header)
     (-64 -63 -8) :long

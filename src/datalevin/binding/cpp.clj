@@ -2594,21 +2594,12 @@
    (raise "Fail to count list in key range: " e {:dbi dbi-name})))
 
 (defn- raw-header-type
+  "Like `b/header->type`, but returns nil for unrecognized headers so the
+   kv-info decoder can fall back to `:data`."
   [header]
-  (case (short header)
-    (-64 -63 -8) :long
-    -15          :bigint
-    -14          :bigdec
-    -11          :float
-    -10          :double
-    -9           :instant
-    -7           :uuid
-    -6           :string
-    -5           :keyword
-    -4           :symbol
-    -3           :boolean
-    -2           :bytes
-    nil))
+  (try
+    (b/header->type header)
+    (catch Exception _ nil)))
 
 (defn- decode-kv-info-buffer
   [^ByteBuffer bf fallback-type]

@@ -1638,7 +1638,8 @@
                   (.put adjacency k values))))))))
     adjacency))
 
-(defn- fulltext-op-ref
+(defn- op-ref
+  "Extract the document reference from a fulltext or idoc index operation."
   [op]
   (let [kind (nth op 0)
         d    (nth op 1)]
@@ -1651,7 +1652,7 @@
   [search-engines res]
   (let [op (peek res)
         d  (nth op 1)
-        ref (fulltext-op-ref op)]
+        ref (op-ref op)]
     (doseq [domain (nth res 0)
             :let   [engine (search-engines domain)]]
       (case (nth op 0)
@@ -1722,7 +1723,7 @@
                                   entries))]]
               (.add entries
                     (fulltext-entry
-                      (fulltext-op-ref op)
+                      (op-ref op)
                       (peek d))))
             (doseq [[engine entries] batches]
               (add-fulltext-batches! engine entries)))
@@ -1742,9 +1743,9 @@
                     (case kind
                       :a (fulltext-op-entry :add d (peek d))
                       :d (fulltext-op-entry :delete d nil)
-                      :g (fulltext-op-entry :add (fulltext-op-ref op)
+                      :g (fulltext-op-entry :add (op-ref op)
                                             (peek d))
-                      :r (fulltext-op-entry :delete (fulltext-op-ref op)
+                      :r (fulltext-op-entry :delete (op-ref op)
                                             nil))))
             (doseq [[engine entries] batches]
               (transact-fulltext-batches! engine entries))))))))
@@ -1816,21 +1817,12 @@
            (add-vec index doc-ref vec-data))
       :d (remove-vec index (nth op 1)))))
 
-(defn- idoc-op-ref
-  [op]
-  (let [kind (nth op 0)
-        d    (nth op 1)]
-    (case kind
-      ;; Keep e and aid in giant refs so projected reads need not load the value.
-      (:g :r) [:g (nth d 2) (nth d 0) (nth d 1)]
-      (:a :d) d)))
-
 (defn- plan-idoc-update!
   [index txs state-actions pending-paths pending-doc-ids old-op new-op]
   (let [old-d   (nth old-op 1)
         new-d   (nth new-op 1)
-        old-ref (idoc-op-ref old-op)
-        new-ref (idoc-op-ref new-op)
+        old-ref (op-ref old-op)
+        new-ref (op-ref new-op)
         old-doc (peek old-d)
         new-doc (peek new-d)
         patch   (some-> (meta new-op) :idoc/patch)
@@ -1930,23 +1922,23 @@
                     od  (nth op 1)]
                 (idoc/add-doc-plan! index txs state-actions
                                     pending-paths pending-doc-ids
-                                    (idoc-op-ref op) (peek od) false))
+                                    (op-ref op) (peek od) false))
 
               (and (zero? na) (= 1 nd))
               (let [op  (first d)
                     od  (nth op 1)]
                 (idoc/remove-doc-plan! index txs state-actions
                                        pending-paths pending-doc-ids
-                                       (idoc-op-ref op) (peek od)))
+                                       (op-ref op) (peek od)))
 
               :else
               (let [adds (mapv (fn [op]
                                  (let [d (nth op 1)]
-                                   [(idoc-op-ref op) (peek d)]))
+                                   [(op-ref op) (peek d)]))
                                a)
                     rems (mapv (fn [op]
                                  (let [d (nth op 1)]
-                                   [(idoc-op-ref op) (peek d)]))
+                                   [(op-ref op) (peek d)]))
                                d)]
                 (idoc/add-docs-plan! index txs state-actions
                                      pending-paths pending-doc-ids adds false)

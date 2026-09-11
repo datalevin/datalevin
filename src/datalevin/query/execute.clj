@@ -478,18 +478,13 @@
   [form]
   (into #{} (filter qu/binding-var?) (qu/collect-vars form)))
 
-(defn- call-vars
-  [[f & args]]
-  (cond-> (qu/collect-fn-arg-vars args)
-    (qu/binding-var? f) (conj f)))
-
 (defn- late-clause-deps
   [clause]
   (let [clause (strip-clause-source clause)
         head   (when (sequential? clause) (first clause))]
     (cond
       (and (sequential? clause) (sequential? head))
-      {:requires (call-vars head)
+      {:requires (qu/call-vars head)
        :provides (clause-vars (second clause))}
 
       (= 'not head)

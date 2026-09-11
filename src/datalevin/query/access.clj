@@ -9,6 +9,8 @@
 ;;
 (ns ^:no-doc datalevin.query.access
   "Logical and physical abstractions for query access methods."
+  (:require
+   [datalevin.query-util :as qu])
   (:import
    [datalevin.parser BindScalar DefaultSrc SrcVar]))
 
@@ -206,16 +208,10 @@
        (-frontier-satisfies? (:implementation path)
                              path demand frontier cutoff)))
 
-(defn- ordering-terms
-  [ordering]
-  (if (every? sequential? ordering)
-    (vec ordering)
-    (mapv vec (partition-all 2 ordering))))
-
 (defn- ordering-prefix?
   [provided required]
-  (let [provided (ordering-terms provided)
-        required (ordering-terms required)]
+  (let [provided (qu/ordering-terms provided)
+        required (qu/ordering-terms required)]
     (and (seq provided)
          (<= (count provided) (count required))
          (= provided (subvec required 0 (count provided))))))

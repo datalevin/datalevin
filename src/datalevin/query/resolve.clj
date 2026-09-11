@@ -1357,11 +1357,6 @@
 (defn- clause-vars [clause]
   (into #{} (filter qu/binding-var?) (nfirst clause)))
 
-(defn- call-vars
-  [[f & args]]
-  (cond-> (qu/collect-fn-arg-vars args)
-    (qu/binding-var? f) (conj f)))
-
 (defn- clause-binding-requirements
   [clause]
   (let [clause (if (and (sequential? clause)
@@ -1373,7 +1368,7 @@
       ;; Predicate and function expressions need their call arguments. The
       ;; function binding, if present, is an output and is not required.
       (and (vector? clause) (sequential? head))
-      {:required (call-vars head)}
+      {:required (qu/call-vars head)}
 
       ;; Plain not joins on whichever variables it shares with the surrounding
       ;; context. Its existing validation requires at least one such variable.
@@ -1460,15 +1455,6 @@
                (indexed-clause-pattern context clause)]
       (contains? candidate-values value))))
 
-(defn- relation-distinct-values
-  [rel sym]
-  (let [idx    (long ((:attrs rel) sym))
-        ^List tuples (:tuples rel)
-        values (HashSet.)]
-    (dotimes [i (.size tuples)]
-      (.add values (aget ^objects (.get tuples i) idx)))
-    values))
-
 (defn- bound-value-scan-pattern
   [context idx clause]
   (when-let [{:keys [source pattern] :as indexed}
@@ -1541,8 +1527,8 @@
                            left-shape right-shape)
           consumer-values
           (when consumer
-            (relation-distinct-values (:entity-rel consumer)
-                                      (:entity consumer)))
+            (qu/relation-distinct-values (:entity-rel consumer)
+                                         (:entity consumer)))
           domain-values
           (when domain
             (doto (HashSet.) (.add (:value domain-shape))))
@@ -1610,7 +1596,7 @@
                                          domain-pattern))
         domain-rel     (-> (reduce j/hash-join (:rels domain-context))
                            (r/project-distinct [owner value]))
-        domain-values  (relation-distinct-values domain-rel value)
+        domain-values  (qu/relation-distinct-values domain-rel value)
         matched-rel    (r/relation!
                          {entity 0, value 1}
                          (if (zero? (.size ^HashSet domain-values))

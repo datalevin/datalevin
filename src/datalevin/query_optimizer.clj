@@ -880,15 +880,6 @@
                       :else 1))]
     (max 1 n)))
 
-(defn- relation-distinct-values
-  [rel sym]
-  (let [idx    (long ((:attrs rel) sym))
-        tuples ^List (:tuples rel)
-        values (HashSet.)]
-    (dotimes [i (.size tuples)]
-      (.add values (aget ^objects (.get tuples i) idx)))
-    values))
-
 (defn- resolved-bound-entity
   [source entity]
   (cond
@@ -939,7 +930,7 @@
         v-rel   (rel-for-var context v)]
     (cond
       e-rel
-      (let [entities (relation-distinct-values e-rel e)
+      (let [entities (qu/relation-distinct-values e-rel e)
             entity-count (.size ^HashSet entities)
             value-var? (qu/binding-var? v)
             existence? (or (= v '_) (qu/placeholder? v))
@@ -961,7 +952,7 @@
             cap)))
 
       v-rel
-      (let [values (relation-distinct-values v-rel v)]
+      (let [values (qu/relation-distinct-values v-rel v)]
         (capped-count-sum
           values
           (fn [value]
@@ -3686,16 +3677,10 @@
       (= provided required)
       (and (= required :approximate) (= provided :exact))))
 
-(defn- ordering-terms
-  [ordering]
-  (if (every? sequential? ordering)
-    (vec ordering)
-    (mapv vec (partition-all 2 ordering))))
-
 (defn- ordering-satisfies?
   [provided required]
-  (let [provided (ordering-terms provided)
-        required (ordering-terms required)]
+  (let [provided (qu/ordering-terms provided)
+        required (qu/ordering-terms required)]
     (or (empty? required)
         (and (<= (count required) (count provided))
              (= required (subvec provided 0 (count required)))))))

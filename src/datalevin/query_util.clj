@@ -11,7 +11,9 @@
   "Some utility functions for Datalog query processing"
   (:require
    [clojure.string :as str]
-   [datalevin.util :as u :refer [cond+ raise]]))
+   [datalevin.util :as u :refer [cond+ raise]])
+  (:import
+   [java.util HashSet List]))
 
 (def ^{:dynamic true
        :doc     "List of symbols in current pattern that might potentiall be resolved to refs"}
@@ -141,3 +143,27 @@
       (doseq [arg args]
         (walk arg))
       @vars)))
+
+(defn call-vars
+  "Variables a function-call form needs from its arguments, including the
+   function binding when it is a variable."
+  [[f & args]]
+  (cond-> (collect-fn-arg-vars args)
+    (binding-var? f) (conj f)))
+
+(defn ordering-terms
+  "Normalize an ordering specification into a vector of term vectors."
+  [ordering]
+  (if (every? sequential? ordering)
+    (vec ordering)
+    (mapv vec (partition-all 2 ordering))))
+
+(defn relation-distinct-values
+  "Return the set of distinct values of `sym` in relation `rel`."
+  [rel sym]
+  (let [idx    (long ((:attrs rel) sym))
+        tuples ^List (:tuples rel)
+        values (HashSet.)]
+    (dotimes [i (.size tuples)]
+      (.add values (aget ^objects (.get tuples i) idx)))
+    values))

@@ -2206,7 +2206,6 @@
    :get-lock get-lock
    :get-store get-store
    :halt-run halt-run
-   :handle-message-error! handle-message-error!
    :in-use-dbs in-use-dbs
    :lmdb lmdb
    :new-runtime-db new-runtime-db
