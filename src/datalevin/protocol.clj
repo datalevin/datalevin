@@ -183,18 +183,6 @@
                                  {:handlers transit-write-handlers})
                  v))
 
-(defn- write-value-bf
-  [bf fmt msg]
-  (case (short fmt)
-    1 (write-transit-bf bf msg)
-    2 (write-nippy-bf bf msg)))
-
-(defn- read-value-bf
-  [bf fmt]
-  (case (short fmt)
-    1 (read-transit-bf bf)
-    2 (read-nippy-bf bf)))
-
 (defn write-message-bf
   "Write a message to a ByteBuffer. First byte is format, then four bytes
   length of the whole message (include header), followed by message value"

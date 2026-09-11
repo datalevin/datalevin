@@ -38,14 +38,6 @@
     "
   Datalevin (version: " c/version ")"))
 
-(defn- parse-version
-  "return [major minor non-breaking] version numbers"
-  [s]
-  (let [[major minor non-breaking] (s/split s #"\.")]
-    [(Integer/parseInt major)
-     (Integer/parseInt minor)
-     (Integer/parseInt non-breaking)]))
-
 (def ^:private commands
   #{"copy" "drop" "dump" "exec" "help" "load" "mcp" "repl" "serv" "stat"})
 

@@ -119,25 +119,6 @@
   (/ (* ^double (.get wqs tid) ^double (tf* tf))
      (double (.get norms did))))
 
-(defn- max-score
-  [^IntDoubleHashMap wqs ^IntDoubleHashMap mws tid]
-  (* ^double (.get wqs tid) ^double (.get mws tid)))
-
-(defn- get-ws
-  [tids qterms k]
-  (let [m   (IntDoubleHashMap.)
-        cnt (count tids)]
-    (loop [i 0]
-      (when (< i cnt)
-        (.put m (nth tids i) ((nth qterms i) k))
-        (recur (unchecked-inc-int i))))
-    m))
-
-(defn- get-mxs [tids wqs mws]
-  (let [m (IntDoubleHashMap.)]
-    (doseq [tid tids] (.put m tid (max-score wqs mws tid)))
-    m))
-
 (defprotocol ICandidate
   (skip-before [this limit] "move the iterator to just before the limit")
   (advance [this] "move the iterator to the next position")

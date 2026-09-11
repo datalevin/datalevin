@@ -135,8 +135,6 @@
 ;;   (binding [*out* w]
 ;;     (pr {:datoms-transacted (count (:tx-data rp))})))
 
-(defn- sf [^SortedSet s] (when-not (.isEmpty s) (.first s)))
-
 (defonce dbs (atom {}))
 
 ;; read caches
@@ -1102,21 +1100,9 @@
 
 (def coerce-uuid prepare/coerce-uuid)
 
-(defn- type-coercion
-  [vt v]
-  (prepare/type-coercion vt v))
-
-(defn- correct-datom*
-  [^Datom datom v]
-  (prepare/correct-datom* datom v))
-
 (defn- correct-datom
   [store ^Datom datom]
   (prepare/correct-datom store datom))
-
-(defn- correct-value
-  [store a v]
-  (prepare/correct-value store a v))
 
 (defn- pour
   [store datoms]

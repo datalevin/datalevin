@@ -725,10 +725,6 @@
              (min (long operation-timeout-ms)
                   (long (or timeout-ms operation-timeout-ms))))))
 
-(defn- single-voter-authority?
-  [{:keys [voters]}]
-  (= 1 (count voters)))
-
 (defn- require-raft-dir!
   [raft-dir group-id local-peer-id]
   (when-not (non-blank-string? raft-dir)

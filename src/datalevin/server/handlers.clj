@@ -743,16 +743,6 @@
                                                 :response-kind])}))
   record)
 
-(defn- write-client-op-replay!
-  [deps skey response-kind response]
-  (case response-kind
-    (:tx-data :tx-data+db-info) (write-result! deps skey response)
-    :kv-result                  (write-result! deps skey response)
-    :command-complete           (write-complete! deps skey)
-    (u/raise "Unsupported HA client op response kind"
-             {:response-kind response-kind
-              :error         :ha/client-op-invalid-response-kind})))
-
 (defn- await-pending-client-op!
   [client-op-id result-promise]
   (let [result (deref result-promise client-op-await-timeout-ms ::timeout)]

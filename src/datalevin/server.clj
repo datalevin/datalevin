@@ -79,40 +79,19 @@
 (def password-matches? auth/password-matches?)
 
 (def ^:private pull-user auth/pull-user)
-(def ^:private query-user auth/query-user)
 (def ^:private pull-db auth/pull-db)
-(def ^:private query-role auth/query-role)
 (def ^:private user-eid auth/user-eid)
 (def ^:private db-eid auth/db-eid)
 (def ^:private role-eid auth/role-eid)
-(def ^:private eid->username auth/eid->username)
-(def ^:private eid->db-name auth/eid->db-name)
-(def ^:private eid->role-key auth/eid->role-key)
-(def ^:private query-users auth/query-users)
 (def ^:private user-roles auth/user-roles)
-(def ^:private query-roles auth/query-roles)
-(def ^:private perm-tgt-eid auth/perm-tgt-eid)
 (def ^:private perm-tgt-name auth/perm-tgt-name)
 (def ^:private user-permissions auth/user-permissions)
 (def ^:private role-permissions auth/role-permissions)
-(def ^:private user-role-eid auth/user-role-eid)
-(def ^:private permission-eid auth/permission-eid)
-(def ^:private role-permission-eid auth/role-permission-eid)
-(def ^:private query-databases auth/query-databases)
 (def ^:private user-role-key auth/user-role-key)
-(def ^:private user-role-key? auth/user-role-key?)
-(def ^:private transact-new-user auth/transact-new-user)
-(def ^:private transact-new-password auth/transact-new-password)
-(def ^:private transact-drop-user auth/transact-drop-user)
 (def ^:private transact-new-role auth/transact-new-role)
-(def ^:private transact-drop-role auth/transact-drop-role)
-(def ^:private transact-user-role auth/transact-user-role)
-(def ^:private transact-withdraw-role auth/transact-withdraw-role)
 (def ^:private transact-role-permission auth/transact-role-permission)
 (def ^:private transact-revoke-permission auth/transact-revoke-permission)
 (def ^:private transact-new-db auth/transact-new-db)
-(def ^:private transact-drop-db auth/transact-drop-db)
-
 (defn- close-store
   [store]
   (cond
@@ -356,10 +335,6 @@
 (defn- get-client [^Server server client-id]
   (sess/get-client (.-clients server) client-id))
 
-(defn- add-client
-  [^Server server ip client-id username]
-  (sess/add-client session-deps server ip client-id username))
-
 (defn- remove-client
   [^Server server client-id]
   (sess/remove-client session-deps server client-id))
@@ -461,30 +436,6 @@
     {:updated? @updated?
      :state (when @present? @final-v)}))
 
-(def ^:private missing-state-value sha/missing-state-value)
-(def ^:private ha-follower-local-side-effect-keys
-  sha/ha-follower-local-side-effect-keys)
-(def ^:private ha-follower-side-effect-keys
-  sha/ha-follower-side-effect-keys)
-(def ^:private state-patch sha/state-patch)
-(def ^:private ha-follower-local-side-effect-patch
-  sha/ha-follower-local-side-effect-patch)
-(def ^:private ha-follower-side-effect-patch
-  sha/ha-follower-side-effect-patch)
-(def ^:private ha-renew-merge-excluded-keys
-  sha/ha-renew-merge-excluded-keys)
-(def ^:private ha-renew-state-patch sha/ha-renew-state-patch)
-(def ^:private apply-state-patch sha/apply-state-patch)
-(def ^:private same-ha-runtime-context? sha/same-ha-runtime-context?)
-(def ^:private same-ha-runtime-state? sha/same-ha-runtime-state?)
-(def ^:private merge-ha-follower-local-side-effect-patch
-  sha/merge-ha-follower-local-side-effect-patch)
-(def ^:private merge-ha-follower-side-effect-patch
-  sha/merge-ha-follower-side-effect-patch)
-(def ^:private merge-ha-renew-state-patch
-  sha/merge-ha-renew-state-patch)
-(def ^:private merge-ha-renew-promotion-state-patch
-  sha/merge-ha-renew-promotion-state-patch)
 (def ^:private persist-ha-follower-side-effects!
   sha/persist-ha-follower-side-effects!)
 
@@ -671,10 +622,7 @@
 (def ^:dynamic *consensus-ha-opts-fn*
   consensus-ha-opts)
 
-(def ^:private ha-runtime-option-keys sha/ha-runtime-option-keys)
 (def ^:private ha-runtime-option-key-set sha/ha-runtime-option-key-set)
-(def ^:private sanitize-ha-path-segment sha/sanitize-ha-path-segment)
-(def ^:private default-ha-control-raft-dir sha/default-ha-control-raft-dir)
 (def ^:private with-default-ha-control-raft-dir
   sha/with-default-ha-control-raft-dir)
 (def ^:private start-ha-authority sha/start-ha-authority)
@@ -699,26 +647,10 @@
          with-db-runtime-store-read-access
          with-db-runtime-store-swap)
 
-(defn- ha-follower-apply-record-with-guard
-  [^Server server db-name expected-state record]
-  (sha/ha-follower-apply-record-with-guard
-   ha-deps server db-name expected-state record))
-
-(defn- with-ha-follower-replay-quiesced
-  [^Server server db-name f]
-  (sha/with-ha-follower-replay-quiesced ha-deps server db-name f))
-
 (def ^:private ha-loop-sleep-ms sha/ha-loop-sleep-ms)
 (def ^:private ha-follower-loop-sleep-ms sha/ha-follower-loop-sleep-ms)
 (def ^:private sleep-ha-loop! sha/sleep-ha-loop!)
 (def ^:private ha-loop-error-backoff! sha/ha-loop-error-backoff!)
-
-(defn- ha-renew-promotion-result?
-  [expected-state next-state]
-  (and (not (contains? #{:leader :demoting} (:ha-role expected-state)))
-       (contains? #{:leader :demoting} (:ha-role next-state))
-       (= (:ha-node-id next-state)
-          (:ha-authority-owner-node-id next-state))))
 
 (defn- publish-ha-renew-state!
   [^Server server db-name expected-state next-state ^AtomicBoolean running?]
@@ -726,15 +658,6 @@
    ha-deps server db-name expected-state next-state running?))
 
 (declare log-ha-loop-crash!)
-
-(defn- run-ha-renew-loop
-  [^Server server db-name ^AtomicBoolean running? ^CountDownLatch stopped-latch]
-  (sha/run-ha-renew-loop ha-deps server db-name running? stopped-latch))
-
-(defn- run-ha-follower-sync-loop
-  [^Server server db-name ^AtomicBoolean running? ^CountDownLatch stopped-latch]
-  (sha/run-ha-follower-sync-loop
-   ha-deps server db-name running? stopped-latch))
 
 (declare execute)
 
@@ -985,10 +908,6 @@
 (def ^:dynamic *stop-ha-follower-sync-loop-fn*
   stop-ha-follower-sync-loop)
 
-(defn- current-ha-runtime-local-opts
-  [m]
-  (sha/current-ha-runtime-local-opts ha-deps m))
-
 (defn- resolved-ha-runtime-opts
   ([root db-name store]
    (resolved-ha-runtime-opts root db-name store nil nil))
@@ -1000,30 +919,11 @@
 
 (def ^:private shared-store-lifecycle? sha/shared-store-lifecycle?)
 
-(defn- stop-ha-runtime
-  [db-name m]
-  (sha/stop-ha-runtime ha-deps db-name m))
-
-(def ^:private ha-authority-running? sha/ha-authority-running?)
-
 (declare db-write-admission-lock)
 
 (defn- ha-write-admission-error
   [^Server server message]
   (sha/ha-write-admission-error ha-deps server message))
-
-(defn- leader-authority-state?
-  [m]
-  (and (= :leader (:ha-role m))
-       (satisfies? ctrl/ILeaseAuthority (:ha-authority m))))
-
-(defn- refresh-ha-write-commit-state!
-  [^Server server db-name]
-  (sha/refresh-ha-write-commit-state! ha-deps server db-name))
-
-(defn- ha-write-commit-admission!
-  [^Server server message]
-  (sha/ha-write-commit-admission! ha-deps server message))
 
 (defn- ha-write-commit-check-fn
   [^Server server message]
@@ -1036,14 +936,6 @@
 (defn- with-ha-write-admission
   [^Server server message f]
   (sha/with-ha-write-admission ha-deps server message f))
-
-(def ^:private ha-abort-cleanup-types
-  #{:abort-transact
-    :abort-transact-kv})
-
-(def ^:private ha-rejected-close-cleanup-types
-  #{:close-transact
-    :close-transact-kv})
 
 (defn- cleanup-rejected-close-transact!
   [^Server server {:keys [type args]}]
@@ -1289,10 +1181,6 @@
   [^SelectionKey skey path copy-meta]
   (scopy/copy-file-out copy-deps skey path copy-meta))
 
-(defn- cleanup-copy-tmp-dir*
-  [tf]
-  (scopy/cleanup-copy-tmp-dir* tf))
-
 (def ^:private ^:redef cleanup-copy-tmp-dir-fn*
   scopy/cleanup-copy-tmp-dir-fn*)
 
@@ -1314,10 +1202,6 @@
 
 (def ^:private ^:redef unpin-server-copy-backup-floor!
   scopy/unpin-server-copy-backup-floor!)
-
-(defn- copy-source-kv-store
-  [store]
-  (scopy/copy-source-kv-store store))
 
 (defn- copy-response-meta
   [db-name store base-meta]
@@ -1344,40 +1228,6 @@
   [^SelectionKey skey]
   (.close ^SocketChannel (.channel skey)))
 
-(defn- client-disconnect?
-  [e]
-  (sdisp/client-disconnect? e))
-
-(defn- handled-request-error?
-  [e]
-  (let [data     (ex-data e)
-        err-data (:err-data data)]
-    (and (instance? clojure.lang.ExceptionInfo e)
-         (map? data)
-         (nil? (ex-cause e))
-         (or (:type data)
-             (:error data)
-             (:resized data)
-             (map? err-data)))))
-
-(defn- log-handled-request-error!
-  [e]
-  (let [data     (or (ex-data e) {})
-        err-data (:err-data data)
-        details  (cond-> {:message (ex-message e)}
-                   (:type data) (assoc :type (:type data))
-                   (:error data) (assoc :error (:error data))
-                   (:db-name data) (assoc :db-name (:db-name data))
-                   (map? err-data)
-                   (cond->
-                     (:type err-data) (assoc :err-type (:type err-data))
-                     (:error err-data) (assoc :err-error (:error err-data))))]
-    (if (handled-request-error? e)
-      ;; These request failures are returned to the client and are often
-      ;; asserted in tests. Keep them out of stderr unless debug logging is on.
-      (log/debug "Handled request error" details)
-      (log/error e))))
-
 (defn- log-ha-loop-crash!
   [loop-name db-name t]
   (let [details (cond-> {:db-name db-name
@@ -1388,28 +1238,6 @@
     ;; reserve the full stack trace for debug logging.
     (log/warn loop-name details)
     (log/debug t (str loop-name " stack trace") {:db-name db-name})))
-
-(defn- close-conn-quietly
-  [^SelectionKey skey]
-  (try
-    (close-conn skey)
-    (catch Exception _ nil)))
-
-(defn- error-response
-  [^SelectionKey skey error-msg error-data]
-  (let [{:keys [^ByteBuffer write-bf wire-opts]} @(.attachment skey)
-        ^SocketChannel ch              (.channel skey)]
-    (p/write-message-blocking ch write-bf
-                              {:type     :error-response
-                               :message  error-msg
-                               :err-data error-data}
-                              wire-opts)))
-
-(defn- reopen-response
-  [^SelectionKey skey msg]
-  (let [{:keys [^ByteBuffer write-bf wire-opts]} @(.attachment skey)
-        ^SocketChannel ch              (.channel skey)]
-    (p/write-message-blocking ch write-bf msg wire-opts)))
 
 (defn- handle-message-error!
   [^SelectionKey skey e]
@@ -1742,8 +1570,6 @@
                                      db-info (assoc :result db-info))))
                   db-info)))))))))
 
-(defn- session-lmdb [sys-conn] (sess/session-lmdb sys-conn))
-
 (def ^:private default-password-env-var "DATALEVIN_DEFAULT_PASSWORD")
 
 (def ^:private default-bind-host "127.0.0.1")
@@ -1868,15 +1694,6 @@
   (when (and (string? backup-root)
              (u/file-exists backup-root))
     (u/delete-files backup-root)))
-
-(defn- restore-assoc-opt-rollback-backup!
-  [env-dir {:keys [backup-dir]}]
-  (when (and (string? backup-dir)
-             (u/file-exists backup-dir))
-    (when (u/file-exists env-dir)
-      (u/delete-files env-dir))
-    (#'dha/copy-dir-contents! backup-dir env-dir)
-    true))
 
 (defn- rollback-assoc-opt!
   [^Server server db-name store old-opts k rollback-backup]
@@ -2074,10 +1891,6 @@
 (declare dispatch-message)
  (declare trace-remote-tx!)
 
-(defn- current-ha-txlog-term
-  [^Server server db-name]
-  (sdisp/current-ha-txlog-term dispatch-deps server db-name))
-
 (defn- dispatch-message-with-ha-write-admission
   [^Server server ^SelectionKey skey message]
   (sdisp/dispatch-message-with-ha-write-admission
@@ -2273,10 +2086,6 @@
                       (handle-message-error! skey e))))]))
         sh/handler-map))
 
-(defn- dispatch-message
-  [^Server server ^SelectionKey skey message]
-  (sdisp/dispatch-message dispatch-deps server skey message))
-
 (defn- execute
   "Execute a function in a thread from the worker thread pool"
   [^Server server f]
@@ -2291,24 +2100,6 @@
     (binding [*out* *err*]
       (apply println xs)
       (flush))))
-
-(def ^:private idempotent-withtxn-control-types
-  #{:close-transact
-    :abort-transact
-    :close-transact-kv
-    :abort-transact-kv})
-
-(defn- handle-writing
-  [^Server server ^SelectionKey skey {:keys [args] :as message}]
-  (sdisp/handle-writing dispatch-deps server skey message))
-
-(defn- set-last-active
-  [^Server server ^SelectionKey skey]
-  nil)
-
-(defn- handle-message
-  [^Server server ^SelectionKey skey fmt msg ]
-  (sdisp/handle-message dispatch-deps server skey fmt msg))
 
 (defn- handle-read
   [^Server server ^SelectionKey skey]

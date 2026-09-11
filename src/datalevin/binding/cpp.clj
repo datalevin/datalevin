@@ -1535,35 +1535,6 @@
                 (.add out tx))))))
       (.toArray out))))
 
-(defn- kv-tx->row
-  [^KVTxData tx]
-  (let [op   (.-op tx)
-        base (if (= op :del)
-               [op (.-dbi-name tx) (.-k tx) (.-kt tx)]
-               [op (.-dbi-name tx) (.-k tx) (.-v tx)
-                (.-kt tx) (.-vt tx) (.-flags tx)])
-        minc (if (= op :del) 3 4)]
-    (loop [row base]
-      (if (and (> (count row) minc) (nil? (peek row)))
-        (recur (pop row))
-        row))))
-
-(def ^:private max-val-size-row-prefix
-  [:put c/kv-info :max-val-size])
-
-(defn- max-val-size-row
-  [size]
-  (conj max-val-size-row-prefix size :data :data))
-
-(defn- maybe-apply-max-val-size-op!
-  [info ^HashMap dbis txn rows]
-  (if (:max-val-size-changed? @info)
-    (let [row (max-val-size-row (:max-val-size @info))]
-      (transact* [row] dbis txn)
-      (vswap! info assoc :max-val-size-changed? false)
-      (conj rows row))
-    rows))
-
 (defn- list-count*
   [^Rtx rtx ^Cursor cur k kt]
   (.put-key rtx k kt)

@@ -64,16 +64,12 @@
                   :event event)))))
 
 (def ^:private long-max2 hu/long-max2)
-(def ^:private long-max3 hu/long-max3)
-(def ^:private long-max4 hu/long-max4)
 (def ^:private long-min2 hu/long-min2)
 (def ^:private saturated-long-add hu/saturated-long-add)
-(def ^:private nonnegative-long-diff hu/nonnegative-long-diff)
 (def ^:private ordered-ha-members hu/ordered-ha-members)
 (def ^:private shutdown-ha-executor! hu/shutdown-ha-executor!)
 (def ^:private ha-thread-label hu/ha-thread-label)
 (def ^:private ha-request-timeout-ms hu/ha-request-timeout-ms)
-(def ^:private bootstrap-empty-lease? lease/bootstrap-empty-lease?)
 (def effective-ha-runtime-local-opts hu/effective-ha-runtime-local-opts)
 (def merge-ha-runtime-local-opts hu/merge-ha-runtime-local-opts)
 
@@ -82,22 +78,13 @@
     nil))
 (declare with-store-runtime-bindings)
 
-(def ^:private closed-kv-store? store/closed-kv-store?)
-(def ^:private read-ha-local-persisted-lsn store/read-ha-local-persisted-lsn)
 (def ^:private read-ha-local-snapshot-current-lsn
   store/read-ha-local-snapshot-current-lsn)
 (def ^:private read-ha-local-payload-lsn store/read-ha-local-payload-lsn)
-(def ^:private ha-local-watermark-snapshot-key
+(def ^:redef ha-local-watermark-snapshot-key
   store/ha-local-watermark-snapshot-key)
-(def ^:private clear-ha-local-store-transient-state
-  store/clear-ha-local-store-transient-state)
 (def ^:redef fresh-ha-local-watermark-snapshot
   store/fresh-ha-local-watermark-snapshot)
-
-(defn- local-kv-store
-  [m]
-  (with-store-runtime-bindings
-    #(store/local-kv-store m)))
 
 (defn- raw-local-kv-store
   [m]
@@ -136,11 +123,6 @@
   (with-store-runtime-bindings
     #(store/read-ha-local-last-applied-lsn m)))
 
-(defn- ^:redef read-ha-local-watermark-lsn
-  [m]
-  (with-store-runtime-bindings
-    #(store/read-ha-local-watermark-lsn m)))
-
 (defn persist-ha-runtime-local-applied-lsn!
   [m]
   (with-store-runtime-bindings
@@ -151,12 +133,12 @@
   (with-store-runtime-bindings
     #(store/ha-local-last-applied-lsn m)))
 
-(defn- refresh-ha-local-watermarks
+(defn ^:redef refresh-ha-local-watermarks
   [m]
   (with-store-runtime-bindings
     #(store/refresh-ha-local-watermarks m)))
 
-(defn- ha-promotion-lag-guard
+(defn ^:redef ha-promotion-lag-guard
   ([m observed-lease]
    (with-store-runtime-bindings
      #(store/ha-promotion-lag-guard m observed-lease)))
@@ -165,7 +147,7 @@
      #(store/ha-promotion-lag-guard
        m observed-lease local-last-applied-lsn))))
 
-(defn- fresh-ha-promotion-local-last-applied-lsn
+(defn ^:redef fresh-ha-promotion-local-last-applied-lsn
   [m observed-lease]
   (with-store-runtime-bindings
     #(store/fresh-ha-promotion-local-last-applied-lsn
@@ -186,7 +168,7 @@
 
 (declare default-ha-probe-executor)
 
-(defn- stop-ha-probe-executor!
+(defn ^:redef stop-ha-probe-executor!
   [db-name executor]
   (when (and executor
              (not (identical? executor default-ha-probe-executor)))
@@ -236,20 +218,12 @@
   (fn [f]
     (f)))
 
-(defn- with-ha-local-store-read
-  [f]
-  (*ha-with-local-store-read-fn* f))
-
 (defn- with-store-runtime-bindings
   [f]
   (binding [store/*ha-current-state-fn* *ha-current-state-fn*
             store/*ha-with-local-store-swap-fn* *ha-with-local-store-swap-fn*
             store/*ha-with-local-store-read-fn* *ha-with-local-store-read-fn*]
     (f)))
-
-(defn- ha-local-store-open-opts
-  [m store]
-  (store/ha-local-store-open-opts m store))
 
 (defn recover-ha-local-store-if-needed
   ([store]
@@ -291,10 +265,6 @@
    (with-store-runtime-bindings
      #(boot/reconcile-ha-installed-snapshot-state
        m snapshot-lsn trusted-max-lsn apply-record-fn))))
-
-(defn- ha-snapshot-open-opts
-  [m db-name db-identity]
-  (boot/ha-snapshot-open-opts m db-name db-identity))
 
 (defn ^:redef fetch-ha-endpoint-watermark-lsn
   [db-name m endpoint]
@@ -421,7 +391,7 @@
 (def ^:private ^ExecutorService default-ha-probe-executor
   (ForkJoinPool/commonPool))
 
-(defn- new-ha-probe-executor
+(defn ^:redef new-ha-probe-executor
   [db-name]
   (Executors/newFixedThreadPool
    (int ha-probe-max-threads)
@@ -653,7 +623,7 @@
         distinct
         vec)))
 
-(defn- ha-member-watermarks
+(defn ^:redef ha-member-watermarks
   ([db-name m]
    (ha-member-watermarks db-name m nil {}))
   ([db-name m extra-endpoints]
@@ -706,7 +676,7 @@
      nil
      watermarks)))
 
-(defn- highest-reachable-ha-member-watermark
+(defn ^:redef highest-reachable-ha-member-watermark
   ([db-name m]
    (highest-reachable-ha-member-watermark db-name m {}))
   ([db-name m prefetched-watermarks]
@@ -2286,7 +2256,7 @@
            :ha-follower-next-sync-not-before-ms
            (+ (long now-ms) (long backoff-ms)))))
 
-(defn- sync-ha-follower-state
+(defn ^:redef sync-ha-follower-state
   [db-name m now-ms]
   (if (not= :follower (:ha-role m))
     m

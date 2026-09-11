@@ -61,19 +61,11 @@
 
 (def ^:private ordered-ha-members hu/ordered-ha-members)
 
-(def ^:private ha-request-timeout-ms hu/ha-request-timeout-ms)
-
-(def ^:private ha-lease-local-remaining-ms
-  lease/ha-lease-local-remaining-ms)
-
 (def ^:private ha-write-admission-lease-margin-ms
   lease/ha-write-admission-lease-margin-ms)
 
 (def ^:private ha-write-admission-lease-margin-nanos
   lease/ha-write-admission-lease-margin-nanos)
-
-(def ^:private ha-clock-skew-budget-ms
-  lease/ha-clock-skew-budget-ms)
 
 (def ^:private ha-lease-expired-for-promotion?
   lease/ha-lease-expired-for-promotion?)
@@ -83,57 +75,24 @@
 
 (def ^:private long-max2 hu/long-max2)
 
-(def ^:private long-max3 hu/long-max3)
-
-(def ^:private long-max4 hu/long-max4)
-
-(def ^:private long-min2 hu/long-min2)
-
-(def ^:private nonnegative-long-diff hu/nonnegative-long-diff)
-
-(def ^:private ha-local-watermark-snapshot-key
-  @#'repl/ha-local-watermark-snapshot-key)
-
 (def ^:redef sync-ha-snapshot-install-target!
   snap/sync-ha-snapshot-install-target!)
 (def ha-snapshot-install-marker-path
   snap/ha-snapshot-install-marker-path)
-(def ^:private copy-dir-contents! snap/copy-dir-contents!)
-(def ^:private move-path! snap/move-path!)
-(def ^:private write-ha-snapshot-install-marker!
-  snap/write-ha-snapshot-install-marker!)
-(def ^:private delete-ha-snapshot-install-marker!
-  snap/delete-ha-snapshot-install-marker!)
-(def ^:private recover-ha-local-snapshot-install!
-  snap/recover-ha-local-snapshot-install!)
 (def recover-ha-local-store-dir-if-needed!
   snap/recover-ha-local-store-dir-if-needed!)
 (def recover-ha-local-store-if-needed
   #'repl/recover-ha-local-store-if-needed)
-(def ^:private close-ha-local-store! snap/close-ha-local-store!)
-(def ^:private refresh-ha-local-dt-db snap/refresh-ha-local-dt-db)
-
-(def ^:private closed-kv-store? #'repl/closed-kv-store?)
-(def ^:private read-ha-local-persisted-lsn #'repl/read-ha-local-persisted-lsn)
 (def ^:redef persist-ha-local-applied-lsn! #'repl/persist-ha-local-applied-lsn!)
 (def ^:redef fresh-ha-local-watermark-snapshot
   #'repl/fresh-ha-local-watermark-snapshot)
 (def ^:redef read-ha-snapshot-payload-lsn #'repl/read-ha-snapshot-payload-lsn)
 (def ^:redef read-ha-local-last-applied-lsn #'repl/read-ha-local-last-applied-lsn)
-(def ^:private read-ha-local-watermark-lsn #'repl/read-ha-local-watermark-lsn)
 (def persist-ha-runtime-local-applied-lsn!
   #'repl/persist-ha-runtime-local-applied-lsn!)
 (def ^:private ha-local-last-applied-lsn #'repl/ha-local-last-applied-lsn)
-(def ^:private refresh-ha-local-watermarks #'repl/refresh-ha-local-watermarks)
-(def ^:private raw-local-kv-store #'repl/raw-local-kv-store)
-(def ^:private reopen-ha-local-store-if-needed
-  #'repl/reopen-ha-local-store-if-needed)
-(def ^:private ha-local-store-reopen-info #'repl/ha-local-store-reopen-info)
 (def ^:redef reopen-ha-local-store-from-info
   #'repl/reopen-ha-local-store-from-info)
-(def ^:private ha-promotion-lag-guard #'repl/ha-promotion-lag-guard)
-(def ^:private fresh-ha-promotion-local-last-applied-lsn
-  #'repl/fresh-ha-promotion-local-last-applied-lsn)
 (def ^:private bootstrap-empty-lease? lease/bootstrap-empty-lease?)
 (def ^:redef fetch-ha-endpoint-watermark-lsn
   #'repl/fetch-ha-endpoint-watermark-lsn)
@@ -151,14 +110,8 @@
 (def ^:redef clear-ha-replica-floor! #'repl/clear-ha-replica-floor!)
 (def ^:redef fetch-ha-endpoint-snapshot-copy!
   #'repl/fetch-ha-endpoint-snapshot-copy!)
-(def ^:private highest-reachable-ha-member-watermark
-  #'repl/highest-reachable-ha-member-watermark)
-(def ^:private ha-member-watermarks #'repl/ha-member-watermarks)
 (def ^:private normalize-leader-watermark-result
   #'repl/normalize-leader-watermark-result)
-(def ^:private sync-ha-follower-state #'repl/sync-ha-follower-state)
-(def ^:private new-ha-probe-executor #'repl/new-ha-probe-executor)
-(def ^:private stop-ha-probe-executor! #'repl/stop-ha-probe-executor!)
 
 (defn- demote-ha-leader
   [db-name m reason details now-ms]
@@ -244,9 +197,6 @@
   [m lease]
   (promo/maybe-wait-unreachable-leader-before-pre-cas! m lease))
 
-(def ^:private authority-observation-from-state
-  auth/authority-observation-from-state)
-
 (def ^:private authority-lease-local-deadline-ms
   auth/authority-lease-local-deadline-ms)
 
@@ -261,12 +211,6 @@
 
 (def ^:private apply-authority-observation
   auth/apply-authority-observation)
-
-(def ^:private authority-read-error
-  auth/authority-read-error)
-
-(def ^:private apply-authority-read-failure
-  auth/apply-authority-read-failure)
 
 (def ^:private apply-authority-read-success
   auth/apply-authority-read-success)
@@ -434,9 +378,6 @@
                                  :lease-release lease-release}
                                 (ha-now-ms)))))))))
 
-(def ^:private parse-ha-clock-skew-output
-  clock/parse-ha-clock-skew-output)
-
 (defn ^:redef run-ha-clock-skew-hook
   [db-name m]
   (clock/run-ha-clock-skew-hook db-name m))
@@ -444,16 +385,6 @@
 (def ^:dynamic *ha-with-local-store-swap-fn*
   (fn [f]
     (f)))
-
-(defn- with-ha-local-store-swap
-  [f]
-  (*ha-with-local-store-swap-fn* f))
-
-(def ^:private ha-clock-skew-hook-configured?
-  clock/ha-clock-skew-hook-configured?)
-
-(def ^:private ha-clock-skew-check-fresh?
-  clock/ha-clock-skew-check-fresh?)
 
 (def ^:private ha-clock-skew-promotion-block-reason
   clock/ha-clock-skew-promotion-block-reason)
@@ -465,12 +396,12 @@
   [db-name m]
   (if-not (:ha-authority m)
     m
-    (let [m0 (refresh-ha-local-watermarks m)]
+    (let [m0 (repl/refresh-ha-local-watermarks m)]
       (cond-> (if (= :follower (:ha-role m0))
-                (sync-ha-follower-state db-name m0 (ha-now-ms))
+                (repl/sync-ha-follower-state db-name m0 (ha-now-ms))
                 m0)
         :always
-        (dissoc ha-local-watermark-snapshot-key)))))
+        (dissoc repl/ha-local-watermark-snapshot-key)))))
 
 (defn- authority-deps
   []
@@ -494,30 +425,18 @@
    :maybe-complete-ha-leader-fencing-fn maybe-complete-ha-leader-fencing
    :fetch-leader-watermark-lsn-fn fetch-leader-watermark-lsn
    :fresh-ha-promotion-local-last-applied-lsn-fn
-   fresh-ha-promotion-local-last-applied-lsn
-   :ha-member-watermarks-fn ha-member-watermarks
+   repl/fresh-ha-promotion-local-last-applied-lsn
+   :ha-member-watermarks-fn repl/ha-member-watermarks
    :highest-reachable-ha-member-watermark-fn
-   highest-reachable-ha-member-watermark
+   repl/highest-reachable-ha-member-watermark
    :normalize-leader-watermark-result-fn normalize-leader-watermark-result
-   :ha-promotion-lag-guard-fn ha-promotion-lag-guard
+   :ha-promotion-lag-guard-fn repl/ha-promotion-lag-guard
    :ha-local-last-applied-lsn-fn ha-local-last-applied-lsn
    :observe-authority-state-fn observe-authority-state})
 
 (defn- refresh-ha-clock-skew-state
   [db-name m]
   (clock/refresh-ha-clock-skew-state (clock-deps) db-name m))
-
-(defn- maybe-enter-ha-candidate
-  [m now-ms]
-  (promo/maybe-enter-ha-candidate (promotion-deps) m now-ms))
-
-(defn- attempt-ha-candidate-promotion
-  [db-name m now-ms]
-  (promo/attempt-ha-candidate-promotion (promotion-deps) db-name m now-ms))
-
-(defn- maybe-promote-ha-candidate
-  [db-name m now-ms]
-  (promo/maybe-promote-ha-candidate (promotion-deps) db-name m now-ms))
 
 (defn- advance-ha-follower-or-candidate
   [db-name m]
@@ -650,7 +569,7 @@
   (if-not (:ha-authority m)
     m
     (let [started-demoting? (= :demoting (:ha-role m))
-          m0 (refresh-ha-local-watermarks m)
+          m0 (repl/refresh-ha-local-watermarks m)
           m1 (if (= :leader (:ha-role m0))
                (try
                  (renew-ha-leader-state db-name m0)
@@ -665,7 +584,7 @@
           end-now-ms (ha-now-ms)]
       (-> (maybe-demote-on-refresh-timeout db-name m3 end-now-ms)
           (maybe-finish-ha-demotion end-now-ms started-demoting?)
-          (dissoc ha-local-watermark-snapshot-key)))))
+          (dissoc repl/ha-local-watermark-snapshot-key)))))
 
 (def ^:private ha-runtime-config-clear-keys
   [:ha-authority
@@ -777,7 +696,7 @@
 (def ^:private ha-runtime-clear-keys
   (vec
    (concat
-    [ha-local-watermark-snapshot-key]
+    [repl/ha-local-watermark-snapshot-key]
     ha-runtime-config-clear-keys
     ha-authority-observation-clear-keys
     ha-clock-skew-clear-keys
@@ -1084,7 +1003,7 @@
         clock-skew-hook (:ha-clock-skew-hook ha-opts)
         local-endpoint (local-ha-endpoint ha-opts)
         client-cache-state (cache/new-ha-client-cache-state db-name)
-        probe-executor (new-ha-probe-executor db-name)
+        probe-executor (repl/new-ha-probe-executor db-name)
         authority (ctrl/new-authority cp)]
     (try
       (ctrl/start-authority! authority)
@@ -1230,7 +1149,7 @@
             (log/warn stop-e "Failed to stop HA authority after startup failure"
                       {:db-name db-name})))
         (cache/stop-ha-client-cache-state! db-name client-cache-state)
-        (stop-ha-probe-executor! db-name probe-executor)
+        (repl/stop-ha-probe-executor! db-name probe-executor)
         (throw e)))))
 
 (defn stop-ha-authority
@@ -1243,4 +1162,4 @@
           (log/warn e "Failed to stop HA authority" {:db-name db-name}))))
     (finally
       (cache/stop-ha-client-cache-state! db-name (:ha-client-cache-state m))
-      (stop-ha-probe-executor! db-name (:ha-probe-executor m)))))
+      (repl/stop-ha-probe-executor! db-name (:ha-probe-executor m)))))

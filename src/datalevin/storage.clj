@@ -343,10 +343,6 @@
           (d/datom (.-e r) (attrs (.-a r)) k)))
       (kv->datom lmdb attrs v k))))
 
-(defn- ae-retrieved->datom
-  [attrs v ^Retrieved r]
-  (d/datom (.-e r) (attrs (.-a r)) v))
-
 (defn- datom-pred->kv-pred
   [lmdb attrs index pred]
   (fn [kv]
@@ -3354,10 +3350,6 @@
    :ha-client-credentials
    :ha-fencing-hook
    :ha-clock-skew-hook])
-
-(def ^:private non-persistable-ha-control-plane-option-keys
-  [:local-peer-id
-   :raft-dir])
 
 (def ^:private raw-persist-open-opts-key
   ::raw-persist-open-opts?)

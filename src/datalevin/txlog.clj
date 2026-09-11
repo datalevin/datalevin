@@ -39,19 +39,6 @@
 (def ^:const record-header-size 14)
 (def ^:const format-major 2)
 (def ^:const compressed-flag 0x01)
-(def ^:private magic-bytes
-  (byte-array [(byte 0x44) (byte 0x4c) (byte 0x57) (byte 0x4c)]))
-(def ^:private segment-pattern #"^segment-(\d{16})\.wal$")
-(def ^:private prepared-segment-pattern #"^segment-(\d{16})\.wal\.tmp$")
-(def ^:private ^"[Ljava.nio.file.StandardOpenOption;"
-  open-segment-read-options
-  (into-array StandardOpenOption [StandardOpenOption/READ]))
-(def ^:private ^"[Ljava.nio.file.StandardOpenOption;"
-  open-segment-create-read-write-options
-  (into-array StandardOpenOption
-              [StandardOpenOption/CREATE
-               StandardOpenOption/READ
-               StandardOpenOption/WRITE]))
 (def ^:private ^"[Ljava.nio.file.StandardOpenOption;"
   open-lock-create-write-options
   (into-array StandardOpenOption
@@ -61,25 +48,13 @@
 (def ^:const meta-slot-payload-size 64)
 (def ^:const meta-slot-size (+ meta-slot-payload-size 4))
 (def ^:const meta-format-major 1)
-(def ^:private meta-file-name "meta")
-(def ^:private meta-lock-file-name "meta.lock")
-(def ^:private sync-lock-file-name "sync.lock")
-(def ^:private recovery-lock-file-name "recovery.lock")
-(def ^:private maintenance-lock-file-name "maintenance.lock")
-(def ^:private meta-magic-bytes
-  (byte-array [(byte 0x44) (byte 0x4c) (byte 0x54) (byte 0x4d)])) ; DLTM
 
 (def ^:const commit-marker-slot-payload-size 60)
 (def ^:const commit-marker-slot-size (+ commit-marker-slot-payload-size 4))
 (def ^:const commit-marker-format-major 1)
-(def ^:private commit-marker-magic-bytes
-  (byte-array [(byte 0x44) (byte 0x4c) (byte 0x43) (byte 0x4d)])) ; DLCM
-(def ^:private commit-payload-ha-term-flag 0x01)
-
 (def ^:dynamic *commit-payload-ha-term*
   nil)
 
-(def ^:private sync-mode-values #{:fsync :fdatasync :extra :none})
 (def ^:private segment-prealloc-mode-values #{:native :none})
 
 (declare segment-files
@@ -1494,37 +1469,6 @@
      :unknown (avg-ms unknown-total unknown-count)}))
 
 (def ^:private pending-lsn-queue-initial-capacity 256)
-
-(defn- enqueue-pending-lsn!
-  [{:keys [pending-lsn-queue
-           pending-lsn-head
-           pending-lsn-tail
-           pending-lsn-size]}
-   ^long lsn]
-  (let [size (long @pending-lsn-size)
-        ^longs queue0 @pending-lsn-queue
-        capacity0 (alength queue0)
-        [^longs queue ^long capacity]
-        (if (< size capacity0)
-          [queue0 capacity0]
-          (let [new-capacity (int (max (inc capacity0) (* 2 capacity0)))
-                queue1 (long-array new-capacity)
-                head0 (long @pending-lsn-head)]
-            (dotimes [i (int size)]
-              (aset-long queue1
-                         i
-                         (aget queue0
-                               (int (mod (+ head0 i) capacity0)))))
-            (vreset! pending-lsn-queue queue1)
-            (vreset! pending-lsn-head 0)
-            (vreset! pending-lsn-tail size)
-            [queue1 (long new-capacity)]))
-        tail (long @pending-lsn-tail)
-        next-tail (long (if (= (inc tail) capacity) 0 (inc tail)))]
-    (aset-long queue (int tail) lsn)
-    (vreset! pending-lsn-tail next-tail)
-    (vreset! pending-lsn-size (inc size))
-    (long @pending-lsn-size)))
 
 (defn- pending-trailing-lsn
   [{:keys [pending-lsn-queue

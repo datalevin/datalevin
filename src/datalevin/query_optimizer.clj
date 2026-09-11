@@ -225,15 +225,6 @@
       (first branches)
       (apply list 'or branches))))
 
-(defn- not-join-clause?
-  [clause]
-  (and (sequential? clause)
-       (not (vector? clause))
-       (= 'not-join
-          (if (qu/source? (first clause))
-            (second clause)
-            (first clause)))))
-
 (defn- get-not-join-vars
   [clause]
   (let [clause (if (qu/source? (first clause)) (next clause) clause)
@@ -247,32 +238,6 @@
 (defn- clause-source-symbol
   [source]
   (if (instance? DefaultSrc source) '$ (:symbol source)))
-
-(defn- not-join-optimizable?
-  "Conservative check for planner-handled not-join.
-   Easy cases only: explicit not-join form, non-empty join vars, pattern-only
-   body, single source, and all join vars used in the body."
-  [sources parsed-clause orig-clause]
-  (when (and (instance? Not parsed-clause) (not-join-clause? orig-clause))
-    (let [vars             (into []
-                                 (comp (map :symbol) (filter qu/binding-var?))
-                                 (:vars parsed-clause))
-          clauses          (:clauses parsed-clause)
-          src              (get-not-join-source orig-clause)
-          pattern-only?    (every? #(instance? Pattern %) clauses)
-          clause-sources   (into #{} (map #(clause-source-symbol (:source %)))
-                                 clauses)
-          body-vars        (qu/collect-vars clauses)
-          all-vars-used?   (set/subset? (set vars) body-vars)
-          searchable-src?  (when-let [db (get sources src)]
-                             (db/-searchable? db))]
-      (when (and searchable-src?
-                 (seq vars)
-                 pattern-only?
-                 (= 1 (count clause-sources))
-                 (= src (first clause-sources))
-                 all-vars-used?)
-        orig-clause))))
 
 (defn- plugin-scalar-inputs
   [parsed-q inputs]
@@ -3927,12 +3892,6 @@
              (qplan/->PropertyMemo
                logical-key demand alternatives selected subsets)))
     context))
-
-(defn selected-access-plan
-  [context]
-  (let [selected (get-in context [:property-memo :selected])]
-    (when (= :access (:kind selected))
-      (get-in selected [:plan :access-plan]))))
 
 (defn selected-alternative
   [context]

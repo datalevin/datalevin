@@ -2417,18 +2417,6 @@
             (add-canonical-kvtx! out dbi-name t kt vt)))
         out))))
 
-(def ^:private tl-single-row-fast-list
-  (ThreadLocal/withInitial
-   (reify java.util.function.Supplier
-     (get [_] (FastList. 1)))))
-
-(defn- single-row-fast-list
-  ^FastList [row]
-  (let [^FastList rows (.get ^ThreadLocal tl-single-row-fast-list)]
-    (.clear rows)
-    (.add rows row)
-    rows))
-
 (defn- payload-lsn-row
   [lsn]
   (l/kv-tx :put c/kv-info c/wal-local-payload-lsn (long lsn) :keyword :data))
@@ -2605,106 +2593,6 @@
                 (vreset! (:sync-in-progress? sync-manager) false)
                 (vreset! (:healthy? sync-manager) true)
                 (vreset! (:failure sync-manager) nil)))))))))
-
-(def ^:private txlog-retention-backpressure-check-interval-ms
-  1000)
-
-(def ^:private txlog-retention-backpressure-idle-check-interval-ms
-  60000)
-
-(def ^:private txlog-retention-pin-floor-limiters
-  #{:replica-floor-lsn :backup-pin-floor-lsn :operator-retain-floor-lsn})
-
-(defn- txlog-retention-pin-backpressure-threshold-ms
-  [lmdb]
-  (let [info (or (i/env-opts lmdb) {})
-        configured (:wal-retention-pin-backpressure-threshold-ms info)]
-    (long (or configured
-              c/*wal-retention-pin-backpressure-threshold-ms*))))
-
-(defn- txlog-retention-backpressure-state
-  [lmdb state]
-  (let [check-v (:retention-backpressure-last-check-ms state)
-        cached-v (:retention-backpressure-state state)
-        blocked-v (:retention-backpressure-blocked-since-ms state)
-        total-bytes-v (:retention-total-bytes state)
-        now-ms (System/currentTimeMillis)
-        info (or (i/env-opts lmdb) {})
-        retention-bytes (long (or (:wal-retention-bytes info)
-                                  c/*wal-retention-bytes*))
-        total-bytes (when (some? total-bytes-v) (long @total-bytes-v))
-        cached-report (when (some? cached-v) @cached-v)
-        bytes-pressure?
-        (and (number? total-bytes)
-             (> ^long total-bytes ^long retention-bytes))
-        tighten? (or bytes-pressure?
-                     (true? (:degraded-now? cached-report))
-                     (true? (:degraded? cached-report)))
-        interval-ms (long (if tighten?
-                            txlog-retention-backpressure-check-interval-ms
-                            txlog-retention-backpressure-idle-check-interval-ms))
-        cached? (and (some? check-v)
-                     (some? cached-v)
-                     (< (- now-ms (long @check-v))
-                        interval-ms))]
-    (if cached?
-      cached-report
-      (let [state-map (txlog-retention-state-map lmdb nil false)
-            pressure (:pressure state-map)
-            floor-limiters (vec (:floor-limiters state-map))
-            degraded-now? (true? (:degraded? pressure))
-            pin-limited? (boolean (some txlog-retention-pin-floor-limiters
-                                        floor-limiters))
-            threshold-ms (txlog-retention-pin-backpressure-threshold-ms lmdb)
-            blocked-since-old (when (some? blocked-v) @blocked-v)
-            blocked-since-ms (cond
-                               (not (map? state-map))
-                               nil
-
-                               (and degraded-now? pin-limited?
-                                    (number? blocked-since-old))
-                               (long blocked-since-old)
-
-                               (and degraded-now? pin-limited?)
-                               now-ms
-
-                               :else
-                               nil)
-            blocked-for-ms (when (some? blocked-since-ms)
-                             (long (max 0 (- (long now-ms)
-                                             (long blocked-since-ms)))))
-            degraded? (if (and degraded-now? pin-limited?)
-                        (and blocked-for-ms
-                             (>= ^long blocked-for-ms ^long threshold-ms))
-                        degraded-now?)
-            report (when (map? state-map)
-                     {:degraded? degraded?
-                      :degraded-now? degraded-now?
-                      :pin-limited? pin-limited?
-                      :pin-backpressure-threshold-ms
-                      (when pin-limited? threshold-ms)
-                      :pin-blocked-since-ms blocked-since-ms
-                      :pin-blocked-for-ms blocked-for-ms
-                      :pressure pressure
-                      :required-retained-floor-lsn
-                      (:required-retained-floor-lsn state-map)
-                      :gc-safety-watermark-lsn
-                      (:gc-safety-watermark-lsn state-map)
-                      :floor-limiters floor-limiters})]
-        (when (some? check-v)
-          (vreset! check-v now-ms))
-        (when (some? cached-v)
-          (vreset! cached-v report))
-        (when (some? blocked-v)
-          (vreset! blocked-v blocked-since-ms))
-        report))))
-
-(defn- txlog-throw-if-retention-backpressure!
-  [lmdb state]
-  (when-let [report (txlog-retention-backpressure-state lmdb state)]
-    (when (:degraded? report)
-      (raise "Txn-log retention pressure is degraded; rejecting writes"
-             (assoc report :type :txlog/retention-degraded)))))
 
 (defn- apply-lmdb-after-txlog-append!
   [lmdb state rows]

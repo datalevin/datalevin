@@ -27,7 +27,6 @@
 
 (def ^:private long-max2 hu/long-max2)
 (def ^:private long-max3 hu/long-max3)
-(def ^:private long-max4 hu/long-max4)
 (def ^:private long-min2 hu/long-min2)
 (def ^:private nonnegative-long-diff hu/nonnegative-long-diff)
 (def ^:private bootstrap-empty-lease? lease/bootstrap-empty-lease?)
