@@ -9,11 +9,11 @@
 
 ### Changed
 - [Storage] update dtlvnative to 1.1.1, which uses DLMDB data format version 2,
-  upgrade nippy to 3.9.0 and contains rust bindings to dlmdb, usearch and
+  upgrade nippy to 3.9.0 and added rust bindings to dlmdb, usearch and
   llama.cpp, laying the foundation for a rust core of Datalevin, parallel to the
   Clojure one. Clojure will still be the source of new feature development and
-  serves JVM, while rust one serves the native platforms. Auto-migration from
-  0.9.27 and above will be conducted on DB open.
+  serves JVM, while rust one serves the native platforms in the future.
+  Auto-migration from 0.9.27 and above will be conducted on DB open.
 ### Improved
 - [Server] harden client/server lifecycle.
 - [Datalog] always refresh giant id floor in transaction.

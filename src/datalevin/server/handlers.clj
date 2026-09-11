@@ -1900,29 +1900,42 @@
                          "Unable to delete temporary copy directory"
                          {:path (str tf)})))))))))
 
+(def ^:private kv-ops
+  "KV interface ops shared by direct wire dispatch and batch-kv calls."
+  {:get-value            i/get-value
+   :get-rank             i/get-rank
+   :get-by-rank          i/get-by-rank
+   :sample-kv            i/sample-kv
+   :get-first            i/get-first
+   :get-first-n          i/get-first-n
+   :get-range            i/get-range
+   :key-range            i/key-range
+   :key-range-count      i/key-range-count
+   :key-range-list-count i/key-range-list-count
+   :range-count          i/range-count
+   :get-list             i/get-list
+   :list-count           i/list-count
+   :in-list?             i/in-list?
+   :list-range           i/list-range
+   :list-range-count     i/list-range-count
+   :list-range-first     i/list-range-first
+   :list-range-first-n   i/list-range-first-n})
+
+(def ^:private copying-kv-ops
+  "Ops whose direct wire handler streams large results via copy."
+  #{:get-range :key-range :get-list :list-range})
+
+(defn- kv-handler
+  [op op-fn]
+  (if (copying-kv-ops op)
+    (copying-kv-handler op-fn)
+    (normal-kv-handler op-fn)))
+
 (defn- run-batch-kv-call
   [kv-store call]
   (let [[op & op-args] call]
-    (case op
-      :get-value            (apply i/get-value kv-store op-args)
-      :get-rank             (apply i/get-rank kv-store op-args)
-      :get-by-rank          (apply i/get-by-rank kv-store op-args)
-      :sample-kv            (apply i/sample-kv kv-store op-args)
-      :get-first            (apply i/get-first kv-store op-args)
-      :get-first-n          (apply i/get-first-n kv-store op-args)
-      :get-range            (apply i/get-range kv-store op-args)
-      :key-range            (apply i/key-range kv-store op-args)
-      :key-range-count      (apply i/key-range-count kv-store op-args)
-      :key-range-list-count (apply i/key-range-list-count kv-store op-args)
-      :range-count          (apply i/range-count kv-store op-args)
-      :get-list             (apply i/get-list kv-store op-args)
-      :list-count           (apply i/list-count kv-store op-args)
-      :in-count?            (apply i/in-list? kv-store op-args)
-      :in-list?             (apply i/in-list? kv-store op-args)
-      :list-range           (apply i/list-range kv-store op-args)
-      :list-range-count     (apply i/list-range-count kv-store op-args)
-      :list-range-first     (apply i/list-range-first kv-store op-args)
-      :list-range-first-n   (apply i/list-range-first-n kv-store op-args)
+    (if-let [op-fn (get kv-ops op)]
+      (apply op-fn kv-store op-args)
       (u/raise "Unsupported batch-kv call"
                {:call op :call-args op-args}))))
 
@@ -2754,7 +2767,7 @@
                           .get))))
          (u/raise "Database is not open" {:db-name db-name})))))
 
-(def handler-map
+(def ^:private base-handler-map
   {:authentication authentication
    :disconnect disconnect
    :set-client-id set-client-id
@@ -2866,33 +2879,15 @@
    :close-transact-kv close-transact-kv
    :abort-transact-kv abort-transact-kv
    :transact-kv transact-kv
-   :get-value (normal-kv-handler i/get-value)
-   :get-rank (normal-kv-handler i/get-rank)
-   :get-by-rank (normal-kv-handler i/get-by-rank)
-   :sample-kv (normal-kv-handler i/sample-kv)
-   :get-first (normal-kv-handler i/get-first)
-   :get-first-n (normal-kv-handler i/get-first-n)
    :batch-kv batch-kv
-   :key-range (copying-kv-handler i/key-range)
-   :key-range-count (normal-kv-handler i/key-range-count)
-   :key-range-list-count (normal-kv-handler i/key-range-list-count)
    :visit-key-range (deserialized-normal-kv-handler 2 i/visit-key-range)
-   :get-range (copying-kv-handler i/get-range)
-   :range-count (normal-kv-handler i/range-count)
    :get-some (deserialized-normal-kv-handler 2 i/get-some)
    :range-filter (deserialized-copying-kv-handler 2 i/range-filter)
    :range-keep (deserialized-copying-kv-handler 2 i/range-keep)
    :range-some (deserialized-normal-kv-handler 2 i/range-some)
    :range-filter-count (deserialized-normal-kv-handler 2 i/range-filter-count)
    :visit (deserialized-normal-kv-handler 2 i/visit)
-   :get-list (copying-kv-handler i/get-list)
    :visit-list (deserialized-normal-kv-handler 2 i/visit-list)
-   :list-count (normal-kv-handler i/list-count)
-   :in-list? (normal-kv-handler i/in-list?)
-   :list-range (copying-kv-handler i/list-range)
-   :list-range-count (normal-kv-handler i/list-range-count)
-   :list-range-first (normal-kv-handler i/list-range-first)
-   :list-range-first-n (normal-kv-handler i/list-range-first-n)
    :list-range-filter (deserialized-copying-kv-handler 2 i/list-range-filter)
    :list-range-some (deserialized-normal-kv-handler 2 i/list-range-some)
    :list-range-keep (deserialized-copying-kv-handler 2 i/list-range-keep)
@@ -2924,3 +2919,10 @@
    :vec-re-index vec-re-index
    :kv-re-index kv-re-index
    :datalog-re-index datalog-re-index})
+
+(def handler-map
+  (merge
+    base-handler-map
+    (into {}
+          (map (fn [[op op-fn]] [op (kv-handler op op-fn)]))
+          kv-ops)))

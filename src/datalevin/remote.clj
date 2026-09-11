@@ -1498,7 +1498,7 @@
 
   (in-list? [_ dbi-name k v kt vt]
     (detect-chatty-kv! db-name dbi-name :in-list?)
-    (cl/normal-request client :in-count?
+    (cl/normal-request client :in-list?
                        [db-name dbi-name k v kt vt] writing?))
 
   (list-range [_ dbi-name k-range kt v-range vt]
@@ -1632,7 +1632,7 @@
   `:get-value`, `:get-rank`, `:get-by-rank`, `:sample-kv`, `:get-first`,
   `:get-first-n`, `:get-range`, `:key-range`, `:key-range-count`,
   `:key-range-list-count`, `:range-count`, `:get-list`, `:list-count`,
-  `:in-count?`, `:list-range`, `:list-range-count`, `:list-range-first`,
+  `:in-list?`, `:list-range`, `:list-range-count`, `:list-range-first`,
   or `:list-range-first-n`."
   [^KVStore store calls]
   (cl/normal-request (.-client store)
