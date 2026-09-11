@@ -30,7 +30,7 @@
               @(l/write-txn lmdb)
               (i/get-rtx lmdb))]
     (try
-      (l/put-key rtx k k-type)
+      (l/put-read-key dbi rtx k k-type)
       (when-let [^ByteBuffer bb (l/get-kv dbi rtx)]
         (if ignore-key?
           (b/read-buffer bb v-type)
@@ -50,7 +50,7 @@
               @(l/write-txn lmdb)
               (i/get-rtx lmdb))]
     (try
-      (l/put-key rtx k k-type)
+      (l/put-read-key dbi rtx k k-type)
       (l/get-key-rank dbi rtx)
       (catch Throwable e
         (raise "Fail to get-rank: " e

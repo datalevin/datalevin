@@ -57,6 +57,8 @@
 (defprotocol IDB
   (dbi [this] "Return the underlying dbi")
   (dbi-name [this] "Return string name of the dbi")
+  (put-read-key [this rtx data k-type]
+    "Encode a lookup key into rtx using this DBI's codec.")
   (put [this txn] [this txn append?]
     "Put kv pair given in `put-key` and `put-val` of dbi")
   (del [this txn] [this txn all?]

@@ -46,19 +46,36 @@ dictionary underneath existing encoded keys or mix dictionaries in one ordered
 stream.
 
 The current experimental binding uses environment-wide `:key-compress :hu`
-and `:val-compress :zstd` options with prebuilt dictionary files. Automatic
-training and safe dictionary replacement are not yet a supported lifecycle.
-Storage work remains, including keeping bootstrap metadata uncompressed on
-later writes so a compressed environment can reopen, auditing native access
-paths, and handling encoded keys that exceed the 511-byte limit. See
+and `:val-compress :zstd` options with prebuilt dictionary files. Select these
+when creating a persistent environment. Its uncompressed metadata records the
+compression methods, generation, and dictionary SHA-256s, so reopening requires
+no compression options. Missing or changed dictionaries and conflicting explicit
+options prevent opening. Changing compression requires a new rebuilt environment;
+never replace dictionary files in place. Physical copies carry both dictionaries.
+Temporary and in-memory stores do not support these options.
+
+With a standard 511-byte key buffer, serialized raw keys up to **253 bytes**
+are guaranteed to fit after encoding, including type headers. Longer raw keys
+are accepted only if their actual encoded size fits within 511 bytes; expansion
+past that limit aborts the write transaction. Smaller configured key buffers
+reduce the guarantee. There is no raw fallback because mixing encodings would
+break ordering.
+
+Automatic training and safe dictionary replacement are not yet a supported
+lifecycle. Storage work remains, including auditing native Datalog access paths
+and validating a complete staged rebuild before activation. See
 [the compression plan](../compression-plan.md) for the evaluation and remaining
 work.
 
 ## Value Compression
 
 The experimental environment value compressor uses a Zstd dictionary stored
-in `valcode.bin` and is selected with `:val-compress :zstd`. Ordered duplicate
-values require an order-preserving codec. General payload compression thresholds
+in `valcode.bin` and is selected with `:val-compress :zstd`. The binding rejects
+non-DUPFIXED list DBIs when this option is enabled: zstd does not preserve their
+duplicate ordering. DUPFIXED values always remain raw. This also prevents using
+the environment value compressor on Datalog stores, whose EAV index has
+variable-width duplicates. Separate per-DBI controls and an ordered duplicate
+codec remain future work. General payload compression thresholds
 are a separate evaluation from the key dictionary.
 
 ## Wire Compression

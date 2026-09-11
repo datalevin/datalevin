@@ -20,9 +20,11 @@
             visit-list-sample list-dbis ICompressor]]
    [datalevin.hu :as hu])
   (:import
+   [java.io ByteArrayInputStream]
    [java.nio ByteBuffer]
    [java.nio.file Files Paths]
-   [java.util HashSet]
+   [java.security MessageDigest]
+   [java.util HashSet HexFormat UUID]
    [datalevin.hu HuTucker]
    [datalevin.utl BitOps]
    [org.eclipse.collections.impl.list.mutable FastList]
@@ -84,8 +86,90 @@
    (hu-compressor (hu/codes->hu-tucker lens codes))))
 
 (defn load-key-compressor
-  [^String path]
-  (hu-compressor (hu/load-hu-tucker (io/input-stream path))))
+  [source]
+  (hu-compressor (hu/load-hu-tucker (io/input-stream source))))
+
+;; The manifest lives in the uncompressed kv-info DBI. Dictionary files are
+;; immutable for the lifetime of an environment, including marked-write views.
+
+(defn- compression-mode [opts option supported]
+  (let [mode (get opts option)]
+    (when-not (contains? #{nil :none supported} mode)
+      (u/raise "Unsupported compression method"
+               {:error :compression/unsupported :option option :method mode}))
+    (if (or (nil? mode) (= :none mode)) :none mode)))
+
+(defn- load-dictionary [dir stream descriptor]
+  (let [{:keys [method sha256]} descriptor]
+    (if (= :none method)
+      [descriptor nil]
+      (let [file (io/file dir (if (= stream :key)
+                               c/keycode-file-name c/valcode-file-name))]
+        (when-not (.isFile file)
+          (u/raise "Required compression dictionary is missing"
+                   {:error :compression/missing-dictionary
+                    :stream stream :file (str file)}))
+        ;; Hash and construct from the same bytes, not two reads of the path.
+        (let [bytes (Files/readAllBytes (.toPath file))
+              hash (.formatHex (HexFormat/of)
+                               (.digest (MessageDigest/getInstance "SHA-256") bytes))]
+          (when (and sha256 (not= sha256 hash))
+            (u/raise "Compression dictionary checksum does not match the stored generation"
+                     {:error :compression/dictionary-mismatch :stream stream
+                      :file (str file) :expected sha256 :actual hash}))
+          [(assoc descriptor :sha256 hash)
+           (if (= stream :key)
+             (load-key-compressor (ByteArrayInputStream. bytes))
+             (val-compressor bytes))])))))
+
+(defn open-compression
+  "Validate persisted encoding and load its immutable dictionaries. New modes
+  can only be selected when creating an environment; changing them needs a rebuild."
+  [dir opts loaded-info]
+  (let [key-mode (compression-mode opts :key-compress :hu)
+        val-mode (compression-mode opts :val-compress :zstd)
+        stored (:compression loaded-info)
+        _ (when (and (seq loaded-info) (nil? stored)
+                     (some #(not= :none %)
+                           [key-mode val-mode
+                            (compression-mode loaded-info :key-compress :hu)
+                            (compression-mode loaded-info :val-compress :zstd)]))
+            (u/raise "Changing compression requires rebuilding into a new environment"
+                     {:error :compression/rebuild-required}))
+        manifest (or stored {:generation (str (UUID/randomUUID))
+                             :key {:method key-mode}
+                             :value {:method val-mode}})]
+    (when stored
+      (when-not (and (string? (:generation stored))
+                     (not-empty (:generation stored))
+                     (every? (fn [[stream supported]]
+                               (let [{:keys [method sha256]} (get stored stream)]
+                                 (and (contains? #{:none supported} method)
+                                      (or (= :none method)
+                                          (and (string? sha256)
+                                               (re-matches #"[0-9a-f]{64}" sha256))))))
+                             [[:key :hu] [:value :zstd]]))
+        (u/raise "Invalid or unsupported compression manifest"
+                 {:error :compression/invalid-manifest}))
+      (doseq [[option stream mode] [[:key-compress :key key-mode]
+                                   [:val-compress :value val-mode]]
+              :when (and (contains? opts option)
+                         (not= mode (get-in stored [stream :method])))]
+        (u/raise "Compression option conflicts with the stored generation; rebuild required"
+                 {:error :compression/mode-conflict :option option
+                  :requested mode :stored (get-in stored [stream :method])})))
+    (when (= :zstd (get-in manifest [:value :method]))
+      (doseq [[dbi {:keys [flags]}] (:dbis loaded-info)
+              :let [flags (set flags)]
+              :when (and (:dupsort flags) (not (:dupfixed flags)))]
+        (u/raise "Value compression is not supported on ordered duplicate values"
+                 {:error :compression/ordered-duplicates :dbi dbi})))
+    (let [[key-desc key-codec] (load-dictionary dir :key (:key manifest))
+          [val-desc val-codec] (load-dictionary dir :value (:value manifest))]
+      {:manifest (assoc manifest :key key-desc :value val-desc)
+       :key-codec key-codec :value-codec val-codec
+       :key-compress (when-not (= :none (:method key-desc)) (:method key-desc))
+       :val-compress (when-not (= :none (:method val-desc)) (:method val-desc))})))
 
 ;; db samplers
 

@@ -1,6 +1,6 @@
 (ns datalevin.compression-test
   (:require [clojure.java.io :as io]
-            [clojure.test :refer [deftest is]]
+            [clojure.test :refer [deftest is testing]]
             [datalevin.binding.cpp]
             [datalevin.compress :as cp]
             [datalevin.constants :as c]
@@ -193,7 +193,162 @@
                                       keys)))
           (check db)
           (finally (i/close-kv db))))
+      (let [db (l/open-kv dir)]
+        (try (check db) (finally (i/close-kv db))))
       (finally (u/delete-files dir)))))
+
+(defmacro with-kv [[binding dir opts] & body]
+  `(let [~binding (l/open-kv ~dir ~opts)]
+     (try ~@body (finally (i/close-kv ~binding)))))
+
+(defmacro with-directory [[binding] & body]
+  `(let [~binding (str (Files/createTempDirectory
+                        "datalevin-compression-"
+                        (make-array java.nio.file.attribute.FileAttribute 0)))]
+     (try ~@body (finally (u/delete-files ~binding)))))
+
+(defn- write-dictionaries! [dir]
+  (hu/dump-hu-tucker @ordered (str (io/file dir c/keycode-file-name)))
+  ;; Zstd accepts a raw-content dictionary; no training is needed for this test.
+  (u/dump-bytes (str (io/file dir c/valcode-file-name))
+                (.getBytes "repeatable test payload dictionary" "UTF-8")))
+
+(deftest ordered-duplicate-value-compression-rejected
+  (with-directory [dir]
+    (write-dictionaries! dir)
+    (with-kv [db dir {:val-compress :zstd}]
+      (is (thrown-with-msg? Exception #"ordered duplicate"
+                           (i/open-dbi db "strings" {:flags [:create :dupsort]})))
+      (is (not (some #{"strings"} (i/list-dbis db))))
+      (is (nil? (get-in @(i/kv-info db) [:dbis "strings"])))
+      (i/open-dbi db "ids" {:flags [:create :dupsort :dupfixed]})
+      (i/transact-kv db [[:put-list "ids" 1 [4 1 3 2] :long :long]])
+      (is (= [[1 2] [1 3]]
+             (i/list-range db "ids" [:all] :long [:closed 2 3] :long))))
+    (with-kv [db dir {}]
+      (is (thrown-with-msg? Exception #"ordered duplicate"
+                           (i/open-dbi db "strings" {:flags [:create :dupsort]})))
+      (is (= [[1 2] [1 3]]
+             (i/list-range db "ids" [:all] :long [:closed 2 3] :long)))))
+  (with-directory [dir]
+    (with-kv [db dir {}]
+      (i/open-dbi db "strings" {:flags [:create :dupsort]})
+      (i/transact-kv db [[:put-list "strings" 1 ["aa" "ab" "b" "ba" "bb" "c"]
+                         :long :string]])
+      (is (= [[1 "b"] [1 "ba"] [1 "bb"]]
+             (i/list-range db "strings" [:all] :long [:closed "b" "bb"] :string))))
+    (write-dictionaries! dir)
+    (is (thrown-with-msg? Exception #"conflicts|rebuild"
+                         (l/open-kv dir {:val-compress :zstd})))
+    (with-kv [db dir {}]
+      (is (= [[1 "b"] [1 "ba"] [1 "bb"]]
+             (i/list-range db "strings" [:all] :long [:closed "b" "bb"] :string))))))
+
+(deftest compression-reopen-and-copy
+  (doseq [opts [{:key-compress :hu} {:val-compress :zstd}
+               {:key-compress :hu :val-compress :zstd}]]
+    (testing (str opts)
+      (with-directory [dir]
+        (with-directory [dest]
+          (write-dictionaries! dir)
+          (let [payload (apply str (repeat 2000 "repeatable test payload"))
+                check (fn [db]
+                        (is (= payload (i/get-value db "records" "a" :string :string)))
+                        (is (= [["a" payload] ["b" "second"]]
+                               (i/get-range db "records" [:all] :string :string)))
+                        (is (= 2 (i/key-range-count db "records" [:closed "a" "b"] :string)))
+                        (is (= 1 (i/get-rank db "records" "b" :string)))
+                        (is (= ["b" "second"]
+                               (i/get-by-rank db "records" 1 :string :string false)))
+                        ;; Both keyed and bounded metadata reads must remain raw.
+                        (is (= c/default-dbi-flags (:flags (i/get-value db c/kv-info
+                                                [:dbis "records"] [:keyword :string] :data))))
+                        (is (= 1 (count (i/get-range db c/kv-info
+                                         [:closed [:dbis "records"] [:dbis "records"]]
+                                         [:keyword :string] :data)))))]
+            (with-kv [db dir opts]
+              (i/open-dbi db "records")
+              (i/transact-kv db [[:put "records" "a" payload :string :string]
+                                 [:put "records" "b" "second" :string :string]])
+              (check db))
+            (with-kv [db dir {}]
+              (check db)
+              (i/open-dbi db "later")
+              (i/transact-kv db [[:put "later" :k :v]])
+              (i/copy db dest))
+            (with-kv [db dest {}]
+              (check db)
+              (is (= :v (i/get-value db "later" :k)))))
+          (with-kv [db dir opts]
+            (is (= :v (i/get-value db "later" :k)))))))))
+
+(deftest compression-open-rejects-missing-or-mismatched-dictionaries
+  (doseq [[option filename] [[:key-compress c/keycode-file-name]
+                             [:val-compress c/valcode-file-name]]]
+    (with-directory [dir]
+      (let [opts {option (if (= option :key-compress) :hu :zstd)}
+            file (io/file dir filename)]
+        (is (thrown-with-msg? Exception #"dictionary is missing" (l/open-kv dir opts)))
+        (write-dictionaries! dir)
+        ;; A failed open must release native resources and the local handle.
+        (with-kv [db dir opts]
+          (i/open-dbi db "data")
+          (i/transact-kv db [[:put "data" :hello :world]]))
+        (is (thrown-with-msg? Exception #"conflicts" (l/open-kv dir {option :none})))
+        (let [original (Files/readAllBytes (.toPath file))]
+          (Files/delete (.toPath file))
+          (is (thrown-with-msg? Exception #"dictionary is missing" (l/open-kv dir)))
+          (u/dump-bytes (str file) (byte-array [1 2 3]))
+          (is (thrown-with-msg? Exception #"checksum" (l/open-kv dir)))
+          (u/dump-bytes (str file) original)
+          (with-kv [db dir {}]
+            (is (= :world (i/get-value db "data" :hello)))))))))
+
+(deftest compression-manifest-validation
+  (with-directory [dir]
+    (write-dictionaries! dir)
+    (let [manifest (with-kv [db dir {:key-compress :hu}]
+                     (i/open-dbi db "data")
+                     (i/transact-kv db [[:put "data" :hello :world]])
+                     (i/get-value db c/kv-info :compression))]
+      (with-kv [db dir {}]
+        (is (= manifest (i/get-value db c/kv-info :compression)))
+        (i/transact-kv db [[:put c/kv-info :compression
+                           (dissoc manifest :generation)]]))
+      (is (thrown-with-msg? Exception #"Invalid or unsupported compression manifest"
+                           (l/open-kv dir)))))
+  (with-directory [dir]
+    (with-kv [db dir {}]
+      (i/open-dbi db "data")
+      (i/transact-kv db [[:put "data" :hello :world]
+                         [:del c/kv-info :compression]]))
+    (write-dictionaries! dir)
+    (is (thrown-with-msg? Exception #"rebuilding into a new environment"
+                         (l/open-kv dir {:key-compress :hu})))
+    ;; Existing raw environments can acquire raw metadata without a data rewrite.
+    (with-kv [db dir {}]
+      (is (= :world (i/get-value db "data" :hello)))
+      (is (= :none (get-in (i/get-value db c/kv-info :compression) [:key :method]))))))
+
+(deftest compressed-key-binding-size-limit
+  ;; At most 32 bits per pair/terminal: 253 raw bytes always fit in 508 bytes.
+  ;; A 511-byte raw key need not fit; compression cannot promise otherwise.
+  (with-directory [dir]
+    (hu/dump-hu-tucker @ordered-deep (str (io/file dir c/keycode-file-name)))
+    (with-kv [db dir {:key-compress :hu}]
+      (i/open-dbi db "keys")
+      (let [;; The 00 20 pair has a 32-bit code, the final 20 a 31-bit code.
+            fits (bytes-of (concat (mapcat identity (repeat 126 [0 32])) [32]))
+            overflows (bytes-of (concat (mapcat identity (repeat 255 [0 32])) [32]))]
+        (is (= 508 (alength ^bytes (encode @ordered-deep fits))))
+        (is (> (alength ^bytes (encode @ordered-deep overflows)) 511))
+        (i/transact-kv db [[:put "keys" fits 1 :raw :long]])
+        (is (= 1 (i/get-value db "keys" fits :raw :long)))
+        (is (thrown-with-msg? Exception #"511 bytes"
+                             (i/transact-kv db [[:put "keys" fits 2 :raw :long]
+                                                [:put "keys" overflows 3 :raw :long]])))
+        (is (= 1 (i/get-value db "keys" fits :raw :long)))
+        (is (= 1 (i/entries db "keys")))))))
 
 (deftest invalid-dictionaries-and-keys
   (let [fixture (serialized-dictionary @ordered)]
