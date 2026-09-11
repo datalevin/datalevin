@@ -36,9 +36,18 @@ public abstract class LeftistHeap<T> {
         if (rhs == null) return this;
 
         root = merge(root, rhs.root);
+        if (root != null) root.parent = null;
         rhs.root = null;
 
+        // Meld the smaller index into the larger one. Consumed heaps must not
+        // retain their entries or backing tables through surviving inner Nodes.
+        if (nodes.size() < rhs.nodes.size()) {
+            HashMap<T, Node> index = nodes;
+            nodes = rhs.nodes;
+            rhs.nodes = index;
+        }
         nodes.putAll(rhs.nodes);
+        rhs.nodes = new HashMap<T, Node>();
 
         return this;
     }
@@ -91,9 +100,13 @@ public abstract class LeftistHeap<T> {
     }
 
     public void deleteMin() {
-        T e = findMin();
+        Node oldRoot = root;
         root = merge(root.leftChild, root.rightChild);
-        nodes.remove(e);
+        if (root != null) root.parent = null;
+        nodes.remove(oldRoot.element);
+        oldRoot.parent = null;
+        oldRoot.leftChild = null;
+        oldRoot.rightChild = null;
     }
 
     public T findMin() {
@@ -139,6 +152,9 @@ public abstract class LeftistHeap<T> {
         } else {
             p.rightChild = h1;
         }
+        h.parent = null;
+        h.leftChild = null;
+        h.rightChild = null;
 
         int before = p.s;
         adjust(p);

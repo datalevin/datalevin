@@ -280,7 +280,7 @@
 
 ;; compression
 
-(def ^:no-doc ^:const +key-compress-num-symbols+ 65536)
+(def ^:no-doc ^:const +key-compress-num-symbols+ 65793)
 
 (def ^:no-doc ^:const +value-compress-dict-size+ 32) ;; in KB
 

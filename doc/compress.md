@@ -12,37 +12,54 @@ For keys, we use an order preserving compression method, so that range queries
 and some predicates can run directly on the compressed data without having to
 decompress data first.
 
-A complete and order preserving dictionary based encoding scheme is implemented,
-where a fixed length interval and variable length code are used [1]. The fixed
-length chosen is two bytes, which captures some first order entropy in data,
-while imposes not too much of a memory and computation overhead, i.e. we
-consider fixed number of 64K symbols. The variable length code chosen is
-Hu-Tucker codes [2], which is optimal. We implement the Hu-Tucker algorithm
-using `n` mergeable priority queues to achieve the `O(nlogn)` theoretical bounds
-[3]. The symbol frequencies are estimated from sampling a fixed number (64K) of
-keys using an optimal reservior sampling algorithm [5].
+A complete dictionary assigns variable-length alphabetic Hu-Tucker codes [1, 2]
+to byte pairs and key terminators. The builder uses mergeable priority queues
+[3]. Frequency collection starts with a count of one for each symbol so that
+unseen input always has a code. The rank sampler uses Floyd sampling without
+replacement, with an optional seed for reproducible samples.
 
-The resulting optimal binary alphabetic tree of each DBI is represented as an
-array of code length (byte) and an array of codes (32 bits integer). These two
-arrays are stored in meta data of the DBI in compressed from, and are also kept
-in memory, as they are used for encoding raw data. We also keep in memory
-pre-computed decoding tables [4] for decoding compressed data 4 bits at a time.
-4 bits are chosen as a good balance between memory usage (10 MiB per dictionary)
-and decoding performance. These tables are computed from the stored codes during
-DBI initialization.
+The alphabet has 65,793 symbols: 65,536 byte pairs, 256 terminals
+for an odd final byte, and one end-of-key terminal. For unsigned bytes `b, c`,
+the symbol ranks are:
 
-In order to obtain a good compression ratio, the key compression dictionary
-should only be created after at least 64K keys have been stored to get good
-samples. Therefore keys are initially not compressed when DB is created. User can run `re-index`
-function with `:compress?` option enabled to create the dictionary and store the
-keys in compressed form when enough keys are seen.
-The computation of dictionary and building all necessary encoding and
-decoding tables takes less than one second on today's CPU.
+| Symbol | Rank |
+|--------|------|
+| End of key | `0` |
+| Final unpaired byte `b` | `1 + 257*b` |
+| Pair `b, c` | `2 + 257*b + c` |
+
+Encoding writes the codes for full pairs, followed by an end-of-key code for
+even-length input or a final-byte code for odd-length input. Only unused bits
+of the last byte are padded with zeros. There is no length trailer. Terminals
+sort before every continuation of the same prefix; alphabetic, prefix-free
+codes therefore preserve unsigned byte-string ordering, including empty keys,
+odd-length keys, and trailing zero bytes.
+
+`keycode.bin` stores the `HUTU` header, dictionary version, and arrays of code
+lengths and 32-bit codes. Four-bit lookup tables [4] are rebuilt when loading
+the dictionary. Each lookup retains every completed symbol, emitting up to
+eight bytes, and stops at a key terminator. The two lookup arrays occupy about
+12 MiB per dictionary, in addition to the code arrays.
+
+Changing a dictionary requires rebuilding its encoded keys. Never replace a
+dictionary underneath existing encoded keys or mix dictionaries in one ordered
+stream.
+
+The current experimental binding uses environment-wide `:key-compress :hu`
+and `:val-compress :zstd` options with prebuilt dictionary files. Automatic
+training and safe dictionary replacement are not yet a supported lifecycle.
+Storage work remains, including keeping bootstrap metadata uncompressed on
+later writes so a compressed environment can reopen, auditing native access
+paths, and handling encoded keys that exceed the 511-byte limit. See
+[the compression plan](../compression-plan.md) for the evaluation and remaining
+work.
 
 ## Value Compression
 
-LZ4 is used to compress values, as it has a good balance of speed and
-compression ratio. It is enabled when `:compress?` is set to true.
+The experimental environment value compressor uses a Zstd dictionary stored
+in `valcode.bin` and is selected with `:val-compress :zstd`. Ordered duplicate
+values require an order-preserving codec. General payload compression thresholds
+are a separate evaluation from the key dictionary.
 
 ## Wire Compression
 
@@ -75,7 +92,3 @@ search trees" (1998). Master Thesis. Rochester Institute of Technology.
 
 [4] Bergman, Eyal, and Shmuel T. Klein. "Fast decoding of prefix encoded texts."
 IEEE Data Compression Conference 2005.
-
-[5] Li, Kim-Hung. "Reservoir-Sampling Algorithms of Time Complexity
-O(n(1+log(N/n)))". ACM Transactions on Mathematical Software. 20.4 (1994):
-481–493.

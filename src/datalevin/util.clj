@@ -19,6 +19,7 @@
    [clojure.lang IEditableCollection IPersistentSet ITransientSet
     IFn$OOL]
    [org.eclipse.collections.impl.list.mutable FastList]
+   [org.eclipse.collections.impl.set.mutable.primitive LongHashSet]
    [java.util Random Arrays Iterator List UUID]
    [java.util.concurrent Executors ExecutorService Future TimeUnit
     ThreadPoolExecutor ThreadPoolExecutor$CallerRunsPolicy ArrayBlockingQueue]
@@ -676,32 +677,29 @@
     (bit-xor z (unsigned-bit-shift-right z 31))))
 
 (defn reservoir-sampling
-  "optimized reservoir sampling, random sample n out of m items, returns a
-  sorted array of sampled indices, or returns nil if n > m"
+  "Uniform sample without replacement of n ranks from [0,m), sorted.
+  Uses Floyd sampling in O(n) expected work before sorting; returns nil if
+  n > m. Samples are cached by population, size, and optional seed."
   ^longs [^long m ^long n]
+  (when (or (neg? m) (neg? n) (> n Integer/MAX_VALUE))
+    (throw (IllegalArgumentException. "Invalid population or sample size")))
   (let [seed      *reservoir-sampling-seed*
-        cache-key (if (some? seed) [m n seed] [m n])]
+        cache-key [::uniform-sample m n seed]]
     (or (.get ^LRUCache sample-cache cache-key)
         (let [res (cond
                     (< n m)
-                    (let [indices (long-array (range n))
-                          r       (if (some? seed)
+                    (let [chosen (LongHashSet. (int n))
+                          r      (if (some? seed)
                                     (Random.
                                       (mix-sampling-seed
                                         (long seed) m n))
-                                    (Random.))
-                          p       (Math/log (- 1.0 (double (/ n m))))]
-                      (loop [i n]
+                                    (Random.))]
+                      (loop [i (- m n)]
                         (when (< i m)
-                          (aset indices (.nextInt r n) i)
-                          (recur (+ i
-                                    (long
-                                      (/ (Math/log
-                                           (- 1.0 (.nextDouble r)))
-                                         p))
-                                    1))))
-                      (Arrays/sort indices)
-                      indices)
+                          (when-not (.add chosen (.nextLong r (inc i)))
+                            (.add chosen i))
+                          (recur (inc i))))
+                      (doto (.toArray chosen) Arrays/sort))
                     (= n m) (long-array (range n))
                     :else   nil)]
           (.put ^LRUCache sample-cache cache-key res)

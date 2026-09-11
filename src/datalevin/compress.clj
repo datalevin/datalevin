@@ -91,14 +91,15 @@
 
 (defn- collect-keys
   [^longs freqs ^ByteBuffer bf]
-  (while (< 0 (.remaining bf))
-    (let [idx (if (= 1 (.remaining bf))
-                (-> (.get bf)
-                    (BitOps/intAnd 0x000000FF)
-                    (bit-shift-left 8))
-                (let [s (.getShort bf)]
-                  (BitOps/intAnd s 0x0000FFFF)))]
-      (aset freqs idx (inc (aget freqs idx))))))
+  (while (< 1 (.remaining bf))
+    (let [pair (bit-or (bit-shift-left (BitOps/intAnd (.get bf) 0xFF) 8)
+                       (BitOps/intAnd (.get bf) 0xFF))
+          idx  (hu/pair-symbol pair)]
+      (aset freqs idx (inc (aget freqs idx)))))
+  (let [idx (if (.hasRemaining bf)
+              (hu/final-byte-symbol (BitOps/intAnd (.get bf) 0xFF))
+              hu/end-symbol)]
+    (aset freqs idx (inc (aget freqs idx)))))
 
 (defn- pick [ratio size]
   (long (Math/ceil (* (double ratio) ^long size))))
@@ -129,8 +130,8 @@
     (visit-list-sample db dbi-name in visitor [:all] :raw :raw)))
 
 (defn sample-key-freqs
-  "return a long array of frequencies of 2 bytes symbols for keys,
-  if there are enough key in DB, otherwise return nil"
+  "Return frequencies of byte-pair and terminal symbols for keys,
+  if there are enough keys in DB; otherwise return nil."
   [db]
   (let [dbis  (list-dbis db)
         lists (map #(do (open-dbi db %) (list-dbi? db %)) dbis)
