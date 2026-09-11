@@ -358,15 +358,15 @@
 
 (defn- add-client
   [^Server server ip client-id username]
-  (sess/add-client (session-deps) server ip client-id username))
+  (sess/add-client session-deps server ip client-id username))
 
 (defn- remove-client
   [^Server server client-id]
-  (sess/remove-client (session-deps) server client-id))
+  (sess/remove-client session-deps server client-id))
 
 (defn- update-client
   [^Server server client-id f]
-  (sess/update-client (session-deps) server client-id f))
+  (sess/update-client session-deps server client-id f))
 
 (declare get-store store-closed?)
 (declare current-runtime-opts new-runtime-db)
@@ -702,11 +702,11 @@
 (defn- ha-follower-apply-record-with-guard
   [^Server server db-name expected-state record]
   (sha/ha-follower-apply-record-with-guard
-   (ha-deps) server db-name expected-state record))
+   ha-deps server db-name expected-state record))
 
 (defn- with-ha-follower-replay-quiesced
   [^Server server db-name f]
-  (sha/with-ha-follower-replay-quiesced (ha-deps) server db-name f))
+  (sha/with-ha-follower-replay-quiesced ha-deps server db-name f))
 
 (def ^:private ha-loop-sleep-ms sha/ha-loop-sleep-ms)
 (def ^:private ha-follower-loop-sleep-ms sha/ha-follower-loop-sleep-ms)
@@ -723,28 +723,28 @@
 (defn- publish-ha-renew-state!
   [^Server server db-name expected-state next-state ^AtomicBoolean running?]
   (sha/publish-ha-renew-state!
-   (ha-deps) server db-name expected-state next-state running?))
+   ha-deps server db-name expected-state next-state running?))
 
 (declare log-ha-loop-crash!)
 
 (defn- run-ha-renew-loop
   [^Server server db-name ^AtomicBoolean running? ^CountDownLatch stopped-latch]
-  (sha/run-ha-renew-loop (ha-deps) server db-name running? stopped-latch))
+  (sha/run-ha-renew-loop ha-deps server db-name running? stopped-latch))
 
 (defn- run-ha-follower-sync-loop
   [^Server server db-name ^AtomicBoolean running? ^CountDownLatch stopped-latch]
   (sha/run-ha-follower-sync-loop
-   (ha-deps) server db-name running? stopped-latch))
+   ha-deps server db-name running? stopped-latch))
 
 (declare execute)
 
 (defn- ensure-ha-renew-loop
   [^Server server db-name]
-  (sha/ensure-ha-renew-loop (ha-deps) server db-name))
+  (sha/ensure-ha-renew-loop ha-deps server db-name))
 
 (defn- ensure-ha-follower-sync-loop
   [^Server server db-name]
-  (sha/ensure-ha-follower-sync-loop (ha-deps) server db-name))
+  (sha/ensure-ha-follower-sync-loop ha-deps server db-name))
 
 (defn- stop-ha-renew-loop
   [m]
@@ -987,7 +987,7 @@
 
 (defn- current-ha-runtime-local-opts
   [m]
-  (sha/current-ha-runtime-local-opts (ha-deps) m))
+  (sha/current-ha-runtime-local-opts ha-deps m))
 
 (defn- resolved-ha-runtime-opts
   ([root db-name store]
@@ -996,13 +996,13 @@
    (resolved-ha-runtime-opts root db-name store m nil))
   ([root db-name store m explicit-ha-runtime-opts]
    (sha/resolved-ha-runtime-opts
-    (ha-deps) root db-name store m explicit-ha-runtime-opts)))
+    ha-deps root db-name store m explicit-ha-runtime-opts)))
 
 (def ^:private shared-store-lifecycle? sha/shared-store-lifecycle?)
 
 (defn- stop-ha-runtime
   [db-name m]
-  (sha/stop-ha-runtime (ha-deps) db-name m))
+  (sha/stop-ha-runtime ha-deps db-name m))
 
 (def ^:private ha-authority-running? sha/ha-authority-running?)
 
@@ -1010,7 +1010,7 @@
 
 (defn- ha-write-admission-error
   [^Server server message]
-  (sha/ha-write-admission-error (ha-deps) server message))
+  (sha/ha-write-admission-error ha-deps server message))
 
 (defn- leader-authority-state?
   [m]
@@ -1019,23 +1019,23 @@
 
 (defn- refresh-ha-write-commit-state!
   [^Server server db-name]
-  (sha/refresh-ha-write-commit-state! (ha-deps) server db-name))
+  (sha/refresh-ha-write-commit-state! ha-deps server db-name))
 
 (defn- ha-write-commit-admission!
   [^Server server message]
-  (sha/ha-write-commit-admission! (ha-deps) server message))
+  (sha/ha-write-commit-admission! ha-deps server message))
 
 (defn- ha-write-commit-check-fn
   [^Server server message]
-  (sha/ha-write-commit-check-fn (ha-deps) server message))
+  (sha/ha-write-commit-check-fn ha-deps server message))
 
 (defn- ha-write-commit-publish-fn
   [^Server server message]
-  (sha/ha-write-commit-publish-fn (ha-deps) server message))
+  (sha/ha-write-commit-publish-fn ha-deps server message))
 
 (defn- with-ha-write-admission
   [^Server server message f]
-  (sha/with-ha-write-admission (ha-deps) server message f))
+  (sha/with-ha-write-admission ha-deps server message f))
 
 (def ^:private ha-abort-cleanup-types
   #{:abort-transact
@@ -1047,14 +1047,14 @@
 
 (defn- cleanup-rejected-close-transact!
   [^Server server {:keys [type args]}]
-  (sha/cleanup-rejected-close-transact! (ha-deps) server {:type type :args args}))
+  (sha/cleanup-rejected-close-transact! ha-deps server {:type type :args args}))
 
 (defn- ensure-ha-runtime
   ([root db-name m store]
    (ensure-ha-runtime root db-name m store nil))
   ([root db-name m store explicit-ha-runtime-opts]
    (sha/ensure-ha-runtime
-    (ha-deps) root db-name m store explicit-ha-runtime-opts)))
+    ha-deps root db-name m store explicit-ha-runtime-opts)))
 
 (defn- add-store
   ([server db-name store]
@@ -1237,19 +1237,19 @@
 
 (defn- update-cached-role
   [^Server server target-username]
-  (sess/update-cached-role (session-deps) server target-username))
+  (sess/update-cached-role session-deps server target-username))
 
 (defn- disconnect-client*
   [^Server server client-id]
-  (sess/disconnect-client* (session-deps) server client-id))
+  (sess/disconnect-client* session-deps server client-id))
 
 (defn- disconnect-user
   [^Server server tgt-username]
-  (sess/disconnect-user (session-deps) server tgt-username))
+  (sess/disconnect-user session-deps server tgt-username))
 
 (defn- update-cached-permission
   [^Server server target-role]
-  (sess/update-cached-permission (session-deps) server target-role))
+  (sess/update-cached-permission session-deps server target-role))
 
 ;; networking
 
@@ -1273,7 +1273,7 @@
 (defn- copy-in
   "Continuously read batched data from the client"
   [^Server server ^SelectionKey skey]
-  (scopy/copy-in (copy-deps) server skey))
+  (scopy/copy-in copy-deps server skey))
 
 (defn- copy-out
   "Continiously write data out to client in batches"
@@ -1282,12 +1282,12 @@
   ([^SelectionKey skey data batch-size copy-meta]
    (copy-out skey data batch-size copy-meta nil))
   ([^SelectionKey skey data batch-size copy-meta response-meta]
-   (scopy/copy-out (copy-deps) skey data batch-size copy-meta response-meta)))
+   (scopy/copy-out copy-deps skey data batch-size copy-meta response-meta)))
 
 (defn- copy-file-out
   "Stream a copied LMDB file to client as raw binary chunks with checksum."
   [^SelectionKey skey path copy-meta]
-  (scopy/copy-file-out (copy-deps) skey path copy-meta))
+  (scopy/copy-file-out copy-deps skey path copy-meta))
 
 (defn- cleanup-copy-tmp-dir*
   [tf]
@@ -1413,7 +1413,7 @@
 
 (defn- handle-message-error!
   [^SelectionKey skey e]
-  (sdisp/handle-message-error! (dispatch-deps) skey e))
+  (sdisp/handle-message-error! dispatch-deps skey e))
 
 (defmacro wrap-error
   [& body]
@@ -1810,16 +1810,16 @@
 
 (defn- reopen-dbs
   [root clients ^ConcurrentHashMap dbs]
-  (sess/reopen-dbs (session-deps) root clients dbs))
+  (sess/reopen-dbs session-deps root clients dbs))
 
 (defn- authenticate
   [^Server server ^SelectionKey skey {:keys [username password]}]
-  (sess/authenticate (session-deps) server skey
+  (sess/authenticate session-deps server skey
                      {:username username :password password}))
 
 (defn- client-display
   [^Server server [client-id m]]
-  (sess/client-display (session-deps) server [client-id m]))
+  (sess/client-display session-deps server [client-id m]))
 
 
 ;; Server-owned option-mutation helpers used by extracted message handlers.
@@ -2076,12 +2076,12 @@
 
 (defn- current-ha-txlog-term
   [^Server server db-name]
-  (sdisp/current-ha-txlog-term (dispatch-deps) server db-name))
+  (sdisp/current-ha-txlog-term dispatch-deps server db-name))
 
 (defn- dispatch-message-with-ha-write-admission
   [^Server server ^SelectionKey skey message]
   (sdisp/dispatch-message-with-ha-write-admission
-   (dispatch-deps) server skey message))
+   dispatch-deps server skey message))
 
 (defprotocol IRunner
   "Ensure calls within `with-transaction-kv` run in the same thread that
@@ -2177,19 +2177,18 @@
     (abort-run runner
                #(cleanup-abandoned-transaction! server db-name runner))))
 
-(defn- handler-deps
-  []
+(def ^:private handler-deps
   {:add-store add-store
    :apply-assoc-opt! apply-assoc-opt!
    :apply-assoc-opts! apply-assoc-opts!
    :authenticate authenticate
    :cleanup-copy-tmp-dir! cleanup-copy-tmp-dir!
    :client-display client-display
-   :close-server-copied-store! close-server-copied-store!
+   :close-server-copied-store! #'close-server-copied-store!
    :copy-in copy-in
    :copy-out copy-out
    :copy-response-meta copy-response-meta
-   :copy-server-file-out! copy-server-file-out!
+   :copy-server-file-out! #'copy-server-file-out!
    :current-runtime-opts current-runtime-opts
    :db-dir db-dir
    :db-exists? db-exists?
@@ -2211,7 +2210,7 @@
    :in-use-dbs in-use-dbs
    :lmdb lmdb
    :new-runtime-db new-runtime-db
-   :open-server-copied-store! open-server-copied-store!
+   :open-server-copied-store! #'open-server-copied-store!
    :open-server-store open-server-store
    :open-write-txn-with-retry open-write-txn-with-retry
    :remove-client remove-client
@@ -2220,13 +2219,13 @@
    :run-calls run-calls
    :search-engine search-engine
    :search-engine* search-engine*
-   :server-copy-store! server-copy-store!
+   :server-copy-store! #'server-copy-store!
    :store store
    :store->db-name store->db-name
    :sync-copy-response-store! sync-copy-response-store!
    :store-closed? store-closed?
    :sys-conn (fn [^Server server] (.-sys-conn server))
-   :unpin-server-copy-backup-floor! unpin-server-copy-backup-floor!
+   :unpin-server-copy-backup-floor! #'unpin-server-copy-backup-floor!
    :update-cached-permission update-cached-permission
    :update-cached-role update-cached-role
    :update-client update-client
@@ -2269,7 +2268,7 @@
                 (fn [server skey message]
                   (try
                     (binding [nv/*wire-reader* (native-request-reader server skey message)]
-                      (handler (handler-deps) server skey
+                      (handler handler-deps server skey
                                (p/resolve-native-request message)))
                     (catch Exception e
                       (handle-message-error! skey e))))]))
@@ -2277,12 +2276,12 @@
 
 (defn- dispatch-message
   [^Server server ^SelectionKey skey message]
-  (sdisp/dispatch-message (dispatch-deps) server skey message))
+  (sdisp/dispatch-message dispatch-deps server skey message))
 
 (defn- execute
   "Execute a function in a thread from the worker thread pool"
   [^Server server f]
-  (sdisp/execute (dispatch-deps) server f))
+  (sdisp/execute dispatch-deps server f))
 
 (def ^:private trace-remote-tx?
   (some? (System/getenv "DTLV_TRACE_REMOTE_TX")))
@@ -2302,7 +2301,7 @@
 
 (defn- handle-writing
   [^Server server ^SelectionKey skey {:keys [args] :as message}]
-  (sdisp/handle-writing (dispatch-deps) server skey message))
+  (sdisp/handle-writing dispatch-deps server skey message))
 
 (defn- set-last-active
   [^Server server ^SelectionKey skey]
@@ -2310,11 +2309,11 @@
 
 (defn- handle-message
   [^Server server ^SelectionKey skey fmt msg ]
-  (sdisp/handle-message (dispatch-deps) server skey fmt msg))
+  (sdisp/handle-message dispatch-deps server skey fmt msg))
 
 (defn- handle-read
   [^Server server ^SelectionKey skey]
-  (sdisp/handle-read (dispatch-deps) server skey))
+  (sdisp/handle-read dispatch-deps server skey))
 
 (defn- handle-registration
   [^Server server]
@@ -2328,7 +2327,7 @@
 
 (defn- remove-idle-sessions
   [^Server server]
-  (sess/remove-idle-sessions (session-deps) server))
+  (sess/remove-idle-sessions session-deps server))
 
 (defn- event-loop
   [^Server server]
@@ -2352,8 +2351,7 @@
                 (recur)))))
         (recur)))))
 
-(defn- session-deps
-  []
+(def ^:private session-deps
   {:sys-conn-fn (fn [^Server server] (.-sys-conn server))
    :clients-fn (fn [^Server server] (.-clients server))
    :selector-fn (fn [^Server server] (.-selector server))
@@ -2363,7 +2361,7 @@
    :perm-tgt-name-fn perm-tgt-name
    :open-store-fn open-store
    :close-store-fn close-store
-   :consensus-ha-opts-fn *consensus-ha-opts-fn*
+   :consensus-ha-opts-fn (fn [store] (*consensus-ha-opts-fn* store))
    :resolved-runtime-opts-fn resolved-runtime-opts
    :ensure-ha-runtime-fn (fn [root db-name m store]
                            (ensure-ha-runtime root db-name m store))
@@ -2376,13 +2374,11 @@
    :cleanup-connection-transactions-fn cleanup-connection-transactions!
    :idle-timeout-fn (fn [^Server server] (.-idle-timeout server))})
 
-(defn- copy-deps
-  []
+(def ^:private copy-deps
   {:register-queue-fn (fn [^Server server] (.-register-queue server))
    :write-message-fn write-message})
 
-(defn- dispatch-deps
-  []
+(def ^:private dispatch-deps
   {:close-conn-fn close-conn
    :cleanup-connection-transactions-fn cleanup-connection-transactions!
    :dbs-fn (fn [^Server server] (.-dbs server))
@@ -2401,8 +2397,7 @@
    :clients-fn (fn [^Server server] (.-clients server))
    :with-db-runtime-read-access-fn with-db-runtime-read-access})
 
-(defn- ha-deps
-  []
+(def ^:private ha-deps
   {:get-lock-fn get-lock
    :db-write-admission-lock-fn db-write-admission-lock
    :dbs-fn (fn [^Server server] (.-dbs server))
@@ -2417,13 +2412,14 @@
    :work-executor-fn (fn [^Server server] (.-work-executor server))
    :update-db-fn update-db
    :current-runtime-opts-fn current-runtime-opts
-   :stop-ha-renew-loop-fn *stop-ha-renew-loop-fn*
-   :stop-ha-follower-sync-loop-fn *stop-ha-follower-sync-loop-fn*
+   :stop-ha-renew-loop-fn (fn [m] (*stop-ha-renew-loop-fn* m))
+   :stop-ha-follower-sync-loop-fn (fn [m] (*stop-ha-follower-sync-loop-fn* m))
    :await-ha-loop-stop-fn await-ha-loop-stop
-   :stop-ha-authority-fn *stop-ha-authority-fn*
-   :start-ha-authority-fn *start-ha-authority-fn*
-   :consensus-ha-opts-fn *consensus-ha-opts-fn*
-   :ensure-udf-readiness-state-fn *ensure-udf-readiness-state-fn*
+   :stop-ha-authority-fn (fn [db-name m] (*stop-ha-authority-fn* db-name m))
+   :start-ha-authority-fn (fn [db-name ha-opts]
+                            (*start-ha-authority-fn* db-name ha-opts))
+   :consensus-ha-opts-fn (fn [store] (*consensus-ha-opts-fn* store))
+   :ensure-udf-readiness-state-fn (fn [m] (*ensure-udf-readiness-state-fn* m))
    :udf-admission-exempt-write-types udf-admission-exempt-write-types
    :udf-write-admission-error-fn udf-write-admission-error
    :get-kv-store-fn get-kv-store

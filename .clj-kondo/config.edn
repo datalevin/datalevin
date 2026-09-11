@@ -4,6 +4,7 @@
    datalevin.search/candidate-array hooks.datalevin/candidate-array
    datalevin.util/cond+ hooks.datalevin/cond-plus
    datalevin.util/defcomp hooks.datalevin/defcomp
+   datalevin.util/deftype+ hooks.datalevin/deftype-plus
    datalevin.util/import-macro hooks.datalevin/import-macro
    datalevin.interpret/inter-fn hooks.datalevin/inter-fn
    datalevin.interpret/definterfn hooks.datalevin/definterfn

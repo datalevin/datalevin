@@ -265,6 +265,20 @@
 (defmacro defrecord-updatable [name fields & impls]
   (apply make-record-updatable-clj  name fields impls))
 
+(defmacro deftype+
+  "Like `deftype`, but any body form that macroexpands to a `(do ...)` is
+  spliced into the method list, so method-generating macros such as
+  `defremote-forward` and `def-read-kv-forwarders` can stand in for
+  individual methods."
+  [name fields & body]
+  `(deftype ~name ~fields
+     ~@(mapcat (fn [form]
+                 (let [expanded (macroexpand-1 form)]
+                   (if (and (seq? expanded) (= 'do (first expanded)))
+                     (rest expanded)
+                     [form])))
+               body)))
+
 ;; ----------------------------------------------------------------------------
 
 (defmacro repeat-try-catch

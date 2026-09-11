@@ -12,7 +12,7 @@
   (:refer-clojure :exclude [sync])
   (:require
    [datalevin.client-op :as cop]
-   [datalevin.util :as u]
+   [datalevin.util :as u :refer [deftype+]]
    [datalevin.constants :as c]
    [datalevin.interface]
    [datalevin.client :as cl]
@@ -373,7 +373,75 @@
                                   (current-read-floor-tx read-floor-tx))]
     (cl/normal-request client call args writing?)))
 
-(deftype DatalogStore [^String uri
+(defn- remote-forward-method
+  [request [mname args & flags]]
+  (let [opts      (apply hash-map flags)
+        wire-op   (or (:op opts) (keyword (name mname)))
+        freeze    (:serialize opts)
+        frozen    (some-> freeze (as-> f (symbol (str "frozen-" (name f)))))
+        wire-args (mapv #(if (and frozen (= % freeze)) frozen %) (rest args))
+        call      (concat request
+                          [wire-op (into ['db-name] wire-args) 'writing?])
+        call      (if (:chatty opts)
+                    (list 'do
+                          (list 'detect-chatty-kv! 'db-name 'dbi-name wire-op)
+                          call)
+                    call)]
+    (list mname args
+          (if frozen
+            (list 'let [frozen (list 'b/serialize freeze)] call)
+            call))))
+
+(defmacro defremote-forward
+  "Expand to remote protocol method forms that forward to a wire request.
+
+  `request` is a call prefix such as `(cl/normal-request client)` or
+  `(datalog-request read-floor-tx client)`. Each spec is
+  `(method-name [args...] & flags)` where flags are key/value pairs:
+    `:op op`          wire op keyword, defaults to the method name
+    `:chatty true`    record a chatty-KV streak before the request
+    `:serialize sym`  serialize `sym` and send it as `frozen-sym`
+
+  The wire arguments are `db-name` followed by the method arguments after
+  the leading store argument."
+  [request & specs]
+  (cons 'do (map #(remote-forward-method request %) specs)))
+
+(defmacro defremote-txlog-methods
+  "Expand to the ITxLog methods shared by the remote store types."
+  []
+  (cons
+    'do
+    (concat
+      (map #(remote-forward-method '(cl/normal-request client) %)
+           '[(txlog-watermarks [_])
+             (open-tx-log [_ from-lsn upto-lsn])
+             (force-txlog-sync! [_])
+             (force-lmdb-sync! [_])
+             (create-snapshot! [_])
+             (list-snapshots [_])
+             (snapshot-scheduler-state [_])
+             (read-commit-marker [_])
+             (verify-commit-marker! [_])
+             (txlog-retention-state [_])
+             (gc-txlog-segments! [_ retain-floor-lsn])
+             (txlog-update-snapshot-floor! [_ snapshot-lsn
+                                            previous-snapshot-lsn])
+             (txlog-clear-snapshot-floor! [_])
+             (txlog-update-replica-floor! [_ replica-id applied-lsn])
+             (txlog-clear-replica-floor! [_ replica-id])
+             (txlog-pin-backup-floor! [_ pin-id floor-lsn expires-ms])
+             (txlog-unpin-backup-floor! [_ pin-id])])
+      '[(open-tx-log [this from-lsn]
+          (.open-tx-log this from-lsn nil))
+        (gc-txlog-segments! [this]
+          (.gc-txlog-segments! this nil))
+        (txlog-update-snapshot-floor! [this snapshot-lsn]
+          (.txlog-update-snapshot-floor! this snapshot-lsn nil))
+        (txlog-pin-backup-floor! [this pin-id floor-lsn]
+          (.txlog-pin-backup-floor! this pin-id floor-lsn nil))])))
+
+(deftype+ DatalogStore [^String uri
                        ^String db-name
                        ^Client client
                        ^Client tx-client
@@ -385,9 +453,9 @@
                        owns-client?
                        ^AtomicBoolean closed?]
   ICustomTypes
-  (register-type [_ type-name definition]
-    (datalog-request read-floor-tx client :datalog-register-type
-                     [db-name type-name (b/serialize definition)] writing?))
+  (defremote-forward (datalog-request read-floor-tx client)
+    (register-type [_ type-name definition]
+      :op :datalog-register-type :serialize definition))
 
   IWriting
   (writing? [_] writing?)
@@ -404,13 +472,10 @@
                    closed?))
 
   IStore
-  (opts [_] (datalog-request read-floor-tx client :opts [db-name] writing?))
-
-  (assoc-opt [_ k v]
-    (datalog-request read-floor-tx client :assoc-opt [db-name k v] writing?))
-
-  (assoc-opts [_ kvs]
-    (datalog-request read-floor-tx client :assoc-opts [db-name kvs] writing?))
+  (defremote-forward (datalog-request read-floor-tx client)
+    (opts [_])
+    (assoc-opt [_ k v])
+    (assoc-opts [_ kvs]))
 
   (db-name [_] db-name)
 
@@ -434,89 +499,41 @@
       true
       (datalog-request read-floor-tx client :closed? [db-name] writing?)))
 
-  (last-modified [_]
-    (datalog-request read-floor-tx client :last-modified [db-name] writing?))
+  (defremote-forward (datalog-request read-floor-tx client)
+    (last-modified [_])
+    (schema [_])
+    (rschema [_])
+    (set-schema [_ new-schema del-attrs rename-map])
+    (init-max-eid [_])
+    (max-tx [_]))
 
-  (schema [_] (datalog-request read-floor-tx client :schema [db-name] writing?))
-
-  (rschema [_] (datalog-request read-floor-tx client :rschema [db-name] writing?))
-
-  (set-schema [_ new-schema]
-    (datalog-request read-floor-tx client :set-schema
-                     [db-name new-schema] writing?))
-  (set-schema [_ new-schema del-attrs rename-map]
-    (datalog-request read-floor-tx client :set-schema
-                     [db-name new-schema del-attrs rename-map] writing?))
-
-  (init-max-eid [_]
-    (datalog-request read-floor-tx client :init-max-eid [db-name] writing?))
-
-  (max-tx [_]
-    (datalog-request read-floor-tx client :max-tx [db-name] writing?))
+  (set-schema [this new-schema]
+    (.set-schema this new-schema nil nil))
 
   (swap-attr [this attr f]
     (.swap-attr this attr f nil nil))
   (swap-attr [this attr f x]
     (.swap-attr this attr f x nil))
-  (swap-attr [_ attr f x y]
-    (let [frozen-f (b/serialize f)]
-      (datalog-request
-        read-floor-tx client :swap-attr
-        [db-name attr frozen-f x y] writing?)))
 
-  (del-attr [_ attr]
-    (datalog-request read-floor-tx client :del-attr [db-name attr] writing?))
-
-  (rename-attr [_ attr new-attr]
-    (datalog-request read-floor-tx client :rename-attr
-                     [db-name attr new-attr] writing?))
-
-  (datom-count [_ index]
-    (datalog-request read-floor-tx client :datom-count
-                     [db-name index] writing?))
+  (defremote-forward (datalog-request read-floor-tx client)
+    (swap-attr [_ attr f x y] :serialize f)
+    (del-attr [_ attr])
+    (rename-attr [_ attr new-attr])
+    (datom-count [_ index]))
 
   (load-datoms [_ datoms]
     (load-datoms* client db-name datoms :raw false writing?))
 
-  (fetch [_ datom]
-    (datalog-request read-floor-tx client :fetch [db-name datom] writing?))
-
-  (populated? [_ index low-datom high-datom]
-    (datalog-request
-      read-floor-tx client :populated?
-      [db-name index low-datom high-datom] writing?))
-
-  (size [_ index low-datom high-datom]
-    (datalog-request
-      read-floor-tx client :size [db-name index low-datom high-datom]
-      writing?))
-
-  (head [_ index low-datom high-datom]
-    (datalog-request
-      read-floor-tx client :head [db-name index low-datom high-datom]
-      writing?))
-
-  (tail [_ index high-datom low-datom]
-    (datalog-request
-      read-floor-tx client :tail [db-name index high-datom low-datom]
-      writing?))
-
-  (slice [_ index low-datom high-datom]
-    (datalog-request
-      read-floor-tx client :slice [db-name index low-datom high-datom]
-      writing?))
-
-  (rslice [_ index high-datom low-datom]
-    (datalog-request
-      read-floor-tx client :rslice [db-name index high-datom low-datom]
-      writing?))
-
-  (e-datoms [_ e]
-    (datalog-request read-floor-tx client :e-datoms [db-name e] writing?))
-
-  (e-first-datom [_ e]
-    (datalog-request read-floor-tx client :e-first-datom
-                     [db-name e] writing?))
+  (defremote-forward (datalog-request read-floor-tx client)
+    (fetch [_ datom])
+    (populated? [_ index low-datom high-datom])
+    (size [_ index low-datom high-datom])
+    (head [_ index low-datom high-datom])
+    (tail [_ index high-datom low-datom])
+    (slice [_ index low-datom high-datom])
+    (rslice [_ index high-datom low-datom])
+    (e-datoms [_ e])
+    (e-first-datom [_ e]))
 
   (start-sampling [_]
     (when (and (background-sampling? open-db-info)
@@ -537,81 +554,29 @@
           (.set sampling-started? true)
           (throw e)))))
 
-  (analyze [_ attr]
-    (datalog-request read-floor-tx client :analyze [db-name attr] writing?))
+  (defremote-forward (datalog-request read-floor-tx client)
+    (analyze [_ attr])
+    (av-datoms [_ a v])
+    (av-first-datom [_ a v])
+    (av-first-e [_ a v])
+    (ea-first-datom [_ e a])
+    (ea-first-v [_ e a])
+    (v-datoms [_ v]))
 
-  (av-datoms [_ a v]
-    (datalog-request read-floor-tx client :av-datoms
-                     [db-name a v] writing?))
-
-  (av-first-datom [_ a v]
-    (datalog-request read-floor-tx client :av-first-datom
-                     [db-name a v] writing?))
-
-  (av-first-e [_ a v]
-    (datalog-request read-floor-tx client :av-first-e
-                     [db-name a v] writing?))
-
-  (ea-first-datom [_ e a]
-    (datalog-request read-floor-tx client :ea-first-datom
-                     [db-name e a] writing?))
-
-  (ea-first-v [_ e a]
-    (datalog-request read-floor-tx client :ea-first-v
-                     [db-name e a] writing?))
-
-  (v-datoms [_ v]
-    (datalog-request read-floor-tx client :v-datoms [db-name v] writing?))
-
-  (size-filter [_ index pred low-datom high-datom]
-    (let [frozen-pred (b/serialize pred)]
-      (datalog-request
-        read-floor-tx client :size-filter
-        [db-name index frozen-pred low-datom high-datom] writing?)))
-
-  (head-filter [_ index pred low-datom high-datom]
-    (let [frozen-pred (b/serialize pred)]
-      (datalog-request
-        read-floor-tx client :head-filter
-        [db-name index frozen-pred low-datom high-datom] writing?)))
-
-  (tail-filter [_ index pred high-datom low-datom]
-    (let [frozen-pred (b/serialize pred)]
-      (datalog-request
-        read-floor-tx client :tail-filter
-        [db-name index frozen-pred high-datom low-datom] writing?)))
-
-  (slice-filter [_ index pred low-datom high-datom]
-    (let [frozen-pred (b/serialize pred)]
-      (datalog-request
-        read-floor-tx client :slice-filter
-        [db-name index frozen-pred low-datom high-datom] writing?)))
-
-  (rslice-filter [_ index pred high-datom low-datom]
-    (let [frozen-pred (b/serialize pred)]
-      (datalog-request
-        read-floor-tx client :rslice-filter
-        [db-name index frozen-pred high-datom low-datom] writing?)))
+  (defremote-forward (datalog-request read-floor-tx client)
+    (size-filter [_ index pred low-datom high-datom] :serialize pred)
+    (head-filter [_ index pred low-datom high-datom] :serialize pred)
+    (tail-filter [_ index pred high-datom low-datom] :serialize pred)
+    (slice-filter [_ index pred low-datom high-datom] :serialize pred)
+    (rslice-filter [_ index pred high-datom low-datom] :serialize pred))
 
   IRemoteDB
-  (q [_ query inputs]
-    (datalog-request read-floor-tx client :q [db-name query inputs] writing?))
-
-  (pull [_ pattern id opts]
-    (datalog-request read-floor-tx client :pull
-                     [db-name pattern id opts] writing?))
-
-  (pull-many [_ pattern id opts]
-    (datalog-request read-floor-tx client :pull-many
-                     [db-name pattern id opts] writing?))
-
-  (explain [_ opts query inputs]
-    (datalog-request read-floor-tx client :explain
-                     [db-name opts query inputs] writing?))
-
-  (fulltext-datoms [_ query opts]
-    (datalog-request read-floor-tx client :fulltext-datoms
-                     [db-name query opts] writing?))
+  (defremote-forward (datalog-request read-floor-tx client)
+    (q [_ query inputs])
+    (pull [_ pattern id opts])
+    (pull-many [_ pattern id opts])
+    (explain [_ opts query inputs])
+    (fulltext-datoms [_ query opts]))
 
   (db-info [_]
     (if-let [cached (let [cached @open-db-info]
@@ -662,55 +627,7 @@
     (cl/normal-request client :sync [db-name force] writing?))
 
   ITxLog
-  (txlog-watermarks [_]
-    (cl/normal-request client :txlog-watermarks [db-name] writing?))
-  (open-tx-log [this from-lsn]
-    (.open-tx-log this from-lsn nil))
-  (open-tx-log [_ from-lsn upto-lsn]
-    (cl/normal-request client :open-tx-log [db-name from-lsn upto-lsn] writing?))
-  (force-txlog-sync! [_]
-    (cl/normal-request client :force-txlog-sync! [db-name] writing?))
-  (force-lmdb-sync! [_]
-    (cl/normal-request client :force-lmdb-sync! [db-name] writing?))
-  (create-snapshot! [_]
-    (cl/normal-request client :create-snapshot! [db-name] writing?))
-  (list-snapshots [_]
-    (cl/normal-request client :list-snapshots [db-name] writing?))
-  (snapshot-scheduler-state [_]
-    (cl/normal-request client :snapshot-scheduler-state [db-name] writing?))
-  (read-commit-marker [_]
-    (cl/normal-request client :read-commit-marker [db-name] writing?))
-  (verify-commit-marker! [_]
-    (cl/normal-request client :verify-commit-marker! [db-name] writing?))
-  (txlog-retention-state [_]
-    (cl/normal-request client :txlog-retention-state [db-name] writing?))
-  (gc-txlog-segments! [this]
-    (.gc-txlog-segments! this nil))
-  (gc-txlog-segments! [_ retain-floor-lsn]
-    (cl/normal-request client :gc-txlog-segments!
-                       [db-name retain-floor-lsn] writing?))
-  (txlog-update-snapshot-floor! [this snapshot-lsn]
-    (.txlog-update-snapshot-floor! this snapshot-lsn nil))
-  (txlog-update-snapshot-floor! [_ snapshot-lsn previous-snapshot-lsn]
-    (cl/normal-request client :txlog-update-snapshot-floor!
-                       [db-name snapshot-lsn previous-snapshot-lsn] writing?))
-  (txlog-clear-snapshot-floor! [_]
-    (cl/normal-request client :txlog-clear-snapshot-floor!
-                       [db-name] writing?))
-  (txlog-update-replica-floor! [_ replica-id applied-lsn]
-    (cl/normal-request client :txlog-update-replica-floor!
-                       [db-name replica-id applied-lsn] writing?))
-  (txlog-clear-replica-floor! [_ replica-id]
-    (cl/normal-request client :txlog-clear-replica-floor!
-                       [db-name replica-id] writing?))
-  (txlog-pin-backup-floor! [this pin-id floor-lsn]
-    (.txlog-pin-backup-floor! this pin-id floor-lsn nil))
-  (txlog-pin-backup-floor! [_ pin-id floor-lsn expires-ms]
-    (cl/normal-request client :txlog-pin-backup-floor!
-                       [db-name pin-id floor-lsn expires-ms] writing?))
-  (txlog-unpin-backup-floor! [_ pin-id]
-    (cl/normal-request client :txlog-unpin-backup-floor!
-                       [db-name pin-id] writing?))
+  (defremote-txlog-methods)
 
   IAdmin
   (re-index [_ schema opts]
@@ -976,7 +893,7 @@
       Object
       (toString [this] (str (apply list this))))))
 
-(deftype KVStore [^String uri
+(deftype+ KVStore [^String uri
                   ^String db-name
                   ^Client client
                   write-txn
@@ -985,9 +902,8 @@
                   owns-client?
                   ^AtomicBoolean closed?]
   ICustomTypes
-  (register-type [_ type-name definition]
-    (cl/normal-request client :register-type
-                       [db-name type-name (b/serialize definition)] writing?))
+  (defremote-forward (cl/normal-request client)
+    (register-type [_ type-name definition] :serialize definition))
 
   IWriting
   (writing? [_] writing?)
@@ -1018,16 +934,12 @@
 
   (open-dbi [db dbi-name]
     (.open-dbi db dbi-name nil))
-  (open-dbi [_ dbi-name opts]
-    (cl/normal-request client :open-dbi [db-name dbi-name opts] writing?))
 
-  (clear-dbi [db dbi-name]
-    (cl/normal-request client :clear-dbi [db-name dbi-name] writing?))
-
-  (drop-dbi [db dbi-name]
-    (cl/normal-request client :drop-dbi [db-name dbi-name] writing?))
-
-  (list-dbis [db] (cl/normal-request client :list-dbis [db-name] writing?))
+  (defremote-forward (cl/normal-request client)
+    (open-dbi [_ dbi-name opts])
+    (clear-dbi [_ dbi-name])
+    (drop-dbi [_ dbi-name])
+    (list-dbis [_]))
 
   (copy [db dest] (.copy db dest false))
   (copy [_ dest compact?]
@@ -1085,82 +997,20 @@
       copy-meta))
 
   (stat [db] (.stat db nil))
-  (stat [_ dbi-name]
-    (cl/normal-request client :stat [db-name dbi-name] writing?))
 
-  (entries [_ dbi-name]
-    (cl/normal-request client :entries [db-name dbi-name] writing?))
-
-  (set-env-flags [_ ks on-off]
-    (cl/normal-request client :set-env-flags [db-name ks on-off] writing?))
-
-  (get-env-flags [_]
-    (cl/normal-request client :get-env-flags [db-name] writing?))
+  (defremote-forward (cl/normal-request client)
+    (stat [_ dbi-name])
+    (entries [_ dbi-name])
+    (set-env-flags [_ ks on-off])
+    (get-env-flags [_]))
 
   (sync [this] (.sync this 1))
-  (sync [_ force]
-    (cl/normal-request client :sync [db-name force] writing?))
+
+  (defremote-forward (cl/normal-request client)
+    (sync [_ force]))
 
   ITxLog
-  (txlog-watermarks [_]
-    (cl/normal-request client :txlog-watermarks [db-name] writing?))
-
-  (open-tx-log [this from-lsn]
-    (.open-tx-log this from-lsn nil))
-  (open-tx-log [_ from-lsn upto-lsn]
-    (cl/normal-request client :open-tx-log [db-name from-lsn upto-lsn] writing?))
-
-  (force-txlog-sync! [_]
-    (cl/normal-request client :force-txlog-sync! [db-name] writing?))
-
-  (force-lmdb-sync! [_]
-    (cl/normal-request client :force-lmdb-sync! [db-name] writing?))
-
-  (create-snapshot! [_]
-    (cl/normal-request client :create-snapshot! [db-name] writing?))
-
-  (list-snapshots [_]
-    (cl/normal-request client :list-snapshots [db-name] writing?))
-
-  (snapshot-scheduler-state [_]
-    (cl/normal-request client :snapshot-scheduler-state [db-name] writing?))
-
-  (read-commit-marker [_]
-    (cl/normal-request client :read-commit-marker [db-name] writing?))
-
-  (verify-commit-marker! [_]
-    (cl/normal-request client :verify-commit-marker! [db-name] writing?))
-
-  (txlog-retention-state [_]
-    (cl/normal-request client :txlog-retention-state [db-name] writing?))
-
-  (gc-txlog-segments! [this]
-    (.gc-txlog-segments! this nil))
-  (gc-txlog-segments! [_ retain-floor-lsn]
-    (cl/normal-request client :gc-txlog-segments!
-                       [db-name retain-floor-lsn] writing?))
-  (txlog-update-snapshot-floor! [this snapshot-lsn]
-    (.txlog-update-snapshot-floor! this snapshot-lsn nil))
-  (txlog-update-snapshot-floor! [_ snapshot-lsn previous-snapshot-lsn]
-    (cl/normal-request client :txlog-update-snapshot-floor!
-                       [db-name snapshot-lsn previous-snapshot-lsn] writing?))
-  (txlog-clear-snapshot-floor! [_]
-    (cl/normal-request client :txlog-clear-snapshot-floor!
-                       [db-name] writing?))
-  (txlog-update-replica-floor! [_ replica-id applied-lsn]
-    (cl/normal-request client :txlog-update-replica-floor!
-                       [db-name replica-id applied-lsn] writing?))
-  (txlog-clear-replica-floor! [_ replica-id]
-    (cl/normal-request client :txlog-clear-replica-floor!
-                       [db-name replica-id] writing?))
-  (txlog-pin-backup-floor! [this pin-id floor-lsn]
-    (.txlog-pin-backup-floor! this pin-id floor-lsn nil))
-  (txlog-pin-backup-floor! [_ pin-id floor-lsn expires-ms]
-    (cl/normal-request client :txlog-pin-backup-floor!
-                       [db-name pin-id floor-lsn expires-ms] writing?))
-  (txlog-unpin-backup-floor! [_ pin-id]
-    (cl/normal-request client :txlog-unpin-backup-floor!
-                       [db-name pin-id] writing?))
+  (defremote-txlog-methods)
 
   (open-transact-kv [db]
     (#'request-ha-open client {:type :open-transact-kv
@@ -1251,19 +1101,9 @@
     (.get-value db dbi-name k k-type :data true))
   (get-value [db dbi-name k k-type v-type]
     (.get-value db dbi-name k k-type v-type true))
-  (get-value [_ dbi-name k k-type v-type ignore-key?]
-    (detect-chatty-kv! db-name dbi-name :get-value)
-    (cl/normal-request
-      client :get-value
-      [db-name dbi-name k k-type v-type ignore-key?] writing?))
 
   (get-rank [db dbi-name k]
     (.get-rank db dbi-name k :data))
-  (get-rank [_ dbi-name k k-type]
-    (detect-chatty-kv! db-name dbi-name :get-rank)
-    (cl/normal-request
-      client :get-rank
-      [db-name dbi-name k k-type] writing?))
 
   (get-by-rank [db dbi-name rank]
     (.get-by-rank db dbi-name rank :data :data true))
@@ -1271,11 +1111,6 @@
     (.get-by-rank db dbi-name rank k-type :data true))
   (get-by-rank [db dbi-name rank k-type v-type]
     (.get-by-rank db dbi-name rank k-type v-type true))
-  (get-by-rank [_ dbi-name rank k-type v-type ignore-key?]
-    (detect-chatty-kv! db-name dbi-name :get-by-rank)
-    (cl/normal-request
-      client :get-by-rank
-      [db-name dbi-name rank k-type v-type ignore-key?] writing?))
 
   (sample-kv [db dbi-name n]
     (.sample-kv db dbi-name n :data :data true))
@@ -1283,10 +1118,6 @@
     (.sample-kv db dbi-name n k-type :data true))
   (sample-kv [db dbi-name n k-type v-type]
     (.sample-kv db dbi-name n k-type v-type true))
-  (sample-kv [_ dbi-name n k-type v-type ignore-key?]
-    (cl/normal-request
-      client :sample-kv
-      [db-name dbi-name n k-type v-type ignore-key?] writing?))
 
   (get-first [db dbi-name k-range]
     (.get-first db dbi-name k-range :data :data false))
@@ -1294,10 +1125,6 @@
     (.get-first db dbi-name k-range k-type :data false))
   (get-first [db dbi-name k-range k-type v-type]
     (.get-first db dbi-name k-range k-type v-type false))
-  (get-first [_ dbi-name k-range k-type v-type ignore-key?]
-    (cl/normal-request
-      client :get-first
-      [db-name dbi-name k-range k-type v-type ignore-key?] writing?))
 
   (get-first-n [this dbi-name n k-range]
     (.get-first-n this dbi-name n k-range :data :data false))
@@ -1305,10 +1132,6 @@
     (.get-first-n this dbi-name n k-range k-type :data false))
   (get-first-n [this dbi-name n k-range k-type v-type]
     (.get-first-n this dbi-name n k-range k-type v-type false))
-  (get-first-n [_ dbi-name n k-range k-type v-type ignore-key?]
-    (cl/normal-request
-      client :get-first-n
-      [db-name dbi-name n k-range k-type v-type ignore-key?] writing?))
 
   (get-range [db dbi-name k-range]
     (.get-range db dbi-name k-range :data :data false))
@@ -1316,37 +1139,33 @@
     (.get-range db dbi-name k-range k-type :data false))
   (get-range [db dbi-name k-range k-type v-type]
     (.get-range db dbi-name k-range k-type v-type false))
-  (get-range [_ dbi-name k-range k-type v-type ignore-key?]
-    (cl/normal-request
-      client :get-range
-      [db-name dbi-name k-range k-type v-type ignore-key?] writing?))
+
+  (defremote-forward (cl/normal-request client)
+    (get-value [_ dbi-name k k-type v-type ignore-key?] :chatty true)
+    (get-rank [_ dbi-name k k-type] :chatty true)
+    (get-by-rank [_ dbi-name rank k-type v-type ignore-key?] :chatty true)
+    (sample-kv [_ dbi-name n k-type v-type ignore-key?])
+    (get-first [_ dbi-name k-range k-type v-type ignore-key?])
+    (get-first-n [_ dbi-name n k-range k-type v-type ignore-key?])
+    (get-range [_ dbi-name k-range k-type v-type ignore-key?]))
 
   (key-range [db dbi-name k-range]
     (.key-range db dbi-name k-range :data))
-  (key-range [_ dbi-name k-range k-type]
-    (cl/normal-request client :key-range
-                       [db-name dbi-name k-range k-type] writing?))
 
   (key-range-count [db dbi-name k-range]
     (.key-range-count db dbi-name k-range :data))
-  (key-range-count [_ dbi-name k-range k-type]
-    (cl/normal-request client :key-range-count
-                       [db-name dbi-name k-range k-type] writing?))
-
-  (key-range-list-count [_ dbi-name k-range k-type]
-    (cl/normal-request client :key-range-list-count
-                       [db-name dbi-name k-range k-type] writing?))
 
   (visit-key-range [db dbi-name visitor k-range]
     (.visit-key-range db dbi-name visitor k-range :data true))
   (visit-key-range [db dbi-name visitor k-range k-type]
     (.visit-key-range db dbi-name visitor k-range k-type true))
-  (visit-key-range [_ dbi-name visitor k-range k-type raw-pred?]
-    (let [frozen-visitor (b/serialize visitor)]
-      (cl/normal-request
-        client :visit-key-range
-        [db-name dbi-name frozen-visitor k-range k-type raw-pred?]
-        writing?)))
+
+  (defremote-forward (cl/normal-request client)
+    (key-range [_ dbi-name k-range k-type])
+    (key-range-count [_ dbi-name k-range k-type])
+    (key-range-list-count [_ dbi-name k-range k-type])
+    (visit-key-range [_ dbi-name visitor k-range k-type raw-pred?]
+      :serialize visitor))
 
   (range-seq [db dbi-name k-range]
     (.range-seq db dbi-name k-range :data :data false nil))
@@ -1369,9 +1188,6 @@
 
   (range-count [db dbi-name k-range]
     (.range-count db dbi-name k-range :data))
-  (range-count [_ dbi-name k-range k-type]
-    (cl/normal-request
-      client :range-count [db-name dbi-name k-range k-type] writing?))
 
   (get-some [db dbi-name pred k-range]
     (.get-some db dbi-name pred k-range :data :data false true))
@@ -1381,13 +1197,6 @@
     (.get-some db dbi-name pred k-range k-type v-type false true))
   (get-some [db dbi-name pred k-range k-type v-type ignore-key?]
     (.get-some db dbi-name pred k-range k-type v-type  ignore-key? true))
-  (get-some [_ dbi-name pred k-range k-type v-type ignore-key? raw-pred?]
-    (let [frozen-pred (b/serialize pred)]
-      (cl/normal-request
-        client :get-some
-        [db-name dbi-name frozen-pred k-range k-type v-type ignore-key?
-         raw-pred?]
-        writing?)))
 
   (range-filter [db dbi-name pred k-range]
     (.range-filter db dbi-name pred k-range :data :data false true))
@@ -1397,13 +1206,6 @@
     (.range-filter db dbi-name pred k-range k-type v-type false true))
   (range-filter [db dbi-name pred k-range k-type v-type ignore-key?]
     (.range-filter db dbi-name pred k-range k-type v-type  ignore-key? true))
-  (range-filter [db dbi-name pred k-range k-type v-type ignore-key? raw-pred?]
-    (let [frozen-pred (b/serialize pred)]
-      (cl/normal-request
-        client :range-filter
-        [db-name dbi-name frozen-pred k-range k-type v-type ignore-key?
-         raw-pred?]
-        writing?)))
 
   (range-keep [this dbi-name pred k-range]
     (.range-keep this dbi-name pred k-range :data :data true))
@@ -1411,12 +1213,6 @@
     (.range-keep this dbi-name pred k-range k-type :data true))
   (range-keep [this dbi-name pred k-range k-type v-type]
     (.range-keep this dbi-name pred k-range k-type v-type true))
-  (range-keep [this dbi-name pred k-range k-type v-type raw-pred?]
-    (let [frozen-pred (b/serialize pred)]
-      (cl/normal-request
-        client :range-keep
-        [db-name dbi-name frozen-pred k-range k-type v-type raw-pred?]
-        writing?)))
 
   (range-some [this dbi-name pred k-range]
     (.range-some this dbi-name pred k-range :data :data true))
@@ -1424,12 +1220,6 @@
     (.range-some this dbi-name pred k-range k-type :data true))
   (range-some [this dbi-name pred k-range k-type v-type]
     (.range-some this dbi-name pred k-range k-type v-type true))
-  (range-some [this dbi-name pred k-range k-type v-type raw-pred?]
-    (let [frozen-pred (b/serialize pred)]
-      (cl/normal-request
-        client :range-some
-        [db-name dbi-name frozen-pred k-range k-type v-type raw-pred?]
-        writing?)))
 
   (range-filter-count [db dbi-name pred k-range]
     (.range-filter-count db dbi-name pred k-range :data :data true))
@@ -1437,24 +1227,27 @@
     (.range-filter-count db dbi-name pred k-range k-type :data true))
   (range-filter-count [db dbi-name pred k-range k-type v-type]
     (.range-filter-count db dbi-name pred k-range k-type v-type true))
-  (range-filter-count [_ dbi-name pred k-range k-type v-type raw-pred?]
-    (let [frozen-pred (b/serialize pred)]
-      (cl/normal-request
-        client :range-filter-count
-        [db-name dbi-name frozen-pred k-range k-type v-type raw-pred?]
-        writing?)))
 
   (visit [db dbi-name visitor k-range]
     (.visit db dbi-name visitor k-range :data :data true))
   (visit [db dbi-name visitor k-range k-type]
     (.visit db dbi-name visitor k-range k-type :data true))
-  (visit
-    [_ dbi-name visitor k-range k-type v-type raw-pred?]
-    (let [frozen-visitor (b/serialize visitor)]
-      (cl/normal-request
-        client :visit
-        [db-name dbi-name frozen-visitor k-range k-type v-type raw-pred?]
-        writing?)))
+
+  (defremote-forward (cl/normal-request client)
+    (range-count [_ dbi-name k-range k-type])
+    (get-some [_ dbi-name pred k-range k-type v-type ignore-key? raw-pred?]
+      :serialize pred)
+    (range-filter [_ dbi-name pred k-range k-type v-type ignore-key?
+                   raw-pred?]
+      :serialize pred)
+    (range-keep [_ dbi-name pred k-range k-type v-type raw-pred?]
+      :serialize pred)
+    (range-some [_ dbi-name pred k-range k-type v-type raw-pred?]
+      :serialize pred)
+    (range-filter-count [_ dbi-name pred k-range k-type v-type raw-pred?]
+      :serialize pred)
+    (visit [_ dbi-name visitor k-range k-type v-type raw-pred?]
+      :serialize visitor))
 
   (open-list-dbi [db dbi-name {:keys [key-size val-size flags]
                                :or   {key-size c/+max-key-size+
@@ -1476,92 +1269,46 @@
   (del-list-items [db dbi-name k vs kt vt]
     (.transact-kv db [[:del-list dbi-name k vs kt vt]]))
 
-  (get-list [_ dbi-name k kt vt]
-    (detect-chatty-kv! db-name dbi-name :get-list)
-    (cl/normal-request client :get-list
-                       [db-name dbi-name k kt vt] writing?))
-
   (visit-list [db list-name visitor k k-type]
     (.visit-list db list-name visitor k k-type nil true))
   (visit-list [db list-name visitor k k-type v-type]
     (.visit-list db list-name visitor k k-type v-type true))
-  (visit-list [_ dbi-name visitor k kt vt raw-pred?]
-    (let [frozen-visitor (b/serialize visitor)]
-      (cl/normal-request
-        client :visit-list
-        [db-name dbi-name frozen-visitor k kt vt raw-pred?] writing?)))
-
-  (list-count [_ dbi-name k kt]
-    (detect-chatty-kv! db-name dbi-name :list-count)
-    (cl/normal-request client :list-count
-                       [db-name dbi-name k kt] writing?))
-
-  (in-list? [_ dbi-name k v kt vt]
-    (detect-chatty-kv! db-name dbi-name :in-list?)
-    (cl/normal-request client :in-list?
-                       [db-name dbi-name k v kt vt] writing?))
-
-  (list-range [_ dbi-name k-range kt v-range vt]
-    (cl/normal-request client :list-range
-                       [db-name dbi-name k-range kt v-range vt] writing?))
-
-  (list-range-count [_ dbi-name k-range kt]
-    (cl/normal-request client :list-range-count
-                       [db-name dbi-name k-range kt] writing?))
-
-  (list-range-first [_ dbi-name k-range kt v-range vt]
-    (cl/normal-request client :list-range-first
-                       [db-name dbi-name k-range kt v-range vt] writing?))
-
-  (list-range-first-n [_ dbi-name n k-range kt v-range vt]
-    (cl/normal-request client :list-range-first-n
-                       [db-name dbi-name n k-range kt v-range vt] writing?))
 
   (list-range-filter [db list-name pred k-range k-type v-range v-type]
     (.list-range-filter db list-name pred k-range k-type v-range v-type true))
-  (list-range-filter [_ dbi-name pred k-range kt v-range vt raw-pred?]
-    (let [frozen-pred (b/serialize pred)]
-      (cl/normal-request
-        client :list-range-filter
-        [db-name dbi-name frozen-pred k-range kt v-range vt raw-pred?]
-        writing?)))
 
   (list-range-keep [this dbi-name pred k-range kt v-range vt]
     (.list-range-keep this dbi-name pred k-range kt v-range vt true))
-  (list-range-keep [this dbi-name pred k-range kt v-range vt raw-pred?]
-    (let [frozen-pred (b/serialize pred)]
-      (cl/normal-request
-        client :list-range-keep
-        [db-name dbi-name frozen-pred k-range kt v-range vt raw-pred?]
-        writing?)))
 
   (list-range-some [db list-name pred k-range k-type v-range v-type]
     (.list-range-some db list-name pred k-range k-type v-range v-type true))
-  (list-range-some [_ dbi-name pred k-range kt v-range vt raw-pred?]
-    (let [frozen-pred (b/serialize pred)]
-      (cl/normal-request
-        client :list-range-some
-        [db-name dbi-name frozen-pred k-range kt v-range vt raw-pred?]
-        writing?)))
 
   (list-range-filter-count [db list-name pred k-range k-type v-range v-type]
     (.list-range-filter-count db list-name pred k-range k-type v-range v-type
                               true))
-  (list-range-filter-count [_ dbi-name pred k-range kt v-range vt raw-pred?]
-    (let [frozen-pred (b/serialize pred)]
-      (cl/normal-request
-        client :list-range-filter-count
-        [db-name dbi-name frozen-pred k-range kt v-range vt raw-pred?]
-        writing?)))
 
   (visit-list-range [db list-name visitor k-range k-type v-range v-type]
     (.visit-list-range db list-name visitor k-range k-type v-range v-type true))
-  (visit-list-range [_ dbi-name visitor k-range kt v-range vt raw-pred?]
-    (let [frozen-visitor (b/serialize visitor)]
-      (cl/normal-request
-        client :visit-list-range
-        [db-name dbi-name frozen-visitor k-range kt v-range vt raw-pred?]
-        writing?)))
+
+  (defremote-forward (cl/normal-request client)
+    (get-list [_ dbi-name k kt vt] :chatty true)
+    (visit-list [_ dbi-name visitor k kt vt raw-pred?] :serialize visitor)
+    (list-count [_ dbi-name k kt] :chatty true)
+    (in-list? [_ dbi-name k v kt vt] :chatty true)
+    (list-range [_ dbi-name k-range kt v-range vt])
+    (list-range-count [_ dbi-name k-range kt])
+    (list-range-first [_ dbi-name k-range kt v-range vt])
+    (list-range-first-n [_ dbi-name n k-range kt v-range vt])
+    (list-range-filter [_ dbi-name pred k-range kt v-range vt raw-pred?]
+      :serialize pred)
+    (list-range-keep [_ dbi-name pred k-range kt v-range vt raw-pred?]
+      :serialize pred)
+    (list-range-some [_ dbi-name pred k-range kt v-range vt raw-pred?]
+      :serialize pred)
+    (list-range-filter-count [_ dbi-name pred k-range kt v-range vt raw-pred?]
+      :serialize pred)
+    (visit-list-range [_ dbi-name visitor k-range kt v-range vt raw-pred?]
+      :serialize visitor))
 
   IAdmin
   (re-index [db opts]

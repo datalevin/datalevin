@@ -575,18 +575,6 @@
     (raise "Fail to keep list range: " e
            {:dbi dbi-name :key-range k-range :val-range v-range})))
 
-(defn- range-some*
-  [iterable pred k-type v-type raw-pred?]
-  (with-open [^AutoCloseable iter (.iterator ^Iterable iterable)]
-    (loop []
-      (when (.hasNext ^Iterator iter)
-        (let [kv (.next ^Iterator iter)]
-          (if raw-pred?
-            (or (pred kv) (recur))
-            (or (pred (b/read-buffer (l/k kv) k-type)
-                      (b/read-buffer (l/v kv) v-type))
-                (recur))))))))
-
 (defn list-range-some
   [lmdb dbi-name pred k-range k-type v-range v-type raw-pred?]
   (scan
