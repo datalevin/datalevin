@@ -12,12 +12,12 @@
   (:require
    [clojure.java.io :as io]
    [clojure.string :as s]
+   [datalevin.binding.cpp.lifecycle :as lifecycle]
    [datalevin.bits :as b]
    [datalevin.util :as u :refer [raise]]
    [datalevin.constants :as c]
    [datalevin.compress :as cp]
    [datalevin.buffer :as bf]
-   [datalevin.async :as a]
    [datalevin.migrate :as m]
    [datalevin.validate :as vld]
    [datalevin.scan :as scan]
@@ -38,10 +38,8 @@
    [datalevin.cpp BufVal Env Txn Dbi Cursor Stat Info Util Util$MapFullException
     UnsafeAccess]
    [datalevin.lmdb DatomKVTxData RangeContext KVTxData]
-   [datalevin.async IAsyncWork]
    [datalevin.utl BitOps]
-   [java.util.concurrent TimeUnit ScheduledExecutorService ScheduledFuture
-    ConcurrentHashMap]
+   [java.util.concurrent ConcurrentHashMap]
    [java.util.concurrent.atomic AtomicBoolean]
    [java.lang AutoCloseable]
    [java.io File]
@@ -52,6 +50,12 @@
    [org.bytedeco.javacpp SizeTPointer LongPointer]
    [org.eclipse.collections.impl.list.mutable FastList]
    [clojure.lang IObj]))
+
+;; Compatibility aliases for callers that use `datalevin.binding.cpp`; the
+;; implementations live in `datalevin.binding.cpp.lifecycle`.
+(def open-local-kv-handle lifecycle/open-local-kv-handle)
+(def register-shutdown-close! lifecycle/register-shutdown-close!)
+(def shutdown-hooks lifecycle/shutdown-hooks)
 
 (defn- version-file
   [^File dir]
@@ -88,12 +92,6 @@
 (def ^:private ^:const ave-multiple-min-items 2)
 (def ^:private ^:const ave-multiple-max-items 65536)
 (def ^:private ^:const ave-multiple-max-buffer-bytes 524288)
-
-(def ^:private duplicate-local-open-msg
-  "Please do not open multiple LMDB connections to the same DB
-           in the same process. Instead, a LMDB connection should be held onto
-           and managed like a stateful resource. Refer to the documentation of
-           `datalevin.core/open-kv` for more details.")
 
 (defn- run-before-write-commit!
   [context]
@@ -1652,131 +1650,6 @@
      :cause     (ex-message e)}
     e))
 
-(defn- sync-key* [dir] (->> dir hash (str "lmdb-sync-") keyword))
-
-(def sync-key (memoize sync-key*))
-
-(deftype AsyncSync [dir ^Env env]
-  IAsyncWork
-  (work-key [_] (sync-key dir))
-  (do-work [_] (.sync env 1))
-  (combine [_] first)
-  (callback [_] nil))
-
-(defn- start-scheduled-sync
-  [scheduled-sync dir ^Env env]
-  (let [scheduler ^ScheduledExecutorService (u/get-scheduler)
-        fut (.scheduleWithFixedDelay
-             scheduler
-             ^Runnable #(let [exe (a/get-executor)]
-                          (when (a/running? exe)
-                            (a/exec exe (AsyncSync. dir env))))
-             ^long (rand-int c/lmdb-sync-interval)
-             ^long c/lmdb-sync-interval
-             TimeUnit/SECONDS)]
-    (vreset! scheduled-sync fut)))
-
-(defonce ^:private shutdown-hooks (atom {}))
-(defonce ^:private shutdown-close-actions (atom {}))
-(defonce ^:private active-local-kv-handles (atom #{}))
-(defonce ^:private open-local-kv-handles (atom {}))
-
-(defn- canonical-dir-key
-  [^File dir-file]
-  (.getCanonicalPath dir-file))
-
-(defn- local-kv-handle-key
-  [^File dir-file flags]
-  (when-not (some #{:inmemory} flags)
-    (canonical-dir-key dir-file)))
-
-(defn- reserve-local-kv-handle!
-  [^File dir-file flags]
-  (when-let [dir-key (local-kv-handle-key dir-file flags)]
-    (let [[before _]
-          (swap-vals! active-local-kv-handles
-                      #(if (contains? % dir-key) % (conj % dir-key)))]
-      (when (contains? before dir-key)
-        (raise duplicate-local-open-msg
-               {:dir dir-key
-                :type :lmdb/duplicate-open}))
-      dir-key)))
-
-(defn- register-local-kv-handle!
-  [dir-key lmdb]
-  (when dir-key
-    (swap! open-local-kv-handles assoc dir-key lmdb))
-  lmdb)
-
-(defn open-local-kv-handle
-  [dir]
-  (when-let [dir-key (some-> dir u/file canonical-dir-key)]
-    (locking open-local-kv-handles
-      (when-let [lmdb (get @open-local-kv-handles dir-key)]
-        (if (i/closed-kv? lmdb)
-          (do
-            (swap! open-local-kv-handles dissoc dir-key)
-            (swap! active-local-kv-handles disj dir-key)
-            nil)
-          lmdb)))))
-
-(defn- release-local-kv-handle!
-  [dir-key]
-  (when dir-key
-    (swap! active-local-kv-handles disj dir-key)
-    (swap! open-local-kv-handles dissoc dir-key))
-  nil)
-
-(defn- register-shutdown-hook!
-  [dir ^Thread hook]
-  (.addShutdownHook (Runtime/getRuntime) hook)
-  (swap! shutdown-hooks assoc dir hook)
-  nil)
-
-(defn register-shutdown-close!
-  "Register a higher-level close action for an open LMDB environment.
-   The raw JVM shutdown hook uses this action when present and otherwise
-   falls back to closing LMDB directly."
-  [lmdb close-fn]
-  (swap! shutdown-close-actions assoc (env-dir lmdb) close-fn)
-  nil)
-
-(defn- run-shutdown-close!
-  [dir lmdb]
-  (if-let [close-fn (get @shutdown-close-actions dir)]
-    (close-fn)
-    (close-kv lmdb)))
-
-(defn- unregister-shutdown-hook!
-  [dir]
-  (swap! shutdown-close-actions dissoc dir)
-  (when-let [^Thread hook (get @shutdown-hooks dir)]
-    (swap! shutdown-hooks dissoc dir)
-    (try
-      (.removeShutdownHook (Runtime/getRuntime) hook)
-      (catch IllegalStateException _)
-      (catch IllegalArgumentException _)
-      (catch SecurityException _)))
-  nil)
-
-(defn- stop-scheduled-sync
-  [scheduled-sync]
-  (when-let [fut @scheduled-sync]
-    (.cancel ^ScheduledFuture fut true)
-    (vreset! scheduled-sync nil)))
-
-(defn- copy-version-file
-  [lmdb dest]
-  (let [src (str (env-dir lmdb) u/+separator+ c/version-file-name)
-        dst (str dest u/+separator+ c/version-file-name)]
-    (u/copy-file src dst)))
-
-(defn- copy-compression-files
-  [lmdb dest]
-  (doseq [name [c/keycode-file-name c/valcode-file-name]
-          :let [src (io/file (env-dir lmdb) name)]
-          :when (.isFile src)]
-    (u/copy-file (str src) (str (io/file dest name)))))
 
 (declare key-range-list-count-fast)
 
@@ -1850,15 +1723,15 @@
 
   (close-kv [this]
     (let [dir         (env-dir this)
-          dir-key     (local-kv-handle-key (u/file dir) (@info :flags))
+          dir-key     (lifecycle/local-kv-handle-key (u/file dir) (@info :flags))
           close-error (volatile! nil)]
       ;; The shutdown hook can race an explicit close. All marked-write views
       ;; share this lock, so guard the complete native teardown rather than only
       ;; the final env close.
       (locking write-txn
         (when-not (.isClosed env)
-          (unregister-shutdown-hook! dir)
-          (stop-scheduled-sync scheduled-sync)
+          (lifecycle/unregister-shutdown-hook! dir)
+          (lifecycle/stop-scheduled-sync scheduled-sync)
           (close-reader-rtxs! reader-registry)
           (when-let [^Rtx wtxn @write-txn]
             (close-rtx-quiet! wtxn)
@@ -1906,7 +1779,7 @@
                 (vreset! close-error e))))
           (when (@info :temp?) (u/delete-files (@info :dir)))))
       (when (.isClosed env)
-        (release-local-kv-handle! dir-key)
+        (lifecycle/release-local-kv-handle! dir-key)
         (swap! l/lmdb-dirs disj dir)
         (when (and (not (@info :spill?)) (zero? (count @l/lmdb-dirs)))
           (l/shutdown-last-lmdb-executors!)))
@@ -2056,8 +1929,8 @@
   (copy [this dest compact?]
     (if (-> dest u/file u/empty-dir?)
       (do (.copy env dest (if compact? true false))
-          (copy-version-file this dest)
-          (copy-compression-files this dest))
+          (lifecycle/copy-version-file this dest)
+          (lifecycle/copy-compression-files this dest))
       (raise "Destination directory is not empty." {})))
 
   (get-rtx [this]
@@ -2672,7 +2545,7 @@
         prepared (when (and (not temp?) (not (some #{:inmemory} flags))
                             (not (.exists ^File db-file)))
                    (cp/open-compression dir opts {}))
-        local-handle-key (reserve-local-kv-handle! dir-file flags)]
+        local-handle-key (lifecycle/reserve-local-kv-handle! dir-file flags)]
     (try
       (let [inmemory? (some #{:inmemory} flags)
           ;; MDB_INMEMORY on Windows expects a simple env identifier instead of
@@ -2745,9 +2618,9 @@
                   (transact-kv lmdb [[:put c/kv-info :compression manifest]]))))
             (set-key-compressor lmdb key-codec)
             (set-val-compressor lmdb value-codec)
-            (register-shutdown-hook!
-              dir (Thread. #(run-shutdown-close! dir lmdb)))
-            (start-scheduled-sync (.-scheduled-sync lmdb) dir env)))
+            (lifecycle/register-shutdown-hook!
+              dir (Thread. #(lifecycle/run-shutdown-close! dir lmdb)))
+            (lifecycle/start-scheduled-sync (.-scheduled-sync lmdb) dir env)))
         ;; Every environment needs the write transaction's value scratch buffer,
         ;; including in-memory and temporary stores that skip persisted metadata.
         (set-max-val-size lmdb (max-val-size lmdb))
@@ -2756,11 +2629,11 @@
         ;; from env-opts and stored metadata.
         (vswap! (.-info lmdb) assoc :custom-type-cache (atom {})
                 :runtime-opts runtime-opts)
-        (register-local-kv-handle! local-handle-key (l/wrap-open-kv lmdb)))
+        (lifecycle/register-local-kv-handle! local-handle-key (l/wrap-open-kv lmdb)))
       (catch Exception e
         (when-let [lmdb @opened]
           (try (close-kv lmdb) (catch Throwable _)))
-        (release-local-kv-handle! local-handle-key)
+        (lifecycle/release-local-kv-handle! local-handle-key)
         (raise "Fail to open database: " e {:dir dir})))))
 
 (defmethod open-kv :cpp
