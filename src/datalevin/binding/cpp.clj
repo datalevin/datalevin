@@ -2743,12 +2743,14 @@
                 (vreset! (.-info lmdb) merged-info)
                 (when-not (:compression loaded-info)
                   (transact-kv lmdb [[:put c/kv-info :compression manifest]]))))
-            (set-max-val-size lmdb (max-val-size lmdb))
             (set-key-compressor lmdb key-codec)
             (set-val-compressor lmdb value-codec)
             (register-shutdown-hook!
               dir (Thread. #(run-shutdown-close! dir lmdb)))
             (start-scheduled-sync (.-scheduled-sync lmdb) dir env)))
+        ;; Every environment needs the write transaction's value scratch buffer,
+        ;; including in-memory and temporary stores that skip persisted metadata.
+        (set-max-val-size lmdb (max-val-size lmdb))
         ;; Runtime state is installed after persistence/loading and before the
         ;; handle is published. It is shared by marked-write views and omitted
         ;; from env-opts and stored metadata.

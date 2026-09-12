@@ -118,6 +118,28 @@ def test_custom_datalog_and_shared_registry(tmp_path):
         assert kv.get_value("tasks", A) == "a"
 
 
+@pytest.mark.parametrize("custom_payload", [False, True])
+def test_entity_many_custom_maps(tmp_path, custom_payload):
+    registry, definition = task_type()
+    if not custom_payload:
+        definition.pop("payload")
+    with connect(str(tmp_path / "many-maps"),
+                 opts={":runtime-opts": {":udf-registry": registry}}) as conn:
+        conn.register_type("app/task", definition)
+        conn.update_schema({"task/many": {
+            ":db/valueType": ":app/task",
+            ":db/cardinality": ":db.cardinality/many"}})
+        conn.transact([{"db/id": 1, "task/many": value} for value in [A, B, A]])
+        entity = conn.entity(1)
+        values = entity[":task/many"]
+        assert isinstance(values, list)
+        assert sorted(values, key=lambda value: value["label"]) == [A, B]
+        assert entity.get(":task/many") == values
+        assert dict(entity)[":task/many"] == values
+        assert sorted(conn.pull("[*]", 1)[":task/many"],
+                      key=lambda value: value["label"]) == [A, B]
+
+
 @dataclass
 class Task:
     rank: int
@@ -263,6 +285,9 @@ def test_native_python_datalog(tmp_path):
         assert sorted(row[0].label for row in conn.query("[:find ?v :where [?e :task/value ?v]]")) == ["a", "b"]
         assert conn.pull("[*]", [":task/id", b])[":task/value"] == b
         assert conn.entity(1)[":task/value"] == a
+        many = conn.entity(1)[":task/many"]
+        assert isinstance(many, list)
+        assert sorted(many, key=lambda task: task.label) == [a, b]
         report = conn.tx_data_to_simulated_report(tx.data(tx.add(2, "task/value", a)))
         assert report[":db-after"].pull("[*]", [":task/id", b])[":task/value"] == a
         assert conn.entity(2)[":task/value"] == b

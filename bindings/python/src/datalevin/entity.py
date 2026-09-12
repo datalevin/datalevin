@@ -14,6 +14,16 @@ from ._java import call_java, classes, is_java_object
 _MISSING = object()
 
 
+def _entity_set(value):
+    items = [_entity_value(item) for item in value]
+    try:
+        return set(items)
+    except TypeError:
+        # Custom maps, vectors, and native values can be unhashable in Python.
+        # Match the general converter's unordered-list fallback for JVM sets.
+        return items
+
+
 def _entity_value(value):
     if value is None or isinstance(value, (bool, int, float, str, bytes)):
         return value
@@ -22,7 +32,7 @@ def _entity_value(value):
         if isinstance(value, Mapping):
             return {_entity_value(key): _entity_value(item) for key, item in value.items()}
         if isinstance(value, (set, frozenset)):
-            return {_entity_value(item) for item in value}
+            return _entity_set(value)
         if isinstance(value, (list, tuple)):
             return [_entity_value(item) for item in value]
         return value
@@ -43,7 +53,7 @@ def _entity_value(value):
         return result
 
     if isinstance(value, cls.set_type):
-        return {_entity_value(item) for item in value}
+        return _entity_set(value)
 
     if isinstance(value, (cls.list_type, cls.collection_type)) or hasattr(value, "iterator"):
         return [_entity_value(item) for item in value]

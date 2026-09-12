@@ -242,3 +242,26 @@ def test_bulk_load_init_db_and_fill_db(tmp_path) -> None:
             "Bob",
             "Cara",
         ]
+
+
+def test_entity_many_scalars_and_references_remain_sets(tmp_path):
+    with connect(str(tmp_path / "entity-sets"), schema={
+        ":name": schema_attr(value_type=":db.type/string"),
+        ":tags": schema_attr(value_type=":db.type/string",
+                             cardinality=":db.cardinality/many"),
+        ":friends": schema_attr(value_type=":db.type/ref",
+                                cardinality=":db.cardinality/many"),
+    }) as conn:
+        conn.transact([
+            {":db/id": 1, ":name": "Ada", ":tags": ["reader", "writer"],
+             ":friends": [2, 3]},
+            {":db/id": 2, ":name": "Bob"},
+            {":db/id": 3, ":name": "Cara"},
+        ])
+        entity = conn.entity(1)
+        assert entity[":tags"] == {"reader", "writer"}
+        friends = entity[":friends"]
+        assert isinstance(friends, set)
+        assert all(isinstance(friend, Entity) for friend in friends)
+        assert {friend[":name"] for friend in friends} == {"Bob", "Cara"}
+        assert conn.entity(2) in friends

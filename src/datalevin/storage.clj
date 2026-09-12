@@ -1606,6 +1606,18 @@
           (ave-filter-tuple-id-list*
             lmdb in v-idx f-idx aid vt))))))
 
+(defn- make-store
+  "Build a Store from a field map, avoiding long positional constructor calls.
+   Keys mirror the `Store` deftype fields."
+  [{:keys [lmdb search-engines vector-indices embedding-indices idoc-indices
+           embedding-providers counts opts schema rschema attrs max-aid max-gt
+           max-tx state-sync-ms scheduled-sampling write-txn sampling-lock
+           local-closed? shared-dir-key]}]
+  (Store. lmdb search-engines vector-indices embedding-indices idoc-indices
+          embedding-providers counts opts schema rschema attrs max-aid max-gt
+          max-tx state-sync-ms scheduled-sampling write-txn sampling-lock
+          local-closed? shared-dir-key))
+
 (defn ^:no-doc ref-attr-adjacency
   "Scan a ref-valued AVE attribute directly into a primitive adjacency map.
    `bound-side` selects whether entity IDs or ref values are map keys."
@@ -4096,30 +4108,32 @@
    opts4 store-opts schema dir-key]
   (let [e-providers (init-embedding-providers dir e-domains
                                               embedding-providers)
-        store       (->Store lmdb
-                             (init-engines lmdb s-domains (:runtime-opts opts4))
-                             (init-indices lmdb v-domains)
-                             (init-embedding-indices lmdb e-domains)
-                             (init-idoc-indices lmdb i-domains)
-                             e-providers
-                             (ConcurrentHashMap.)
-                             store-opts
-                             schema
-                             (schema->rschema schema)
-                             (init-attrs schema)
-                             (init-max-aid schema)
-                             (init-max-gt lmdb)
-                             (init-max-tx lmdb)
-                             (init-state-sync-ms lmdb)
-                             (volatile! nil)
-                             ;; Keep allocation and commit under the same
-                             ;; lock as explicit transactions and KV writes.
-                             ;; A separate store mutex would invert the lock
-                             ;; order when direct and explicit writes race.
-                             (lmdb/write-txn lmdb)
-                             (ReentrantReadWriteLock.)
-                             false
-                             dir-key)]
+        store       (make-store
+                      {:lmdb lmdb
+                       :search-engines
+                       (init-engines lmdb s-domains (:runtime-opts opts4))
+                       :vector-indices (init-indices lmdb v-domains)
+                       :embedding-indices (init-embedding-indices lmdb e-domains)
+                       :idoc-indices (init-idoc-indices lmdb i-domains)
+                       :embedding-providers e-providers
+                       :counts (ConcurrentHashMap.)
+                       :opts store-opts
+                       :schema schema
+                       :rschema (schema->rschema schema)
+                       :attrs (init-attrs schema)
+                       :max-aid (init-max-aid schema)
+                       :max-gt (init-max-gt lmdb)
+                       :max-tx (init-max-tx lmdb)
+                       :state-sync-ms (init-state-sync-ms lmdb)
+                       :scheduled-sampling (volatile! nil)
+                       ;; Keep allocation and commit under the same
+                       ;; lock as explicit transactions and KV writes.
+                       ;; A separate store mutex would invert the lock
+                       ;; order when direct and explicit writes race.
+                       :write-txn (lmdb/write-txn lmdb)
+                       :sampling-lock (ReentrantReadWriteLock.)
+                       :local-closed? false
+                       :shared-dir-key dir-key})]
     ;; Upgrade composite tuple attributes after the Store exists so
     ;; legacy :data values can be re-encoded through set-schema.
     (datalevin.interface/set-schema store nil)
@@ -4242,37 +4256,38 @@
                        idoc-indices
                        (merge-missing-idoc-indices
                          lmdb idoc-indices schema* opts*))]
-    (->Store lmdb
-             (transfer-engines (.-search-engines old) lmdb)
-             (transfer-indices (.-vector-indices old) lmdb)
-             (transfer-indices (.-embedding-indices old) lmdb)
-             idoc-indices
-             (.-embedding-providers old)
-             (.-counts old)
-             opts*
-             schema*
-             (if reuse-derived-schema-state?
-               (rschema old)
-               (schema->rschema schema*))
-             (if reuse-derived-schema-state?
-               (attrs old)
-               (init-attrs schema*))
-             (if reuse-derived-schema-state?
-               (max-aid old)
-               (init-max-aid schema*))
-             max-gt*
-             (max-tx old)
-             (if reuse-derived-schema-state?
-               (observed-state-sync-ms old)
-               (init-state-sync-ms lmdb))
-             (.-scheduled-sampling old)
-             (.-write-txn old)
-             ;; Sampling work may still be queued against an older Store wrapper.
-             ;; Keep close/sampling coordination on a shared lock across wrappers
-             ;; that refer to the same logical store/LMDB lifecycle.
-             (.-sampling-lock old)
-             false
-             (.-shared-dir-key old))))
+    (make-store
+      {:lmdb lmdb
+       :search-engines (transfer-engines (.-search-engines old) lmdb)
+       :vector-indices (transfer-indices (.-vector-indices old) lmdb)
+       :embedding-indices (transfer-indices (.-embedding-indices old) lmdb)
+       :idoc-indices idoc-indices
+       :embedding-providers (.-embedding-providers old)
+       :counts (.-counts old)
+       :opts opts*
+       :schema schema*
+       :rschema (if reuse-derived-schema-state?
+                  (rschema old)
+                  (schema->rschema schema*))
+       :attrs (if reuse-derived-schema-state?
+                (attrs old)
+                (init-attrs schema*))
+       :max-aid (if reuse-derived-schema-state?
+                  (max-aid old)
+                  (init-max-aid schema*))
+       :max-gt max-gt*
+       :max-tx (max-tx old)
+       :state-sync-ms (if reuse-derived-schema-state?
+                        (observed-state-sync-ms old)
+                        (init-state-sync-ms lmdb))
+       :scheduled-sampling (.-scheduled-sampling old)
+       :write-txn (.-write-txn old)
+       ;; Sampling work may still be queued against an older Store wrapper.
+       ;; Keep close/sampling coordination on a shared lock across wrappers
+       ;; that refer to the same logical store/LMDB lifecycle.
+       :sampling-lock (.-sampling-lock old)
+       :local-closed? false
+       :shared-dir-key (.-shared-dir-key old)})))
 
 (defn transfer
   "transfer state of an existing store to a new store that has a different
@@ -4299,27 +4314,29 @@
   ([^Store old new-opts {:keys [search-engines vector-indices
                                 embedding-indices idoc-indices
                                 embedding-providers]}]
-   (let [schema* (schema old)]
-     (->Store (.-lmdb old)
-              (or search-engines (.-search-engines old))
-              (or vector-indices (.-vector-indices old))
-              (or embedding-indices (.-embedding-indices old))
-              (or idoc-indices (store-idoc-indices old))
-              (or embedding-providers (.-embedding-providers old))
-              (.-counts old)
-              (store-visible-opts new-opts)
-              schema*
-              (schema->rschema schema*)
-              (init-attrs schema*)
-              (init-max-aid schema*)
-              (max-gt old)
-              (max-tx old)
-              (init-state-sync-ms (.-lmdb old))
-              (.-scheduled-sampling old)
-              (.-write-txn old)
-              (.-sampling-lock old)
-              false
-              (.-shared-dir-key old)))))
+    (let [schema* (schema old)]
+      (make-store
+        {:lmdb (.-lmdb old)
+         :search-engines (or search-engines (.-search-engines old))
+         :vector-indices (or vector-indices (.-vector-indices old))
+         :embedding-indices (or embedding-indices (.-embedding-indices old))
+         :idoc-indices (or idoc-indices (store-idoc-indices old))
+         :embedding-providers (or embedding-providers
+                                  (.-embedding-providers old))
+         :counts (.-counts old)
+         :opts (store-visible-opts new-opts)
+         :schema schema*
+         :rschema (schema->rschema schema*)
+         :attrs (init-attrs schema*)
+         :max-aid (init-max-aid schema*)
+         :max-gt (max-gt old)
+         :max-tx (max-tx old)
+         :state-sync-ms (init-state-sync-ms (.-lmdb old))
+         :scheduled-sampling (.-scheduled-sampling old)
+         :write-txn (.-write-txn old)
+         :sampling-lock (.-sampling-lock old)
+         :local-closed? false
+         :shared-dir-key (.-shared-dir-key old)}))))
 
 (defn- close-store-resources!
   [^Store this]
