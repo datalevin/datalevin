@@ -3920,6 +3920,218 @@
       (close-failed-open! dir shared-store lmdb)
       (throw t))))
 
+(defn- default-store-opts
+  "Default options for a newly created store."
+  []
+  {:validate-data?       false
+   :auto-entity-time?    false
+   :closed-schema?       false
+   :background-sampling? c/*db-background-sampling?*
+   :async-secondary-index-worker-max-jobs
+   c/*async-secondary-index-worker-max-jobs*
+   :async-secondary-index-worker-lease-ms
+   c/*async-secondary-index-worker-lease-ms*
+   :async-secondary-index-retry-base-ms
+   c/*async-secondary-index-retry-base-ms*
+   :async-secondary-index-retry-max-ms
+   c/*async-secondary-index-retry-max-ms*
+   :ha-mode c/*ha-mode*
+   :ha-lease-renew-ms c/*ha-lease-renew-ms*
+   :ha-lease-timeout-ms c/*ha-lease-timeout-ms*
+   :ha-promotion-base-delay-ms c/*ha-promotion-base-delay-ms*
+   :ha-promotion-rank-delay-ms c/*ha-promotion-rank-delay-ms*
+   :ha-max-promotion-lag-lsn c/*ha-max-promotion-lag-lsn*
+   :ha-demotion-drain-ms c/*ha-demotion-drain-ms*
+   :ha-clock-skew-budget-ms c/*ha-clock-skew-budget-ms*
+   :ha-control-plane c/*ha-control-plane*
+   :wal?             c/*datalog-wal?*
+   :wal-rollout-mode c/*wal-rollout-mode*
+   :wal-rollback?    c/*wal-rollback?*
+   :wal-durability-profile
+   c/*datalog-wal-durability-profile*
+   :wal-commit-marker? c/*wal-commit-marker?*
+   :wal-commit-marker-version
+   c/*wal-commit-marker-version*
+   :wal-sync-mode            c/*wal-sync-mode*
+   :wal-group-commit         c/*wal-group-commit*
+   :wal-group-commit-ms      c/*wal-group-commit-ms*
+   :wal-meta-flush-max-txs
+   c/*wal-meta-flush-max-txs*
+   :wal-meta-flush-max-ms
+   c/*wal-meta-flush-max-ms*
+   :wal-commit-wait-ms       c/*wal-commit-wait-ms*
+   :wal-sync-adaptive?       c/*wal-sync-adaptive?*
+   :wal-segment-max-bytes c/*wal-segment-max-bytes*
+   :wal-segment-max-ms    c/*wal-segment-max-ms*
+   :wal-segment-prealloc?
+   c/*wal-segment-prealloc?*
+   :wal-segment-prealloc-mode
+   c/*wal-segment-prealloc-mode*
+   :wal-segment-prealloc-bytes
+   c/*wal-segment-prealloc-bytes*
+   :wal-retention-bytes c/*wal-retention-bytes*
+   :wal-retention-ms    c/*wal-retention-ms*
+   :wal-retention-pin-backpressure-threshold-ms
+   c/*wal-retention-pin-backpressure-threshold-ms*
+   :wal-vec-checkpoint-interval-ms
+   c/*wal-vec-checkpoint-interval-ms*
+   :wal-vec-max-lsn-delta
+   c/*wal-vec-max-lsn-delta*
+   :wal-vec-max-buffer-bytes
+   c/*wal-vec-max-buffer-bytes*
+   :wal-vec-chunk-bytes
+   c/*wal-vec-chunk-bytes*
+   :db-name              (str (UUID/randomUUID))
+   :cache-limit          512})
+
+(defn- debug-open-opts
+  [dir opts opts0 opts3]
+  (when (= "1" (System/getenv "DTLV_DEBUG_STORAGE_OPEN"))
+    (prn :storage-open
+         {:dir dir
+          :incoming-opts opts
+          :persisted-opts (select-keys opts0
+                                       [:ha-mode
+                                        :db-name
+                                        :db-identity
+                                        :ha-node-id
+                                        :ha-members
+                                        :ha-control-plane
+                                        :ha-demotion-drain-ms
+                                        :ha-fencing-hook
+                                        :wal?
+                                        :kv-opts])
+          :opts3 (select-keys opts3
+                              [:ha-mode
+                               :db-name
+                               :db-identity
+                               :ha-node-id
+                               :ha-members
+                               :ha-control-plane
+                               :ha-demotion-drain-ms
+                               :ha-fencing-hook
+                               :wal?
+                               :kv-opts])})))
+
+(defn- resolve-store-opts
+  "Merge persisted, loaded, incoming, and default store options and validate."
+  [dir incoming-opts0 opts persisted-opts loaded-opts]
+  (let [opts0      (or persisted-opts loaded-opts {})
+        opts1      (if (empty? opts0) (default-store-opts) opts0)
+        opts2-base (-> (merge opts1 opts)
+                       c/canonicalize-wal-opts
+                       normalize-ha-open-opts
+                       promote-kv-wal-opts)
+        opts2      (-> (if (and (or (some? persisted-opts)
+                                    (some? loaded-opts))
+                                (empty? (or incoming-opts0 {})))
+                         (propagate-top-level-txlog-opts-to-kv-opts
+                           opts2-base)
+                         opts2-base)
+                       normalize-ha-open-opts
+                       promote-kv-wal-opts)
+        db-identity (or (:db-identity opts2)
+                        (:db-name opts2)
+                        (str (UUID/randomUUID)))
+        opts3       (assoc opts2 :db-identity db-identity)]
+    (vld/validate-ha-store-opts opts3)
+    (vld/validate-secondary-index-worker-options opts3)
+    (vld/validate-search-options opts3)
+    (vld/validate-vector-options opts3)
+    (vld/validate-embedding-options opts3)
+    (vld/validate-idoc-options opts3)
+    (debug-open-opts dir opts opts0 opts3)
+    opts3))
+
+(defn- init-store-domains
+  [dir schema opts3 search-opts search-domains
+   vector-opts vector-domains embedding-opts embedding-domains
+   embedding-providers]
+  (let [s-domains (init-search-domains (:search-domains opts3)
+                                       schema search-opts search-domains)
+        v-domains (init-vector-domains (:vector-domains opts3)
+                                       schema vector-opts vector-domains)
+        e-domains (init-embedding-domains dir
+                                          (:embedding-domains opts3)
+                                          schema
+                                          embedding-opts
+                                          embedding-domains
+                                          embedding-providers)
+        i-domains (init-idoc-domains schema opts3)]
+    {:s-domains s-domains
+     :v-domains v-domains
+     :e-domains e-domains
+     :i-domains i-domains
+     :opts4     (cond-> opts3
+                  (seq e-domains)
+                  (assoc :embedding-opts
+                         (merge default-embedding-opts
+                                (or (:embedding-opts opts3) embedding-opts))
+                         :embedding-domains e-domains))}))
+
+(defn- attach-shared-store!
+  [shared-store lmdb s-domains opts4 store-opts dir-key]
+  (let [runtime-opts (:runtime-opts opts4)
+        wrapper      (with-open-opts
+                       shared-store
+                       store-opts
+                       (cond-> {}
+                         (:udf-registry runtime-opts)
+                         (assoc :search-engines
+                                (init-engines lmdb s-domains
+                                              runtime-opts))))]
+    (when dir-key
+      (locking shared-local-stores
+        (swap! shared-local-stores
+               assoc dir-key
+               {:store wrapper
+                :refs  (unchecked-inc
+                        (long (get-in @shared-local-stores
+                                      [dir-key :refs]
+                                      0)))})))
+    (enqueue-secondary-index-work-if-needed! wrapper)))
+
+(defn- create-new-store!
+  [lmdb dir s-domains v-domains e-domains i-domains embedding-providers
+   opts4 store-opts schema dir-key]
+  (let [e-providers (init-embedding-providers dir e-domains
+                                              embedding-providers)
+        store       (->Store lmdb
+                             (init-engines lmdb s-domains (:runtime-opts opts4))
+                             (init-indices lmdb v-domains)
+                             (init-embedding-indices lmdb e-domains)
+                             (init-idoc-indices lmdb i-domains)
+                             e-providers
+                             (ConcurrentHashMap.)
+                             store-opts
+                             schema
+                             (schema->rschema schema)
+                             (init-attrs schema)
+                             (init-max-aid schema)
+                             (init-max-gt lmdb)
+                             (init-max-tx lmdb)
+                             (init-state-sync-ms lmdb)
+                             (volatile! nil)
+                             ;; Keep allocation and commit under the same
+                             ;; lock as explicit transactions and KV writes.
+                             ;; A separate store mutex would invert the lock
+                             ;; order when direct and explicit writes race.
+                             (lmdb/write-txn lmdb)
+                             (ReentrantReadWriteLock.)
+                             false
+                             dir-key)]
+    ;; Upgrade composite tuple attributes after the Store exists so
+    ;; legacy :data values can be re-encoded through set-schema.
+    (datalevin.interface/set-schema store nil)
+    (when dir-key
+      (locking shared-local-stores
+        (swap! shared-local-stores
+               assoc dir-key {:store store :refs 1})))
+    (cpp/register-shutdown-close!
+      (kv/raw-lmdb lmdb)
+      #(close-store-resources! store))
+    (enqueue-secondary-index-work-if-needed! store)))
+
 (defn open
   "Open and return the storage."
   ([]
@@ -3957,7 +4169,8 @@
          lmdb (or (some-> shared-store .-lmdb)
                   (lmdb/open-kv dir (cond-> kv-opts
                                      (:runtime-opts opts)
-                                     (assoc :runtime-opts (:runtime-opts opts)))))]
+                                     (assoc :runtime-opts
+                                            (:runtime-opts opts)))))]
      (with-open-failure-cleanup
        dir
        shared-store
@@ -3965,210 +4178,36 @@
        (fn []
          (open-dbis lmdb)
          (let [loaded-opts (when-not persisted-opts
-                         (not-empty (load-opts lmdb)))
-           opts0     (or persisted-opts
-                         loaded-opts
-                         {})
-           opts1     (if (empty? opts0)
-                       {:validate-data?       false
-                        :auto-entity-time?    false
-                        :closed-schema?       false
-                        :background-sampling? c/*db-background-sampling?*
-                        :async-secondary-index-worker-max-jobs
-                        c/*async-secondary-index-worker-max-jobs*
-                        :async-secondary-index-worker-lease-ms
-                        c/*async-secondary-index-worker-lease-ms*
-                        :async-secondary-index-retry-base-ms
-                        c/*async-secondary-index-retry-base-ms*
-                        :async-secondary-index-retry-max-ms
-                        c/*async-secondary-index-retry-max-ms*
-                        :ha-mode c/*ha-mode*
-                        :ha-lease-renew-ms c/*ha-lease-renew-ms*
-                        :ha-lease-timeout-ms c/*ha-lease-timeout-ms*
-                        :ha-promotion-base-delay-ms c/*ha-promotion-base-delay-ms*
-                        :ha-promotion-rank-delay-ms c/*ha-promotion-rank-delay-ms*
-                        :ha-max-promotion-lag-lsn c/*ha-max-promotion-lag-lsn*
-                        :ha-demotion-drain-ms c/*ha-demotion-drain-ms*
-                        :ha-clock-skew-budget-ms c/*ha-clock-skew-budget-ms*
-                        :ha-control-plane c/*ha-control-plane*
-                        :wal?             c/*datalog-wal?*
-                        :wal-rollout-mode c/*wal-rollout-mode*
-                        :wal-rollback?    c/*wal-rollback?*
-                        :wal-durability-profile
-                        c/*datalog-wal-durability-profile*
-                        :wal-commit-marker? c/*wal-commit-marker?*
-                        :wal-commit-marker-version
-                        c/*wal-commit-marker-version*
-                        :wal-sync-mode            c/*wal-sync-mode*
-                        :wal-group-commit         c/*wal-group-commit*
-                        :wal-group-commit-ms      c/*wal-group-commit-ms*
-                        :wal-meta-flush-max-txs
-                        c/*wal-meta-flush-max-txs*
-                        :wal-meta-flush-max-ms
-                        c/*wal-meta-flush-max-ms*
-                        :wal-commit-wait-ms       c/*wal-commit-wait-ms*
-                        :wal-sync-adaptive?       c/*wal-sync-adaptive?*
-                        :wal-segment-max-bytes c/*wal-segment-max-bytes*
-                        :wal-segment-max-ms    c/*wal-segment-max-ms*
-                        :wal-segment-prealloc?
-                        c/*wal-segment-prealloc?*
-                        :wal-segment-prealloc-mode
-                        c/*wal-segment-prealloc-mode*
-                        :wal-segment-prealloc-bytes
-                        c/*wal-segment-prealloc-bytes*
-                        :wal-retention-bytes c/*wal-retention-bytes*
-                        :wal-retention-ms    c/*wal-retention-ms*
-                        :wal-retention-pin-backpressure-threshold-ms
-                        c/*wal-retention-pin-backpressure-threshold-ms*
-                        :wal-vec-checkpoint-interval-ms
-                        c/*wal-vec-checkpoint-interval-ms*
-                        :wal-vec-max-lsn-delta
-                        c/*wal-vec-max-lsn-delta*
-                        :wal-vec-max-buffer-bytes
-                        c/*wal-vec-max-buffer-bytes*
-                        :wal-vec-chunk-bytes
-                        c/*wal-vec-chunk-bytes*
-                        :db-name              (str (UUID/randomUUID))
-                        :cache-limit          512}
-                       opts0)
-           opts2-base (-> (merge opts1 opts)
-                          c/canonicalize-wal-opts
-                          normalize-ha-open-opts
-                          promote-kv-wal-opts)
-           opts2     (-> (if (and (or (some? persisted-opts)
-                                      (some? loaded-opts))
-                                  (empty? (or incoming-opts0 {})))
-                           (propagate-top-level-txlog-opts-to-kv-opts
-                             opts2-base)
-                           opts2-base)
-                         normalize-ha-open-opts
-                         promote-kv-wal-opts)
-           db-identity (or (:db-identity opts2)
-                           (:db-name opts2)
-                           (str (UUID/randomUUID)))
-           opts3     (assoc opts2 :db-identity db-identity)
-           _         (vld/validate-ha-store-opts opts3)
-           _         (vld/validate-secondary-index-worker-options opts3)
-           _         (vld/validate-search-options opts3)
-           _         (vld/validate-vector-options opts3)
-           _         (vld/validate-embedding-options opts3)
-           _         (vld/validate-idoc-options opts3)
-           _         (when (= "1" (System/getenv "DTLV_DEBUG_STORAGE_OPEN"))
-                       (prn :storage-open
-                            {:dir dir
-                             :incoming-opts opts
-                             :persisted-opts (select-keys opts0
-                                                          [:ha-mode
-                                                           :db-name
-                                                           :db-identity
-                                                           :ha-node-id
-                                                           :ha-members
-                                                           :ha-control-plane
-                                                           :ha-demotion-drain-ms
-                                                           :ha-fencing-hook
-                                                           :wal?
-                                                           :kv-opts])
-                             :opts3 (select-keys opts3
-                                                 [:ha-mode
-                                                  :db-name
-                                                  :db-identity
-                                                  :ha-node-id
-                                                  :ha-members
-                                                  :ha-control-plane
-                                                  :ha-demotion-drain-ms
-                                                  :ha-fencing-hook
-                                                  :wal?
-                                                  :kv-opts])}))
-           raw-open-metadata? (or raw-persist-open-opts?
-                                  (= :consensus-lease (:ha-mode opts3)))
-           _         (sync-wal-runtime-opts! lmdb opts3)
-           _         (when (and (not opened-with-wal?)
-                                (true? (:wal? opts3)))
-                       (kv/ensure-txlog-ready! lmdb))
-           schema    (if shared-store
-                       (datalevin.interface/set-schema shared-store schema)
-                       (init-schema lmdb schema))
-           s-domains (init-search-domains (:search-domains opts3)
-                                          schema search-opts search-domains)
-           v-domains (init-vector-domains (:vector-domains opts3)
-                                          schema vector-opts vector-domains)
-           e-domains (init-embedding-domains dir
-                                             (:embedding-domains opts3)
-                                             schema
-                                             embedding-opts
-                                             embedding-domains
-                                             embedding-providers)
-           i-domains (init-idoc-domains schema opts3)
-           opts4     (cond-> opts3
-                       (seq e-domains)
-                       (assoc :embedding-opts (merge default-embedding-opts
-                                                     (or (:embedding-opts opts3)
-                                                         embedding-opts))
-                              :embedding-domains e-domains))
-           store-opts (store-visible-opts opts4)
-           dir-key    (shared-local-store-key dir)]
-         (if raw-open-metadata?
-           (transact-opts-raw lmdb opts4)
-           (transact-opts lmdb opts4))
-         (ensure-open-last-modified! lmdb raw-open-metadata?)
-         (if shared-store
-           (let [runtime-opts (:runtime-opts opts4)
-                 wrapper      (with-open-opts
-                                shared-store
-                                store-opts
-                                (cond-> {}
-                                  (:udf-registry runtime-opts)
-                                  (assoc :search-engines
-                                         (init-engines lmdb s-domains
-                                                       runtime-opts))))]
-             (when dir-key
-               (locking shared-local-stores
-                 (swap! shared-local-stores
-                        assoc dir-key
-                        {:store wrapper
-                         :refs  (unchecked-inc
-                                 (long (get-in @shared-local-stores
-                                               [dir-key :refs]
-                                               0)))})))
-             (enqueue-secondary-index-work-if-needed! wrapper))
-           (let [e-providers (init-embedding-providers dir e-domains
-                                                       embedding-providers)
-                 store (->Store lmdb
-                                (init-engines lmdb s-domains
-                                              (:runtime-opts opts4))
-                                (init-indices lmdb v-domains)
-                                (init-embedding-indices lmdb e-domains)
-                                (init-idoc-indices lmdb i-domains)
-                                e-providers
-                                (ConcurrentHashMap.)
-                                store-opts
-                                schema
-                                (schema->rschema schema)
-                                (init-attrs schema)
-                                (init-max-aid schema)
-                                (init-max-gt lmdb)
-                                (init-max-tx lmdb)
-                                (init-state-sync-ms lmdb)
-                                (volatile! nil)
-                                ;; Keep allocation and commit under the same
-                                ;; lock as explicit transactions and KV writes.
-                                ;; A separate store mutex would invert the lock
-                                ;; order when direct and explicit writes race.
-                                (lmdb/write-txn lmdb)
-                                (ReentrantReadWriteLock.)
-                                false
-                                dir-key)]
-             ;; Upgrade composite tuple attributes after the Store exists so
-             ;; legacy :data values can be re-encoded through set-schema.
-             (datalevin.interface/set-schema store nil)
-             (when dir-key
-               (locking shared-local-stores
-                 (swap! shared-local-stores
-                        assoc dir-key {:store store :refs 1})))
-             (cpp/register-shutdown-close!
-               (kv/raw-lmdb lmdb)
-               #(close-store-resources! store))
-             (enqueue-secondary-index-work-if-needed! store)))))))))
+                             (not-empty (load-opts lmdb)))
+               opts3       (resolve-store-opts dir incoming-opts0 opts
+                                               persisted-opts loaded-opts)
+               raw-open-metadata? (or raw-persist-open-opts?
+                                      (= :consensus-lease (:ha-mode opts3)))]
+           (sync-wal-runtime-opts! lmdb opts3)
+           (when (and (not opened-with-wal?)
+                      (true? (:wal? opts3)))
+             (kv/ensure-txlog-ready! lmdb))
+           (let [schema (if shared-store
+                          (datalevin.interface/set-schema shared-store schema)
+                          (init-schema lmdb schema))
+                 {:keys [s-domains v-domains e-domains i-domains opts4]}
+                 (init-store-domains dir schema opts3
+                                     search-opts search-domains
+                                     vector-opts vector-domains
+                                     embedding-opts embedding-domains
+                                     embedding-providers)
+                 store-opts (store-visible-opts opts4)
+                 dir-key    (shared-local-store-key dir)]
+             (if raw-open-metadata?
+               (transact-opts-raw lmdb opts4)
+               (transact-opts lmdb opts4))
+             (ensure-open-last-modified! lmdb raw-open-metadata?)
+             (if shared-store
+               (attach-shared-store! shared-store lmdb s-domains opts4
+                                     store-opts dir-key)
+               (create-new-store! lmdb dir s-domains v-domains e-domains
+                                  i-domains embedding-providers opts4
+                                  store-opts schema dir-key)))))))))
 
 (defn- transfer-engines
   [engines lmdb]

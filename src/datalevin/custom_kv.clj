@@ -313,175 +313,247 @@
       :visit nil
       (if first? (first result) (mapv first result)))))
 
+(defn- read-range-seq
+  [kv raw dbi args opts]
+  (let [[kr kt vt ignore? seq-opts] (defaults args [nil :data :data false nil])
+        [kr pkt] (physical-range kv opts :key-type kt kr)
+        kt (field-type opts :key-type kt)
+        vt (if (= vt :ignore) :ignore (field-type opts :value-type vt))
+        key-type (when (and (:key-type opts) (not ignore?))
+                   (custom/resolve-type kv kt))
+        val-type (when (and (:value-type opts) (not= vt :ignore))
+                   (custom/resolve-type kv vt))]
+    ;; Decode in the iterator's own snapshot, including deferred batches.
+    (i/range-seq raw dbi kr pkt :raw false
+                 (assoc seq-opts :datalevin.scan/map-kv
+                        (fn [entry rtx]
+                          (let [[k v] (raw-pair entry)
+                                v (cond (= vt :ignore) nil
+                                        val-type (cv/read-value-at kv val-type
+                                                                   v rtx)
+                                        :else (b/read-buffer
+                                                (ByteBuffer/wrap ^bytes v)
+                                                vt))]
+                            (if ignore? v
+                                [(if key-type
+                                   (cv/read-value-at kv key-type k rtx)
+                                   (b/read-buffer
+                                     (ByteBuffer/wrap ^bytes k)
+                                     kt))
+                                 v])))))))
+
+(defn- read-get-value
+  [kv raw dbi args opts rtx]
+  (let [[key kt vt ignore?] (defaults args [nil :data :data true])
+        kt (field-type opts :key-type kt)]
+    (if-let [name (:key-type opts)]
+      (do
+        (when (and ignore? (= vt :ignore))
+          (raise "Cannot ignore both key and value" {}))
+        (let [decode (decode-field kv opts :value-type vt rtx)
+              type (custom/resolve-type-at kv name rtx)]
+          (when-let [match (cv/find-value-at kv (index raw dbi :key nil)
+                                             type key rtx)]
+            ;; Matching already copied the associated index bytes and
+            ;; reconstructed the stored key in this snapshot.
+            (let [value (decode (:associated match))]
+              (if ignore? value [(:value match) value])))))
+      (let [decode (pair-decoder kv opts kt vt ignore? rtx)
+            ref (cv/encode-order kt key)]
+        (when-let [pair (i/get-value raw dbi ref :raw :raw false)]
+          (decode pair))))))
+
+(defn- read-range
+  [kv raw dbi op args opts rtx]
+  (let [[n args] (if (= op :get-first-n)
+                   [(first args) (subvec args 1)]
+                   [nil args])
+        [kr kt vt ignore?] (defaults args [nil :data :data false])
+        [kr pkt] (physical-range kv opts :key-type kt kr)
+        decode (pair-decoder kv opts kt vt ignore? rtx)]
+    (case op
+      :get-first (some-> (i/get-first raw dbi kr pkt :raw false) decode)
+      :get-first-n (mapv decode (i/get-first-n raw dbi n kr pkt :raw false))
+      (mapv decode (i/get-range raw dbi kr pkt :raw false)))))
+
+(defn- read-range-count
+  [kv raw dbi op args opts]
+  (let [[kr kt] (defaults args [nil :data])
+        [kr pkt] (physical-range kv opts :key-type kt kr)]
+    ((case op :key-range-count i/key-range-count
+           :range-count i/range-count
+           :list-range-count i/list-range-count
+           i/key-range-list-count)
+     raw dbi kr pkt)))
+
+(defn- read-key-range
+  [kv raw dbi args opts rtx]
+  (let [[kr kt] (defaults args [nil :data])
+        [kr pkt] (physical-range kv opts :key-type kt kr)
+        decode (decode-field kv opts :key-type kt rtx)]
+    (mapv decode (i/key-range raw dbi kr pkt))))
+
+(defn- read-get-rank
+  [kv raw dbi args opts]
+  (let [[key kt] (defaults args [nil :data])
+        kt (field-type opts :key-type kt)]
+    (when-let [ref (key-ref kv raw dbi opts key kt)]
+      (i/get-rank raw dbi ref :raw))))
+
+(defn- read-by-rank
+  [kv raw dbi op args opts rtx]
+  (let [[n kt vt ignore?] (defaults args [nil :data :data true])
+        decode (pair-decoder kv opts kt vt ignore? rtx)]
+    (if (= op :sample-kv)
+      (mapv decode (i/sample-kv raw dbi n :raw :raw false))
+      (some-> (i/get-by-rank raw dbi n :raw :raw false) decode))))
+
+(defn- read-list
+  [kv raw dbi op args opts rtx]
+  (let [[visitor args] (if (= op :visit-list)
+                         [(first args) (subvec args 1)]
+                         [nil args])
+        [key value kt vt raw?]
+        (if (#{:in-list? :near-list} op)
+          (defaults args [nil nil :data :data true])
+          (let [[key kt vt raw?] (defaults args [nil :data :data true])]
+            [key nil kt vt raw?]))
+        kt (field-type opts :key-type kt)
+        vt (field-type opts :value-type vt)
+        ref (key-ref kv raw dbi opts key kt)]
+    (case op
+      :list-count (if ref (i/list-count raw dbi ref :raw) 0)
+      :get-list (if ref (mapv (decode-field kv opts :value-type vt rtx)
+                              (i/get-list raw dbi ref :raw :raw))
+                    [])
+      :in-list? (boolean
+                  (when ref
+                    (if-let [name (:value-type opts)]
+                      (cv/find-value kv (index raw dbi :item ref)
+                                     (custom/resolve-type kv name) value)
+                      (i/in-list? raw dbi ref value :raw vt))))
+      :near-list
+      (when ref
+        (let [[vr pvt] (physical-range kv opts :value-type vt
+                                       [:at-least value])]
+          (when-let [[_ v] (i/list-range-first raw dbi [:closed ref ref]
+                                               :raw vr pvt)]
+            (if (:value-type opts)
+              (ByteBuffer/wrap
+                ^bytes (i/get-value raw c/custom-values
+                                    (cv/reference-id v) :id :raw))
+              (ByteBuffer/wrap ^bytes v)))))
+      :visit-list
+      (when ref
+        (i/visit-list raw dbi
+                      (if raw? visitor
+                          (let [decode (decode-field kv opts :value-type vt
+                                                     rtx)]
+                            (fn [v] (visitor (decode v)))))
+                      ref :raw :raw raw?)))))
+
+(defn- read-list-range
+  [kv raw dbi op args opts rtx]
+  (let [[n args] (if (= op :list-range-first-n)
+                   [(first args) (subvec args 1)]
+                   [nil args])
+        [kr kt vr vt] args
+        [kr pkt] (physical-range kv opts :key-type kt kr)
+        [vr pvt] (physical-range kv opts :value-type vt vr)
+        decode (pair-decoder kv opts kt vt false rtx)
+        physical (fn [[k v]] [(if (= pkt :raw) k (cv/encode-order pkt k))
+                              (if (= pvt :raw) v (cv/encode-order pvt v))])]
+    (case op
+      :list-range-first (some-> (i/list-range-first raw dbi kr pkt vr pvt)
+                                physical decode)
+      :list-range-first-n (mapv (comp decode physical)
+                                (i/list-range-first-n raw dbi n kr pkt vr pvt))
+      (mapv (comp decode physical) (i/list-range raw dbi kr pkt vr pvt)))))
+
+(defn- read-filter-scan
+  [kv raw dbi op args opts rtx]
+  (let [[pred kr kt vt & tail] (defaults args [nil nil :data :data])
+        [ignore? raw?] (if (#{:get-some :range-filter} op)
+                         (defaults tail [false true])
+                         [false (first (defaults tail [true]))])]
+    (scan-callback kv raw dbi opts op pred kr kt nil vt ignore? raw? rtx)))
+
+(defn- read-list-filter-scan
+  [kv raw dbi op args opts rtx]
+  (let [[pred kr kt vr vt raw?]
+        (if (= op :visit-list-key-range)
+          (let [[pred kr kt vt raw?] (defaults args
+                                               [nil nil :data :data true])]
+            [pred kr kt [:all] vt raw?])
+          (defaults args [nil nil :data nil :data true]))]
+    (scan-callback kv raw dbi opts op pred kr kt vr vt false raw? rtx)))
+
+(defn- read-visit
+  [kv raw dbi op args opts rtx]
+  (let [[indices args] (if (#{:visit-key-sample :visit-list-sample} op)
+                         [(first args) (subvec args 1)]
+                         [nil args])
+        [visitor kr kt vt raw?]
+        (if (= op :visit-list-sample)
+          (defaults args [nil nil :data :data true])
+          (let [[visitor kr kt raw?] (defaults args [nil nil :data true])]
+            [visitor kr kt :ignore raw?]))
+        [kr pkt] (physical-range kv opts :key-type kt kr)
+        decode (pair-decoder kv opts kt vt false rtx)
+        dk (decode-field kv opts :key-type kt rtx)
+        f (if raw? visitor
+              (if (= op :visit-list-sample)
+                #(apply visitor (decode (raw-pair %)))
+                (if (= op :visit-key-range)
+                  #(visitor (dk (b/read-buffer % :raw)))
+                  #(visitor (dk (b/read-buffer (l/k %) :raw)) nil))))]
+    (case op
+      :visit-key-range (i/visit-key-range raw dbi f kr pkt true)
+      :visit-key-sample (i/visit-key-sample raw dbi indices f kr pkt true)
+      (i/visit-list-sample raw dbi indices f kr pkt :raw true))))
+
 (defn read-operation [kv raw op dbi args]
   (let [opts (i/dbi-opts raw dbi)]
     (if (= op :range-seq)
-      (let [[kr kt vt ignore? seq-opts] (defaults args [nil :data :data false nil])
-            [kr pkt] (physical-range kv opts :key-type kt kr)
-            kt (field-type opts :key-type kt)
-            vt (if (= vt :ignore) :ignore (field-type opts :value-type vt))
-            key-type (when (and (:key-type opts) (not ignore?)) (custom/resolve-type kv kt))
-            val-type (when (and (:value-type opts) (not= vt :ignore)) (custom/resolve-type kv vt))]
-        ;; Decode in the iterator's own snapshot, including deferred batches.
-        (i/range-seq raw dbi kr pkt :raw false
-                     (assoc seq-opts :datalevin.scan/map-kv
-                            (fn [entry rtx]
-                              (let [[k v] (raw-pair entry)
-                                    v (cond (= vt :ignore) nil
-                                            val-type (cv/read-value-at kv val-type v rtx)
-                                            :else (b/read-buffer (ByteBuffer/wrap ^bytes v) vt))]
-                                (if ignore? v
-                                    [(if key-type (cv/read-value-at kv key-type k rtx)
-                                         (b/read-buffer (ByteBuffer/wrap ^bytes k) kt)) v]))))))
+      (read-range-seq kv raw dbi args opts)
       (with-snapshot kv raw
         (fn [rtx]
           (case op
             :get-value
-            (let [[key kt vt ignore?] (defaults args [nil :data :data true])
-                  kt (field-type opts :key-type kt)]
-              (if-let [name (:key-type opts)]
-                (do
-                  (when (and ignore? (= vt :ignore))
-                    (raise "Cannot ignore both key and value" {}))
-                  (let [decode (decode-field kv opts :value-type vt rtx)
-                        type (custom/resolve-type-at kv name rtx)]
-                    (when-let [match (cv/find-value-at kv (index raw dbi :key nil)
-                                                      type key rtx)]
-                      ;; Matching already copied the associated index bytes and
-                      ;; reconstructed the stored key in this snapshot.
-                      (let [value (decode (:associated match))]
-                        (if ignore? value [(:value match) value])))))
-                (let [decode (pair-decoder kv opts kt vt ignore? rtx)
-                      ref (cv/encode-order kt key)]
-                  (when-let [pair (i/get-value raw dbi ref :raw :raw false)]
-                    (decode pair)))))
+            (read-get-value kv raw dbi args opts rtx)
 
             (:get-range :get-first :get-first-n)
-            (let [[n args] (if (= op :get-first-n) [(first args) (subvec args 1)] [nil args])
-                  [kr kt vt ignore?] (defaults args [nil :data :data false])
-                  [kr pkt] (physical-range kv opts :key-type kt kr)
-                  decode (pair-decoder kv opts kt vt ignore? rtx)]
-              (case op
-                :get-first (some-> (i/get-first raw dbi kr pkt :raw false) decode)
-                :get-first-n (mapv decode (i/get-first-n raw dbi n kr pkt :raw false))
-                (mapv decode (i/get-range raw dbi kr pkt :raw false))))
+            (read-range kv raw dbi op args opts rtx)
 
-            (:range-count :key-range-count :key-range-list-count :list-range-count)
-            (let [[kr kt] (defaults args [nil :data])
-                  [kr pkt] (physical-range kv opts :key-type kt kr)]
-              ((case op :key-range-count i/key-range-count
-                     :range-count i/range-count
-                     :list-range-count i/list-range-count i/key-range-list-count)
-               raw dbi kr pkt))
+            (:range-count :key-range-count :key-range-list-count
+                          :list-range-count)
+            (read-range-count kv raw dbi op args opts)
 
             :key-range
-            (let [[kr kt] (defaults args [nil :data])
-                  [kr pkt] (physical-range kv opts :key-type kt kr)
-                  decode (decode-field kv opts :key-type kt rtx)]
-              (mapv decode (i/key-range raw dbi kr pkt)))
+            (read-key-range kv raw dbi args opts rtx)
 
             :get-rank
-            (let [[key kt] (defaults args [nil :data])
-                  kt (field-type opts :key-type kt)]
-              (when-let [ref (key-ref kv raw dbi opts key kt)]
-                (i/get-rank raw dbi ref :raw)))
+            (read-get-rank kv raw dbi args opts)
 
             (:get-by-rank :sample-kv)
-            (let [[n kt vt ignore?] (defaults args [nil :data :data true])
-                  decode (pair-decoder kv opts kt vt ignore? rtx)]
-              (if (= op :sample-kv)
-                (mapv decode (i/sample-kv raw dbi n :raw :raw false))
-                (some-> (i/get-by-rank raw dbi n :raw :raw false) decode)))
+            (read-by-rank kv raw dbi op args opts rtx)
 
             (:get-list :list-count :in-list? :near-list :visit-list)
-            (let [[visitor args] (if (= op :visit-list)
-                                   [(first args) (subvec args 1)] [nil args])
-                  [key value kt vt raw?]
-                  (if (#{:in-list? :near-list} op)
-                    (defaults args [nil nil :data :data true])
-                    (let [[key kt vt raw?] (defaults args [nil :data :data true])]
-                      [key nil kt vt raw?]))
-                  kt (field-type opts :key-type kt)
-                  vt (field-type opts :value-type vt)
-                  ref (key-ref kv raw dbi opts key kt)]
-              (case op
-                :list-count (if ref (i/list-count raw dbi ref :raw) 0)
-                :get-list (if ref (mapv (decode-field kv opts :value-type vt rtx)
-                                        (i/get-list raw dbi ref :raw :raw)) [])
-                :in-list? (boolean
-                           (when ref
-                             (if-let [name (:value-type opts)]
-                               (cv/find-value kv (index raw dbi :item ref)
-                                              (custom/resolve-type kv name) value)
-                               (i/in-list? raw dbi ref value :raw vt))))
-                :near-list
-                (when ref
-                  (let [[vr pvt] (physical-range kv opts :value-type vt [:at-least value])]
-                    (when-let [[_ v] (i/list-range-first raw dbi [:closed ref ref] :raw vr pvt)]
-                      (if (:value-type opts)
-                        (ByteBuffer/wrap ^bytes
-                                         (i/get-value raw c/custom-values
-                                                      (cv/reference-id v) :id :raw))
-                        (ByteBuffer/wrap ^bytes v)))))
-                :visit-list
-                (when ref
-                  (i/visit-list raw dbi
-                                (if raw? visitor
-                                    (let [decode (decode-field kv opts :value-type vt rtx)]
-                                      (fn [v] (visitor (decode v)))))
-                                ref :raw :raw raw?))))
+            (read-list kv raw dbi op args opts rtx)
 
             (:list-range :list-range-first :list-range-first-n)
-            (let [[n args] (if (= op :list-range-first-n)
-                             [(first args) (subvec args 1)] [nil args])
-                  [kr kt vr vt] args
-                  [kr pkt] (physical-range kv opts :key-type kt kr)
-                  [vr pvt] (physical-range kv opts :value-type vt vr)
-                  decode (pair-decoder kv opts kt vt false rtx)
-                  physical (fn [[k v]] [(if (= pkt :raw) k (cv/encode-order pkt k))
-                                        (if (= pvt :raw) v (cv/encode-order pvt v))])]
-              (case op
-                :list-range-first (some-> (i/list-range-first raw dbi kr pkt vr pvt) physical decode)
-                :list-range-first-n (mapv (comp decode physical)
-                                          (i/list-range-first-n raw dbi n kr pkt vr pvt))
-                (mapv (comp decode physical) (i/list-range raw dbi kr pkt vr pvt))))
+            (read-list-range kv raw dbi op args opts rtx)
 
-            (:get-some :range-filter :range-keep :range-some :range-filter-count :visit)
-            (let [[pred kr kt vt & tail] (defaults args [nil nil :data :data])
-                  [ignore? raw?] (if (#{:get-some :range-filter} op)
-                                  (defaults tail [false true])
-                                  [false (first (defaults tail [true]))])]
-              (scan-callback kv raw dbi opts op pred kr kt nil vt ignore? raw? rtx))
+            (:get-some :range-filter :range-keep :range-some
+                       :range-filter-count :visit)
+            (read-filter-scan kv raw dbi op args opts rtx)
 
             (:list-range-filter :list-range-filter-count :list-range-keep
-                                :list-range-some :visit-list-range :visit-list-key-range)
-            (let [[pred kr kt vr vt raw?]
-                  (if (= op :visit-list-key-range)
-                    (let [[pred kr kt vt raw?] (defaults args [nil nil :data :data true])]
-                      [pred kr kt [:all] vt raw?])
-                    (defaults args [nil nil :data nil :data true]))]
-              (scan-callback kv raw dbi opts op pred kr kt vr vt false raw? rtx))
+                                :list-range-some :visit-list-range
+                                :visit-list-key-range)
+            (read-list-filter-scan kv raw dbi op args opts rtx)
 
             (:visit-key-range :visit-key-sample :visit-list-sample)
-            (let [[indices args] (if (#{:visit-key-sample :visit-list-sample} op)
-                                  [(first args) (subvec args 1)] [nil args])
-                  [visitor kr kt vt raw?]
-                  (if (= op :visit-list-sample)
-                    (defaults args [nil nil :data :data true])
-                    (let [[visitor kr kt raw?] (defaults args [nil nil :data true])]
-                      [visitor kr kt :ignore raw?]))
-                  [kr pkt] (physical-range kv opts :key-type kt kr)
-                  decode (pair-decoder kv opts kt vt false rtx)
-                  dk (decode-field kv opts :key-type kt rtx)
-                  f (if raw? visitor
-                        (if (= op :visit-list-sample)
-                          #(apply visitor (decode (raw-pair %)))
-                          (if (= op :visit-key-range)
-                            #(visitor (dk (b/read-buffer % :raw)))
-                            #(visitor (dk (b/read-buffer (l/k %) :raw)) nil))))]
-              (case op
-                :visit-key-range (i/visit-key-range raw dbi f kr pkt true)
-                :visit-key-sample (i/visit-key-sample raw dbi indices f kr pkt true)
-                (i/visit-list-sample raw dbi indices f kr pkt :raw true)))
+            (read-visit kv raw dbi op args opts rtx)
 
             (raise "Unsupported custom KV read" {:operation op})))))))

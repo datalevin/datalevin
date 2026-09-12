@@ -2825,6 +2825,277 @@
      :recursive? (when stratum
                    (recursive-stratum? stratum deps rule-name))}))
 
+(declare solve-stratified*)
+
+(defn- rename-stratum-rules
+  [rules stratum]
+  (reduce
+    (fn [m rname]
+      (assoc m rname (rename-rule (rules rname))))
+    {} stratum))
+
+(defn- precompute-stratum-rels
+  [context precompute-context deps full-renamed-rules external-heads
+   resolve-clause-fn]
+  (reduce
+    (fn [m rname]
+      (let [branches (full-renamed-rules rname)]
+        (cond
+          (nil? branches)                        m
+          (contains? (:rule-rels context) rname) m
+          (recursive? deps rname)                m
+          :else
+          (let [head-vars (rest (ffirst branches))]
+            (assoc m rname
+                   (solve-stratified* precompute-context
+                                      rname
+                                      head-vars
+                                      resolve-clause-fn))))))
+    {} external-heads))
+
+(defn- build-stratum-seeds
+  [context args entry-renamed-branches entry-renamed-head stratum-set
+   stratum-recursive?]
+  (let [required-indices (required-seeds entry-renamed-branches
+                                         entry-renamed-head context)
+        bound-indices    (bound-arg-indices args context)
+        ;; When recursion preserves certain head vars unchanged, we can
+        ;; safely seed on those bound args (lightweight magic-set style)
+        stable-indices   (stable-head-idxs entry-renamed-branches
+                                           stratum-set)
+        magic-indices    (set/intersection bound-indices stable-indices)
+        constant-indices (into #{}
+                               (keep-indexed
+                                 (fn [idx arg]
+                                   (when (not (qu/free-var? arg))
+                                     idx)))
+                               args)
+        stable-const-indices (set/intersection stable-indices
+                                               constant-indices)
+        ;; Seeding recursive strata with constant arguments can drop
+        ;; necessary intermediate bindings (e.g. recursive calls that
+        ;; introduce new head values), so only seed on required vars
+        ;; when recursion is involved. Constants are also safe if the
+        ;; corresponding head var is stable through recursion.
+        seed-indices (sort
+                       (if stratum-recursive?
+                         (set/union required-indices magic-indices
+                                    stable-const-indices)
+                         (set/union required-indices constant-indices
+                                    bound-indices)))
+        ;; warm start: only when a single outer relation already covers
+        ;; all head vars
+        warm-start
+        (when (and stratum-recursive? (every? qu/free-var? args))
+          (when-let [rel (some #(when (every? (set entry-renamed-head)
+                                              (keys (:attrs %)))
+                                  %)
+                               (:rels context))]
+            (project-rule-result rel entry-renamed-head)))
+        seed-rels
+        (reduce
+          (fn [rels idx]
+            (let [hv  (nth entry-renamed-head idx)
+                  arg (nth args idx)]
+              (if (qu/free-var? arg)
+                ;; Bind to Outer Context Var
+                ;; Filter and extract index in single pass to avoid
+                ;; repeated (:attrs rel) lookups
+                (let [outer-with-idx (into []
+                                           (keep (fn [rel]
+                                                   (when-let [idx ((:attrs rel)
+                                                                   arg)]
+                                                     [rel idx])))
+                                           (:rels context))]
+                  (if (seq outer-with-idx)
+                    (into
+                      rels
+                      (map (fn [[rel idx]]
+                             ;; View: Rename attr
+                             (r/relation! {hv 0}
+                                          (unique-seeds rel idx))))
+                      outer-with-idx)
+                    rels))
+                ;; Bind to Constant
+                (conj rels
+                      (r/relation! {hv 0}
+                                   (doto (FastList.)
+                                     (.add (object-array [arg]))))))))
+          [] seed-indices)]
+    {:seed-rels  seed-rels
+     :warm-start warm-start}))
+
+(defn- partition-stratum-branches
+  [renamed-rules-map stratum stratum-set full-renamed-rules]
+  (let [base-branches-map
+        (reduce
+          (fn [m rname]
+            (let [branches (renamed-rules-map rname)
+                  base     (filterv
+                             #(not (recursive-branch? % stratum-set))
+                             branches)]
+              (if (seq base) (assoc m rname base) m)))
+          {} stratum)
+        rec-branches-map
+        (reduce
+          (fn [m rname]
+            (let [branches (renamed-rules-map rname)
+                  rec      (filterv
+                             #(recursive-branch? % stratum-set)
+                             branches)]
+              (if (seq rec) (assoc m rname rec) m)))
+          {} stratum)
+        ;; Track recursive dependencies so we can skip work when no
+        ;; relevant deltas arrived in an iteration.
+        stratum-deps
+        (reduce
+          (fn [m rname]
+            (assoc m rname (reduce
+                             (fn [acc branch]
+                               (reduce
+                                 (fn [acc clause]
+                                   (if (sequential? clause)
+                                     (let [head (rule-head clause)]
+                                       (if (stratum-set head)
+                                         (conj acc head)
+                                         acc))
+                                     acc))
+                                 acc (rest branch)))
+                             #{} (renamed-rules-map rname))))
+          {} stratum)
+        empty-stratum-rels
+        (zipmap stratum
+                (mapv #(empty-rel-for-rule % full-renamed-rules)
+                      stratum))]
+    {:base-branches-map  base-branches-map
+     :rec-branches-map   rec-branches-map
+     :stratum-deps       stratum-deps
+     :empty-stratum-rels empty-stratum-rels}))
+
+(defn- eval-stratum-base-cases
+  [context rule-name stratum base-branches-map clean-context
+   full-renamed-rules seed-rels base-rule-rels warm-start magic-seeds
+   stratum-set resolve-clause-fn]
+  (let [start-totals
+        (reduce
+          (fn [acc rname]
+            (let [branches (base-branches-map rname)]
+              (assoc acc rname (if branches
+                                 (eval-rule-body
+                                   (assoc clean-context
+                                          :rules full-renamed-rules
+                                          :rels seed-rels
+                                          :rule-totals base-rule-rels)
+                                   rname branches resolve-clause-fn)
+                                 (empty-rel-for-rule
+                                   rname full-renamed-rules)))))
+          {} stratum)
+        start-totals (if warm-start
+                       (update start-totals rule-name
+                               #(r/sum-rel warm-start %))
+                       start-totals)]
+    (if magic-seeds
+      (reduce
+        (fn [acc [rname seed-rel]]
+          (if (and seed-rel (stratum-set rname))
+            (let [head-vars (rest (ffirst (full-renamed-rules rname)))
+                  seed-rel  (rename-rel-attrs seed-rel head-vars)]
+              (update acc rname r/sum-rel seed-rel))
+            acc))
+        start-totals magic-seeds)
+      start-totals)))
+
+(defn- run-stratum-fixpoint
+  [start-totals stratum-recursive? stratum clean-context full-renamed-rules
+   seed-rels base-rule-rels empty-stratum-rels rec-branches-map stratum-deps
+   temporal-elim? magic-threshold resolve-clause-fn]
+  (if-not stratum-recursive?
+    start-totals
+    ;; Maintain seen-sets for deduplication across iterations.
+    ;; This is critical for cyclic graphs where the same tuple can be
+    ;; reached through paths of different lengths.
+    (let [seen-sets
+          (reduce
+            (fn [m rname]
+              (let [init-rel  (start-totals rname)
+                    init-size (if-let [^List ts (:tuples init-rel)]
+                                (.size ts)
+                                0)
+                    capacity  (max 16 (* 4 ^long init-size))
+                    seen      (HashSet. (int capacity))]
+                (r/add-to-seen! init-rel seen)
+                (assoc m rname seen)))
+            {} stratum)]
+      (loop [totals      start-totals
+             deltas      start-totals
+             has-deltas? (some r/rel-not-empty (vals start-totals))
+             iter        0]
+        (if (not has-deltas?)
+          totals
+          (let [iter-context
+                (assoc clean-context
+                       :rules full-renamed-rules
+                       :rels seed-rels
+                       :rule-rels (merge base-rule-rels
+                                         empty-stratum-rels
+                                         deltas)
+                       ;; Only use base-rule-rels for size estimation
+                       ;; (pre-computed non-recursive rules), not the
+                       ;; stratum's iterative totals which can affect
+                       ;; clause ordering in ways that break correctness
+                       :rule-totals base-rule-rels)
+
+                ;; Fused tuple production with deduplication.
+                eval-one
+                (fn [rname]
+                  (let [branches (rec-branches-map rname)
+                        deps     (stratum-deps rname)
+                        dep-delta?
+                        (some (fn [dep]
+                                (let [rel (deltas dep)]
+                                  (and rel (r/rel-not-empty rel))))
+                              deps)]
+                    (when (and branches dep-delta?)
+                      (let [deduped (eval-rule-body-with-dedup
+                                      iter-context rname branches
+                                      resolve-clause-fn
+                                      (seen-sets rname))]
+                        (when (r/rel-not-empty deduped)
+                          [rname deduped])))))
+
+                new-deltas
+                (if (> (count stratum) 1)
+                  (into {} (keep identity) (pmap eval-one stratum))
+                  (if-let [result (eval-one (first stratum))]
+                    {(first result) (second result)}
+                    {}))
+
+                new-totals
+                (if (and temporal-elim?
+                         (not *keep-temporal-intermediates*))
+                  (if (some r/rel-not-empty (vals new-deltas))
+                    new-deltas
+                    totals)
+                  (reduce
+                    (fn [acc rname]
+                      (let [diff (new-deltas rname)]
+                        (if diff
+                          (update acc rname r/sum-rel diff)
+                          acc)))
+                    totals stratum))
+
+                ;; Check for magic explosion: if magic rules have grown
+                ;; beyond threshold, abort and fall back to non-magic
+                _ (when magic-threshold
+                    (let [cur-size (magic-rules-size new-totals)]
+                      (when (> cur-size ^long magic-threshold)
+                        (throw (ex-info "Magic explosion"
+                                        {:type         ::magic-explosion
+                                         :current-size cur-size
+                                         :threshold    magic-threshold})))))]
+            (recur new-totals new-deltas
+                   (seq new-deltas) (inc iter))))))))
+
 (defn- solve-stratified*
   [context rule-name args resolve-clause-fn]
   (let [{:keys [rules deps] :as info}
@@ -2840,20 +3111,16 @@
           (let [stratum-set    (set stratum)
                 temporal-cache (:temporal-idx-cache (meta deps))
                 ;; 1. Rename rules in stratum to avoid collision & freshen vars
-                renamed-rules-map
-                (reduce
-                  (fn [m rname]
-                    (assoc m rname (rename-rule (rules rname))))
-                  {} stratum)
-
+                renamed-rules-map (rename-stratum-rules rules stratum)
                 full-renamed-rules (merge rules renamed-rules-map)
                 rules-context      (assoc context :rules full-renamed-rules)
                 stratum-branches   (mapcat identity (vals renamed-rules-map))
                 external-heads     (external-rule-heads stratum-branches
                                                         rules-context
                                                         stratum-set)
-                ;; Check if any args are bound (either constants or vars with values)
-                ;; If so, skip precomputation - filtering will be more efficient
+                ;; Check if any args are bound (either constants or vars with
+                ;; values). If so, skip precomputation - filtering will be more
+                ;; efficient.
                 has-bound-args?    (some (fn [arg]
                                            (or (not (qu/free-var? arg))
                                                (some #(contains? (:attrs %) arg)
@@ -2873,21 +3140,9 @@
                       (dissoc :magic-seeds)))
                 precomputed-rels
                 (when precompute?
-                  (reduce
-                    (fn [m rname]
-                      (let [branches (full-renamed-rules rname)]
-                        (cond
-                          (nil? branches)                        m
-                          (contains? (:rule-rels context) rname) m
-                          (recursive? deps rname)                m
-                          :else
-                          (let [head-vars (rest (ffirst branches))]
-                            (assoc m rname
-                                   (solve-stratified* precompute-context
-                                                      rname
-                                                      head-vars
-                                                      resolve-clause-fn))))))
-                    {} external-heads))
+                  (precompute-stratum-rels context precompute-context deps
+                                           full-renamed-rules external-heads
+                                           resolve-clause-fn))
                 base-rule-rels     (merge (:rule-rels context) precomputed-rels)
 
                 ;; Detection of Temporal Elimination
@@ -2902,155 +3157,36 @@
                 entry-renamed-branches (renamed-rules-map rule-name)
                 entry-renamed-head     (rest (ffirst entry-renamed-branches))
 
-                required-indices (required-seeds entry-renamed-branches
-                                                 entry-renamed-head context)
-                bound-indices    (bound-arg-indices args context)
-
-                ;; When recursion preserves certain head vars unchanged, we can
-                ;; safely seed on those bound args (lightweight magic-set style)
-                stable-indices (stable-head-idxs entry-renamed-branches
-                                                 stratum-set)
-                magic-indices  (set/intersection bound-indices stable-indices)
+                {:keys [seed-rels warm-start]}
+                (build-stratum-seeds context args entry-renamed-branches
+                                     entry-renamed-head stratum-set
+                                     stratum-recursive?)
 
                 ;; 3. Build Seed Relations (only for required vars or constants)
-                constant-indices     (into #{}
-                                           (keep-indexed
-                                             (fn [idx arg]
-                                               (when (not (qu/free-var? arg))
-                                                 idx)))
-                                           args)
-                stable-const-indices (set/intersection stable-indices
-                                                       constant-indices)
-
-                ;; Seeding recursive strata with constant arguments can drop
-                ;; necessary intermediate bindings (e.g. recursive calls that
-                ;; introduce new head values), so only seed on required vars
-                ;; when recursion is involved. Constants are also safe if the
-                ;; corresponding head var is stable through recursion.
-                seed-indices (sort
-                               (if stratum-recursive?
-                                 (set/union required-indices magic-indices
-                                            stable-const-indices)
-                                 (set/union required-indices constant-indices
-                                            bound-indices)))
-
-                ;; warm start: only when a single outer relation already covers
-                ;; all head vars
-                warm-start
-                (when (and stratum-recursive? (every? qu/free-var? args))
-                  (when-let [rel (some #(when (every? (set entry-renamed-head)
-                                                      (keys (:attrs %)))
-                                          %)
-                                       (:rels context))]
-                    (project-rule-result rel entry-renamed-head)))
-
-                seed-rels
-                (reduce
-                  (fn [rels idx]
-                    (let [hv  (nth entry-renamed-head idx)
-                          arg (nth args idx)]
-                      (if (qu/free-var? arg)
-                        ;; Bind to Outer Context Var
-                        ;; Filter and extract index in single pass to avoid
-                        ;; repeated (:attrs rel) lookups
-                        (let [outer-with-idx (into []
-                                                   (keep (fn [rel]
-                                                           (when-let [idx ((:attrs rel) arg)]
-                                                             [rel idx])))
-                                                   (:rels context))]
-                          (if (seq outer-with-idx)
-                            (into
-                              rels
-                              (map (fn [[rel idx]]
-                                     ;; View: Rename attr
-                                     (r/relation! {hv 0}
-                                                  (unique-seeds rel idx))))
-                              outer-with-idx)
-                            rels))
-                        ;; Bind to Constant
-                        (conj rels
-                              (r/relation! {hv 0}
-                                           (doto (FastList.)
-                                             (.add (object-array [arg]))))))))
-                  [] seed-indices)
-
-	                clean-context
-	                (assoc (select-keys context
-	                                    [:sources :rule-rels :rules-deps
-	                                     :magic-seeds])
-	                       :rules-deps deps
-	                       :rule-rels base-rule-rels
-	                       :linear-eav-cache (atom {})
-	                       :linear-eav-keyed-seen-cache (atom {}))
+                clean-context
+                (assoc (select-keys context
+                                    [:sources :rule-rels :rules-deps
+                                     :magic-seeds])
+                       :rules-deps deps
+                       :rule-rels base-rule-rels
+                       :linear-eav-cache (atom {})
+                       :linear-eav-keyed-seen-cache (atom {}))
 
                 ;; Split branches into base (non-recursive) and recursive
-                base-branches-map
-                (reduce
-                  (fn [m rname]
-                    (let [branches (renamed-rules-map rname)
-                          base     (filterv
-                                     #(not (recursive-branch? % stratum-set))
-                                     branches)]
-                      (if (seq base) (assoc m rname base) m)))
-                  {} stratum)
-
-                rec-branches-map
-                (reduce
-                  (fn [m rname]
-                    (let [branches (renamed-rules-map rname)
-                          rec      (filterv
-                                     #(recursive-branch? % stratum-set)
-                                     branches)]
-                      (if (seq rec) (assoc m rname rec) m)))
-                  {} stratum)
-
-                ;; Track recursive dependencies so we can skip work when no
-                ;; relevant deltas arrived in an iteration.
-                stratum-deps
-                (reduce
-                  (fn [m rname]
-                    (assoc m rname (reduce
-                                     (fn [acc branch]
-                                       (reduce
-                                         (fn [acc clause]
-                                           (if (sequential? clause)
-                                             (let [head (rule-head clause)]
-                                               (if (stratum-set head)
-                                                 (conj acc head)
-                                                 acc))
-                                             acc))
-                                         acc (rest branch)))
-                                     #{} (renamed-rules-map rname))))
-                  {} stratum)
-
-                empty-stratum-rels
-                (zipmap stratum
-                        (mapv #(empty-rel-for-rule % full-renamed-rules)
-                              stratum))
+                {:keys [base-branches-map rec-branches-map stratum-deps
+                        empty-stratum-rels]}
+                (partition-stratum-branches renamed-rules-map stratum
+                                            stratum-set full-renamed-rules)
 
                 ;; 4. Evaluate Base Cases
-                start-totals
-                (reduce
-                  (fn [acc rname]
-                    (let [branches (base-branches-map rname)]
-                      (assoc acc rname (if branches
-                                         (eval-rule-body
-                                           (assoc clean-context
-                                                  :rules full-renamed-rules
-                                                  :rels seed-rels
-                                                  :rule-totals base-rule-rels)
-                                           rname branches resolve-clause-fn)
-                                         (empty-rel-for-rule
-                                           rname full-renamed-rules)))))
-                  {} stratum)
-
-                start-totals (if warm-start
-                               (update start-totals rule-name
-                                       #(r/sum-rel warm-start %))
-                               start-totals)
+                magic-seeds     (:magic-seeds context)
+                start-totals    (eval-stratum-base-cases
+                                  context rule-name stratum base-branches-map
+                                  clean-context full-renamed-rules seed-rels
+                                  base-rule-rels warm-start magic-seeds
+                                  stratum-set resolve-clause-fn)
 
                 ;; Track initial magic seed size for explosion detection
-                magic-seeds     (:magic-seeds context)
                 init-magic-size (if magic-seeds
                                   (reduce-kv
                                     (fn [^long acc _ rel]
@@ -3063,112 +3199,12 @@
                                   (* ^long init-magic-size
                                      ^long c/magic-explosion-factor))
 
-                start-totals (if magic-seeds
-                               (reduce
-                                 (fn [acc [rname seed-rel]]
-                                   (if (and seed-rel (stratum-set rname))
-                                     (let [head-vars (rest (ffirst
-                                                             (full-renamed-rules
-                                                               rname)))
-                                           seed-rel  (rename-rel-attrs
-                                                       seed-rel head-vars)]
-                                       (update acc rname r/sum-rel seed-rel))
-                                     acc))
-                                 start-totals magic-seeds)
-                               start-totals)
-
-                ;; Maintain seen-sets for deduplication across iterations.
-                ;; This is critical for cyclic graphs where the same tuple can be
-                ;; reached through paths of different lengths.
-                seen-sets
-                (when stratum-recursive?
-                  (reduce
-                    (fn [m rname]
-                      (let [init-rel  (start-totals rname)
-                            init-size (if-let [^List ts (:tuples init-rel)]
-                                        (.size ts)
-                                        0)
-                            capacity  (max 16 (* 4 ^long init-size))
-                            seen      (HashSet. (int capacity))]
-                        (r/add-to-seen! init-rel seen)
-                        (assoc m rname seen)))
-                    {} stratum))
-
-                final-totals
-                (if-not stratum-recursive?
-                  start-totals
-                  (loop [totals      start-totals
-                         deltas      start-totals
-                         has-deltas? (some r/rel-not-empty
-                                           (vals start-totals))
-                         iter        0]
-                    (if (not has-deltas?)
-                      totals
-                      (let [iter-context
-                            (assoc clean-context
-                                   :rules full-renamed-rules
-                                   :rels seed-rels
-                                   :rule-rels (merge base-rule-rels
-                                                     empty-stratum-rels
-                                                     deltas)
-                                   ;; Only use base-rule-rels for size estimation
-                                   ;; (pre-computed non-recursive rules), not the
-                                   ;; stratum's iterative totals which can affect
-                                   ;; clause ordering in ways that break correctness
-                                   :rule-totals base-rule-rels)
-
-                          ;; Fused tuple production with deduplication.
-                          eval-one
-                          (fn [rname]
-                            (let [branches (rec-branches-map rname)
-                                  deps     (stratum-deps rname)
-                                  dep-delta?
-                                  (some (fn [dep]
-                                          (let [rel (deltas dep)]
-                                            (and rel (r/rel-not-empty rel))))
-                                        deps)]
-                              (when (and branches dep-delta?)
-                                (let [deduped (eval-rule-body-with-dedup
-                                                iter-context rname branches
-                                                resolve-clause-fn
-                                                (seen-sets rname))]
-                                  (when (r/rel-not-empty deduped)
-                                    [rname deduped])))))
-
-                          new-deltas
-                          (if (> (count stratum) 1)
-                            (into {} (keep identity) (pmap eval-one stratum))
-                            (if-let [result (eval-one (first stratum))]
-                              {(first result) (second result)}
-                              {}))
-
-                          new-totals
-                          (if (and temporal-elim?
-                                   (not *keep-temporal-intermediates*))
-                            (if (some r/rel-not-empty (vals new-deltas))
-                              new-deltas
-                              totals)
-                            (reduce
-                              (fn [acc rname]
-                                (let [diff (new-deltas rname)]
-                                  (if diff
-                                    (update acc rname r/sum-rel diff)
-                                    acc)))
-                              totals stratum))
-
-                          ;; Check for magic explosion: if magic rules have grown
-                          ;; beyond threshold, abort and fall back to non-magic
-                          _ (when magic-threshold
-                              (let [cur-size (magic-rules-size new-totals)]
-                                (when (> cur-size ^long magic-threshold)
-                                  (throw (ex-info "Magic explosion"
-                                                  {:type         ::magic-explosion
-                                                   :current-size cur-size
-                                                   :threshold    magic-threshold})))))]
-
-                        (recur new-totals new-deltas
-                               (seq new-deltas) (inc iter))))))]
-
+                final-totals    (run-stratum-fixpoint
+                                  start-totals stratum-recursive? stratum
+                                  clean-context full-renamed-rules seed-rels
+                                  base-rule-rels empty-stratum-rels
+                                  rec-branches-map stratum-deps temporal-elim?
+                                  magic-threshold resolve-clause-fn)]
             (map-rule-result (final-totals rule-name)
                              entry-renamed-head args)))))))
 

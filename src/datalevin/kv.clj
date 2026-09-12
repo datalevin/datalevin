@@ -1105,6 +1105,141 @@
 
       :else nil)))
 
+(defn- note-snapshot-max-age-breach!
+  [info-v trigger-k now-ms]
+  (when (= trigger-k :max-age)
+    (vswap! info-v
+            (fn [m]
+              (-> m
+                  (update :snapshot-scheduler-max-age-breach-count
+                          (fnil inc 0))
+                  (assoc :snapshot-scheduler-last-max-age-breach-ms
+                         now-ms))))))
+
+(defn- defer-snapshot-run!
+  "When `trigger` must be deferred, record the defer state and return the
+   deferred result map; otherwise return nil."
+  [lmdb info-v trigger trigger-k now-ms]
+  (when-let [defer (snapshot-scheduler-defer-reason lmdb trigger now-ms)]
+    (let [min-backoff-ms (long (snapshot-defer-backoff-min-ms lmdb))
+          max-backoff-ms (long (snapshot-defer-backoff-max-ms lmdb))
+          m (vswap! info-v
+                    (fn [m]
+                      (let [reason (:reason defer)
+                            defer-count (or (:snapshot-scheduler-defer-count m)
+                                            {})
+                            defer-since-ms
+                            (long (or (:snapshot-scheduler-defer-since-ms m)
+                                      now-ms))
+                            defer-ms (max 0 (- now-ms defer-since-ms))
+                            prev-backoff-ms
+                            (long (or (:snapshot-scheduler-defer-backoff-ms m)
+                                      0))
+                            backoff-ms (if (pos? prev-backoff-ms)
+                                         (long (min max-backoff-ms
+                                                    (max min-backoff-ms
+                                                         (long (* 2
+                                                                  prev-backoff-ms)))))
+                                         min-backoff-ms)
+                            next-ms (long (+ (long now-ms) backoff-ms))
+                            defer* (assoc defer
+                                          :backoff-ms backoff-ms
+                                          :next-eligible-ms next-ms)]
+                        (assoc m
+                               :snapshot-scheduler-last-trigger trigger-k
+                               :snapshot-scheduler-last-trigger-details
+                               trigger
+                               :snapshot-scheduler-last-defer-ms now-ms
+                               :snapshot-scheduler-last-defer-reason reason
+                               :snapshot-scheduler-last-defer-trigger
+                               trigger-k
+                               :snapshot-scheduler-last-defer-details defer*
+                               :snapshot-scheduler-defer-since-ms
+                               defer-since-ms
+                               :snapshot-scheduler-last-defer-duration-ms
+                               defer-ms
+                               :snapshot-scheduler-next-eligible-ms next-ms
+                               :snapshot-scheduler-defer-backoff-ms backoff-ms
+                               :snapshot-scheduler-defer-count
+                               (update defer-count reason (fnil inc 0))
+                               :snapshot-scheduler-last-error nil))))]
+      {:deferred? true
+       :trigger trigger-k
+       :defer (:snapshot-scheduler-last-defer-details m)
+       :defer-duration-ms (:snapshot-scheduler-last-defer-duration-ms m)
+       :backoff-ms (:snapshot-scheduler-defer-backoff-ms m)
+       :next-eligible-ms (:snapshot-scheduler-next-eligible-ms m)})))
+
+(defn- run-snapshot-now!
+  "Run a scheduled snapshot and record success or failure bookkeeping."
+  [lmdb info-v trigger trigger-k]
+  (let [run-start-ms (System/currentTimeMillis)]
+    (vswap! info-v
+            (fn [m]
+              (let [defer-since-ms (:snapshot-scheduler-defer-since-ms m)
+                    defer-ms (when (number? defer-since-ms)
+                               (max 0 (- run-start-ms
+                                         (long defer-since-ms))))
+                    m' (-> m
+                           (assoc :snapshot-scheduler-last-run-start-ms
+                                  run-start-ms)
+                           (dissoc :snapshot-scheduler-next-eligible-ms
+                                   :snapshot-scheduler-defer-backoff-ms
+                                   :snapshot-scheduler-defer-since-ms))]
+                (if (number? defer-ms)
+                  (-> m'
+                      (update :snapshot-scheduler-defer-duration-ms
+                              (fnil + 0)
+                              (long defer-ms))
+                      (assoc :snapshot-scheduler-last-defer-duration-ms
+                             (long defer-ms)))
+                  m'))))
+    (try
+      (let [res (create-snapshot-now! lmdb)
+            run-finished-ms (System/currentTimeMillis)
+            run-duration-ms (max 0 (- run-finished-ms run-start-ms))]
+        (vswap! info-v
+                (fn [m]
+                  (-> m
+                      (update :snapshot-scheduler-run-count (fnil inc 0))
+                      (update :snapshot-scheduler-run-duration-ms
+                              (fnil + 0)
+                              run-duration-ms)
+                      (assoc
+                       :snapshot-scheduler-last-run-finished-ms run-finished-ms
+                       :snapshot-scheduler-last-run-duration-ms run-duration-ms
+                       :snapshot-scheduler-last-success-ms run-finished-ms
+                       :snapshot-scheduler-last-trigger trigger-k
+                       :snapshot-scheduler-last-trigger-details trigger
+                       :snapshot-scheduler-consecutive-failure-count 0
+                       :snapshot-scheduler-last-error nil))))
+        (assoc res
+               :trigger trigger-k
+               :run-duration-ms run-duration-ms))
+      (catch Exception e
+        (let [run-finished-ms (System/currentTimeMillis)
+              run-duration-ms (max 0 (- run-finished-ms run-start-ms))]
+          (vswap! info-v
+                  (fn [m]
+                    (-> m
+                        (update :snapshot-scheduler-run-count (fnil inc 0))
+                        (update :snapshot-scheduler-failure-count (fnil inc 0))
+                        (update :snapshot-scheduler-consecutive-failure-count
+                                (fnil inc 0))
+                        (update :snapshot-scheduler-run-duration-ms
+                                (fnil + 0)
+                                run-duration-ms)
+                        (assoc
+                         :snapshot-scheduler-last-run-finished-ms
+                         run-finished-ms
+                         :snapshot-scheduler-last-run-duration-ms
+                         run-duration-ms
+                         :snapshot-scheduler-last-failure-ms run-finished-ms
+                         :snapshot-scheduler-last-trigger trigger-k
+                         :snapshot-scheduler-last-trigger-details trigger
+                         :snapshot-scheduler-last-error (.getMessage e)))))
+          nil)))))
+
 (defn- maybe-run-snapshot-scheduler!
   [lmdb]
   (when (and (snapshot-scheduler-enabled? lmdb)
@@ -1121,186 +1256,18 @@
                    now-ms (System/currentTimeMillis)]
                (locking lock
                  (vswap! info-v assoc :snapshot-scheduler-last-run-ms now-ms)
-                 (let [next-eligible-ms (:snapshot-scheduler-next-eligible-ms @info-v)]
+                 (let [next-eligible-ms
+                       (:snapshot-scheduler-next-eligible-ms @info-v)]
                    (when-not (and (number? next-eligible-ms)
                                   (< now-ms (long next-eligible-ms)))
                      (if-let [trigger (snapshot-scheduler-trigger lmdb now-ms)]
                        (let [trigger-k (:trigger trigger)]
-                         (when (= trigger-k :max-age)
-                           (vswap! info-v
-                                   (fn [m]
-                                     (-> m
-                                         (update :snapshot-scheduler-max-age-breach-count
-                                                 (fnil inc 0))
-                                         (assoc
-                                          :snapshot-scheduler-last-max-age-breach-ms
-                                          now-ms)))))
-                         (if-let [defer (snapshot-scheduler-defer-reason
-                                         lmdb trigger now-ms)]
-                           (let [min-backoff-ms (long
-                                                 (snapshot-defer-backoff-min-ms lmdb))
-                                 max-backoff-ms (long
-                                                 (snapshot-defer-backoff-max-ms lmdb))
-                                 m (vswap! info-v
-                                           (fn [m]
-                                             (let [reason (:reason defer)
-                                                   defer-count (or
-                                                                (:snapshot-scheduler-defer-count
-                                                                 m)
-                                                                {})
-                                                   defer-since-ms (long
-                                                                   (or (:snapshot-scheduler-defer-since-ms
-                                                                        m)
-                                                                       now-ms))
-                                                   defer-ms (max 0
-                                                                 (- now-ms
-                                                                    defer-since-ms))
-                                                   prev-backoff-ms (long
-                                                                    (or (:snapshot-scheduler-defer-backoff-ms
-                                                                         m)
-                                                                        0))
-                                                   backoff-ms (if (pos?
-                                                                   prev-backoff-ms)
-                                                                (long
-                                                                 (min
-                                                                  max-backoff-ms
-                                                                  (max
-                                                                   min-backoff-ms
-                                                                   (long (* 2
-                                                                            prev-backoff-ms)))))
-                                                                min-backoff-ms)
-                                                   next-ms (long (+ (long now-ms)
-                                                                    backoff-ms))
-                                                   defer* (assoc defer
-                                                                 :backoff-ms
-                                                                 backoff-ms
-                                                                 :next-eligible-ms
-                                                                 next-ms)]
-                                               (assoc m
-                                                      :snapshot-scheduler-last-trigger
-                                                      trigger-k
-                                                      :snapshot-scheduler-last-trigger-details
-                                                      trigger
-                                                      :snapshot-scheduler-last-defer-ms
-                                                      now-ms
-                                                      :snapshot-scheduler-last-defer-reason
-                                                      reason
-                                                      :snapshot-scheduler-last-defer-trigger
-                                                      trigger-k
-                                                      :snapshot-scheduler-last-defer-details
-                                                      defer*
-                                                      :snapshot-scheduler-defer-since-ms
-                                                      defer-since-ms
-                                                      :snapshot-scheduler-last-defer-duration-ms
-                                                      defer-ms
-                                                      :snapshot-scheduler-next-eligible-ms
-                                                      next-ms
-                                                      :snapshot-scheduler-defer-backoff-ms
-                                                      backoff-ms
-                                                      :snapshot-scheduler-defer-count
-                                                      (update defer-count
-                                                              reason
-                                                              (fnil inc 0))
-                                                      :snapshot-scheduler-last-error
-                                                      nil))))]
-                             {:deferred? true
-                              :trigger trigger-k
-                              :defer (:snapshot-scheduler-last-defer-details m)
-                              :defer-duration-ms
-                              (:snapshot-scheduler-last-defer-duration-ms m)
-                              :backoff-ms (:snapshot-scheduler-defer-backoff-ms m)
-                              :next-eligible-ms
-                              (:snapshot-scheduler-next-eligible-ms m)})
-                           (let [run-start-ms (System/currentTimeMillis)]
-                             (vswap! info-v
-                                     (fn [m]
-                                       (let [defer-since-ms
-                                             (:snapshot-scheduler-defer-since-ms m)
-                                             defer-ms (when (number? defer-since-ms)
-                                                        (max 0
-                                                             (- run-start-ms
-                                                                (long defer-since-ms))))
-                                             m' (-> m
-                                                    (assoc
-                                                     :snapshot-scheduler-last-run-start-ms
-                                                     run-start-ms)
-                                                    (dissoc
-                                                     :snapshot-scheduler-next-eligible-ms
-                                                     :snapshot-scheduler-defer-backoff-ms
-                                                     :snapshot-scheduler-defer-since-ms))]
-                                         (if (number? defer-ms)
-                                           (-> m'
-                                               (update :snapshot-scheduler-defer-duration-ms
-                                                       (fnil + 0)
-                                                       (long defer-ms))
-                                               (assoc
-                                                :snapshot-scheduler-last-defer-duration-ms
-                                                (long defer-ms)))
-                                           m'))))
-                             (try
-                               (let [res (create-snapshot-now! lmdb)
-                                     run-finished-ms (System/currentTimeMillis)
-                                     run-duration-ms (max 0
-                                                          (- run-finished-ms
-                                                             run-start-ms))]
-                                 (vswap! info-v
-                                         (fn [m]
-                                           (-> m
-                                               (update :snapshot-scheduler-run-count
-                                                       (fnil inc 0))
-                                               (update :snapshot-scheduler-run-duration-ms
-                                                       (fnil + 0)
-                                                       run-duration-ms)
-                                               (assoc
-                                                :snapshot-scheduler-last-run-finished-ms
-                                                run-finished-ms
-                                                :snapshot-scheduler-last-run-duration-ms
-                                                run-duration-ms
-                                                :snapshot-scheduler-last-success-ms
-                                                run-finished-ms
-                                                :snapshot-scheduler-last-trigger
-                                                trigger-k
-                                                :snapshot-scheduler-last-trigger-details
-                                                trigger
-                                                :snapshot-scheduler-consecutive-failure-count
-                                                0
-                                                :snapshot-scheduler-last-error nil))))
-                                 (assoc res
-                                        :trigger trigger-k
-                                        :run-duration-ms run-duration-ms))
-                               (catch Exception e
-                                 (let [run-finished-ms (System/currentTimeMillis)
-                                       run-duration-ms (max 0
-                                                            (- run-finished-ms
-                                                               run-start-ms))]
-                                   (vswap! info-v
-                                           (fn [m]
-                                             (-> m
-                                                 (update :snapshot-scheduler-run-count
-                                                         (fnil inc 0))
-                                                 (update :snapshot-scheduler-failure-count
-                                                         (fnil inc 0))
-                                                 (update
-                                                  :snapshot-scheduler-consecutive-failure-count
-                                                  (fnil inc 0))
-                                                 (update
-                                                  :snapshot-scheduler-run-duration-ms
-                                                  (fnil + 0)
-                                                  run-duration-ms)
-                                                 (assoc
-                                                  :snapshot-scheduler-last-run-finished-ms
-                                                  run-finished-ms
-                                                  :snapshot-scheduler-last-run-duration-ms
-                                                  run-duration-ms
-                                                  :snapshot-scheduler-last-failure-ms
-                                                  run-finished-ms
-                                                  :snapshot-scheduler-last-trigger
-                                                  trigger-k
-                                                  :snapshot-scheduler-last-trigger-details
-                                                  trigger
-                                                  :snapshot-scheduler-last-error
-                                                  (.getMessage e)))))
-                                   nil))))))
+                         (note-snapshot-max-age-breach! info-v trigger-k
+                                                        now-ms)
+                         (or (defer-snapshot-run! lmdb info-v trigger
+                                                  trigger-k now-ms)
+                             (run-snapshot-now! lmdb info-v trigger
+                                                trigger-k)))
                        (vswap! info-v dissoc
                                :snapshot-scheduler-defer-since-ms
                                :snapshot-scheduler-next-eligible-ms

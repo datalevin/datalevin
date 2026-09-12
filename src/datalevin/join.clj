@@ -338,6 +338,159 @@
         (sequential? (aget ^objects (.get tuples i) idx)) true
         :else (recur (unchecked-inc-int i))))))
 
+(defn- build-dense-value-domain!
+  "Populate `value-ordinals`/`ordinal-values` and exact hash-side join counts.
+   Marks `unresolved-projection` when a lookup-marked value is a sequential
+   lookup ref."
+  [hash-tuples value-idx lookup-value? value-ordinals
+   ordinal-values hash-key-fn join-counts unresolved-projection]
+  (let [^List hash-tuples hash-tuples
+        value-idx (long value-idx)
+        ^HashMap value-ordinals value-ordinals
+        ^FastList ordinal-values ordinal-values
+        ^HashMap join-counts join-counts
+        ^booleans unresolved-projection unresolved-projection]
+    (dotimes [i (.size hash-tuples)]
+      (let [^objects tuple (.get hash-tuples i)
+            value          (aget tuple value-idx)]
+        ;; A lookup-marked var is common for ref-valued rule heads, even
+        ;; when an EAV scan has already produced numeric entity ids. The
+        ;; dense representation is safe for those resolved values. Keep
+        ;; the conservative path for actual lookup-ref tuples because it
+        ;; preserves their original query representation.
+        (when (and lookup-value? (sequential? value))
+          (aset unresolved-projection 0 true))
+        (when-not (.containsKey value-ordinals value)
+          (.put value-ordinals value (.size ordinal-values))
+          (.add ordinal-values value))
+        (let [join-key (hash-key-fn tuple)
+              n        (.get join-counts join-key)]
+          (.put join-counts join-key
+                (unchecked-inc (long (or n 0)))))))))
+
+(defn- count-dense-candidate-pairs
+  "Count the exact number of proof pairs and the distinct anchor domain.
+   Returns `[candidate-pairs anchors]`."
+  [scan-tuples anchor-idx lookup-anchor? join-counts scan-key-fn
+   unresolved-projection]
+  (let [^List scan-tuples scan-tuples
+        anchor-idx (long anchor-idx)
+        ^HashMap join-counts join-counts
+        ^booleans unresolved-projection unresolved-projection
+        ^HashSet anchors (HashSet.)
+        candidate-pairs
+        (long
+          (loop [i 0, total 0]
+            (if (< i (.size scan-tuples))
+              (let [^objects tuple (.get scan-tuples i)
+                    anchor         (aget tuple anchor-idx)
+                    _              (when (and lookup-anchor?
+                                              (sequential? anchor))
+                                     (aset unresolved-projection 0 true))
+                    _              (.add anchors anchor)
+                    n              (.get join-counts (scan-key-fn tuple))
+                    n              (long (or n 0))
+                    total          (if (> total (- Long/MAX_VALUE n))
+                                     Long/MAX_VALUE
+                                     (unchecked-add total n))]
+                (recur (unchecked-inc-int i) total))
+              total)))]
+    [candidate-pairs anchors]))
+
+(defn- build-dense-adjacency
+  "Map each join key to the bitmap of distinct projected values reachable on
+   the hash side."
+  [hash-tuples hash-key-fn value-idx value-ordinals roaring? domain-size]
+  (let [^List hash-tuples hash-tuples
+        value-idx (long value-idx)
+        ^HashMap value-ordinals value-ordinals
+        domain-size (long domain-size)
+        ^HashMap adjacency (HashMap.)]
+    ;; Each join key maps to the distinct projected values reachable on the
+    ;; hash side.
+    (dotimes [i (.size hash-tuples)]
+      (let [^objects tuple (.get hash-tuples i)
+            join-key       (hash-key-fn tuple)
+            values         (or (.get adjacency join-key)
+                               (let [values (composition-bitmap
+                                              roaring? domain-size)]
+                                 (.put adjacency join-key values)
+                                 values))
+            ^Number ordinal (.get value-ordinals (aget tuple value-idx))]
+        (composition-bitmap-add! roaring? values (.intValue ordinal))))
+    adjacency))
+
+(defn- compose-dense-groups
+  "OR the hash-side value sets into per-anchor groups. Returns
+   `[groups total-output]`, where `total-output` is a one-element long array."
+  [scan-tuples adjacency scan-key-fn anchor-idx roaring? domain-size]
+  (let [^List scan-tuples scan-tuples
+        ^HashMap adjacency adjacency
+        anchor-idx (long anchor-idx)
+        domain-size (long domain-size)
+        ^HashMap groups (HashMap.)
+        ^longs total-output (long-array 1)]
+    ;; Composition becomes an OR of complete value sets instead of one
+    ;; hash-set insertion for every proof pair.
+    (dotimes [i (.size scan-tuples)]
+      (let [^objects tuple (.get scan-tuples i)
+            values         (.get adjacency (scan-key-fn tuple))]
+        (when values
+          (let [anchor        (aget tuple anchor-idx)
+                known         (.get groups anchor)]
+            (if known
+              (when (< (composition-bitmap-cardinality roaring? known)
+                       domain-size)
+                (let [before (composition-bitmap-cardinality roaring? known)]
+                  (composition-bitmap-or! roaring? known values)
+                  (aset total-output 0
+                        (unchecked-add
+                          (aget total-output 0)
+                          (long
+                            (- (composition-bitmap-cardinality
+                                 roaring? known)
+                               before))))))
+              (let [copy (clone-composition-bitmap roaring? values)]
+                (.put groups anchor copy)
+                (aset total-output 0
+                      (unchecked-add
+                        (aget total-output 0)
+                        (composition-bitmap-cardinality roaring? copy)))))))))
+    [groups total-output]))
+
+(defn- emit-dense-composition
+  "Emit the composed relation tuples."
+  [groups total-output vars anchor-var value-var ordinal-values roaring?]
+  (let [^HashMap groups groups
+        ^longs total-output total-output
+        ^List vars vars
+        ^FastList ordinal-values ordinal-values
+        anchor-pos (int (.indexOf vars anchor-var))
+        value-pos  (int (.indexOf vars value-var))
+        capacity   (int (Math/min (aget total-output 0) (long 1000000)))
+        output     (FastList. capacity)]
+    (doseq [^Map$Entry entry (.entrySet groups)]
+      (let [anchor (.getKey entry)
+            known  (.getValue entry)
+            emit!  (fn [^long ordinal]
+                     (let [tuple (object-array 2)]
+                       (aset tuple anchor-pos anchor)
+                       (aset tuple value-pos
+                             (.get ordinal-values ordinal))
+                       (.add output tuple)))]
+        (if roaring?
+          (let [^PeekableIntIterator iter
+                (.getIntIterator ^RoaringBitmap known)]
+            (while (.hasNext iter)
+              (emit! (.next iter))))
+          (loop [ordinal (.nextSetBit ^BitSet known 0)]
+            (when-not (neg? ordinal)
+              (emit! ordinal)
+              (recur (.nextSetBit
+                       ^BitSet known
+                       (unchecked-inc-int ordinal))))))))
+    output))
+
 (defn ^:no-doc dense-binary-composition
   "Use bitset unions for a dense two-relation composition. Returns nil when
    the shape or measured relation density does not justify the representation."
@@ -393,44 +546,14 @@
                        (sampled-key-reuse? hash-tuples hash-key-fn)
                        (sampled-key-reuse? scan-tuples scan-build-key-fn)))
           ;; Establish a compact value domain and exact hash-side key counts.
-          (dotimes [i (.size hash-tuples)]
-            (let [^objects tuple (.get hash-tuples i)
-                  value          (aget tuple value-idx)]
-              ;; A lookup-marked var is common for ref-valued rule heads, even
-              ;; when an EAV scan has already produced numeric entity ids. The
-              ;; dense representation is safe for those resolved values. Keep
-              ;; the conservative path for actual lookup-ref tuples because it
-              ;; preserves their original query representation.
-              (when (and lookup-value? (sequential? value))
-                (aset unresolved-projection 0 true))
-              (when-not (.containsKey value-ordinals value)
-                (.put value-ordinals value (.size ordinal-values))
-                (.add ordinal-values value))
-              (let [join-key (hash-key-fn tuple)
-                    n        (.get join-counts join-key)]
-                (.put join-counts join-key
-                      (unchecked-inc (long (or n 0)))))))
+          (build-dense-value-domain!
+            hash-tuples value-idx lookup-value? value-ordinals
+            ordinal-values hash-key-fn join-counts unresolved-projection)
           ;; Count the other output domain and exact number of proof pairs.
-          (let [^HashSet anchors (HashSet.)
-                candidate-pairs
-                (long
-                  (loop [i 0, total 0]
-                    (if (< i (.size scan-tuples))
-                      (let [^objects tuple (.get scan-tuples i)
-                            anchor         (aget tuple anchor-idx)
-                            _              (when (and lookup-anchor?
-                                                      (sequential? anchor))
-                                             (aset unresolved-projection
-                                                   0 true))
-                            _              (.add anchors anchor)
-                            n              (.get join-counts
-                                                 (scan-key-fn tuple))
-                            n              (long (or n 0))
-                            total          (if (> total (- Long/MAX_VALUE n))
-                                             Long/MAX_VALUE
-                                             (unchecked-add total n))]
-                        (recur (unchecked-inc-int i) total))
-                      total)))
+          (let [[candidate-pairs anchors]
+                (count-dense-candidate-pairs
+                  scan-tuples anchor-idx lookup-anchor? join-counts
+                  scan-key-fn unresolved-projection)
                 domain-size  (.size ordinal-values)
                 anchor-count (.size anchors)
                 bitset-words (long (quot (+ (long domain-size) 63) 64))
@@ -446,92 +569,27 @@
                        (>= candidate-pairs
                            (* dense-composition-min-fanout input-size))
                        (<= bitset-bytes dense-composition-max-bitset-bytes))
-              (let [^HashMap adjacency (HashMap.)]
-                ;; Each join key maps to the distinct projected values
-                ;; reachable on the hash side.
-                (dotimes [i (.size hash-tuples)]
-                  (let [^objects tuple (.get hash-tuples i)
-                        join-key       (hash-key-fn tuple)
-                        values         (or (.get adjacency join-key)
-                                           (let [values
-                                                 (composition-bitmap
-                                                   roaring? domain-size)]
-                                             (.put adjacency join-key values)
-                                             values))
-                        ^Number ordinal
-                        (.get value-ordinals (aget tuple value-idx))]
-                    (composition-bitmap-add!
-                      roaring? values (.intValue ordinal))))
-                ;; Composition becomes an OR of complete value sets instead of
-                ;; one hash-set insertion for every proof pair.
-                (let [^HashMap groups (HashMap.)
-                      ^longs total-output (long-array 1)]
-                  (dotimes [i (.size scan-tuples)]
-                    (let [^objects tuple (.get scan-tuples i)
-                          values         (.get adjacency (scan-key-fn tuple))]
-                      (when values
-                        (let [anchor        (aget tuple anchor-idx)
-                              known         (.get groups anchor)]
-                          (if known
-                            (when (< (composition-bitmap-cardinality
-                                      roaring? known)
-                                     domain-size)
-                              (let [before (composition-bitmap-cardinality
-                                             roaring? known)]
-                                (composition-bitmap-or!
-                                  roaring? known values)
-                                (aset total-output 0
-                                      (unchecked-add
-                                        (aget total-output 0)
-                                        (long
-                                          (- (composition-bitmap-cardinality
-                                               roaring? known)
-                                             before))))))
-                            (let [copy (clone-composition-bitmap
-                                         roaring? values)]
-                              (.put groups anchor copy)
-                              (aset total-output 0
-                                    (unchecked-add
-                                      (aget total-output 0)
-                                      (composition-bitmap-cardinality
-                                        roaring? copy)))))))))
-                  (let [anchor-pos (int (.indexOf ^List vars anchor-var))
-                        value-pos  (int (.indexOf ^List vars value-var))
-                        capacity   (int (Math/min (aget total-output 0)
-                                                  (long 1000000)))
-                        output     (FastList. capacity)]
-                    (doseq [^Map$Entry entry (.entrySet groups)]
-                      (let [anchor (.getKey entry)
-                            known  (.getValue entry)
-                            emit!  (fn [^long ordinal]
-                                     (let [tuple (object-array 2)]
-                                       (aset tuple anchor-pos anchor)
-                                       (aset tuple value-pos
-                                             (.get ordinal-values ordinal))
-                                       (.add output tuple)))]
-                        (if roaring?
-                          (let [^PeekableIntIterator iter
-                                (.getIntIterator ^RoaringBitmap known)]
-                            (while (.hasNext iter)
-                              (emit! (.next iter))))
-                          (loop [ordinal (.nextSetBit ^BitSet known 0)]
-                            (when-not (neg? ordinal)
-                              (emit! ordinal)
-                              (recur (.nextSetBit
-                                       ^BitSet known
-                                       (unchecked-inc-int ordinal))))))))
-                    (-> (r/relation! (zipmap vars (range)) output)
-                        (r/with-unique-key vars)
-                        (vary-meta
-                          assoc ::dense-composition
-                          {:candidate-pairs candidate-pairs
-                           :input-tuples   input-size
-                           :output-tuples  (aget total-output 0)
-                           :anchor-count   anchor-count
-                           :domain-size    domain-size
-                           :bitmap         (if roaring? :roaring :dense)
-                           :memory-limit   dense-composition-max-bitset-bytes
-                           :memory-upper-bound bitset-bytes}))))))))))))
+              (let [adjacency (build-dense-adjacency
+                                hash-tuples hash-key-fn value-idx
+                                value-ordinals roaring? domain-size)
+                    [groups total-output]
+                    (compose-dense-groups scan-tuples adjacency scan-key-fn
+                                          anchor-idx roaring? domain-size)
+                    output (emit-dense-composition
+                             groups total-output vars anchor-var value-var
+                             ordinal-values roaring?)]
+                (-> (r/relation! (zipmap vars (range)) output)
+                    (r/with-unique-key vars)
+                    (vary-meta
+                      assoc ::dense-composition
+                      {:candidate-pairs candidate-pairs
+                       :input-tuples   input-size
+                       :output-tuples  (aget total-output 0)
+                       :anchor-count   anchor-count
+                       :domain-size    domain-size
+                       :bitmap         (if roaring? :roaring :dense)
+                       :memory-limit   dense-composition-max-bitset-bytes
+                       :memory-upper-bound bitset-bytes}))))))))))
 
 (defn hash-join-project-distinct
   "Hash-join two relations while retaining only distinct `vars`, without

@@ -2316,6 +2316,86 @@
         [base-cost input-rows]
         stages))))
 
+(defn- adjust-access-sample
+  [db parsed-q inputs plan step sample? bounded-sample? sample-size
+   sample-cost-budget estimate range-rows join-candidates]
+  (let [preflight (when bounded-sample?
+                    (access-sample-preflight
+                      step (:joins plan) join-candidates sample-size
+                      (max 0.0 (double sample-cost-budget)) estimate
+                      range-rows))]
+    (cond
+      (:aborted? preflight)
+      {:sample        (FastList.)
+       :sample-batch  nil
+       :sample-rows   0
+       :sample-output 0
+       :sample-cost   0.0
+       :stages        (:stages preflight)
+       :aborted?      true
+       :abort         (:abort preflight)}
+
+      sample?
+      (sample-access-joins
+        db parsed-q inputs step (:joins plan) sample-size
+        sample-cost-budget estimate)
+
+      :else
+      {:sample        (FastList.)
+       :sample-batch  nil
+       :sample-rows   0
+       :sample-output 0
+       :sample-cost   0.0
+       :stages        []})))
+
+(defn- access-remaining-budget
+  [sample-rows candidate-budget range-rows point-scan-rows scan-rows reusable?]
+  (let [reused-rows (long (if reusable? sample-rows 0))
+        candidate-remaining (- candidate-budget reused-rows)
+        range-remaining (- range-rows reused-rows)
+        point-scan-remaining (- point-scan-rows reused-rows)
+        scan-remaining (- scan-rows reused-rows)]
+    {:reused-rows          reused-rows
+     :remaining-candidates (if (pos? candidate-remaining)
+                             candidate-remaining
+                             0)
+     :remaining-range      (if (pos? range-remaining) range-remaining 0)
+     :remaining-point-scan (if (pos? point-scan-remaining)
+                             point-scan-remaining
+                             0)
+     :remaining-scan       (if (pos? scan-remaining) scan-remaining 0)}))
+
+(defn- access-selection-cost
+  [estimate adaptive? sample-rows sample-output range-rows
+   remaining-point-scan point-output-rows remaining-scan output-rows stages]
+  (let [point-cost (adjusted-access-cost
+                     estimate remaining-point-scan point-output-rows stages)
+        upper-cost (adjusted-access-cost
+                     estimate remaining-scan output-rows stages)
+        selection-cost (if (or (not adaptive?)
+                               (and (pos? sample-rows)
+                                    (zero? sample-output)
+                                    (< sample-rows range-rows)))
+                         upper-cost
+                         point-cost)]
+    {:point-cost     point-cost
+     :upper-cost     upper-cost
+     :selection-cost selection-cost}))
+
+(defn- apply-access-adjustments
+  [plan step work estimate sample sample-batch reusable? aborted? abort]
+  (cond-> (assoc plan
+                 :work work
+                 :estimate estimate
+                 :step (assoc step
+                              :work work
+                              :sample sample
+                              :sample-batch (when reusable? sample-batch))
+                 :sample-batch (when reusable? sample-batch))
+    aborted?
+    (assoc :unavailable? true
+           :unavailable-reason (:reason abort))))
+
 (defn- adjust-access-plan
   [db parsed-q inputs
    {:keys [step path demand work estimate sample-cost-budget join-candidates]
@@ -2335,36 +2415,11 @@
                                (number? sample-cost-budget)
                                (Double/isFinite
                                  (double sample-cost-budget)))
-          preflight       (when bounded-sample?
-                            (access-sample-preflight
-                              step (:joins plan) join-candidates sample-size
-                              (max 0.0 (double sample-cost-budget)) estimate
-                              range-rows))
           {:keys [sample sample-batch sample-rows sample-output sample-cost
                   stages aborted? abort]}
-          (cond
-            (:aborted? preflight)
-            {:sample        (FastList.)
-             :sample-batch  nil
-             :sample-rows   0
-             :sample-output 0
-             :sample-cost   0.0
-             :stages        (:stages preflight)
-             :aborted?      true
-             :abort         (:abort preflight)}
-
-            sample?
-            (sample-access-joins
-              db parsed-q inputs step (:joins plan) sample-size
-              sample-cost-budget estimate)
-
-            :else
-            {:sample        (FastList.)
-             :sample-batch  nil
-             :sample-rows   0
-             :sample-output 0
-             :sample-cost   0.0
-             :stages        []})
+          (adjust-access-sample db parsed-q inputs plan step sample?
+                                bounded-sample? sample-size sample-cost-budget
+                                estimate range-rows join-candidates)
           sample-rows     (long sample-rows)
           sample-output   (long sample-output)
           yield           (if (pos? sample-rows)
@@ -2403,30 +2458,15 @@
                                (qaccess/reusable-sample? path)
                                adaptive?
                                (some? sample-batch))
-          reused-rows     (long (if reusable? sample-rows 0))
-          candidate-remaining (- candidate-budget reused-rows)
-          remaining-candidates
-          (if (pos? candidate-remaining) candidate-remaining 0)
-          range-remaining (- range-rows reused-rows)
-          remaining-range
-          (if (pos? range-remaining) range-remaining 0)
-          point-scan-remaining (- point-scan-rows reused-rows)
-          remaining-point-scan
-          (if (pos? point-scan-remaining) point-scan-remaining 0)
-          scan-remaining (- scan-rows reused-rows)
-          remaining-scan
-          (if (pos? scan-remaining) scan-remaining 0)
-          point-cost      (adjusted-access-cost
-                            estimate remaining-point-scan
-                            point-output-rows stages)
-          upper-cost      (adjusted-access-cost
-                            estimate remaining-scan output-rows stages)
-          selection-cost  (if (or (not adaptive?)
-                                  (and (pos? sample-rows)
-                                       (zero? sample-output)
-                                       (< sample-rows range-rows)))
-                            upper-cost
-                            point-cost)
+          {:keys [reused-rows remaining-candidates remaining-range
+                  remaining-point-scan remaining-scan]}
+          (access-remaining-budget sample-rows candidate-budget range-rows
+                                   point-scan-rows scan-rows reusable?)
+          {:keys [point-cost upper-cost selection-cost]}
+          (access-selection-cost estimate adaptive? sample-rows sample-output
+                                 range-rows remaining-point-scan
+                                 point-output-rows remaining-scan output-rows
+                                 stages)
           estimate        (assoc estimate
                                  :rows point-output-rows
                                  :range-rows range-rows
@@ -2464,18 +2504,8 @@
                      (long (or (:batch-size work)
                                initial-candidate-budget))
                      (long initial-candidate-budget))))]
-      (cond->
-          (assoc plan
-                 :work work
-                 :estimate estimate
-                 :step (assoc step
-                              :work work
-                              :sample sample
-                              :sample-batch (when reusable? sample-batch))
-                 :sample-batch (when reusable? sample-batch))
-        aborted?
-        (assoc :unavailable? true
-               :unavailable-reason (:reason abort))))
+      (apply-access-adjustments plan step work estimate sample sample-batch
+                                reusable? aborted? abort))
     plan))
 
 (defn plan-access-joins
