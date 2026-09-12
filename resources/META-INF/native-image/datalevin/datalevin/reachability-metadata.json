@@ -131,25 +131,25 @@
             "type": "datalevin.binding.cpp.CppLMDB"
         },
         {
-            "type": "datalevin.binding.cpp.DBI"
+            "type": "datalevin.binding.cpp.buffer.DBI"
         },
         {
-            "type": "datalevin.binding.cpp.KV"
+            "type": "datalevin.binding.cpp.iter.KV"
         },
         {
-            "type": "datalevin.binding.cpp.KeyIterable"
+            "type": "datalevin.binding.cpp.iter.KeyIterable"
         },
         {
-            "type": "datalevin.binding.cpp.ListFullValIterable"
+            "type": "datalevin.binding.cpp.iter.ListFullValIterable"
         },
         {
-            "type": "datalevin.binding.cpp.ListIterable"
+            "type": "datalevin.binding.cpp.iter.ListIterable"
         },
         {
             "type": "datalevin.binding.cpp.ListRandKeyValIterable"
         },
         {
-            "type": "datalevin.binding.cpp.ListSampleIterable"
+            "type": "datalevin.binding.cpp.iter.ListSampleIterable"
         },
         {
             "type": "datalevin.binding.cpp.Rtx"
