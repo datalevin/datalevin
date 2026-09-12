@@ -13,15 +13,13 @@
    [datalevin.constants :as c]
    [datalevin.custom-kv :as custom-kv]
    [datalevin.interface :as i]
-   [datalevin.kv.snapshot :refer [list-snapshot-entries
-                                  snapshot-max-age-ms]]
+   [datalevin.kv.snapshot :refer [list-snapshot-entries]]
    [datalevin.kv.retention :refer [delete-txlog-segment!
                                    txlog-log-dbi-drop!
                                    txlog-log-dbi-registration!
                                    txlog-retention-state-map]]
    [datalevin.kv.scheduler :as scheduler]
-   [datalevin.kv.txlog :as kvtx :refer [*wal-copy-backup-pin-enabled?*
-                                        close-failed-open!
+   [datalevin.kv.txlog :as kvtx :refer [close-failed-open!
                                         close-txlog-state!
                                         close-with-txlog!
                                         read-commit-marker-state
@@ -32,8 +30,6 @@
                                         verify-commit-marker-state
                                         create-snapshot-now!
                                         force-lmdb-sync-now!
-                                        maybe-notify-txn-log-copy-backup-pin-observer!
-                                        maybe-run-txn-log-copy-backup-pin-failpoint!
                                         recover-from-snapshot-open!
                                         txlog-clear-replica-floor-state!
                                         txlog-clear-snapshot-floor-state!
@@ -42,15 +38,13 @@
                                         txlog-rollout-mode
                                         txlog-rollout-watermarks
                                         txlog-records
-                                        txlog-snapshot-floor-state
                                         txlog-unpin-backup-floor-state!
                                         txlog-update-replica-floor-state!
                                         txlog-update-snapshot-floor-state!
                                         txlog-watermarks-map
                                         txlog-write-path-enabled?
                                         with-runtime-txlog-state-guard
-                                        with-write-txn-lock-before-runtime-txlog-state
-                                        write-txn-open?]]
+                                        with-write-txn-lock-before-runtime-txlog-state]]
    [datalevin.lmdb :as l]
    [datalevin.txlog :as txlog]
    [datalevin.util :refer [deftype+ raise]])
@@ -236,72 +230,6 @@
 (defn txlog-unpin-backup-floor!
   [db pin-id]
   (txlog-unpin-backup-floor-state! db pin-id))
-
-(defn- txlog-copy-with-backup-pin!
-  [lmdb raw-lmdb dest compact?]
-  (if (and *wal-copy-backup-pin-enabled?*
-           (txlog-write-path-enabled? raw-lmdb))
-    (let [compact? (boolean compact?)
-          context
-          (with-write-txn-lock-before-runtime-txlog-state
-            raw-lmdb
-            (fn []
-              (when (write-txn-open? raw-lmdb)
-                (raise "Cannot copy LMDB while write transaction is open"
-                       {:type :txlog/copy-write-transaction-open
-                        :dest dest
-                        :compact? compact?}))
-              (let [state (txlog/enabled-state raw-lmdb)
-                    _ (txlog-force-sync! state)
-                    _ (force-lmdb-sync-now! raw-lmdb)
-                    watermarks (txlog-watermarks-map raw-lmdb state)
-                    applied-lsn (long (or (:last-applied-lsn watermarks) 0))
-                    snapshot-pin-floor-state
-                    (txlog-snapshot-floor-state raw-lmdb
-                                                (or (i/env-opts raw-lmdb) {})
-                                                applied-lsn)
-                    pin-floor-lsn (long (:floor-lsn
-                                         snapshot-pin-floor-state))
-                    started-ms (System/currentTimeMillis)
-                    pin-id (str "backup-copy/" started-ms "-"
-                                (java.util.UUID/randomUUID))
-                    pin-ttl-ms (long (max 60000
-                                          (long (snapshot-max-age-ms
-                                                 raw-lmdb))))
-                    pin-expires-ms (long (+ (long started-ms) pin-ttl-ms))]
-                (txlog-pin-backup-floor-state! raw-lmdb
-                                               pin-id
-                                               pin-floor-lsn
-                                               pin-expires-ms)
-                {:lmdb lmdb
-                 :dest dest
-                 :compact? compact?
-                 :pin-id pin-id
-                 :pin-floor-lsn pin-floor-lsn
-                 :pin-expires-ms pin-expires-ms
-                 :applied-lsn applied-lsn
-                 :started-ms started-ms})))]
-      (try
-        (maybe-notify-txn-log-copy-backup-pin-observer! context)
-        (maybe-run-txn-log-copy-backup-pin-failpoint! context)
-        (i/copy raw-lmdb dest compact?)
-        (let [completed-ms (System/currentTimeMillis)]
-          {:started-ms (:started-ms context)
-           :completed-ms completed-ms
-           :duration-ms (max 0 (- completed-ms
-                                   (long (:started-ms context))))
-           :compact? compact?
-           :backup-pin {:pin-id (:pin-id context)
-                        :floor-lsn (:pin-floor-lsn context)
-                        :expires-ms (:pin-expires-ms context)}})
-        (finally
-          (try
-            (txlog-unpin-backup-floor-state! raw-lmdb (:pin-id context))
-            (catch Exception e
-              (when-let [info-v (i/kv-info raw-lmdb)]
-                (vswap! info-v assoc :copy-last-backup-unpin-error
-                        (.getMessage e))))))))
-    (i/copy raw-lmdb dest compact?)))
 
 (declare wrap-lmdb)
 
@@ -541,7 +469,7 @@
           (i/close-transact-kv db)))))
   (closed-kv? [this] (i/closed-kv? db))
   (copy [this dest] (.copy this dest false))
-  (copy [this dest compact?] (txlog-copy-with-backup-pin! this db dest compact?))
+  (copy [this dest compact?] (kvtx/txlog-copy-with-backup-pin! this db dest compact?))
   (dbi-opts [this dbi-name] (i/dbi-opts db dbi-name))
   (drop-dbi [this dbi-name]
     (custom-kv/guard-internal! db dbi-name)
