@@ -27,7 +27,7 @@
    [datalevin.relation :as r]
    [datalevin.storage :as storage]
    [datalevin.timeout :as timeout]
-   [datalevin.util :as u])
+   [datalevin.util :as u :refer [raise]])
   (:import
    [java.util AbstractCollection ArrayList Collection Collections HashSet List]
    [java.util.concurrent Callable CompletableFuture ConcurrentHashMap
@@ -965,7 +965,7 @@
                                         (get-pipe-thread-pool) tasks)]
             (.get f))))
 
-      (u/raise "Unsupported indexed semi-join step count"
+      (raise "Unsupported indexed semi-join step count"
                {:step-count (count join-steps)}))))
 
 (defn index-semi-join-execute-into
@@ -1481,7 +1481,7 @@
      (let [steps (into [] (remove #(identical? :identity (-type %))) steps)
            n     (count steps)]
        (when (zero? n)
-         (u/raise "Cannot execute an empty query plan" {}))
+         (raise "Cannot execute an empty query plan" {}))
        (when-not (and (< 2 n) (partition-plan? context db steps))
          (case n
            1
@@ -1546,9 +1546,9 @@
              (when (p/produce output)
                (recur))))]
     (when (zero? n)
-      (u/raise "Cannot count an empty query plan" {}))
+      (raise "Cannot count an empty query plan" {}))
     (when (writing? db)
-      (u/raise "Exact plan counting requires a read-only database" {}))
+      (raise "Exact plan counting requires a read-only database" {}))
     (doseq [^Future f (.invokeAll ^ExecutorService (get-pipe-thread-pool)
                                   (conj workers drain))]
       (.get f))
@@ -1559,7 +1559,7 @@
   [steps]
   (let [steps (vec steps)]
     (when (empty? steps)
-      (u/raise "Cannot inspect an empty query plan" {}))
+      (raise "Cannot inspect an empty query plan" {}))
     (cols->attrs (:cols (peek steps)))))
 
 (defn reduce-step-batches
@@ -1599,12 +1599,12 @@
                    (recur acc batch)))
                (if (pos? (.size batch)) (rf acc batch) acc))))]
     (when (zero? n)
-      (u/raise "Cannot reduce an empty query plan" {}))
+      (raise "Cannot reduce an empty query plan" {}))
     (when-not (pos? batch-size)
-      (u/raise "Plan reduction batch size must be positive"
+      (raise "Plan reduction batch size must be positive"
                {:batch-size batch-size}))
     (when (writing? db)
-      (u/raise "Exact plan reduction requires a read-only database" {}))
+      (raise "Exact plan reduction requires a read-only database" {}))
     (let [^java.util.List futures
           (.invokeAll ^ExecutorService (get-pipe-thread-pool)
                       (conj workers drain))]

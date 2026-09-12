@@ -14,7 +14,7 @@
    [datalevin.constants :as c]
    [datalevin.interface :as i :refer [get-range transact-kv]]
    [datalevin.lmdb :as l]
-   [datalevin.util :as u]
+   [datalevin.util :refer [raise]]
    [datalevin.validate :as vld])
   (:import
    [java.nio ByteBuffer]))
@@ -54,7 +54,7 @@
           (try
             [k (decode-kv-info-buffer vb (raw-header-type val-type))]
             (catch Exception e
-              (u/raise "Fail to decode kv-info entry"
+              (raise "Fail to decode kv-info entry"
                        e
                        {:key k
                         :key-type key-type

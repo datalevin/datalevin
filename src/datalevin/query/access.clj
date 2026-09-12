@@ -10,7 +10,8 @@
 (ns ^:no-doc datalevin.query.access
   "Logical and physical abstractions for query access methods."
   (:require
-   [datalevin.query-util :as qu])
+   [datalevin.query-util :as qu]
+   [datalevin.util :refer [raise]])
   (:import
    [datalevin.parser BindScalar DefaultSrc SrcVar]))
 
@@ -120,11 +121,11 @@
    (->AccessPolicy :restart :planning))
   ([sampling preparation]
    (when-not (#{:resumable :restart :none} sampling)
-     (throw (ex-info "Invalid access sampling policy"
-                     {:sampling sampling})))
+     (raise "Invalid access sampling policy"
+            {:sampling sampling}))
    (when-not (#{:planning :execution} preparation)
-     (throw (ex-info "Invalid access preparation policy"
-                     {:preparation preparation})))
+     (raise "Invalid access preparation policy"
+            {:preparation preparation}))
    (->AccessPolicy sampling preparation)))
 
 (defn source-symbol
@@ -197,9 +198,9 @@
      (if (satisfies? ICorrelatedAccessMethod method)
        (-open-correlated-access method path demand bounds work source bindings)
        (if (seq bindings)
-         (throw (ex-info "Access method does not support correlated bindings"
-                         {:method   (:method path)
-                          :bindings (keys bindings)}))
+         (raise "Access method does not support correlated bindings"
+                {:method   (:method path)
+                 :bindings (keys bindings)})
          (-open-access method path demand bounds work source))))))
 
 (defn frontier-satisfies?

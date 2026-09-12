@@ -13,7 +13,7 @@
    [datalevin.interface :refer [bf-uncompress]]
    [datalevin.lmdb :as l :refer [IKV IListRandKeyValIterable
                                  IListRandKeyValIterator]]
-   [datalevin.util :as u])
+   [datalevin.util :refer [raise]])
   (:import
    [datalevin.dtlvnative DTLV DTLV$MDB_val DTLV$dtlv_key_iter
     DTLV$dtlv_key_rank_sample_iter DTLV$dtlv_list_iter
@@ -68,11 +68,11 @@
   (cond
     (== x DTLV/DTLV_TRUE)  true
     (== x DTLV/DTLV_FALSE) false
-    :else (u/raise "Native iterator returns error code" x {})))
+    :else (raise "Native iterator returns error code" x {})))
 
 (defn dtlv-c [^long x]
   (if (< x 0)
-    (u/raise "Native counter returns error code" x {})
+    (raise "Native counter returns error code" x {})
     x))
 
 (deftype KeyIterable [lmdb

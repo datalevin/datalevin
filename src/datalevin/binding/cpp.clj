@@ -683,7 +683,7 @@
               (vswap! info update :custom-dbis (fnil conj #{}) dbi-name))
             (.put dbis dbi-name db)
             db)
-          (u/raise (str "Reached maximal number of DBI: " max-dbis) {})))))
+          (raise (str "Reached maximal number of DBI: " max-dbis) {})))))
 
   (get-dbi [this dbi-name]
     (.get-dbi this dbi-name true))
@@ -696,7 +696,7 @@
               ;; environment reopen without creating an unknown database.
               (if (or create? (contains? (:dbis @info) dbi-name))
                 (.open-dbi this dbi-name)
-                (u/raise (str "DBI " dbi-name " is not open") {}))))))
+                (raise (str "DBI " dbi-name " is not open") {}))))))
 
   (clear-dbi [this dbi-name]
     (.check-ready this)

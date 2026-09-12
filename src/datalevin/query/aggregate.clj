@@ -14,7 +14,7 @@
    [datalevin.parser :as dp]
    [datalevin.query.resolve :as qresolve]
    [datalevin.relation :as r]
-   [datalevin.util :as u])
+   [datalevin.util :as u :refer [raise]])
   (:import
    [datalevin.parser Constant PlainSymbol SrcVar Variable]
    [datalevin.utl NumberOps]
@@ -366,7 +366,7 @@
           (when-not (qresolve/server-safe-resolver?)
             (qresolve/resolve-sym sym))
           (when (qresolve/server-safe-resolver?)
-            (u/raise
+            (raise
               "Server query cannot call unregistered aggregate function '" sym
               {:error :query/where
                :var sym
@@ -382,7 +382,7 @@
     (when (and (qresolve/server-safe-resolver?)
                (instance? Variable fn-expr))
       (let [sym (.-symbol ^Variable fn-expr)]
-        (u/raise
+        (raise
           "Server query cannot call unregistered aggregate function '" sym
           {:error :query/where
            :var sym

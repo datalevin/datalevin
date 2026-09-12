@@ -17,7 +17,7 @@
    [datalevin.constants :as c]
    [datalevin.interface :refer [bf-compress set-max-val-size]]
    [datalevin.lmdb :as l :refer [IBuffer IDB]]
-   [datalevin.util :as u :refer [raise]])
+   [datalevin.util :refer [raise]])
   (:import
    [datalevin.dtlvnative DTLV DTLV$MDB_val DTLV$MDB_stat]
    [datalevin.cpp BufVal Cursor Dbi Stat Txn UnsafeAccess Util]
