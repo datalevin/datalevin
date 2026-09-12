@@ -15,12 +15,16 @@
    [datalevin.interface :as i]
    [datalevin.kv.txlog :as kvtx :refer [read-commit-marker-state
                                         txlog-backup-pin-floor-state
+                                        txlog-config-enabled?
                                         txlog-replica-floor-state
+                                        txlog-rollout-mode
+                                        txlog-rollout-watermarks
                                         txlog-snapshot-floor-state
                                         txlog-vector-floor-state
                                         txlog-record-lsn
                                         txlog-watermarks
-                                        txlog-write-path-enabled?]]
+                                        txlog-write-path-enabled?
+                                        with-runtime-txlog-state-guard]]
    [datalevin.txlog :as txlog]
    [datalevin.util :refer [raise]]))
 
@@ -131,3 +135,54 @@
                    c/kv-info
                    [[:del [:dbis dbi-name]]]
                    [:keyword :string])))
+
+(defn txlog-retention-state-local
+  [db]
+  (with-runtime-txlog-state-guard
+    db
+    (fn []
+      (if-let [state (txlog-retention-state-map db nil false)]
+        (dissoc state :gc-target-segments)
+        (if (txlog-config-enabled? db)
+          (let [rollout-mode (txlog-rollout-mode db)]
+            {:wal? true
+             :skipped? true
+             :reason :rollback
+             :watermarks (txlog-rollout-watermarks db rollout-mode)})
+          {:wal? false})))))
+
+(defn gc-txlog-segments-local!
+  [db retain-floor-lsn]
+  (with-runtime-txlog-state-guard
+    db
+    (fn []
+      (if-let [before (txlog-retention-state-map db retain-floor-lsn true)]
+        (let [targets (:gc-target-segments before)
+              deleted (mapv delete-txlog-segment! targets)
+              deleted-bytes (reduce (fn [acc {:keys [bytes]}]
+                                      (+ ^long acc ^long bytes))
+                                    0 targets)
+              _ (when-let [state (txlog/state db)]
+                  (txlog/note-gc-deleted-bytes! state deleted-bytes))
+              after (txlog-retention-state-map db retain-floor-lsn false)]
+          {:ok? true
+           :deleted-count (count deleted)
+           :deleted-bytes deleted-bytes
+           :deleted-segment-ids (mapv :segment-id targets)
+           :deleted-segments deleted
+           :operator-retain-floor-lsn
+           (get-in before [:floors :operator-retain-floor-lsn])
+           :before (dissoc before :gc-target-segments)
+           :after (dissoc after :gc-target-segments)})
+        (if (txlog-config-enabled? db)
+          (let [rollout-mode (txlog-rollout-mode db)]
+            {:ok? false
+             :skipped? true
+             :reason :rollback
+             :retain-floor-lsn retain-floor-lsn
+             :watermarks (txlog-rollout-watermarks db rollout-mode)})
+          {:ok? false
+           :skipped? true
+           :reason :wal-disabled
+           :retain-floor-lsn retain-floor-lsn
+           :watermarks {:wal? false}})))))
