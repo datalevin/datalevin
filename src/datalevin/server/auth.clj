@@ -21,15 +21,15 @@
    [org.bouncycastle.crypto.params Argon2Parameters
     Argon2Parameters$Builder]))
 
-(def ^:private view-act :datalevin.server/view)
-(def ^:private alter-act :datalevin.server/alter)
-(def ^:private create-act :datalevin.server/create)
-(def ^:private control-act :datalevin.server/control)
+(def view-act :datalevin.server/view)
+(def alter-act :datalevin.server/alter)
+(def create-act :datalevin.server/create)
+(def control-act :datalevin.server/control)
 
-(def ^:private database-obj :datalevin.server/database)
-(def ^:private user-obj :datalevin.server/user)
-(def ^:private role-obj :datalevin.server/role)
-(def ^:private server-obj :datalevin.server/server)
+(def database-obj :datalevin.server/database)
+(def user-obj :datalevin.server/user)
+(def role-obj :datalevin.server/role)
+(def server-obj :datalevin.server/server)
 
 (def server-schema
   (merge c/implicit-schema
@@ -82,6 +82,25 @@
 (def permission-actions #{view-act alter-act create-act control-act})
 
 (def permission-objects #{database-obj user-obj role-obj server-obj})
+
+(def privileged-server-option-keys
+  "Server option keys that may only be set or mutated with the `::control`
+  permission. Shared by the server option filter and the message handlers."
+  #{:ha-mode
+    :ha-control-plane
+    :ha-members
+    :ha-membership-hash
+    :ha-node-id
+    :ha-client-credentials
+    :ha-fencing-hook
+    :ha-clock-skew-hook
+    :runtime-opts
+    :snapshot-dir
+    :spill-opts
+    :embedding-opts
+    :embedding-domains
+    :embedding-providers
+    :embedding-domain-providers})
 
 (defn salt
   "Generate a 16 byte salt."

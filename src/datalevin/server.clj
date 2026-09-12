@@ -183,26 +183,10 @@
 
 (def ^:private has-permission? auth/has-permission?)
 
-(def ^:private privileged-server-option-keys
-  #{:ha-mode
-    :ha-control-plane
-    :ha-members
-    :ha-node-id
-    :ha-client-credentials
-    :ha-fencing-hook
-    :ha-clock-skew-hook
-    :runtime-opts
-    :snapshot-dir
-    :spill-opts
-    :embedding-opts
-    :embedding-domains
-    :embedding-providers
-    :embedding-domain-providers})
-
 (defn- privileged-server-options
   [opts]
   (not-empty
-   (vec (filter #(contains? (or opts {}) %) privileged-server-option-keys))))
+   (vec (filter #(contains? (or opts {}) %) auth/privileged-server-option-keys))))
 
 (defn- require-control-for-privileged-server-options!
   [permissions opts]

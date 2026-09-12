@@ -26,7 +26,9 @@
    [datalevin.lmdb :as l]
    [datalevin.protocol :as p]
    [datalevin.server.api :as sapi]
-   [datalevin.server.auth :as auth]
+   [datalevin.server.auth :as auth
+    :refer [view-act alter-act create-act control-act database-obj user-obj
+            role-obj server-obj privileged-server-option-keys]]
    [datalevin.storage :as st]
    [datalevin.util :as u :refer [raise]]
    [datalevin.validate :as vld]
@@ -38,35 +40,10 @@
    [java.util.concurrent ConcurrentHashMap Semaphore]
    [datalevin.storage Store]))
 
-(def ^:private view-act :datalevin.server/view)
-(def ^:private alter-act :datalevin.server/alter)
-(def ^:private create-act :datalevin.server/create)
-(def ^:private control-act :datalevin.server/control)
-
-(def ^:private database-obj :datalevin.server/database)
-(def ^:private user-obj :datalevin.server/user)
-(def ^:private role-obj :datalevin.server/role)
-(def ^:private server-obj :datalevin.server/server)
 (def ^:private transient-runtime-store-max-attempts 8)
 (def ^:private transient-runtime-store-retry-sleep-ms 25)
 (def ^:private client-op-await-timeout-ms 30000)
 (def ^:private client-op-completed-retain-ms 60000)
-(def ^:private privileged-server-option-keys
-  #{:ha-mode
-    :ha-control-plane
-    :ha-members
-    :ha-membership-hash
-    :ha-node-id
-    :ha-client-credentials
-    :ha-fencing-hook
-    :ha-clock-skew-hook
-    :runtime-opts
-    :snapshot-dir
-    :spill-opts
-    :embedding-opts
-    :embedding-domains
-    :embedding-providers
-    :embedding-domain-providers})
 
 (defn- skey-state
   ^clojure.lang.Volatile [^SelectionKey skey]
