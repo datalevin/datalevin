@@ -14,7 +14,6 @@
    [datalevin.util :refer [raise]])
   (:import
    [datalevin.llm LlamaGenerator]
-   [java.io File]
    [java.lang AutoCloseable]))
 
 (defprotocol ILLMProvider

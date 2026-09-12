@@ -30,14 +30,14 @@
    [datalevin.query-util :as qu]
    [datalevin.relation :as r]
    [datalevin.rules :as rules]
-   [datalevin.util :as u :refer [cond+ raise conjv concatv map+]])
+   [datalevin.util :as u :refer [cond+ raise concatv map+]])
   (:import
    [java.util HashMap HashSet IdentityHashMap List]
    [java.util.concurrent ConcurrentHashMap]
    [datalevin.db DB]
    [datalevin.storage Store]
    [datalevin.utl DPKey LRUCache]
-   [datalevin.parser And BindColl BindIgnore BindScalar BindTuple Constant
+   [datalevin.parser And BindColl BindScalar BindTuple Constant
     DefaultSrc Function Or Variable Pattern Predicate Not RuleExpr]
    [org.eclipse.collections.impl.list.mutable FastList]))
 

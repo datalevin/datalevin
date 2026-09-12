@@ -12,14 +12,12 @@
   (:require
    [clojure.string :as s]
    [datalevin.constants :as c]
-   [datalevin.binding.cpp :as cpp]
    [datalevin.ha :as dha]
    [datalevin.ha.authority :as auth]
    [datalevin.ha.control :as ctrl]
    [datalevin.interface :as i]
    [datalevin.ha.replication :as drep]
    [datalevin.ha.util :as hu]
-   [datalevin.txlog :as txlog]
    [datalevin.util :as u]
    [taoensso.timbre :as log])
   (:import

@@ -1059,8 +1059,8 @@
                    :vec-checkpoint-duration-ms 0
                    :vec-checkpoint-bytes
                    (nonneg-long (or (:total-bytes meta-val) 0))
-                   :vec-checkpoint-failure-count 0})]
-      (let [vi (->VectorIndex lmdb
+                   :vec-checkpoint-failure-count 0})
+            vi (->VectorIndex lmdb
                               (volatile! false)
                               index
                               fname
@@ -1078,7 +1078,7 @@
                               checkpoint-stats
                               (ReentrantReadWriteLock.))]
         (swap! l/vector-indices assoc fname vi)
-        vi)))))
+        vi))))
 
 (defn new-vector-index
   [lmdb opts]

@@ -23,7 +23,7 @@
    [datalevin.db.tx.prepare :as txprep]
    [datalevin.idoc :as idoc]
    [datalevin.util :as u
-    :refer [case-tree defrecord-updatable conjv concatv]]
+    :refer [case-tree defrecord-updatable]]
    [datalevin.lmdb :as l]
    [datalevin.storage :as s]
    [datalevin.prepare :as prepare]
@@ -51,7 +51,7 @@
    [datalevin.storage Store]
    [datalevin.remote DatalogStore]
    [datalevin.utl LRUCache]
-   [java.util SortedSet Comparator Date]
+   [java.util Comparator]
    [java.util.concurrent ConcurrentHashMap]
    [org.eclipse.collections.impl.list.mutable FastList]
    [org.eclipse.collections.impl.set.sorted.mutable TreeSortedSet]))
@@ -2009,24 +2009,24 @@
               res                                    (r/tx-data store txs simulated?)
               db-info                                (when (map? res) (:db-info res))
               res                                    (if db-info (dissoc res :db-info) res)
-              [tx-data tempids max-eid new-attributes] (remote-tx-result res)]
-          (let [info (resolved-remote-db-info
-                       store db (or db-info {}) max-eid simulated?)]
-            (when-not simulated?
-              (invalidate-cache store
-                                tx-data
-                                (:last-modified info)
-                                (:max-tx info)))
-            (cond-> (assoc initial-report
-                           :db-after (-> (carry-runtime-opts (new-db store info) db)
-                                         (assoc :max-eid (:max-eid info))
-                                       (#(if simulated?
-                                           (update % :max-tx u/long-inc)
-                                           %)))
-                           :tx-data tx-data
-                           :tempids tempids)
-              (seq new-attributes) (assoc :new-attributes new-attributes)
-              simulated? mark-simulated-tx-cache!)))
+              [tx-data tempids max-eid new-attributes] (remote-tx-result res)
+              info (resolved-remote-db-info
+                     store db (or db-info {}) max-eid simulated?)]
+          (when-not simulated?
+            (invalidate-cache store
+                              tx-data
+                              (:last-modified info)
+                              (:max-tx info)))
+          (cond-> (assoc initial-report
+                         :db-after (-> (carry-runtime-opts (new-db store info) db)
+                                       (assoc :max-eid (:max-eid info))
+                                     (#(if simulated?
+                                         (update % :max-tx u/long-inc)
+                                         %)))
+                         :tx-data tx-data
+                         :tempids tempids)
+            (seq new-attributes) (assoc :new-attributes new-attributes)
+            simulated? mark-simulated-tx-cache!))
         (catch Exception e
           (throw e)))
       (let [entities (prepare-entities db initial-es tx-time)]

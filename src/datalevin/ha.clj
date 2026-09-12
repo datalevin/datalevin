@@ -12,7 +12,6 @@
   (:require
    [clojure.string :as s]
    [datalevin.constants :as c]
-   [datalevin.db :as db]
    [datalevin.ha.authority :as auth]
    [datalevin.ha.client-cache :as cache]
    [datalevin.ha.clock :as clock]
@@ -23,22 +22,13 @@
    [datalevin.ha.snapshot :as snap]
    [datalevin.ha.util :as hu]
    [datalevin.interface :as i]
-   [datalevin.kv :as kv]
-   [datalevin.remote :as r]
-   [datalevin.storage :as st]
    [datalevin.util :as u]
    [datalevin.validate :as vld]
    [taoensso.timbre :as log])
   (:import
-   [datalevin.db DB]
-   [datalevin.interface IStore ILMDB]
-   [datalevin.storage Store]
-   [java.net ConnectException URI]
-   [java.nio.channels ClosedChannelException]
-   [java.util UUID]
-   [java.util.concurrent Callable ExecutorCompletionService
-    ExecutorService Executors ForkJoinPool Future ThreadFactory TimeUnit]
-   [java.util.concurrent.atomic AtomicLong]))
+   [datalevin.interface IStore]
+   [java.util.concurrent TimeUnit]
+))
 
 (defn consensus-ha-opts
   [store]

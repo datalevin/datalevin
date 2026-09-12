@@ -106,12 +106,12 @@
           (is (some? fred) "fred is a friend")
           (is (nil? (find-fred ava-db-no-fred-friend)) "fred is not a friend anymore :(")
           ;; ava and fred make up
-          (let [ava-friends-with-fred (d/add ava-db-no-fred-friend :user/friends fred)]
+          (let [ava-friends-with-fred (d/add ava-db-no-fred-friend :user/friends fred)
+                db-with-friends       (d/db-with db [ava-friends-with-fred])
+                ava                   (d/entity db-with-friends [:user/handle "ava"])]
                                         ; tx-stage does not handle cardinality properly yet:
                                         ;(is (some? (find-fred ava-friends-with-fred))) ;; fails
-            (let [db-with-friends (d/db-with db [ava-friends-with-fred])
-                  ava             (d/entity db-with-friends [:user/handle "ava"])]
-              (is (some? (find-fred ava)) "officially friends again"))))))
+            (is (some? (find-fred ava)) "officially friends again")))))
 
     (d/close-db db)
     (u/delete-files dir)))

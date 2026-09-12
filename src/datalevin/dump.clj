@@ -258,13 +258,13 @@
                      (dump-datalog-section conn)
                      [schema opts])
                    (finally
-                     (conn/close conn))))]
-           (let [lmdb (l/open-kv src-dir)]
-             (try
-               (doseq [dbi (user-kv-dbis dbis schema opts)]
-                 (l/dump-dbi-section lmdb dbi))
-               (finally
-                 (i/close-kv lmdb))))))
+                     (conn/close conn))))
+               lmdb (l/open-kv src-dir)]
+           (try
+             (doseq [dbi (user-kv-dbis dbis schema opts)]
+               (l/dump-dbi-section lmdb dbi))
+             (finally
+               (i/close-kv lmdb)))))
        (let [lmdb (l/open-kv src-dir)]
          (try
            (l/dump-all lmdb data-output)

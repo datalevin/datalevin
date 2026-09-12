@@ -10,10 +10,8 @@
 (ns ^:no-doc datalevin.server.session
   "Client tracking and session bookkeeping."
   (:require
-   [datalevin.constants :as c]
    [datalevin.core :as d]
    [datalevin.lmdb :as l]
-   [datalevin.util :as u]
    [taoensso.timbre :as log])
   (:import
    [java.nio.channels ClosedSelectorException Selector SelectionKey]
@@ -88,14 +86,13 @@
             :when (not (get-in dbs [db-name :store]))
             :let  [m (get dbs db-name {})]]
       (if consensus-ha?
-        (do
-          ;; Consensus HA runtime identity is node-local. Persist the
-          ;; classification at explicit open time so restart can skip automatic
-          ;; reopen entirely, instead of probing the store and triggering txlog
-          ;; recovery before the fresh HA peer open happens.
-          (log/info "Skipping automatic reopen of consensus HA database"
-                    {:db-name db-name
-                     :root root}))
+        ;; Consensus HA runtime identity is node-local. Persist the
+        ;; classification at explicit open time so restart can skip automatic
+        ;; reopen entirely, instead of probing the store and triggering txlog
+        ;; recovery before the fresh HA peer open happens.
+        (log/info "Skipping automatic reopen of consensus HA database"
+                  {:db-name db-name
+                   :root root})
         (let [store ((:open-store-fn deps) root db-name dbis datalog?)
               consensus-ha? (and datalog?
                                  (some? ((:consensus-ha-opts-fn deps) store)))]

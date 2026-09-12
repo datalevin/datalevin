@@ -16,7 +16,7 @@
    [datalevin.bits :as b]
    [datalevin.util :as u]
    [datalevin.interface :as i
-    :refer [open-dbi close-kv list-dbi? entries visit-key-sample
+    :refer [open-dbi list-dbi? entries visit-key-sample
             visit-list-sample list-dbis ICompressor]]
    [datalevin.hu :as hu])
   (:import

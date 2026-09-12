@@ -1778,7 +1778,7 @@
           :when (.isFile src)]
     (u/copy-file (str src) (str (io/file dest name)))))
 
-(declare key-range-list-count-fast key-range-list-count-slow)
+(declare key-range-list-count-fast)
 
 (deftype CppLMDB [^Env env
                   info
@@ -2295,7 +2295,7 @@
   (key-range-count [lmdb dbi-name k-range]
     (.key-range-count lmdb dbi-name k-range :data))
   (key-range-count [lmdb dbi-name [range-type k1 k2] k-type]
-    (scan/scan
+    (scan/scan lmdb dbi-name
       (let [^RangeContext ctx (key-range-info* (.-key-codec ^DBI dbi) rtx
                                               range-type k1 k2 k-type)
             forward?          (.-forward? ctx)
@@ -2438,14 +2438,14 @@
   (list-count [lmdb dbi-name k kt]
     (.check-ready lmdb)
     (if k
-      (scan/scan
+      (scan/scan lmdb dbi-name
         (list-count* rtx cur k kt)
         (raise "Fail to count list: " e {:dbi dbi-name :k k}))
       0))
 
   (near-list [lmdb dbi-name k v kt vt]
     (.check-ready lmdb)
-    (scan/scan
+    (scan/scan lmdb dbi-name
       (near-list* dbi rtx cur k kt v vt)
       (raise "Fail to get an item that is near in a list: "
              e {:dbi dbi-name :k k :v v})))
@@ -2453,7 +2453,7 @@
   (in-list? [lmdb dbi-name k v kt vt]
     (.check-ready lmdb)
     (if (and k v)
-      (scan/scan
+      (scan/scan lmdb dbi-name
         (in-list?* dbi rtx cur k kt v vt)
         (raise "Fail to test if an item is in list: "
                e {:dbi dbi-name :k k :v v}))
@@ -2542,7 +2542,7 @@
 
 (defn- key-range-list-count-fast
   [lmdb dbi-name [range-type k1 k2] k-type]
-  (scan/scan
+  (scan/scan lmdb dbi-name
    (let [^RangeContext ctx (key-range-info* (.-key-codec ^DBI dbi) rtx
                                           range-type k1 k2 k-type)
          forward? (.-forward? ctx)

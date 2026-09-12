@@ -1074,14 +1074,14 @@
   [^bytes body]
   (let [bf (ByteBuffer/wrap body)
         {:keys [lsn ts ha-term op-count]}
-        (decode-commit-row-payload-prefix bf)]
-    (let [ops (loop [i (int 0)
-                     acc []]
-                (if (< i ^long op-count)
-                  (recur (unchecked-inc-int i) (conj acc (decode-kv-row bf)))
-                  acc))]
-      (cond-> {:lsn lsn
-               :ts ts
-               :ops ops}
-        (some? ha-term)
-        (assoc :ha-term (long ha-term))))))
+        (decode-commit-row-payload-prefix bf)
+        ops (loop [i (int 0)
+                   acc []]
+              (if (< i ^long op-count)
+                (recur (unchecked-inc-int i) (conj acc (decode-kv-row bf)))
+                acc))]
+    (cond-> {:lsn lsn
+             :ts ts
+             :ops ops}
+      (some? ha-term)
+      (assoc :ha-term (long ha-term)))))

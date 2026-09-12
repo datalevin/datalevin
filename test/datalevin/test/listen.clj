@@ -1,7 +1,7 @@
 (ns datalevin.test.listen
   (:require
    [datalevin.test.core :as tdc :refer [db-fixture]]
-   [clojure.test :refer [deftest testing is use-fixtures]]
+   [clojure.test :refer [deftest is use-fixtures]]
    [datalevin.core :as d]
    [datalevin.datom :as dd]
    [datalevin.util :as u]

@@ -13,7 +13,7 @@
    [datalevin.lmdb :as l]
    [datalevin.interface :as if
     :refer [clear-dbi env-dir get-value visit transact-kv closed-kv? open-dbi]]
-   [datalevin.util :as u :refer [cond+ raise conjs]]
+   [datalevin.util :as u :refer [cond+ raise]]
    [datalevin.spill :as sp]
    [datalevin.sparselist :as sl]
    [datalevin.analyzer :as a]
@@ -1642,8 +1642,8 @@
           :or   {analyzer        (default-opts :analyzer)
                  index-position? (default-opts :index-position?)
                  include-text?   (default-opts :include-text?)
-                 search-opts     (default-opts :search-opts)}} opts]
-   (let [terms-dbi     (str domain "/" c/terms)
+                 search-opts     (default-opts :search-opts)}} opts
+         terms-dbi     (str domain "/" c/terms)
          docs-dbi      (str domain "/" c/docs)
          positions-dbi (str domain "/" c/positions)
          rawtext-dbi   (str domain "/" c/rawtext)]
@@ -1665,7 +1665,7 @@
                        (AtomicInteger. max-term)
                        index-position?
                        include-text?
-                       search-opts))))))
+                       search-opts)))))
 
 (defn new-search-engine
   ([lmdb]
@@ -1785,8 +1785,8 @@
          {:keys [analyzer index-position? include-text?]
           :or   {analyzer        a/en-analyzer
                  index-position? false
-                 include-text?   false}} opts]
-   (let [terms-dbi     (str domain "/" c/terms)
+                 include-text?   false}} opts
+         terms-dbi     (str domain "/" c/terms)
          docs-dbi      (str domain "/" c/docs)
          positions-dbi (str domain "/" c/positions)
          rawtext-dbi   (str domain "/" c/rawtext)]
@@ -1802,7 +1802,7 @@
                     index-position?
                     include-text?
                     (FastList.)
-                    (HashMap.))))))
+                    (HashMap.)))))
 
 
 

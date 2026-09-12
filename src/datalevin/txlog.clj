@@ -11,8 +11,6 @@
   "WAL record codec, segment management, sync state, and metadata helpers."
   (:require
    [datalevin.binding.cpp]
-   [datalevin.buffer :as bf]
-   [datalevin.bits :as b]
    [clojure.java.io :as io]
    [datalevin.constants :as c]
    [datalevin.interface :as i]
@@ -21,20 +19,15 @@
    [datalevin.txlog.meta :as tmeta]
    [datalevin.txlog.recovery :as trec]
    [datalevin.txlog.segment :as tseg]
-   [datalevin.util :as u :refer [raise map+]]
+   [datalevin.util :as u :refer [raise]]
    [taoensso.timbre :as log])
   (:import
-   [datalevin.io PosixFsync]
    [java.io File]
-   [java.nio ByteBuffer ByteOrder BufferOverflowException]
    [java.nio.channels FileChannel FileLock OverlappingFileLockException]
-   [java.nio.file Files Path StandardCopyOption StandardOpenOption
-    AtomicMoveNotSupportedException]
-   [java.nio.charset StandardCharsets]
+   [java.nio.file StandardOpenOption]
    [java.util.concurrent.locks ReentrantLock]
-   [java.util Arrays HashMap List Collection]
    [org.eclipse.collections.impl.list.mutable FastList]
-   [java.util.zip CRC32C]))
+))
 
 (def ^:const record-header-size 14)
 (def ^:const format-major 2)

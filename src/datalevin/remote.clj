@@ -633,6 +633,7 @@
   (re-index [_ schema opts]
     (cl/normal-request client :datalog-re-index [db-name schema opts])))
 
+#_{:clj-kondo/ignore [:redefined-var]}
 (defn ->DatalogStore
   ([uri db-name client write-txn writing? open-db-info
     sampling-started? owns-client? closed?]
@@ -1315,6 +1316,7 @@
     (cl/normal-request client :kv-re-index [db-name opts])
     db))
 
+#_{:clj-kondo/ignore [:redefined-var]}
 (defn ->KVStore
   ([uri db-name client]
    (KVStore. uri db-name client

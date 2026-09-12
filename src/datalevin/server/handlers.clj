@@ -596,15 +596,15 @@
 (defn- deserialized-normal-dt-handler
   [idx op]
   (fn [deps server skey {:keys [args writing?] :as message}]
-    (let [args (deserialize-arg args idx)]
-      (let [db-name (nth args 0)
-            store   (dt-store deps server skey db-name writing?)]
-        (ensure-ha-read-floor! deps server db-name writing?
-                               message store)
-        (write-result!
-         deps
-         skey
-         (apply op store (rest args)))))))
+    (let [args    (deserialize-arg args idx)
+          db-name (nth args 0)
+          store   (dt-store deps server skey db-name writing?)]
+      (ensure-ha-read-floor! deps server db-name writing?
+                             message store)
+      (write-result!
+       deps
+       skey
+       (apply op store (rest args))))))
 
 (defn- deserialized-normal-kv-handler
   [idx op]
@@ -620,15 +620,15 @@
 (defn- deserialized-copying-dt-handler
   [idx op]
   (fn [deps server skey {:keys [args writing?] :as message}]
-    (let [args (deserialize-arg args idx)]
-      (let [db-name (nth args 0)
-            store   (dt-store deps server skey db-name writing?)]
-        (ensure-ha-read-floor! deps server db-name writing?
-                               message store)
-        (write-or-copy-result!
-         deps
-         skey
-         (apply op store (rest args)))))))
+    (let [args    (deserialize-arg args idx)
+          db-name (nth args 0)
+          store   (dt-store deps server skey db-name writing?)]
+      (ensure-ha-read-floor! deps server db-name writing?
+                             message store)
+      (write-or-copy-result!
+       deps
+       skey
+       (apply op store (rest args))))))
 
 (defn- deserialized-copying-kv-handler
   [idx op]

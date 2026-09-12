@@ -20,7 +20,7 @@
     IFn$OOL]
    [org.eclipse.collections.impl.list.mutable FastList]
    [org.eclipse.collections.impl.set.mutable.primitive LongHashSet]
-   [java.util Random Arrays Iterator List UUID]
+   [java.util Random Arrays Iterator UUID]
    [java.util.concurrent Executors ExecutorService Future TimeUnit
     ThreadPoolExecutor ThreadPoolExecutor$CallerRunsPolicy ArrayBlockingQueue]
    [java.io File]
@@ -437,24 +437,6 @@
                           [(conj! seen key) res]))))
                 [(transient #{}) (FastList.)]
                 coll)))
-
-(defn min-key-comp
-  "similar to min-key, but use compare instead of <, so (k x) is not limited
-  to a number"
-  ([k x] x)
-  ([k x y] (if (< (compare (k x) (k y)) 0) x y))
-  ([k x y & more]
-   (let [kx     (k x)
-         ky     (k y)
-         [v kv] (if (< (compare kx ky) 0) [x kx] [y ky])]
-     (loop [v v kv kv more more]
-       (if more
-         (let [w  (first more)
-               kw (k w)]
-           (if (<= (compare kw kv) 0)
-             (recur w kw (next more))
-             (recur v kv (next more))))
-         v)))))
 
 (defn list-add [^FastList lst item] (.add lst item) lst)
 

@@ -1,7 +1,6 @@
 (ns datalevin.test.lru
   (:require
-   [clojure.test :as t :refer [is are deftest]]
-   [datalevin.util :as u])
+   [clojure.test :as t :refer [is deftest]])
   (:import [datalevin.utl LRUCache]))
 
 (deftest test-put

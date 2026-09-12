@@ -46,6 +46,7 @@
 
 (def ^:private ->PreparedTx* ->PreparedTx)
 
+#_{:clj-kondo/ignore [:redefined-var]}
 (defn ->PreparedTx
   "Positional constructor for PreparedTx.
 

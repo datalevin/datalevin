@@ -41,10 +41,10 @@
    [datalevin.interface
     :refer [transact-kv get-range get-first get-value visit-list-sample
             visit-list-key-range near-list env-dir close-kv closed-kv?
-            visit entries list-range list-range-first list-range-count
+            entries list-range list-range-first list-range-count
             list-count key-range-list-count key-range-count rschema
             list-range-first-n get-list list-range-filter-count max-aid
-            list-range-some list-range-keep visit-list-range
+            list-range-some list-range-keep
             max-gt advance-max-gt max-tx
             open-list-dbi open-dbi attrs add-doc remove-doc opts env-opts kv-info swap-attr
             add-vec remove-vec close-vecs vec-closed? schema closed? a-size db-name populated?
@@ -471,7 +471,7 @@
   [lmdb ^List in eid-idx aid]
   (let [out      (FastList. (.size in))
         dbi-name c/eav]
-    (scan/scan
+    (scan/scan lmdb dbi-name
       (cpp/filter-list-id-int-prefix! rtx cur in eid-idx aid out)
       (u/raise "Fail to filter EAV attribute presence: " e
                {:eid-idx eid-idx :aid aid}))))
@@ -480,7 +480,7 @@
   [lmdb ^List in value-idx aid value-type bound-id]
   (let [out      (FastList. (.size in))
         dbi-name c/ave]
-    (scan/scan
+    (scan/scan lmdb dbi-name
       (if (map? value-type)
         (do
           (doseq [^objects tuple in]
@@ -496,7 +496,7 @@
   [lmdb ^List in value-idx entity-idx aid value-type]
   (let [out      (FastList. (.size in))
         dbi-name c/ave]
-    (scan/scan
+    (scan/scan lmdb dbi-name
       (if (map? value-type)
         (do
           (doseq [^objects tuple in]
@@ -746,7 +746,7 @@
         seen     (when cache-eids? (LongObjectHashMap. nt))
         preds    (qpred/fork-predicates preds)
         dbi-name c/eav]
-    (scan/scan
+    (scan/scan lmdb dbi-name
       (with-open [^AutoCloseable iter
                   (lmdb/val-iterator
                     (lmdb/iterate-list-val-full dbi rtx cur))]
@@ -1439,7 +1439,7 @@
             aids        (int-array aids)
             seen        (when cache-eids? (LongObjectHashMap.))
             dbi-name    c/eav]
-        (scan/scan
+        (scan/scan lmdb dbi-name
           (with-open [^AutoCloseable iter
                       (lmdb/val-iterator
                         (lmdb/iterate-list-val-full dbi rtx cur))]
@@ -1514,7 +1514,7 @@
               aid      (props :db/aid)
               seen     (HashMap.)
               dbi-name c/ave]
-          (scan/scan
+          (scan/scan lmdb dbi-name
             (with-open [^AutoCloseable iter
                         (lmdb/val-iterator
                           (lmdb/iterate-list-val-full dbi rtx cur))]
@@ -1538,7 +1538,7 @@
               out      (FastList. (* 2 nt))
               seen     (HashMap. nt)
               dbi-name c/ave]
-          (scan/scan
+          (scan/scan lmdb dbi-name
             (with-open [^AutoCloseable iter
                         (lmdb/val-iterator
                           (lmdb/iterate-list-val-full dbi rtx cur))]
@@ -1555,7 +1555,7 @@
         (let [vt       (idx/storage-type lmdb props)
               aid      (props :db/aid)
               dbi-name c/ave]
-          (scan/scan
+          (scan/scan lmdb dbi-name
             (loop [^objects tuple (p/produce in)]
               (when tuple
                 (let [v (aget tuple v-idx)]
@@ -1583,7 +1583,7 @@
         (let [vt       (idx/storage-type lmdb props)
               dbi-name c/ave
               aid      (props :db/aid)]
-          (scan/scan
+          (scan/scan lmdb dbi-name
             (loop [^objects tuple (p/produce in)]
               (when tuple
                 (let [old-e (aget tuple f-idx)
@@ -3029,13 +3029,13 @@
             (when-let [vec-data (some-> ^HashMap domain-vecs (.get domain))]
               (.add em-ds [domain [:a [doc-ref vec-data]]]))))))
     (when (identical? vt :db.type/idoc)
-      (let [domain (or (props :db/domain) (u/keyword->string attr))]
-        (let [op    (if giant?
-                      [:g [e aid max-gt v]]
-                      [:a [e aid v]])
-              patch (some-> (meta d) :idoc/patch)
-              op    (if patch (with-meta op {:idoc/patch patch}) op)]
-          (.add id-ds [domain op]))))
+      (let [domain (or (props :db/domain) (u/keyword->string attr))
+            op     (if giant?
+                     [:g [e aid max-gt v]]
+                     [:a [e aid v]])
+            patch  (some-> (meta d) :idoc/patch)
+            op     (if patch (with-meta op {:idoc/patch patch}) op)]
+        (.add id-ds [domain op])))
     (when fulltext?
       (let [text (str v)
             ref  (if giant? [:g max-gt e aid] [e aid text])]
@@ -3898,9 +3898,8 @@
     ;; not probe closed stores just to read them; the real open can load opts.
     (when-let [probe (or (some-> ^Store (current-shared-local-store dir) .-lmdb)
                          (datalevin.binding.cpp/open-local-kv-handle dir))]
-      (do
-        (open-dbis probe)
-        (not-empty (load-opts probe))))))
+      (open-dbis probe)
+      (not-empty (load-opts probe)))))
 
 (defn- close-failed-open!
   [dir shared-store lmdb]
@@ -4099,15 +4098,15 @@
                                              embedding-opts
                                              embedding-domains
                                              embedding-providers)
-           i-domains (init-idoc-domains schema opts3)]
-       (let [opts4       (cond-> opts3
-                           (seq e-domains)
-                           (assoc :embedding-opts (merge default-embedding-opts
-                                                         (or (:embedding-opts opts3)
-                                                             embedding-opts))
-                                  :embedding-domains e-domains))
-             store-opts  (store-visible-opts opts4)
-             dir-key     (shared-local-store-key dir)]
+           i-domains (init-idoc-domains schema opts3)
+           opts4     (cond-> opts3
+                       (seq e-domains)
+                       (assoc :embedding-opts (merge default-embedding-opts
+                                                     (or (:embedding-opts opts3)
+                                                         embedding-opts))
+                              :embedding-domains e-domains))
+           store-opts (store-visible-opts opts4)
+           dir-key    (shared-local-store-key dir)]
          (if raw-open-metadata?
            (transact-opts-raw lmdb opts4)
            (transact-opts lmdb opts4))
@@ -4169,7 +4168,7 @@
              (cpp/register-shutdown-close!
                (kv/raw-lmdb lmdb)
                #(close-store-resources! store))
-             (enqueue-secondary-index-work-if-needed! store))))))))))
+             (enqueue-secondary-index-work-if-needed! store)))))))))
 
 (defn- transfer-engines
   [engines lmdb]

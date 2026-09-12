@@ -1,7 +1,7 @@
 (ns ^:no-doc datalevin.test.db
   (:require
    [clojure.data]
-   [clojure.test :as t :refer [is are deftest testing]]
+   [clojure.test :as t :refer [is deftest testing]]
    [datalevin.binding.cpp]
    [datalevin.constants :as c]
    [datalevin.core :as d]

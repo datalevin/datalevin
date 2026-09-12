@@ -28,17 +28,13 @@
    [datalevin.remote :as r]
    [datalevin.storage :as st]
    [datalevin.util :as u]
-   [datalevin.validate :as vld]
    [taoensso.timbre :as log])
   (:import
    [datalevin.bits Indexable Retrieved CustomReference]
-   [datalevin.db DB]
-   [datalevin.interface IStore ILMDB]
-   [datalevin.storage Store]
+   [datalevin.interface IStore]
    [java.net ConnectException URI]
    [java.nio ByteBuffer]
    [java.nio.channels ClosedChannelException]
-   [java.util UUID]
    [java.util.concurrent Callable ExecutorCompletionService
     ExecutorService Executors ForkJoinPool Future ThreadFactory TimeUnit]
    [java.util.concurrent.atomic AtomicLong]))

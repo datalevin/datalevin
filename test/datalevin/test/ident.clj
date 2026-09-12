@@ -1,7 +1,7 @@
 (ns datalevin.test.ident
   (:require
    [datalevin.test.core :as tdc :refer [db-fixture]]
-   [clojure.test :refer [deftest testing is use-fixtures]]
+   [clojure.test :refer [deftest is use-fixtures]]
    [datalevin.util :as u]
    [datalevin.core :as d])
   (:import

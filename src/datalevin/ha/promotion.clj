@@ -359,34 +359,34 @@
       (let [{acquired-lease :lease
              acquired-version :version
              :keys [term authority-now-ms]} acquire
-            observed-at-ms (ha-now-ms deps)]
-        (let [promoted-m
-              (-> m
-                  clear-ha-candidate-state
-                  (assoc :ha-role :leader
-                         :ha-leader-term term
-                         :ha-authority-lease acquired-lease
-                         :ha-authority-version acquired-version
-                         :ha-authority-now-ms authority-now-ms
-                         :ha-lease-local-deadline-ms
-                         (auth/authority-lease-local-deadline-ms
-                          acquired-lease authority-now-ms local-start-ms)
-                         :ha-lease-local-deadline-nanos
-                         (auth/authority-lease-local-deadline-nanos
-                          acquired-lease authority-now-ms local-start-nanos)
-                         :ha-authority-owner-node-id (:leader-node-id acquired-lease)
-                         :ha-authority-term (:term acquired-lease)
-                         :ha-lease-until-ms (:lease-until-ms acquired-lease)
-                         :ha-last-authority-refresh-ms observed-at-ms
-                         :ha-db-identity-mismatch? false
-                         :ha-membership-mismatch? false
-                         :ha-promotion-last-failure nil
-                         :ha-promotion-failure-details nil
-                         :ha-leader-fencing-pending? true
-                         :ha-leader-fencing-started-at-ms observed-at-ms
-                         :ha-leader-fencing-observed-lease observed-lease
-                         :ha-leader-fencing-last-error nil))]
-          (maybe-complete-ha-leader-fencing deps promoted-m db-name)))
+            observed-at-ms (ha-now-ms deps)
+            promoted-m
+            (-> m
+                clear-ha-candidate-state
+                (assoc :ha-role :leader
+                       :ha-leader-term term
+                       :ha-authority-lease acquired-lease
+                       :ha-authority-version acquired-version
+                       :ha-authority-now-ms authority-now-ms
+                       :ha-lease-local-deadline-ms
+                       (auth/authority-lease-local-deadline-ms
+                        acquired-lease authority-now-ms local-start-ms)
+                       :ha-lease-local-deadline-nanos
+                       (auth/authority-lease-local-deadline-nanos
+                        acquired-lease authority-now-ms local-start-nanos)
+                       :ha-authority-owner-node-id (:leader-node-id acquired-lease)
+                       :ha-authority-term (:term acquired-lease)
+                       :ha-lease-until-ms (:lease-until-ms acquired-lease)
+                       :ha-last-authority-refresh-ms observed-at-ms
+                       :ha-db-identity-mismatch? false
+                       :ha-membership-mismatch? false
+                       :ha-promotion-last-failure nil
+                       :ha-promotion-failure-details nil
+                       :ha-leader-fencing-pending? true
+                       :ha-leader-fencing-started-at-ms observed-at-ms
+                       :ha-leader-fencing-observed-lease observed-lease
+                       :ha-leader-fencing-last-error nil))]
+        (maybe-complete-ha-leader-fencing deps promoted-m db-name))
       (fail-ha-candidate m :lease-cas-failed {:acquire acquire}))))
 
 (defn- finalize-ha-candidate-promotion

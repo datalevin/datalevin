@@ -13,7 +13,6 @@
   (:require
    [datalevin.util :as u]
    [datalevin.core :as d]
-   [datalevin.bits :as b]
    [datalevin.buffer :as bf]
    [datalevin.db :as db]
    [datalevin.udf :as udf]
@@ -24,34 +23,28 @@
    [datalevin.protocol :as p]
    [datalevin.storage :as st]
    [datalevin.ha :as dha]
-   [datalevin.ha.control :as ctrl]
    [datalevin.ha.replication :as drep]
-   [datalevin.ha.util :as hu]
    [datalevin.server.auth :as auth]
    [datalevin.server.copy :as scopy]
    [datalevin.server.dispatch :as sdisp]
    [datalevin.server.handlers :as sh]
    [datalevin.server.ha :as sha]
    [datalevin.server.session :as sess]
-   [datalevin.txlog :as txlog]
    [datalevin.kv :as kv]
    [datalevin.replica :as replica]
    [datalevin.constants :as c]
    [datalevin.interface :as i]
    [taoensso.timbre :as log]
-   [clojure.stacktrace :as stt]
    [clojure.string :as s])
   (:import
    [java.nio ByteBuffer BufferOverflowException]
-   [java.nio.file Files Paths OpenOption]
-   [java.nio.channels ClosedChannelException Selector SelectionKey
+   [java.nio.channels Selector SelectionKey
     ServerSocketChannel SocketChannel]
    [java.net InetAddress InetSocketAddress]
-   [java.security MessageDigest]
-   [java.util Iterator UUID Map]
+   [java.util Iterator Map]
    [java.util.function BiFunction]
    [java.util.concurrent.atomic AtomicBoolean]
-   [java.util.concurrent Executors Executor ExecutorService Future
+   [java.util.concurrent Executors ExecutorService
     ConcurrentLinkedQueue ConcurrentHashMap CountDownLatch Semaphore TimeUnit
     LinkedBlockingQueue ThreadPoolExecutor
     ThreadPoolExecutor$CallerRunsPolicy ArrayBlockingQueue]

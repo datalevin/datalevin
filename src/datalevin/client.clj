@@ -146,6 +146,7 @@
       (finally
         (clear-conn-wire-opts! ch)))))
 
+#_{:clj-kondo/ignore [:redefined-var]}
 (defn ^:no-doc ->Connection
   ([^SocketChannel ch ^ByteBuffer bf]
    (Connection. ch (long c/default-connection-timeout) bf))

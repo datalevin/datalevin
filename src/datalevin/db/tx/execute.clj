@@ -10,14 +10,14 @@
 (ns ^:no-doc datalevin.db.tx.execute
   "Transaction execution loop."
   (:require
-   [datalevin.constants :as c :refer [e0 tx0 emax txmax v0 vmax]]
+   [datalevin.constants :as c :refer [e0 tx0 emax txmax]]
    [datalevin.datom :as d :refer [datom datom-added datom?]]
    [datalevin.db.tx.common :as txcommon]
    [datalevin.db.tx.prepare :as txprep]
    [datalevin.idoc :as idoc]
    [datalevin.index :as idx]
    [datalevin.interface :refer [av-first-e ea-first-v ea-first-datom
-                                av-first-datom fetch slice e-datoms
+                                fetch slice e-datoms
                                 v-datoms opts schema]]
    [datalevin.prepare :as coreprep]
    [datalevin.storage :as s]

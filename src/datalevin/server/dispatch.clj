@@ -21,7 +21,7 @@
    [datalevin.util :as u]
    [taoensso.timbre :as log])
   (:import
-   [java.nio ByteBuffer BufferOverflowException]
+   [java.nio ByteBuffer]
    [java.nio.channels ClosedChannelException SelectionKey SocketChannel
     ServerSocketChannel]
    [java.util.concurrent Executor]))

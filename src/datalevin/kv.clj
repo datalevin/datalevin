@@ -2842,29 +2842,29 @@
                                nil
                                (:lsn append-res))
                   _ (when marker-entry
-                      (.add ^FastList commit-rows (:row marker-entry)))]
-              (let [status
-                    (try
-                      (when (pos? (.size ^FastList commit-rows))
-                        (apply-lmdb-after-txlog-append! lmdb state
-                                                        commit-rows))
-                      (let [status (binding [cpp/*before-write-commit-fn* nil]
-                                     (i/close-transact-kv lmdb))]
-                        (when (= status :committed)
-                          (txlog/commit-finished! state marker-entry)
-                          (txlog/note-commit-applied! state append-res))
-                        (when-not (write-txn-open? lmdb)
-                          (txlog-reset-pending! info-v))
-                        status)
-                      (catch Exception e
-                        (txlog-mark-fatal! state e)
-                        (throw e)))]
-                (when (= status :committed)
-                  (run-after-txlog-append!
-                   {:operation :close-transact-kv
-                    :txlog-lsn (long (:lsn append-res))
-                    :append-res append-res}))
-                status))
+                      (.add ^FastList commit-rows (:row marker-entry)))
+                  status
+                  (try
+                    (when (pos? (.size ^FastList commit-rows))
+                      (apply-lmdb-after-txlog-append! lmdb state
+                                                      commit-rows))
+                    (let [status (binding [cpp/*before-write-commit-fn* nil]
+                                   (i/close-transact-kv lmdb))]
+                      (when (= status :committed)
+                        (txlog/commit-finished! state marker-entry)
+                        (txlog/note-commit-applied! state append-res))
+                      (when-not (write-txn-open? lmdb)
+                        (txlog-reset-pending! info-v))
+                      status)
+                    (catch Exception e
+                      (txlog-mark-fatal! state e)
+                      (throw e)))]
+              (when (= status :committed)
+                (run-after-txlog-append!
+                 {:operation :close-transact-kv
+                  :txlog-lsn (long (:lsn append-res))
+                  :append-res append-res}))
+              status)
             (let [status (i/close-transact-kv lmdb)]
               (when-not (write-txn-open? lmdb)
                 (txlog-reset-pending! info-v))

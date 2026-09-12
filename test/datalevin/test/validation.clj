@@ -1,7 +1,7 @@
 (ns datalevin.test.validation
   (:require
    [datalevin.test.core :as tdc :refer [db-fixture]]
-   [clojure.test :refer [deftest testing are is use-fixtures]]
+   [clojure.test :refer [deftest are is use-fixtures]]
    [datalevin.util :as u]
    [datalevin.core :as d]
    [datalevin.prepare :as prepare])
