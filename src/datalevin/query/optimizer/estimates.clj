@@ -1,5 +1,5 @@
 ;;
-;; Copyright (c) Huahai Yang, Nikita Prokopov. All rights reserved.
+;; Copyright (c) Huahai Yang. All rights reserved.
 ;; The use and distribution terms for this software are covered by the
 ;; Eclipse Public License 2.0 (https://opensource.org/license/epl-2-0)
 ;; which can be found in the file LICENSE at the root of this distribution.
@@ -8,38 +8,23 @@
 ;; You must not remove this notice, or any other, from this software.
 ;;
 (ns ^:no-doc datalevin.query.optimizer.estimates
-  "Auto-split from datalevin.query-optimizer."
+  "Cost estimation"
   (:require
-   [clojure.set :as set]
    [clojure.core.reducers :as rd]
    [clojure.walk :as w]
    [datalevin.constants :as c]
-   [datalevin.datom :as dd]
+   [datalevin.util :as u]
    [datalevin.db :as db]
-   [datalevin.interface :refer [av-size populated?]]
+   [datalevin.interface :refer [av-size]]
    [datalevin.join :as j]
-   [datalevin.lmdb :as l]
    [datalevin.parser :as dp]
-   [datalevin.query.optimizer.graph :as qog]
    [datalevin.pipe :as p]
-   [datalevin.query.access :as qaccess]
-   [datalevin.query.optimizer.range :as qor]
-   [datalevin.query.predicate :as qpred]
-   [datalevin.query.plan :as qplan]
    [datalevin.query.resolve :as qresolve]
-   [datalevin.query-util :as qu]
-   [datalevin.relation :as r]
-   [datalevin.rules :as rules]
-   [datalevin.util :as u :refer [cond+ raise concatv map+]])
+   [datalevin.query-util :as qu])
   (:import
-   [java.util HashMap HashSet IdentityHashMap List]
-   [java.util.concurrent ConcurrentHashMap]
+   [java.util HashMap IdentityHashMap List]
    [datalevin.db DB]
-   [datalevin.storage Store]
-   [datalevin.utl DPKey LRUCache]
-   [datalevin.parser And BindColl BindScalar BindTuple Constant
-    DefaultSrc Function Or Variable Pattern Predicate Not RuleExpr]
-   [org.eclipse.collections.impl.list.mutable FastList]))
+   [datalevin.parser Variable ]))
 
 (declare estimate-hash-join-cost estimate-link-cost)
 

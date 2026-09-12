@@ -10,11 +10,18 @@
 (ns ^:no-doc datalevin.query-optimizer
   "Compatibility facade over datalevin.query.optimizer.*"
   (:require
-   [datalevin.query.optimizer.plan-build :as qpb
-    :refer [alternative-satisfies? build-plan* estimate-scan-v-cost
-            merge-pred-options multi-key-result-size]]
+   [datalevin.constants :as c]
+   [datalevin.query.optimizer.access-plan :as qaccess]
+   [datalevin.query.optimizer.bound-patterns :as qbound]
    [datalevin.query.optimizer.estimates :refer [estimate-hash-join-cost]]
-   [datalevin.constants :as c])
+   [datalevin.query.optimizer.plan-build :as qpb
+    :refer [build-plan* merge-pred-options multi-key-result-size]]
+   [datalevin.query.optimizer.plan-cost :as qcost
+    :refer [estimate-scan-v-cost]]
+   [datalevin.query.optimizer.properties :as qprops
+    :refer [alternative-satisfies?]]
+   [datalevin.query.optimizer.rewrite :as qrewrite]
+   [datalevin.query.optimizer.selective :as qselective])
   (:import
    [datalevin.utl LRUCache]))
 
@@ -23,29 +30,31 @@
 (qpb/set-plan-cache-provider! (fn [] *plan-cache*))
 
 ;; Public API aliases kept for callers of `datalevin.query-optimizer`.
-(def access-sample-cost-budget qpb/access-sample-cost-budget)
-(def build-graph qpb/build-graph)
+(def access-sample-cost-budget qcost/access-sample-cost-budget)
+(def build-graph qrewrite/build-graph)
 (def build-plan qpb/build-plan)
-(def build-property-memo qpb/build-property-memo)
-(def combine-ranges qpb/combine-ranges)
-(def estimated-plan-cost qpb/estimated-plan-cost)
-(def fast-clause-count qpb/fast-clause-count)
+(def build-property-memo qprops/build-property-memo)
+(def combine-ranges qrewrite/combine-ranges)
+(def estimated-plan-cost qcost/estimated-plan-cost)
+(def fast-clause-count qcost/fast-clause-count)
 (def find-index qpb/find-index)
-(def flip-ranges qpb/flip-ranges)
-(def intersect-ranges qpb/intersect-ranges)
-(def materialize-input-bound-patterns qpb/materialize-input-bound-patterns)
-(def materialize-selective-rule-anchors qpb/materialize-selective-rule-anchors)
-(def materialize-selective-value-lookups qpb/materialize-selective-value-lookups)
-(def plan-access-joins qpb/plan-access-joins)
+(def flip-ranges qrewrite/flip-ranges)
+(def intersect-ranges qrewrite/intersect-ranges)
+(def materialize-input-bound-patterns qbound/materialize-input-bound-patterns)
+(def materialize-selective-rule-anchors
+  qselective/materialize-selective-rule-anchors)
+(def materialize-selective-value-lookups
+  qselective/materialize-selective-value-lookups)
+(def plan-access-joins qaccess/plan-access-joins)
 (def plan-not-joins qpb/plan-not-joins)
-(def plugin-inputs qpb/plugin-inputs)
-(def propagate-physical-properties qpb/propagate-physical-properties)
-(def properties-satisfy? qpb/properties-satisfy?)
-(def property-memo-summary qpb/property-memo-summary)
-(def push-down-equality-disjunctions qpb/push-down-equality-disjunctions)
-(def retain-property-alternative qpb/retain-property-alternative)
-(def rewrite-unused-vars qpb/rewrite-unused-vars)
-(def schedule-correlated-access qpb/schedule-correlated-access)
-(def selected-alternative qpb/selected-alternative)
-(def unused-var-replacements qpb/unused-var-replacements)
+(def plugin-inputs qrewrite/plugin-inputs)
+(def propagate-physical-properties qprops/propagate-physical-properties)
+(def properties-satisfy? qprops/properties-satisfy?)
+(def property-memo-summary qprops/property-memo-summary)
+(def push-down-equality-disjunctions qrewrite/push-down-equality-disjunctions)
+(def retain-property-alternative qprops/retain-property-alternative)
+(def rewrite-unused-vars qrewrite/rewrite-unused-vars)
+(def schedule-correlated-access qaccess/schedule-correlated-access)
+(def selected-alternative qprops/selected-alternative)
+(def unused-var-replacements qrewrite/unused-var-replacements)
 (def writing? qpb/writing?)
