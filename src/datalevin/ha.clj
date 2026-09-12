@@ -22,7 +22,7 @@
    [datalevin.ha.snapshot :as snap]
    [datalevin.ha.util :as hu]
    [datalevin.interface :as i]
-   [datalevin.util :as u]
+   [datalevin.util :as u :refer [raise]]
    [datalevin.validate :as vld]
    [taoensso.timbre :as log])
   (:import
@@ -998,11 +998,11 @@
     (try
       (ctrl/start-authority! authority)
       (when (or (nil? db-identity) (s/blank? db-identity))
-        (u/raise "HA db identity is missing for consensus mode"
+        (raise "HA db identity is missing for consensus mode"
                  {:error :ha/missing-db-identity
                   :db-name db-name}))
       (when (or (nil? local-endpoint) (s/blank? local-endpoint))
-        (u/raise "HA local endpoint is missing for consensus mode"
+        (raise "HA local endpoint is missing for consensus mode"
                  {:error :ha/missing-local-endpoint
                   :db-name db-name
                   :ha-node-id node-id}))
@@ -1017,7 +1017,7 @@
             observed-at-ms (ha-now-ms)
             {:keys [lease version authority-now-ms error]} startup-read
             _ (when (and lease (not= db-identity (:db-identity lease)))
-                (u/raise "HA lease db identity mismatch at startup"
+                (raise "HA lease db identity mismatch at startup"
                          {:error :ha/db-identity-mismatch
                           :db-name db-name
                           :local-db-identity db-identity
@@ -1054,7 +1054,7 @@
                            (long renew-ms)))))]
         (when (and (not init-ok?)
                    (not= :membership-hash-mismatch (:reason init-result)))
-          (u/raise "HA membership hash initialization failed"
+          (raise "HA membership hash initialization failed"
                    {:error :ha/membership-hash-init-failed
                     :db-name db-name
                     :derived-hash derived-hash

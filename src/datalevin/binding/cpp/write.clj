@@ -227,9 +227,8 @@
     (.putValId ave (.-e tx))
     (if (.-no-overwrite? tx)
       (when-not (.tryPut cur (int flags))
-        (throw
-          (ex-info "Blind unique value already exists"
-                   {:type l/blind-unique-collision-type})))
+        (raise "Blind unique value already exists"
+                   {:type l/blind-unique-collision-type}))
       (.put cur (int flags)))))
 
 (defn- put-ave-added-segment!

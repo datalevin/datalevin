@@ -1,6 +1,7 @@
 (ns ^:no-doc datalevin.native-value
   "Native value snapshots for process-local spills and explicit wire readers."
-  (:require [taoensso.nippy :as nippy])
+  (:require
+   [datalevin.util :refer [raise]] [taoensso.nippy :as nippy])
   (:import [datalevin NativeValue]
            [java.io DataInput DataOutput]
            [java.util HashMap]))
@@ -45,8 +46,8 @@
         (nippy/freeze-to-out! out [(.typeName value) payload]))
       (do
         (when-not (and *spill-bindings* (not-empty id))
-          (throw (ex-info "Cannot serialize a native value outside its spill store"
-                          {:type-name (.typeName value)})))
+          (raise "Cannot serialize a native value outside its spill store"
+                          {:type-name (.typeName value)}))
         (let [bindings ^HashMap *spill-bindings*]
           (when-not (.containsKey bindings id)
             (.put bindings id (.withPayload value (byte-array 0))))
@@ -60,12 +61,12 @@
     (if (empty? id)
       (do
         (when-not (and *wire-native-value* (wire-native-value? data))
-          (throw (ex-info "Malformed native wire value or wrong decoding context"
-                          {:codec-id id})))
+          (raise "Malformed native wire value or wrong decoding context"
+                          {:codec-id id}))
         (try
           (when-not *wire-reader*
-            (throw (ex-info "Missing receiver native type binding"
-                            {:type-name (first data)})))
+            (raise "Missing receiver native type binding"
+                            {:type-name (first data)}))
           (*wire-reader* (first data) (second data))
           (catch Exception e
             (throw (ex-info (str "Native value decoding failed: " (ex-message e))
@@ -76,8 +77,8 @@
                  (.get ^HashMap *spill-bindings* id))]
         (if (bytes? data)
           (.withPayload binding data)
-          (throw (ex-info "Malformed native value payload in spill binding mode"
+          (raise "Malformed native value payload in spill binding mode"
                           {:codec-id id
-                           :payload-type (type data)})))
-        (throw (ex-info "Malformed native value or missing spill binding"
-                        {:codec-id id :payload data}))))))
+                           :payload-type (type data)}))
+        (raise "Malformed native value or missing spill binding"
+                        {:codec-id id :payload data})))))

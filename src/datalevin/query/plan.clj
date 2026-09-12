@@ -213,16 +213,14 @@
   ([expr path demand bounds work input-cols access-source]
    (let [access-cols (or
                        (:cols expr)
-                       (throw
-                         (ex-info "Access expression requires an output schema"
-                                  {:expr expr})))
+                       (raise "Access expression requires an output schema"
+                                  {:expr expr}))
          input-cols  (vec input-cols)
          requires    (set (:requires expr))
          supplied    (set input-cols)]
      (when-not (set/subset? requires supplied)
-       (throw
-         (ex-info "Access expression requirements are not bound"
-                  {:requires requires :supplied supplied})))
+       (raise "Access expression requirements are not bound"
+                  {:requires requires :supplied supplied}))
      (let [cols (into input-cols (remove supplied) access-cols)
            out  (set cols)]
        (->AccessStep expr path demand bounds work supplied out cols

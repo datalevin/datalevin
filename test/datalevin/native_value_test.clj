@@ -1,5 +1,6 @@
 (ns datalevin.native-value-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require
+   [datalevin.util :refer [raise]] [clojure.test :refer [deftest is testing]]
             [datalevin.bits :as b]
             [datalevin.constants :as c]
             [datalevin.native-value :as nv]
@@ -24,7 +25,7 @@
 
 (defn- receiver [type-name payload]
   (when-not (= type-name ":app/task")
-    (throw (ex-info "Unknown native type" {:type-name type-name})))
+    (raise "Unknown native type" {:type-name type-name}))
   (snapshot "receiver" type-name payload))
 
 (defn- message-buffer [message wire-opts]
@@ -96,7 +97,7 @@
   (let [bf (message-buffer [(value :a 1)] nil)]
     (is (thrown? Exception
                  (binding [nv/*wire-reader* (fn [_ _]
-                                             (throw (ex-info "Missing binding" {})))]
+                                             (raise "Missing binding" {}))]
                    (p/receive-one-message (.duplicate bf)))))
     (let [[restored _] (binding [nv/*wire-reader* receiver]
                          (p/receive-one-message bf))]

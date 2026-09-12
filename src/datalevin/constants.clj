@@ -12,7 +12,7 @@
   (:refer-clojure :exclude [meta])
   (:require
    [clojure.string :as s]
-   [datalevin.util :as u])
+   [datalevin.util :as u :refer [raise]])
   (:import
    [java.io File]
    [java.util UUID Arrays HashSet]
@@ -683,7 +683,7 @@
 (defn ^:no-doc canonical-wal-option-key
   [k]
   (if (legacy-txn-log-option-key? k)
-    (u/raise "Legacy txn-log option key is no longer supported. Use WAL option keys (for example :wal? and :wal-durability-profile)."
+    (raise "Legacy txn-log option key is no longer supported. Use WAL option keys (for example :wal? and :wal-durability-profile)."
              {:option k})
     k))
 

@@ -12,7 +12,7 @@
   (:refer-clojure :exclude [sync])
   (:require
    [datalevin.client-op :as cop]
-   [datalevin.util :as u :refer [deftype+]]
+   [datalevin.util :as u :refer [ deftype+ raise]]
    [datalevin.constants :as c]
    [datalevin.interface]
    [datalevin.client :as cl]
@@ -277,7 +277,7 @@
          response]
      (if (= type :error-response)
        (if (:resized err-data)
-         (u/raise message err-data)
+         (raise message err-data)
          (if (#'cl/retryable-ha-write-reject? err-data)
            (if-let [retry-context (#'cl/client-retry-context client)]
              (#'cl/retry-ha-write-request*
@@ -681,7 +681,7 @@
                          (AtomicBoolean. false)
                          owns-client?
                          (AtomicBoolean. false)))
-       (u/raise "URI should contain a database name" {})))))
+       (raise "URI should contain a database name" {})))))
 
 ;; remote kv store
 
@@ -719,7 +719,7 @@
       :open-closed {:back? back?
                     :lower {:v (if back? k2 k1) :incl? false}
                     :upper {:v (if back? k1 k2) :incl? true}}
-      (u/raise "Unsupported key range type for remote range-seq"
+      (raise "Unsupported key range type for remote range-seq"
                {:k-range k-range}))))
 
 (defn- interval->k-range
@@ -951,7 +951,7 @@
                               :writing? writing?
                               :args     [db-name compact?]})
           _    (when (= type :error-response)
-                 (u/raise "Request to Datalevin server failed: "
+                 (raise "Request to Datalevin server failed: "
                           message
                           {:type :copy
                            :args [db-name compact?]
@@ -979,14 +979,14 @@
                   0 result))
               actual-checksum (u/hexify (.digest md))]
           (when (and checksum-algo (not= :sha-256 checksum-algo))
-            (u/raise "Unsupported checksum algorithm from server"
+            (raise "Unsupported checksum algorithm from server"
                      {:checksum-algo checksum-algo}))
           (when (and bytes (not= (long bytes) (long written-bytes)))
-            (u/raise "Copy size mismatch"
+            (raise "Copy size mismatch"
                      {:expected-bytes (long bytes)
                       :actual-bytes   (long written-bytes)}))
           (when (and checksum (not= checksum actual-checksum))
-            (u/raise "Copy checksum mismatch"
+            (raise "Copy checksum mismatch"
                      {:expected-checksum checksum
                       :actual-checksum   actual-checksum})))
         (let [bs (->> result
@@ -1081,7 +1081,7 @@
                   (throw e))))]
       (when (= type :error-response)
         (if (:resized err-data)
-          (u/raise message err-data)
+          (raise message err-data)
           (if (#'cl/retryable-ha-write-reject? err-data)
             (if-let [retry-context (#'cl/client-retry-context client)]
               (#'cl/retry-ha-write-request*
@@ -1094,7 +1094,7 @@
                #'cl/new-client-for-endpoint
                #(#'cl/set-preferred-ha-endpoint! client %))
               (#'cl/raise-normal-request-error req message err-data nil))
-            (u/raise "Error transacting kv to server:" message {:uri uri}))))))
+            (raise "Error transacting kv to server:" message {:uri uri}))))))
 
   (get-value [db dbi-name k]
     (.get-value db dbi-name k :data :data true))
@@ -1372,7 +1372,7 @@
                       (volatile! opts)
                       owns-client?
                       (AtomicBoolean. false)))
-       (u/raise "URI should contain a database name" {})))))
+       (raise "URI should contain a database name" {})))))
 
 (defn batch-kv
   "Run multiple KV calls against a remote KV store in one RPC round trip.

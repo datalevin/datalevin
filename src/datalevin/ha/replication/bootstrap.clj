@@ -19,7 +19,7 @@
    [datalevin.interface :as i]
    [datalevin.kv :as kv]
    [datalevin.storage :as st]
-   [datalevin.util :as u]
+   [datalevin.util :as u :refer [raise]]
    [taoensso.timbre :as log])
   (:import
    [datalevin.interface IStore]
@@ -308,18 +308,18 @@
         payload-last-lsn (:payload-last-applied-lsn copy-meta)
         txlog-last-lsn (:txlog-last-applied-lsn copy-meta)]
     (when (not= db-name snapshot-db-name)
-      (u/raise "HA snapshot copy DB name mismatch"
+      (raise "HA snapshot copy DB name mismatch"
                {:error :ha/follower-snapshot-db-name-mismatch
                 :db-name db-name
                 :snapshot-db-name snapshot-db-name
                 :source-endpoint source-endpoint}))
     (when (or (nil? snapshot-db-identity) (s/blank? snapshot-db-identity))
-      (u/raise "HA snapshot copy is missing DB identity"
+      (raise "HA snapshot copy is missing DB identity"
                {:error :ha/follower-snapshot-missing-db-identity
                 :db-name db-name
                 :source-endpoint source-endpoint}))
     (when (not= (:ha-db-identity m) snapshot-db-identity)
-      (u/raise "HA snapshot copy DB identity mismatch"
+      (raise "HA snapshot copy DB identity mismatch"
                {:error :ha/follower-snapshot-db-identity-mismatch
                 :db-name db-name
                 :local-db-identity (:ha-db-identity m)
@@ -328,7 +328,7 @@
     (when-not (or (integer? snapshot-last-lsn)
                   (integer? payload-last-lsn)
                   (integer? txlog-last-lsn))
-      (u/raise "HA snapshot copy is missing payload last applied LSN"
+      (raise "HA snapshot copy is missing payload last applied LSN"
                {:error :ha/follower-snapshot-missing-last-applied-lsn
                 :db-name db-name
                 :source-endpoint source-endpoint
@@ -345,7 +345,7 @@
           install-last-lsn (long-max2 materialized-last-lsn
                                       (or txlog-last-lsn 0))]
       (when (< install-last-lsn (long required-lsn))
-        (u/raise "HA snapshot copy payload is older than the required follower floor"
+        (raise "HA snapshot copy payload is older than the required follower floor"
                  {:error :ha/follower-snapshot-too-stale
                   :db-name db-name
                   :required-lsn (long required-lsn)

@@ -15,7 +15,7 @@
    [datalevin.custom-datalog :as cd]
    [datalevin.datom :as d]
    [datalevin.constants :as c]
-   [datalevin.util :as u])
+   [datalevin.util :refer [raise]])
   (:import
    [com.github.luben.zstd Zstd]
    [java.nio ByteBuffer]
@@ -57,7 +57,7 @@
              (if e
                (b/indexable e am v :db.type/ref gm)
                (b/indexable (if high? c/emax c/e0) am v :db.type/ref gm))
-             (u/raise
+             (raise
                "When v is known but a is unknown, v must be a :db.type/ref"
                {:v v}))
            (b/indexable e am vm :db.type/sysMin gm)))))))

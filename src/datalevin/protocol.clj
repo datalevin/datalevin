@@ -15,7 +15,7 @@
    [datalevin.constants :as c]
    [datalevin.datom :as d]
    [datalevin.native-value :as nv]
-   [datalevin.util :as u]
+   [datalevin.util :refer [raise]]
    [datalevin.spill :as sp]
    [cognitect.transit :as transit])
   (:import
@@ -82,7 +82,7 @@
     1 (write-transit-bytes msg)
     2 (binding [nv/*wire-native-value* true]
         (b/serialize msg))
-    (u/raise "Unknown wire message format"
+    (raise "Unknown wire message format"
              {:format fmt
               :format-code (fmt-code fmt)})))
 
@@ -115,20 +115,20 @@
 (defn- unpack-zstd
   ^bytes [^bytes payload]
   (when (< (alength payload) 4)
-    (u/raise "Wire message compression payload is corrupted"
+    (raise "Wire message compression payload is corrupted"
              {:reason :missing-uncompressed-length
               :payload-bytes (alength payload)}))
   (let [bb              (ByteBuffer/wrap payload)
         uncompressed-len (.getInt bb)]
     (when (neg? uncompressed-len)
-      (u/raise "Wire message compression payload is corrupted"
+      (raise "Wire message compression payload is corrupted"
                {:reason :negative-uncompressed-length
                 :uncompressed-length uncompressed-len}))
     (let [compressed (byte-array (.remaining bb))]
       (.get bb compressed)
       (let [raw ^bytes (Zstd/decompress compressed (long uncompressed-len))]
         (when-not (= uncompressed-len (alength raw))
-          (u/raise "Wire message decompression length mismatch"
+          (raise "Wire message decompression length mismatch"
                    {:expected uncompressed-len
                     :actual   (alength raw)}))
         raw))))
@@ -142,7 +142,7 @@
         (ByteArrayInputStream. (.getBytes s "utf-8")) :json
         {:handlers transit-read-handlers}))
     (catch Exception e
-      (u/raise "Unable to read transit:" e {:string s}))))
+      (raise "Unable to read transit:" e {:string s}))))
 
 (defn write-transit-string
   "Write a Clojure value as a transit+json encoded string"
@@ -153,7 +153,7 @@
         (transit/writer baos :json {:handlers transit-write-handlers}) v)
       (.toString baos "utf-8"))
     (catch Exception e
-      (u/raise "Unable to write transit:" e {:value v}))))
+      (raise "Unable to write transit:" e {:value v}))))
 
 (defn read-nippy-bf
   "Read from a ByteBuffer containing nippy encoded bytes, return a Clojure
@@ -225,7 +225,7 @@
                      (let [{:keys [compression]}
                            (merge (default-wire-opts) wire-opts)]
                        (when-not (= compression :zstd)
-                         (u/raise "Received compressed wire message without negotiated support"
+                         (raise "Received compressed wire message without negotiated support"
                                   {:compression-flag :zstd
                                    :wire-opts        wire-opts}))
                        (unpack-zstd bs))
@@ -233,7 +233,7 @@
      (case (short code)
        1 (read-transit-bytes payload)
        2 (deserialize-nippy payload)
-       (u/raise "Unknown wire message format"
+       (raise "Unknown wire message format"
                 {:format fmt
                  :format-code code})))))
 
@@ -247,7 +247,7 @@
                                             (UUID/randomUUID))]
                   (read-value fmt bs wire-opts))]
     (when-not (map? message)
-      (u/raise "Expected a request map" {}))
+      (raise "Expected a request map" {}))
     (let [message (vary-meta message dissoc ::native-request)]
       (if @native?
         (vary-meta message assoc ::native-request [fmt bs wire-opts])
@@ -285,7 +285,7 @@
             (cond
               (== n -1)
               (do (.close ch)
-                  (u/raise "Socket channel is closed." {}))
+                  (raise "Socket channel is closed." {}))
 
               (> n 0)
               (recur)
@@ -378,7 +378,7 @@
     (loop []
       (let [remaining-ms (- deadline-ms (System/currentTimeMillis))]
         (when-not (pos? remaining-ms)
-          (u/raise "Socket channel receive timed out."
+          (raise "Socket channel receive timed out."
                    {:error :socket/timeout
                     :timeout-ms timeout-ms}))
         (if (pos? (.select sel remaining-ms))
@@ -418,7 +418,7 @@
                                                        deadline-ms timeout-ms))
                                   (recur bf))
                    (= readn -1) (do (.close ch)
-                                    (u/raise "Socket channel is closed." {}))))))
+                                    (raise "Socket channel is closed." {}))))))
            (let [^int readn (read-ch ch bf)]
              (cond
                (> readn 0)  (let [[msg bf] (receive-one-message bf wire-opts)]
@@ -429,7 +429,7 @@
                                                    deadline-ms timeout-ms))
                               (recur bf))
                (= readn -1) (do (.close ch)
-                                (u/raise "Socket channel is closed." {}))))))
+                                (raise "Socket channel is closed." {}))))))
        (finally
          (when-let [^Selector sel @selector-v]
            (.close sel))
@@ -455,7 +455,7 @@
             (.position pos))
           (let [cnt-len (- length c/message-header-size)]
             (if (< cnt-len 0)
-              (u/raise "Message corruption: length is less than header size"
+              (raise "Message corruption: length is less than header size"
                        {:length length})
               (let [ba (byte-array cnt-len)]
                 (.get read-bf ba)

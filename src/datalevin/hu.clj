@@ -10,7 +10,7 @@
 (ns ^:no-doc datalevin.hu
   "Fast encoder and decoder for Hu-Tucker codes. Used for key compression."
   (:require
-   [datalevin.util :as u])
+   [datalevin.util :as u :refer [raise]])
   (:import
    [java.util LinkedList Arrays ArrayList]
    [java.nio ByteBuffer ByteOrder]
@@ -239,7 +239,7 @@
                 (let [sym (.-sym node)]
                   (aset lens sym (byte (.-level node)))
                   (when (> (long (.-level node)) 32)
-                    (u/raise "Hu-Tucker code exceeds 32 bits" {:symbol sym}))
+                    (raise "Hu-Tucker code exceeds 32 bits" {:symbol sym}))
                   (aset codes sym (unchecked-int code)))
                 (let [code1 (bit-shift-left code 1)]
                   (traverse (.-left-child node) code1)
@@ -277,14 +277,14 @@
       (let [len  (bit-and 0xFF (aget lens sym))
             code (bit-and 0xFFFFFFFF (aget codes sym))]
         (when (or (not (<= 1 len 32)) (>= code (bit-shift-left 1 len)))
-          (u/raise "Invalid Hu-Tucker code" {:symbol sym :length len :code code}))
+          (raise "Invalid Hu-Tucker code" {:symbol sym :length len :code code}))
         (loop [bit (dec len) node root]
           (let [left? (zero? (bit-and 1 (unsigned-bit-shift-right code bit)))
                 child (if left? (left-child node) (right-child node))]
             (if (zero? bit)
               (do
                 (when child
-                  (u/raise "Overlapping Hu-Tucker codes" {:symbol sym}))
+                  (raise "Overlapping Hu-Tucker codes" {:symbol sym}))
                 (let [leaf (DecodeNode. sym nil nil)]
                   (if left? (set-left-child node leaf) (set-right-child node leaf))))
               (let [child (or child
@@ -292,7 +292,7 @@
                                 (if left? (set-left-child node n)
                                     (set-right-child node n))))]
                 (when (leaf? child)
-                  (u/raise "Overlapping Hu-Tucker codes" {:symbol sym}))
+                  (raise "Overlapping Hu-Tucker codes" {:symbol sym}))
                 (recur (dec bit) child)))))))
     root))
 
@@ -332,7 +332,7 @@
 (defn create-decode-tables
   [^bytes lens ^ints codes]
   (when-not (= symbol-count (alength lens) (alength codes))
-    (u/raise "Invalid Hu-Tucker dictionary size"
+    (raise "Invalid Hu-Tucker dictionary size"
              {:lengths (alength lens) :codes (alength codes)}))
   (let [tree     (build-decode-tree lens codes)
         offsets  (ObjectLongHashMap.)
@@ -342,11 +342,11 @@
               (if (leaf? node)
                 (do
                   (when-not (= @expected (.-sym ^DecodeNode node))
-                    (u/raise "Hu-Tucker dictionary is not alphabetic" {}))
+                    (raise "Hu-Tucker dictionary is not alphabetic" {}))
                   (vswap! expected u/long-inc))
                 (do
                   (when-not (and (left-child node) (right-child node))
-                    (u/raise "Incomplete Hu-Tucker dictionary" {}))
+                    (raise "Incomplete Hu-Tucker dictionary" {}))
                   (.put offsets node (long (* 16 (.size nodes))))
                   (.add nodes node)
                   (collect (left-child node))
@@ -420,7 +420,7 @@
         ^ints steps   (.-steps tables)]
     (loop [state (long 0) b (long 0) low? false]
       (when (and (not low?) (not (.hasRemaining src)))
-        (u/raise "Missing Hu-Tucker key terminator" {}))
+        (raise "Missing Hu-Tucker key terminator" {}))
       (let [b     (if low? b (bit-and 0xFF (.get src)))
             idx   (+ state (if low? (bit-and b 0xF) (unsigned-bit-shift-right b 4)))
             step  (aget steps idx)
@@ -430,7 +430,7 @@
           (let [unused (- (if low? 4 8) (unsigned-bit-shift-right step 5))]
             (when (or (.hasRemaining src)
                       (not (zero? (bit-and b (dec (bit-shift-left 1 unused))))))
-              (u/raise "Trailing data after Hu-Tucker key terminator" {})))
+              (raise "Trailing data after Hu-Tucker key terminator" {})))
           (recur (unsigned-bit-shift-right step 5) b (not low?)))))))
 
 (defprotocol IHuTucker
@@ -451,9 +451,9 @@
   [^longs freqs]
   (let [n (alength freqs)]
     (when-not (= n symbol-count)
-      (u/raise "Invalid Hu-Tucker frequency array" {:symbols n}))
+      (raise "Invalid Hu-Tucker frequency array" {:symbols n}))
     (when (some #(not (pos? (long %))) freqs)
-      (u/raise "Hu-Tucker frequencies must be positive" {}))
+      (raise "Hu-Tucker frequencies must be positive" {}))
     (let [lens (byte-array n) codes (int-array n)]
       (create-codes n lens codes freqs)
       (codes->hu-tucker lens codes))))
@@ -487,18 +487,18 @@
     (let [magic (byte-array 4)]
       (.readFully in magic)
       (when-not (Arrays/equals magic ^bytes magic-bytes)
-        (u/raise "Invalid magic header" {:magic magic})))
+        (raise "Invalid magic header" {:magic magic})))
     (let [version (.readUnsignedByte in)
           flags   (.readUnsignedByte in)
           reserved (.readUnsignedShort in)
           llen    (.readInt in)
           lcodes  (.readInt in)]
       (when-not (= version format-version)
-        (u/raise "Unsupported Hu-Tucker dictionary version" {:version version}))
+        (raise "Unsupported Hu-Tucker dictionary version" {:version version}))
       (when (or (not (zero? flags)) (not (zero? reserved)))
-        (u/raise "Unsupported Hu-Tucker dictionary flags" {:flags flags :reserved reserved}))
+        (raise "Unsupported Hu-Tucker dictionary flags" {:flags flags :reserved reserved}))
       (when-not (= symbol-count llen lcodes)
-        (u/raise "Invalid Hu-Tucker dictionary size"
+        (raise "Invalid Hu-Tucker dictionary size"
                  {:version version :lengths llen :codes lcodes}))
       (let [lens (byte-array llen) codes (int-array lcodes)
             ibuf (byte-array 4) bb (doto (ByteBuffer/wrap ibuf) (.order order))]

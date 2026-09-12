@@ -18,7 +18,7 @@
    [sci.core :as sci]
    [taoensso.nippy :as nippy]
    [datalevin.query-util :as qu]
-   [datalevin.util :as u]
+   [datalevin.util :refer [raise]]
    [datalevin.core]
    [datalevin.analyzer]
    [datalevin.bits]
@@ -342,7 +342,7 @@
                  (not (contains? allowed-inter-fn-interop-symbols sym))
                  (not (quoted-query-dot-syntax? quoted? sym))
                  (interop-symbol? sym)))
-    (u/raise "Disallowed inter-fn symbol " sym
+    (raise "Disallowed inter-fn symbol " sym
              {:type   :datalevin/disallowed-inter-fn-symbol
               :symbol sym})))
 
@@ -491,7 +491,7 @@
        (fn [m sym]
          (let [var-sym (symbol (name sym))
                v       (or (resolve-public-host-var sym)
-                           (u/raise
+                           (raise
                              "Cannot resolve host var for inter-fn " sym
                              {:type   :datalevin/unresolved-inter-fn-host-var
                               :symbol sym}))]
@@ -522,7 +522,7 @@
 (defn ^:no-doc validate-inter-fn-source!
   [src]
   (when-not (inter-fn-source-form? src)
-    (u/raise "Invalid inter-fn source form"
+    (raise "Invalid inter-fn source form"
              {:type :datalevin/invalid-inter-fn-source
               :source src}))
   (validate-inter-fn-code! src)
@@ -571,7 +571,7 @@
     [^AFn x ^DataOutput out]
   (if (inter-fn? x)
     (nippy/freeze-to-out! out (:source (meta x)))
-    (u/raise "Can only freeze an inter-fn" {:x x})))
+    (raise "Can only freeze an inter-fn" {:x x})))
 
 (nippy/extend-thaw :datalevin/inter-fn
     [^DataInput in]
@@ -605,7 +605,7 @@
   [ms]
   (let [ms (long ms)]
     (when-not (<= 0 ms max-inter-fn-sleep-ms)
-      (u/raise "inter-fn Thread/sleep exceeds allowed bound"
+      (raise "inter-fn Thread/sleep exceeds allowed bound"
                {:type   :datalevin/inter-fn-sleep-out-of-bounds
                 :ms     ms
                 :max-ms max-inter-fn-sleep-ms}))

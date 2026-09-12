@@ -15,7 +15,7 @@
    [datalevin.index :as idx]
    [datalevin.custom-datalog :as cd]
    [datalevin.datom :as d]
-   [datalevin.util :as u]
+   [datalevin.util :refer [raise]]
    [datalevin.bits :as b])
   (:import
    [datalevin.datom Datom]
@@ -143,7 +143,7 @@
     (instance? java.time.Instant v) (Date. (long (inst-ms v)))
     (inst? v)    v ; java.sql.Date and java.sql.Timestamp are java.util.Date
     (integer? v) (Date. (long v))
-    :else        (u/raise "Expect java.util.Date" {:input v})))
+    :else        (raise "Expect java.util.Date" {:input v})))
 
 (defn coerce-uuid
   "Coerce a value to java.util.UUID."
@@ -152,8 +152,8 @@
     (uuid? v)   v
     (string? v) (if-let [u (parse-uuid v)]
                   u
-                  (u/raise "Unable to parse string to UUID" {:input v}))
-    :else       (u/raise "Expect java.util.UUID" {:input v})))
+                  (raise "Unable to parse string to UUID" {:input v}))
+    :else       (raise "Expect java.util.UUID" {:input v})))
 
 (defn type-coercion
   "Coerce a value to the appropriate type based on value type."
@@ -196,7 +196,7 @@
                (some? v)
                (seqable? v)
                (empty? v))
-      (u/raise "Cannot store an empty homogeneous tuple for attribute " a
+      (raise "Cannot store an empty homogeneous tuple for attribute " a
                {:error      :transact/syntax
                 :attribute  a
                 :value      v
@@ -208,7 +208,7 @@
         (or (not (store-opts :validate-data?))
             (cd/custom-type? vt)
             (b/valid-data? v vt)
-            (u/raise "Invalid data, expecting" vt " got " v {:input v}))
+            (raise "Invalid data, expecting" vt " got " v {:input v}))
         (type-coercion vt v)))))
 
 (defn correct-value

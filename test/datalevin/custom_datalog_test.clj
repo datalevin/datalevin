@@ -12,7 +12,7 @@
             [datalevin.lmdb :as l]
             [datalevin.kv :as kv]
             [datalevin.udf :as udf]
-            [datalevin.util :as u])
+            [datalevin.util :as u :refer [raise]])
   (:import [java.util UUID]))
 
 (def ^:dynamic *dir* nil)
@@ -137,7 +137,7 @@
                  (d/with-transaction [tx conn]
                    (d/transact! tx [[:db/add 3 :task/many a]])
                    (is (= #{a b c} (set (:task/many (d/entity @tx 3)))))
-                   (throw (ex-info "rollback" {})))))
+                   (raise "rollback" {}))))
     (is (= #{b c} (set (:task/many (d/entity @conn 3)))))
     (is (= 6 (d/entries kv c/custom-values)))
     (is (thrown? Exception
@@ -385,7 +385,7 @@
     (is (= 4 (d/entries (d/datalog-kv conn) c/custom-values)))
     (udf/register! registry (descriptor :serializer)
                    (fn [^OpaqueTask v]
-                     (when (= "bad" (.-label v)) (throw (ex-info "bad payload" {})))
+                     (when (= "bad" (.-label v)) (raise "bad payload" {}))
                      (bits/serialize [(.-rank v) (.-label v)])))
     (is (thrown? Exception
                  (d/transact! conn [[:db/add 1 :item/value (OpaqueTask. 2 "new")]

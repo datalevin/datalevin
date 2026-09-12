@@ -18,7 +18,7 @@
    [datalevin.interface :as i]
    [datalevin.ha.replication :as drep]
    [datalevin.ha.util :as hu]
-   [datalevin.util :as u]
+   [datalevin.util :as u :refer [raise]]
    [taoensso.timbre :as log])
   (:import
    [java.util.concurrent ConcurrentHashMap]
@@ -479,7 +479,7 @@
                 db-name
                 #(drep/apply-ha-follower-txlog-record! expected-state record))
               (drep/apply-ha-follower-txlog-record! expected-state record))
-            (u/raise "HA follower replay aborted because follower state changed"
+            (raise "HA follower replay aborted because follower state changed"
                      {:error :ha/follower-stale-state
                       :db-name db-name
                       :record-lsn (:lsn record)
@@ -543,7 +543,7 @@
                   expected-state
                   local-patch)))
              result)))
-        (u/raise "HA follower store swap aborted because follower state changed"
+        (raise "HA follower store swap aborted because follower state changed"
                  {:error :ha/follower-stale-state
                   :db-name db-name
                   :state current-state
@@ -1017,7 +1017,7 @@
     (when db-name
       (refresh-ha-write-commit-state! deps server db-name)))
   (when-let [err (ha-write-admission-error deps server message)]
-    (u/raise "HA write admission rejected" err)))
+    (raise "HA write admission rejected" err)))
 
 (defn ha-write-commit-check-fn
   [deps server message]
@@ -1055,7 +1055,7 @@
     (when (satisfies? ctrl/ILeaseAuthority (:ha-authority state0))
       (let [txlog-lsn (long (or txlog-lsn 0))]
         (when-not (pos? txlog-lsn)
-          (u/raise "HA write commit confirmation failed"
+          (raise "HA write commit confirmation failed"
                    {:error :ha/write-indeterminate
                     :indeterminate? true
                     :reason :invalid-txlog-lsn
@@ -1063,14 +1063,14 @@
                     :leader-last-applied-lsn txlog-lsn}))
         (locking ((:db-write-admission-lock-fn deps) server db-name)
           (let [m (or (get ((:dbs-fn deps) server) db-name)
-                      (u/raise "HA write commit confirmation failed"
+                      (raise "HA write commit confirmation failed"
                                {:error :ha/write-indeterminate
                                 :indeterminate? true
                                 :reason :missing-db-state
                                 :db-name db-name
                                 :leader-last-applied-lsn txlog-lsn}))]
             (when-not (leader-authority-state? m)
-              (u/raise "HA write commit confirmation failed"
+              (raise "HA write commit confirmation failed"
                        {:error :ha/write-indeterminate
                         :indeterminate? true
                         :reason :not-leader
@@ -1138,7 +1138,7 @@
                                                             :leader-last-applied-lsn])
                                                    0)))))))))
               (when-not (:ok? result)
-                (u/raise "HA write commit confirmation failed"
+                (raise "HA write commit confirmation failed"
                          (ha-write-commit-confirmation-error
                           db-name
                           commit-lsn

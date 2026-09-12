@@ -18,7 +18,7 @@
    [datalevin.interface :as i]
    [datalevin.kv :as kv]
    [datalevin.storage :as st]
-   [datalevin.util :as u]
+   [datalevin.util :refer [raise]]
    [taoensso.timbre :as log])
   (:import
    [datalevin.db DB]
@@ -615,7 +615,7 @@
         (try
           (reopen-ha-local-store-from-info m reopen-info)
           (catch Throwable e
-            (u/raise "HA local store reopen failed"
+            (raise "HA local store reopen failed"
                      {:error :ha/follower-local-store-reopen-failed
                       :env-dir (:env-dir reopen-info)
                       :reopen-info reopen-info

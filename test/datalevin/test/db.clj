@@ -11,7 +11,7 @@
    [datalevin.lmdb :as l]
    [datalevin.query.plan :as qplan]
    [datalevin.storage :as s]
-   [datalevin.util :as u :refer [defrecord-updatable]])
+   [datalevin.util :as u :refer [ defrecord-updatable raise]])
   (:import
    [java.lang Thread$State]
    [java.util UUID]
@@ -143,7 +143,7 @@
                       clojure.lang.ExceptionInfo #"rollback giant update"
                       (d/with-transaction [cn conn-a]
                         (d/transact! cn [{:db/id 1 :item/data (value 101)}])
-                        (throw (ex-info "rollback giant update" {})))))
+                        (raise "rollback giant update" {}))))
                 (is (= (value 4) (:item/data (d/entity @conn-b 1))))
                 (write! @conn-c 5))
               (doseq [conn [conn-a conn-b @conn-c]]
@@ -248,7 +248,7 @@
         (with-redefs-fn
           {summary-var
            (fn [_]
-             (throw (ex-info "empty cache should not summarize datoms" {})))}
+             (raise "empty cache should not summarize datoms" {}))}
           #(d/transact! conn [{:db/id 1 :item/value 100}]))
         (is (> (.generation ^datalevin.utl.LRUCache cache)
                (long generation))))

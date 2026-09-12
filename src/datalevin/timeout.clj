@@ -8,7 +8,9 @@
 ;; You must not remove this notice, or any other, from this software.
 ;;
 (ns ^:no-doc datalevin.timeout
-  "Timeout for Datalog query processing")
+  "Timeout for Datalog query processing"
+  (:require
+   [datalevin.util :refer [raise]]))
 
 (def ^:dynamic *deadline*
   "When non nil, query pr pull will throw if its not done before *deadline*
@@ -45,7 +47,6 @@
   []
   (when (some-> *deadline*
                 (#(<= ^long % ^long (System/currentTimeMillis))))
-    (throw
-      (ex-info "Query and/or pull expression took too long to run."
+    (raise "Query and/or pull expression took too long to run."
                {:type :query/timeout
-                :deadline *deadline*}))))
+                :deadline *deadline*})))

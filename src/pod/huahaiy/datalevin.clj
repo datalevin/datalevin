@@ -14,7 +14,7 @@
    [bencode.core :as bencode]
    [sci.core :as sci]
    [datalevin.core :as d]
-   [datalevin.util :as u]
+   [datalevin.util :as u :refer [raise]]
    [datalevin.lmdb :as l]
    [datalevin.interpret :as i]
    [datalevin.protocol :as p]
@@ -158,7 +158,7 @@
   (or (:db/id ent)
       (when (instance? Entity ent)
         (.-eid ^Entity ent))
-      (u/raise "Entity must have :db/id" {:entity ent})))
+      (raise "Entity must have :db/id" {:entity ent})))
 
 (defn add
   [ent attr value]
@@ -186,7 +186,7 @@
     {::db (:db-name ent)}
 
     :else
-    (u/raise "Entity must have :db-name" {:entity ent})))
+    (raise "Entity must have :db-name" {:entity ent})))
 
 (defn touch [{:keys [db-name db/id]}]
   (when-let [d (get @dl-dbs db-name)]
@@ -519,16 +519,16 @@
 
     (::inter-fn callback)
     (or (ns-resolve 'pod.huahaiy.datalevin (symbol (::inter-fn callback)))
-        (u/raise "Pod function not found: " (::inter-fn callback)
+        (raise "Pod function not found: " (::inter-fn callback)
                  {:callback callback}))
 
     (symbol? callback)
     (or (ns-resolve 'pod.huahaiy.datalevin callback)
-        (u/raise "Pod function not found: " callback
+        (raise "Pod function not found: " callback
                  {:callback callback}))
 
     :else
-    (u/raise "Callback must be a function, pod function token, or symbol"
+    (raise "Callback must be a function, pod function token, or symbol"
              {:callback callback})))
 
 (defn listen!

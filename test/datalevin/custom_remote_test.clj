@@ -12,7 +12,7 @@
             [datalevin.server :as server]
             [datalevin.test.core :refer [allocate-port]]
             [datalevin.udf :as udf]
-            [datalevin.util :as u]
+            [datalevin.util :as u :refer [raise]]
             [taoensso.timbre :as log])
   (:import [datalevin NativeValue]
            [datalevin.server Server]
@@ -186,7 +186,7 @@
       (is (thrown-with-msg? Exception #"abort"
                             (d/with-transaction [tx conn]
                               (d/transact! tx [[:db/add 1 :task/value b]])
-                              (throw (ex-info "abort" {})))))
+                              (raise "abort" {}))))
       (is (= "receiver" (.codecId ^NativeValue (:task/value (d/pull @conn '[*] 1)))))
       (is (= a (:task/value (d/pull @conn '[*] 1))))
       (finally (d/close conn)))))
@@ -279,7 +279,7 @@
                             (d/with-transaction-kv [tx kv]
                               (d/register-type tx :app/aborted task-type)
                               (d/transact-kv tx "tasks" [[:del b]])
-                              (throw (ex-info "abort" {})))))
+                              (raise "abort" {}))))
       (is (not (contains? (:types (custom/registry (local-kv name))) :app/aborted)))
       (is (= :b (d/get-value kv "tasks" b)))
       (d/transact-kv kv "tasks" [[:del a]])
@@ -320,7 +320,7 @@
                             (d/with-transaction [tx conn]
                               (d/register-type tx :app/aborted task-type)
                               (d/transact! tx [[:db/add 2 :task/value z]])
-                              (throw (ex-info "abort" {})))))
+                              (raise "abort" {}))))
       (is (not (contains? (:types (custom/registry (local-kv name))) :app/aborted)))
       (is (= b (:task/value (d/entity @conn 2))))
       (finally (d/close conn)))
@@ -351,7 +351,7 @@
       (udf/register! *registry* (descriptor :serializer)
                      (fn [v]
                        (if (= "bad" (:name v))
-                         (throw (ex-info "bad payload" {}))
+                         (raise "bad payload" {})
                          (b/serialize v))))
       (udf/register! *registry* (descriptor :deserializer) b/deserialize)
       (d/transact-kv kv "tasks" [[:put a :a] [:put b :b]])

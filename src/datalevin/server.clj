@@ -11,7 +11,7 @@
   "Non-blocking event-driven database server with role based access control"
   (:refer-clojure :exclude [run-calls sync])
   (:require
-   [datalevin.util :as u]
+   [datalevin.util :as u :refer [raise]]
    [datalevin.core :as d]
    [datalevin.buffer :as bf]
    [datalevin.db :as db]
@@ -90,7 +90,7 @@
   (cond
     (instance? IStore store) (i/close store)
     (instance? ILMDB store)  (i/close-kv store)
-    :else                    (u/raise "Unknown store" {})))
+    :else                    (raise "Unknown store" {})))
 
 (declare store-closed?)
 (declare ensure-ha-client-op-dbi-open!)
@@ -120,7 +120,7 @@
         (l/open-kv env-dir env-opts)))
 
     :else
-    (u/raise "Unknown store" {})))
+    (raise "Unknown store" {})))
 
 (defn- closed-store-race?
   [t store]
@@ -208,7 +208,7 @@
   [permissions opts]
   (when-let [options (privileged-server-options opts)]
     (when-not (has-permission? ::control ::server nil permissions)
-      (u/raise
+      (raise
        "Server control permission is required to configure consensus HA or server-local options"
        {:error :server/privileged-options
         :options options}))))
@@ -221,7 +221,7 @@
      (if ~'permissions
        (if (has-permission? ~req-act ~req-obj ~req-tgt ~'permissions)
          (do ~@body)
-         (u/raise ~message {}))
+         (raise ~message {}))
        (do
          (remove-client ~'server ~'client-id)
          (p/write-message-blocking ~'ch ~'write-bf
@@ -257,10 +257,10 @@
   (let [threads    (long (or worker-threads (default-worker-thread-count)))
         queue-size (long (or worker-queue-size (* 4 threads)))]
     (when-not (pos? threads)
-      (u/raise "Server worker thread count must be positive"
+      (raise "Server worker thread count must be positive"
                {:worker-threads worker-threads}))
     (when-not (pos? queue-size)
-      (u/raise "Server worker queue size must be positive"
+      (raise "Server worker queue size must be positive"
                {:worker-queue-size worker-queue-size}))
     (ThreadPoolExecutor.
       threads
@@ -1211,7 +1211,7 @@
       (.bind (InetSocketAddress. ^String host (int port)))
       (.configureBlocking false))
     (catch Exception e
-      (u/raise "Error opening port " host ":" port ": " (ex-message e) {}))))
+      (raise "Error opening port " host ":" port ": " (ex-message e) {}))))
 
 (defn- get-ip [^SelectionKey skey]
   (let [ch ^SocketChannel (.channel skey)]
@@ -1267,7 +1267,7 @@
     (cond
       (instance? IStore store) (i/dir store)
       (instance? ILMDB store)  (i/env-dir store)
-      :else                    (u/raise "Unknown store type" {}))))
+      :else                    (raise "Unknown store type" {}))))
 
 (defn- detach-client-store!
   [^Server server ^SelectionKey skey db-name]
@@ -1296,7 +1296,7 @@
   (or (if writing?
         (writing-store server db-name)
         (db-store server skey db-name))
-      (u/raise "Store not found"
+      (raise "Store not found"
                {:type :reopen :db-name db-name :db-type "datalog"})))
 
 (defn- lmdb
@@ -1308,7 +1308,7 @@
                  (if (instance? Store store)
                    (.-lmdb ^Store store)
                    store))))
-      (u/raise "LMDB store not found"
+      (raise "LMDB store not found"
                {:type :reopen :db-name db-name :db-type "kv"})))
 
 (defn- store-closed?
@@ -1317,7 +1317,7 @@
     (nil? store)             true
     (instance? IStore store) (i/closed? store)
     (instance? ILMDB store)  (i/closed-kv? store)
-    :else                    (u/raise "Unknown store type" {})))
+    :else                    (raise "Unknown store type" {})))
 
 (defn- store-in-use?
   [[db-name store]]
@@ -1362,7 +1362,7 @@
 (defn- search-engine
   [^Server server ^SelectionKey skey db-name]
   (or (search-engine* server skey db-name)
-      (u/raise "Search engine not found"
+      (raise "Search engine not found"
                {:type :reopen :db-name db-name :db-type "engine"})))
 
 (defn- vector-index*
@@ -1374,7 +1374,7 @@
 (defn- vector-index
   [^Server server ^SelectionKey skey db-name]
   (or (vector-index* server skey db-name)
-      (u/raise "Vector index not found"
+      (raise "Vector index not found"
                {:type :reopen :db-name db-name :db-type "index"})))
 
 (defn- open-store
@@ -1589,7 +1589,7 @@
   [host]
   (when (and (not (loopback-bind-host? host))
              (not (default-password-env-set?)))
-    (u/raise "Refusing to bind Datalevin server to non-loopback host "
+    (raise "Refusing to bind Datalevin server to non-loopback host "
              host
              " with the built-in default password. Set "
              default-password-env-var
@@ -1671,7 +1671,7 @@
                      db-name
                      store
                      (get (.-dbs server) db-name))))
-    (u/raise "Option :ha-members cannot be changed via assoc-opt on a live consensus HA database"
+    (raise "Option :ha-members cannot be changed via assoc-opt on a live consensus HA database"
              {:error :ha/unsafe-live-option-mutation
               :db-name db-name
               :option k})))
@@ -1878,7 +1878,7 @@
   (let [s (get-store server db-name)]
     (or (when s
           (if (instance? Store s) (.-lmdb ^Store s) s))
-        (u/raise "LMDB store not found"
+        (raise "LMDB store not found"
                  {:type :reopen :db-name db-name :db-type "kv"}))))
 
 (declare dispatch-message)
@@ -1907,7 +1907,7 @@
     (locking queue
       (if (.get running?)
         (.put queue [skey message])
-        (u/raise "Transaction runner is closed" {}))))
+        (raise "Transaction runner is closed" {}))))
 
   (halt-run [_]
     (locking queue
@@ -2054,7 +2054,7 @@
                            (has-permission? action ::database
                                             (db-eid (.-sys-conn server) db-name)
                                             permissions))
-              (u/raise "Don't have permission to decode native database values" {}))
+              (raise "Don't have permission to decode native database values" {}))
             ;; Resolving on the transaction runner observes pending registrations.
             (lmdb server skey db-name writing?)))
         readers (volatile! {})]
@@ -2254,4 +2254,4 @@
           (ensure-ha-follower-sync-loop server db-name))
         server))
     (catch Exception e
-      (u/raise "Error creating server:" (ex-message e) {}))))
+      (raise "Error creating server:" (ex-message e) {}))))

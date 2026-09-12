@@ -706,11 +706,11 @@
 (defn- search-page-value
   [k v]
   (when-not (integer? v)
-    (u/raise "Search pagination option must be an integer"
+    (raise "Search pagination option must be an integer"
              {:option k :value v}))
   (let [v (long v)]
     (when-not (<= 0 v Integer/MAX_VALUE)
-      (u/raise "Search pagination option must be a non-negative integer"
+      (raise "Search pagination option must be a non-negative integer"
                {:option k :value v}))
     v))
 
@@ -752,7 +752,7 @@
                       page-end)
         top         (max ^long page-end ^long cache-top)]
     (when (< Integer/MAX_VALUE ^long top)
-      (u/raise "Search pagination window exceeds maximum"
+      (raise "Search pagination window exceeds maximum"
                {:offset              offset
                 :limit               limit
                 :paging-cache-pages  cache-pages
@@ -792,7 +792,7 @@
   (remove-doc [this doc-ref]
     (if-let [[doc-id stored-ref] (stored-doc-entry this doc-ref)]
       (remove-doc* this doc-id stored-ref)
-      (u/raise "Document does not exist." {:doc-ref doc-ref})))
+      (raise "Document does not exist." {:doc-ref doc-ref})))
 
   (clear-docs [_]
     (.empty docs)
@@ -864,8 +864,8 @@
             (u/delete-files dfname)
             new))
         (catch Exception e
-          (u/raise "Unable to re-index search. " e {:dir (env-dir lmdb)})))
-      (u/raise "Can only re-index search when :include-text? is true" {}))))
+          (raise "Unable to re-index search. " e {:dir (env-dir lmdb)})))
+      (raise "Can only re-index search when :include-text? is true" {}))))
 
 (defn- phrase-stats-empty
   [query]
@@ -1374,7 +1374,7 @@
                           [doc-id doc-ref]
                           (stored-doc-entry engine doc-ref)))]
                   (when-not stored-ref
-                    (u/raise "Document does not exist." {:doc-ref doc-ref}))
+                    (raise "Document does not exist." {:doc-ref doc-ref}))
                   (.add txs (l/kv-tx :del rawtext-dbi doc-id :int))
                   (if-let [^objects doc-terms
                            (.get pending-doc-terms stored-ref)]

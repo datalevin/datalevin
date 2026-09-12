@@ -27,7 +27,7 @@
    [datalevin.kv :as kv]
    [datalevin.remote :as r]
    [datalevin.storage :as st]
-   [datalevin.util :as u]
+   [datalevin.util :refer [raise]]
    [taoensso.timbre :as log])
   (:import
    [datalevin.bits Indexable Retrieved CustomReference]
@@ -575,11 +575,11 @@
                              (do
                                (assign-timeout-results!)
                                (finish first-failure))
-                             (throw (ex-info "HA parallel probe timed out"
+                             (raise "HA parallel probe timed out"
                                              {:error :ha/parallel-probe-timeout
                                               :timeout-ms timeout-ms
                                               :pending-count remaining
-                                              :items (timeout-items)})))))))))))))))))
+                                              :items (timeout-items)}))))))))))))))))
 
 (defn- normalize-leader-watermark-result
   [lease result]
@@ -1126,7 +1126,7 @@
   [lease source-endpoint watermark]
   (let [check (ha-source-authority-check lease source-endpoint watermark)]
     (when-not (:ok? check)
-      (u/raise "Follower txlog replay source is not aligned with current authority"
+      (raise "Follower txlog replay source is not aligned with current authority"
                {:error :ha/txlog-source-authority-mismatch
                 :source-endpoint source-endpoint
                 :leader-endpoint (:leader-endpoint lease)
@@ -1526,7 +1526,7 @@
                        (merge source-watermarks
                               prefetched-source-watermarks))
                      (conj gap-errors (:gap-error attempt))))))
-        (u/raise "Follower txlog replay gap unresolved across deterministic sources"
+        (raise "Follower txlog replay gap unresolved across deterministic sources"
                  {:error :ha/txlog-gap-unresolved
                   :expected-lsn next-lsn
                   :upto-lsn upto-lsn
@@ -1548,7 +1548,7 @@
            :open-tx-log-rows
            [db-name (long from-lsn) (long upto-lsn)]
            false))))
-    (u/raise "Invalid HA leader endpoint for txlog fetch"
+    (raise "Invalid HA leader endpoint for txlog fetch"
              {:error :ha/follower-invalid-leader-endpoint
               :leader-endpoint leader-endpoint})))
 
@@ -1558,7 +1558,7 @@
     (when (seq records)
       (let [first-lsn (long (:lsn (first records)))]
         (when (not= first-lsn expected-from)
-          (u/raise "Follower txlog replay detected LSN gap"
+          (raise "Follower txlog replay detected LSN gap"
                    {:error :ha/txlog-gap
                     :expected-lsn expected-from
                     :actual-lsn first-lsn})))
@@ -1568,7 +1568,7 @@
           (let [actual (long (:lsn record))
                 want (unchecked-inc (long prev))]
             (when (not= actual want)
-              (u/raise "Follower txlog replay detected non-contiguous LSN"
+              (raise "Follower txlog replay detected non-contiguous LSN"
                        {:error :ha/txlog-non-contiguous
                         :expected-lsn want
                         :actual-lsn actual}))
@@ -1586,7 +1586,7 @@
            (if-some [record-term* (:ha-term record)]
              (let [record-term (long record-term*)]
                (when-not (pos? record-term)
-                 (u/raise "Follower txlog replay record has invalid HA term"
+                 (raise "Follower txlog replay record has invalid HA term"
                           {:error           :ha/txlog-record-invalid-term
                            :source-endpoint source-endpoint
                            :lease-term      lease-term
@@ -1599,7 +1599,7 @@
                ;; later batches must not fall back below that term even if the
                ;; sync source changes.
                (when (> record-term lease-term)
-                 (u/raise "Follower txlog replay record term is ahead of current lease"
+                 (raise "Follower txlog replay record term is ahead of current lease"
                           {:error           :ha/txlog-record-invalid-term
                            :source-endpoint source-endpoint
                            :lease-term      lease-term
@@ -1607,7 +1607,7 @@
                            :record-term     record-term}))
                (when (and prev-term
                           (< record-term (long prev-term)))
-                 (u/raise "Follower txlog replay record terms regressed"
+                 (raise "Follower txlog replay record terms regressed"
                           {:error                :ha/txlog-record-invalid-term
                            :source-endpoint      source-endpoint
                            :lease-term           lease-term
@@ -1624,7 +1624,7 @@
   (when-some [record-term* (:ha-term record)]
     (let [record-term (long record-term*)]
       (when-not (pos? record-term)
-        (u/raise "Follower txlog replay record has invalid HA term"
+        (raise "Follower txlog replay record has invalid HA term"
                  {:error :ha/txlog-record-invalid-term
                   :record-lsn (:lsn record)
                   :record-term record-term}))
@@ -1634,7 +1634,7 @@
           ;; historical committed records may trail the current authority term,
           ;; but replay must never advance into a future term.
           (when (> record-term authority-term)
-            (u/raise "Follower txlog replay record term is ahead of current authority"
+            (raise "Follower txlog replay record term is ahead of current authority"
                      {:error :ha/txlog-record-invalid-term
                       :record-lsn (:lsn record)
                       :record-term record-term
@@ -1767,7 +1767,7 @@
                       (sequential? ops)  (vec ops)
                       :else              nil)]
     (when-not kv-store
-      (u/raise "Follower txlog replay requires a local KV store"
+      (raise "Follower txlog replay requires a local KV store"
                {:error :ha/follower-missing-store}))
     (assert-ha-follower-record-term! m record)
     (cond
@@ -1818,7 +1818,7 @@
                       (try
                         (reopen-ha-local-store-from-info m reopen-info)
                         (catch Throwable e
-                          (u/raise
+                          (raise
                            "HA follower schema replay failed to reopen local store"
                            {:error       :ha/follower-schema-reopen-failed
                             :record-lsn  (:lsn record)
@@ -1903,7 +1903,7 @@
         next-state)
 
       :else
-      (u/raise "Follower txlog replay record is missing rows"
+      (raise "Follower txlog replay record is missing rows"
                {:error  :ha/follower-invalid-record
                 :record record}))))
 
@@ -1929,7 +1929,7 @@
            :txlog-update-replica-floor!
            [db-name (:ha-node-id m) (long applied-lsn)]
            false))))
-    (u/raise "Invalid HA leader endpoint for replica-floor update"
+    (raise "Invalid HA leader endpoint for replica-floor update"
              {:error :ha/follower-invalid-leader-endpoint
               :leader-endpoint leader-endpoint
               :applied-lsn applied-lsn})))
@@ -1951,7 +1951,7 @@
            :txlog-clear-replica-floor!
            [db-name (:ha-node-id m)]
            false))))
-    (u/raise "Invalid HA leader endpoint for replica-floor clear"
+    (raise "Invalid HA leader endpoint for replica-floor clear"
              {:error :ha/follower-invalid-leader-endpoint
               :leader-endpoint leader-endpoint})))
 
@@ -2023,7 +2023,7 @@
           {:copy-meta copy-meta})
         (finally
           (close-ha-snapshot-remote-store! remote-store))))
-    (u/raise "Invalid HA endpoint for snapshot copy"
+    (raise "Invalid HA endpoint for snapshot copy"
              {:error :ha/follower-invalid-snapshot-endpoint
               :db-name db-name
               :source-endpoint endpoint})))
@@ -2045,7 +2045,7 @@
         local-node-id (:ha-node-id m)
         requested-batch-records (long (ha-follower-request-batch-records m))]
     (when (or (nil? leader-endpoint) (s/blank? leader-endpoint))
-      (u/raise "HA follower is missing leader endpoint for txlog sync"
+      (raise "HA follower is missing leader endpoint for txlog sync"
                {:error :ha/follower-missing-leader-endpoint
                 :lease lease}))
     (let [upto-lsn (long (+ (long next-lsn)

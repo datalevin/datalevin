@@ -16,7 +16,7 @@
    [datalevin.db :as db]
    [datalevin.interface :as i]
    [datalevin.kv :as kv]
-   [datalevin.util :as u]
+   [datalevin.util :as u :refer [raise]]
    [taoensso.timbre :as log])
   (:import
    [datalevin.io PosixFsync]
@@ -83,7 +83,7 @@
     (try
       (atomic-move-replace-existing-paths! src-path dst-path)
       (catch AtomicMoveNotSupportedException e
-        (u/raise "HA snapshot install requires atomic path moves"
+        (raise "HA snapshot install requires atomic path moves"
                  e
                  {:error :ha/follower-snapshot-atomic-move-unsupported
                   :src src
@@ -103,7 +103,7 @@
       (let [marker (try
                      (edn/read-string (slurp marker-path))
                      (catch Exception e
-                       (u/raise "HA snapshot install marker is unreadable"
+                       (raise "HA snapshot install marker is unreadable"
                                 e
                                 {:error :ha/follower-snapshot-install-marker-invalid
                                  :env-dir env-dir
@@ -118,7 +118,7 @@
                            (and (string? stage-dir)
                                 (not (s/blank? stage-dir))))
                        (keyword? stage))
-          (u/raise "HA snapshot install marker is invalid"
+          (raise "HA snapshot install marker is invalid"
                    {:error :ha/follower-snapshot-install-marker-invalid
                     :env-dir env-dir
                     :marker-path marker-path
@@ -203,7 +203,7 @@
       marker)
 
     :else
-    (u/raise "HA snapshot install backup is missing during recovery"
+    (raise "HA snapshot install backup is missing during recovery"
              {:error :ha/follower-snapshot-install-recovery-failed
               :env-dir env-dir
               :backup-dir backup-dir
@@ -234,7 +234,7 @@
           marker)
 
         :else
-        (u/raise "HA snapshot install marker has no recoverable store"
+        (raise "HA snapshot install marker has no recoverable store"
                  {:error :ha/follower-snapshot-install-recovery-failed
                   :env-dir env-dir
                   :backup-dir backup-dir
@@ -260,7 +260,7 @@
           marker)
 
         :else
-        (u/raise "HA snapshot install marker has no recoverable store"
+        (raise "HA snapshot install marker has no recoverable store"
                  {:error :ha/follower-snapshot-install-recovery-failed
                   :env-dir env-dir
                   :backup-dir backup-dir
@@ -278,7 +278,7 @@
        marker
        "Recovering HA snapshot install after interrupted staged snapshot")
 
-      (u/raise "HA snapshot install marker has an unsupported stage"
+      (raise "HA snapshot install marker has an unsupported stage"
                {:error :ha/follower-snapshot-install-marker-invalid
                 :env-dir env-dir
                 :marker marker}))))

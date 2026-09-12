@@ -3089,10 +3089,10 @@
                 _ (when magic-threshold
                     (let [cur-size (magic-rules-size new-totals)]
                       (when (> cur-size ^long magic-threshold)
-                        (throw (ex-info "Magic explosion"
+                        (raise "Magic explosion"
                                         {:type         ::magic-explosion
                                          :current-size cur-size
-                                         :threshold    magic-threshold})))))]
+                                         :threshold    magic-threshold}))))]
             (recur new-totals new-deltas
                    (seq new-deltas) (inc iter))))))))
 

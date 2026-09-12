@@ -10,6 +10,7 @@
 (ns ^:no-doc datalevin.query.access.fulltext
   "Ranked and resumable access paths for fulltext query functions."
   (:require
+   [datalevin.util :refer [raise]]
    [datalevin.built-ins :as built-ins]
    [datalevin.constants :as c]
    [datalevin.interface :refer [doc-count]]
@@ -227,9 +228,8 @@
     (let [request   (get-in path [:options :request])
           source    (or source (get-in path [:options :spec :source-value]))
           _         (when-not (instance? DB source)
-                      (throw
-                        (ex-info "Fulltext access requires a database source"
-                                 {:source source})))
+                      (raise "Fulltext access requires a database source"
+                                 {:source source}))
           resume    (:resume work)
           index     (continuation-index resume)
           emitted   (long (or (:emitted work) index))]

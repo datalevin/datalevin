@@ -13,7 +13,7 @@
    [clojure.string :as s]
    [datalevin.bits :as b]
    [datalevin.ha.lease :as lease]
-   [datalevin.util :as u]
+   [datalevin.util :as u :refer [raise]]
    [taoensso.timbre :as log])
   (:import
    [com.alipay.sofa.jraft Closure Iterator Node RaftGroupService Status]
@@ -105,7 +105,7 @@
 (defn- require-non-blank-string!
   [x where]
   (when-not (non-blank-string? x)
-    (u/raise "HA control value must be a non-blank string"
+    (raise "HA control value must be a non-blank string"
              {:error :ha/control-invalid-request
               :where where
               :value x})))
@@ -113,7 +113,7 @@
 (defn- require-positive-int!
   [x where]
   (when-not (positive-int? x)
-    (u/raise "HA control value must be a positive integer"
+    (raise "HA control value must be a positive integer"
              {:error :ha/control-invalid-request
               :where where
               :value x})))
@@ -121,7 +121,7 @@
 (defn- require-integer!
   [x where]
   (when-not (integer? x)
-    (u/raise "HA control value must be an integer"
+    (raise "HA control value must be an integer"
              {:error :ha/control-invalid-request
               :where where
               :value x})))
@@ -137,14 +137,14 @@
   (require-integer! now-ms :now-ms)
   (when (some? observed-version)
     (when-not (non-negative-int? observed-version)
-      (u/raise "HA observed-version must be a non-negative integer"
+      (raise "HA observed-version must be a non-negative integer"
                {:error :ha/control-invalid-request
                 :where :observed-version
                 :value observed-version})))
   (when (and observed-lease
              (some? (:db-identity observed-lease))
              (not= db-identity (:db-identity observed-lease)))
-    (u/raise "HA observed lease db-identity mismatch"
+    (raise "HA observed lease db-identity mismatch"
              {:error :ha/control-invalid-request
               :where :observed-lease
               :db-identity db-identity
@@ -251,7 +251,7 @@
 (defn- ensure-running!
   [running-v]
   (when-not (running? running-v)
-    (u/raise "HA lease authority is not started"
+    (raise "HA lease authority is not started"
              {:error :ha/control-not-started})))
 
 (defn- apply-try-acquire-transition
@@ -617,7 +617,7 @@
     :update-membership-hash (apply-update-membership-hash-transition
                              state (:req cmd))
     :read-state          (apply-read-state-transition state (:db-identity cmd))
-    (u/raise "Unsupported HA control command"
+    (raise "Unsupported HA control command"
              {:error :ha/control-invalid-command
               :command cmd})))
 
@@ -728,7 +728,7 @@
 (defn- require-raft-dir!
   [raft-dir group-id local-peer-id]
   (when-not (non-blank-string? raft-dir)
-    (u/raise
+    (raise
      "HA control-plane :raft-dir is required for :sofa-jraft; use a durable directory outside tmp"
      {:error :ha/control-missing-raft-dir
       :group-id group-id
@@ -749,19 +749,19 @@
 (defn- validated-peer-ids!
   [voters where]
   (when-not (vector? voters)
-    (u/raise "HA control-plane voters must be a vector"
+    (raise "HA control-plane voters must be a vector"
              {:error :ha/control-invalid-voters
               :where where
               :voters voters}))
   (when (empty? voters)
-    (u/raise "HA control-plane voters cannot be empty"
+    (raise "HA control-plane voters cannot be empty"
              {:error :ha/control-invalid-voters
               :where where
               :voters voters}))
   (let [peer-ids
         (mapv (fn [idx v]
                 (when-not (map? v)
-                  (u/raise "HA control-plane voter must be a map"
+                  (raise "HA control-plane voter must be a map"
                            {:error :ha/control-invalid-voters
                             :where [where idx]
                             :voter v}))
@@ -772,7 +772,7 @@
               (range (count voters))
               voters)]
     (when (not= (count peer-ids) (count (distinct peer-ids)))
-      (u/raise "HA control-plane voter peer IDs must be unique"
+      (raise "HA control-plane voter peer IDs must be unique"
                {:error :ha/control-invalid-voters
                 :where where
                 :peer-ids peer-ids}))
@@ -782,7 +782,7 @@
   [peer-id where]
   (let [p (PeerId.)]
     (when-not (.parse p peer-id)
-      (u/raise "Invalid HA control peer-id"
+      (raise "Invalid HA control peer-id"
                {:error :ha/control-invalid-peer-id
                 :where where
                 :peer-id peer-id}))
@@ -791,23 +791,23 @@
 (defn- normalize-snapshot-state!
   [state]
   (when-not (map? state)
-    (u/raise "HA control snapshot payload must be a map"
+    (raise "HA control snapshot payload must be a map"
              {:error :ha/control-invalid-snapshot-state
               :state state}))
   (let [leases          (:leases state)
         membership-hash (:membership-hash state)
         voters          (or (:voters state) [])]
     (when-not (map? leases)
-      (u/raise "HA control snapshot :leases must be a map"
+      (raise "HA control snapshot :leases must be a map"
                {:error :ha/control-invalid-snapshot-state
                 :leases leases}))
     (when-not (or (nil? membership-hash)
                   (non-blank-string? membership-hash))
-      (u/raise "HA control snapshot :membership-hash must be nil or non-blank string"
+      (raise "HA control snapshot :membership-hash must be nil or non-blank string"
                {:error :ha/control-invalid-snapshot-state
                 :membership-hash membership-hash}))
     (when-not (vector? voters)
-      (u/raise "HA control snapshot :voters must be a vector"
+      (raise "HA control snapshot :voters must be a vector"
                {:error :ha/control-invalid-snapshot-state
                 :voters voters}))
     (let [leases (into {}
@@ -825,7 +825,7 @@
                          (range (count voters))
                          voters)]
       (when (not= (count peer-ids) (count (distinct peer-ids)))
-        (u/raise "HA control snapshot voter peer IDs must be unique"
+        (raise "HA control snapshot voter peer IDs must be unique"
                  {:error :ha/control-invalid-snapshot-state
                   :voters voters}))
       {:leases leases
@@ -848,7 +848,7 @@
     (try
       (atomic-move-replace-existing-paths! from-path to-path)
       (catch AtomicMoveNotSupportedException e
-        (u/raise "HA control snapshot save requires atomic file replacement"
+        (raise "HA control snapshot save requires atomic file replacement"
                  e
                  {:error :ha/control-snapshot-atomic-move-unsupported
                   :from from
@@ -869,7 +869,7 @@
     (u/dump-bytes tmp-path ^bytes (b/serialize state))
     (move-replace-existing! tmp-path snapshot-path)
     (when-not (.addFile writer fsm-snapshot-file)
-      (u/raise "Failed to add HA control FSM snapshot file"
+      (raise "Failed to add HA control FSM snapshot file"
                {:error :ha/control-snapshot-save-failed
                 :snapshot-file fsm-snapshot-file
                 :snapshot-root snapshot-root}))))
@@ -879,7 +879,7 @@
   (let [snapshot-root (.getPath reader)
         files         (set (.listFiles reader))]
     (when-not (contains? files fsm-snapshot-file)
-      (u/raise "HA control FSM snapshot file is missing"
+      (raise "HA control FSM snapshot file is missing"
                {:error :ha/control-snapshot-load-failed
                 :snapshot-file fsm-snapshot-file
                 :snapshot-root snapshot-root
@@ -1061,7 +1061,7 @@
   [{:keys [node-v]}]
   (if-let [^Node node @node-v]
     node
-    (u/raise "HA control-plane node is unavailable"
+    (raise "HA control-plane node is unavailable"
              {:error :ha/control-node-unavailable})))
 
 (defn- running-runtime!
@@ -1069,10 +1069,10 @@
   (let [^Node node @node-v
         ^RpcClient rpc-client @rpc-client-v]
     (when-not node
-      (u/raise "HA control-plane node is unavailable"
+      (raise "HA control-plane node is unavailable"
                {:error :ha/control-node-unavailable}))
     (when-not rpc-client
-      (u/raise "HA control-plane rpc client is unavailable"
+      (raise "HA control-plane rpc client is unavailable"
                {:error :ha/control-rpc-unavailable}))
     {:node node
      :rpc-client rpc-client}))
@@ -1120,7 +1120,7 @@
                            (.setRpcConnectTimeoutMs (int timeout-ms))
                            (.setRpcDefaultTimeout (int timeout-ms)))]
     (when-not (.init client opts)
-      (u/raise "Failed to initialize HA control rpc client"
+      (raise "Failed to initialize HA control rpc client"
                {:error :ha/control-rpc-init-failed}))
     client))
 
@@ -1150,7 +1150,7 @@
                    invoke-timeout)
       (catch InterruptedException e
         (.interrupt (Thread/currentThread))
-        (u/raise "HA control forward interrupted"
+        (raise "HA control forward interrupted"
                  {:error :ha/control-interrupted
                   :attempt attempt}))
       (catch Exception e
@@ -1166,7 +1166,7 @@
                rpc-timeout-ms leader request invoke-timeout)
               (catch InterruptedException fresh-e
                 (.interrupt (Thread/currentThread))
-                (u/raise "HA control forward interrupted"
+                (raise "HA control forward interrupted"
                          {:error :ha/control-interrupted
                           :attempt attempt}))
               (catch Exception fresh-e
@@ -1203,7 +1203,7 @@
                                                  (System/currentTimeMillis)))
              ^Node node (running-node! authority)]
          (if (<= remaining 0)
-           (u/raise "HA control readIndex timed out"
+           (raise "HA control readIndex timed out"
                     {:error :ha/control-timeout
                      :where :read-index
                      :attempt attempt
@@ -1249,7 +1249,7 @@
                        (recur (inc attempt)))
 
                    :else
-                   (u/raise "HA control readIndex failed"
+                   (raise "HA control readIndex failed"
                             {:error :ha/control-read-failed
                              :status (status-data ^Status status)
                              :authority (authority-diagnostics authority)})))))))))))
@@ -1409,7 +1409,7 @@
            now-ms  start-ms]
       (let [remaining (- deadline now-ms)]
         (when (<= remaining 0)
-          (u/raise "HA control command timed out"
+          (raise "HA control command timed out"
                    {:error :ha/control-timeout
                     :attempt attempt
                     :command (:op cmd)}))
@@ -1432,7 +1432,7 @@
                            (long (System/currentTimeMillis))))
 
                 :else
-                (u/raise "HA control local apply failed"
+                (raise "HA control local apply failed"
                          {:error :ha/control-apply-failed
                           :attempt attempt
                           :command (:op cmd)
@@ -1492,7 +1492,7 @@
                                  (long (System/currentTimeMillis))))
 
                       :else
-                      (u/raise "HA control forward response failed"
+                      (raise "HA control forward response failed"
                                {:error :ha/control-forward-failed
                                 :attempt attempt
                                 :payload payload})))))
@@ -1623,12 +1623,12 @@
                   client             (.createRpcClient
                                       (RpcFactoryHelper/rpcFactory))]
               (when-not node
-                (u/raise "Failed to start HA control JRaft node"
+                (raise "Failed to start HA control JRaft node"
                          {:error :ha/control-start-failed
                           :group-id group-id
                           :peer-id local-peer-id}))
               (when-not (.init ^RpcClient client opts)
-                (u/raise "Failed to initialize HA control rpc client"
+                (raise "Failed to initialize HA control rpc client"
                          {:error :ha/control-rpc-init-failed
                           :group-id group-id
                           :peer-id local-peer-id}))
@@ -1747,7 +1747,7 @@
       (loop [attempt 0]
         (let [remaining (- deadline (System/currentTimeMillis))]
           (when (<= remaining 0)
-            (u/raise "HA control voter reconfiguration timed out"
+            (raise "HA control voter reconfiguration timed out"
                      {:error :ha/control-timeout
                       :where :replace-voters
                       :attempt attempt
@@ -1770,7 +1770,7 @@
                       (recur (inc attempt)))
 
                   :else
-                  (u/raise "HA control voter reconfiguration failed"
+                  (raise "HA control voter reconfiguration failed"
                            {:error :ha/control-change-peers-failed
                             :attempt attempt
                             :peer-ids peer-ids
@@ -1825,7 +1825,7 @@
                             (recur (inc attempt)))
 
                         :else
-                        (u/raise "HA control forward response failed"
+                        (raise "HA control forward response failed"
                                  {:error :ha/control-forward-failed
                                   :attempt attempt
                                   :payload payload})))))
@@ -1932,7 +1932,7 @@
         :voters (read-voters authority)})
 
      :else
-     (u/raise "Unsupported HA control authority type"
+     (raise "Unsupported HA control authority type"
               {:error :ha/control-unsupported-authority
                :class (some-> authority class .getName)}))))
 
@@ -1989,6 +1989,6 @@
   [{:keys [backend] :as opts}]
   (case backend
     :sofa-jraft (new-sofa-jraft-authority opts)
-    (u/raise "Unsupported HA control-plane backend"
+    (raise "Unsupported HA control-plane backend"
              {:error :ha/unsupported-backend
               :backend backend})))

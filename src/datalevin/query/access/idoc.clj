@@ -17,7 +17,7 @@
    [datalevin.query.access :as access]
    [datalevin.query.access.function :as function]
    [datalevin.storage :as st]
-   [datalevin.util :as u])
+   [datalevin.util :as u :refer [raise]])
   (:import
    [datalevin.db DB]
    [datalevin.storage Store]
@@ -67,10 +67,9 @@
   [^DB source spec resume]
   (let [[arg1 arg2 arg3]
         (or (argument-slots (function/resolve-arguments spec))
-            (throw
-              (ex-info "Invalid idoc access function arity"
+            (raise "Invalid idoc access function arity"
                        {:function (:function spec)
-                        :args     (:args spec)})))
+                        :args     (:args spec)}))
         needed  (get-in spec [:projection :needed])
         request (built-ins/idoc-match-request
                   source arg1 arg2 arg3 needed)]
@@ -176,9 +175,8 @@
     (let [spec   (get-in path [:options :spec])
           source (or source (:source-value spec))]
       (when-not (instance? DB source)
-        (throw
-          (ex-info "Idoc access requires a database source"
-                   {:source source})))
+        (raise "Idoc access requires a database source"
+                   {:source source}))
       (IdocCursor.
         source spec
         (max 1 (long (or (:batch-size work) default-batch-size)))

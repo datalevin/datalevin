@@ -1,6 +1,7 @@
 (ns ^:no-doc datalevin.test-adapter.runner
   "Run selected original test vars with their namespace fixtures."
   (:require
+   [datalevin.util :refer [raise]]
    [clojure.edn :as edn]
    [clojure.java.io :as io]
    [clojure.java.shell :as shell]
@@ -17,8 +18,8 @@
     (when-not (and (= 1 (:version selection)) (seq tests) (vector? tests)
                    (every? qualified-symbol? symbols)
                    (= (count symbols) (count (distinct symbols))))
-      (throw (ex-info "Expected a version 1 selection of distinct qualified test vars"
-                      {:selection selection})))
+      (raise "Expected a version 1 selection of distinct qualified test vars"
+                      {:selection selection}))
     selection))
 
 (defn- var-symbol [v]
@@ -94,8 +95,8 @@
                                (let [v (ns-resolve ns-sym (symbol (name sym)))]
                                  (when-not (and (var? v) (:test (meta v))
                                                 (= sym (var-symbol v)))
-                                   (throw (ex-info "Selected test var does not exist"
-                                                   {:test sym})))
+                                   (raise "Selected test var does not exist"
+                                                   {:test sym}))
                                  (swap! states update sym merge
                                         (select-keys (meta v) [:file :line]))
                                  v)) symbols)
@@ -184,8 +185,8 @@
                  (when-not (and (contains? #{"reference" "rust"} backend-name)
                                 manifest-path report-path (empty? extra)
                                 (if (= "rust" backend-name) peer (nil? peer)))
-                   (throw (ex-info
-                           "Usage: reference|rust selection.edn report.edn [rust-peer-executable]" {})))
+                   (raise
+                           "Usage: reference|rust selection.edn report.edn [rust-peer-executable]" {}))
                  (let [selection (validate-selection (edn/read-string (slurp manifest-path)))
                        provenance (provenance selection manifest-path peer)
                        backend (if (= "reference" backend-name)

@@ -1217,10 +1217,10 @@
               (do
                 (.wait monitor remaining)
                 (recur deadline))
-              (throw (ex-info "Timed out waiting for durable LSN"
+              (raise "Timed out waiting for durable LSN"
                               {:type :txlog/commit-timeout
                                :lsn lsn
-                               :timeout-ms timeout-ms})))))))))
+                               :timeout-ms timeout-ms}))))))))
 
 (defn- await-durable-retry-window!
   [sync-manager lsn wait-ms]
@@ -1250,10 +1250,10 @@
            (let [now (System/currentTimeMillis)
                  remaining (- ^long deadline ^long now)]
              (when-not (pos? remaining)
-               (throw (ex-info "Timed out waiting for durable LSN"
+               (raise "Timed out waiting for durable LSN"
                                {:type :txlog/commit-timeout
                                 :lsn lsn
-                                :timeout-ms timeout-ms})))
+                                :timeout-ms timeout-ms}))
             (if-let [sync-begin* (or sync-begin
                                      (begin-sync! sync-manager lsn))]
               (if-let [sync-res
@@ -1901,7 +1901,7 @@
                (do
                  (.wait monitor remaining)
                  (recur deadline))
-               (throw (ex-info "Timed out waiting for durable LSN"
+               (raise "Timed out waiting for durable LSN"
                              {:type :txlog/commit-timeout
                               :lsn lsn
-                              :timeout-ms timeout-ms}))))))))))
+                              :timeout-ms timeout-ms})))))))))

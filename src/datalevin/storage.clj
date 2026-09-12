@@ -16,7 +16,7 @@
    [datalevin.inline :refer [update assoc]]
    [datalevin.kv :as kv]
    [datalevin.remote :as remote]
-   [datalevin.util :as u :refer [conjs conjv]]
+   [datalevin.util :as u :refer [ conjs conjv raise]]
    [datalevin.buffer :as bf]
    [datalevin.relation :as r]
    [datalevin.bits :as b]
@@ -80,7 +80,7 @@
 (defn- apply-option-mutations
   [opts kvs]
   (when-not (map? kvs)
-    (u/raise "Option mutations must be a map" {:value kvs}))
+    (raise "Option mutations must be a map" {:value kvs}))
   (reduce-kv
    (fn [m k v]
      (let [k' (c/canonical-wal-option-key k)]
@@ -473,7 +473,7 @@
         dbi-name c/eav]
     (scan/scan lmdb dbi-name
       (cpp/filter-list-id-int-prefix! rtx cur in eid-idx aid out)
-      (u/raise "Fail to filter EAV attribute presence: " e
+      (raise "Fail to filter EAV attribute presence: " e
                {:eid-idx eid-idx :aid aid}))))
 
 (defn- ave-filter-bound-id-chunk
@@ -489,7 +489,7 @@
           out)
         (cpp/filter-list-avg-bound-id!
           rtx cur in value-idx aid value-type bound-id out))
-      (u/raise "Fail to filter AVE by bound entity: " e
+      (raise "Fail to filter AVE by bound entity: " e
                {:value-idx value-idx :aid aid :bound-id bound-id}))))
 
 (defn- ave-filter-tuple-id-chunk
@@ -506,7 +506,7 @@
           out)
         (cpp/filter-list-avg-tuple-id!
           rtx cur in value-idx entity-idx aid value-type out))
-      (u/raise "Fail to filter AVE by tuple entity: " e
+      (raise "Fail to filter AVE by tuple entity: " e
                {:value-idx value-idx :entity-idx entity-idx :aid aid}))))
 
 (defn- parallel-scan-participant-capacity
@@ -759,7 +759,7 @@
             (eav-scan-v-multi*
               lmdb iter na out (.get in i) eid-idx seen aids preds fidxs skips
               gstarts gcounts))))
-      (u/raise "Fail to eav-scan-v: " e
+      (raise "Fail to eav-scan-v: " e
                {:eid-idx eid-idx :attrs-v attrs-v}))
     out))
 
@@ -1054,7 +1054,7 @@
           attrs
 
           (and props new-props)
-          (u/raise "Cannot rename attribute: target already exists"
+          (raise "Cannot rename attribute: target already exists"
                    {:error     :schema/rename-conflict
                     :attribute attr
                     :target    new-attr})
@@ -1077,7 +1077,7 @@
           attrs
 
           :else
-          (u/raise "Cannot rename missing attribute"
+          (raise "Cannot rename missing attribute"
                    {:error     :schema/missing-attribute
                     :attribute attr
                     :target    new-attr})))))
@@ -1458,7 +1458,7 @@
                                        seen aids preds fidxs skips gstarts
                                        gcounts)
                     (recur (p/produce in)))))))
-          (u/raise "Fail to eav-scan-v: " e
+          (raise "Fail to eav-scan-v: " e
                    {:eid-idx eid-idx :attrs-v attrs-v})))
       (loop []
         (when (p/produce in)
@@ -1523,7 +1523,7 @@
                   (let [v (aget tuple v-idx)]
                     (val-eq-scan-e* lmdb iter out tuple seen aid v vt)
                     (recur (p/produce in))))))
-            (u/raise "Fail to val-eq-scan-e: " e {:v-idx v-idx :attr attr}))))
+            (raise "Fail to val-eq-scan-e: " e {:v-idx v-idx :attr attr}))))
       (loop []
         (when (p/produce in)
           (recur)))))
@@ -1546,7 +1546,7 @@
                 (let [^objects tuple (.get ^List in i)
                       v              (aget tuple v-idx)]
                   (val-eq-scan-e* lmdb iter out tuple seen aid v vt))))
-            (u/raise "Fail to val-eq-scan-e-list: " e {:v-idx v-idx :attr attr}))
+            (raise "Fail to val-eq-scan-e-list: " e {:v-idx v-idx :attr attr}))
           out))))
 
   (val-eq-scan-e [_ in out v-idx attr bound]
@@ -1562,7 +1562,7 @@
                   (val-eq-scan-e-bound*
                     lmdb rtx cur out tuple aid v vt bound)
                   (recur (p/produce in)))))
-            (u/raise "Fail to val-eq-scan-e-bound: " e
+            (raise "Fail to val-eq-scan-e-bound: " e
                      {:v-idx v-idx :attr attr}))))
       (loop []
         (when (p/produce in)
@@ -1591,7 +1591,7 @@
                   (val-eq-filter-e*
                     lmdb rtx cur out tuple aid v vt old-e)
                   (recur (p/produce in)))))
-            (u/raise "Fail to val-eq-filter-e: " e
+            (raise "Fail to val-eq-filter-e: " e
                      {:v-idx v-idx :attr attr}))))
       (loop []
         (when (p/produce in)
@@ -2033,21 +2033,21 @@
   (when-not (or (nil? del-attrs)
                 (set? del-attrs)
                 (sequential? del-attrs))
-    (u/raise "Schema attributes to delete must be a set or sequence"
+    (raise "Schema attributes to delete must be a set or sequence"
              {:error :schema/validation
               :value del-attrs}))
   (doseq [attr del-attrs]
     (when-not (keyword? attr)
-      (u/raise "Schema attribute to delete must be a keyword"
+      (raise "Schema attribute to delete must be a keyword"
                {:error     :schema/validation
                 :attribute attr})))
   (when-not (or (nil? rename-map) (map? rename-map))
-    (u/raise "Schema attribute renames must be a map"
+    (raise "Schema attribute renames must be a map"
              {:error :schema/validation
               :value rename-map}))
   (doseq [[old new] rename-map]
     (when-not (and (keyword? old) (keyword? new))
-      (u/raise "Schema rename attributes must be keywords"
+      (raise "Schema rename attributes must be keywords"
                {:error     :schema/validation
                 :attribute old
                 :target    new}))))
@@ -2057,13 +2057,13 @@
   (let [renames (into {} (remove (fn [[old new]] (= old new))) rename-map)
         targets (vec (vals renames))]
     (when-not (= (count targets) (count (set targets)))
-      (u/raise "Schema rename targets must be unique"
+      (raise "Schema rename targets must be unique"
                {:error      :schema/rename-conflict
                 :rename-map rename-map}))
     (let [sources (set (keys renames))
           overlap (set (filter sources targets))]
       (when (seq overlap)
-        (u/raise "Schema rename chains and cycles are not supported"
+        (raise "Schema rename chains and cycles are not supported"
                  {:error      :schema/rename-conflict
                   :attributes overlap
                   :rename-map rename-map})))
@@ -2078,7 +2078,7 @@
             patch-old? (contains? schema-update old)]
         (cond
           (and old? new?)
-          (u/raise "Cannot rename attribute: target already exists"
+          (raise "Cannot rename attribute: target already exists"
                    {:error     :schema/rename-conflict
                     :attribute old
                     :target    new})
@@ -2093,7 +2093,7 @@
           (conj plans {:old old :new new :canonical old :pending? true})
 
           :else
-          (u/raise "Cannot rename missing attribute"
+          (raise "Cannot rename missing attribute"
                    {:error     :schema/missing-attribute
                     :attribute old
                     :target    new}))))
@@ -2110,7 +2110,7 @@
       (fn [resolved attr property-patch]
         (let [canonical (get aliases attr attr)]
           (when (contains? resolved canonical)
-            (u/raise "Schema patches resolve to the same renamed attribute"
+            (raise "Schema patches resolve to the same renamed attribute"
                      {:error     :schema/rename-conflict
                       :attribute canonical}))
           (assoc resolved canonical property-patch)))
@@ -2131,11 +2131,11 @@
         renames       (normalize-schema-renames (or rename-map {}))
         endpoints     (concat (keys renames) (vals renames))]
     (when-let [attr (first (filter deletion-set (keys schema-update)))]
-      (u/raise "Cannot patch and delete the same schema attribute"
+      (raise "Cannot patch and delete the same schema attribute"
                {:error     :schema/update-conflict
                 :attribute attr}))
     (when-let [attr (first (filter deletion-set endpoints))]
-      (u/raise "Cannot delete an attribute participating in a rename"
+      (raise "Cannot delete an attribute participating in a rename"
                {:error     :schema/update-conflict
                 :attribute attr}))
     (let [current-schema  (schema store)
@@ -2168,7 +2168,7 @@
                   (if pending?
                     (let [props (result old)]
                       (when (or (nil? props) (contains? result new))
-                        (u/raise "Schema rename cannot be applied"
+                        (raise "Schema rename cannot be applied"
                                  {:error     :schema/rename-conflict
                                   :attribute old
                                   :target    new}))
@@ -2197,7 +2197,7 @@
       (datalevin.interface/rename-attr store old new))
     (let [result (schema store)]
       (when-not (= final-schema result)
-        (u/raise "Schema update result differed from its validated plan"
+        (raise "Schema update result differed from its validated plan"
                  {:error    :schema/update-conflict
                   :expected final-schema
                   :actual   result}))
@@ -2229,7 +2229,7 @@
                             nil)))
                       datoms)]
         (when (seq @errors)
-          (u/raise "Cannot migrate attribute values to new type"
+          (raise "Cannot migrate attribute values to new type"
                    {:attribute   attr
                     :target-type new-vt
                     :errors      @errors}))
@@ -2479,13 +2479,13 @@
   (let [domain (:job/domain job)
         ref (:job/ref job)
         index (or (embedding-index-by-domain store domain)
-                  (u/raise "Embedding index is not initialized"
+                  (raise "Embedding index is not initialized"
                            {:domain domain
                             :job job}))]
     (case (:job/op job)
       :add
       (let [provider (or (embedding-provider store domain)
-                         (u/raise "Embedding provider is not initialized"
+                         (raise "Embedding provider is not initialized"
                                   {:domain domain
                                    :job job}))
             dimensions (get-in (embedding-domain-config store domain)
@@ -2504,7 +2504,7 @@
       (fn []
         (remove-vec index ref))
 
-      (u/raise "Unsupported embedding secondary index op"
+      (raise "Unsupported embedding secondary index op"
                {:op (:job/op job)
                 :job job}))))
 
@@ -2513,7 +2513,7 @@
   (let [domain (:job/domain job)
         ref    (:job/ref job)
         index  (or ((.-vector-indices store) domain)
-                   (u/raise "Vector index is not initialized"
+                   (raise "Vector index is not initialized"
                             {:domain domain
                              :job job}))]
     (case (:job/op job)
@@ -2527,7 +2527,7 @@
       (fn []
         (remove-vec index ref))
 
-      (u/raise "Unsupported vector secondary index op"
+      (raise "Unsupported vector secondary index op"
                {:op (:job/op job)
                 :job job}))))
 
@@ -2544,7 +2544,7 @@
   (let [domain (:job/domain job)
         ref    (:job/ref job)
         engine (or ((.-search-engines store) domain)
-                   (u/raise "Fulltext search engine is not initialized"
+                   (raise "Fulltext search engine is not initialized"
                             {:domain domain
                              :job job}))]
     (case (:job/op job)
@@ -2557,7 +2557,7 @@
       (fn []
         (remove-fulltext-doc-idempotently! engine ref))
 
-      (u/raise "Unsupported fulltext secondary index op"
+      (raise "Unsupported fulltext secondary index op"
                {:op (:job/op job)
                 :job job}))))
 
@@ -2567,7 +2567,7 @@
     :fulltext (fulltext-job-application store job)
     :vector (vector-job-application store job)
     :embedding (embedding-job-application store job)
-    (u/raise "Unsupported secondary index job type"
+    (raise "Unsupported secondary index job type"
              {:type (:job/type job)
               :job job})))
 
@@ -2869,7 +2869,7 @@
     (count vec-data)
 
     :else
-    (u/raise "Embedding provider returned an unsupported vector value"
+    (raise "Embedding provider returned an unsupported vector value"
              {:vector vec-data})))
 
 (defn- ensure-embedding-vector!
@@ -2877,7 +2877,7 @@
   (let [dimensions (vector-dim vec-data)]
     (when (and expected-dimensions
                (not= (long expected-dimensions) (long dimensions)))
-      (u/raise "Embedding vector dimensions do not match domain configuration"
+      (raise "Embedding vector dimensions do not match domain configuration"
                {:domain              domain
                 :expected-dimensions expected-dimensions
                 :actual-dimensions   dimensions}))
@@ -2917,7 +2917,7 @@
         (let [plan (IdentityHashMap.)]
           (doseq [[domain items] batches
                   :let [provider    (or (embedding-provider store domain)
-                                        (u/raise "Embedding provider is not initialized"
+                                        (raise "Embedding provider is not initialized"
                                                  {:domain domain}))
                         dimensions (get-in (embedding-domain-config store domain)
                                            [:dimensions])
@@ -2925,7 +2925,7 @@
                                                   (mapv #(dissoc % :datom) items)
                                                   nil)]]
             (when-not (= (count items) (count vectors))
-              (u/raise "Embedding provider returned the wrong number of vectors"
+              (raise "Embedding provider returned the wrong number of vectors"
                        {:domain  domain
                         :items   (count items)
                         :vectors (count vectors)}))
@@ -3688,7 +3688,7 @@
              {:provider provider-id :dir dir})
 
       runtime
-      (u/raise "Embedding provider registry entry is invalid"
+      (raise "Embedding provider registry entry is invalid"
                {:domain domain
                 :provider provider-id
                 :entry runtime})
@@ -3697,7 +3697,7 @@
       (assoc domain-opts :provider provider-id :dir dir)
 
       :else
-      (u/raise "Embedding provider is not configured"
+      (raise "Embedding provider is not configured"
                {:domain domain :provider provider-id}))))
 
 (defn- resolve-embedding-domain
@@ -3714,7 +3714,7 @@
         embedding-metadata          (or stored-metadata provider-metadata)]
     (when (and stored-dimensions provider-dimensions
                (not= (long stored-dimensions) (long provider-dimensions)))
-      (u/raise "Embedding domain dimensions do not match the runtime provider"
+      (raise "Embedding domain dimensions do not match the runtime provider"
                {:domain              domain
                 :provider            (:provider domain-opts)
                 :stored-dimensions   stored-dimensions
@@ -3722,7 +3722,7 @@
     (when stored-metadata
       (emb/ensure-compatible-metadata stored-metadata provider-metadata))
     (when-not dimensions
-      (u/raise "Embedding domain dimensions could not be resolved"
+      (raise "Embedding domain dimensions could not be resolved"
                {:domain domain :provider (:provider domain-opts)}))
     [domain
      (-> domain-opts
@@ -3864,7 +3864,7 @@
                     (:wal-durability-profile opts)
                     ha-wal-durability-profile)]
     (when (= :relaxed profile)
-      (u/raise "Consensus-lease HA requires :wal-durability-profile :strict or :extra"
+      (raise "Consensus-lease HA requires :wal-durability-profile :strict or :extra"
                {:error :ha/validation
                 :option :wal-durability-profile
                 :value profile}))

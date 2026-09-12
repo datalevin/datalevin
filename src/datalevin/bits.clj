@@ -12,7 +12,7 @@
   (:require
    [datalevin.constants :as c]
    [datalevin.buffer :as bf]
-   [datalevin.util :as u]
+   [datalevin.util :as u :refer [raise]]
    [datalevin.ints :as i]
    [datalevin.sparselist :as sl]
    [clojure.string :as s]
@@ -104,7 +104,7 @@
                     c/*data-serializable-classes*)
               nippy/*thaw-serializable-allowlist*)]
     (if (instance? java.lang.Class x)
-      (u/raise "Unfreezable type: java.lang.Class" {})
+      (raise "Unfreezable type: java.lang.Class" {})
       (nippy/fast-freeze x))))
 
 (defn deserialize
@@ -291,7 +291,7 @@
   (.putLong bf (code-instant
                  (if (inst? x)
                    (inst-ms x)
-                   (u/raise "Expect an inst? value" {:value x})))))
+                   (raise "Expect an inst? value" {:value x})))))
 
 (defn- decode-float
   [x]
@@ -319,7 +319,7 @@
   (case (short b)
     2 true
     1 false
-    (u/raise "Illegal value, expecting a Datalevin boolean value" {})))
+    (raise "Illegal value, expecting a Datalevin boolean value" {})))
 
 (defn- get-boolean [^ByteBuffer bb] (boolean-value (get-byte bb)))
 
@@ -499,7 +499,7 @@
      (case ~v
        :db.value/sysMin ~vmin
        :db.value/sysMax ~vmax
-       (u/raise "Expect other data types, got keyword instead: " ~v {}))
+       (raise "Expect other data types, got keyword instead: " ~v {}))
      ~b))
 
 (defn- string-bytes
@@ -577,7 +577,7 @@
     (case v
       :db.value/sysMin c/type-long-neg
       :db.value/sysMax c/type-long-pos
-      (u/raise "Expecting long, got keyword" v {}))
+      (raise "Expecting long, got keyword" v {}))
     (if (neg? ^long v) c/type-long-neg c/type-long-pos)))
 
 (defn- raw-header
@@ -638,7 +638,7 @@
   "x-type is a single raw value type"
   [^ByteBuffer bf x x-type]
   (when (empty? x)
-    (u/raise "Cannot store an empty homogeneous tuple"
+    (raise "Cannot store an empty homogeneous tuple"
              {:error      :data/validation
               :value      x
               :tuple-type x-type}))
@@ -656,7 +656,7 @@
                         (let [np   (.position bf)
                               size (- np cp)]
                           (when (< c/+tuple-max+ (- size 2))
-                            (u/raise "The maximal tuple element size is
+                            (raise "The maximal tuple element size is
                               255 bytes" {:too-large v}))
                           ;; The final component also needs a separator so a
                           ;; prefix sorts before a longer value; otherwise the
@@ -689,7 +689,7 @@
                       (let [np   (.position bf)
                             size (- np cp)]
                         (when (< c/+tuple-max+ (- size 2))
-                          (u/raise "The maximal tuple element size is
+                          (raise "The maximal tuple element size is
                               255 bytes" {:too-large v}))
                         (recur (conj ss size) (inc i) np)))
                     ss))]
@@ -1070,7 +1070,7 @@
                        (put-byte-buffer bf x)
 
                        :else
-                       (u/raise "Raw value must be bytes or ByteBuffer, got "
+                       (raise "Raw value must be bytes or ByteBuffer, got "
                                 (type x)
                                 {:input x}))
      (if (vector? x-type)
@@ -1081,7 +1081,7 @@
              (put-hete-tuple bf x x-type)))
        (do
          (when (qualified-keyword? x-type)
-           (u/raise "Custom storage types require a declared DBI"
+           (raise "Custom storage types require a declared DBI"
                     {:error :custom-type/undeclared :type x-type}))
          (put-data bf x))))))
 
@@ -1135,7 +1135,7 @@
              (get-hete-tuple bf)))
        (do
          (when (qualified-keyword? v-type)
-           (u/raise "Custom storage types require a declared DBI"
+           (raise "Custom storage types require a declared DBI"
                     {:error :custom-type/undeclared :type v-type}))
          (get-data bf))))))
 

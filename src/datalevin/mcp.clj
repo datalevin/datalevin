@@ -10,6 +10,7 @@
 (ns ^:no-doc datalevin.mcp
   "Minimal MCP stdio server for Datalevin."
   (:require
+   [datalevin.util :refer [raise]]
    [clojure.string :as str]
    [clojure.walk :as walk]
    [datalevin.constants :as c]
@@ -581,10 +582,10 @@
                (fit-tool-envelope (omit-tool-structured structured)
                                   false
                                   wrap-fn)))
-         (throw (ex-info "Result exceeds max-response-bytes limit."
+         (raise "Result exceeds max-response-bytes limit."
                          {:code  :result-too-large
                           :kind  :bytes
-                          :limit (:max-response-bytes *mcp-limits*)}))))))
+                          :limit (:max-response-bytes *mcp-limits*)})))))
 
 (def ^:private public-tool-error-detail-keys
   {:field "field"
@@ -666,14 +667,14 @@
   [request]
   (cond
     (not (contains? request "id"))
-    (throw (ex-info "id is required for requests."
+    (raise "id is required for requests."
                     {:code  :invalid-request
-                     :field "id"}))
+                     :field "id"})
 
     (not (valid-request-id? (get request "id")))
-    (throw (ex-info "id must be a string or number."
+    (raise "id must be a string or number."
                     {:code  :invalid-request
-                     :field "id"}))
+                     :field "id"})
 
     :else
     (get request "id")))
@@ -729,9 +730,9 @@
   (let [dir? (contains? arguments "dir")
         uri? (contains? arguments "uri")]
     (when (= dir? uri?)
-      (throw (ex-info "Exactly one of dir or uri must be provided."
+      (raise "Exactly one of dir or uri must be provided."
                       {:code :invalid-params
-                       :field "dir|uri"})))
+                       :field "dir|uri"}))
     (let [target (require-string (get arguments (if dir? "dir" "uri"))
                                  (if dir? "dir" "uri"))]
       {:target target
@@ -755,8 +756,8 @@
 (defn- require-write-enabled!
   [state]
   (when-not (:allow-writes? @state)
-    (throw (ex-info "Write tools are disabled for this MCP session."
-                    {:code :writes-disabled}))))
+    (raise "Write tools are disabled for this MCP session."
+                    {:code :writes-disabled})))
 
 (defn- normalize-kv-tx
   [tx]
@@ -1504,34 +1505,34 @@
     (case phase
       :new
       (when-not (= method "initialize")
-        (throw (ex-info "Requests are not allowed before initialize."
+        (raise "Requests are not allowed before initialize."
                         {:code   :invalid-request
                          :method method
-                         :phase  "uninitialized"})))
+                         :phase  "uninitialized"}))
 
       :initializing
       (cond
         (= method "initialize")
-        (throw (ex-info "Initialize may only be sent once per session."
+        (raise "Initialize may only be sent once per session."
                         {:code   :invalid-request
                          :method method
-                         :phase  "initializing"}))
+                         :phase  "initializing"})
 
         (= method "ping")
         nil
 
         :else
-        (throw (ex-info "Requests are not allowed before initialized."
+        (raise "Requests are not allowed before initialized."
                         {:code   :invalid-request
                          :method method
-                         :phase  "initializing"})))
+                         :phase  "initializing"}))
 
       :ready
       (when (= method "initialize")
-        (throw (ex-info "Initialize may only be sent once per session."
+        (raise "Initialize may only be sent once per session."
                         {:code   :invalid-request
                          :method method
-                         :phase  "ready"})))
+                         :phase  "ready"}))
 
       nil)))
 
@@ -1655,11 +1656,11 @@
         method (get request "method")
         params (require-map (get request "params") "params")]
     (when-not (= "2.0" (get request "jsonrpc"))
-      (throw (ex-info "jsonrpc must be \"2.0\"."
-                      {:code :invalid-request})))
+      (raise "jsonrpc must be \"2.0\"."
+                      {:code :invalid-request}))
     (when-not (string? method)
-      (throw (ex-info "method must be a string."
-                      {:code :invalid-request})))
+      (raise "method must be a string."
+                      {:code :invalid-request}))
     (require-request-phase! state method)
     (case method
       "initialize"

@@ -16,7 +16,7 @@
    [datalevin.storage :as s]
    [datalevin.async :as a]
    [datalevin.remote :as r]
-   [datalevin.util :as u]
+   [datalevin.util :as u :refer [raise]]
    [datalevin.interface :as i]
    [datalevin.validate :as vld])
   (:import
@@ -47,7 +47,7 @@
                 (conn? x) @x
                 (db/db? x) x
                 :else
-                (u/raise "Expected a Datalog connection or DB"
+                (raise "Expected a Datalog connection or DB"
                          {:input x}))
         store (.-store ^DB db)]
     (cond
@@ -58,7 +58,7 @@
       store
 
       :else
-      (u/raise "Datalog DB does not expose a KV handle"
+      (raise "Datalog DB does not expose a KV handle"
                {:store store}))))
 
 (deftype ^:private CloseableConn [^clojure.lang.Atom state]
@@ -1152,7 +1152,7 @@
                                   (db/stamp-local-patch-idoc-tx
                                     current patch (.-tx-meta req)))
               _                 (when-not stamped
-                                  (u/raise
+                                  (raise
                                     "Prepared patchIdoc batch became stale"
                                     {:type ::stale-patch-idoc-batch}))
               ^TxReport report  (:report stamped)]
@@ -1242,8 +1242,8 @@
 
 (defn- sync-queued-blind-fallback!
   []
-  (throw (ex-info "Queued blind transaction requires full resolution"
-                  {:type sync-queued-blind-fallback-type})))
+  (raise "Queued blind transaction requires full resolution"
+                  {:type sync-queued-blind-fallback-type}))
 
 (defn- prepared-blind-batch-valid?
   [^DB db ^objects prepared]

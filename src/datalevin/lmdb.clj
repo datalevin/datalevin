@@ -18,7 +18,7 @@
    [taoensso.nippy :as nippy]
    [datalevin.async :as a]
    [datalevin.bits :as b]
-   [datalevin.util :as u]
+   [datalevin.util :as u :refer [raise]]
    [datalevin.constants :as c]
    [datalevin.interface
     :refer [close-kv list-dbis entries get-range open-dbi transact-kv clear-dbi
@@ -146,7 +146,7 @@
     :open-back         (RangeContext. false false false b1 b2)
     :open-closed       (RangeContext. true false true b1 b2)
     :open-closed-back  (RangeContext. false false true b1 b2)
-    (u/raise "Unknown range type" range-type {})))
+    (raise "Unknown range type" range-type {})))
 
 (defprotocol IKVTxable (kv-txable? [_]))
 
@@ -248,7 +248,7 @@
                       (when (< 4 cnt) (.nth tx 4)))
                     (when (< 5 cnt) (.nth tx 5))
                     (when (< 6 cnt) (.nth tx 6))))
-       (u/raise "Invalid KV transaction data " x {}))))
+       (raise "Invalid KV transaction data " x {}))))
   ([x kt vt]
    (if (vector? x)
      (let [tx  ^IPersistentVector x
@@ -260,7 +260,7 @@
                   kt
                   vt
                   (when (< 3 cnt) (.nth tx 3))))
-     (u/raise "Invalid KV transaction data " x {}))))
+     (raise "Invalid KV transaction data " x {}))))
 
 (defn dump-dbis-list
   ([lmdb]
@@ -412,11 +412,11 @@
                                      (take entries)
                                      (map #(load-kv dbi %))))))))
      (catch IOException e
-       (u/raise "IO error while loading raw data: " (ex-message e) {}))
+       (raise "IO error while loading raw data: " (ex-message e) {}))
      (catch RuntimeException e
-       (u/raise "Parse error while loading raw data: " (ex-message e) {}))
+       (raise "Parse error while loading raw data: " (ex-message e) {}))
      (catch Exception e
-       (u/raise "Error loading raw data: " (ex-message e) {})))))
+       (raise "Error loading raw data: " (ex-message e) {})))))
 
 (declare load-all-forms)
 
@@ -439,11 +439,11 @@
          (load-all-forms lmdb (take-while #(not= ::EOF %)
                                           (repeatedly read-form)))))
      (catch IOException e
-       (u/raise "IO error while loading raw data: " (ex-message e) {}))
+       (raise "IO error while loading raw data: " (ex-message e) {}))
      (catch RuntimeException e
-       (u/raise "Parse error while loading raw data: " (ex-message e) {}))
+       (raise "Parse error while loading raw data: " (ex-message e) {}))
      (catch Exception e
-       (u/raise "Error loading raw data: " (ex-message e) {})))))
+       (raise "Error loading raw data: " (ex-message e) {})))))
 
 (defn load-all-forms
   [lmdb forms]
@@ -452,7 +452,7 @@
           read-form #(let [form (first @remaining)] (vswap! remaining rest) form)
           bundle (custom-dump-call :read-bundle (first forms) read-form)]
       (when (seq @remaining)
-        (u/raise "Trailing forms after custom KV dump" {:error :custom-type/dump}))
+        (raise "Trailing forms after custom KV dump" {:error :custom-type/dump}))
       (custom-dump-call :restore! lmdb bundle nil))
     (let [saved-opts (volatile! {})
           load-dbi (fn [[ms vs]]
@@ -504,7 +504,7 @@
         (close-kv db))
       (open-kv d opts))
     (catch Exception e
-      (u/raise "Unable to re-index" e {:dir (env-dir db)}))))
+      (raise "Unable to re-index" e {:dir (env-dir db)}))))
 
 (defn resized? [e] (:resized (ex-data e)))
 
@@ -515,7 +515,7 @@
   (cond
     (nil? timeout-ms) nil
     (and (integer? timeout-ms) (pos? ^long timeout-ms)) (long timeout-ms)
-    :else (u/raise "Explicit transaction timeout must be nil or a positive "
+    :else (raise "Explicit transaction timeout must be nil or a positive "
                    "integer of milliseconds"
                    {:timeout-ms timeout-ms})))
 

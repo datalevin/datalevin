@@ -11,7 +11,7 @@
   "Datalevin client to Datalevin server, blocking API, with a connection pool"
   (:require
    [datalevin.datom :as dd]
-   [datalevin.util :as u]
+   [datalevin.util :as u :refer [raise]]
    [datalevin.constants :as c]
    [datalevin.native-value :as nv]
    [datalevin.udf :as udf]
@@ -118,7 +118,7 @@
           (send-n-receive this msg)))
       (catch Exception e
         (when (nv/decoding-error? e) (throw e))
-        (u/raise "Error sending message and receiving response: "
+        (raise "Error sending message and receiving response: "
                  e {:msg msg}))))
 
   (send-only [this msg]
@@ -129,7 +129,7 @@
           (set! bf (bf/allocate-buffer size))
           (send-only this msg)))
       (catch Exception e
-        (u/raise "Error sending message: " e {:msg msg}))))
+        (raise "Error sending message: " e {:msg msg}))))
 
   (receive [this]
     (try
@@ -138,7 +138,7 @@
         resp)
       (catch Exception e
         (when (nv/decoding-error? e) (throw e))
-        (u/raise "Error receiving data:" e {}))))
+        (raise "Error receiving data:" e {}))))
 
   (close [this]
     (try
@@ -175,7 +175,7 @@
                     (let [remaining-ms (- deadline-ms
                                           (System/currentTimeMillis))]
                       (when-not (pos? remaining-ms)
-                        (u/raise "Unable to connect to server: timed out"
+                        (raise "Unable to connect to server: timed out"
                                  {:host host
                                   :port port
                                   :timeout-ms timeout-ms
@@ -194,7 +194,7 @@
         (try
           (.close ch)
           (catch Exception _ nil))
-        (u/raise "Unable to connect to server: " e
+        (raise "Unable to connect to server: " e
                  {:host host
                   :port port
                   :timeout-ms timeout-ms})))))
@@ -214,7 +214,7 @@
         (send-n-receive conn {:type              :set-client-id
                               :client-id         client-id
                               :wire-capabilities (p/local-wire-capabilities)})]
-    (when-not (= type :set-client-id-ok) (u/raise message {}))
+    (when-not (= type :set-client-id-ok) (raise message {}))
     (set-conn-wire-opts! (.-ch ^Connection conn)
                          (p/negotiate-wire-opts wire-capabilities))))
 
@@ -231,7 +231,7 @@
   IConnectionPool
   (get-connection [this]
     (let [start (System/currentTimeMillis)
-          closed-error #(u/raise "This client is closed"
+          closed-error #(raise "This client is closed"
                                  {:client-id client-id})]
       (loop []
         (when (.get closed?)
@@ -274,7 +274,7 @@
           (if (.get closed?)
             (closed-error)
             (if (>= (- (System/currentTimeMillis) start) ^long time-out)
-              (u/raise "Timeout in obtaining a connection" {})
+              (raise "Timeout in obtaining a connection" {})
               (do
                 (Thread/sleep 1000)
                 (recur))))))))
@@ -316,7 +316,7 @@
     (close conn)
     (if (= type :authentication-ok)
       client-id
-      (u/raise "Authentication failure: " message {}))))
+      (raise "Authentication failure: " message {}))))
 
 (defn- new-connectionpool
   [host port client-id pool-size time-out]
@@ -414,13 +414,13 @@
                    (when (map? copy-out-response)
                      (dissoc copy-out-response :type))
                    (dissoc msg :type))
-                 (u/raise "Server error while copying out data" {:msg msg})))
+                 (raise "Server error while copying out data" {:msg msg})))
              (do (doseq [d msg] (conj! data d))
                  (recur))))))
      (catch Exception e
        (close conn)
        (when (nv/decoding-error? e) (throw e))
-       (u/raise "Unable to receive copy:" e {:req req})))))
+       (raise "Unable to receive copy:" e {:req req})))))
 
 (defn- copy-in*
   [conn req data batch-size ]
@@ -436,7 +436,7 @@
         (close conn)
         (throw e))
       (send-n-receive conn {:type :copy-fail})
-      (u/raise "Unable to copy in:" e
+      (raise "Unable to copy in:" e
                {:req req :count (count data)}))))
 
 (declare open-database disconnect-retry-clients!)
@@ -515,7 +515,7 @@
                                        res)]
             (if (>= (- (System/currentTimeMillis) start)
                     ^long (.-time-out pool'))
-              (u/raise "Timeout in making request" {})
+              (raise "Timeout in making request" {})
               (if @success?
                 res'
                 (recur))))))))
@@ -528,7 +528,7 @@
           (let [{:keys [type]} (send-n-receive conn req)]
             (if (= type :copy-in-response)
               (copy-in* conn req data batch-size)
-              (u/raise "Server refuses to accept copy in" {:req req})))
+              (raise "Server refuses to accept copy in" {:req req})))
           (finally (release-connection pool conn))))))
 
   (disconnect [client]
@@ -635,7 +635,7 @@
                     :else
                     {:type :new-search-engine :db-name db-name :opts opts}))]
      (when (= type :error-response)
-       (u/raise "Unable to open database:" db-name " " message
+       (raise "Unable to open database:" db-name " " message
                 {:db-type db-type}))
      (cache-known-ha-db-endpoints! client db-name
                                    (concat
@@ -791,7 +791,7 @@
 
 (defn- raise-normal-request-error
   [req message err-data extra-data]
-  (u/raise "Request to Datalevin server failed: "
+  (raise "Request to Datalevin server failed: "
            message
            (merge req
                   {:err-data (sanitize-error-data err-data)

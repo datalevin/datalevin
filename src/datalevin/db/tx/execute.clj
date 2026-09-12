@@ -22,7 +22,7 @@
    [datalevin.prepare :as coreprep]
    [datalevin.storage :as s]
    [datalevin.udf :as udf]
-   [datalevin.util :as u :refer [conjv conjs concatv cond+]]
+   [datalevin.util :as u :refer [ conjv conjs concatv cond+ raise]]
    [datalevin.validate :as vld])
   (:import
    [datalevin.datom Datom]
@@ -208,7 +208,7 @@
           ident      (effective-attr-value report db e :db/ident)]
       (vld/validate-installed-udf-ident ident descriptor ent)
       (when (some? (effective-attr-value report db e :db/fn))
-        (u/raise "Installed callable entity cannot have both :db/fn and :db/udf at "
+        (raise "Installed callable entity cannot have both :db/fn and :db/udf at "
                  ent
                  {:error   :transact/syntax
                   :tx-data ent
@@ -216,7 +216,7 @@
 
     :db/fn
     (when (some? (effective-attr-value report db e :db/udf))
-      (u/raise "Installed callable entity cannot have both :db/fn and :db/udf at "
+      (raise "Installed callable entity cannot have both :db/fn and :db/udf at "
                ent
                {:error   :transact/syntax
                 :tx-data ent

@@ -15,7 +15,7 @@
    [clojure.pprint :as p]
    [clojure.edn :as edn]
    [taoensso.nippy :as nippy]
-   [datalevin.util :as u]
+   [datalevin.util :as u :refer [raise]]
    [datalevin.constants :as c]
    [datalevin.conn :as conn]
    [datalevin.db :as db]
@@ -191,7 +191,7 @@
 
 (defn- restore-custom-datalog [dir bundle schema opts]
   (when (seq schema)
-    (u/raise "Custom Datalog dumps retain their stored schema; apply schema updates after restore"
+    (raise "Custom Datalog dumps retain their stored schema; apply schema updates after restore"
              {:error :custom-type/restore-conflict}))
   (let [kv (l/open-kv dir (merge (select-keys opts [:wal?]) (:kv-opts opts)))]
     (try
@@ -245,7 +245,7 @@
      (if (and datalog? (not (contains? dbis c/custom-values)))
        (do
          (when data-output
-           (u/raise "Auto dump of mixed Datalog/KV stores is not supported "
+           (raise "Auto dump of mixed Datalog/KV stores is not supported "
                     "in nippy format; use text auto dump or explicit -g/-a."
                     {}))
          (p/pprint {mixed-dump-format-key mixed-dump-format
@@ -337,7 +337,7 @@
           (recur (read-form)))
 
         :else
-        (u/raise "Unexpected section in mixed dump" {:form form} {})))))
+        (raise "Unexpected section in mixed dump" {:form form} {})))))
 
 (defn load-auto
   [dir in schema opts]
@@ -367,11 +367,11 @@
           :else
           (load-datalog-from-first dir read-form first-form schema opts))))
     (catch IOException e
-      (u/raise "IO error while loading auto-detected data: " e {}))
+      (raise "IO error while loading auto-detected data: " e {}))
     (catch RuntimeException e
-      (u/raise "Parse error while loading auto-detected data: " e {}))
+      (raise "Parse error while loading auto-detected data: " e {}))
     (catch Exception e
-      (u/raise "Error loading auto-detected data: " e {}))))
+      (raise "Error loading auto-detected data: " e {}))))
 
 (defn- dump
   [conn ^String dumpfile]
@@ -395,7 +395,7 @@
                                 dir new-schema new-opts)]
              (db/close-db db))))
        (catch Exception e
-         (u/raise "Error loading nippy file into Datalog DB: " e {})))
+         (raise "Error loading nippy file into Datalog DB: " e {})))
      (load-datalog dir in schema opts)))
   ([dir in schema opts]
    (try
@@ -417,11 +417,11 @@
                  db (db/init-db datoms dir new-schema new-opts)]
              (db/close-db db)))))
      (catch IOException e
-       (u/raise "IO error while loading Datalog data: " e {}))
+       (raise "IO error while loading Datalog data: " e {}))
      (catch RuntimeException e
-       (u/raise "Parse error while loading Datalog data: " e {}))
+       (raise "Parse error while loading Datalog data: " e {}))
      (catch Exception e
-       (u/raise "Error loading Datalog data: " e {})))))
+       (raise "Error loading Datalog data: " e {})))))
 
 (defn- load
   [dir schema opts ^String dumpfile]
@@ -433,7 +433,7 @@
 (defn re-index-datalog
   [conn schema opts]
   (when (and (seq schema) (custom-datalog-kv conn))
-    (u/raise "Custom Datalog schema migration requires an explicit rewrite"
+    (raise "Custom Datalog schema migration requires an explicit rewrite"
              {:error :custom-type/migration}))
   (let [d (dir (.-store ^DB @conn))]
     (try
@@ -443,7 +443,7 @@
         (load d schema opts dumpfile)
         (conn/create-conn d))
       (catch Exception e
-        (u/raise "Unable to re-index Datalog database" e {:dir d})))))
+        (raise "Unable to re-index Datalog database" e {:dir d})))))
 
 (defn copy
   ([db dest]

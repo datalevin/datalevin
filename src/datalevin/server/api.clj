@@ -18,7 +18,7 @@
    [datalevin.query :as q]
    [datalevin.query.resolve :as qresolve]
    [datalevin.search :as sc]
-   [datalevin.util :as u]
+   [datalevin.util :refer [raise]]
    [datalevin.vector :as v])
   (:import
    [datalevin.db DB]))
@@ -79,7 +79,7 @@
         engine         (or (search-engine* server skey db-name)
                            (if-let [store (get-store server db-name)]
                              (sc/new-search-engine store opts)
-                             (u/raise "engine store not found"
+                             (raise "engine store not found"
                                       {:type :reopen
                                        :db-name db-name
                                        :db-type "kv"})))]
@@ -109,7 +109,7 @@
   (let [[db-name opts] args
         index          (if-let [store (get-store server db-name)]
                          (v/new-vector-index store opts)
-                         (u/raise "vector store not found"
+                         (raise "vector store not found"
                                   {:type :reopen
                                    :db-name db-name
                                    :db-type "kv"}))]

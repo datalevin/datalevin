@@ -1,6 +1,7 @@
 (ns ^:no-doc datalevin.test-adapter.rust
   "A synchronous, bounded Nippy process bridge. No reference engine calls."
   (:require
+   [datalevin.util :refer [raise]]
    [taoensso.nippy :as nippy]
    [datalevin.test-adapter :as adapter])
   (:import
@@ -16,7 +17,7 @@
 (defn- read-frame [^DataInputStream input]
   (let [size (.readInt input)]
     (when-not (<= 1 size max-frame-bytes)
-      (throw (ex-info "Invalid Rust adapter frame size" {:size size})))
+      (raise "Invalid Rust adapter frame size" {:size size}))
     (let [bytes (byte-array size)]
       (.readFully input bytes)
       (nippy/fast-thaw bytes))))
@@ -45,7 +46,7 @@
 (defn- exchange! [{:keys [worker timeout-ms stopped] :as peer} f]
   (locking peer
     (when @stopped
-      (throw (ex-info "Rust adapter process is closed" {})))
+      (raise "Rust adapter process is closed" {}))
     (let [task (.submit ^ExecutorService worker ^Callable (bound-fn [] (f)))]
       (try
         (.get task (long timeout-ms) TimeUnit/MILLISECONDS)
@@ -61,13 +62,13 @@
   (if (instance? DbHandle value)
     (if (identical? session (.-session ^DbHandle value))
       {:kind :db :id (.-id ^DbHandle value)}
-      (throw (ex-info "Database belongs to a different Rust adapter session"
-                      {:operation operation})))
+      (raise "Database belongs to a different Rust adapter session"
+                      {:operation operation}))
     {:kind :value :value value}))
 
 (defn- result-value [session operation response]
   (when-not (map? response)
-    (throw (ex-info "Rust adapter response must be a map" {:operation operation})))
+    (raise "Rust adapter response must be a map" {:operation operation}))
   (case (:status response)
     :ok
     (let [{:keys [kind id] :as result} (:result response)
@@ -79,22 +80,22 @@
         (and (not expects-db?) (= :value kind) (contains? result :value))
         (:value result)
 
-        :else (throw (ex-info "Invalid Rust adapter result descriptor"
-                              {:operation operation :result result}))))
+        :else (raise "Invalid Rust adapter result descriptor"
+                              {:operation operation :result result})))
     :unsupported
     (adapter/unsupported! :rust operation
                           (or (:message response) "Unsupported Rust operation"))
     :error
     (let [{:keys [class message data]} (:error response)]
       (when-not (and (string? class) (string? message))
-        (throw (ex-info "Invalid Rust adapter error descriptor" {:response response})))
+        (raise "Invalid Rust adapter error descriptor" {:response response}))
       (throw (case class
                "java.lang.IllegalArgumentException" (IllegalArgumentException. message)
                "java.lang.IllegalStateException" (IllegalStateException. message)
                "clojure.lang.ExceptionInfo" (ex-info message (or data {}))
                (adapter/unsupported! :adapter operation
                                      (str "Exception class is not mapped: " class)))))
-    (throw (ex-info "Invalid Rust adapter response status" {:response response}))))
+    (raise "Invalid Rust adapter response status" {:response response})))
 
 (defrecord RustBackend [peer session info]
   adapter/Backend
@@ -114,7 +115,7 @@
   ([command timeout-ms]
    (when-not (and (vector? command) (seq command) (every? string? command)
                   (int? timeout-ms) (pos? (long timeout-ms)))
-     (throw (ex-info "Expected a peer command vector and positive timeout" {})))
+     (raise "Expected a peer command vector and positive timeout" {}))
    (let [process (.start (doto (ProcessBuilder. ^java.util.List command)
                           (.redirectError ProcessBuilder$Redirect/INHERIT)))
          worker (Executors/newSingleThreadExecutor
@@ -130,7 +131,7 @@
        (let [hello (exchange! peer #(read-frame (:input peer)))]
          (when-not (and (= "datalevin-test-adapter" (:protocol hello))
                         (= 1 (:version hello)) (= :rust (:backend hello)))
-           (throw (ex-info "Incompatible Rust adapter handshake" {:hello hello})))
+           (raise "Incompatible Rust adapter handshake" {:hello hello}))
          (->RustBackend peer (Object.)
                         {:backend :rust :runtime :rust :command command :peer hello}))
        (catch Throwable error

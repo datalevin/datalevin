@@ -12,7 +12,7 @@
    [datalevin.kv :as kv]
    [datalevin.lmdb :as l]
    [datalevin.udf :as udf]
-   [datalevin.util :as u])
+   [datalevin.util :as u :refer [raise]])
   (:import
    [java.util Arrays Date Random UUID]
    [java.util.concurrent TimeUnit]))
@@ -126,7 +126,7 @@
            (d/register-type tx :app/task (task-type 1))
            (is (= 4 (order-key tx :app/task {:rank 3})))
            (is (= 0 (:revision (custom/registry kv))))
-           (throw (ex-info "abort registration" {})))))
+           (raise "abort registration" {}))))
     (is (= {:revision 0 :types {}} (custom/registry kv)))
     (d/with-transaction-kv [tx kv]
       (d/register-type tx :app/task (task-type 8))
@@ -291,7 +291,7 @@
          (when (l/writing? kv) (swap! writers conj txn))
          (fn [value]
            (when-not (identical? txn @(l/write-txn kv))
-             (throw (ex-info "Resolver retained an earlier native writer" {})))
+             (raise "Resolver retained an earlier native writer" {}))
            (:rank value)))))
     (d/register-type kv :app/large {:index {:type :long :order-fn (udf-desc :order-fn)}})
     (d/open-dbi kv "items" {:key-type :app/large})
@@ -556,7 +556,7 @@
                                                   (byte-array [3]))))))
              (cv/delete-value! tx index type a)
              (is (nil? (cv/find-value tx index type a)))
-             (throw (ex-info "rollback" {})))))
+             (raise "rollback" {}))))
       (is (= [1] (vec (:associated (cv/find-value kv index type a)))))
       (is (nil? (cv/find-value kv index type b)))
       (is (= 1 (d/entries kv c/custom-values)))
@@ -627,7 +627,7 @@
                        (reset! reader-thread nil)
                        (deliver entered true)
                        (when (= ::timeout (deref release 10000 ::timeout))
-                         (throw (ex-info "snapshot test timed out" {}))))
+                         (raise "snapshot test timed out" {})))
                      (b/deserialize bs)))
     (d/register-type kv :app/value
                      {:index {:type :long :order-fn (inter/inter-fn [v] (:order v))}
@@ -751,7 +751,7 @@
                      (cv/transact! tx [(l/kv-tx :del "primary" 42 :id)
                                        (l/kv-tx :del "secondary" ref :raw)
                                        (cv/delete-payload-tx ref)])
-                     (throw (ex-info "rollback" {})))))
+                     (raise "rollback" {}))))
       (is (= 1 (d/entries kv c/custom-values)))
       (is (= 1 (d/entries kv "primary")))
       (is (= 1 (d/entries kv "secondary")))
@@ -932,7 +932,7 @@
                    (d/with-transaction-kv [tx kv]
                      (d/clear-dbi tx "items")
                      (is (empty? (d/get-list tx "items" a :app/task :app/task)))
-                     (throw (ex-info "abort" {})))))
+                     (raise "abort" {}))))
       (is (= [a b] (vec (d/get-list kv "items" a :app/task :app/task))))
       (d/clear-dbi kv "items")
       (is (= 2 (d/entries kv c/custom-values)))

@@ -12,7 +12,7 @@
   (:require
    [datalevin.constants :as c]
    [datalevin.lmdb :as lmdb]
-   [datalevin.util :as u]))
+   [datalevin.util :refer [raise]]))
 
 (def supported-indexing-modes
   #{:sync :async})
@@ -44,7 +44,7 @@
     default-indexing-mode
     (if (supported-indexing-modes mode)
       mode
-      (u/raise "Unsupported secondary indexing mode"
+      (raise "Unsupported secondary indexing mode"
                {:mode mode
                 :expected supported-indexing-modes}))))
 
@@ -60,7 +60,7 @@
   [job k]
   (let [v (get job k)]
     (when (nil? v)
-      (u/raise "Secondary index job is missing required value"
+      (raise "Secondary index job is missing required value"
                {:key k
                 :job job}))
     v))
@@ -78,11 +78,11 @@
         created-ms (long (or created-ms (System/currentTimeMillis)))
         updated-ms (long (or updated-ms created-ms))]
     (when-not (supported-job-types type)
-      (u/raise "Unsupported secondary index job type"
+      (raise "Unsupported secondary index job type"
                {:type type
                 :expected supported-job-types}))
     (when-not (supported-job-ops op)
-      (u/raise "Unsupported secondary index job op"
+      (raise "Unsupported secondary index job op"
                {:op op
                 :expected supported-job-ops}))
     {:job/id         [type domain tx ordinal]

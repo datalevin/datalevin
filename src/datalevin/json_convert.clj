@@ -9,6 +9,7 @@
 ;;
 (ns ^:no-doc datalevin.json-convert
   (:require
+   [datalevin.util :refer [raise]]
    [clojure.edn :as edn]
    [clojure.string :as str]
    [datalevin.datom :as dd]
@@ -109,9 +110,9 @@
     "~edn" (edn/read-string ^String value)
     "~handle" (handle-ref value)
     "~pull" (pull-form (decode-json-value value))
-    (throw (ex-info "Unsupported JSON tag."
+    (raise "Unsupported JSON tag."
                     {:code :invalid-json-tag
-                     :tag  tag}))))
+                     :tag  tag})))
 
 (defn decode-json-value
   [x]
@@ -206,9 +207,9 @@
     (instance? java.util.Collection x) (mapv json-ready x)
     (integer? x) {"~bigint" (str x)}
     :else
-    (throw (ex-info "Unsupported value for JSON conversion."
+    (raise "Unsupported value for JSON conversion."
                     {:code  :json-unsupported-type
-                     :class (str (class x))}))))
+                     :class (str (class x))})))
 
 (defn- limited-output-stream
   [^long max-bytes]
@@ -221,19 +222,19 @@
          ([b]
           (let [n (inc ^long @count)]
             (when (> n max-bytes)
-              (throw (ex-info "Result exceeds max-response-bytes limit."
+              (raise "Result exceeds max-response-bytes limit."
                               {:code  :result-too-large
                                :kind  :bytes
-                               :limit max-bytes})))
+                               :limit max-bytes}))
             (vreset! count n)
             (.write baos (int b))))
          ([b off len]
           (let [n (+ ^long @count ^long len)]
             (when (> n max-bytes)
-              (throw (ex-info "Result exceeds max-response-bytes limit."
+              (raise "Result exceeds max-response-bytes limit."
                               {:code  :result-too-large
                                :kind  :bytes
-                               :limit max-bytes})))
+                               :limit max-bytes}))
             (vreset! count n)
             (.write baos ^bytes b (int off) (int len)))))
        (flush []

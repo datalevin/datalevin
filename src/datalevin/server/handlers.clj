@@ -28,7 +28,7 @@
    [datalevin.server.api :as sapi]
    [datalevin.server.auth :as auth]
    [datalevin.storage :as st]
-   [datalevin.util :as u]
+   [datalevin.util :as u :refer [raise]]
    [datalevin.validate :as vld]
    [taoensso.timbre :as log])
   (:import
@@ -117,7 +117,7 @@
     (if permissions
       (if (auth/has-permission? req-act req-obj req-tgt permissions)
         (f)
-        (u/raise denied-message {}))
+        (raise denied-message {}))
       (do
         ((:remove-client deps) server client-id)
         (p/write-message-blocking ch write-bf {:type :reconnect} wire-opts)))))
@@ -280,13 +280,13 @@
   (when-not writing?
     (when-let [state (db-state deps server db-name)]
       (when-let [err (ha-read-admission-error db-name state)]
-        (u/raise "HA read admission rejected" err))
+        (raise "HA read admission rejected" err))
       (when-let [min-tx (ha-read-min-tx message)]
         (let [min-tx       (long min-tx)
               max-tx       (durable-dt-store-max-tx dt-store)
               store-max-tx (dt-store-max-tx dt-store)]
           (when (< max-tx min-tx)
-            (u/raise "HA read floor not satisfied"
+            (raise "HA read floor not satisfied"
                      {:error :ha/read-rejected
                       :reason :read-floor-not-satisfied
                       :retryable? true
@@ -456,7 +456,7 @@
         (f)
         (finally
           (.release lock)))
-      (u/raise
+      (raise
        "Cannot copy database while a write transaction is active; retry later"
        {:error :db/copy-write-transaction-active
         :db-name db-name}))))
@@ -687,7 +687,7 @@
        :response-kind client-op-response-kind}
 
       :else
-      (u/raise "Incomplete HA client op metadata"
+      (raise "Incomplete HA client op metadata"
                {:message-type type
                 :present-keys present-keys
                 :error        :ha/client-op-invalid-request}))))
@@ -732,7 +732,7 @@
   (when (or (not= request-type (:request-type record))
             (not= request-hash (:request-hash record))
             (not= response-kind (:response-kind record)))
-    (u/raise "HA client op id reused for a different request"
+    (raise "HA client op id reused for a different request"
              {:error              :ha/client-op-conflict
               :client-op-id       client-op-id
               :request-type       request-type
@@ -748,7 +748,7 @@
   [client-op-id result-promise]
   (let [result (deref result-promise client-op-await-timeout-ms ::timeout)]
     (if (= ::timeout result)
-      (u/raise "Timed out waiting for HA client op replay"
+      (raise "Timed out waiting for HA client op replay"
                {:error        :ha/client-op-timeout
                 :client-op-id client-op-id
                 :timeout-ms   client-op-await-timeout-ms})
@@ -782,7 +782,7 @@
                         :response-kind response-kind
                         :response      response}
                 :error (throw exception)
-                (u/raise "Unexpected pending HA client op state"
+                (raise "Unexpected pending HA client op state"
                          {:client-op-id client-op-id
                           :status       status})))
             (try
@@ -810,7 +810,7 @@
   (if-let [client-id ((:authenticate deps) server skey message)]
     ((:write-message deps) skey
      {:type :authentication-ok :client-id client-id})
-    (u/raise "Failed to authenticate" {})))
+    (raise "Failed to authenticate" {})))
 
 (defn disconnect
   [deps server ^SelectionKey skey _]
@@ -838,7 +838,7 @@
       "Don't have permission to create user"
       (fn []
         (if (s/blank? password)
-          (u/raise "Password is required when creating user." {})
+          (raise "Password is required when creating user." {})
           (do
             (auth/transact-new-user sys-conn username password)
             ((:write-message deps) skey
@@ -855,11 +855,11 @@
         (str "Don't have permission to reset password of " username)
         (fn []
           (if (s/blank? password)
-            (u/raise "New password is required when resetting password" {})
+            (raise "New password is required when resetting password" {})
             (do
               (auth/transact-new-password sys-conn username password)
               (write-complete! deps skey)))))
-      (u/raise "User does not exist" {:username username}))))
+      (raise "User does not exist" {:username username}))))
 
 (defn drop-user
   [deps server skey {:keys [args]}]
@@ -867,7 +867,7 @@
         [username] args
         uid        (auth/user-eid sys-conn username)]
     (if (= username c/default-username)
-      (u/raise "Default user cannot be dropped." {})
+      (raise "Default user cannot be dropped." {})
       (if uid
         (with-permission!
           deps server skey create-act user-obj uid
@@ -876,7 +876,7 @@
             ((:disconnect-user deps) server username)
             (auth/transact-drop-user sys-conn uid username)
             (write-complete! deps skey)))
-        (u/raise "User does not exist." {:user username})))))
+        (raise "User does not exist." {:user username})))))
 
 (defn list-users
   [deps server skey _]
@@ -903,7 +903,7 @@
         rid        (auth/role-eid sys-conn role-key)]
     (if rid
       (if (auth/user-role-key? sys-conn role-key)
-        (u/raise "Cannot drop default role of an active user" {})
+        (raise "Cannot drop default role of an active user" {})
         (with-permission!
           deps server skey create-act role-obj rid
           "Don't have permission to drop the role"
@@ -911,7 +911,7 @@
             (auth/transact-drop-role sys-conn rid)
             ((:update-cached-permission deps) server role-key)
             (write-complete! deps skey))))
-      (u/raise "Role does not exist." {:role role-key}))))
+      (raise "Role does not exist." {:role role-key}))))
 
 (defn list-roles
   [deps server skey _]
@@ -930,7 +930,7 @@
       "Don't have permission to create database"
       (fn []
         (if ((:db-exists? deps) server db-name)
-          (u/raise "Database already exists." {:db db-name})
+          (raise "Database already exists." {:db db-name})
           (do
             ((:open-server-store deps) server skey
              {:db-name db-name :respond? false}
@@ -956,8 +956,8 @@
                 ((:disconnect-client* deps) server cid)))
             ((:remove-store deps) server db-name)
             (write-complete! deps skey)))
-        (u/raise "Database is closed already." {}))
-      (u/raise "Database doe snot exist." {}))))
+        (raise "Database is closed already." {}))
+      (raise "Database doe snot exist." {}))))
 
 (defn drop-database
   [deps server skey {:keys [args]}]
@@ -970,13 +970,13 @@
         "Don't have permission to drop the database"
         (fn []
           (if ((:db-in-use? deps) server db-name)
-            (u/raise "Cannot drop a database currently in use." {})
+            (raise "Cannot drop a database currently in use." {})
             (do
               (auth/transact-drop-db sys-conn did)
               (u/delete-files
                ((:db-dir deps) ((:root deps) server) db-name))
               (write-complete! deps skey)))))
-      (u/raise "Database does not exist." {}))))
+      (raise "Database does not exist." {}))))
 
 (defn list-databases
   [deps server skey _]
@@ -1008,7 +1008,7 @@
           (auth/transact-user-role sys-conn rid username)
           ((:update-cached-role deps) server username)
           (write-complete! deps skey)))
-      (u/raise "Role does not exist." {}))))
+      (raise "Role does not exist." {}))))
 
 (defn withdraw-role
   [deps server skey {:keys [args]}]
@@ -1017,7 +1017,7 @@
         rid                 (auth/role-eid sys-conn role-key)]
     (if rid
       (if (auth/user-role-key? sys-conn role-key username)
-        (u/raise "Cannot withdraw the default role of a user" {})
+        (raise "Cannot withdraw the default role of a user" {})
         (with-permission!
           deps server skey alter-act role-obj rid
           "Don't have permission to withdraw the role from user"
@@ -1025,7 +1025,7 @@
             (auth/transact-withdraw-role sys-conn rid username)
             ((:update-cached-role deps) server username)
             (write-complete! deps skey))))
-      (u/raise "Role does not exist." {}))))
+      (raise "Role does not exist." {}))))
 
 (defn list-user-roles
   [deps server skey {:keys [args]}]
@@ -1038,7 +1038,7 @@
         "Don't have permission to view the user's roles"
         (fn []
           (write-result! deps skey (auth/user-roles sys-conn username))))
-      (u/raise "User does not exist." {}))))
+      (raise "User does not exist." {}))))
 
 (defn grant-permission
   [deps server skey {:keys [args]}]
@@ -1054,10 +1054,10 @@
                    (auth/permission-objects perm-obj))
             (auth/transact-role-permission
              sys-conn rid perm-act perm-obj perm-tgt)
-            (u/raise "Unknown permission action or object." {}))
+            (raise "Unknown permission action or object." {}))
           ((:update-cached-permission deps) server role-key)
           (write-complete! deps skey)))
-      (u/raise "Role does not exist." {}))))
+      (raise "Role does not exist." {}))))
 
 (defn revoke-permission
   [deps server skey {:keys [args]}]
@@ -1073,7 +1073,7 @@
            sys-conn rid perm-act perm-obj perm-tgt)
           ((:update-cached-permission deps) server role-key)
           (write-complete! deps skey)))
-      (u/raise "Role does not exist." {}))))
+      (raise "Role does not exist." {}))))
 
 (defn list-role-permissions
   [deps server skey {:keys [args]}]
@@ -1087,7 +1087,7 @@
         (fn []
           (write-result!
             deps skey (auth/role-permissions sys-conn role-key))))
-      (u/raise "Role does not exist." {}))))
+      (raise "Role does not exist." {}))))
 
 (defn list-user-permissions
   [deps server skey {:keys [args]}]
@@ -1101,7 +1101,7 @@
         (fn []
           (write-result!
             deps skey (auth/user-permissions sys-conn username))))
-      (u/raise "User does not exist." {}))))
+      (raise "User does not exist." {}))))
 
 (defn query-system
   [deps server skey {:keys [args]}]
@@ -1178,7 +1178,7 @@
         store   (dt-store deps server skey db-name writing?)
         kvs     (nth args 1)]
     (when-not (map? kvs)
-      (u/raise "assoc-opts expects a map of option mutations"
+      (raise "assoc-opts expects a map of option mutations"
                {:error :server/invalid-request
                 :db-name db-name
                 :value kvs}))
@@ -1218,22 +1218,22 @@
 (defn- validate-ha-membership-update-spec!
   [spec]
   (when-not (map? spec)
-    (u/raise "HA membership update expects a map"
+    (raise "HA membership update expects a map"
              {:error :ha/membership-update-invalid-request
               :spec spec}))
   (when-let [unknown (seq (remove ha-membership-update-spec-keys (keys spec)))]
-    (u/raise "HA membership update contains unknown keys"
+    (raise "HA membership update contains unknown keys"
              {:error :ha/membership-update-invalid-request
               :unknown-keys (vec unknown)}))
   (when (and (contains? spec :ha-control-plane)
              (not (map? (:ha-control-plane spec))))
-    (u/raise "HA membership update :ha-control-plane expects a map"
+    (raise "HA membership update :ha-control-plane expects a map"
              {:error :ha/membership-update-invalid-request
               :ha-control-plane (:ha-control-plane spec)}))
   (when-let [extra-cp-keys
              (seq (remove #{:voters}
                           (keys (:ha-control-plane spec))))]
-    (u/raise "HA membership update can only change :ha-control-plane :voters"
+    (raise "HA membership update can only change :ha-control-plane :voters"
              {:error :ha/membership-update-invalid-request
               :unsupported-control-plane-keys (vec extra-cp-keys)}))
   spec)
@@ -1311,7 +1311,7 @@
   (let [db-name (u/lisp-case (nth args 0 nil))
         spec    (validate-ha-membership-update-spec! (nth args 1))]
     (when writing?
-      (u/raise "HA membership update must be issued outside with-transaction"
+      (raise "HA membership update must be issued outside with-transaction"
                {:error :ha/membership-update-invalid-request
                 :db-name db-name}))
     (db-alter-permission!
@@ -1326,7 +1326,7 @@
                  db-state  (db-state deps server db-name)
                  authority (:ha-authority db-state)]
              (when-not authority
-               (u/raise "Database is not running consensus HA"
+               (raise "Database is not running consensus HA"
                         {:error :ha/not-enabled
                          :db-name db-name}))
              (let [{:keys [old-kvs persist-kvs runtime-opts
@@ -1336,7 +1336,7 @@
                    expected-hash (or (:expected-membership-hash spec)
                                      current-hash)]
                (when-not (= current-hash expected-hash)
-                 (u/raise "HA membership update expected hash does not match authority"
+                 (raise "HA membership update expected hash does not match authority"
                           {:error :ha/membership-hash-mismatch
                            :db-name db-name
                            :expected expected-hash
@@ -1374,7 +1374,7 @@
                            (throw t)))]
                    (when-not (:ok? update-result)
                      (rollback-ha-membership-local-opts! store old-kvs)
-                     (u/raise "HA membership update was rejected by the control plane"
+                     (raise "HA membership update was rejected by the control plane"
                               {:error :ha/membership-update-rejected
                                :db-name db-name
                                :result update-result}))
@@ -1441,7 +1441,7 @@
                        (dt-store deps server skey db-name writing?)
                        (rest args)))
 
-              (u/raise "Missing :mode when loading datoms" {}))))))))
+              (raise "Missing :mode when loading datoms" {}))))))))
 
 (defn- transact*
   [deps db0 txs tx-meta s? server db-name writing?]
@@ -1462,7 +1462,7 @@
   (let [txs (case mode
               :copy-in ((:copy-in deps) server skey)
               :request (nth args 1)
-              (u/raise "Missing :mode when transact data" {}))
+              (raise "Missing :mode when transact data" {}))
         db0 (get-in (db-state deps server db-name)
                     [(if writing? :wdt-db :dt-db)])
         s?  (last args)
@@ -1771,7 +1771,7 @@
   (let [[op & op-args] call]
     (if-let [op-fn (get kv-ops op)]
       (apply op-fn kv-store op-args)
-      (u/raise "Unsupported batch-kv call"
+      (raise "Unsupported batch-kv call"
                {:call op :call-args op-args}))))
 
 (defn batch-kv
@@ -1779,7 +1779,7 @@
   (let [[db-name calls] args
         kv-store        (kv-store deps server skey db-name writing?)]
     (when-not (sequential? calls)
-      (u/raise "batch-kv calls must be a sequential collection"
+      (raise "batch-kv calls must be a sequential collection"
                {:calls calls}))
     (write-result!
       deps
@@ -1787,7 +1787,7 @@
       (mapv
         (fn [call]
           (when-not (sequential? call)
-            (u/raise "Each batch-kv call must be a vector [op & args]"
+            (raise "Each batch-kv call must be a vector [op & args]"
                      {:call call}))
           (run-batch-kv-call kv-store call))
         calls))))
@@ -2278,7 +2278,7 @@
                   (let [txs0 (case mode
                                :copy-in ((:copy-in deps) server skey)
                                :request (nth args 2)
-                               (u/raise "Missing :mode when transacting kv"
+                               (raise "Missing :mode when transacting kv"
                                         {}))
                         dbi-name (nth args 1)
                         k-type   (nth args 3 nil)
@@ -2492,7 +2492,7 @@
                (some-> ^java.util.concurrent.atomic.AtomicBoolean
                        (:replica-loop-running? m)
                        .get))))
-      (u/raise "Database is not open" {:db-name db-name}))))
+      (raise "Database is not open" {:db-name db-name}))))
 
 (def ^:private base-handler-map
   {:authentication authentication

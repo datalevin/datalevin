@@ -13,7 +13,7 @@
    [datalevin.relation :as r]
    [datalevin.db :as db]
    [datalevin.query-util :as qu]
-   [datalevin.util :as u :refer [concatv]])
+   [datalevin.util :as u :refer [ concatv raise]])
   (:import
    [java.util BitSet Collection HashMap HashSet List Map$Entry]
    [org.eclipse.collections.impl.list.mutable FastList]
@@ -605,7 +605,7 @@
         available     (into (set (keys attrs1)) (keys attrs2))
         missing       (into [] (remove available) vars)
         _             (when (seq missing)
-                        (u/raise "Cannot project missing joined attributes"
+                        (raise "Cannot project missing joined attributes"
                                  {:missing   missing
                                   :available available}))
         output-attrs  (zipmap vars (range))

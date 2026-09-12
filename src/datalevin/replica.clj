@@ -15,7 +15,7 @@
    [datalevin.interface :as i]
    [datalevin.kv :as kv]
    [datalevin.remote :as r]
-   [datalevin.util :as u]
+   [datalevin.util :as u :refer [raise]]
    [taoensso.timbre :as log])
   (:import
    [datalevin.remote KVStore]
@@ -35,7 +35,7 @@
 (defn require-source!
   [opts]
   (or (:replica/source opts)
-      (u/raise "Replica read-only mode requires :replica/source" {})))
+      (raise "Replica read-only mode requires :replica/source" {})))
 
 (defn replica-id
   [opts]
@@ -104,7 +104,7 @@
   [{:keys [store]}]
   (let [wm (kv/txlog-watermarks store)]
     (when-not (:wal? wm)
-      (u/raise "Replica source does not have WAL enabled"
+      (raise "Replica source does not have WAL enabled"
                {:type :replica/source-wal-disabled
                 :watermarks wm}))
     wm))
@@ -152,7 +152,7 @@
   (let [expected (range (long from-lsn) (inc (long upto-lsn)))
         actual   (map :lsn records)]
     (when-not (= (seq expected) (seq actual))
-      (u/raise "Replica source WAL has a gap"
+      (raise "Replica source WAL has a gap"
                {:type :replica/source-wal-gap
                 :from-lsn from-lsn
                 :upto-lsn upto-lsn
@@ -186,7 +186,7 @@
                                                    source-durable-lsn))
                     copy-meta            (i/copy (:store source) stage false)]
                 (when-not (local-data-exists? stage)
-                  (u/raise "Replica bootstrap copy did not produce an LMDB data file"
+                  (raise "Replica bootstrap copy did not produce an LMDB data file"
                            {:db-name db-name
                             :stage stage
                             :copy-meta copy-meta}))

@@ -16,7 +16,7 @@
    [datalevin.prepare :as coreprep]
    [datalevin.datom :as d :refer [datom?]]
    [datalevin.udf :as udf]
-   [datalevin.util :as u :refer [cond+]]
+   [datalevin.util :as u :refer [ cond+ raise]]
    [datalevin.validate :as vld])
   (:import
    [java.io Writer]
@@ -184,7 +184,7 @@
             udf-desc (ea-first-v store eid :db/udf)
             ident    (ea-first-v store eid :db/ident)]
         (when (and fun udf-desc)
-          (u/raise "Installed callable entity cannot have both :db/fn and :db/udf: "
+          (raise "Installed callable entity cannot have both :db/fn and :db/udf: "
                    target
                    {:error     :transact/syntax
                     :target    target

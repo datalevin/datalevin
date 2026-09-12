@@ -37,7 +37,7 @@
    [datalevin.rules :as rules]
    [datalevin.spill :as sp]
    [datalevin.timeout :as timeout]
-   [datalevin.util :as u :refer [cond+ concatv map+]])
+   [datalevin.util :as u :refer [ cond+ concatv map+ raise]])
   (:import
    [clojure.lang IPersistentCollection PersistentVector]
    [java.util Collection Comparator HashSet List PriorityQueue]
@@ -2366,11 +2366,10 @@
                                  (when (nil? idx) (nth cols i))))
                              indices)
             _          (when (seq missing)
-                         (throw
-                           (ex-info "Access fragment lost projected columns"
+                         (raise "Access fragment lost projected columns"
                                     {:missing missing
                                      :available (keys attrs)
-                                     :projected cols})))
+                                     :projected cols}))
             projected  (FastList. n)
             ^ints idxs (int-array indices)
             width      (alength idxs)]
@@ -3108,18 +3107,16 @@
             (= result-set #{}) 0
 
             (seq rels)
-            (throw
-              (ex-info "Streaming plan count does not support input relations"
-                       {:relation-count (count rels)}))
+            (raise "Streaming plan count does not support input relations"
+                       {:relation-count (count rels)})
 
             (seq late-clauses)
             (do
               (when-not (= 1 (count component-plans))
-                (throw
-                  (ex-info
+                (raise
                     "Streaming late-clause count requires one connected plan"
                     {:component-count (count component-plans)
-                     :late-clauses late-clauses})))
+                     :late-clauses late-clauses}))
               (let [[source steps] (first component-plans)
                     attrs          (qplan/step-attrs steps)]
                 (qplan/reduce-step-batches

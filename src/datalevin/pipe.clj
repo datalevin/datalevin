@@ -13,7 +13,7 @@
   (:require
    [datalevin.constants :as c]
    [datalevin.timeout :as timeout]
-   [datalevin.util :as u])
+   [datalevin.util :as u :refer [raise]])
   (:import
    [java.util List Collection HashMap]
    [java.util.concurrent LinkedBlockingQueue Semaphore TimeUnit]
@@ -41,7 +41,7 @@
     true
     (catch InterruptedException e
       (.interrupt (Thread/currentThread))
-      (u/raise "Interrupted while enqueuing to pipe" e {:object o}))))
+      (raise "Interrupted while enqueuing to pipe" e {:object o}))))
 
 (deftype TupleBatch [^List tuples ^long start ^long end])
 
@@ -51,7 +51,7 @@
     (.acquire permits (int n))
     (catch InterruptedException e
       (.interrupt (Thread/currentThread))
-      (u/raise "Interrupted while enqueuing to pipe" e {:tuple-count n}))))
+      (raise "Interrupted while enqueuing to pipe" e {:tuple-count n}))))
 
 (defn- enqueue-batches
   [^LinkedBlockingQueue queue ^Semaphore permits ^List tuples ^long batch-size]
@@ -131,7 +131,7 @@
                        TimeUnit/MILLISECONDS)]
           (when (nil? o)
             (timeout/assert-time-left)
-            (u/raise "Pipe take timed out waiting for producer"
+            (raise "Pipe take timed out waiting for producer"
                      {:timeout wait-ms}))
           (when-not (identical? :datalevin/end-scan o)
             (set! consumer o)
@@ -246,7 +246,7 @@
         (set! i (inc i))
         tuple)))
   (add-batch [_ _]
-    (u/raise "Cannot add tuples to a list input pipe" {}))
+    (raise "Cannot add tuples to a list input pipe" {}))
   (drain-to [this sink]
     (loop [tuple (produce this)]
       (when tuple
@@ -309,7 +309,7 @@
                   (set! j 0)
                   (recur))))))))
   (add-batch [_ _]
-    (u/raise "Cannot add tuples to an or-join input pipe" {}))
+    (raise "Cannot add tuples to an or-join input pipe" {}))
   (drain-to [this sink]
     (loop [t (produce this)]
       (when t

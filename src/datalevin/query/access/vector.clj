@@ -10,6 +10,7 @@
 (ns ^:no-doc datalevin.query.access.vector
   "Ranked and resumable access paths over existing approximate vector results."
   (:require
+   [datalevin.util :refer [raise]]
    [datalevin.built-ins :as built-ins]
    [datalevin.constants :as c]
    [datalevin.interface :refer [vecs-info]]
@@ -257,9 +258,8 @@
     (let [request (get-in path [:options :request])
           source  (or source (get-in path [:options :spec :source-value]))
           _       (when-not (instance? DB source)
-                    (throw
-                      (ex-info "Vector access requires a database source"
-                               {:source source})))
+                    (raise "Vector access requires a database source"
+                               {:source source}))
           resume  (:resume work)
           index   (continuation-index resume)
           emitted (long (or (:emitted work) index))]

@@ -888,7 +888,7 @@
           (u/delete-files dfname)
           new))
       (catch Exception e
-        (u/raise "Unable to re-index vectors. " e {:dir (i/env-dir lmdb)})))))
+        (raise "Unable to re-index vectors. " e {:dir (i/env-dir lmdb)})))))
 
 (defn- rollback-add-vecs!
   [raw-index ^SpillableMap vecs lmdb vecs-dbi ^objects refs ^longs ids

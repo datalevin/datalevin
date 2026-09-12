@@ -13,7 +13,7 @@
    [datalevin.bits :as b]
    [datalevin.constants :as c]
    [datalevin.core :as d]
-   [datalevin.util :as u])
+   [datalevin.util :as u :refer [raise]])
   (:import
    [java.nio.charset StandardCharsets]
    [java.security MessageDigest SecureRandom]
@@ -310,7 +310,7 @@
 (defn transact-new-user
   [sys-conn username password]
   (if (query-user sys-conn username)
-    (u/raise "User already exits" {:username username})
+    (raise "User already exits" {:username username})
     (let [s (salt)]
       (d/transact! sys-conn [{:db/id        -1
                               :user/name    username
@@ -359,7 +359,7 @@
 (defn transact-new-role
   [sys-conn role-key]
   (if (query-role sys-conn role-key)
-    (u/raise "Role already exits" {:role-key role-key})
+    (raise "Role already exits" {:role-key role-key})
     (d/transact! sys-conn [{:db/id    -1
                             :role/key role-key}
                            {:db/id          -2
@@ -389,14 +389,14 @@
   [sys-conn rid username]
   (if-let [uid (user-eid sys-conn username)]
     (d/transact! sys-conn [{:user-role/user uid :user-role/role rid}])
-    (u/raise "User does not exist." {:username username})))
+    (raise "User does not exist." {:username username})))
 
 (defn transact-withdraw-role
   [sys-conn rid username]
   (if-let [uid (user-eid sys-conn username)]
     (when-let [urid (user-role-eid sys-conn uid rid)]
       (d/transact! sys-conn [[:db/retractEntity urid]]))
-    (u/raise "User does not exist." {:username username})))
+    (raise "User does not exist." {:username username})))
 
 (defn transact-role-permission
   [sys-conn rid perm-act perm-obj perm-tgt]
@@ -411,7 +411,7 @@
                                {:db/id          -2
                                 :role-perm/perm -1
                                 :role-perm/role rid}]))
-      (u/raise "Permission target does not exist." {}))
+      (raise "Permission target does not exist." {}))
     (d/transact! sys-conn [{:db/id          -1
                             :permission/act perm-act
                             :permission/obj perm-obj}
@@ -426,12 +426,12 @@
       (if-let [pid (permission-eid sys-conn perm-act perm-obj tid)]
         (when-let [rpid (role-permission-eid sys-conn rid pid)]
           (d/transact! sys-conn [[:db/retractEntity rpid]]))
-        (u/raise "Permission does not exist." {}))
-      (u/raise "Permission target does not exist." {}))
+        (raise "Permission does not exist." {}))
+      (raise "Permission target does not exist." {}))
     (if-let [pid (permission-eid sys-conn perm-act perm-obj nil)]
       (when-let [rpid (role-permission-eid sys-conn rid pid)]
         (d/transact! sys-conn [[:db/retractEntity rpid]]))
-      (u/raise "Permission does not exist." {}))))
+      (raise "Permission does not exist." {}))))
 
 (defn transact-new-db
   [sys-conn username db-type db-name]

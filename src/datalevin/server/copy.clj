@@ -16,7 +16,7 @@
    [datalevin.native-value :as nv]
    [datalevin.protocol :as p]
    [datalevin.storage :as st]
-   [datalevin.util :as u]
+   [datalevin.util :as u :refer [raise]]
    [taoensso.timbre :as log])
   (:import
    [java.nio ByteBuffer]
@@ -84,8 +84,8 @@
             (let [{:keys [type]} msg]
               (case type
                 :copy-done :break
-                :copy-fail (u/raise "Client error while loading data" {})
-                (u/raise "Receive unexpected message while loading data"
+                :copy-fail (raise "Client error while loading data" {})
+                (raise "Receive unexpected message while loading data"
                          {:msg msg})))
             (do
               (when-not @decode-error

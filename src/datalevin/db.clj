@@ -23,7 +23,7 @@
    [datalevin.db.tx.prepare :as txprep]
    [datalevin.idoc :as idoc]
    [datalevin.util :as u
-    :refer [case-tree defrecord-updatable]]
+    :refer [ case-tree defrecord-updatable raise]]
    [datalevin.lmdb :as l]
    [datalevin.storage :as s]
    [datalevin.prepare :as prepare]
@@ -1108,7 +1108,7 @@
   [store datoms]
   (let [batch-size (long c/*fill-db-batch-size*)]
     (when-not (<= 1 batch-size Integer/MAX_VALUE)
-      (u/raise "Invalid fill-db batch size" {:batch-size batch-size}))
+      (raise "Invalid fill-db batch size" {:batch-size batch-size}))
     (let [^FastList batch (FastList. (int batch-size))]
       (doseq [datom datoms]
         (.add batch (correct-datom store datom))
@@ -1131,7 +1131,7 @@
   (let [store (.-store db)]
     (if (instance? Store store)
       store
-      (u/raise "Secondary index job APIs require a local Datalog store"
+      (raise "Secondary index job APIs require a local Datalog store"
                {:op op
                 :store (some-> store class str)}))))
 

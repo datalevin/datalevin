@@ -9,6 +9,7 @@
 ;;
 (ns ^:no-doc datalevin.json-api.shared
   (:require
+   [datalevin.util :refer [raise]]
    [clojure.edn :as edn]
    [clojure.string :as str]
    [datalevin.client :as dc]
@@ -204,10 +205,10 @@
             (let [seen' (unchecked-add (long seen)
                                        (long (count-direct-items x)))]
             (when (> seen' limit)
-              (throw (ex-info "Result exceeds max-result-items limit."
+              (raise "Result exceeds max-result-items limit."
                               {:code  :result-too-large
                                :kind  :items
-                               :limit limit})))
+                               :limit limit}))
               (recur (concat (nested-items x) (rest stack)) seen'))))))
     json-result))
 
@@ -247,8 +248,8 @@
     (map? x) x
     (instance? java.util.Map x) (into {} x)
     :else
-    (throw (ex-info "Request args must be a JSON object."
-                    {:code :invalid-request}))))
+    (raise "Request args must be a JSON object."
+                    {:code :invalid-request})))
 
 (defn- require-string
   [x field]
@@ -469,8 +470,8 @@
   (let [attr (or (get m :attr)
                  (get m "attr"))]
     (when-not attr
-      (throw (ex-info "Tagged pull attr must include :attr."
-                      {:code :invalid-request})))
+      (raise "Tagged pull attr must include :attr."
+                      {:code :invalid-request}))
     (reduce (fn [expr k]
               (if (contains? m k)
                 (conj expr k (normalize-pull-selector (get m k)))
@@ -602,8 +603,8 @@
     (d/dir (:store (resolve-db context (get args "conn"))))
 
     :else
-    (throw (ex-info "dir requires kv or conn."
-                    {:code :invalid-request}))))
+    (raise "dir requires kv or conn."
+                    {:code :invalid-request})))
 
 (defn- handle-open-dbi
   [args context]
@@ -1099,33 +1100,33 @@
 (defn- handle-abort-transact
   [_args context]
   (when-not (:in-transaction? context)
-    (throw (ex-info "abort-transact is only valid inside with-transaction."
+    (raise "abort-transact is only valid inside with-transaction."
                     {:code :invalid-op-context
-                     :op   "abort-transact"})))
+                     :op   "abort-transact"}))
   (d/abort-transact (:transaction-conn context))
-  (throw (ex-info "Transaction aborted."
+  (raise "Transaction aborted."
                   {:code                    :transaction-aborted
                    :op                      "abort-transact"
-                   aborted-transaction-key  true})))
+                   aborted-transaction-key  true}))
 
 (defn- handle-abort-transact-kv
   [_args context]
   (when-not (:in-kv-transaction? context)
-    (throw (ex-info "abort-transact-kv is only valid inside with-transaction-kv."
+    (raise "abort-transact-kv is only valid inside with-transaction-kv."
                     {:code :invalid-op-context
-                     :op   "abort-transact-kv"})))
+                     :op   "abort-transact-kv"}))
   (d/abort-transact-kv (:transaction-kv context))
-  (throw (ex-info "Transaction aborted."
+  (raise "Transaction aborted."
                   {:code                    :transaction-aborted
                    :op                      "abort-transact-kv"
-                   aborted-transaction-key  true})))
+                   aborted-transaction-key  true}))
 
 (defn- handle-with-transaction
   [args context]
   (when (:in-transaction? context)
-    (throw (ex-info "Nested with-transaction is not supported."
+    (raise "Nested with-transaction is not supported."
                     {:code :invalid-op-context
-                     :op   "with-transaction"})))
+                     :op   "with-transaction"}))
   (let [h   (get args "conn")
         ops (require-vector (get args "ops") "ops")
         c   (resolve-conn context h)]
@@ -1152,10 +1153,10 @@
         ops (require-vector (get args "ops") "ops")]
     (when (and (:in-kv-transaction? context)
                (not= (:kv-handle context) h))
-      (throw (ex-info
+      (raise
                "Nested with-transaction-kv is only supported on the active kv handle."
                {:code :invalid-op-context
-                :op   "with-transaction-kv"})))
+                :op   "with-transaction-kv"}))
     (let [kv (resolve-kv context h)]
       (try
         (d/with-transaction-kv [tx-kv kv]
@@ -1503,15 +1504,15 @@
     (:store (resolve-db context (get args "conn")))
 
     :else
-    (throw (ex-info "Operation requires kv or conn."
-                    {:code :invalid-request}))))
+    (raise "Operation requires kv or conn."
+                    {:code :invalid-request})))
 
 (defn- reject-open-tx-log-offset
   [args]
   (when (contains? args "offset")
-    (throw (ex-info "open-tx-log does not support offset."
+    (raise "open-tx-log does not support offset."
                     {:code  :invalid-request
-                     :field "offset"}))))
+                     :field "offset"})))
 
 (defn- handle-txlog-watermarks
   [args context]
@@ -1573,8 +1574,8 @@
       h)
 
     :else
-    (throw (ex-info "re-index requires kv or conn."
-                    {:code :invalid-request}))))
+    (raise "re-index requires kv or conn."
+                    {:code :invalid-request})))
 
 (def ^:private op-registry
   {"api-info"                    (fn [_args _context] (api-info))
@@ -1725,8 +1726,8 @@
         op      (get request "op")
         args    (require-map (get request "args"))]
     (when-not (string? op)
-      (throw (ex-info "Request op must be a string."
-                      {:code :invalid-request})))
+      (raise "Request op must be a string."
+                      {:code :invalid-request}))
     (let [handler (or (get op-registry op) (unsupported-op op))]
       (handler args context))))
 

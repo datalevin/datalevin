@@ -13,7 +13,7 @@
    [clojure.string :as s]
    [datalevin.constants :as c]
    [datalevin.ha.util :as hu]
-   [datalevin.util :as u])
+   [datalevin.util :as u :refer [raise]])
   (:import
    [java.util.concurrent TimeUnit]))
 
@@ -28,7 +28,7 @@
 (defn- require-non-blank-string
   [x where]
   (when-not (non-blank-string? x)
-    (u/raise "HA value must be a non-blank string"
+    (raise "HA value must be a non-blank string"
              {:error :ha/validation
               :where where
               :value x}))

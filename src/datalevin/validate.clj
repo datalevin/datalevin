@@ -20,7 +20,7 @@
    [datalevin.udf :as udf]
    [datalevin.constants :as c]
    [datalevin.secondary-index :as si]
-   [datalevin.util :as u]
+   [datalevin.util :as u :refer [raise]]
    [datalevin.bits :as b]
    [datalevin.lmdb :as lmdb])
   (:import
@@ -39,7 +39,7 @@
   "Validate that attribute is defined in schema when :closed-schema? is true."
   [schema opts attr value]
   (when (and (opts :closed-schema?) (not (schema attr)))
-    (u/raise "Attribute is not defined in schema when
+    (raise "Attribute is not defined in schema when
 `:closed-schema?` is true: " attr {:attr attr :value value})))
 
 (defn validate-cardinality-change
@@ -50,7 +50,7 @@
     (let [low-datom  (d/datom c/e0 attr c/v0)
           high-datom (d/datom c/emax attr c/vmax)]
       (when (populated? store :ave low-datom high-datom)
-        (u/raise "Cardinality change is not allowed when data exist"
+        (raise "Cardinality change is not allowed when data exist"
                  {:attribute attr})))))
 
 (defn validate-value-type-change
@@ -64,7 +64,7 @@
           (let [low-datom  (d/datom c/e0 attr c/v0)
                 high-datom (d/datom c/emax attr c/vmax)]
             (when (populated? store :ave low-datom high-datom)
-              (u/raise "Value type change is not allowed when data exist"
+              (raise "Value type change is not allowed when data exist"
                        {:attribute attr}))))))))
 
 (defn violate-unique?
@@ -106,7 +106,7 @@
           high-datom (d/datom c/emax attr c/vmax)]
       (when (populated? store :ave low-datom high-datom)
         (when (violate-unique? lmdb (schema store) low-datom high-datom)
-          (u/raise "Attribute uniqueness change is inconsistent with data"
+          (raise "Attribute uniqueness change is inconsistent with data"
                    {:attribute attr}))))))
 
 (def ^:private embedding-schema-keys
@@ -128,7 +128,7 @@
                          k))
                      embedding-schema-keys)]
     (when (populated-attribute? store attr)
-      (u/raise "Embedding schema changes require an explicit rebuild"
+      (raise "Embedding schema changes require an explicit rebuild"
                {:attribute attr :key k}))))
 
 (defn- validate-idoc-index-schema-change
@@ -138,7 +138,7 @@
                          k))
                      idoc-index-schema-keys)]
     (when (populated-attribute? store attr)
-      (u/raise "Idoc path indexing schema changes require an explicit rebuild"
+      (raise "Idoc path indexing schema changes require an explicit rebuild"
                {:attribute attr :key k}))))
 
 (defn validate-schema-mutation
@@ -225,26 +225,26 @@
 (defn- validate-peer-id
   [peer-id where]
   (when-not (non-blank-string? peer-id)
-    (u/raise "HA peer-id must be a non-blank host:port string"
+    (raise "HA peer-id must be a non-blank host:port string"
              {:error :ha/validation
               :where where
               :peer-id peer-id}))
   (let [[_ host port-str] (re-matches peer-id-pattern peer-id)]
     (when (or (s/blank? host) (nil? port-str))
-      (u/raise "HA peer-id must have host:port format"
+      (raise "HA peer-id must have host:port format"
                {:error :ha/validation
                 :where where
                 :peer-id peer-id}))
     (let [port (try
                  (Long/parseLong ^String port-str)
                  (catch NumberFormatException _
-                   (u/raise "HA peer-id port must be a valid integer"
+                   (raise "HA peer-id port must be a valid integer"
                             {:error :ha/validation
                              :where where
                              :peer-id peer-id
                              :port port-str})))]
       (when-not (<= 1 port 65535)
-        (u/raise "HA peer-id port must be in [1, 65535]"
+        (raise "HA peer-id port must be in [1, 65535]"
                  {:error :ha/validation
                   :where where
                   :peer-id peer-id
@@ -254,7 +254,7 @@
 (defn- validate-ha-member
   [m idx]
   (when-not (map? m)
-    (u/raise "HA member must be a map"
+    (raise "HA member must be a map"
              {:error :ha/validation
               :where :ha-members
               :index idx
@@ -262,13 +262,13 @@
   (let [node-id  (:node-id m)
         endpoint (:endpoint m)]
     (when-not (positive-int? node-id)
-      (u/raise "HA member :node-id must be a positive integer"
+      (raise "HA member :node-id must be a positive integer"
                {:error :ha/validation
                 :where :ha-members
                 :index idx
                 :member m}))
     (when-not (non-blank-string? endpoint)
-      (u/raise "HA member :endpoint must be a non-blank string"
+      (raise "HA member :endpoint must be a non-blank string"
                {:error :ha/validation
                 :where :ha-members
                 :index idx
@@ -278,13 +278,13 @@
 (defn- validate-ha-members-shape
   [members]
   (when-not (sequential? members)
-    (u/raise "Option :ha-members expects a sequential collection"
+    (raise "Option :ha-members expects a sequential collection"
              {:error :ha/validation
               :option :ha-members
               :value members}))
   (let [members (vec members)]
     (when (empty? members)
-      (u/raise "Option :ha-members must be non-empty for consensus HA"
+      (raise "Option :ha-members must be non-empty for consensus HA"
                {:error :ha/validation
                 :option :ha-members}))
     (doseq [[idx m] (map-indexed vector members)]
@@ -292,12 +292,12 @@
     (let [node-ids (mapv :node-id members)
           sorted-ids (vec (sort node-ids))]
       (when-not (= (count node-ids) (count (set node-ids)))
-        (u/raise "Option :ha-members contains duplicate :node-id values"
+        (raise "Option :ha-members contains duplicate :node-id values"
                  {:error :ha/validation
                   :option :ha-members
                   :node-ids node-ids}))
       (when-not (= node-ids sorted-ids)
-        (u/raise "Option :ha-members must be ordered by ascending :node-id"
+        (raise "Option :ha-members must be ordered by ascending :node-id"
                  {:error :ha/validation
                   :option :ha-members
                   :node-ids node-ids
@@ -307,13 +307,13 @@
 (defn- validate-ha-command-hook-shape
   [option hook-label hook]
   (when-not (map? hook)
-    (u/raise (str "Option " option " expects a map")
+    (raise (str "Option " option " expects a map")
              {:error :ha/validation
               :option option
               :value hook}))
   (let [cmd (:cmd hook)]
     (when-not (and (vector? cmd) (seq cmd) (every? non-blank-string? cmd))
-      (u/raise (str "HA " hook-label
+      (raise (str "HA " hook-label
                     " hook :cmd must be a non-empty vector of non-blank strings")
                {:error :ha/validation
                 :option option
@@ -328,7 +328,7 @@
                          (str "HA " hook-label
                               " hook :retry-delay-ms must be a non-negative integer")]]]
     (when-not (pred (get hook k))
-      (u/raise msg
+      (raise msg
                {:error :ha/validation
                 :option option
                 :hook hook})))
@@ -342,7 +342,7 @@
 (defn- validate-ha-fencing-hook-required
   [hook]
   (when-not (some? hook)
-    (u/raise
+    (raise
       "Consensus HA requires :ha-fencing-hook at startup; failover is disabled without it"
       {:error :ha/missing-fencing-hook
        :option :ha-fencing-hook
@@ -357,7 +357,7 @@
 (defn- validate-ha-client-credentials-shape
   [credentials]
   (when-not (map? credentials)
-    (u/raise "Option :ha-client-credentials expects a map"
+    (raise "Option :ha-client-credentials expects a map"
              {:error :ha/validation
               :option :ha-client-credentials
               :value credentials}))
@@ -365,13 +365,13 @@
         password (:password credentials)]
     (when-not (and (non-blank-string? username)
                    (not (s/includes? username ":")))
-      (u/raise
+      (raise
        "Option :ha-client-credentials :username must be a non-blank string without ':'"
        {:error :ha/validation
         :option :ha-client-credentials
         :credentials credentials}))
     (when-not (non-blank-string? password)
-      (u/raise "Option :ha-client-credentials :password must be a non-blank string"
+      (raise "Option :ha-client-credentials :password must be a non-blank string"
                {:error :ha/validation
                 :option :ha-client-credentials
                 :credentials credentials})))
@@ -380,27 +380,27 @@
 (defn- validate-ha-voter
   [v idx]
   (when-not (map? v)
-    (u/raise "HA control-plane voter must be a map"
+    (raise "HA control-plane voter must be a map"
              {:error :ha/validation
               :where :ha-control-plane
               :index idx
               :value v}))
   (validate-peer-id (:peer-id v) :ha-control-plane-voter)
   (when-not (or (true? (:promotable? v)) (false? (:promotable? v)))
-    (u/raise "HA control-plane voter :promotable? must be boolean"
+    (raise "HA control-plane voter :promotable? must be boolean"
              {:error :ha/validation
               :where :ha-control-plane
               :index idx
               :voter v}))
   (if (:promotable? v)
     (when-not (positive-int? (:ha-node-id v))
-      (u/raise "Promotable HA voter must include positive :ha-node-id"
+      (raise "Promotable HA voter must include positive :ha-node-id"
                {:error :ha/validation
                 :where :ha-control-plane
                 :index idx
                 :voter v}))
     (when (contains? v :ha-node-id)
-      (u/raise "Non-promotable HA voter must not include :ha-node-id"
+      (raise "Non-promotable HA voter must not include :ha-node-id"
                {:error :ha/validation
                 :where :ha-control-plane
                 :index idx
@@ -412,17 +412,17 @@
    (validate-ha-control-plane-shape cp true))
   ([cp require-local-runtime?]
    (when-not (map? cp)
-     (u/raise "Option :ha-control-plane expects a map"
+     (raise "Option :ha-control-plane expects a map"
               {:error :ha/validation
                :option :ha-control-plane
                :value cp}))
    (when-not (= :sofa-jraft (:backend cp))
-     (u/raise "Option :ha-control-plane :backend must be :sofa-jraft in V2"
+     (raise "Option :ha-control-plane :backend must be :sofa-jraft in V2"
               {:error :ha/validation
                :option :ha-control-plane
                :backend (:backend cp)}))
    (when-not (non-blank-string? (:group-id cp))
-     (u/raise "Option :ha-control-plane :group-id must be a non-blank string"
+     (raise "Option :ha-control-plane :group-id must be a non-blank string"
               {:error :ha/validation
                :option :ha-control-plane
                :group-id (:group-id cp)}))
@@ -432,7 +432,7 @@
    (when (or require-local-runtime?
              (contains? cp :raft-dir))
      (when-not (non-blank-string? (:raft-dir cp))
-       (u/raise "Option :ha-control-plane :raft-dir must be a non-blank durable path"
+       (raise "Option :ha-control-plane :raft-dir must be a non-blank durable path"
                 {:error :ha/validation
                  :option :ha-control-plane
                  :field :raft-dir
@@ -441,19 +441,19 @@
                   [:election-timeout-ms (:election-timeout-ms cp)]
                   [:operation-timeout-ms (:operation-timeout-ms cp)]]]
      (when-not (positive-int? v)
-       (u/raise "HA control-plane timeout must be a positive integer"
+       (raise "HA control-plane timeout must be a positive integer"
                 {:error :ha/validation
                  :option :ha-control-plane
                  :field k
                  :value v})))
    (let [voters (:voters cp)]
      (when-not (vector? voters)
-       (u/raise "Option :ha-control-plane :voters must be a vector"
+       (raise "Option :ha-control-plane :voters must be a vector"
                {:error :ha/validation
                 :option :ha-control-plane
                 :voters voters}))
      (when (< (count voters) 3)
-       (u/raise "Consensus HA requires at least 3 control-plane voters"
+       (raise "Consensus HA requires at least 3 control-plane voters"
                 {:error :ha/validation
                  :option :ha-control-plane
                  :voter-count (count voters)}))
@@ -466,20 +466,20 @@
            promotable-voters (filter :promotable? voters)
            promotable-node-ids (mapv :ha-node-id promotable-voters)]
        (when-not (= (count peer-ids) (count (set peer-ids)))
-         (u/raise "HA control-plane voter :peer-id values must be unique"
+         (raise "HA control-plane voter :peer-id values must be unique"
                   {:error :ha/validation
                    :option :ha-control-plane
                    :peer-ids peer-ids}))
        (when (or require-local-runtime? local-peer-present?)
          (when-not (= local-count 1)
-           (u/raise "HA local control-plane peer must appear exactly once in :voters"
+           (raise "HA local control-plane peer must appear exactly once in :voters"
                     {:error :ha/validation
                      :option :ha-control-plane
                      :local-peer-id local-peer-id
                      :matches local-count})))
        (when-not (= (count promotable-node-ids)
                     (count (set promotable-node-ids)))
-         (u/raise "Promotable HA voters must map one-to-one by :ha-node-id"
+         (raise "Promotable HA voters must map one-to-one by :ha-node-id"
                   {:error :ha/validation
                    :option :ha-control-plane
                    :promotable-node-ids promotable-node-ids}))))
@@ -537,19 +537,19 @@
   (let [opts (or opts {})
         mode (:ha-mode opts)]
     (when (and (some? mode) (not= mode :consensus-lease))
-      (u/raise "Option :ha-mode expects nil or :consensus-lease"
+      (raise "Option :ha-mode expects nil or :consensus-lease"
                {:error :ha/validation
                 :option :ha-mode
                 :value mode}))
     (when (= mode :consensus-lease)
       (when (and (contains? opts :wal?)
                  (not (true? (:wal? opts))))
-        (u/raise "Consensus-lease HA requires :wal? true"
+        (raise "Consensus-lease HA requires :wal? true"
                  {:error :ha/validation
                   :option :wal?
                   :value (:wal? opts)}))
       (when (= :relaxed (:wal-durability-profile opts))
-        (u/raise "Consensus-lease HA requires :wal-durability-profile :strict or :extra"
+        (raise "Consensus-lease HA requires :wal-durability-profile :strict or :extra"
                  {:error :ha/validation
                   :option :wal-durability-profile
                   :value (:wal-durability-profile opts)}))
@@ -589,7 +589,7 @@
                                         set)
             db-identity (:db-identity opts)]
         (when-not (non-blank-string? db-identity)
-          (u/raise "Option :db-identity must be a non-blank string in consensus mode"
+          (raise "Option :db-identity must be a non-blank string in consensus mode"
                    {:error :ha/validation
                     :option :db-identity
                     :value db-identity}))
@@ -597,39 +597,39 @@
                        (positive-int? timeout-ms)
                        (positive-int? base-delay-ms)
                        (positive-int? rank-delay-ms))
-          (u/raise "Consensus HA timing options must be positive integers"
+          (raise "Consensus HA timing options must be positive integers"
                    {:error :ha/validation
                     :renew-ms renew-ms
                     :timeout-ms timeout-ms
                     :base-delay-ms base-delay-ms
                     :rank-delay-ms rank-delay-ms}))
         (when-not (non-negative-int? max-lag-lsn)
-          (u/raise "Option :ha-max-promotion-lag-lsn must be a non-negative integer"
+          (raise "Option :ha-max-promotion-lag-lsn must be a non-negative integer"
                    {:error :ha/validation
                     :option :ha-max-promotion-lag-lsn
                     :value max-lag-lsn}))
         (when-not (non-negative-int? demotion-drain-ms)
-          (u/raise "Option :ha-demotion-drain-ms must be a non-negative integer"
+          (raise "Option :ha-demotion-drain-ms must be a non-negative integer"
                    {:error :ha/validation
                     :option :ha-demotion-drain-ms
                     :value demotion-drain-ms}))
         (when-not (positive-int? clock-skew-budget-ms)
-          (u/raise "Option :ha-clock-skew-budget-ms must be a positive integer"
+          (raise "Option :ha-clock-skew-budget-ms must be a positive integer"
                    {:error :ha/validation
                     :option :ha-clock-skew-budget-ms
                     :value clock-skew-budget-ms}))
         (when-not (positive-int? follower-max-batch-records)
-          (u/raise "Option :ha-follower-max-batch-records must be a positive integer"
+          (raise "Option :ha-follower-max-batch-records must be a positive integer"
                    {:error :ha/validation
                     :option :ha-follower-max-batch-records
                     :value follower-max-batch-records}))
         (when-not (positive-int? follower-target-batch-bytes)
-          (u/raise "Option :ha-follower-target-batch-bytes must be a positive integer"
+          (raise "Option :ha-follower-target-batch-bytes must be a positive integer"
                    {:error :ha/validation
                     :option :ha-follower-target-batch-bytes
                     :value follower-target-batch-bytes}))
         (when (< (long timeout-ms) (unchecked-multiply 2 (long renew-ms)))
-          (u/raise "Option :ha-lease-timeout-ms must be >= 2 * :ha-lease-renew-ms"
+          (raise "Option :ha-lease-timeout-ms must be >= 2 * :ha-lease-renew-ms"
                    {:error :ha/validation
                     :ha-lease-timeout-ms timeout-ms
                     :ha-lease-renew-ms renew-ms}))
@@ -637,7 +637,7 @@
                   (< (long stale-leader-window-ms) 0)
                   (> (unchecked-multiply 2 (long clock-skew-budget-ms))
                      (long stale-leader-window-ms)))
-          (u/raise
+          (raise
            (str "Option :ha-clock-skew-budget-ms is too large for the lease window; "
                 "require 2 * :ha-clock-skew-budget-ms <= "
                 "(:ha-lease-timeout-ms - :ha-lease-renew-ms)")
@@ -656,7 +656,7 @@
         (let [missing (seq (sort (remove promotable-node-id-set member-id-set)))
               extras  (seq (sort (remove member-id-set promotable-node-id-set)))]
           (when (or missing extras)
-            (u/raise "Promotable control-plane voters must map exactly to :ha-members node IDs"
+            (raise "Promotable control-plane voters must map exactly to :ha-members node IDs"
                      {:error :ha/validation
                       :missing-promotable-voters missing
                       :extra-promotable-voters extras
@@ -664,36 +664,36 @@
                       :promotable-voters (sort promotable-node-id-set)})))
         (when (some? node-id)
           (when-not (positive-int? node-id)
-            (u/raise "Option :ha-node-id must be a positive integer in consensus mode"
+            (raise "Option :ha-node-id must be a positive integer in consensus mode"
                      {:error :ha/validation
                       :option :ha-node-id
                       :value node-id}))
           (when-not (contains? member-id-set node-id)
-            (u/raise "Option :ha-node-id must exist in :ha-members"
+            (raise "Option :ha-node-id must exist in :ha-members"
                      {:error :ha/validation
                       :option :ha-node-id
                       :ha-node-id node-id
                       :ha-members member-ids}))
           (when local-voter
             (when-not (:promotable? local-voter)
-              (u/raise "Local control-plane voter must be promotable in consensus mode"
+              (raise "Local control-plane voter must be promotable in consensus mode"
                        {:error :ha/validation
                         :local-peer-id local-peer-id
                         :voter local-voter}))
             (when-not (= node-id (:ha-node-id local-voter))
-              (u/raise "Local control-plane voter :ha-node-id must match :ha-node-id"
+              (raise "Local control-plane voter :ha-node-id must match :ha-node-id"
                        {:error :ha/validation
                         :ha-node-id node-id
                         :local-voter local-voter}))))
         (when-let [expected (:ha-membership-hash opts)]
           (when-not (non-blank-string? expected)
-            (u/raise "Option :ha-membership-hash must be a non-blank string when provided"
+            (raise "Option :ha-membership-hash must be a non-blank string when provided"
                      {:error :ha/validation
                       :option :ha-membership-hash
                       :value expected}))
           (let [derived (derive-ha-membership-hash opts)]
             (when-not (= expected derived)
-              (u/raise "Local HA membership hash does not match authoritative hash"
+              (raise "Local HA membership hash does not match authoritative hash"
                        {:error :ha/validation
                         :option :ha-membership-hash
                         :expected expected
@@ -720,23 +720,23 @@
           (validate-ha-fencing-hook-required
             (:ha-fencing-hook opts)))
         (when-not (positive-int? node-id)
-          (u/raise "Option :ha-node-id must be a positive integer in consensus mode"
+          (raise "Option :ha-node-id must be a positive integer in consensus mode"
                    {:error :ha/validation
                     :option :ha-node-id
                     :value node-id}))
         (when-not (contains? member-id-set node-id)
-          (u/raise "Option :ha-node-id must exist in :ha-members"
+          (raise "Option :ha-node-id must exist in :ha-members"
                    {:error :ha/validation
                     :option :ha-node-id
                     :ha-node-id node-id
                     :ha-members member-ids}))
         (when-not (:promotable? local-voter)
-          (u/raise "Local control-plane voter must be promotable in consensus mode"
+          (raise "Local control-plane voter must be promotable in consensus mode"
                    {:error :ha/validation
                     :local-peer-id local-peer-id
                     :voter local-voter}))
         (when-not (= node-id (:ha-node-id local-voter))
-          (u/raise "Local control-plane voter :ha-node-id must match :ha-node-id"
+          (raise "Local control-plane voter :ha-node-id must match :ha-node-id"
                    {:error :ha/validation
                     :ha-node-id node-id
                     :local-voter local-voter})))))
@@ -748,13 +748,13 @@
   (let [k (c/canonical-wal-option-key k)]
     (cond
       (contains? non-persistable-ha-option-keys k)
-      (u/raise (str "Option " k " is node-local HA runtime config and cannot "
+      (raise (str "Option " k " is node-local HA runtime config and cannot "
                     "be persisted via assoc-opt")
                {:option k :value v})
 
       (= k :ha-mode)
       (when-not (or (nil? v) (= :consensus-lease v))
-        (u/raise "Option :ha-mode expects nil or :consensus-lease"
+        (raise "Option :ha-mode expects nil or :consensus-lease"
                  {:option k :value v}))
 
       (= k :ha-members)
@@ -765,7 +765,7 @@
       (when (some? v)
         (when-let [local-fields (seq (sort (filter #(contains? v %)
                                                    non-persistable-ha-control-plane-option-keys)))]
-          (u/raise "Option :ha-control-plane cannot persist node-local fields via assoc-opt"
+          (raise "Option :ha-control-plane cannot persist node-local fields via assoc-opt"
                    {:option k
                     :value v
                     :local-fields local-fields}))
@@ -773,38 +773,38 @@
 
       (= k :ha-membership-hash)
       (when-not (or (nil? v) (non-blank-string? v))
-        (u/raise "Option :ha-membership-hash expects nil or a non-blank string"
+        (raise "Option :ha-membership-hash expects nil or a non-blank string"
                  {:option k :value v}))
 
       (= k :db-identity)
       (when-not (non-blank-string? v)
-        (u/raise "Option :db-identity expects a non-blank string"
+        (raise "Option :db-identity expects a non-blank string"
                  {:option k :value v}))
 
       (boolean-opts k)
       (when-not (or (true? v) (false? v))
-        (u/raise "Option " k " expects a boolean, got " v
+        (raise "Option " k " expects a boolean, got " v
                  {:option k :value v}))
 
       (non-negative-int-opts k)
       (when-not (and (integer? v) (not (neg? ^long v)))
-        (u/raise "Option " k " expects a non-negative integer, got " v
+        (raise "Option " k " expects a non-negative integer, got " v
                  {:option k :value v}))
 
       (positive-int-opts k)
       (when-not (and (integer? v) (pos? ^long v))
-        (u/raise "Option " k " expects a positive integer, got " v
+        (raise "Option " k " expects a positive integer, got " v
                  {:option k :value v}))
 
       (= k :db-name)
       (when-not (string? v)
-        (u/raise "Option :db-name expects a string, got " v
+        (raise "Option :db-name expects a string, got " v
                  {:option k :value v}))
 
       :else
       (when-let [allowed (keyword-enum-opts k)]
         (when-not (allowed v)
-          (u/raise "Option " k " expects one of " allowed ", got " v
+          (raise "Option " k " expects one of " allowed ", got " v
                    {:option k :value v :allowed allowed}))))))
 
 ;; ---- Key size validation ----
@@ -822,7 +822,7 @@
   [key key-type]
   (when (and key (not (size-exempt-key-types key-type)))
     (when (> ^long (b/measure-size key) c/+max-key-size+)
-      (u/raise "Key cannot be larger than 511 bytes" {:input key}))))
+      (raise "Key cannot be larger than 511 bytes" {:input key}))))
 
 ;; ---- KV validation ----
 
@@ -832,25 +832,25 @@
   "Validate that the KV operation is a known operator."
   [op]
   (when-not (kv-ops op)
-    (u/raise "Unknown kv transact operator: " op {})))
+    (raise "Unknown kv transact operator: " op {})))
 
 (defn validate-kv-key
   "Validate a KV key: must not be nil; optionally check data type."
   [k kt validate-data?]
   (when (nil? k)
-    (u/raise "Key cannot be nil" {}))
+    (raise "Key cannot be nil" {}))
   (when validate-data?
     (when-not (b/valid-data? k kt)
-      (u/raise "Invalid data, expecting " kt " got " k {:input k}))))
+      (raise "Invalid data, expecting " kt " got " k {:input k}))))
 
 (defn validate-kv-value
   "Validate a KV value: must not be nil; optionally check data type."
   [v vt validate-data?]
   (when (nil? v)
-    (u/raise "Value cannot be nil" {}))
+    (raise "Value cannot be nil" {}))
   (when validate-data?
     (when-not (b/valid-data? v vt)
-      (u/raise "Invalid data, expecting " vt " got " v {:input v}))))
+      (raise "Invalid data, expecting " vt " got " v {:input v}))))
 
 (defn validate-kv-tx-data
   "Validate a single KVTxData: op shape, key, value, and key size."
@@ -866,17 +866,17 @@
     (case op
       :put      (validate-kv-value v vt validate-data?)
       :put-list (do (when-not (or (sequential? v) (instance? java.util.List v))
-                      (u/raise "List value must be a sequential collection, got "
+                      (raise "List value must be a sequential collection, got "
                                (if (nil? v) "nil" (type v)) {:input v}))
                     (doseq [vi v]
                       (validate-kv-value vi vt validate-data?)))
       :del-list (do (when-not (or (sequential? v) (instance? java.util.List v))
-                      (u/raise "List value must be a sequential collection, got "
+                      (raise "List value must be a sequential collection, got "
                                (if (nil? v) "nil" (type v)) {:input v}))
                     (when validate-data?
                       (doseq [vi v]
                         (when-not (b/valid-data? vi vt)
-                          (u/raise "Invalid data, expecting " vt " got " vi
+                          (raise "Invalid data, expecting " vt " got " vi
                                    {:input vi})))))
       :del      nil)))
 
@@ -886,7 +886,7 @@
   "Validate a single schema key-value pair against expected values."
   [a k v expected]
   (when-not (or (nil? v) (contains? expected v))
-    (u/raise "Bad attribute specification for " {a {k v}}
+    (raise "Bad attribute specification for " {a {k v}}
              ", expected one of " expected
              {:error     :schema/validation
               :attribute a
@@ -901,16 +901,16 @@
   :db/retract property-removal marker."
   [schema-update]
   (when-not (or (nil? schema-update) (map? schema-update))
-    (u/raise "Schema update must be a map"
+    (raise "Schema update must be a map"
              {:error :schema/validation
               :value schema-update}))
   (doseq [[a props] schema-update]
     (when-not (keyword? a)
-      (u/raise "Schema attribute must be a keyword: " a
+      (raise "Schema attribute must be a keyword: " a
                {:error     :schema/validation
                 :attribute a}))
     (when-not (map? props)
-      (u/raise "Schema properties for " a " must be a map"
+      (raise "Schema properties for " a " must be a map"
                {:error     :schema/validation
                 :attribute a
                 :value     props})))
@@ -940,15 +940,15 @@
                  :key       :db.attr/preds
                  :value     preds}]
     (when-not preds'
-      (u/raise a " :db.attr/preds must be a qualified symbol, predicate UDF descriptor map, registered UDF keyword id, or a sequential collection of those"
+      (raise a " :db.attr/preds must be a qualified symbol, predicate UDF descriptor map, registered UDF keyword id, or a sequential collection of those"
                ex-data))
     (when (empty? preds')
-      (u/raise a " :db.attr/preds cannot be empty" ex-data))
+      (raise a " :db.attr/preds cannot be empty" ex-data))
     (doseq [pred preds']
       (cond
         (symbol? pred)
         (when-not (qualified-symbol? pred)
-          (u/raise a " :db.attr/preds entries must be qualified symbols, predicate UDF descriptor maps, or registered UDF keyword ids, got: "
+          (raise a " :db.attr/preds entries must be qualified symbols, predicate UDF descriptor maps, or registered UDF keyword ids, got: "
                    pred
                    (assoc ex-data :predicate pred)))
 
@@ -959,7 +959,7 @@
         nil
 
         :else
-        (u/raise a " :db.attr/preds entries must be qualified symbols, predicate UDF descriptor maps, or registered UDF keyword ids, got: "
+        (raise a " :db.attr/preds entries must be qualified symbols, predicate UDF descriptor maps, or registered UDF keyword ids, got: "
                  pred
                  (assoc ex-data :predicate pred))))))
 
@@ -973,47 +973,47 @@
                  :attribute a
                  :key       :db.embedding/domains}]
     (when-not (sequential? domains)
-      (u/raise a " :db.embedding/domains must be a sequential collection"
+      (raise a " :db.embedding/domains must be a sequential collection"
                ex-data))
     (when (empty? domains)
-      (u/raise a " :db.embedding/domains cannot be empty" ex-data))
+      (raise a " :db.embedding/domains cannot be empty" ex-data))
     (doseq [domain domains]
       (when-not (and (string? domain) (not (s/blank? domain)))
-        (u/raise a " :db.embedding/domains entries must be non-blank strings"
+        (raise a " :db.embedding/domains entries must be non-blank strings"
                  (assoc ex-data :value domain))))))
 
 (defn- validate-embedding-domain-config*
   [where domain config]
   (when-not (map? config)
-    (u/raise "Embedding domain config must be a map"
+    (raise "Embedding domain config must be a map"
              {:error :store/validation
               :where where
               :domain domain
               :value config}))
   (when-let [provider (:provider config)]
     (when-not (keyword? provider)
-      (u/raise "Embedding provider id must be a keyword"
+      (raise "Embedding provider id must be a keyword"
                {:error :store/validation
                 :where where
                 :domain domain
                 :provider provider})))
   (when-let [dimensions (:dimensions config)]
     (when-not (positive-int? dimensions)
-      (u/raise "Embedding dimensions must be a positive integer"
+      (raise "Embedding dimensions must be a positive integer"
                {:error :store/validation
                 :where where
                 :domain domain
                 :dimensions dimensions})))
   (when-let [metric-type (:metric-type config)]
     (when-not (embedding-metric-types metric-type)
-      (u/raise "Embedding metric type is not supported"
+      (raise "Embedding metric type is not supported"
                {:error :store/validation
                 :where where
                 :domain domain
                 :metric-type metric-type})))
   (when-let [indexing-mode (:indexing-mode config)]
     (when-not (si/supported-indexing-modes indexing-mode)
-      (u/raise "Embedding indexing mode is not supported"
+      (raise "Embedding indexing mode is not supported"
                {:error :store/validation
                 :where where
                 :domain domain
@@ -1021,7 +1021,7 @@
                 :expected si/supported-indexing-modes})))
   (when-let [metadata (:embedding-metadata config)]
     (when-not (map? metadata)
-      (u/raise "Embedding metadata must be a map"
+      (raise "Embedding metadata must be a map"
                {:error :store/validation
                 :where where
                 :domain domain
@@ -1033,20 +1033,20 @@
     (validate-embedding-domain-config* :embedding-opts nil embedding-opts))
   (when-let [embedding-domains (:embedding-domains opts)]
     (when-not (map? embedding-domains)
-      (u/raise "Option :embedding-domains expects a map"
+      (raise "Option :embedding-domains expects a map"
                {:error :store/validation
                 :option :embedding-domains
                 :value embedding-domains}))
     (doseq [[domain config] embedding-domains]
       (when-not (and (string? domain) (not (s/blank? domain)))
-        (u/raise "Embedding domain names must be non-blank strings"
+        (raise "Embedding domain names must be non-blank strings"
                  {:error :store/validation
                   :option :embedding-domains
                   :domain domain}))
       (validate-embedding-domain-config* :embedding-domains domain config)))
   (when-let [embedding-providers (:embedding-providers opts)]
     (when-not (map? embedding-providers)
-      (u/raise "Option :embedding-providers expects a map"
+      (raise "Option :embedding-providers expects a map"
                {:error :store/validation
                 :option :embedding-providers
                 :value embedding-providers})))
@@ -1055,14 +1055,14 @@
 (defn- validate-search-domain-config*
   [where domain config]
   (when-not (map? config)
-    (u/raise "Search domain config must be a map"
+    (raise "Search domain config must be a map"
              {:error :store/validation
               :where where
               :domain domain
               :config config}))
   (when-let [indexing-mode (:indexing-mode config)]
     (when-not (si/supported-indexing-modes indexing-mode)
-      (u/raise "Search indexing mode is not supported"
+      (raise "Search indexing mode is not supported"
                {:error :store/validation
                 :where where
                 :domain domain
@@ -1075,13 +1075,13 @@
     (validate-search-domain-config* :search-opts nil search-opts))
   (when-let [search-domains (:search-domains opts)]
     (when-not (map? search-domains)
-      (u/raise "Option :search-domains expects a map"
+      (raise "Option :search-domains expects a map"
                {:error :store/validation
                 :option :search-domains
                 :value search-domains}))
     (doseq [[domain config] search-domains]
       (when-not (and (string? domain) (not (s/blank? domain)))
-        (u/raise "Search domain names must be non-blank strings"
+        (raise "Search domain names must be non-blank strings"
                  {:error :store/validation
                   :option :search-domains
                   :domain domain}))
@@ -1091,14 +1091,14 @@
 (defn- validate-vector-domain-config*
   [where domain config]
   (when-not (map? config)
-    (u/raise "Vector domain config must be a map"
+    (raise "Vector domain config must be a map"
              {:error :store/validation
               :where where
               :domain domain
               :config config}))
   (when-let [indexing-mode (:indexing-mode config)]
     (when-not (si/supported-indexing-modes indexing-mode)
-      (u/raise "Vector indexing mode is not supported"
+      (raise "Vector indexing mode is not supported"
                {:error :store/validation
                 :where where
                 :domain domain
@@ -1111,13 +1111,13 @@
     (validate-vector-domain-config* :vector-opts nil vector-opts))
   (when-let [vector-domains (:vector-domains opts)]
     (when-not (map? vector-domains)
-      (u/raise "Option :vector-domains expects a map"
+      (raise "Option :vector-domains expects a map"
                {:error :store/validation
                 :option :vector-domains
                 :value vector-domains}))
     (doseq [[domain config] vector-domains]
       (when-not (and (string? domain) (not (s/blank? domain)))
-        (u/raise "Vector domain names must be non-blank strings"
+        (raise "Vector domain names must be non-blank strings"
                  {:error :store/validation
                   :option :vector-domains
                   :domain domain}))
@@ -1132,14 +1132,14 @@
                    (vector? selector)  selector
                    :else nil)]
     (when-not segments
-      (u/raise "Idoc path selector must be a keyword, string, or vector"
+      (raise "Idoc path selector must be a keyword, string, or vector"
                {:error :store/validation
                 :where where
                 :key k
                 :selector selector}))
     (doseq [seg segments]
       (when-not (or (keyword? seg) (string? seg))
-        (u/raise "Idoc path selector segments must be keywords or strings"
+        (raise "Idoc path selector segments must be keywords or strings"
                  {:error :store/validation
                   :where where
                   :key k
@@ -1149,7 +1149,7 @@
 (defn- validate-idoc-path-selectors
   [where k selectors]
   (when-not (sequential? selectors)
-    (u/raise "Idoc path selector option must be a sequential collection"
+    (raise "Idoc path selector option must be a sequential collection"
              {:error :store/validation
               :where where
               :key k
@@ -1160,7 +1160,7 @@
 (defn- validate-idoc-domain-config*
   [where domain config]
   (when-not (map? config)
-    (u/raise "Idoc domain config must be a map"
+    (raise "Idoc domain config must be a map"
              {:error :store/validation
               :where where
               :domain domain
@@ -1175,13 +1175,13 @@
     (validate-idoc-domain-config* :idoc-opts nil idoc-opts))
   (when-let [idoc-domains (:idoc-domains opts)]
     (when-not (map? idoc-domains)
-      (u/raise "Option :idoc-domains expects a map"
+      (raise "Option :idoc-domains expects a map"
                {:error :store/validation
                 :option :idoc-domains
                 :value idoc-domains}))
     (doseq [[domain config] idoc-domains]
       (when-not (and (string? domain) (not (s/blank? domain)))
-        (u/raise "Idoc domain names must be non-blank strings"
+        (raise "Idoc domain names must be non-blank strings"
                  {:error :store/validation
                   :option :idoc-domains
                   :domain domain}))
@@ -1199,7 +1199,7 @@
   (let [base-ms (:async-secondary-index-retry-base-ms opts)
         max-ms (:async-secondary-index-retry-max-ms opts)]
     (when (and base-ms max-ms (> (long base-ms) (long max-ms)))
-      (u/raise "Option :async-secondary-index-retry-base-ms must be <= :async-secondary-index-retry-max-ms"
+      (raise "Option :async-secondary-index-retry-base-ms must be <= :async-secondary-index-retry-max-ms"
                {:option :async-secondary-index-retry-base-ms
                 :value base-ms
                 :max-retry-ms max-ms})))
@@ -1213,7 +1213,7 @@
     (let [comp? (:db/isComponent kv false)]
       (validate-schema-key a :db/isComponent (:db/isComponent kv) #{true false})
       (when (and comp? (not (identical? (:db/valueType kv) :db.type/ref)))
-        (u/raise
+        (raise
           "Bad attribute specification for " a
           ": {:db/isComponent true} should also have {:db/valueType :db.type/ref}"
           {:error     :schema/validation
@@ -1245,7 +1245,7 @@
     (doseq [k [:db.idoc/indexedPaths :db.idoc/excludedPaths]]
       (when (contains? kv k)
         (when-not (identical? (:db/valueType kv) :db.type/idoc)
-          (u/raise "Bad attribute specification for idoc path indexing"
+          (raise "Bad attribute specification for idoc path indexing"
                    {:error     :schema/validation
                     :attribute a
                     :key       k
@@ -1254,7 +1254,7 @@
 
     (when (and (:db/embedding kv)
                (not (identical? (:db/valueType kv) :db.type/string)))
-      (u/raise "Bad attribute specification for embedding"
+      (raise "Bad attribute specification for embedding"
                {:error     :schema/validation
                 :attribute a
                 :key       :db/embedding
@@ -1263,7 +1263,7 @@
     ;; tuple should have one of tuple-props
     (when (and (identical? :db.type/tuple (:db/valueType kv))
                (not (some tuple-props (keys kv))))
-      (u/raise
+      (raise
         "Bad attribute specification for " a
         ": {:db/valueType :db.type/tuple} should also have :db/tupleAttrs, :db/tupleTypes, or :db/tupleType"
         {:error     :schema/validation
@@ -1276,26 +1276,26 @@
                      :attribute a
                      :key       :db/tupleAttrs}]
         (when (identical? :db.cardinality/many (:db/cardinality kv))
-          (u/raise a " has :db/tupleAttrs, must be :db.cardinality/one" ex-data))
+          (raise a " has :db/tupleAttrs, must be :db.cardinality/one" ex-data))
 
         (let [attrs (:db/tupleAttrs kv)]
           (when-not (sequential? attrs)
-            (u/raise a " :db/tupleAttrs must be a sequential collection, got: " attrs ex-data))
+            (raise a " :db/tupleAttrs must be a sequential collection, got: " attrs ex-data))
 
           (when (empty? attrs)
-            (u/raise a " :db/tupleAttrs can\u2019t be empty" ex-data))
+            (raise a " :db/tupleAttrs can\u2019t be empty" ex-data))
 
           (doseq [attr attrs
                   :let [ex-data (assoc ex-data :value attr)]]
             (when (contains? (schema attr) :db/tupleAttrs)
-              (u/raise a " :db/tupleAttrs can\u2019t depend on another tuple attribute: " attr ex-data))
+              (raise a " :db/tupleAttrs can\u2019t depend on another tuple attribute: " attr ex-data))
 
             (when (identical? :db.cardinality/many (:db/cardinality (schema attr)))
-              (u/raise a " :db/tupleAttrs can\u2019t depend on :db.cardinality/many attribute: " attr ex-data))
+              (raise a " :db/tupleAttrs can\u2019t depend on :db.cardinality/many attribute: " attr ex-data))
 
             (when-let [value-type (:db/valueType (schema attr))]
               (when-not (c/tuple-value-types value-type)
-                (u/raise
+                (raise
                   a " :db/tupleAttrs can\u2019t depend on attribute with unsupported tuple component type: "
                   attr " (" value-type ")" ex-data)))))))
 
@@ -1305,7 +1305,7 @@
                      :key       :db/tupleType}
             attr    (:db/tupleType kv)]
         (when-not (c/tuple-value-types attr)
-          (u/raise
+          (raise
             a " :db/tupleType must be a supported scalar tuple component type, got: "
             attr ex-data))))
 
@@ -1316,7 +1316,7 @@
             attrs   (:db/tupleTypes kv)]
         (when-not (and (sequential? attrs) (< 1 (count attrs))
                        (every? c/tuple-value-types attrs))
-          (u/raise
+          (raise
             a " :db/tupleTypes must be a sequential collection of more than one supported scalar tuple component types, got: "
             attrs ex-data))))))
 
@@ -1324,14 +1324,14 @@
   "Validate that an attribute is a keyword."
   [attr at]
   (when-not (keyword? attr)
-    (u/raise "Bad entity attribute " attr " at " at ", expected keyword"
+    (raise "Bad entity attribute " attr " at " at ", expected keyword"
              {:error :transact/syntax, :attribute attr, :context at})))
 
 (defn validate-val
   "Validate that a value is not nil."
   [v at]
   (when (nil? v)
-    (u/raise "Cannot store nil as a value at " at
+    (raise "Cannot store nil as a value at " at
              {:error :transact/syntax, :value v, :context at})))
 
 (defn validate-datom-unique
@@ -1342,7 +1342,7 @@
         v (.-v datom)]
     (when (and unique? (d/datom-added datom))
       (when-some [found (found?)]
-        (u/raise "Cannot add " datom " because of unique constraint: " found
+        (raise "Cannot add " datom " because of unique constraint: " found
                  {:error     :transact/unique
                   :attribute a
                   :datom     datom})))
@@ -1363,7 +1363,7 @@
     (if (<= 2 (count upsert-ids))
       (let [[e1 [a1 v1]] (first upsert-ids)
             [e2 [a2 v2]] (second upsert-ids)]
-        (u/raise "Conflicting upserts: " [a1 v1] " resolves to " e1 ", but " [a2 v2] " resolves to " e2
+        (raise "Conflicting upserts: " [a1 v1] " resolves to " e1 ", but " [a2 v2] " resolves to " e2
                {:error     :transact/upsert
                 :assertion [e1 a1 v1]
                 :conflict  [e2 a2 v2]}))
@@ -1374,7 +1374,7 @@
                 (some? eid)
                 (not (tempid-fn? eid))
                 (not= upsert-id eid))
-          (u/raise "Conflicting upsert: " [a v] " resolves to " upsert-id ", but entity already has :db/id " eid
+          (raise "Conflicting upsert: " [a v] " resolves to " upsert-id ", but entity already has :db/id " eid
                  {:error     :transact/upsert
                   :assertion [upsert-id a v]
                   :conflict  {:db/id eid}}))
@@ -1392,7 +1392,7 @@
     (or (not (st-opts :validate-data?))
         (cd/custom-type? vt)
         (b/valid-data? v vt)
-        (u/raise "Invalid data, expecting" vt " got " v {:input v}))
+        (raise "Invalid data, expecting" vt " got " v {:input v}))
     vt))
 
 (defn- resolve-attr-pred
@@ -1400,7 +1400,7 @@
   (let [callable (if (attr-pred-udf-ref? pred)
                    (if resolve-udf
                      (resolve-udf pred)
-                     (u/raise "Attribute predicate UDF " pred
+                     (raise "Attribute predicate UDF " pred
                               " requires a UDF resolver"
                               {:error     :schema/validation
                                :key       :db.attr/preds
@@ -1408,7 +1408,7 @@
                    (let [resolved (requiring-resolve pred)]
                      (if (var? resolved) @resolved resolved)))]
     (when-not (ifn? callable)
-      (u/raise "Attribute predicate " pred " does not resolve to a callable value"
+      (raise "Attribute predicate " pred " does not resolve to a callable value"
                {:error     :schema/validation
                 :key       :db.attr/preds
                 :predicate pred
@@ -1423,7 +1423,7 @@
    (doseq [pred (normalize-attr-preds (:db.attr/preds props))]
      (let [pred-return ((resolve-attr-pred pred resolve-udf) v)]
        (when-not (true? pred-return)
-         (u/raise "Entity " e " attribute " a " value " v
+         (raise "Entity " e " attribute " a " value " v
                   " failed pred " pred
                   {:error                :transact/attr-pred
                    :entity               e
@@ -1438,14 +1438,14 @@
   "Validate that tempids are only used with :db/add."
   [tempid? op entity]
   (when (and tempid? (not (identical? op :db/add)))
-    (u/raise "Can't use tempid in '" entity "'. Tempids are allowed in :db/add only"
+    (raise "Can't use tempid in '" entity "'. Tempids are allowed in :db/add only"
              {:error :transact/syntax, :op entity})))
 
 (defn validate-ensure-arity
   "Validate :db/ensure arity: expected predicate and at least one argument."
   [argc entity]
   (when (< (long argc) 3)
-    (u/raise "Bad arity for :db/ensure, expected predicate and at least one argument: "
+    (raise "Bad arity for :db/ensure, expected predicate and at least one argument: "
              entity
              {:error :transact/syntax
               :operation :db/ensure
@@ -1460,7 +1460,7 @@
                 (qualified-symbol? pred)
                 (udf/descriptor? pred)
                 (keyword? pred))
-    (u/raise ":db/ensure predicate must be a function, var, qualified symbol, UDF descriptor, or registered UDF id: "
+    (raise ":db/ensure predicate must be a function, var, qualified symbol, UDF descriptor, or registered UDF id: "
              pred
              {:error :transact/syntax
               :operation :db/ensure
@@ -1470,7 +1470,7 @@
 (defn validate-ensure-tempid
   "Validate that a :db/ensure tempid argument resolved."
   [arg entity]
-  (u/raise ":db/ensure could not resolve tempid argument " arg
+  (raise ":db/ensure could not resolve tempid argument " arg
            {:error :transact/syntax
             :operation :db/ensure
             :tempid arg
@@ -1480,7 +1480,7 @@
   "Validate that :db/ensure predicate returned truthy."
   [result pred args entity]
   (when-not result
-    (u/raise ":db/ensure failed for predicate " pred " with args " args
+    (raise ":db/ensure failed for predicate " pred " with args " args
              {:error     :transact/ensure
               :operation :db/ensure
               :predicate pred
@@ -1495,18 +1495,18 @@
   [multival? e a ov nv datoms]
   (if multival?
     (when-not (some (fn [^Datom d] (= (.-v d) ov)) datoms)
-      (u/raise ":db.fn/cas failed on datom [" e " " a " " (map :v datoms) "], expected " ov
+      (raise ":db.fn/cas failed on datom [" e " " a " " (map :v datoms) "], expected " ov
                {:error :transact/cas, :old datoms, :expected ov, :new nv}))
     (let [v (:v (first datoms))]
       (when-not (= v ov)
-        (u/raise ":db.fn/cas failed on datom [" e " " a " " v "], expected " ov
+        (raise ":db.fn/cas failed on datom [" e " " a " " v "], expected " ov
                  {:error :transact/cas, :old (first datoms), :expected ov, :new nv})))))
 
 (defn validate-patch-idoc-arity
   "Validate patchIdoc arity: expected 4 or 5 items."
   [argc entity op]
   (when-not (or (= argc 4) (= argc 5))
-    (u/raise "Bad arity for :db.fn/patchIdoc, expected 4 or 5 items: "
+    (raise "Bad arity for :db.fn/patchIdoc, expected 4 or 5 items: "
              entity
              {:error :transact/syntax, :operation op, :tx-data entity})))
 
@@ -1514,44 +1514,44 @@
   "Validate that the attribute has idoc value type."
   [value-type a]
   (when-not (identical? value-type :db.type/idoc)
-    (u/raise "Attribute is not an idoc type: " a
+    (raise "Attribute is not an idoc type: " a
              {:attribute a})))
 
 (defn validate-patch-idoc-cardinality
   "Validate patchIdoc cardinality rules for old value."
   [many? old-v a]
   (when (and many? (nil? old-v))
-    (u/raise "Idoc patch requires old value for cardinality many attribute: "
+    (raise "Idoc patch requires old value for cardinality many attribute: "
              a {:attribute a}))
   (when (and (not many?) (some? old-v))
-    (u/raise "Idoc patch old value is only supported for cardinality many attribute: "
+    (raise "Idoc patch old value is only supported for cardinality many attribute: "
              a {:attribute a})))
 
 (defn validate-patch-idoc-old-value
   "Validate that old value exists for cardinality-many idoc patch."
   [old-datom old-v a]
   (when-not old-datom
-    (u/raise "Idoc patch old value not found: " old-v
+    (raise "Idoc patch old value not found: " old-v
              {:attribute a :value old-v})))
 
 (defn validate-custom-tx-fn-value
   "Validate that a resolved entity has a fn? :db/fn attribute."
   [fun op entity]
   (when-not (fn? fun)
-    (u/raise "Entity " op " expected to have :db/fn attribute with fn? value"
+    (raise "Entity " op " expected to have :db/fn attribute with fn? value"
              {:error :transact/syntax, :operation :db.fn/call, :tx-data entity})))
 
 (defn validate-installed-callable-entity
   "Validate stored function attributes on an entity map."
   [entity]
   (when (and (contains? entity :db/fn) (contains? entity :db/udf))
-    (u/raise "Entity cannot have both :db/fn and :db/udf at " entity
+    (raise "Entity cannot have both :db/fn and :db/udf at " entity
              {:error :transact/syntax, :tx-data entity}))
   (when (contains? entity :db/udf)
     (let [descriptor (udf/descriptor (:db/udf entity))]
       (when-let [ident (:db/ident entity)]
         (when-not (= ident (:udf/id descriptor))
-          (u/raise "Installed :db/udf id must match :db/ident at " entity
+          (raise "Installed :db/udf id must match :db/ident at " entity
                    {:error      :transact/syntax
                     :tx-data    entity
                     :db/ident   ident
@@ -1562,7 +1562,7 @@
   "Validate that an installed descriptor matches the entity ident when known."
   [ident descriptor at]
   (when (and ident (not= ident (:udf/id descriptor)))
-    (u/raise "Installed :db/udf id must match :db/ident at " at
+    (raise "Installed :db/udf id must match :db/ident at " at
              {:error      :transact/syntax
               :db/ident   ident
               :descriptor descriptor
@@ -1572,26 +1572,26 @@
   "Validate that an entity exists for a custom transaction function."
   [ident op entity]
   (when-not ident
-    (u/raise "Can\u2019t find entity for transaction fn " op
+    (raise "Can\u2019t find entity for transaction fn " op
              {:error :transact/syntax, :operation :db.fn/call, :tx-data entity})))
 
 (defn validate-tuple-direct-write
   "Validate that tuple attrs cannot be modified directly."
   [match? entity]
   (when-not match?
-    (u/raise "Can\u2019t modify tuple attrs directly: " entity
+    (raise "Can\u2019t modify tuple attrs directly: " entity
              {:error :transact/syntax, :tx-data entity})))
 
 (defn validate-tx-op
   "Validate that the operation is a known transaction operation."
   [op entity]
-  (u/raise "Unknown operation at " entity ", expected :db/add, :db/retract, :db/ensure, :db.fn/call, :db.fn/retractAttribute, :db.fn/retractEntity or an ident corresponding to an installed transaction function (e.g. {:db/ident <keyword> :db/fn <Ifn>} or {:db/ident <keyword> :db/udf <descriptor>}, usage of :db/ident requires {:db/unique :db.unique/identity} in schema)"
+  (raise "Unknown operation at " entity ", expected :db/add, :db/retract, :db/ensure, :db.fn/call, :db.fn/retractAttribute, :db.fn/retractEntity or an ident corresponding to an installed transaction function (e.g. {:db/ident <keyword> :db/fn <Ifn>} or {:db/ident <keyword> :db/udf <descriptor>}, usage of :db/ident requires {:db/unique :db.unique/identity} in schema)"
            {:error :transact/syntax, :operation op, :tx-data entity}))
 
 (defn validate-tx-entity-type
   "Validate that the entity is a valid type (map, vector, or datom)."
   [entity]
-  (u/raise "Bad entity type at " entity ", expected map, vector, or datom"
+  (raise "Bad entity type at " entity ", expected map, vector, or datom"
            {:error :transact/syntax, :tx-data entity}))
 
 ;; ---- Entity-id / lookup-ref validators ----
@@ -1600,33 +1600,33 @@
   "Validate that a lookup ref contains exactly 2 elements."
   [eid]
   (when (not= (count eid) 2)
-    (u/raise "Lookup ref should contain 2 elements: " eid
+    (raise "Lookup ref should contain 2 elements: " eid
              {:error :lookup-ref/syntax, :entity-id eid})))
 
 (defn validate-lookup-ref-unique
   "Validate that a lookup ref attribute is marked as :db/unique."
   [unique? eid]
   (when-not unique?
-    (u/raise "Lookup ref attribute should be marked as :db/unique: " eid
+    (raise "Lookup ref attribute should be marked as :db/unique: " eid
              {:error :lookup-ref/unique, :entity-id eid})))
 
 (defn validate-entity-id-syntax
   "Validate entity id syntax: must be a number or lookup ref."
   [eid]
-  (u/raise "Expected number or lookup ref for entity id, got " eid
+  (raise "Expected number or lookup ref for entity id, got " eid
            {:error :entity-id/syntax, :entity-id eid}))
 
 (defn validate-map-entity-id-syntax
   "Validate :db/id in a map entity: must be a number, string, or lookup ref."
   [eid]
-  (u/raise "Expected number, string or lookup ref for :db/id, got " eid
+  (raise "Expected number, string or lookup ref for :db/id, got " eid
            {:error :entity-id/syntax, :entity-id eid}))
 
 (defn validate-entity-id-exists
   "Validate that an entity id resolves to an existing entity."
   [result eid]
   (when-not result
-    (u/raise "Nothing found for entity id " eid
+    (raise "Nothing found for entity id " eid
              {:error     :entity-id/missing
               :entity-id eid})))
 
@@ -1634,14 +1634,14 @@
   "Validate that a reverse-ref attribute is a keyword."
   [attr]
   (when-not (keyword? attr)
-    (u/raise "Bad entity attribute: " attr ", expected keyword"
+    (raise "Bad entity attribute: " attr ", expected keyword"
              {:error :transact/syntax, :attribute attr})))
 
 (defn validate-reverse-ref-type
   "Validate that a reverse attribute has :db/valueType :db.type/ref in schema."
   [ref? a eid vs]
   (when-not ref?
-    (u/raise "Bad attribute " a ": reverse attribute name requires {:db/valueType :db.type/ref} in schema"
+    (raise "Bad attribute " a ": reverse attribute name requires {:db/valueType :db.type/ref} in schema"
              {:error   :transact/syntax, :attribute a,
               :context {:db/id eid, a vs}})))
 
@@ -1652,7 +1652,7 @@
    unused is a collection of tempid values that were never added as entities."
   [unused]
   (when (seq unused)
-    (u/raise "Tempids used only as value in transaction: " (sort unused)
+    (raise "Tempids used only as value in transaction: " (sort unused)
              {:error :transact/syntax, :tempids unused})))
 
 (defn validate-upsert-retry-conflict
@@ -1660,7 +1660,7 @@
    Raised when a tempid resolves to two different eids across retries."
   [eid tempid upserted-eid]
   (when eid
-    (u/raise "Conflicting upsert: " tempid " resolves"
+    (raise "Conflicting upsert: " tempid " resolves"
              " both to " upserted-eid " and " eid
              {:error :transact/upsert})))
 
@@ -1669,7 +1669,7 @@
    Raised when no unprocessed tempid is available to retry."
   [tempid e upserted-eid entity]
   (when-not tempid
-    (u/raise "Conflicting upsert: " e " resolves to " upserted-eid
+    (raise "Conflicting upsert: " e " resolves to " upserted-eid
              " via " entity {:error :transact/upsert})))
 
 (defn validate-tx-data-shape
@@ -1677,18 +1677,18 @@
   [tx-data]
   (when-not (or (nil? tx-data)
                 (sequential? tx-data))
-    (u/raise "Bad transaction data " tx-data ", expected sequential collection"
+    (raise "Bad transaction data " tx-data ", expected sequential collection"
              {:error :transact/syntax, :tx-data tx-data})))
 
 (defn validate-attr-deletable
   "Validate that an attribute can be deleted (no datoms exist for it)."
   [populated?]
   (when populated?
-    (u/raise "Cannot delete attribute with datoms" {})))
+    (raise "Cannot delete attribute with datoms" {})))
 
 (defn validate-datom-list
   "Validate that every element in a collection is a Datom."
   [datoms]
   (when-some [not-datom (first (drop-while d/datom? datoms))]
-    (u/raise "init-db expects list of Datoms, got " (type not-datom)
+    (raise "init-db expects list of Datoms, got " (type not-datom)
              {:error :init-db})))

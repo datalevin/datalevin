@@ -20,7 +20,7 @@
    [datalevin.test.codec.nippy-support :as support]
    [datalevin.interpret :as interpret]
    [datalevin.core :as d]
-   [datalevin.util :as u]
+   [datalevin.util :as u :refer [raise]]
    [datalevin.test-adapter :as adapter]
    [datalevin.test-adapter.rust :as rust-adapter])
   (:import
@@ -67,9 +67,9 @@
                   (io/file (System/getProperty "user.dir")))
         manifest (io/file root "src/rust/Cargo.toml")]
     (when-not (.isFile manifest)
-      (throw (ex-info "Cannot locate the Rust codec manifest"
+      (raise "Cannot locate the Rust codec manifest"
                       {:working-directory (.getPath root)
-                       :expected          (.getPath manifest)})))
+                       :expected          (.getPath manifest)}))
     root))
 
 (defn- start-rust-peer []
@@ -90,8 +90,8 @@
         ready    (.readLine reader)]
     (when-not (= "ready" ready)
       (.destroyForcibly process)
-      (throw (ex-info "Rust Nippy test peer failed to start"
-                      {:command command :response ready})))
+      (raise "Rust Nippy test peer failed to start"
+                      {:command command :response ready}))
     (->RustPeer process reader writer)))
 
 (defn- stop-rust-peer [{:keys [process reader writer]}]
@@ -134,14 +134,14 @@
 
 (defn- hex->bytes ^bytes [^String value]
   (when (odd? (.length value))
-    (throw (ex-info "Rust peer returned odd-length hex" {:hex value})))
+    (raise "Rust peer returned odd-length hex" {:hex value}))
   (let [result (byte-array (quot (.length value) 2))]
     (dotimes [index (alength result)]
       (let [offset (* 2 index)
             high   (Character/digit (.charAt value offset) 16)
             low    (Character/digit (.charAt value (inc offset)) 16)]
         (when (or (= -1 high) (= -1 low))
-          (throw (ex-info "Rust peer returned invalid hex" {:hex value})))
+          (raise "Rust peer returned invalid hex" {:hex value}))
         (aset-byte result index
                    (unchecked-byte (bit-or (bit-shift-left high 4) low)))))
     result))
@@ -157,17 +157,17 @@
       (.write ^BufferedWriter writer "\n")
       (.flush ^BufferedWriter writer)
       (or (.readLine ^BufferedReader reader)
-          (throw (ex-info "Rust Nippy test peer terminated"
+          (raise "Rust Nippy test peer terminated"
                           {:operation operation
                            :exit-code (when-not (.isAlive ^Process process)
-                                        (.exitValue ^Process process))}))))))
+                                        (.exitValue ^Process process))})))))
 
 (defn- request ^bytes [operation payload]
   (let [response (rust-response operation payload)
         [status hex] (str/split response #"\t" 2)]
     (when-not (= status "ok")
-      (throw (ex-info "Rust Nippy codec rejected the request"
-                      {:operation operation :response response})))
+      (raise "Rust Nippy codec rejected the request"
+                      {:operation operation :response response}))
     (hex->bytes hex)))
 
 (defn- roundtrip [value]

@@ -10,6 +10,7 @@
 (ns ^:no-doc datalevin.query.access.function
   "Compilation shared by function-backed query access methods."
   (:require
+   [datalevin.util :refer [raise]]
    [datalevin.query.access :as access]
    [datalevin.query.tuple :as qtuple])
   (:import
@@ -123,17 +124,15 @@
            (let [sym (:symbol ^Variable arg)]
              (if (contains? values sym)
                (get values sym)
-               (throw
-                 (ex-info "Access function argument is not bound"
+               (raise "Access function argument is not bound"
                           {:function (:function spec)
                            :variable sym
-                           :requires (:requires spec)}))))
+                           :requires (:requires spec)})))
 
            :else
-           (throw
-             (ex-info "Unsupported access function argument"
+           (raise "Unsupported access function argument"
                       {:function (:function spec)
-                       :argument arg}))))
+                       :argument arg})))
        args))))
 
 (defn access-expr
@@ -174,8 +173,7 @@
             (compile-function-accesses planning-context registry))))
 
   (-open-access [_ _path _demand _bounds _work _source]
-    (throw
-      (ex-info "Function access dispatcher cannot open a concrete path" {})))
+    (raise "Function access dispatcher cannot open a concrete path" {}))
 
   (-frontier-satisfies? [_ _path _demand _frontier _cutoff]
     false))

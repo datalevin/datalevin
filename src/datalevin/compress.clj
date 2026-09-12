@@ -14,7 +14,7 @@
    [datalevin.constants :as c]
    [datalevin.lmdb :as l]
    [datalevin.bits :as b]
-   [datalevin.util :as u]
+   [datalevin.util :as u :refer [raise]]
    [datalevin.interface :as i
     :refer [open-dbi list-dbi? entries visit-key-sample
             visit-list-sample list-dbis ICompressor]]
@@ -95,7 +95,7 @@
 (defn- compression-mode [opts option supported]
   (let [mode (get opts option)]
     (when-not (contains? #{nil :none supported} mode)
-      (u/raise "Unsupported compression method"
+      (raise "Unsupported compression method"
                {:error :compression/unsupported :option option :method mode}))
     (if (or (nil? mode) (= :none mode)) :none mode)))
 
@@ -106,7 +106,7 @@
       (let [file (io/file dir (if (= stream :key)
                                c/keycode-file-name c/valcode-file-name))]
         (when-not (.isFile file)
-          (u/raise "Required compression dictionary is missing"
+          (raise "Required compression dictionary is missing"
                    {:error :compression/missing-dictionary
                     :stream stream :file (str file)}))
         ;; Hash and construct from the same bytes, not two reads of the path.
@@ -114,7 +114,7 @@
               hash (.formatHex (HexFormat/of)
                                (.digest (MessageDigest/getInstance "SHA-256") bytes))]
           (when (and sha256 (not= sha256 hash))
-            (u/raise "Compression dictionary checksum does not match the stored generation"
+            (raise "Compression dictionary checksum does not match the stored generation"
                      {:error :compression/dictionary-mismatch :stream stream
                       :file (str file) :expected sha256 :actual hash}))
           [(assoc descriptor :sha256 hash)
@@ -134,7 +134,7 @@
                            [key-mode val-mode
                             (compression-mode loaded-info :key-compress :hu)
                             (compression-mode loaded-info :val-compress :zstd)]))
-            (u/raise "Changing compression requires rebuilding into a new environment"
+            (raise "Changing compression requires rebuilding into a new environment"
                      {:error :compression/rebuild-required}))
         manifest (or stored {:generation (str (UUID/randomUUID))
                              :key {:method key-mode}
@@ -149,20 +149,20 @@
                                           (and (string? sha256)
                                                (re-matches #"[0-9a-f]{64}" sha256))))))
                              [[:key :hu] [:value :zstd]]))
-        (u/raise "Invalid or unsupported compression manifest"
+        (raise "Invalid or unsupported compression manifest"
                  {:error :compression/invalid-manifest}))
       (doseq [[option stream mode] [[:key-compress :key key-mode]
                                    [:val-compress :value val-mode]]
               :when (and (contains? opts option)
                          (not= mode (get-in stored [stream :method])))]
-        (u/raise "Compression option conflicts with the stored generation; rebuild required"
+        (raise "Compression option conflicts with the stored generation; rebuild required"
                  {:error :compression/mode-conflict :option option
                   :requested mode :stored (get-in stored [stream :method])})))
     (when (= :zstd (get-in manifest [:value :method]))
       (doseq [[dbi {:keys [flags]}] (:dbis loaded-info)
               :let [flags (set flags)]
               :when (and (:dupsort flags) (not (:dupfixed flags)))]
-        (u/raise "Value compression is not supported on ordered duplicate values"
+        (raise "Value compression is not supported on ordered duplicate values"
                  {:error :compression/ordered-duplicates :dbi dbi})))
     (let [[key-desc key-codec] (load-dictionary dir :key (:key manifest))
           [val-desc val-codec] (load-dictionary dir :value (:value manifest))]

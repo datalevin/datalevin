@@ -18,7 +18,7 @@
    [datalevin.kv.txlog :as kvtx]
    [datalevin.protocol :as p]
    [datalevin.txlog :as txlog]
-   [datalevin.util :as u]
+   [datalevin.util :as u :refer [raise]]
    [taoensso.timbre :as log])
   (:import
    [java.nio ByteBuffer]
@@ -354,7 +354,7 @@
           ((:write-message-fn deps) skey {:type :command-complete}))
 
         runner
-        (u/raise "Active transaction belongs to another client"
+        (raise "Active transaction belongs to another client"
                  (missing-withtxn-error db-name type
                                         :transaction-owner-mismatch))
 
@@ -363,12 +363,12 @@
         ((:write-message-fn deps) skey {:type :command-complete})
 
         (withtxn-close-types type)
-        (u/raise "Cannot confirm a transaction that is no longer active"
+        (raise "Cannot confirm a transaction that is no longer active"
                  (missing-withtxn-error db-name type
                                         :missing-transaction))
 
         :else
-        (u/raise "No active with-transaction runner"
+        (raise "No active with-transaction runner"
                  (missing-withtxn-error db-name type
                                         :missing-transaction))))
     (catch Exception e
