@@ -22,6 +22,7 @@
    [datalevin.ha.control :as ctrl]
    [datalevin.interface :as i]
    [datalevin.kv :as kv]
+   [datalevin.kv.txlog :as kvtx]
    [datalevin.lmdb :as l]
    [datalevin.protocol :as p]
    [datalevin.server.api :as sapi]
@@ -1662,14 +1663,14 @@
               (u/create-dirs tf))
             (copy-store! [source-store backup-pin-enabled?]
               (reset! copy-backup-pin nil)
-              (binding [kv/*wal-copy-backup-pin-observer*
+              (binding [kvtx/*wal-copy-backup-pin-observer*
                         (when backup-pin-enabled?
                           (fn [{:keys [pin-id pin-floor-lsn pin-expires-ms]}]
                             (reset! copy-backup-pin
                                     {:pin-id pin-id
                                      :floor-lsn pin-floor-lsn
                                      :expires-ms pin-expires-ms})))
-                        kv/*wal-copy-backup-pin-enabled?*
+                        kvtx/*wal-copy-backup-pin-enabled?*
                         backup-pin-enabled?]
                 ((:server-copy-store! deps) source-store tf compact?)))]
     (try
