@@ -50,7 +50,7 @@
                    :ns-default pod.huahaiy.datalevin
                    :exec-fn    run}
            :test  {
-                   :extra-paths ["test"]
+                   :extra-paths ["test" "test-src"]
                    :jvm-opts    ["--add-opens=java.base/java.lang=ALL-UNNAMED"
                                  "--add-opens=java.base/java.nio=ALL-UNNAMED"
                                  "--add-opens=java.base/java.util=ALL-UNNAMED"

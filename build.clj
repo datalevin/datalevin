@@ -73,10 +73,13 @@
    "datalevin/main.clj"
    "datalevin/mcp.clj"
    "datalevin/server.clj"
+   "datalevin/test_adapter"
+   "datalevin/test_adapter.clj"
    "datalevin/DatalevinServer.java"])
 (def release-runtime-class-excludes
   ["datalevin/ha"
    "datalevin/server"
+   "datalevin/test_adapter"
    "datalevin/DatalevinServer.class"])
 (def runtime-excluded-deps
   release-runtime-excluded-deps)

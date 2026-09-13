@@ -165,10 +165,10 @@
    :source-sha256
    (into {} (for [file (distinct
                         (concat ["project.clj"
-                                 "checkouts/datalevin/src/datalevin/test_adapter.clj"
-                                 "checkouts/datalevin/src/datalevin/test_adapter/reference.clj"
-                                 "checkouts/datalevin/src/datalevin/test_adapter/rust.clj"
-                                 "checkouts/datalevin/src/datalevin/test_adapter/runner.clj"
+                                 "checkouts/datalevin/test-src/datalevin/test_adapter.clj"
+                                 "checkouts/datalevin/test-src/datalevin/test_adapter/reference.clj"
+                                 "checkouts/datalevin/test-src/datalevin/test_adapter/rust.clj"
+                                 "checkouts/datalevin/test-src/datalevin/test_adapter/runner.clj"
                                  "checkouts/datalevin/src/rust/test-adapter/Cargo.toml"
                                  "checkouts/datalevin/src/rust/test-adapter/Cargo.lock"
                                  "checkouts/datalevin/src/rust/test-adapter/src/main.rs"]

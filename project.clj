@@ -52,7 +52,11 @@
    [com.cognitect/transit-clj]
    [com.github.luben/zstd-jni]
    ]
-  :source-paths ["src" "test"]
+  ;; `test-src` holds test-only infrastructure (the cross-language test
+  ;; adapter). It stays a source path so the sibling dtlvtest harness can
+  ;; resolve it through `checkouts/datalevin`, but it is excluded from the
+  ;; published jars below.
+  :source-paths ["src" "test" "test-src"]
   :java-source-paths ["src/java"]
   ;; :aot :all
   :profiles
@@ -90,8 +94,10 @@
                    #"\.csv" #"\.edn" #"\.java"
                    #"\.md" #"\.txt"
                    #"^java/"
+                   #"datalevin/test_adapter"
                    #"client_quickstart_check\.clj"]
   :uberjar-exclusions [#"pod.huahaiy.datalevin-test"
+                       #"datalevin/test_adapter"
                        #"^META-INF/maven/.*"
                        #"^META-INF/leiningen/.*/project\.clj$"
                        #"^META-INF/leiningen/.*/README(\.[^/]+)?$"
