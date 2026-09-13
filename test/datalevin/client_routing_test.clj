@@ -2,8 +2,94 @@
   (:require
    [clojure.test :refer [deftest is testing]]
    [datalevin.client :as client]
-   [datalevin.command :as command])
-  (:import [java.io IOException]))
+   [datalevin.command :as command]
+   [datalevin.constants :as c]
+   [datalevin.protocol :as p])
+  (:import
+   [java.io IOException]
+   [java.nio ByteBuffer]
+   [java.nio.channels SocketChannel]
+   [java.nio.channels.spi SelectorProvider]
+   [java.util.concurrent ConcurrentLinkedQueue]
+   [java.util.concurrent.atomic AtomicBoolean]))
+
+(defn- with-expired-request-budget [responses f]
+  (let [frames    (ConcurrentLinkedQueue.)
+        sent      (atom 0)
+        channel   (proxy [SocketChannel] [(SelectorProvider/provider)]
+                    (write [^ByteBuffer src]
+                      (swap! sent inc)
+                      (let [n (.remaining src)]
+                        (.position src (.limit src))
+                        n))
+                    (read [^ByteBuffer dst]
+                      (if-let [^ByteBuffer frame (.poll frames)]
+                        (let [n (.remaining frame)]
+                          (.put dst frame)
+                          n)
+                        (throw (IOException. "Response lost"))))
+                    (implConfigureBlocking [_])
+                    (implCloseSelectableChannel []))
+        conn      (client/->Connection channel 5000 (ByteBuffer/allocate 65536))
+        available (doto (ConcurrentLinkedQueue.) (.add conn))
+        used      (ConcurrentLinkedQueue.)
+        ;; A zero cumulative budget deterministically reaches the deadline
+        ;; after the first attempt, without sleeps or changing the clock.
+        pool      (client/->ConnectionPool "localhost" 19001 nil 1 0
+                                           available used (AtomicBoolean. false))
+        base      (client/->Client "user" "password" "localhost" 19001
+                                    1 0 nil pool)]
+    (doseq [response responses]
+      (let [frame (ByteBuffer/allocate 65536)]
+        (p/write-message-bf frame response c/message-format-nippy)
+        (.flip frame)
+        (.add frames frame)))
+    (try
+      (f base sent)
+      (is (.isEmpty used) "the completed attempt releases its connection")
+      (is (identical? conn (.peek available)))
+      (is (.isEmpty frames) "all response frames were consumed")
+      (finally (client/close-pool pool)))))
+
+(deftest completed-responses-survive-expired-request-budget-test
+  (doseq [[op responses expected]
+          [[:add-vec [{:type :command-complete :result :added}]
+            {:type :command-complete :result :added}]
+           [:doc-count [{:type :command-complete :result 42}]
+            {:type :command-complete :result 42}]
+           [:add-vec [{:type :error-response :message "Rejected"
+                       :err-data {:reason :not-leader}}]
+            {:type :error-response :message "Rejected"
+             :err-data {:reason :not-leader}}]
+           [:search [{:type :copy-out-response} [:one :two] {:type :copy-done}]
+            {:type :command-complete :result [:one :two]}]]]
+    (testing (str op " " responses)
+      (with-expired-request-budget
+        responses
+        (fn [base sent]
+          (is (= expected (client/request base {:type op :args ["db"]})))
+          (is (= 1 @sent) "a completed response must not cause a resend"))))))
+
+(deftest unfinished-requests-still-respect-expired-request-budget-test
+  (testing "a replay-safe transport failure stops at the deadline"
+    (with-expired-request-budget
+      []
+      (fn [base sent]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                             #"Timeout in making request"
+                             (client/request base {:type :doc-count
+                                                   :args ["db"]})))
+        (is (= 1 @sent)))))
+  (testing "reopening a database does not complete the original request"
+    (with-expired-request-budget
+      [{:type :reopen :db-name "db" :db-type "kv"}
+       {:type :command-complete}]
+      (fn [base sent]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                             #"Timeout in making request"
+                             (client/request base {:type :doc-count
+                                                   :args ["db"]})))
+        (is (= 2 @sent) "only the original request and the reopen are sent")))))
 
 (def ^:private mutations
   [:add-doc :remove-doc :clear-docs :search-re-index

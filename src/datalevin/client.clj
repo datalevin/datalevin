@@ -233,7 +233,7 @@
                   :port port
                   :timeout-ms timeout-ms})))))
 
-(defn- new-connection
+(defn- ^:redef new-connection
   ([host port time-out]
    (new-connection host port time-out time-out))
   ([host port connect-time-out receive-time-out]
@@ -251,6 +251,25 @@
     (when-not (= type :set-client-id-ok) (raise message {}))
     (set-conn-wire-opts! (.-ch ^Connection conn)
                          (p/negotiate-wire-opts wire-capabilities))))
+
+(defn- cleanup-after-failure!
+  [^Throwable failure cleanup]
+  (try
+    (cleanup)
+    (catch Throwable cleanup-error
+      (when-not (identical? failure cleanup-error)
+        (.addSuppressed failure cleanup-error)))))
+
+(defn- new-registered-connection
+  "Own a new connection until registration succeeds and a pool can adopt it."
+  [host port client-id time-out]
+  (let [conn (new-connection host port time-out)]
+    (try
+      (set-client-id conn client-id)
+      conn
+      (catch Throwable t
+        (cleanup-after-failure! t #(close conn))
+        (throw t)))))
 
 (defprotocol ^:no-doc IConnectionPool
   (get-connection [this] "Get a connection from the pool")
@@ -287,8 +306,8 @@
                   (.add used conn)
                   conn)))
             (try
-              (let [new-conn (new-connection host port time-out)]
-                (set-client-id new-conn client-id)
+              (let [new-conn (new-registered-connection
+                              host port client-id time-out)]
                 (locking this
                   (if (.get closed?)
                     (do
@@ -324,18 +343,26 @@
   (close-pool [this]
     (locking this
       (when (.compareAndSet closed? false true)
-        (dotimes [_ (.size used)] (close ^Connection (.poll used)))
-        (.clear used)
-        (dotimes [_ (.size available)] (close ^Connection (.poll available)))
-        (.clear available))))
+        (let [failure (volatile! nil)]
+          (doseq [^ConcurrentLinkedQueue queue [used available]]
+            (loop []
+              (when-let [conn (.poll queue)]
+                (try
+                  (close conn)
+                  (catch Throwable t
+                    (if-let [primary @failure]
+                      (when-not (identical? primary t)
+                        (.addSuppressed ^Throwable primary t))
+                      (vreset! failure t))))
+                (recur))))
+          (when-let [t @failure] (throw t))))))
 
   (closed-pool? [_]
     (.get closed?)))
 
 (defn- authenticate
   "Send an authenticate message to server, and wait to receive the response.
-  If authentication succeeds,  return a client id.
-  Otherwise, close connection, raise exception"
+  Always close the temporary connection. Return a client id on success."
   [host port username password time-out]
   (let [conn (new-connection host
                              port
@@ -343,14 +370,20 @@
                              (max (long time-out)
                                   (long c/default-connection-timeout)))
 
-        {:keys [type client-id message]}
-        (send-n-receive conn {:type     :authentication
-                              :username username
-                              :password password})]
+        client-id
+        (try
+          (let [{:keys [type client-id message]}
+                (send-n-receive conn {:type     :authentication
+                                      :username username
+                                      :password password})]
+            (if (= type :authentication-ok)
+              client-id
+              (raise "Authentication failure: " message {})))
+          (catch Throwable t
+            (cleanup-after-failure! t #(close conn))
+            (throw t)))]
     (close conn)
-    (if (= type :authentication-ok)
-      client-id
-      (raise "Authentication failure: " message {}))))
+    client-id))
 
 (defn- new-connectionpool
   [host port client-id pool-size time-out]
@@ -365,14 +398,13 @@
         ^ConcurrentLinkedQueue available (.-available pool)]
     (try
       (dotimes [_ pool-size]
-        (let [conn (new-connection host port time-out)]
-          (set-client-id conn client-id)
+        (let [conn (new-registered-connection host port client-id time-out)]
           (.add available conn)))
       pool
       (catch Throwable t
         ;; A server can disappear while the initial pool is being populated.
         ;; Do not leak connections that were established earlier in the loop.
-        (close-pool pool)
+        (cleanup-after-failure! t #(close-pool pool))
         (throw t)))))
 
 (defprotocol ^:no-doc IClient
@@ -586,11 +618,12 @@
                                          nil)
 
                                        res)]
-            (if (>= (- (System/currentTimeMillis) start)
-                    ^long (.-time-out pool'))
-              (raise "Timeout in making request" {})
-              (if @success?
-                res'
+            ;; The deadline limits retries, not an already completed response.
+            (if @success?
+              res'
+              (if (>= (- (System/currentTimeMillis) start)
+                      ^long (.-time-out pool'))
+                (raise "Timeout in making request" {})
                 (recur))))))))
 
   (copy-in [client req data batch-size]
