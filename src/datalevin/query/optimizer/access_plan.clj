@@ -817,10 +817,10 @@
 (defn- access-remaining-budget
   [sample-rows candidate-budget range-rows point-scan-rows scan-rows reusable?]
   (let [reused-rows (long (if reusable? sample-rows 0))
-        candidate-remaining (- candidate-budget reused-rows)
-        range-remaining (- range-rows reused-rows)
-        point-scan-remaining (- point-scan-rows reused-rows)
-        scan-remaining (- scan-rows reused-rows)]
+        candidate-remaining (- (long candidate-budget) reused-rows)
+        range-remaining (- (long range-rows) reused-rows)
+        point-scan-remaining (- (long point-scan-rows) reused-rows)
+        scan-remaining (- (long scan-rows) reused-rows)]
     {:reused-rows          reused-rows
      :remaining-candidates (if (pos? candidate-remaining)
                              candidate-remaining
@@ -839,9 +839,9 @@
         upper-cost (adjusted-access-cost
                      estimate remaining-scan output-rows stages)
         selection-cost (if (or (not adaptive?)
-                               (and (pos? sample-rows)
-                                    (zero? sample-output)
-                                    (< sample-rows range-rows)))
+                               (and (pos? (long sample-rows))
+                                    (zero? (long sample-output))
+                                    (< (long sample-rows) (long range-rows))))
                          upper-cost
                          point-cost)]
     {:point-cost     point-cost

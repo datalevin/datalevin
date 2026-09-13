@@ -56,7 +56,7 @@
    (let [renew-ms (long (or (:ha-lease-renew-ms m) c/*ha-lease-renew-ms*))
          lease-until-ms (long (or (:lease-until-ms lease) 0))
          wait-until-ms (+ lease-until-ms renew-ms)
-         now-ms (ha-now-ms deps)
+         now-ms (long (ha-now-ms deps))
          wait-ms (long (max 0 (- wait-until-ms now-ms)))]
      {:wait-ms wait-ms
       :wait-until-ms wait-until-ms})))
