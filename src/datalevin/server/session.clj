@@ -219,7 +219,7 @@
   [deps server]
   (let [^long timeout ((:idle-timeout-fn deps) server)
         clients ((:clients-fn deps) server)
-        now-ms  ((:now-ms-fn deps))]
+        now-ms  (long ((:now-ms-fn deps)))]
     (doseq [[client-id session] clients
             :let                [{:keys [last-active]} session]]
       (if last-active
