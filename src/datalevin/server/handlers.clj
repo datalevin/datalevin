@@ -37,7 +37,7 @@
    [java.nio.channels SelectionKey SocketChannel]
    [java.nio.file Paths]
    [java.util Map$Entry UUID]
-   [java.util.concurrent ConcurrentHashMap Semaphore]
+   [java.util.concurrent ConcurrentHashMap Semaphore TimeUnit]
    [datalevin.storage Store]))
 
 (def ^:private transient-runtime-store-max-attempts 8)
@@ -62,7 +62,7 @@
      :sync-copy-response-store! :sys-conn :unpin-server-copy-backup-floor!
      :update-cached-permission :update-cached-role :update-client :update-db
      :vector-index :with-db-runtime-store-read-access :write-message
-     :with-index-write-admission :write-txn-runner}})
+     :with-index-write-admission :write-txn-runner :transaction-lock-timeout-ms}})
 
 (defn- skey-state
   ^clojure.lang.Volatile [^SelectionKey skey]
@@ -453,12 +453,20 @@
        {:error :db/copy-write-transaction-active
         :db-name db-name}))))
 
+(defn- acquire-db-transaction-slot!
+  [deps server db-name ^Semaphore lock]
+  (let [timeout-ms (long ((:transaction-lock-timeout-ms deps) server))]
+    (when-not (.tryAcquire lock timeout-ms TimeUnit/MILLISECONDS)
+      (raise "Database writer is busy; retry the request later"
+             {:error :server/busy :reason :write-transaction-open
+              :retryable? true :db-name db-name :timeout-ms timeout-ms}))))
+
 (defn- with-direct-db-transaction-slot
   [deps server db-name writing? f]
   (if writing?
     (f)
     (let [^Semaphore lock (db-lock deps server db-name)]
-      (.acquire lock)
+      (acquire-db-transaction-slot! deps server db-name lock)
       (try
         (f)
         (finally
@@ -1793,7 +1801,7 @@
       deps server skey db-name
       "Don't have permission to alter the database"
       (fn []
-        (.acquire lock)
+        (acquire-db-transaction-slot! deps server db-name lock)
         (let [runner*   (volatile! nil)
               kv-store* (volatile! nil)]
           (try
@@ -1871,7 +1879,7 @@
       deps server skey db-name
       "Don't have permission to alter the database"
       (fn []
-        (.acquire lock)
+        (acquire-db-transaction-slot! deps server db-name lock)
         (let [runner*   (volatile! nil)
               kv-store* (volatile! nil)]
           (try

@@ -102,6 +102,31 @@ Stopping or failing to start is permanent for that server instance. A later
 `create` with the same root and port after `stop` completes, then start the new
 instance. The stored databases and sessions are retained.
 
+`create` accepts these execution limits:
+
+* `:worker-threads`: request worker count, default four times the CPU count,
+  bounded between 16 and 128.
+* `:worker-queue-size`: queued request limit, default four times the worker count.
+  The routing queue uses the same limit and up to four routing threads.
+* `:transaction-threads`: maximum simultaneous explicit transaction runners,
+  default the worker count. A runner keeps its native transaction on one thread
+  until close, abort, or connection cleanup. Transaction opens are not queued
+  when this limit is reached.
+* `:background-threads`: maximum simultaneous HA and replica background loops,
+  default the worker count. Allow capacity for all configured loops; startup or
+  loop scheduling fails if capacity is exhausted.
+* `:transaction-lock-timeout-ms`: maximum wait for the server's database writer
+  semaphore, default `1000` milliseconds. Use `0` for immediate rejection when
+  another transaction owns the writer slot.
+
+Exhausted request or transaction capacity and expired writer-slot waits return
+an error with `:error :server/busy` and `:retryable? true` before the operation
+executes. Close and abort requests are forwarded to their owning transaction
+runner even when request workers are full. If the routing queue itself is full,
+the server closes the rejected connection and signals transaction cleanup.
+That transport failure is subject to the client's usual indeterminate-write
+handling; it is not a promise that a write can be retried safely.
+
 ## Implementation
 
 The client/server mode is enabled with little changes to the Datalevin core library.
@@ -486,15 +511,16 @@ need programmatic server setup.
 ### Networking
 
 The server employs a non-blocking event driven architecture, so it can support a
-large number of concurrent connected clients. The server event loop runs as a
-single process. It accepts and segments incoming bytes from the network into
-messages, then dispatches them to a work stealing thread pool to handle each
-individual message.
+large number of concurrent connected clients. The server event loop runs on a
+single thread. It accepts and segments incoming bytes from the network into
+messages, then submits them to a bounded routing executor. Routing decodes each
+message and forwards it to a bounded request executor or an explicit transaction
+runner. HA and replica loops use a separate bounded background executor.
+Saturation never runs a request handler on the event loop.
 
-Work stealing thread pool reduces lock contentions and maximizes the server CPU
-utilization. Each thread processes its message and writes its own response back
-to the network channel when it becomes ready, so the server message handling is
-asynchronous. It is the client's responsibility to track request/response
+Each handling thread writes its response back to the network channel when it
+becomes ready, so message handling is asynchronous. It is the client's
+responsibility to track request/response
 correspondence if multiple messages are on the wire.
 
 For developer convenience, the current implemented client in the library makes

@@ -25,7 +25,7 @@
    [java.nio ByteBuffer]
    [java.nio.channels ClosedChannelException SelectionKey SocketChannel
     ServerSocketChannel]
-   [java.util.concurrent ConcurrentHashMap Executor]
+   [java.util.concurrent ConcurrentHashMap Executor RejectedExecutionException]
    [java.util.function BiFunction]))
 
 (def dispatch-deps-contract
@@ -37,7 +37,8 @@
      :ha-write-commit-check-fn-fn :ha-write-commit-publish-fn-fn
      :new-message-fn :trace-remote-tx-fn :update-db-fn
      :with-db-runtime-read-access-fn :with-ha-write-admission-fn
-     :work-executor-fn :write-message-fn}
+     :work-executor-fn :routing-executor-fn :transaction-executor-fn
+     :write-message-fn}
    :values {:message-handler-map map?}})
 
 (defn- missing-withtxn-error
@@ -372,44 +373,91 @@
           (apply [_ _ session]
             (assoc session :last-active (System/currentTimeMillis))))))))
 
-(defn handle-message
+(defn- read-message
   [deps server ^SelectionKey skey fmt msg]
+  (let [state (.attachment skey)
+        {:keys [message-lock]} @state]
+    (locking message-lock
+      (let [wire-opts (:wire-opts @state)
+            {:keys [type] :as message} (p/read-request fmt msg wire-opts)]
+        (if (= type :set-client-id)
+          (do
+            (dispatch-message deps server skey message)
+            ::handled)
+          message)))))
+
+(defn- transaction-message?
+  [message]
+  (or (:writing? message)
+      (#{:close :abort} (cmd/transaction-control (:type message)))))
+
+(defn- handle-decoded-message
+  [deps server skey message]
   (try
-    (let [state (.attachment skey)
-          {:keys [message-lock]} @state
-          message
-          (locking message-lock
-            (let [wire-opts (:wire-opts @state)
-                  {:keys [type] :as message}
-                  (p/read-request fmt msg wire-opts)]
-              (if (= type :set-client-id)
-                (do
-                  (log/debug "Message received:" (dissoc message :password :args))
-                  (dispatch-message deps server skey message)
-                  ::handled)
-                message)))]
-      (when-not (= ::handled message)
-        (log/debug "Message received:" (dissoc message :password :args))
-        (set-last-active deps server skey)
-        (if-let [err (when-not (and (not (:writing? message))
-                                   (cmd/deferred-write? (:type message)))
-                       (replica-read-only-error deps server message))]
-          (error-response skey "Replica is read-only" err)
-          ;; Close/abort must use the owner's runner even when a client omits
-          ;; :writing?, both for authorization and native transaction affinity.
-          (if (or (:writing? message)
-                  (#{:close :abort} (cmd/transaction-control (:type message))))
-            (handle-writing deps server skey message)
-            (let [dispatch! #(dispatch-message-with-ha-write-admission
-                                deps server skey message)]
-              (if (runtime-read-access-message? message)
-                ((:with-db-runtime-read-access-fn deps)
-                 server
-                 message
-                 dispatch!)
-                (dispatch!)))))))
+    (when-not (= ::handled message)
+      (log/debug "Message received:" (dissoc message :password :args))
+      (set-last-active deps server skey)
+      (if-let [err (when-not (and (not (:writing? message))
+                                (cmd/deferred-write? (:type message)))
+                    (replica-read-only-error deps server message))]
+        (error-response skey "Replica is read-only" err)
+        ;; Close/abort must use the owner's runner even when a client omits
+        ;; :writing?, both for authorization and native transaction affinity.
+        (if (transaction-message? message)
+          (handle-writing deps server skey message)
+          (let [dispatch! #(dispatch-message-with-ha-write-admission
+                            deps server skey message)]
+            (if (runtime-read-access-message? message)
+              ((:with-db-runtime-read-access-fn deps)
+               server
+               message
+               dispatch!)
+              (dispatch!))))))
     (catch Exception e
       (handle-message-error! deps skey e))))
+
+(defn handle-message
+  "Decode and handle a message synchronously. Network ingress uses submit-message."
+  [deps server skey fmt msg]
+  (try
+    (handle-decoded-message deps server skey (read-message deps server skey fmt msg))
+    (catch Exception e
+      (handle-message-error! deps skey e))))
+
+(defn- route-message
+  [deps server skey fmt msg]
+  (try
+    (let [message (read-message deps server skey fmt msg)]
+      (when-not (= ::handled message)
+        (if (or (transaction-message? message) (= :disconnect (:type message)))
+          ;; Forward to the owner without competing with queries or waiting
+          ;; transaction opens. Native transaction work stays on its runner.
+          (handle-decoded-message deps server skey message)
+          (let [open? (= :open (cmd/transaction-control (:type message)))
+                executor ((if open? (:transaction-executor-fn deps)
+                                    (:work-executor-fn deps)) server)]
+            (try
+              (.execute ^Executor executor
+                        ^Runnable #(handle-decoded-message deps server skey message))
+              (catch RejectedExecutionException _
+                (error-response skey "Server is busy; retry the request later"
+                                {:error :server/busy :retryable? true
+                                 :reason (if open? :transaction-capacity :worker-capacity)})))))))
+    (catch Exception e
+      (handle-message-error! deps skey e))))
+
+(defn submit-message
+  "Keep decoding and all potentially blocking handlers off the selector. If
+  routing itself is saturated, close the rejected connection and wake any
+  transaction it owns; do not silently discard its request or run it inline."
+  [deps server skey fmt msg]
+  (try
+    (.execute ^Executor ((:routing-executor-fn deps) server)
+              ^Runnable #(route-message deps server skey fmt msg))
+    (catch RejectedExecutionException _
+      (try
+        ((:cleanup-connection-transactions-fn deps) server skey)
+        (finally ((:close-conn-fn deps) skey))))))
 
 (defn handle-read
   [deps server ^SelectionKey skey]
@@ -436,7 +484,7 @@
           (p/extract-message
            read-bf
            (fn [fmt msg]
-             (execute deps server #(handle-message deps server skey fmt msg))))
+             (submit-message deps server skey fmt msg)))
           (when (= (.position read-bf) capacity)
             (let [size (* ^long c/+buffer-grow-factor+ capacity)
                   bf   (bf/allocate-buffer size)]

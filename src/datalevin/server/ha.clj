@@ -789,9 +789,9 @@
     (try
       (.execute executor
                 ^Runnable (fn []
-                            ;; CallerRunsPolicy is useful for bounded request
-                            ;; handling, but must not run an HA loop in start.
-                            ;; The same worker may run a queued loop later.
+                            ;; Defend against an injected executor running an
+                            ;; HA loop synchronously in start. The same worker
+                            ;; may run a queued loop after submission returns.
                             (when (and (identical? caller (Thread/currentThread))
                                        (.get submitting?))
                               (throw (RejectedExecutionException.

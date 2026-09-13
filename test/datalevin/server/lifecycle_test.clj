@@ -66,6 +66,9 @@
   (is (false? (.isOpen ^ServerSocketChannel (.-server-socket srv))))
   (is (.isTerminated ^ExecutorService (.-dispatcher srv)))
   (is (.isTerminated ^ExecutorService (.-work-executor srv)))
+  (doseq [executor (vals (select-keys (.-execution srv)
+                                     [:routing :transactions :background]))]
+    (is (.isTerminated ^ExecutorService executor)))
   (is (d/closed? (.-sys-conn srv))))
 
 (defn- start-error [srv]

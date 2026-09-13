@@ -69,8 +69,10 @@
             (catch Throwable t t))))
     (is (= [:first :second] @closed))))
 
-(deftest invalid-worker-options-do-not-acquire-server-resources-test
-  (doseq [invalid [{:worker-threads 0} {:worker-queue-size 0}]]
+(deftest invalid-execution-options-do-not-acquire-server-resources-test
+  (doseq [invalid [{:worker-threads 0} {:worker-queue-size 0}
+                  {:transaction-threads 0} {:background-threads 0}
+                  {:transaction-lock-timeout-ms -1}]]
     (let [root (u/tmp-dir (str "invalid-server-workers-" (UUID/randomUUID)))
           port (allocate-port)
           opened @l/lmdb-dirs]
@@ -156,7 +158,7 @@
          #'server/*ha-follower-sync-step-fn* (fn [_ state] (deliver followed true) state)}
         (fn []
           (let [^Server srv (server/create opts)
-                ^ThreadPoolExecutor executor (.-work-executor srv)]
+                ^ThreadPoolExecutor executor (:background (.-execution srv))]
             (reset! srv-v srv)
             (try
               (is (zero? (.getTaskCount executor)))
@@ -169,6 +171,8 @@
               (server/start srv)
               (await! renewed)
               (await! followed)
+              (is (= 2 (.getActiveCount executor)))
+              (is (zero? (.getTaskCount ^ThreadPoolExecutor (.-work-executor srv))))
               (let [state (get (.-dbs srv) "data")
                     loop-keys [:ha-renew-loop-future :ha-follower-loop-future]]
                 (is (nil? (server/start srv)))

@@ -50,7 +50,7 @@
    [java.util.concurrent Executors ExecutorService
     ConcurrentLinkedQueue ConcurrentHashMap CountDownLatch Semaphore TimeUnit
     LinkedBlockingQueue ThreadPoolExecutor
-    ThreadPoolExecutor$CallerRunsPolicy ArrayBlockingQueue]
+    ThreadPoolExecutor$AbortPolicy ArrayBlockingQueue SynchronousQueue]
    [java.util.concurrent.locks ReentrantReadWriteLock]
    [datalevin.db DB]
    [datalevin.storage Store]
@@ -258,7 +258,16 @@
       0
       TimeUnit/MILLISECONDS
       (ArrayBlockingQueue. queue-size)
-      (ThreadPoolExecutor$CallerRunsPolicy.))))
+      (ThreadPoolExecutor$AbortPolicy.))))
+
+(defn- bounded-runner-executor
+  [threads option]
+  (when-not (pos-int? threads)
+    (raise "Server runner thread count must be positive" {option threads}))
+  ;; Long-lived jobs cannot wait behind other long-lived jobs. Reject before
+  ;; opening a transaction or starting a background loop when all slots are used.
+  (ThreadPoolExecutor. 0 (int threads) 60 TimeUnit/SECONDS
+                       (SynchronousQueue.) (ThreadPoolExecutor$AbortPolicy.)))
 
 (deftype Server [^AtomicBoolean running
                  ^int port
@@ -286,7 +295,8 @@
                  dbs
                  ;; :created, :running, or :stopped. Its monitor serializes
                  ;; lifecycle calls; event/worker loops only read running.
-                 lifecycle]
+                 lifecycle
+                 execution]
   IServer
   (start [server]
     (letfn [(init []
@@ -329,11 +339,17 @@
 #_{:clj-kondo/ignore [:redefined-var]}
 (defn ^:no-doc ->Server
   "Preserve the constructor used by server fixtures."
-  [^AtomicBoolean running port root idle-timeout server-socket selector
-   register-queue dispatcher work-executor sys-conn clients dbs]
-  (Server. running port root idle-timeout server-socket selector register-queue
-           dispatcher work-executor sys-conn clients dbs
-           (atom (if (.get running) :running :created))))
+  ([running port root idle-timeout server-socket selector register-queue
+    dispatcher work-executor sys-conn clients dbs]
+   (->Server running port root idle-timeout server-socket selector register-queue
+             dispatcher work-executor sys-conn clients dbs
+             {:routing work-executor :transactions work-executor
+              :background work-executor :lock-timeout-ms 1000}))
+  ([^AtomicBoolean running port root idle-timeout server-socket selector
+    register-queue dispatcher work-executor sys-conn clients dbs execution]
+   (Server. running port root idle-timeout server-socket selector register-queue
+            dispatcher work-executor sys-conn clients dbs
+            (atom (if (.get running) :running :created)) execution)))
 
 (defn- shutdown-server!
   [^Server server]
@@ -361,6 +377,10 @@
     (cleanup! #(shutdown-executor! (.-dispatcher server) "Server dispatcher"))
     (cleanup! #(shutdown-executor! (.-work-executor server)
                                   "Server worker executor"))
+    (doseq [executor (distinct (vals (select-keys (.-execution server)
+                                                [:routing :transactions :background])))
+            :when (not (identical? executor (.-work-executor server)))]
+      (cleanup! #(shutdown-executor! executor "Server routing/runner executor")))
     (doseq [db-name (keys (.-dbs server))]
       (cleanup! #(remove-store server db-name)))
     (cleanup! #(d/close (.-sys-conn server)))
@@ -918,9 +938,13 @@
                    #(assoc %
                            :replica-loop-running? running?
                            :replica-loop-stopped-latch stopped-latch))
-        (execute server
-                 #(run-replica-sync-loop server db-name
-                                         running? stopped-latch))))))
+        (try
+          (execute server #(run-replica-sync-loop server db-name
+                                                running? stopped-latch))
+          (catch Throwable t
+            (.set running? false)
+            (.countDown stopped-latch)
+            (throw t)))))))
 
 (defn- stop-ha-background-loops!
   [^Server server]
@@ -2053,6 +2077,10 @@
 (defn- server-selector [^Server server] (.-selector server))
 (defn- server-idle-timeout [^Server server] (.-idle-timeout server))
 (defn- server-work-executor [^Server server] (.-work-executor server))
+(defn- server-routing-executor [^Server server] (:routing (.-execution server)))
+(defn- server-transaction-executor [^Server server] (:transactions (.-execution server)))
+(defn- server-background-executor [^Server server] (:background (.-execution server)))
+(defn- transaction-lock-timeout-ms [^Server server] (:lock-timeout-ms (.-execution server)))
 (defn- server-register-queue [^Server server] (.-register-queue server))
 (defn- server-running [^Server server] (.-running server))
 (defn- server-db-state [^Server server db-name]
@@ -2130,6 +2158,7 @@
      :with-index-write-admission #'with-index-write-admission
      :write-message #'write-message
      :write-txn-runner #'write-txn-runner
+     :transaction-lock-timeout-ms #'transaction-lock-timeout-ms
      :clients #'server-clients}
     {:strict? true}))
 
@@ -2172,9 +2201,9 @@
         sh/handler-map))
 
 (defn- execute
-  "Execute a function in a thread from the worker thread pool"
+  "Submit a long-lived replication task without consuming request workers."
   [^Server server f]
-  (sdisp/execute dispatch-deps server f))
+  (.execute ^ExecutorService (server-background-executor server) ^Runnable f))
 
 (defonce ^:private trace-remote-tx-cache* (atom nil))
 
@@ -2288,6 +2317,8 @@
      :cleanup-rejected-close-transact!-fn #'cleanup-rejected-close-transact!
      :message-handler-map #'message-handler-map
      :work-executor-fn #'server-work-executor
+     :routing-executor-fn #'server-routing-executor
+     :transaction-executor-fn #'server-transaction-executor
      :trace-remote-tx-fn #'trace-remote-tx!
      :get-kv-store-fn #'get-kv-store
      :new-message-fn #'new-message
@@ -2312,7 +2343,7 @@
      :ha-follower-sync-step-fn #'ha-follower-sync-step
      :persist-ha-follower-side-effects!-fn #'persist-ha-follower-side-effects!
      :running-fn #'server-running
-     :work-executor-fn #'server-work-executor
+     :work-executor-fn #'server-background-executor
      :update-db-fn #'update-db
      :current-runtime-opts-fn #'current-runtime-opts
      :stop-ha-renew-loop-fn #'deps-stop-ha-renew-loop
@@ -2350,18 +2381,23 @@
   loops, and `stop` to release resources even if it was never started. After
   stop or a failed start, create a new instance with the same root to restart."
   [{:keys [host port root idle-timeout verbose
-           worker-threads worker-queue-size]
+           worker-threads worker-queue-size transaction-threads
+           background-threads transaction-lock-timeout-ms]
     :as   opts
     :or   {host         default-bind-host
            port         8898
            root         "/var/lib/datalevin"
            idle-timeout c/default-idle-timeout
-           verbose      false}}]
+           verbose      false
+           transaction-lock-timeout-ms 1000}}]
   {:pre [(int? port) (not (s/blank? host)) (not (s/blank? root))]}
   (try
     (when (contains? opts :verbose)
       (log/set-min-level! (if verbose :debug :info)))
     (require-safe-bind-password! host)
+    (when-not (nat-int? transaction-lock-timeout-ms)
+      (raise "Transaction lock timeout must be a nonnegative integer"
+             {:transaction-lock-timeout-ms transaction-lock-timeout-ms}))
     (resources/with-acquired
       (fn [own!]
         ;; Validate and allocate the worker executor before opening native
@@ -2371,6 +2407,16 @@
                                   #(shutdown-executor! % "Server worker executor"))
               dispatcher    (own! (Executors/newSingleThreadExecutor)
                                    #(shutdown-executor! % "Server dispatcher"))
+              threads (long (or worker-threads (default-worker-thread-count)))
+              routing (own! (bounded-worker-executor (min 4 threads)
+                                                      (or worker-queue-size (* 4 threads)))
+                             #(shutdown-executor! % "Server routing executor"))
+              transactions (own! (bounded-runner-executor (or transaction-threads threads)
+                                                            :transaction-threads)
+                                  #(shutdown-executor! % "Server transaction executor"))
+              background (own! (bounded-runner-executor (or background-threads threads)
+                                                        :background-threads)
+                                #(shutdown-executor! % "Server background executor"))
               ^ServerSocketChannel server-socket
               (own! (open-port host port) #(.close ^ServerSocketChannel %))
               ^Selector selector (own! (Selector/open) #(.close ^Selector %))
@@ -2381,7 +2427,9 @@
           (.register server-socket selector SelectionKey/OP_ACCEPT)
           (->Server (AtomicBoolean. false) port root idle-timeout
                     server-socket selector (ConcurrentLinkedQueue.)
-                    dispatcher work-executor sys-conn clients dbs))))
+                    dispatcher work-executor sys-conn clients dbs
+                    {:routing routing :transactions transactions :background background
+                     :lock-timeout-ms transaction-lock-timeout-ms}))))
     (catch Exception e
       (throw (ex-info (str "Error creating server: " (ex-message e))
                       (ex-data e) e)))))
