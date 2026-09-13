@@ -427,7 +427,7 @@
                     [(if (seq rest)
                        (l/kv-tx :put c/tmp-dbi (hash k) rest :int)
                        (l/kv-tx :del c/tmp-dbi (hash k) :int))])
-          (vswap! disk-total dec)
+          (vswap! disk-total u/long-dec)
           (second entry))))))
 
 (defn- disk-map-entries [db bindings]
