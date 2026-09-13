@@ -358,12 +358,14 @@
 
 ;; Q14: Promotion Effect
 ;;
-;; The SQL CASE is split into a promo-only aggregate and a full aggregate
-;; because `if` is not resolvable inside a nested query.
+;; `if` is not resolvable inside a nested query, so the SQL CASE becomes a
+;; per-row contribution: `(or (and ?promo? ?v) 0.0)`. Aggregating that over
+;; every in-range lineitem keeps the numerator row present (0.0 when no promo
+;; part qualifies) instead of the empty result a promo-only filter produces.
 (def q-14
   '[:find ?promo
     :where
-    [(q [:find (sum ?v) .
+    [(q [:find (sum ?contrib) .
          :with ?l
          :where
          [?l :lineitem/shipdate ?sd]
@@ -372,11 +374,12 @@
          [?l :lineitem/partkey ?pk]
          [?p :part/partkey ?pk]
          [?p :part/type ?pt]
-         [(like ?pt "PROMO%")]
+         [(like ?pt "PROMO%") ?promo?]
          [?l :lineitem/extendedprice ?ep]
          [?l :lineitem/discount ?d]
          [(- 1 ?d) ?x]
-         [(* ?ep ?x) ?v]] $) ?pvsum]
+         [(* ?ep ?x) ?v]
+         [(or (and ?promo? ?v) 0.0) ?contrib]] $) ?pvsum]
     [(q [:find (sum ?v) .
          :with ?l
          :where
