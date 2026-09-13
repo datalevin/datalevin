@@ -628,7 +628,7 @@
   ([client db-name db-type schema opts return-db-info?]
    (let [_ (when-let [registry (get-in opts [:runtime-opts :udf-registry])]
              (locking native-readers
-               (let [readers ^ConcurrentHashMap
+               (let [^ConcurrentHashMap readers
                      (or (.get native-readers client) (ConcurrentHashMap.))]
                  (.put readers db-name (udf/native-value-reader registry))
                  (.put native-readers client readers))))
