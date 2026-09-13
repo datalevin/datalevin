@@ -396,7 +396,7 @@
                             defer-since-ms
                             (long (or (:snapshot-scheduler-defer-since-ms m)
                                       now-ms))
-                            defer-ms (max 0 (- now-ms defer-since-ms))
+                            defer-ms (max 0 (- (long now-ms) defer-since-ms))
                             prev-backoff-ms
                             (long (or (:snapshot-scheduler-defer-backoff-ms m)
                                       0))
