@@ -12,6 +12,7 @@
    [datalevin-tpcc.sqlite :as sqlite]
    [datalevin-tpcc.txns :as t])
   (:import
+   [java.lang.reflect InvocationHandler InvocationTargetException Proxy]
    [java.sql Connection DriverManager]))
 
 (def ^:dynamic *test-dir* nil)
@@ -101,43 +102,102 @@
       (is (= initial-stock (stocks)))
       (is (= before (order-count))))))
 
-(deftest datalevin-stock-updates
-  (let [conn (d/get-conn *test-dir* datalevin/schema)]
-    (try
-      (d/transact! conn
-                   (vec (for [[table rows] (seed-rows) row rows]
-                          (zipmap (c/attrs table) row))))
-      (let [eids (into {} (map (fn [[e w i]] [[w i] e]))
-                       (d/q '[:find ?e ?w ?i
-                              :where [?e :stock/w-id ?w] [?e :stock/i-id ?i]]
-                            (d/db conn)))]
-        (check-new-orders!
-         {:reset-stock!
-          (fn [stocks]
-            (d/transact! conn
-                         (mapv (fn [[k [qty ytd ocnt rcnt]]]
-                                 {:db/id (eids k) :stock/quantity qty :stock/ytd ytd
-                                  :stock/order-cnt ocnt :stock/remote-cnt rcnt})
-                               stocks)))
-          :new-order! #(t/new-order! conn %)
-          :stocks
-          #(into {} (map (fn [[w i & values]] [[w i] (vec values)]))
-                 (d/q '[:find ?w ?i ?qty ?ytd ?ocnt ?rcnt
+(defn- check-rollback-work!
+  [{:keys [snapshot observed-order! new-order!]}]
+  (doseq [[prefix expected-stock]
+          [[[(line 1 1 5) (line 2 1 5) (line 1 2 5) (line 1 1 10)]
+            {[1 1] [86 35 32 40] [1 2] [10 27 33 42] [2 1] [100 29 35 45]}]
+           [[] initial-stock]]]
+    (testing (str "writes before rollback after " (count prefix) " valid lines")
+      (let [before (snapshot)
+            [result pending] (observed-order!
+                              {:w 1 :d 1 :c 1
+                               :ol (conj prefix (line 1 999 1))})]
+        (is (= :invalid-item (:status result)))
+        (is (= (:next before) (:o-id result)))
+        (is (= 999 (:i-id result)))
+        ;; The transaction really advanced the counter, inserted both headers,
+        ;; and applied every valid line, including repeated and remote stock.
+        (is (= (-> (select-keys before [:next :orders :new-orders :lines :stocks])
+                   (update :next inc)
+                   (update :orders inc)
+                   (update :new-orders inc)
+                   (update :lines + (count prefix))
+                   (assoc :stocks expected-stock))
+               (select-keys pending [:next :orders :new-orders :lines :stocks])))
+        (is (= before (snapshot)) "all database rows are restored by rollback"))))
+  (testing "the connection remains usable and the aborted order id is reusable"
+    (let [before (snapshot)
+          result (new-order! {:w 1 :d 1 :c 1 :ol (vec (repeat 5 (line 1 1 5)))})]
+      (is (= :ok (:status result)))
+      (is (= (:next before) (:o-id result)))
+      (is (= (inc (:next before)) (:next (snapshot)))))))
+
+(defn- datalevin-state [db]
+  {:rows (mapv (juxt :e :a :v) (d/datoms db :eav))
+   :next (d/q '[:find ?n . :where [?e :district/next-o-id ?n]] db)
+   :orders (count (d/q '[:find ?e :where [?e :orders/id]] db))
+   :new-orders (count (d/q '[:find ?e :where [?e :new-order/o-id]] db))
+   :lines (count (d/q '[:find ?e :where [?e :order-line/o-id]] db))
+   :stocks (into {} (map (fn [[w i & values]] [[w i] (vec values)]))
+                 (d/q '[:find ?w ?i ?q ?y ?o ?r
                         :where [?e :stock/w-id ?w] [?e :stock/i-id ?i]
-                               [?e :stock/quantity ?qty] [?e :stock/ytd ?ytd]
-                               [?e :stock/order-cnt ?ocnt] [?e :stock/remote-cnt ?rcnt]]
-                      (d/db conn)))
-          :order-lines
-          (fn [o-id]
-            (vec (sort (d/q '[:find ?n ?i ?w ?qty :in $ ?o
-                              :where [?e :order-line/o-id ?o]
-                                     [?e :order-line/number ?n]
-                                     [?e :order-line/i-id ?i]
-                                     [?e :order-line/supply-w-id ?w]
-                                     [?e :order-line/quantity ?qty]]
-                            (d/db conn) o-id))))
-          :order-count #(t/order-count conn 1 1)}))
-      (finally (d/close conn)))))
+                               [?e :stock/quantity ?q] [?e :stock/ytd ?y]
+                               [?e :stock/order-cnt ?o] [?e :stock/remote-cnt ?r]] db))})
+
+(deftest datalevin-stock-updates
+  (doseq [kv-opts [{:wal? false}
+                  {:wal? true :wal-durability-profile :strict}
+                  {:wal? true :wal-durability-profile :relaxed}]]
+    (testing (str kv-opts)
+      (let [conn (d/get-conn (str *test-dir* "/" (random-uuid))
+                             datalevin/schema {:kv-opts kv-opts})]
+        (try
+          (d/transact! conn
+                       (vec (for [[table rows] (seed-rows) row rows]
+                              (zipmap (c/attrs table) row))))
+          (let [eids (into {} (map (fn [[e w i]] [[w i] e]))
+                           (d/q '[:find ?e ?w ?i
+                                  :where [?e :stock/w-id ?w] [?e :stock/i-id ?i]]
+                                (d/db conn)))]
+            (check-new-orders!
+             {:reset-stock!
+              (fn [stocks]
+                (d/transact! conn
+                             (mapv (fn [[k [qty ytd ocnt rcnt]]]
+                                     {:db/id (eids k) :stock/quantity qty :stock/ytd ytd
+                                      :stock/order-cnt ocnt :stock/remote-cnt rcnt})
+                                   stocks)))
+              :new-order! #(t/new-order! conn %)
+              :stocks
+              #(into {} (map (fn [[w i & values]] [[w i] (vec values)]))
+                     (d/q '[:find ?w ?i ?qty ?ytd ?ocnt ?rcnt
+                            :where [?e :stock/w-id ?w] [?e :stock/i-id ?i]
+                                   [?e :stock/quantity ?qty] [?e :stock/ytd ?ytd]
+                                   [?e :stock/order-cnt ?ocnt] [?e :stock/remote-cnt ?rcnt]]
+                          (d/db conn)))
+              :order-lines
+              (fn [o-id]
+                (vec (sort (d/q '[:find ?n ?i ?w ?qty :in $ ?o
+                                  :where [?e :order-line/o-id ?o]
+                                         [?e :order-line/number ?n]
+                                         [?e :order-line/i-id ?i]
+                                         [?e :order-line/supply-w-id ?w]
+                                         [?e :order-line/quantity ?qty]]
+                                (d/db conn) o-id))))
+              :order-count #(t/order-count conn 1 1)}))
+          (check-rollback-work!
+           {:snapshot #(datalevin-state (d/db conn))
+            :new-order! #(t/new-order! conn %)
+            :observed-order!
+            (fn [input]
+              (let [pending (atom nil)]
+                (d/listen! conn ::rollback-work
+                           #(reset! pending (datalevin-state (:db-after %))))
+                (try
+                  [(t/new-order! conn input) @pending]
+                  (finally (d/unlisten! conn ::rollback-work)))))})
+          (finally (d/close conn)))))))
 
 (defn- sql-exec! [^Connection conn sql params]
   (with-open [ps (.prepareStatement conn sql)]
@@ -155,6 +215,32 @@
           (if (.next rs)
             (recur (conj rows (mapv #(.getObject rs (int %)) (range 1 (inc n)))))
             rows))))))
+
+(defn- sql-state [^Connection conn]
+  {:rows (into {} (for [table c/table-order]
+                   [table (set (sql-rows conn (str "SELECT * FROM " table) []))]))
+   :next (ffirst (sql-rows conn "SELECT d_next_o_id FROM district" []))
+   :orders (ffirst (sql-rows conn "SELECT count(*) FROM orders" []))
+   :new-orders (ffirst (sql-rows conn "SELECT count(*) FROM new_order" []))
+   :lines (ffirst (sql-rows conn "SELECT count(*) FROM order_line" []))
+   :stocks (into {} (map (fn [[w i & values]] [[w i] (vec values)]))
+                 (sql-rows conn
+                           "SELECT s_w_id, s_i_id, s_quantity, s_ytd, s_order_cnt, s_remote_cnt FROM stock"
+                           []))})
+
+(defn- observed-sql-order! [^Connection conn new-order! input]
+  (let [pending (atom nil)
+        observed (Proxy/newProxyInstance
+                  (.getClassLoader Connection) (into-array Class [Connection])
+                  (reify InvocationHandler
+                    (invoke [_ _ method args]
+                      ;; Inspect the real transaction before JDBC discards it.
+                      (when (= "rollback" (.getName method))
+                        (reset! pending (sql-state conn)))
+                      (try (.invoke method conn args)
+                           (catch InvocationTargetException e
+                             (throw (.getCause e)))))))]
+    [(new-order! observed input) @pending]))
 
 (defn- check-sql-stock! [^Connection conn dialect new-order!]
   (with-open [st (.createStatement conn)]
@@ -185,7 +271,11 @@
     :order-lines #(sql-rows conn
                            "SELECT ol_number, ol_i_id, ol_supply_w_id, ol_quantity FROM order_line WHERE ol_o_id=? ORDER BY ol_number"
                            [%])
-    :order-count #(ffirst (sql-rows conn "SELECT count(*) FROM orders" []))}))
+    :order-count #(ffirst (sql-rows conn "SELECT count(*) FROM orders" []))})
+  (check-rollback-work!
+   {:snapshot #(sql-state conn)
+    :new-order! #(new-order! conn %)
+    :observed-order! #(observed-sql-order! conn new-order! %)}))
 
 (deftest sqlite-stock-updates
   (with-open [conn (DriverManager/getConnection "jdbc:sqlite::memory:")]

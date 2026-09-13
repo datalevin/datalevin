@@ -71,24 +71,25 @@
                     [?e :customer/first ?first]]
                   db w d last-name)
         sorted (sort-by #(nth % 5) rows)]
-    (when (seq sorted)
-      (nth sorted (quot (count sorted) 2)))))
+    (common/middle-customer sorted)))
 
 (defn- item [db i-id]
   (first (d/q '[:find ?e ?price :in $ ?i
                 :where [?e :item/id ?i] [?e :item/price ?price]]
               db i-id)))
 
-(defn- stock [db w i-id]
-  (first (d/q '[:find ?e ?qty ?ytd ?ocnt ?rcnt :in $ ?w ?i
+(defn- stock [db w i-id district]
+  (first (d/q '[:find ?e ?dist ?qty ?ytd ?ocnt ?rcnt
+                :in $ ?w ?i ?dist-attr
                 :where
                 [?e :stock/w-id ?w]
                 [?e :stock/i-id ?i]
+                [?e ?dist-attr ?dist]
                 [?e :stock/quantity ?qty]
                 [?e :stock/ytd ?ytd]
                 [?e :stock/order-cnt ?ocnt]
                 [?e :stock/remote-cnt ?rcnt]]
-              db w i-id)))
+              db w i-id (common/stock-dist-attr district))))
 
 ;; ---------------------------------------------------------------------------
 ;; New-Order
@@ -98,65 +99,46 @@
   (d/with-transaction [tx-conn conn]
     (let [db                   (d/db tx-conn)
           [_ _ _w-tax]          (warehouse db w)
-          [d-eid _ _d-tax d-next] (district db w d)
+          [d-eid _ _d-tax o-id]  (district db w d)
           [_c-eid _c-id _c-disc] (customer-by-id db w d c)
-          line-data            (mapv (fn [{:keys [i-id supply-w qty]}]
-                                       {:i-id i-id :supply-w supply-w :qty qty
-                                        :item (item db i-id)
-                                        :stock (stock db supply-w i-id)})
-                                     ol)
-          missing              (some #(when (nil? (:item %)) %) line-data)]
-      (cond
-        (nil? d-eid)
-        (throw (ex-info "No such district" {:w w :d d}))
-
-        ;; A single invalid item rolls the whole New-Order back.
-        missing
-        {:type :new-order :status :invalid-item :w w :d d :i-id (:i-id missing)}
-
-        :else
-        (let [o-id      d-next
-              all-local (long (if (every? #(= w (:supply-w %)) line-data) 1 0))
-              ;; Keep repeated lines in order, then write each stock row once.
-              stock-groups (group-by (juxt :supply-w :i-id) line-data)
-              stock-txs (mapcat
-                         (fn [[[supply-w _] lines]]
-                           (let [[s-eid & stock] (:stock (first lines))
-                                 [qty ytd ocnt rcnt]
-                                 (common/stock-after-lines stock (map :qty lines)
-                                                           (not= supply-w w))]
-                             [[:db/add s-eid :stock/quantity qty]
-                              [:db/add s-eid :stock/ytd ytd]
-                              [:db/add s-eid :stock/order-cnt ocnt]
-                              [:db/add s-eid :stock/remote-cnt rcnt]]))
-                         stock-groups)
-              line-txs  (map-indexed
-                         (fn [n {:keys [i-id supply-w qty item]}]
-                           (let [[_ price] item
-                                 amount (* (double qty) (double price))]
-                             {:db/id (- (+ 3 n)) :order-line/o-id o-id
-                              :order-line/d-id d :order-line/w-id w
-                              :order-line/number (inc n) :order-line/i-id i-id
-                              :order-line/supply-w-id supply-w
-                              :order-line/quantity (long qty)
-                              :order-line/amount amount
-                              :order-line/dist-info "distinfo-distinfo-distinfo"}))
-                         line-data)
-              tx (into
-                  [[:db/add d-eid :district/next-o-id (inc d-next)]
-                   {:db/id -1 :orders/id o-id :orders/d-id d :orders/w-id w
-                    :orders/c-id c :orders/entry-d (now-str)
-                    :orders/ol-cnt (count line-data)
-                    :orders/all-local all-local}
-                   {:db/id -2 :new-order/o-id o-id :new-order/d-id d
-                    :new-order/w-id w}]
-                  (concat stock-txs line-txs))]
-          (d/transact! tx-conn tx)
+          all-local            (long (if (every? #(= w (:supply-w %)) ol) 1 0))]
+      (when (nil? d-eid)
+        (throw (ex-info "No such district" {:w w :d d})))
+      (d/transact!
+       tx-conn
+       [[:db/add d-eid :district/next-o-id (inc o-id)]
+        {:db/id -1 :orders/id o-id :orders/d-id d :orders/w-id w
+         :orders/c-id c :orders/entry-d (now-str)
+         :orders/ol-cnt (count ol) :orders/all-local all-local}
+        {:db/id -2 :new-order/o-id o-id :new-order/d-id d :new-order/w-id w}])
+      ;; TPC-C 2.4.2.3 requires the valid prefix to perform its writes before
+      ;; discovering the invalid item. Prevalidating the order skips that work.
+      (loop [lines (seq ol) number 1 total 0.0]
+        (if-let [{:keys [i-id supply-w qty]} (first lines)]
+          (let [db (d/db tx-conn)]
+            (if-let [[_ price] (item db i-id)]
+              (let [[s-eid dist-info & values] (stock db supply-w i-id d)
+                    [quantity ytd ocnt rcnt]
+                    (common/stock-after-lines values [qty] (not= supply-w w))
+                    amount (* (double qty) (double price))]
+                (d/transact!
+                 tx-conn
+                 [[:db/add s-eid :stock/quantity quantity]
+                  [:db/add s-eid :stock/ytd ytd]
+                  [:db/add s-eid :stock/order-cnt ocnt]
+                  [:db/add s-eid :stock/remote-cnt rcnt]
+                  {:db/id -1 :order-line/o-id o-id :order-line/d-id d
+                   :order-line/w-id w :order-line/number number
+                   :order-line/i-id i-id :order-line/supply-w-id supply-w
+                   :order-line/quantity (long qty) :order-line/amount amount
+                   :order-line/dist-info dist-info}])
+                (recur (next lines) (inc number) (+ total amount)))
+              (do
+                (d/abort-transact tx-conn)
+                {:type :new-order :status :invalid-item :w w :d d
+                 :o-id o-id :i-id i-id})))
           {:type :new-order :status :ok :w w :d d :o-id o-id
-           :amount (reduce + 0.0
-                           (map #(* (double (:qty %))
-                                    (double (second (:item %))))
-                                line-data))})))))
+           :amount total})))))
 
 ;; ---------------------------------------------------------------------------
 ;; Payment
@@ -173,6 +155,8 @@
       (if (nil? cust)
         {:type :payment :status :no-customer :w w :d d}
         (let [[c-eid c-id _ c-credit c-data] cust
+              w-name (:warehouse/name (d/entity db w-eid))
+              d-name (:district/name (d/entity db d-eid))
               [cb]  (first (d/q '[:find ?v :in $ ?e
                                   :where [?e :customer/balance ?v]] db c-eid))
               [cyp] (first (d/q '[:find ?v :in $ ?e
@@ -180,9 +164,7 @@
               [cpc] (first (d/q '[:find ?v :in $ ?e
                                   :where [?e :customer/payment-cnt ?v]] db c-eid))
               new-data (when (= "BC" c-credit)
-                         (let [s (str (format "|%d %d %d %d %s" w d c-id w (now-str))
-                                      c-data)]
-                           (subs s 0 (min 500 (count s)))))
+                         (common/bad-credit-data c-id d w d w amount c-data))
               tx (cond-> [[:db/add w-eid :warehouse/ytd
                            (+ (double w-ytd) (double amount))]
                           [:db/add d-eid :district/ytd
@@ -195,7 +177,7 @@
                           {:db/id -1 :history/c-id c-id :history/c-d-id d
                            :history/c-w-id w :history/d-id d :history/w-id w
                            :history/date (now-str) :history/amount (double amount)
-                           :history/data "hdata-hdata-hdata-hdata"}]
+                           :history/data (common/payment-history-data w-name d-name)}]
                     new-data (conj [:db/add c-eid :customer/data new-data]))]
           (d/transact! tx-conn tx)
           {:type :payment :status :ok :w w :d d :c c-id :amount amount

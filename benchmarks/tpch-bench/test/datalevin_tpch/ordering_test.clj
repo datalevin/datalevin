@@ -16,7 +16,7 @@
 
 (defn- sql-ordering
   [columns sql]
-  (when-let [clause (second (re-find #"(?is)\border\s+by\s+([^;]+);?\s*$" sql))]
+  (when-let [clause (second (re-find #"(?is)\border\s+by\s+(.+?)(?:\s+limit\s+\d+)?;?\s*$" sql))]
     (mapv (fn [term]
             (let [[column direction] (s/split (s/trim term) #"\s+")]
               [(.indexOf ^java.util.List columns column)
@@ -107,21 +107,22 @@
    [30 "1995-03-01" 10.0]])
 
 (defn- q3-datoms
-  []
-  (let [entities
-        (into [{:customer/custkey 1 :customer/mktsegment "BUILDING"}]
-              (mapcat (fn [[orderkey date price]]
-                        (let [line {:lineitem/orderkey orderkey
-                                    :lineitem/shipdate "1995-03-20"
-                                    :lineitem/extendedprice price
-                                    :lineitem/discount 0.0}]
-                          [{:orders/orderkey orderkey :orders/custkey 1
-                            :orders/orderdate date :orders/shippriority 0}
-                           line line]))
-                      q3-orders))]
-    (vec (mapcat (fn [eid entity]
-                   (map (fn [[a value]] [eid a value]) entity))
-                 (range 1 (inc (count entities))) entities))))
+  ([] (q3-datoms q3-orders))
+  ([orders]
+   (let [entities
+         (into [{:customer/custkey 1 :customer/mktsegment "BUILDING"}]
+               (mapcat (fn [[orderkey date price]]
+                         (let [line {:lineitem/orderkey orderkey
+                                     :lineitem/shipdate "1995-03-20"
+                                     :lineitem/extendedprice price
+                                     :lineitem/discount 0.0}]
+                           [{:orders/orderkey orderkey :orders/custkey 1
+                             :orders/orderdate date :orders/shippriority 0}
+                            line line]))
+                       orders))]
+     (vec (mapcat (fn [eid entity]
+                    (map (fn [[a value]] [eid a value]) entity))
+                  (range 1 (inc (count entities))) entities)))))
 
 (deftest q3-orders-aggregates-inside-the-query
   (let [datoms (q3-datoms)
@@ -140,3 +141,12 @@
                                    (parse-double exec-ms))))
                  0.001)
               "reported execution includes all time after preparation"))))))
+
+(deftest q3-row-limit-truncates-to-ten
+  ;; TPC-H 2.1.2.9 limits Q3 to 10 rows. Eleven qualifying orders must still
+  ;; return ten, highest revenue first.
+  (let [orders (vec (for [i (range 1 12)]
+                      [(+ 100 i) "1995-03-01" (double (- 100 i))]))
+        rows   (d/q q/q-3 (q3-datoms orders))]
+    (is (= 10 (count rows)))
+    (is (= (mapv #(+ 100 %) (range 1 11)) (mapv first rows)))))

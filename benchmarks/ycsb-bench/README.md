@@ -213,10 +213,10 @@ bounded by `records + warmup + ops`.
 Load, warmup, and measurement are separate phases. Warmup changes the database
 but contributes no measured samples. Each measured operation's latency includes
 request generation, waiting for client/transaction locks, database calls,
-complete result materialization, and read/scan shape checks. A shared start gate
-releases workers together. Overall throughput divides successfully completed
-logical operations by wall-clock phase duration; scans and RMW each count as
-one operation, independent of their number of rows or wire requests.
+complete result materialization, and read/scan shape and ASCII checks. A shared
+start gate releases workers together. Overall throughput divides successfully
+completed logical operations by wall-clock phase duration; scans and RMW each
+count as one operation, independent of their number of rows or wire requests.
 
 This is a **closed-loop** workload: each worker waits for one operation before
 issuing the next. It has no target arrival rate or coordinated-omission

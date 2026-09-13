@@ -77,6 +77,21 @@
       (doseq [[operation weight] mix]
         (is (< (abs (- (get counts operation) (* 100 weight))) 250))))))
 
+(deftest malformed-operation-mix-test
+  (let [rng (proxy [Random] [] (nextInt [_bound] 99))]
+    (is (= :update (w/choose-operation rng [[:read 50] [:update 50]])))
+    (doseq [[mix remaining-draw] [[nil 99]
+                                 [[] 99]
+                                 [[[:read]] 99]
+                                 [[[:read nil]] 99]
+                                 [[[:read 50] [:update 49]] 0]]]
+      (let [failure (try (w/choose-operation rng mix)
+                         (catch Exception e e))]
+        (is (instance? clojure.lang.ExceptionInfo failure))
+        (is (= {:mix mix :remaining-draw remaining-draw} (ex-data failure)))
+        (when (instance? clojure.lang.ExceptionInfo failure)
+          (is (re-find #"Invalid operation mix" (ex-message failure))))))))
+
 (deftest invalid-options-test
   (doseq [bad [{:ops 0} {:warmup -1} {:threads 0} {:pool-size -1}
                {:records nil} {:field-length 0} {:seed 1.5}
@@ -88,8 +103,16 @@
 
 (deftest latency-summary-test
   (is (= {:mean 2.5 :p50 2.0 :p95 4.0 :p99 4.0 :max 4.0}
-         (runner/latency-summary (long-array [4000 1000 3000 2000]))))
-  (is (nil? (runner/latency-summary (long-array 0)))))
+         (runner/latency-summary! (long-array [4000 1000 3000 2000]))))
+  (is (nil? (runner/latency-summary! (long-array 0)))))
+
+(deftest record-byte-length-validation-test
+  (doseq [value ["aaaa" "a\u0000\u007fz"]]
+    (is (nil? (runner/validate-record! [value "bbbb" "cccc"] small-options))))
+  ;; Each string occupies four UTF-16 code units, just like a valid field.
+  (doseq [value ["éaaa" "aaaé" "ab😀" (str "aaa" (char 0xd800))]]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Missing or malformed record"
+                         (runner/validate-record! [value "bbbb" "cccc"] small-options)))))
 
 (defn- concurrent-modifications! [db]
   (let [executor (Executors/newFixedThreadPool 2)]

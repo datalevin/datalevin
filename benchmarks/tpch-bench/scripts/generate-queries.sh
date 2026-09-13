@@ -24,11 +24,20 @@ fi
 
 mkdir -p "$STD_DIR" "$PG_DIR"
 for n in $(seq 1 22); do
-  DSS_QUERY="$DBGEN_DIR/queries" \
-    "$DBGEN_DIR/qgen" -d -b "$DBGEN_DIR/dists.dss" "$n" \
+  raw="$(DSS_QUERY="$DBGEN_DIR/queries" \
+           "$DBGEN_DIR/qgen" -d -b "$DBGEN_DIR/dists.dss" "$n")"
+  # TPC-H 2.1.2.9 requires a result row limit on Q2, Q3, Q10, Q18, and Q21.
+  # qgen reports it as the ROWS_FETCH directive, which is only a comment in
+  # portable dialects, so restore it as a real LIMIT clause.
+  rows="$(printf '%s\n' "$raw" \
+            | sed -n 's/^--#SET ROWS_FETCH \([0-9][0-9]*\)$/\1/p')"
+  printf '%s\n' "$raw" \
     | sed -e 's/^-- using default substitutions$//' \
           -e '/^--#SET ROWS_FETCH/d' \
     > "$STD_DIR/$n.sql"
+  if [[ -n "$rows" ]]; then
+    perl -0777 -i -pe "s/;(\s*)\$/\nlimit $rows;\$1/" "$STD_DIR/$n.sql"
+  fi
   # PostgreSQL rejects the `day (3)` precision suffix and reads plural unit
   # names more reliably than `interval '90' day`. -E keeps the alternation
   # portable between GNU and BSD sed.

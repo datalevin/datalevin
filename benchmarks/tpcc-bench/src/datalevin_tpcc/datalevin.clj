@@ -94,7 +94,7 @@
        :ol (g/new-order-lines r w #(t/nurand r 8191 1 c/item-count c-item))}
 
       :payment
-      (let [by-name? (<= (rint r 1 100) 40)]
+      (let [by-name? (<= (rint r 1 100) 60)]
         {:w w :d (rint r 1 10) :c (t/nurand r 1023 1 3000 c-cust)
          :by-name? by-name?
          :last-name (when by-name? (nth g/last-names (t/nurand r 255 0 999 c-last)))
@@ -167,7 +167,7 @@
                                                           (:amount res))
                                                (update-in [k :count] (fnil inc 0)))))
                                   nil)))
-                            (swap! lat conj [type ms]))))))]
+                            (swap! lat conj [type ms (:status res)]))))))]
     (try
       (println (format "TPC-C-derived: %d warehouse(s), %d terminal(s), %d txns"
                        warehouses threads txns))
@@ -206,7 +206,8 @@
               errors (into order-errors payment-errors)]
           (when (seq errors)
             (throw (ex-info "TPC-C accounting invariant failure" {:errors errors}))))
-        (let [new-orders (reduce + 0 (vals @committed))
+        (let [{:keys [new-orders committed-new-orders rolled-back-new-orders tpmc]
+               :as metrics} (c/new-order-metrics @lat elapsed)
               by-type    (group-by first @lat)
               stats      (into {}
                                (for [[ty xs] by-type]
@@ -215,18 +216,17 @@
                                         :mean  (/ (reduce + 0.0 ms) (count ms))
                                         :p50   (percentile ms 0.50)
                                         :p95   (percentile ms 0.95)
-                                        :p99   (percentile ms 0.99)}])))
-              tpmc       (/ (* 60.0 new-orders) elapsed)]
+                                        :p99   (percentile ms 0.99)}])))]
           (println "district next_o_id invariant: OK")
           (println "order count invariant: OK")
           (println "Payment accounting invariants: OK")
-          (println (format "Elapsed: %.2fs  New-Orders: %d  tpmC: %.1f"
-                           elapsed new-orders tpmc))
+          (println (format "Elapsed: %.2fs  New-Orders: %d (%d committed, %d rolled back)  tpmC: %.1f"
+                           elapsed new-orders committed-new-orders rolled-back-new-orders tpmc))
           (doseq [[ty {:keys [count mean p50 p95 p99]}] (sort-by key stats)]
             (println (format "  %-13s n=%-6d mean=%7.3fms p50=%7.3f p95=%7.3f p99=%7.3f"
                              (name ty) count mean p50 p95 p99)))
-          {:tpmc tpmc :new-orders new-orders :elapsed elapsed :stats stats
-           :payments @payments :invariants :ok})))
+          (assoc metrics :elapsed elapsed :stats stats
+                 :payments @payments :invariants :ok))))
       (finally
         (d/close conn)))))
 
@@ -234,4 +234,3 @@
   (bench {})
   (shutdown-agents)
   (System/exit 0))
-

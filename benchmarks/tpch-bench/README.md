@@ -49,6 +49,13 @@ lexicographically. Date arithmetic in the SQL is precomputed to literal bounds
 that match the fixed default substitutions, e.g. Q1's
 `l_shipdate <= date '1998-12-01' - interval '90' day` becomes `"1998-09-02"`.
 
+TPC-H §2.1.2.9 requires a result row limit on Q2 (100), Q3 (10), Q10 (20),
+Q18 (100), and Q21 (100). `qgen` emits these as the `ROWS_FETCH` directive,
+which is only a comment in portable dialects, so `scripts/generate-queries.sh`
+restores each one as a real `LIMIT` clause and the Datalog translations carry
+the matching `:limit`. The committed query files and `queries.clj` are checked
+by the test suite.
+
 ## Running
 
 Run all commands from this directory.
@@ -80,10 +87,13 @@ JVM properties.
 ## Verification
 
 SQLite is the local correctness oracle. `clj -X:verify` runs every Datalevin
-Datalog translation and the corresponding SQLite query, normalizes both result
-sets for content comparison, and compares cell by cell with a relative numeric
-tolerance. Before normalization, it checks that each backend's output satisfies
-the query's required ordering. Rows tied on all sort keys may appear in any order:
+Datalog translation and the corresponding SQLite query, then compares columns
+according to their meaning. Identifiers, projected values, counts (including
+Q12's conditional counts), and Q1/Q18 quantity sums must match exactly. Other
+monetary aggregates, averages, and ratios retain a relative rounding tolerance
+of `1e-6`. Numeric normalization preserves integer precision. Before comparing
+contents, verification checks the output width and each backend's required
+ordering. Rows tied on all sort keys may appear in any order:
 
 ```bash
 clj -X:verify '{:queries :all}'

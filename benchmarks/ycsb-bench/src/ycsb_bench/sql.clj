@@ -144,7 +144,24 @@
 
 (defn- with-session [^ArrayBlockingQueue pool timeout-ms f]
   (if-let [session (.poll pool (long timeout-ms) TimeUnit/MILLISECONDS)]
-    (try (f session) (finally (.add pool session)))
+    (let [failure (volatile! nil)]
+      (try
+        (f session)
+        (catch Throwable t
+          (vreset! failure t)
+          (throw t))
+        (finally
+          (try
+            ;; A failed rollback closes its connection. Never let another
+            ;; worker borrow it; the case owner still retains it for cleanup.
+            (when-not (.isClosed ^Connection (:connection session))
+              (.add pool session))
+            (catch Throwable t
+              ;; An uninspectable connection is also discarded, without
+              ;; replacing the operation failure with a cleanup error.
+              (if-let [^Throwable primary @failure]
+                (when-not (identical? primary t) (.addSuppressed primary t))
+                (throw t)))))))
     (throw (ex-info "Timed out borrowing a SQL connection" {}))))
 
 (defrecord SQLRecords [pool connections fields timeout-ms info]

@@ -8,7 +8,8 @@
    [clojure.java.io :as io]
    [clojure.string :as s])
   (:import
-   [java.io File]))
+   [java.io File]
+   [java.util Locale]))
 
 (def base-dir
   (or (System/getenv "TPCC_DIR") "."))
@@ -30,6 +31,28 @@
 ;; ---------------------------------------------------------------------------
 ;; Shared transaction calculations
 
+(defn middle-customer
+  "Select from customers already sorted by first name, or return nil if empty.
+  TPC-C 2.5.2.2 chooses the lower middle customer when the count is even."
+  [customers]
+  (when (seq customers)
+    (nth customers (quot (dec (count customers)) 2))))
+
+(defn bad-credit-data
+  "Prepend the six Payment history fields required by TPC-C 2.5.2.2 to C_DATA,
+  retaining at most 500 characters. IDs are customer, customer district,
+  customer warehouse, payment district, and payment warehouse, in that order."
+  [c-id c-d-id c-w-id d-id w-id amount old-data]
+  (let [prefix (String/format Locale/ROOT "%d %d %d %d %d %.2f | "
+                              (to-array [c-id c-d-id c-w-id d-id w-id (double amount)]))
+        data   (str prefix old-data)]
+    (subs data 0 (min 500 (count data)))))
+
+(defn payment-history-data
+  "Build H_DATA from the payment warehouse and district names (TPC-C 2.5.2.2)."
+  [warehouse-name district-name]
+  (str warehouse-name "    " district-name))
+
 (defn stock-after-lines
   "Apply TPC-C 2.4.2 stock updates in order to [quantity ytd order-cnt remote-cnt].
   `quantities` contains the order-line quantities for one supplying warehouse
@@ -45,6 +68,26 @@
         (inc (long order-cnt))
         (+ (long remote-cnt) (if remote? 1 0))]))
    (mapv long stock) quantities))
+
+;; ---------------------------------------------------------------------------
+;; Measured transaction results
+
+(defn new-order-metrics
+  "Summarize measured [type latency-ms status] records over `elapsed` seconds.
+  TPC-C 5.1.2 counts both committed New-Orders and required invalid-item
+  rollbacks as completed transactions. Other statuses do not contribute to
+  tpmC. Callers must exclude warmup records."
+  [samples elapsed]
+  (let [statuses    (frequencies (for [[type _ status] samples
+                                      :when (= type :new-order)]
+                                  status))
+        committed   (get statuses :ok 0)
+        rolled-back (get statuses :invalid-item 0)
+        completed   (+ committed rolled-back)]
+    {:new-orders completed
+     :committed-new-orders committed
+     :rolled-back-new-orders rolled-back
+     :tpmc (/ (* 60.0 completed) elapsed)}))
 
 ;; ---------------------------------------------------------------------------
 ;; Table metadata
@@ -119,6 +162,18 @@
 
 (defn attrs [table]
   (mapv #(col->attr table %) (:columns (table-specs table))))
+
+(defn stock-dist-column
+  "The S_DIST_xx column for the ordering district, restricted to the schema."
+  [district]
+  (when-not (and (integer? district) (<= 1 district districts-per-warehouse))
+    (throw (ex-info "Invalid stock district" {:district district})))
+  (nth (:columns (table-specs "stock")) (+ 2 district)))
+
+(defn stock-dist-attr
+  "The Datalevin attribute corresponding to the ordering district's S_DIST_xx."
+  [district]
+  (col->attr "stock" (stock-dist-column district)))
 
 (defn type->db-type [t]
   (case t

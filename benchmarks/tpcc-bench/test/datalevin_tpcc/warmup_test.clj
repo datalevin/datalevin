@@ -1,6 +1,7 @@
 (ns datalevin-tpcc.warmup-test
   (:require
    [clojure.test :refer [deftest is testing use-fixtures]]
+   [datalevin-bench.host :as host]
    [datalevin.core :as d]
    [datalevin-tpcc.datalevin]
    [datalevin-tpcc.postgres]
@@ -25,11 +26,11 @@
   (let [calls    (atom [])
         done     (ex-info "Warmup complete" {})
         conn     (reify java.sql.Connection (close [_]))
-        generate (ns-resolve driver 'gen-input)
-        capture  (fn [_ r opts type]
+        generate (var-get (ns-resolve driver 'gen-input))
+        capture  (fn [r opts type]
                    (let [input (generate r opts type)]
                      (swap! calls conj {:rng r :type type :input input})
-                     [type input {:status :probe} 0.0]))
+                     input))
         stop     (fn [& _] (throw done))
         db-stubs (case driver
                    datalevin-tpcc.datalevin
@@ -44,8 +45,17 @@
 
                    datalevin-tpcc.postgres
                    {(ns-resolve driver 'get-connection) (constantly conn)
-                    (ns-resolve driver 'district-next-o-id) stop})]
-    (with-redefs-fn (assoc db-stubs (ns-resolve driver 'do-txn) capture)
+                    (ns-resolve driver 'district-next-o-id) stop})
+        stubs (assoc db-stubs
+                     #'host/pause! (constantly [])
+                     #'host/resume! (constantly nil)
+                     (ns-resolve driver 'gen-input) capture
+                     (ns-resolve driver 'do-txn)
+                     (if (= driver 'datalevin-tpcc.sqlite)
+                       (fn [_ _ _] {:status :probe})
+                       (fn [_ r opts type]
+                         [type (capture r opts type) {:status :probe} 0.0])))]
+    (with-redefs-fn stubs
       (fn []
         ;; Stop at the first accounting baseline read, after warmup and before
         ;; measured transactions. No database is opened or modified.

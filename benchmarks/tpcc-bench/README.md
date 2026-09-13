@@ -40,6 +40,13 @@ Population follows the specification's cardinalities for `w` warehouses:
 | new_order | 9,000 |
 | order_line | ~300,000 |
 
+`C_LAST` follows TPC-C §4.3.3.1: within each district, customers 1-1,000 iterate
+the 1,000 standard names in order, and customers 1,001-3,000 draw from the same
+pool with `NURand(255,0,999)` using a population constant chosen independently
+of the transaction-run constant. That draw is deliberately non-uniform, so
+name-based Payment and Order-Status see the specification's surname match sizes
+rather than a uniform one-per-name or unmatched random string.
+
 Each district's 3,000 orders map bijectively to its 3,000 customers, the first
 2,100 orders are delivered, and orders 2,101-3,000 are the open new orders.
 Generation is deterministic per table from a seed, so reloads are reproducible.
@@ -54,17 +61,29 @@ Generation is deterministic per table from a seed, so reloads are reproducible.
 | Delivery | 4% | new_order, orders, order_line, customer |
 | Stock-Level | 4% | none |
 
+All drivers select Payment customers by last name 60% of the time and by
+customer ID 40% of the time.
+
 All drivers share New-Order line generation: 5-15 lines per order, with one
 random 1-in-100 rollback decision per order. A rollback order has only its
 final item id replaced with an unused value, as specified in
 [TPC-C §2.4.1.3-5](https://www.tpc.org/tpc_documents_current_versions/pdf/tpc-c_v5.11.0.pdf#page=28).
 
-New-Order reads the warehouse tax, the district counter and tax, the customer
-discount, and each item and stock row; it then updates stock and inserts the
-order, the new-order row, and the order lines. Any invalid item rolls the whole
-transaction back. Payment updates the warehouse and district year-to-date
+New-Order reads the warehouse tax, the district counter and tax, and the customer
+discount, then advances the counter and inserts the order and new-order headers.
+It processes each line in input order, updating stock and inserting the line
+before looking up the next item. An invalid item rolls back the header and all
+preceding valid-line writes, exercising the rollback workload required by
+TPC-C §2.4.2.3. Payment updates the warehouse and district year-to-date
 totals, the customer balance/payment count, and appends a history row. Delivery
 removes the oldest new-order in each district and delivers its lines.
+
+New-Order copies `S_DIST_xx` from each supplying stock row into `OL_DIST_INFO`,
+where `xx` is the order's district. For bad-credit customers, Payment prepends
+`C_ID`, `C_D_ID`, `C_W_ID`, `D_ID`, `W_ID`, and the amount to `C_DATA`, preserving
+the first 500 characters of the combined text. Good-credit `C_DATA` is unchanged.
+`H_DATA` contains the payment warehouse and district names separated by four
+spaces. These payloads follow [TPC-C §§2.4.2.2 and 2.5.2.2](https://www.tpc.org/tpc_documents_current_versions/pdf/tpc-c_v5.11.0.pdf).
 
 ## Concurrency and correctness
 
@@ -90,9 +109,9 @@ All backends share the stock calculation from
 [TPC-C §2.4.2](https://www.tpc.org/TPC_Documents_Current_Versions/pdf/tpc-c_v5.11.0.pdf#page=30):
 subtract the ordered quantity when stock is at least that quantity plus 10;
 otherwise add 91 after subtracting it. Repeated lines for the same supplying
-warehouse and item are processed in input order before writing the final stock
-row. This preserves multiple replenishments and increments the order and remote
-counters for each applicable line.
+warehouse and item read and update the stock row in input order within the same
+transaction. This preserves multiple replenishments and increments the order
+and remote counters for each applicable line.
 
 All drivers check two New-Order invariants after every run:
 
@@ -109,11 +128,21 @@ The Datalevin driver also checks Payment accounting:
 5. Each district's customer year-to-date payments and payment counts increased
    by those same amounts and counts. Delivery does not change these fields.
 
-Datalevin checks use baselines captured after warmup and count only successful
-measured transactions. Counts must match exactly; monetary deltas allow less
-than half a cent of floating point error. Checks run after all terminals finish,
-outside the timed interval. Any mismatch throws with details instead of
-reporting a successful benchmark result.
+All drivers capture baselines after warmup and use only committed measured
+transactions for these invariants. Every configured district is checked,
+including districts with zero committed New-Orders. Counts must match exactly;
+Datalevin's monetary deltas allow less than half a cent of floating point error. Checks run after all
+terminals finish, outside the timed interval. Any mismatch throws with an
+`:errors` vector containing the invariant, affected key, expected value, and
+actual value, before throughput or latency metrics are reported. Successful
+runs return `:invariants :ok`.
+
+Throughput counts completed measured New-Orders: both commits and the required
+invalid-item rollbacks, as specified in TPC-C §5.1.2. Warmup, other transaction
+types, and unexpected failures do not contribute. All three drivers calculate
+`tpmC = 60 × completed New-Orders / elapsed seconds` using the same helper.
+The console and result map report the completed total (`:new-orders`) and
+separate counts for `:committed-new-orders` and `:rolled-back-new-orders`.
 
 PostgreSQL New-Order stock updates are covered by integration tests against
 PostgreSQL 18.6. A full PostgreSQL transaction-mix run has not been validated.
@@ -152,7 +181,9 @@ same and different customers/districts, Payment with Delivery, concurrent
 New-Order and Delivery, rollback, and detection of lost Payment totals. Payment
 concurrency is checked with WAL disabled and with strict and relaxed WAL.
 Stock tests cover the threshold, repeated items, multiple replenishments, local
-and remote supply, and rollback using Datalevin and SQLite. Enable the same
+and remote supply, and rollback using Datalevin and SQLite. Rollback tests observe
+the pending header, counter, stock, and line writes and verify that every row is
+restored afterward. Enable the same
 integration cases for PostgreSQL with a test database URL:
 
 ```bash
@@ -178,7 +209,10 @@ separately; the runner does not yet switch modes.
 
 ## Smoke results (not performance claims)
 
-Current Datalevin smoke runs use fresh one-warehouse databases, seed 42, 100
+The figures below predate completed-New-Order accounting: their New-Order counts
+and tpmC exclude required rollbacks. Rerun the benchmark for corrected tpmC.
+
+Recorded Datalevin smoke runs use fresh one-warehouse databases, seed 42, 100
 warmup transactions, and native 1.1.1 with default durability:
 
 | Terminals | Measured txns | New-Orders | tpmC | New-Order and Payment invariants |

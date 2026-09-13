@@ -41,3 +41,28 @@
     (doseq [n (range 1 23)]
       (is (.exists (c/query-file :sqlite n)) (str "sqlite " n))
       (is (.exists (c/query-file :postgres n)) (str "postgres " n)))))
+
+(def required-limits
+  "TPC-H 2.1.2.9 requires a result row limit on these queries. qgen reports it
+  as the ROWS_FETCH directive, which must be restored as a real LIMIT clause."
+  {2 100, 3 10, 10 20, 18 100, 21 100})
+
+(deftest required-row-limits
+  (testing "Datalog translations carry the specification limit"
+    (doseq [[n expected] required-limits]
+      (let [form (q/datalog n)
+            i    (first (keep-indexed (fn [i x] (when (= :limit x) i)) form))]
+        (is (some? i) (str "q-" n " has no :limit"))
+        (is (= expected (nth form (inc i))) (str "q-" n " limit")))))
+  (testing "SQL files carry the specification limit"
+    (doseq [[n expected] required-limits
+            dialect     [:standard :postgres :sqlite]]
+      (let [sql (slurp (c/query-file dialect n))]
+        (is (re-find (re-pattern (str "(?i)\\blimit\\s+" expected "\\b")) sql)
+            (str (name dialect) " q" n " limit " expected)))))
+  (testing "queries without a specification limit do not add one"
+    (doseq [n       (remove required-limits (range 1 23))
+            dialect [:standard :postgres :sqlite]]
+      (let [sql (slurp (c/query-file dialect n))]
+        (is (not (re-find #"(?i)\blimit\b" sql))
+            (str (name dialect) " q" n " should not have a limit"))))))

@@ -70,3 +70,19 @@
         (let [n (count (:columns (c/table-specs table)))
               row (first (get rows table))]
           (is (= n (count row)) (str table " width")))))))
+
+(deftest customer-last-name-distribution
+  ;; TPC-C 4.3.3.1: per district, c_id 1..1000 iterate the 1000 standard names
+  ;; in order; c_id 1001..3000 draw from the same pool with NURand(255,0,999).
+  (let [rows     (vec (g/customer-rows 42 1))
+        by-dist  (group-by #(nth % 1) rows)
+        name-set (set g/last-names)]
+    (is (= c/districts-per-warehouse (count by-dist)))
+    (doseq [[did rs] by-dist]
+      (let [lasts (mapv #(nth % 5) (sort-by #(nth % 0) rs))]
+        (testing (str "district " did)
+          (is (= (mapv #(nth g/last-names %) (range 1000))
+                 (subvec lasts 0 1000))
+              "the first 1000 customers iterate the 1000 standard names")
+          (is (every? name-set (subvec lasts 1000))
+              "the remaining 2000 draw names from the same pool"))))))

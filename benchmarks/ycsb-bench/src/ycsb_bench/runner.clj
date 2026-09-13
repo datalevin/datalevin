@@ -59,9 +59,20 @@
                       (select-keys opts [:system :api :mode]))))
     selected))
 
-(defn validate-record! [values {:keys [field-count field-length]}]
+(defn- ascii-field? [value ^long field-length]
+  (and (string? value)
+       (= (.length ^String value) field-length)
+       (loop [i 0]
+         (if (= i field-length)
+           true
+           (and (< (int (.charAt ^String value (int i))) 128)
+                (recur (inc i)))))))
+
+(defn validate-record!
+  "Validate field count and fixed ASCII byte lengths."
+  [values {:keys [field-count field-length]}]
   (when-not (and (= (count values) field-count)
-                 (every? #(and (string? %) (= (.length ^String %) field-length)) values))
+                 (every? #(ascii-field? % field-length) values))
     (throw (ex-info "Missing or malformed record" {:field-count (count values)}))))
 
 (defn- execute!
@@ -84,8 +95,8 @@
                   (throw (ex-info "Scan returned incorrect IDs" {:start id :count n})))
                 (doseq [[_ values] rows] (validate-record! values opts)))))))
 
-(defn latency-summary
-  "Exact nearest-rank percentiles in microseconds; sorts the supplied array."
+(defn latency-summary!
+  "Exact nearest-rank percentiles in microseconds; sorts the supplied array in place."
   [^longs samples]
   (let [n (alength samples)]
     (when (pos? n)
@@ -120,9 +131,9 @@
                            (do (aset-long samples j (aget latencies i))
                                (recur (inc i) (inc j)))
                            (recur (inc i) j))))
-                     [operation {:count cnt :latency-us (latency-summary samples)}]))))
+                     [operation {:count cnt :latency-us (latency-summary! samples)}]))))
              w/operations))
-     :latency-us (latency-summary latencies)}))
+     :latency-us (latency-summary! latencies)}))
 
 (defn- stop-workers!
   "Join every worker before the owner can close the database. Interruptions

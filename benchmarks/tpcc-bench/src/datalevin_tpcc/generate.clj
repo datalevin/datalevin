@@ -64,15 +64,21 @@
   "The 1000 TPC-C customer last names, indexed 0..999."
   (mapv last-name-from-index (range 1000)))
 
+(defn- nurand
+  "TPC-C NURand(A, x, y) with the population-time constant `c`."
+  [r a x y c]
+  (+ x (mod (+ (bit-or (.nextInt r (inc a)) (rint r x y)) c)
+            (inc (- y x)))))
+
 (defn- customer-last
-  "TPC-C 4.3.3: the first 1000 customers in each district carry the 1000
-  distinct standard names, one each. The remaining 2000 draw from the same
-  name pool. Without this, name-based Payment and Order-Status lookups miss
-  and take the :no-customer path."
-  [^Random r ^long c-id]
+  "TPC-C 4.3.3.1: the first 1000 customers in each district iterate the 1000
+  standard names in order; the remaining 2000 draw from the same pool with
+  NURand(255,0,999) using the population constant. Both branches matter for the
+  surname match sizes that Payment and Order-Status see."
+  [^Random r ^long c-id ^long c-pop]
   (if (<= c-id 1000)
     (nth last-names (dec c-id))
-    (nth last-names (rint r 0 999))))
+    (nth last-names (nurand r 255 0 999 c-pop))))
 
 (defn- address-row [^Random r]
   [(rand-string r 10 20) (rand-string r 10 20) (rand-string r 10 20)
@@ -120,13 +126,16 @@
               (maybe-original r (rand-string r 26 50))])))))
 
 (defn customer-rows [seed w]
-  (let [r (Random. (+ seed 15))]
+  (let [r     (Random. (+ seed 15))
+        ;; TPC-C 4.3.3.1: the population constant is chosen independently of the
+        ;; transaction-run constant and is reproducible from the population seed.
+        c-pop (rint r 0 255)]
     (for [wid (range 1 (inc w))
           did (range 1 (inc c/districts-per-warehouse))
           cid (range 1 (inc c/customers-per-district))]
       (let [[s1 s2 city state zip] (address-row r)]
         [cid did wid
-         (rand-string r 8 16) "OE" (customer-last r cid)
+         (rand-string r 8 16) "OE" (customer-last r cid c-pop)
          s1 s2 city state zip
          (rand-numeric r 16 16)
          "2026-01-01T00:00:00" (if (= 1 (rint r 1 10)) "BC" "GC")

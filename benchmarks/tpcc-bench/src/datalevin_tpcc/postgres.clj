@@ -177,11 +177,6 @@
 
 (defn- now-str [] (str (Instant/now)))
 
-;; The SQLite driver uses a 26-character ol_dist_info literal, but the
-;; PostgreSQL schema declares order_line.ol_dist_info as char(24) and rejects
-;; over-length values, so use an exactly-24-character value here.
-(def ^:private dist-info "distinfo-distinfo-distin")
-
 (defn new-order!
   [^Connection conn {:keys [w d c ol]}]
   (.setAutoCommit conn false)
@@ -195,54 +190,47 @@
           _       (when (nil? drow)
                     (throw (ex-info "No such district" {:w w :d d})))
           _d-tax  (double (nth drow 0))
-          d-next  (long (nth drow 1))
+          o-id    (long (nth drow 1))
           _c-disc (double (first (q1 conn
                                      "SELECT c_discount FROM customer WHERE c_w_id = ? AND c_d_id = ? AND c_id = ?"
                                      w d c)))
-          line-data (mapv
-                     (fn [{:keys [i-id supply-w qty]}]
-                       (let [prow (q1 conn "SELECT i_price FROM item WHERE i_id = ?"
-                                      i-id)]
-                         {:i-id i-id :supply-w supply-w :qty qty
-                          :price (when prow (double (first prow)))}))
-                     ol)
-          missing (some #(when (nil? (:price %)) %) line-data)]
-      (if missing
-        ;; A single invalid item rolls the whole New-Order back.
-        (do
-          (.rollback conn)
-          {:type :new-order :status :invalid-item :w w :d d
-           :i-id (:i-id missing)})
-        (let [o-id      d-next
-              all-local (long (if (every? #(= w (:supply-w %)) line-data) 1 0))
-              ;; Keep repeated lines in order, then write each stock row once.
-              stock-groups (group-by (juxt :supply-w :i-id) line-data)]
-          (exec! conn
-                 "UPDATE district SET d_next_o_id = ? WHERE d_w_id = ? AND d_id = ?"
-                 (inc d-next) w d)
-          (exec! conn
-                 "INSERT INTO orders (o_id, o_d_id, o_w_id, o_c_id, o_entry_d, o_carrier_id, o_ol_cnt, o_all_local) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-                 o-id d w c (now-str) nil (count line-data) all-local)
-          (exec! conn
-                 "INSERT INTO new_order (no_o_id, no_d_id, no_w_id) VALUES (?, ?, ?)"
-                 o-id d w)
-          (doseq [[n {:keys [i-id supply-w qty price]}] (map-indexed vector line-data)]
-            (exec! conn
-                   "INSERT INTO order_line (ol_o_id, ol_d_id, ol_w_id, ol_number, ol_i_id, ol_supply_w_id, ol_delivery_d, ol_quantity, ol_amount, ol_dist_info) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
-                   o-id d w (inc n) i-id supply-w nil qty
-                   (* (double qty) (double price))
-                   dist-info))
-          (doseq [[[supply-w i-id] lines] stock-groups]
-            (let [srow  (q1 conn
-                            "SELECT s_quantity, s_ytd, s_order_cnt, s_remote_cnt FROM stock WHERE s_w_id = ? AND s_i_id = ? FOR UPDATE"
-                            supply-w i-id)
-                  [qty ytd ocnt rcnt]
-                  (c/stock-after-lines srow (map :qty lines) (not= supply-w w))]
+          all-local (long (if (every? #(= w (:supply-w %)) ol) 1 0))]
+      (exec! conn
+             "UPDATE district SET d_next_o_id = ? WHERE d_w_id = ? AND d_id = ?"
+             (inc o-id) w d)
+      (exec! conn
+             "INSERT INTO orders (o_id, o_d_id, o_w_id, o_c_id, o_entry_d, o_carrier_id, o_ol_cnt, o_all_local) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+             o-id d w c (now-str) nil (count ol) all-local)
+      (exec! conn
+             "INSERT INTO new_order (no_o_id, no_d_id, no_w_id) VALUES (?, ?, ?)"
+             o-id d w)
+      ;; Process and write each valid line before looking up the next item,
+      ;; including when the final item will require a rollback (TPC-C 2.4.2.3).
+      (loop [lines (seq ol) number 1]
+        (if-let [{:keys [i-id supply-w qty]} (first lines)]
+          (if-let [[price] (q1 conn "SELECT i_price FROM item WHERE i_id = ?" i-id)]
+            (let [[dist-info & srow]
+                  (q1 conn
+                      (str "SELECT " (c/stock-dist-column d)
+                           ", s_quantity, s_ytd, s_order_cnt, s_remote_cnt FROM stock WHERE s_w_id = ? AND s_i_id = ? FOR UPDATE")
+                      supply-w i-id)
+                  [quantity ytd ocnt rcnt]
+                  (c/stock-after-lines srow [qty] (not= supply-w w))]
               (exec! conn
                      "UPDATE stock SET s_quantity = ?, s_ytd = ?, s_order_cnt = ?, s_remote_cnt = ? WHERE s_w_id = ? AND s_i_id = ?"
-                     qty ytd ocnt rcnt supply-w i-id)))
-          (.commit conn)
-          {:type :new-order :status :ok :w w :d d :o-id o-id})))
+                     quantity ytd ocnt rcnt supply-w i-id)
+              (exec! conn
+                     "INSERT INTO order_line (ol_o_id, ol_d_id, ol_w_id, ol_number, ol_i_id, ol_supply_w_id, ol_delivery_d, ol_quantity, ol_amount, ol_dist_info) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                     o-id d w number i-id supply-w nil qty
+                     (* (double qty) (double price)) dist-info)
+              (recur (next lines) (inc number)))
+            (do
+              (.rollback conn)
+              {:type :new-order :status :invalid-item :w w :d d
+               :o-id o-id :i-id i-id}))
+          (do
+            (.commit conn)
+            {:type :new-order :status :ok :w w :d d :o-id o-id}))))
     (catch Exception e
       (try (.rollback conn) (catch Exception _))
       (throw e))
@@ -255,8 +243,7 @@
   (let [rows (qall conn
                    "SELECT c_id, rtrim(c_credit), c_data, c_balance, c_ytd_payment, c_payment_cnt FROM customer WHERE c_w_id = ? AND c_d_id = ? AND c_last = ? ORDER BY c_first, c_id FOR UPDATE"
                    w d last-name)]
-    (when (seq rows)
-      (nth rows (quot (count rows) 2)))))
+    (c/middle-customer rows)))
 
 (defn- customer-by-id
   [^Connection conn w d c]
@@ -268,12 +255,12 @@
   [^Connection conn {:keys [w d c last-name amount by-name?]}]
   (.setAutoCommit conn false)
   (try
-    (let [w-ytd (double (first (q1 conn
-                                  "SELECT w_ytd FROM warehouse WHERE w_id = ? FOR UPDATE"
-                                  w)))
-          d-ytd (double (first (q1 conn
-                                   "SELECT d_ytd FROM district WHERE d_w_id = ? AND d_id = ? FOR UPDATE"
-                                   w d)))
+    (let [[w-ytd w-name] (q1 conn
+                            "SELECT w_ytd, w_name FROM warehouse WHERE w_id = ? FOR UPDATE"
+                            w)
+          [d-ytd d-name] (q1 conn
+                            "SELECT d_ytd, d_name FROM district WHERE d_w_id = ? AND d_id = ? FOR UPDATE"
+                            w d)
           cust  (if by-name?
                   (customer-by-name conn w d last-name)
                   (customer-by-id conn w d c))]
@@ -288,13 +275,11 @@
               cyp      (double (nth cust 4))
               cpc      (long (nth cust 5))
               new-data (when (= "BC" c-credit)
-                         (let [s (str (format "|%d %d %d %d %s" w d c-id w (now-str))
-                                      c-data)]
-                           (subs s 0 (min 500 (count s)))))]
+                         (c/bad-credit-data c-id d w d w amount c-data))]
           (exec! conn "UPDATE warehouse SET w_ytd = ? WHERE w_id = ?"
-                 (+ w-ytd (double amount)) w)
+                 (+ (double w-ytd) (double amount)) w)
           (exec! conn "UPDATE district SET d_ytd = ? WHERE d_w_id = ? AND d_id = ?"
-                 (+ d-ytd (double amount)) w d)
+                 (+ (double d-ytd) (double amount)) w d)
           (exec! conn
                  "UPDATE customer SET c_balance = ?, c_ytd_payment = ?, c_payment_cnt = ? WHERE c_w_id = ? AND c_d_id = ? AND c_id = ?"
                  (- cb (double amount)) (+ cyp (double amount)) (inc cpc)
@@ -306,7 +291,7 @@
           (exec! conn
                  "INSERT INTO history (h_c_id, h_c_d_id, h_c_w_id, h_d_id, h_w_id, h_date, h_amount, h_data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
                  c-id d w d w (now-str) (double amount)
-                 "hdata-hdata-hdata-hdata")
+                 (c/payment-history-data w-name d-name))
           (.commit conn)
           {:type :payment :status :ok :w w :d d :c c-id :amount amount
            :credit c-credit})))
@@ -322,8 +307,7 @@
                (let [rows (qall conn
                                 "SELECT c_id FROM customer WHERE c_w_id = ? AND c_d_id = ? AND c_last = ? ORDER BY c_first, c_id"
                                 w d last-name)]
-                 (when (seq rows)
-                   (long (first (nth rows (quot (count rows) 2))))))
+                 (some-> (c/middle-customer rows) first long))
                (let [row (q1 conn
                              "SELECT c_id FROM customer WHERE c_w_id = ? AND c_d_id = ? AND c_id = ?"
                              w d c)]
@@ -447,7 +431,7 @@
        :ol (g/new-order-lines r w #(nurand r 8191 1 c/item-count c-item))}
 
       :payment
-      (let [by-name? (<= (rint r 1 100) 40)]
+      (let [by-name? (<= (rint r 1 100) 60)]
         {:w w :d (rint r 1 10) :c (nurand r 1023 1 3000 c-cust)
          :by-name? by-name?
          :last-name (when by-name? (nth g/last-names (nurand r 255 0 999 c-last)))
@@ -489,7 +473,7 @@
             [res (/ (- (System/nanoTime) t0) 1.0e6)]))))))
 
 (defn- do-txn [conn ^Random r opts type]
-  (let [input    (gen-input r opts type)
+  (let [input   (gen-input r opts type)
         [res ms] (run-with-retry
                    type
                    #(case type
@@ -516,90 +500,89 @@
     :txns        measured transactions (default 10000)
     :threads     terminals (default 1)
     :warmup      warmup transactions (default 1000)
-    :seed        input seed (default 42)"
+    :seed        input seed (default 42)
+
+  Throws with accounting errors before reporting metrics if any district's
+  next order id or order count disagrees with committed New-Orders."
   [{:keys [warehouses txns threads warmup seed]
     :or   {warehouses 1 txns 10000 threads 1 warmup 1000 seed 42}
     :as   opts}]
-  (let [conn     (get-connection (conn-opts opts))
-        c-r      (Random. seed)
-        txn-opts {:warehouses warehouses
-                  :c-item     (rint c-r 0 8191)
-                  :c-cust     (rint c-r 0 1023)
-                  :c-last     (rint c-r 0 255)}
-        committed (atom {})
-        lat       (atom [])
-        run       (fn [^Connection cnn ^long ti ^long n record?]
-                    (let [r (Random. (+ seed ti 1))]
-                      (dotimes [_ n]
-                        (let [[type input res ms] (do-txn cnn r txn-opts (pick-type r))]
-                          (when (and (= :new-order type) (= :ok (:status res)))
-                            (swap! committed update [(:w input) (:d input)]
-                                   (fnil inc 0)))
-                          (when record?
-                            (swap! lat conj [type ms]))))))]
-    (println (format "TPC-C-derived: %d warehouse(s), %d terminal(s), %d txns"
-                     warehouses threads txns))
-    ;; Each terminal uses its own connection so transactions are isolated.
-    ;; A run owns its RNG, so execute the whole warmup as one batch.
-    (let [warm-conn (get-connection (conn-opts opts))]
-      (try (run warm-conn 0 warmup false)
-           (finally (.close warm-conn))))
-    (host/with-paused-media
-     (let [dists    (for [w (range 1 (inc warehouses)) d (range 1 11)] [w d])
-          baseline (into {} (map (fn [[w d]] [[w d] (district-next-o-id conn w d)])
-                                 dists))
-          base-ord (into {} (map (fn [[w d]] [[w d] (order-count conn w d)])
-                                 dists))]
-      (reset! committed {})
-      (reset! lat [])
-      (let [t0       (System/nanoTime)
-            per      (quot txns threads)
-            futs     (mapv (fn [ti]
-                             (future
-                               (let [c (get-connection (conn-opts opts))]
-                                 (try
-                                   (run c ti (+ per (if (= ti (dec threads))
-                                                       (mod txns threads)
-                                                       0))
-                                        true)
-                                   (finally (.close c))))))
-                           (range threads))]
-        (doseq [f futs] @f)
-        (let [elapsed    (/ (- (System/nanoTime) t0) 1.0e9)
-              new-orders (reduce + 0 (vals @committed))
-              by-type    (group-by first @lat)
-              stats      (into {}
-                               (for [[ty xs] by-type]
-                                 (let [ms (vec (sort (map second xs)))]
-                                   [ty {:count (count ms)
-                                        :mean  (/ (reduce + 0.0 ms) (count ms))
-                                        :p50   (percentile ms 0.50)
-                                        :p95   (percentile ms 0.95)
-                                        :p99   (percentile ms 0.99)}])))
-              tpmc       (/ (* 60.0 new-orders) elapsed)]
-          (println (format "Elapsed: %.2fs  New-Orders: %d  tpmC: %.1f"
-                           elapsed new-orders tpmc))
-          (doseq [[ty {:keys [count mean p50 p95 p99]}] (sort-by key stats)]
-            (println (format "  %-13s n=%-6d mean=%7.3fms p50=%7.3f p95=%7.3f p99=%7.3f"
-                             (name ty) count mean p50 p95 p99)))
-          ;; Invariant: every district's next_o_id advanced by exactly the number
-          ;; of New-Order transactions it committed in the measured interval.
-          (let [bad (for [[[w d] n] @committed
-                          :let [actual (district-next-o-id conn w d)]
-                          :when (not= actual (+ (get baseline [w d]) n))]
-                      [w d :expected (+ (get baseline [w d]) n) :actual actual])]
-            (println (if (seq bad)
-                       (str "INVARIANT FAILURE: " (pr-str bad))
-                       "district next_o_id invariant: OK")))
-          (let [bad (for [[[w d] n] @committed
-                          :let [actual (order-count conn w d)]
-                          :when (not= actual (+ (get base-ord [w d]) n))]
-                      [w d :expected (+ (get base-ord [w d]) n) :actual actual])]
-            (println (if (seq bad)
-                       (str "ORDER COUNT FAILURE: " (pr-str bad))
-                       "order count invariant: OK")))
-          (.close conn)
-          {:tpmc tpmc :new-orders new-orders :elapsed elapsed :stats stats}))))))
+  (with-open [conn (get-connection (conn-opts opts))]
+    (let [c-r      (Random. seed)
+          txn-opts {:warehouses warehouses
+                    :c-item     (rint c-r 0 8191)
+                    :c-cust     (rint c-r 0 1023)
+                    :c-last     (rint c-r 0 255)}
+          committed (atom {})
+          lat       (atom [])
+          run       (fn [^Connection cnn ^long ti ^long n record?]
+                      (let [r (Random. (+ seed ti 1))]
+                        (dotimes [_ n]
+                          (let [[type input res ms] (do-txn cnn r txn-opts (pick-type r))]
+                            (when (and (= :new-order type) (= :ok (:status res)))
+                              (swap! committed update [(:w input) (:d input)]
+                                     (fnil inc 0)))
+                            (when record?
+                              (swap! lat conj [type ms (:status res)]))))))]
+      (println (format "TPC-C-derived: %d warehouse(s), %d terminal(s), %d txns"
+                       warehouses threads txns))
+      ;; Each terminal uses its own connection so transactions are isolated.
+      ;; A run owns its RNG, so execute the whole warmup as one batch.
+      (let [warm-conn (get-connection (conn-opts opts))]
+        (try (run warm-conn 0 warmup false)
+             (finally (.close warm-conn))))
+      (host/with-paused-media
+        (let [dists    (for [w (range 1 (inc warehouses)) d (range 1 11)] [w d])
+              baseline (into {} (map (fn [[w d]] [[w d] (district-next-o-id conn w d)])
+                                     dists))
+              base-ord (into {} (map (fn [[w d]] [[w d] (order-count conn w d)])
+                                     dists))]
+          (reset! committed {})
+          (reset! lat [])
+          (let [t0       (System/nanoTime)
+                per      (quot txns threads)
+                futs     (mapv (fn [ti]
+                                 (future
+                                   (let [c (get-connection (conn-opts opts))]
+                                     (try
+                                       (run c ti (+ per (if (= ti (dec threads))
+                                                           (mod txns threads)
+                                                           0))
+                                            true)
+                                       (finally (.close c))))))
+                               (range threads))]
+            (doseq [f futs] @f)
+            (let [elapsed    (/ (- (System/nanoTime) t0) 1.0e9)
+                  errors
+                  (vec (for [[w d :as k] dists
+                             [invariant base actual]
+                             [[:district-next-o-id baseline (district-next-o-id conn w d)]
+                              [:order-count base-ord (order-count conn w d)]]
+                             :let [expected (+ (get base k) (get @committed k 0))]
+                             :when (not= actual expected)]
+                         {:invariant invariant :key k :expected expected :actual actual}))
+                  {:keys [new-orders committed-new-orders rolled-back-new-orders tpmc]
+                   :as metrics} (c/new-order-metrics @lat elapsed)
+                  by-type    (group-by first @lat)
+                  stats      (into {}
+                                   (for [[ty xs] by-type]
+                                     (let [ms (vec (sort (map second xs)))]
+                                       [ty {:count (count ms)
+                                            :mean  (/ (reduce + 0.0 ms) (count ms))
+                                            :p50   (percentile ms 0.50)
+                                            :p95   (percentile ms 0.95)
+                                            :p99   (percentile ms 0.99)}])))]
+              (when (seq errors)
+                (throw (ex-info "TPC-C accounting invariant failure" {:errors errors})))
+              (println "district next_o_id invariant: OK")
+              (println "order count invariant: OK")
+              (println (format "Elapsed: %.2fs  New-Orders: %d (%d committed, %d rolled back)  tpmC: %.1f"
+                               elapsed new-orders committed-new-orders rolled-back-new-orders tpmc))
+              (doseq [[ty {:keys [count mean p50 p95 p99]}] (sort-by key stats)]
+                (println (format "  %-13s n=%-6d mean=%7.3fms p50=%7.3f p95=%7.3f p99=%7.3f"
+                                 (name ty) count mean p50 p95 p99)))
+              (assoc metrics :elapsed elapsed :stats stats
+                     :invariants :ok))))))))
 
 (defn -main [& _args]
   (bench {})

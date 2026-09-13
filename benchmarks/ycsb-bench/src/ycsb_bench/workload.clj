@@ -17,6 +17,9 @@
 
 (defn choose-operation [^Random rng mix]
   (loop [draw (.nextInt rng 100), [[operation weight] & more] mix]
+    (when (nil? weight)
+      (throw (ex-info "Invalid operation mix: missing weight or weights do not cover the draw"
+                      {:mix mix :remaining-draw draw})))
     (if (< draw (long weight))
       operation
       (recur (- draw (long weight)) more))))

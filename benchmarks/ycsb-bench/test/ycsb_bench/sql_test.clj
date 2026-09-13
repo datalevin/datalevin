@@ -4,7 +4,53 @@
             [ycsb-bench.runner :as runner]
             [ycsb-bench.sql :as sql]
             [ycsb-bench.store :as store])
-  (:import [java.sql Connection SQLException]))
+  (:import [java.sql Connection SQLException]
+           [java.util.concurrent ArrayBlockingQueue]))
+
+(deftest rollback-failure-discards-closed-session-test
+  (let [failure (SQLException. "Operation failed")
+        rollback (SQLException. "Rollback failed")
+        closed? (atom false)
+        auto-commit (atom [])
+        broken (reify Connection
+                 (setAutoCommit [_ enabled] (swap! auto-commit conj enabled))
+                 (rollback [_] (throw rollback))
+                 (close [_] (reset! closed? true))
+                 (isClosed [_] @closed?))
+        healthy {:connection (reify Connection (isClosed [_] false))}
+        pool (ArrayBlockingQueue. 2)]
+    (.add pool {:connection broken})
+    (.add pool healthy)
+    (is (identical? failure
+                    (try
+                      (#'sql/with-session pool 10
+                        (fn [{:keys [connection]}]
+                          (#'sql/transaction! connection #(throw failure))))
+                      (catch Throwable t t))))
+    (is (= [rollback] (vec (.getSuppressed failure))))
+    (is @closed?)
+    (is (= [false] @auto-commit)
+        "An uncertain transaction must not be switched back to auto-commit")
+    (is (= [healthy] (vec (.toArray pool)))
+        "Only the healthy connection is available to subsequent workers")
+    (dotimes [_ 2]
+      (is (identical? healthy (#'sql/with-session pool 10 identity))))
+    (is (= [healthy] (vec (.toArray pool))))))
+
+(deftest session-state-check-failure-test
+  (doseq [operation-fails? [false true]]
+    (let [failure (SQLException. "Operation failed")
+          inspection (SQLException. "Connection state unavailable")
+          pool (ArrayBlockingQueue. 1)]
+      (.add pool {:connection (reify Connection (isClosed [_] (throw inspection)))})
+      (is (identical? (if operation-fails? failure inspection)
+                      (try
+                        (#'sql/with-session pool 10
+                          (fn [_] (when operation-fails? (throw failure))))
+                        (catch Throwable t t))))
+      (when operation-fails?
+        (is (= [inspection] (vec (.getSuppressed failure)))))
+      (is (.isEmpty pool) "A session with unknown state must not be reused"))))
 
 (defn- check-sql! [opts]
   (sql/with-store

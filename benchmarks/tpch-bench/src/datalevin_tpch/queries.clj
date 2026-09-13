@@ -59,6 +59,7 @@
   '[:find ?s-acctbal ?s-name ?n-name ?p-partkey ?p-mfgr ?s-address ?s-phone
     ?s-comment
     :order-by [0 :desc 2 :asc 1 :asc 3 :asc]
+    :limit 100
     :where
     [?p :part/partkey ?p-partkey]
     [?p :part/size 15]
@@ -98,6 +99,7 @@
 (def q-3
   '[:find ?l-orderkey (sum ?revenue) ?o-orderdate ?o-shippriority
     :order-by [1 :desc 2 :asc]
+    :limit 10
     :with ?l
     :where
     [?c :customer/mktsegment "BUILDING"]
@@ -268,6 +270,7 @@
   '[:find ?c-custkey ?c-name (sum ?revenue) ?c-acctbal ?n-name ?c-address
     ?c-phone ?c-comment
     :order-by [2 :desc]
+    :limit 20
     :with ?l
     :where
     [?c :customer/custkey ?c-custkey]
@@ -488,6 +491,7 @@
     (sum ?l-quantity)
     :with ?l
     :order-by [4 :desc 3 :asc]
+    :limit 100
     :where
     [(q [:find ?ok (sum ?q)
          :with ?l
@@ -577,6 +581,7 @@
 (def q-21
   '[:find ?s-name (count-distinct ?l1)
     :order-by [1 :desc 0 :asc]
+    :limit 100
     :where
     [?s :supplier/suppkey ?sk]
     [?s :supplier/name ?s-name]

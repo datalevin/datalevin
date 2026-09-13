@@ -2,9 +2,9 @@
   "Compare Datalevin Datalog results against the SQLite reference.
 
   Required ORDER BY is checked on the original results before canonicalizing
-  rows for content comparison, allowing arbitrary order among ties. Numeric cells
-  are compared with a relative tolerance because SQLite stores money as REAL while
-  PostgreSQL and Datalevin keep exact or double values."
+  rows for content comparison, allowing arbitrary order among ties. Singleton
+  values, counts and quantity sums are exact. Other aggregates allow relative
+  tolerance for floating-point rounding differences between backends."
   (:require
    [clojure.java.io :as io]
    [datalevin.core :as d]
@@ -35,22 +35,57 @@
       (coll? res)  (mapv vec res)
       :else        [[res]])))
 
+(def ^:private column-comparisons
+  "Comparison rules in SELECT-list order, per TPC-H 2.1.3.5. Only computed
+  monetary aggregates, averages and ratios allow rounding tolerance. Singleton
+  values (including balances/prices), COUNTs, Q12's conditional counts and
+  Q1/Q18's SUM(l_quantity) require exact equality."
+  {1  [:exact :exact :exact :relative :relative :relative :relative :relative :relative :exact]
+   2  [:exact :exact :exact :exact :exact :exact :exact :exact]
+   3  [:exact :relative :exact :exact]
+   4  [:exact :exact]
+   5  [:exact :relative]
+   6  [:relative]
+   7  [:exact :exact :exact :relative]
+   8  [:exact :relative]
+   9  [:exact :exact :relative]
+   10 [:exact :exact :relative :exact :exact :exact :exact :exact]
+   11 [:exact :relative]
+   12 [:exact :exact :exact]
+   13 [:exact :exact]
+   14 [:relative]
+   15 [:exact :exact :exact :exact :relative]
+   16 [:exact :exact :exact :exact]
+   17 [:relative]
+   18 [:exact :exact :exact :exact :exact :exact]
+   19 [:relative]
+   20 [:exact :exact]
+   21 [:exact :exact]
+   22 [:exact :exact :relative]})
+
 (defn- normalize
-  [rows]
-  (->> rows
-       (map (fn [row]
-              (mapv (fn [v] (if (number? v) (double v) v)) row)))
-       (sort-by pr-str)
-       vec))
+  [rules rows]
+  ;; Compare decimal representations across JDBC/Clojure numeric types without
+  ;; rounding integer keys to doubles. Sort exact columns first so rounding in
+  ;; aggregates cannot change which identifiers are paired for comparison.
+  (let [columns (sort-by #(if (= :exact (rules %)) 0 1) (range (count rules)))]
+    (->> rows
+         (map (fn [row]
+                (mapv (fn [v] (if (number? v) (bigdec v) v)) row)))
+         (sort-by #(mapv % columns))
+         vec)))
 
 (defn- rows-match?
-  [a b]
+  [rules a b]
   (and (= (count a) (count b))
        (every? true?
                (map (fn [ra rb]
-                      (and (= (count ra) (count rb))
-                           (every? true?
-                                   (map c/close-enough? ra rb))))
+                      (every? true?
+                              (map (fn [rule va vb]
+                                     (case rule
+                                       :exact (= va vb)
+                                       :relative (c/close-enough? va vb)))
+                                   rules ra rb)))
                     a b))))
 
 (defn ordered?
@@ -71,11 +106,18 @@
             (partition 2 1 rows))))
 
 (defn results-match?
-  "Check required ordering before comparing row contents with numeric tolerance."
+  "Check row shape and required ordering, then compare each output column using
+  its exact or aggregate-rounding rule."
   [n expected actual]
-  (and (ordered? n expected)
-       (ordered? n actual)
-       (rows-match? (normalize expected) (normalize actual))))
+  (let [rules (or (column-comparisons n)
+                  (throw (ex-info "No result comparison rules for query"
+                                  {:query n})))
+        width (count rules)]
+    (and (every? #(= width (count %)) expected)
+         (every? #(= width (count %)) actual)
+         (ordered? n expected)
+         (ordered? n actual)
+         (rows-match? rules (normalize rules expected) (normalize rules actual)))))
 
 (defn verify
   "Run the Datalevin translations and check them against SQLite.

@@ -28,14 +28,17 @@
     (try
       (d/transact!
        conn
-       (into [{:db/id 1 :warehouse/id 1 :warehouse/ytd 300000.0 :warehouse/tax 0.1}
+       (into [{:db/id 1 :warehouse/id 1 :warehouse/ytd 300000.0 :warehouse/tax 0.1
+               :warehouse/name "WAREHOUSE"}
               {:db/id 2 :item/id 1 :item/price 2.0}
               {:db/id 3 :stock/w-id 1 :stock/i-id 1 :stock/quantity 100
-               :stock/ytd 0 :stock/order-cnt 0 :stock/remote-cnt 0}]
+               :stock/ytd 0 :stock/order-cnt 0 :stock/remote-cnt 0
+               :stock/dist-01 "123456789012345678901234"}]
              (concat
               (for [did (range 1 11)]
                 {:db/id (+ 10 did) :district/id did :district/w-id 1
-                 :district/ytd 30000.0 :district/tax 0.1 :district/next-o-id 3001})
+                 :district/ytd 30000.0 :district/tax 0.1 :district/next-o-id 3001
+                 :district/name (str "DISTRICT" did)})
               (for [did (range 1 11) cid [1 2]]
                 {:db/id (customer-eid did cid) :customer/id cid
                  :customer/w-id 1 :customer/d-id did
