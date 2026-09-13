@@ -8,52 +8,84 @@
 ;; You must not remove this notice, or any other, from this software.
 ;;
 (ns ^:no-doc datalevin.storage
-  "Storage layer of Datalog store"
+  "Datalog Store implementation, transactions, workers, and resource lifecycle."
   (:refer-clojure :exclude [update assoc])
   (:require
-   [datalevin.lmdb :as lmdb :refer [IWriting]]
-   [datalevin.binding.cpp :as cpp]
-   [datalevin.inline :refer [update assoc]]
-   [datalevin.kv :as kv]
-   [datalevin.remote :as remote]
-   [datalevin.util :as u :refer [ conjs conjv raise]]
-   [datalevin.buffer :as bf]
-   [datalevin.relation :as r]
-   [datalevin.bits :as b]
-   [datalevin.custom-datalog :as cd]
-   [datalevin.custom-value :as cv]
-   [datalevin.pipe :as p]
-   [datalevin.scan :as scan :refer [visit-list*]]
-   [datalevin.search :as s]
-   [datalevin.secondary-index :as si]
-   [datalevin.idoc :as idoc]
-   [datalevin.embedding :as emb]
-   [datalevin.vector :as v]
-   [datalevin.prepare :as prep]
-   [datalevin.query.predicate :as qpred]
-   [datalevin.constants :as c]
-   [datalevin.datom :as d]
+   [clojure.string :as str]
    [datalevin.async :as a]
+   [datalevin.binding.cpp :as cpp]
+   [datalevin.bits :as b]
+   [datalevin.buffer :as bf]
+   [datalevin.constants :as c]
+   [datalevin.custom-datalog :as cd]
+   [datalevin.datom :as d]
+   [datalevin.embedding :as emb]
+   [datalevin.idoc :as idoc]
    [datalevin.index :as idx
     :refer [value-type datom->indexable index->dbi index->ktype index->vtype
-            index->k index->v gt->datom retrieved->v encode-giant-datom]]
-   [datalevin.validate :as vld]
+            index->k index->v retrieved->v encode-giant-datom]]
+   [datalevin.inline :refer [update assoc]]
    [datalevin.interface
-    :refer [transact-kv get-range get-first get-value visit-list-sample
-            visit-list-key-range near-list env-dir close-kv closed-kv?
-            entries list-range list-range-first list-range-count
+    :refer [transact-kv get-range get-first get-value env-dir close-kv
+            closed-kv? entries list-range list-range-first list-range-count
             list-count key-range-list-count key-range-count rschema
             list-range-first-n get-list list-range-filter-count max-aid
-            list-range-some list-range-keep
-            max-gt advance-max-gt max-tx
-            open-list-dbi open-dbi attrs add-doc remove-doc opts env-opts kv-info swap-attr
-            add-vec remove-vec close-vecs vec-closed? schema closed? a-size db-name populated?
-            get-env-flags set-env-flags]]
-   [clojure.string :as str])
+            list-range-some list-range-keep max-gt advance-max-gt max-tx
+            open-list-dbi open-dbi attrs add-doc opts swap-attr add-vec
+            remove-vec close-vecs vec-closed? schema closed? a-size db-name]]
+   [datalevin.kv :as kv]
+   [datalevin.lmdb :as lmdb :refer [IWriting]]
+   [datalevin.pipe :as p]
+   [datalevin.prepare :as prep]
+   [datalevin.query.predicate :as qpred]
+   [datalevin.relation :as r]
+   [datalevin.remote :as remote]
+   [datalevin.scan :as scan]
+   [datalevin.secondary-index :as si]
+   [datalevin.storage.domains
+    :refer [embedding-attr-domains ensure-embedding-vector!
+            init-embedding-indices init-embedding-providers init-engines
+            init-idoc-domains init-idoc-indices init-indices
+            init-store-domains transfer-engines transfer-idoc-indices
+            transfer-indices]]
+   [datalevin.storage.indexing :as indexing
+    :refer [remove-fulltext-doc-idempotently!]]
+   [datalevin.storage.jobs
+    :refer [add-job-to-secondary-index-status claimable-secondary-index-job?
+            claimed-secondary-index-job? embedding-job-item
+            finalize-secondary-index-status secondary-index-job-matches?
+            secondary-index-status-init]]
+   [datalevin.storage.options :as options
+    :refer [apply-option-mutations async-secondary-index-option-keys
+            normalize-ha-open-opts raw-persist-open-opts-key
+            resolve-store-opts store-visible-opts sync-wal-runtime-opts!
+            transact-opts-raw]]
+   [datalevin.storage.scan :as scans
+    :refer [av-entities ave-filter-bound-id-chunk ave-filter-tuple-id-chunk
+            ave-tuples-scan* ave-tuples-scan-need-v
+            ave-tuples-scan-need-v-vpred ave-tuples-scan-no-v
+            ave-tuples-scan-no-v-vpred datom-pred->kv-pred ea->avg-buffer
+            eav-filter-presence-chunk eav-scan-v-list-chunk eav-scan-v-multi*
+            eav-scan-v-single* group-counts group-starts kv->datom
+            ordered-parallel-list-chunks parallel-scan-participant-count
+            retrieved->attr retrieved->datom single-attrs? sort-tuples-by-eid
+            sort-tuples-by-val sorted-distinct-tuple-values val-eq-filter-e*
+            val-eq-scan-e* val-eq-scan-e-bound*
+            ;; Resolved here by query-not-test in the sibling test project.
+            #_{:clj-kondo/ignore [:unused-referred-var]}
+            parallel-scan-participant-capacity]]
+   [datalevin.storage.schema :as schemas
+    :refer [init-attrs init-max-aid init-schema load-schema
+            normalize-schema-renames populated-attr? prepare-schema-update
+            resolve-renamed-schema-patches schema-rename-plans
+            schema-update-required? transact-schema update-schema
+            validate-schema-operations]]
+   [datalevin.util :as u :refer [conjv raise]]
+   [datalevin.validate :as vld]
+   [datalevin.vector :as v])
   (:import
-   [java.util ArrayList List Comparator Collection HashMap IdentityHashMap UUID]
-   [java.util.concurrent Callable ForkJoinPool ForkJoinWorkerThread Future
-    TimeUnit ScheduledExecutorService ConcurrentHashMap ScheduledFuture]
+   [java.util List Collection HashMap IdentityHashMap UUID]
+   [java.util.concurrent TimeUnit ScheduledExecutorService ConcurrentHashMap ScheduledFuture]
    [java.util.concurrent.locks ReentrantReadWriteLock]
    [java.nio ByteBuffer]
    [java.lang AutoCloseable]
@@ -66,88 +98,33 @@
    [datalevin.bits Retrieved Indexable]
    [datalevin.lmdb DatomKVTxData]))
 
-(declare with-open-opts close-store-resources! release-shared-local-store!)
-(declare enqueue-secondary-index-work! enqueue-secondary-index-work-if-needed!)
+(declare with-open-opts close-store-resources! release-shared-local-store!
+         enqueue-secondary-index-work! enqueue-secondary-index-work-if-needed!
+         insert-datom delete-datom check load-datoms-with-plan!
+         prepare-embedding-plan prepare-datoms-kv-plan commit-datoms-kv-plan!
+         migrate-attr-values ->SamplingWork e-sample* default-ratio* analyze*
+         apply-schema-update! transfer-current)
+
+;; Retain the existing entry points for storage callers.
+(def attr-tuples schemas/attr-tuples)
+(def schema->rschema schemas/schema->rschema)
+(def e-aid-v->datom scans/e-aid-v->datom)
+(def fulltext-index indexing/fulltext-index)
+(def vector-index indexing/vector-index)
+(def embedding-index indexing/embedding-index)
+(def idoc-index indexing/idoc-index)
+(def vpred scans/vpred)
+
+;; Retain interned helpers used by server code and sibling tests.
+(def ^:private existing-store? options/existing-store?)
+(def ^:private load-opts options/load-opts)
+(def ^:private propagate-top-level-txlog-opts-to-kv-opts
+  options/propagate-top-level-txlog-opts-to-kv-opts)
+(def ^:private transact-opts options/transact-opts)
 
 (def ^:dynamic ^:no-doc *enforce-blind-unique-inserts?* false)
 
-(def ^:private async-secondary-index-option-keys
-  #{:async-secondary-index-worker-max-jobs
-    :async-secondary-index-worker-lease-ms
-    :async-secondary-index-retry-base-ms
-    :async-secondary-index-retry-max-ms})
-
-(defn- apply-option-mutations
-  [opts kvs]
-  (when-not (map? kvs)
-    (raise "Option mutations must be a map" {:value kvs}))
-  (reduce-kv
-   (fn [m k v]
-     (let [k' (c/canonical-wal-option-key k)]
-       (vld/validate-option-mutation k' v)
-       (-> m
-           (dissoc k)
-           (assoc k' v))))
-   opts
-   kvs))
-
 (defonce ^:private shared-local-stores (atom {}))
-
-(defn- patch-attr-schema
-  [old-props property-patch]
-  (reduce-kv
-    (fn [props k v]
-      (cond
-        ;; Attribute IDs are allocated and owned by storage. Ignoring incoming
-        ;; IDs makes the result of `schema` safe to reuse as schema input.
-        (identical? k :db/aid) props
-
-        ;; A schema property is removed only when explicitly retracted.
-        (identical? v :db/retract) (dissoc props k)
-
-        :else (assoc props k v)))
-    (or old-props {})
-    property-patch))
-
-(defn- apply-schema-patch
-  [old-schema schema-update]
-  (reduce-kv
-    (fn [updates attr property-patch]
-      (assoc updates attr
-             (patch-attr-schema (old-schema attr) property-patch)))
-    {}
-    (or schema-update {})))
-
-(defn- infer-tuple-attr-types
-  "Add typed tuple encoding to composite attributes whose schema only declares
-  :db/tupleAttrs. Component types come from the source attributes. Attributes
-  with untyped or non-scalar sources retain the legacy :data encoding until
-  those source types are declared."
-  [old-schema schema-update]
-  (let [full-schema (merge old-schema schema-update)]
-    (reduce-kv
-      (fn [updates attr props]
-        (if (and (sequential? (:db/tupleAttrs props))
-                 (not (contains? props :db/tupleType))
-                 (not (contains? props :db/tupleTypes)))
-          (let [types (mapv #(get-in full-schema [% :db/valueType])
-                            (:db/tupleAttrs props))]
-            (if (and (< 1 (count types))
-                     (every? c/tuple-value-types types))
-              (assoc updates attr
-                     (assoc props
-                            :db/valueType :db.type/tuple
-                            :db/tupleTypes types))
-              updates))
-          updates))
-      (or schema-update {})
-      full-schema)))
-
-(defn- prepare-schema-update
-  [old-schema schema-update]
-  (vld/validate-schema-update schema-update)
-  (infer-tuple-attr-types
-    old-schema (apply-schema-patch old-schema schema-update)))
 
 (defn- shared-local-store-key
   [dir]
@@ -164,134 +141,6 @@
             (swap! shared-local-stores dissoc dir-key)
             nil)
           store)))))
-
-(defn- attr->properties [k v]
-  (case v
-    :db.unique/identity  [:db/unique :db.unique/identity]
-    :db.unique/value     [:db/unique :db.unique/value]
-    :db.cardinality/many [:db.cardinality/many]
-    (case k
-      :db/tupleAttrs [:db.type/tuple :db/tupleAttrs]
-      :db/tupleType  [:db.type/tuple :db/tupleType]
-      :db/tupleTypes [:db.type/tuple :db/tupleTypes]
-      (cond
-        (and (identical? :db/valueType k)
-             (identical? :db.type/ref v)) [:db.type/ref]
-        (and (identical? :db/isComponent k)
-             (true? v))                   [:db/isComponent]
-        (and (identical? :db.attr/preds k)
-             (some? v))                   [:db.attr/preds]
-        :else                             []))))
-
-(defn attr-tuples
-  "e.g. :reg/semester => #{:reg/semester+course+student ...}"
-  [schema rschema]
-  (reduce
-    (fn [m tuple-attr] ;; e.g. :reg/semester+course+student
-      (u/reduce-indexed
-        (fn [m src-attr idx] ;; e.g. :reg/semester
-          (update m src-attr assoc tuple-attr idx))
-        m ((schema tuple-attr) :db/tupleAttrs)))
-    {} (rschema :db/tupleAttrs)))
-
-(defn schema->rschema
-  ":db/unique           => #{attr ...}
-   :db.unique/identity  => #{attr ...}
-   :db.unique/value     => #{attr ...}
-   :db.cardinality/many => #{attr ...}
-   :db.type/ref         => #{attr ...}
-   :db/isComponent      => #{attr ...}
-   :db.attr/preds       => #{attr ...}
-   :db.type/tuple       => #{attr ...}
-   :db/tupleAttr        => #{attr ...}
-   :db/tupleType        => #{attr ...}
-   :db/tupleTypes       => #{attr ...}
-   :db/attrTuples       => {attr => {tuple-attr => idx}}"
-  [schema]
-  (let [rschema (reduce-kv
-                  (fn [rschema attr attr-schema]
-                    (reduce-kv
-                      (fn [rschema key value]
-                        (reduce
-                          (fn [rschema prop]
-                            (update rschema prop conjs attr))
-                          rschema (attr->properties key value)))
-                      rschema attr-schema))
-                  {} schema)]
-    (assoc rschema :db/attrTuples (attr-tuples schema rschema))))
-
-(defn- transact-schema
-  [lmdb schema]
-  (transact-kv
-    lmdb
-    (conj (for [[attr props] schema]
-            (lmdb/kv-tx :put c/schema attr props :attr :data))
-          (lmdb/kv-tx :put c/meta :last-modified
-                      (System/currentTimeMillis) :attr :long))))
-
-(defn- load-schema
-  [lmdb]
-  (into {} (get-range lmdb c/schema [:all] :attr :data)))
-
-(defn- init-max-aid
-  [schema]
-  (inc ^long (apply max (map :db/aid (vals schema)))))
-
-(defn- update-schema
-  [old schema]
-  (let [^long init-aid (init-max-aid old)
-        i              (volatile! 0)]
-    (into {}
-          (map (fn [[attr props]]
-                 (if-let [old-props (old attr)]
-                   [attr (assoc props :db/aid (old-props :db/aid))]
-                   (let [res [attr (assoc props :db/aid (+ init-aid ^long @i))]]
-                     (vswap! i u/long-inc)
-                     res))))
-          schema)))
-
-(defn- effective-schema-update
-  [old schema]
-  (into {}
-        (map (fn [[attr props]]
-               [attr (if-let [old-props (old attr)]
-                       (assoc props :db/aid (old-props :db/aid))
-                       props)]))
-        schema))
-
-(defn- schema-update-required?
-  [old schema]
-  (boolean
-    (some (fn [[attr props]]
-            (not= (old attr) props))
-          (effective-schema-update old schema))))
-
-(defn- init-schema
-  [lmdb schema]
-  (let [now     (load-schema lmdb)
-        missing (reduce-kv
-                  (fn [acc attr props]
-                    (if (contains? now attr) acc (assoc acc attr props)))
-                  {} c/implicit-schema)]
-    (cond
-      (empty? now)
-      (transact-schema lmdb c/implicit-schema)
-
-      (seq missing)
-      (transact-schema lmdb (update-schema now missing))))
-  (when schema
-    (let [old-schema   (load-schema lmdb)
-          schema       (prepare-schema-update old-schema schema)
-          full-schema  (merge old-schema schema)]
-      (vld/validate-schema full-schema)
-      (cd/validate-schema! lmdb full-schema)
-      (cd/initialize! lmdb full-schema)
-      (when (schema-update-required? old-schema schema)
-        (transact-schema lmdb (update-schema old-schema schema)))))
-  (cd/initialize! lmdb (load-schema lmdb)))
-
-(defn- init-attrs [schema]
-  (into {} (map (fn [[k v]] [(v :db/aid) k])) schema))
 
 (defn- ^:redef init-max-gt
   [lmdb]
@@ -320,255 +169,9 @@
          (kv/transact-kv-without-txlog! lmdb tx-data)
          (transact-kv lmdb tx-data))))))
 
-(defn e-aid-v->datom
-  [store e-aid-v]
-  (d/datom (nth e-aid-v 0) ((attrs store) (nth e-aid-v 1)) (peek e-aid-v)))
-
-(defn- retrieved->attr [attrs ^Retrieved r] (attrs (.-a r)))
-
-(defn- kv->datom
-  [lmdb attrs ^long k ^Retrieved v]
-  (let [g (.-g v)]
-    (if (= g c/normal)
-      (d/datom k (attrs (.-a v)) (retrieved->v lmdb v))
-      (gt->datom lmdb g))))
-
-(defn- retrieved->datom
-  [lmdb attrs [k v :as kv]]
-  (when kv
-    (if (integer? k)
-      (let [r ^Retrieved v]
-        (if (.-g r)
-          (kv->datom lmdb attrs k r)
-          (d/datom (.-e r) (attrs (.-a r)) k)))
-      (kv->datom lmdb attrs v k))))
-
-(defn- datom-pred->kv-pred
-  [lmdb attrs index pred]
-  (fn [kv]
-    (let [k (b/read-buffer (lmdb/k kv) (index->ktype index))
-          v (b/read-buffer (lmdb/v kv) (index->vtype index))]
-      (pred (retrieved->datom lmdb attrs [k v])))))
-
-(defn- av-entities [lmdb schema a v]
-  (let [props (schema a)
-        vt (idx/storage-type lmdb props)]
-    (if (map? vt)
-      (cd/exact-entities lmdb (:db/aid props) vt v)
-      (get-list lmdb c/ave (datom->indexable lmdb schema (d/datom c/e0 a v) false)
-                :avg :id))))
-
-(defn- ave-key-range
-  [aid vt val-range]
-  (let [[[cl lv] [ch hv]] val-range
-        op                (cond
-                            (and (identical? cl :closed)
-                                 (identical? ch :closed)) :closed
-                            (identical? ch :closed)       :open-closed
-                            (identical? cl :closed)       :closed-open
-                            :else                         :open)]
-    (if (map? vt)
-      [:closed
-       (b/indexable nil aid lv vt (if (= cl :closed) cv/min-id cv/max-id))
-       (b/indexable nil aid hv vt (if (= ch :closed) cv/max-id cv/min-id))]
-      [op (b/indexable nil aid lv vt c/gmax) (b/indexable nil aid hv vt c/gmax)])))
-
-(defn- ave-tuples-scan*
-  [lmdb aid vt val-ranges sample-indices work]
-  (doseq [val-range val-ranges]
-    (let [[[cl lv] [ch hv]] val-range
-          ;; Query equality is represented as a closed singleton range. The
-          ;; order bucket alone cannot decide complete-value equality.
-          work (if (map? vt)
-                 (fn [entry]
-                   (let [entry (cd/copy-kv entry)]
-                     (when (or (not (and (= cl ch :closed) (= lv hv)))
-                               (= lv (idx/avg-buffer->v lmdb (lmdb/k entry))))
-                       (work entry))))
-                 work)]
-      (if sample-indices
-        (visit-list-sample
-         lmdb c/ave sample-indices work (ave-key-range aid vt val-range) :avg :id)
-        (visit-list-key-range
-         lmdb c/ave work (ave-key-range aid vt val-range) :avg :id)))))
-
-(defn- ave-tuples-scan-need-v
-  [lmdb ^Collection out aid vt val-ranges sample-indices]
-  (ave-tuples-scan*
-    lmdb aid vt val-ranges sample-indices
-    (fn [kv]
-      (let [e (.getLong ^ByteBuffer (lmdb/v kv) 0)
-            v (idx/avg-buffer->v lmdb (lmdb/k kv))]
-        (.add out (object-array [e v]))))))
-
-(defn- ave-tuples-scan-need-v-vpred
-  [lmdb ^Collection out vpred aid vt val-ranges sample-indices]
-  (ave-tuples-scan*
-    lmdb aid vt val-ranges sample-indices
-    (fn [kv]
-      (let [v (idx/avg-buffer->v lmdb (lmdb/k kv))]
-        (when (vpred v)
-          (.add out (object-array [(.getLong ^ByteBuffer (lmdb/v kv) 0)
-                                  v])))))))
-
-(defn- ave-tuples-scan-no-v
-  [lmdb ^Collection out aid vt val-ranges sample-indices]
-  (ave-tuples-scan*
-    lmdb aid vt val-ranges sample-indices
-    (fn [kv]
-      (.add out (object-array [(.getLong ^ByteBuffer (lmdb/v kv) 0)])))))
-
-(defn- ave-tuples-scan-no-v-vpred
-  [lmdb ^Collection out vpred aid vt val-ranges sample-indices]
-  (ave-tuples-scan*
-    lmdb aid vt val-ranges sample-indices
-    (fn [kv]
-      (let [v (idx/avg-buffer->v lmdb (lmdb/k kv))]
-        (when (vpred v)
-          (.add out (object-array [(.getLong ^ByteBuffer (lmdb/v kv) 0)])))))))
-
-(defn- sort-tuples-by-eid
-  [^List tuples ^long eid-idx]
-  (doto tuples
-    (.sort (reify Comparator
-             (compare [_ a b]
-               (Long/compare ^long (aget ^objects a eid-idx)
-                             ^long (aget ^objects b eid-idx)))))))
-
-(defn- sort-tuples-by-val
-  [^List tuples ^long v-idx vt]
-  (if (or (identical? vt :db.type/ref)
-          (identical? vt :db.type/long))
-    (sort-tuples-by-eid tuples v-idx)
-    (doto tuples
-      (.sort (reify Comparator
-               (compare [_ a b]
-                 (d/compare-with-type (aget ^objects a v-idx)
-                                      (aget ^objects b v-idx))))))))
-
-(defn- sorted-distinct-tuple-values
-  ^long [^List tuples ^long value-idx]
-  (let [n (.size tuples)]
-    (if (zero? n)
-      0
-      (loop [i          (long 1)
-             last-value (aget ^objects (.get tuples 0) value-idx)
-             total      (long 1)]
-        (if (== i n)
-          total
-          (let [value (aget ^objects (.get tuples (int i)) value-idx)]
-            (if (== 0 (long (d/compare-with-type value last-value)))
-              (recur (u/long-inc i) last-value total)
-              (recur (u/long-inc i) value (u/long-inc total)))))))))
-
-(def ^:private ^:const parallel-scan-target-chunk-size 4000)
-
 (def ^:dynamic *parallel-list-scan?*
   "Whether a list storage operation may create its own parallel scan chunks."
   true)
-
-(defn- eav-filter-presence-chunk
-  [lmdb ^List in eid-idx aid]
-  (let [out      (FastList. (.size in))
-        dbi-name c/eav]
-    (scan/scan lmdb dbi-name
-      (cpp/filter-list-id-int-prefix! rtx cur in eid-idx aid out)
-      (raise "Fail to filter EAV attribute presence: " e
-               {:eid-idx eid-idx :aid aid}))))
-
-(defn- ave-filter-bound-id-chunk
-  [lmdb ^List in value-idx aid value-type bound-id]
-  (let [out      (FastList. (.size in))
-        dbi-name c/ave]
-    (scan/scan lmdb dbi-name
-      (if (map? value-type)
-        (do
-          (doseq [^objects tuple in]
-            (when (some #{bound-id} (cd/exact-entities lmdb aid value-type (aget tuple value-idx)))
-              (.add out (r/conj-tuple tuple (long bound-id)))))
-          out)
-        (cpp/filter-list-avg-bound-id!
-          rtx cur in value-idx aid value-type bound-id out))
-      (raise "Fail to filter AVE by bound entity: " e
-               {:value-idx value-idx :aid aid :bound-id bound-id}))))
-
-(defn- ave-filter-tuple-id-chunk
-  [lmdb ^List in value-idx entity-idx aid value-type]
-  (let [out      (FastList. (.size in))
-        dbi-name c/ave]
-    (scan/scan lmdb dbi-name
-      (if (map? value-type)
-        (do
-          (doseq [^objects tuple in]
-            (when (some #{(aget tuple entity-idx)}
-                        (cd/exact-entities lmdb aid value-type (aget tuple value-idx)))
-              (.add out tuple)))
-          out)
-        (cpp/filter-list-avg-tuple-id!
-          rtx cur in value-idx entity-idx aid value-type out))
-      (raise "Fail to filter AVE by tuple entity: " e
-               {:value-idx value-idx :entity-idx entity-idx :aid aid}))))
-
-(defn- parallel-scan-participant-capacity
-  ^long [^long n ^long cpu-count ^long pool-slots]
-  (let [cpu-capacity      (max 1 cpu-count)
-        executor-capacity (inc (max 0 pool-slots))
-        useful-work       (max
-                            1
-                            (quot (+ n
-                                     (dec parallel-scan-target-chunk-size))
-                                  parallel-scan-target-chunk-size))]
-    (long (min cpu-capacity executor-capacity useful-work))))
-
-(defn- parallel-scan-participant-count
-  ^long [^long n]
-  (let [^ForkJoinPool pool (ForkJoinPool/commonPool)
-        ^Thread thread    (Thread/currentThread)
-        parallelism      (long (.getParallelism pool))
-        pool-slots       (if (and (instance? ForkJoinWorkerThread thread)
-                                  (identical?
-                                    pool
-                                    (.getPool ^ForkJoinWorkerThread thread)))
-                           (max 0 (dec parallelism))
-                           parallelism)]
-    (parallel-scan-participant-capacity
-      n (.availableProcessors (Runtime/getRuntime)) pool-slots)))
-
-(defn- ordered-parallel-list-chunks
-  [^List in ^long requested-participants f]
-  (let [n            (.size in)
-        participants (long (max 1 (min requested-participants (max 1 n))))]
-    (if (== 1 participants)
-      (f in)
-      (let [^ForkJoinPool pool (ForkJoinPool/commonPool)
-            bindings          (get-thread-bindings)
-            futures           (ArrayList. (dec participants))]
-        (dotimes [offset (dec participants)]
-          (let [i     (inc offset)
-                start (quot (* i n) participants)
-                end   (quot (* (inc i) n) participants)
-                chunk (.subList in (int start) (int end))]
-            (.add futures
-                  (.submit
-                    pool
-                    ^Callable
-                    (reify Callable
-                      (call [_]
-                        (with-bindings bindings
-                          (f chunk))))))))
-        (try
-          (let [first-end   (quot n participants)
-                first-chunk (.subList in 0 (int first-end))
-                out         (FastList. n)]
-            (.addAll out ^Collection (f first-chunk))
-            (dotimes [i (.size futures)]
-              (.addAll out ^Collection
-                       (.get ^Future (.get futures i))))
-            out)
-          (catch Throwable e
-            (dotimes [i (.size futures)]
-              (.cancel ^Future (.get futures i) true))
-            (throw e)))))))
 
 (defn- scan-list-in-chunks
   ([lmdb ^List in f]
@@ -605,171 +208,6 @@
       (ave-filter-tuple-id-chunk
         lmdb chunk value-idx entity-idx aid value-type))))
 
-(defn- group-counts
-  [aids]
-  (sequence (comp (partition-by identity) (map count)) aids))
-
-(defn- group-starts
-  [counts]
-  (int-array (->> counts (reductions +) butlast (into [0]))))
-
-(defn- eav-scan-v-single*
-  [lmdb iter na nvs ^Collection out ^objects tuple eid-idx
-   ^LongObjectHashMap seen ^ints aids ^objects preds ^objects fidxs
-   ^booleans skips]
-  (let [te ^long (aget tuple eid-idx)
-        ts (when seen (.get seen te))]
-    (if ts
-      (if (identical? ts :skip)
-        (.add out tuple)
-        (.add out (r/join-tuples tuple ts)))
-      (let [vs (object-array (int nvs))]
-        (loop [next? (lmdb/seek-key iter te :id)
-               ai    0
-               vi    0]
-          (if (and next? (< ^long ai ^long na))
-            (let [vb ^ByteBuffer (lmdb/next-val iter)
-                  a  (.getInt vb 0)]
-              (if (== ^int a ^int (aget aids ai))
-                (let [v    (idx/avg-buffer->v lmdb vb)
-                      pred (aget preds ai)
-                      fidx (aget fidxs ai)]
-                  (if (and (or (nil? pred) (pred v))
-                           (or (nil? fidx) (= v (aget tuple (int fidx)))))
-                    (if (aget skips ai)
-                      (recur (lmdb/has-next-val iter) (u/long-inc ai) vi)
-                      (do (aset vs (int vi) v)
-                          (recur (lmdb/has-next-val iter) (u/long-inc ai)
-                                 (u/long-inc vi))))
-                    :reject))
-                (recur (lmdb/has-next-val iter) ai vi)))
-            (when (== ^long ai ^long na)
-              (if (zero? ^long nvs)
-                (do (when seen (.put seen te :skip))
-                    (.add out tuple))
-                (do (when seen (.put seen te vs))
-                    (.add out (r/join-tuples tuple vs)))))))))))
-
-(defn- eav-scan-v-multi*
-  [lmdb iter na ^Collection out ^objects tuple eid-idx
-   ^LongObjectHashMap seen ^ints aids ^objects preds ^objects fidxs
-   ^booleans skips ^ints gstarts ^ints gcounts]
-  (let [te ^long (aget tuple eid-idx)
-        ts (when seen (.get seen te))]
-    (if ts
-      (.addAll out (r/prod-tuples (r/single-tuples tuple) ts))
-      (let [vs (object-array na)
-            fa ^int (aget aids 0)
-            la ^int (aget aids (dec ^long na))]
-        (dotimes [i na] (aset vs i (FastList.)))
-        (loop [next? (lmdb/seek-key iter te :id)
-               gi    0
-               pa    (int (aget aids 0))
-               in?   false]
-          (when next?
-            (let [vb ^ByteBuffer (lmdb/next-val iter)
-                  a  (.getInt vb 0)]
-              (cond
-                (neg? (Integer/compare a fa))
-                (recur (lmdb/has-next-val iter) gi pa false)
-                (not (pos? (Integer/compare a la)))
-                (let [gi (if (== pa ^int a)
-                           gi
-                           (if in? (inc gi) gi))
-                      s  (aget gstarts gi)]
-                  (if (== ^int a ^int (aget aids s))
-                    (let [v (idx/avg-buffer->v lmdb vb)]
-                      (dotimes [i (aget gcounts gi)]
-                        (let [aj   (+ s i)
-                              pred (aget preds aj)
-                              fidx (aget fidxs aj)]
-                          (when (and (or (nil? pred) (pred v))
-                                     (or (nil? fidx)
-                                         (= v (aget tuple (int fidx)))))
-                            (.add ^FastList (aget vs aj) v))))
-                      (recur (lmdb/has-next-val iter) gi (int a) true))
-                    (recur (lmdb/has-next-val iter) gi pa false)))
-                :else :done))))
-        (when-not (some #(.isEmpty ^FastList %) vs)
-          (let [vst (r/many-tuples (sequence
-                                     (comp (map (fn [v s] (when-not s v)))
-                                        (remove nil?))
-                                     vs skips))]
-            (when seen (.put seen te vst))
-            (.addAll out (r/prod-tuples (r/single-tuples tuple)
-                                        vst))))))))
-
-(defn- val-eq-scan-e*
-  [lmdb iter ^Collection out tuple ^HashMap seen aid v vt]
-  (if-let [ts (.get seen v)]
-    (when-not (identical? ts :no-result)
-      (.addAll out (r/prod-tuples (r/single-tuples tuple) ts)))
-    (let [ts (FastList.)]
-      (if (map? vt)
-        (doseq [e (cd/exact-entities lmdb aid vt v)] (.add ts (object-array [e])))
-        (visit-list* iter
-                     (fn [^ByteBuffer vb]
-                       (.add ts (object-array [(.getLong vb 0)])))
-                     (b/indexable nil aid v vt nil) :avg vt true))
-      (if (.isEmpty ts)
-        (.put seen v :no-result)
-        (do (.put seen v ts)
-            (.addAll out (r/prod-tuples (r/single-tuples tuple) ts)))))))
-
-(defn- val-eq-scan-e-bound*
-  [lmdb rtx cur ^Collection out tuple aid v vt bound]
-  (when (if (map? vt)
-          (some #{bound} (cd/exact-entities lmdb aid vt v))
-          (cpp/list-avg-id? rtx cur aid v vt bound))
-    (.add out (r/conj-tuple tuple (long bound)))))
-
-(defn- val-eq-filter-e*
-  [lmdb rtx cur ^Collection out tuple aid v vt old-e]
-  (when (if (map? vt)
-          (some #{old-e} (cd/exact-entities lmdb aid vt v))
-          (cpp/list-avg-id? rtx cur aid v vt old-e))
-    (.add out tuple)))
-
-(defn- single-attrs?
-  [schema attrs-v]
-  (let [attrs (mapv first attrs-v)]
-    (and (apply distinct? attrs)
-         (not-any? #(identical? (-> % schema :db/cardinality)
-                                :db.cardinality/many)
-                   attrs))))
-
-(defn- eav-scan-v-list-chunk
-  [lmdb ^List in eid-idx attrs-v single? na nvs ^ints aids ^objects preds
-   ^objects fidxs ^booleans skips cache-eids? ^ints gstarts ^ints gcounts]
-  (let [nt       (.size in)
-        out      (FastList. nt)
-        seen     (when cache-eids? (LongObjectHashMap. nt))
-        preds    (qpred/fork-predicates preds)
-        dbi-name c/eav]
-    (scan/scan lmdb dbi-name
-      (with-open [^AutoCloseable iter
-                  (lmdb/val-iterator
-                    (lmdb/iterate-list-val-full dbi rtx cur))]
-        (if single?
-          (dotimes [i nt]
-            (eav-scan-v-single*
-              lmdb iter na nvs out (.get in i) eid-idx seen aids preds fidxs
-              skips))
-          (dotimes [i nt]
-            (eav-scan-v-multi*
-              lmdb iter na out (.get in i) eid-idx seen aids preds fidxs skips
-              gstarts gcounts))))
-      (raise "Fail to eav-scan-v: " e
-               {:eid-idx eid-idx :attrs-v attrs-v}))
-    out))
-
-(defn- ea->avg-buffer
-  [schema lmdb e a]
-  (when-let [aid (:db/aid (schema a))]
-    (when-let [^ByteBuffer bf (near-list lmdb c/eav e aid :id :int)]
-      (when (= ^int aid (.getInt bf 0))
-        bf))))
-
 (defprotocol IStateSync
   (mark-state-current! [this last-modified-ms])
   (observed-state-sync-ms [this])
@@ -782,17 +220,6 @@
   (if (satisfies? IStateSync this)
     (ensure-current! this)
     this))
-
-(declare insert-datom delete-datom fulltext-index vector-index embedding-index
-         idoc-index check
-         load-datoms-with-plan! prepare-embedding-plan
-         prepare-datoms-kv-plan
-         commit-datoms-kv-plan!
-         ensure-embedding-vector!
-         migrate-attr-values transact-opts ->SamplingWork e-sample*
-         default-ratio* analyze*
-         init-idoc-domains init-idoc-indices
-         apply-schema-update! transfer-current)
 
 (defn- merge-missing-idoc-indices
   [lmdb idoc-indices schema opts]
@@ -1646,314 +1073,6 @@
                   (.put adjacency k values))))))))
     adjacency))
 
-(defn- op-ref
-  "Extract the document reference from a fulltext or idoc index operation."
-  [op]
-  (let [kind (nth op 0)
-        d    (nth op 1)]
-    (case kind
-      ;; Keep e and aid in giant refs so projected reads need not load the value.
-      (:g :r) [:g (nth d 2) (nth d 0) (nth d 1)]
-      (:a :d) d)))
-
-(defn- apply-fulltext-op!
-  [search-engines res]
-  (let [op (peek res)
-        d  (nth op 1)
-        ref (op-ref op)]
-    (doseq [domain (nth res 0)
-            :let   [engine (search-engines domain)]]
-      (case (nth op 0)
-        (:a :g) (add-doc engine ref (peek d) false)
-        (:d :r) (remove-doc engine ref)))))
-
-(defn- fulltext-entry
-  [ref text]
-  (let [entry (object-array 2)]
-    (aset entry 0 ref)
-    (aset entry 1 text)
-    entry))
-
-(defn- fulltext-op-entry
-  [kind ref text]
-  (let [entry (object-array 3)]
-    (aset entry 0 kind)
-    (aset entry 1 ref)
-    (aset entry 2 text)
-    entry))
-
-(def ^:private ^:const max-fulltext-batch-size 1024)
-
-(defn- add-fulltext-batches!
-  [engine ^FastList entries]
-  (let [n (long (.size entries))]
-    (loop [start (long 0)]
-      (when (< start n)
-        (let [end (long (min n (+ start max-fulltext-batch-size)))]
-          (s/add-docs engine (.subList entries (int start) (int end)))
-          (recur end))))))
-
-(defn- transact-fulltext-batches!
-  [engine ^FastList entries]
-  (let [n (long (.size entries))]
-    (loop [start (long 0)]
-      (when (< start n)
-        (let [end (long (min n (+ start max-fulltext-batch-size)))]
-          (s/transact-docs engine (.subList entries (int start) (int end)))
-          (recur end))))))
-
-(defn fulltext-index
-  [search-engines ft-ds]
-  (let [^FastList ft-ds ft-ds
-        n               (.size ft-ds)]
-    (if (= n 1)
-      (apply-fulltext-op! search-engines (.get ft-ds 0))
-      (let [add-only? (loop [idx 0]
-                        (if (< idx n)
-                          (let [op   (peek (.get ft-ds idx))
-                                kind (nth op 0)]
-                            (if (or (identical? kind :a)
-                                    (identical? kind :g))
-                              (recur (unchecked-inc-int idx))
-                              false))
-                          true))]
-        (if add-only?
-          (let [batches (IdentityHashMap.)]
-            (doseq [res    ft-ds
-                    :let   [op   (peek res)
-                            d    (nth op 1)]
-                    domain (nth res 0)
-                    :let   [engine (search-engines domain)
-                            ^FastList entries
-                            (or (.get batches engine)
-                                (let [entries (FastList.)]
-                                  (.put batches engine entries)
-                                  entries))]]
-              (.add entries
-                    (fulltext-entry
-                      (op-ref op)
-                      (peek d))))
-            (doseq [[engine entries] batches]
-              (add-fulltext-batches! engine entries)))
-          (let [batches (IdentityHashMap.)]
-            (doseq [res    ft-ds
-                    :let   [op   (peek res)
-                            d    (nth op 1)
-                            kind (nth op 0)]
-                    domain (nth res 0)
-                    :let   [engine (search-engines domain)
-                            ^FastList entries
-                            (or (.get batches engine)
-                                (let [entries (FastList.)]
-                                  (.put batches engine entries)
-                                  entries))]]
-              (.add entries
-                    (case kind
-                      :a (fulltext-op-entry :add d (peek d))
-                      :d (fulltext-op-entry :delete d nil)
-                      :g (fulltext-op-entry :add (op-ref op)
-                                            (peek d))
-                      :r (fulltext-op-entry :delete (op-ref op)
-                                            nil))))
-            (doseq [[engine entries] batches]
-              (transact-fulltext-batches! engine entries))))))))
-
-(defn- apply-vector-op!
-  [vector-indices res]
-  (let [op (peek res)
-        d  (nth op 1)]
-    (doseq [domain (nth res 0)
-            :let   [index (vector-indices domain)]]
-      (case (nth op 0)
-        :a (add-vec index d (peek d))
-        :d (remove-vec index d)
-        :g (add-vec index [:g (nth d 2) (nth d 0) (nth d 1)] (peek d))
-        :r (remove-vec index [:g (nth d 2) (nth d 0) (nth d 1)])))))
-
-(defn- vector-entry
-  [ref value]
-  (let [entry (object-array 2)]
-    (aset entry 0 ref)
-    (aset entry 1 value)
-    entry))
-
-(defn vector-index
-  [vector-indices vi-ds]
-  (let [^FastList vi-ds vi-ds
-        n               (.size vi-ds)]
-    (if (= n 1)
-      (apply-vector-op! vector-indices (.get vi-ds 0))
-      (let [add-only? (loop [idx 0]
-                        (if (< idx n)
-                          (let [op   (peek (.get vi-ds idx))
-                                kind (nth op 0)]
-                            (if (or (identical? kind :a)
-                                    (identical? kind :g))
-                              (recur (unchecked-inc-int idx))
-                              false))
-                          true))]
-        (if add-only?
-          (let [batches (IdentityHashMap.)]
-            (doseq [res    vi-ds
-                    :let   [op   (peek res)
-                            d    (nth op 1)
-                            kind (nth op 0)]
-                    domain (nth res 0)
-                    :let   [index   (vector-indices domain)
-                            ^FastList entries
-                            (or (.get batches index)
-                                (let [entries (FastList.)]
-                                  (.put batches index entries)
-                                  entries))]]
-              (.add entries (vector-entry
-                             (if (identical? kind :g)
-                               [:g (nth d 2) (nth d 0) (nth d 1)]
-                               d)
-                             (peek d))))
-            (doseq [[index entries] batches]
-              (v/add-vecs index entries)))
-          (doseq [res vi-ds]
-            (apply-vector-op! vector-indices res)))))))
-
-(defn embedding-index
-  [embedding-indices em-ds]
-  (doseq [res em-ds
-          :let [[domain op] res
-                index       (embedding-indices domain)]]
-    (case (nth op 0)
-      :a (let [[doc-ref vec-data] (nth op 1)]
-           (add-vec index doc-ref vec-data))
-      :d (remove-vec index (nth op 1)))))
-
-(defn- plan-idoc-update!
-  [index txs state-actions pending-paths pending-doc-ids old-op new-op]
-  (let [old-d   (nth old-op 1)
-        new-d   (nth new-op 1)
-        old-ref (op-ref old-op)
-        new-ref (op-ref new-op)
-        old-doc (peek old-d)
-        new-doc (peek new-d)
-        patch   (some-> (meta new-op) :idoc/patch)
-        res     (if patch
-                  (idoc/patch-doc-plan!
-                    index txs state-actions
-                    pending-paths pending-doc-ids
-                    old-ref old-doc new-ref new-doc patch)
-                  (idoc/update-doc-plan!
-                    index txs state-actions
-                    pending-paths pending-doc-ids
-                    old-ref old-doc new-ref new-doc))]
-    (when (= res :doc-missing)
-      (idoc/remove-doc-plan! index txs state-actions
-                             pending-paths pending-doc-ids
-                             old-ref old-doc)
-      (idoc/add-doc-plan! index txs state-actions
-                          pending-paths pending-doc-ids
-                          new-ref new-doc false))))
-
-(defn- fast-idoc-update!
-  [idoc-indices ^FastList id-ds txs state-actions]
-  (when (= 2 (.size id-ds))
-    (let [res0    (.get id-ds 0)
-          res1    (.get id-ds 1)
-          domain0 (nth res0 0)
-          domain1 (nth res1 0)
-          op0     (peek res0)
-          op1     (peek res1)
-          kind0   (nth op0 0)
-          kind1   (nth op1 0)
-          [old-op new-op]
-          (cond
-            (and (or (identical? kind0 :d) (identical? kind0 :r))
-                 (or (identical? kind1 :a) (identical? kind1 :g)))
-            [op0 op1]
-
-            (and (or (identical? kind1 :d) (identical? kind1 :r))
-                 (or (identical? kind0 :a) (identical? kind0 :g)))
-            [op1 op0])]
-      (when (and old-op
-                 (= domain0 domain1)
-                 (let [old-d (nth old-op 1)
-                       new-d (nth new-op 1)]
-                   (and (= (nth old-d 0) (nth new-d 0))
-                        (= (nth old-d 1) (nth new-d 1)))))
-        (let [index (idoc-indices domain0)]
-          (plan-idoc-update! index txs state-actions
-                              (HashMap.) (HashMap.) old-op new-op))
-        true))))
-
-(defn idoc-index
-  [idoc-indices id-ds txs]
-  (let [state-actions (FastList.)]
-    (if (fast-idoc-update! idoc-indices id-ds txs state-actions)
-      state-actions
-      (let [updates (volatile! {})
-            path-plans (IdentityHashMap.)
-            doc-plans  (IdentityHashMap.)
-            path-plan  (fn [index]
-                         (or (.get path-plans index)
-                             (let [m (HashMap.)]
-                               (.put path-plans index m)
-                               m)))
-            doc-plan   (fn [index]
-                         (or (.get doc-plans index)
-                             (let [m (HashMap.)]
-                               (.put doc-plans index m)
-                               m)))]
-        (doseq [res  id-ds
-                :let [op     (peek res)
-                      d      (nth op 1)
-                      domain (nth res 0)
-                      kind   (nth op 0)]]
-          (case kind
-            (:a :g)
-            (let [k [(nth d 0) (nth d 1)]]
-              (vswap! updates update-in [domain k :a] (fnil conj []) op))
-            (:d :r)
-            (let [k [(nth d 0) (nth d 1)]]
-              (vswap! updates update-in [domain k :d] (fnil conj []) op))))
-        (doseq [[domain domain-ops] @updates
-                :let         [index (idoc-indices domain)
-                              pending-paths (path-plan index)
-                              pending-doc-ids (doc-plan index)]]
-          (doseq [[_ {:keys [a d]}] domain-ops
-                  :let              [na (count a)
-                                     nd (count d)]]
-            (cond
-              (and (= 1 na) (= 1 nd))
-              (plan-idoc-update! index txs state-actions
-                                  pending-paths pending-doc-ids
-                                  (first d) (first a))
-
-              (and (= 1 na) (zero? nd))
-              (let [op  (first a)
-                    od  (nth op 1)]
-                (idoc/add-doc-plan! index txs state-actions
-                                    pending-paths pending-doc-ids
-                                    (op-ref op) (peek od) false))
-
-              (and (zero? na) (= 1 nd))
-              (let [op  (first d)
-                    od  (nth op 1)]
-                (idoc/remove-doc-plan! index txs state-actions
-                                       pending-paths pending-doc-ids
-                                       (op-ref op) (peek od)))
-
-              :else
-              (let [adds (mapv (fn [op]
-                                 (let [d (nth op 1)]
-                                   [(op-ref op) (peek d)]))
-                               a)
-                    rems (mapv (fn [op]
-                                 (let [d (nth op 1)]
-                                   [(op-ref op) (peek d)]))
-                               d)]
-                (idoc/add-docs-plan! index txs state-actions
-                                     pending-paths pending-doc-ids adds false)
-                (idoc/remove-docs-plan! index txs state-actions
-                                        pending-paths pending-doc-ids rems)))))
-        state-actions))))
-
 (defn e-sample*
   [^Store store a aid]
   (when-not (.closed? store)
@@ -2026,101 +1145,6 @@
 
 (defn- check [store attr old new]
   (vld/validate-schema-mutation store (.-lmdb ^Store store) attr old new))
-
-(defn- validate-schema-operations
-  [schema-update del-attrs rename-map]
-  (vld/validate-schema-update schema-update)
-  (when-not (or (nil? del-attrs)
-                (set? del-attrs)
-                (sequential? del-attrs))
-    (raise "Schema attributes to delete must be a set or sequence"
-             {:error :schema/validation
-              :value del-attrs}))
-  (doseq [attr del-attrs]
-    (when-not (keyword? attr)
-      (raise "Schema attribute to delete must be a keyword"
-               {:error     :schema/validation
-                :attribute attr})))
-  (when-not (or (nil? rename-map) (map? rename-map))
-    (raise "Schema attribute renames must be a map"
-             {:error :schema/validation
-              :value rename-map}))
-  (doseq [[old new] rename-map]
-    (when-not (and (keyword? old) (keyword? new))
-      (raise "Schema rename attributes must be keywords"
-               {:error     :schema/validation
-                :attribute old
-                :target    new}))))
-
-(defn- normalize-schema-renames
-  [rename-map]
-  (let [renames (into {} (remove (fn [[old new]] (= old new))) rename-map)
-        targets (vec (vals renames))]
-    (when-not (= (count targets) (count (set targets)))
-      (raise "Schema rename targets must be unique"
-               {:error      :schema/rename-conflict
-                :rename-map rename-map}))
-    (let [sources (set (keys renames))
-          overlap (set (filter sources targets))]
-      (when (seq overlap)
-        (raise "Schema rename chains and cycles are not supported"
-                 {:error      :schema/rename-conflict
-                  :attributes overlap
-                  :rename-map rename-map})))
-    renames))
-
-(defn- schema-rename-plans
-  [current-schema schema-update renames]
-  (reduce-kv
-    (fn [plans old new]
-      (let [old?       (contains? current-schema old)
-            new?       (contains? current-schema new)
-            patch-old? (contains? schema-update old)]
-        (cond
-          (and old? new?)
-          (raise "Cannot rename attribute: target already exists"
-                   {:error     :schema/rename-conflict
-                    :attribute old
-                    :target    new})
-
-          old?
-          (conj plans {:old old :new new :canonical old :pending? true})
-
-          new?
-          (conj plans {:old old :new new :canonical new :pending? false})
-
-          patch-old?
-          (conj plans {:old old :new new :canonical old :pending? true})
-
-          :else
-          (raise "Cannot rename missing attribute"
-                   {:error     :schema/missing-attribute
-                    :attribute old
-                    :target    new}))))
-    [] renames))
-
-(defn- resolve-renamed-schema-patches
-  [schema-update rename-plans]
-  (let [aliases
-        (reduce
-          (fn [m {:keys [old new canonical]}]
-            (-> m (assoc old canonical) (assoc new canonical)))
-          {} rename-plans)]
-    (reduce-kv
-      (fn [resolved attr property-patch]
-        (let [canonical (get aliases attr attr)]
-          (when (contains? resolved canonical)
-            (raise "Schema patches resolve to the same renamed attribute"
-                     {:error     :schema/rename-conflict
-                      :attribute canonical}))
-          (assoc resolved canonical property-patch)))
-      {} schema-update)))
-
-(defn- populated-attr?
-  [store attr]
-  (populated? store :ave
-              (d/datom c/e0 attr c/v0)
-              (d/datom c/emax attr c/vmax)))
 
 (defn- plan-schema-update
   [^Store store schema-update del-attrs rename-map]
@@ -2303,14 +1327,6 @@
                        :value text})
         (.add ft-ds [[domain] op])))))
 
-(defn- embedding-attr-domains
-  [attr props]
-  (vec
-    (distinct
-      (cond-> (or (seq (props :db.embedding/domains))
-                  [c/default-domain])
-        (props :db.embedding/autoDomain) (conj (v/attr-domain attr))))))
-
 (defn embedding-domain-config
   [^Store store domain]
   (get-in (opts store) [:embedding-domains domain]))
@@ -2351,96 +1367,6 @@
   [^Store store job-id]
   (get-value (.-lmdb store) c/secondary-index-jobs job-id :data :data))
 
-(defn- max-long-value
-  [a b]
-  (if (some? a)
-    (max (long a) (long b))
-    (long b)))
-
-(defn- min-long-value
-  [a b]
-  (if (some? a)
-    (min (long a) (long b))
-    (long b)))
-
-(defn- latest-updated-job
-  [a b]
-  (if (or (nil? a)
-          (< (long (or (:job/updated-ms a) 0))
-             (long (or (:job/updated-ms b) 0))))
-    b
-    a))
-
-(defn- maybe-update-stat
-  [m k f v]
-  (if (some? v)
-    (update m k f v)
-    m))
-
-(defn- secondary-index-status-init
-  []
-  {:total-count 0
-   :pending-count 0
-   :running-count 0
-   :completed-count 0
-   :failed-count 0})
-
-(defn- add-job-to-secondary-index-status
-  [status job]
-  (let [status (update status :total-count (fnil inc 0))
-        tx (:job/tx job)
-        status (maybe-update-stat status :last-enqueued-tx max-long-value tx)]
-    (case (:job/status job)
-      :pending
-      (-> status
-          (update :pending-count (fnil inc 0))
-          (maybe-update-stat :oldest-pending-ms
-                             min-long-value
-                             (:job/created-ms job)))
-
-      :completed
-      (-> status
-          (update :completed-count (fnil inc 0))
-          (maybe-update-stat :last-completed-tx max-long-value tx))
-
-      :running
-      (-> status
-          (update :running-count (fnil inc 0))
-          (maybe-update-stat :oldest-running-ms
-                             min-long-value
-                             (:job/claimed-ms job))
-          (maybe-update-stat :next-lease-ms
-                             min-long-value
-                             (:job/lease-until-ms job)))
-
-      :failed
-      (-> status
-          (update :failed-count (fnil inc 0))
-          (maybe-update-stat :last-failed-tx max-long-value tx)
-          (maybe-update-stat :next-retry-ms
-                             min-long-value
-                             (:job/next-retry-ms job))
-          (update :latest-failed-job latest-updated-job job))
-
-      status)))
-
-(defn- finalize-secondary-index-status
-  [now-ms status]
-  (let [failed-job (:latest-failed-job status)
-        oldest-ms (:oldest-pending-ms status)
-        oldest-running-ms (:oldest-running-ms status)]
-    (cond-> (dissoc status :latest-failed-job)
-      failed-job
-      (assoc :last-error (:job/last-error failed-job))
-
-      oldest-ms
-      (assoc :oldest-pending-age-ms
-             (max 0 (- (long now-ms) (long oldest-ms))))
-
-      oldest-running-ms
-      (assoc :oldest-running-age-ms
-             (max 0 (- (long now-ms) (long oldest-running-ms)))))))
-
 (defn secondary-index-status
   [^Store store]
   (let [jobs (secondary-index-jobs store)
@@ -2466,13 +1392,6 @@
 (defn- update-secondary-index-job!
   [^Store store job]
   (transact-kv (.-lmdb store) [(si/job-tx job)]))
-
-(defn- embedding-job-item
-  [job]
-  {:text (:job/value job)
-   :ref (:job/ref job)
-   :kind :document
-   :domain (:job/domain job)})
 
 (defn- embedding-job-application
   [^Store store job]
@@ -2531,14 +1450,6 @@
                {:op (:job/op job)
                 :job job}))))
 
-(defn- remove-fulltext-doc-idempotently!
-  [engine ref]
-  (try
-    (remove-doc engine ref)
-    (catch clojure.lang.ExceptionInfo e
-      (when-not (= "Document does not exist." (ex-message e))
-        (throw e)))))
-
 (defn- fulltext-job-application
   [^Store store job]
   (let [domain (:job/domain job)
@@ -2584,44 +1495,6 @@
         delay-ms (* base-ms (bit-shift-left 1 exp))]
     (min max-ms delay-ms)))
 
-(defn- due-failed-secondary-index-job?
-  [now-ms job]
-  (and (si/failed-job? job)
-       (<= (long (or (:job/next-retry-ms job) 0))
-           (long now-ms))))
-
-(defn- expired-secondary-index-job-lease?
-  [now-ms job]
-  (and (si/running-job? job)
-       (<= (long (or (:job/lease-until-ms job) 0))
-           (long now-ms))))
-
-(defn- previously-failed-secondary-index-job?
-  [job]
-  (pos? (long (or (:job/attempts job) 0))))
-
-(defn- claimable-secondary-index-job?
-  [now-ms retry-failed? retry-due-only? reclaim-failed-running? job]
-  (or (si/pending-job? job)
-      (expired-secondary-index-job-lease? now-ms job)
-      (and retry-failed?
-           reclaim-failed-running?
-           (si/running-job? job)
-           (previously-failed-secondary-index-job? job))
-      (and retry-failed?
-           (si/failed-job? job)
-           (or (not retry-due-only?)
-               (due-failed-secondary-index-job? now-ms job)))))
-
-(defn- secondary-index-job-matches?
-  [{:keys [tx type domain]} job]
-  (and (or (nil? tx)
-           (<= (long (:job/tx job)) (long tx)))
-       (or (nil? type)
-           (= type (:job/type job)))
-       (or (nil? domain)
-           (= domain (:job/domain job)))))
-
 (defn- claim-secondary-index-job!
   [^Store store job owner lease-ms retry-failed? retry-due-only?
    reclaim-failed-running?]
@@ -2639,11 +1512,6 @@
                                         now-ms)]
             (update-secondary-index-job! store claimed)
             claimed))))))
-
-(defn- claimed-secondary-index-job?
-  [job owner]
-  (and (si/running-job? job)
-       (= owner (:job/lease-owner job))))
 
 (defn- complete-claimed-secondary-index-job!
   [^Store store job owner apply-job!]
@@ -2841,47 +1709,6 @@
   (when (some si/unfinished-job? (secondary-index-jobs store))
     (enqueue-secondary-index-work! store))
   store)
-
-(declare provider-spec-for-domain)
-
-(def ^:private persisted-embedding-space-keys
-  #{:dimensions :embedding-metadata})
-
-(defn- runtime-provider-space
-  [dir runtime-providers domain domain-opts]
-  (let [provider-spec (provider-spec-for-domain
-                        dir
-                        runtime-providers
-                        domain
-                        (apply dissoc domain-opts persisted-embedding-space-keys))]
-    (emb/provider-space provider-spec)))
-
-(defn- vector-dim
-  [vec-data]
-  (cond
-    (u/array? vec-data)
-    (java.lang.reflect.Array/getLength vec-data)
-
-    (instance? java.util.List vec-data)
-    (.size ^java.util.List vec-data)
-
-    (sequential? vec-data)
-    (count vec-data)
-
-    :else
-    (raise "Embedding provider returned an unsupported vector value"
-             {:vector vec-data})))
-
-(defn- ensure-embedding-vector!
-  [domain expected-dimensions vec-data]
-  (let [dimensions (vector-dim vec-data)]
-    (when (and expected-dimensions
-               (not= (long expected-dimensions) (long dimensions)))
-      (raise "Embedding vector dimensions do not match domain configuration"
-               {:domain              domain
-                :expected-dimensions expected-dimensions
-                :actual-dimensions   dimensions}))
-    vec-data))
 
 (defn prepare-embedding-plan
   [^Store store datoms]
@@ -3224,15 +2051,6 @@
     (transact-kv lmdb txs)
     (idoc/apply-state-actions! idoc-state-actions)))
 
-(defn vpred
-  [v]
-  (cond
-    (string? v)  (fn [x] (if (string? x) (.equals ^String v x) false))
-    (integer? v) (fn [x] (if (integer? x) (= (long v) (long x)) false))
-    (keyword? v) (fn [x] (.equals ^Object v x))
-    (nil? v)     (fn [x] (nil? x))
-    :else        (fn [x] (= v x))))
-
 (defn ea-tuples
   [^Store store e a]
   (cd/with-snapshot (.-lmdb store)
@@ -3346,192 +2164,6 @@
                                  (retrieved->v lmdb r)])))
       res)))
 
-(def ^:private nippy-meta-protocol-key
-  :taoensso.nippy/meta-protocol-key)
-
-(def ^:private legacy-ha-nil-sentinel-keys
-  [:ha-mode
-   :ha-control-plane
-   :ha-members
-   :ha-fencing-hook
-   :ha-clock-skew-hook
-   :ha-membership-hash])
-
-(def ^:private non-persistable-ha-option-keys
-  [:ha-node-id
-   :ha-client-credentials
-   :ha-fencing-hook
-   :ha-clock-skew-hook])
-
-(def ^:private raw-persist-open-opts-key
-  ::raw-persist-open-opts?)
-
-(defn- encode-legacy-ha-nil-sentinels
-  [opts]
-  (reduce
-    (fn [m k]
-      (if (and (contains? m k) (nil? (get m k)))
-        (assoc m k nippy-meta-protocol-key)
-        m))
-    (or opts {})
-    legacy-ha-nil-sentinel-keys))
-
-(defn- persistable-provider-spec
-  [spec]
-  (cond-> (or spec {})
-    (map? spec) (dissoc :dir :embed-dir :api-key :headers)))
-
-(defn- maybe-persistable-provider-spec
-  [spec]
-  (when spec
-    (persistable-provider-spec spec)))
-
-(defn- compact-persisted-kv-opts
-  [opts]
-  (let [opts (or opts {})
-        kv-opts (c/canonicalize-wal-opts (or (:kv-opts opts) {}))
-        compact-kv-opts
-        (into {}
-              (remove (fn [[k v]]
-                        (and (not= k :wal?)
-                             (contains? opts k)
-                             (= v (get opts k)))))
-              kv-opts)]
-    (cond-> (dissoc opts :kv-opts)
-      (contains? opts :kv-opts)
-      (assoc :kv-opts compact-kv-opts))))
-
-(defn- persistable-ha-control-plane-opts
-  [cp]
-  (cond-> (or cp {})
-    (map? cp) (dissoc :local-peer-id :raft-dir)))
-
-(defn- persistable-ha-opts
-  [opts]
-  (let [opts (apply dissoc (or opts {}) non-persistable-ha-option-keys)]
-    (cond-> opts
-      (contains? opts :ha-control-plane)
-      (update :ha-control-plane persistable-ha-control-plane-opts))))
-
-(defn- store-visible-opts
-  [opts]
-  (-> (persistable-ha-opts opts)
-      (dissoc :embedding-providers
-              :embedding-domain-providers
-              :runtime-opts
-              raw-persist-open-opts-key)))
-
-(defn- persistable-opts
-  [opts]
-  (let [opts (-> opts
-                 compact-persisted-kv-opts
-                 persistable-ha-opts
-                 (dissoc :embedding-providers
-                         :embedding-domain-providers
-                         :runtime-opts
-                         raw-persist-open-opts-key))
-        opts (cond-> opts
-               (contains? opts :embedding-opts)
-               (assoc :embedding-opts
-                      (maybe-persistable-provider-spec (:embedding-opts opts)))
-
-               (contains? opts :embedding-domains)
-               (assoc :embedding-domains
-                      (when-let [domains (:embedding-domains opts)]
-                        (into {}
-                              (map (fn [[domain cfg]]
-                                     [domain (persistable-provider-spec cfg)]))
-                              domains))))]
-    (cond-> opts
-    true c/canonicalize-wal-opts
-    true encode-legacy-ha-nil-sentinels)))
-
-(declare load-opts)
-
-(defn- transact-opts
-  [lmdb opts]
-  (let [opts (persistable-opts opts)
-        current (some-> (load-opts lmdb) persistable-opts)]
-    (when (not= current opts)
-      (when (true? (:wal? opts))
-        (let [flags (or (get-env-flags lmdb) #{})]
-          (when (and (not (contains? flags :nosync))
-                     (not (contains? flags :rdonly)))
-            (set-env-flags lmdb #{:nosync} true))))
-      (transact-kv
-        lmdb (conj (for [[k v] opts]
-                     (lmdb/kv-tx :put c/opts k v :attr :data))
-                   (lmdb/kv-tx :put c/meta :last-modified
-                               (System/currentTimeMillis) :attr :long))))))
-
-(defn- raw-lmdb
-  [db]
-  db)
-
-(defn- transact-opts-raw
-  [lmdb opts]
-  (let [opts (persistable-opts opts)
-        current (some-> (load-opts lmdb) persistable-opts)
-        raw-db (raw-lmdb lmdb)]
-    (when (not= current opts)
-      (when (true? (:wal? opts))
-        (let [flags (or (get-env-flags raw-db) #{})]
-          (when (and (not (contains? flags :nosync))
-                     (not (contains? flags :rdonly)))
-            (set-env-flags raw-db #{:nosync} true))))
-      (kv/transact-kv-without-txlog!
-        raw-db
-        (conj (for [[k v] opts]
-                (lmdb/kv-tx :put c/opts k v :attr :data))
-              (lmdb/kv-tx :put c/meta :last-modified
-                          (System/currentTimeMillis) :attr :long))))))
-
-(defn- normalize-legacy-ha-nil-sentinels
-  [opts]
-  (reduce
-    (fn [m k]
-      (if (= nippy-meta-protocol-key (get m k))
-        (assoc m k nil)
-        m))
-    (or opts {})
-    legacy-ha-nil-sentinel-keys))
-
-(defn- load-opts
-  [lmdb]
-  (-> (into {} (get-range lmdb c/opts [:all] :attr :data))
-      c/canonicalize-wal-opts
-      normalize-legacy-ha-nil-sentinels))
-
-(defn- sync-wal-runtime-opts!
-  [lmdb opts]
-  (let [opts (c/canonicalize-wal-opts opts)]
-    (when (true? (:wal? opts))
-      (let [runtime-opts (or (env-opts lmdb) {})
-            info-v       (kv-info lmdb)
-            wal-opts     (into {}
-                               (filter (fn [[k _]]
-                                         (c/wal-option-key? k)))
-                               opts)
-            runtime-missing?
-            (some (fn [[k v]]
-                    (not= v (get runtime-opts k)))
-                  wal-opts)
-            persisted-missing?
-            (some (fn [[k v]]
-                    (not= v
-                          (get-value lmdb c/kv-info k :keyword :data)))
-                  wal-opts)]
-        (when (and info-v runtime-missing?)
-          (vswap! info-v merge wal-opts))
-        (when (and info-v
-                   persisted-missing?
-                   (not (contains? (or (get-env-flags lmdb) #{}) :rdonly)))
-          (kv/transact-kv-without-txlog!
-            lmdb
-            (mapv (fn [[k v]]
-                    (lmdb/kv-tx :put c/kv-info k v :keyword :data))
-                  wal-opts)))))))
-
 (defn- open-dbis
   [lmdb]
   ;; AVE duplicate values are fixed-width entity IDs. The binding keeps
@@ -3547,361 +2179,6 @@
   (open-dbi lmdb c/opts {:key-size c/+max-key-size+})
   (open-dbi lmdb c/schema {:key-size c/+max-key-size+})
   (open-dbi lmdb c/secondary-index-jobs {:key-size c/+max-key-size+}))
-
-(defn- default-search-domain
-  [dms search-opts search-domains]
-  (let [new-opts (assoc (or (get search-domains c/default-domain)
-                            search-opts
-                            {})
-                        :domain c/default-domain)]
-    (assoc dms c/default-domain (if-let [opts (dms c/default-domain)]
-                                  (merge opts new-opts)
-                                  new-opts))))
-
-(defn- listed-search-domains
-  [dms domains search-domains]
-  (reduce (fn [m domain]
-            (let [new-opts (assoc (get search-domains domain {})
-                                  :domain domain)]
-              (assoc m domain (if-let [opts (m domain)]
-                                (merge opts new-opts)
-                                new-opts))))
-          dms domains))
-
-(defn- init-search-domains
-  [search-domains0 schema search-opts search-domains]
-  (reduce-kv
-    (fn [dms attr
-        {:keys [db/fulltext db.fulltext/domains db.fulltext/autoDomain]}]
-      (if fulltext
-        (cond-> (if (seq domains)
-                  (listed-search-domains dms domains search-domains)
-                  (default-search-domain dms search-opts search-domains))
-          autoDomain (#(let [domain (u/keyword->string attr)]
-                         (assoc
-                           % domain
-                           (let [new-opts (assoc (get search-domains domain {})
-                                                 :domain domain)]
-                             (if-let [opts (% domain)]
-                               (merge opts new-opts)
-                               new-opts))))))
-        dms))
-    (or search-domains0 {}) schema))
-
-(defn- init-engines
-  [lmdb domains runtime-opts]
-  (reduce-kv
-    (fn [m domain opts]
-      (assoc m domain
-             (s/new-search-engine
-               lmdb
-               (cond-> opts
-                 (:udf-registry runtime-opts)
-                 (assoc :udf-registry (:udf-registry runtime-opts))))))
-    {} domains))
-
-(defn- listed-vector-domains
-  [dms domains vector-opts vector-domains]
-  (reduce (fn [m domain]
-            (let [new-opts (assoc (get vector-domains domain vector-opts)
-                                  :domain domain)]
-              (assoc m domain (if-let [opts (m domain)]
-                                (merge opts new-opts)
-                                new-opts))))
-          dms domains))
-
-(defn- init-vector-domains
-  [vector-domains0 schema vector-opts vector-domains]
-  (reduce-kv
-    (fn [dms attr {:keys [db/valueType db.vec/domains]}]
-      (if (identical? valueType :db.type/vec)
-        (if (seq domains)
-          (listed-vector-domains dms domains vector-opts vector-domains)
-          (let [domain (v/attr-domain attr)]
-            (assoc dms domain (assoc (get vector-domains domain vector-opts)
-                                     :domain domain))))
-        dms))
-    (or vector-domains0 {}) schema))
-
-(def ^:private default-embedding-opts
-  {:provider    :default
-   :metric-type :cosine})
-
-(def ^:private embedding-index-prefix
-  "__embedding__")
-
-(defn- embedding-index-domain
-  [domain]
-  (str embedding-index-prefix "/" domain))
-
-(defn- default-embedding-domain
-  [dms embedding-opts]
-  (if (contains? dms c/default-domain)
-    dms
-    (assoc dms c/default-domain
-           (assoc (merge default-embedding-opts (or embedding-opts {}))
-                  :domain c/default-domain))))
-
-(defn- listed-embedding-domains
-  [dms domains embedding-opts embedding-domains]
-  (reduce
-    (fn [m domain]
-      (if (contains? m domain)
-        m
-        (assoc m domain
-               (assoc (merge default-embedding-opts
-                             (get embedding-domains domain)
-                             embedding-opts)
-                      :domain domain))))
-    dms
-    domains))
-
-(defn- init-embedding-domain-refs
-  [embedding-domains0 schema embedding-opts embedding-domains]
-  (reduce-kv
-    (fn [dms attr
-         {:keys [db/embedding db.embedding/domains db.embedding/autoDomain]}]
-      (if embedding
-        (let [dms (if (seq domains)
-                    (listed-embedding-domains dms domains embedding-opts
-                                              embedding-domains)
-                    (default-embedding-domain dms embedding-opts))]
-          (if autoDomain
-            (listed-embedding-domains dms [(v/attr-domain attr)] embedding-opts
-                                      embedding-domains)
-            dms))
-        dms))
-    (or embedding-domains0 {})
-    schema))
-
-(defn- provider-spec-for-domain
-  [dir runtime-providers domain {:keys [provider] :as domain-opts}]
-  (let [provider-id (or provider :default)
-        runtime     (get runtime-providers provider-id)]
-    (cond
-      (satisfies? emb/IEmbeddingProvider runtime)
-      runtime
-
-      (or (map? runtime) (keyword? runtime))
-      (merge (if (map? runtime) runtime {:provider runtime})
-             domain-opts
-             {:provider provider-id :dir dir})
-
-      runtime
-      (raise "Embedding provider registry entry is invalid"
-               {:domain domain
-                :provider provider-id
-                :entry runtime})
-
-      (#{:default :llama.cpp :openai-compatible} provider-id)
-      (assoc domain-opts :provider provider-id :dir dir)
-
-      :else
-      (raise "Embedding provider is not configured"
-               {:domain domain :provider provider-id}))))
-
-(defn- resolve-embedding-domain
-  [dir runtime-providers [domain domain-opts]]
-  (let [domain-opts                 (merge default-embedding-opts domain-opts)
-        {:keys [dimensions
-                embedding-metadata]} (runtime-provider-space dir runtime-providers
-                                                             domain domain-opts)
-        provider-dimensions         dimensions
-        provider-metadata           embedding-metadata
-        stored-dimensions           (:dimensions domain-opts)
-        stored-metadata             (:embedding-metadata domain-opts)
-        dimensions                  (or stored-dimensions provider-dimensions)
-        embedding-metadata          (or stored-metadata provider-metadata)]
-    (when (and stored-dimensions provider-dimensions
-               (not= (long stored-dimensions) (long provider-dimensions)))
-      (raise "Embedding domain dimensions do not match the runtime provider"
-               {:domain              domain
-                :provider            (:provider domain-opts)
-                :stored-dimensions   stored-dimensions
-                :provider-dimensions provider-dimensions}))
-    (when stored-metadata
-      (emb/ensure-compatible-metadata stored-metadata provider-metadata))
-    (when-not dimensions
-      (raise "Embedding domain dimensions could not be resolved"
-               {:domain domain :provider (:provider domain-opts)}))
-    [domain
-     (-> domain-opts
-         (assoc :provider (or (:provider domain-opts) :default)
-                :dimensions dimensions
-                :embedding-metadata embedding-metadata))]))
-
-(defn- init-embedding-domains
-  [dir embedding-domains0 schema embedding-opts embedding-domains runtime-providers]
-  (let [domains (init-embedding-domain-refs embedding-domains0 schema
-                                            embedding-opts embedding-domains)]
-    (into {}
-          (map #(resolve-embedding-domain dir runtime-providers %))
-          domains)))
-
-(defn- init-embedding-providers
-  [dir domains runtime-providers]
-  (reduce-kv
-    (fn [m domain domain-opts]
-      (assoc m domain
-             (emb/init-embedding-provider
-               (provider-spec-for-domain dir runtime-providers domain domain-opts))))
-    {}
-    domains))
-
-(defn- init-indices
-  [lmdb domains]
-  (reduce-kv
-    (fn [m domain opts]
-      (assoc m domain (v/new-vector-index lmdb opts)))
-    {} domains))
-
-(defn- init-embedding-indices
-  [lmdb domains]
-  (reduce-kv
-    (fn [m domain opts]
-      (assoc m domain
-             (v/new-vector-index
-               lmdb
-               (assoc opts :domain (embedding-index-domain domain)))))
-    {}
-    domains))
-
-(defn- idoc-schema-domain-opts
-  [props]
-  (cond-> {}
-    (contains? props :db.idoc/indexedPaths)
-    (assoc :indexed-paths (:db.idoc/indexedPaths props))
-
-    (contains? props :db.idoc/excludedPaths)
-    (assoc :excluded-paths (:db.idoc/excludedPaths props))))
-
-(defn- merge-idoc-path-option
-  [a b]
-  (cond
-    (nil? a) b
-    (nil? b) a
-    :else (vec (distinct (concat a b)))))
-
-(defn- merge-idoc-domain-opts
-  [a b]
-  (-> (merge a b)
-      (assoc :indexed-paths
-             (merge-idoc-path-option (:indexed-paths a)
-                                     (:indexed-paths b)))
-      (assoc :excluded-paths
-             (merge-idoc-path-option (:excluded-paths a)
-                                     (:excluded-paths b)))))
-
-(defn- init-idoc-domains
-  [schema opts]
-  (let [default-opts (:idoc-opts opts)
-        domain-opts  (:idoc-domains opts)]
-    (reduce-kv
-      (fn [dms attr {:keys [db/valueType db/domain db/idocFormat] :as props}]
-        (if (identical? valueType :db.type/idoc)
-          (let [domain      (or domain (u/keyword->string attr))
-                fmt         (or idocFormat :edn)
-                prior       (get dms domain)
-                schema-opts (idoc-schema-domain-opts props)
-                opts        (merge default-opts
-                                   schema-opts
-                                   (get domain-opts domain))
-                opts        (assoc opts :domain domain :format fmt)]
-            (cond
-              (nil? prior) (assoc dms domain opts)
-              (= (:format prior) fmt)
-              (assoc dms domain (merge-idoc-domain-opts prior opts))
-              :else
-              (assoc dms domain
-                     (merge-idoc-domain-opts prior (assoc opts :format :mixed)))))
-          dms))
-      {}
-      schema)))
-
-(defn- init-idoc-indices
-  [lmdb domains]
-  (reduce-kv
-    (fn [m domain opts]
-      (assoc m domain (idoc/new-idoc-index lmdb opts)))
-    {} domains))
-
-(defn- propagate-top-level-txlog-opts-to-kv-opts
-  [opts]
-  (let [opts      (or opts {})
-        kv-opts?  (contains? opts :kv-opts)
-        kv-opts   (c/canonicalize-wal-opts (or (:kv-opts opts) {}))
-        txlog-opts (into {}
-                         (keep (fn [[k v]]
-                                 (let [k' (c/canonical-wal-option-key k)]
-                                   (when (and (c/wal-option-key? k)
-                                              (not (contains? kv-opts k')))
-                                     [k' v]))))
-                         opts)]
-    (cond-> (c/canonicalize-wal-opts opts)
-      (or kv-opts? (seq txlog-opts))
-      (assoc :kv-opts (if (seq txlog-opts)
-                        (merge kv-opts txlog-opts)
-                        kv-opts)))))
-
-(def ^:private ha-wal-durability-profile :strict)
-
-(defn- kv-wal-opts
-  [opts]
-  (when-let [kv-opts (:kv-opts opts)]
-    (into {}
-          (filter (fn [[k _]] (c/wal-option-key? k)))
-          kv-opts)))
-
-(defn- promote-kv-wal-opts
-  [opts]
-  (let [wal-opts (kv-wal-opts opts)]
-    (cond-> opts
-      (seq wal-opts) (merge wal-opts))))
-
-(defn- ha-wal-durability-profile-for
-  [opts]
-  (let [profile (or (get-in opts [:kv-opts :wal-durability-profile])
-                    (:wal-durability-profile opts)
-                    ha-wal-durability-profile)]
-    (when (= :relaxed profile)
-      (raise "Consensus-lease HA requires :wal-durability-profile :strict or :extra"
-               {:error :ha/validation
-                :option :wal-durability-profile
-                :value profile}))
-    profile))
-
-(defn- force-ha-wal-opts
-  [opts]
-  (let [profile (ha-wal-durability-profile-for opts)]
-    (-> opts
-        (assoc :wal? true
-               :wal-durability-profile profile)
-        (update :kv-opts
-                (fn [kv-opts]
-                  (assoc (or kv-opts {})
-                         :wal? true
-                         :wal-durability-profile profile))))))
-
-(defn- normalize-ha-open-opts
-  [opts]
-  (cond-> opts
-    (= :consensus-lease (:ha-mode opts))
-    force-ha-wal-opts
-
-    (= :consensus-lease (:ha-mode opts))
-    ;; Background sampling performs follower-local metadata writes. In HA mode
-    ;; that extra local write traffic obscures replicated progress and can race
-    ;; with follower replay. Keep it disabled on consensus-lease stores.
-    (assoc :background-sampling? false)))
-
-(defn- txlog-dir-path
-  [dir]
-  (str dir u/+separator+ "txlog"))
-
-(defn- existing-store?
-  [dir]
-  (or (u/file-exists (str dir u/+separator+ c/data-file-name))
-      (u/file-exists (txlog-dir-path dir))))
 
 (defn- load-existing-store-opts
   [dir _kv-opts]
@@ -3931,155 +2208,6 @@
     (catch Throwable t
       (close-failed-open! dir shared-store lmdb)
       (throw t))))
-
-(defn- default-store-opts
-  "Default options for a newly created store."
-  []
-  {:validate-data?       false
-   :auto-entity-time?    false
-   :closed-schema?       false
-   :background-sampling? c/*db-background-sampling?*
-   :async-secondary-index-worker-max-jobs
-   c/*async-secondary-index-worker-max-jobs*
-   :async-secondary-index-worker-lease-ms
-   c/*async-secondary-index-worker-lease-ms*
-   :async-secondary-index-retry-base-ms
-   c/*async-secondary-index-retry-base-ms*
-   :async-secondary-index-retry-max-ms
-   c/*async-secondary-index-retry-max-ms*
-   :ha-mode c/*ha-mode*
-   :ha-lease-renew-ms c/*ha-lease-renew-ms*
-   :ha-lease-timeout-ms c/*ha-lease-timeout-ms*
-   :ha-promotion-base-delay-ms c/*ha-promotion-base-delay-ms*
-   :ha-promotion-rank-delay-ms c/*ha-promotion-rank-delay-ms*
-   :ha-max-promotion-lag-lsn c/*ha-max-promotion-lag-lsn*
-   :ha-demotion-drain-ms c/*ha-demotion-drain-ms*
-   :ha-clock-skew-budget-ms c/*ha-clock-skew-budget-ms*
-   :ha-control-plane c/*ha-control-plane*
-   :wal?             c/*datalog-wal?*
-   :wal-rollout-mode c/*wal-rollout-mode*
-   :wal-rollback?    c/*wal-rollback?*
-   :wal-durability-profile
-   c/*datalog-wal-durability-profile*
-   :wal-commit-marker? c/*wal-commit-marker?*
-   :wal-commit-marker-version
-   c/*wal-commit-marker-version*
-   :wal-sync-mode            c/*wal-sync-mode*
-   :wal-group-commit         c/*wal-group-commit*
-   :wal-group-commit-ms      c/*wal-group-commit-ms*
-   :wal-meta-flush-max-txs
-   c/*wal-meta-flush-max-txs*
-   :wal-meta-flush-max-ms
-   c/*wal-meta-flush-max-ms*
-   :wal-commit-wait-ms       c/*wal-commit-wait-ms*
-   :wal-sync-adaptive?       c/*wal-sync-adaptive?*
-   :wal-segment-max-bytes c/*wal-segment-max-bytes*
-   :wal-segment-max-ms    c/*wal-segment-max-ms*
-   :wal-segment-prealloc?
-   c/*wal-segment-prealloc?*
-   :wal-segment-prealloc-mode
-   c/*wal-segment-prealloc-mode*
-   :wal-segment-prealloc-bytes
-   c/*wal-segment-prealloc-bytes*
-   :wal-retention-bytes c/*wal-retention-bytes*
-   :wal-retention-ms    c/*wal-retention-ms*
-   :wal-retention-pin-backpressure-threshold-ms
-   c/*wal-retention-pin-backpressure-threshold-ms*
-   :wal-vec-checkpoint-interval-ms
-   c/*wal-vec-checkpoint-interval-ms*
-   :wal-vec-max-lsn-delta
-   c/*wal-vec-max-lsn-delta*
-   :wal-vec-max-buffer-bytes
-   c/*wal-vec-max-buffer-bytes*
-   :wal-vec-chunk-bytes
-   c/*wal-vec-chunk-bytes*
-   :db-name              (str (UUID/randomUUID))
-   :cache-limit          512})
-
-(defn- debug-open-opts
-  [dir opts opts0 opts3]
-  (when (= "1" (System/getenv "DTLV_DEBUG_STORAGE_OPEN"))
-    (prn :storage-open
-         {:dir dir
-          :incoming-opts opts
-          :persisted-opts (select-keys opts0
-                                       [:ha-mode
-                                        :db-name
-                                        :db-identity
-                                        :ha-node-id
-                                        :ha-members
-                                        :ha-control-plane
-                                        :ha-demotion-drain-ms
-                                        :ha-fencing-hook
-                                        :wal?
-                                        :kv-opts])
-          :opts3 (select-keys opts3
-                              [:ha-mode
-                               :db-name
-                               :db-identity
-                               :ha-node-id
-                               :ha-members
-                               :ha-control-plane
-                               :ha-demotion-drain-ms
-                               :ha-fencing-hook
-                               :wal?
-                               :kv-opts])})))
-
-(defn- resolve-store-opts
-  "Merge persisted, loaded, incoming, and default store options and validate."
-  [dir incoming-opts0 opts persisted-opts loaded-opts]
-  (let [opts0      (or persisted-opts loaded-opts {})
-        opts1      (if (empty? opts0) (default-store-opts) opts0)
-        opts2-base (-> (merge opts1 opts)
-                       c/canonicalize-wal-opts
-                       normalize-ha-open-opts
-                       promote-kv-wal-opts)
-        opts2      (-> (if (and (or (some? persisted-opts)
-                                    (some? loaded-opts))
-                                (empty? (or incoming-opts0 {})))
-                         (propagate-top-level-txlog-opts-to-kv-opts
-                           opts2-base)
-                         opts2-base)
-                       normalize-ha-open-opts
-                       promote-kv-wal-opts)
-        db-identity (or (:db-identity opts2)
-                        (:db-name opts2)
-                        (str (UUID/randomUUID)))
-        opts3       (assoc opts2 :db-identity db-identity)]
-    (vld/validate-ha-store-opts opts3)
-    (vld/validate-secondary-index-worker-options opts3)
-    (vld/validate-search-options opts3)
-    (vld/validate-vector-options opts3)
-    (vld/validate-embedding-options opts3)
-    (vld/validate-idoc-options opts3)
-    (debug-open-opts dir opts opts0 opts3)
-    opts3))
-
-(defn- init-store-domains
-  [dir schema opts3 search-opts search-domains
-   vector-opts vector-domains embedding-opts embedding-domains
-   embedding-providers]
-  (let [s-domains (init-search-domains (:search-domains opts3)
-                                       schema search-opts search-domains)
-        v-domains (init-vector-domains (:vector-domains opts3)
-                                       schema vector-opts vector-domains)
-        e-domains (init-embedding-domains dir
-                                          (:embedding-domains opts3)
-                                          schema
-                                          embedding-opts
-                                          embedding-domains
-                                          embedding-providers)
-        i-domains (init-idoc-domains schema opts3)]
-    {:s-domains s-domains
-     :v-domains v-domains
-     :e-domains e-domains
-     :i-domains i-domains
-     :opts4     (cond-> opts3
-                  (seq e-domains)
-                  (assoc :embedding-opts
-                         (merge default-embedding-opts
-                                (or (:embedding-opts opts3) embedding-opts))
-                         :embedding-domains e-domains))}))
 
 (defn- attach-shared-store!
   [shared-store lmdb s-domains opts4 store-opts dir-key]
@@ -4222,24 +2350,6 @@
                (create-new-store! lmdb dir s-domains v-domains e-domains
                                   i-domains embedding-providers opts4
                                   store-opts schema dir-key)))))))))
-
-(defn- transfer-engines
-  [engines lmdb]
-  (if (empty? engines)
-    engines
-    (zipmap (keys engines) (map #(s/transfer % lmdb) (vals engines)))))
-
-(defn- transfer-indices
-  [indices lmdb]
-  (if (empty? indices)
-    indices
-    (zipmap (keys indices) (map #(v/transfer % lmdb) (vals indices)))))
-
-(defn- transfer-idoc-indices
-  [indices lmdb]
-  (if (empty? indices)
-    indices
-    (zipmap (keys indices) (map #(idoc/transfer % lmdb) (vals indices)))))
 
 (defn- transfer-with-schema
   [^Store old lmdb schema* reuse-derived-schema-state?]

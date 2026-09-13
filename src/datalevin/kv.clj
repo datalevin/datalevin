@@ -208,12 +208,15 @@
   (reset-write [_] (wrap-lmdb (l/reset-write db)))
 
   i/IList
-  (del-list-items [this list-name k k-type]
+  (del-list-items
+    [this list-name k k-type]
     (i/transact-kv this [(l/kv-tx :del list-name k k-type)]))
-  (del-list-items [this list-name k vs k-type v-type]
+  (del-list-items
+    [this list-name k vs k-type v-type]
     (i/transact-kv this [(l/kv-tx :del-list list-name k vs k-type v-type)]))
-  (list-dbi? [this dbi-name] (i/list-dbi? db dbi-name))
-  (put-list-items [this list-name k vs k-type v-type]
+  (list-dbi? [_ dbi-name] (i/list-dbi? db dbi-name))
+  (put-list-items
+    [this list-name k vs k-type v-type]
     (i/transact-kv this [(l/kv-tx :put-list list-name k vs k-type v-type)]))
 
   (def-read-kv-forwarders this db
@@ -246,37 +249,41 @@
       [list-name indices visitor k-range k-type v-type raw-pred?]))
 
   i/IAdmin
-  (re-index [this opts] (i/re-index db opts))
-  (re-index [this schema opts] (i/re-index db schema opts))
+  (re-index [_ opts] (i/re-index db opts))
+  (re-index [_ schema opts] (i/re-index db schema opts))
 
   i/ITxLog
-  (txlog-watermarks [_]
+  (txlog-watermarks
+    [_]
     (if-let [state (txlog/state db)]
       (txlog-watermarks-map db state)
       (if (txlog-config-enabled? db)
         (txlog-rollout-watermarks db (txlog-rollout-mode db))
         {:wal? false})))
 
-  (open-tx-log [this from-lsn]
+  (open-tx-log
+    [this from-lsn]
     (.open-tx-log this from-lsn nil))
-  (open-tx-log [_ from-lsn upto-lsn]
+  (open-tx-log
+    [_ from-lsn upto-lsn]
     (if-let [state (or (txlog/state db)
                        (when (txlog-write-path-enabled? db)
                          (ensure-txlog-ready! db)))]
       (do
-      (txlog/refresh-shared-state! state)
-      (txlog/select-open-records
-       (txlog-records state from-lsn upto-lsn)
-       from-lsn
-       upto-lsn))
-     (if (txlog-config-enabled? db)
-       []
-       (txlog/select-open-records
-        (txlog-records (txlog/enabled-state db) from-lsn upto-lsn)
-        from-lsn
-        upto-lsn))))
+        (txlog/refresh-shared-state! state)
+        (txlog/select-open-records
+          (txlog-records state from-lsn upto-lsn)
+          from-lsn
+          upto-lsn))
+      (if (txlog-config-enabled? db)
+        []
+        (txlog/select-open-records
+          (txlog-records (txlog/enabled-state db) from-lsn upto-lsn)
+          from-lsn
+          upto-lsn))))
 
-  (force-txlog-sync! [_]
+  (force-txlog-sync!
+    [_]
     (with-runtime-txlog-state-guard
       db
       (fn []
@@ -286,9 +293,9 @@
 
           (not (txlog-write-path-enabled? db))
           (let [rollout-mode (txlog-rollout-mode db)]
-            {:synced? false
-             :skipped? true
-             :reason :rollback
+            {:synced?    false
+             :skipped?   true
+             :reason     :rollback
              :watermarks (txlog-rollout-watermarks db rollout-mode)})
 
           :else
@@ -296,18 +303,20 @@
             (assoc (txlog-force-sync! state)
                    :watermarks (txlog-watermarks-map db state)))))))
 
-  (force-lmdb-sync! [_]
+  (force-lmdb-sync!
+    [_]
     (if (txlog-config-enabled? db)
       (do
         (force-lmdb-sync-now! db)
-        {:synced? true
+        {:synced?    true
          :watermarks (if-let [state (txlog/state db)]
                        (txlog-watermarks-map db state)
                        (txlog-rollout-watermarks db
                                                  (txlog-rollout-mode db)))})
       (txlog/enabled-state db)))
 
-  (create-snapshot! [_]
+  (create-snapshot!
+    [_]
     ;; Snapshot creation updates backup-pin floor metadata before copying the
     ;; environment, so it participates in the same write-capable lock ordering
     ;; as replica-floor bookkeeping and transaction close.
@@ -318,19 +327,21 @@
           (create-snapshot-now! db)
           (if (txlog-config-enabled? db)
             (let [rollout-mode (txlog-rollout-mode db)]
-              {:ok? false
-               :skipped? true
-               :reason :rollback
+              {:ok?        false
+               :skipped?   true
+               :reason     :rollback
                :watermarks (txlog-rollout-watermarks db rollout-mode)})
             (txlog/enabled-state db))))))
 
   (list-snapshots [_]
-    (list-snapshot-entries db))
+                  (list-snapshot-entries db))
 
-  (snapshot-scheduler-state [_]
+  (snapshot-scheduler-state
+    [_]
     (scheduler/snapshot-scheduler-state-map db))
 
-  (read-commit-marker [_]
+  (read-commit-marker
+    [_]
     (if-let [state (txlog/state db)]
       (do
         (refresh-runtime-marker-revision! db state)
@@ -338,11 +349,12 @@
                :commit-marker? (boolean (:commit-marker? state))
                :marker-revision (long @(:marker-revision state))))
       {:commit-marker? false
-       :slot-a nil
-       :slot-b nil
-       :current nil}))
+       :slot-a         nil
+       :slot-b         nil
+       :current        nil}))
 
-  (verify-commit-marker! [_]
+  (verify-commit-marker!
+    [_]
     (with-runtime-txlog-state-guard
       db
       (fn []
@@ -350,66 +362,76 @@
           (verify-commit-marker-state db state)
           (if (txlog-config-enabled? db)
             (let [rollout-mode (txlog-rollout-mode db)]
-              {:ok? false
-               :skipped? true
-               :reason :rollback
+              {:ok?        false
+               :skipped?   true
+               :reason     :rollback
                :watermarks (txlog-rollout-watermarks db rollout-mode)})
             (verify-commit-marker-state db (txlog/enabled-state db)))))))
 
-  (txlog-retention-state [this]
-    (txlog-retention-state-local db))
+  (txlog-retention-state [_] (txlog-retention-state-local db))
 
-  (gc-txlog-segments! [this]
-    (.gc-txlog-segments! this nil))
-  (gc-txlog-segments! [this retain-floor-lsn]
+  (gc-txlog-segments! [this] (.gc-txlog-segments! this nil))
+  (gc-txlog-segments!
+    [_ retain-floor-lsn]
     (gc-txlog-segments-local! db retain-floor-lsn))
 
-  (txlog-update-snapshot-floor! [this snapshot-lsn]
+  (txlog-update-snapshot-floor!
+    [this snapshot-lsn]
     (.txlog-update-snapshot-floor! this snapshot-lsn nil))
-  (txlog-update-snapshot-floor! [_ snapshot-lsn previous-snapshot-lsn]
+  (txlog-update-snapshot-floor!
+    [_ snapshot-lsn previous-snapshot-lsn]
     (txlog-update-snapshot-floor! db snapshot-lsn previous-snapshot-lsn))
 
-  (txlog-clear-snapshot-floor! [_]
-    (txlog-clear-snapshot-floor! db))
+  (txlog-clear-snapshot-floor! [_] (txlog-clear-snapshot-floor! db))
 
-  (txlog-update-replica-floor! [_ replica-id applied-lsn]
+  (txlog-update-replica-floor!
+    [_ replica-id applied-lsn]
     (txlog-update-replica-floor! db replica-id applied-lsn))
 
-  (txlog-clear-replica-floor! [_ replica-id]
+  (txlog-clear-replica-floor!
+    [_ replica-id]
     (txlog-clear-replica-floor! db replica-id))
 
-  (txlog-pin-backup-floor! [this pin-id floor-lsn]
+  (txlog-pin-backup-floor!
+    [this pin-id floor-lsn]
     (.txlog-pin-backup-floor! this pin-id floor-lsn nil))
-  (txlog-pin-backup-floor! [_ pin-id floor-lsn expires-ms]
+  (txlog-pin-backup-floor!
+    [_ pin-id floor-lsn expires-ms]
     (txlog-pin-backup-floor! db pin-id floor-lsn expires-ms))
 
-  (txlog-unpin-backup-floor! [_ pin-id]
+  (txlog-unpin-backup-floor!
+    [_ pin-id]
     (txlog-unpin-backup-floor! db pin-id))
 
   i/ILMDB
-  (open-transact-kv [_]
+  (open-transact-kv
+    [_]
     (when (txlog-write-path-enabled? db)
       (ensure-txlog-ready! db))
     (let [wdb (i/open-transact-kv db)]
       (when (txlog-write-path-enabled? db)
         (txlog-reset-pending! (i/kv-info db)))
       (->KVLMDB wdb)))
-  (abort-transact-kv [_]
+  (abort-transact-kv
+    [_]
     (when (txlog-config-enabled? db)
       (txlog-reset-pending! (i/kv-info db)))
     (i/abort-transact-kv db))
-  (check-ready [this] (i/check-ready db))
-  (clear-dbi [this dbi-name]
+  (check-ready [_] (i/check-ready db))
+  (clear-dbi
+    [this dbi-name]
     (custom-kv/guard-internal! db dbi-name)
     (if (custom-kv/custom-dbi? db dbi-name)
       (custom-kv/clear! this db dbi-name)
       (i/clear-dbi db dbi-name)))
-  (close-kv [_]
+  (close-kv
+    [_]
     (try
       (i/close-kv db)
       (finally
         (close-txlog-state! db))))
-  (close-transact-kv [_]
+  (close-transact-kv
+    [_]
     (with-write-txn-lock-before-runtime-txlog-state
       db
       (fn []
@@ -418,11 +440,15 @@
             (close-with-txlog! db state)
             (i/close-transact-kv db))
           (i/close-transact-kv db)))))
-  (closed-kv? [this] (i/closed-kv? db))
+  (closed-kv? [_] (i/closed-kv? db))
   (copy [this dest] (.copy this dest false))
-  (copy [this dest compact?] (kvtx/txlog-copy-with-backup-pin! this db dest compact?))
-  (dbi-opts [this dbi-name] (i/dbi-opts db dbi-name))
-  (drop-dbi [this dbi-name]
+  (copy
+    [this dest compact?]
+    (kvtx/txlog-copy-with-backup-pin! this db dest compact?))
+
+  (dbi-opts [_ dbi-name] (i/dbi-opts db dbi-name))
+  (drop-dbi
+    [this dbi-name]
     (custom-kv/guard-internal! db dbi-name)
     (locking (l/write-txn db)
       (when (and (custom-kv/custom-dbi? db dbi-name) (some? @(l/write-txn db)))
@@ -436,20 +462,20 @@
             res    (i/drop-dbi db dbi-name)]
         (txlog-log-dbi-drop! this db dbi-name before)
         res)))
-  (entries [this dbi-name] (i/entries db dbi-name))
-  (env-dir [this] (i/env-dir db))
-  (kv-info [this] (i/kv-info db))
-  (env-opts [this] (i/env-opts db))
-  (get-dbi [this dbi-name] (i/get-dbi db dbi-name))
-  (get-dbi [this dbi-name create?] (i/get-dbi db dbi-name create?))
-  (get-env-flags [this] (i/get-env-flags db))
-  (get-rtx [this] (i/get-rtx db))
-  (key-compressor [this] (i/key-compressor db))
-  (list-dbis [this] (i/list-dbis db))
-  (max-val-size [this] (i/max-val-size db))
-  (open-dbi [this dbi-name]
-    (.open-dbi this dbi-name nil))
-  (open-dbi [this dbi-name opts]
+  (entries [_ dbi-name] (i/entries db dbi-name))
+  (env-dir [_] (i/env-dir db))
+  (kv-info [_] (i/kv-info db))
+  (env-opts [_] (i/env-opts db))
+  (get-dbi [_ dbi-name] (i/get-dbi db dbi-name))
+  (get-dbi [_ dbi-name create?] (i/get-dbi db dbi-name create?))
+  (get-env-flags [_] (i/get-env-flags db))
+  (get-rtx [_] (i/get-rtx db))
+  (key-compressor [_] (i/key-compressor db))
+  (list-dbis [_] (i/list-dbis db))
+  (max-val-size [_] (i/max-val-size db))
+  (open-dbi [this dbi-name] (.open-dbi this dbi-name nil))
+  (open-dbi
+    [this dbi-name opts]
     (let [before   (try
                      (i/dbi-opts db dbi-name)
                      (catch Exception _ nil))
@@ -459,9 +485,9 @@
           after    (i/dbi-opts db dbi-name)]
       (txlog-log-dbi-registration! this db dbi-name before after)
       res))
-  (open-list-dbi [this list-name]
-    (.open-list-dbi this list-name nil))
-  (open-list-dbi [this list-name opts]
+  (open-list-dbi [this list-name] (.open-list-dbi this list-name nil))
+  (open-list-dbi
+    [this list-name opts]
     (let [before   (try
                      (i/dbi-opts db list-name)
                      (catch Exception _ nil))
@@ -475,21 +501,24 @@
           after    (i/dbi-opts db list-name)]
       (txlog-log-dbi-registration! this db list-name before after)
       res))
-  (return-rtx [this rtx] (i/return-rtx db rtx))
-  (set-env-flags [this ks on-off] (i/set-env-flags db ks on-off))
-  (set-key-compressor [this c] (i/set-key-compressor db c))
-  (set-max-val-size [this size] (i/set-max-val-size db size))
-  (set-val-compressor [this c] (i/set-val-compressor db c))
-  (stat [this] (i/stat db))
-  (stat [this dbi-name] (i/stat db dbi-name))
-  (sync [this] (i/sync db))
-  (sync [this force] (i/sync db force))
+  (return-rtx [_ rtx] (i/return-rtx db rtx))
+  (set-env-flags [_ ks on-off] (i/set-env-flags db ks on-off))
+  (set-key-compressor [_ c] (i/set-key-compressor db c))
+  (set-max-val-size [_ size] (i/set-max-val-size db size))
+  (set-val-compressor [_ c] (i/set-val-compressor db c))
+  (stat [_] (i/stat db))
+  (stat [_ dbi-name] (i/stat db dbi-name))
+  (sync [_] (i/sync db))
+  (sync [_ force] (i/sync db force))
   (transact-kv [this txs] (.transact-kv this nil txs))
-  (transact-kv [this dbi-name txs]
+  (transact-kv
+    [this dbi-name txs]
     (.transact-kv this dbi-name txs :data :data))
-  (transact-kv [this dbi-name txs k-type]
+  (transact-kv
+    [this dbi-name txs k-type]
     (.transact-kv this dbi-name txs k-type :data))
-  (transact-kv [this dbi-name txs k-type v-type]
+  (transact-kv
+    [this dbi-name txs k-type v-type]
     (if (custom-kv/custom-txs? db dbi-name txs)
       (custom-kv/transact! this db dbi-name txs k-type v-type)
       (with-write-txn-lock-before-runtime-txlog-state
@@ -500,7 +529,7 @@
               (transact-with-txlog! db state dbi-name txs k-type v-type)
               (i/transact-kv db dbi-name txs k-type v-type))
             (i/transact-kv db dbi-name txs k-type v-type))))))
-  (val-compressor [this] (i/val-compressor db))
+  (val-compressor [_] (i/val-compressor db))
 
   (def-read-kv-forwarders this db
     (get-by-rank [dbi-name rank])
@@ -602,14 +631,7 @@
                 (close-failed-open! db)
                 (throw e)))))))))
 
-(defn- maybe-run-snapshot-scheduler!
-  "Compatibility shim for callers that reach into the scheduler runtime
-   through `datalevin.kv`; the implementation lives in
-   `datalevin.kv.scheduler`."
-  [lmdb]
-  (scheduler/maybe-run-snapshot-scheduler! lmdb))
-
 (l/set-open-kv-wrapper! wrap-lmdb)
 
 (kvtx/set-snapshot-scheduler-hooks! scheduler/start-snapshot-scheduler!
-                                     scheduler/stop-snapshot-scheduler!)
+                                    scheduler/stop-snapshot-scheduler!)
