@@ -202,3 +202,29 @@
                (set (map :invariant
                          (check/payment-errors before (check/payment-state conn)
                                                expected)))))))))
+
+(deftest stock-level-examines-last-20-orders
+  (with-db {}
+    (fn [conn]
+      ;; District 1 has :district/next-o-id 3001, so the TPC-C 2.8 window is
+      ;; [2981, 3001). Item 1 is low and appears in every order of the window,
+      ;; so it must be counted once, not once per order. Item 3 is low but its
+      ;; only order (2980) is outside the window and must not be counted.
+      (d/transact!
+       conn
+       (concat
+        [{:db/id 50 :item/id 2 :item/price 3.0}
+         {:db/id 51 :item/id 3 :item/price 4.0}
+         {:db/id 52 :stock/w-id 1 :stock/i-id 2 :stock/quantity 300
+          :stock/ytd 0 :stock/order-cnt 0 :stock/remote-cnt 0}
+         {:db/id 53 :stock/w-id 1 :stock/i-id 3 :stock/quantity 50
+          :stock/ytd 0 :stock/order-cnt 0 :stock/remote-cnt 0}]
+        (mapcat (fn [oid]
+                  [{:db/id (+ 100000 oid) :order-line/o-id oid :order-line/d-id 1
+                    :order-line/w-id 1 :order-line/i-id 1 :order-line/number 1}
+                   {:db/id (+ 200000 oid) :order-line/o-id oid :order-line/d-id 1
+                    :order-line/w-id 1 :order-line/i-id 2 :order-line/number 2}])
+                (range 2981 3001))
+        [{:db/id 300001 :order-line/o-id 2980 :order-line/d-id 1
+          :order-line/w-id 1 :order-line/i-id 3 :order-line/number 1}]))
+      (is (= 1 (:low-stock (t/stock-level! conn {:w 1 :d 1 :threshold 200})))))))

@@ -317,10 +317,10 @@
                    new-data w d c-id))
           (exec! conn
                  "INSERT INTO history (h_c_id, h_c_d_id, h_c_w_id, h_d_id, h_w_id, h_date, h_amount, h_data) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-                 c d w d w (now-str) (double amount)
+                 c-id d w d w (now-str) (double amount)
                  "hdata-hdata-hdata-hdata")
           (.commit conn)
-          {:type :payment :status :ok :w w :d d :amount amount
+          {:type :payment :status :ok :w w :d d :c c-id :amount amount
            :credit c-credit})))
     (catch Exception e
       (try (.rollback conn) (catch Exception _))
@@ -402,15 +402,15 @@
 
 (defn stock-level!
   [^Connection conn {:keys [w d threshold]}]
-  (let [o-id (first (q1 conn
-                        "SELECT MAX(no_o_id) FROM new_order WHERE no_w_id = ? AND no_d_id = ?"
-                        w d))
-        low  (if o-id
-               (long (first
-                      (q1 conn
-                          "SELECT COUNT(DISTINCT s.s_i_id) FROM stock s WHERE s.s_w_id = ? AND s.s_quantity < ? AND s.s_i_id IN (SELECT ol.ol_i_id FROM order_line ol WHERE ol.ol_w_id = ? AND ol.ol_d_id = ? AND ol.ol_o_id = ?)"
-                          w threshold w d (long o-id))))
-               0)]
+  (let [next-id (long (first (q1 conn
+                                 "SELECT d_next_o_id FROM district WHERE d_w_id = ? AND d_id = ?"
+                                 w d)))
+        ;; TPC-C 2.8: examine the last 20 orders, [d_next_o_id - 20,
+        ;; d_next_o_id), including orders already delivered.
+        low     (long (first
+                       (q1 conn
+                           "SELECT COUNT(DISTINCT s.s_i_id) FROM stock s WHERE s.s_w_id = ? AND s.s_quantity < ? AND s.s_i_id IN (SELECT ol.ol_i_id FROM order_line ol WHERE ol.ol_w_id = ? AND ol.ol_d_id = ? AND ol.ol_o_id >= ? AND ol.ol_o_id < ?)"
+                           w threshold w d (- next-id 20) next-id)))]
     {:type :stock-level :status :ok :low-stock low}))
 
 ;; ---------------------------------------------------------------------------
