@@ -378,8 +378,10 @@
 ;; per-row contribution: `(or (and ?promo? ?v) 0.0)`. Aggregating that over
 ;; every in-range lineitem keeps the numerator row present (0.0 when no promo
 ;; part qualifies) instead of the empty result a promo-only filter produces.
+;; A scalar result preserves SQL's NULL when no lineitems qualify; the verifier
+;; wraps it as one row, just as it does for the other ungrouped aggregates.
 (def q-14
-  '[:find ?promo
+  '[:find ?promo .
     :where
     [(q [:find (sum ?contrib) .
          :with ?l

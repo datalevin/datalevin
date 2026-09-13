@@ -502,18 +502,15 @@
     :threads     terminals (default 1)
     :warmup      warmup transactions (default 1000)
     :seed        input seed (default 42)
+    :load-seed   seed used to populate the database (default 42)
 
   Throws with accounting errors before reporting metrics if any district's
   next order id or order count disagrees with committed New-Orders."
-  [{:keys [warehouses txns threads warmup seed]
-    :or   {warehouses 1 txns 10000 threads 1 warmup 1000 seed 42}
+  [{:keys [warehouses txns threads warmup seed load-seed]
+    :or   {warehouses 1 txns 10000 threads 1 warmup 1000 seed 42 load-seed 42}
     :as   opts}]
   (with-open [conn (get-connection (conn-opts opts))]
-    (let [c-r      (Random. seed)
-          txn-opts {:warehouses warehouses
-                    :c-item     (rint c-r 0 8191)
-                    :c-cust     (rint c-r 0 1023)
-                    :c-last     (rint c-r 0 255)}
+    (let [txn-opts (assoc (g/run-constants seed load-seed) :warehouses warehouses)
           committed (atom {})
           lat       (atom [])
           run       (fn [^Connection cnn ^long ti ^long n record?]
@@ -551,8 +548,12 @@
                                                            0))
                                             true)
                                        (finally (.close c))))))
-                               (range threads))]
-            (doseq [f futs] @f)
+                               (range threads))
+                ;; Drain every terminal before leaving the run, including
+                ;; when one has failed, so all terminal connections close.
+                results  (mapv (fn [f] (try @f (catch Throwable e e))) futs)]
+            (when-let [error (some #(when (instance? Throwable %) %) results)]
+              (throw error))
             (let [elapsed    (/ (- (System/nanoTime) t0) 1.0e9)
                   errors
                   (vec (for [[w d :as k] dists

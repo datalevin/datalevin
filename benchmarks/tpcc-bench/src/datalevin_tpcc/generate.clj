@@ -16,6 +16,31 @@
 (defn- rint ^long [^Random r ^long lo ^long hi]
   (+ lo (.nextInt r (inc (- hi lo)))))
 
+(defn- customer-rng ^Random [seed]
+  (Random. (+ seed 15)))
+
+(defn load-c-last
+  "Recover C-Load from the first customer-generator draw for the population seed."
+  [load-seed]
+  (rint (customer-rng load-seed) 0 255))
+
+(defn- run-c-last [^Random r c-load]
+  (loop [c-run (rint r 0 255)]
+    (let [delta (Math/abs (long (- c-load c-run)))]
+      (if (and (<= 65 delta 119) (not (#{96 112} delta)))
+        c-run
+        (recur (rint r 0 255))))))
+
+(defn run-constants
+  "Choose NURand constants once for all terminals, using separate input and
+  population seeds. TPC-C 2.1.6.1 requires |C-Load - C-Run| in [65,119],
+  excluding 96 and 112. Rejection sampling is uniform over valid C-Run values."
+  [seed load-seed]
+  (let [r (Random. seed)]
+    {:c-item (rint r 0 8191)
+     :c-cust (rint r 0 1023)
+     :c-last (run-c-last r (load-c-last load-seed))}))
+
 (defn new-order-lines
   "TPC-C 2.4.1.3-5: generate 5-15 lines and choose rollback once per order.
   `item-id-fn` draws a valid NURand item using the driver's PRNG. In 1% of
@@ -126,9 +151,9 @@
               (maybe-original r (rand-string r 26 50))])))))
 
 (defn customer-rows [seed w]
-  (let [r     (Random. (+ seed 15))
-        ;; TPC-C 4.3.3.1: the population constant is chosen independently of the
-        ;; transaction-run constant and is reproducible from the population seed.
+  (let [r     (customer-rng seed)
+        ;; Keep C-Load as the first draw, shared with load-c-last. Run constants
+        ;; are constrained relative to this value by TPC-C 2.1.6.1.
         c-pop (rint r 0 255)]
     (for [wid (range 1 (inc w))
           did (range 1 (inc c/districts-per-warehouse))

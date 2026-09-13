@@ -42,8 +42,12 @@ Population follows the specification's cardinalities for `w` warehouses:
 
 `C_LAST` follows TPC-C §4.3.3.1: within each district, customers 1-1,000 iterate
 the 1,000 standard names in order, and customers 1,001-3,000 draw from the same
-pool with `NURand(255,0,999)` using a population constant chosen independently
-of the transaction-run constant. That draw is deliberately non-uniform, so
+pool with `NURand(255,0,999)` using a constant drawn from the population seed.
+All drivers select the run constant so its absolute difference from the load
+constant is 65-119, excluding 96 and 112, as required by
+[TPC-C §2.1.6.1](https://www.tpc.org/tpc_documents_current_versions/pdf/tpc-c_v5.11.0.pdf#page=22).
+The run constants are shared by every terminal and stay fixed through warmup
+and measurement. That surname draw is deliberately non-uniform, so
 name-based Payment and Order-Status see the specification's surname match sizes
 rather than a uniform one-per-name or unmatched random string.
 
@@ -182,6 +186,13 @@ clj -X:sqlite-bench    '{:path "sqlite-tpcc.db" :warehouses 1 :txns 10000 :warmu
 Options: `:warehouses`, `:txns`, `:threads`, `:warmup`, and `:seed` for both.
 The Datalevin runner takes `:dir`; the SQLite runner takes `:path`.
 
+All three runners also accept `:load-seed` (default 42). Set it to the `:seed`
+used when loading the database so the surname constant is checked against the
+actual population. The run's `:seed` controls transaction inputs independently;
+for example, a database loaded with `:seed 123` can be benchmarked with
+`{:load-seed 123 :seed 42 ...}`. The load seed is supplied by the caller; it is
+not read from database metadata.
+
 Run generator and transaction regression tests from this directory:
 
 ```bash
@@ -223,6 +234,8 @@ separately; the runner does not yet switch modes.
 
 The figures below predate completed-New-Order accounting: their New-Order counts
 and tpmC exclude required rollbacks. Rerun the benchmark for corrected tpmC.
+They also predate the constrained load/run surname constants and do not measure
+the current surname lookup distribution.
 
 Recorded Datalevin smoke runs use fresh one-warehouse databases, seed 42, 100
 warmup transactions, and native 1.1.1 with default durability:

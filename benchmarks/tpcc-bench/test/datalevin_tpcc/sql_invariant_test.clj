@@ -43,7 +43,8 @@
                      (close [_] (swap! closed conj id)))))
           transact
           (fn [& _]
-            (let [{:keys [type status changes error]} (nth actions (dec (swap! calls inc)))]
+            (let [{:keys [type status changes error before]} (nth actions (dec (swap! calls inc)))]
+              (when before (before))
               (when error (throw error))
               (doseq [[k deltas] changes [invariant delta] deltas]
                 (swap! state update-in [k invariant] + delta))
@@ -178,3 +179,54 @@
         (is (some? error))
         (is (nil? result))
         (is (not (str/includes? output "tpmC:")))))))
+
+(deftest failed-sql-runs-wait-for-every-terminal
+  (doseq [driver '[datalevin-tpcc.sqlite datalevin-tpcc.postgres]]
+    (testing (str driver)
+      (let [failed-started (promise)
+            other-started (promise)
+            other-active (promise)
+            release-other (promise)
+            failure (ex-info "Terminal failed" {})
+            start-future clojure.core/future-call
+            workers (atom [])
+            start-terminal
+            (fn [f]
+              (let [first? (empty? @workers)
+                    worker (start-future #(do (when-not first?
+                                               (deliver other-started true))
+                                             (f)))]
+                (swap! workers conj worker)
+                ;; Ensure the first future takes the failing action, so an
+                ;; early exit from awaiting that future cannot hide the bug.
+                (when first?
+                  (is (= true (deref failed-started 5000 ::timeout))))
+                worker))
+            actions [{:type :payment :error failure
+                      :before #(do (deliver failed-started true)
+                                   (is (= true (deref other-started 5000 ::timeout))))}
+                     {:type :payment :status :ok
+                      :before #(do (deliver other-active true) @release-other)}]]
+        (with-redefs [clojure.core/future-call start-terminal]
+          (let [runner (start-future #(run-benchmark driver actions 0 2))]
+            (try
+              (is (= true (deref other-active 5000 ::timeout)))
+              (is (= ::pending (deref runner 250 ::pending))
+                  "the run must not throw while another terminal is active")
+              (deliver release-other true)
+              (let [{:keys [error result output] :as outcome}
+                    (deref runner 5000 ::timeout)]
+                (is (not= ::timeout outcome))
+                (is (identical? failure (some-> ^Throwable error .getCause))
+                    "the original terminal failure is propagated after cleanup")
+                (is (nil? result))
+                (is (not (str/includes? (or output "") "tpmC:")))
+                (is (not (str/includes? (or output "") "invariant: OK"))))
+              (finally
+                (deliver release-other true)
+                ;; Also drain workers if an assertion fails against a runner
+                ;; that still exits early, before restoring the test stubs.
+                (doseq [worker @workers]
+                  (try (deref worker 5000 ::timeout)
+                       (catch Throwable _)))
+                (deref runner 5000 ::timeout)))))))))

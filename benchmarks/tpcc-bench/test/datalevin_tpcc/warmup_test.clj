@@ -6,7 +6,8 @@
    [datalevin-tpcc.datalevin]
    [datalevin-tpcc.postgres]
    [datalevin-tpcc.sqlite]
-   [datalevin-tpcc.txns :as t]))
+   [datalevin-tpcc.txns :as t])
+  (:import [java.util Random]))
 
 (def ^:private drivers
   '[datalevin-tpcc.datalevin datalevin-tpcc.sqlite datalevin-tpcc.postgres])
@@ -22,14 +23,15 @@
       (finally
         (doseq [driver drivers] (require driver :reload))))))
 
-(defn- warmup-stream [driver seed n]
+(defn- warmup-stream [driver seed n & [load-seed]]
   (let [calls    (atom [])
         done     (ex-info "Warmup complete" {})
         conn     (reify java.sql.Connection (close [_]))
         generate (var-get (ns-resolve driver 'gen-input))
         capture  (fn [r opts type]
                    (let [input (generate r opts type)]
-                     (swap! calls conj {:rng r :type type :input input})
+                     (swap! calls conj {:rng r :type type :input input
+                                        :constants (select-keys opts [:c-last :c-cust :c-item])})
                      input))
         stop     (fn [& _] (throw done))
         db-stubs (case driver
@@ -63,14 +65,33 @@
           (is (identical? done
                           (try
                             ((ns-resolve driver 'bench)
-                             {:seed seed :warehouses 1 :warmup n
-                              :threads 1 :txns 1})
+                             (cond-> {:seed seed :warehouses 1 :warmup n
+                                      :threads 1 :txns 1}
+                               (some? load-seed) (assoc :load-seed load-seed)))
                             nil
                             (catch clojure.lang.ExceptionInfo e e)))))))
     @calls))
 
 (defn- inputs [calls]
   (mapv #(select-keys % [:type :input]) calls))
+
+(deftest surname-constants-match-the-population-in-every-driver
+  (doseq [[seed load-seed] [[42 nil] [42 42] [43 42] [42 104729] [12345 123456789]]]
+    (let [c-load (.nextInt (Random. (+ (or load-seed 42) 15)) 256)
+          streams (mapv #(warmup-stream % seed 100 load-seed) drivers)]
+      (when (= seed 42)
+        (when (or (nil? load-seed) (= load-seed 42))
+          (is (= 186 c-load) "the default population constant remains unchanged")))
+      (is (apply = (map inputs streams)) "all drivers generate the same workload")
+      (doseq [[driver calls] (map vector drivers streams)]
+        (testing (str driver " input seed=" seed " load seed=" load-seed)
+          (let [constants (map :constants calls)
+                c-run (:c-last (first constants))
+                delta (Math/abs (long (- c-load c-run)))]
+            (is (= 1 (count (distinct constants))) "constants stay fixed throughout the run")
+            (is (<= 0 c-run 255))
+            (is (<= 65 delta 119))
+            (is (not (#{96 112} delta)))))))))
 
 (deftest warmup-advances-one-random-stream-through-the-full-mix
   (doseq [driver drivers]

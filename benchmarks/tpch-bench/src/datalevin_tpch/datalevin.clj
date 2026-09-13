@@ -82,12 +82,9 @@
     :else (throw (ex-info "Unsupported :queries value" {:queries queries}))))
 
 (defn- result-rows
-  "Row count for either a collection result or a scalar aggregate result."
+  "Row count for a collection or a scalar aggregate, including SQL NULL."
   [res]
-  (cond
-    (nil? res)   0
-    (coll? res)  (count res)
-    :else        1))
+  (if (coll? res) (count res) 1))
 
 (defn- run-one
   "Run one Datalog query and return elapsed milliseconds. `explain?` also

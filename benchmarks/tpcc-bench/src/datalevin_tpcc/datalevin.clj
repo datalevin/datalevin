@@ -137,15 +137,13 @@
     :txns       measured transactions (default 10000)
     :threads    terminals (default 1)
     :warmup     warmup transactions (default 1000)
-    :seed       input seed (default 42)"
-  [{:keys [dir warehouses txns threads warmup seed]
-    :or   {dir "db-w1" warehouses 1 txns 10000 threads 1 warmup 1000 seed 42}}]
+    :seed       input seed (default 42)
+    :load-seed  seed used to populate the database (default 42)"
+  [{:keys [dir warehouses txns threads warmup seed load-seed]
+    :or   {dir "db-w1" warehouses 1 txns 10000 threads 1 warmup 1000
+           seed 42 load-seed 42}}]
   (let [conn      (d/get-conn (.getPath (io/file c/base-dir dir)))
-        c-r       (Random. seed)
-        opts      {:warehouses warehouses
-                   :c-item     (rint c-r 0 8191)
-                   :c-cust     (rint c-r 0 1023)
-                   :c-last     (rint c-r 0 255)}
+        opts      (assoc (g/run-constants seed load-seed) :warehouses warehouses)
         committed (atom {})
         payments  (atom {})
         lat       (atom [])
