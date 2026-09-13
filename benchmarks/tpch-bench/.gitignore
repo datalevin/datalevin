@@ -1,0 +1,12 @@
+# Generated TPC-H data and tooling
+data/tbl/
+dbgen/
+sqlite.db
+
+# Datalevin / SQLite working stores
+db/
+db-*/
+tmp/
+
+# Generated timing reports
+*_pass.csv

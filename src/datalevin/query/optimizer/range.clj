@@ -282,15 +282,17 @@
            (= i ac-1) (add-range m [[:closed c/v0] [:closed fa]])
            :else      (add-range m [[:closed pa] [:closed fa]])))))
 
-(defn range->inequality
+(defn range->inequalities
+  "Return predicates whose conjunction preserves both range endpoints."
   [v [[so sc :as s] [eo ec :as e]]]
-  (cond
-    (= s [:closed c/v0])
-    (if (identical? eo :open) (list '< v ec) (list '<= v ec))
-    (= e [:closed c/vmax])
-    (if (identical? so :open) (list '< sc v) (list '<= sc v))
-    :else
-    (if (identical? so :open) (list '< sc v ec) (list '<= sc v ec))))
+  (let [lower-op (if (identical? so :open) '< '<=)
+        upper-op (if (identical? eo :open) '< '<=)]
+    (cond
+      (= s [:closed c/v0]) [(list upper-op v ec)]
+      (= e [:closed c/vmax]) [(list lower-op sc v)]
+      (= so eo) [(list lower-op sc v ec)]
+      ;; A chained comparison can only represent matching endpoint kinds.
+      :else [(list lower-op sc v) (list upper-op v ec)])))
 
 (defn- equality->range
   [m args]

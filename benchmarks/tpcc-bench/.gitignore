@@ -1,0 +1,10 @@
+# Generated databases
+db/
+db-*/
+*.db
+*.mdb/
+tmp/
+
+# Generated timing reports
+*_pass.csv
+results/*.edn

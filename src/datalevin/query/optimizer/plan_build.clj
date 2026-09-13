@@ -107,7 +107,7 @@
 
 (def ^:private add-pred qor/add-pred)
 
-(def ^:private range->inequality qor/range->inequality)
+(def ^:private range->inequalities qor/range->inequalities)
 
 (defn- activate-var-pred
   [var clause]
@@ -163,7 +163,11 @@
           (reduce
             (fn [p r]
               (if r
-                (add-pred p (activate-var-pred v (range->inequality v r)) true)
+                (add-pred p
+                          (reduce (fn [p clause]
+                                    (add-pred p (activate-var-pred v clause)))
+                                  nil (range->inequalities v r))
+                          true)
                 p))
             nil range)]
       (add-pred pred range-pred))

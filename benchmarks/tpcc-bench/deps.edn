@@ -1,0 +1,59 @@
+{:paths ["src"]
+ :deps  {
+         datalevin/datalevin                           {:local/root "../.."}
+         org.clojure/clojure                           {:mvn/version "1.12.5"}
+         org.xerial/sqlite-jdbc                        {:mvn/version "3.51.1.0"}
+         org.postgresql/postgresql                     {:mvn/version "42.7.5"}
+         }
+
+ :aliases
+ {:dev
+  {:extra-paths ["target/classes"]
+   :jvm-opts    ["--add-opens=java.base/java.nio=ALL-UNNAMED"
+                 "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
+                 "--enable-native-access=ALL-UNNAMED"
+                 "-Dclojure.compiler.direct-linking=true"]}
+
+  :test
+  {:extra-paths ["test"]
+   :jvm-opts    ["--add-opens=java.base/java.nio=ALL-UNNAMED"
+                 "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
+                 "--enable-native-access=ALL-UNNAMED"
+                 "-Dclojure.compiler.direct-linking=true"]
+   :extra-deps  {io.github.cognitect-labs/test-runner
+                 {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+   :main-opts   ["-m" "cognitect.test-runner"]
+   :exec-fn     cognitect.test-runner.api/test}
+
+  :datalevin-db
+  {:jvm-opts ["--add-opens=java.base/java.nio=ALL-UNNAMED"
+              "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
+              "--enable-native-access=ALL-UNNAMED"
+              "-Dclojure.compiler.direct-linking=true"]
+   :exec-fn  datalevin-tpcc.datalevin/db}
+
+  :datalevin-bench
+  {:jvm-opts  ["--add-opens=java.base/java.nio=ALL-UNNAMED"
+               "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
+               "--enable-native-access=ALL-UNNAMED"
+               "-Dclojure.compiler.direct-linking=true"]
+   :main-opts ["-m" "datalevin-tpcc.datalevin"]
+   :exec-fn   datalevin-tpcc.datalevin/bench}
+
+  :sqlite-db
+  {:jvm-opts ["-Dclojure.compiler.direct-linking=true"]
+   :exec-fn  datalevin-tpcc.sqlite/db}
+
+  :sqlite-bench
+  {:jvm-opts  ["-Dclojure.compiler.direct-linking=true"]
+   :main-opts ["-m" "datalevin-tpcc.sqlite"]
+   :exec-fn   datalevin-tpcc.sqlite/bench}
+
+  :pg-db
+  {:jvm-opts ["-Dclojure.compiler.direct-linking=true"]
+   :exec-fn  datalevin-tpcc.postgres/db}
+
+  :pg-bench
+  {:jvm-opts  ["-Dclojure.compiler.direct-linking=true"]
+   :main-opts ["-m" "datalevin-tpcc.postgres"]
+   :exec-fn   datalevin-tpcc.postgres/bench}}}

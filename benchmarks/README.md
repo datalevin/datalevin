@@ -28,6 +28,10 @@ The current benchmark suite includes:
 * [iDOC](idoc-bench) compares Datalevin, PostgreSQL, SQLite, and MongoDB on
   YCSB-style A/C/F workloads plus document-query mixes covering nested paths,
   ranges, wildcards, and arrays.
+* [YCSB-style](ycsb-bench) runs A–F workloads against Datalevin KV and Datalog
+  in embedded and local-server modes, with seeded records, concurrent clients,
+  per-operation latency, throughput, and record validation. Datalog comparisons
+  pair embedded mode with SQLite and remote mode with PostgreSQL.
 * [Wikipedia Full-text Search](search-bench) compares Lucene and Datalevin on
   full-text search performance using a Wikipedia data set and realistic Web
   queries.
