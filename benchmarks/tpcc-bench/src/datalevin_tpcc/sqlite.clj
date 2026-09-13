@@ -429,16 +429,31 @@
       :stock-level
       {:w w :d (rint r 1 10) :threshold (rint r 10 20)})))
 
-(defn- do-txn [conn ^Random r opts type]
-  (let [input (gen-input r opts type)
-        t0    (System/nanoTime)
-        res   (case type
-                :new-order    (new-order! conn input)
-                :payment      (payment! conn input)
-                :order-status (order-status! conn input)
-                :delivery     (delivery! conn input)
-                :stock-level  (stock-level! conn input))]
-    [type input res (/ (- (System/nanoTime) t0) 1.0e6)]))
+(defn- with-write-lock
+  "Run `f` while holding the shared SQLite writer lock, returning
+  `[result elapsed-ms]`. The wait to acquire the lock is inside the timed
+  region, so writer contention is part of the reported latency."
+  [^java.util.concurrent.locks.ReentrantLock lock f]
+  (let [t0 (System/nanoTime)]
+    (.lock lock)
+    (try
+      [(f) (/ (- (System/nanoTime) t0) 1.0e6)]
+      (finally (.unlock lock)))))
+
+(defn- do-txn
+  "Run one transaction. Input generation happens before the timed region;
+  waiting for the SQLite writer lock is inside it, matching the Datalevin and
+  PostgreSQL backends."
+  [conn ^Random r opts type]
+  (let [input    (gen-input r opts type)
+        [res ms] (with-write-lock (:write-lock opts)
+                                   #(case type
+                                      :new-order    (new-order! conn input)
+                                      :payment      (payment! conn input)
+                                      :order-status (order-status! conn input)
+                                      :delivery     (delivery! conn input)
+                                      :stock-level  (stock-level! conn input)))]
+    [type input res ms]))
 
 (defn- percentile [sorted p]
   (when (seq sorted)
@@ -487,32 +502,29 @@
   (enable-wal! path)
   (let [conn      (open-conn path)
         c-r       (Random. seed)
-        opts      {:warehouses warehouses
-                   :c-item     (rint c-r 0 8191)
-                   :c-cust     (rint c-r 0 1023)
-                   :c-last     (rint c-r 0 255)}
         committed (atom {})
         lat       (atom [])
         ;; SQLite has a single writer, so write transactions serialize on one
         ;; lock. Reads run concurrently.
         write-lock (java.util.concurrent.locks.ReentrantLock.)
+        opts      {:warehouses warehouses
+                   :c-item     (rint c-r 0 8191)
+                   :c-cust     (rint c-r 0 1023)
+                   :c-last     (rint c-r 0 255)
+                   :write-lock write-lock}
         run       (fn [^java.sql.Connection cnn ^long ti ^long n record?]
                     (let [r (Random. (+ seed ti 1))]
                       (dotimes [_ n]
-                        (let [type (pick-type r)]
-                          ;; SQLite has a single writer. Serializing every
-                          ;; transaction on one lock makes the read-modify-write
-                          ;; sequences atomic and avoids snapshot conflicts;
-                          ;; terminals still use independent connections.
-                          (.lock write-lock)
-                          (let [[ty input res ms]
-                                (try (do-txn cnn r opts type)
-                                     (finally (.unlock write-lock)))]
-                            (when (and (= :new-order ty) (= :ok (:status res)))
-                              (swap! committed update [(:w input) (:d input)]
-                                     (fnil inc 0)))
-                            (when record?
-                              (swap! lat conj [ty ms])))))))]
+                        (let [type              (pick-type r)
+                              ;; Every transaction serializes on the shared
+                              ;; writer lock inside `do-txn`; the wait for it
+                              ;; is part of the measured latency.
+                              [ty input res ms] (do-txn cnn r opts type)]
+                          (when (and (= :new-order ty) (= :ok (:status res)))
+                            (swap! committed update [(:w input) (:d input)]
+                                   (fnil inc 0)))
+                          (when record?
+                            (swap! lat conj [ty ms]))))))]
     (println (format "TPC-C-derived: %d warehouse(s), %d terminal(s), %d txns"
                      warehouses threads txns))
     ;; A run owns its RNG, so execute the whole warmup as one batch.

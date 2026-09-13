@@ -469,26 +469,36 @@
   (let [s (.getSQLState e)]
     (or (= "40001" s) (= "40P01" s))))
 
-(defn- do-txn [conn ^Random r opts type]
-  (let [input (gen-input r opts type)]
+(defn- run-with-retry
+  "Run `f` until it completes or a non-retryable failure occurs, returning
+  `[result elapsed-ms]`. Timing spans every attempt and the backoff between
+  them, so a retried transaction does not report only its final attempt."
+  [label f]
+  (let [t0 (System/nanoTime)]
     (loop [attempt 0]
-      (let [t0     (System/nanoTime)
-            result (try
-                     [:ok (case type
-                            :new-order    (new-order! conn input)
-                            :payment      (payment! conn input)
-                            :order-status (order-status! conn input)
-                            :delivery     (delivery! conn input)
-                            :stock-level  (stock-level! conn input))]
+      (let [result (try
+                     [:ok (f)]
                      (catch java.sql.SQLException e
                        (if (retryable? e) :retry (throw e))))]
         (if (= result :retry)
           (if (< attempt 50)
             (do (Thread/sleep 2) (recur (inc attempt)))
             (throw (ex-info "TPC-C transaction retry budget exhausted"
-                            {:type type})))
+                            {:type label})))
           (let [[_ res] result]
-            [type input res (/ (- (System/nanoTime) t0) 1.0e6)]))))))
+            [res (/ (- (System/nanoTime) t0) 1.0e6)]))))))
+
+(defn- do-txn [conn ^Random r opts type]
+  (let [input    (gen-input r opts type)
+        [res ms] (run-with-retry
+                   type
+                   #(case type
+                      :new-order    (new-order! conn input)
+                      :payment      (payment! conn input)
+                      :order-status (order-status! conn input)
+                      :delivery     (delivery! conn input)
+                      :stock-level  (stock-level! conn input)))]
+    [type input res ms]))
 
 (defn- percentile [sorted p]
   (when (seq sorted)
