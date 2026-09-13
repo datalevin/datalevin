@@ -113,12 +113,14 @@
              (client/retry-ha-transport-failure
               base req send ["127.0.0.1:19001" "127.0.0.1:19002"] failed)))
       (is (= [[target req]] @calls))
-      (let [decode-error (ex-info "invalid native value"
-                                  {:error :native-value/decode})
-            wrapped      (ex-info "wire read failed" {} decode-error)
-            actual       (try
-                           (client/retry-ha-transport-failure
-                            base req send ["127.0.0.1:19002"] wrapped)
-                           (catch Exception e e))]
-        (is (identical? wrapped actual))
-        (is (= 1 (count @calls)))))))
+      (doseq [failure [(ex-info "wire read failed" {}
+                               (ex-info "invalid native value"
+                                        {:error :native-value/decode}))
+                       (ex-info "write outcome unknown"
+                                {:err-data {:error :ha/write-indeterminate}})]]
+        (let [actual (try
+                       (client/retry-ha-transport-failure
+                        base req send ["127.0.0.1:19002"] failure)
+                       (catch Exception e e))]
+          (is (identical? failure actual))
+          (is (= 1 (count @calls))))))))

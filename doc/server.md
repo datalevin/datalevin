@@ -217,6 +217,17 @@ the open request. Once the transaction session is opened, however, it stays
 bound to that server connection and is not automatically migrated to a new
 leader mid-transaction.
 
+A transport failure after a write starts can hide a committed mutation. Without
+supported deduplication metadata, the client stops instead of resending to the
+same or another endpoint. It throws an exception whose `ex-data` contains
+`:indeterminate? true` and `:err-data` with `:error :ha/write-indeterminate`,
+`:retryable? false`, and the failed `:endpoint`. The mutation may have committed;
+check its outcome before issuing it again. Reads and requests carrying complete
+client operation metadata for `:tx-data`, `:tx-data+db-info`, or `:transact-kv`
+can still recover from a lost reply. Metadata on other commands, including
+`:add-vec`, does not enable deduplication. Connection setup failures before
+sending the request can still fall back to another endpoint.
+
 #### HA static membership changes
 
 Consensus HA membership is static and operator managed. Datalevin does not

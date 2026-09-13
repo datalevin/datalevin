@@ -1,12 +1,20 @@
 (ns datalevin.client-routing-test
   (:require
    [clojure.test :refer [deftest is testing]]
-   [datalevin.client :as client]))
+   [datalevin.client :as client]
+   [datalevin.command :as command])
+  (:import [java.io IOException]))
 
 (def ^:private mutations
   [:add-doc :remove-doc :clear-docs :search-re-index
    :add-vec :remove-vec :clear-vecs :persist-vecs :close-vecs :vec-re-index
    :new-search-engine :new-vector-index])
+
+(def ^:private administrative-mutations
+  [:create-user :reset-password :drop-user :create-role :drop-role
+   :create-database :assign-role :withdraw-role :grant-permission
+   :revoke-permission :close-database :disconnect-client :open :close
+   :open-kv :close-kv :start-sampling :stop-sampling])
 
 (defn- request-client [send]
   (reify client/IClient
@@ -56,7 +64,7 @@
     (#'client/cache-known-ha-db-endpoints! base "db" ["127.0.0.1:19002"])
     (with-redefs [client/new-client-for-endpoint
                   (fn [& _] (swap! creates inc) target)]
-      (doseq [op (conj mutations :assoc-opt)]
+      (doseq [op (into (conj mutations :assoc-opt) administrative-mutations)]
         (is (identical? failure
                         (try (client/normal-request base op ["db"])
                              (catch Exception e e))) (str op)))
@@ -87,3 +95,143 @@
         (client/normal-request target re-index ["db" updated])
         (client/open-database base "db" db-type)
         (is (= {:type op :args ["db" updated]} (last @requests)))))))
+
+(defn- retry-context [base]
+  {:client base :host "127.0.0.1" :port 19001 :time-out 1000
+   :ha-write-retry-timeout-ms 1000})
+
+(def ^:private client-op
+  {:client-op-id "operation-1" :client-op-hash "payload-hash"
+   :client-op-response-kind :kv-result})
+
+(deftest preferred-write-lost-reply-does-not-fall-back-test
+  (doseq [op mutations]
+    (testing (str op)
+      (let [commits  (atom 0)
+            fallback (atom 0)
+            lost     (IOException. "reply lost after commit")
+            base     (request-client
+                      (fn [_]
+                        (swap! fallback inc)
+                        {:type :command-complete :result :duplicated}))
+            target   (request-client
+                      (fn [req]
+                        (when (= op (:type req))
+                          (swap! commits inc)
+                          (throw lost))
+                        {:type :command-complete}))]
+        (#'client/set-preferred-ha-endpoint! base "127.0.0.1:19002")
+        (with-redefs [client/client-retry-context (fn [_] (retry-context base))
+                      client/new-client-for-endpoint (fn [& _] target)]
+          (let [e (try (client/normal-request base op ["db" :one [1.0 0.0]])
+                       (catch Exception e e))
+                err (:err-data (ex-data e))]
+            (is (= :ha/write-indeterminate (:error err)))
+            (is (false? (:retryable? err)))
+            (is (true? (:indeterminate? (ex-data e))))
+            (is (= "127.0.0.1:19002" (:endpoint err)))
+            (is (identical? lost (ex-cause e)))
+            (is (= 1 @commits))
+            (is (zero? @fallback))))))))
+
+(deftest connection-failure-before-preferred-request-can-fall-back-test
+  (let [calls (atom [])
+        base  (request-client
+               (fn [req]
+                 (swap! calls conj req)
+                 {:type :command-complete :result :added}))]
+    (#'client/set-preferred-ha-endpoint! base "127.0.0.1:19002")
+    (with-redefs [client/client-retry-context (fn [_] (retry-context base))
+                  client/new-client-for-endpoint
+                  (fn [& _] (throw (IOException. "connection refused")))]
+      (is (= :added (client/normal-request base :add-vec ["db" :one [1.0]]))))
+    (is (= [{:type :add-vec :args ["db" :one [1.0]] :writing? false}]
+           @calls))
+    (is (identical? base (client/active-ha-request-client base)))))
+
+(deftest ha-retry-stops-after-an-ambiguous-mutation-test
+  ;; IDs only protect handlers that actually deduplicate them. Neither forged
+  ;; metadata on add-vec nor incomplete transaction metadata permits a replay.
+  (doseq [req [{:type :add-vec :args ["db"]}
+               (merge client-op {:type :add-vec :args ["db"]})
+               {:type :transact-kv :args ["db"]}
+               {:type :transact-kv :args ["db"] :client-op-id "operation-1"}]]
+    (let [base     (client/->Client "user" "password" "127.0.0.1" 19001
+                                    1 1000 nil nil)
+          attempts (atom [])
+          send     (fn [endpoint _]
+                     (swap! attempts conj endpoint)
+                     (if (= 1 (count @attempts))
+                       (throw (IOException. "reply lost after commit"))
+                       {:type :command-complete :result :duplicated}))]
+      (with-redefs [client/new-client-for-endpoint (fn [_ _ port] port)]
+        (let [e (try
+                  (client/retry-ha-write-request
+                   base req "not leader"
+                   {:error :ha/write-rejected :retryable? true
+                    :ha-retry-endpoints ["127.0.0.1:19002" "127.0.0.1:19003"]}
+                   send)
+                  (catch Exception e e))]
+          (is (= :ha/write-indeterminate (:error (:err-data (ex-data e)))))))
+      (is (= [19002] @attempts)))))
+
+(deftest replay-safe-requests-can-recover-a-lost-reply-test
+  (doseq [req (cons {:type :doc-count :args ["db"]}
+                   (for [op [:tx-data :tx-data+db-info :transact-kv]]
+                     (merge client-op
+                            {:type op :args ["db"]
+                             :client-op-response-kind
+                             (if (= op :transact-kv) :kv-result op)})))]
+    (let [base     (Object.)
+          attempts (atom [])
+          commits  (atom 0)
+          results  (atom {})
+          send     (fn [_ request]
+                     (swap! attempts conj request)
+                     ;; Simulate the server's atomic mutation/result record.
+                     (when-let [id (:client-op-id request)]
+                       (when-not (contains? @results id)
+                         (swap! commits inc)
+                         (swap! results assoc id :saved)))
+                     (if (= 1 (count @attempts))
+                       (throw (IOException. "reply lost after commit"))
+                       {:type :command-complete
+                        :result (get @results (:client-op-id request) :read)}))]
+      (is (= (if (:client-op-id req) :saved :read)
+             (#'client/retry-ha-write-request*
+              req "not leader"
+              {:error :ha/write-rejected :retryable? true
+               :ha-retry-endpoints ["127.0.0.1:19002" "127.0.0.1:19003"]}
+              (retry-context base) send (constantly nil)
+              (fn [_ _ port] port))))
+      (is (= [req req] @attempts) "retries preserve the deduplication metadata")
+      (is (= (if (:client-op-id req) 1 0) @commits)))))
+
+(deftest pooled-request-does-not-resend-an-ambiguous-mutation-test
+  (doseq [op (concat (keys (filter (comp :replica-write? val) command/properties))
+                    administrative-mutations
+                    [:unknown-command])]
+    (testing (str op)
+      (let [sent     (atom 0)
+            released (atom 0)
+            closed   (atom 0)
+            lost     (IOException. "reply lost after commit")
+            conn     (reify client/IConnection
+                       (send-n-receive [_ _] (swap! sent inc) (throw lost))
+                       (send-only [_ _] nil)
+                       (receive [_] nil)
+                       (close [_] (swap! closed inc)))
+            pool     (reify client/IConnectionPool
+                       (get-connection [_] conn)
+                       (release-connection [_ c]
+                         (is (identical? conn c))
+                         (swap! released inc))
+                       (close-pool [_] nil)
+                       (closed-pool? [_] false))
+            base     (client/->Client "user" "password" "127.0.0.1" 19001
+                                      1 1000 nil pool)
+            e        (try (client/request base {:type op :args ["db"]})
+                          (catch Exception e e))]
+        (is (= :ha/write-indeterminate (:error (:err-data (ex-data e)))))
+        (is (identical? lost (ex-cause e)))
+        (is (= 1 @sent @released @closed))))))

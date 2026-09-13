@@ -44,11 +44,16 @@
   (doseq [[type properties] cmd/properties]
     (testing (str type)
       (is (boolean? (:ha-write? properties)))
-      (is (boolean? (:replica-write? properties)))))
+      (is (boolean? (:replica-write? properties)))
+      (is (boolean? (:read-only? properties)))
+      (when (:replica-write? properties)
+        (is (false? (:read-only? properties))))))
   (is (= (into database-writes index-opens)
          (set (filter cmd/ha-write? (keys handlers/handler-map)))))
   (is (= (into (into database-writes local-writes) index-opens)
          (set (filter cmd/replica-write? (keys handlers/handler-map)))))
+  (is (= #{:tx-data :tx-data+db-info :transact-kv}
+         (set (filter cmd/supports-client-op? (keys handlers/handler-map)))))
   (doseq [type (keys handlers/handler-map)]
     (is (= (contains? (into database-writes index-opens) type)
            (ha/ha-write-message? {:type type})) (str type))

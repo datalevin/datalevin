@@ -14,16 +14,26 @@
   writes require HA admission, commit fencing, and replica protection. Local
   administration is protected on read-only replicas but remains available on
   HA followers (for example, membership changes and retention floor reports).
-  Session, store lifecycle, and read commands do not require these write gates.")
+  Session, store lifecycle, and read commands do not require these write gates.
+  Transport replay safety is separate: only read-only commands or writes with
+  supported client operation metadata may be resent after an ambiguous failure.")
 
 (def ^:private unguarded
-  {:ha-write? false :replica-write? false})
+  {:ha-write? false :replica-write? false :read-only? true})
+
+(def ^:private unguarded-write
+  (assoc unguarded :read-only? false))
 
 (def ^:private db-write
-  {:ha-write? true :replica-write? true})
+  {:ha-write? true :replica-write? true :read-only? false})
+
+(def ^:private client-op-write
+  ;; These handlers persist client operation IDs and their results atomically
+  ;; with the mutation. Metadata on other commands does not enable deduplication.
+  (assoc db-write :client-op? true))
 
 (def ^:private local-write
-  {:ha-write? false :replica-write? true})
+  {:ha-write? false :replica-write? true :read-only? false})
 
 (def ^:private index-open
   ;; The handler first attempts an existing-only open. Creation and legacy
@@ -50,36 +60,39 @@
   ;; holds a narrower read lock only during the snapshot, not file transfer.
   (assoc unguarded :runtime-read-access-exempt? true))
 
+(def ^:private runtime-write
+  (assoc runtime-managed :read-only? false))
+
 (def properties
   "Command classifications. Keep entries in server handler-table order so
   additions can be reviewed together; tests require the tables to agree."
-  {:authentication unguarded
-   :disconnect unguarded
-   :set-client-id unguarded
-   :create-user unguarded
-   :reset-password unguarded
-   :drop-user unguarded
+  {:authentication unguarded-write
+   :disconnect unguarded-write
+   :set-client-id unguarded-write
+   :create-user unguarded-write
+   :reset-password unguarded-write
+   :drop-user unguarded-write
    :list-users unguarded
-   :create-role unguarded
-   :drop-role unguarded
+   :create-role unguarded-write
+   :drop-role unguarded-write
    :list-roles unguarded
-   :create-database unguarded
-   :close-database runtime-managed
+   :create-database unguarded-write
+   :close-database runtime-write
    :drop-database local-write
    :list-databases unguarded
    :list-databases-in-use unguarded
-   :assign-role unguarded
-   :withdraw-role unguarded
+   :assign-role unguarded-write
+   :withdraw-role unguarded-write
    :list-user-roles unguarded
-   :grant-permission unguarded
-   :revoke-permission unguarded
+   :grant-permission unguarded-write
+   :revoke-permission unguarded-write
    :list-role-permissions unguarded
    :list-user-permissions unguarded
    :query-system unguarded
    :show-clients unguarded
-   :disconnect-client unguarded
-   :open runtime-managed
-   :close unguarded
+   :disconnect-client unguarded-write
+   :open runtime-write
+   :close unguarded-write
    :closed? unguarded
    :opts unguarded
    :assoc-opt local-write
@@ -96,9 +109,9 @@
    :rename-attr db-write
    :datom-count unguarded
    :load-datoms db-write
-   :tx-data db-write
+   :tx-data client-op-write
    :db-info unguarded
-   :tx-data+db-info db-write
+   :tx-data+db-info client-op-write
    :open-transact transaction-open
    :close-transact transaction-close
    :abort-transact transaction-abort
@@ -133,8 +146,8 @@
    :tail unguarded
    :slice unguarded
    :rslice unguarded
-   :start-sampling unguarded
-   :stop-sampling unguarded
+   :start-sampling unguarded-write
+   :stop-sampling unguarded-write
    ;; Explicit analysis persists sampling metadata.
    :analyze db-write
    :e-datoms unguarded
@@ -150,8 +163,8 @@
    :tail-filter unguarded
    :slice-filter unguarded
    :rslice-filter unguarded
-   :open-kv runtime-managed
-   :close-kv unguarded
+   :open-kv runtime-write
+   :close-kv unguarded-write
    :closed-kv? unguarded
    :open-dbi db-write
    :register-type db-write
@@ -164,7 +177,7 @@
    :open-transact-kv transaction-open
    :close-transact-kv transaction-close
    :abort-transact-kv transaction-abort
-   :transact-kv db-write
+   :transact-kv client-op-write
    :batch-kv unguarded
    :visit-key-range unguarded
    :get-some unguarded
@@ -234,10 +247,21 @@
   [type]
   (true? (:replica-write? (properties type))))
 
+(defn read-only?
+  "Whether a command can be replayed after transport failure without deduplication.
+  Unknown commands are not assumed to be safe."
+  [type]
+  (true? (:read-only? (properties type))))
+
 (defn transaction-control
   "Return :open, :close, or :abort for transaction control commands."
   [type]
   (:transaction (properties type)))
+
+(defn supports-client-op?
+  "Whether the handler deduplicates writes carrying client operation metadata."
+  [type]
+  (true? (:client-op? (properties type))))
 
 (defn deferred-write?
   "Whether the handler admits writes only when an existing-only open fails."

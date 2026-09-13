@@ -475,6 +475,38 @@
 
 (declare open-database disconnect-retry-clients!)
 
+(defn- transport-replay-safe?
+  [{:keys [type writing? client-op-id client-op-hash client-op-response-kind]}]
+  (or (and (not writing?) (cmd/read-only? type))
+      (and (cmd/supports-client-op? type)
+           (every? #(and (string? %) (not (s/blank? %)))
+                   [client-op-id client-op-hash])
+           (keyword? client-op-response-kind))))
+
+(defn- write-indeterminate?
+  [e]
+  (let [data (ex-data e)]
+    (= :ha/write-indeterminate (or (:error data) (:error (:err-data data))))))
+
+(defn- reject-unsafe-transport-replay!
+  [req endpoint e]
+  (when (or (nv/decoding-error? e) (write-indeterminate? e))
+    (throw e))
+  (when-not (transport-replay-safe? req)
+    (let [message "Write outcome is unknown after transport failure; request was not retried"
+          error   {:error :ha/write-indeterminate
+                   :reason :transport-failure
+                   :indeterminate? true
+                   :retryable? false
+                   :db-name (or (:db-name req) (first (:args req)))
+                   :type (:type req)
+                   :endpoint endpoint}]
+      (throw (ex-info message
+                      (merge req {:err-data error
+                                  :server-message message
+                                  :indeterminate? true})
+                      e)))))
+
 (deftype ^:no-doc Client [username password host port pool-size time-out
                           ^:volatile-mutable ^UUID id
                           ^:volatile-mutable ^ConnectionPool pool]
@@ -491,9 +523,12 @@
                                        (send-n-receive conn req)
                                        (catch Exception e
                                          (close conn)
-                                         (when (nv/decoding-error? e)
+                                         (when (or (nv/decoding-error? e)
+                                                   (write-indeterminate? e)
+                                                   (not (transport-replay-safe? req)))
                                            (release-connection pool' conn)
-                                           (throw e))
+                                           (reject-unsafe-transport-replay!
+                                            req (str host ":" port) e))
                                          nil))
                 res                  (try
                                        (when-let [{:keys [type] :as result}
@@ -514,6 +549,10 @@
                                              (close conn)
                                              (vreset! success? false)
                                              {:request-status :reconnect})))
+                                       (catch Exception e
+                                         (reject-unsafe-transport-replay!
+                                          req (str host ":" port) e)
+                                         (throw e))
                                        (finally
                                          (release-connection pool' conn)))
                 res'                 (case (:request-status res)
@@ -1286,12 +1325,16 @@
         (catch Exception e
           (when cached?
             (evict-retry-client! base-client endpoint disconnect-fn))
+          ;; Once request-fn has started, a lost reply can hide a commit. Only
+          ;; reads and writes with supported deduplication may visit another
+          ;; endpoint. Failures while preparing the client remain safe to retry.
+          (reject-unsafe-transport-replay! req endpoint e)
           (throw e))
         (finally
           (when-not cached?
             (safe-disconnect-retry-client! client disconnect-fn)))))
     (catch Exception e
-      (when (nv/decoding-error? e) (throw e))
+      (when (or (nv/decoding-error? e) (write-indeterminate? e)) (throw e))
       {:kind :exception
        :exception e})))
 
@@ -1456,7 +1499,8 @@
   "Internal retry API: handle a failed write using the client's HA settings.
   Returns the successful result and remembers its endpoint. Raises a normal
   request error if the rejection is not retryable, retries are disabled, or the
-  deadline expires. Optional request-fn takes [client request] and returns a wire
+  deadline expires. An ambiguous unprotected write raises :ha/write-indeterminate.
+  Optional request-fn takes [client request] and returns a wire
   response; remote stores supply it to replay copy-in payloads."
   ([client req message err-data]
    (retry-ha-write-request client req message err-data request))
@@ -1475,9 +1519,10 @@
   request-fn takes [client request] and returns a wire response. Starts with known
   endpoints other than the failed client's endpoint, returning a command-complete
   response with transaction metadata, or nil when no retry is available. Native
-  decoding errors and exhausted retry errors propagate to the caller."
+  decoding errors, indeterminate writes, and exhausted retries propagate."
   [client req request-fn known-endpoints throwable]
-  (when (nv/decoding-error? throwable) (throw throwable))
+  (when (or (nv/decoding-error? throwable) (write-indeterminate? throwable))
+    (throw throwable))
   (when-let [retry-context (client-retry-context client)]
     (let [self-endpoint (endpoint-key (:host retry-context) (:port retry-context))
           retry-endpoints (->> known-endpoints
@@ -1614,7 +1659,7 @@
    (normal-request* client call args false))
   ([client call args writing?]
    (let [write-route?        (or writing? (cmd/ha-write? call))
-         read-route?         (not (or write-route? (cmd/replica-write? call)))
+         read-route?         (and (not writing?) (cmd/read-only? call))
          read-min-tx         (when (and read-route?
                                        (integer? *ha-read-min-tx*))
                               (long *ha-read-min-tx*))
