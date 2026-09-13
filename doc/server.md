@@ -87,6 +87,21 @@ function that takes a `dir` argument can also take a connection URI string,
 e.g. `(get-conn "dtlv://datalevin:datalevin@localhost/mydb")`. The remote access
 is transparent to the function callers.
 
+## Embedded server lifecycle
+
+When using `datalevin.server` from Clojure, `create` allocates server resources
+and binds the listening port; `start` begins processing requests and starts the
+HA renewal and follower loops. Failed construction or startup releases acquired
+resources. Always call `stop` after successful creation, even if `start` was
+never called.
+Calling `start` on a running instance or calling `stop` repeatedly is harmless.
+Concurrent calls to `start` and `stop` are serialized.
+
+Stopping or failing to start is permanent for that server instance. A later
+`start` throws an exception with `:error :server/stopped`. To restart, call
+`create` with the same root and port after `stop` completes, then start the new
+instance. The stored databases and sessions are retained.
+
 ## Implementation
 
 The client/server mode is enabled with little changes to the Datalevin core library.

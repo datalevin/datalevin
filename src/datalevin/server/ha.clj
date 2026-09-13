@@ -25,7 +25,7 @@
   (:import
    [java.util.concurrent ConcurrentHashMap]
    [java.util.concurrent CountDownLatch ExecutorService Future FutureTask
-    Semaphore TimeUnit]
+    RejectedExecutionException Semaphore TimeUnit]
    [java.util.concurrent.atomic AtomicBoolean]
    [datalevin.storage Store]))
 
@@ -778,6 +778,29 @@
     (finally
       (.countDown stopped-latch))))
 
+(defn- submit-ha-loop!
+  [^ExecutorService executor ^FutureTask task]
+  (let [caller (Thread/currentThread)
+        submitting? (AtomicBoolean. true)
+        reject-shutdown! #(when (.isShutdown executor)
+                            (throw (RejectedExecutionException.
+                                     "Server worker executor is shut down")))]
+    (reject-shutdown!)
+    (try
+      (.execute executor
+                ^Runnable (fn []
+                            ;; CallerRunsPolicy is useful for bounded request
+                            ;; handling, but must not run an HA loop in start.
+                            ;; The same worker may run a queued loop later.
+                            (when (and (identical? caller (Thread/currentThread))
+                                       (.get submitting?))
+                              (throw (RejectedExecutionException.
+                                       "No worker capacity for HA background loop")))
+                            (.run task)))
+      (finally (.set submitting? false)))
+    ;; CallerRunsPolicy silently discards tasks submitted after shutdown.
+    (reject-shutdown!)))
+
 (defn ensure-ha-renew-loop
   [deps server db-name]
   (let [new-running-v (volatile! nil)
@@ -821,7 +844,7 @@
          m)))
     (when-let [^FutureTask future @new-future-v]
       (try
-        (.execute ^ExecutorService ((:work-executor-fn deps) server) future)
+        (submit-ha-loop! ((:work-executor-fn deps) server) future)
         (catch Throwable t
           (when-let [^AtomicBoolean running? @new-running-v]
             (.set running? false))
@@ -886,7 +909,7 @@
          m)))
     (when-let [^FutureTask future @new-future-v]
       (try
-        (.execute ^ExecutorService ((:work-executor-fn deps) server) future)
+        (submit-ha-loop! ((:work-executor-fn deps) server) future)
         (catch Throwable t
           (when-let [^AtomicBoolean running? @new-running-v]
             (.set running? false))

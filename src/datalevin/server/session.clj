@@ -11,7 +11,9 @@
   "Client tracking and session bookkeeping."
   (:require
    [datalevin.core :as d]
+   [datalevin.db :as db]
    [datalevin.lmdb :as l]
+   [datalevin.server.resources :as resources]
    [taoensso.timbre :as log])
   (:import
    [java.nio.channels ClosedSelectorException Selector SelectionKey]
@@ -122,31 +124,38 @@
         (log/info "Skipping automatic reopen of consensus HA database"
                   {:db-name db-name
                    :root root})
-        (let [store ((:open-store-fn deps) root db-name dbis datalog?)
-              consensus-ha? (and datalog?
-                                 (some? ((:consensus-ha-opts-fn deps) store)))]
-          (if consensus-ha?
-            (do
-              ;; Backward compatibility for persisted sessions created before
-              ;; the stored `:consensus-ha?` flag existed.
-              ((:close-store-fn deps) store)
-              (log/info "Skipping automatic reopen of consensus HA database"
-                        {:db-name db-name
-                         :root root}))
-            (let [runtime-opts ((:resolved-runtime-opts-fn deps) nil db-name store m)
-                  next-m       ((:ensure-ha-runtime-fn deps)
-                                root
-                                db-name
-                                (cond-> (assoc m
-                                               :store store
-                                               :runtime-opts runtime-opts)
-                                  datalog?
-                                  (assoc :dt-db
-                                         ((:new-runtime-db-fn deps)
-                                          store
-                                          runtime-opts)))
-                                store)]
-              (.put dbs db-name next-m))))))
+        (resources/with-acquired
+          (fn [own!]
+            (let [dt-db-v (volatile! nil)
+                  store (own! ((:open-store-fn deps) root db-name dbis datalog?)
+                              #(if-let [dt-db @dt-db-v]
+                                 (db/close-db dt-db)
+                                 ((:close-store-fn deps) %)))
+                  consensus-ha? (and datalog?
+                                     (some? ((:consensus-ha-opts-fn deps) store)))]
+              (if consensus-ha?
+                (do
+                  ;; Backward compatibility for persisted sessions created before
+                  ;; the stored `:consensus-ha?` flag existed.
+                  ((:close-store-fn deps) store)
+                  (log/info "Skipping automatic reopen of consensus HA database"
+                            {:db-name db-name
+                             :root root}))
+                (let [runtime-opts ((:resolved-runtime-opts-fn deps) nil db-name store m)
+                      next-m       ((:ensure-ha-runtime-fn deps)
+                                    root
+                                    db-name
+                                    (cond-> (assoc m
+                                                   :store store
+                                                   :runtime-opts runtime-opts)
+                                      datalog?
+                                      (assoc :dt-db
+                                             (vreset! dt-db-v
+                                                      ((:new-runtime-db-fn deps)
+                                                       store
+                                                       runtime-opts))))
+                                    store)]
+                  (.put dbs db-name next-m))))))))
     (doseq [db-name engines
             :when   (and (not (get-in dbs [db-name :engine]))
                          (get-in dbs [db-name :store]))

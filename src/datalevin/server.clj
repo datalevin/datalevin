@@ -31,6 +31,7 @@
    [datalevin.server.dispatch :as sdisp]
    [datalevin.server.handlers :as sh]
    [datalevin.server.ha :as sha]
+   [datalevin.server.resources :as resources]
    [datalevin.server.session :as sess]
    [datalevin.kv :as kv]
    [datalevin.replica :as replica]
@@ -56,8 +57,10 @@
    [datalevin.interface ILMDB IStore]))
 
 (defprotocol IServer
-  (start [srv] "Start the server")
-  (stop [srv] "Stop the server"))
+  (start [srv] "Start the server. Repeated calls while running are harmless.
+  A stopped instance cannot be restarted; call create for a new instance.")
+  (stop [srv] "Release server resources, including before the first start.
+  Repeated calls are harmless. Concurrent lifecycle calls are serialized."))
 
 ;; system db management
 
@@ -218,7 +221,8 @@
          with-db-runtime-store-swap
          halt-run cleanup-connection-transactions! session-deps copy-deps
          dispatch-deps ha-deps
-         stop-ha-background-loops!)
+         stop-ha-background-loops! shutdown-server!
+         ensure-ha-renew-loop ensure-ha-follower-sync-loop)
 
 (def session-dbi sess/session-dbi)
 
@@ -279,37 +283,90 @@
                  ;; db-name -> { store, search engine, vector index,
                  ;;              datalog db, lock, write txn runner,
                  ;;              and writing variants of stores }
-                 dbs]
+                 dbs
+                 ;; :created, :running, or :stopped. Its monitor serializes
+                 ;; lifecycle calls; event/worker loops only read running.
+                 lifecycle]
   IServer
   (start [server]
     (letfn [(init []
               (log/info "Datalevin server started on port" port)
-              (try (event-loop server)
-                   (catch Exception e
-                     (when (.get running)
-                       (.submit dispatcher ^Callable init)))))]
-      (when-not (.get running)
-        (.set running true)
-        (try
-          (.submit dispatcher ^Callable init)
-          (catch Throwable t
-            (.set running false)
-            (throw t))))))
+              ;; Retry on this task instead of racing shutdown with another
+              ;; submission to the dispatcher.
+              (loop []
+                (when (.get running)
+                  (try
+                    (event-loop server)
+                    (catch Exception e
+                      (when (.get running)
+                        (log/error e "Server event loop failed; retrying"))))
+                  (recur))))]
+      (locking lifecycle
+        (when (= :stopped @lifecycle)
+          (raise "Cannot start a stopped server; create a new server instance"
+                 {:error :server/stopped :port port :root root}))
+        (when (= :created @lifecycle)
+          (.set running true)
+          (reset! lifecycle :running)
+          (try
+            (doseq [db-name (keys dbs)]
+              (ensure-ha-renew-loop server db-name)
+              (ensure-ha-follower-sync-loop server db-name))
+            (.submit dispatcher ^Callable init)
+            (catch Throwable t
+              (.set running false)
+              (reset! lifecycle :stopped)
+              (resources/close-suppressing! t #(shutdown-server! server))
+              (throw t)))))))
 
   (stop [server]
-    (.set running false)
-    (stop-ha-background-loops! server)
-    (.wakeup selector)
-    (doseq [skey (.keys selector)]
-      (cleanup-connection-transactions! server skey)
-      (close-conn skey))
-    (.close server-socket)
-    (when (.isOpen selector) (.close selector))
-    (shutdown-executor! dispatcher "Server dispatcher")
-    (shutdown-executor! work-executor "Server worker executor")
-    (doseq [db-name (keys dbs)] (remove-store server db-name))
-    (d/close sys-conn)
-    (log/info "Datalevin server shuts down.")))
+    (locking lifecycle
+      (when-not (= :stopped @lifecycle)
+        (reset! lifecycle :stopped)
+        (.set running false)
+        (shutdown-server! server)))))
+
+#_{:clj-kondo/ignore [:redefined-var]}
+(defn ^:no-doc ->Server
+  "Preserve the constructor used by server fixtures."
+  [^AtomicBoolean running port root idle-timeout server-socket selector
+   register-queue dispatcher work-executor sys-conn clients dbs]
+  (Server. running port root idle-timeout server-socket selector register-queue
+           dispatcher work-executor sys-conn clients dbs
+           (atom (if (.get running) :running :created))))
+
+(defn- shutdown-server!
+  [^Server server]
+  (let [^Selector selector (.-selector server)
+        failure            (volatile! nil)
+        cleanup!           (fn [f]
+                             (try
+                               (f)
+                               (catch Throwable t
+                                 (if-let [^Throwable first-error @failure]
+                                   (when-not (identical? first-error t)
+                                     (.addSuppressed first-error t))
+                                   (vreset! failure t)))))]
+    ;; A failed close must not skip the remaining resources now that the
+    ;; lifecycle is terminal. Report the first failure after all cleanup.
+    (cleanup! #(stop-ha-background-loops! server))
+    (cleanup! #(.wakeup selector))
+    (cleanup!
+      #(when (.isOpen selector)
+         (doseq [skey (.keys selector)]
+           (cleanup! (fn [] (cleanup-connection-transactions! server skey)))
+           (cleanup! (fn [] (close-conn skey))))))
+    (cleanup! #(.close ^ServerSocketChannel (.-server-socket server)))
+    (cleanup! #(.close selector))
+    (cleanup! #(shutdown-executor! (.-dispatcher server) "Server dispatcher"))
+    (cleanup! #(shutdown-executor! (.-work-executor server)
+                                  "Server worker executor"))
+    (doseq [db-name (keys (.-dbs server))]
+      (cleanup! #(remove-store server db-name)))
+    (cleanup! #(d/close (.-sys-conn server)))
+    (if-let [t @failure]
+      (throw t)
+      (log/info "Datalevin server shuts down."))))
 
 (defn- get-client [^Server server client-id]
   (sess/get-client (.-clients server) client-id))
@@ -1095,16 +1152,16 @@
     server
     db-name
     (fn []
-      (let [m (get (.-dbs server) db-name)]
-        (stop-replica-sync-loop m)
-        (stop-ha-renew-loop m)
-        (stop-ha-follower-sync-loop m)
-        (stop-ha-authority db-name m)
-        (when-let [store (:store m)]
-          (if-let [db (:dt-db m)]
-            (db/close-db db)
-            (close-store store))))
-      (.remove ^Map (.-dbs server) db-name))))
+      (let [{:keys [store dt-db index] :as m} (get (.-dbs server) db-name)]
+        (try
+          (resources/close-all!
+            [#(stop-replica-sync-loop m)
+             #(stop-ha-renew-loop m)
+             #(stop-ha-follower-sync-loop m)
+             #(stop-ha-authority db-name m)
+             #(when index (i/close-vecs index))
+             #(if dt-db (db/close-db dt-db) (when store (close-store store)))])
+          (finally (.remove ^Map (.-dbs server) db-name)))))))
 
 (defn- update-cached-role
   [^Server server target-username]
@@ -1193,11 +1250,17 @@
 (defn- open-port
   [host port]
   (try
-    (doto (ServerSocketChannel/open)
-      (.bind (InetSocketAddress. ^String host (int port)))
-      (.configureBlocking false))
+    (resources/with-acquired
+      (fn [own!]
+        (let [^ServerSocketChannel ch
+              (own! (ServerSocketChannel/open)
+                    #(.close ^ServerSocketChannel %))]
+          (.bind ch (InetSocketAddress. ^String host (int port)))
+          (.configureBlocking ch false)
+          ch)))
     (catch Exception e
-      (raise "Error opening port " host ":" port ": " (ex-message e) {}))))
+      (throw (ex-info (str "Error opening port " host ":" port ": " (ex-message e))
+                      (ex-data e) e)))))
 
 (defn- get-ip [^SelectionKey skey]
   (let [ch ^SocketChannel (.channel skey)]
@@ -1370,9 +1433,12 @@
       (do
         (dha/recover-ha-local-store-dir-if-needed! dir)
         (st/open dir))
-      (let [lmdb (ensure-ha-client-op-dbi-open! (l/open-kv dir))]
-        (doseq [dbi dbis] (i/open-dbi lmdb dbi))
-        lmdb))))
+      (resources/with-acquired
+        (fn [own!]
+          (let [lmdb (own! (l/open-kv dir) i/close-kv)]
+            (ensure-ha-client-op-dbi-open! lmdb)
+            (doseq [dbi dbis] (i/open-dbi lmdb dbi))
+            lmdb))))))
 
 (defn- reusable-open-store
   [store schema]
@@ -1586,28 +1652,31 @@
 
 (defn- init-sys-db
   [root password]
-  (let [sys-conn (d/get-conn (str root u/+separator+ c/system-dir)
-                             server-schema)]
-    (when (= 0 (i/datom-count (.-store ^DB (d/db sys-conn)) c/eav))
-      (let [s (salt)
-            h (password-hashing password s)
-            txs [{:db/id        -1
-                  :user/name    c/default-username
-                  :user/pw-hash h
-                  :user/pw-salt s}
-                 {:db/id    -2
-                  :role/key (user-role-key c/default-username)}
-                 {:db/id          -3
-                  :user-role/user -1
-                  :user-role/role -2}
-                 {:db/id          -4
-                  :permission/act ::control
-                  :permission/obj ::server}
-                 {:db/id          -5
-                  :role-perm/perm -4
-                  :role-perm/role -2}]]
-        (d/transact! sys-conn txs)))
-    sys-conn))
+  (resources/with-acquired
+    (fn [own!]
+      (let [sys-conn (own! (d/get-conn (str root u/+separator+ c/system-dir)
+                                     server-schema)
+                           d/close)]
+        (when (= 0 (i/datom-count (.-store ^DB (d/db sys-conn)) c/eav))
+          (let [s (salt)
+                h (password-hashing password s)
+                txs [{:db/id        -1
+                      :user/name    c/default-username
+                      :user/pw-hash h
+                      :user/pw-salt s}
+                     {:db/id    -2
+                      :role/key (user-role-key c/default-username)}
+                     {:db/id          -3
+                      :user-role/user -1
+                      :user-role/role -2}
+                     {:db/id          -4
+                      :permission/act ::control
+                      :permission/obj ::server}
+                     {:db/id          -5
+                      :role-perm/perm -4
+                      :role-perm/role -2}]]
+            (d/transact! sys-conn txs)))
+        sys-conn))))
 
 (defn- load-sessions
   [sys-conn]
@@ -2264,8 +2333,22 @@
      :ha-loop-error-backoff-fn #'ha-loop-error-backoff!}
     {:strict? true}))
 
+(defn- close-reopened-dbs!
+  [^ConcurrentHashMap dbs]
+  (try
+    (resources/close-all!
+      (mapcat (fn [[db-name {:keys [store dt-db index] :as state}]]
+                [#(stop-ha-authority db-name state)
+                 #(when index (i/close-vecs index))
+                 #(if dt-db (db/close-db dt-db) (when store (close-store store)))])
+              dbs))
+    (finally (.clear dbs))))
+
 (defn create
-  "Create a Datalevin server. Initially not running, call `start` to run."
+  "Create a Datalevin server and allocate its resources. Failed construction
+  releases acquired resources. Call `start` to begin serving requests and HA
+  loops, and `stop` to release resources even if it was never started. After
+  stop or a failed start, create a new instance with the same root to restart."
   [{:keys [host port root idle-timeout verbose
            worker-threads worker-queue-size]
     :as   opts
@@ -2279,30 +2362,26 @@
     (when (contains? opts :verbose)
       (log/set-min-level! (if verbose :debug :info)))
     (require-safe-bind-password! host)
-    (let [^ServerSocketChannel server-socket (open-port host port)
-          ^Selector selector                 (Selector/open)
-          running                            (AtomicBoolean. false)
-          sys-conn                           (init-sys-db root (get-default-password))
-          clients                            (load-sessions sys-conn)
-          dbs                                (ConcurrentHashMap.)]
-      (reopen-dbs root clients dbs)
-      (.register server-socket selector SelectionKey/OP_ACCEPT)
-      (let [server (->Server running
-                             port
-                             root
-                             idle-timeout
-                             server-socket
-                             selector
-                             (ConcurrentLinkedQueue.)
-                             (Executors/newSingleThreadExecutor)
-                             (bounded-worker-executor worker-threads
-                                                      worker-queue-size)
-                             sys-conn
-                             clients
-                             dbs)]
-        (doseq [db-name (keys dbs)]
-          (ensure-ha-renew-loop server db-name)
-          (ensure-ha-follower-sync-loop server db-name))
-        server))
+    (resources/with-acquired
+      (fn [own!]
+        ;; Validate and allocate the worker executor before opening native
+        ;; resources. Every later acquisition has a rollback action.
+        (let [work-executor (own! (bounded-worker-executor worker-threads
+                                                          worker-queue-size)
+                                  #(shutdown-executor! % "Server worker executor"))
+              dispatcher    (own! (Executors/newSingleThreadExecutor)
+                                   #(shutdown-executor! % "Server dispatcher"))
+              ^ServerSocketChannel server-socket
+              (own! (open-port host port) #(.close ^ServerSocketChannel %))
+              ^Selector selector (own! (Selector/open) #(.close ^Selector %))
+              sys-conn (own! (init-sys-db root (get-default-password)) d/close)
+              clients  (load-sessions sys-conn)
+              dbs      (own! (ConcurrentHashMap.) close-reopened-dbs!)]
+          (reopen-dbs root clients dbs)
+          (.register server-socket selector SelectionKey/OP_ACCEPT)
+          (->Server (AtomicBoolean. false) port root idle-timeout
+                    server-socket selector (ConcurrentLinkedQueue.)
+                    dispatcher work-executor sys-conn clients dbs))))
     (catch Exception e
-      (raise "Error creating server:" (ex-message e) {}))))
+      (throw (ex-info (str "Error creating server: " (ex-message e))
+                      (ex-data e) e)))))
