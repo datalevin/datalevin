@@ -1553,13 +1553,13 @@
 
 (defn- ^:redef default-password-env-set?
   []
-  (some? (System/getenv default-password-env-var)))
+  (some? (u/env default-password-env-var)))
 
 (defn get-default-password
   "Return the initial admin password, checking DATALEVIN_DEFAULT_PASSWORD
   environment variable first, falling back to the built-in default."
   []
-  (or (System/getenv default-password-env-var)
+  (or (u/env default-password-env-var)
       c/default-password))
 
 (defn- loopback-bind-host?
@@ -2068,12 +2068,26 @@
   [^Server server f]
   (sdisp/execute dispatch-deps server f))
 
-(def ^:private trace-remote-tx?
-  (some? (System/getenv "DTLV_TRACE_REMOTE_TX")))
+(defonce ^:private trace-remote-tx-cache* (atom nil))
+
+(defn- trace-remote-tx?
+  []
+  (if-some [cached @trace-remote-tx-cache*]
+    cached
+    (let [v (some? (u/env "DTLV_TRACE_REMOTE_TX"))]
+      (reset! trace-remote-tx-cache* v)
+      v)))
+
+(defn reset-trace-remote-tx!
+  "Forget the cached `DTLV_TRACE_REMOTE_TX` lookup so changes to
+  `datalevin.util/*env-overrides*` take effect. Intended for tests."
+  []
+  (reset! trace-remote-tx-cache* nil)
+  nil)
 
 (defn- trace-remote-tx!
   [& xs]
-  (when trace-remote-tx?
+  (when (trace-remote-tx?)
     (binding [*out* *err*]
       (apply println xs)
       (flush))))
@@ -2139,7 +2153,8 @@
    :get-ip-fn get-ip
    :close-conn-fn close-conn
    :cleanup-connection-transactions-fn cleanup-connection-transactions!
-   :idle-timeout-fn (fn [^Server server] (.-idle-timeout server))})
+   :idle-timeout-fn (fn [^Server server] (.-idle-timeout server))
+   :now-ms-fn (fn [] (System/currentTimeMillis))})
 
 (def ^:private copy-deps
   {:register-queue-fn (fn [^Server server] (.-register-queue server))

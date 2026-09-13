@@ -102,6 +102,28 @@
       :some `(or ~expr (cond+ ~@rest))
       `(if ~test ~expr (cond+ ~@rest)))))
 
+;; environment
+
+(def ^:dynamic *env-overrides*
+  "When bound to a map of name -> value, shadows the process environment for
+  `env` and `env-enabled?`. Intended for tests that exercise
+  environment-driven behavior without mutating the JVM environment."
+  nil)
+
+(defn env
+  "Return the value of environment variable `name`, honoring
+  `*env-overrides*` when it is bound."
+  [name]
+  (if (contains? *env-overrides* name)
+    (get *env-overrides* name)
+    (System/getenv name)))
+
+(defn env-enabled?
+  "True when environment variable `name` is set to \"1\", honoring
+  `*env-overrides*`."
+  [name]
+  (= "1" (env name)))
+
 ;; files
 
 (defn windows? [] (s/starts-with? (System/getProperty "os.name") "Windows"))

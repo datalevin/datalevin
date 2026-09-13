@@ -60,6 +60,18 @@
 (defonce ^:private ^java.util.Map native-readers
   (Collections/synchronizedMap (WeakHashMap.)))
 
+(defn reset-client-state!
+  "Clear the process-local client and HA endpoint caches. Intended for tests
+  that need a clean slate or that exercise reconnect/retry behavior."
+  []
+  (.clear connection-wire-opts)
+  (doseq [^java.util.Map m [ha-preferred-endpoints ha-retry-clients
+                            ha-known-db-endpoints ha-preferred-read-endpoints
+                            ha-retry-open-targets ha-retry-disabled-clients
+                            ha-write-retry-settings native-readers]]
+    (.clear m))
+  nil)
+
 (defn- request-native-reader [client req]
   (get (.get native-readers client) (or (:db-name req) (first (:args req)))))
 

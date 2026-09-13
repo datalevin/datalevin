@@ -27,7 +27,7 @@
    [datalevin.kv :as kv]
    [datalevin.remote :as r]
    [datalevin.storage :as st]
-   [datalevin.util :refer [raise]]
+   [datalevin.util :as u :refer [raise]]
    [taoensso.timbre :as log])
   (:import
    [datalevin.bits Indexable Retrieved CustomReference]
@@ -49,7 +49,7 @@
 
 (defn- ha-replay-debug-enabled?
   []
-  (= "1" (System/getenv "HA_REPLAY_DEBUG")))
+  (u/env-enabled? "HA_REPLAY_DEBUG"))
 
 (defn- ha-replay-debug!
   [event data]

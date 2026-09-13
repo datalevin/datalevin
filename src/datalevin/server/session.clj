@@ -38,7 +38,7 @@
         session  {:ip          ip
                   :uid         ((:user-eid-fn deps) sys-conn username)
                   :username    username
-                  :last-active (System/currentTimeMillis)
+                  :last-active ((:now-ms-fn deps))
                   :stores      {}
                   :engines     #{}
                   :indices     #{}
@@ -218,12 +218,13 @@
 (defn remove-idle-sessions
   [deps server]
   (let [^long timeout ((:idle-timeout-fn deps) server)
-        clients ((:clients-fn deps) server)]
+        clients ((:clients-fn deps) server)
+        now-ms  ((:now-ms-fn deps))]
     (doseq [[client-id session] clients
             :let                [{:keys [last-active]} session]]
       (if last-active
-        (when (< timeout (- (System/currentTimeMillis) ^long last-active))
+        (when (< timeout (- now-ms ^long last-active))
           (disconnect-client* deps server client-id))
         ;; migrate old sessions that don't have last-active
         (update-client deps server client-id
-                       #(assoc % :last-active (System/currentTimeMillis)))))))
+                       #(assoc % :last-active now-ms))))))

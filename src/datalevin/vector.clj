@@ -625,7 +625,21 @@
 
 (defn- vec-save-key* [fname] (->> fname hash (str "vec-save-") keyword))
 
-(def vec-save-key (memoize vec-save-key*))
+(defonce ^:private vec-save-key-cache* (atom {}))
+
+(defn vec-save-key
+  "Stable async work key for a vector save, memoized across calls."
+  [fname]
+  (or (get @vec-save-key-cache* fname)
+      (let [k (vec-save-key* fname)]
+        (swap! vec-save-key-cache* assoc fname k)
+        k)))
+
+(defn reset-vec-save-cache!
+  "Clear memoized vector-save work keys. Intended for tests."
+  []
+  (reset! vec-save-key-cache* {})
+  nil)
 
 (def ^:dynamic *submit-async-vec-save*
   (fn [work]

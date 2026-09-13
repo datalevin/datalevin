@@ -45,15 +45,21 @@
                   :ha-leader-fencing-last-error)))
     m))
 
+(defn- ha-now-ms
+  [deps]
+  ((or (:ha-now-ms-fn deps) #(System/currentTimeMillis))))
+
 (defn maybe-wait-unreachable-leader-before-pre-cas!
-  [m lease]
-  (let [renew-ms (long (or (:ha-lease-renew-ms m) c/*ha-lease-renew-ms*))
-        lease-until-ms (long (or (:lease-until-ms lease) 0))
-        wait-until-ms (+ lease-until-ms renew-ms)
-        now-ms (System/currentTimeMillis)
-        wait-ms (long (max 0 (- wait-until-ms now-ms)))]
-    {:wait-ms wait-ms
-     :wait-until-ms wait-until-ms}))
+  ([m lease]
+   (maybe-wait-unreachable-leader-before-pre-cas! nil m lease))
+  ([deps m lease]
+   (let [renew-ms (long (or (:ha-lease-renew-ms m) c/*ha-lease-renew-ms*))
+         lease-until-ms (long (or (:lease-until-ms lease) 0))
+         wait-until-ms (+ lease-until-ms renew-ms)
+         now-ms (ha-now-ms deps)
+         wait-ms (long (max 0 (- wait-until-ms now-ms)))]
+     {:wait-ms wait-ms
+      :wait-until-ms wait-until-ms})))
 
 (defn- clear-ha-candidate-state
   [m]
@@ -68,10 +74,6 @@
 (defn- ordered-ha-members
   [deps m]
   ((or (:ordered-ha-members-fn deps) hu/ordered-ha-members) m))
-
-(defn- ha-now-ms
-  [deps]
-  ((or (:ha-now-ms-fn deps) #(System/currentTimeMillis))))
 
 (defn- maybe-complete-ha-leader-fencing
   [deps m db-name]
@@ -470,6 +472,7 @@
              lag-input))
           (let [wait-info ((or (:maybe-wait-unreachable-leader-before-pre-cas-fn deps)
                                maybe-wait-unreachable-leader-before-pre-cas!)
+                           deps
                            m1
                            observed-lease)
                 wait-ms (long (or (:wait-ms wait-info)

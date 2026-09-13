@@ -1746,7 +1746,7 @@
             lmdb
             (fn []
               (txlog-prepare-replay-dbis! lmdb [record] (dec (long lsn)))
-              (when (= "1" (System/getenv "HA_REPLAY_DEBUG"))
+              (when (u/env-enabled? "HA_REPLAY_DEBUG")
                 (binding [*out* *err*]
                   (prn {:ha-replay-debug true
                         :lsn (long lsn)

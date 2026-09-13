@@ -184,8 +184,10 @@
   (System/nanoTime))
 
 (defn ^:redef maybe-wait-unreachable-leader-before-pre-cas!
-  [m lease]
-  (promo/maybe-wait-unreachable-leader-before-pre-cas! m lease))
+  ([m lease]
+   (maybe-wait-unreachable-leader-before-pre-cas! nil m lease))
+  ([deps m lease]
+   (promo/maybe-wait-unreachable-leader-before-pre-cas! deps m lease)))
 
 (def ^:private authority-lease-local-deadline-ms
   auth/authority-lease-local-deadline-ms)

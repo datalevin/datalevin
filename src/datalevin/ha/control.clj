@@ -1196,11 +1196,11 @@
    (let [timeout-ms (long (command-operation-timeout-ms
                            operation-timeout-ms
                            timeout-ms))
-         deadline   (long (unchecked-add (System/currentTimeMillis)
+         deadline   (long (unchecked-add (control-now-ms)
                                          timeout-ms))]
      (loop [attempt 0]
        (let [remaining (long (unchecked-subtract deadline
-                                                 (System/currentTimeMillis)))
+                                                 (control-now-ms)))
              ^Node node (running-node! authority)]
          (if (<= remaining 0)
            (raise "HA control readIndex timed out"
@@ -1400,7 +1400,7 @@
 (defn- submit-command!
   [{:keys [rpc-timeout-ms operation-timeout-ms] :as authority}
    {:keys [timeout-ms] :as cmd}]
-  (let [start-ms (long (System/currentTimeMillis))
+  (let [start-ms (long (control-now-ms))
         deadline (+ start-ms
                     (long (command-operation-timeout-ms
                            operation-timeout-ms
@@ -1429,7 +1429,7 @@
                 (#{:not-leader :timeout} (:error local-res))
                 (do (sleep-command-retry! attempt remaining rpc-timeout-ms)
                     (recur (inc attempt)
-                           (long (System/currentTimeMillis))))
+                           (long (control-now-ms))))
 
                 :else
                 (raise "HA control local apply failed"
@@ -1460,12 +1460,12 @@
                   (= ::invoke-failed response)
                   (do (sleep-command-retry! attempt remaining rpc-timeout-ms)
                       (recur (inc attempt)
-                             (long (System/currentTimeMillis))))
+                             (long (control-now-ms))))
 
                   (not (instance? RpcRequests$ErrorResponse response))
                   (do (sleep-command-retry! attempt remaining rpc-timeout-ms)
                       (recur (inc attempt)
-                             (long (System/currentTimeMillis))))
+                             (long (control-now-ms))))
 
                   :else
                   (let [^RpcRequests$ErrorResponse response-msg response
@@ -1480,7 +1480,7 @@
                             (.getErrorCode response-msg))
                       (do (sleep-command-retry! attempt remaining rpc-timeout-ms)
                           (recur (inc attempt)
-                                 (long (System/currentTimeMillis))))
+                                 (long (control-now-ms))))
 
                       (:ok? payload)
                       (:result payload)
@@ -1489,7 +1489,7 @@
                                  (:error payload))
                       (do (sleep-command-retry! attempt remaining rpc-timeout-ms)
                           (recur (inc attempt)
-                                 (long (System/currentTimeMillis))))
+                                 (long (control-now-ms))))
 
                       :else
                       (raise "HA control forward response failed"
@@ -1498,7 +1498,7 @@
                                 :payload payload})))))
               (do (sleep-command-retry! attempt remaining rpc-timeout-ms)
                   (recur (inc attempt)
-                         (long (System/currentTimeMillis)))))))))))
+                         (long (control-now-ms)))))))))))
 
 (defn- new-jraft-fsm
   [state-atom]
@@ -1743,9 +1743,9 @@
   (replace-voters! [this voters]
     (ensure-running! running-v)
     (let [peer-ids (validated-peer-ids! voters :ha-control-plane-voters)
-          deadline (+ (System/currentTimeMillis) (long operation-timeout-ms))]
+          deadline (+ (control-now-ms) (long operation-timeout-ms))]
       (loop [attempt 0]
-        (let [remaining (- deadline (System/currentTimeMillis))]
+        (let [remaining (- deadline (control-now-ms))]
           (when (<= remaining 0)
             (raise "HA control voter reconfiguration timed out"
                      {:error :ha/control-timeout
