@@ -21,7 +21,10 @@ benchmarks/openrulebench/data/downloaded/
 /test-jar/tmp
 /test-jar/target
 /target
-/src/rust/test-adapter/target
+/src/rust/**/target/
+/src/rust/fuzz/artifacts/
+/src/rust/fuzz/coverage/
+/src/rust/fuzz/corpus/
 /jepsen/target
 /bench/target
 /classes

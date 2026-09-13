@@ -75,12 +75,21 @@
    "datalevin/server.clj"
    "datalevin/test_adapter"
    "datalevin/test_adapter.clj"
+   "rust/target"
+   "rust/fuzz/target"
+   "rust/test-adapter/target"
    "datalevin/DatalevinServer.java"])
 (def release-runtime-class-excludes
   ["datalevin/ha"
    "datalevin/server"
    "datalevin/test_adapter"
    "datalevin/DatalevinServer.class"])
+(def runtime-source-includes
+  "Source paths copied from `src` into release artifacts. The Rust tree is
+  native-only and its `target` caches are never copied; `pod` and `java`
+  are covered by `release-runtime-source-excludes`."
+  ["datalevin"
+   "data_readers.clj"])
 (def runtime-excluded-deps
   release-runtime-excluded-deps)
 (def runtime-source-excludes
@@ -519,8 +528,9 @@
   [target-dir]
   (compile-java nil)
   (b/delete {:path target-dir})
-  (b/copy-dir {:src-dirs   (existing-dirs ["src" "resources" class-dir])
+  (b/copy-dir {:src-dirs   (existing-dirs ["resources" class-dir])
                :target-dir target-dir})
+  (copy-paths-under-root! "src" target-dir runtime-source-includes)
   ;; Keep release jars free of embedded Java sources.
   (b/delete {:path (str target-dir "/java")})
   ;; Embedded consumers do not need the CLI, pod entrypoint, or HA/server runtime.
@@ -560,9 +570,9 @@
 
 (defn java-source-jar [_]
   (b/delete {:path java-source-dir})
-  (b/copy-dir {:src-dirs   (existing-dirs ["src" "resources"])
+  (b/copy-dir {:src-dirs   (existing-dirs ["resources"])
                :target-dir java-source-dir})
-  (b/delete {:path (str java-source-dir "/java")})
+  (copy-paths-under-root! "src" java-source-dir runtime-source-includes)
   (b/copy-dir {:src-dirs   (existing-dirs ["src/java"])
                :target-dir java-source-dir})
   ;; Keep the published sources aligned with the trimmed runtime jar.
