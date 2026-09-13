@@ -26,7 +26,7 @@
 (deftest empty-homogeneous-tuple-test
   (is (not (b/valid-data? [] [:string])))
   (let [bf    (ByteBuffer/allocate 16)
-        error (try
+        ^Throwable error (try
                 (b/put-buffer bf [] [:string])
                 nil
                 (catch clojure.lang.ExceptionInfo e e))]
