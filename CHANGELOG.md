@@ -6,7 +6,7 @@
   types, and this also works on Datalog. Details are in the [custom data
   documentation](/doc/custom-data.md).
   [#234](https://github.com/datalevin/datalevin/issues/234)
-- [Benchmark] TPC-C and TPC-H like benchmarks.
+- [Benchmark] added TPC-C, TPC-H and YCSB like benchmarks.
 
 ### Changed
 - [Storage] update dtlvnative to 1.1.1, which uses DLMDB data format version 2,

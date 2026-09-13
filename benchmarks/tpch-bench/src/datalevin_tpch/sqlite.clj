@@ -8,7 +8,8 @@
    [clojure.java.io :as io]
    [clojure.string :as s]
    [datalevin.core :as d]
-   [datalevin-tpch.common :as c])
+   [datalevin-tpch.common :as c]
+   [datalevin-bench.host :as host])
   (:import
    [java.io File]
    [java.sql Connection DriverManager]
@@ -113,7 +114,8 @@
   [{:keys [path queries out timeout]
     :or   {path default-db-name out "sqlite_pass.csv" timeout 120}}]
   (let [f (db-path path)]
-    (with-open [conn (DriverManager/getConnection (db-url f))
+    (host/with-paused-media
+      (with-open [conn (DriverManager/getConnection (db-url f))
                 w    (io/writer (io/file c/base-dir out))]
       (with-open [stmt (.createStatement conn)]
         (.execute stmt "PRAGMA journal_mode=WAL")
@@ -153,7 +155,7 @@
                 (finally
                   (.close stmt)))))
           (finally
-            (.shutdown pool))))))
+            (.shutdown pool)))))))
   (println "Results written to" out)
   (shutdown-agents)
   (System/exit 0))

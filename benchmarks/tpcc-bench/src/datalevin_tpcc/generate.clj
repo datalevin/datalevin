@@ -1,5 +1,5 @@
 (ns datalevin-tpcc.generate
-  "Deterministic TPC-C population.
+  "Deterministic TPC-C population and order-line inputs.
 
   Each table draws from its own seeded PRNG, so generation is reproducible and
   independent of the order in which tables are loaded. The field widths and
@@ -15,6 +15,22 @@
 
 (defn- rint ^long [^Random r ^long lo ^long hi]
   (+ lo (.nextInt r (inc (- hi lo)))))
+
+(defn new-order-lines
+  "TPC-C 2.4.1.3-5: generate 5-15 lines and choose rollback once per order.
+  `item-id-fn` draws a valid NURand item using the driver's PRNG. In 1% of
+  orders, replace only the final item id with an unused value."
+  [^Random r w item-id-fn]
+  (let [n         (rint r 5 15)
+        rollback? (= 1 (rint r 1 100))
+        lines     (mapv (fn [_]
+                          {:i-id (item-id-fn)
+                           :supply-w w
+                           :qty (rint r 1 10)})
+                        (range n))]
+    (if rollback?
+      (assoc-in lines [(dec n) :i-id] (inc c/item-count))
+      lines)))
 
 (defn- rand-string [^Random r ^long min-len ^long max-len]
   (let [n  (rint r min-len max-len)

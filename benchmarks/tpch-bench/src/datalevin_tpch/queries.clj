@@ -5,12 +5,13 @@
   live under queries/{postgres,sqlite}/N.sql. Parameter values match the fixed
   qgen defaults used to generate the SQL, so results are directly comparable.
 
+  ORDER BY is part of each query, using zero-based output column indexes so
+  aggregate columns are sorted too. Sorting is included in query execution.
+
   Date literals are precomputed from the SQL date arithmetic, e.g. the default
   Q1 predicate `l_shipdate <= date '1998-12-01' - interval '90' day` becomes the
   bound `\"1998-09-02\"`. Dates are stored as ISO-8601 strings, which compare
-  correctly lexicographically."
-  (:require
-   [clojure.string :as s]))
+  correctly lexicographically.")
 
 ;; Q1: Pricing Summary Report
 (def q-1
@@ -23,6 +24,7 @@
     (avg ?l-extendedprice)
     (avg ?l-discount)
     (count ?l)
+    :order-by [0 :asc 1 :asc]
     :where
     [?l :lineitem/returnflag ?l-returnflag]
     [?l :lineitem/linestatus ?l-linestatus]
@@ -56,6 +58,7 @@
 (def q-2
   '[:find ?s-acctbal ?s-name ?n-name ?p-partkey ?p-mfgr ?s-address ?s-phone
     ?s-comment
+    :order-by [0 :desc 2 :asc 1 :asc 3 :asc]
     :where
     [?p :part/partkey ?p-partkey]
     [?p :part/size 15]
@@ -94,6 +97,7 @@
 ;; Q3: Shipping Priority
 (def q-3
   '[:find ?l-orderkey (sum ?revenue) ?o-orderdate ?o-shippriority
+    :order-by [1 :desc 2 :asc]
     :with ?l
     :where
     [?c :customer/mktsegment "BUILDING"]
@@ -114,6 +118,7 @@
 ;; Q4: Order Priority Checking
 (def q-4
   '[:find ?o-orderpriority (count-distinct ?o)
+    :order-by [0 :asc]
     :where
     [?o :orders/orderdate ?od]
     [(>= ?od "1993-07-01")]
@@ -128,6 +133,7 @@
 ;; Q5: Local Supplier Volume
 (def q-5
   '[:find ?n-name (sum ?revenue)
+    :order-by [1 :desc]
     :with ?l
     :where
     [?c :customer/custkey ?c-custkey]
@@ -155,6 +161,7 @@
 ;; Q7: Volume Shipping
 (def q-7
   '[:find ?supp-nation ?cust-nation ?l-year (sum ?volume)
+    :order-by [0 :asc 1 :asc 2 :asc]
     :with ?l
     :where
     [?s :supplier/suppkey ?s-suppkey]
@@ -188,6 +195,7 @@
 ;; a given year.
 (def q-8
   '[:find ?o-year ?mkt
+    :order-by [0 :asc]
     :where
     [(q [:find ?y (sum ?volume) (sum ?bz)
          :with ?l
@@ -227,6 +235,7 @@
 ;; Q9: Product Type Profit Measure
 (def q-9
   '[:find ?nation ?o-year (sum ?amount)
+    :order-by [0 :asc 1 :desc]
     :with ?l
     :where
     [?p :part/partkey ?p-partkey]
@@ -258,6 +267,7 @@
 (def q-10
   '[:find ?c-custkey ?c-name (sum ?revenue) ?c-acctbal ?n-name ?c-address
     ?c-phone ?c-comment
+    :order-by [2 :desc]
     :with ?l
     :where
     [?c :customer/custkey ?c-custkey]
@@ -284,6 +294,7 @@
 ;; Q11: Important Stock Identification
 (def q-11
   '[:find ?ps-partkey ?value
+    :order-by [1 :desc]
     :where
     [(q [:find ?pk (sum ?v)
          :with ?ps
@@ -314,6 +325,7 @@
 ;; Q12: Shipping Modes and Order Priority
 (def q-12
   '[:find ?l-shipmode (sum ?high) (sum ?low)
+    :order-by [0 :asc]
     :with ?l
     :where
     [?l :lineitem/orderkey ?ok]
@@ -341,6 +353,7 @@
 ;; to catch the rest and bind zero.
 (def q-13
   '[:find ?c-count (count ?c)
+    :order-by [1 :desc 0 :desc]
     :where
     (or-join [?c ?c-count]
              (and [?c :customer/custkey ?ck]
@@ -397,6 +410,7 @@
 ;; Q15: Top Supplier
 (def q-15
   '[:find ?s-suppkey ?s-name ?s-address ?s-phone ?total
+    :order-by [0 :asc]
     :where
     [(q [:find (max ?t) .
          :where
@@ -431,6 +445,7 @@
 ;; Q16: Parts/Supplier Relationship
 (def q-16
   '[:find ?p-brand ?p-type ?p-size (count-distinct ?ps-suppkey)
+    :order-by [3 :desc 0 :asc 1 :asc 2 :asc]
     :where
     [?p :part/partkey ?pk]
     [?p :part/brand ?p-brand]
@@ -472,6 +487,7 @@
   '[:find ?c-name ?c-custkey ?ok ?o-orderdate ?o-totalprice
     (sum ?l-quantity)
     :with ?l
+    :order-by [4 :desc 3 :asc]
     :where
     [(q [:find ?ok (sum ?q)
          :with ?l
@@ -530,6 +546,7 @@
 ;; Q20: Potential Part Promotion
 (def q-20
   '[:find ?s-name ?s-address
+    :order-by [0 :asc]
     :where
     [?s :supplier/suppkey ?sk]
     [?s :supplier/name ?s-name]
@@ -559,6 +576,7 @@
 ;; Q21: Suppliers Who Kept Orders Waiting
 (def q-21
   '[:find ?s-name (count-distinct ?l1)
+    :order-by [1 :desc 0 :asc]
     :where
     [?s :supplier/suppkey ?sk]
     [?s :supplier/name ?s-name]
@@ -585,6 +603,7 @@
 ;; Q22: Global Sales Opportunity
 (def q-22
   '[:find ?cntrycode (count ?c) (sum ?c-acctbal)
+    :order-by [0 :asc]
     :where
     [?c :customer/custkey ?ck]
     [?c :customer/phone ?phone]
@@ -625,3 +644,11 @@
     (or (some-> (ns-resolve 'datalevin-tpch.queries sym) var-get)
         (throw (ex-info (str "No Datalog translation for query " n)
                         {:query n :available (query-ids)})))))
+
+(defn ordering
+  "Output column index/direction pairs for query `n`, or nil if unordered."
+  [n]
+  (some->> (datalog n)
+           (drop-while #(not= :order-by %))
+           second
+           (partition 2)))

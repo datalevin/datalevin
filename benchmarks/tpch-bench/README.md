@@ -81,8 +81,9 @@ JVM properties.
 
 SQLite is the local correctness oracle. `clj -X:verify` runs every Datalevin
 Datalog translation and the corresponding SQLite query, normalizes both result
-sets to a canonical order, and compares cell by cell with a relative numeric
-tolerance:
+sets for content comparison, and compares cell by cell with a relative numeric
+tolerance. Before normalization, it checks that each backend's output satisfies
+the query's required ordering. Rows tied on all sort keys may appear in any order:
 
 ```bash
 clj -X:verify '{:queries :all}'
@@ -98,10 +99,19 @@ by default, whereas TPC-H and PostgreSQL are case-sensitive.
 - Data generation, loading, index creation, correctness checks, and warmup are
   outside the measured interval.
 - SQLite uses WAL and a 1 GiB memory map for reads.
+- On macOS the harness pauses the current user's `mediaanalysisd` and
+  `photoanalysisd` with `SIGSTOP` for the measured interval and resumes exactly
+  those processes with `SIGCONT` afterward. A daemon that was already stopped is
+  left alone. The control is a no-op on other platforms or where the signal is
+  not permitted.
 - PostgreSQL timings come from `EXPLAIN (ANALYZE, FORMAT JSON)` planning and
   execution times, matching the JOB-bench protocol.
-- Datalevin timings are wall-clock around `d/q`; `d/explain` planning and
-  execution splits are reported when available.
+- SQL `ORDER BY` and matching Datalog `:order-by` clauses run inside the timed
+  query, with identical sort keys and directions across all three backends.
+- Datalevin wall time covers the complete `d/q` or `d/explain` call and result
+  consumption. With `:explain? true`, execution time is wall time minus reported
+  preparation time, including final sorting and explain overhead. The engine's
+  execution counter can stop before sorting on some query paths.
 - Publishable results should use one warmup pass followed by one measurement
   pass in separate JVM processes, and a fixed data set, seed, and machine.
 

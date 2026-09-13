@@ -7,6 +7,7 @@
   (:require
    [clojure.java.io :as io]
    [clojure.string :as s]
+   [datalevin-bench.host :as host]
    [datalevin-tpcc.common :as c]
    [datalevin-tpcc.generate :as g])
   (:import
@@ -178,16 +179,8 @@
            :i-id (:i-id missing)})
         (let [o-id      d-next
               all-local (long (if (every? #(= w (:supply-w %)) line-data) 1 0))
-              ;; A TPC-C order may repeat an item id. Aggregate by stock row so
-              ;; each row receives exactly one quantity update per order.
-              stock-aggs (reduce
-                          (fn [m {:keys [i-id supply-w qty]}]
-                            (let [k [supply-w i-id]]
-                              (-> m
-                                  (update-in [k :qty] (fnil + 0) qty)
-                                  (update-in [k :lines] (fnil inc 0))
-                                  (assoc-in [k :remote?] (not= supply-w w)))))
-                          {} line-data)]
+              ;; Keep repeated lines in order, then write each stock row once.
+              stock-groups (group-by (juxt :supply-w :i-id) line-data)]
           (exec! conn
                  "UPDATE district SET d_next_o_id = ? WHERE d_w_id = ? AND d_id = ?"
                  (inc d-next) w d)
@@ -203,27 +196,22 @@
                    o-id d w (inc n) i-id supply-w nil qty
                    (* (double qty) (double price))
                    "distinfo-distinfo-distinfo"))
-          (doseq [[[supply-w i-id] {:keys [qty lines remote?]}] stock-aggs]
+          (doseq [[[supply-w i-id] lines] stock-groups]
             (let [srow  (q1 conn
                             "SELECT s_quantity, s_ytd, s_order_cnt, s_remote_cnt FROM stock WHERE s_w_id = ? AND s_i_id = ?"
                             supply-w i-id)
-                  s-qty (long (nth srow 0))
-                  s-ytd (long (nth srow 1))
-                  s-ocnt (long (nth srow 2))
-                  s-rcnt (long (nth srow 3))
-                  qty   (long qty)
-                  new-q (if (>= s-qty qty)
-                          (- s-qty qty)
-                          (+ (- s-qty qty) 91))]
+                  [qty ytd ocnt rcnt]
+                  (c/stock-after-lines srow (map :qty lines) (not= supply-w w))]
               (exec! conn
                      "UPDATE stock SET s_quantity = ?, s_ytd = ?, s_order_cnt = ?, s_remote_cnt = ? WHERE s_w_id = ? AND s_i_id = ?"
-                     new-q (+ s-ytd qty) (+ s-ocnt (long lines))
-                     (if remote? (inc s-rcnt) s-rcnt) supply-w i-id)))
+                     qty ytd ocnt rcnt supply-w i-id)))
           (.commit conn)
           {:type :new-order :status :ok :w w :d d :o-id o-id})))
     (catch Exception e
       (try (.rollback conn) (catch Exception _))
-      (throw e))))
+      (throw e))
+    (finally
+      (.setAutoCommit conn true))))
 
 (defn- customer-by-name
   "The middle customer by c_first with the given last name in the district."
@@ -288,7 +276,9 @@
            :credit c-credit})))
     (catch Exception e
       (try (.rollback conn) (catch Exception _))
-      (throw e))))
+      (throw e))
+    (finally
+      (.setAutoCommit conn true))))
 
 (defn order-status!
   [^Connection conn {:keys [w d c last-name by-name?]}]
@@ -362,7 +352,9 @@
           {:type :delivery :status :ok :delivered (count plans)})))
     (catch Exception e
       (try (.rollback conn) (catch Exception _))
-      (throw e))))
+      (throw e))
+    (finally
+      (.setAutoCommit conn true))))
 
 (defn stock-level!
   [^Connection conn {:keys [w d threshold]}]
@@ -416,13 +408,7 @@
     (case type
       :new-order
       {:w w :d (rint r 1 10) :c (nurand r 1023 1 3000 c-cust)
-       :ol (mapv (fn [_]
-                   {:i-id (if (zero? (mod (rint r 1 100) 100))
-                            100001
-                            (nurand r 8191 1 c/item-count c-item))
-                    :supply-w w
-                    :qty (rint r 1 10)})
-                 (range (rint r 1 15)))}
+       :ol (g/new-order-lines r w #(nurand r 8191 1 c/item-count c-item))}
 
       :payment
       (let [by-name? (<= (rint r 1 100) 40)]
@@ -529,10 +515,12 @@
                               (swap! lat conj [ty ms])))))))]
     (println (format "TPC-C-derived: %d warehouse(s), %d terminal(s), %d txns"
                      warehouses threads txns))
+    ;; A run owns its RNG, so execute the whole warmup as one batch.
     (let [warm-conn (open-conn path)]
-      (try (dotimes [_ warmup] (run warm-conn 0 1 false))
+      (try (run warm-conn 0 warmup false)
            (finally (.close warm-conn))))
-    (let [dists    (for [w (range 1 (inc warehouses)) d (range 1 11)] [w d])
+    (host/with-paused-media
+     (let [dists    (for [w (range 1 (inc warehouses)) d (range 1 11)] [w d])
           baseline (into {} (map (fn [[w d]] [[w d] (district-next-o-id conn w d)])
                                  dists))
           base-ord (into {} (map (fn [[w d]] [[w d] (order-count conn w d)])
@@ -586,7 +574,7 @@
                        (str "ORDER COUNT FAILURE: " (pr-str bad))
                        "order count invariant: OK")))
           (.close conn)
-          {:tpmc tpmc :new-orders new-orders :elapsed elapsed :stats stats})))))
+          {:tpmc tpmc :new-orders new-orders :elapsed elapsed :stats stats}))))))
 
 (defn -main [& _args]
   (bench {})

@@ -1,5 +1,6 @@
 {:paths ["src"]
  :deps  {
+         datalevin-bench/host                          {:local/root "../host-control"}
          datalevin/datalevin                           {:local/root "../.."}
          org.clojure/clojure                           {:mvn/version "1.12.5"}
          com.cognitect/transit-clj                     {:mvn/version "1.0.333"}

@@ -28,6 +28,25 @@
 (def new-orders-per-district 900)
 
 ;; ---------------------------------------------------------------------------
+;; Shared transaction calculations
+
+(defn stock-after-lines
+  "Apply TPC-C 2.4.2 stock updates in order to [quantity ytd order-cnt remote-cnt].
+  `quantities` contains the order-line quantities for one supplying warehouse
+  and item. Replenishment and both counters apply separately to every line."
+  [stock quantities remote?]
+  (reduce
+   (fn [[quantity ytd order-cnt remote-cnt] ordered]
+     (let [quantity  (long quantity)
+           ordered   (long ordered)
+           remaining (- quantity ordered)]
+       [(if (>= quantity (+ ordered 10)) remaining (+ remaining 91))
+        (+ (long ytd) ordered)
+        (inc (long order-cnt))
+        (+ (long remote-cnt) (if remote? 1 0))]))
+   (mapv long stock) quantities))
+
+;; ---------------------------------------------------------------------------
 ;; Table metadata
 
 (def table-order

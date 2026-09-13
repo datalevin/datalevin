@@ -8,7 +8,8 @@
    [clojure.java.io :as io]
    [clojure.string :as s]
    [datalevin.core :as d]
-   [datalevin-tpch.common :as c])
+   [datalevin-tpch.common :as c]
+   [datalevin-bench.host :as host])
   (:import
    [java.io File PipedReader PipedWriter]
    [java.sql Connection DriverManager]
@@ -117,8 +118,9 @@
     :out      CSV output path (default \"postgres_pass.csv\")"
   [{:keys [out queries] :or {out "postgres_pass.csv"} :as opts}]
   (let [c-opts (conn-opts opts)]
-    (with-open [conn (get-connection c-opts)
-                w    (io/writer (io/file c/base-dir out))]
+    (host/with-paused-media
+      (with-open [conn (get-connection c-opts)
+                  w    (io/writer (io/file c/base-dir out))]
       (d/write-csv w [["Query" "Planning (ms)" "Execution (ms)"]])
       (doseq [n (query-numbers queries)]
         (let [sql (str "EXPLAIN (ANALYZE, FORMAT JSON) "
@@ -139,7 +141,7 @@
               (println "ERROR:" (.getMessage e))
               (d/write-csv w [[n "error" ""]]))
             (finally
-              (.close stmt)))))))
+              (.close stmt))))))))
   (println "Results written to" out)
   (shutdown-agents)
   (System/exit 0))

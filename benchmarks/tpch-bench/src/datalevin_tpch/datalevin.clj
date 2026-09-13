@@ -2,14 +2,11 @@
   "Load TPC-H data into Datalevin and run the Datalog query set."
   (:require
    [clojure.java.io :as io]
-   [clojure.string :as s]
    [datalevin.core :as d]
    [datalevin.util :as u]
+   [datalevin-bench.host :as host]
    [datalevin-tpch.common :as c]
-   [datalevin-tpch.queries :as q])
-  (:import
-   [java.io File]
-   [java.util.concurrent Executors TimeUnit TimeoutException]))
+   [datalevin-tpch.queries :as q]))
 
 ;; ---------------------------------------------------------------------------
 ;; Schema
@@ -94,23 +91,26 @@
 
 (defn- run-one
   "Run one Datalog query and return elapsed milliseconds. `explain?` also
-  collects Datalevin's own prepare/execution split when available."
+  reports preparation time and the remaining wall time, including sorting."
   [db n explain?]
   (let [query (q/datalog n)
         t0    (System/nanoTime)]
     (if explain?
       (try
-        (let [res (d/explain {:run? true :intermediate-counts? false} query db)]
+        (let [res        (d/explain {:run? true :intermediate-counts? false} query db)
+              rows       (result-rows (:result res))
+              wall-ms    (/ (- (System/nanoTime) t0) 1.0e6)
+              prepare-ms (some-> (:prepare-time res) str parse-double)]
           {:query n
-           :rows  (result-rows (:result res))
+           :rows rows
            :prepare-ms (:prepare-time res)
-           :exec-ms (:execution-time res)
-           :wall-ms (/ (- (System/nanoTime) t0) 1.0e6)})
+           ;; Some execution paths record :execution-time before ORDER BY.
+           ;; Measure through return so the CSV always includes the full sort.
+           :exec-ms (when prepare-ms
+                      (format "%.3f" (max 0.0 (- wall-ms prepare-ms))))
+           :wall-ms wall-ms})
         (catch Throwable _
-          (let [res (d/q query db)]
-            {:query n
-             :rows  (result-rows res)
-             :wall-ms (/ (- (System/nanoTime) t0) 1.0e6)})))
+          (run-one db n false)))
       (let [res (d/q query db)]
         {:query n
          :rows  (result-rows res)
@@ -123,23 +123,24 @@
     :dir      database directory (default \"db\")
     :queries  vector of query numbers, or :all (default :all)
     :out      CSV output path (default \"datalevin_pass.csv\")
-    :explain? also report Datalevin plan/execution times (default true)"
+    :explain? report preparation and remaining wall time (default true)"
   [{:keys [dir queries out explain?]
     :or   {dir "db" out "datalevin_pass.csv" explain? true}}]
   (let [conn (d/get-conn (.getPath (io/file c/base-dir dir)))
         ids  (selected-ids queries)]
     (try
-      (with-open [w (io/writer (io/file c/base-dir out))]
-        (d/write-csv w [["Query" "Rows" "Prepare (ms)" "Execution (ms)"
-                         "Wall (ms)"]])
-        (doseq [n ids]
-          (print (format "  q%-2d ... " n)) (flush)
-          (let [{:keys [rows prepare-ms exec-ms wall-ms]} (run-one (d/db conn) n explain?)]
-            (println (format "%,.1f ms" (double wall-ms)))
-            (d/write-csv w [[n rows
-                             (or prepare-ms "")
-                             (or exec-ms "")
-                             (format "%.3f" (double wall-ms))]]))))
+      (host/with-paused-media
+        (with-open [w (io/writer (io/file c/base-dir out))]
+          (d/write-csv w [["Query" "Rows" "Prepare (ms)" "Execution (ms)"
+                           "Wall (ms)"]])
+          (doseq [n ids]
+            (print (format "  q%-2d ... " n)) (flush)
+            (let [{:keys [rows prepare-ms exec-ms wall-ms]} (run-one (d/db conn) n explain?)]
+              (println (format "%,.1f ms" (double wall-ms)))
+              (d/write-csv w [[n rows
+                               (or prepare-ms "")
+                               (or exec-ms "")
+                               (format "%.3f" (double wall-ms))]])))))
       (finally
         (d/close conn))))
   (println "Results written to" out)

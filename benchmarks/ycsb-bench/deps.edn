@@ -1,0 +1,14 @@
+{:paths ["src"]
+ :deps {datalevin-bench/host {:local/root "../host-control"}
+        datalevin/datalevin {:local/root "../.."}
+        org.xerial/sqlite-jdbc {:mvn/version "3.51.1.0"}
+        org.postgresql/postgresql {:mvn/version "42.7.5"}}
+ :aliases
+ {:jvm {:jvm-opts ["--add-opens=java.base/java.lang=ALL-UNNAMED"
+                   "--add-opens=java.base/java.nio=ALL-UNNAMED"
+                   "--add-opens=java.base/java.util=ALL-UNNAMED"
+                   "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
+                   "--enable-native-access=ALL-UNNAMED"]}
+  :bench {:main-opts ["-m" "ycsb-bench.core"]}
+  :test {:extra-paths ["test"]
+         :main-opts ["-m" "ycsb-bench.test-runner"]}}}

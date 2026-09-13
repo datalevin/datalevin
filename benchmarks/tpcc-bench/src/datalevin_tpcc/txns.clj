@@ -5,7 +5,8 @@
   Datalevin transaction. The transaction-bound connection keeps shared totals,
   counters, and dependent reads consistent while concurrent terminals wait."
   (:require
-   [datalevin.core :as d])
+   [datalevin.core :as d]
+   [datalevin-tpcc.common :as common])
   (:import
    [java.time Instant]
    [java.util Random]))
@@ -116,31 +117,19 @@
         :else
         (let [o-id      d-next
               all-local (long (if (every? #(= w (:supply-w %)) line-data) 1 0))
-              ;; A TPC-C order may repeat an item id. Aggregate by stock row so
-              ;; each row receives exactly one quantity update per order.
-              stock-aggs (reduce
-                          (fn [m {:keys [i-id supply-w qty stock]}]
-                            (let [k [supply-w i-id]]
-                              (-> m
-                                  (update-in [k :qty] (fnil + 0) qty)
-                                  (update-in [k :lines] (fnil inc 0))
-                                  (assoc-in [k :stock] stock)
-                                  (assoc-in [k :remote?] (not= supply-w w)))))
-                          {} line-data)
+              ;; Keep repeated lines in order, then write each stock row once.
+              stock-groups (group-by (juxt :supply-w :i-id) line-data)
               stock-txs (mapcat
-                         (fn [[[_ _] {:keys [qty lines stock remote?]}]]
-                           (let [[s-eid s-qty s-ytd s-ocnt s-rcnt] stock
-                                 qty   (long qty)
-                                 new-q (if (>= (long s-qty) qty)
-                                         (- (long s-qty) qty)
-                                         (+ (- (long s-qty) qty) 91))]
-                             [[:db/add s-eid :stock/quantity new-q]
-                              [:db/add s-eid :stock/ytd (+ (long s-ytd) qty)]
-                              [:db/add s-eid :stock/order-cnt
-                               (+ (long s-ocnt) (long lines))]
-                              [:db/add s-eid :stock/remote-cnt
-                               (if remote? (inc (long s-rcnt)) (long s-rcnt))]]))
-                         stock-aggs)
+                         (fn [[[supply-w _] lines]]
+                           (let [[s-eid & stock] (:stock (first lines))
+                                 [qty ytd ocnt rcnt]
+                                 (common/stock-after-lines stock (map :qty lines)
+                                                           (not= supply-w w))]
+                             [[:db/add s-eid :stock/quantity qty]
+                              [:db/add s-eid :stock/ytd ytd]
+                              [:db/add s-eid :stock/order-cnt ocnt]
+                              [:db/add s-eid :stock/remote-cnt rcnt]]))
+                         stock-groups)
               line-txs  (map-indexed
                          (fn [n {:keys [i-id supply-w qty item]}]
                            (let [[_ price] item

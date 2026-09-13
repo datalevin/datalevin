@@ -1,0 +1,167 @@
+(ns ycsb-bench.core-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [datalevin-bench.host :as host]
+            [ycsb-bench.core :as core]
+            [ycsb-bench.runner :as runner]
+            [ycsb-bench.sql :as sql]
+            [ycsb-bench.store :as store]
+            [ycsb-bench.workload :as w])
+  (:import [java.util Random]
+           [java.util.concurrent Callable ExecutionException Executors Future TimeUnit]))
+
+(def small-options
+  (runner/options {:records 4 :ops 11 :warmup 7 :threads 3
+                   :field-count 3 :field-length 4 :scan-length 3}))
+
+(deftest benchmark-resumes-media-test
+  (doseq [fail? [false true]]
+    (testing (if fail? "case failure" "successful comparison")
+      (let [events (atom [])
+            paused [123 456]
+            failure (ex-info "Injected benchmark failure" {})
+            opts (assoc small-options :system :all :api :datalog
+                        :mode :remote :workload :c)
+            result {:measured {:ops-per-second 1.0 :latency-us {:p99 1.0}}
+                    :validation {:records 4}}]
+        (with-redefs [sql/check-postgres! (fn [_] (swap! events conj :preflight))
+                      host/pause! (fn [] (swap! events conj :pause) paused)
+                      host/resume! (fn [pids] (swap! events conj [:resume pids]))
+                      runner/run-case!
+                      (fn [{:keys [system]}]
+                        (swap! events conj [:run system])
+                        (when (and fail? (= system :postgres)) (throw failure))
+                        result)]
+          (binding [*out* (java.io.StringWriter.)]
+            (if fail?
+              (is (identical? failure
+                              (try (core/run-benchmark opts)
+                                   (catch Exception e e))))
+              (is (= [result result] (:results (core/run-benchmark opts)))))))
+        (is (= [:preflight :pause [:run :datalevin] [:run :postgres]
+                [:resume paused]]
+               @events))))))
+
+(deftest deterministic-records-test
+  (let [values (w/initial-values 17 4 small-options)]
+    (is (= values (w/initial-values 17 4 small-options)))
+    (is (not= values (w/initial-values 18 4 small-options)))
+    (is (= [4 4 4] (mapv count values)))
+    (is (every? #(re-matches #"[a-z]+" %) values))
+    (is (= "aaaa" (w/modified-value "zaaa")))))
+
+(deftest committed-keyspace-test
+  (let [space (w/keyspace 3)
+        first-id (w/reserve-key! space)
+        second-id (w/reserve-key! space)]
+    (is (= [3 4] [first-id second-id]))
+    (w/acknowledge-key! space second-id)
+    (is (= 3 (:visible @space)))
+    (w/acknowledge-key! space first-id)
+    (is (= {:next 5 :visible 5 :pending #{}} @space))))
+
+(deftest request-generators-test
+  (let [cdf (w/zipf-cdf 100)]
+    (doseq [distribution [:uniform :zipfian :latest]
+            n [1 7 100]]
+      (let [rng (Random. 17)
+            keys (repeatedly 2000 #(w/choose-key rng distribution cdf n))]
+        (is (every? #(<= 0 % (dec n)) keys))))
+    (let [rng (Random. 17)
+          keys (repeatedly 10000 #(w/choose-key rng :zipfian cdf 100))]
+      (is (> (count (filter #(< % 10) keys))
+             (* 5 (count (filter #(>= % 90) keys)))))))
+  (doseq [[workload {:keys [mix]}] w/workloads]
+    (let [rng (Random. 42)
+          counts (frequencies (repeatedly 10000 #(w/choose-operation rng mix)))]
+      (is (= (set (map first mix)) (set (keys counts))) (str workload))
+      (doseq [[operation weight] mix]
+        (is (< (abs (- (get counts operation) (* 100 weight))) 250))))))
+
+(deftest invalid-options-test
+  (doseq [bad [{:ops 0} {:warmup -1} {:threads 0} {:pool-size -1}
+               {:records nil} {:field-length 0} {:seed 1.5}
+               {:distribution :random} {:durability :off}
+               {:api :sql} {:records Integer/MAX_VALUE}]]
+    (is (thrown? clojure.lang.ExceptionInfo (runner/options bad)) (str bad)))
+  (is (= 3 (:pool-size (runner/options {:threads 3}))))
+  (is (= 0 (:warmup (runner/options {:warmup 0})))))
+
+(deftest latency-summary-test
+  (is (= {:mean 2.5 :p50 2.0 :p95 4.0 :p99 4.0 :max 4.0}
+         (runner/latency-summary (long-array [4000 1000 3000 2000]))))
+  (is (nil? (runner/latency-summary (long-array 0)))))
+
+(defn- concurrent-modifications! [db]
+  (let [executor (Executors/newFixedThreadPool 2)]
+    (try
+      (let [tasks (.invokeAll executor
+                              (vec (repeat 2
+                                           ^Callable
+                                           (fn []
+                                             (dotimes [_ 10]
+                                               (store/modify-field! db 0 0))))))]
+        (doseq [^Future task tasks] (.get task)))
+      (finally
+        (.shutdownNow executor)
+        (.awaitTermination executor 30 TimeUnit/SECONDS)))))
+
+(defn check-adapter! [db]
+  (let [values ["aaaa" "bbbb" "cccc"]]
+    (store/put-records! db (mapv #(vector % values) (range 3)))
+    (is (= 3 (store/record-count db)))
+    (is (= values (store/read-record db 1)))
+    (store/update-field! db 0 1 "zzzz")
+    (is (= ["aaaa" "zzzz" "cccc"] (store/read-record db 0)))
+    (concurrent-modifications! db)
+    (is (= ["uaaa" "zzzz" "cccc"] (store/read-record db 0))
+        "Atomic RMW must not lose concurrent modifications")
+    (is (= [[1 values]] (store/scan-records db 1 1)))
+    (is (= [[1 values] [2 values]] (store/scan-records db 1 10)))
+    (store/put-records! db [[3 values]])
+    (is (= 4 (store/record-count db)))
+    (is (= [[2 values] [3 values]] (store/scan-records db 2 2))))
+  {})
+
+(deftest adapter-semantics-test
+  (doseq [api [:kv :datalog], mode [:embedded :remote]]
+    (testing (str api " " mode)
+      (store/with-store (assoc small-options :api api :mode mode) check-adapter!))))
+
+(deftest comparison-selection-test
+  (let [opts (runner/options {:system :all :api :datalog :workload :all})
+        cases (runner/cases opts)]
+    (is (= 24 (count cases)))
+    (is (= #{[:datalevin :embedded] [:sqlite :embedded]
+             [:datalevin :remote] [:postgres :remote]}
+           (set (map (juxt :system :mode) cases))))
+    (is (= 36 (count (runner/cases (assoc opts :api :all)))))
+    (is (= 6 (count (runner/cases (assoc opts :system :postgres))))))
+  (is (thrown? clojure.lang.ExceptionInfo
+               (runner/cases (runner/options {:system :postgres :mode :embedded})))))
+
+(deftest warmup-and-measurement-test
+  (let [result (runner/run-case! (assoc small-options :api :kv :mode :embedded
+                                       :workload :c :distribution :uniform))]
+    (is (= 7 (get-in result [:warmup :operations])))
+    (is (= 11 (get-in result [:measured :operations])))
+    (is (= 11 (get-in result [:measured :by-operation :read :count])))
+    (is (= {:status :passed :records 4 :all-records-checked? true} (:validation result)))
+    (is (pos? (get-in result [:measured :ops-per-second])))))
+
+(deftest worker-failure-invalidates-run-test
+  (let [db (reify store/Records
+             (read-record [_ _] (throw (ex-info "Injected read failure" {}))))]
+    (is (thrown? ExecutionException
+                 (runner/run-phase! db (w/keyspace 4) nil
+                                    (assoc small-options :workload :c :distribution :uniform)
+                                    :measured 11)))))
+
+(deftest phase-timeout-test
+  (let [db (reify store/Records
+             (read-record [_ _] (Thread/sleep 10000)))]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"phase timed out"
+                         (runner/run-phase! db (w/keyspace 4) nil
+                                            (assoc small-options :workload :c
+                                                   :distribution :uniform
+                                                   :phase-timeout-ms 100)
+                                            :measured 11)))))

@@ -1,0 +1,66 @@
+(ns ycsb-bench.sql-test
+  (:require [clojure.test :refer [deftest is testing]]
+            [ycsb-bench.core-test :as shared]
+            [ycsb-bench.runner :as runner]
+            [ycsb-bench.sql :as sql]
+            [ycsb-bench.store :as store])
+  (:import [java.sql Connection SQLException]))
+
+(defn- check-sql! [opts]
+  (sql/with-store
+    opts
+    (fn [db]
+      (shared/check-adapter! db)
+      (testing "A failed insert batch rolls back completely and releases its connection"
+        (is (thrown? SQLException
+                     (store/put-records! db [[4 ["dddd" "eeee" "ffff"]]
+                                            [0 ["aaaa" "bbbb" "cccc"]]])))
+        (is (= 4 (store/record-count db)))
+        (is (= [] (store/scan-records db 4 1)))
+        (store/update-field! db 1 0 "xxxx")
+        (is (= ["xxxx" "bbbb" "cccc"] (store/read-record db 1))))
+      {:storage (store/storage-info db)})))
+
+(deftest sqlite-semantics-and-durability-test
+  (doseq [durability [:strict :relaxed]]
+    (let [result (check-sql! (assoc shared/small-options :system :sqlite
+                                   :api :datalog :mode :embedded :durability durability))]
+      (is (= "wal" (get-in result [:storage :configuration :journal-mode])))
+      (is (= (if (= durability :strict) "2" "1")
+             (get-in result [:storage :configuration :synchronous]))))))
+
+(deftest postgres-semantics-and-durability-test
+  (if (System/getenv "YCSB_PG_URL")
+    (doseq [durability [:strict :relaxed]]
+      (let [result (check-sql! (assoc shared/small-options :system :postgres
+                                     :api :datalog :mode :remote :durability durability))]
+        (is (= "on" (get-in result [:storage :configuration :fsync])))
+        (is (= "on" (get-in result [:storage :configuration :full-page-writes])))
+        (is (= (if (= durability :strict) "on" "off")
+               (get-in result [:storage :configuration :synchronous-commit])))))
+    (println "Skipping PostgreSQL integration test: set YCSB_PG_URL and optional YCSB_PG_USER/PASSWORD.")))
+
+(deftest sqlite-load-warmup-and-report-test
+  (let [result (runner/run-case! (assoc shared/small-options :system :sqlite
+                                       :api :datalog :mode :embedded :workload :d
+                                       :ops 200 :warmup 50
+                                       :pg-url "not-used-secret" :pg-user "not-reported"))
+        inserted (+ (get-in result [:warmup :by-operation :insert :count] 0)
+                    (get-in result [:measured :by-operation :insert :count] 0))]
+    (is (pos? inserted))
+    (is (= (+ 4 inserted) (get-in result [:validation :records])))
+    (is (= 200 (get-in result [:measured :operations])))
+    (is (not (contains? (:configuration result) :pg-url)))
+    (is (not (contains? (:configuration result) :pg-user)))))
+
+(deftest failure-closes-all-sql-connections-test
+  (doseq [system (cond-> [:sqlite] (System/getenv "YCSB_PG_URL") (conj :postgres))]
+    (let [connections (atom [])]
+      (is (thrown-with-msg?
+            clojure.lang.ExceptionInfo #"Injected benchmark failure"
+            (sql/with-store (assoc shared/small-options :system system)
+              (fn [db]
+                (reset! connections (:connections db))
+                (throw (ex-info "Injected benchmark failure" {}))))))
+      (is (= 3 (count @connections)))
+      (is (every? #(.isClosed ^Connection %) @connections)))))

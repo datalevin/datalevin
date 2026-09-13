@@ -1,5 +1,6 @@
 {:paths ["src"]
  :deps  {
+         datalevin-bench/host                          {:local/root "../host-control"}
          datalevin/datalevin                           {:local/root "../.."}
          org.clojure/clojure                           {:mvn/version "1.12.5"}
          org.xerial/sqlite-jdbc                        {:mvn/version "3.51.1.0"}

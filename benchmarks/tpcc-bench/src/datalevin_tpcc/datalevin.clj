@@ -2,6 +2,7 @@
   "Load the TPC-C-derived data set into Datalevin."
   (:require
    [clojure.java.io :as io]
+   [datalevin-bench.host :as host]
    [datalevin.core :as d]
    [datalevin.util :as u]
    [datalevin-tpcc.check :as check]
@@ -90,13 +91,7 @@
     (case type
       :new-order
       {:w w :d (rint r 1 10) :c (t/nurand r 1023 1 3000 c-cust)
-       :ol (mapv (fn [_]
-                   {:i-id (if (zero? (mod (rint r 1 100) 100))
-                            100001
-                            (t/nurand r 8191 1 c/item-count c-item))
-                    :supply-w w
-                    :qty (rint r 1 10)})
-                 (range (rint r 1 15)))}
+       :ol (g/new-order-lines r w #(t/nurand r 8191 1 c/item-count c-item))}
 
       :payment
       (let [by-name? (<= (rint r 1 100) 40)]
@@ -177,7 +172,8 @@
       (println (format "TPC-C-derived: %d warehouse(s), %d terminal(s), %d txns"
                        warehouses threads txns))
       (run 0 warmup false)
-      (let [dists    (for [w (range 1 (inc warehouses)) d (range 1 11)] [w d])
+      (host/with-paused-media
+        (let [dists    (for [w (range 1 (inc warehouses)) d (range 1 11)] [w d])
             baseline (into {} (map (fn [[w d]] [[w d] (t/district-next-o-id conn w d)])
                                    dists))
             base-ord (into {} (map (fn [[w d]] [[w d] (t/order-count conn w d)])
@@ -230,7 +226,7 @@
             (println (format "  %-13s n=%-6d mean=%7.3fms p50=%7.3f p95=%7.3f p99=%7.3f"
                              (name ty) count mean p50 p95 p99)))
           {:tpmc tpmc :new-orders new-orders :elapsed elapsed :stats stats
-           :payments @payments :invariants :ok}))
+           :payments @payments :invariants :ok})))
       (finally
         (d/close conn)))))
 

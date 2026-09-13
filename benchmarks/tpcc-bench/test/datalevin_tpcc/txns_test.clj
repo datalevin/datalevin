@@ -255,3 +255,23 @@
                      :order-line/i-id 1}))
                 [[10 1] [20 2] [30 3]])))
       (is (= 3 (:lines (t/order-status! conn {:w 1 :d 1 :c 1})))))))
+
+(deftest order-status-by-name-uses-selected-customer
+  (with-db {}
+    (fn [conn]
+      ;; Only customer 2 has an order. The input :c is customer 1, but the
+      ;; name resolves to customer 2, so Order-Status must report customer 2's
+      ;; order rather than looking up the unrelated input id.
+      (d/transact! conn
+                   [{:db/id 600001 :orders/id 40 :orders/d-id 1 :orders/w-id 1
+                     :orders/c-id 2 :orders/entry-d "2026-01-01T00:00:00"
+                     :orders/ol-cnt 2 :orders/all-local 1}
+                    {:db/id 600002 :order-line/o-id 40 :order-line/d-id 1
+                     :order-line/w-id 1 :order-line/number 1 :order-line/i-id 1}
+                    {:db/id 600003 :order-line/o-id 40 :order-line/d-id 1
+                     :order-line/w-id 1 :order-line/number 2 :order-line/i-id 1}])
+      (is (= {:type :order-status :status :ok :lines 2}
+             (t/order-status! conn {:w 1 :d 1 :c 1 :by-name? true
+                                    :last-name "CUSTOMER2"})))
+      (is (= :no-order
+             (:status (t/order-status! conn {:w 1 :d 1 :c 1 :by-name? false})))))))
