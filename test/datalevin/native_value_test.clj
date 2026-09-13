@@ -1,15 +1,30 @@
 (ns datalevin.native-value-test
   (:require
-   [datalevin.util :refer [raise]] [clojure.test :refer [deftest is testing]]
-            [datalevin.bits :as b]
-            [datalevin.constants :as c]
-            [datalevin.native-value :as nv]
-            [datalevin.protocol :as p]
-            [datalevin.spill :as sp]
-            [taoensso.nippy :as nippy])
+   [clojure.test :refer [deftest is testing use-fixtures]]
+   [datalevin.binding.cpp]
+   [datalevin.bits :as b]
+   [datalevin.constants :as c]
+   [datalevin.native-value :as nv]
+   [datalevin.protocol :as p]
+   [datalevin.spill :as sp]
+   [datalevin.util :refer [raise]]
+   [taoensso.nippy :as nippy])
   (:import [datalevin NativeValue]
            [java.nio ByteBuffer]
            [java.util.function BiPredicate]))
+
+(defn- without-memory-updater [f]
+  (let [installed? (seq @sp/listeners)]
+    (sp/uninstall-memory-updater)
+    (try
+      ;; Constructors must not register a GC listener while the test controls
+      ;; memory pressure. Restore the updater's previous state afterward.
+      (with-redefs [sp/memory-updater (constantly nil)]
+        (f))
+      (finally
+        (when installed? (sp/install-memory-updater))))))
+
+(use-fixtures :once without-memory-updater)
 
 (defn- logical [^NativeValue value]
   (first (b/deserialize (.payload value))))

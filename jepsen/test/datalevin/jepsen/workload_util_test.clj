@@ -416,7 +416,7 @@
                 (is (= 2 actual-key-count))
                 (is (= bootstrap-result actual-bootstrap))
                 (is (<= 1 (long timeout-ms) 1000))
-                (case (swap! attempts inc)
+                (case (int (swap! attempts inc))
                   1 (throw (ex-info "LMDB env is closed."
                                     {:type :lmdb/closed}))
                   2 (throw (ex-info "Request to Datalevin server failed"
@@ -432,7 +432,7 @@
              (#'rejoin-bootstrap/with-retrying-bootstrap-gap!
               1000
               (fn [_timeout-ms]
-                (case (swap! attempts inc)
+                (case (int (swap! attempts inc))
                   1 (throw (ex-info "DBI datalevin/kv-info is not open" {}))
                   2 (throw (ex-info
                              "Request to Datalevin server failed"
