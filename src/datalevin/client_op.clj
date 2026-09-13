@@ -37,9 +37,10 @@
 
 (defn request-hash
   [payload]
-  (let [^MessageDigest md (MessageDigest/getInstance "SHA-256")]
-    (.update md ^bytes (binding [nv/*wire-native-value* true]
-                        (b/serialize payload)))
+  (let [^MessageDigest md (MessageDigest/getInstance "SHA-256")
+        ^bytes payload-bytes (binding [nv/*wire-native-value* true]
+                               (b/serialize payload))]
+    (.update md payload-bytes)
     (u/hexify (.digest md))))
 
 (defn tx-request-payload
