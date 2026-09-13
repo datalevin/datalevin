@@ -27,9 +27,8 @@
    [datalevin.udf :as udf-reg]
    [datalevin.vector :as v]
    [datalevin.entity :as de]
-   [datalevin.remote :as r]
    [datalevin.util :as u :refer [raise long-inc]]
-   [datalevin.interface :refer [search schema search-vec attrs]])
+   [datalevin.interface :as i :refer [search schema search-vec attrs]])
   (:import
    [java.util List]
    [java.nio.charset StandardCharsets]
@@ -38,7 +37,6 @@
    [org.roaringbitmap PeekableIntIterator RoaringBitmap]
    [datalevin.idoc IdocIndex]
    [datalevin.storage Store]
-   [datalevin.remote DatalogStore]
    [datalevin.db DB]))
 
 (def ^:no-doc like-cache (LRUCache. 256))
@@ -306,8 +304,8 @@
    (fulltext-datoms db query nil))
   ([^DB db query opts]
    (let [store (.-store db)]
-     (if (instance? DatalogStore store)
-       (r/fulltext-datoms store query opts)
+     (if (satisfies? i/IRemoteDB store)
+       (i/fulltext-datoms store query opts)
        (let [^FastList res (fulltext db query opts)]
          (mapv (fn [^objects t] [(aget t 0) (aget t 1) (aget t 2)])
                res))))))

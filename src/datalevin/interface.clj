@@ -462,3 +462,49 @@ values;")
   (uncompress [this obj] "takes a byte array")
   (bf-compress [this src-bf dst-bf] "compress between byte buffers")
   (bf-uncompress [this src-bf dst-bf] "decompress between byte buffers"))
+
+;; Remote store protocols. Defined here, below the local store protocols, so
+;; that `search`, `idoc`, `vector`, and `db` can dispatch to remote
+;; implementations without depending on `datalevin.remote`.
+
+(defprotocol IRemoteKV
+  "Operations a remote KV store must provide to the local search/vector/idoc
+  layers."
+  (remote-kv? [store] "true for stores backed by a remote connection")
+  (remote-new-search-engine [store opts])
+  (remote-batch-get-values [store dbi-name ks k-type v-type ignore-key?])
+  (remote-new-vector-index [store opts]))
+
+(defprotocol IRemoteDB
+  (q [store query inputs]
+    "For special case of queries with a single remote store as source,
+     send the query and inputs over to remote server")
+  (pull [store pattern id opts])
+  (pull-many [store pattern id opts])
+  (explain [store opts query inputs])
+  (fulltext-datoms [store query opts])
+  (db-info [store]
+    "Fetch all DB initialization info in a single round trip")
+  (tx-data [store data simulated?]
+    "Send to remote server the data from call to `db/transact-tx-data`")
+  (open-transact [store])
+  (abort-transact [store])
+  (close-transact [store]))
+
+(defonce ^:private remote-open-fn* (atom nil))
+
+(defn set-remote-open-fn!
+  "Register the function that opens a remote store from a `dtlv://` URI.
+  `datalevin.remote` installs this at load so `datalevin.db` need not depend
+  on it."
+  [f]
+  (reset! remote-open-fn* f)
+  nil)
+
+(defn open-remote-store
+  [dir schema opts]
+  (if-let [f @remote-open-fn*]
+    (f dir schema opts)
+    (throw (ex-info "Remote store support is not loaded"
+                    {:dir dir}))))
+

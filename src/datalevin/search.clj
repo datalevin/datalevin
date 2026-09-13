@@ -18,7 +18,6 @@
    [datalevin.sparselist :as sl]
    [datalevin.analyzer :as a]
    [datalevin.udf :as udf]
-   [datalevin.remote :as r]
    [datalevin.constants :as c]
    [datalevin.bits :as b]
    [taoensso.nippy :as nippy]
@@ -1671,8 +1670,8 @@
   ([lmdb]
    (new-search-engine lmdb {}))
   ([lmdb opts]
-   (if (instance? datalevin.remote.KVStore lmdb)
-     (r/new-search-engine lmdb opts)
+   (if (satisfies? if/IRemoteKV lmdb)
+     (if/remote-new-search-engine lmdb opts)
      (new-search-engine* lmdb opts))))
 
 (defn transfer

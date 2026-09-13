@@ -26,7 +26,6 @@
    [datalevin.db DB]
    [datalevin.datom Datom]
    [datalevin.storage Store]
-   [datalevin.remote DatalogStore]
    [java.io PushbackReader FileOutputStream FileInputStream DataOutputStream
     DataInputStream IOException]))
 
@@ -462,7 +461,7 @@
               (u/tmp-dir (str "dtlv-re-index-" (System/currentTimeMillis))))]
      (if (conn/conn? db)
        (let [store (.-store ^DB @db)]
-         (if (instance? DatalogStore store)
+         (if (satisfies? i/IRemoteDB store)
            (do (i/re-index store schema opts) db)
            (do (when bk (copy @db bk true))
                (re-index-datalog db schema opts))))

@@ -13,16 +13,14 @@
   (:require
    [clojure.core :as c]
    [datalevin.db :as db]
-   [datalevin.remote :as r]
    [datalevin.util :as u]
-   [datalevin.interface :refer [db-name]]
+   [datalevin.interface :as i :refer [db-name]]
    [taoensso.nippy :as nippy]
    [clojure.set :as set]
    [datalevin.query-util :as qu])
   (:import
    [datalevin.db DB]
    [datalevin.interface IStore]
-   [datalevin.remote DatalogStore]
    [java.io DataInput DataOutput]))
 
 (declare entity ->Entity equiv-entity lookup-entity touch entity->txs
@@ -253,7 +251,7 @@
 (defn- map->ent
   [{:keys [db-name touched cache db/id]}]
   (let [db (let [^DB db (@db/dbs db-name)]
-             (when-not (instance? DatalogStore (.-store db)) db))
+             (when-not (satisfies? i/IRemoteDB (.-store db)) db))
         e  (entity db id)]
     (if touched
       (load-cache e cache)

@@ -15,7 +15,6 @@
    [datalevin.spill :as sp]
    [datalevin.constants :as c]
    [datalevin.async :as a]
-   [datalevin.remote :as r]
    [datalevin.bits :as b]
    [datalevin.interface :as i]
    [datalevin.txlog :as txlog]
@@ -26,7 +25,6 @@
    [datalevin.cpp VecIdx VecIdx$SearchResult VecIdx$IndexInfo]
    [datalevin.spill SpillableMap]
    [datalevin.async IAsyncWork]
-   [datalevin.remote KVStore]
    [datalevin.interface IAdmin IVectorIndex]
    [java.io File FileOutputStream FileInputStream DataOutputStream
     DataInputStream]
@@ -1096,8 +1094,8 @@
 
 (defn new-vector-index
   [lmdb opts]
-  (if (instance? KVStore lmdb)
-    (r/new-vector-index lmdb opts)
+  (if (satisfies? i/IRemoteKV lmdb)
+    (i/remote-new-vector-index lmdb opts)
     (new-vector-index* lmdb opts)))
 
 (defn transfer

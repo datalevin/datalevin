@@ -30,7 +30,6 @@
    [datalevin.query-util :as qu]
    [datalevin.udf :as udf]
    [datalevin.validate :as vld]
-   [datalevin.remote :as r]
    [datalevin.relation :as rel]
    [datalevin.inline :refer [update assoc]]
    [datalevin.interface :as i
@@ -49,7 +48,6 @@
    [datalevin.datom Datom]
    [datalevin.interface IStore]
    [datalevin.storage Store]
-   [datalevin.remote DatalogStore]
    [datalevin.utl LRUCache]
    [java.util Comparator]
    [java.util.concurrent ConcurrentHashMap]
@@ -144,19 +142,19 @@
 
 (defn- mark-remote-cache-check!
   [store]
-  (when (instance? DatalogStore store)
+  (when (satisfies? i/IRemoteDB store)
     (.put ^ConcurrentHashMap remote-cache-check-ms
           (dir store)
           (System/currentTimeMillis))))
 
 (defn- cached-remote-cache-max-tx
   [store]
-  (when (instance? DatalogStore store)
+  (when (satisfies? i/IRemoteDB store)
     (.get ^ConcurrentHashMap remote-cache-max-tx (dir store))))
 
 (defn- mark-remote-cache-max-tx!
   [store remote-max-tx]
-  (when (and (instance? DatalogStore store)
+  (when (and (satisfies? i/IRemoteDB store)
              (some? remote-max-tx))
     (.put ^ConcurrentHashMap remote-cache-max-tx
           (dir store)
@@ -164,7 +162,7 @@
 
 (defn- should-check-remote-cache?
   [store cache]
-  (if (instance? DatalogStore store)
+  (if (satisfies? i/IRemoteDB store)
     (let [interval-ms (long c/*remote-db-last-modified-check-interval-ms*)]
       (or (nil? cache)
           (not (pos? interval-ms))
@@ -959,9 +957,9 @@
   (when (-searchable? x)
     (let [store  (.-store ^DB x)
           cache  (.get ^ConcurrentHashMap caches (dir store))]
-      (when (and (instance? DatalogStore store)
+      (when (and (satisfies? i/IRemoteDB store)
                  (should-check-remote-cache? store cache))
-        (let [{:keys [last-modified max-tx]} (r/db-info store)
+        (let [{:keys [last-modified max-tx]} (i/db-info store)
               target        (long (or last-modified 0))
               cached-max-tx (cached-remote-cache-max-tx store)]
           (if (or (nil? cache)
@@ -1022,8 +1020,8 @@
 
 (defn- open-store
   [dir schema opts]
-  (if (r/dtlv-uri? dir)
-    (r/open dir schema opts)
+  (if (u/dtlv-uri? dir)
+    (i/open-remote-store dir schema opts)
     (s/open dir schema opts)))
 
 (defn- tx-datom-comparator [store index]
@@ -1046,8 +1044,8 @@
   ([^IStore store] (new-db store nil))
   ([^IStore store info]
    (let [info (or info
-                  (when (instance? datalevin.remote.DatalogStore store)
-                    (r/db-info store)))
+                  (when (satisfies? i/IRemoteDB store)
+                    (i/db-info store)))
          db   (map->DB
                 {:store         store
                  :max-eid       (if info (:max-eid info) (init-max-eid store))
@@ -2000,13 +1998,13 @@
   (let [^DB db  (:db-before initial-report)
         store   (.-store db)
         tx-time (System/currentTimeMillis)]
-    (if (instance? datalevin.remote.DatalogStore store)
+    (if (satisfies? i/IRemoteDB store)
       (try
         (let [txs                                    (sequence
                                                       (mapcat
                                                         expand-transactable-entity)
                                                       initial-es)
-              res                                    (r/tx-data store txs simulated?)
+              res                                    (i/tx-data store txs simulated?)
               db-info                                (when (map? res) (:db-info res))
               res                                    (if db-info (dissoc res :db-info) res)
               [tx-data tempids max-eid new-attributes] (remote-tx-result res)
@@ -2047,8 +2045,8 @@
 (defn abort-transact
   [conn]
   (let [s (.-store ^DB (deref conn))]
-    (if (instance? DatalogStore s)
-      (r/abort-transact s)
+    (if (satisfies? i/IRemoteDB s)
+      (i/abort-transact s)
       (abort-transact-kv (.-lmdb ^Store s)))))
 
 (defn datalog-index-cache-limit

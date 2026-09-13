@@ -124,6 +124,11 @@
   [name]
   (= "1" (env name)))
 
+(defn dtlv-uri?
+  "Return true if the given string is a Datalevin connection string."
+  [s]
+  (when s (s/starts-with? s "dtlv://")))
+
 ;; files
 
 (defn windows? [] (s/starts-with? (System/getProperty "os.name") "Windows"))

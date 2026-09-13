@@ -6,10 +6,9 @@
    [datalevin.query.execute :as qexec]
    [datalevin.query.plan :as qplan]
    [datalevin.query-optimizer :as qo]
-   [datalevin.remote :as rt])
+   [datalevin.interface :as i])
   (:import
-   [datalevin.db DB]
-   [datalevin.remote DatalogStore]))
+   [datalevin.db DB]))
 
 (def ^:dynamic *cache?*
   "Whether query result caching is enabled.
@@ -79,14 +78,14 @@
     (when-let [rdb (first dbs)]
       (let [rstore (.-store ^DB rdb)]
         (when (and (= 1 (count dbs))
-                   (instance? DatalogStore rstore)
+                   (satisfies? i/IRemoteDB rstore)
                    (db/db? rdb))
           [rstore (vec (replace {rdb :remote-db-placeholder} inputs))])))))
 
 (defn q
   [query & inputs]
   (if-let [[store inputs'] (only-remote-db inputs)]
-    (rt/q store query inputs')
+    (i/q store query inputs')
     (apply perform query inputs)))
 
 (defn ^:no-doc q-nested
@@ -99,5 +98,5 @@
 (defn explain
   [opts query & inputs]
   (if-let [[store inputs'] (only-remote-db inputs)]
-    (rt/explain store opts query inputs')
+    (i/explain store opts query inputs')
     (apply explain* opts query inputs)))

@@ -18,7 +18,6 @@
    [datalevin.index :as idx]
    [datalevin.interface :as i
     :refer [open-dbi open-list-dbi get-value visit transact-kv]]
-   [datalevin.remote :as r]
    [datalevin.lmdb :as l]
    [datalevin.spill :as sp]
    [datalevin.util :as u :refer [raise map+]]
@@ -1232,11 +1231,11 @@
 
 (defn- remote-doc-ref-entries
   [lmdb doc-ref-dbi docs]
-  (when (instance? datalevin.remote.KVStore lmdb)
+  (when (satisfies? i/IRemoteKV lmdb)
     (let [doc-refs    (map first docs)
           lookup-refs (vec (distinct (mapcat doc-ref-lookups doc-refs)))
-          ids         (r/get-values lmdb doc-ref-dbi lookup-refs
-                                    :data :int true)
+          ids         (i/remote-batch-get-values lmdb doc-ref-dbi lookup-refs
+                                                 :data :int true)
           ref->id     (zipmap lookup-refs ids)]
       (into {}
             (keep (fn [doc-ref]

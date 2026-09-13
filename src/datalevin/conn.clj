@@ -135,7 +135,7 @@
 
 (defn- shared-local-store-key
   [dir]
-  (when (and (string? dir) (not (r/dtlv-uri? dir)))
+  (when (and (string? dir) (not (u/dtlv-uri? dir)))
     (.getCanonicalPath ^java.io.File (u/file dir))))
 
 (defn- acquire-shared-local-store
@@ -247,7 +247,7 @@
 (defn abort-open-datalog-transaction!
   [store primary]
   (try
-    (r/abort-transact store)
+    (i/abort-transact store)
     (catch Throwable abort-error
       (.addSuppressed ^Throwable primary abort-error))))
 
@@ -310,7 +310,7 @@
                                    (finally
                                      (l/cancel-explicit-transaction-watchdog!
                                       @watchdog#))))
-                               (let [s1# (r/open-transact s#)
+                               (let [s1# (i/open-transact s#)
                                      w#  #(let [~conn
                                                 (atom (db/transfer db# s1#)
                                                       :meta (meta orig-conn#))]
@@ -328,7 +328,7 @@
                                       @watchdog#)
                                      (l/assert-explicit-transaction-live!
                                       @watchdog#)
-                                     (r/close-transact s#)
+                                     (i/close-transact s#)
                                      res#)
                                    (catch Throwable t#
                                      (abort-open-datalog-transaction! s# t#)
@@ -1429,7 +1429,7 @@
   ([dir]
    (open-kv dir nil))
   ([dir opts]
-   (if (r/dtlv-uri? dir)
+   (if (u/dtlv-uri? dir)
      (r/open-kv dir opts)
      (l/open-kv dir opts))))
 

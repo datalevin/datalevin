@@ -14,7 +14,7 @@
    [datalevin.client-op :as cop]
    [datalevin.util :as u :refer [ deftype+ raise]]
    [datalevin.constants :as c]
-   [datalevin.interface]
+   [datalevin.interface :as i]
    [datalevin.client :as cl]
    [datalevin.bits :as b]
    [datalevin.datom :as d]
@@ -23,7 +23,8 @@
    [clojure.string :as str])
   (:import
    [datalevin.client Client]
-   [datalevin.interface ICustomTypes ILMDB ITxLog IList IAdmin IStore ISearchEngine IVectorIndex]
+   [datalevin.interface ICustomTypes ILMDB ITxLog IList IAdmin IStore
+    ISearchEngine IVectorIndex IRemoteDB IRemoteKV]
    [clojure.lang Seqable IReduceInit]
    [java.lang AutoCloseable]
    [java.util.concurrent ConcurrentHashMap]
@@ -81,10 +82,9 @@
     (when (>= streak ^long *chatty-kv-detect-threshold*)
       (inc-chatty-kv-stat! [db-name dbi-name op]))))
 
-(defn dtlv-uri?
-  "return true if the given string is a Datalevin connection string"
-  [s]
-  (when s (str/starts-with? s "dtlv://")))
+(def dtlv-uri?
+  "Return true if the given string is a Datalevin connection string."
+  u/dtlv-uri?)
 
 (defn redact-uri
   [s]
@@ -308,23 +308,6 @@
          result)))))
 
 ;; remote datalog db
-
-(defprotocol IRemoteDB
-  (q [store query inputs]
-    "For special case of queries with a single remote store as source,
-     send the query and inputs over to remote server")
-  (pull [store pattern id opts])
-  (pull-many [store pattern id opts])
-  (explain [store opts query inputs])
-  (fulltext-datoms [store query opts])
-  (db-info [store]
-    "Fetch all DB initialization info in a single round trip")
-  (tx-data [store data simulated?]
-    "Send to remote server the data from call to `db/transact-tx-data`")
-  (open-transact [store])
-  (abort-transact [store])
-  (close-transact [store])
-  )
 
 (declare ->DatalogStore)
 
@@ -683,9 +666,12 @@
                          (AtomicBoolean. false)))
        (raise "URI should contain a database name" {})))))
 
+;; Let `datalevin.db` open remote stores without depending on this namespace.
+(i/set-remote-open-fn! open)
+
 ;; remote kv store
 
-(declare ->KVStore)
+(declare ->KVStore get-values new-search-engine new-vector-index)
 
 (defn- backward-range-type?
   [range-type]
@@ -902,6 +888,13 @@
                   open-db-opts
                   owns-client?
                   ^AtomicBoolean closed?]
+  IRemoteKV
+  (remote-kv? [_] true)
+  (remote-new-search-engine [this opts] (new-search-engine this opts))
+  (remote-batch-get-values [this dbi-name ks k-type v-type ignore-key?]
+    (get-values this dbi-name ks k-type v-type ignore-key?))
+  (remote-new-vector-index [this opts] (new-vector-index this opts))
+
   ICustomTypes
   (defremote-forward (cl/normal-request client)
     (register-type [_ type-name definition] :serialize definition))

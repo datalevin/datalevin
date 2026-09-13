@@ -14,12 +14,11 @@
    [datalevin.db :as db]
    [datalevin.constants :as c]
    [datalevin.datom :as dd]
-   [datalevin.remote :as r]
+   [datalevin.interface :as i]
    [datalevin.timeout :as timeout]
    [datalevin.util :as u :refer [cond+]])
   (:import
    [datalevin.db DB]
-   [datalevin.remote DatalogStore]
    [datalevin.utl LRUCache]
    [datalevin.datom Datom]
    [datalevin.pull_parser PullAttr PullPattern]))
@@ -341,8 +340,8 @@
 (defn pull
   ([db pattern id opts]
    (let [store (.-store ^DB db)]
-     (if (instance? DatalogStore store)
-       (r/pull store pattern id opts)
+     (if (satisfies? i/IRemoteDB store)
+       (i/pull store pattern id opts)
        (pull* db pattern id opts))))
   ([db pattern id]
    (pull db pattern id {})))
@@ -358,8 +357,8 @@
 (defn pull-many
   ([db pattern id opts]
    (let [store (.-store ^DB db)]
-     (if (instance? DatalogStore store)
-       (r/pull-many store pattern id opts)
+     (if (satisfies? i/IRemoteDB store)
+       (i/pull-many store pattern id opts)
        (pull-many* db pattern id opts))))
   ([db pattern id]
    (pull-many db pattern id {})))
