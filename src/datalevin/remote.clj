@@ -311,6 +311,20 @@
 
 (declare ->DatalogStore)
 
+;; The remote datalog protocol now lives in `datalevin.interface` so the
+;; local layers can dispatch without depending on this namespace. Keep these
+;; aliases for callers that used `datalevin.remote` directly.
+(def q i/q)
+(def pull i/pull)
+(def pull-many i/pull-many)
+(def explain i/explain)
+(def fulltext-datoms i/fulltext-datoms)
+(def db-info i/db-info)
+(def tx-data i/tx-data)
+(def open-transact i/open-transact)
+(def abort-transact i/abort-transact)
+(def close-transact i/close-transact)
+
 (defn- update-read-floor-tx!
   [^AtomicLong read-floor-tx tx]
   (when (integer? tx)
