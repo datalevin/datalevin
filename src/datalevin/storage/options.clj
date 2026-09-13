@@ -145,7 +145,13 @@
     true c/canonicalize-wal-opts
     true encode-legacy-ha-nil-sentinels)))
 
-(defn transact-opts
+(defn ^:no-doc transact-opts
+  "Internal persistence API for storage mutations and server option rollback.
+  Takes the store's LMDB handle and an option map. Upserts normalized, persistable
+  options and :last-modified in one regular KV transaction only when values
+  differ. Keys omitted from opts are not deleted; runtime-only options are not
+  persisted. Does not refresh a Store's cached options: rollback callers must
+  reopen the store after this call."
   [lmdb opts]
   (let [opts (persistable-opts opts)
         current (some-> (load-opts lmdb) persistable-opts)]

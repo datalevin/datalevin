@@ -22,6 +22,7 @@
    [datalevin.binding.cpp :as cpp]
    [datalevin.protocol :as p]
    [datalevin.storage :as st]
+   [datalevin.storage.options :as store-opts]
    [datalevin.ha :as dha]
    [datalevin.ha.replication :as drep]
    [datalevin.server.auth :as auth]
@@ -1681,7 +1682,7 @@
     (try
       (let [env-dir (i/dir store)
             schema (i/schema store)]
-        (#'st/transact-opts (.-lmdb ^Store store) old-opts)
+        (store-opts/transact-opts (.-lmdb ^Store store) old-opts)
         (when-not (store-closed? store)
           (close-store store))
         (dha/recover-ha-local-store-dir-if-needed! env-dir)

@@ -731,7 +731,9 @@
   [host port]
   (str host ":" port))
 
-(defn- retryable-ha-write-reject?
+(defn ^:no-doc retryable-ha-write-reject?
+  "Internal retry API: true only for a server HA write rejection explicitly
+  marked retryable. Other errors must retain their original failure semantics."
   [err-data]
   (and (map? err-data)
        (= :ha/write-rejected (:error err-data))
@@ -749,12 +751,15 @@
       (retryable-ha-read-reject? err-data)))
 
 (defn ^:no-doc disable-ha-write-retry!
+  "Internal routing API: pin subsequent writes to the selected server session.
+  Returns client; pair with `enable-ha-write-retry!` after transaction cleanup."
   [client]
   (when client
     (.put ha-retry-disabled-clients client true))
   client)
 
 (defn ^:no-doc enable-ha-write-retry!
+  "Internal routing API: allow HA write rerouting again. Returns client."
   [client]
   (when client
     (.remove ha-retry-disabled-clients client))
@@ -940,6 +945,8 @@
            :ha-write-retry-timeout-ms attempt-timeout-ms)))
 
 (defn ^:no-doc sync-ha-routing!
+  "Internal routing API: copy the preferred write endpoint from source-client
+  to target-client, clearing stale routing when source has none. Returns target."
   [source-client target-client]
   (when (and source-client target-client)
     (if-let [endpoint (read-preferred-ha-endpoint source-client)]
@@ -948,6 +955,8 @@
   target-client)
 
 (defn ^:no-doc active-ha-request-client
+  "Internal routing API: return the live cached client for the preferred write
+  endpoint, or client itself. Explicit transactions must use this owning session."
   [client]
   (if-let [endpoint (read-preferred-ha-endpoint client)]
     (if-let [retry-client (cached-retry-client client endpoint)]
@@ -989,7 +998,9 @@
     (.put ha-preferred-endpoints client endpoint)
     (.remove ha-preferred-endpoints client)))
 
-(defn- clear-preferred-ha-endpoint!
+(defn ^:no-doc clear-preferred-ha-endpoint!
+  "Internal routing API: forget a client's preferred write endpoint. Used when
+  pinning an explicit transaction so a nested preference cannot change sessions."
   [client]
   (set-preferred-ha-endpoint! client nil))
 
@@ -1415,19 +1426,75 @@
         (clear-preferred-ha-endpoint! client)
         {:handled? false}))))
 
-(defn- ^:redef retry-ha-write-request
-  [client req message err-data]
+(defn ^:no-doc ^:redef retry-ha-write-request
+  "Internal retry API: handle a failed write using the client's HA settings.
+  Returns the successful result and remembers its endpoint. Raises a normal
+  request error if the rejection is not retryable, retries are disabled, or the
+  deadline expires. Optional request-fn takes [client request] and returns a wire
+  response; remote stores supply it to replay copy-in payloads."
+  ([client req message err-data]
+   (retry-ha-write-request client req message err-data request))
+  ([client req message err-data request-fn]
+   (if-let [retry-context (and (retryable-ha-write-reject? err-data)
+                              (client-retry-context client))]
+     (#'retry-ha-write-request*
+      req message err-data retry-context request-fn disconnect
+      #'new-client-for-endpoint
+      #(#'set-preferred-ha-endpoint! client %))
+     (raise-normal-request-error req message err-data nil))))
+
+(defn ^:no-doc retry-ha-transport-failure
+  "Internal retry API for replay-safe remote writes after a transport failure.
+  The caller must establish replay safety (for example, a client operation ID).
+  request-fn takes [client request] and returns a wire response. Starts with known
+  endpoints other than the failed client's endpoint, returning a command-complete
+  response with transaction metadata, or nil when no retry is available. Native
+  decoding errors and exhausted retry errors propagate to the caller."
+  [client req request-fn known-endpoints throwable]
+  (when (nv/decoding-error? throwable) (throw throwable))
+  (when-let [retry-context (client-retry-context client)]
+    (let [self-endpoint (endpoint-key (:host retry-context) (:port retry-context))
+          retry-endpoints (->> known-endpoints
+                               (remove #(= self-endpoint %))
+                               vec)]
+      (when (seq retry-endpoints)
+        (let [retry-result
+              (#'retry-ha-write-request*
+               req
+               (or (ex-message throwable) "HA write target became unavailable")
+               {:error :ha/write-rejected
+                :reason :endpoint-unreachable
+                :retryable? true
+                :ha-retry-endpoints retry-endpoints}
+               retry-context request-fn disconnect #'new-client-for-endpoint
+               #(#'set-preferred-ha-endpoint! client %))]
+          (cond-> {:type :command-complete :result retry-result}
+            (map? retry-result)
+            (merge (select-keys retry-result [:db-info :new-attributes]))))))))
+
+(defn ^:no-doc request-ha-open
+  "Internal retry API: send a transaction-open request, trying the preferred HA
+  endpoint first and retrying eligible write rejections. Returns the result and
+  records the winning endpoint. The caller must then pin the transaction to
+  `active-ha-request-client` before sending transaction data or control messages."
+  [client req]
   (if-let [retry-context (client-retry-context client)]
-    (retry-ha-write-request*
-      req
-      message
-      err-data
-      retry-context
-      request
-      disconnect
-      new-client-for-endpoint
-      #(set-preferred-ha-endpoint! client %))
-    (raise-normal-request-error req message err-data nil)))
+    (let [preferred-attempt
+          (try-preferred-ha-write-request*
+           client req retry-context request disconnect
+           #'new-client-for-endpoint #'retry-ha-write-request)]
+      (if (:handled? preferred-attempt)
+        (:result preferred-attempt)
+        (let [{:keys [type message result err-data]} (request client req)]
+          (if (= type :error-response)
+            (retry-ha-write-request client req message err-data)
+            (do
+              (clear-preferred-ha-endpoint! client)
+              result)))))
+    (let [{:keys [type message result err-data]} (request client req)]
+      (if (= type :error-response)
+        (raise-normal-request-error req message err-data nil)
+        result))))
 
 (defn- try-preferred-ha-read-request*
   [client req routing-context request-fn disconnect-fn new-client-fn]

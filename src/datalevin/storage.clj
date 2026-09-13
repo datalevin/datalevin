@@ -59,7 +59,7 @@
     :refer [apply-option-mutations async-secondary-index-option-keys
             normalize-ha-open-opts raw-persist-open-opts-key
             resolve-store-opts store-visible-opts sync-wal-runtime-opts!
-            transact-opts-raw]]
+            transact-opts transact-opts-raw]]
    [datalevin.storage.scan :as scans
     :refer [av-entities ave-filter-bound-id-chunk ave-filter-tuple-id-chunk
             ave-tuples-scan* ave-tuples-scan-need-v
@@ -115,12 +115,11 @@
 (def idoc-index indexing/idoc-index)
 (def vpred scans/vpred)
 
-;; Retain interned helpers used by server code and sibling tests.
+;; Retain interned helpers used by sibling tests.
 (def ^:private existing-store? options/existing-store?)
 (def ^:private load-opts options/load-opts)
 (def ^:private propagate-top-level-txlog-opts-to-kv-opts
   options/propagate-top-level-txlog-opts-to-kv-opts)
-(def ^:private transact-opts options/transact-opts)
 
 (def ^:dynamic ^:no-doc *enforce-blind-unique-inserts?* false)
 

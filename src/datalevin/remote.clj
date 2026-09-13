@@ -19,7 +19,6 @@
    [datalevin.bits :as b]
    [datalevin.datom :as d]
    [datalevin.lmdb :as l :refer [IWriting]]
-   [datalevin.native-value :as nv]
    [clojure.string :as str])
   (:import
    [datalevin.client Client]
@@ -123,58 +122,11 @@
 
 (defn- retry-ha-transport-failure
   [client req request-fn known-endpoints throwable]
-  (when (nv/decoding-error? throwable) (throw throwable))
-  (when-let [retry-context (#'cl/client-retry-context client)]
-    (let [self-endpoint (str (:host retry-context) ":" (:port retry-context))
-          retry-endpoints (->> known-endpoints
-                               (remove #(= self-endpoint %))
-                               vec)]
-      (when (seq retry-endpoints)
-        (let [retry-result
-              (#'cl/retry-ha-write-request*
-               req
-               (or (ex-message throwable)
-                   "HA write target became unavailable")
-               {:error :ha/write-rejected
-                :reason :endpoint-unreachable
-                :retryable? true
-                :ha-retry-endpoints retry-endpoints}
-               retry-context
-               request-fn
-               cl/disconnect
-               #'cl/new-client-for-endpoint
-               #(#'cl/set-preferred-ha-endpoint! client %))]
-          (cond-> {:type :command-complete
-                   :result retry-result}
-            (map? retry-result)
-            (merge (select-keys retry-result [:db-info :new-attributes]))))))))
+  (cl/retry-ha-transport-failure client req request-fn known-endpoints throwable))
 
 (defn- request-ha-open
   [client req]
-  (if-let [retry-context (#'cl/client-retry-context client)]
-    (let [preferred-attempt
-          (#'cl/try-preferred-ha-write-request*
-           client
-           req
-           retry-context
-           cl/request
-           cl/disconnect
-           #'cl/new-client-for-endpoint
-           #'cl/retry-ha-write-request)]
-      (if (:handled? preferred-attempt)
-        (:result preferred-attempt)
-        (let [{:keys [type message result err-data]} (cl/request client req)]
-          (if (= type :error-response)
-            (if (#'cl/retryable-ha-write-reject? err-data)
-              (#'cl/retry-ha-write-request client req message err-data)
-              (#'cl/raise-normal-request-error req message err-data nil))
-            (do
-              (#'cl/clear-preferred-ha-endpoint! client)
-              result)))))
-    (let [{:keys [type message result err-data]} (cl/request client req)]
-      (if (= type :error-response)
-        (#'cl/raise-normal-request-error req message err-data nil)
-        result))))
+  (cl/request-ha-open client req))
 
 (defn- disable-ha-transaction-retry!
   [routing-client]
@@ -278,19 +230,7 @@
      (if (= type :error-response)
        (if (:resized err-data)
          (raise message err-data)
-         (if (#'cl/retryable-ha-write-reject? err-data)
-           (if-let [retry-context (#'cl/client-retry-context client)]
-             (#'cl/retry-ha-write-request*
-             req
-              message
-              err-data
-              retry-context
-              request-fn
-              cl/disconnect
-              #'cl/new-client-for-endpoint
-              #(#'cl/set-preferred-ha-endpoint! client %))
-             (#'cl/raise-normal-request-error req message err-data nil))
-           (#'cl/raise-normal-request-error req message err-data nil)))
+         (cl/retry-ha-write-request client req message err-data request-fn))
        (cond
          (and tx? (map? result) (contains? result :tx-data))
          (merge
@@ -1089,18 +1029,8 @@
       (when (= type :error-response)
         (if (:resized err-data)
           (raise message err-data)
-          (if (#'cl/retryable-ha-write-reject? err-data)
-            (if-let [retry-context (#'cl/client-retry-context client)]
-              (#'cl/retry-ha-write-request*
-               req
-               message
-               err-data
-               retry-context
-               request-fn
-               cl/disconnect
-               #'cl/new-client-for-endpoint
-               #(#'cl/set-preferred-ha-endpoint! client %))
-              (#'cl/raise-normal-request-error req message err-data nil))
+          (if (cl/retryable-ha-write-reject? err-data)
+            (cl/retry-ha-write-request client req message err-data request-fn)
             (raise "Error transacting kv to server:" message {:uri uri}))))))
 
   (get-value [db dbi-name k]
