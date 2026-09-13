@@ -97,11 +97,11 @@
 (defn new-order!
   [conn {:keys [w d c ol]}]
   (d/with-transaction [tx-conn conn]
-    (let [db                   (d/db tx-conn)
-          [_ _ _w-tax]          (warehouse db w)
-          [d-eid _ _d-tax o-id]  (district db w d)
-          [_c-eid _c-id _c-disc] (customer-by-id db w d c)
-          all-local            (long (if (every? #(= w (:supply-w %)) ol) 1 0))]
+    (let [db                    (d/db tx-conn)
+          [_ _ w-tax]           (warehouse db w)
+          [d-eid _ d-tax o-id]   (district db w d)
+          [_c-eid _c-id c-disc]  (customer-by-id db w d c)
+          all-local             (long (if (every? #(= w (:supply-w %)) ol) 1 0))]
       (when (nil? d-eid)
         (throw (ex-info "No such district" {:w w :d d})))
       (d/transact!
@@ -113,7 +113,7 @@
         {:db/id -2 :new-order/o-id o-id :new-order/d-id d :new-order/w-id w}])
       ;; TPC-C 2.4.2.3 requires the valid prefix to perform its writes before
       ;; discovering the invalid item. Prevalidating the order skips that work.
-      (loop [lines (seq ol) number 1 total 0.0]
+      (loop [lines (seq ol) number 1 subtotal 0.0]
         (if-let [{:keys [i-id supply-w qty]} (first lines)]
           (let [db (d/db tx-conn)]
             (if-let [[_ price] (item db i-id)]
@@ -132,13 +132,13 @@
                    :order-line/i-id i-id :order-line/supply-w-id supply-w
                    :order-line/quantity (long qty) :order-line/amount amount
                    :order-line/dist-info dist-info}])
-                (recur (next lines) (inc number) (+ total amount)))
+                (recur (next lines) (inc number) (+ subtotal amount)))
               (do
                 (d/abort-transact tx-conn)
                 {:type :new-order :status :invalid-item :w w :d d
                  :o-id o-id :i-id i-id})))
           {:type :new-order :status :ok :w w :d d :o-id o-id
-           :amount total})))))
+           :amount (common/new-order-total subtotal c-disc w-tax d-tax)})))))
 
 ;; ---------------------------------------------------------------------------
 ;; Payment
@@ -189,12 +189,25 @@
 (defn order-status!
   [conn {:keys [w d c last-name by-name?]}]
   (let [db   (d/db conn)
+        rows (d/q '[:find ?id ?balance ?first ?middle ?last
+                     :in $ ?w ?d ?attr ?value
+                     :where
+                     [?e :customer/w-id ?w]
+                     [?e :customer/d-id ?d]
+                     [?e ?attr ?value]
+                     [?e :customer/id ?id]
+                     [?e :customer/balance ?balance]
+                     [?e :customer/first ?first]
+                     [?e :customer/middle ?middle]
+                     [?e :customer/last ?last]]
+                   db w d (if by-name? :customer/last :customer/id)
+                   (if by-name? last-name c))
         cust (if by-name?
-               (customer-by-last db w d last-name)
-               (customer-by-id db w d c))]
+               (common/middle-customer (sort-by (juxt #(nth % 2) first) rows))
+               (first rows))]
     (if (nil? cust)
       {:type :order-status :status :no-customer}
-      (let [c-id (second cust)
+      (let [c-id (first cust)
             ;; TPC-C 2.6: inspect the customer's most recent order, i.e. the
             ;; greatest order id, matching the SQL backends' ORDER BY o_id DESC.
             o-id (ffirst (d/q '[:find (max ?id)
@@ -206,14 +219,35 @@
                                 [?e :orders/id ?id]]
                               db w d c-id))]
         (if o-id
-          (let [lines (d/q '[:find ?number :in $ ?w ?d ?o
+          ;; Pull keeps orders and lines whose optional carrier/delivery
+          ;; attributes are absent, the equivalent of SQL NULL.
+          (let [order (ffirst
+                       (d/q '[:find (pull ?e [:orders/id :orders/entry-d
+                                              :orders/carrier-id])
+                              :in $ ?w ?d ?o
+                              :where
+                              [?e :orders/w-id ?w]
+                              [?e :orders/d-id ?d]
+                              [?e :orders/id ?o]]
+                            db w d o-id))
+                lines (d/q '[:find (pull ?l [:order-line/number :order-line/i-id
+                                            :order-line/supply-w-id
+                                            :order-line/quantity :order-line/amount
+                                            :order-line/delivery-d])
+                             :in $ ?w ?d ?o
                              :where
                              [?l :order-line/w-id ?w]
                              [?l :order-line/d-id ?d]
-                             [?l :order-line/o-id ?o]
-                             [?l :order-line/number ?number]]
+                             [?l :order-line/o-id ?o]]
                            db w d o-id)]
-            {:type :order-status :status :ok :lines (count lines)})
+            (common/order-status-result
+             cust ((juxt :orders/id :orders/entry-d :orders/carrier-id) order)
+             (->> lines
+                  (map first)
+                  (sort-by :order-line/number)
+                  (map (juxt :order-line/number :order-line/i-id
+                             :order-line/supply-w-id :order-line/quantity
+                             :order-line/amount :order-line/delivery-d)))))
           {:type :order-status :status :no-order})))))
 
 ;; ---------------------------------------------------------------------------

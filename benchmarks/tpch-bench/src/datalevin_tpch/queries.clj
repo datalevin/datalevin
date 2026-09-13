@@ -657,3 +657,11 @@
            (drop-while #(not= :order-by %))
            second
            (partition 2)))
+
+(defn limit
+  "The `:limit` for query `n`, or nil when the query returns every row."
+  [n]
+  (some->> (datalog n)
+           (take-while #(not= :where %))
+           (drop-while #(not= :limit %))
+           second))

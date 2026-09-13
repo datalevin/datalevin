@@ -1448,7 +1448,11 @@
 (defn- transact*
   [deps db0 txs tx-meta s? server db-name writing?]
   (try
-    (d/with db0 txs (or tx-meta {}) s?)
+    ;; db0 is published to concurrent pull/query handlers. Give the writer
+    ;; private mutable overlays while retaining db0 as the report's before DB.
+    (db/transact-tx-data
+      (db/->TxReport db0 (db/transfer db0 (:store db0)) [] {} (or tx-meta {}))
+      txs s?)
     (catch Exception e
       (when (:resized (ex-data e))
         (let [new-db (db/carry-runtime-opts

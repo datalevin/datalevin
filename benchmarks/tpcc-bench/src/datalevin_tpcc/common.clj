@@ -31,12 +31,39 @@
 ;; ---------------------------------------------------------------------------
 ;; Shared transaction calculations
 
+(defn new-order-total
+  "Apply the customer discount and home warehouse/district taxes to the sum
+  of OL_AMOUNT values (TPC-C 2.4.2.2). Rates are fractions, not percentages."
+  [subtotal c-discount w-tax d-tax]
+  (* (double subtotal)
+     (- 1.0 (double c-discount))
+     (+ 1.0 (double w-tax) (double d-tax))))
+
 (defn middle-customer
   "Select from customers already sorted by first name, or return nil if empty.
   TPC-C 2.5.2.2 chooses the lower middle customer when the count is even."
   [customers]
   (when (seq customers)
     (nth customers (quot (dec (count customers)) 2))))
+
+(defn order-status-result
+  "Materialize the TPC-C 2.6.2.2 fields in the same shape for every backend.
+  Rows are customer [id balance first middle last], order [id entry carrier],
+  and lines [number item supply quantity amount delivery], in line-number order.
+  Keep the line count for callers that only need the transaction summary."
+  [[c-id balance first-name middle last-name] [o-id entry carrier] lines]
+  (let [order-lines
+        (mapv (fn [[number item supply quantity amount delivery]]
+                {:number (long number) :i-id (long item)
+                 :supply-w-id (long supply) :quantity (long quantity)
+                 :amount (double amount) :delivery-d delivery})
+              lines)]
+    {:type :order-status :status :ok
+     :customer {:id (long c-id) :balance (double balance)
+                :first first-name :middle middle :last last-name}
+     :order {:id (long o-id) :entry-d entry
+             :carrier-id (some-> carrier long)}
+     :lines (count order-lines) :order-lines order-lines}))
 
 (defn bad-credit-data
   "Prepend the six Payment history fields required by TPC-C 2.5.2.2 to C_DATA,

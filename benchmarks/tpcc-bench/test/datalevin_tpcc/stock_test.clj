@@ -114,6 +114,7 @@
                               {:w 1 :d 1 :c 1
                                :ol (conj prefix (line 1 999 1))})]
         (is (= :invalid-item (:status result)))
+        (is (not (contains? result :amount)) "rolled-back orders have no final total")
         (is (= (:next before) (:o-id result)))
         (is (= 999 (:i-id result)))
         ;; The transaction really advanced the counter, inserted both headers,

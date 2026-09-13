@@ -72,11 +72,23 @@ final item id replaced with an unused value, as specified in
 New-Order reads the warehouse tax, the district counter and tax, and the customer
 discount, then advances the counter and inserts the order and new-order headers.
 It processes each line in input order, updating stock and inserting the line
-before looking up the next item. An invalid item rolls back the header and all
+before looking up the next item. All backends return the successful order's
+`:amount` as `sum(OL_AMOUNT) * (1 - C_DISCOUNT) * (1 + W_TAX + D_TAX)`
+(TPC-C §2.4.2.2); stored line amounts remain quantity times item price.
+An invalid item rolls back the header and all
 preceding valid-line writes, exercising the rollback workload required by
 TPC-C §2.4.2.3. Payment updates the warehouse and district year-to-date
 totals, the customer balance/payment count, and appends a history row. Delivery
 removes the oldest new-order in each district and delivers its lines.
+
+Order-Status retrieves the selected customer's ID, balance, and full name; the
+latest order's ID, entry date, and carrier; and every line's item, supplying
+warehouse, quantity, amount, and delivery date, as required by
+[TPC-C §2.6.2.2](https://www.tpc.org/TPC_Documents_Current_Versions/pdf/tpc-c_v5.11.0.pdf#page=38).
+All three backends return these fields in `:customer`, `:order`, and
+`:order-lines`, with lines ordered by `:number`. Undelivered carriers and dates
+are `nil`. The `:lines` count remains available. Earlier Order-Status timings
+measured incomplete reads and should be rerun before comparison.
 
 New-Order copies `S_DIST_xx` from each supplying stock row into `OL_DIST_INFO`,
 where `xx` is the order's district. For bad-credit customers, Payment prepends

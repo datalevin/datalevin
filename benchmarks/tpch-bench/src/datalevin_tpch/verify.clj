@@ -2,9 +2,11 @@
   "Compare Datalevin Datalog results against the SQLite reference.
 
   Required ORDER BY is checked on the original results before canonicalizing
-  rows for content comparison, allowing arbitrary order among ties. Singleton
-  values, counts and quantity sums are exact. Other aggregates allow relative
-  tolerance for floating-point rounding differences between backends."
+  rows for content comparison, allowing arbitrary order among ties. For a
+  `:limit` query, rows tied on the ORDER BY key at the limit boundary may be
+  chosen differently by each system, so those rows are allowed to differ.
+  Singleton values, counts and quantity sums are exact. Other aggregates allow
+  relative tolerance for floating-point rounding differences between backends."
   (:require
    [clojure.java.io :as io]
    [datalevin.core :as d]
@@ -105,19 +107,77 @@
     (every? (fn [[a b]] (not (pos? (compare-rows a b))))
             (partition 2 1 rows))))
 
+(defn- same-ordering-key?
+  "Whether two rows share the same ORDER BY key. `:relative` ordering columns
+  (computed monetary values) use the same rounding tolerance as the cell
+  comparison; everything else must be exactly equal."
+  [rules ordering a b]
+  (every? true?
+          (map (fn [[column _]]
+                 (let [va (nth a column)
+                       vb (nth b column)]
+                   (case (rules column)
+                     :exact    (if (and (number? va) (number? vb))
+                                 (zero? (compare va vb))
+                                 (= va vb))
+                     :relative (c/close-enough? va vb))))
+               ordering)))
+
+(defn- tie-groups
+  "Split already-sorted `rows` into maximal runs sharing an ORDER BY key."
+  [rules ordering rows]
+  (reduce
+   (fn [groups row]
+     (let [group (peek groups)]
+       (if (and group (same-ordering-key? rules ordering (peek group) row))
+         (conj (pop groups) (conj group row))
+         (conj groups [row]))))
+   [] rows))
+
 (defn results-match?
   "Check row shape and required ordering, then compare each output column using
-  its exact or aggregate-rounding rule."
+  its exact or aggregate-rounding rule.
+
+  When a query has a `:limit`, rows tied on the ORDER BY key at the boundary
+  may be chosen differently by each backend. Only the tie groups wholly above
+  the limit must match cell by cell; the final group is compared on its
+  ordering key alone."
   [n expected actual]
-  (let [rules (or (column-comparisons n)
-                  (throw (ex-info "No result comparison rules for query"
-                                  {:query n})))
-        width (count rules)]
+  (let [rules    (or (column-comparisons n)
+                     (throw (ex-info "No result comparison rules for query"
+                                     {:query n})))
+        width    (count rules)
+        ordering (vec (or (q/ordering n) []))
+        limit    (q/limit n)]
     (and (every? #(= width (count %)) expected)
          (every? #(= width (count %)) actual)
+         (= (count expected) (count actual))
          (ordered? n expected)
          (ordered? n actual)
-         (rows-match? rules (normalize rules expected) (normalize rules actual)))))
+         (if (seq ordering)
+           (let [expected-groups (tie-groups rules ordering expected)
+                 actual-groups   (tie-groups rules ordering actual)
+                 ;; A run of tied rows that reaches the limit may be truncated,
+                 ;; so its members are interchangeable with unreturned ones.
+                 truncated?      (and limit (= limit (count expected)))
+                 complete        (if truncated?
+                                   (dec (count expected-groups))
+                                   (count expected-groups))]
+             (and (= (count expected-groups) (count actual-groups))
+                  (every? true?
+                          (map (fn [ga gb]
+                                 (same-ordering-key? rules ordering
+                                                     (first ga) (first gb)))
+                               expected-groups actual-groups))
+                  (every? true?
+                          (map (fn [ga gb]
+                                 (rows-match? rules
+                                              (normalize rules ga)
+                                              (normalize rules gb)))
+                               (take complete expected-groups)
+                               (take complete actual-groups)))))
+           (rows-match? rules (normalize rules expected)
+                        (normalize rules actual))))))
 
 (defn verify
   "Run the Datalevin translations and check them against SQLite.

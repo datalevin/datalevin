@@ -150,7 +150,7 @@
   [^Connection conn {:keys [w d c ol]}]
   (.setAutoCommit conn false)
   (try
-    (let [_w-tax  (double (first (q1 conn
+    (let [w-tax   (double (first (q1 conn
                                      "SELECT w_tax FROM warehouse WHERE w_id = ?"
                                      w)))
           drow    (q1 conn
@@ -158,9 +158,9 @@
                       w d)
           _       (when (nil? drow)
                     (throw (ex-info "No such district" {:w w :d d})))
-          _d-tax  (double (nth drow 0))
+          d-tax   (double (nth drow 0))
           o-id    (long (nth drow 1))
-          _c-disc (double (first (q1 conn
+          c-disc  (double (first (q1 conn
                                      "SELECT c_discount FROM customer WHERE c_w_id = ? AND c_d_id = ? AND c_id = ?"
                                      w d c)))
           all-local (long (if (every? #(= w (:supply-w %)) ol) 1 0))]
@@ -175,7 +175,7 @@
              o-id d w)
       ;; Process and write each valid line before looking up the next item,
       ;; including when the final item will require a rollback (TPC-C 2.4.2.3).
-      (loop [lines (seq ol) number 1]
+      (loop [lines (seq ol) number 1 subtotal 0.0]
         (if-let [{:keys [i-id supply-w qty]} (first lines)]
           (if-let [[price] (q1 conn "SELECT i_price FROM item WHERE i_id = ?" i-id)]
             (let [[dist-info & srow]
@@ -184,22 +184,24 @@
                            ", s_quantity, s_ytd, s_order_cnt, s_remote_cnt FROM stock WHERE s_w_id = ? AND s_i_id = ?")
                       supply-w i-id)
                   [quantity ytd ocnt rcnt]
-                  (c/stock-after-lines srow [qty] (not= supply-w w))]
+                  (c/stock-after-lines srow [qty] (not= supply-w w))
+                  amount (* (double qty) (double price))]
               (exec! conn
                      "UPDATE stock SET s_quantity = ?, s_ytd = ?, s_order_cnt = ?, s_remote_cnt = ? WHERE s_w_id = ? AND s_i_id = ?"
                      quantity ytd ocnt rcnt supply-w i-id)
               (exec! conn
                      "INSERT INTO order_line (ol_o_id, ol_d_id, ol_w_id, ol_number, ol_i_id, ol_supply_w_id, ol_delivery_d, ol_quantity, ol_amount, ol_dist_info) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
                      o-id d w number i-id supply-w nil qty
-                     (* (double qty) (double price)) dist-info)
-              (recur (next lines) (inc number)))
+                     amount dist-info)
+              (recur (next lines) (inc number) (+ subtotal amount)))
             (do
               (.rollback conn)
               {:type :new-order :status :invalid-item :w w :d d
                :o-id o-id :i-id i-id}))
-          (do
+          (let [amount (c/new-order-total subtotal c-disc w-tax d-tax)]
             (.commit conn)
-            {:type :new-order :status :ok :w w :d d :o-id o-id}))))
+            {:type :new-order :status :ok :w w :d d :o-id o-id
+             :amount amount}))))
     (catch Exception e
       (try (.rollback conn) (catch Exception _))
       (throw e))
@@ -272,26 +274,25 @@
 
 (defn order-status!
   [^Connection conn {:keys [w d c last-name by-name?]}]
-  (let [c-id (if by-name?
-               (let [rows (qall conn
-                                "SELECT c_id FROM customer WHERE c_w_id = ? AND c_d_id = ? AND c_last = ? ORDER BY c_first, c_id"
-                                w d last-name)]
-                 (some-> (c/middle-customer rows) first long))
-               (let [row (q1 conn
-                             "SELECT c_id FROM customer WHERE c_w_id = ? AND c_d_id = ? AND c_id = ?"
-                             w d c)]
-                 (when row (long (first row)))))]
-    (if (nil? c-id)
+  (let [cust (if by-name?
+               (c/middle-customer
+                (qall conn
+                      "SELECT c_id, c_balance, c_first, c_middle, c_last FROM customer WHERE c_w_id = ? AND c_d_id = ? AND c_last = ? ORDER BY c_first, c_id"
+                      w d last-name))
+               (q1 conn
+                   "SELECT c_id, c_balance, c_first, c_middle, c_last FROM customer WHERE c_w_id = ? AND c_d_id = ? AND c_id = ?"
+                   w d c))]
+    (if (nil? cust)
       {:type :order-status :status :no-customer}
       (let [orow (q1 conn
-                     "SELECT o_id FROM orders WHERE o_w_id = ? AND o_d_id = ? AND o_c_id = ? ORDER BY o_id DESC LIMIT 1"
-                     w d c-id)]
+                     "SELECT o_id, o_entry_d, o_carrier_id FROM orders WHERE o_w_id = ? AND o_d_id = ? AND o_c_id = ? ORDER BY o_id DESC LIMIT 1"
+                     w d (first cust))]
         (if orow
           (let [o-id  (long (first orow))
-                lines (long (first (q1 conn
-                                       "SELECT COUNT(*) FROM order_line WHERE ol_w_id = ? AND ol_d_id = ? AND ol_o_id = ?"
-                                       w d o-id)))]
-            {:type :order-status :status :ok :lines lines})
+                lines (qall conn
+                            "SELECT ol_number, ol_i_id, ol_supply_w_id, ol_quantity, ol_amount, ol_delivery_d FROM order_line WHERE ol_w_id = ? AND ol_d_id = ? AND ol_o_id = ? ORDER BY ol_number"
+                            w d o-id)]
+            (c/order-status-result cust orow lines))
           {:type :order-status :status :no-order})))))
 
 (defn delivery!

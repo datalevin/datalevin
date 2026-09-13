@@ -61,7 +61,7 @@
         (is (= (if selected
                  {:type :order-status :status :ok :lines lines}
                  {:type :order-status :status :no-customer})
-               (order-status! input)))
+               (select-keys (order-status! input) [:type :status :lines])))
         (is (= (if selected {:status :ok :c selected} {:status :no-customer})
                (select-keys (payment! (assoc input :amount 5.0)) [:status :c]))))))
   (let [selected (set (keep second customer-cases))]

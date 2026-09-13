@@ -43,6 +43,7 @@
                 {:db/id (customer-eid did cid) :customer/id cid
                  :customer/w-id 1 :customer/d-id did
                  :customer/first (str cid) :customer/last (str "CUSTOMER" cid)
+                 :customer/middle "OE"
                  :customer/discount 0.0 :customer/credit (if (= cid 2) "BC" "GC")
                  :customer/data "initial" :customer/balance -10.0
                  :customer/ytd-payment 10.0 :customer/payment-cnt 1
@@ -255,7 +256,8 @@
                     {:db/id (+ 400000 (* oid 10) n)
                      :order-line/o-id oid :order-line/d-id 1
                      :order-line/w-id 1 :order-line/number n
-                     :order-line/i-id 1}))
+                     :order-line/i-id 1 :order-line/supply-w-id 1
+                     :order-line/quantity 5 :order-line/amount 10.0}))
                 [[10 1] [20 2] [30 3]])))
       (is (= 3 (:lines (t/order-status! conn {:w 1 :d 1 :c 1})))))))
 
@@ -270,11 +272,16 @@
                      :orders/c-id 2 :orders/entry-d "2026-01-01T00:00:00"
                      :orders/ol-cnt 2 :orders/all-local 1}
                     {:db/id 600002 :order-line/o-id 40 :order-line/d-id 1
-                     :order-line/w-id 1 :order-line/number 1 :order-line/i-id 1}
+                     :order-line/w-id 1 :order-line/number 1 :order-line/i-id 1
+                     :order-line/supply-w-id 1 :order-line/quantity 5
+                     :order-line/amount 10.0}
                     {:db/id 600003 :order-line/o-id 40 :order-line/d-id 1
-                     :order-line/w-id 1 :order-line/number 2 :order-line/i-id 1}])
+                     :order-line/w-id 1 :order-line/number 2 :order-line/i-id 1
+                     :order-line/supply-w-id 1 :order-line/quantity 5
+                     :order-line/amount 10.0}])
       (is (= {:type :order-status :status :ok :lines 2}
-             (t/order-status! conn {:w 1 :d 1 :c 1 :by-name? true
-                                    :last-name "CUSTOMER2"})))
+             (select-keys (t/order-status! conn {:w 1 :d 1 :c 1 :by-name? true
+                                                 :last-name "CUSTOMER2"})
+                          [:type :status :lines])))
       (is (= :no-order
              (:status (t/order-status! conn {:w 1 :d 1 :c 1 :by-name? false})))))))
