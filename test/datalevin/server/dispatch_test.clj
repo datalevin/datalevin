@@ -92,7 +92,9 @@
                            (channel [] channel))
                      (.attach (volatile! {:message-lock (Object.)
                                           :write-bf (ByteBuffer/allocate 65536)})))
-         dbs       (doto (ConcurrentHashMap.) (.put "db" db-state))
+         dbs       (doto (ConcurrentHashMap.)
+                     (.put "db" (assoc db-state :runner ::runner
+                                              :runner-skey skey)))
          ha-deps   {:dbs-fn (constantly dbs)
                     :update-db-fn (fn [_ db-name f]
                                     (let [m (f (.get dbs db-name))]
@@ -104,6 +106,12 @@
          admission-deps (atom nil)
          deps
          {:dbs-fn (constantly dbs)
+          :trace-remote-tx-fn (fn [& _])
+          :get-kv-store-fn (fn [_ _] ::store)
+          :new-message-fn
+          (fn [_ skey message]
+            (dispatch/dispatch-message-with-ha-write-admission
+              @admission-deps ::server skey message))
           :with-db-runtime-read-access-fn
           (fn [_ _ f]
             (swap! events conj :runtime-enter)
@@ -187,8 +195,11 @@
       (let [{:keys [events response]}
             (dispatch-probe (assoc (leader-state) :ha-role :follower)
                             {:type type :args ["db"]})]
-        (is (= [:runtime-enter :admission-enter :admission-exit
-                :rejected-cleanup :runtime-exit] events))
+        (is (= (if (= :close (cmd/transaction-control type))
+                 [:admission-enter :admission-exit :rejected-cleanup]
+                 [:runtime-enter :admission-enter :admission-exit
+                  :rejected-cleanup :runtime-exit])
+               events))
         (is (= :ha/write-rejected (get-in response [:err-data :error])))
         (is (= :not-leader (get-in response [:err-data :reason])))))))
 
@@ -200,8 +211,11 @@
       (let [{:keys [events response]}
             (dispatch-probe (leader-state) {:type type :args ["db"]})]
         (is (nil? response))
-        (is (= [:runtime-enter :admission-enter [:handler type 7]
-                :commit-check :commit-publish :admission-exit :runtime-exit]
+        (is (= (if (= :close (cmd/transaction-control type))
+                 [:admission-enter [:handler type 7]
+                  :commit-check :commit-publish :admission-exit]
+                 [:runtime-enter :admission-enter [:handler type 7]
+                  :commit-check :commit-publish :admission-exit :runtime-exit])
                events))))))
 
 (deftest re-index-commit-guards-recheck-leadership-test
@@ -235,7 +249,7 @@
             (dispatch-probe (assoc (leader-state) :ha-role :follower)
                             {:type type :args ["db"]})]
         (is (nil? response))
-        (is (= [:runtime-enter [:handler type nil] :runtime-exit] events)))))
+        (is (= [[:handler type nil]] events)))))
   (testing "open checks admission before starting the transaction runner"
     (doseq [type [:open-transact :open-transact-kv]]
       (let [{:keys [events response]}

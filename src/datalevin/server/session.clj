@@ -16,7 +16,8 @@
   (:import
    [java.nio.channels ClosedSelectorException Selector SelectionKey]
    [java.util Map UUID]
-   [java.util.concurrent ConcurrentHashMap]))
+   [java.util.concurrent ConcurrentHashMap]
+   [java.util.function BiFunction]))
 
 (def session-dbi "datalevin-server/sessions")
 
@@ -56,30 +57,48 @@
                   :roles       roles
                   :permissions perms}
         clients  ((:clients-fn deps) server)]
-    (d/transact-kv (session-lmdb sys-conn)
-                   [(l/kv-tx :put session-dbi client-id session :uuid :data)])
-    (.put ^Map clients client-id session)
+    ;; All session writers use the map's per-key computation lock, including
+    ;; persistence. A delete must not commit between a read and its later put.
+    (.compute ^ConcurrentHashMap clients client-id
+              (reify BiFunction
+                (apply [_ _ _]
+                  (d/transact-kv
+                    (session-lmdb sys-conn)
+                    [(l/kv-tx :put session-dbi client-id session :uuid :data)])
+                  session)))
     (log/info "Added client " client-id
               "from:" ip
               "for user:" username)))
 
 (defn remove-client
+  "Delete the persisted and live session in order with other session changes.
+  A nil client ID is ignored."
   [deps server client-id]
-  (let [sys-conn ((:sys-conn-fn deps) server)
-        clients  ((:clients-fn deps) server)]
-    (d/transact-kv (session-lmdb sys-conn)
-                   [(l/kv-tx :del session-dbi client-id :uuid)])
-    (.remove ^Map clients client-id)
-    (log/info "Removed client:" client-id)))
+  (when client-id
+    (let [clients ((:clients-fn deps) server)]
+      (.compute ^ConcurrentHashMap clients client-id
+                (reify BiFunction
+                  (apply [_ _ _]
+                    (d/transact-kv
+                      (session-lmdb ((:sys-conn-fn deps) server))
+                      [(l/kv-tx :del session-dbi client-id :uuid)])
+                    nil)))
+      (log/info "Removed client:" client-id))))
 
 (defn update-client
+  "Atomically update and persist an existing session. Nil or missing IDs are
+  ignored without invoking f. Returns the updated session, or nil if absent."
   [deps server client-id f]
-  (let [clients  ((:clients-fn deps) server)
-        session  (f (get-client clients client-id))
-        sys-conn ((:sys-conn-fn deps) server)]
-    (d/transact-kv (session-lmdb sys-conn)
-                   [(l/kv-tx :put session-dbi client-id session :uuid :data)])
-    (.put ^Map clients client-id session)))
+  (when client-id
+    (.computeIfPresent
+      ^ConcurrentHashMap ((:clients-fn deps) server) client-id
+      (reify BiFunction
+        (apply [_ _ current]
+          (let [session (f current)]
+            (d/transact-kv
+              (session-lmdb ((:sys-conn-fn deps) server))
+              [(l/kv-tx :put session-dbi client-id session :uuid :data)])
+            session))))))
 
 (defn load-sessions
   [sys-conn]

@@ -25,14 +25,15 @@
    [java.nio ByteBuffer]
    [java.nio.channels ClosedChannelException SelectionKey SocketChannel
     ServerSocketChannel]
-   [java.util.concurrent Executor]))
+   [java.util.concurrent ConcurrentHashMap Executor]
+   [java.util.function BiFunction]))
 
 (def dispatch-deps-contract
   "Callbacks (and the handler table) `datalevin.server` must inject for
   message dispatch."
   {:callbacks
    #{:cleanup-connection-transactions-fn :cleanup-rejected-close-transact!-fn
-     :clients-fn :close-conn-fn :dbs-fn :get-client-fn :get-kv-store-fn
+     :clients-fn :close-conn-fn :dbs-fn :get-kv-store-fn
      :ha-write-commit-check-fn-fn :ha-write-commit-publish-fn-fn
      :new-message-fn :trace-remote-tx-fn :update-db-fn
      :with-db-runtime-read-access-fn :with-ha-write-admission-fn
@@ -331,16 +332,15 @@
         (and runner (transaction-owner? skey runner-skey))
         ((:new-message-fn deps) runner skey message)
 
-        (= :abort (cmd/transaction-control type))
-        (do
-          (when-not runner
-            (remember-idempotent-abort! deps server db-name skey type))
-          ((:write-message-fn deps) skey {:type :command-complete}))
-
         runner
         (raise "Active transaction belongs to another client"
                  (missing-withtxn-error db-name type
                                         :transaction-owner-mismatch))
+
+        (= :abort (cmd/transaction-control type))
+        (do
+          (remember-idempotent-abort! deps server db-name skey type)
+          ((:write-message-fn deps) skey {:type :command-complete}))
 
         (and (= :close (cmd/transaction-control type))
              (consume-aborted-close! deps server db-name skey type))
@@ -366,10 +366,11 @@
   (let [{:keys [client-id]} @(.attachment skey)]
     (when client-id
       ;; Avoid durable session writes on every request; this path is hot.
-      (when-let [session ((:get-client-fn deps) server client-id)]
-        (.put ^java.util.Map ((:clients-fn deps) server)
-              client-id
-              (assoc session :last-active (System/currentTimeMillis)))))))
+      (.computeIfPresent
+        ^ConcurrentHashMap ((:clients-fn deps) server) client-id
+        (reify BiFunction
+          (apply [_ _ session]
+            (assoc session :last-active (System/currentTimeMillis))))))))
 
 (defn handle-message
   [deps server ^SelectionKey skey fmt msg]
@@ -394,7 +395,10 @@
                                    (cmd/deferred-write? (:type message)))
                        (replica-read-only-error deps server message))]
           (error-response skey "Replica is read-only" err)
-          (if (:writing? message)
+          ;; Close/abort must use the owner's runner even when a client omits
+          ;; :writing?, both for authorization and native transaction affinity.
+          (if (or (:writing? message)
+                  (#{:close :abort} (cmd/transaction-control (:type message))))
             (handle-writing deps server skey message)
             (let [dispatch! #(dispatch-message-with-ha-write-admission
                                 deps server skey message)]

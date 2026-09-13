@@ -77,10 +77,6 @@
   ^Semaphore [deps server db-name]
   ((:get-lock deps) server db-name))
 
-(defn- state-lock
-  ^Semaphore [dbs db-name]
-  (get-in dbs [db-name :lock]))
-
 (defn- cleanup-failed-open-transaction!
   [deps server db-name runner kv-store ^Semaphore lock]
   (let [dbs    ((:dbs deps) server)
@@ -1814,52 +1810,58 @@
                deps server db-name @runner* @kv-store* lock)
               (throw t))))))))
 
-(defn close-transact-kv
-  [deps server skey {:keys [args]}]
-  (let [db-name          (nth args 0)
-        kv-store         ((:get-kv-store deps) server db-name)
-        dbs              ((:dbs deps) server)
-        ^Semaphore lock (state-lock dbs db-name)]
-    (db-alter-permission!
-      deps server skey db-name
-      "Don't have permission to alter the database"
-      (fn []
+(defn- finish-transaction!
+  "Run on the owning transaction runner. A denied commit must still abort and
+  release the writer slot; permission revocation must not prevent owner abort."
+  [deps server skey db-name close-type commit?]
+  (let [kv-store        ((:get-kv-store deps) server db-name)
+        db-state        (get ((:dbs deps) server) db-name)
+        ^Semaphore lock (:lock db-state)
+        aborted?        (volatile! false)
+        marker          (aborted-transaction-close-marker skey close-type)
+        completed?
         (try
-          (i/close-transact-kv kv-store)
-          (write-complete! deps skey)
+          (if commit?
+            (let [closing? (volatile! false)]
+              (try
+                (db-alter-permission!
+                  deps server skey db-name
+                  "Don't have permission to alter the database"
+                  (fn []
+                    (vreset! closing? true)
+                    (i/close-transact-kv kv-store)
+                    (when (= close-type :close-transact)
+                      ((:add-store deps)
+                       server db-name
+                       (st/transfer (:wstore db-state) kv-store)))
+                    true))
+                (finally
+                  ;; Permission denial can throw or send :reconnect without
+                  ;; calling the commit callback. Both paths need rollback.
+                  (when-not @closing?
+                    (i/abort-transact-kv kv-store)
+                    (i/close-transact-kv kv-store)))))
+            (do
+              (i/abort-transact-kv kv-store)
+              (i/close-transact-kv kv-store)
+              (vreset! aborted? true)))
           (finally
-            ((:halt-run deps) (get-in dbs [db-name :runner]))
+            ((:halt-run deps) (:runner db-state))
             ((:update-db deps) server db-name
              (fn [m]
-               (dissoc m :runner :runner-skey :wlmdb)))
-            (.release lock)))))))
+               (cond-> (dissoc m :runner :runner-skey :wlmdb :wstore :wdt-db)
+                 @aborted? (assoc :aborted-transaction-close marker))))
+            (.release lock)))]
+    (when (true? completed?)
+      (write-complete! deps skey))))
+
+(defn close-transact-kv
+  [deps server skey {:keys [args]}]
+  (finish-transaction! deps server skey (nth args 0) :close-transact-kv true))
 
 (defn abort-transact-kv
   [deps server skey {:keys [args]}]
-  (let [db-name          (nth args 0)
-        kv-store         ((:get-kv-store deps) server db-name)
-        dbs              ((:dbs deps) server)
-        aborted?         (volatile! false)
-        marker           (aborted-transaction-close-marker
-                          skey :close-transact-kv)
-        ^Semaphore lock (state-lock dbs db-name)]
-    (db-alter-permission!
-      deps server skey db-name
-      "Don't have permission to alter the database"
-      (fn []
-        (try
-          (i/abort-transact-kv kv-store)
-          (i/close-transact-kv kv-store)
-          (vreset! aborted? true)
-          (finally
-            ((:halt-run deps) (get-in dbs [db-name :runner]))
-            ((:update-db deps) server db-name
-             (fn [m]
-               (cond-> (dissoc m :runner :runner-skey :wlmdb)
-                 @aborted?
-                 (assoc :aborted-transaction-close marker))))
-            (.release lock)))
-        (write-complete! deps skey)))))
+  (finish-transaction! deps server skey (nth args 0) :close-transact-kv false))
 
 (defn open-transact
   [deps server skey {:keys [args]}]
@@ -1895,54 +1897,11 @@
 
 (defn close-transact
   [deps server skey {:keys [args]}]
-  (let [db-name          (nth args 0)
-        kv-store         ((:get-kv-store deps) server db-name)
-        dbs              ((:dbs deps) server)
-        ^Semaphore lock (state-lock dbs db-name)]
-    (db-alter-permission!
-      deps server skey db-name
-      "Don't have permission to alter the database"
-      (fn []
-        (try
-          (i/close-transact-kv kv-store)
-          ((:add-store deps)
-           server db-name
-           (st/transfer (get-in dbs [db-name :wstore]) kv-store))
-          (write-complete! deps skey)
-          (finally
-            ((:halt-run deps) (get-in dbs [db-name :runner]))
-            ((:update-db deps) server db-name
-             (fn [m]
-               (dissoc m :wlmdb :wstore :wdt-db :runner :runner-skey)))
-            (.release lock)))))))
+  (finish-transaction! deps server skey (nth args 0) :close-transact true))
 
 (defn abort-transact
   [deps server skey {:keys [args]}]
-  (let [db-name  (nth args 0)
-        kv-store ((:get-kv-store deps) server db-name)
-        dbs      ((:dbs deps) server)
-        aborted? (volatile! false)
-        marker   (aborted-transaction-close-marker
-                  skey :close-transact)
-        ^Semaphore lock (state-lock dbs db-name)]
-    (db-alter-permission!
-      deps server skey db-name
-      "Don't have permission to alter the database"
-      (fn []
-        (try
-          (i/abort-transact-kv kv-store)
-          (i/close-transact-kv kv-store)
-          (vreset! aborted? true)
-          (finally
-            ((:halt-run deps) (get-in dbs [db-name :runner]))
-            ((:update-db deps) server db-name
-             (fn [m]
-               (cond-> (dissoc m :wlmdb :wstore :wdt-db
-                               :runner :runner-skey)
-                 @aborted?
-                 (assoc :aborted-transaction-close marker))))
-            (.release lock)))
-        (write-complete! deps skey)))))
+  (finish-transaction! deps server skey (nth args 0) :close-transact false))
 
 (defn sync
   [deps server skey {:keys [args]}]

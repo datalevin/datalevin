@@ -2224,7 +2224,6 @@
      :new-message-fn #'new-message
      :write-message-fn #'write-message
      :update-db-fn #'update-db
-     :get-client-fn #'get-client
      :clients-fn #'server-clients
      :with-db-runtime-read-access-fn #'with-db-runtime-read-access}
     {:strict? true}))
