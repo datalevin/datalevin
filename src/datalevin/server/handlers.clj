@@ -62,7 +62,7 @@
      :sync-copy-response-store! :sys-conn :unpin-server-copy-backup-floor!
      :update-cached-permission :update-cached-role :update-client :update-db
      :vector-index :with-db-runtime-store-read-access :write-message
-     :write-txn-runner}})
+     :with-index-write-admission :write-txn-runner}})
 
 (defn- skey-state
   ^clojure.lang.Volatile [^SelectionKey skey]
@@ -663,6 +663,7 @@
                 :update-client
                 :update-db
                 :vector-index
+                :with-index-write-admission
                 :write-message]))
 
 (defn- client-op-request

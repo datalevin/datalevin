@@ -1875,6 +1875,10 @@
   (sdisp/dispatch-message-with-ha-write-admission
    dispatch-deps server skey message))
 
+(defn- with-index-write-admission
+  [server message f]
+  (sdisp/with-index-write-admission dispatch-deps server message f))
+
 (defprotocol IRunner
   "Ensure calls within `with-transaction-kv` run in the same thread that
   runs `open-transact-kv`, otherwise LMDB will deadlock"
@@ -2054,6 +2058,7 @@
      :update-db #'update-db
      :vector-index #'vector-index
      :with-db-runtime-store-read-access #'with-db-runtime-store-read-access
+     :with-index-write-admission #'with-index-write-admission
      :write-message #'write-message
      :write-txn-runner #'write-txn-runner
      :clients #'server-clients}

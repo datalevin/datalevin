@@ -1040,7 +1040,9 @@
                    :search-opts      default-search-opts})
 
 (defn new-vector-index*
-  [lmdb {:keys [domain metric-type quantization dimensions connectivity
+  ([lmdb opts]
+   (new-vector-index* lmdb opts true))
+  ([lmdb {:keys [domain metric-type quantization dimensions connectivity
                 expansion-add expansion-search search-opts]
          :or   {metric-type      (default-opts :metric-type)
                 quantization     (default-opts :quantization)
@@ -1048,49 +1050,64 @@
                 expansion-add    (default-opts :expansion-add)
                 expansion-search (default-opts :expansion-search)
                 search-opts      (default-opts :search-opts)
-                domain           c/default-domain}}]
-  (assert dimensions ":dimensions is required")
-  (let [vecs-dbi (str domain "/" c/vec-refs)
-        domain   (str domain)]
-    (open-dbi lmdb vecs-dbi)
-    (open-vec-blob-dbis lmdb)
-    (let [[max-vec-id vecs] (init-vecs lmdb vecs-dbi)
-          fname             (index-fname lmdb domain)
-          index             (create-index dimensions metric-type
-                                          quantization connectivity
-                                          expansion-add expansion-search)]
-      ;; Prefer LMDB blob. If absent, migrate from legacy .vid file.
-      (when-not (load-from-lmdb lmdb index domain)
-        (when (u/file-exists fname)
-          (VecIdx/load index fname)
-          (checkpoint-to-lmdb lmdb index domain)
-          (u/delete-files fname)))
-      (let [meta-val (i/get-value lmdb c/vec-meta-dbi domain :string :data)
-            checkpoint-stats
-            (atom {:vec-checkpoint-count 0
-                   :vec-checkpoint-duration-ms 0
-                   :vec-checkpoint-bytes
-                   (nonneg-long (or (:total-bytes meta-val) 0))
-                   :vec-checkpoint-failure-count 0})
-            vi (->VectorIndex lmdb
-                              (volatile! false)
-                              index
-                              fname
-                              domain
-                              dimensions
-                              metric-type
-                              quantization
-                              connectivity
-                              expansion-add
-                              expansion-search
-                              vecs-dbi
-                              vecs
-                              (AtomicLong. max-vec-id)
-                              search-opts
-                              checkpoint-stats
-                              (ReentrantReadWriteLock.))]
-        (swap! l/vector-indices assoc fname vi)
-        vi))))
+                domain           c/default-domain}} create?]
+   (assert dimensions ":dimensions is required")
+   (let [vecs-dbi (str domain "/" c/vec-refs)
+         domain   (str domain)
+         fname    (index-fname lmdb domain)]
+     (when (or create?
+               (and (every? (set (i/list-dbis lmdb))
+                            [vecs-dbi c/vec-index-dbi c/vec-meta-dbi])
+                    (or (not (u/file-exists fname))
+                        (some? (i/get-value lmdb c/vec-meta-dbi domain
+                                            :string :data)))))
+       (if create?
+         (do (open-dbi lmdb vecs-dbi)
+             (open-vec-blob-dbis lmdb))
+         (doseq [dbi [vecs-dbi c/vec-index-dbi c/vec-meta-dbi]]
+           (i/get-dbi lmdb dbi false)))
+       (let [[max-vec-id vecs]   (init-vecs lmdb vecs-dbi)
+             index             (create-index dimensions metric-type
+                                             quantization connectivity
+                                             expansion-add expansion-search)]
+         ;; Prefer LMDB blob. If absent, migrate from legacy .vid file.
+         (when-not (load-from-lmdb lmdb index domain)
+           (when (and create? (u/file-exists fname))
+             (VecIdx/load index fname)
+             (checkpoint-to-lmdb lmdb index domain)
+             (u/delete-files fname)))
+         (let [meta-val (i/get-value lmdb c/vec-meta-dbi domain :string :data)
+               checkpoint-stats
+               (atom {:vec-checkpoint-count 0
+                      :vec-checkpoint-duration-ms 0
+                      :vec-checkpoint-bytes
+                      (nonneg-long (or (:total-bytes meta-val) 0))
+                      :vec-checkpoint-failure-count 0})
+               vi (->VectorIndex lmdb
+                                 (volatile! false)
+                                 index
+                                 fname
+                                 domain
+                                 dimensions
+                                 metric-type
+                                 quantization
+                                 connectivity
+                                 expansion-add
+                                 expansion-search
+                                 vecs-dbi
+                                 vecs
+                                 (AtomicLong. max-vec-id)
+                                 search-opts
+                                 checkpoint-stats
+                                 (ReentrantReadWriteLock.))]
+           (swap! l/vector-indices assoc fname vi)
+           vi))))))
+
+(defn ^:no-doc open-vector-index
+  "Open existing vector storage without creating DBIs or migrating a legacy
+  file. Return nil when initialization requires a write."
+  [lmdb opts]
+  (new-vector-index* lmdb opts false))
 
 (defn new-vector-index
   [lmdb opts]

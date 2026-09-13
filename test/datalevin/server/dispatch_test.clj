@@ -36,6 +36,8 @@
     :txlog-update-replica-floor! :txlog-clear-replica-floor!
     :txlog-pin-backup-floor! :txlog-unpin-backup-floor!})
 
+(def ^:private index-opens #{:new-search-engine :new-vector-index})
+
 (deftest every-handler-has-command-properties-test
   (is (= (set (keys handlers/handler-map)) (set (keys cmd/properties)))
       "adding a wire handler requires an explicit command classification")
@@ -43,13 +45,14 @@
     (testing (str type)
       (is (boolean? (:ha-write? properties)))
       (is (boolean? (:replica-write? properties)))))
-  (is (= database-writes
+  (is (= (into database-writes index-opens)
          (set (filter cmd/ha-write? (keys handlers/handler-map)))))
-  (is (= (into database-writes local-writes)
+  (is (= (into (into database-writes local-writes) index-opens)
          (set (filter cmd/replica-write? (keys handlers/handler-map)))))
   (doseq [type (keys handlers/handler-map)]
-    (is (= (contains? database-writes type)
-           (ha/ha-write-message? {:type type})) (str type))))
+    (is (= (contains? (into database-writes index-opens) type)
+           (ha/ha-write-message? {:type type})) (str type))
+    (is (= (contains? index-opens type) (cmd/deferred-write? type)))))
 
 (defn- leader-state []
   {:ha-authority ::authority
@@ -93,6 +96,7 @@
                     :ensure-udf-readiness-state-fn identity
                     :udf-admission-exempt-write-types #{}
                     :udf-write-admission-error-fn (fn [_ _] nil)}
+         admission-deps (atom nil)
          deps
          {:dbs-fn (constantly dbs)
           :with-db-runtime-read-access-fn
@@ -119,23 +123,57 @@
           (into {}
                 (map (fn [type]
                        [type
-                        (fn [_ _ _]
-                          (swap! events conj [:handler type
-                                              txlog/*commit-payload-ha-term*])
-                          (when before-commit (before-commit dbs))
-                          (when cpp/*before-write-commit-fn*
-                            (cpp/*before-write-commit-fn* nil))
-                          (when kvtx/*after-txlog-append-fn*
-                            (kvtx/*after-txlog-append-fn* nil)))]))
+                        (fn [server _ message]
+                          (let [f (fn []
+                                    (swap! events conj
+                                           [:handler type
+                                            txlog/*commit-payload-ha-term*])
+                                    (when before-commit (before-commit dbs))
+                                    (when cpp/*before-write-commit-fn*
+                                      (cpp/*before-write-commit-fn* nil))
+                                    (when kvtx/*after-txlog-append-fn*
+                                      (kvtx/*after-txlog-append-fn* nil)))]
+                            (if (:initialize? message)
+                              (dispatch/with-index-write-admission
+                                @admission-deps server message f)
+                              (f))))]))
                 (keys handlers/handler-map))}]
+     (reset! admission-deps deps)
      (binding [cpp/*before-write-commit-fn* nil
                kvtx/*after-txlog-append-fn* nil
                txlog/*commit-payload-ha-term* nil]
        (dispatch/handle-message deps ::server skey c/message-format-transit
                                 (p/write-transit-bytes message)))
      {:events @events
-      :response (when (pos? (.position response))
+     :response (when (pos? (.position response))
                   (first (p/receive-one-message response)))})))
+
+(deftest index-opens-defer-guards-until-initialization-test
+  (doseq [type index-opens]
+    (let [message {:type type :args ["db"]}
+          follower (assoc (leader-state) :ha-role :follower)]
+      (doseq [state [follower {:replica/read-only? true}]]
+        (let [{:keys [events response]} (dispatch-probe state message)]
+          (is (nil? response))
+          (is (= [:runtime-enter [:handler type nil] :runtime-exit] events)))
+        (let [{:keys [events response]}
+              (dispatch-probe state (assoc message :initialize? true))]
+          (is (not-any? vector? events) "initialization must not run")
+          (is (= (if (:replica/read-only? state)
+                   :replica/read-only :ha/write-rejected)
+                 (get-in response [:err-data :error])))))
+      (let [{:keys [events response]}
+            (dispatch-probe (leader-state) (assoc message :initialize? true))]
+        (is (nil? response))
+        (is (= [:runtime-enter :admission-enter [:handler type 7]
+                :commit-check :commit-publish :admission-exit :runtime-exit]
+               events)))
+      (let [{:keys [events response]}
+            (dispatch-probe
+             (leader-state) (assoc message :initialize? true)
+             (fn [^ConcurrentHashMap dbs] (.put dbs "db" follower)))]
+        (is (= :not-leader (get-in response [:err-data :reason])))
+        (is (not-any? #{:commit-publish} events))))))
 
 (deftest follower-rejects-every-database-write-before-handler-test
   (doseq [type database-writes

@@ -73,12 +73,16 @@
     (write-or-copy-result! write-message copy-out skey data)))
 
 (defn new-search-engine
-  [{:keys [search-engine* get-store update-client update-db write-message]}
-   server skey client-id {:keys [args]}]
+  [{:keys [search-engine* get-store update-client update-db write-message
+           with-index-write-admission]}
+   server skey client-id {:keys [args] :as message}]
   (let [[db-name opts] args
         engine         (or (search-engine* server skey db-name)
                            (if-let [store (get-store server db-name)]
-                             (sc/new-search-engine store opts)
+                             (or (sc/open-search-engine store opts)
+                                 (with-index-write-admission
+                                   server message
+                                   #(sc/new-search-engine store opts)))
                              (raise "engine store not found"
                                       {:type :reopen
                                        :db-name db-name
@@ -104,11 +108,15 @@
     (write-message skey {:type :command-complete})))
 
 (defn new-vector-index
-  [{:keys [get-store update-client update-db write-message]}
-   server skey client-id {:keys [args]}]
+  [{:keys [get-store update-client update-db write-message
+           with-index-write-admission]}
+   server skey client-id {:keys [args] :as message}]
   (let [[db-name opts] args
         index          (if-let [store (get-store server db-name)]
-                         (v/new-vector-index store opts)
+                         (or (v/open-vector-index store opts)
+                             (with-index-write-admission
+                               server message
+                               #(v/new-vector-index store opts)))
                          (raise "vector store not found"
                                   {:type :reopen
                                    :db-name db-name

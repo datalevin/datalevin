@@ -237,48 +237,66 @@
 
 (declare dispatch-message)
 
+(defn- call-with-write-guards
+  [deps server message f]
+  (binding [txlog/*commit-payload-ha-term*
+            (current-ha-txlog-term deps server (first (:args message)))
+            cpp/*before-write-commit-fn*
+            ((:ha-write-commit-check-fn-fn deps) server message)
+            kvtx/*after-txlog-append-fn*
+            ((:ha-write-commit-publish-fn-fn deps) server message)]
+    (f)))
+
+(defn with-index-write-admission
+  "Admit the persistent initialization branch of an index-open request.
+  Existing-only opens never enter this path. Rejections throw before `f` runs."
+  [deps server message f]
+  (when-let [err (replica-read-only-error deps server message)]
+    (raise "Replica is read-only" err))
+  (let [{:keys [ok? error result]}
+        ((:with-ha-write-admission-fn deps)
+         server message #(call-with-write-guards deps server message f))]
+    (if ok?
+      result
+      (raise "HA write admission rejected" error))))
+
 (defn dispatch-message-with-ha-write-admission
   [deps server ^SelectionKey skey message]
-  (let [type          (:type message)
-        transaction   (cmd/transaction-control type)
-        cleanup-only? (= :abort transaction)
-        write?        (and (not cleanup-only?) (cmd/ha-write? type))
-        db-name       (nth (:args message) 0 nil)
-        ha-txlog-term  (current-ha-txlog-term deps server db-name)
-        precheck-only? (= :open transaction)
-        {:keys [ok? error]}
-        (if cleanup-only?
-          {:ok? true}
-          ((:with-ha-write-admission-fn deps)
-           server
-           message
-           #(cond
-              precheck-only?
-              nil
+  (if (cmd/deferred-write? (:type message))
+    (dispatch-message deps server skey message)
+    (let [type          (:type message)
+          transaction   (cmd/transaction-control type)
+          cleanup-only? (= :abort transaction)
+          write?        (and (not cleanup-only?) (cmd/ha-write? type))
+          precheck-only? (= :open transaction)
+          {:keys [ok? error]}
+          (if cleanup-only?
+            {:ok? true}
+            ((:with-ha-write-admission-fn deps)
+             server
+             message
+             #(cond
+                precheck-only?
+                nil
 
-              write?
-              (binding [txlog/*commit-payload-ha-term* ha-txlog-term
-                        cpp/*before-write-commit-fn*
-                        ((:ha-write-commit-check-fn-fn deps) server message)
-                        kvtx/*after-txlog-append-fn*
-                        ((:ha-write-commit-publish-fn-fn deps)
-                         server
-                         message)]
-                (dispatch-message deps server skey message))
+                write?
+                (call-with-write-guards
+                 deps server message
+                 (fn [] (dispatch-message deps server skey message)))
 
-              :else
-              (dispatch-message deps server skey message))))]
-    (cond
-      (not ok?)
-      (do
-        ((:cleanup-rejected-close-transact!-fn deps) server message)
-        (error-response skey "HA write admission rejected" error))
+                :else
+                (dispatch-message deps server skey message))))]
+      (cond
+        (not ok?)
+        (do
+          ((:cleanup-rejected-close-transact!-fn deps) server message)
+          (error-response skey "HA write admission rejected" error))
 
-      cleanup-only?
-      (dispatch-message deps server skey message)
+        cleanup-only?
+        (dispatch-message deps server skey message)
 
-      precheck-only?
-      (dispatch-message deps server skey message))))
+        precheck-only?
+        (dispatch-message deps server skey message)))))
 
 (defn dispatch-message
   [deps server ^SelectionKey skey message]
@@ -372,7 +390,9 @@
       (when-not (= ::handled message)
         (log/debug "Message received:" (dissoc message :password :args))
         (set-last-active deps server skey)
-        (if-let [err (replica-read-only-error deps server message)]
+        (if-let [err (when-not (and (not (:writing? message))
+                                   (cmd/deferred-write? (:type message)))
+                       (replica-read-only-error deps server message))]
           (error-response skey "Replica is read-only" err)
           (if (:writing? message)
             (handle-writing deps server skey message)

@@ -1627,14 +1627,11 @@
 (defn new-search-engine*
   ([lmdb]
    (new-search-engine* lmdb nil))
-  ([lmdb {:keys [domain analyzer query-analyzer index-position? include-text?
-                 search-opts]
-          :or   {analyzer        (default-opts :analyzer)
-                 index-position? (default-opts :index-position?)
-                 include-text?   (default-opts :include-text?)
-                 search-opts     (default-opts :search-opts)
-                 domain          c/default-domain}
-          :as   opts}]
+  ([lmdb opts]
+   (new-search-engine* lmdb opts true))
+  ([lmdb {:keys [domain]
+          :or   {domain c/default-domain}
+          :as   opts} create?]
    (let [opts (resolve-analyzer-options (assoc opts :domain domain))
          {:keys [analyzer query-analyzer index-position? include-text?
                  search-opts]
@@ -1646,25 +1643,36 @@
          docs-dbi      (str domain "/" c/docs)
          positions-dbi (str domain "/" c/positions)
          rawtext-dbi   (str domain "/" c/rawtext)]
-     (open-dbis lmdb terms-dbi docs-dbi positions-dbi rawtext-dbi)
-     (let [[max-doc norms docs] (init-docs lmdb docs-dbi)
-           [max-term terms]     (init-terms lmdb terms-dbi)]
-       (->SearchEngine lmdb
-                       analyzer
-                       (or query-analyzer analyzer)
-                       terms-dbi
-                       docs-dbi
-                       positions-dbi
-                       rawtext-dbi
-                       terms     ;; term-id -> term
-                       docs      ;; doc-id -> doc-ref
-                       norms     ;; doc-id -> norm
-                       (LRUCache. 10000)
-                       (AtomicInteger. max-doc)
-                       (AtomicInteger. max-term)
-                       index-position?
-                       include-text?
-                       search-opts)))))
+     (when (or create?
+               (every? (set (if/list-dbis lmdb))
+                       [terms-dbi docs-dbi positions-dbi rawtext-dbi]))
+       (if create?
+         (open-dbis lmdb terms-dbi docs-dbi positions-dbi rawtext-dbi)
+         (doseq [dbi [terms-dbi docs-dbi positions-dbi rawtext-dbi]]
+           (if/get-dbi lmdb dbi false)))
+       (let [[max-doc norms docs] (init-docs lmdb docs-dbi)
+             [max-term terms]     (init-terms lmdb terms-dbi)]
+         (->SearchEngine lmdb
+                         analyzer
+                         (or query-analyzer analyzer)
+                         terms-dbi
+                         docs-dbi
+                         positions-dbi
+                         rawtext-dbi
+                         terms     ;; term-id -> term
+                         docs      ;; doc-id -> doc-ref
+                         norms     ;; doc-id -> norm
+                         (LRUCache. 10000)
+                         (AtomicInteger. max-doc)
+                         (AtomicInteger. max-term)
+                         index-position?
+                         include-text?
+                         search-opts))))))
+
+(defn ^:no-doc open-search-engine
+  "Open existing search DBIs without creating them. Return nil when missing."
+  [lmdb opts]
+  (new-search-engine* lmdb opts false))
 
 (defn new-search-engine
   ([lmdb]

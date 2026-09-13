@@ -25,6 +25,16 @@
 (def ^:private local-write
   {:ha-write? false :replica-write? true})
 
+(def ^:private index-open
+  ;; The handler first attempts an existing-only open. Creation and legacy
+  ;; migration run through write admission before touching persistent state.
+  (assoc db-write :deferred-write? true :db-type "kv"))
+
+(def ^:private search-read (assoc unguarded :db-type "engine"))
+(def ^:private search-write (assoc db-write :db-type "engine"))
+(def ^:private vector-read (assoc unguarded :db-type "index"))
+(def ^:private vector-write (assoc db-write :db-type "index"))
+
 (def ^:private transaction-open
   (assoc db-write :transaction :open))
 
@@ -174,25 +184,25 @@
    :pull-many unguarded
    :explain unguarded
    :fulltext-datoms unguarded
-   :new-search-engine unguarded
-   :add-doc db-write
-   :remove-doc db-write
-   :clear-docs db-write
-   :doc-indexed? unguarded
-   :doc-count unguarded
-   :search unguarded
-   :search-re-index db-write
-   :new-vector-index unguarded
-   :add-vec db-write
-   :remove-vec db-write
-   :persist-vecs db-write
+   :new-search-engine index-open
+   :add-doc search-write
+   :remove-doc search-write
+   :clear-docs search-write
+   :doc-indexed? search-read
+   :doc-count search-read
+   :search search-read
+   :search-re-index search-write
+   :new-vector-index index-open
+   :add-vec vector-write
+   :remove-vec vector-write
+   :persist-vecs vector-write
    ;; Closing a vector index checkpoints it to LMDB.
-   :close-vecs db-write
-   :clear-vecs db-write
-   :vecs-info unguarded
-   :vec-indexed? unguarded
-   :search-vec unguarded
-   :vec-re-index db-write
+   :close-vecs vector-write
+   :clear-vecs vector-write
+   :vecs-info vector-read
+   :vec-indexed? vector-read
+   :search-vec vector-read
+   :vec-re-index vector-write
    :kv-re-index db-write
    :datalog-re-index db-write
    :get-value unguarded
@@ -228,6 +238,16 @@
   "Return :open, :close, or :abort for transaction control commands."
   [type]
   (:transaction (properties type)))
+
+(defn deferred-write?
+  "Whether the handler admits writes only when an existing-only open fails."
+  [type]
+  (true? (:deferred-write? (properties type))))
+
+(defn db-type
+  "Database/index type a retry endpoint must open for this command, if known."
+  [type]
+  (:db-type (properties type)))
 
 (defn runtime-read-access-exempt?
   "Whether the handler manages its own runtime-store lock."

@@ -13,6 +13,7 @@
    [datalevin.datom :as dd]
    [datalevin.util :as u :refer [raise]]
    [datalevin.constants :as c]
+   [datalevin.command :as cmd]
    [datalevin.native-value :as nv]
    [datalevin.udf :as udf]
    [clojure.string :as s]
@@ -60,6 +61,9 @@
 (defonce ^:private ^java.util.Map native-readers
   (Collections/synchronizedMap (WeakHashMap.)))
 
+(defonce ^:private ^java.util.Map index-open-options
+  (Collections/synchronizedMap (WeakHashMap.)))
+
 (defn reset-client-state!
   "Clear the process-local client and HA endpoint caches. Intended for tests
   that need a clean slate or that exercise reconnect/retry behavior."
@@ -68,7 +72,8 @@
   (doseq [^java.util.Map m [ha-preferred-endpoints ha-retry-clients
                             ha-known-db-endpoints ha-preferred-read-endpoints
                             ha-retry-open-targets ha-retry-disabled-clients
-                            ha-write-retry-settings native-readers]]
+                            ha-write-retry-settings native-readers
+                            index-open-options]]
     (.clear m))
   nil)
 
@@ -82,6 +87,23 @@
         (.put native-readers source readers)
         (.put native-readers client readers))))
   client)
+
+(defn- inherit-index-options! [client source]
+  (when source
+    (locking index-open-options
+      (let [options (or (.get index-open-options source) (ConcurrentHashMap.))]
+        (.put index-open-options source options)
+        (.put index-open-options client options))))
+  client)
+
+(defn- remember-index-options! [client call args]
+  (when-let [db-type (case call
+                      (:new-search-engine :search-re-index) "engine"
+                      (:new-vector-index :vec-re-index) "index"
+                      nil)]
+    (inherit-index-options! client client)
+    (let [^ConcurrentHashMap options (.get index-open-options client)]
+      (.put options [(first args) db-type] (or (second args) {})))))
 
 (def ^:dynamic *ha-read-min-tx*
   "Minimum datalog tx a remote HA read must observe."
@@ -552,6 +574,7 @@
         (try
           (.remove ha-write-retry-settings client)
           (.remove native-readers client)
+          (.remove index-open-options client)
           (.remove ha-retry-disabled-clients client)
           (.remove ha-preferred-endpoints client)
           (.remove ha-preferred-read-endpoints client)
@@ -618,7 +641,7 @@
 
 (defn open-database
   "Open a database on server. `db-type` can be \"datalog\", \"kv\",
-  or \"engine\""
+  \"engine\", or \"index\""
   ([client db-name db-type]
    (open-database client db-name db-type nil nil false))
   ([client db-name db-type opts]
@@ -633,7 +656,9 @@
                  (.put readers db-name (udf/native-value-reader registry))
                  (.put native-readers client readers))))
          ;; Runtime handles belong to the caller and must never cross the wire.
-         opts (dissoc opts :runtime-opts :client-opts)
+         opts (dissoc (or opts (get (.get index-open-options client)
+                                    [db-name db-type]))
+                      :runtime-opts :client-opts)
          {:keys [type message result]}
          (request client
                   (cond
@@ -645,10 +670,17 @@
                       opts   (assoc :opts (assoc opts :db-name db-name))
                       return-db-info? (assoc :return-db-info? true))
                     :else
-                    {:type :new-search-engine :db-name db-name :opts opts}))]
+                    {:type (if (= db-type "index")
+                             :new-vector-index :new-search-engine)
+                     :args [db-name opts]}))]
      (when (= type :error-response)
        (raise "Unable to open database:" db-name " " message
                 {:db-type db-type}))
+     (when (#{"engine" "index"} db-type)
+       (remember-index-options! client
+                                (if (= db-type "index")
+                                  :new-vector-index :new-search-engine)
+                                [db-name opts]))
      (cache-known-ha-db-endpoints! client db-name
                                    (concat
                                      (or (map :endpoint (:ha-members opts)) [])
@@ -724,6 +756,7 @@
                         client-id pool)
               (set-client-ha-write-retry-settings! time-out ha-settings)
               (inherit-native-readers! client)
+              (inherit-index-options! client)
               (as-> tx-client (sync-ha-routing! client tx-client))))))
     client))
 
@@ -1019,6 +1052,7 @@
     (-> (->Client username password host port pool-size time-out
                   client-id pool)
         (inherit-native-readers! (:client retry-context))
+        (inherit-index-options! (:client retry-context))
         (set-client-ha-write-retry-settings! time-out retry-context))))
 
 (def ^:private ha-kv-retry-request-types
@@ -1084,12 +1118,6 @@
     :abort-transact
     :datalog-re-index})
 
-(def ^:private ha-engine-retry-request-types
-  #{:add-doc
-    :remove-doc
-    :clear-docs
-    :search-re-index})
-
 (defn- request-db-name
   [req]
   (let [db-name (or (:db-name req) (first (:args req)))]
@@ -1099,6 +1127,7 @@
 (defn- request-db-type
   [req]
   (or (:db-type req)
+      (cmd/db-type (:type req))
       (let [req-type (:type req)]
         (cond
           (contains? ha-kv-retry-request-types req-type)
@@ -1106,9 +1135,6 @@
 
           (contains? ha-datalog-retry-request-types req-type)
           c/db-store-datalog
-
-          (contains? ha-engine-retry-request-types req-type)
-          "engine"
 
           :else nil))))
 
@@ -1580,30 +1606,32 @@
         new-client-for-endpoint
         #(set-preferred-ha-read-endpoint! client db-name %)))))
 
-(defn ^:no-doc normal-request
+(defn- normal-request*
   "Send request to server and returns results. Does not use the
   copy-in protocol. `call` is a keyword, `args` is a vector,
   `writing?` is a boolean indicating if write-txn should be used"
   ([client call args]
-   (normal-request client call args false))
+   (normal-request* client call args false))
   ([client call args writing?]
-   (let [read-min-tx         (when (and (not writing?)
-                                        (integer? *ha-read-min-tx*))
-                               (long *ha-read-min-tx*))
+   (let [write-route?        (or writing? (cmd/ha-write? call))
+         read-route?         (not (or write-route? (cmd/replica-write? call)))
+         read-min-tx         (when (and read-route?
+                                       (integer? *ha-read-min-tx*))
+                              (long *ha-read-min-tx*))
          req                 (cond-> {:type call :args args :writing? writing?}
                                read-min-tx
                                (assoc :ha-read-min-tx read-min-tx))
          db-name             (request-db-name req)
          known-endpoints     (and db-name
                                   (known-ha-db-endpoints client db-name))
-         read-routing-context (and (not writing?) (client-routing-context client))
-         routing-context     (and writing? (client-routing-context client))
-         retry-context       (and writing? (client-retry-context client))
-         preferred-endpoint  (and writing?
+         read-routing-context (and read-route? (client-routing-context client))
+         routing-context     (and write-route? (client-routing-context client))
+         retry-context       (and write-route? (client-retry-context client))
+         preferred-endpoint  (and write-route?
                                  (not retry-context)
                                  (read-preferred-ha-endpoint client))
          preferred-read-attempt
-         (when-not writing?
+         (when read-route?
            (try-preferred-ha-read-request*
              client
              req
@@ -1668,14 +1696,14 @@
          (let [{:keys [type message result err-data]} (request client req)]
            (if (= type :error-response)
              (cond
-               (and writing?
+               (and write-route?
                     (retryable-ha-write-reject? err-data))
                (do
                  (cache-known-ha-db-endpoints! client db-name
                                                (:ha-retry-endpoints err-data))
                  (retry-ha-write-request client req message err-data))
 
-               (and (not writing?)
+               (and read-route?
                     (retryable-ha-read-reject? err-data))
                (do
                  (cache-known-ha-db-endpoints! client db-name
@@ -1690,7 +1718,7 @@
                  (clear-preferred-ha-endpoint! client))
                result)))
          (catch Exception e
-           (if (or writing? (nv/decoding-error? e))
+           (if (or (not read-route?) (nv/decoding-error? e))
              (throw e)
              (or (retry-ha-read-request
                    client
@@ -1699,6 +1727,17 @@
                        "HA read target became unavailable")
                    known-endpoints)
                  (throw e)))))))))
+
+(defn ^:no-doc normal-request
+  "Send a command, routing mutations by command properties. `writing?` only
+  selects an existing transaction on the server; it is preserved on the wire.
+  Mutations are retried on explicit HA rejection, never as transport-failed reads."
+  ([client call args]
+   (normal-request client call args false))
+  ([client call args writing?]
+   (let [result (normal-request* client call args writing?)]
+     (remember-index-options! client call args)
+     result)))
 
 ;; we do input validation and normalization in the server, as
 ;; 3rd party clients may be written
