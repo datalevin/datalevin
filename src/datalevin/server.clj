@@ -31,6 +31,7 @@
    [datalevin.server.dispatch :as sdisp]
    [datalevin.server.handlers :as sh]
    [datalevin.server.ha :as sha]
+   [datalevin.server.request :as request]
    [datalevin.server.resources :as resources]
    [datalevin.server.session :as sess]
    [datalevin.kv :as kv]
@@ -2002,6 +2003,27 @@
 (def ^:private runner-stop-signal ::runner-stop)
 (def ^:private runner-abort-signal ::runner-abort)
 
+(defn- stop-runner-queue!
+  [server ^LinkedBlockingQueue queue ^AtomicBoolean running? signal]
+  (let [pending (locking queue
+                  (when (.compareAndSet running? true false)
+                    (let [pending (.toArray queue)]
+                      (.clear queue)
+                      (.offer queue signal)
+                      pending)))]
+    ;; Other pooled sockets can have a call waiting on this runner. Closing
+    ;; them prevents a discarded call from retaining its paused connection.
+    ;; Do cleanup outside the queue monitor to avoid locking other runners
+    ;; while holding this one's monitor.
+    (doseq [[skey] pending]
+      (try
+        (try
+          (cleanup-connection-transactions! server skey)
+          (finally (close-conn skey)))
+        (catch Exception e
+          (log/warn "Failed to close discarded transaction request"
+                    {:message (ex-message e)}))))))
+
 (deftype Runner [server ^LinkedBlockingQueue queue ^AtomicBoolean running?]
   IRunner
   (new-message [_ skey message]
@@ -2012,18 +2034,12 @@
         (raise "Transaction runner is closed" {}))))
 
   (halt-run [_]
-    (locking queue
-      (when (.compareAndSet running? true false)
-        (.clear queue)
-        (.offer queue runner-stop-signal))))
+    (stop-runner-queue! server queue running? runner-stop-signal))
 
   (abort-run [_ f]
-    (locking queue
-      (when (.compareAndSet running? true false)
-        (.clear queue)
-        (.offer queue [runner-abort-signal f]))))
+    (stop-runner-queue! server queue running? [runner-abort-signal f]))
 
-  (run-calls [_]
+  (run-calls [this]
     (loop []
       (let [item (.take queue)]
         (cond
@@ -2037,7 +2053,15 @@
           (let [[skey message] item]
             (trace-remote-tx! "runner-dispatch" (:type message)
                               (nth (:args message) 0 nil))
-            (dispatch-message-with-ha-write-admission server skey message)
+            (try
+              (dispatch-message-with-ha-write-admission server skey message)
+              (catch Exception e
+                ;; An open request has already completed. Report failures on
+                ;; this call's socket, after releasing the native transaction.
+                (halt-run this)
+                (cleanup-abandoned-transaction! server (first (:args message)) this)
+                (sdisp/handle-message-error! dispatch-deps skey e))
+              (finally (request/complete! message)))
             (recur)))))))
 
 (defn- write-txn-runner
@@ -2081,7 +2105,10 @@
   (doseq [[db-name m] (.-dbs server)
           :let        [runner (:runner m)]
           :when       (and runner
-                           (identical? skey (:runner-skey m)))]
+                           (or (identical? skey (:runner-skey m))
+                               (and (:runner-skey m)
+                                    (identical? (.channel skey)
+                                                (.channel ^SelectionKey (:runner-skey m))))))]
     (abort-run runner
                #(cleanup-abandoned-transaction! server db-name runner))))
 
@@ -2256,11 +2283,20 @@
   [^Server server]
   (let [^Selector selector           (.-selector server)
         ^ConcurrentLinkedQueue queue (.-register-queue server)]
-    (loop []
+    ;; A continuously replenished completion queue must not starve socket
+    ;; readiness or session maintenance.
+    (dotimes [_ (.size queue)]
       (when-let [[^SocketChannel ch ops state] (.poll queue)]
         (try
-          (.register ch selector ops state)
-          (log/debug "Registered client" (@state :client-id))
+          (when (.isOpen ch)
+            ;; Flush a cancelled copy-in key before registering the same
+            ;; channel again. selectNow preserves other ready keys for dispatch.
+            (when-let [key (.keyFor ch selector)]
+              (when-not (.isValid key) (.selectNow selector)))
+            (let [key (.register ch selector ops state)]
+              (when (zero? (long ops))
+                (sdisp/resume-read dispatch-deps server key)))
+            (log/debug "Registered client" (@state :client-id)))
           (catch Exception e
             ;; copy-in cancels its old key before handing the channel back.
             ;; Locate its runner by channel even if keyFor now returns nil.
@@ -2275,8 +2311,8 @@
                     (instance? InterruptedException e))
               (throw e)
               (log/warn "Closing failed client registration"
-                        {:message (ex-message e)}))))
-        (recur)))))
+                        {:message (ex-message e)}))))))
+    (when-not (.isEmpty queue) (.wakeup selector))))
 
 (defn- ^:redef remove-idle-sessions
   [^Server server]
@@ -2449,6 +2485,7 @@
      :message-handler-map #'message-handler-map
      :work-executor-fn #'server-work-executor
      :routing-executor-fn #'server-routing-executor
+     :register-queue-fn #'server-register-queue
      :transaction-executor-fn #'server-transaction-executor
      :trace-remote-tx-fn #'trace-remote-tx!
      :get-kv-store-fn #'get-kv-store

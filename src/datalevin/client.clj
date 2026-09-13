@@ -277,6 +277,24 @@
   (close-pool [this])
   (closed-pool? [this]))
 
+(defn- ^:redef connection-ready?
+  "Probe an exclusively borrowed, idle socket without sending a request.
+  isOpen only describes the local channel; a peer's FIN can already be waiting.
+  An idle connection has no outstanding response, so unexpected bytes also
+  mean it cannot safely carry the next request."
+  [^Connection conn]
+  (let [^SocketChannel ch (.-ch conn)]
+    (and (.isOpen ch)
+         (try
+           (let [blocking? (.isBlocking ch)]
+             (try
+               (.configureBlocking ch false)
+               (zero? (.read ch (ByteBuffer/allocate 1)))
+               (finally
+                 (when (.isOpen ch)
+                   (.configureBlocking ch blocking?)))))
+           (catch Exception _ false)))))
+
 (deftype ^:no-doc ConnectionPool [host port client-id pool-size time-out
                                   ^ConcurrentLinkedQueue available
                                   ^ConcurrentLinkedQueue used
@@ -296,7 +314,7 @@
                   (locking this
                     (when-not (.get closed?)
                       (.poll available)))]
-          (if (.isOpen ^SocketChannel (.-ch conn))
+          (if (connection-ready? conn)
             (locking this
               (if (.get closed?)
                 (do
@@ -306,6 +324,7 @@
                   (.add used conn)
                   conn)))
             (try
+              (close conn)
               (let [new-conn (new-registered-connection
                               host port client-id time-out)]
                 (locking this

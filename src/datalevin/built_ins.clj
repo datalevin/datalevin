@@ -47,7 +47,12 @@
   [^String pattern escape not?]
   (let [pb  (.getBytes pattern StandardCharsets/UTF_8)
         fsm (if escape (LikeFSM. pb escape) (LikeFSM. pb))
-        f   #(.match fsm (.getBytes ^String % StandardCharsets/UTF_8))]
+        ;; A scan now retains exact LIKE predicates instead of replacing
+        ;; their variables with constants. The FSM has no accepting-state
+        ;; lookup for an empty pattern, which matches only the empty string.
+        f   (if (.isEmpty pattern)
+              #(.isEmpty ^String %)
+              #(.match fsm (.getBytes ^String % StandardCharsets/UTF_8)))]
     (if not? #(clojure.core/not (f %)) f)))
 
 (defn like

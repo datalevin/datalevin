@@ -6,14 +6,19 @@
   types, and this also works on Datalog. Details are in the [custom data
   documentation](/doc/custom-data.md).
   [#234](https://github.com/datalevin/datalevin/issues/234)
+- [Benchmark] TPC-C and TPC-H like benchmarks.
 
 ### Changed
 - [Storage] update dtlvnative to 1.1.1, which uses DLMDB data format version 2,
   upgrade nippy to 3.9.0 and added rust bindings to dlmdb, usearch and
   llama.cpp, laying the foundation for a rust core of Datalevin, parallel to the
   Clojure one. Clojure will still be the source of new feature development and
-  serves JVM, while rust one serves the native platforms in the future.
+  serves JVM, while rust one serves the native embedded/client in the future.
   Auto-migration from 0.9.27 and above will be conducted on DB open.
+
+### Fixed
+- [Datalog] planner range conversion for `like`
+
 ### Improved
 - [Server] harden client/server lifecycle.
 - [Datalog] always refresh giant id floor in transaction.

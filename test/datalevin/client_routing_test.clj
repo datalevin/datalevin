@@ -45,7 +45,9 @@
         (.flip frame)
         (.add frames frame)))
     (try
-      (f base sent)
+      ;; Frames here are preloaded responses, not unsolicited socket data.
+      (with-redefs [client/connection-ready? (constantly true)]
+        (f base sent))
       (is (.isEmpty used) "the completed attempt releases its connection")
       (is (identical? conn (.peek available)))
       (is (.isEmpty frames) "all response frames were consumed")

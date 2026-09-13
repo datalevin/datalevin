@@ -79,7 +79,8 @@
     (try
       (p/write-message-blocking ch write-bf {:type :copy-in-response}
                                 wire-opts)
-      (.clear ^ByteBuffer read-bf)
+      ;; Ingress has compacted the opening request and paused selector reads.
+      ;; Any coalesced copy batches already in read-bf belong to this transfer.
       (loop [bf read-bf]
         (let [[msg bf'] (binding [nv/*wire-reader* read-native]
                           (p/receive-ch ch bf wire-opts))]
@@ -102,12 +103,16 @@
         (log/debug "Copied in" (count txs) "data items")
         txs)
       (finally
-        ;; switch back
+        ;; Network ingress re-registers only when the whole request completes,
+        ;; after its final response. A separate copy-in registration could race
+        ;; the next request's switch back to blocking mode.
         (.configureBlocking ch false)
-        (.add ^ConcurrentLinkedQueue
-              ((:register-queue-fn deps) server)
-              [ch SelectionKey/OP_READ state])
-        (.wakeup selector)))))
+        (when-not (:request-active? @state)
+          ;; Synchronous callers without managed ingress retain the old handoff.
+          (.add ^ConcurrentLinkedQueue
+                ((:register-queue-fn deps) server)
+                [ch SelectionKey/OP_READ state])
+          (.wakeup selector))))))
 
 (defn copy-out
   "Continiously write data out to client in batches"

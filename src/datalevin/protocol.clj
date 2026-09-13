@@ -441,23 +441,27 @@
   on it. The message is a byte array. Message parsing will be done in the
   msg-handler. In non-blocking mode, it should be handled by a worker thread,
   so the main event loop is not hindered by slow parsing. Assume the message
-  is small enough for the buffer."
+  is small enough for the buffer. Compact before handing off buffer ownership
+  to the handler. Return true if a complete message was extracted."
   [^ByteBuffer read-bf msg-handler]
   (let [pos (.position read-bf)]
-    (when (> pos c/message-header-size)
+    (when (>= pos c/message-header-size)
       (.flip read-bf)
       (let [available (.limit read-bf)
             fmt       (.get read-bf)
             length    (.getInt read-bf)]
         (if (< available length)
-          (doto read-bf
-            (.limit (.capacity read-bf))
-            (.position pos))
+          (do
+            (doto read-bf
+              (.limit (.capacity read-bf))
+              (.position pos))
+            false)
           (let [cnt-len (- length c/message-header-size)]
             (if (< cnt-len 0)
               (raise "Message corruption: length is less than header size"
                        {:length length})
               (let [ba (byte-array cnt-len)]
                 (.get read-bf ba)
+                (.compact read-bf)
                 (msg-handler fmt ba)
-                (.compact read-bf)))))))))
+                true))))))))

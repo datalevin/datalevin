@@ -11,6 +11,14 @@ The current benchmark suite includes:
   on all 113 queries in the standard IMDB workload. Its complex multiway joins
   stress query optimization; the publication protocol uses one complete warmup
   pass followed by one retained measurement pass.
+* [TPC-H Benchmark](tpch-bench) compares Datalevin, SQLite, and PostgreSQL on
+  the standard TPC-H decision-support workload (22 queries, 8 tables) at a
+  chosen scale factor. It is a TPC-H-style, derived benchmark and is not an
+  audited TPC result.
+* [TPC-C Benchmark](tpcc-bench) exercises the standard TPC-C OLTP schema and
+  five-transaction mix with deterministic population, optimistic concurrency,
+  tpmC and latency metrics, and post-run invariants. It is a TPC-C-derived
+  benchmark and is not an audited TPC result.
 * [LDBC-SNB Benchmark](LDBC-SNB-bench) compares Datalevin and Neo4j on an
   industry-standard graph workload containing interactive short reads and
   complex graph queries over a synthetic social-network data set.

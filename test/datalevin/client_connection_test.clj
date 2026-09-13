@@ -5,13 +5,15 @@
    [datalevin.constants :as c]
    [datalevin.protocol :as p])
   (:import
-   [datalevin.client ConnectionPool]
+   [datalevin.client Connection ConnectionPool]
    [java.io IOException]
+   [java.net InetSocketAddress]
    [java.nio ByteBuffer]
-   [java.nio.channels SocketChannel]
+   [java.nio.channels ServerSocketChannel SocketChannel]
    [java.nio.channels.spi SelectorProvider]
    [java.util UUID]
-   [java.util.concurrent ConcurrentHashMap ConcurrentLinkedQueue]))
+   [java.util.concurrent ConcurrentHashMap ConcurrentLinkedQueue]
+   [java.util.concurrent.atomic AtomicBoolean]))
 
 (def ^:private registered {:type :set-client-id-ok})
 (def ^:private completed {:type :command-complete :result :pong})
@@ -29,9 +31,15 @@
   ([responses close-error]
    (let [frames  (ConcurrentLinkedQueue.)
          closed  (atom 0)
+         sent    (atom [])
          channel (proxy [SocketChannel] [(SelectorProvider/provider)]
                    (write [^ByteBuffer src]
-                     (let [n (.remaining src)]
+                     (let [n (.remaining src)
+                           copy (.duplicate src)
+                           fmt (.get copy)
+                           bytes (byte-array (- (.getInt copy) c/message-header-size))]
+                       (.get copy bytes)
+                       (swap! sent conj (p/read-value fmt bytes))
                        (.position src (.limit src))
                        n))
                    (read [^ByteBuffer dst]
@@ -56,17 +64,21 @@
            (.flip frame)
            (.add frames frame))))
      (#'client/set-conn-wire-opts! channel (p/default-wire-opts))
-     {:conn conn :channel channel :closed closed})))
+     {:conn conn :channel channel :closed closed :sent sent})))
 
 (defn- with-connections [connections f]
   (let [pending (ConcurrentLinkedQueue. (mapv :conn connections))]
     (try
-      ;; Retain the real registration, wire decoder, pool, and channel close.
-      ;; Only socket creation is replaced to inject failures deterministically.
+      ;; Retain the real registration, wire decoder, pool, and channel close
+      ;; while injecting transport failures deterministically.
       (with-redefs [client/new-connection
                     (fn [& _]
                       (or (.poll pending)
-                          (throw (ex-info "Unexpected connection attempt" {}))))]
+                          (throw (ex-info "Unexpected connection attempt" {}))))
+                    ;; These scripted sockets preload responses before writes.
+                    ;; The real idle-socket probe is covered with TCP below.
+                    client/connection-ready?
+                    (fn [^Connection conn] (.isOpen ^SocketChannel (.-ch conn)))]
         (f))
       (finally
         (doseq [{:keys [conn]} connections]
@@ -190,3 +202,69 @@
         (is (= [close-error] (vec (.getSuppressed failure))))
         (doseq [connection [first-conn second-conn failed]]
           (assert-closed! connection))))))
+
+(defn- with-socket-pair [f]
+  (with-open [listener (ServerSocketChannel/open)]
+    (.bind listener (InetSocketAddress. "127.0.0.1" 0))
+    (with-open [channel (SocketChannel/open (.getLocalAddress listener))
+                peer (.accept listener)]
+      (let [conn (client/->Connection channel 1000 (ByteBuffer/allocate 65536))]
+        (try (f conn peer)
+             (finally (client/close conn)))))))
+
+(deftest idle-socket-probe-preserves-live-connections-test
+  (with-socket-pair
+    (fn [^Connection conn ^SocketChannel peer]
+      (let [^SocketChannel channel (.-ch conn)]
+        (doseq [blocking? [true false]]
+          (.configureBlocking channel blocking?)
+          (is (true? (#'client/connection-ready? conn)))
+          (is (= blocking? (.isBlocking channel)))))
+      ;; Probing performs no round trip and sends no bytes to the peer.
+      (.configureBlocking peer false)
+      (is (zero? (.read peer (ByteBuffer/allocate 1)))))))
+
+(deftest peer-closed-socket-is-replaced-before-an-unsafe-request-test
+  (doseq [request [{:type :open-kv :db-name "db"}
+                   {:type :open-transact :args ["db"]}
+                   {:type :transact-kv :args ["db"]}]]
+    (with-socket-pair
+      (fn [^Connection stale ^SocketChannel peer]
+        (.shutdownOutput peer)
+        ;; Wait for FIN deterministically. EOF does not close the local channel.
+        (is (= -1 (.read ^SocketChannel (.-ch stale) (ByteBuffer/allocate 1))))
+        (is (.isOpen ^SocketChannel (.-ch stale)))
+        (let [fresh (test-connection [registered completed])
+              available (doto (ConcurrentLinkedQueue.) (.add stale))
+              used (ConcurrentLinkedQueue.)
+              pool (client/->ConnectionPool "localhost" 19001 nil 1 1000
+                                             available used (AtomicBoolean. false))
+              base (client/->Client "user" "password" "localhost" 19001
+                                     1 1000 nil pool)
+              replacements (atom 0)]
+          (try
+            (with-redefs [client/new-connection
+                          (fn [& _] (swap! replacements inc) (:conn fresh))]
+              (is (= completed (client/request base request))))
+            (is (= 1 @replacements))
+            (is (= [:set-client-id (:type request)] (mapv :type @(:sent fresh))))
+            (is (.isEmpty used))
+            (is (identical? (:conn fresh) (.peek available)))
+            ;; The old server must never receive even the first mutation byte.
+            (.configureBlocking peer false)
+            (is (= -1 (.read peer (ByteBuffer/allocate 1))))
+            (finally (client/close-pool pool))))))))
+
+(deftest transport-failure-after-borrowing-does-not-replay-a-write-test
+  (let [connection (test-connection [registered])]
+    (with-connections
+      [connection]
+      (fn []
+        (let [pool (#'client/new-connectionpool "localhost" 19001 nil 1 1000)
+              base (client/->Client "user" "password" "localhost" 19001
+                                     1 1000 nil pool)]
+          (try
+            (let [error (thrown-by #(client/request base {:type :open-kv :db-name "db"}))]
+              (is (= :ha/write-indeterminate (get-in (ex-data error) [:err-data :error])))
+              (is (= [:set-client-id :open-kv] (mapv :type @(:sent connection)))))
+            (finally (client/close-pool pool))))))))

@@ -10,17 +10,15 @@
 (ns ^:no-doc datalevin.query.optimizer.range
   "Range and predicate pushdown helpers."
   (:require
-   [clojure.string :as str]
    [clojure.walk :as w]
-   [datalevin.bits :as b]
    [datalevin.constants :as c]
    [datalevin.query.predicate :as qpred]
    [datalevin.query-util :as qu]
    [datalevin.util :as u])
   (:import
-   [java.util Arrays]
-   [datalevin.parser Predicate SrcVar]
-   [datalevin.utl LikeFSM]))
+   [java.nio.charset StandardCharsets]
+   [datalevin.utl LikeFSM]
+   [datalevin.parser Predicate SrcVar]))
 
 (defn- source-form?
   [form]
@@ -154,56 +152,57 @@
                         :empty-range)
                       (combine-ranges rs)))))
 
-(defn- prefix-max-string
+(defn- prefix-successor
+  "An exclusive upper bound for a string prefix in both UTF-8 index order and
+  UTF-16 predicate order. Carry past code points with no successor in both."
   [^String prefix]
-  (let [n (alength (.getBytes prefix))]
-    (if (< n c/+val-bytes-wo-hdr+)
-      (let [l  (- c/+val-bytes-wo-hdr+ n)
-            ba (byte-array l)]
-        (Arrays/fill ba (unchecked-byte 0xFF))
-        (str prefix (String. ba)))
-      prefix)))
+  (loop [end (.length prefix)]
+    (when (pos? end)
+      (let [cp (.codePointBefore prefix end)
+            start (- end (Character/charCount cp))]
+        ;; U+FFFF -> U+10000 reverses UTF-16 order. U+10FFFF has no
+        ;; successor. A shorter prefix gives a safe, possibly wider bound.
+        (if (or (= cp 0xFFFF) (= cp 0x10FFFF))
+          (recur start)
+          (str (.substring prefix 0 start)
+               (String. (Character/toChars
+                          (if (= cp 0xD7FF) 0xE000 (inc cp))))))))))
 
-(def ^:const wildm (int \%))
-(def ^:const wilds (int \_))
-(def ^:const max-string (b/text-ba->str c/max-bytes))
+(defn- inline-string-bound?
+  [^String s]
+  ;; Giant keys truncate their value and append an allocated ID, so they
+  ;; cannot serve as exact logical range endpoints.
+  (< (alength (.getBytes s StandardCharsets/UTF_8)) c/+val-bytes-wo-hdr+))
 
 (defn- like-convert-range
-  "Turn wildcard-free prefix into range."
-  [m ^String pattern not?]
-  (let [wm-s (.indexOf pattern wildm)
-        ws-s (.indexOf pattern wilds)]
-    (cond
-      (or (zero? wm-s) (zero? ws-s)) m
-      (== wm-s ws-s -1)
-      (add-range m [[:closed ""] [:open pattern]]
-                 [[:open pattern] [:closed max-string]])
-      :else
-      (let [min-s    (min wm-s ws-s)
-            end      (if (== min-s -1) (max wm-s ws-s) min-s)
-            prefix-s (subs pattern 0 end)
-            prefix-e (prefix-max-string prefix-s)
-            range    [[:closed prefix-s] [:closed prefix-e]]]
-        (if not?
-          (apply add-range m (flip-ranges [range] "" max-string))
-          (add-range m range))))))
+  "Restrict scans only where the literal pattern proves a safe bound.
+  Escapes terminate the known prefix; the original matcher interprets them."
+  [m ^String pattern escape]
+  (let [escape (or escape \!)]
+    (if (and (char? escape) (< (int escape) 128)
+             (.canEncode (.newEncoder StandardCharsets/UTF_8) pattern))
+      (let [end (long (reduce min (.length pattern)
+                              (filter #(<= 0 ^long %)
+                                      [(.indexOf pattern (int \%))
+                                       (.indexOf pattern (int \_))
+                                       (.indexOf pattern (int escape))])))
+            exact? (= end (.length pattern))
+            prefix (.substring pattern 0 end)]
+        (cond
+          (not (inline-string-bound? prefix)) m
 
-(defn- like-pattern-as-string
-  "Used for plain text matching, e.g. as bounded val or range, not as FSM."
-  [^String pattern escape]
-  (let [esc (str (or escape \!))]
-    (-> pattern
-        (str/replace (str esc esc) esc)
-        (str/replace (str esc "%") "%")
-        (str/replace (str esc "_") "_"))))
+          exact?
+          (add-range m [[:closed pattern] [:closed pattern]])
 
-(defn- wildcard-free-like-pattern
-  [^String pattern {:keys [escape]}]
-  (LikeFSM/isValid (.getBytes pattern) (or escape \!))
-  (let [pstring (like-pattern-as-string pattern escape)]
-    (when (and (not (str/includes? pstring "%"))
-               (not (str/includes? pstring "_")))
-      pstring)))
+          (zero? end) m
+
+          :else
+          (let [upper (prefix-successor prefix)]
+            (if (and upper (not (inline-string-bound? upper)))
+              m
+              (add-range m [[:closed prefix]
+                            (if upper [:open upper] [:closed c/vmax])])))))
+      m)))
 
 (defn activate-var-pred
   [{:keys [make-call resolve-pred]} var clause]
@@ -244,10 +243,19 @@
     (not (exact-inequality-range? (attr-value-type source attr)))))
 
 (defn- optimize-like
-  [helpers m pred [_ ^String pattern {:keys [escape]}] v not?]
-  (let [pstring (like-pattern-as-string pattern escape)
-        m'      (update m :pred add-pred (activate-var-pred helpers v pred))]
-    (like-convert-range m' pstring not?)))
+  [helpers m pred [input pattern {:keys [escape]}] v not?]
+  ;; Validate constant patterns before choosing a range. An empty scan may
+  ;; never invoke the residual matcher that would otherwise reject them.
+  (when (and (= input v) (string? pattern))
+    (LikeFSM/isValid (.getBytes ^String pattern StandardCharsets/UTF_8)
+                     (or escape \!)))
+  (let [m' (update m :pred add-pred (activate-var-pred helpers v pred))]
+    ;; A literal prefix is only a superset of LIKE matches. Complementing
+    ;; it for NOT LIKE would discard valid rows before the predicate runs.
+    ;; Keep negation as a residual filter, including alongside other ranges.
+    (if (and (not not?) (= input v) (string? pattern))
+      (like-convert-range m' pattern escape)
+      m')))
 
 (defn- inequality->range
   [m f args v]
@@ -371,33 +379,6 @@
      (assoc graph source (add-pred-clause-to-source helpers source nodes clause v)))
    {} graph))
 
-(defn- free->bound
-  "Cases where free var can be rewritten as bound:
-    * like pattern is free of wildcards."
-  [graph clause v]
-  (w/postwalk
-   (fn [m]
-     (if-let [free (:free m)]
-       (if-let [[new k]
-                (u/some-indexed
-                 (fn [{:keys [var] :as old}]
-                   (when (= v var)
-                     (let [[f & args] (first clause)]
-                       (when (= f 'like)
-                         (let [[_ pattern opts] args]
-                           (when-let [ps (wildcard-free-like-pattern
-                                          pattern opts)]
-                             (-> old
-                                 (dissoc :var)
-                                 (assoc :val ps))))))))
-                 free)]
-         (-> m
-             (update :bound u/conjv new)
-             (update :free u/vec-remove k))
-         m)
-       m))
-   graph))
-
 (defn pushdown-predicates
   "Optimization that pushes predicates down to value scans."
   [{:keys [parsed-q graph] :as context} helpers]
@@ -409,7 +390,8 @@
            (-> c
                (update :late-clauses #(remove #{clause} %))
                (update :opt-clauses conj clause)
-               (update :graph #(free->bound % clause v))
+               ;; Keep :var even for exact LIKE so projection and later joins
+               ;; retain the binding. A singleton range still uses the index.
                (update :graph #(add-pred-clause helpers % clause v))))
          c))
      context (:qwhere parsed-q))))

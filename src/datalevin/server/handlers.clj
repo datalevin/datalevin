@@ -26,6 +26,7 @@
    [datalevin.lmdb :as l]
    [datalevin.protocol :as p]
    [datalevin.server.api :as sapi]
+   [datalevin.server.request :as request]
    [datalevin.server.auth :as auth
     :refer [view-act alter-act create-act control-act database-obj user-obj
             role-obj server-obj privileged-server-option-keys]]
@@ -1794,7 +1795,7 @@
         calls))))
 
 (defn open-transact-kv
-  [deps server skey {:keys [args]}]
+  [deps server skey {:keys [args] :as message}]
   (let [db-name          (nth args 0)
         ^Semaphore lock (db-lock deps server db-name)]
     (db-alter-permission!
@@ -1812,6 +1813,9 @@
                           server db-name skey {:wlmdb wlmdb})]
               (vreset! runner* runner)
               (write-complete! deps skey)
+              ;; The runner is published and the acknowledgement is sent.
+              ;; Its subsequent calls must now be allowed onto this connection.
+              (request/complete! message)
               ((:run-calls deps) runner))
             (catch Throwable t
               (cleanup-failed-open-transaction!
@@ -1872,7 +1876,7 @@
   (finish-transaction! deps server skey (nth args 0) :close-transact-kv false))
 
 (defn open-transact
-  [deps server skey {:keys [args]}]
+  [deps server skey {:keys [args] :as message}]
   (let [db-name          (nth args 0)
         ^Semaphore lock (db-lock deps server db-name)]
     (db-alter-permission!
@@ -1897,6 +1901,7 @@
                                     wstore runtime-opts)})]
               (vreset! runner* runner)
               (write-complete! deps skey)
+              (request/complete! message)
               ((:run-calls deps) runner))
             (catch Throwable t
               (cleanup-failed-open-transaction!

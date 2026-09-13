@@ -114,10 +114,15 @@ not contain a dynamic source form.
 
 Comparisons (`<`, `<=`, `>`, and `>=`) involving constants become open or
 closed AVE range boundaries. Equality becomes an exact range, while `in` and
-`not-in` become one or more exact or complementary ranges. `like` and
-`not-like` derive a prefix range when the pattern permits it and retain the
-value predicate for the final check; a wildcard-free `like` becomes an exact
-bound value. Multiple range predicates on the same value are intersected, so a
+`not-in` become one or more exact or complementary ranges. `like` derives a
+safe prefix range when the pattern permits it, or a singleton range for an
+unescaped literal pattern. It retains both the value predicate and the query
+variable, including for exact matches used in projections and joins. Prefix
+bounds use a valid Unicode successor; escapes end the known literal prefix,
+and bounds that would require truncated giant keys are not used. `not-like`
+remains a value predicate: excluding an entire literal prefix would also
+exclude values that fail the rest of the pattern. Multiple range predicates
+on the same value are intersected, so a
 contradictory intersection can be recognized without scanning. Big-decimal
 inequalities and other single-variable predicates that cannot safely become
 index bounds are still attached to the value scan instead of being evaluated

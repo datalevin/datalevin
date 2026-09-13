@@ -541,10 +541,18 @@ message and forwards it to a bounded request executor or an explicit transaction
 runner. HA and replica loops use a separate bounded background executor.
 Saturation never runs a request handler on the event loop.
 
-Each handling thread writes its response back to the network channel when it
-becomes ready, so message handling is asynchronous. It is the client's
-responsibility to track request/response
-correspondence if multiple messages are on the wire.
+Requests on each connection execute in arrival order, and their responses are
+sent in the same order. Connections run independently. While a request is in
+progress, the server pauses ordinary reads on that connection, applying socket
+backpressure instead of accumulating a request queue. Complete buffered requests
+are processed without waiting for more network traffic.
+
+A transaction open completes when its acknowledgement is sent; subsequent
+transaction requests execute on the owning transaction runner. Bulk transfers
+occupy the connection until their final response. During copy-in, send only
+transfer batches followed by `:copy-done` (or `:copy-fail`); ordinary requests
+can follow that terminator. A copy-out response includes every batch through
+`:copy-done` before the next request's response begins.
 
 For developer convenience, the current implemented client in the library makes
 synchronous and blocking network connections. For normal commands, it sends a
