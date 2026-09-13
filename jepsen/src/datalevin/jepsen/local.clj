@@ -8,7 +8,7 @@
    [datalevin.jepsen.local.ops :as lops]
    [datalevin.jepsen.local.remote :as lremote]
    [datalevin.jepsen.remote :as remote]
-   [datalevin.kv :as kv]
+   [datalevin.kv.txlog :as kvtx]
    [datalevin.server :as srv]
    [jepsen.db :as db]))
 
@@ -215,7 +215,7 @@
 
 (defonce ^:private storage-fault-hook-installed?
   (do
-    (kv/set-storage-fault-hook!
+    (kvtx/set-storage-fault-hook!
      (fn [context]
        (lfaults/maybe-apply-storage-fault! (faults-deps) context)))
     true))
