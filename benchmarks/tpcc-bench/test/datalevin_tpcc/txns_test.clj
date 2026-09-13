@@ -228,3 +228,30 @@
         [{:db/id 300001 :order-line/o-id 2980 :order-line/d-id 1
           :order-line/w-id 1 :order-line/i-id 3 :order-line/number 1}]))
       (is (= 1 (:low-stock (t/stock-level! conn {:w 1 :d 1 :threshold 200})))))))
+
+(deftest order-status-selects-latest-order
+  (with-db {}
+    (fn [conn]
+      ;; Customer 1 in district 1 has three orders; the most recent (30) has
+      ;; three lines, while the older ones have fewer. Order-Status must
+      ;; inspect order 30 rather than an arbitrary order from the result set.
+      (d/transact!
+       conn
+       (concat
+        [{:db/id 500010 :orders/id 10 :orders/d-id 1 :orders/w-id 1
+          :orders/c-id 1 :orders/entry-d "2026-01-01T00:00:00"
+          :orders/ol-cnt 1 :orders/all-local 1}
+         {:db/id 500020 :orders/id 20 :orders/d-id 1 :orders/w-id 1
+          :orders/c-id 1 :orders/entry-d "2026-01-01T00:00:00"
+          :orders/ol-cnt 2 :orders/all-local 1}
+         {:db/id 500030 :orders/id 30 :orders/d-id 1 :orders/w-id 1
+          :orders/c-id 1 :orders/entry-d "2026-01-01T00:00:00"
+          :orders/ol-cnt 3 :orders/all-local 1}]
+        (mapcat (fn [[oid lines]]
+                  (for [n (range 1 (inc lines))]
+                    {:db/id (+ 400000 (* oid 10) n)
+                     :order-line/o-id oid :order-line/d-id 1
+                     :order-line/w-id 1 :order-line/number n
+                     :order-line/i-id 1}))
+                [[10 1] [20 2] [30 3]])))
+      (is (= 3 (:lines (t/order-status! conn {:w 1 :d 1 :c 1})))))))

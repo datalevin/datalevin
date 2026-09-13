@@ -223,20 +223,19 @@
                (customer-by-id db w d c))]
     (if (nil? cust)
       {:type :order-status :status :no-customer}
-      (let [c-id  (second cust)
-            order (first (d/q '[:find ?e ?id ?entry ?carrier
+      (let [c-id (second cust)
+            ;; TPC-C 2.6: inspect the customer's most recent order, i.e. the
+            ;; greatest order id, matching the SQL backends' ORDER BY o_id DESC.
+            o-id (ffirst (d/q '[:find (max ?id)
                                 :in $ ?w ?d ?c
                                 :where
                                 [?e :orders/w-id ?w]
                                 [?e :orders/d-id ?d]
                                 [?e :orders/c-id ?c]
-                                [?e :orders/id ?id]
-                                [?e :orders/entry-d ?entry]
-                                [(get-else $ ?e :orders/carrier-id -1) ?carrier]]
+                                [?e :orders/id ?id]]
                               db w d c-id))]
-        (if order
-          (let [o-id (second order)
-                lines (d/q '[:find ?number :in $ ?w ?d ?o
+        (if o-id
+          (let [lines (d/q '[:find ?number :in $ ?w ?d ?o
                              :where
                              [?l :order-line/w-id ?w]
                              [?l :order-line/d-id ?d]
