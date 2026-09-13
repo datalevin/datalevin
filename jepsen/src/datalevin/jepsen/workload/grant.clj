@@ -293,7 +293,7 @@
 (defn- random-op
   [key-count]
   (let [grant-id (rand-int (int key-count))]
-    (case (rand-int 10)
+    (case (int (rand-int 10))
       0 {:type :invoke
          :f :create
          :value {:grant-id grant-id
