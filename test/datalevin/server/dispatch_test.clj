@@ -17,6 +17,23 @@
    [java.nio.channels.spi SelectorProvider]
    [java.util.concurrent ConcurrentHashMap]))
 
+(deftest failed-read-closes-channel-even-if-transaction-cleanup-fails-test
+  (doseq [cleanup-fails? [false true]]
+    (with-open [channel (SocketChannel/open)]
+      (let [cleanups (atom 0)
+            skey (doto (proxy [SelectionKey] [] (channel [] channel))
+                   (.attach (volatile! {:read-bf (ByteBuffer/allocate 32)})))
+            deps {:cleanup-connection-transactions-fn
+                  (fn [_ _]
+                    (swap! cleanups inc)
+                    (when cleanup-fails?
+                      (throw (java.io.IOException. "Cleanup failed"))))
+                  :close-conn-fn (fn [_] (.close channel))}]
+        ;; read-ch turns an unconnected socket's read failure into EOF.
+        (dispatch/handle-read deps nil skey)
+        (is (= 1 @cleanups))
+        (is (not (.isOpen channel)))))))
+
 ;; An independent inventory of mutations: changing a property to read-only
 ;; must not silently remove a handler from the guard tests below.
 (def ^:private database-writes

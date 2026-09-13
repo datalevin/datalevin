@@ -281,12 +281,13 @@
 (defn- close-client-connections!
   [deps server client-id]
   (let [^Selector selector ((:selector-fn deps) server)]
-    (doseq [^SelectionKey k (open-selector-keys selector)
-            :let            [state (.attachment k)]
-            :when           state]
-      (when (= client-id (@state :client-id))
-        ((:cleanup-connection-transactions-fn deps) server k)
-        ((:close-conn-fn deps) k)))))
+    (resources/close-all!
+      (for [^SelectionKey k (open-selector-keys selector)
+            :let [state (.attachment k)]
+            :when (and state (= client-id (@state :client-id)))]
+        #(try
+           ((:cleanup-connection-transactions-fn deps) server k)
+           (finally ((:close-conn-fn deps) k)))))))
 
 (defn disconnect-client*
   [deps server client-id]
@@ -331,36 +332,55 @@
                      (long last-active))]
       (< timeout (- now-ms baseline)))))
 
+(defn- expire-idle-session!
+  [deps server ^ConcurrentHashMap clients client-id now-ms timeout]
+  (let [expired? (volatile! false)]
+    ;; Recheck under the same per-session lock as touches and persistence.
+    ;; A snapshot taken before a request must not delete its fresh activity.
+    (.computeIfPresent
+      clients client-id
+      (reify BiFunction
+        (apply [_ _ session]
+          (cond
+            (nil? (:last-active session))
+            (persist-session! deps server client-id
+                              (assoc session :last-active now-ms))
+
+            (idle-session? session now-ms timeout)
+            (do
+              (d/transact-kv
+                (session-lmdb ((:sys-conn-fn deps) server))
+                [(l/kv-tx :del session-dbi client-id :uuid)])
+              (vreset! expired? true)
+              nil)
+
+            :else session))))
+    (when @expired?
+      (close-client-connections! deps server client-id)
+      (log/info "Removed idle client:" client-id))))
+
 (defn remove-idle-sessions
+  "Sweep all sessions, then report failures so the caller can back off without
+  a malformed session or failed delete preventing cleanup of other clients."
   [deps server]
   (let [^long timeout ((:idle-timeout-fn deps) server)
         clients ((:clients-fn deps) server)
-        now-ms  (long ((:now-ms-fn deps)))]
-    (doseq [[client-id snapshot] clients
-            ;; Do not make the selector wait on persistence for active sessions.
-            :when (or (nil? (:last-active snapshot))
-                      (idle-session? snapshot now-ms timeout))]
-      (let [expired? (volatile! false)]
-        ;; Recheck under the same per-session lock as touches and persistence.
-        ;; A snapshot taken before a request must not delete its fresh activity.
-        (.computeIfPresent
-          ^ConcurrentHashMap clients client-id
-          (reify BiFunction
-            (apply [_ _ session]
-              (cond
-                (nil? (:last-active session))
-                (persist-session! deps server client-id
-                                  (assoc session :last-active now-ms))
-
-                (idle-session? session now-ms timeout)
-                (do
-                  (d/transact-kv
-                    (session-lmdb ((:sys-conn-fn deps) server))
-                    [(l/kv-tx :del session-dbi client-id :uuid)])
-                  (vreset! expired? true)
-                  nil)
-
-                :else session))))
-        (when @expired?
-          (close-client-connections! deps server client-id)
-          (log/info "Removed idle client:" client-id))))))
+        now-ms  (long ((:now-ms-fn deps)))
+        failure (volatile! nil)
+        failed-count (volatile! 0)]
+    (doseq [[client-id snapshot] clients]
+      (try
+        ;; Do not wait on persistence for active sessions. Keep even this
+        ;; timestamp check inside the boundary for malformed legacy records.
+        (when (or (nil? (:last-active snapshot))
+                  (idle-session? snapshot now-ms timeout))
+          (expire-idle-session! deps server clients client-id now-ms timeout))
+        (catch InterruptedException e (throw e))
+        (catch Exception e
+          (when-not @failure (vreset! failure e))
+          (vreset! failed-count (inc (long @failed-count))))))
+    (when-let [cause @failure]
+      (throw (ex-info "Idle session cleanup failed"
+                      {:error :server/session-cleanup-failed
+                       :failed-count @failed-count}
+                      cause)))))

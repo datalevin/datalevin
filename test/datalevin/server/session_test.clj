@@ -311,3 +311,59 @@
       (finally
         (deliver release true)
         (await! update)))))
+
+(deftest idle-sweep-isolates-malformed-sessions-and-failed-deletes-test
+  (doseq [failure-mode [:timestamp :storage]]
+    (add-session!)
+    (add-session!)
+    (let [{:keys [deps clients clock conn]} *sessions*
+          bad-id (key (first clients))
+          original (get clients bad-id)
+          fail? (atom true)
+          sweep-deps (if (= :storage failure-mode)
+                       (assoc deps :sys-conn-fn
+                              (fn [_]
+                                (if (compare-and-set! fail? true false)
+                                  (throw (java.io.IOException. "Delete failed"))
+                                  conn)))
+                       deps)]
+      (when (= :timestamp failure-mode)
+        (.put ^java.util.concurrent.ConcurrentHashMap clients bad-id
+              (assoc original :last-active :malformed)))
+      (reset! clock (+ 2000 (long @clock)))
+      (let [error (try (session/remove-idle-sessions sweep-deps nil)
+                       (catch Exception e e))]
+        (is (= :server/session-cleanup-failed (:error (ex-data error))))
+        (is (= 1 (:failed-count (ex-data error))))
+        (is (= #{bad-id} (set (keys clients))))
+        (is (= #{bad-id} (set (keys (persisted-sessions))))))
+      ;; Failed deletion preserves the session for a later successful sweep.
+      (.put ^java.util.concurrent.ConcurrentHashMap clients bad-id original)
+      (session/remove-idle-sessions deps nil)
+      (is (empty? clients))
+      (is (empty? (persisted-sessions))))))
+
+(deftest idle-sweep-closes-all-client-sockets-despite-a-cleanup-failure-test
+  (let [id (add-session!)
+        {:keys [deps clock clients]} *sessions*
+        keys (repeatedly 2 #(doto (proxy [SelectionKey] [])
+                              (.attach (volatile! {:client-id id}))))
+        selector (proxy [Selector] []
+                   (isOpen [] true)
+                   (keys [] (set keys)))
+        cleaned (atom [])
+        closed (atom [])
+        sweep-deps (assoc deps
+                          :selector-fn (constantly selector)
+                          :cleanup-connection-transactions-fn
+                          (fn [_ key]
+                            (swap! cleaned conj key)
+                            (throw (java.io.IOException. "Cleanup failed")))
+                          :close-conn-fn #(swap! closed conj %))]
+    (reset! clock 2000)
+    (is (= :server/session-cleanup-failed
+           (try (session/remove-idle-sessions sweep-deps nil)
+                (catch Exception e (:error (ex-data e))))))
+    (is (= (set keys) (set @cleaned) (set @closed)))
+    (is (empty? clients))
+    (is (empty? (persisted-sessions)))))

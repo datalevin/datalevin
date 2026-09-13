@@ -4,6 +4,7 @@
    [datalevin.client :as client]
    [datalevin.core :as d]
    [datalevin.ha.control :as control]
+   [datalevin.interface :as i]
    [datalevin.server :as server]
    [datalevin.server.ha :as ha]
    [datalevin.server.session :as session]
@@ -12,11 +13,12 @@
   (:import
    [datalevin.server Server]
    [java.io IOException]
-   [java.nio.channels Selector ServerSocketChannel]
-   [java.util UUID]
+   [java.nio.channels ClosedSelectorException Selector SelectionKey
+    ServerSocketChannel SocketChannel]
+   [java.util LinkedHashSet Set UUID]
    [java.util.concurrent ArrayBlockingQueue ConcurrentHashMap ConcurrentLinkedQueue
     CountDownLatch ExecutorService Executors Future FutureTask LinkedBlockingQueue
-    RejectedExecutionException ThreadPoolExecutor
+    RejectedExecutionException Semaphore ThreadPoolExecutor
     ThreadPoolExecutor$CallerRunsPolicy TimeUnit]
    [java.util.concurrent.atomic AtomicBoolean]))
 
@@ -28,24 +30,26 @@
       (throw (ex-info "Server lifecycle test timed out" {})))
     result))
 
-(defn- fake-server [{:keys [on-execute on-select on-close work-executor]}]
-  (let [delegate  (Selector/open)
+(defn- fake-server [{:keys [on-execute on-select on-close work-executor
+                           selector selected-keys]}]
+  (let [^Selector delegate (or selector (Selector/open))
         submitted (atom 0)
         closed    (atom 0)
-        selector  (proxy [Selector] []
+        selector  (or selector (proxy [Selector] []
                     (isOpen [] (.isOpen delegate))
                     (provider [] (.provider delegate))
                     (keys [] (.keys delegate))
-                    (selectedKeys [] (.selectedKeys delegate))
+                    (selectedKeys [] (or selected-keys (.selectedKeys delegate)))
                     (selectNow [] (.selectNow delegate))
                     (select
                       ([] (when on-select (on-select)) (.select delegate))
-                      ([timeout] (.select delegate (long timeout))))
+                      ([timeout] (when on-select (on-select))
+                                 (.select delegate (long timeout))))
                     (wakeup [] (.wakeup delegate))
                     (close []
                       (.close delegate)
                       (swap! closed inc)
-                      (when on-close (on-close))))
+                      (when on-close (on-close)))))
         dispatcher
         (proxy [ThreadPoolExecutor]
             [1 1 0 TimeUnit/MILLISECONDS (LinkedBlockingQueue.)]
@@ -74,6 +78,26 @@
 
 (defn- start-error [srv]
   (try (server/start srv) nil (catch Exception e (:error (ex-data e)))))
+
+(defn- await-condition! [pred]
+  (let [deadline (+ (System/currentTimeMillis) 5000)]
+    (loop []
+      (when-not (pred)
+        (when (>= (System/currentTimeMillis) deadline)
+          (throw (ex-info "Server lifecycle condition timed out" {})))
+        (Thread/sleep 5)
+        (recur)))))
+
+(defn- fake-key [channel selector ops]
+  (let [valid (atom true)]
+    (doto (proxy [SelectionKey] []
+            (channel [] channel)
+            (selector [] selector)
+            (isValid [] @valid)
+            (cancel [] (reset! valid false))
+            (interestOps ([] ops) ([new-ops] new-ops))
+            (readyOps [] ops))
+      (.attach (volatile! {})))))
 
 (deftest stop-before-start-releases-created-resources-test
   (let [root (u/tmp-dir (str "unstarted-server-" (UUID/randomUUID)))
@@ -356,6 +380,227 @@
       (is (= 1 @submitted))
       (server/stop server)
       (assert-stopped server)
+      (finally (server/stop server)))))
+
+(deftest persistent-select-failures-have-a-real-delay-test
+  (let [attempts (atom [])
+        retried (promise)
+        {:keys [server submitted]}
+        (fake-server
+          {:on-select #(do
+                         (when (= 3 (count (swap! attempts conj (System/nanoTime))))
+                           (deliver retried true))
+                         (throw (IOException. "Persistent select failure")))})]
+    (try
+      (server/start server)
+      (await! retried)
+      (is (>= (- (long (nth @attempts 2)) (long (first @attempts))) 250000000)
+          "repeated failures must wait instead of spinning")
+      (server/stop server)
+      (is (= 1 @submitted))
+      (assert-stopped server)
+      (finally (server/stop server)))))
+
+(deftest network-backoff-is-capped-and-resets-after-a-successful-cycle-test
+  (let [selects (atom 0)
+        delays (atom [])
+        complete (promise)
+        srv-v (volatile! nil)
+        {:keys [server submitted]}
+        (fake-server
+          {:on-select #(if (= 10 (swap! selects inc))
+                         (.wakeup ^Selector (.-selector ^Server @srv-v))
+                         (throw (IOException. "Select failed")))})
+        wait! @#'server/wait-event-loop-retry!]
+    (vreset! srv-v server)
+    (with-redefs-fn
+      {#'server/wait-event-loop-retry!
+       (fn [srv delay-ms]
+         (when (= 10 (count (swap! delays conj delay-ms)))
+           (deliver complete true)
+           (wait! srv 5000)))}
+      #(try
+         (server/start server)
+         (await! complete)
+         (is (= [100 200 400 800 1600 3200 5000 5000 5000 100] @delays))
+         (server/stop server)
+         (is (= 1 @submitted))
+         (assert-stopped server)
+         (finally (server/stop server))))))
+
+(deftest stop-wakes-maximum-event-loop-backoff-test
+  (let [waiting (promise)
+        wait! @#'server/wait-event-loop-retry!
+        {:keys [server]} (fake-server
+                          {:on-select #(throw (IOException. "Persistent failure"))})]
+    (with-redefs-fn
+      {#'server/event-loop-backoff-ms (fn ^long [_] 5000)
+       #'server/wait-event-loop-retry!
+       (fn [srv delay-ms] (deliver waiting true) (wait! srv delay-ms))}
+      #(try
+         (server/start server)
+         (await! waiting)
+         (let [stopping (future (server/stop server))]
+           (is (nil? (deref stopping 1000 ::timeout)))
+           (await! stopping))
+         (assert-stopped server)
+         (finally (server/stop server))))))
+
+(deftest failed-selected-key-does-not-skip-other-clients-test
+  (doseq [accept-failure? [false true]]
+    (let [selected (LinkedHashSet.)
+          {:keys [server]} (fake-server {:selected-keys selected})
+          selector (.-selector ^Server server)
+          bad (if accept-failure? (.-server-socket ^Server server)
+                                 (SocketChannel/open))
+          good (SocketChannel/open)
+          bad-key (fake-key bad selector (if accept-failure? SelectionKey/OP_ACCEPT
+                                                            SelectionKey/OP_READ))
+          good-key (fake-key good selector SelectionKey/OP_READ)
+          served (atom [])
+          failure (IOException. "Key handler failed")]
+      (.add selected bad-key)
+      (.add selected good-key)
+      (try
+        (with-redefs-fn
+          {#'server/handle-accept (fn [_ _] (throw failure))
+           #'server/handle-read (fn [_ key]
+                                 (if (identical? key bad-key)
+                                   (throw failure)
+                                   (swap! served conj key)))}
+          #(let [error (try (#'server/handle-selected-keys server)
+                            (catch Exception e e))]
+             (is (if accept-failure? (identical? failure error) (nil? error)))))
+        (is (= [good-key] @served))
+        (is (.isEmpty selected))
+        (is (.isOpen good))
+        (is (= accept-failure? (.isOpen ^java.nio.channels.Channel bad)))
+        (finally
+          (.close ^java.nio.channels.Channel bad)
+          (.close good)
+          (server/stop server))))))
+
+(deftest failed-registration-closes-channel-and-drains-other-entries-test
+  (with-open [selector (Selector/open)
+              bad (SocketChannel/open)
+              good (SocketChannel/open)]
+    (let [{:keys [server]} (fake-server {:selector selector})
+          queue (.-register-queue ^Server server)
+          connections (:connections (.-execution ^Server server))]
+      (try
+        ;; A blocking channel cannot be registered. The following valid
+        ;; registration must still run on this pass through the queue.
+        (.configureBlocking good false)
+        (doseq [ch [bad good]]
+          (.add ^Set connections ch)
+          (.add ^ConcurrentLinkedQueue queue [ch SelectionKey/OP_READ (volatile! {})]))
+        (#'server/handle-registration server)
+        (is (not (.isOpen bad)))
+        (is (.isValid (.keyFor good selector)))
+        (is (.isEmpty ^ConcurrentLinkedQueue queue))
+        (is (= #{good} (set connections)))
+        (finally (server/stop server))))))
+
+(deftest idle-sweep-failure-does-not-stop-network-processing-test
+  (let [root (u/tmp-dir (str "server-sweep-failure-" (UUID/randomUUID)))
+        port (allocate-port)
+        srv (server/create {:root root :port port})
+        failing? (atom true)
+        failures (atom 0)
+        recovered (promise)
+        c-v (volatile! nil)]
+    (with-redefs-fn
+      {#'server/remove-idle-sessions
+       (fn [_]
+         (if @failing?
+           (do (swap! failures inc)
+               (throw (IOException. "Session store unavailable")))
+           (deliver recovered true)))}
+      #(try
+         (server/start srv)
+         (vreset! c-v (client/new-client
+                       (str "dtlv://datalevin:datalevin@localhost:" port)
+                       {:pool-size 1 :time-out 3000}))
+         (dotimes [_ 10]
+           (is (= :command-complete
+                  (:type (client/request @c-v {:type :list-databases :args []})))))
+         (is (pos? @failures))
+         (reset! failing? false)
+         (await! recovered)
+         (finally
+           (when @c-v (client/disconnect @c-v))
+           (server/stop srv)
+           (u/delete-files root))))))
+
+(deftest terminal-selector-failure-releases-sockets-and-active-transaction-test
+  (let [root (u/tmp-dir (str "server-selector-failure-" (UUID/randomUUID)))
+        opts {:root root :port (allocate-port)}
+        ^Server srv (server/create opts)
+        c-v (volatile! nil)]
+    (try
+      (server/start srv)
+      (vreset! c-v (client/new-client
+                    (str "dtlv://datalevin:datalevin@localhost:" (:port opts))
+                    {:pool-size 1 :time-out 3000}))
+      (client/open-database @c-v "data" "kv")
+      (client/normal-request @c-v :open-transact-kv ["data"])
+      (let [{:keys [store lock]} (get (.-dbs srv) "data")
+            channels (vec (:connections (.-execution srv)))]
+        (is (seq channels))
+        (.close ^Selector (.-selector srv))
+        (await-condition! #(d/closed? (.-sys-conn srv)))
+        ;; Join cleanup through the public lifecycle call, including its race
+        ;; with the dispatcher handing terminal cleanup to another thread.
+        (is (nil? (await! (future (server/stop srv)))))
+        (assert-stopped srv)
+        (is (every? #(not (.isOpen ^SocketChannel %)) channels))
+        (is (i/closed-kv? store))
+        (is (= 1 (.availablePermits ^Semaphore lock)))
+        (is (= :server/stopped (start-error srv))))
+      (let [replacement (server/create opts)]
+        (server/stop replacement)
+        (assert-stopped replacement))
+      (finally
+        (when @c-v (client/close-pool (client/get-pool @c-v)))
+        (server/stop srv)
+        (u/delete-files root)))))
+
+(deftest terminal-event-loop-error-can-race-explicit-stop-test
+  (let [entered (promise)
+        release (promise)
+        closing (promise)
+        {:keys [server]}
+        (fake-server {:on-select #(do (deliver entered true)
+                                     (await! release)
+                                     (throw (ClosedSelectorException.)))
+                      :on-close #(deliver closing true)})
+        stopping (atom nil)]
+    (try
+      (server/start server)
+      (await! entered)
+      (reset! stopping (future (server/stop server)))
+      (await! closing)
+      (deliver release true)
+      (is (nil? (await! @stopping)))
+      (assert-stopped server)
+      (finally
+        (deliver release true)
+        (when @stopping (await! @stopping))
+        (server/stop server)))))
+
+(deftest interrupted-event-loop-stops-instead-of-spinning-on-select-test
+  (let [selects (atom 0)
+        {:keys [server]}
+        (fake-server {:on-select #(do (swap! selects inc)
+                                     (.interrupt (Thread/currentThread)))})]
+    (try
+      (server/start server)
+      (await-condition! #(.isTerminated ^ExecutorService
+                                       (.-work-executor ^Server server)))
+      (server/stop server)
+      (is (= 1 @selects))
+      (assert-stopped server)
+      (is (= :server/stopped (start-error server)))
       (finally (server/stop server)))))
 
 (deftest cleanup-failure-does-not-skip-other-resources-test

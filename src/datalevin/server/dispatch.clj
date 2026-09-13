@@ -18,6 +18,7 @@
    [datalevin.kv.txlog :as kvtx]
    [datalevin.protocol :as p]
    [datalevin.server.deps :as sdeps]
+   [datalevin.server.resources :as resources]
    [datalevin.txlog :as txlog]
    [datalevin.util :as u :refer [raise]]
    [taoensso.timbre :as log])
@@ -25,6 +26,7 @@
    [java.nio ByteBuffer]
    [java.nio.channels ClosedChannelException SelectionKey SocketChannel
     ServerSocketChannel]
+   [java.util Set]
    [java.util.concurrent Executor RejectedExecutionException]))
 
 (def dispatch-deps-contract
@@ -119,22 +121,29 @@
        :message "Replica is read-only"})))
 
 (defn handle-accept
-  [^SelectionKey skey]
+  [^SelectionKey skey ^Set connections]
   (when-let [client-socket (.accept ^ServerSocketChannel (.channel skey))]
-    (doto ^SocketChannel client-socket
-      (.configureBlocking false)
-      (.register (.selector skey) SelectionKey/OP_READ
-                 ;; attach a connection state
-                 ;; { read-bf, write-bf, client-id }
-                 (volatile! {:read-bf  (bf/allocate-buffer
+    (.add connections client-socket)
+    (try
+      (doto ^SocketChannel client-socket
+        (.configureBlocking false)
+        (.register (.selector skey) SelectionKey/OP_READ
+                   ;; attach a connection state
+                   ;; { read-bf, write-bf, client-id }
+                   (volatile! {:read-bf  (bf/allocate-buffer
                                          c/+buffer-size+)
-                             :write-bf (bf/allocate-buffer
+                               :write-bf (bf/allocate-buffer
                                          c/+buffer-size+)
-                             ;; Preserve client message order per connection.
-                             ;; Authentication/session setup must not race
-                             ;; with subsequent requests like :open.
-                             :message-lock (Object.)
-                             :wire-opts (p/default-wire-opts)})))))
+                               ;; Preserve client message order per connection.
+                               ;; Authentication/session setup must not race
+                               ;; with subsequent requests like :open.
+                               :message-lock (Object.)
+                               :connections connections
+                               :wire-opts (p/default-wire-opts)})))
+      (catch Throwable t
+        (resources/close-suppressing! t #(.close ^SocketChannel client-socket))
+        (.remove connections client-socket)
+        (throw t)))))
 
 (defn client-disconnect?
   [e]
@@ -453,6 +462,18 @@
         ((:cleanup-connection-transactions-fn deps) server skey)
         (finally ((:close-conn-fn deps) skey))))))
 
+(defn- close-read-connection!
+  [deps server skey]
+  (try
+    (try
+      ((:cleanup-connection-transactions-fn deps) server skey)
+      (finally ((:close-conn-fn deps) skey)))
+    (catch Exception e
+      ;; The channel has already been closed in finally. Do not run cleanup
+      ;; again through the surrounding read-error handler.
+      (log/warn "Client connection cleanup failed" {:message (ex-message e)})
+      (log/debug e "Client connection cleanup failure"))))
+
 (defn handle-read
   [deps server ^SelectionKey skey]
   (try
@@ -490,14 +511,11 @@
         :continue
 
         (= readn -1)
-        (do
-          ((:cleanup-connection-transactions-fn deps) server skey)
-          (.close ch))))
-    (catch java.io.IOException e
-      (if (s/includes? (ex-message e) "Connection reset by peer")
-        (do
-          ((:cleanup-connection-transactions-fn deps) server skey)
-          (.close (.channel skey)))
-        (log/error "Read IOException:" (ex-message e))))
+        (close-read-connection! deps server skey)))
     (catch Exception e
-      (log/error "Read error:" (ex-message e)))))
+      ;; A failed read/frame must not leave a ready key producing the same
+      ;; error forever. Connection cleanup must also run if reporting fails.
+      (resources/close-suppressing! e #(close-read-connection! deps server skey))
+      (when-not (client-disconnect? e)
+        (log/warn "Closing failed client read" {:message (ex-message e)})
+        (log/debug e "Client read failure")))))

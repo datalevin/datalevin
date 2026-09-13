@@ -41,10 +41,10 @@
    [clojure.string :as s])
   (:import
    [java.nio ByteBuffer BufferOverflowException]
-   [java.nio.channels Selector SelectionKey
+   [java.nio.channels Selector SelectionKey ClosedSelectorException
     ServerSocketChannel SocketChannel]
    [java.net InetAddress InetSocketAddress]
-   [java.util Iterator Map]
+   [java.util Iterator Map Set]
    [java.util.function BiFunction]
    [java.util.concurrent.atomic AtomicBoolean]
    [java.util.concurrent Executors ExecutorService
@@ -217,9 +217,10 @@
                                    {:type :reconnect}
                                    ~'wire-opts)))))
 
-(declare event-loop close-conn store->db-name session-lmdb remove-store
+(declare run-event-loop! close-conn store->db-name session-lmdb remove-store
          with-db-runtime-store-swap
-         halt-run cleanup-connection-transactions! session-deps copy-deps
+         halt-run abort-run cleanup-connection-transactions! cleanup-abandoned-transaction!
+         session-deps copy-deps
          dispatch-deps ha-deps
          stop-ha-background-loops! shutdown-server!
          ensure-ha-renew-loop ensure-ha-follower-sync-loop)
@@ -301,16 +302,7 @@
   (start [server]
     (letfn [(init []
               (log/info "Datalevin server started on port" port)
-              ;; Retry on this task instead of racing shutdown with another
-              ;; submission to the dispatcher.
-              (loop []
-                (when (.get running)
-                  (try
-                    (event-loop server)
-                    (catch Exception e
-                      (when (.get running)
-                        (log/error e "Server event loop failed; retrying"))))
-                  (recur))))]
+              (run-event-loop! server))]
       (locking lifecycle
         (when (= :stopped @lifecycle)
           (raise "Cannot start a stopped server; create a new server instance"
@@ -325,6 +317,7 @@
             (.submit dispatcher ^Callable init)
             (catch Throwable t
               (.set running false)
+              (.countDown ^CountDownLatch (:event-loop-stop execution))
               (reset! lifecycle :stopped)
               (resources/close-suppressing! t #(shutdown-server! server))
               (throw t)))))))
@@ -334,6 +327,7 @@
       (when-not (= :stopped @lifecycle)
         (reset! lifecycle :stopped)
         (.set running false)
+        (.countDown ^CountDownLatch (:event-loop-stop execution))
         (shutdown-server! server)))))
 
 #_{:clj-kondo/ignore [:redefined-var]}
@@ -349,7 +343,10 @@
     register-queue dispatcher work-executor sys-conn clients dbs execution]
    (Server. running port root idle-timeout server-socket selector register-queue
             dispatcher work-executor sys-conn clients dbs
-            (atom (if (.get running) :running :created)) execution)))
+            (atom (if (.get running) :running :created))
+            (assoc execution
+                   :event-loop-stop (CountDownLatch. 1)
+                   :connections (ConcurrentHashMap/newKeySet)))))
 
 (defn- shutdown-server!
   [^Server server]
@@ -365,6 +362,13 @@
                                    (vreset! failure t)))))]
     ;; A failed close must not skip the remaining resources now that the
     ;; lifecycle is terminal. Report the first failure after all cleanup.
+    ;; A closed selector has already discarded its keys. Wake all runners and
+    ;; retain socket ownership independently so terminal failure can clean up.
+    (doseq [[db-name {:keys [runner]}] (.-dbs server)
+            :when runner]
+      (cleanup! #(abort-run runner
+                           (fn [] (cleanup-abandoned-transaction!
+                                    server db-name runner)))))
     (cleanup! #(stop-ha-background-loops! server))
     (cleanup! #(.wakeup selector))
     (cleanup!
@@ -375,6 +379,14 @@
     (cleanup! #(.close ^ServerSocketChannel (.-server-socket server)))
     (cleanup! #(.close selector))
     (cleanup! #(shutdown-executor! (.-dispatcher server) "Server dispatcher"))
+    (doseq [^SocketChannel ch (:connections (.-execution server))]
+      (cleanup! #(.close ch)))
+    (.clear ^Set (:connections (.-execution server)))
+    (loop []
+      (when-let [[^SocketChannel ch] (.poll ^ConcurrentLinkedQueue
+                                          (.-register-queue server))]
+        (cleanup! #(.close ch))
+        (recur)))
     (cleanup! #(shutdown-executor! (.-work-executor server)
                                   "Server worker executor"))
     (doseq [executor (distinct (vals (select-keys (.-execution server)
@@ -1222,9 +1234,9 @@
           (vswap! state assoc :write-bf (bf/allocate-buffer size))
           (write-message skey msg))))))
 
-(defn- handle-accept
-  [^SelectionKey skey]
-  (sdisp/handle-accept skey))
+(defn- ^:redef handle-accept
+  [^Server server ^SelectionKey skey]
+  (sdisp/handle-accept skey (:connections (.-execution server))))
 
 (defn- copy-in
   "Continuously read batched data from the client"
@@ -1296,7 +1308,10 @@
 
 (defn- close-conn
   [^SelectionKey skey]
-  (.close ^SocketChannel (.channel skey)))
+  (.cancel skey)
+  (.close (.channel skey))
+  (when-let [connections (some-> skey .attachment deref :connections)]
+    (.remove ^Set connections (.channel skey))))
 
 (defn- log-ha-loop-crash!
   [loop-name db-name t]
@@ -2233,7 +2248,7 @@
       (apply println xs)
       (flush))))
 
-(defn- handle-read
+(defn- ^:redef handle-read
   [^Server server ^SelectionKey skey]
   (sdisp/handle-read dispatch-deps server skey))
 
@@ -2243,35 +2258,147 @@
         ^ConcurrentLinkedQueue queue (.-register-queue server)]
     (loop []
       (when-let [[^SocketChannel ch ops state] (.poll queue)]
-        (.register ch selector ops state)
-        (log/debug "Registered client" (@state :client-id))
+        (try
+          (.register ch selector ops state)
+          (log/debug "Registered client" (@state :client-id))
+          (catch Exception e
+            ;; copy-in cancels its old key before handing the channel back.
+            ;; Locate its runner by channel even if keyFor now returns nil.
+            (doseq [[_ {:keys [^SelectionKey runner-skey]}] (.-dbs server)
+                    :when (and runner-skey
+                               (identical? ch (.channel runner-skey)))]
+              (resources/close-suppressing!
+                e #(cleanup-connection-transactions! server runner-skey)))
+            (resources/close-suppressing! e #(.close ch))
+            (.remove ^Set (:connections (.-execution server)) ch)
+            (if (or (instance? ClosedSelectorException e)
+                    (instance? InterruptedException e))
+              (throw e)
+              (log/warn "Closing failed client registration"
+                        {:message (ex-message e)}))))
         (recur)))))
 
-(defn- remove-idle-sessions
+(defn- ^:redef remove-idle-sessions
   [^Server server]
   (sess/remove-idle-sessions session-deps server))
 
+(defn- ^:redef event-loop-backoff-ms
+  ^long [failures]
+  (min 5000 (bit-shift-left 100 (min 6 (dec (long failures))))))
+
+(defn- log-event-loop-error!
+  [phase e failures delay-ms]
+  (log/warn "Server event loop operation failed"
+            {:phase phase :message (ex-message e)
+             :consecutive-failures failures :retry-in-ms delay-ms})
+  (log/debug e "Server event loop failure" {:phase phase}))
+
+(defn- ^:redef wait-event-loop-retry!
+  [^Server server delay-ms]
+  ;; stop wakes this wait immediately, including at the maximum backoff.
+  (.await ^CountDownLatch (:event-loop-stop (.-execution server))
+          (long delay-ms) TimeUnit/MILLISECONDS))
+
+(defn- sweep-idle-sessions!
+  [server sweep-state]
+  (when (>= (System/nanoTime) (long (:next-ns @sweep-state)))
+    (let [failure (try
+                    (remove-idle-sessions server)
+                    nil
+                    (catch InterruptedException e (throw e))
+                    (catch Exception e e))
+          failures (if failure (inc (long (:failures @sweep-state))) 0)
+          delay-ms (if failure (event-loop-backoff-ms failures) 1000)]
+      (vreset! sweep-state {:failures failures
+                           :next-ns (+ (System/nanoTime) (* 1000000 delay-ms))})
+      (when failure
+        (log-event-loop-error! :idle-sessions failure failures delay-ms)))))
+
+(defn- handle-selected-keys
+  [^Server server]
+  (let [^Selector selector (.-selector server)
+        ^Iterator iter (.iterator (.selectedKeys selector))
+        accept-error (volatile! nil)]
+    (while (.hasNext iter)
+      (let [^SelectionKey skey (.next iter)]
+        ;; Remove before invoking callbacks, even if a callback throws or
+        ;; cancels the key. A bad connection must not prevent the next one.
+        (.remove iter)
+        (try
+          (when (and (.isValid skey) (.isAcceptable skey))
+            (handle-accept server skey))
+          (when (and (.isValid skey) (.isReadable skey))
+            (handle-read server skey))
+          (catch ClosedSelectorException e (throw e))
+          (catch InterruptedException e (throw e))
+          (catch Exception e
+            (if (instance? ServerSocketChannel (.channel skey))
+              ;; Keep a usable listener and back off after serving other keys.
+              (vreset! accept-error e)
+              (do
+                (resources/close-suppressing!
+                  e #(cleanup-connection-transactions! server skey))
+                (resources/close-suppressing! e #(close-conn skey))
+                (log/warn "Closing failed client event"
+                          {:message (ex-message e)})))))))
+    (when-let [e @accept-error] (throw e))))
+
 (defn- event-loop
   [^Server server]
-  (let [^Selector selector     (.-selector server)
-        ^AtomicBoolean running (.-running server)]
-    (loop []
+  (let [^Selector selector (.-selector server)
+        ^AtomicBoolean running (.-running server)
+        sweep-state (volatile! {:failures 0 :next-ns (System/nanoTime)})]
+    (loop [failures 0]
       (when (.get running)
-        (remove-idle-sessions server)
-        (handle-registration server)
-        (.select selector)
-        (when (.get running)
-          (let [^Iterator iter (-> selector (.selectedKeys) (.iterator))]
-            (loop []
-              (when (.hasNext iter)
-                (let [^SelectionKey skey (.next iter)]
-                  (when (and (.isValid skey) (.isAcceptable skey))
-                    (handle-accept skey))
-                  (when (and (.isValid skey) (.isReadable skey))
-                    (handle-read server skey)))
-                (.remove iter)
-                (recur)))))
-        (recur)))))
+        (let [failure
+              (try
+                (when (.isInterrupted (Thread/currentThread))
+                  (throw (InterruptedException. "Server event loop interrupted")))
+                (when-not (.isOpen selector) (throw (ClosedSelectorException.)))
+                (when-not (.isOpen ^ServerSocketChannel (.-server-socket server))
+                  (raise "Server listener is closed" {:error :server/listener-closed}))
+                (sweep-idle-sessions! server sweep-state)
+                (handle-registration server)
+                ;; Timed selection also runs maintenance on an idle server.
+                (.select selector
+                         (max 1 (min 1000
+                                     (inc (quot (- (long (:next-ns @sweep-state))
+                                                   (System/nanoTime))
+                                                1000000)))))
+                (when (.get running) (handle-selected-keys server))
+                nil
+                (catch Exception e
+                  (if (or (instance? ClosedSelectorException e)
+                          (instance? InterruptedException e)
+                          (not (.isOpen selector))
+                          (not (.isOpen ^ServerSocketChannel (.-server-socket server))))
+                    (throw e)
+                    e)))]
+          (if failure
+            (let [failures (inc failures)
+                  delay-ms (event-loop-backoff-ms failures)]
+              (when (.get running)
+                (log-event-loop-error! :network failure failures delay-ms)
+                (wait-event-loop-retry! server delay-ms))
+              (recur failures))
+            (recur 0)))))))
+
+(defn- run-event-loop!
+  [^Server server]
+  (try
+    (event-loop server)
+    (catch Throwable t
+      (when (.compareAndSet ^AtomicBoolean (.-running server) true false)
+        (.countDown ^CountDownLatch (:event-loop-stop (.-execution server)))
+        (log/error t "Server event loop cannot continue; shutting down")
+        ;; Cleanup must not await its own dispatcher, or take the lifecycle
+        ;; monitor while a concurrent stop holds it and awaits the dispatcher.
+        (.start (Thread.
+                  ^Runnable #(try
+                               (stop server)
+                               (catch Throwable cleanup-error
+                                 (log/error cleanup-error "Server failure cleanup failed")))
+                  (str "datalevin-server-shutdown-" (.-port server))))))))
 
 (def ^:private session-deps
   (sdeps/validate

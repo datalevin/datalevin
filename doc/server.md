@@ -102,6 +102,18 @@ Stopping or failing to start is permanent for that server instance. A later
 `create` with the same root and port after `stop` completes, then start the new
 instance. The stored databases and sessions are retained.
 
+Recoverable selector and accept failures retry in the same dispatcher task,
+with exponential backoff from 100 milliseconds to 5 seconds. A successful
+network cycle resets that delay, and `stop` wakes a pending retry immediately.
+Idle-session sweeps have their own retry schedule, so a failed session cleanup
+does not prevent socket processing or cleanup of other sessions. Failed client
+reads and registrations close the affected connection.
+
+A closed selector or listener, an interrupted event loop, or a fatal error
+stops the server and releases its resources. Cleanup runs outside the dispatcher
+so it can wait for that thread to exit. Restart requires a new server instance,
+as with an explicit `stop`.
+
 `create` accepts these execution limits:
 
 * `:worker-threads`: request worker count, default four times the CPU count,
