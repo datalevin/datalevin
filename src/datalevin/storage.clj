@@ -1539,21 +1539,21 @@
    (process-secondary-index-jobs! store nil))
   ([^Store store {:keys [max-jobs retry-due-only? reclaim-failed-running?]
                   :or {max-jobs Long/MAX_VALUE}
-                  :as opts}]
+                  :as job-opts}]
    (let [now-ms (System/currentTimeMillis)
-         owner (or (:owner opts)
+         owner (or (:owner job-opts)
                    (str (db-name store) "/" (UUID/randomUUID)))
          lease-ms (long (get (opts store)
                              :async-secondary-index-worker-lease-ms
                              c/*async-secondary-index-worker-lease-ms*))
-         retry-failed? (true? (:retry-failed? opts))
+         retry-failed? (true? (:retry-failed? job-opts))
          processable? #(claimable-secondary-index-job? now-ms
                                                        retry-failed?
                                                        retry-due-only?
                                                        reclaim-failed-running?
                                                        %)
          jobs (take (long max-jobs)
-                    (filter #(and (secondary-index-job-matches? opts %)
+                    (filter #(and (secondary-index-job-matches? job-opts %)
                                   (processable? %))
                             (secondary-index-jobs store)))
          result (volatile! {:processed-count 0
