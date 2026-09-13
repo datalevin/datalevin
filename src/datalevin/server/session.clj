@@ -43,6 +43,37 @@
   (when client-id
     (get clients client-id)))
 
+(defn- activity-checkpoint-ms
+  ^long [deps server]
+  (max 1 (min 60000 (quot (long ((:idle-timeout-fn deps) server)) 4))))
+
+(defn- persist-session!
+  [deps server client-id session]
+  (let [session (assoc session :last-active-checkpoint-until
+                       (+ (long (:last-active session))
+                          (activity-checkpoint-ms deps server)))]
+    (d/transact-kv
+      (session-lmdb ((:sys-conn-fn deps) server))
+      [(l/kv-tx :put session-dbi client-id (with-meta session nil) :uuid :data)])
+    session))
+
+(defn touch-client
+  "Record activity, checkpointing at most once per minute (or a quarter of
+  the idle timeout). Persist before accepting activity beyond the saved window."
+  [deps server client-id]
+  (when client-id
+    (.computeIfPresent
+      ^ConcurrentHashMap ((:clients-fn deps) server) client-id
+      (reify BiFunction
+        (apply [_ _ current]
+          (let [now-ms (long ((:now-ms-fn deps)))
+                session (-> current
+                            (assoc :last-active now-ms)
+                            (vary-meta dissoc ::restored?))]
+            (if (>= now-ms (long (or (:last-active-checkpoint-until current) 0)))
+              (persist-session! deps server client-id session)
+              session)))))))
+
 (defn add-client
   [deps server ip client-id username]
   (let [sys-conn ((:sys-conn-fn deps) server)
@@ -64,10 +95,7 @@
     (.compute ^ConcurrentHashMap clients client-id
               (reify BiFunction
                 (apply [_ _ _]
-                  (d/transact-kv
-                    (session-lmdb sys-conn)
-                    [(l/kv-tx :put session-dbi client-id session :uuid :data)])
-                  session)))
+                  (persist-session! deps server client-id session))))
     (log/info "Added client " client-id
               "from:" ip
               "for user:" username)))
@@ -96,18 +124,54 @@
       ^ConcurrentHashMap ((:clients-fn deps) server) client-id
       (reify BiFunction
         (apply [_ _ current]
-          (let [session (f current)]
-            (d/transact-kv
-              (session-lmdb ((:sys-conn-fn deps) server))
-              [(l/kv-tx :put session-dbi client-id session :uuid :data)])
-            session))))))
+          (persist-session! deps server client-id (f current)))))))
 
 (defn load-sessions
-  [sys-conn]
-  (let [lmdb (session-lmdb sys-conn)]
-    (d/open-dbi lmdb session-dbi)
-    (ConcurrentHashMap.
-     ^Map (into {} (d/get-range lmdb session-dbi [:all] :uuid :data)))))
+  "Restore activity windows without renewing them on each restart. Legacy
+  records have unbounded timestamp lag, so migrate them once to the current time."
+  ([sys-conn] (load-sessions sys-conn (System/currentTimeMillis)))
+  ([sys-conn now-ms]
+   (let [lmdb (session-lmdb sys-conn)]
+     (d/open-dbi lmdb session-dbi)
+     (let [sessions (d/get-range lmdb session-dbi [:all] :uuid :data)
+           migrated (into {}
+                          (keep (fn [[id session]]
+                                  (when-not (:last-active-checkpoint-until session)
+                                    [id (assoc session :last-active now-ms
+                                                       :last-active-checkpoint-until now-ms)])))
+                          sessions)]
+       (when (seq migrated)
+         (d/transact-kv lmdb
+                        (mapv (fn [[id session]]
+                                (l/kv-tx :put session-dbi id session :uuid :data))
+                              migrated)))
+       (ConcurrentHashMap.
+         ^Map (into {}
+                    (map (fn [[id session]]
+                           [id (vary-meta (get migrated id session)
+                                          assoc ::restored? true)]))
+                    sessions))))))
+
+(defn flush-sessions!
+  "Save exact activity after request workers stop. An untouched restored
+  session keeps its existing crash allowance, without extending it."
+  [deps server]
+  (let [^ConcurrentHashMap clients ((:clients-fn deps) server)]
+    (resources/close-all!
+      (for [client-id (keys clients)]
+        #(.computeIfPresent
+           clients client-id
+           (reify BiFunction
+             (apply [_ _ current]
+               (let [session (if (::restored? (meta current))
+                               current
+                               (assoc current :last-active-checkpoint-until
+                                              (:last-active current)))]
+                 (d/transact-kv
+                   (session-lmdb ((:sys-conn-fn deps) server))
+                   [(l/kv-tx :put session-dbi client-id
+                             (with-meta session nil) :uuid :data)])
+                 session))))))))
 
 (defn reopen-dbs
   [deps root clients ^ConcurrentHashMap dbs]
@@ -214,7 +278,7 @@
     (catch ClosedSelectorException _
       nil)))
 
-(defn disconnect-client*
+(defn- close-client-connections!
   [deps server client-id]
   (let [^Selector selector ((:selector-fn deps) server)]
     (doseq [^SelectionKey k (open-selector-keys selector)
@@ -222,7 +286,11 @@
             :when           state]
       (when (= client-id (@state :client-id))
         ((:cleanup-connection-transactions-fn deps) server k)
-        ((:close-conn-fn deps) k))))
+        ((:close-conn-fn deps) k)))))
+
+(defn disconnect-client*
+  [deps server client-id]
+  (close-client-connections! deps server client-id)
   (remove-client deps server client-id))
 
 (defn disconnect-user
@@ -253,16 +321,46 @@
                      #(assoc % :permissions
                              ((:user-permissions-fn deps) sys-conn uname))))))
 
+(defn- idle-session?
+  [session ^long now-ms ^long timeout]
+  (when-let [last-active (:last-active session)]
+    (let [baseline (if (::restored? (meta session))
+                     (max (long last-active)
+                          (long (or (:last-active-checkpoint-until session)
+                                    last-active)))
+                     (long last-active))]
+      (< timeout (- now-ms baseline)))))
+
 (defn remove-idle-sessions
   [deps server]
   (let [^long timeout ((:idle-timeout-fn deps) server)
         clients ((:clients-fn deps) server)
         now-ms  (long ((:now-ms-fn deps)))]
-    (doseq [[client-id session] clients
-            :let                [{:keys [last-active]} session]]
-      (if last-active
-        (when (< timeout (- now-ms ^long last-active))
-          (disconnect-client* deps server client-id))
-        ;; migrate old sessions that don't have last-active
-        (update-client deps server client-id
-                       #(assoc % :last-active now-ms))))))
+    (doseq [[client-id snapshot] clients
+            ;; Do not make the selector wait on persistence for active sessions.
+            :when (or (nil? (:last-active snapshot))
+                      (idle-session? snapshot now-ms timeout))]
+      (let [expired? (volatile! false)]
+        ;; Recheck under the same per-session lock as touches and persistence.
+        ;; A snapshot taken before a request must not delete its fresh activity.
+        (.computeIfPresent
+          ^ConcurrentHashMap clients client-id
+          (reify BiFunction
+            (apply [_ _ session]
+              (cond
+                (nil? (:last-active session))
+                (persist-session! deps server client-id
+                                  (assoc session :last-active now-ms))
+
+                (idle-session? session now-ms timeout)
+                (do
+                  (d/transact-kv
+                    (session-lmdb ((:sys-conn-fn deps) server))
+                    [(l/kv-tx :del session-dbi client-id :uuid)])
+                  (vreset! expired? true)
+                  nil)
+
+                :else session))))
+        (when @expired?
+          (close-client-connections! deps server client-id)
+          (log/info "Removed idle client:" client-id))))))

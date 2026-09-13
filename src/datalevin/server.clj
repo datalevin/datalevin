@@ -383,6 +383,7 @@
       (cleanup! #(shutdown-executor! executor "Server routing/runner executor")))
     (doseq [db-name (keys (.-dbs server))]
       (cleanup! #(remove-store server db-name)))
+    (cleanup! #(sess/flush-sessions! session-deps server))
     (cleanup! #(d/close (.-sys-conn server)))
     (if-let [t @failure]
       (throw t)
@@ -390,6 +391,9 @@
 
 (defn- get-client [^Server server client-id]
   (sess/get-client (.-clients server) client-id))
+
+(defn- touch-client [server client-id]
+  (sess/touch-client session-deps server client-id))
 
 (defn- remove-client
   [^Server server client-id]
@@ -2324,7 +2328,7 @@
      :new-message-fn #'new-message
      :write-message-fn #'write-message
      :update-db-fn #'update-db
-     :clients-fn #'server-clients
+     :touch-client-fn #'touch-client
      :with-db-runtime-read-access-fn #'with-db-runtime-read-access}
     {:strict? true}))
 

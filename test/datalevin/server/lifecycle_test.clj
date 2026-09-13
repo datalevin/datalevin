@@ -6,6 +6,7 @@
    [datalevin.ha.control :as control]
    [datalevin.server :as server]
    [datalevin.server.ha :as ha]
+   [datalevin.server.session :as session]
    [datalevin.test.core :refer [allocate-port db-fixture]]
    [datalevin.util :as u])
   (:import
@@ -87,6 +88,47 @@
       (let [replacement (server/create opts)]
         (server/stop replacement)
         (assert-stopped replacement))
+      (finally
+        (server/stop srv)
+        (u/delete-files root)))))
+
+(deftest stop-flushes-request-activity-before-restarting-test
+  (let [root (u/tmp-dir (str "server-session-restart-" (UUID/randomUUID)))
+        port (allocate-port)
+        opts {:root root :port port :idle-timeout 1000}
+        uri (str "dtlv://datalevin:datalevin@localhost:" port)
+        clock (atom 1)
+        ^Server srv (server/create opts)]
+    (try
+      (with-redefs-fn
+        {#'server/deps-now-ms #(deref clock)}
+        (fn []
+          (server/start srv)
+          (let [c (client/new-client uri {:pool-size 1})]
+            (try
+              (let [id (first (keys (.-clients srv)))
+                    lmdb (session/session-lmdb (.-sys-conn srv))]
+                (doseq [now-ms [200 1001 1200]]
+                  (reset! clock now-ms)
+                  (is (= [] (client/list-databases c))))
+                (is (= 1001 (:last-active (d/get-value lmdb session/session-dbi
+                                                       id :uuid :data))))
+                (is (= 1200 (:last-active (get (.-clients srv) id))))
+                (server/stop srv)
+                (reset! clock 2002)
+                (let [^Server replacement (server/create opts)]
+                  (try
+                    (server/start replacement)
+                    ;; A real request ensures the first idle sweep has run.
+                    (let [probe (client/new-client uri {:pool-size 1})]
+                      (try
+                        (is (= [] (client/list-databases probe)))
+                        (is (= 1200 (:last-active (get (.-clients replacement) id))))
+                        (is (= 1200 (:last-active-checkpoint-until
+                                     (get (.-clients replacement) id))))
+                        (finally (client/close-pool (client/get-pool probe)))))
+                    (finally (server/stop replacement)))))
+              (finally (client/close-pool (client/get-pool c)))))))
       (finally
         (server/stop srv)
         (u/delete-files root)))))

@@ -25,15 +25,14 @@
    [java.nio ByteBuffer]
    [java.nio.channels ClosedChannelException SelectionKey SocketChannel
     ServerSocketChannel]
-   [java.util.concurrent ConcurrentHashMap Executor RejectedExecutionException]
-   [java.util.function BiFunction]))
+   [java.util.concurrent Executor RejectedExecutionException]))
 
 (def dispatch-deps-contract
   "Callbacks (and the handler table) `datalevin.server` must inject for
   message dispatch."
   {:callbacks
    #{:cleanup-connection-transactions-fn :cleanup-rejected-close-transact!-fn
-     :clients-fn :close-conn-fn :dbs-fn :get-kv-store-fn
+     :touch-client-fn :close-conn-fn :dbs-fn :get-kv-store-fn
      :ha-write-commit-check-fn-fn :ha-write-commit-publish-fn-fn
      :new-message-fn :trace-remote-tx-fn :update-db-fn
      :with-db-runtime-read-access-fn :with-ha-write-admission-fn
@@ -366,12 +365,7 @@
   [deps server ^SelectionKey skey]
   (let [{:keys [client-id]} @(.attachment skey)]
     (when client-id
-      ;; Avoid durable session writes on every request; this path is hot.
-      (.computeIfPresent
-        ^ConcurrentHashMap ((:clients-fn deps) server) client-id
-        (reify BiFunction
-          (apply [_ _ session]
-            (assoc session :last-active (System/currentTimeMillis))))))))
+      ((:touch-client-fn deps) server client-id))))
 
 (defn- read-message
   [deps server ^SelectionKey skey fmt msg]

@@ -451,6 +451,17 @@ The returned map includes `:replica/read-only?`, `:replica/source`,
 CLI option `--idle-timeout` (default `172800000` ms, i.e. 48 hours) controls
 when inactive sessions are disconnected to reclaim resources.
 
+Activity is checkpointed on requests at intervals of at most one minute, or
+one quarter of the idle timeout for shorter timeouts (minimum 1 ms). Ordinary
+requests within that window update only memory. Graceful shutdown saves the
+latest activity timestamp after request workers finish.
+
+After a crash, restored sessions receive only the saved checkpoint window as
+an allowance for activity that may not have reached disk. Server downtime
+counts toward expiry, and repeated restarts do not renew this allowance. Once
+a client sends another request, normal idle tracking resumes. Sessions saved
+by older versions receive a one-time fresh idle baseline during migration.
+
 ```console
 dtlv serv -r /data/dtlv --idle-timeout 3600000
 ```
