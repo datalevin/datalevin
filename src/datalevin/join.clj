@@ -564,9 +564,10 @@
                                 dense-composition-roaring-min-domain)]
             (when (and (not (aget unresolved-projection 0))
                        (pos? domain-size)
-                       (pos? anchor-count)
-                       (>= candidate-pairs dense-composition-min-candidates)
-                       (>= candidate-pairs
+                       (pos? (long anchor-count))
+                       (>= (long candidate-pairs)
+                           dense-composition-min-candidates)
+                       (>= (long candidate-pairs)
                            (* dense-composition-min-fanout input-size))
                        (<= bitset-bytes dense-composition-max-bitset-bytes))
               (let [adjacency (build-dense-adjacency
