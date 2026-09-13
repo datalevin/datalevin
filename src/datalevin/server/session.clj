@@ -20,6 +20,16 @@
 
 (def session-dbi "datalevin-server/sessions")
 
+(def session-deps-contract
+  "Callbacks `datalevin.server` must inject for session bookkeeping."
+  {:callbacks
+   #{:cleanup-connection-transactions-fn :clients-fn :close-conn-fn
+     :close-store-fn :consensus-ha-opts-fn :current-runtime-opts-fn
+     :ensure-ha-runtime-fn :get-ip-fn :idle-timeout-fn :new-runtime-db-fn
+     :now-ms-fn :open-store-fn :password-matches?-fn :perm-tgt-name-fn
+     :pull-user-fn :resolved-runtime-opts-fn :selector-fn :sys-conn-fn
+     :user-eid-fn :user-permissions-fn :user-roles-fn}})
+
 (defn session-lmdb
   [sys-conn]
   (let [db ^datalevin.db.DB (d/db sys-conn)]

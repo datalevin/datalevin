@@ -28,6 +28,10 @@
    [datalevin.storage Store]
    [datalevin.interface ILMDB IStore]))
 
+(def copy-deps-contract
+  "Callbacks `datalevin.server` must inject for client/server copy."
+  {:callbacks #{:register-queue-fn :write-message-fn}})
+
 (defn cleanup-copy-tmp-dir*
   [tf]
   (u/delete-files tf))

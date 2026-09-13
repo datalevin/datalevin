@@ -18,6 +18,7 @@
    [datalevin.interface :as i]
    [datalevin.ha.replication :as drep]
    [datalevin.ha.util :as hu]
+   [datalevin.server.deps :as sdeps]
    [datalevin.util :as u :refer [raise]]
    [taoensso.timbre :as log])
   (:import
@@ -26,6 +27,24 @@
     Semaphore TimeUnit]
    [java.util.concurrent.atomic AtomicBoolean]
    [datalevin.storage Store]))
+
+(def ha-deps-contract
+  "Callbacks (and shared data) `datalevin.server` must inject for HA
+  runtime management."
+  {:callbacks
+   #{:await-ha-loop-stop-fn :consensus-ha-opts-fn :current-runtime-opts-fn
+     :db-write-admission-lock-fn :dbs-fn :ensure-udf-readiness-state-fn
+     :get-kv-store-fn :get-lock-fn :ha-follower-loop-sleep-ms-fn
+     :ha-follower-sync-step-fn :ha-loop-error-backoff-fn :ha-loop-sleep-ms-fn
+     :ha-renew-step-fn :halt-run-fn :log-ha-loop-crash!-fn
+     :persist-ha-follower-side-effects!-fn :replace-db-state-if-current-fn
+     :running-fn :sleep-ha-loop-fn :start-ha-authority-fn
+     :stop-ha-authority-fn :stop-ha-follower-sync-loop-fn
+     :stop-ha-renew-loop-fn :transform-db-state-when-fn
+     :udf-write-admission-error-fn :update-db-fn
+     :with-db-runtime-store-read-access-fn :with-db-runtime-store-swap-fn
+     :work-executor-fn}
+   :values {:udf-admission-exempt-write-types set?}})
 
 (def missing-state-value
   (Object.))
@@ -969,7 +988,8 @@
         m       m0]
     (or (and write?
              db-name
-             (not (contains? (:udf-admission-exempt-write-types deps)
+             (not (contains? (sdeps/value deps
+                                          :udf-admission-exempt-write-types)
                              (:type message)))
              ((:udf-write-admission-error-fn deps) db-name m))
         (dha/ha-write-admission-error ((:dbs-fn deps) server) message))))

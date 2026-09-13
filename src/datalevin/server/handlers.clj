@@ -45,6 +45,25 @@
 (def ^:private client-op-await-timeout-ms 30000)
 (def ^:private client-op-completed-retain-ms 60000)
 
+(def handler-deps-contract
+  "Every callback `datalevin.server` must inject for the handlers in this
+  namespace. Validated when the server dependency map is built."
+  {:callbacks
+   #{:add-store :apply-assoc-opt! :apply-assoc-opts! :authenticate
+     :cleanup-copy-tmp-dir! :client-display :clients
+     :close-server-copied-store! :copy-in :copy-out :copy-response-meta
+     :copy-server-file-out! :current-runtime-opts :db-dir :db-exists?
+     :db-in-use? :db-state :db-store :dbs :detach-client-store!
+     :disconnect-client* :disconnect-user :get-client :get-db :get-kv-store
+     :get-lock :get-store :halt-run :in-use-dbs :lmdb :new-runtime-db
+     :open-server-copied-store! :open-server-store :open-write-txn-with-retry
+     :remove-client :remove-store :root :run-calls :search-engine
+     :search-engine* :server-copy-store! :store :store->db-name :store-closed?
+     :sync-copy-response-store! :sys-conn :unpin-server-copy-backup-floor!
+     :update-cached-permission :update-cached-role :update-client :update-db
+     :vector-index :with-db-runtime-store-read-access :write-message
+     :write-txn-runner}})
+
 (defn- skey-state
   ^clojure.lang.Volatile [^SelectionKey skey]
   (.attachment skey))

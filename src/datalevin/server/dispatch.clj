@@ -17,6 +17,7 @@
    [datalevin.ha :as dha]
    [datalevin.kv.txlog :as kvtx]
    [datalevin.protocol :as p]
+   [datalevin.server.deps :as sdeps]
    [datalevin.txlog :as txlog]
    [datalevin.util :as u :refer [raise]]
    [taoensso.timbre :as log])
@@ -25,6 +26,18 @@
    [java.nio.channels ClosedChannelException SelectionKey SocketChannel
     ServerSocketChannel]
    [java.util.concurrent Executor]))
+
+(def dispatch-deps-contract
+  "Callbacks (and the handler table) `datalevin.server` must inject for
+  message dispatch."
+  {:callbacks
+   #{:cleanup-connection-transactions-fn :cleanup-rejected-close-transact!-fn
+     :clients-fn :close-conn-fn :dbs-fn :get-client-fn :get-kv-store-fn
+     :ha-write-commit-check-fn-fn :ha-write-commit-publish-fn-fn
+     :new-message-fn :trace-remote-tx-fn :update-db-fn
+     :with-db-runtime-read-access-fn :with-ha-write-admission-fn
+     :work-executor-fn :write-message-fn}
+   :values {:message-handler-map map?}})
 
 (def ^:private ha-abort-cleanup-types
   #{:abort-transact
@@ -301,7 +314,8 @@
 
 (defn dispatch-message
   [deps server ^SelectionKey skey message]
-  (if-let [handler (get (:message-handler-map deps) (:type message))]
+  (if-let [handler (get (sdeps/value deps :message-handler-map)
+                        (:type message))]
     (handler server skey message)
     (error-response skey
                     (str "Unknown message type " (:type message))

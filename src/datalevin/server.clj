@@ -26,6 +26,7 @@
    [datalevin.ha.replication :as drep]
    [datalevin.server.auth :as auth]
    [datalevin.server.copy :as scopy]
+   [datalevin.server.deps :as sdeps]
    [datalevin.server.dispatch :as sdisp]
    [datalevin.server.handlers :as sh]
    [datalevin.server.ha :as sha]
@@ -1967,63 +1968,95 @@
     (abort-run runner
                #(cleanup-abandoned-transaction! server db-name runner))))
 
+;; Named accessors and late-bound wrappers backing the dependency maps
+;; below. Naming them (instead of using inline closures or captured
+;; function values) lets every entry be a Var, so redefining an
+;; underlying function is observed through the map at call time.
+(defn- server-dbs [^Server server] (.-dbs server))
+(defn- server-root [^Server server] (.-root server))
+(defn- server-sys-conn [^Server server] (.-sys-conn server))
+(defn- server-clients [^Server server] (.-clients server))
+(defn- server-selector [^Server server] (.-selector server))
+(defn- server-idle-timeout [^Server server] (.-idle-timeout server))
+(defn- server-work-executor [^Server server] (.-work-executor server))
+(defn- server-register-queue [^Server server] (.-register-queue server))
+(defn- server-running [^Server server] (.-running server))
+(defn- server-db-state [^Server server db-name]
+  (get (.-dbs server) db-name))
+
+(defn- deps-consensus-ha-opts [store] (*consensus-ha-opts-fn* store))
+(defn- deps-ensure-udf-readiness-state [m]
+  (*ensure-udf-readiness-state-fn* m))
+(defn- deps-start-ha-authority [db-name ha-opts]
+  (*start-ha-authority-fn* db-name ha-opts))
+(defn- deps-stop-ha-authority [db-name m] (*stop-ha-authority-fn* db-name m))
+(defn- deps-stop-ha-renew-loop [m] (*stop-ha-renew-loop-fn* m))
+(defn- deps-stop-ha-follower-sync-loop [m]
+  (*stop-ha-follower-sync-loop-fn* m))
+(defn- deps-ensure-ha-runtime [root db-name m store]
+  (ensure-ha-runtime root db-name m store))
+(defn- deps-now-ms [] (System/currentTimeMillis))
+
 (def ^:private handler-deps
-  {:add-store add-store
-   :apply-assoc-opt! apply-assoc-opt!
-   :apply-assoc-opts! apply-assoc-opts!
-   :authenticate authenticate
-   :cleanup-copy-tmp-dir! cleanup-copy-tmp-dir!
-   :client-display client-display
-   :close-server-copied-store! #'close-server-copied-store!
-   :copy-in copy-in
-   :copy-out copy-out
-   :copy-response-meta copy-response-meta
-   :copy-server-file-out! #'copy-server-file-out!
-   :current-runtime-opts current-runtime-opts
-   :db-dir db-dir
-   :db-exists? db-exists?
-   :db-in-use? db-in-use?
-   :db-state (fn [^Server server db-name]
-               (get (.-dbs server) db-name))
-   :db-store db-store
-   :dbs (fn [^Server server] (.-dbs server))
-   :detach-client-store! detach-client-store!
-   :disconnect-client* disconnect-client*
-   :disconnect-user disconnect-user
-   :get-client get-client
-   :get-db get-db
-   :get-kv-store get-kv-store
-   :get-lock get-lock
-   :get-store get-store
-   :halt-run halt-run
-   :in-use-dbs in-use-dbs
-   :lmdb lmdb
-   :new-runtime-db new-runtime-db
-   :open-server-copied-store! #'open-server-copied-store!
-   :open-server-store open-server-store
-   :open-write-txn-with-retry open-write-txn-with-retry
-   :remove-client remove-client
-   :remove-store remove-store
-   :root (fn [^Server server] (.-root server))
-   :run-calls run-calls
-   :search-engine search-engine
-   :search-engine* search-engine*
-   :server-copy-store! #'server-copy-store!
-   :store store
-   :store->db-name store->db-name
-   :sync-copy-response-store! sync-copy-response-store!
-   :store-closed? store-closed?
-   :sys-conn (fn [^Server server] (.-sys-conn server))
-   :unpin-server-copy-backup-floor! #'unpin-server-copy-backup-floor!
-   :update-cached-permission update-cached-permission
-   :update-cached-role update-cached-role
-   :update-client update-client
-   :update-db update-db
-   :vector-index vector-index
-   :with-db-runtime-store-read-access with-db-runtime-store-read-access
-   :write-message write-message
-   :write-txn-runner write-txn-runner
-   :clients (fn [^Server server] (.-clients server))})
+  (sdeps/validate
+    ::handler-deps
+    sh/handler-deps-contract
+    {:add-store #'add-store
+     :apply-assoc-opt! #'apply-assoc-opt!
+     :apply-assoc-opts! #'apply-assoc-opts!
+     :authenticate #'authenticate
+     :cleanup-copy-tmp-dir! #'cleanup-copy-tmp-dir!
+     :client-display #'client-display
+     :close-server-copied-store! #'close-server-copied-store!
+     :copy-in #'copy-in
+     :copy-out #'copy-out
+     :copy-response-meta #'copy-response-meta
+     :copy-server-file-out! #'copy-server-file-out!
+     :current-runtime-opts #'current-runtime-opts
+     :db-dir #'db-dir
+     :db-exists? #'db-exists?
+     :db-in-use? #'db-in-use?
+     :db-state #'server-db-state
+     :db-store #'db-store
+     :dbs #'server-dbs
+     :detach-client-store! #'detach-client-store!
+     :disconnect-client* #'disconnect-client*
+     :disconnect-user #'disconnect-user
+     :get-client #'get-client
+     :get-db #'get-db
+     :get-kv-store #'get-kv-store
+     :get-lock #'get-lock
+     :get-store #'get-store
+     :halt-run #'halt-run
+     :in-use-dbs #'in-use-dbs
+     :lmdb #'lmdb
+     :new-runtime-db #'new-runtime-db
+     :open-server-copied-store! #'open-server-copied-store!
+     :open-server-store #'open-server-store
+     :open-write-txn-with-retry #'open-write-txn-with-retry
+     :remove-client #'remove-client
+     :remove-store #'remove-store
+     :root #'server-root
+     :run-calls #'run-calls
+     :search-engine #'search-engine
+     :search-engine* #'search-engine*
+     :server-copy-store! #'server-copy-store!
+     :store #'store
+     :store->db-name #'store->db-name
+     :sync-copy-response-store! #'sync-copy-response-store!
+     :store-closed? #'store-closed?
+     :sys-conn #'server-sys-conn
+     :unpin-server-copy-backup-floor! #'unpin-server-copy-backup-floor!
+     :update-cached-permission #'update-cached-permission
+     :update-cached-role #'update-cached-role
+     :update-client #'update-client
+     :update-db #'update-db
+     :vector-index #'vector-index
+     :with-db-runtime-store-read-access #'with-db-runtime-store-read-access
+     :write-message #'write-message
+     :write-txn-runner #'write-txn-runner
+     :clients #'server-clients}
+    {:strict? true}))
 
 (defn- native-request-reader
   [^Server server ^SelectionKey skey {:keys [args writing?] :as message}]
@@ -2133,84 +2166,98 @@
         (recur)))))
 
 (def ^:private session-deps
-  {:sys-conn-fn (fn [^Server server] (.-sys-conn server))
-   :clients-fn (fn [^Server server] (.-clients server))
-   :selector-fn (fn [^Server server] (.-selector server))
-   :user-roles-fn user-roles
-   :user-permissions-fn user-permissions
-   :user-eid-fn user-eid
-   :perm-tgt-name-fn perm-tgt-name
-   :open-store-fn open-store
-   :close-store-fn close-store
-   :consensus-ha-opts-fn (fn [store] (*consensus-ha-opts-fn* store))
-   :resolved-runtime-opts-fn resolved-runtime-opts
-   :ensure-ha-runtime-fn (fn [root db-name m store]
-                           (ensure-ha-runtime root db-name m store))
-   :new-runtime-db-fn new-runtime-db
-   :current-runtime-opts-fn current-runtime-opts
-   :pull-user-fn pull-user
-   :password-matches?-fn password-matches?
-   :get-ip-fn get-ip
-   :close-conn-fn close-conn
-   :cleanup-connection-transactions-fn cleanup-connection-transactions!
-   :idle-timeout-fn (fn [^Server server] (.-idle-timeout server))
-   :now-ms-fn (fn [] (System/currentTimeMillis))})
+  (sdeps/validate
+    ::session-deps
+    sess/session-deps-contract
+    {:sys-conn-fn #'server-sys-conn
+     :clients-fn #'server-clients
+     :selector-fn #'server-selector
+     :user-roles-fn #'user-roles
+     :user-permissions-fn #'user-permissions
+     :user-eid-fn #'user-eid
+     :perm-tgt-name-fn #'perm-tgt-name
+     :open-store-fn #'open-store
+     :close-store-fn #'close-store
+     :consensus-ha-opts-fn #'deps-consensus-ha-opts
+     :resolved-runtime-opts-fn #'resolved-runtime-opts
+     :ensure-ha-runtime-fn #'deps-ensure-ha-runtime
+     :new-runtime-db-fn #'new-runtime-db
+     :current-runtime-opts-fn #'current-runtime-opts
+     :pull-user-fn #'pull-user
+     :password-matches?-fn #'password-matches?
+     :get-ip-fn #'get-ip
+     :close-conn-fn #'close-conn
+     :cleanup-connection-transactions-fn #'cleanup-connection-transactions!
+     :idle-timeout-fn #'server-idle-timeout
+     :now-ms-fn #'deps-now-ms}
+    {:strict? true}))
 
 (def ^:private copy-deps
-  {:register-queue-fn (fn [^Server server] (.-register-queue server))
-   :write-message-fn write-message})
+  (sdeps/validate
+    ::copy-deps
+    scopy/copy-deps-contract
+    {:register-queue-fn #'server-register-queue
+     :write-message-fn #'write-message}
+    {:strict? true}))
 
 (def ^:private dispatch-deps
-  {:close-conn-fn close-conn
-   :cleanup-connection-transactions-fn cleanup-connection-transactions!
-   :dbs-fn (fn [^Server server] (.-dbs server))
-   :with-ha-write-admission-fn with-ha-write-admission
-   :ha-write-commit-check-fn-fn ha-write-commit-check-fn
-   :ha-write-commit-publish-fn-fn ha-write-commit-publish-fn
-   :cleanup-rejected-close-transact!-fn cleanup-rejected-close-transact!
-   :message-handler-map message-handler-map
-   :work-executor-fn (fn [^Server server] (.-work-executor server))
-   :trace-remote-tx-fn trace-remote-tx!
-   :get-kv-store-fn get-kv-store
-   :new-message-fn new-message
-   :write-message-fn write-message
-   :update-db-fn update-db
-   :get-client-fn get-client
-   :clients-fn (fn [^Server server] (.-clients server))
-   :with-db-runtime-read-access-fn with-db-runtime-read-access})
+  (sdeps/validate
+    ::dispatch-deps
+    sdisp/dispatch-deps-contract
+    {:close-conn-fn #'close-conn
+     :cleanup-connection-transactions-fn #'cleanup-connection-transactions!
+     :dbs-fn #'server-dbs
+     :with-ha-write-admission-fn #'with-ha-write-admission
+     :ha-write-commit-check-fn-fn #'ha-write-commit-check-fn
+     :ha-write-commit-publish-fn-fn #'ha-write-commit-publish-fn
+     :cleanup-rejected-close-transact!-fn #'cleanup-rejected-close-transact!
+     :message-handler-map #'message-handler-map
+     :work-executor-fn #'server-work-executor
+     :trace-remote-tx-fn #'trace-remote-tx!
+     :get-kv-store-fn #'get-kv-store
+     :new-message-fn #'new-message
+     :write-message-fn #'write-message
+     :update-db-fn #'update-db
+     :get-client-fn #'get-client
+     :clients-fn #'server-clients
+     :with-db-runtime-read-access-fn #'with-db-runtime-read-access}
+    {:strict? true}))
 
 (def ^:private ha-deps
-  {:get-lock-fn get-lock
-   :db-write-admission-lock-fn db-write-admission-lock
-   :dbs-fn (fn [^Server server] (.-dbs server))
-   :replace-db-state-if-current-fn replace-db-state-if-current
-   :transform-db-state-when-fn transform-db-state-when
-   :with-db-runtime-store-read-access-fn with-db-runtime-store-read-access
-   :with-db-runtime-store-swap-fn with-db-runtime-store-swap
-   :ha-renew-step-fn ha-renew-step
-   :ha-follower-sync-step-fn ha-follower-sync-step
-   :persist-ha-follower-side-effects!-fn persist-ha-follower-side-effects!
-   :running-fn (fn [^Server server] (.-running server))
-   :work-executor-fn (fn [^Server server] (.-work-executor server))
-   :update-db-fn update-db
-   :current-runtime-opts-fn current-runtime-opts
-   :stop-ha-renew-loop-fn (fn [m] (*stop-ha-renew-loop-fn* m))
-   :stop-ha-follower-sync-loop-fn (fn [m] (*stop-ha-follower-sync-loop-fn* m))
-   :await-ha-loop-stop-fn await-ha-loop-stop
-   :stop-ha-authority-fn (fn [db-name m] (*stop-ha-authority-fn* db-name m))
-   :start-ha-authority-fn (fn [db-name ha-opts]
-                            (*start-ha-authority-fn* db-name ha-opts))
-   :consensus-ha-opts-fn (fn [store] (*consensus-ha-opts-fn* store))
-   :ensure-udf-readiness-state-fn (fn [m] (*ensure-udf-readiness-state-fn* m))
-   :udf-admission-exempt-write-types udf-admission-exempt-write-types
-   :udf-write-admission-error-fn udf-write-admission-error
-   :get-kv-store-fn get-kv-store
-   :halt-run-fn halt-run
-   :log-ha-loop-crash!-fn log-ha-loop-crash!
-   :sleep-ha-loop-fn sleep-ha-loop!
-   :ha-loop-sleep-ms-fn ha-loop-sleep-ms
-   :ha-follower-loop-sleep-ms-fn ha-follower-loop-sleep-ms
-   :ha-loop-error-backoff-fn ha-loop-error-backoff!})
+  (sdeps/validate
+    ::ha-deps
+    sha/ha-deps-contract
+    {:get-lock-fn #'get-lock
+     :db-write-admission-lock-fn #'db-write-admission-lock
+     :dbs-fn #'server-dbs
+     :replace-db-state-if-current-fn #'replace-db-state-if-current
+     :transform-db-state-when-fn #'transform-db-state-when
+     :with-db-runtime-store-read-access-fn #'with-db-runtime-store-read-access
+     :with-db-runtime-store-swap-fn #'with-db-runtime-store-swap
+     :ha-renew-step-fn #'ha-renew-step
+     :ha-follower-sync-step-fn #'ha-follower-sync-step
+     :persist-ha-follower-side-effects!-fn #'persist-ha-follower-side-effects!
+     :running-fn #'server-running
+     :work-executor-fn #'server-work-executor
+     :update-db-fn #'update-db
+     :current-runtime-opts-fn #'current-runtime-opts
+     :stop-ha-renew-loop-fn #'deps-stop-ha-renew-loop
+     :stop-ha-follower-sync-loop-fn #'deps-stop-ha-follower-sync-loop
+     :await-ha-loop-stop-fn #'await-ha-loop-stop
+     :stop-ha-authority-fn #'deps-stop-ha-authority
+     :start-ha-authority-fn #'deps-start-ha-authority
+     :consensus-ha-opts-fn #'deps-consensus-ha-opts
+     :ensure-udf-readiness-state-fn #'deps-ensure-udf-readiness-state
+     :udf-admission-exempt-write-types #'udf-admission-exempt-write-types
+     :udf-write-admission-error-fn #'udf-write-admission-error
+     :get-kv-store-fn #'get-kv-store
+     :halt-run-fn #'halt-run
+     :log-ha-loop-crash!-fn #'log-ha-loop-crash!
+     :sleep-ha-loop-fn #'sleep-ha-loop!
+     :ha-loop-sleep-ms-fn #'ha-loop-sleep-ms
+     :ha-follower-loop-sleep-ms-fn #'ha-follower-loop-sleep-ms
+     :ha-loop-error-backoff-fn #'ha-loop-error-backoff!}
+    {:strict? true}))
 
 (defn create
   "Create a Datalevin server. Initially not running, call `start` to run."
