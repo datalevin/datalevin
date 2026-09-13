@@ -28,10 +28,29 @@ public class Dbi {
     }
 
     /**
+     * Open a DBI inside a caller-owned transaction. The caller is responsible
+     * for committing or aborting the transaction; aborting also rolls back the
+     * named-database catalog entry created here.
+     */
+    public Dbi(Txn txn, String name, int flags) {
+        this.name = name;
+        this.ptr = new IntPointer(1);
+        Util.checkRc(DTLV.mdb_dbi_open(txn.get(), name, flags, ptr));
+        handle = (int) ptr.get();
+    }
+
+    /**
      * Factory method to create an instance
      */
     public static Dbi create(Env env, String name, int flags) {
         return new Dbi(env, name, flags);
+    }
+
+    /**
+     * Factory method to open a DBI within an existing transaction
+     */
+    public static Dbi open(Txn txn, String name, int flags) {
+        return new Dbi(txn, name, flags);
     }
 
     /**

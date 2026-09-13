@@ -108,21 +108,27 @@
     (write-message skey {:type :command-complete})))
 
 (defn new-vector-index
-  [{:keys [get-store update-client update-db write-message
+  [{:keys [db-state get-store update-client update-db write-message
            with-index-write-admission]}
    server skey client-id {:keys [args] :as message}]
-  (let [[db-name opts] args
-        index          (if-let [store (get-store server db-name)]
-                         (or (v/open-vector-index store opts)
-                             (with-index-write-admission
-                               server message
-                               #(v/new-vector-index store opts)))
-                         (raise "vector store not found"
-                                  {:type :reopen
-                                   :db-name db-name
-                                   :db-type "kv"}))]
+  (let [[db-name opts] args]
+    (if-let [store (get-store server db-name)]
+      ;; Dispatch holds runtime read access, keeping this store stable. Serialize
+      ;; the shared-state check, initialization, and publication across clients:
+      ;; reloading a live index can discard vectors whose checkpoint is pending.
+      (locking store
+        (let [index (:index (db-state server db-name))]
+          (when (or (nil? index) (i/vec-closed? index))
+            (let [index (or (v/open-vector-index store opts)
+                            (with-index-write-admission
+                              server message
+                              #(v/new-vector-index store opts)))]
+              (update-db server db-name #(assoc % :index index))))))
+      (raise "vector store not found"
+               {:type :reopen
+                :db-name db-name
+                :db-type "kv"}))
     (update-client server client-id #(update % :indices conj db-name))
-    (update-db server db-name #(assoc % :index index))
     (write-message skey {:type :command-complete})))
 
 (defn vector-call

@@ -663,7 +663,35 @@
                 vp       (buffer/new-bufval val-size)
                 kc       (bf/allocate-buffer key-size)
                 vc       (bf/allocate-buffer val-size)
-                dbi      (Dbi/create env dbi-name (buffer/kv-flags flags))
+                dbi      (if (and (not raw?) (not= existing-opts opts))
+                           ;; Create the native DBI and persist its metadata in
+                           ;; one write transaction, so the HA commit guard
+                           ;; fences the catalog change and a rejection rolls
+                           ;; the DBI back out of the environment instead of
+                           ;; leaking a native handle.
+                           (do
+                             (.open-transact-kv this)
+                             (let [native-dbi (Dbi/open (.-txn @write-txn)
+                                                        dbi-name
+                                                        (buffer/kv-flags flags))]
+                               (try
+                                 (transact-kv
+                                   this [(l/kv-tx :put c/kv-info
+                                                  [:dbis dbi-name] opts
+                                                  [:keyword :string])])
+                                 (let [status (.close-transact-kv this)]
+                                   (when-not (= :committed status)
+                                     (raise
+                                       "DBI creation transaction did not commit"
+                                       {:dbi dbi-name :status status}))
+                                   native-dbi)
+                                 (catch Throwable e
+                                   (when (some? @write-txn)
+                                     (.abort-transact-kv this)
+                                     (.close-transact-kv this))
+                                   (.close native-dbi)
+                                   (throw e)))))
+                           (Dbi/create env dbi-name (buffer/kv-flags flags)))
                 db       (buffer/->DBI this (when-not raw? k-comp)
                                (when-not (or raw? dupfixed?) v-comp)
                                dbi (buffer/new-pools) kp vp kc vc
@@ -673,12 +701,9 @@
                                (and validate-data?
                                     (not (or (:key-type opts) (:value-type opts))))
                                nil nil)]
-            (when (not= dbi-name c/kv-info)
-              (when (not= existing-opts opts)
-                (vswap! info assoc-in [:dbis dbi-name] opts)
-                (transact-kv
-                  this [(l/kv-tx :put c/kv-info [:dbis dbi-name] opts
-                                 [:keyword :string])])))
+            (when (and (not raw?) (not= existing-opts opts))
+              ;; Publish cached metadata only after the guarded commit.
+              (vswap! info assoc-in [:dbis dbi-name] opts))
             (when (or (:key-type opts) (:value-type opts))
               (vswap! info update :custom-dbis (fnil conj #{}) dbi-name))
             (.put dbis dbi-name db)
