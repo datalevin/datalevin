@@ -861,7 +861,7 @@
       parsed-q inputs plan
       {:scanned-by    :work
        :done?         (fn [rows _frontier window-end]
-                        (<= window-end (long (count rows))))
+                        (<= (long window-end) (long (count rows))))
        :finish        (fn [rows] (result-window rows limit offset))
        :retry-empty?  true
        :empty-window? true})))
