@@ -1196,11 +1196,11 @@
    (let [timeout-ms (long (command-operation-timeout-ms
                            operation-timeout-ms
                            timeout-ms))
-         deadline   (long (unchecked-add (control-now-ms)
+         deadline   (long (unchecked-add (long (control-now-ms))
                                          timeout-ms))]
      (loop [attempt 0]
        (let [remaining (long (unchecked-subtract deadline
-                                                 (control-now-ms)))
+                                                 (long (control-now-ms))))
              ^Node node (running-node! authority)]
          (if (<= remaining 0)
            (raise "HA control readIndex timed out"
@@ -1743,9 +1743,9 @@
   (replace-voters! [this voters]
     (ensure-running! running-v)
     (let [peer-ids (validated-peer-ids! voters :ha-control-plane-voters)
-          deadline (+ (control-now-ms) (long operation-timeout-ms))]
+          deadline (+ (long (control-now-ms)) (long operation-timeout-ms))]
       (loop [attempt 0]
-        (let [remaining (- deadline (control-now-ms))]
+        (let [remaining (- deadline (long (control-now-ms)))]
           (when (<= remaining 0)
             (raise "HA control voter reconfiguration timed out"
                      {:error :ha/control-timeout
