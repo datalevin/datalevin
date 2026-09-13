@@ -550,7 +550,7 @@
             hash-tuples value-idx lookup-value? value-ordinals
             ordinal-values hash-key-fn join-counts unresolved-projection)
           ;; Count the other output domain and exact number of proof pairs.
-          (let [[candidate-pairs anchors]
+          (let [[candidate-pairs ^HashSet anchors]
                 (count-dense-candidate-pairs
                   scan-tuples anchor-idx lookup-anchor? join-counts
                   scan-key-fn unresolved-projection)
@@ -573,7 +573,7 @@
               (let [adjacency (build-dense-adjacency
                                 hash-tuples hash-key-fn value-idx
                                 value-ordinals roaring? domain-size)
-                    [groups total-output]
+                    [groups ^longs total-output]
                     (compose-dense-groups scan-tuples adjacency scan-key-fn
                                           anchor-idx roaring? domain-size)
                     output (emit-dense-composition
