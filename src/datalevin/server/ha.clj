@@ -11,6 +11,7 @@
   "High Availability helpers and runtime state."
   (:require
    [clojure.string :as s]
+   [datalevin.command :as cmd]
    [datalevin.constants :as c]
    [datalevin.ha :as dha]
    [datalevin.ha.authority :as auth]
@@ -1194,9 +1195,7 @@
   (let [db-name (nth args 0 nil)
         dbs     ((:dbs-fn deps) server)
         runner  (and db-name (get-in dbs [db-name :runner]))]
-    (when (and db-name runner (contains? #{:close-transact
-                                          :close-transact-kv}
-                                        type))
+    (when (and db-name runner (= :close (cmd/transaction-control type)))
       (let [kv-store ((:get-kv-store-fn deps) server db-name)
             ^Semaphore lock (get-in dbs [db-name :lock])]
         (try

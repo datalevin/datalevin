@@ -13,8 +13,8 @@
    [clojure.string :as s]
    [datalevin.binding.cpp :as cpp]
    [datalevin.buffer :as bf]
+   [datalevin.command :as cmd]
    [datalevin.constants :as c]
-   [datalevin.ha :as dha]
    [datalevin.kv.txlog :as kvtx]
    [datalevin.protocol :as p]
    [datalevin.server.deps :as sdeps]
@@ -38,18 +38,6 @@
      :with-db-runtime-read-access-fn :with-ha-write-admission-fn
      :work-executor-fn :write-message-fn}
    :values {:message-handler-map map?}})
-
-(def ^:private ha-abort-cleanup-types
-  #{:abort-transact
-    :abort-transact-kv})
-
-(def ^:private idempotent-withtxn-control-types
-  #{:abort-transact
-    :abort-transact-kv})
-
-(def ^:private withtxn-close-types
-  #{:close-transact
-    :close-transact-kv})
 
 (defn- missing-withtxn-error
   [db-name type reason]
@@ -111,27 +99,6 @@
            state))))
     @consumed?))
 
-(def ^:private replica-extra-write-command-types
-  #{:drop-database
-    :assoc-opt
-    :assoc-opts
-    :ha-update-membership!
-    :force-txlog-sync!
-    :force-lmdb-sync!
-    :create-snapshot!
-    :gc-txlog-segments!
-    :txlog-update-snapshot-floor!
-    :txlog-clear-snapshot-floor!
-    :txlog-update-replica-floor!
-    :txlog-clear-replica-floor!
-    :txlog-pin-backup-floor!
-    :txlog-unpin-backup-floor!})
-
-(defn- replica-write-message?
-  [{:keys [type] :as message}]
-  (or (dha/ha-write-message? message)
-      (contains? replica-extra-write-command-types type)))
-
 (defn- message-db-name
   [{:keys [args db-name]}]
   (when-let [db-name (or db-name (nth args 0 nil))]
@@ -144,7 +111,7 @@
   (let [db-name (message-db-name message)
         m       (and db-name (get ((:dbs-fn deps) server) db-name))]
     (when (and (:replica/read-only? m)
-               (replica-write-message? message))
+               (cmd/replica-write? (:type message)))
       {:error :replica/read-only
        :db-name db-name
        :type (:type message)
@@ -273,11 +240,12 @@
 (defn dispatch-message-with-ha-write-admission
   [deps server ^SelectionKey skey message]
   (let [type          (:type message)
-        cleanup-only? (ha-abort-cleanup-types type)
-        write?        (and (not cleanup-only?) (dha/ha-write-message? message))
+        transaction   (cmd/transaction-control type)
+        cleanup-only? (= :abort transaction)
+        write?        (and (not cleanup-only?) (cmd/ha-write? type))
         db-name       (nth (:args message) 0 nil)
-        ha-txlog-term (current-ha-txlog-term deps server db-name)
-        precheck-only? (contains? #{:open-transact :open-transact-kv} type)
+        ha-txlog-term  (current-ha-txlog-term deps server db-name)
+        precheck-only? (= :open transaction)
         {:keys [ok? error]}
         (if cleanup-only?
           {:ok? true}
@@ -321,26 +289,10 @@
                     (str "Unknown message type " (:type message))
                     {})))
 
-(def ^:private runtime-read-access-exempt-types
-  ;; `:close-database` removes the live store and takes the runtime-store write
-  ;; lock during `remove-store`. Wrapping it in the generic read-access guard
-  ;; would deadlock on a same-thread read->write lock upgrade.
-  ;;
-  ;; `:copy` takes a narrower source-store read lock in its handler while it
-  ;; performs the LMDB snapshot copy. The generic guard would also cover the
-  ;; response file transfer, delaying shutdown longer than necessary.
-  ;;
-  ;; `:open` and `:open-kv` publish the live store from `open-server-store`,
-  ;; which takes the runtime-store write lock around that mutation.
-  #{:close-database
-    :copy
-    :open
-    :open-kv})
-
 (defn- runtime-read-access-message?
   [{:keys [type writing?]}]
   (and (not writing?)
-       (not (contains? runtime-read-access-exempt-types type))))
+       (not (cmd/runtime-read-access-exempt? type))))
 
 (defn execute
   "Execute a function in a thread from the worker thread pool"
@@ -361,7 +313,7 @@
         (and runner (transaction-owner? skey runner-skey))
         ((:new-message-fn deps) runner skey message)
 
-        (idempotent-withtxn-control-types type)
+        (= :abort (cmd/transaction-control type))
         (do
           (when-not runner
             (remember-idempotent-abort! deps server db-name skey type))
@@ -372,11 +324,11 @@
                  (missing-withtxn-error db-name type
                                         :transaction-owner-mismatch))
 
-        (and (withtxn-close-types type)
+        (and (= :close (cmd/transaction-control type))
              (consume-aborted-close! deps server db-name skey type))
         ((:write-message-fn deps) skey {:type :command-complete})
 
-        (withtxn-close-types type)
+        (= :close (cmd/transaction-control type))
         (raise "Cannot confirm a transaction that is no longer active"
                  (missing-withtxn-error db-name type
                                         :missing-transaction))

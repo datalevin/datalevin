@@ -11,6 +11,7 @@
   "Consensus-lease HA runtime helpers shared by server runtime."
   (:require
    [clojure.string :as s]
+   [datalevin.command :as cmd]
    [datalevin.constants :as c]
    [datalevin.ha.authority :as auth]
    [datalevin.ha.client-cache :as cache]
@@ -701,40 +702,9 @@
   [m]
   (apply dissoc m ha-runtime-clear-keys))
 
-(def ^:private ha-write-command-types
-  #{:set-schema
-    :register-type
-    :datalog-register-type
-    :swap-attr
-    :del-attr
-    :rename-attr
-    :load-datoms
-    :tx-data
-    :tx-data+db-info
-    :open-transact
-    :close-transact
-    :abort-transact
-    :open-transact-kv
-    :close-transact-kv
-    :abort-transact-kv
-    :transact-kv
-    :open-dbi
-    :clear-dbi
-    :drop-dbi
-    :set-env-flags
-    :add-doc
-    :remove-doc
-    :clear-docs
-    :add-vec
-    :remove-vec
-    :persist-vecs
-    :clear-vecs
-    :kv-re-index
-    :datalog-re-index})
-
 (defn ha-write-message?
   [{:keys [type]}]
-  (boolean (ha-write-command-types type)))
+  (cmd/ha-write? type))
 
 (defn ha-write-admission-error
   [dbs {:keys [type args]}]
