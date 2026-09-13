@@ -57,7 +57,7 @@
   (merge default-mcp-limits
          (select-keys opts mcp-limit-keys)))
 
-(def ^:private tool-specs
+(def ^:private tool-spec-data
   {"datalevin_api_info"
    {"name"        "datalevin_api_info"
     "description" "Return Datalevin JSON API and MCP server capability info."
@@ -1536,116 +1536,68 @@
 
       nil)))
 
+(defn- api-info
+  [state _arguments]
+  (let [result (get (shared/exec-request (:session-state @state)
+                                         {"op"   "api-info"
+                                          "args" {}})
+                    "result")]
+    {"mcp"       {"protocolVersion" protocol-version
+                  "transport"       "stdio"
+                  "allowWrites"     (:allow-writes? @state)}
+     "datalevin" result}))
+
+(def ^:private tool-handlers
+  {
+   "datalevin_api_info"            api-info
+   "datalevin_open_database"       open-database
+   "datalevin_close_database"      close-database
+   "datalevin_open_kv"             open-kv-store
+   "datalevin_close_kv"            close-kv-store
+   "datalevin_open_search_index"   open-search-index
+   "datalevin_close_search_index"  close-search-index
+   "datalevin_add_document"        add-document
+   "datalevin_remove_document"     remove-document
+   "datalevin_clear_documents"     clear-documents
+   "datalevin_document_indexed"    document-indexed
+   "datalevin_document_count"      document-count
+   "datalevin_search_documents"    search-documents
+   "datalevin_open_vector_index"   open-vector-index
+   "datalevin_close_vector_index"  close-vector-index
+   "datalevin_vector_index_info"   vector-index-info
+   "datalevin_add_vector"          add-vector
+   "datalevin_remove_vector"       remove-vector
+   "datalevin_vector_indexed"      vector-indexed
+   "datalevin_vector_search"       search-vector-index
+   "datalevin_kv_get"              kv-get
+   "datalevin_kv_range"            kv-range
+   "datalevin_kv_transact"         transact-kv-store
+   "datalevin_query"               query-database
+   "datalevin_datoms"              datoms-database
+   "datalevin_search_datoms"       search-datoms-database
+   "datalevin_count_datoms"        count-datoms-database
+   "datalevin_pull"                pull-database
+   "datalevin_entity"              entity-database
+   "datalevin_pull_many"           pull-many-database
+   "datalevin_transact"            transact-database
+   "datalevin_fulltext_datoms"     fulltext-datoms-database})
+
+(def ^:private tool-specs
+  (reduce-kv
+   (fn [m name spec]
+     (if-let [handler (get tool-handlers name)]
+       (assoc m name {:spec spec :handler handler})
+       (raise "No handler registered for tool" {:tool name})))
+   {}
+   tool-spec-data))
+
 (defn- call-tool
   ([state name arguments]
    (call-tool state name arguments identity))
   ([state name arguments wrap-fn]
-   (letfn [(respond [value]
-             (tool-response value false wrap-fn))]
-     (case name
-       "datalevin_api_info"
-       (let [result (get (shared/exec-request (:session-state @state)
-                                              {"op"   "api-info"
-                                               "args" {}})
-                         "result")]
-         (respond {"mcp"       {"protocolVersion" protocol-version
-                                "transport"       "stdio"
-                                "allowWrites"     (:allow-writes? @state)}
-                   "datalevin" result}))
-
-       "datalevin_open_database"
-       (respond (open-database state arguments))
-
-       "datalevin_close_database"
-       (respond (close-database state arguments))
-
-       "datalevin_open_kv"
-       (respond (open-kv-store state arguments))
-
-       "datalevin_close_kv"
-       (respond (close-kv-store state arguments))
-
-       "datalevin_open_search_index"
-       (respond (open-search-index state arguments))
-
-       "datalevin_close_search_index"
-       (respond (close-search-index state arguments))
-
-       "datalevin_add_document"
-       (respond (add-document state arguments))
-
-       "datalevin_remove_document"
-       (respond (remove-document state arguments))
-
-       "datalevin_clear_documents"
-       (respond (clear-documents state arguments))
-
-       "datalevin_document_indexed"
-       (respond (document-indexed state arguments))
-
-       "datalevin_document_count"
-       (respond (document-count state arguments))
-
-       "datalevin_search_documents"
-       (respond (search-documents state arguments))
-
-       "datalevin_open_vector_index"
-       (respond (open-vector-index state arguments))
-
-       "datalevin_close_vector_index"
-       (respond (close-vector-index state arguments))
-
-       "datalevin_vector_index_info"
-       (respond (vector-index-info state arguments))
-
-       "datalevin_add_vector"
-       (respond (add-vector state arguments))
-
-       "datalevin_remove_vector"
-       (respond (remove-vector state arguments))
-
-       "datalevin_vector_indexed"
-       (respond (vector-indexed state arguments))
-
-       "datalevin_vector_search"
-       (respond (search-vector-index state arguments))
-
-       "datalevin_kv_get"
-       (respond (kv-get state arguments))
-
-       "datalevin_kv_range"
-       (respond (kv-range state arguments))
-
-       "datalevin_kv_transact"
-       (respond (transact-kv-store state arguments))
-
-       "datalevin_query"
-       (respond (query-database state arguments))
-
-       "datalevin_datoms"
-       (respond (datoms-database state arguments))
-
-       "datalevin_search_datoms"
-       (respond (search-datoms-database state arguments))
-
-       "datalevin_count_datoms"
-       (respond (count-datoms-database state arguments))
-
-       "datalevin_pull"
-       (respond (pull-database state arguments))
-
-       "datalevin_entity"
-       (respond (entity-database state arguments))
-
-       "datalevin_pull_many"
-       (respond (pull-many-database state arguments))
-
-       "datalevin_transact"
-       (respond (transact-database state arguments))
-
-       "datalevin_fulltext_datoms"
-       (respond (fulltext-datoms-database state arguments))
-
+   (let [respond (fn [value] (tool-response value false wrap-fn))]
+     (if-let [{:keys [handler]} (get tool-specs name)]
+       (respond (handler state arguments))
        (throw (ex-info (str "Unknown tool: " name)
                        {:code :unknown-tool
                         :tool name}))))))
@@ -1677,7 +1629,7 @@
       (jsonrpc-result id {})
 
       "tools/list"
-      (jsonrpc-result id {"tools" (->> tool-specs vals (sort-by #(get % "name")) vec)})
+      (jsonrpc-result id {"tools" (->> tool-specs vals (map :spec) (sort-by #(get % "name")) vec)})
 
       "tools/call"
       (let [name      (require-string (get params "name") "name")
