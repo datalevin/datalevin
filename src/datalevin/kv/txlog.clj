@@ -21,7 +21,20 @@
    [datalevin.lmdb DatomKVTxData]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
-(declare txlog-retention-state-map delete-txlog-segment! txlog-snapshot-floor-state txlog-recovery-context txlog-force-sync! txlog-config-enabled? txlog-rollout-mode txlog-rollout-watermarks ensure-txlog-ready! txlog-write-path-enabled? write-txn-open? txlog-watermarks-map txlog-update-snapshot-floor-state! txlog-clear-snapshot-floor-state! txlog-update-replica-floor-state! txlog-clear-replica-floor-state! txlog-pin-backup-floor-state! txlog-unpin-backup-floor-state! reset-txlog-runtime-for-snapshot! txlog-mark-recovery-source! persisted-payload-floor-lsn persisted-runtime-floor-lsn start-snapshot-scheduler-hook! stop-snapshot-scheduler-hook! create-snapshot-now! txlog-watermarks close-failed-open! recover-from-snapshot-open! txlog-vector-floor-state txlog-backup-pin-floor-state txlog-replica-floor-state read-commit-marker-state txlog-copy-with-backup-pin!
+(declare txlog-retention-state-map delete-txlog-segment!
+         txlog-snapshot-floor-state txlog-recovery-context txlog-force-sync!
+         txlog-config-enabled? txlog-rollout-mode txlog-rollout-watermarks
+         ensure-txlog-ready! txlog-write-path-enabled? write-txn-open?
+         txlog-watermarks-map txlog-update-snapshot-floor-state!
+         txlog-clear-snapshot-floor-state! txlog-update-replica-floor-state!
+         txlog-clear-replica-floor-state! txlog-pin-backup-floor-state!
+         txlog-unpin-backup-floor-state! reset-txlog-runtime-for-snapshot!
+         txlog-mark-recovery-source! persisted-payload-floor-lsn
+         persisted-runtime-floor-lsn start-snapshot-scheduler-hook!
+         stop-snapshot-scheduler-hook! create-snapshot-now! txlog-watermarks
+         close-failed-open! recover-from-snapshot-open! txlog-vector-floor-state
+         txlog-backup-pin-floor-state txlog-replica-floor-state
+         read-commit-marker-state txlog-copy-with-backup-pin!
          with-runtime-txlog-state-guard
          with-write-txn-lock-before-runtime-txlog-state
          txlog-vector-floor-state txlog-backup-pin-floor-state
@@ -2091,10 +2104,10 @@
   (with-runtime-txlog-state-guard
     lmdb
     (fn []
-      (when-let [info-v (i/kv-info lmdb)]
+      (when (i/kv-info lmdb)
         (when-let [state (txlog/state lmdb)]
-          (let [floor-lsn (long (persisted-runtime-floor-lsn lmdb))
-                target-next-lsn (unchecked-inc floor-lsn)
+          (let [floor-lsn        (long (persisted-runtime-floor-lsn lmdb))
+                target-next-lsn  (unchecked-inc floor-lsn)
                 current-next-lsn (long @(:next-lsn state))]
             (when (> target-next-lsn current-next-lsn)
               ;; Snapshot-installed followers can restore LMDB payload state
@@ -2102,11 +2115,11 @@
               ;; the restored payload floor so the next mirrored HA record can
               ;; append contiguously without inventing placeholder WAL rows.
               (let [last-applied-v (:meta-last-applied-lsn state)
-                    _ (when (and last-applied-v
-                                 (> floor-lsn (long @last-applied-v)))
-                        (vreset! last-applied-v floor-lsn))
-                    sync-manager (:sync-manager state)
-                    now-ms (System/currentTimeMillis)]
+                    _              (when (and last-applied-v
+                                              (> floor-lsn (long @last-applied-v)))
+                                     (vreset! last-applied-v floor-lsn))
+                    sync-manager   (:sync-manager state)
+                    now-ms         (System/currentTimeMillis)]
                 (vreset! (:next-lsn state) target-next-lsn)
                 (vreset! (:last-appended-lsn sync-manager) floor-lsn)
                 (vreset! (:last-durable-lsn sync-manager) floor-lsn)

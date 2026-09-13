@@ -1148,39 +1148,39 @@
                    (.getEndpoint leader)
                    request
                    invoke-timeout)
-      (catch InterruptedException e
+      (catch InterruptedException _
         (.interrupt (Thread/currentThread))
         (raise "HA control forward interrupted"
-                 {:error :ha/control-interrupted
-                  :attempt attempt}))
+               {:error   :ha/control-interrupted
+                :attempt attempt}))
       (catch Exception e
         (if (forward-connect-failure? e)
           (let [plain-socket (plain-socket-connect-diagnostics
-                              leader invoke-timeout)]
+                               leader invoke-timeout)]
             (log/warn e "HA control forward failed with cached rpc client; retrying with fresh client"
-                      {:attempt attempt
-                       :leader leader-str
+                      {:attempt      attempt
+                       :leader       leader-str
                        :plain-socket plain-socket})
             (try
               (invoke-forward-with-fresh-rpc-client
-               rpc-timeout-ms leader request invoke-timeout)
-              (catch InterruptedException fresh-e
+                rpc-timeout-ms leader request invoke-timeout)
+              (catch InterruptedException _
                 (.interrupt (Thread/currentThread))
                 (raise "HA control forward interrupted"
-                         {:error :ha/control-interrupted
-                          :attempt attempt}))
+                       {:error   :ha/control-interrupted
+                        :attempt attempt}))
               (catch Exception fresh-e
                 (let [plain-socket (plain-socket-connect-diagnostics
-                                    leader invoke-timeout)]
+                                     leader invoke-timeout)]
                   (log/warn fresh-e "HA control forward with fresh rpc client failed"
-                            {:attempt attempt
-                             :leader leader-str
+                            {:attempt      attempt
+                             :leader       leader-str
                              :plain-socket plain-socket})
                   ::invoke-failed))))
           (do
             (log/warn e "HA control forward failed"
                       {:attempt attempt
-                       :leader leader-str})
+                       :leader  leader-str})
             ::invoke-failed))))))
 
 (defn- authority-fsm-snapshot

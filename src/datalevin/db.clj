@@ -425,7 +425,7 @@
 
         :seek
         (let [[_ index c1 c2 c3] k]
-          (if-some [[e a _] (index-components->pattern index c1 c2 c3)]
+          (if-some [[_ a _] (index-components->pattern index c1 c2 c3)]
             (let [[e* _ v*] (index-components->pattern index c1 c2 c3)]
               (or (unresolved-pattern? e* v*)
                   (tx-affects-pattern? touches e* a nil)))
@@ -433,7 +433,7 @@
 
         :rseek
         (let [[_ index c1 c2 c3] k]
-          (if-some [[e a _] (index-components->pattern index c1 c2 c3)]
+          (if-some [[_ a _] (index-components->pattern index c1 c2 c3)]
             (let [[e* _ v*] (index-components->pattern index c1 c2 c3)]
               (or (unresolved-pattern? e* v*)
                   (tx-affects-pattern? touches e* a nil)))
@@ -638,93 +638,93 @@
 
   ITuples
   (-init-tuples
-    [db out a v-ranges pred get-v?]
+    [_ out a v-ranges pred get-v?]
     (ave-tuples store out a v-ranges pred get-v?))
 
   (-init-tuples-list
-    [db a v-ranges pred get-v?]
+    [_ a v-ranges pred get-v?]
     (wrap-cache
-        store [:init-tuples a v-ranges pred get-v?]
+      store [:init-tuples a v-ranges pred get-v?]
       (ave-tuples-list store a v-ranges pred get-v?)))
 
   (-sample-init-tuples
-    [db out a mcount v-ranges pred get-v?]
+    [_ out a mcount v-ranges pred get-v?]
     (sample-ave-tuples store out a mcount v-ranges pred get-v?))
 
   (-sample-init-tuples-list
-    [db a mcount v-ranges pred get-v?]
+    [_ a mcount v-ranges pred get-v?]
     (wrap-cache
-        store (sample-init-cache-key a mcount v-ranges pred get-v?)
+      store (sample-init-cache-key a mcount v-ranges pred get-v?)
       (sample-ave-tuples-list store a mcount v-ranges pred get-v?)))
 
   (-e-sample
-    [db a]
+    [_ a]
     (if (some? u/*reservoir-sampling-seed*)
       (let [mcount (a-size store a)]
         (wrap-cache
-            store (e-sample-cache-key a mcount)
+          store (e-sample-cache-key a mcount)
           (sample-ave-tuples-list
             store a mcount [[[:closed c/v0] [:closed c/vmax]]] nil false)))
       (wrap-cache
-          store [:e-sample a]
+        store [:e-sample a]
         (e-sample store a))))
 
   (-default-ratio
-    [db a]
+    [_ a]
     (wrap-cache
-        store [:default-ratio a]
+      store [:default-ratio a]
       (default-ratio store a)))
 
   (-eav-scan-v
-    [db in out eid-idx attrs-v]
+    [_ in out eid-idx attrs-v]
     (eav-scan-v store in out eid-idx attrs-v))
 
   (-eav-scan-v-list
-    [db in eid-idx attrs-v]
+    [_ in eid-idx attrs-v]
     (wrap-cache
-        store [:eav-scan-v in eid-idx attrs-v]
+      store [:eav-scan-v in eid-idx attrs-v]
       (eav-scan-v-list store in eid-idx attrs-v)))
 
   (-eav-filter-presence-list
-    [db in eid-idx attr]
+    [_ in eid-idx attr]
     (eav-scan-v-list store in eid-idx [[attr {:skip? true}]]))
 
   (-val-eq-scan-e
-    [db in out v-idx attr]
+    [_ in out v-idx attr]
     (val-eq-scan-e store in out v-idx attr))
 
   (-val-eq-scan-e-list
-    [db in v-idx attr]
+    [_ in v-idx attr]
     (wrap-cache
-        store [:val-eq-scan-e in v-idx attr]
+      store [:val-eq-scan-e in v-idx attr]
       (val-eq-scan-e-list store in v-idx attr)))
 
   (-val-eq-scan-e
-    [db in out v-idx attr bound]
+    [_ in out v-idx attr bound]
     (val-eq-scan-e store in out v-idx attr bound))
 
   (-val-eq-scan-e-list
-    [db in v-idx attr bound]
+    [_ in v-idx attr bound]
     (wrap-cache
-        store [:val-eq-scan-e in v-idx attr bound]
+      store [:val-eq-scan-e in v-idx attr bound]
       (val-eq-scan-e-list store in v-idx attr bound)))
 
   (-val-eq-filter-e
-    [db in out v-idx attr f-idx]
+    [_ in out v-idx attr f-idx]
     (val-eq-filter-e store in out v-idx attr f-idx))
 
   (-val-eq-filter-e-list
-    [db in v-idx attr f-idx]
+    [_ in v-idx attr f-idx]
     (wrap-cache
-        store [:val-eq-filter-e in v-idx attr f-idx]
+      store [:val-eq-filter-e in v-idx attr f-idx]
       (val-eq-filter-e-list store in v-idx attr f-idx)))
 
   ISearch
   (-search
-    [db pattern]
+    [_ pattern]
     (let [[e a v _] pattern]
       (wrap-cache
-          store [:search e a v]
+        store [:search e a v]
         (case-tree
           [e a (some? v)]
           [(fetch store (datom e a v)) ; e a v
@@ -745,10 +745,10 @@
            (slice store :eav (datom e0 nil nil) (datom emax nil nil))])))) ; _ _ _
 
   (-search-tuples
-    [db pattern]
+    [_ pattern]
     (let [[e a v _] pattern]
       (wrap-cache
-          store [:search-tuples e a v]
+        store [:search-tuples e a v]
         (case-tree
           [e a (some? v)]
           [(when (if (cd/custom-type? (:db/valueType ((schema store) a)))
@@ -764,10 +764,10 @@
            (s/all-tuples store)])))) ; _ _ _
 
   (-first
-    [db pattern]
+    [_ pattern]
     (let [[e a v _] pattern]
       (wrap-cache
-          store [:first e a v]
+        store [:first e a v]
         (case-tree
           [e a (some? v)]
           [(first (fetch store (datom e a v))) ; e a v
@@ -791,10 +791,10 @@
     [db pattern]
     (.-count db pattern nil))
   (-count
-    [db pattern cap]
+    [_ pattern cap]
     (let [[e a v] pattern]
       (wrap-cache
-          store [:count e a v cap]
+        store [:count e a v cap]
         (case-tree
           [e a (some? v)]
           [(if (cd/custom-type? (:db/valueType ((schema store) a)))
@@ -814,7 +814,7 @@
   (-populated?
     [db index c1 c2 c3]
     (wrap-cache
-        store [:populated? index c1 c2 c3]
+      store [:populated? index c1 c2 c3]
       (populated? store index
                   (components->pattern db index c1 c2 c3 e0 v0)
                   (components->pattern db index c1 c2 c3 emax vmax))))
@@ -831,9 +831,9 @@
   (-datoms
     [db index c1 c2 c3]
     (wrap-cache
-        store [:datoms index c1 c2 c3]
-      (let [a (case index :eav c2 :ave c1)
-            v (case index :eav c3 :ave c2)
+      store [:datoms index c1 c2 c3]
+      (let [a  (case index :eav c2 :ave c1)
+            v  (case index :eav c3 :ave c2)
             ds (slice store index
                       (components->pattern db index c1 c2 c3 e0 v0)
                       (components->pattern db index c1 c2 c3 emax vmax))]
@@ -843,7 +843,7 @@
   (-datoms
     [db index c1 c2 c3 n]
     (wrap-cache
-        store [:datoms index c1 c2 c3 n]
+      store [:datoms index c1 c2 c3 n]
       (if (cd/custom-type? (:db/valueType ((schema store) (case index :eav c2 :ave c1))))
         (take n (-datoms db index c1 c2 c3))
         (slice store index
@@ -858,14 +858,14 @@
       (with-tx-cache-e-datoms db e (e-datoms store e))))
 
   (-av-datoms
-    [db attr v]
+    [_ attr v]
     (wrap-cache store [:av-datoms attr v] (av-datoms store attr v)))
 
   (-range-datoms
     [db index start-datom end-datom]
     (if (tx-cache-empty? db)
       (wrap-cache
-          store [:range-datoms index start-datom end-datom]
+        store [:range-datoms index start-datom end-datom]
         (slice store index start-datom end-datom))
       (with-tx-cache-range
         db index start-datom end-datom
@@ -874,14 +874,14 @@
   (-seek-datoms
     [db index c1 c2 c3]
     (wrap-cache
-        store [:seek index c1 c2 c3]
+      store [:seek index c1 c2 c3]
       (slice store index
              (components->pattern db index c1 c2 c3 e0 v0)
              (components->end-datom db index c1 c2 c3 emax vmax))))
   (-seek-datoms
     [db index c1 c2 c3 n]
     (wrap-cache
-        store [:seek index c1 c2 c3 n]
+      store [:seek index c1 c2 c3 n]
       (slice store index
              (components->pattern db index c1 c2 c3 e0 v0)
              (components->end-datom db index c1 c2 c3 emax vmax)
@@ -890,36 +890,36 @@
   (-rseek-datoms
     [db index c1 c2 c3]
     (wrap-cache
-        store [:rseek index c1 c2 c3]
+      store [:rseek index c1 c2 c3]
       (rslice store index
               (components->pattern db index c1 c2 c3 emax vmax)
               (components->end-datom db index c1 c2 c3 e0 v0))))
   (-rseek-datoms
     [db index c1 c2 c3 n]
     (wrap-cache
-        store [:rseek index c1 c2 c3 n]
+      store [:rseek index c1 c2 c3 n]
       (rslice store index
               (components->pattern db index c1 c2 c3 emax vmax)
               (components->end-datom db index c1 c2 c3 e0 v0)
               n)))
 
   (-cardinality
-    [db attr]
+    [_ attr]
     (wrap-cache store [:cardinality attr]
-      (cardinality store attr)))
+                (cardinality store attr)))
 
   (-index-range
     [db attr start end]
     (wrap-cache
-        store [:index-range attr start end]
+      store [:index-range attr start end]
       (do (vld/validate-attr attr (list '-index-range 'db attr start end))
           (slice store :ave (resolve-datom db nil attr start e0 v0)
                  (resolve-datom db nil attr end emax vmax)))))
 
   (-index-range-size
-    [db attr start end]
+    [_ attr start end]
     (wrap-cache
-        store [:index-range-size attr start end]
+      store [:index-range-size attr start end]
       (av-range-size store attr start end))))
 
 (defn ^:no-doc -ea-populated?
@@ -1083,7 +1083,7 @@
   (swap! dbs assoc (db-name (.-store db)) db)
   db)
 
-(defn ^DB empty-db
+(defn empty-db
   ([] (empty-db nil nil))
   ([dir] (empty-db dir nil))
   ([dir schema] (empty-db dir schema nil))
@@ -1201,7 +1201,7 @@
         (when-not nosync? (set-env-flags lmdb #{:nosync} false))))
     (sync lmdb)))
 
-(defn ^DB init-db
+(defn init-db
   ([datoms] (init-db datoms nil nil nil))
   ([datoms dir] (init-db datoms dir nil nil))
   ([datoms dir schema] (init-db datoms dir schema nil))
@@ -1210,7 +1210,7 @@
    (vld/validate-datom-list datoms)
    (vld/validate-schema-update schema)
    (let [[_ runtime-opts] (split-runtime-opts opts)
-         ^Store store    (open-store dir schema opts)]
+         ^Store store     (open-store dir schema opts)]
      (quick-fill store datoms)
      (cond-> (new-db store)
        (some? runtime-opts) (with-runtime-opts runtime-opts)))))
@@ -1260,7 +1260,7 @@
   ^Boolean [db attr]
   (txcommon/multival? db attr))
 
-(defn ^Boolean multi-value?
+(defn multi-value?
   ^Boolean [db attr value]
   (txcommon/multi-value? db attr value))
 
