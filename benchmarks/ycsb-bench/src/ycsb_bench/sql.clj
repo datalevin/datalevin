@@ -243,9 +243,26 @@
         (let [pool (ArrayBlockingQueue. (int pool-size))
               metadata (.getMetaData first-conn)
               info {:layout :sql-row :atomic-rmw? true
+                    :client-topology {:handles :pooled :read-connections pool-size
+                                      :transaction-connections :same-pool}
                     :engine system :engine-version (.getDatabaseProductVersion metadata)
                     :jdbc-driver-version (.getDriverVersion metadata)
-                    :pool-size pool-size :configuration (configure! first-conn opts)}]
+                    :pool-size pool-size :configuration (configure! first-conn opts)}
+              info (cond-> info
+                     (= system :postgres)
+                     (assoc :server
+                            {:placement :separate-process
+                             :transport :tcp
+                             :host (scalar first-conn "SELECT inet_server_addr()::text")
+                             :port (parse-long (scalar first-conn "SELECT inet_server_port()"))
+                             :configuration
+                             (into {}
+                                   (map (fn [setting]
+                                          [(keyword (str/replace setting "_" "-"))
+                                           (scalar first-conn (str "SHOW " setting))]))
+                                   ["shared_buffers" "work_mem" "maintenance_work_mem"
+                                    "max_connections" "wal_sync_method" "checkpoint_timeout"
+                                    "max_wal_size" "autovacuum" "max_parallel_workers_per_gather"])}))]
           (doseq [conn @connections]
             (.add pool (prepare-session conn table field-count timeout-ms system)))
           (cond-> (f (->SQLRecords pool @connections field-count timeout-ms info))

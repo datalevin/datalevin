@@ -3,13 +3,14 @@
    [clojure.test :refer [deftest is use-fixtures]]
    [datalevin.client :as client]
    [datalevin.server :as server]
+   [datalevin.server.connection :as connection]
    [datalevin.test.core :refer [allocate-port db-fixture]]
    [datalevin.util :as u])
   (:import
    [datalevin.server Server]
    [java.util UUID]
    [java.util.concurrent CountDownLatch ExecutorService Semaphore
-    ThreadPoolExecutor TimeUnit]))
+    TimeUnit]))
 
 (use-fixtures :once db-fixture)
 
@@ -64,16 +65,6 @@
   (await-condition! #(nil? (:runner (get (.-dbs srv) db-name))))
   (is (= 1 (.availablePermits ^Semaphore (:lock (get (.-dbs srv) db-name))))))
 
-(defn- saturate! [^ThreadPoolExecutor executor]
-  (let [started (promise)
-        release (CountDownLatch. 1)]
-    (.execute executor
-              ^Runnable #(do (deliver started true) (.await release)))
-    (await! started)
-    (.execute executor ^Runnable (fn []))
-    (is (zero? (.remainingCapacity (.getQueue executor))))
-    #(.countDown release)))
-
 (deftest transaction-contention-is-bounded-for-both-store-types-test
   (with-server
     (fn [^Server srv [owner contender observer] _]
@@ -100,7 +91,7 @@
           (complete! (request! owner abort db-name))
           (assert-released! srv db-name))))))
 
-(deftest idle-transactions-have-a-cap-and-do-not-occupy-request-workers-test
+(deftest idle-transactions-have-a-cap-without-blocking-other-connections-test
   (with-server
     (fn [^Server srv [first-client second-client observer] _]
       (doseq [[c db-name] [[first-client "first"] [second-client "second"]
@@ -116,55 +107,53 @@
       (complete! (request! second-client :abort-transact-kv "second"))
       (assert-released! srv "first")
       (assert-released! srv "second")
-      (await-condition! #(zero? (.getActiveCount ^ThreadPoolExecutor
-                                                (:transactions (.-execution srv)))))
+      (is (= 2 (.availablePermits ^Semaphore (:transaction-slots (.-execution srv)))))
       (complete! (request! observer :open-transact-kv "third"))
       (complete! (request! observer :close-transact-kv "third")))))
 
-(deftest saturated-request-workers-still-allow-control-and-socket-registration-test
+(deftest blocked-connection-does-not-block-other-connections-test
   (with-server
-    (fn [^Server srv [owner observer] port]
-      (doseq [[open end db-type] [[:open-transact-kv :close-transact-kv "kv"]
-                                  [:open-transact-kv :abort-transact-kv "kv"]
-                                  [:open-transact :close-transact "datalog"]
-                                  [:open-transact :abort-transact "datalog"]]]
-        (let [db-name (str "control-" (name end))]
-          (client/open-database owner db-name db-type)
-          (complete! (request! owner open db-name))
-          (let [release! (saturate! (.-work-executor srv))]
-            (try
-              (busy! (request! observer :list-databases nil) :worker-capacity)
-              ;; A new socket must be accepted and its handshake processed even
-              ;; with the request executor and its queue completely occupied.
-              (let [pool (#'client/new-connectionpool
-                           "localhost" port (client/get-id observer) 1 3000)]
-                (client/close-pool pool))
-              (complete! (await! (future (request! owner end db-name))))
-              (assert-released! srv db-name)
-              (finally (release!))))
-          (await-condition! #(and (zero? (.getActiveCount ^ThreadPoolExecutor
-                                                          (.-work-executor srv)))
-                                  (.isEmpty (.getQueue ^ThreadPoolExecutor
-                                                       (.-work-executor srv)))))))
-      (complete! (request! observer :list-databases nil)))))
+    (fn [^Server srv [owner observer blocked] port]
+      (client/open-database owner "independent" "kv")
+      (complete! (request! owner :open-transact-kv "independent"))
+      (let [started (promise)
+            release (CountDownLatch. 1)
+            done (atom nil)]
+        (with-redefs-fn
+          {#'server/message-handler-map
+           (assoc @#'server/message-handler-map ::block
+                  (fn [_ key _]
+                    (deliver started true)
+                    (.await release)
+                    (#'server/write-message key {:type :command-complete})))}
+          #(try
+             (reset! done (future (client/request blocked {:type ::block})))
+             (await! started)
+             (complete! (request! observer :list-databases nil))
+             (let [pool (#'client/new-connectionpool
+                          "localhost" port (client/get-id observer) 1 3000)]
+               (client/close-pool pool))
+             (complete! (request! owner :close-transact-kv "independent"))
+             (assert-released! srv "independent")
+             (finally
+               (.countDown release)
+               (when @done (complete! (await! @done))))))))))
 
-(deftest saturated-routing-closes-rejected-connection-and-aborts-its-transaction-test
+(deftest cancelling-connection-thread-releases-its-native-transaction-test
   (with-server
     (fn [^Server srv [owner observer] _]
-      (client/open-database owner "disconnect" "kv")
-      (complete! (request! owner :open-transact-kv "disconnect"))
-      (let [release! (saturate! (:routing (.-execution srv)))]
-        (try
-          ;; No request can run inline on the event loop. Rejection closes this
-          ;; socket and signals cleanup directly to its independent runner.
-          (is (thrown? Exception
-                       (client/request owner {:type :close-transact-kv
-                                              :args ["disconnect"]})))
-          (assert-released! srv "disconnect")
-          (finally (release!))))
-      (await-condition! #(zero? (.getActiveCount ^ThreadPoolExecutor
-                                                (:routing (.-execution srv)))))
-      (complete! (request! observer :list-databases nil)))))
+      (client/open-database owner "cancel" "kv")
+      (complete! (request! owner :open-transact-kv "cancel"))
+      (let [key (:runner-skey (get (.-dbs srv) "cancel"))
+            id (:connection-id @(.attachment ^java.nio.channels.SelectionKey key))
+            ^Thread thread (get (:connection-threads (.-execution srv)) id)]
+        (is (.isAlive thread))
+        (connection/close! key)
+        (.join thread 5000)
+        (is (not (.isAlive thread)))
+        (is (nil? (get (:connection-threads (.-execution srv)) id)))
+        (assert-released! srv "cancel")
+        (complete! (request! observer :list-databases nil))))))
 
 (deftest background-jobs-do-not-occupy-request-workers-test
   (with-server

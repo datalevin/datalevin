@@ -15,7 +15,7 @@
    [java.io IOException]
    [java.nio.channels ClosedSelectorException Selector SelectionKey
     ServerSocketChannel SocketChannel]
-   [java.util LinkedHashSet Set UUID]
+   [java.util LinkedHashSet UUID]
    [java.util.concurrent ArrayBlockingQueue ConcurrentHashMap ConcurrentLinkedQueue
     CountDownLatch ExecutorService Executors Future FutureTask LinkedBlockingQueue
     RejectedExecutionException Semaphore ThreadPoolExecutor
@@ -479,27 +479,6 @@
           (.close ^java.nio.channels.Channel bad)
           (.close good)
           (server/stop server))))))
-
-(deftest failed-registration-closes-channel-and-drains-other-entries-test
-  (with-open [selector (Selector/open)
-              bad (SocketChannel/open)
-              good (SocketChannel/open)]
-    (let [{:keys [server]} (fake-server {:selector selector})
-          queue (.-register-queue ^Server server)
-          connections (:connections (.-execution ^Server server))]
-      (try
-        ;; A blocking channel cannot be registered. The following valid
-        ;; registration must still run on this pass through the queue.
-        (.configureBlocking good false)
-        (doseq [ch [bad good]]
-          (.add ^Set connections ch)
-          (.add ^ConcurrentLinkedQueue queue [ch SelectionKey/OP_READ (volatile! {})]))
-        (#'server/handle-registration server)
-        (is (not (.isOpen bad)))
-        (is (.isValid (.keyFor good selector)))
-        (is (.isEmpty ^ConcurrentLinkedQueue queue))
-        (is (= #{good} (set connections)))
-        (finally (server/stop server))))))
 
 (deftest idle-sweep-failure-does-not-stop-network-processing-test
   (let [root (u/tmp-dir (str "server-sweep-failure-" (UUID/randomUUID)))

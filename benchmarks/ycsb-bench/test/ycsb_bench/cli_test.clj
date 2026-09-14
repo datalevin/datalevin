@@ -35,7 +35,7 @@
         (Files/delete directory)))))
 
 (defn- check-report! [report systems]
-  (is (= {:format-version 2 :benchmark :datalevin-ycsb-style
+  (is (= {:format-version 3 :benchmark :datalevin-ycsb-style
           :measurement-model :closed-loop}
          (select-keys report [:format-version :benchmark :measurement-model])))
   (is (string? (:datalevin-version report)))
@@ -125,3 +125,21 @@
           (if existing?
             (is (= previous (slurp file)))
             (is (not (.exists file)))))))))
+
+(deftest timed-repeated-cli-report-test
+  (with-report-path
+    (fn [file]
+      (with-out-str
+        (apply core/-main
+               (concat small-args
+                       ["--system" "sqlite" "--client-counts" "1,2"
+                        "--repetitions" "2" "--warmup-ms" "0" "--measurement-ms" "20"
+                        "--server-workers" "12" "--output" (str file)])))
+      (let [report (edn/read-string (slurp file))
+            results (:results report)]
+        (is (= 4 (count results)))
+        (is (= [1 2 2 1] (mapv #(get-in % [:configuration :threads]) results)))
+        (is (= [1 1 2 2] (mapv #(get-in % [:configuration :trial]) results)))
+        (is (every? #(>= (get-in % [:measured :seconds]) 0.02) results))
+        (is (every? #(= 0 (get-in % [:warmup :operations])) results))
+        (is (= [2 2] (mapv :trials (:summary report))))))))

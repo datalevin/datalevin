@@ -172,7 +172,7 @@
               (await! renewed)
               (await! followed)
               (is (= 2 (.getActiveCount executor)))
-              (is (zero? (.getTaskCount ^ThreadPoolExecutor (.-work-executor srv))))
+              (is (empty? (:connection-threads (.-execution srv))))
               (let [state (get (.-dbs srv) "data")
                     loop-keys [:ha-renew-loop-future :ha-follower-loop-future]]
                 (is (nil? (server/start srv)))

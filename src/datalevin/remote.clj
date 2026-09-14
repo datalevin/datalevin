@@ -837,6 +837,7 @@
 (deftype+ KVStore [^String uri
                   ^String db-name
                   ^Client client
+                  ^Client tx-client
                   write-txn
                   writing?
                   open-db-opts
@@ -859,7 +860,7 @@
   (write-txn [_] write-txn)
 
   (mark-write [_]
-    (->KVStore uri db-name client (volatile! :remote-kv-mutex) true
+    (->KVStore uri db-name tx-client (volatile! :remote-kv-mutex) true
                open-db-opts
                owns-client? closed?))
 
@@ -870,7 +871,10 @@
       (when-not (cl/disconnected? client)
         (cl/normal-request client :close-kv [db-name]))
       (when (and owns-client? (not (cl/disconnected? client)))
-        (cl/disconnect client))))
+        (cl/disconnect client))
+      (when (and (not (identical? tx-client client))
+                 (not (cl/disconnected? tx-client)))
+        (cl/disconnect tx-client))))
 
   (closed-kv? [_]
     (if (or (.get closed?) (cl/disconnected? client))
@@ -960,11 +964,13 @@
   ITxLog
   (defremote-txlog-methods)
 
-  (open-transact-kv [db]
-    (#'request-ha-open client {:type :open-transact-kv
+  (open-transact-kv [_]
+    (#'cl/sync-ha-routing! client tx-client)
+    (#'request-ha-open tx-client {:type :open-transact-kv
                                :args [db-name]
                                :writing? false})
-    (let [active-client (disable-ha-transaction-retry! client)]
+    (#'cl/sync-ha-routing! tx-client client)
+    (let [active-client (disable-ha-transaction-retry! tx-client)]
       (->KVStore uri db-name active-client
                  (volatile! :remote-kv-mutex) true
                  open-db-opts
@@ -972,10 +978,10 @@
                  closed?)))
 
   (close-transact-kv [_]
-    (close-ha-transaction! client :close-transact-kv db-name))
+    (close-ha-transaction! tx-client :close-transact-kv db-name))
 
   (abort-transact-kv [_]
-    (abort-ha-transaction! client :abort-transact-kv db-name))
+    (abort-ha-transaction! tx-client :abort-transact-kv db-name))
 
   (transact-kv [this txs] (.transact-kv this nil txs))
   (transact-kv [this dbi-name txs]
@@ -1256,34 +1262,37 @@
 #_{:clj-kondo/ignore [:redefined-var]}
 (defn ->KVStore
   ([uri db-name client]
-   (KVStore. uri db-name client
+   (KVStore. uri db-name client client
              (volatile! :remote-kv-mutex)
              false
              (volatile! nil)
              false
              (AtomicBoolean. false)))
   ([uri db-name client write-txn]
-   (KVStore. uri db-name client
+   (KVStore. uri db-name client client
              write-txn
              false
              (volatile! nil)
              false
              (AtomicBoolean. false)))
   ([uri db-name client write-txn writing?]
-   (KVStore. uri db-name client
+   (KVStore. uri db-name client client
              write-txn
              writing?
              (volatile! nil)
              false
              (AtomicBoolean. false)))
   ([uri db-name client write-txn writing? open-db-opts]
-   (KVStore. uri db-name client write-txn writing? open-db-opts
+   (KVStore. uri db-name client client write-txn writing? open-db-opts
              false (AtomicBoolean. false)))
   ([uri db-name client write-txn writing? open-db-opts owns-client?]
-   (KVStore. uri db-name client write-txn writing? open-db-opts
+   (KVStore. uri db-name client client write-txn writing? open-db-opts
              owns-client? (AtomicBoolean. false)))
   ([uri db-name client write-txn writing? open-db-opts owns-client? closed?]
-   (KVStore. uri db-name client write-txn writing? open-db-opts owns-client?
+   (KVStore. uri db-name client client write-txn writing? open-db-opts owns-client?
+             closed?))
+  ([uri db-name client tx-client write-txn writing? open-db-opts owns-client? closed?]
+   (KVStore. uri db-name client tx-client write-txn writing? open-db-opts owns-client?
              closed?)))
 
 (defn open-kv
@@ -1303,6 +1312,7 @@
      (if-let [db-name (cl/parse-db uri)]
        (do (cl/open-database client db-name c/db-store-kv opts)
            (->KVStore uri-str db-name client
+                      (cl/dedicated-transaction-client client)
                       (volatile! :remote-kv-mutex) false
                       ;; KV stores do not implement IStore/opts on the server.
                       ;; Preserve caller-supplied open opts only for HA retry hints.

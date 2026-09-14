@@ -24,13 +24,12 @@
    [java.nio.file Files OpenOption]
    [java.security MessageDigest]
    [java.util UUID]
-   [java.util.concurrent ConcurrentLinkedQueue]
    [datalevin.storage Store]
    [datalevin.interface ILMDB IStore]))
 
 (def copy-deps-contract
   "Callbacks `datalevin.server` must inject for client/server copy."
-  {:callbacks #{:register-queue-fn :write-message-fn}})
+  {:callbacks #{:write-message-fn}})
 
 (defn cleanup-copy-tmp-dir*
   [tf]
@@ -57,10 +56,9 @@
 
 (defn copy-in
   "Continuously read batched data from the client"
-  [deps server ^SelectionKey skey]
+  [_deps _server ^SelectionKey skey]
   (let [state                      (.attachment skey)
         {:keys [read-bf write-bf wire-opts]} @state
-        ^java.nio.channels.Selector selector (.selector skey)
         ^SocketChannel ch          (.channel skey)
         data                       (transient [])
         decode-error               (volatile! nil)
@@ -73,46 +71,31 @@
                                          (catch Exception e
                                            (vreset! decode-error e)
                                            (UUID/randomUUID)))))]
-    ;; switch this channel to blocking mode for copy-in
-    (.cancel skey)
-    (.configureBlocking ch true)
-    (try
-      (p/write-message-blocking ch write-bf {:type :copy-in-response}
-                                wire-opts)
-      ;; Ingress has compacted the opening request and paused selector reads.
-      ;; Any coalesced copy batches already in read-bf belong to this transfer.
-      (loop [bf read-bf]
-        (let [[msg bf'] (binding [nv/*wire-reader* read-native]
-                          (p/receive-ch ch bf wire-opts))]
-          (when-not (identical? bf bf') (vswap! state assoc :read-bf bf'))
-          (if (map? msg)
-            (let [{:keys [type]} msg]
-              (case type
-                :copy-done :break
-                :copy-fail (raise "Client error while loading data" {})
-                (raise "Receive unexpected message while loading data"
-                         {:msg msg})))
-            (do
-              (when-not @decode-error
-                (doseq [d msg] (conj! data d)))
-              (recur bf')))))
-      ;; Drain through :copy-done before reporting a decode failure so the next
-      ;; request starts at a message boundary and no partial transaction runs.
-      (when-let [e @decode-error] (throw e))
-      (let [txs (persistent! data)]
-        (log/debug "Copied in" (count txs) "data items")
-        txs)
-      (finally
-        ;; Network ingress re-registers only when the whole request completes,
-        ;; after its final response. A separate copy-in registration could race
-        ;; the next request's switch back to blocking mode.
-        (.configureBlocking ch false)
-        (when-not (:request-active? @state)
-          ;; Synchronous callers without managed ingress retain the old handoff.
-          (.add ^ConcurrentLinkedQueue
-                ((:register-queue-fn deps) server)
-                [ch SelectionKey/OP_READ state])
-          (.wakeup selector))))))
+    (p/write-message-blocking ch write-bf {:type :copy-in-response}
+                              wire-opts)
+    ;; The connection owner has compacted the opening request.
+    ;; Any coalesced copy batches already in read-bf belong to this transfer.
+    (loop [bf read-bf]
+      (let [[msg bf'] (binding [nv/*wire-reader* read-native]
+                        (p/receive-ch ch bf wire-opts))]
+        (when-not (identical? bf bf') (vswap! state assoc :read-bf bf'))
+        (if (map? msg)
+          (let [{:keys [type]} msg]
+            (case type
+              :copy-done :break
+              :copy-fail (raise "Client error while loading data" {})
+              (raise "Receive unexpected message while loading data"
+                       {:msg msg})))
+          (do
+            (when-not @decode-error
+              (doseq [d msg] (conj! data d)))
+            (recur bf')))))
+    ;; Drain through :copy-done before reporting a decode failure so the next
+    ;; request starts at a message boundary and no partial transaction runs.
+    (when-let [e @decode-error] (throw e))
+    (let [txs (persistent! data)]
+      (log/debug "Copied in" (count txs) "data items")
+      txs)))
 
 (defn copy-out
   "Continiously write data out to client in batches"

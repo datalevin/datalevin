@@ -18,18 +18,12 @@
    [datalevin.kv.txlog :as kvtx]
    [datalevin.protocol :as p]
    [datalevin.server.deps :as sdeps]
-   [datalevin.server.request :as request]
-   [datalevin.server.resources :as resources]
    [datalevin.txlog :as txlog]
    [datalevin.util :as u :refer [raise]]
    [taoensso.timbre :as log])
   (:import
    [java.nio ByteBuffer]
-   [java.nio.channels ClosedChannelException SelectionKey SocketChannel
-    ServerSocketChannel]
-   [java.util Set]
-   [java.util.concurrent ConcurrentLinkedQueue Executor RejectedExecutionException]
-   [java.util.concurrent.atomic AtomicBoolean]))
+   [java.nio.channels ClosedChannelException SelectionKey SocketChannel]))
 
 (def dispatch-deps-contract
   "Callbacks (and the handler table) `datalevin.server` must inject for
@@ -40,8 +34,7 @@
      :ha-write-commit-check-fn-fn :ha-write-commit-publish-fn-fn
      :new-message-fn :trace-remote-tx-fn :update-db-fn
      :with-db-runtime-read-access-fn :with-ha-write-admission-fn
-     :work-executor-fn :routing-executor-fn :transaction-executor-fn
-     :write-message-fn :register-queue-fn}
+     :write-message-fn}
    :values {:message-handler-map map?}})
 
 (defn- missing-withtxn-error
@@ -57,14 +50,10 @@
   (some-> skey .attachment deref :client-id))
 
 (defn- transaction-owner?
-  [^SelectionKey skey ^SelectionKey runner-skey]
-  ;; A dedicated transaction client can replace a closed pooled socket while
-  ;; retaining its server session. HA rerouting authenticates a different
-  ;; client, which must not operate or close the original runner.
-  (or (identical? skey runner-skey)
-      (let [client-id        (selection-key-client-id skey)
-            runner-client-id (selection-key-client-id runner-skey)]
-        (and client-id (= client-id runner-client-id)))))
+  [skey runner-skey]
+  ;; A transaction belongs to this exact TCP connection and its native thread.
+  ;; Another socket, even in the same authenticated session, cannot inherit it.
+  (identical? skey runner-skey))
 
 (defn- close-type-for-abort
   [type]
@@ -121,29 +110,6 @@
        :db-name db-name
        :type (:type message)
        :message "Replica is read-only"})))
-
-(defn handle-accept
-  [^SelectionKey skey ^Set connections]
-  (when-let [client-socket (.accept ^ServerSocketChannel (.channel skey))]
-    (.add connections client-socket)
-    (try
-      (doto ^SocketChannel client-socket
-        (.configureBlocking false)
-        (.register (.selector skey) SelectionKey/OP_READ
-                   ;; attach a connection state
-                   ;; { read-bf, write-bf, client-id }
-                   (volatile! {:read-bf  (bf/allocate-buffer
-                                         c/+buffer-size+)
-                               :write-bf (bf/allocate-buffer
-                                         c/+buffer-size+)
-                               :message-lock (Object.)
-                               :request-active? (AtomicBoolean. false)
-                               :connections connections
-                               :wire-opts (p/default-wire-opts)})))
-      (catch Throwable t
-        (resources/close-suppressing! t #(.close ^SocketChannel client-socket))
-        (.remove connections client-socket)
-        (throw t)))))
 
 (defn client-disconnect?
   [e]
@@ -322,11 +288,6 @@
   (and (not writing?)
        (not (cmd/runtime-read-access-exempt? type))))
 
-(defn execute
-  "Execute a function in a thread from the worker thread pool"
-  [deps server f]
-  (.execute ^Executor ((:work-executor-fn deps) server) f))
-
 (defn handle-writing
   [deps server ^SelectionKey skey {:keys [args] :as message}]
   (try
@@ -339,9 +300,7 @@
           runner-skey (:runner-skey db-state)]
       (cond
         (and runner (transaction-owner? skey runner-skey))
-        (do
-          ((:new-message-fn deps) runner skey message)
-          ::queued)
+        ((:new-message-fn deps) runner skey message)
 
         runner
         (raise "Active transaction belongs to another client"
@@ -380,16 +339,11 @@
 
 (defn- read-message
   [deps server ^SelectionKey skey fmt msg]
-  (let [state (.attachment skey)
-        {:keys [message-lock]} @state]
-    (locking message-lock
-      (let [wire-opts (:wire-opts @state)
-            {:keys [type] :as message} (p/read-request fmt msg wire-opts)]
-        (if (= type :set-client-id)
-          (do
-            (dispatch-message deps server skey message)
-            ::handled)
-          message)))))
+  (let [wire-opts (:wire-opts @(.attachment skey))
+        {:keys [type] :as message} (p/read-request fmt msg wire-opts)]
+    (if (= type :set-client-id)
+      (do (dispatch-message deps server skey message) ::handled)
+      message)))
 
 (defn- transaction-message?
   [message]
@@ -398,95 +352,31 @@
 
 (defn- handle-decoded-message
   [deps server skey message]
-  (let [queued? (volatile! false)]
-    (try
-      (when-not (= ::handled message)
-        (log/debug "Message received:" (dissoc message :password :args))
-        (set-last-active deps server skey)
-        (if-let [err (when-not (and (not (:writing? message))
-                                   (cmd/deferred-write? (:type message)))
-                      (replica-read-only-error deps server message))]
-          (error-response skey "Replica is read-only" err)
-          ;; Close/abort must use the owner's runner even when a client omits
-          ;; :writing?, both for authorization and native transaction affinity.
-          (if (transaction-message? message)
-            (vreset! queued? (= ::queued (handle-writing deps server skey message)))
-            (let [dispatch! #(dispatch-message-with-ha-write-admission
-                              deps server skey message)]
-              (if (runtime-read-access-message? message)
-                ((:with-db-runtime-read-access-fn deps) server message dispatch!)
-                (dispatch!))))))
-      (catch Exception e
-        (handle-message-error! deps skey e))
-      (finally
-        (when-not @queued?
-          (request/complete! message))))))
+  (when-not (= ::handled message)
+    (log/debug "Message received:" (dissoc message :password :args))
+    (set-last-active deps server skey)
+    (if-let [err (when-not (and (not (:writing? message))
+                               (cmd/deferred-write? (:type message)))
+                  (replica-read-only-error deps server message))]
+      (error-response skey "Replica is read-only" err)
+      ;; Ownership and native transaction affinity also apply when a client
+      ;; omits :writing? on close/abort.
+      (if (transaction-message? message)
+        (handle-writing deps server skey message)
+        (let [dispatch! #(dispatch-message-with-ha-write-admission
+                          deps server skey message)]
+          (if (runtime-read-access-message? message)
+            ((:with-db-runtime-read-access-fn deps) server message dispatch!)
+            (dispatch!)))))))
 
 (defn handle-message
-  "Decode and handle a message synchronously. Network ingress uses submit-message."
+  "Decode, execute and reply on the connection's owning thread."
   [deps server skey fmt msg]
   (try
     (handle-decoded-message deps server skey (read-message deps server skey fmt msg))
+    (catch InterruptedException e (throw e))
     (catch Exception e
       (handle-message-error! deps skey e))))
-
-(defn- route-message
-  [deps server skey fmt msg complete!]
-  (try
-    (let [message (read-message deps server skey fmt msg)]
-      (if (= ::handled message)
-        (complete!)
-        (let [message (request/with-completion message complete!)]
-          (if (or (transaction-message? message) (= :disconnect (:type message)))
-            ;; Forward to the owner without competing with queries or waiting
-            ;; transaction opens. Native transaction work stays on its runner.
-            (handle-decoded-message deps server skey message)
-            (let [open? (= :open (cmd/transaction-control (:type message)))
-                  executor ((if open? (:transaction-executor-fn deps)
-                                      (:work-executor-fn deps)) server)]
-              (try
-                (.execute ^Executor executor
-                          ^Runnable #(handle-decoded-message deps server skey message))
-                (catch RejectedExecutionException _
-                  (error-response skey "Server is busy; retry the request later"
-                                  {:error :server/busy :retryable? true
-                                   :reason (if open? :transaction-capacity :worker-capacity)})
-                  (complete!))))))))
-    (catch Exception e
-      (try
-        (handle-message-error! deps skey e)
-        (finally (complete!))))))
-
-(defn- request-completion
-  [deps server ^SelectionKey skey]
-  (let [done? (AtomicBoolean. false)
-        state (.attachment skey)
-        ^AtomicBoolean active? (:request-active? @state)
-        ^SocketChannel ch (.channel skey)
-        selector (.selector skey)
-        ^ConcurrentLinkedQueue queue ((:register-queue-fn deps) server)]
-    (fn []
-      (when (.compareAndSet done? false true)
-        (.set active? false)
-        (when (.isOpen ch)
-          ;; Registration and buffered-frame draining belong to the selector.
-          ;; Copy-in may have cancelled the original key in the meantime.
-          (.add queue [ch 0 state])
-          (.wakeup selector))))))
-
-(defn submit-message
-  "Keep decoding and all potentially blocking handlers off the selector. If
-  routing itself is saturated, close the rejected connection and wake any
-  transaction it owns; do not silently discard its request or run it inline."
-  [deps server skey fmt msg]
-  (try
-    (.execute ^Executor ((:routing-executor-fn deps) server)
-              ^Runnable #(route-message deps server skey fmt msg
-                                        (request-completion deps server skey)))
-    (catch RejectedExecutionException _
-      (try
-        ((:cleanup-connection-transactions-fn deps) server skey)
-        (finally ((:close-conn-fn deps) skey))))))
 
 (defn- close-read-connection!
   [deps server skey]
@@ -500,62 +390,38 @@
       (log/warn "Client connection cleanup failed" {:message (ex-message e)})
       (log/debug e "Client connection cleanup failure"))))
 
-(defn resume-read
-  "On the selector thread, dispatch one buffered request or resume socket reads.
-  Pausing between requests keeps ingress bounded and leaves copy-in bytes with
-  the handler. Completion resumes here even if no new network bytes arrive."
+(defn handle-read
+  "Serve a blocking connection until EOF or cancellation. Process buffered
+  frames in order, finishing each handler (including bulk transfers) before
+  reading the next request. No request queue or selector rearming is needed."
   [deps server ^SelectionKey skey]
   (let [state (.attachment skey)
-        {:keys [^ByteBuffer read-bf ^AtomicBoolean request-active?]} @state]
-    (when-not (.get request-active?)
-      (when-not
-        (p/extract-message
-          read-bf
-          (fn [fmt msg]
-            (.interestOps skey 0)
-            (.set request-active? true)
-            (submit-message deps server skey fmt msg)))
-        (when (= (.position read-bf) (.capacity read-bf))
-          (let [size (* ^long c/+buffer-grow-factor+ (.capacity read-bf))
-                bf (bf/allocate-buffer size)]
-            (.flip read-bf)
-            (bf/buffer-transfer read-bf bf)
-            (vswap! state assoc :read-bf bf)))
-        (.interestOps skey SelectionKey/OP_READ)))))
-
-(defn handle-read
-  [deps server ^SelectionKey skey]
-  (try
-    (let [state                         (.attachment skey)
-          {:keys [^ByteBuffer read-bf ^AtomicBoolean request-active?]} @state
-          ^SocketChannel ch             (.channel skey)
-          ;; A selected key can still carry an old ready bit after reads pause.
-          active?                       (and request-active? (.get request-active?))
-          ^int readn                    (if active? 0 (p/read-ch ch read-bf))]
-      (when (pos? readn)
-        ((:trace-remote-tx-fn deps) "handle-read" readn (.hashCode skey)))
-      (when (and (not active?) (> (.position read-bf) c/message-header-size))
-        (let [^ByteBuffer probe (.duplicate read-bf)
-              pos (.position probe)]
-          (.flip probe)
-          ((:trace-remote-tx-fn deps)
-           "buffer-header"
-           (.hashCode skey)
-           "pos" pos
-           "len" (.getInt (doto probe (.get))))))
-      (cond
-        (> readn 0)
-        (resume-read deps server skey)
-
-        (= readn 0)
-        :continue
-
-        (= readn -1)
-        (close-read-connection! deps server skey)))
-    (catch Exception e
-      ;; A failed read/frame must not leave a ready key producing the same
-      ;; error forever. Connection cleanup must also run if reporting fails.
-      (resources/close-suppressing! e #(close-read-connection! deps server skey))
-      (when-not (client-disconnect? e)
-        (log/warn "Closing failed client read" {:message (ex-message e)})
-        (log/debug e "Client read failure")))))
+        ^SocketChannel ch (.channel skey)]
+    (try
+      (loop []
+        (when (and (.isOpen ch) (not (.isInterrupted (Thread/currentThread))))
+          (let [^ByteBuffer read-bf (:read-bf @state)]
+            (if (p/extract-message read-bf
+                                  #(handle-message deps server skey %1 %2))
+              ;; Copy-in may have grown the shared buffer. Fetch it afresh.
+              (recur)
+              (let [^ByteBuffer read-bf
+                    (if (.hasRemaining read-bf)
+                      read-bf
+                      (let [buffer (bf/allocate-buffer
+                                     (* (long c/+buffer-grow-factor+)
+                                        (.capacity read-bf)))]
+                        (.flip read-bf)
+                        (bf/buffer-transfer read-bf buffer)
+                        (vswap! state assoc :read-bf buffer)
+                        buffer))]
+                (when (pos? (p/read-ch ch read-bf)) (recur)))))))
+      (catch InterruptedException _ nil)
+      (catch Exception e
+        (when-not (client-disconnect? e)
+          (log/debug e "Closing failed client read")))
+      (finally
+        ;; Interrupts cancel transport waits; native abort still runs here on
+        ;; the same thread that opened the transaction.
+        (Thread/interrupted)
+        (close-read-connection! deps server skey)))))

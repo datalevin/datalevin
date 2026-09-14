@@ -8,13 +8,12 @@
    [datalevin.test.core :refer [allocate-port db-fixture]]
    [datalevin.util :as u])
   (:import
-   [datalevin.server Runner Server]
+   [datalevin.server Server]
    [java.net InetSocketAddress]
    [java.nio ByteBuffer]
    [java.nio.channels SocketChannel]
    [java.util UUID]
-   [java.util.concurrent CountDownLatch LinkedBlockingQueue Semaphore
-    ThreadPoolExecutor TimeUnit]))
+   [java.util.concurrent CountDownLatch Semaphore TimeUnit]))
 
 (use-fixtures :once db-fixture)
 
@@ -240,27 +239,13 @@
              (is (= :copy-done (:type (receive!))))
              (is (= :copied (:result (receive!))))))))))
 
-(deftest rejected-and-invalid-requests-do-not-strand-pipeline-test
+(deftest invalid-requests-do-not-strand-pipeline-test
   (with-server
-    (fn [^Server srv observer port]
+    (fn [_ observer port]
       (with-open [ch (connect port)]
         (let [receive! (receiver ch)]
           (send! ch [(handshake observer)])
           (is (= :set-client-id-ok (:type (receive!))))
-          (let [^ThreadPoolExecutor executor (.-work-executor srv)
-                started (CountDownLatch. 2)
-                release (CountDownLatch. 1)]
-            (try
-              (dotimes [_ 2]
-                (.execute executor ^Runnable #(do (.countDown started) (.await release))))
-              (is (.await started 5 TimeUnit/SECONDS))
-              (dotimes [_ 2] (.execute executor ^Runnable (fn [])))
-              (send! ch [{:type :list-databases} {:type :list-databases}])
-              (dotimes [_ 2]
-                (is (= :server/busy (get-in (receive!) [:err-data :error]))))
-              (finally (.countDown release)))
-            (await-condition! #(and (zero? (.getActiveCount executor))
-                                    (.isEmpty (.getQueue executor)))))
           (send! ch [[:invalid-request] {:type ::unknown} {:type :list-databases}])
           (is (= :error-response (:type (receive!))))
           (is (= :error-response (:type (receive!))))
@@ -277,7 +262,7 @@
                      {:type :open-transact-kv :args ["copy-disconnect"]}])
           (is (= :set-client-id-ok (:type (receive!))))
           (complete! (receive!))
-          ;; Repeated copies cancel and replace the selection key each time.
+          ;; Repeated copies remain on the same owning connection thread.
           (dotimes [n 3]
             (send! ch [{:type :transact-kv :mode :copy-in :writing? true
                        :args ["copy-disconnect" nil]}
@@ -290,48 +275,30 @@
       (is (nil? (client/normal-request observer :get-value
                   ["copy-disconnect" "data" :key :data :data true]))))))
 
-(deftest closing-runner-closes-discarded-calls-on-other-pooled-sockets-test
+(deftest other-sockets-in-the-same-session-cannot-use-a-transaction-test
   (with-server
     (fn [^Server srv observer port]
-      (client/open-database observer "runner-queue" "kv")
-      (client/normal-request observer :open-dbi ["runner-queue" "data"])
-      (let [started (promise)
-            release (CountDownLatch. 1)]
-        (with-redefs-fn
-          {#'server/message-handler-map
-           (assoc @#'server/message-handler-map ::hold-runner
-                  (fn [_ skey _]
-                    (deliver started true)
-                    (.await release 5 TimeUnit/SECONDS)
-                    (#'server/write-message skey {:type :command-complete})))}
-          #(with-open [owner (connect port)
-                       closer (connect port)
-                       pending (connect port)]
-             (let [owner-receive! (receiver owner)
-                   close-receive! (receiver closer)
-                   pending-receive! (receiver pending)]
-               (try
-                 (doseq [[ch receive!] [[owner owner-receive!]
-                                       [closer close-receive!]
-                                       [pending pending-receive!]]]
-                   (send! ch [(handshake observer)])
-                   (is (= :set-client-id-ok (:type (receive!)))))
-                 (send! owner [{:type :open-transact-kv :args ["runner-queue"]}
-                               {:type ::hold-runner :writing? true
-                                :args ["runner-queue"]}])
-                 (complete! (owner-receive!))
-                 (is (= true (deref started 5000 ::timeout)))
-                 (let [^Runner runner (:runner (get (.-dbs srv) "runner-queue"))
-                       ^LinkedBlockingQueue queue (.-queue runner)]
-                   (send! closer [{:type :close-transact-kv :args ["runner-queue"]}])
-                   (await-condition! (fn [] (= 1 (.size queue))))
-                   (send! pending [{:type :get-value :writing? true
-                                    :args ["runner-queue" "data" :key :data :data true]}])
-                   (await-condition! (fn [] (= 2 (.size queue)))))
-                 (.countDown release)
-                 (complete! (owner-receive!))
-                 (complete! (close-receive!))
-                 (is (thrown-with-msg? Exception #"Socket channel is closed"
-                                      (pending-receive!)))
-                 (is (nil? (:runner (get (.-dbs srv) "runner-queue"))))
-                 (finally (.countDown release))))))))))
+      (client/open-database observer "pinned" "kv")
+      (client/normal-request observer :open-dbi ["pinned" "data"])
+      (with-open [owner (connect port) other (connect port)]
+        (let [receive-owner! (receiver owner) receive-other! (receiver other)]
+          (doseq [[ch receive!] [[owner receive-owner!] [other receive-other!]]]
+            (send! ch [(handshake observer)])
+            (is (= :set-client-id-ok (:type (receive!)))))
+          (send! owner [{:type :open-transact-kv :args ["pinned"]}])
+          (complete! (receive-owner!))
+          (doseq [message [{:type :close-transact-kv :args ["pinned"]}
+                           {:type :abort-transact-kv :args ["pinned"]}
+                           {:type :get-value :writing? true
+                            :args ["pinned" "data" :key :data :data true]}]]
+            (send! other [message])
+            (is (= :transaction-owner-mismatch
+                   (get-in (receive-other!) [:err-data :reason]))))
+          (is (some? (:runner (get (.-dbs srv) "pinned"))))
+          (send! owner [{:type :transact-kv :mode :request :writing? true
+                         :args ["pinned" nil [[:put "data" :key :committed]]]}
+                        {:type :close-transact-kv :args ["pinned"]}])
+          (complete! (receive-owner!))
+          (complete! (receive-owner!))
+          (is (= :committed (client/normal-request observer :get-value
+                              ["pinned" "data" :key :data :data true]))))))))

@@ -25,7 +25,7 @@
                  :user-eid-fn (constantly 1)
                  :now-ms-fn #(deref clock)
                  :idle-timeout-fn (constantly 1000)
-                 :selector-fn (constantly selector)}]
+                 :connection-keys-fn (fn [_] (.keys selector))}]
     (try
       (binding [*sessions* {:conn conn :clients clients :deps deps :clock clock}]
         (f))
@@ -354,7 +354,7 @@
         cleaned (atom [])
         closed (atom [])
         sweep-deps (assoc deps
-                          :selector-fn (constantly selector)
+                          :connection-keys-fn (fn [_] (.keys selector))
                           :cleanup-connection-transactions-fn
                           (fn [_ key]
                             (swap! cleaned conj key)

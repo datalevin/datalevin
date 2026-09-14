@@ -20,7 +20,7 @@
 - [Datalog] planner range conversion for `like`
 
 ### Improved
-- [Server] harden client/server lifecycle.
+- [Server] simplify, speedup and harden client/server lifecycle.
 - [Datalog] always refresh giant id floor in transaction.
 
 ## 1.1.0 (2026-09-02)

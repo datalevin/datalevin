@@ -11,6 +11,7 @@
 
 (def small-options
   (runner/options {:records 4 :ops 11 :warmup 7 :threads 3
+                   :server-mode :in-process
                    :field-count 3 :field-length 4 :scan-length 3}))
 
 (deftest benchmark-resumes-media-test

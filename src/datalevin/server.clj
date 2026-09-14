@@ -8,8 +8,8 @@
 ;; You must not remove this notice, or any other, from this software.
 ;;
 (ns ^:no-doc datalevin.server
-  "Non-blocking event-driven database server with role based access control"
-  (:refer-clojure :exclude [run-calls sync])
+  "Database server with one owning thread per connection and role based access control"
+  (:refer-clojure :exclude [sync])
   (:require
    [datalevin.util :as u :refer [raise]]
    [datalevin.core :as d]
@@ -26,12 +26,12 @@
    [datalevin.ha :as dha]
    [datalevin.ha.replication :as drep]
    [datalevin.server.auth :as auth]
+   [datalevin.server.connection :as connection]
    [datalevin.server.copy :as scopy]
    [datalevin.server.deps :as sdeps]
    [datalevin.server.dispatch :as sdisp]
    [datalevin.server.handlers :as sh]
    [datalevin.server.ha :as sha]
-   [datalevin.server.request :as request]
    [datalevin.server.resources :as resources]
    [datalevin.server.session :as sess]
    [datalevin.kv :as kv]
@@ -50,8 +50,7 @@
    [java.util.concurrent.atomic AtomicBoolean]
    [java.util.concurrent Executors ExecutorService
     ConcurrentLinkedQueue ConcurrentHashMap CountDownLatch Semaphore TimeUnit
-    LinkedBlockingQueue ThreadPoolExecutor
-    ThreadPoolExecutor$AbortPolicy ArrayBlockingQueue SynchronousQueue]
+    ThreadPoolExecutor ThreadPoolExecutor$AbortPolicy SynchronousQueue]
    [java.util.concurrent.locks ReentrantReadWriteLock]
    [datalevin.db DB]
    [datalevin.storage Store]
@@ -244,23 +243,15 @@
         (max 16)
         (min 128))))
 
-(defn- bounded-worker-executor
+(defn- configured-runner-thread-count
   [worker-threads worker-queue-size]
-  (let [threads    (long (or worker-threads (default-worker-thread-count)))
-        queue-size (long (or worker-queue-size (* 4 threads)))]
-    (when-not (pos? threads)
-      (raise "Server worker thread count must be positive"
-               {:worker-threads worker-threads}))
-    (when-not (pos? queue-size)
-      (raise "Server worker queue size must be positive"
-               {:worker-queue-size worker-queue-size}))
-    (ThreadPoolExecutor.
-      threads
-      threads
-      0
-      TimeUnit/MILLISECONDS
-      (ArrayBlockingQueue. queue-size)
-      (ThreadPoolExecutor$AbortPolicy.))))
+  ;; Retain validation of legacy options. Requests no longer use worker pools;
+  ;; worker-threads only supplies the legacy default for background/txn limits.
+  (doseq [[option value] [[:worker-threads worker-threads]
+                          [:worker-queue-size worker-queue-size]]]
+    (when (and (some? value) (not (pos-int? value)))
+      (raise "Server execution limit must be positive" {option value})))
+  (or worker-threads (default-worker-thread-count)))
 
 (defn- bounded-runner-executor
   [threads option]
@@ -279,6 +270,8 @@
                  ^Selector selector
                  ^ConcurrentLinkedQueue register-queue
                  ^ExecutorService dispatcher
+                 ;; Legacy constructor slot; production uses the background
+                 ;; executor here. Requests run on their connection threads.
                  ^ExecutorService work-executor
                  sys-conn
                  ;; client session data, a map of
@@ -347,7 +340,9 @@
             (atom (if (.get running) :running :created))
             (assoc execution
                    :event-loop-stop (CountDownLatch. 1)
-                   :connections (ConcurrentHashMap/newKeySet)))))
+                   :connections (ConcurrentHashMap/newKeySet)
+                   :connection-keys (ConcurrentHashMap.)
+                   :connection-threads (ConcurrentHashMap.)))))
 
 (defn- shutdown-server!
   [^Server server]
@@ -380,6 +375,12 @@
     (cleanup! #(.close ^ServerSocketChannel (.-server-socket server)))
     (cleanup! #(.close selector))
     (cleanup! #(shutdown-executor! (.-dispatcher server) "Server dispatcher"))
+    ;; Acceptance has stopped. Cancel every owner, then join it before stores
+    ;; close; each owner aborts its native transaction in its read-loop finally.
+    (doseq [key (vals (:connection-keys (.-execution server)))]
+      (cleanup! #(close-conn key)))
+    (doseq [^Thread thread (vals (:connection-threads (.-execution server)))]
+      (cleanup! #(.join thread)))
     (doseq [^SocketChannel ch (:connections (.-execution server))]
       (cleanup! #(.close ch)))
     (.clear ^Set (:connections (.-execution server)))
@@ -1237,7 +1238,9 @@
 
 (defn- ^:redef handle-accept
   [^Server server ^SelectionKey skey]
-  (sdisp/handle-accept skey (:connections (.-execution server))))
+  (let [{:keys [connections connection-keys connection-threads]} (.-execution server)]
+    (connection/accept! skey connections connection-keys connection-threads
+                        #(sdisp/handle-read dispatch-deps server %))))
 
 (defn- copy-in
   "Continuously read batched data from the client"
@@ -1308,11 +1311,15 @@
     (.toString (.getAddress ^InetSocketAddress (.getRemoteAddress ch)))))
 
 (defn- close-conn
-  [^SelectionKey skey]
-  (.cancel skey)
-  (.close (.channel skey))
-  (when-let [connections (some-> skey .attachment deref :connections)]
-    (.remove ^Set connections (.channel skey))))
+  [skey]
+  (connection/close! skey))
+
+(defn ^:no-doc cancel-connection!
+  "Cancel the connection identified by its ID. Its owning thread aborts any
+  native transaction before leaving the server's thread registry."
+  [^Server server connection-id]
+  (when-let [key (get (:connection-keys (.-execution server)) connection-id)]
+    (close-conn key)))
 
 (defn- log-ha-loop-crash!
   [loop-name db-name t]
@@ -1993,83 +2000,50 @@
   (sdisp/with-index-write-admission dispatch-deps server message f))
 
 (defprotocol IRunner
-  "Ensure calls within `with-transaction-kv` run in the same thread that
-  runs `open-transact-kv`, otherwise LMDB will deadlock"
+  "The connection thread owns its explicit native transaction."
   (new-message [this skey message])
-  (run-calls [this])
   (halt-run [this])
   (abort-run [this f]))
 
-(def ^:private runner-stop-signal ::runner-stop)
-(def ^:private runner-abort-signal ::runner-abort)
-
-(defn- stop-runner-queue!
-  [server ^LinkedBlockingQueue queue ^AtomicBoolean running? signal]
-  (let [pending (locking queue
-                  (when (.compareAndSet running? true false)
-                    (let [pending (.toArray queue)]
-                      (.clear queue)
-                      (.offer queue signal)
-                      pending)))]
-    ;; Other pooled sockets can have a call waiting on this runner. Closing
-    ;; them prevents a discarded call from retaining its paused connection.
-    ;; Do cleanup outside the queue monitor to avoid locking other runners
-    ;; while holding this one's monitor.
-    (doseq [[skey] pending]
-      (try
-        (try
-          (cleanup-connection-transactions! server skey)
-          (finally (close-conn skey)))
-        (catch Exception e
-          (log/warn "Failed to close discarded transaction request"
-                    {:message (ex-message e)}))))))
-
-(deftype Runner [server ^LinkedBlockingQueue queue ^AtomicBoolean running?]
+(deftype TransactionOwner [server skey ^Thread thread release-slot!]
   IRunner
-  (new-message [_ skey message]
-    (trace-remote-tx! "runner-enqueue" (:type message) (nth (:args message) 0 nil))
-    (locking queue
-      (if (.get running?)
-        (.put queue [skey message])
-        (raise "Transaction runner is closed" {}))))
+  (new-message [this request-key message]
+    (when-not (identical? thread (Thread/currentThread))
+      (raise "Transaction must execute on its owning connection" {}))
+    (try
+      (dispatch-message-with-ha-write-admission server request-key message)
+      (catch Exception e
+        (cleanup-abandoned-transaction! server (first (:args message)) this)
+        (halt-run this)
+        (sdisp/handle-message-error! dispatch-deps request-key e))))
 
-  (halt-run [_]
-    (stop-runner-queue! server queue running? runner-stop-signal))
+  (halt-run [_] (release-slot!))
 
-  (abort-run [_ f]
-    (stop-runner-queue! server queue running? [runner-abort-signal f]))
+  (abort-run [this f]
+    (if (identical? thread (Thread/currentThread))
+      (try (f) (finally (halt-run this)))
+      ;; Closing/interrupting wakes a blocked read or handler. Native cleanup
+      ;; belongs to the connection thread's finally, never to the cancelling one.
+      (close-conn skey))))
 
-  (run-calls [this]
-    (loop []
-      (let [item (.take queue)]
-        (cond
-          (= runner-stop-signal item)
-          nil
-
-          (= runner-abort-signal (first item))
-          ((second item))
-
-          :else
-          (let [[skey message] item]
-            (trace-remote-tx! "runner-dispatch" (:type message)
-                              (nth (:args message) 0 nil))
-            (try
-              (dispatch-message-with-ha-write-admission server skey message)
-              (catch Exception e
-                ;; An open request has already completed. Report failures on
-                ;; this call's socket, after releasing the native transaction.
-                (halt-run this)
-                (cleanup-abandoned-transaction! server (first (:args message)) this)
-                (sdisp/handle-message-error! dispatch-deps skey e))
-              (finally (request/complete! message)))
-            (recur)))))))
+(defn- acquire-transaction-slot!
+  [^Server server]
+  (let [^Semaphore slots (:transaction-slots (.-execution server))
+        released? (AtomicBoolean. false)]
+    (when (and slots (not (.tryAcquire slots)))
+      (raise "Server is busy; retry the request later"
+             {:error :server/busy :retryable? true :reason :transaction-capacity}))
+    (fn []
+      (when (and slots (.compareAndSet released? false true))
+        (.release slots)))))
 
 (defn- write-txn-runner
   [^Server server db-name skey tx-state]
-  (let [runner (->Runner server (LinkedBlockingQueue.) (AtomicBoolean. true))]
+  (let [runner (->TransactionOwner server skey (Thread/currentThread)
+                                   (:release-slot! tx-state))]
     (update-db server db-name
                #(merge (dissoc % :aborted-transaction-close)
-                       tx-state
+                       (dissoc tx-state :release-slot!)
                        {:runner runner :runner-skey skey}))
     runner))
 
@@ -2120,14 +2094,11 @@
 (defn- server-root [^Server server] (.-root server))
 (defn- server-sys-conn [^Server server] (.-sys-conn server))
 (defn- server-clients [^Server server] (.-clients server))
-(defn- server-selector [^Server server] (.-selector server))
+(defn- server-connection-keys [^Server server]
+  (vals (:connection-keys (.-execution server))))
 (defn- server-idle-timeout [^Server server] (.-idle-timeout server))
-(defn- server-work-executor [^Server server] (.-work-executor server))
-(defn- server-routing-executor [^Server server] (:routing (.-execution server)))
-(defn- server-transaction-executor [^Server server] (:transactions (.-execution server)))
 (defn- server-background-executor [^Server server] (:background (.-execution server)))
 (defn- transaction-lock-timeout-ms [^Server server] (:lock-timeout-ms (.-execution server)))
-(defn- server-register-queue [^Server server] (.-register-queue server))
 (defn- server-running [^Server server] (.-running server))
 (defn- server-db-state [^Server server db-name]
   (get (.-dbs server) db-name))
@@ -2185,7 +2156,7 @@
      :remove-client #'remove-client
      :remove-store #'remove-store
      :root #'server-root
-     :run-calls #'run-calls
+     :acquire-transaction-slot! #'acquire-transaction-slot!
      :search-engine #'search-engine
      :search-engine* #'search-engine*
      :server-copy-store! #'server-copy-store!
@@ -2279,41 +2250,6 @@
   [^Server server ^SelectionKey skey]
   (sdisp/handle-read dispatch-deps server skey))
 
-(defn- handle-registration
-  [^Server server]
-  (let [^Selector selector           (.-selector server)
-        ^ConcurrentLinkedQueue queue (.-register-queue server)]
-    ;; A continuously replenished completion queue must not starve socket
-    ;; readiness or session maintenance.
-    (dotimes [_ (.size queue)]
-      (when-let [[^SocketChannel ch ops state] (.poll queue)]
-        (try
-          (when (.isOpen ch)
-            ;; Flush a cancelled copy-in key before registering the same
-            ;; channel again. selectNow preserves other ready keys for dispatch.
-            (when-let [key (.keyFor ch selector)]
-              (when-not (.isValid key) (.selectNow selector)))
-            (let [key (.register ch selector ops state)]
-              (when (zero? (long ops))
-                (sdisp/resume-read dispatch-deps server key)))
-            (log/debug "Registered client" (@state :client-id)))
-          (catch Exception e
-            ;; copy-in cancels its old key before handing the channel back.
-            ;; Locate its runner by channel even if keyFor now returns nil.
-            (doseq [[_ {:keys [^SelectionKey runner-skey]}] (.-dbs server)
-                    :when (and runner-skey
-                               (identical? ch (.channel runner-skey)))]
-              (resources/close-suppressing!
-                e #(cleanup-connection-transactions! server runner-skey)))
-            (resources/close-suppressing! e #(.close ch))
-            (.remove ^Set (:connections (.-execution server)) ch)
-            (if (or (instance? ClosedSelectorException e)
-                    (instance? InterruptedException e))
-              (throw e)
-              (log/warn "Closing failed client registration"
-                        {:message (ex-message e)}))))))
-    (when-not (.isEmpty queue) (.wakeup selector))))
-
 (defn- ^:redef remove-idle-sessions
   [^Server server]
   (sess/remove-idle-sessions session-deps server))
@@ -2394,7 +2330,6 @@
                 (when-not (.isOpen ^ServerSocketChannel (.-server-socket server))
                   (raise "Server listener is closed" {:error :server/listener-closed}))
                 (sweep-idle-sessions! server sweep-state)
-                (handle-registration server)
                 ;; Timed selection also runs maintenance on an idle server.
                 (.select selector
                          (max 1 (min 1000
@@ -2442,7 +2377,7 @@
     sess/session-deps-contract
     {:sys-conn-fn #'server-sys-conn
      :clients-fn #'server-clients
-     :selector-fn #'server-selector
+     :connection-keys-fn #'server-connection-keys
      :user-roles-fn #'user-roles
      :user-permissions-fn #'user-permissions
      :user-eid-fn #'user-eid
@@ -2467,8 +2402,7 @@
   (sdeps/validate
     ::copy-deps
     scopy/copy-deps-contract
-    {:register-queue-fn #'server-register-queue
-     :write-message-fn #'write-message}
+    {:write-message-fn #'write-message}
     {:strict? true}))
 
 (def ^:private dispatch-deps
@@ -2483,10 +2417,6 @@
      :ha-write-commit-publish-fn-fn #'ha-write-commit-publish-fn
      :cleanup-rejected-close-transact!-fn #'cleanup-rejected-close-transact!
      :message-handler-map #'message-handler-map
-     :work-executor-fn #'server-work-executor
-     :routing-executor-fn #'server-routing-executor
-     :register-queue-fn #'server-register-queue
-     :transaction-executor-fn #'server-transaction-executor
      :trace-remote-tx-fn #'trace-remote-tx!
      :get-kv-store-fn #'get-kv-store
      :new-message-fn #'new-message
@@ -2568,20 +2498,13 @@
              {:transaction-lock-timeout-ms transaction-lock-timeout-ms}))
     (resources/with-acquired
       (fn [own!]
-        ;; Validate and allocate the worker executor before opening native
-        ;; resources. Every later acquisition has a rollback action.
-        (let [work-executor (own! (bounded-worker-executor worker-threads
-                                                          worker-queue-size)
-                                  #(shutdown-executor! % "Server worker executor"))
-              dispatcher    (own! (Executors/newSingleThreadExecutor)
-                                   #(shutdown-executor! % "Server dispatcher"))
-              threads (long (or worker-threads (default-worker-thread-count)))
-              routing (own! (bounded-worker-executor (min 4 threads)
-                                                      (or worker-queue-size (* 4 threads)))
-                             #(shutdown-executor! % "Server routing executor"))
-              transactions (own! (bounded-runner-executor (or transaction-threads threads)
-                                                            :transaction-threads)
-                                  #(shutdown-executor! % "Server transaction executor"))
+        (let [threads (configured-runner-thread-count worker-threads worker-queue-size)
+              transaction-limit (or transaction-threads threads)
+              _ (when-not (pos-int? transaction-limit)
+                  (raise "Server transaction limit must be positive"
+                         {:transaction-threads transaction-threads}))
+              dispatcher (own! (Executors/newSingleThreadExecutor)
+                                #(shutdown-executor! % "Server dispatcher"))
               background (own! (bounded-runner-executor (or background-threads threads)
                                                         :background-threads)
                                 #(shutdown-executor! % "Server background executor"))
@@ -2595,8 +2518,9 @@
           (.register server-socket selector SelectionKey/OP_ACCEPT)
           (->Server (AtomicBoolean. false) port root idle-timeout
                     server-socket selector (ConcurrentLinkedQueue.)
-                    dispatcher work-executor sys-conn clients dbs
-                    {:routing routing :transactions transactions :background background
+                    dispatcher background sys-conn clients dbs
+                    {:background background
+                     :transaction-slots (Semaphore. transaction-limit)
                      :lock-timeout-ms transaction-lock-timeout-ms}))))
     (catch Exception e
       (throw (ex-info (str "Error creating server: " (ex-message e))

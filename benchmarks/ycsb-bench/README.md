@@ -114,10 +114,63 @@ and [PostgreSQL WAL settings](https://www.postgresql.org/docs/current/runtime-co
 
 Keep PostgreSQL on the same host for a loopback comparison, with sufficient
 connections and no unrelated load. PostgreSQL runs in its own process; the
-managed Datalevin server shares the benchmark JVM. Account for both processes'
-resources when interpreting results. The harness leaves PostgreSQL's buffer,
-checkpoint, autovacuum, and query planner settings unchanged. Full warmup and
-repeated runs matter more than a short smoke run's ordering.
+managed Datalevin server also runs in a separate JVM by default. Both servers
+use the host's CPU and memory; neither has a CPU quota. The Datalevin server's
+heap and background limits stay fixed as client counts change. The harness
+records PostgreSQL's buffer, checkpoint, autovacuum, and parallel-query settings
+without changing them. Equal commit policies do not imply identical indexes,
+transaction isolation, memory management, or storage architecture.
+
+For a remote Datalevin concurrency sweep:
+
+```sh
+clojure -J-Xms4g -J-Xmx4g -M:jvm:bench \
+  --system datalevin --api all --mode remote --workload c \
+  --client-counts 1,2,4,8 --datalog-handles shared --repetitions 1 \
+  --records 100000 --warmup-ms 10000 --measurement-ms 30000 \
+  --server-workers 16 --server-heap-mb 4096 --durability strict \
+  --output /tmp/datalevin-ycsb-comparison.edn
+```
+
+Use `--api datalog --threads 8 --datalog-handles both` without `--client-counts`
+to compare shared and independent handles for writes: workload A mixes reads
+and updates, and F includes atomic read-modify-write. Use `--system all --api
+datalog` when a new PostgreSQL baseline is needed. KV has a different physical
+layout.
+
+`--client-counts` expands the cases with matching worker and pool sizes.
+`--datalog-handles shared` gives workers one Datalog handle with a pooled read
+client and the normal dedicated transaction connection. `independent` creates
+one handle and one authenticated, single-connection client per worker; that
+connection also handles its transactions. Workers keep their assigned handles
+throughout each phase. `both` runs and labels both arrangements, with one SQL
+baseline per client count. Independent mode requires pool size to equal worker
+count. This option applies to remote Datalevin Datalog only.
+
+One trial is the default. Optional repetitions reload fresh data and start a
+fresh owned Datalevin server each time.
+Even-numbered repetitions reverse the full case order. Results retain every
+trial and summarize median/min/max throughput separately for each topology.
+Timed phases run for the requested duration, then finish in-flight operations;
+`--warmup-ms` and `--measurement-ms` override their respective operation counts.
+Every latency sample is retained, and percentile calculation is outside phase
+timing. Timed inserts grow the Zipf table as necessary, with growth included in
+timing. The phase timeout must exceed the requested duration.
+
+The default Datalevin server uses a fixed 4096 MiB heap, one thread per connection,
+a limit of 16 explicit transactions, 4 background threads, and a 1000 ms writer
+slot timeout. KV and Datalog handles with pooled clients have one additional
+connection for explicit transactions. Legacy `--server-workers` and
+`--server-queue-size` options remain accepted, but requests no longer use those
+pools or queues. Corresponding `--server-*` options appear in
+`--help`. `--server-mode in-process` is available for diagnostic controls and
+is explicitly labeled in reports. Child startup, readiness, and shutdown are
+outside phase timing. A startup failure or timeout terminates the child;
+closing the parent's control pipe also stops it. Effective WAL state is read
+from Datalevin and checked before the case starts. Server PID, Java version,
+heap, execution model, background limits, client topology, and final WAL watermarks are
+included in the storage report. Format version 3 adds run options and trial
+summaries to the complete EDN report.
 
 `clojure -M:jvm:test` always tests SQLite. Set `YCSB_PG_URL` (plus credentials
 if needed) to include PostgreSQL integration checks. They check field
@@ -184,16 +237,17 @@ fields of 100 bytes, excluding keys and database overhead.
 * **Durability:** WAL is enabled with `--durability strict` by default for both
   APIs and modes. `--durability relaxed` selects a separately labeled profile.
   The initial LMDB map size is 4096 MiB; normal automatic growth remains enabled.
-* **Remote:** a new server binds to `127.0.0.1` on an OS-assigned port for each
-  case. Workers share one remote handle; the normal connection pool's default
-  size equals `--threads`. Datalog also uses its standard dedicated transaction
-  client when the pool has more than one connection. Server worker threads
-  are `max(4, threads)`. Debug
+* **Remote:** a new server process binds to `127.0.0.1` on an OS-assigned port for
+  each case. Workers share one remote handle by default; independent Datalog
+  handles can be selected explicitly. The connection pool's default size equals
+  `--threads`. Datalog's shared handle also uses its standard dedicated
+  transaction client when the pool has more than one connection. Server worker
+  counts stay fixed independently of client concurrency. Debug
   request logging is disabled. The server uses its normal initial credentials,
   honoring `DATALEVIN_DEFAULT_PASSWORD`. Credentials are not included in reports.
-  This measures TCP, encoding, pooling, and server dispatch **in the same JVM**;
-  client/server CPU, heap, and GC are shared. It does not model network latency
-  or an independently deployed server.
+  This measures TCP, encoding, pooling, and server dispatch with separate
+  client/server heaps and GC. The loopback transport does not model network
+  latency between different machines.
 
 Initial field values and per-worker random streams are seeded. Concurrency
 changes commit interleaving, so a seed does not reproduce one global request
@@ -204,9 +258,10 @@ The Zipf generator uses finite rank weights with exponent 0.99. It favors low
 numeric IDs; latest reverses ranks to favor the newest committed IDs. Unlike
 upstream YCSB's scrambled Zipfian generator and hashed record keys, keys here
 are ordered and hot ranks are contiguous. `--distribution uniform` overrides
-the default for any workload. The generator is built outside measured phases;
+the default for any workload. The generator is initially built outside measured phases;
 its cumulative weights use eight bytes per possible record, conservatively
-bounded by `records + warmup + ops`.
+bounded by `records + warmup + ops` for count-based phases. Timed insert phases
+grow that table if they exceed this initial capacity.
 
 ## Measurements and interpretation
 

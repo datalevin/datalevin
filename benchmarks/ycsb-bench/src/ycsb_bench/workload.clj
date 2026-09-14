@@ -72,11 +72,36 @@
                          (recur (inc mid) hi)))))]
         (if (= distribution :latest) (- n 1 rank) rank)))))
 
+(defn grow-cdf!
+  "Grow a timed phase's Zipf table as inserts extend the visible keyspace.
+  Existing prefix weights stay unchanged. Growth is included in phase timing."
+  [cdf-ref visible]
+  (let [^doubles current @cdf-ref]
+    (if (<= (long visible) (alength current))
+      current
+      (locking cdf-ref
+        (let [^doubles current @cdf-ref
+              n (alength current)]
+          (if (<= (long visible) n)
+            current
+            (let [capacity (min Integer/MAX_VALUE (max (long visible) (* 2 (long n))))
+                  expanded (java.util.Arrays/copyOf current (int capacity))]
+              (loop [i n, total (aget current (dec n))]
+                (when (< i capacity)
+                  (let [total (+ total (/ 1.0 (Math/pow (double (inc i)) 0.99)))]
+                    (aset-double expanded i total)
+                    (recur (inc i) total))))
+              (reset! cdf-ref expanded))))))))
+
 (defn keyspace [records]
   (atom {:next records :visible records :pending (sorted-set)}))
 
 (defn reserve-key! [space]
-  (:next (first (swap-vals! space update :next inc))))
+  (:next (first (swap-vals! space update :next
+                            (fn [n]
+                              (when (>= (long n) Integer/MAX_VALUE)
+                                (throw (ex-info "Benchmark keyspace exceeds the supported range" {})))
+                              (inc (long n)))))))
 
 (defn acknowledge-key!
   "Publish inserts after commit, retaining out-of-order completions until

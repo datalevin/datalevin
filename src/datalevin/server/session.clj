@@ -16,7 +16,7 @@
    [datalevin.server.resources :as resources]
    [taoensso.timbre :as log])
   (:import
-   [java.nio.channels ClosedSelectorException Selector SelectionKey]
+   [java.nio.channels SelectionKey]
    [java.util Map UUID]
    [java.util.concurrent ConcurrentHashMap]
    [java.util.function BiFunction]))
@@ -30,7 +30,7 @@
      :close-store-fn :consensus-ha-opts-fn :current-runtime-opts-fn
      :ensure-ha-runtime-fn :get-ip-fn :idle-timeout-fn :new-runtime-db-fn
      :now-ms-fn :open-store-fn :password-matches?-fn :perm-tgt-name-fn
-     :pull-user-fn :resolved-runtime-opts-fn :selector-fn :sys-conn-fn
+     :pull-user-fn :resolved-runtime-opts-fn :connection-keys-fn :sys-conn-fn
      :user-eid-fn :user-permissions-fn :user-roles-fn}})
 
 (defn session-lmdb
@@ -270,24 +270,15 @@
          (assoc :open-dbs (:stores m))
          (select-keys [:ip :username :roles :permissions :open-dbs]))]))
 
-(defn- open-selector-keys
-  [^Selector selector]
-  (try
-    (when (.isOpen selector)
-      (.keys selector))
-    (catch ClosedSelectorException _
-      nil)))
-
 (defn- close-client-connections!
   [deps server client-id]
-  (let [^Selector selector ((:selector-fn deps) server)]
-    (resources/close-all!
-      (for [^SelectionKey k (open-selector-keys selector)
-            :let [state (.attachment k)]
-            :when (and state (= client-id (@state :client-id)))]
-        #(try
-           ((:cleanup-connection-transactions-fn deps) server k)
-           (finally ((:close-conn-fn deps) k)))))))
+  (resources/close-all!
+    (for [^SelectionKey k ((:connection-keys-fn deps) server)
+          :let [state (.attachment k)]
+          :when (and state (= client-id (@state :client-id)))]
+      #(try
+         ((:cleanup-connection-transactions-fn deps) server k)
+         (finally ((:close-conn-fn deps) k))))))
 
 (defn disconnect-client*
   [deps server client-id]

@@ -27,7 +27,6 @@
    [datalevin.protocol :as p]
    [datalevin.server.client-op-cache :as op-cache]
    [datalevin.server.api :as sapi]
-   [datalevin.server.request :as request]
    [datalevin.server.auth :as auth
     :refer [view-act alter-act create-act control-act database-obj user-obj
             role-obj server-obj privileged-server-option-keys]]
@@ -58,7 +57,7 @@
      :disconnect-client* :disconnect-user :get-client :get-db :get-kv-store
      :get-lock :get-store :halt-run :in-use-dbs :lmdb :new-runtime-db
      :open-server-copied-store! :open-server-store :open-write-txn-with-retry
-     :remove-client :remove-store :root :run-calls :search-engine
+     :remove-client :remove-store :root :acquire-transaction-slot! :search-engine
      :search-engine* :server-copy-store! :store :store->db-name :store-closed?
      :sync-copy-response-store! :sys-conn :unpin-server-copy-backup-floor!
      :update-cached-permission :update-cached-role :update-client :update-db
@@ -1780,33 +1779,47 @@
           (run-batch-kv-call kv-store call))
         calls))))
 
+(defn- open-transaction!
+  [deps server skey db-name datalog?]
+  (db-alter-permission!
+    deps server skey db-name
+    "Don't have permission to alter the database"
+    (fn []
+      (let [release-slot! ((:acquire-transaction-slot! deps) server)]
+        (try
+          (let [^Semaphore lock (db-lock deps server db-name)]
+            (acquire-db-transaction-slot! deps server db-name lock)
+            (let [runner* (volatile! nil)
+                  kv-store* (volatile! nil)]
+              (try
+                (let [{:keys [store kv-store wlmdb]}
+                      ((:open-write-txn-with-retry deps) server db-name)
+                      _ (vreset! kv-store* kv-store)
+                      tx-state
+                      (cond-> {:wlmdb wlmdb :release-slot! release-slot!}
+                        datalog?
+                        (merge
+                          (let [wstore (st/transfer store wlmdb)
+                                opts ((:current-runtime-opts deps)
+                                      ((:db-state deps) server db-name))]
+                            {:wstore wstore
+                             :wdt-db ((:new-runtime-db deps) wstore opts)})))
+                      runner ((:write-txn-runner deps) server db-name skey tx-state)]
+                  (vreset! runner* runner)
+                  ;; This thread returns to its own socket read loop. Later
+                  ;; transaction calls execute inline on the same native owner.
+                  (write-complete! deps skey))
+                (catch Throwable t
+                  (cleanup-failed-open-transaction!
+                    deps server db-name @runner* @kv-store* lock)
+                  (throw t)))))
+          (catch Throwable t
+            (release-slot!)
+            (throw t)))))))
+
 (defn open-transact-kv
-  [deps server skey {:keys [args] :as message}]
-  (let [db-name          (nth args 0)
-        ^Semaphore lock (db-lock deps server db-name)]
-    (db-alter-permission!
-      deps server skey db-name
-      "Don't have permission to alter the database"
-      (fn []
-        (acquire-db-transaction-slot! deps server db-name lock)
-        (let [runner*   (volatile! nil)
-              kv-store* (volatile! nil)]
-          (try
-            (let [{:keys [kv-store wlmdb]}
-                  ((:open-write-txn-with-retry deps) server db-name)
-                  _      (vreset! kv-store* kv-store)
-                  runner ((:write-txn-runner deps)
-                          server db-name skey {:wlmdb wlmdb})]
-              (vreset! runner* runner)
-              (write-complete! deps skey)
-              ;; The runner is published and the acknowledgement is sent.
-              ;; Its subsequent calls must now be allowed onto this connection.
-              (request/complete! message)
-              ((:run-calls deps) runner))
-            (catch Throwable t
-              (cleanup-failed-open-transaction!
-               deps server db-name @runner* @kv-store* lock)
-              (throw t))))))))
+  [deps server skey {:keys [args]}]
+  (open-transaction! deps server skey (nth args 0) false))
 
 (defn- finish-transaction!
   "Run on the owning transaction runner. A denied commit must still abort and
@@ -1862,37 +1875,8 @@
   (finish-transaction! deps server skey (nth args 0) :close-transact-kv false))
 
 (defn open-transact
-  [deps server skey {:keys [args] :as message}]
-  (let [db-name          (nth args 0)
-        ^Semaphore lock (db-lock deps server db-name)]
-    (db-alter-permission!
-      deps server skey db-name
-      "Don't have permission to alter the database"
-      (fn []
-        (acquire-db-transaction-slot! deps server db-name lock)
-        (let [runner*   (volatile! nil)
-              kv-store* (volatile! nil)]
-          (try
-            (let [{:keys [store kv-store wlmdb]}
-                  ((:open-write-txn-with-retry deps) server db-name)
-                  _      (vreset! kv-store* kv-store)
-                  wstore (st/transfer store wlmdb)
-                  runtime-opts ((:current-runtime-opts deps)
-                                ((:db-state deps) server db-name))
-                  runner ((:write-txn-runner deps)
-                          server db-name skey
-                          {:wlmdb wlmdb
-                           :wstore wstore
-                           :wdt-db ((:new-runtime-db deps)
-                                    wstore runtime-opts)})]
-              (vreset! runner* runner)
-              (write-complete! deps skey)
-              (request/complete! message)
-              ((:run-calls deps) runner))
-            (catch Throwable t
-              (cleanup-failed-open-transaction!
-               deps server db-name @runner* @kv-store* lock)
-              (throw t))))))))
+  [deps server skey {:keys [args]}]
+  (open-transaction! deps server skey (nth args 0) true))
 
 (defn close-transact
   [deps server skey {:keys [args]}]

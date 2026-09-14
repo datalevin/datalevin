@@ -107,37 +107,37 @@ with exponential backoff from 100 milliseconds to 5 seconds. A successful
 network cycle resets that delay, and `stop` wakes a pending retry immediately.
 Idle-session sweeps have their own retry schedule, so a failed session cleanup
 does not prevent socket processing or cleanup of other sessions. Failed client
-reads and registrations close the affected connection.
+reads close the affected connection.
 
 A closed selector or listener, an interrupted event loop, or a fatal error
 stops the server and releases its resources. Cleanup runs outside the dispatcher
 so it can wait for that thread to exit. Restart requires a new server instance,
 as with an explicit `stop`.
 
+Each accepted TCP connection has an ID and an owning thread. The server keeps
+an ID-to-thread registry for cancellation and joins those threads during shutdown
+before closing stores. Closing a connection closes its socket and interrupts its
+owner, which aborts any active native transaction on that same thread.
+
 `create` accepts these execution limits:
 
-* `:worker-threads`: request worker count, default four times the CPU count,
-  bounded between 16 and 128.
-* `:worker-queue-size`: queued request limit, default four times the worker count.
-  The routing queue uses the same limit and up to four routing threads.
-* `:transaction-threads`: maximum simultaneous explicit transaction runners,
-  default the worker count. A runner keeps its native transaction on one thread
-  until close, abort, or connection cleanup. Transaction opens are not queued
-  when this limit is reached.
+* `:transaction-threads`: maximum simultaneous explicit transactions. Despite the
+  legacy option name, transactions use their connection threads, with no separate
+  transaction executor. Default four times the CPU count, bounded between 16 and
+  128. Exhausting this limit rejects the open immediately.
 * `:background-threads`: maximum simultaneous HA and replica background loops,
-  default the worker count. Allow capacity for all configured loops; startup or
-  loop scheduling fails if capacity is exhausted.
-* `:transaction-lock-timeout-ms`: maximum wait for the server's database writer
-  semaphore, default `1000` milliseconds. Use `0` for immediate rejection when
-  another transaction owns the writer slot.
+  with the same default. Allow capacity for all configured loops.
+* `:transaction-lock-timeout-ms`: maximum wait for the database writer semaphore,
+  default `1000` milliseconds. Use `0` for immediate rejection.
 
-Exhausted request or transaction capacity and expired writer-slot waits return
-an error with `:error :server/busy` and `:retryable? true` before the operation
-executes. Close and abort requests are forwarded to their owning transaction
-runner even when request workers are full. If the routing queue itself is full,
-the server closes the rejected connection and signals transaction cleanup.
-That transport failure is subject to the client's usual indeterminate-write
-handling; it is not a promise that a write can be retried safely.
+The legacy `:worker-threads` option supplies defaults for transaction and background
+limits when those options are omitted. `:worker-queue-size` is accepted and
+validated for compatibility but has no effect. There is no request worker pool
+or routing queue.
+
+Exhausted transaction capacity and expired writer-slot waits return
+`:error :server/busy` with `:retryable? true` before the operation executes.
+Other connections, including transaction commit and abort, continue independently.
 
 ## Implementation
 
@@ -533,26 +533,25 @@ need programmatic server setup.
 
 ### Networking
 
-The server employs a non-blocking event driven architecture, so it can support a
-large number of concurrent connected clients. The server event loop runs on a
-single thread. It accepts and segments incoming bytes from the network into
-messages, then submits them to a bounded routing executor. Routing decodes each
-message and forwards it to a bounded request executor or an explicit transaction
-runner. HA and replica loops use a separate bounded background executor.
-Saturation never runs a request handler on the event loop.
+The listener's event loop accepts connections and performs session maintenance.
+Each connection has a blocking socket and its own thread, which reads, decodes,
+executes and replies in arrival order. Complete buffered requests are processed
+before the next socket read. Slow handlers apply socket backpressure without
+adding requests to an application queue. HA and replica loops use a separate
+bounded background executor.
 
-Requests on each connection execute in arrival order, and their responses are
-sent in the same order. Connections run independently. While a request is in
-progress, the server pauses ordinary reads on that connection, applying socket
-backpressure instead of accumulating a request queue. Complete buffered requests
-are processed without waiting for more network traffic.
+Explicit transactions are pinned to the connection that opens them. Its thread
+owns the native transaction through commit or abort. Another socket cannot use
+that transaction, even within the same authenticated session. Clients using the
+wire protocol directly must keep open, transaction operations and close/abort on
+one socket. The bundled KV and Datalog clients use a dedicated one-connection
+transaction client when their ordinary pool has more than one connection. A lost
+connection aborts its transaction; replacing the socket cannot resume or commit it.
 
-A transaction open completes when its acknowledgement is sent; subsequent
-transaction requests execute on the owning transaction runner. Bulk transfers
-occupy the connection until their final response. During copy-in, send only
-transfer batches followed by `:copy-done` (or `:copy-fail`); ordinary requests
-can follow that terminator. A copy-out response includes every batch through
-`:copy-done` before the next request's response begins.
+Bulk transfers stay on the connection thread until their final response. During
+copy-in, send transfer batches followed by `:copy-done` (or `:copy-fail`); ordinary
+requests can follow that terminator. A copy-out response includes every batch
+through `:copy-done` before the next request's response begins.
 
 For developer convenience, the bundled client provides a synchronous API.
 For normal commands, it sends a
