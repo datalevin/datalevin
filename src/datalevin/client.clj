@@ -23,8 +23,8 @@
    [java.nio ByteBuffer BufferOverflowException]
    [java.nio.channels SocketChannel Selector SelectionKey]
    [java.util UUID WeakHashMap Collections]
-   [java.util.concurrent ConcurrentLinkedQueue ConcurrentHashMap]
-   [java.util.concurrent.atomic AtomicBoolean]
+   [java.util.concurrent ConcurrentHashMap]
+   [java.util.concurrent.atomic AtomicBoolean AtomicInteger AtomicReference]
    [java.net InetSocketAddress StandardSocketOptions URI]))
 
 (defprotocol ^:no-doc IConnection
@@ -144,12 +144,13 @@
   (send-n-receive [this msg]
     (try
       (locking bf
-        (p/write-message-blocking ch bf msg (conn-wire-opts ch))
-        (.clear bf)
-        (let [[resp bf'] (p/receive-ch ch bf (conn-wire-opts ch) time-out
-                                      (when-not (.isBlocking ch) read-selector))]
-          (when-not (identical? bf' bf) (set! bf bf'))
-          resp))
+        (let [wire-opts (conn-wire-opts ch)]
+          (p/write-message-blocking ch bf msg wire-opts)
+          (.clear bf)
+          (let [[resp bf'] (p/receive-ch ch bf wire-opts time-out
+                                        (when-not (.isBlocking ch) read-selector))]
+            (when-not (identical? bf' bf) (set! bf bf'))
+            resp)))
       (catch BufferOverflowException _
         (let [size (* ^long c/+buffer-grow-factor+ (.capacity bf))]
           (set! bf (bf/allocate-buffer size))
@@ -319,89 +320,149 @@
                    (.configureBlocking ch true)))))
            (catch Exception _ false)))))
 
+(deftype ^:no-doc ConnectionSlot [^AtomicReference connection
+                                  ^AtomicBoolean borrowed?])
+
+(declare borrow-connection)
+
 (deftype ^:no-doc ConnectionPool [host port client-id pool-size time-out
-                                  ^ConcurrentLinkedQueue available
-                                  ^ConcurrentLinkedQueue used
-                                  ^AtomicBoolean closed?]
+                                  ^objects slots
+                                  ^ConcurrentHashMap owners
+                                  ^ThreadLocal preferred
+                                  ^AtomicBoolean closed?
+                                  ^AtomicInteger waiters]
   IConnectionPool
   (get-connection [this]
-    (let [start (System/currentTimeMillis)
-          closed-error #(raise "This client is closed"
-                                 {:client-id client-id})]
-      (loop []
-        (when (.get closed?)
-          (closed-error))
-        ;; Poll once instead of checking isEmpty before polling: concurrent
-        ;; borrowers can otherwise both observe a singleton queue and one gets
-        ;; nil after the other wins the poll.
-        (if-some [^Connection conn
-                  (locking this
-                    (when-not (.get closed?)
-                      (.poll available)))]
-          (if (connection-ready? conn)
-            (locking this
-              (if (.get closed?)
-                (do
-                  (close conn)
-                  (closed-error))
-                (do
-                  (.add used conn)
-                  conn)))
-            (try
-              (close conn)
-              (let [new-conn (new-registered-connection
-                              host port client-id time-out)]
-                (locking this
-                  (if (.get closed?)
-                    (do
-                      (close new-conn)
-                      (closed-error))
-                    (do
-                      (.add used new-conn)
-                      new-conn))))
-              (catch Throwable t
-                (locking this
-                  ;; Keep a dead connection as a replacement placeholder.
-                  ;; Without it, another call cannot retry replacement after a
-                  ;; one-connection pool sees a temporary server outage.
-                  (when-not (.get closed?)
-                    (.add available conn)))
-                (throw t))))
-          (if (.get closed?)
-            (closed-error)
-            (if (>= (- (System/currentTimeMillis) start) ^long time-out)
-              (raise "Timeout in obtaining a connection" {})
-              (do
-                (Thread/sleep 1000)
-                (recur))))))))
+    (borrow-connection this true))
 
-  (release-connection [this conn]
-    (locking this
-      (when (.contains used conn)
-        (.remove used conn)
-        (if (.get closed?)
-          (close ^Connection conn)
-          (.add available conn)))))
+  (release-connection [_ conn]
+    (when-let [^ConnectionSlot slot (.get owners conn)]
+      (when (.compareAndSet ^AtomicBoolean (.-borrowed? slot) true false)
+        (when (pos? (.get waiters))
+          (locking waiters (.notify waiters))))))
 
   (close-pool [this]
     (locking this
       (when (.compareAndSet closed? false true)
+        (locking waiters (.notifyAll waiters))
         (let [failure (volatile! nil)]
-          (doseq [^ConcurrentLinkedQueue queue [used available]]
-            (loop []
-              (when-let [conn (.poll queue)]
-                (try
-                  (close conn)
-                  (catch Throwable t
-                    (if-let [primary @failure]
-                      (when-not (identical? primary t)
-                        (.addSuppressed ^Throwable primary t))
-                      (vreset! failure t))))
-                (recur))))
+          (doseq [^ConnectionSlot slot slots]
+            (when-let [conn (.getAndSet ^AtomicReference (.-connection slot) nil)]
+              (try
+                (close conn)
+                (catch Throwable t
+                  (if-let [primary @failure]
+                    (when-not (identical? primary t)
+                      (.addSuppressed ^Throwable primary t))
+                    (vreset! failure t))))))
+          (.clear owners)
+          (.remove preferred)
           (when-let [t @failure] (throw t))))))
 
   (closed-pool? [_]
     (.get closed?)))
+
+(defn- check-pool-open!
+  [^ConnectionPool pool]
+  (when (.get ^AtomicBoolean (.-closed? pool))
+    (raise "This client is closed" {:client-id (.-client-id pool)})))
+
+(defn- claim-connection-slot
+  "Prefer this worker's last socket, without reserving it between requests."
+  [^ConnectionPool pool]
+  (let [^objects slots (.-slots pool)
+        ^ThreadLocal preferred (.-preferred pool)
+        index (.get preferred)
+        ^ConnectionSlot previous (when index (aget slots (int index)))]
+    (if (and previous
+             (.compareAndSet ^AtomicBoolean (.-borrowed? previous) false true))
+      previous
+      (loop [i 0]
+        (when (< i (alength slots))
+          (let [^ConnectionSlot slot (aget slots i)]
+            (if (.compareAndSet ^AtomicBoolean (.-borrowed? slot) false true)
+              (do (.set preferred (Integer/valueOf (int i))) slot)
+              (recur (inc i)))))))))
+
+(defn- await-connection-slot
+  [^ConnectionPool pool]
+  (let [^AtomicInteger waiters (.-waiters pool)
+        deadline (+ (System/nanoTime) (* 1000000 (long (.-time-out pool))))]
+    (locking waiters
+      (.incrementAndGet waiters)
+      (try
+        (loop []
+          (check-pool-open! pool)
+          ;; Recheck after publishing the waiter so a concurrent release
+          ;; between the first scan and this monitor cannot be lost.
+          (or (claim-connection-slot pool)
+              (let [remaining (- deadline (System/nanoTime))]
+                (when (<= remaining 0)
+                  (raise "Timeout in obtaining a connection" {}))
+                (.wait waiters (quot remaining 1000000)
+                       (int (rem remaining 1000000)))
+                (recur))))
+        (finally (.decrementAndGet waiters))))))
+
+(defn- install-pool-connection!
+  [^ConnectionPool pool ^ConnectionSlot slot conn]
+  (let [^AtomicReference reference (.-connection slot)
+        ^ConcurrentHashMap owners (.-owners pool)]
+    (when-let [previous (.get reference)]
+      (.remove owners previous))
+    (.put owners conn slot)
+    (.set reference conn))
+  conn)
+
+(defn- replace-pool-connection
+  [^ConnectionPool pool ^ConnectionSlot slot conn]
+  (close conn)
+  (let [replacement (new-registered-connection
+                      (.-host pool) (.-port pool) (.-client-id pool)
+                      (.-time-out pool))]
+    (try
+      ;; Registration can block. Only publication and shutdown share a monitor.
+      (locking pool
+        (check-pool-open! pool)
+        (install-pool-connection! pool slot replacement))
+      (catch Throwable t
+        (cleanup-after-failure! t #(close replacement))
+        (throw t)))))
+
+(defn- borrow-connection
+  [^ConnectionPool pool probe?]
+  (check-pool-open! pool)
+  (let [^ConnectionSlot slot (or (claim-connection-slot pool)
+                                 (await-connection-slot pool))]
+    (try
+      (let [^Connection conn (.get ^AtomicReference (.-connection slot))
+            _ (check-pool-open! pool)
+            conn (if (if probe?
+                       (connection-ready? conn)
+                       (.isOpen ^SocketChannel (.-ch conn)))
+                   conn
+                   (replace-pool-connection pool slot conn))]
+        (check-pool-open! pool)
+        conn)
+      (catch Throwable t
+        ;; Failed replacement retains the old slot, allowing a later borrower
+        ;; to retry registration without shrinking the pool.
+        (.set ^AtomicBoolean (.-borrowed? slot) false)
+        (let [^AtomicInteger waiters (.-waiters pool)]
+          (when (pos? (.get waiters))
+            (locking waiters (.notify waiters))))
+        (throw t)))))
+
+(defn- connection-pool
+  [host port client-id pool-size time-out]
+  (->ConnectionPool host port client-id pool-size time-out
+                     (into-array ConnectionSlot
+                                 (repeatedly pool-size
+                                             #(ConnectionSlot.
+                                                (AtomicReference.)
+                                                (AtomicBoolean. false))))
+                     (ConcurrentHashMap.) (ThreadLocal.) (AtomicBoolean. false)
+                     (AtomicInteger. 0)))
 
 (defn- authenticate
   "Send an authenticate message to server, and wait to receive the response.
@@ -432,17 +493,13 @@
   [host port client-id pool-size time-out]
   (assert (> ^long pool-size 0)
           "Number of connections must be greater than zero")
-  (let [^ConnectionPool pool             (->ConnectionPool
-                                           host port client-id
-                                           pool-size time-out
-                                           (ConcurrentLinkedQueue.)
-                                           (ConcurrentLinkedQueue.)
-                                           (AtomicBoolean. false))
-        ^ConcurrentLinkedQueue available (.-available pool)]
+  (let [^ConnectionPool pool (connection-pool
+                              host port client-id pool-size time-out)
+        ^objects slots (.-slots pool)]
     (try
-      (dotimes [_ pool-size]
+      (dotimes [i pool-size]
         (let [conn (new-registered-connection host port client-id time-out)]
-          (.add available conn)))
+          (install-pool-connection! pool (aget slots i) conn)))
       pool
       (catch Throwable t
         ;; A server can disappear while the initial pool is being populated.
@@ -590,10 +647,15 @@
     (binding [nv/*wire-reader* (or (request-native-reader client req)
                                  nv/*wire-reader*)]
       (let [success? (volatile! false)
-            start    (System/currentTimeMillis)]
+            start    (System/currentTimeMillis)
+            read?    (and (not (:writing? req)) (cmd/read-only? (:type req)))]
         (loop []
           (let [^ConnectionPool pool' pool
-                conn                 (get-connection pool')
+                ;; A read can retry after EOF; mutations still probe idle
+                ;; sockets before sending anything with an ambiguous outcome.
+                conn                 (if (and read? (instance? ConnectionPool pool'))
+                                       (borrow-connection pool' false)
+                                       (get-connection pool'))
                 response             (try
                                        (send-n-receive conn req)
                                        (catch Exception e
@@ -1743,9 +1805,9 @@
                                read-min-tx
                                (assoc :ha-read-min-tx read-min-tx))
          db-name             (request-db-name req)
-         known-endpoints     (and db-name
-                                  (known-ha-db-endpoints client db-name))
-         read-routing-context (and read-route? (client-routing-context client))
+         read-routing-context (when (and read-route? db-name
+                                         (preferred-ha-read-endpoint client db-name))
+                                (client-routing-context client))
          routing-context     (and write-route? (client-routing-context client))
          retry-context       (and write-route? (client-retry-context client))
          preferred-endpoint  (and write-route?
@@ -1846,7 +1908,7 @@
                    req
                    (or (ex-message e)
                        "HA read target became unavailable")
-                   known-endpoints)
+                   (when db-name (known-ha-db-endpoints client db-name)))
                  (throw e)))))))))
 
 (defn ^:no-doc normal-request

@@ -6,12 +6,12 @@
    [datalevin.constants :as c]
    [datalevin.protocol :as p])
   (:import
+   [datalevin.client ConnectionPool]
    [java.io IOException]
    [java.nio ByteBuffer]
    [java.nio.channels SocketChannel]
    [java.nio.channels.spi SelectorProvider]
-   [java.util.concurrent ConcurrentLinkedQueue]
-   [java.util.concurrent.atomic AtomicBoolean]))
+   [java.util.concurrent ConcurrentLinkedQueue]))
 
 (defn- with-expired-request-budget [responses f]
   (let [frames    (ConcurrentLinkedQueue.)
@@ -31,12 +31,11 @@
                     (implConfigureBlocking [_])
                     (implCloseSelectableChannel []))
         conn      (client/->Connection channel 5000 (ByteBuffer/allocate 65536))
-        available (doto (ConcurrentLinkedQueue.) (.add conn))
-        used      (ConcurrentLinkedQueue.)
         ;; A zero cumulative budget deterministically reaches the deadline
         ;; after the first attempt, without sleeps or changing the clock.
-        pool      (client/->ConnectionPool "localhost" 19001 nil 1 0
-                                           available used (AtomicBoolean. false))
+        ^ConnectionPool pool (#'client/connection-pool "localhost" 19001 nil 1 0)
+        _         (#'client/install-pool-connection!
+                    pool (aget ^objects (.-slots pool) 0) conn)
         base      (client/->Client "user" "password" "localhost" 19001
                                     1 0 nil pool)]
     (doseq [response responses]
@@ -47,9 +46,10 @@
     (try
       ;; Frames here are preloaded responses, not unsolicited socket data.
       (with-redefs [client/connection-ready? (constantly true)]
-        (f base sent))
-      (is (.isEmpty used) "the completed attempt releases its connection")
-      (is (identical? conn (.peek available)))
+        (f base sent)
+        (let [returned (client/get-connection pool)]
+          (is (identical? conn returned) "the completed attempt releases its connection")
+          (client/release-connection pool returned)))
       (is (.isEmpty frames) "all response frames were consumed")
       (finally (client/close-pool pool)))))
 
@@ -112,6 +112,17 @@
     (disconnected? [_] false)
     (get-pool [_] nil)
     (get-id [_] nil)))
+
+(deftest successful-unrouted-reads-do-not-build-retry-state-test
+  (with-expired-request-budget
+    [{:type :command-complete :result :ok}]
+    (fn [base _]
+      (let [result (locking @#'client/ha-known-db-endpoints
+                     (locking @#'client/ha-write-retry-settings
+                       (let [result (future (client/normal-request base :doc-count ["db"]))]
+                         (is (= :ok (deref result 1000 ::timeout)))
+                         result)))]
+        (is (= :ok (deref result 2000 ::timeout)))))))
 
 (deftest index-mutations-use-write-retries-without-selecting-a-transaction-test
   (doseq [op mutations

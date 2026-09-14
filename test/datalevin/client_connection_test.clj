@@ -5,7 +5,7 @@
    [datalevin.constants :as c]
    [datalevin.protocol :as p])
   (:import
-   [datalevin.client Connection ConnectionPool]
+   [datalevin.client Connection ConnectionPool ConnectionSlot]
    [java.io IOException]
    [java.net InetSocketAddress StandardSocketOptions]
    [java.nio ByteBuffer]
@@ -13,7 +13,7 @@
    [java.nio.channels.spi SelectorProvider]
    [java.util Arrays UUID]
    [java.util.concurrent ConcurrentHashMap ConcurrentLinkedQueue]
-   [java.util.concurrent.atomic AtomicBoolean]))
+   [java.util.concurrent.atomic AtomicBoolean AtomicInteger AtomicReference]))
 
 (def ^:private registered {:type :set-client-id-ok})
 (def ^:private completed {:type :command-complete :result :pong})
@@ -91,8 +91,196 @@
                         channel))
       "closing the socket also releases its wire-options cache entry"))
 
+(defn- pool-with-connections [connections time-out]
+  (let [^ConnectionPool pool (#'client/connection-pool
+                               "localhost" 19001 nil (count connections) time-out)]
+    (doseq [[i conn] (map-indexed vector connections)]
+      (#'client/install-pool-connection! pool (aget ^objects (.-slots pool) (int i)) conn))
+    pool))
+
+(defn- idle-connections [^ConnectionPool pool]
+  (into []
+        (keep (fn [^ConnectionSlot slot]
+                (when-not (.get ^AtomicBoolean (.-borrowed? slot))
+                  (.get ^AtomicReference (.-connection slot)))))
+        (.-slots pool)))
+
 (defn- thrown-by [f]
   (try (f) nil (catch Throwable t t)))
+
+(defn- await-pool-waiter [^ConnectionPool pool]
+  (let [deadline (+ (System/nanoTime) 2000000000)]
+    (loop []
+      (cond
+        (pos? (.get ^AtomicInteger (.-waiters pool))) true
+        (>= (System/nanoTime) deadline) false
+        :else (do (Thread/sleep 1) (recur))))))
+
+(deftest worker-prefers-its-last-connection-without-reserving-it-test
+  (let [connections (repeatedly 2 #(test-connection []))]
+    (with-connections
+      connections
+      (fn []
+        (let [pool (pool-with-connections (mapv :conn connections) 1000)]
+          (try
+            (let [first (client/get-connection pool)
+                  nested (client/get-connection pool)]
+              (is (not (identical? first nested)) "nested borrows remain exclusive")
+              (client/release-connection pool first)
+              (client/release-connection pool nested)
+              (let [again (client/get-connection pool)]
+                (is (identical? nested again))
+                (client/release-connection pool again)))
+            (let [other (future
+                          (let [a (client/get-connection pool)
+                                b (client/get-connection pool)]
+                            (try #{a b}
+                                 (finally
+                                   (client/release-connection pool a)
+                                   (client/release-connection pool b)))))]
+              (is (= (set (map :conn connections)) (deref other 2000 ::timeout))
+                  "an idle worker does not retain either connection"))
+            (finally (client/close-pool pool))))))))
+
+(deftest ordinary-checkout-and-return-do-not-take-the-pool-monitor-test
+  (let [connection (test-connection [])]
+    (with-connections
+      [connection]
+      (fn []
+        (let [pool (pool-with-connections [(:conn connection)] 1000)]
+          (try
+            (let [work (locking pool
+                         (let [work (future
+                                      (let [conn (client/get-connection pool)]
+                                        (client/release-connection pool conn)
+                                        conn))]
+                           (is (identical? (:conn connection) (deref work 1000 ::timeout)))
+                           work))]
+              (is (identical? (:conn connection) (deref work 2000 ::timeout))))
+            (finally (client/close-pool pool))))))))
+
+(deftest return-and-shutdown-wake-waiting-borrowers-test
+  (doseq [shutdown? [false true]]
+    (let [connection (test-connection [])]
+      (with-connections
+        [connection]
+        (fn []
+          (let [pool (pool-with-connections [(:conn connection)] 30000)
+                conn (client/get-connection pool)
+                waiting (future
+                          (try
+                            (let [borrowed (client/get-connection pool)]
+                              (client/release-connection pool borrowed)
+                              borrowed)
+                            (catch Exception e e)))]
+            (try
+              (is (await-pool-waiter pool))
+              (if shutdown?
+                (client/close-pool pool)
+                (client/release-connection pool conn))
+              (let [result (deref waiting 2000 ::timeout)]
+                (if shutdown?
+                  (is (= "This client is closed" (some-> result ex-message)))
+                  (is (identical? conn result))))
+              (finally
+                (client/close-pool pool)
+                (client/release-connection pool conn)
+                (deref waiting 2000 nil)))))))))
+
+(deftest shutdown-closes-a-connection-being-probed-test
+  (let [connection (test-connection [])
+        pool (pool-with-connections [(:conn connection)] 1000)
+        entered (promise)
+        proceed (promise)]
+    (with-redefs [client/connection-ready?
+                  (fn [_] (deliver entered true) @proceed true)]
+      (let [borrow (future (thrown-by #(client/get-connection pool)))]
+        (try
+          (is (true? (deref entered 2000 false)))
+          (client/close-pool pool)
+          (assert-closed! connection)
+          (deliver proceed true)
+          (is (= "This client is closed" (some-> (deref borrow 2000 nil) ex-message)))
+          (finally
+            (deliver proceed true)
+            (deref borrow 2000 nil)
+            (client/close-pool pool)))))))
+
+(deftest shutdown-during-replacement-closes-the-unpublished-socket-test
+  (let [initial (test-connection [registered])
+        replacement (test-connection [registered])
+        entered (promise)
+        proceed (promise)]
+    (with-connections
+      [initial replacement]
+      (fn []
+        (let [pool (#'client/new-connectionpool "localhost" 19001 nil 1 1000)
+              connect @#'client/new-connection]
+          (client/close (:conn initial))
+          (with-redefs [client/new-connection
+                        (fn [& args]
+                          (deliver entered true)
+                          @proceed
+                          (apply connect args))]
+            (let [borrow (future (thrown-by #(client/get-connection pool)))]
+              (try
+                (is (true? (deref entered 2000 false)))
+                (client/close-pool pool)
+                (deliver proceed true)
+                (is (= "This client is closed" (some-> (deref borrow 2000 nil) ex-message)))
+                (assert-closed! initial)
+                (assert-closed! replacement)
+                (finally
+                  (deliver proceed true)
+                  (deref borrow 2000 nil)
+                  (client/close-pool pool))))))))))
+
+(deftest contending-workers-never-share-a-borrowed-connection-test
+  (let [connections (vec (repeatedly 4 #(test-connection [])))]
+    (with-connections
+      connections
+      (fn []
+        (let [pool (pool-with-connections (mapv :conn connections) 10000)
+              active (ConcurrentHashMap.)
+              duplicates (ConcurrentLinkedQueue.)
+              start (promise)
+              workers (mapv (fn [worker]
+                              (future
+                                @start
+                                (dotimes [iteration 500]
+                                  (let [conn (client/get-connection pool)]
+                                    (try
+                                      (when (.putIfAbsent active conn worker)
+                                        (.add duplicates [worker iteration]))
+                                      (when (zero? (bit-and (long iteration) 15)) (Thread/yield))
+                                      (.remove active conn)
+                                      (finally (client/release-connection pool conn)))))
+                                :done))
+                            (range 16))]
+          (try
+            (deliver start true)
+            (is (= (repeat 16 :done) (mapv #(deref % 10000 ::timeout) workers)))
+            (is (.isEmpty duplicates))
+            (is (= (set (map :conn connections)) (set (idle-connections pool))))
+            (finally (client/close-pool pool))))))))
+
+(deftest retry-safe-reads-skip-the-idle-probe-but-writes-still-probe-test
+  (let [connection (test-connection [registered completed completed completed])
+        probes (atom 0)]
+    (with-connections
+      [connection]
+      (fn []
+        (let [pool (#'client/new-connectionpool "localhost" 19001 nil 1 1000)
+              base (client/->Client "user" "password" "localhost" 19001 1 1000 nil pool)]
+          (try
+            (with-redefs [client/connection-ready? (fn [_] (swap! probes inc) true)]
+              (is (= completed (client/request base {:type :doc-count :args ["db"]})))
+              (is (zero? (long @probes)))
+              (is (= completed (client/request base {:type :doc-count :args ["db"] :writing? true})))
+              (is (= 1 @probes))
+              (is (= completed (client/request base {:type :open-kv :db-name "db"})))
+              (is (= 2 @probes)))
+            (finally (client/close-pool pool))))))))
 
 (deftest initial-registration-failure-closes-every-created-connection-test
   (doseq [response [{:type :error-response :message "Registration rejected"}
@@ -126,9 +314,7 @@
       (into [initial] (conj failures recovered))
       (fn []
         (let [^ConnectionPool pool (#'client/new-connectionpool
-                                     "localhost" 19001 (UUID/randomUUID) 1 1000)
-              ^ConcurrentLinkedQueue available (.-available pool)
-              ^ConcurrentLinkedQueue used (.-used pool)]
+                                     "localhost" 19001 (UUID/randomUUID) 1 1000)]
           (try
             (let [conn (client/get-connection pool)]
               (is (identical? (:conn initial) conn))
@@ -139,17 +325,14 @@
               (is (some? (thrown-by #(client/get-connection pool))))
               (assert-closed! failed)
               (is (not (client/closed-pool? pool)))
-              (is (.isEmpty used))
-              (is (= 1 (.size available)))
-              (is (identical? (:conn initial) (.peek available))))
+              (is (= [(:conn initial)] (idle-connections pool))))
             (let [conn (client/get-connection pool)]
               (is (identical? (:conn recovered) conn))
               (is (.isOpen ^SocketChannel (:channel recovered)))
               (is (zero? @(:closed recovered)))
               (is (= completed (client/send-n-receive conn {:type :ping})))
               (client/release-connection pool conn)
-              (is (.isEmpty used))
-              (is (identical? conn (.peek available))))
+              (is (= [conn] (idle-connections pool))))
             (finally (client/close-pool pool)))
           (assert-closed! initial)
           (assert-closed! recovered))))))
@@ -235,10 +418,7 @@
         (is (= -1 (.read ^SocketChannel (.-ch stale) (ByteBuffer/allocate 1))))
         (is (.isOpen ^SocketChannel (.-ch stale)))
         (let [fresh (test-connection [registered completed])
-              available (doto (ConcurrentLinkedQueue.) (.add stale))
-              used (ConcurrentLinkedQueue.)
-              pool (client/->ConnectionPool "localhost" 19001 nil 1 1000
-                                             available used (AtomicBoolean. false))
+              pool (pool-with-connections [stale] 1000)
               base (client/->Client "user" "password" "localhost" 19001
                                      1 1000 nil pool)
               replacements (atom 0)]
@@ -248,8 +428,7 @@
               (is (= completed (client/request base request))))
             (is (= 1 @replacements))
             (is (= [:set-client-id (:type request)] (mapv :type @(:sent fresh))))
-            (is (.isEmpty used))
-            (is (identical? (:conn fresh) (.peek available)))
+            (is (= [(:conn fresh)] (idle-connections pool)))
             ;; The old server must never receive even the first mutation byte.
             (.configureBlocking peer false)
             (is (= -1 (.read peer (ByteBuffer/allocate 1))))
@@ -268,6 +447,24 @@
               (is (= :ha/write-indeterminate (get-in (ex-data error) [:err-data :error])))
               (is (= [:set-client-id :open-kv] (mapv :type @(:sent connection)))))
             (finally (client/close-pool pool))))))))
+
+(deftest a-read-retries-on-a-peer-closed-socket-without-an-idle-probe-test
+  (with-socket-pair
+    (fn [^Connection stale ^SocketChannel peer]
+      (.shutdownOutput peer)
+      (is (= -1 (.read ^SocketChannel (.-ch stale) (ByteBuffer/allocate 1))))
+      (let [fresh (test-connection [registered completed])
+            pool (pool-with-connections [stale] 1000)
+            base (client/->Client "user" "password" "localhost" 19001 1 1000 nil pool)
+            probes (atom 0)]
+        (try
+          (with-redefs [client/new-connection (fn [& _] (:conn fresh))
+                        client/connection-ready? (fn [_] (swap! probes inc) true)]
+            (is (= completed (client/request base {:type :doc-count :args ["db"]}))))
+          (is (zero? (long @probes)))
+          (is (= [:set-client-id :doc-count] (mapv :type @(:sent fresh))))
+          (is (= [(:conn fresh)] (idle-connections pool)))
+          (finally (client/close-pool pool)))))))
 
 (defn- await-read-selector [^Connection conn]
   (let [deadline (+ (System/nanoTime) 2000000000)]
