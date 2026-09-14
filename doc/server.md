@@ -554,11 +554,13 @@ transfer batches followed by `:copy-done` (or `:copy-fail`); ordinary requests
 can follow that terminator. A copy-out response includes every batch through
 `:copy-done` before the next request's response begins.
 
-For developer convenience, the current implemented client in the library makes
-synchronous and blocking network connections. For normal commands, it sends a
+For developer convenience, the bundled client provides a synchronous API.
+For normal commands, it sends a
 request and waits for the responses from the server, so the data access API is
 the same for both the local databases and remote databases. In addition, the
 client has a built-in connection pool, to reuse pre-established connections.
+Each connection uses a nonblocking socket and reuses its receive selector to
+enforce receive timeouts without allocating a selector for each response.
 
 The wire protocol between server and client is largely inspired by the wire
 protocol of PostgreSQL. It uses TLV message format, with 1 byte message type in
