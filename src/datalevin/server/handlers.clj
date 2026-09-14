@@ -25,6 +25,7 @@
    [datalevin.kv.txlog :as kvtx]
    [datalevin.lmdb :as l]
    [datalevin.protocol :as p]
+   [datalevin.server.client-op-cache :as op-cache]
    [datalevin.server.api :as sapi]
    [datalevin.server.request :as request]
    [datalevin.server.auth :as auth
@@ -37,14 +38,13 @@
   (:import
    [java.nio.channels SelectionKey SocketChannel]
    [java.nio.file Paths]
-   [java.util Map$Entry UUID]
+   [java.util UUID]
    [java.util.concurrent ConcurrentHashMap Semaphore TimeUnit]
    [datalevin.storage Store]))
 
 (def ^:private transient-runtime-store-max-attempts 8)
 (def ^:private transient-runtime-store-retry-sleep-ms 25)
 (def ^:private client-op-await-timeout-ms 30000)
-(def ^:private client-op-completed-retain-ms 60000)
 
 (def handler-deps-contract
   "Every callback `datalevin.server` must inject for the handlers in this
@@ -694,30 +694,16 @@
                 :present-keys present-keys
                 :error        :ha/client-op-invalid-request}))))
 
-(defn- client-op-pending-map
+(defn- client-op-cache
   [deps server db-name]
-  (let [pending-map
-        (or (:ha-client-op-pending (db-state deps server db-name))
-            (:ha-client-op-pending
-             ((:update-db deps) server db-name
-              (fn [m]
-                (if (:ha-client-op-pending m)
-                  m
-                  (assoc m :ha-client-op-pending (ConcurrentHashMap.)))))))]
-    (doseq [^Map$Entry entry (.entrySet ^ConcurrentHashMap pending-map)]
-      (let [pending-entry (.getValue entry)
-            result-promise (:result-promise pending-entry)
-            result         (when (realized? result-promise)
-                             @result-promise)]
-        (when-let [completed-at-ms (some-> result :completed-at-ms)]
-          (let [completed-at-ms (long completed-at-ms)
-                retain-ms       (long client-op-completed-retain-ms)]
-            (when (>= (- (System/currentTimeMillis) completed-at-ms)
-                      retain-ms)
-              (.remove ^ConcurrentHashMap pending-map
-                       (.getKey entry)
-                       pending-entry))))))
-    pending-map))
+  (op-cache/prune!
+    (or (:ha-client-op-cache (db-state deps server db-name))
+        (:ha-client-op-cache
+         ((:update-db deps) server db-name
+          (fn [m]
+            (if (:ha-client-op-cache m)
+              m
+              (assoc m :ha-client-op-cache (op-cache/create)))))))))
 
 (defn- ^:redef read-committed-client-op-record
   [deps server skey db-name writing? client-op-id]
@@ -760,8 +746,8 @@
   [deps server skey db-name writing? message exec-fn]
   (if-let [request (client-op-request message)]
     (let [{:keys [client-op-id response-kind]} request
-          ^ConcurrentHashMap pending-map
-          (client-op-pending-map deps server db-name)]
+          cache (client-op-cache deps server db-name)
+          ^ConcurrentHashMap pending-map (:pending cache)]
       (if-let [record (some->> client-op-id
                                (read-committed-client-op-record
                                 deps server skey db-name writing?)
@@ -789,20 +775,16 @@
                           :status       status})))
             (try
               (let [response (exec-fn request)]
-                (deliver result-promise {:status          :ok
-                                         :response-kind   response-kind
-                                         :response        response
-                                         :completed-at-ms
-                                         (System/currentTimeMillis)})
+                (op-cache/complete! cache pending-entry
+                                    {:status        :ok
+                                     :response-kind response-kind
+                                     :response      response})
                 {:replay?       false
                  :response-kind response-kind
                  :response      response})
               (catch Throwable t
-                (deliver result-promise
-                         {:status          :error
-                          :exception       t
-                          :completed-at-ms
-                          (System/currentTimeMillis)})
+                (op-cache/complete! cache pending-entry
+                                    {:status :error :exception t})
                 (throw t)))))))
     {:replay? false
      :response (exec-fn nil)}))

@@ -119,6 +119,7 @@
          cached-retry-client
          retry-client-disconnected?
          evict-retry-client!
+         cleanup-after-failure!
          disconnect)
 
 (defn- conn-wire-opts
@@ -136,14 +137,17 @@
 
 (deftype ^:no-doc Connection [^SocketChannel ch
                               ^long time-out
-                              ^:volatile-mutable ^ByteBuffer bf]
+                              ^:volatile-mutable ^ByteBuffer bf
+                              read-selector
+                              ^ByteBuffer probe-bf]
   IConnection
   (send-n-receive [this msg]
     (try
       (locking bf
         (p/write-message-blocking ch bf msg (conn-wire-opts ch))
         (.clear bf)
-        (let [[resp bf'] (p/receive-ch ch bf (conn-wire-opts ch) time-out)]
+        (let [[resp bf'] (p/receive-ch ch bf (conn-wire-opts ch) time-out
+                                      (when-not (.isBlocking ch) read-selector))]
           (when-not (identical? bf' bf) (set! bf bf'))
           resp))
       (catch BufferOverflowException _
@@ -167,25 +171,37 @@
 
   (receive [this]
     (try
-      (let [[resp bf'] (p/receive-ch ch bf (conn-wire-opts ch) time-out)]
+      (let [[resp bf'] (p/receive-ch ch bf (conn-wire-opts ch) time-out
+                                    (when-not (.isBlocking ch) read-selector))]
         (when-not (identical? bf' bf) (set! bf bf'))
         resp)
       (catch Exception e
         (when (nv/decoding-error? e) (throw e))
         (raise "Error receiving data:" e {}))))
 
-  (close [this]
-    (try
-      (.close ch)
-      (finally
-        (clear-conn-wire-opts! ch)))))
+  (close [_]
+    ;; Closing the channel wakes an in-flight read. Serialize only lazy
+    ;; selector creation/closure, never the blocking receive itself.
+    (locking read-selector
+      (let [^Selector selector @read-selector]
+        (try
+          (try
+            (.close ch)
+            (catch Throwable t
+              (when selector
+                (cleanup-after-failure! t #(.close selector)))
+              (throw t)))
+          (when selector (.close selector))
+          (finally
+            (vreset! read-selector nil)
+            (clear-conn-wire-opts! ch)))))))
 
 #_{:clj-kondo/ignore [:redefined-var]}
 (defn ^:no-doc ->Connection
   ([^SocketChannel ch ^ByteBuffer bf]
-   (Connection. ch (long c/default-connection-timeout) bf))
+   (->Connection ch c/default-connection-timeout bf))
   ([^SocketChannel ch time-out ^ByteBuffer bf]
-   (Connection. ch (long time-out) bf)))
+   (Connection. ch (long time-out) bf (volatile! nil) (ByteBuffer/allocate 1))))
 
 (defn- ^SocketChannel connect-socket
   "connect to server and return the client socket channel"
@@ -238,9 +254,15 @@
    (new-connection host port time-out time-out))
   ([host port connect-time-out receive-time-out]
    (let [ch (connect-socket host port connect-time-out)]
-    (set-conn-wire-opts! ch (p/default-wire-opts))
-    (->Connection ch (long receive-time-out)
-                  (bf/allocate-buffer c/+buffer-size+)))))
+     (try
+       (.configureBlocking ch false)
+       (set-conn-wire-opts! ch (p/default-wire-opts))
+       (->Connection ch (long receive-time-out)
+                     (bf/allocate-buffer c/+buffer-size+))
+       (catch Throwable t
+         (cleanup-after-failure! t #(try (.close ch)
+                                        (finally (clear-conn-wire-opts! ch))))
+         (throw t))))))
 
 (defn- set-client-id
   [conn client-id]
@@ -286,13 +308,15 @@
   (let [^SocketChannel ch (.-ch conn)]
     (and (.isOpen ch)
          (try
-           (let [blocking? (.isBlocking ch)]
+           (let [blocking? (.isBlocking ch)
+                 ^ByteBuffer probe (.-probe-bf conn)]
              (try
-               (.configureBlocking ch false)
-               (zero? (.read ch (ByteBuffer/allocate 1)))
+               (when blocking? (.configureBlocking ch false))
+               (.clear probe)
+               (zero? (.read ch probe))
                (finally
-                 (when (.isOpen ch)
-                   (.configureBlocking ch blocking?)))))
+                 (when (and blocking? (.isOpen ch))
+                   (.configureBlocking ch true)))))
            (catch Exception _ false)))))
 
 (deftype ^:no-doc ConnectionPool [host port client-id pool-size time-out

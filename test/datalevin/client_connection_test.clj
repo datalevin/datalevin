@@ -7,11 +7,11 @@
   (:import
    [datalevin.client Connection ConnectionPool]
    [java.io IOException]
-   [java.net InetSocketAddress]
+   [java.net InetSocketAddress StandardSocketOptions]
    [java.nio ByteBuffer]
-   [java.nio.channels ServerSocketChannel SocketChannel]
+   [java.nio.channels Selector ServerSocketChannel SocketChannel]
    [java.nio.channels.spi SelectorProvider]
-   [java.util UUID]
+   [java.util Arrays UUID]
    [java.util.concurrent ConcurrentHashMap ConcurrentLinkedQueue]
    [java.util.concurrent.atomic AtomicBoolean]))
 
@@ -268,3 +268,129 @@
               (is (= :ha/write-indeterminate (get-in (ex-data error) [:err-data :error])))
               (is (= [:set-client-id :open-kv] (mapv :type @(:sent connection)))))
             (finally (client/close-pool pool))))))))
+
+(defn- await-read-selector [^Connection conn]
+  (let [deadline (+ (System/nanoTime) 2000000000)]
+    (loop []
+      (or @(.-read-selector conn)
+          (when (< (System/nanoTime) deadline)
+            (Thread/sleep 1)
+            (recur))))))
+
+(deftest timed-receives-reuse-selector-across-fragmented-and-large-frames-test
+  (with-socket-pair
+    (fn [^Connection conn ^SocketChannel peer]
+      (.configureBlocking ^SocketChannel (.-ch conn) false)
+      (let [selectors (atom [])]
+        (doseq [message [{:result :small}
+                         {:result (apply str (repeat 100000 "x"))}
+                         {:result :small-again}]]
+          (let [reading (future (client/receive conn))
+                selector (await-read-selector conn)
+                frame (ByteBuffer/allocate 200000)]
+            (is (some? selector))
+            (swap! selectors conj selector)
+            (p/write-message-bf frame message c/message-format-nippy)
+            (.flip frame)
+            (let [prefix (doto (.duplicate frame) (.limit 3))]
+              (p/send-all peer prefix))
+            (.position frame 3)
+            (p/send-all peer frame)
+            (is (= message (deref reading 2000 ::timeout)))
+            (is (false? (.isBlocking ^SocketChannel (.-ch conn))))
+            (is (true? (#'client/connection-ready? conn)))))
+        (is (every? #(identical? (first @selectors) %) @selectors))
+        (is (= 1 (.size (.keys ^Selector (first @selectors)))))
+        (client/close conn)
+        (is (not (.isOpen ^Selector (first @selectors))))))))
+
+(deftest reusable-receive-selector-honors-a-fresh-deadline-test
+  (with-socket-pair
+    (fn [^Connection conn ^SocketChannel peer]
+      (let [^SocketChannel channel (.-ch conn)
+            selector (.-read-selector conn)
+            buffer (ByteBuffer/allocate 256)]
+        (.configureBlocking channel false)
+        (dotimes [_ 2]
+          (let [error (thrown-by #(p/receive-ch channel buffer nil 25 selector))]
+            (is (= :socket/timeout (:error (ex-data error))))
+            (is (.isOpen ^Selector @selector))))
+        (p/write-message-blocking peer (ByteBuffer/allocate 256) completed)
+        (is (= completed (first (p/receive-ch channel buffer nil 1000 selector))))))))
+
+(deftest close-releases-selector-and-unblocks-a-pending-receive-test
+  (with-socket-pair
+    (fn [^Connection conn _]
+      (.configureBlocking ^SocketChannel (.-ch conn) false)
+      (let [reading (future (thrown-by #(client/receive conn)))
+            selector (await-read-selector conn)]
+        (is (some? selector))
+        (client/close conn)
+        (is (instance? Throwable (deref reading 1000 ::timeout)))
+        (is (nil? @(.-read-selector conn)))
+        (is (not (.isOpen ^Selector selector)))))))
+
+(deftest interrupted-select-does-not-spin-until-the-receive-deadline-test
+  (with-socket-pair
+    (fn [^Connection conn _]
+      (.configureBlocking ^SocketChannel (.-ch conn) false)
+      (let [result (promise)
+            reader (Thread. ^Runnable #(deliver result (thrown-by (fn [] (client/receive conn)))))]
+        (try
+          (.start reader)
+          (is (some? (await-read-selector conn)))
+          (.interrupt reader)
+          (.join reader 500)
+          (is (not (.isAlive reader)))
+          (is (instance? Throwable (deref result 1000 ::timeout)))
+          (finally
+            (client/close conn)
+            (.join reader 1000)))))))
+
+(deftest nonblocking-send-preserves-bytes-under-backpressure-test
+  (with-socket-pair
+    (fn [^Connection conn ^SocketChannel peer]
+      (let [^SocketChannel channel (.-ch conn)
+            bytes (byte-array (* 8 1024 1024))
+            received (ByteBuffer/allocate (alength bytes))]
+        (.configureBlocking channel false)
+        (.setOption channel StandardSocketOptions/SO_SNDBUF (int 4096))
+        (dotimes [i (alength bytes)] (aset-byte bytes i (unchecked-byte i)))
+        (let [sending (future (p/send-all channel (ByteBuffer/wrap bytes)) :sent)]
+          (is (= ::pending (deref sending 50 ::pending)))
+          (let [reading (future
+                          (while (.hasRemaining received)
+                            (when (neg? (.read peer received))
+                              (throw (IOException. "Unexpected EOF"))))
+                          :received)]
+            (try
+              (is (= :sent (deref sending 10000 ::timeout)))
+              (is (= :received (deref reading 10000 ::timeout)))
+              (is (Arrays/equals bytes (.array received)))
+              (finally
+                (client/close conn)
+                (.close peer)
+                (future-cancel sending)
+                (future-cancel reading)))))))))
+
+(deftest interrupted-send-closes-a-partially-written-connection-test
+  (with-socket-pair
+    (fn [^Connection conn _]
+      (let [^SocketChannel channel (.-ch conn)
+            buffer (ByteBuffer/allocate (* 8 1024 1024))
+            result (promise)
+            writer (Thread. ^Runnable
+                            #(deliver result (thrown-by (fn [] (p/send-all channel buffer)))))]
+        (.configureBlocking channel false)
+        (.setOption channel StandardSocketOptions/SO_SNDBUF (int 4096))
+        (try
+          (.start writer)
+          (is (= ::pending (deref result 50 ::pending)))
+          (.interrupt writer)
+          (.join writer 1000)
+          (is (not (.isAlive writer)))
+          (is (instance? InterruptedException (deref result 1000 ::timeout)))
+          (is (not (.isOpen channel)))
+          (finally
+            (client/close conn)
+            (.join writer 1000)))))))

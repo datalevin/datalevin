@@ -272,6 +272,19 @@
       ;; (st/print-stack-trace e)
       -1)))
 
+(defn- open-selector
+  ^Selector [^SocketChannel ch ^long ops]
+  (let [selector (Selector/open)]
+    (try
+      (.register ch selector (int ops))
+      selector
+      (catch Throwable t
+        (try (.close selector)
+             (catch Throwable close-error
+               (when-not (identical? t close-error)
+                 (.addSuppressed t close-error))))
+        (throw t)))))
+
 (defn send-all
   "Send all data in buffer to channel, will block if channel is busy.
   Close the channel and raise exception if something is wrong"
@@ -292,12 +305,15 @@
 
               non-blocking?
               (let [^Selector sel (or @selector
-                                      (let [^Selector s (Selector/open)]
-                                        (.register ch s SelectionKey/OP_WRITE)
+                                      (let [s (open-selector ch SelectionKey/OP_WRITE)]
                                         (vreset! selector s)
                                         s))]
                 ;; Avoid busy-spinning on non-blocking sockets under backpressure.
                 (.select sel)
+                (when (.isInterrupted (Thread/currentThread))
+                  ;; A partial frame cannot be reused for another request.
+                  (.close ch)
+                  (throw (InterruptedException. "Interrupted while sending a socket message")))
                 (.clear (.selectedKeys sel))
                 (recur))
 
@@ -371,11 +387,14 @@
 (defn- await-read-ready!
   [^SocketChannel ch selector-v ^long deadline-ms ^long timeout-ms]
   (let [^Selector sel (or @selector-v
-                          (let [^Selector s (Selector/open)]
-                            (.register ch s SelectionKey/OP_READ)
-                            (vreset! selector-v s)
-                            s))]
+                          (locking selector-v
+                            (or @selector-v
+                                (let [s (open-selector ch SelectionKey/OP_READ)]
+                                  (vreset! selector-v s)
+                                  s))))]
     (loop []
+      (when (.isInterrupted (Thread/currentThread))
+        (throw (InterruptedException. "Interrupted while receiving a socket message")))
       (let [remaining-ms (- deadline-ms (System/currentTimeMillis))]
         (when-not (pos? remaining-ms)
           (raise "Socket channel receive timed out."
@@ -388,19 +407,25 @@
 (defn receive-ch
   "Receive one message from channel and put it in buffer, will block
   until one full message is received. When buffer is too small for a
-  message, a new buffer is allocated. Return [msg bf]."
+  message, a new buffer is allocated. Return [msg bf]. The optional selector
+  volatile belongs to the caller, which must keep the channel nonblocking and
+  close the selector under the volatile's lock when closing the connection."
   ([^SocketChannel ch ^ByteBuffer bf]
    (receive-ch ch bf nil))
   ([^SocketChannel ch ^ByteBuffer bf wire-opts]
    (receive-ch ch bf wire-opts nil))
   ([^SocketChannel ch ^ByteBuffer bf wire-opts timeout-ms]
+   (receive-ch ch bf wire-opts timeout-ms nil))
+  ([^SocketChannel ch ^ByteBuffer bf wire-opts timeout-ms read-selector]
    (let [timed?      (some? timeout-ms)
          timeout-ms  (if timed? (long (max 1 (long timeout-ms))) 0)
          deadline-ms (if timed?
                        (long (+ (System/currentTimeMillis) timeout-ms))
                        0)
          blocking?   (and timed? (.isBlocking ch))
-         selector-v  (volatile! nil)]
+         selector-v  (or read-selector (volatile! nil))]
+     (when (and read-selector (.isBlocking ch))
+       (raise "A reusable receive selector requires a nonblocking channel" {}))
      (try
        (when blocking? (.configureBlocking ch false))
        (loop [^ByteBuffer bf bf]
@@ -431,8 +456,9 @@
                (= readn -1) (do (.close ch)
                                 (raise "Socket channel is closed." {}))))))
        (finally
-         (when-let [^Selector sel @selector-v]
-           (.close sel))
+         (when-not read-selector
+           (when-let [^Selector sel @selector-v]
+             (.close sel)))
          (when (and blocking? (.isOpen ch))
            (.configureBlocking ch true)))))))
 
