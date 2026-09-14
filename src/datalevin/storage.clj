@@ -2514,11 +2514,16 @@
 (defn sync-max-tx-floor!
   "Advance an open store's in-memory transaction cursor to at least `next-tx`.
   HA replay can materialize durable metadata through raw KV rows, bypassing the
-  normal local transaction path that advances this volatile cursor."
+  normal local transaction path that advances this volatile cursor. An already
+  satisfied floor does not need the writer lock."
   [^Store store next-tx]
-  (locking (.-write-txn store)
-    (loop [current (long (max-tx store))
-           target (long next-tx)]
-      (if (< current target)
-        (recur (long (.advance-max-tx store)) target)
-        current))))
+  (let [current (long (max-tx store))
+        target  (long next-tx)]
+    (if (< current target)
+      (locking (.-write-txn store)
+        ;; A writer or another floor update may have advanced it while we waited.
+        (loop [current (long (max-tx store))]
+          (if (< current target)
+            (recur (long (.advance-max-tx store)))
+            current)))
+      current)))

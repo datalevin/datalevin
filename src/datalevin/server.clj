@@ -1911,11 +1911,12 @@
 (defn- get-runtime-access-lock
   [^Server server db-name]
   (let [dbs (.-dbs server)]
-    (locking dbs
-      (or (get-in dbs [db-name :runtime-access-lock])
-          (let [lock (ReentrantReadWriteLock. true)]
-            (update-db server db-name #(assoc % :runtime-access-lock lock))
-            lock)))))
+    (or (get-in dbs [db-name :runtime-access-lock])
+        (locking dbs
+          (or (get-in dbs [db-name :runtime-access-lock])
+              (let [lock (ReentrantReadWriteLock. true)]
+                (update-db server db-name #(assoc % :runtime-access-lock lock))
+                lock))))))
 
 (defn with-db-runtime-store-read-access
   "Run `f` while holding the runtime-store read lock for `db-name`.
@@ -2210,9 +2211,13 @@
                [type
                 (fn [server skey message]
                   (try
-                    (binding [nv/*wire-reader* (native-request-reader server skey message)]
-                      (handler handler-deps server skey
-                               (p/resolve-native-request message)))
+                    (if (or (p/native-request? message)
+                            ;; Native values can arrive in later copy-in batches.
+                            (= :copy-in (:mode message)))
+                      (binding [nv/*wire-reader* (native-request-reader server skey message)]
+                        (handler handler-deps server skey
+                                 (p/resolve-native-request message)))
+                      (handler handler-deps server skey message))
                     (catch Exception e
                       (handle-message-error! skey e))))]))
         sh/handler-map))

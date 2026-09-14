@@ -122,18 +122,21 @@
   (let [message {:type :q :args ["tasks" {:nested {(value :a 1) :a}}]}
         bytes (binding [nv/*wire-native-value* true] (b/serialize message))
         pending (p/read-request c/message-format-nippy bytes nil)]
+    (is (p/native-request? pending))
     (is (= :q (:type pending)))
     (is (= "tasks" (first (:args pending))))
     (is (thrown? Exception (p/resolve-native-request pending)))
     (let [resolved (binding [nv/*wire-reader* receiver]
                      (p/resolve-native-request pending))]
       (is (= message resolved))
+      (is (not (p/native-request? resolved)))
       (is (empty? (meta resolved))))
     ;; Client metadata must never supply a replacement request body.
     (let [ordinary (with-meta {:type :q :args ["ordinary"]}
                      {:datalevin.protocol/native-request
                       [c/message-format-nippy bytes nil]})
           read-back (p/read-request c/message-format-nippy (b/serialize ordinary) nil)]
+      (is (not (p/native-request? read-back)))
       (is (= ordinary (p/resolve-native-request read-back))))))
 
 (deftest native-wire-decoding-can-spill

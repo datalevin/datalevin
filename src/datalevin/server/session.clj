@@ -59,20 +59,30 @@
 
 (defn touch-client
   "Record activity, checkpointing at most once per minute (or a quarter of
-  the idle timeout). Persist before accepting activity beyond the saved window."
+  the idle timeout). Persist before accepting activity beyond the saved window.
+  Repeated activity in an already recorded millisecond needs no session update."
   [deps server client-id]
   (when client-id
-    (.computeIfPresent
-      ^ConcurrentHashMap ((:clients-fn deps) server) client-id
-      (reify BiFunction
-        (apply [_ _ current]
-          (let [now-ms (long ((:now-ms-fn deps)))
-                session (-> current
-                            (assoc :last-active now-ms)
-                            (vary-meta dissoc ::restored?))]
-            (if (>= now-ms (long (or (:last-active-checkpoint-until current) 0)))
-              (persist-session! deps server client-id session)
-              session)))))))
+    (let [^ConcurrentHashMap clients ((:clients-fn deps) server)]
+      (when-let [current (.get clients client-id)]
+        (let [now-ms (long ((:now-ms-fn deps)))]
+          (if (and (= now-ms (:last-active current))
+                   (< now-ms (long (or (:last-active-checkpoint-until current) 0)))
+                   (not (::restored? (meta current))))
+            current
+            (.computeIfPresent
+              clients client-id
+              (reify BiFunction
+                (apply [_ _ current]
+                  ;; Re-read the clock and session under the key lock, retaining
+                  ;; concurrent permission updates and checkpoint ordering.
+                  (let [now-ms (long ((:now-ms-fn deps)))
+                        session (-> current
+                                    (assoc :last-active now-ms)
+                                    (vary-meta dissoc ::restored?))]
+                    (if (>= now-ms (long (or (:last-active-checkpoint-until current) 0)))
+                      (persist-session! deps server client-id session)
+                      session)))))))))))
 
 (defn add-client
   [deps server ip client-id username]

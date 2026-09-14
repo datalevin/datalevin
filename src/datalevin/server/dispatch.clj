@@ -414,8 +414,9 @@
                         (.flip read-bf)
                         (bf/buffer-transfer read-bf buffer)
                         (vswap! state assoc :read-bf buffer)
-                        buffer))]
-                (when (pos? (p/read-ch ch read-bf)) (recur)))))))
+                        buffer))
+                    ^int readn (p/read-ch ch read-bf)]
+                (when (pos? readn) (recur)))))))
       (catch InterruptedException _ nil)
       (catch Exception e
         (when-not (client-disconnect? e)

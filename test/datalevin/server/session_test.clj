@@ -147,6 +147,51 @@
       (is (= {id persisted} (persisted-sessions))
           "activity timestamps do not cause durable writes on every request"))))
 
+(deftest recorded-activity-does-not-wait-for-another-session-update-test
+  (let [id (add-session!)
+        {:keys [deps clients]} *sessions*
+        entered (promise)
+        release (promise)]
+    (touch! id 100)
+    (let [update (future
+                   (session/update-client
+                     deps nil id
+                     #(do (deliver entered true)
+                          (await! release)
+                          (assoc % :permissions #{:write}))))
+          activity (future
+                     (await! entered)
+                     (session/touch-client deps nil id))]
+      (try
+        (await! entered)
+        (is (= 100 (:last-active (deref activity 1000 {}))))
+        (finally
+          (deliver release true)
+          (await! update)
+          (await! activity))))
+    (is (= #{:write} (:permissions (get clients id))))
+    (is (= 100 (:last-active (get clients id))))))
+
+(deftest recorded-activity-still-checkpoints-an-expired-window-test
+  (let [id (add-session!)
+        {:keys [deps clients]} *sessions*]
+    (touch! id 100)
+    (session/flush-sessions! deps nil)
+    (is (= 100 (:last-active-checkpoint-until (get clients id))))
+    (touch! id 100)
+    (is (= 350 (:last-active-checkpoint-until (get clients id))))
+    (is (= 350 (:last-active-checkpoint-until (get (persisted-sessions) id))))))
+
+(deftest recorded-activity-consumes-restored-metadata-test
+  (let [id (add-session!)
+        {:keys [conn deps clock]} *sessions*
+        clients (session/load-sessions conn 1)
+        restored (assoc deps :clients-fn (constantly clients))]
+    (reset! clock 1)
+    (is (true? (:datalevin.server.session/restored? (meta (get clients id)))))
+    (session/touch-client restored nil id)
+    (is (nil? (:datalevin.server.session/restored? (meta (get clients id)))))))
+
 (deftest failed-session-persistence-leaves-live-state-intact-test
   (let [id (add-session!)
         {:keys [deps clients]} *sessions*

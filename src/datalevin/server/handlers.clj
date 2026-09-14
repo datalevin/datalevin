@@ -654,22 +654,6 @@
     denied-message
     f))
 
-(defn- api-deps
-  [deps]
-  (select-keys deps
-               [:copy-out
-                :db-state
-                :get-db
-                :get-store
-                :lmdb
-                :search-engine
-                :search-engine*
-                :update-client
-                :update-db
-                :vector-index
-                :with-index-write-admission
-                :write-message]))
-
 (defn- client-op-request
   [{:keys [client-op-id client-op-hash client-op-response-kind type]
     :as   message}]
@@ -2266,40 +2250,40 @@
   (let [db-name (nth args 0)
         store   (dt-store deps server skey db-name writing?)]
     (ensure-ha-read-floor! deps server db-name writing? message store)
-    (sapi/q (api-deps deps) server skey message)))
+    (sapi/q deps server skey message)))
 
 (defn pull
   [deps server skey {:keys [args writing?] :as message}]
   (let [db-name (nth args 0)
         store   (dt-store deps server skey db-name writing?)]
     (ensure-ha-read-floor! deps server db-name writing? message store)
-    (sapi/pull (api-deps deps) server skey message)))
+    (sapi/pull deps server skey message)))
 
 (defn pull-many
   [deps server skey {:keys [args writing?] :as message}]
   (let [db-name (nth args 0)
         store   (dt-store deps server skey db-name writing?)]
     (ensure-ha-read-floor! deps server db-name writing? message store)
-    (sapi/pull-many (api-deps deps) server skey message)))
+    (sapi/pull-many deps server skey message)))
 
 (defn explain
   [deps server skey {:keys [args writing?] :as message}]
   (let [db-name (nth args 0)
         store   (dt-store deps server skey db-name writing?)]
     (ensure-ha-read-floor! deps server db-name writing? message store)
-    (sapi/explain (api-deps deps) server skey message)))
+    (sapi/explain deps server skey message)))
 
 (defn fulltext-datoms
   [deps server skey {:keys [args writing?] :as message}]
   (let [db-name (nth args 0)
         store   (dt-store deps server skey db-name writing?)]
     (ensure-ha-read-floor! deps server db-name writing? message store)
-    (sapi/fulltext-datoms (api-deps deps) server skey message)))
+    (sapi/fulltext-datoms deps server skey message)))
 
 (defn new-search-engine
   [deps server ^SelectionKey skey message]
   (sapi/new-search-engine
-   (api-deps deps)
+   deps
    server
    skey
    (:client-id @(skey-state skey))
@@ -2307,42 +2291,42 @@
 
 (defn add-doc
   [deps server skey {:keys [args] :as _message}]
-  (sapi/search-call (api-deps deps) server skey {:args args}
+  (sapi/search-call deps server skey {:args args}
                     i/add-doc))
 
 (defn remove-doc
   [deps server skey {:keys [args] :as _message}]
-  (sapi/search-call (api-deps deps) server skey {:args args}
+  (sapi/search-call deps server skey {:args args}
                     i/remove-doc))
 
 (defn clear-docs
   [deps server skey {:keys [args] :as _message}]
-  (sapi/search-call (api-deps deps) server skey {:args args}
+  (sapi/search-call deps server skey {:args args}
                     i/clear-docs))
 
 (defn doc-indexed?
   [deps server skey {:keys [args] :as _message}]
-  (sapi/search-call (api-deps deps) server skey {:args args}
+  (sapi/search-call deps server skey {:args args}
                     i/doc-indexed?))
 
 (defn doc-count
   [deps server skey {:keys [args] :as _message}]
-  (sapi/search-call (api-deps deps) server skey {:args args}
+  (sapi/search-call deps server skey {:args args}
                     i/doc-count))
 
 (defn search
   [deps server skey {:keys [args] :as _message}]
-  (sapi/search-call (api-deps deps) server skey {:args args}
+  (sapi/search-call deps server skey {:args args}
                     i/search))
 
 (defn search-re-index
   [deps server skey {:keys [args] :as _message}]
-  (sapi/search-re-index (api-deps deps) server skey {:args args}))
+  (sapi/search-re-index deps server skey {:args args}))
 
 (defn new-vector-index
   [deps server ^SelectionKey skey message]
   (sapi/new-vector-index
-   (api-deps deps)
+   deps
    server
    skey
    (:client-id @(skey-state skey))
@@ -2350,55 +2334,55 @@
 
 (defn add-vec
   [deps server skey {:keys [args] :as _message}]
-  (sapi/vector-call (api-deps deps) server skey {:args args}
+  (sapi/vector-call deps server skey {:args args}
                     i/add-vec))
 
 (defn remove-vec
   [deps server skey {:keys [args] :as _message}]
-  (sapi/vector-call (api-deps deps) server skey {:args args}
+  (sapi/vector-call deps server skey {:args args}
                     i/remove-vec))
 
 (defn persist-vecs
   [deps server skey {:keys [args] :as _message}]
-  (sapi/vector-call (api-deps deps) server skey {:args args}
+  (sapi/vector-call deps server skey {:args args}
                     i/persist-vecs))
 
 (defn close-vecs
   [deps server skey {:keys [args] :as _message}]
-  (sapi/vector-call (api-deps deps) server skey {:args args}
+  (sapi/vector-call deps server skey {:args args}
                     i/close-vecs))
 
 (defn clear-vecs
   [deps server skey {:keys [args] :as _message}]
-  (sapi/vector-call (api-deps deps) server skey {:args args}
+  (sapi/vector-call deps server skey {:args args}
                     i/clear-vecs))
 
 (defn vec-indexed?
   [deps server skey {:keys [args] :as _message}]
-  (sapi/vector-call (api-deps deps) server skey {:args args}
+  (sapi/vector-call deps server skey {:args args}
                     i/vec-indexed?))
 
 (defn vecs-info
   [deps server skey {:keys [args] :as _message}]
-  (sapi/vector-call (api-deps deps) server skey {:args args}
+  (sapi/vector-call deps server skey {:args args}
                     i/vecs-info))
 
 (defn search-vec
   [deps server skey {:keys [args] :as _message}]
-  (sapi/vector-call (api-deps deps) server skey {:args args}
+  (sapi/vector-call deps server skey {:args args}
                     i/search-vec))
 
 (defn vec-re-index
   [deps server skey {:keys [args] :as _message}]
-  (sapi/vec-re-index (api-deps deps) server skey {:args args}))
+  (sapi/vec-re-index deps server skey {:args args}))
 
 (defn kv-re-index
   [deps server skey {:keys [args] :as _message}]
-  (sapi/kv-re-index (api-deps deps) server skey {:args args}))
+  (sapi/kv-re-index deps server skey {:args args}))
 
 (defn datalog-re-index
   [deps server skey {:keys [args] :as _message}]
-  (sapi/datalog-re-index (api-deps deps) server skey {:args args}))
+  (sapi/datalog-re-index deps server skey {:args args}))
 
 (defn replica-status
   [deps server skey {:keys [args] :as _message}]

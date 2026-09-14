@@ -407,11 +407,29 @@
         (s/replace #"(\p{javaLowerCase})(\p{javaUpperCase})" "$1 $2")
         (s/split #"[^\w0-9]+"))))
 
+(defn- canonical-lisp-case?
+  [^String s]
+  (let [n (.length s)]
+    (loop [i 0 after-hyphen? true]
+      (if (= i n)
+        (not after-hyphen?)
+        (let [ch (int (.charAt s i))]
+          (cond
+            (or (<= 97 ch 122) (<= 48 ch 57))
+            (recur (inc i) false)
+
+            (= ch 45)
+            (and (not after-hyphen?) (recur (inc i) true))
+
+            :else false))))))
+
 (defn lisp-case
   ^String [^String s]
   {:pre  [(string? s)]
    :post [(string? %)]}
-  (s/join "-" (map s/lower-case (split-words s))))
+  (if (canonical-lisp-case? s)
+    s
+    (s/join "-" (map s/lower-case (split-words s)))))
 
 (defn keyword->string [k] (subs (str k) 1))
 

@@ -253,6 +253,11 @@
         (vary-meta message assoc ::native-request [fmt bs wire-opts])
         message))))
 
+(defn native-request?
+  "True when read-request retained native values for authorized decoding."
+  [message]
+  (boolean (::native-request (meta message))))
+
 (defn resolve-native-request
   "Rebuild native requests with the bound receiver before constructing keys,
   sets, or query inputs. Ordinary requests require no second decode."
