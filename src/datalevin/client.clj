@@ -35,6 +35,7 @@
   (close [conn]))
 
 (defonce ^:private ^ConcurrentHashMap connection-wire-opts
+  ;; Lifecycle/reset registry only. I/O reads the connection's own reference.
   (ConcurrentHashMap.))
 
 (deftype ^:no-doc ClientState [^AtomicReference readers
@@ -100,6 +101,8 @@
   "Clear the process-local client and HA endpoint caches. Intended for tests
   that need a clean slate or that exercise reconnect/retry behavior."
   []
+  (doseq [^AtomicReference options (.values connection-wire-opts)]
+    (.set options (p/default-wire-opts)))
   (.clear connection-wire-opts)
   (locking client-state-refs
     (doseq [^ClientState state (.keySet client-state-refs)]
@@ -158,15 +161,6 @@
          cleanup-after-failure!
          disconnect)
 
-(defn- conn-wire-opts
-  [^SocketChannel ch]
-  (or (.get connection-wire-opts ch)
-      (p/default-wire-opts)))
-
-(defn- set-conn-wire-opts!
-  [^SocketChannel ch wire-opts]
-  (.put connection-wire-opts ch wire-opts))
-
 (defn- clear-conn-wire-opts!
   [^SocketChannel ch]
   (.remove connection-wire-opts ch))
@@ -175,43 +169,56 @@
                               ^long time-out
                               ^:volatile-mutable ^ByteBuffer bf
                               read-selector
-                              ^ByteBuffer probe-bf]
+                              ^ByteBuffer probe-bf
+                              ^AtomicReference wire-options
+                              receive-buffer]
   IConnection
   (send-n-receive [this msg]
-    (try
-      (locking bf
-        (let [wire-opts (conn-wire-opts ch)]
-          (p/write-message-blocking ch bf msg wire-opts)
+    (locking this
+      (try
+        (let [wire-opts (.get wire-options)]
+          ;; Grow before any bytes are sent; decoder failures must not resend.
+          (loop []
+            (when-not (try
+                        (p/write-message-owned ch bf msg wire-opts)
+                        true
+                        (catch BufferOverflowException _ false))
+              (set! bf (bf/allocate-buffer
+                         (* ^long c/+buffer-grow-factor+ (.capacity bf))))
+              (recur)))
           (.clear bf)
-          (let [[resp bf'] (p/receive-ch ch bf wire-opts time-out
-                                        (when-not (.isBlocking ch) read-selector))]
-            (when-not (identical? bf' bf) (set! bf bf'))
-            resp)))
-      (catch BufferOverflowException _
-        (let [size (* ^long c/+buffer-grow-factor+ (.capacity bf))]
-          (set! bf (bf/allocate-buffer size))
-          (send-n-receive this msg)))
-      (catch Exception e
-        (when (nv/decoding-error? e) (throw e))
-        (raise "Error sending message and receiving response: "
-                 e {:msg msg}))))
+          (vreset! receive-buffer bf)
+          (try
+            (p/receive-ch! ch receive-buffer wire-opts time-out
+                          (when-not (.isBlocking ch) read-selector))
+            (finally (set! bf @receive-buffer))))
+        (catch Exception e
+          (when (nv/decoding-error? e) (throw e))
+          (raise "Error sending message and receiving response: "
+                 e {:msg msg})))))
 
   (send-only [this msg]
-    (try
-      (p/write-message-blocking ch bf msg (conn-wire-opts ch))
-      (catch BufferOverflowException _
-        (let [size (* ^long c/+buffer-grow-factor+ (.capacity bf))]
-          (set! bf (bf/allocate-buffer size))
-          (send-only this msg)))
-      (catch Exception e
-        (raise "Error sending message: " e {:msg msg}))))
+    (locking this
+      (try
+        (loop []
+          (when-not (try
+                      (p/write-message-owned ch bf msg (.get wire-options))
+                      true
+                      (catch BufferOverflowException _ false))
+            (set! bf (bf/allocate-buffer
+                       (* ^long c/+buffer-grow-factor+ (.capacity bf))))
+            (recur)))
+        (catch Exception e
+          (raise "Error sending message: " e {:msg msg})))))
 
   (receive [this]
     (try
-      (let [[resp bf'] (p/receive-ch ch bf (conn-wire-opts ch) time-out
-                                    (when-not (.isBlocking ch) read-selector))]
-        (when-not (identical? bf' bf) (set! bf bf'))
-        resp)
+      (locking this
+        (vreset! receive-buffer bf)
+        (try
+          (p/receive-ch! ch receive-buffer (.get wire-options) time-out
+                        (when-not (.isBlocking ch) read-selector))
+          (finally (set! bf @receive-buffer))))
       (catch Exception e
         (when (nv/decoding-error? e) (throw e))
         (raise "Error receiving data:" e {}))))
@@ -238,7 +245,15 @@
   ([^SocketChannel ch ^ByteBuffer bf]
    (->Connection ch c/default-connection-timeout bf))
   ([^SocketChannel ch time-out ^ByteBuffer bf]
-   (Connection. ch (long time-out) bf (volatile! nil) (ByteBuffer/allocate 1))))
+   (let [options (AtomicReference. (p/default-wire-opts))
+         conn (Connection. ch (long time-out) bf (volatile! nil)
+                           (ByteBuffer/allocate 1) options (volatile! bf))]
+     (.put connection-wire-opts ch options)
+     conn)))
+
+(defn- set-conn-wire-opts!
+  [^Connection conn wire-opts]
+  (.set ^AtomicReference (.-wire-options conn) wire-opts))
 
 (defn- ^SocketChannel connect-socket
   "connect to server and return the client socket channel"
@@ -293,7 +308,6 @@
    (let [ch (connect-socket host port connect-time-out)]
      (try
        (.configureBlocking ch false)
-       (set-conn-wire-opts! ch (p/default-wire-opts))
        (->Connection ch (long receive-time-out)
                      (bf/allocate-buffer c/+buffer-size+))
        (catch Throwable t
@@ -308,7 +322,7 @@
                               :client-id         client-id
                               :wire-capabilities (p/local-wire-capabilities)})]
     (when-not (= type :set-client-id-ok) (raise message {}))
-    (set-conn-wire-opts! (.-ch ^Connection conn)
+    (set-conn-wire-opts! conn
                          (p/negotiate-wire-opts wire-capabilities))))
 
 (defn- cleanup-after-failure!

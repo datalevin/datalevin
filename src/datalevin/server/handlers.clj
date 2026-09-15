@@ -1733,9 +1733,20 @@
 
 (defn- kv-handler
   [op op-fn]
-  (if (copying-kv-ops op)
+  (cond
+    (copying-kv-ops op)
     (copying-kv-handler op-fn)
-    (normal-kv-handler op-fn)))
+    (= op :get-value)
+    (fn [deps server ^SelectionKey skey {:keys [args writing?]}]
+      (let [store (kv-store deps server skey (nth args 0) writing?)]
+        (write-result!
+          deps skey
+          (if (and (= 6 (count args))
+                   (get-in @(.attachment skey) [:wire-opts :storage-read?]))
+            (kv/read-value-result store (nth args 1) (nth args 2)
+                                  (nth args 3) (nth args 4) (nth args 5))
+            (apply op-fn store (rest args))))))
+    :else (normal-kv-handler op-fn)))
 
 (defn- run-batch-kv-call
   [kv-store call]

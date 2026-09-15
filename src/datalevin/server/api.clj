@@ -15,12 +15,14 @@
    [datalevin.core :as d]
    [datalevin.dump :as dump]
    [datalevin.interface :as i]
+   [datalevin.pull-api :as pull]
    [datalevin.query :as q]
    [datalevin.query.resolve :as qresolve]
    [datalevin.search :as sc]
    [datalevin.util :refer [raise]]
    [datalevin.vector :as v])
   (:import
+   [java.nio.channels SelectionKey]
    [datalevin.db DB]))
 
 (defn- write-or-copy-result!
@@ -41,10 +43,12 @@
     (write-or-copy-result! write-message copy-out skey data)))
 
 (defn pull
-  [{:keys [get-db write-message copy-out]} server skey {:keys [args writing?]}]
+  [{:keys [get-db write-message copy-out]} server ^SelectionKey skey {:keys [args writing?]}]
   (let [[db-name pattern id opts] args
         db                        (get-db server db-name writing?)
-        data                      (d/pull db pattern id opts)]
+        data                      (if (get-in @(.attachment skey) [:wire-opts :storage-read?])
+                                    (pull/read-result db pattern id opts)
+                                    (d/pull db pattern id opts))]
     (write-or-copy-result! write-message copy-out skey data)))
 
 (defn pull-many

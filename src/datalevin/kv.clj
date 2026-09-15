@@ -13,6 +13,8 @@
    [datalevin.constants :as c]
    [datalevin.custom-kv :as custom-kv]
    [datalevin.interface :as i]
+   [datalevin.read-encode :as enc]
+   [datalevin.scan :as scan]
    [datalevin.kv.snapshot :refer [list-snapshot-entries]]
    [datalevin.kv.retention :refer [delete-txlog-segment!
                                    gc-txlog-segments-local!
@@ -607,6 +609,16 @@
   (if (instance? KVLMDB db)
     (.-db ^KVLMDB db)
     db))
+
+(defn read-value-result
+  "A synchronous encoded point-read result for negotiated remote reads.
+  Declared custom DBIs retain their logical codec and native receiver behavior."
+  [db dbi-name k k-type v-type ignore-key?]
+  (let [raw (raw-lmdb db)]
+    (if (custom-kv/custom-dbi? raw dbi-name)
+      (i/get-value db dbi-name k k-type v-type ignore-key?)
+      (enc/read-result
+        #(scan/write-value! raw dbi-name k k-type v-type ignore-key? %)))))
 
 (defn wrap-lmdb
   [db]

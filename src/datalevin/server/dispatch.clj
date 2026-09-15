@@ -405,15 +405,15 @@
   reading the next request. No request queue or selector rearming is needed."
   [deps server ^SelectionKey skey]
   (let [state (.attachment skey)
-        ^SocketChannel ch (.channel skey)]
+        ^SocketChannel ch (.channel skey)
+        read-message! #(read-message deps server skey %1 %2)
+        handle-message! (fn [_ message]
+                          (handle-message deps server skey message))]
     (try
       (loop []
         (when (and (.isOpen ch) (not (.isInterrupted (Thread/currentThread))))
           (let [^ByteBuffer read-bf (:read-bf @state)]
-            (if (p/extract-message read-bf
-                                  #(read-message deps server skey %1 %2)
-                                  (fn [_ message]
-                                    (handle-message deps server skey message)))
+            (if (p/extract-message read-bf read-message! handle-message!)
               ;; Copy-in may have grown the shared buffer. Fetch it afresh.
               (recur)
               (let [^ByteBuffer read-bf

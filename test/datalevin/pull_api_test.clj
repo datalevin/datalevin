@@ -2,10 +2,13 @@
   (:require
    [clojure.test :refer [deftest is testing use-fixtures]]
    [datalevin.core :as d]
+   [datalevin.protocol :as p]
+   [datalevin.pull-api :as pull]
    [datalevin.test.core :refer [db-fixture]]
    [datalevin.timeout :as timeout]
    [datalevin.util :as u])
-  (:import [java.util UUID]))
+  (:import [java.nio ByteBuffer]
+           [java.util UUID]))
 
 (use-fixtures :each db-fixture)
 
@@ -13,6 +16,13 @@
   ;; A visitor requires the general interpreter, giving an independent path
   ;; through the same public API for comparison with the scalar fast path.
   (d/pull db pattern id {:visitor (fn [& _])}))
+
+(defn- encoded-pull
+  ([db pattern id] (encoded-pull db pattern id nil))
+  ([db pattern id opts]
+   (let [buffer (ByteBuffer/allocate 65536)]
+     (p/write-message-bf buffer {:result (pull/read-result db pattern id opts)})
+     (:result (first (p/receive-one-message buffer))))))
 
 (deftest scalar-pull-matches-general-interpreter
   (let [dir (u/tmp-dir (str "flat-pull-" (UUID/randomUUID)))
@@ -37,7 +47,9 @@
                                      (reverse fields))
                         with-id? (conj :db/id))]
           (is (= (general-pull @conn pattern id) (d/pull @conn pattern id))
-              (str pattern " " id))))
+              (str pattern " " id))
+          (is (= (general-pull @conn pattern id) (encoded-pull @conn pattern id))
+              (str "encoded " pattern " " id))))
       (is (= (mapv #(general-pull @conn [:z :a :db/id] %) [1 2 99])
              (d/pull-many @conn [:z :a :db/id] [1 2 99])))
       (testing "transaction-local changes and giant values remain visible"
@@ -46,7 +58,8 @@
                           [:db/retract 1 :a (:a (first rows))]])
           (is (= {:z (.repeat "x" 3000) :db/id 1}
                  (d/pull @tx [:z :a :db/id] 1)))
-          (is (= (general-pull @tx fields 1) (d/pull @tx fields 1)))))
+          (is (= (general-pull @tx fields 1) (d/pull @tx fields 1)))
+          (is (= (general-pull @tx fields 1) (encoded-pull @tx fields 1)))))
       (finally
         (d/close conn)
         (u/delete-files dir)))))
@@ -60,9 +73,11 @@
       (d/transact! conn [{:db/id 1 :name "one" :value 1 :friend 2 :tags [:a :b]}
                         {:db/id 2 :name "two"}])
       (is (= {:value 1} (d/pull @conn [:value] 1)))
+      (is (= {:value 1} (encoded-pull @conn [:value] 1)))
       (d/update-schema conn {:value {:db/cardinality :db.cardinality/many}})
       (d/transact! conn [[:db/add 1 :value 2]])
       (is (= {:value [1 2]} (d/pull @conn [:value] 1)))
+      (is (= {:value [1 2]} (encoded-pull @conn [:value] 1)))
       (doseq [pattern ['[*] [:unknown] []
                        '[[:name :as :label]]
                        '[[:unknown :default false]]
@@ -72,7 +87,9 @@
                        '[{:_friend [:name]}]
                        '[{:friend ...}]]]
         (is (= (general-pull @conn pattern 1) (d/pull @conn pattern 1))
-            (str pattern)))
+            (str pattern))
+        (is (= (general-pull @conn pattern 1) (encoded-pull @conn pattern 1))
+            (str "encoded " pattern)))
       (let [visits (atom [])]
         (is (= {:name "one"}
                (d/pull @conn [:name :unknown] 1

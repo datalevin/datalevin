@@ -31,10 +31,12 @@
       (srv/reset-trace-remote-tx!))))
 
 (deftest client-state-reset-test
-  (let [^java.util.concurrent.ConcurrentHashMap m @#'cl/connection-wire-opts]
-    (.put m :testability-key {:timeout 1})
+  (let [^java.util.concurrent.ConcurrentHashMap m @#'cl/connection-wire-opts
+        options (java.util.concurrent.atomic.AtomicReference. {:compression :zstd})]
+    (.put m :testability-key options)
     (is (pos? (.size m)))
     (is (nil? (cl/reset-client-state!)))
+    (is (nil? (:compression (.get options))))
     (is (zero? (.size m)))))
 
 (deftest vector-save-cache-reset-test

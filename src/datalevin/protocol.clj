@@ -15,6 +15,7 @@
    [datalevin.constants :as c]
    [datalevin.datom :as d]
    [datalevin.native-value :as nv]
+   [datalevin.read-encode]
    [datalevin.util :refer [raise]]
    [datalevin.spill :as sp]
    [taoensso.nippy :as nippy]
@@ -49,6 +50,7 @@
 (defn ^:no-doc local-wire-capabilities
   []
   {:compression           [:zstd]
+   :storage-read?         true
    :compression-threshold (long c/*wire-compression-threshold*)})
 
 (defn ^:no-doc default-wire-opts
@@ -66,7 +68,9 @@
   [peer-capabilities]
   (cond-> (default-wire-opts)
     (peer-supports-zstd? peer-capabilities)
-    (assoc :compression :zstd)))
+    (assoc :compression :zstd)
+    (true? (:storage-read? peer-capabilities))
+    (assoc :storage-read? true)))
 
 (defn- fmt-int ^long [fmt]
   (bit-and (long fmt) 0xFF))
@@ -427,59 +431,69 @@
         (when-let [^Selector sel @selector]
           (.close sel))))))
 
+(defn write-message-owned
+  "Write using an exclusively owned buffer. The caller supplies synchronization."
+  [^SocketChannel ch ^ByteBuffer bf msg wire-opts]
+  (.clear bf)
+  (write-message-bf bf msg c/message-format-nippy wire-opts)
+  (.flip bf)
+  (send-all ch bf))
+
 (defn write-message-blocking
   "Write a message in blocking mode"
   ([^SocketChannel ch ^ByteBuffer bf msg]
    (write-message-blocking ch bf msg nil))
   ([^SocketChannel ch ^ByteBuffer bf msg wire-opts]
    (locking bf
-     (.clear bf)
-     (write-message-bf bf msg c/message-format-nippy wire-opts)
-     (.flip bf)
-     (send-all ch bf))))
+     (write-message-owned ch bf msg wire-opts))))
+
+(defn receive-one-message!
+  "Consume a frame using a connection-owned buffer volatile. Return the message
+  or nil for an incomplete frame, and publish any buffer growth to buffer-v."
+  [buffer-v wire-opts]
+  (let [^ByteBuffer read-bf @buffer-v
+        pos (.position read-bf)]
+    (when (>= pos c/message-header-size)
+      (.flip read-bf)
+      (let [available (.limit read-bf)
+            fmt       (.get read-bf)
+            length    ^int (.getInt read-bf)
+            _         (when (< length c/message-header-size)
+                        (raise "Message corruption: length is less than header size"
+                               {:length length}))
+            read-bf   (if (< (.capacity read-bf) length)
+                        (let [^ByteBuffer bf
+                              (ByteBuffer/allocateDirect
+                                (* ^long c/+buffer-grow-factor+ length))]
+                          (.rewind read-bf)
+                          (bf/buffer-transfer read-bf bf)
+                          (vreset! buffer-v bf)
+                          bf)
+                        read-bf)]
+        (if (< available length)
+          (do (doto read-bf
+                (.limit (.capacity read-bf))
+                (.position pos))
+              nil)
+          (try
+            ;; The decoder cannot read into a following frame.
+            (.limit read-bf length)
+            (read-value fmt read-bf wire-opts)
+            (finally
+              (.limit read-bf available)
+              (.position read-bf length)
+              (if (= available length)
+                (.clear read-bf)
+                (.compact read-bf)))))))))
 
 (defn receive-one-message
-  "Consume one message from the read-bf and return it.
-  If there is not enough data for one message, return nil. Prepare the
-  buffer for write. If one message is bigger than read-bf, allocate a
-  new read-bf. Return `[msg read-bf]`"
-  ([^ByteBuffer read-bf]
-   (receive-one-message read-bf nil))
-  ([^ByteBuffer read-bf wire-opts]
-   (let [pos (.position read-bf)]
-     (if (>= pos c/message-header-size)
-       (do (.flip read-bf)
-           (let [available (.limit read-bf)
-                 fmt       (.get read-bf)
-                 length    ^int (.getInt read-bf)
-                 _         (when (< length c/message-header-size)
-                             (raise "Message corruption: length is less than header size"
-                                      {:length length}))
-                 read-bf   (if (< (.capacity read-bf) length)
-                             (let [^ByteBuffer bf
-                                   (ByteBuffer/allocateDirect
-                                     (* ^long c/+buffer-grow-factor+ length))]
-                               (.rewind read-bf)
-                               (bf/buffer-transfer read-bf bf)
-                               bf)
-                             read-bf)]
-             (if (< available length)
-               (do (doto read-bf
-                     (.limit (.capacity read-bf))
-                     (.position pos))
-                   [nil read-bf])
-               (let [msg (try
-                           ;; The decoder cannot read into a following frame.
-                           (.limit read-bf length)
-                           (read-value fmt read-bf wire-opts)
-                           (finally
-                             (.limit read-bf available)
-                             (.position read-bf length)
-                             (if (= available length)
-                               (.clear read-bf)
-                               (.compact read-bf))))]
-                 [msg read-bf]))))
-       [nil read-bf]))))
+  "Consume a frame and return [message buffer], with nil for an incomplete frame.
+  Connections use receive-one-message! to reuse the buffer holder."
+  ([read-bf] (receive-one-message read-bf nil))
+  ([read-bf wire-opts]
+   (let [buffer-v (volatile! read-bf)
+         message (receive-one-message! buffer-v wire-opts)]
+     [message @buffer-v])))
 
 (defn read-ch
   "Read from the socket channel, return the number of bytes read. Return -1
@@ -511,63 +525,54 @@
           (.clear (.selectedKeys sel))
           (recur))))))
 
-(defn receive-ch
+(defn receive-ch!
   "Receive one message from channel and put it in buffer, will block
   until one full message is received. When buffer is too small for a
-  message, a new buffer is allocated. Return [msg bf]. The optional selector
+  message, a new buffer is published to buffer-v. Return the message. The selector
   volatile belongs to the caller, which must keep the channel nonblocking and
   close the selector under the volatile's lock when closing the connection."
-  ([^SocketChannel ch ^ByteBuffer bf]
-   (receive-ch ch bf nil))
-  ([^SocketChannel ch ^ByteBuffer bf wire-opts]
-   (receive-ch ch bf wire-opts nil))
-  ([^SocketChannel ch ^ByteBuffer bf wire-opts timeout-ms]
-   (receive-ch ch bf wire-opts timeout-ms nil))
-  ([^SocketChannel ch ^ByteBuffer bf wire-opts timeout-ms read-selector]
-   (let [timed?      (some? timeout-ms)
-         timeout-ms  (if timed? (long (max 1 (long timeout-ms))) 0)
-         deadline-ms (if timed?
-                       (long (+ (System/currentTimeMillis) timeout-ms))
-                       0)
-         blocking?   (and timed? (.isBlocking ch))
-         selector-v  (or read-selector (volatile! nil))]
-     (when (and read-selector (.isBlocking ch))
-       (raise "A reusable receive selector requires a nonblocking channel" {}))
-     (try
-       (when blocking? (.configureBlocking ch false))
-       (loop [^ByteBuffer bf bf]
-         (if (> (.position bf) c/message-header-size)
-           (let [[msg ^ByteBuffer bf] (receive-one-message bf wire-opts)]
-             (if msg
-               [msg bf]
-               (let [^int readn (read-ch ch bf)]
-                 (cond
-                   (> readn 0)  (let [[msg bf] (receive-one-message bf wire-opts)]
-                                  (if msg [msg bf] (recur bf)))
-                   (= readn 0)  (do
-                                  (when timed?
-                                    (await-read-ready! ch selector-v
-                                                       deadline-ms timeout-ms))
-                                  (recur bf))
-                   (= readn -1) (do (.close ch)
-                                    (raise "Socket channel is closed." {}))))))
-           (let [^int readn (read-ch ch bf)]
-             (cond
-               (> readn 0)  (let [[msg bf] (receive-one-message bf wire-opts)]
-                              (if msg [msg bf] (recur bf)))
-               (= readn 0)  (do
-                              (when timed?
-                                (await-read-ready! ch selector-v
-                                                   deadline-ms timeout-ms))
-                              (recur bf))
-               (= readn -1) (do (.close ch)
-                                (raise "Socket channel is closed." {}))))))
-       (finally
-         (when-not read-selector
-           (when-let [^Selector sel @selector-v]
-             (.close sel)))
-         (when (and blocking? (.isOpen ch))
-           (.configureBlocking ch true)))))))
+  [^SocketChannel ch buffer-v wire-opts timeout-ms read-selector]
+  (let [timed?      (some? timeout-ms)
+        timeout-ms  (if timed? (long (max 1 (long timeout-ms))) 0)
+        deadline-ms (if timed?
+                      (long (+ (System/currentTimeMillis) timeout-ms))
+                      0)
+        blocking?   (and timed? (.isBlocking ch))
+        selector-v  (or read-selector (volatile! nil))]
+    (when (and read-selector (.isBlocking ch))
+      (raise "A reusable receive selector requires a nonblocking channel" {}))
+    (try
+      (when blocking? (.configureBlocking ch false))
+      (loop []
+        (if-let [msg (receive-one-message! buffer-v wire-opts)]
+          msg
+          (let [^int readn (read-ch ch @buffer-v)]
+            (cond
+              (> readn 0)  (recur)
+              (= readn 0)  (do
+                             (when timed?
+                               (await-read-ready! ch selector-v
+                                                  deadline-ms timeout-ms))
+                             (recur))
+              (= readn -1) (do (.close ch)
+                               (raise "Socket channel is closed." {}))))))
+      (finally
+        (when-not read-selector
+          (when-let [^Selector sel @selector-v]
+            (.close sel)))
+        (when (and blocking? (.isOpen ch))
+          (.configureBlocking ch true))))))
+
+(defn receive-ch
+  "Receive a message and return [message buffer]. For repeated reads, use a
+  connection-owned buffer holder with receive-ch! instead."
+  ([ch bf] (receive-ch ch bf nil))
+  ([ch bf wire-opts] (receive-ch ch bf wire-opts nil))
+  ([ch bf wire-opts timeout-ms] (receive-ch ch bf wire-opts timeout-ms nil))
+  ([ch bf wire-opts timeout-ms read-selector]
+   (let [buffer-v (volatile! bf)
+         message (receive-ch! ch buffer-v wire-opts timeout-ms read-selector)]
+     [message @buffer-v])))
 
 (defn extract-message
   "Extract a complete frame. The optional msg-reader decodes (fmt, buffer)

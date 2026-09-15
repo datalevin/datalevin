@@ -11,16 +11,22 @@
   "API for pull syntax"
   (:require
    [datalevin.pull-parser :as dpp]
+   [datalevin.bits :as b]
+   [datalevin.custom-datalog :as cd]
    [datalevin.db :as db]
    [datalevin.constants :as c]
    [datalevin.datom :as dd]
    [datalevin.interface :as i]
+   [datalevin.index :as idx]
+   [datalevin.read-encode :as enc]
+   [datalevin.storage :as storage]
    [datalevin.timeout :as timeout]
    [datalevin.util :as u :refer [cond+]])
   (:import
    [datalevin.db DB]
    [datalevin.utl LRUCache]
    [datalevin.datom Datom]
+   [datalevin.storage Store]
    [datalevin.pull_parser PullAttr PullPattern]))
 
 (declare pull-impl attrs-frame ref-frame ->ReverseAttrsFrame)
@@ -37,7 +43,7 @@
 
 (defrecord Context [db visitor])
 
-(deftype ^:no-doc FlatPattern [^objects names ^longs aids schema id?])
+(deftype ^:no-doc FlatPattern [^objects names ^longs aids schema id? ^objects keys])
 (deftype ^:no-doc CachedPattern [schema pattern flat])
 
 (defn- flat-pattern
@@ -60,7 +66,7 @@
           names (filterv #(not= :db/id %) names)]
       (FlatPattern. (object-array names)
                     (long-array (map #(:db/aid (get schema %)) names))
-                    schema id?))))
+                    schema id? (object-array (map b/serialize names))))))
 
 (defn visit [^Context context pattern e a v]
   (when-some [visitor (.-visitor context)]
@@ -414,6 +420,25 @@
        (pull* db pattern id opts))))
   ([db pattern id]
    (pull db pattern id {})))
+
+(defn read-result
+  "Prepare a scalar pull for direct storage encoding. Other patterns, custom
+  codecs, deadlines and transaction overlays retain the ordinary pull path."
+  [^DB db pattern id {:keys [visitor timeout] :as opts}]
+  (let [store (.-store db)]
+    (if (and (instance? Store store) (nil? visitor) (nil? timeout)
+             (nil? timeout/*deadline*) (not (db/pending-tx-cache? db)))
+      (let [_ (storage/maybe-ensure-current! store)
+            {^FlatPattern flat :flat :as parsed} (parse-opts db pattern opts)]
+        (if (and flat
+                 (< (alength ^objects (.-names flat)) (long c/+wire-datom-batch-size+))
+                 (not-any? #(cd/custom-type? (idx/value-type (get (.-schema flat) %)))
+                           (.-names flat)))
+          (when-some [eid (db/entid db id)]
+            (enc/read-result
+              #(storage/write-entity! store % eid (.-keys flat) (.-aids flat) (.-id? flat))))
+          (pull-impl parsed id)))
+      (pull db pattern id opts))))
 
 (defn pull-many*
   ([^DB db pattern ids] (pull-many* db pattern ids {}))

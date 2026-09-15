@@ -14,6 +14,7 @@
    [datalevin.spill :as sp]
    [datalevin.util :as u :refer [raise]]
    [datalevin.lmdb :as l]
+   [datalevin.read-encode :as enc]
    [datalevin.interface :as i])
   (:import
    [datalevin.spill SpillableVector]
@@ -41,6 +42,25 @@
       (finally
         (when-not (l/writing? lmdb)
           (i/return-rtx lmdb rtx))))))
+
+(defn write-value!
+  "Encode a point read directly into a response, releasing its snapshot before
+  the caller sends bytes. Buffer overflow propagates so the caller can retry."
+  [lmdb dbi-name k k-type v-type ignore-key? out]
+  (i/check-ready lmdb)
+  (let [dbi (i/get-dbi lmdb dbi-name false)
+        writing? (l/writing? lmdb)
+        rtx (if writing? @(l/write-txn lmdb) (i/get-rtx lmdb))]
+    (try
+      (l/put-read-key dbi rtx k k-type)
+      (if-let [buffer (l/get-kv dbi rtx)]
+        (do
+          (when-not ignore-key?
+            (enc/start-pair! out)
+            (enc/write-value! out (b/expected-return k k-type)))
+          (enc/write-buffer! out buffer v-type))
+        (enc/write-value! out nil))
+      (finally (when-not writing? (i/return-rtx lmdb rtx))))))
 
 (defn get-rank
   [lmdb dbi-name k k-type]

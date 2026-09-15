@@ -63,7 +63,7 @@
            (p/write-message-bf frame response c/message-format-nippy)
            (.flip frame)
            (.add frames frame))))
-     (#'client/set-conn-wire-opts! channel (p/default-wire-opts))
+     (#'client/set-conn-wire-opts! conn (p/default-wire-opts))
      {:conn conn :channel channel :closed closed :sent sent})))
 
 (defn- with-connections [connections f]
@@ -394,6 +394,22 @@
       (let [conn (client/->Connection channel 1000 (ByteBuffer/allocate 65536))]
         (try (f conn peer)
              (finally (client/close conn)))))))
+
+(deftest connection-owned-options-survive-registry-removal-test
+  (with-socket-pair
+    (fn [^Connection conn ^SocketChannel peer]
+      (.remove ^ConcurrentHashMap @#'client/connection-wire-opts (.-ch conn))
+      (doseq [options [{:compression :zstd :compression-threshold 0}
+                       (p/default-wire-opts)]]
+        (#'client/set-conn-wire-opts! conn options)
+        (let [request {:type :echo :args [(apply str (repeat 100000 "x"))]}
+              response {:type :command-complete :result (:args request)}
+              reading (future (client/send-n-receive conn request))
+              [received _] (p/receive-ch peer (ByteBuffer/allocate 1024)
+                                        options 1000)]
+          (is (= request received))
+          (p/write-message-blocking peer (ByteBuffer/allocate 200000) response options)
+          (is (= response (deref reading 2000 ::timeout))))))))
 
 (deftest idle-socket-probe-preserves-live-connections-test
   (with-socket-pair

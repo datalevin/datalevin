@@ -25,7 +25,7 @@
     :refer [value-type datom->indexable index->dbi index->ktype index->vtype
             index->k index->v retrieved->v encode-giant-datom]]
    [datalevin.inline :refer [update assoc]]
-   [datalevin.interface
+   [datalevin.interface :as i
     :refer [transact-kv get-range get-first get-value env-dir close-kv
             closed-kv? entries list-range list-range-first list-range-count
             list-count key-range-list-count key-range-count rschema
@@ -37,6 +37,7 @@
    [datalevin.lmdb :as lmdb :refer [IWriting]]
    [datalevin.pipe :as p]
    [datalevin.prepare :as prep]
+   [datalevin.read-encode :as enc]
    [datalevin.query.predicate :as qpred]
    [datalevin.relation :as r]
    [datalevin.remote :as remote]
@@ -1071,6 +1072,54 @@
                   (.add values v)
                   (.put adjacency k values))))))))
     adjacency))
+
+(defn- write-giant-value!
+  [lmdb rtx giant-id out]
+  (let [dbi (i/get-dbi lmdb c/giants false)]
+    (lmdb/put-read-key dbi rtx giant-id :id)
+    (if-let [buffer (lmdb/get-kv dbi rtx)]
+      (enc/write-value! out (d/datom-v (idx/decode-giant-datom (b/get-bytes buffer))))
+      (raise "Missing giant value" {:giant-id giant-id}))))
+
+(defn write-entity!
+  "Write a plain scalar projection from EAV into Nippy under one read snapshot.
+  Attribute keys are pre-encoded Nippy keywords. No borrowed values escape;
+  giant values use their existing decoder in the same snapshot."
+  [^Store store ^ByteBuffer out eid ^objects keys ^longs aids id?]
+  (let [lmdb (.-lmdb store)
+        n (alength aids)
+        start (enc/start-map! out)]
+    (when id?
+      (enc/write-value! out :db/id)
+      (enc/write-value! out eid))
+    (if (zero? n)
+      (enc/finish-map! out start (if id? 1 0))
+      (scan/scan lmdb c/eav
+        (with-open [^AutoCloseable iter
+                    (lmdb/val-iterator (lmdb/iterate-list-val-full dbi rtx cur))]
+          (loop [index 0
+                 next? (lmdb/seek-key iter eid :id)
+                 count (long (if id? 1 0))]
+            (if (and next? (< index n))
+              (let [^ByteBuffer value (lmdb/next-val iter)
+                    aid (b/avg->aid value)
+                    index (long (loop [j (long index)]
+                                  (if (and (< j n) (< (aget aids j) aid))
+                                    (recur (inc j)) j)))
+                    match? (and (< index n) (= aid (aget aids index)))]
+                (when match?
+                  (.put out ^bytes (aget keys index))
+                  (let [giant-id (b/avg->giant-id value)]
+                    (if (= giant-id c/normal)
+                      (enc/write-avg! out value)
+                      (write-giant-value! lmdb rtx giant-id out))))
+                (recur (if match? (inc index) index)
+                       (lmdb/has-next-val iter)
+                       (if match? (inc count) count)))
+              (enc/finish-map! out start count))))
+        ;; Preserve Nippy's overflow exception for transport growth/retry.
+        #_{:clj-kondo/ignore [:type-mismatch]} ; scan's lint hook binds e to nil
+        (throw e)))))
 
 (defn e-sample*
   [^Store store a aid]

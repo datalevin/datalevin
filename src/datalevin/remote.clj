@@ -306,9 +306,11 @@
 
 (defn- datalog-request
   [^AtomicLong read-floor-tx client call args writing?]
-  (binding [cl/*ha-read-min-tx* (when-not writing?
-                                  (current-read-floor-tx read-floor-tx))]
-    (cl/normal-request client call args writing?)))
+  (let [floor (when-not writing? (current-read-floor-tx read-floor-tx))]
+    (if (= floor cl/*ha-read-min-tx*)
+      (cl/normal-request client call args writing?)
+      (binding [cl/*ha-read-min-tx* floor]
+        (cl/normal-request client call args writing?)))))
 
 (defn- remote-forward-method
   [request [mname args & flags]]
