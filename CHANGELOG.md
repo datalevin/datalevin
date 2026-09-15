@@ -6,8 +6,8 @@
   types, and this also works on Datalog. Details are in the [custom data
   documentation](/doc/custom-data.md).
   [#234](https://github.com/datalevin/datalevin/issues/234)
-- [Query] prepared variant of queries `prepared-pull`, `prepare-get-value`,
-  `prepared-execute` that are reusable.
+- [Query] prepared variant of queries `prepare-q`, `prepare-pull`,
+  `prepare-get-value`, `prepared-execute` that are reusable.
 - [Benchmark] added TPC-C, TPC-H and YCSB benchmarks.
 
 ### Changed

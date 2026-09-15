@@ -6,6 +6,7 @@
   (:require [datalevin.kv :as kv]
             [datalevin.prepared :as prepared]
             [datalevin.pull-api :as pull]
+            [datalevin.query :as q]
             [datalevin.util :refer [raise]])
   (:import [java.nio.channels SelectionKey]
            [java.util LinkedHashMap]))
@@ -55,12 +56,16 @@
       (when-not (case type
                   :get-value (= 6 (count args))
                   :pull (= 4 (count args))
+                  :q (and (= 3 (count args))
+                          (true? (get-in @(.attachment skey)
+                                         [:wire-opts :prepared-query?])))
                   false)
         (raise "Unsupported prepared read" {:error :prepared/unsupported :type type}))
       (let [reader (case type
                      :get-value (kv/value-reader (nth args 1) (nth args 3)
                                                  (nth args 4) (nth args 5))
-                     :pull (pull/pull-reader (nth args 1) (nth args 3)))
+                     :pull (pull/pull-reader (nth args 1) (nth args 3))
+                     :q (q/query-reader (nth args 1)))
             attachment (.attachment skey)
             ^LinkedHashMap cache (or (:prepared-handles @attachment)
                                      (let [cache (prepared/handle-cache)]

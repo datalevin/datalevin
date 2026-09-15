@@ -520,7 +520,7 @@
 
   IRemotePrepared
   (prepare-remote-read [_ operation args]
-    (when-not (= operation :pull)
+    (when-not (#{:pull :q} operation)
       (raise "Unsupported prepared Datalog operation" {:operation operation}))
     (let [request (prepared/request (into [db-name] args))]
       (prepared/prepared-read

@@ -160,6 +160,52 @@
           (finally (d/close-kv reader-kv))))
       (finally (d/close-kv kv) (client/disconnect admin)))))
 
+(deftest prepared-queries-reauthorize-before-native-input-decoding
+  (let [admin (client/new-client (uri ""))
+        registry (native-registry (udf/create-registry) "receiver")
+        conn (d/create-conn (uri "prepared-native-query") {}
+                            {:runtime-opts {:udf-registry registry}})
+        decoded (atom 0)]
+    (native-registry *registry* "server")
+    (udf/register! *registry* (native-descriptor :deserializer)
+                   (fn [payload]
+                     (swap! decoded inc)
+                     (native-snapshot "server" ":app/native-task" payload)))
+    (try
+      (d/register-type conn :app/native-task native-definition)
+      (d/update-schema conn {:task/value {:db/valueType :app/native-task}})
+      (d/transact! conn [{:db/id 1 :task/value (native-task 1 "a")}
+                         {:db/id 2 :task/value (native-task 2 "b")}])
+      (client/create-user admin "query-reader" "reader-password")
+      (client/create-role admin :query-reader)
+      (client/assign-role admin :query-reader "query-reader")
+      (client/grant-permission admin :query-reader :datalevin.server/view
+                               :datalevin.server/database "prepared-native-query")
+      (let [reader-conn (d/create-conn
+                          "dtlv://query-reader:reader-password@localhost/prepared-native-query"
+                          {} {:client-opts {:pool-size 1}
+                              :runtime-opts {:udf-registry registry}})
+            reader (d/prepare-q @reader-conn
+                                '[:find ?e :in $ ?v :where [?e :task/value ?v]])]
+        (try
+          (is (= #{[1]} (reader [(native-task 1 "a")])))
+          (is (= #{[2]} (reader [(native-task 2 "b")])))
+          (is (pos? @decoded))
+          (client/revoke-permission admin :query-reader :datalevin.server/view
+                                    :datalevin.server/database "prepared-native-query")
+          (reset! decoded 0)
+          (is (thrown-with-msg? Exception #"permission" (reader [(native-task 1 "a")])))
+          (is (zero? @decoded))
+          (client/grant-permission admin :query-reader :datalevin.server/view
+                                   :datalevin.server/database "prepared-native-query")
+          (is (= #{[2]} (reader [(native-task 2 "b")])))
+          (let [unsafe (d/prepare-q @reader-conn
+                                    '[:find ?x . :in $ ?v
+                                      :where [(clojure.core/identity ?v) ?x]])]
+            (dotimes [_ 2] (is (thrown? Exception (unsafe [1])))))
+          (finally (d/close reader-conn))))
+      (finally (d/close conn) (client/disconnect admin)))))
+
 (deftest remote-native-kv-readers-and-streams
   (let [registry (native-registry (udf/create-registry) "receiver")
         opts {:runtime-opts {:udf-registry registry}
@@ -220,6 +266,10 @@
       (is (= #{[1] [3]}
              (d/q '[:find ?e :in $ ?v :where [?e :task/value ?v]]
                   @conn (native-task 1 "a"))))
+      (let [reader (d/prepare-q @conn '[:find ?e :in $ ?v :where [?e :task/value ?v]])]
+        (is (= #{[1] [3]} (reader [(native-task 1 "a")])))
+        (is (= #{[2]} (reader [(native-task 1 "b")])))
+        (is (= #{[1] [3]} (reader [(native-task 1 "a")]))))
       (is (= #{[a] [b]}
              (d/q '[:find ?v :where [?e :task/value ?v] [?other :task/value ?v]] @conn)))
       (d/with-transaction [tx conn]

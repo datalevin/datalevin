@@ -35,12 +35,15 @@
     (write-message-fn skey {:type :command-complete :result data})))
 
 (defn q
-  [{:keys [get-db write-message copy-out]} server skey {:keys [args writing?]}]
+  [{:keys [get-db write-message copy-out]} server skey
+   {:keys [args writing?] :as message}]
   (let [[db-name query inputs] args
         db                     (get-db server db-name writing?)
         inputs                 (replace {:remote-db-placeholder db} inputs)
         data                   (binding [qresolve/*resolver-mode* :server-safe]
-                                 (apply q/q query inputs))]
+                                 (if-let [reader (prepared/reader! skey message)]
+                                   (reader db inputs false)
+                                   (apply q/q query inputs)))]
     (write-or-copy-result! write-message copy-out skey data)))
 
 (defn pull

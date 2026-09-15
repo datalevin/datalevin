@@ -15,7 +15,7 @@
 (defn prepared-read [run] (PreparedRead. run))
 
 (defn execute
-  "Execute a prepared read with its changing key or entity identifier."
+  "Execute a prepared read with its key, entity identifier or query inputs."
   [^PreparedRead prepared input]
   (.invoke prepared input))
 
@@ -39,7 +39,7 @@
 (deftype Request [^long id args metadata])
 
 (defn request
-  "The changing argument of both point reads and pulls is at wire index 2."
+  "The changing argument of point reads, pulls and queries is at wire index 2."
   [args]
   (let [id (.incrementAndGet ids)]
     (Request. id args {::id id})))

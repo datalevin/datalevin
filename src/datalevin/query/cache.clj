@@ -28,8 +28,8 @@
 (def ^:dynamic *cache?* true)
 
 (defn- run-query
-  [parsed-q inputs]
-  (qexec/q* parsed-q inputs))
+  [parsed-q inputs execute]
+  (if execute (execute inputs) (qexec/q* parsed-q inputs)))
 
 (defn- cache-enabled? []
   (boolean *cache?*))
@@ -153,24 +153,54 @@
        (store-write-context-token store)])
     input))
 
+(deftype ^:no-doc CacheAnalysis [nested? deps udf? qualified?])
+
+(defn- single-input-store
+  "A store's result cache tracks only its own writes. Multiple database sources
+  must execute until their revisions can be tracked together."
+  [inputs]
+  (loop [inputs (seq inputs) store nil]
+    (if inputs
+      (let [input (first inputs)]
+        (if (db/-searchable? input)
+          (when-not store (recur (next inputs) (.-store ^DB input)))
+          (recur (next inputs) store)))
+      store)))
+
 (defn q-result
-  [parsed-q inputs]
-  (if (and (cache-enabled?)
-           (not (contains-nested-query? parsed-q)))
-    (if-let [store (some #(when (db/-searchable? %) (.-store ^DB %)) inputs)]
-      (let [parsed-q' (-> (update parsed-q :qwhere-qualified-fns
-                                  qualified-fn-cache-token))
-            deps      (query-cache-deps parsed-q')
-            udf-token (when (query-uses-udf? parsed-q')
-                        (udf-cache-token inputs))
-            k         [:query-result deps :exact-window-v1
-                       qresolve/*resolver-mode* parsed-q' udf-token
-                       (mapv cache-input-token inputs)]
-            token     (db/cache-token store)]
-        (if-let [cached (db/cache-get store k)]
-          cached
-          (let [res (run-query parsed-q inputs)]
-            (db/cache-put-if-current store token k res)
-            res)))
-      (run-query parsed-q inputs))
-    (run-query parsed-q inputs)))
+  ([parsed-q inputs] (q-result parsed-q inputs nil nil))
+  ([parsed-q inputs ^CacheAnalysis analysis execute]
+   (if (and (cache-enabled?)
+            (not (if analysis (.-nested? analysis)
+                     (contains-nested-query? parsed-q))))
+     (if-let [store (single-input-store inputs)]
+       (let [parsed-q' (if (and analysis (not (.-qualified? analysis)))
+                         parsed-q
+                         (update parsed-q :qwhere-qualified-fns qualified-fn-cache-token))
+             deps      (if analysis (.-deps analysis)
+                           (query-cache-deps parsed-q'))
+             udf-token (when (if analysis (.-udf? analysis)
+                                 (query-uses-udf? parsed-q'))
+                         (udf-cache-token inputs))
+             k         [:query-result deps :exact-window-v1
+                        qresolve/*resolver-mode* parsed-q' udf-token
+                        (mapv cache-input-token inputs)]
+             token     (db/cache-token store)]
+         (if-let [cached (db/cache-get store k)]
+           cached
+           (let [res (run-query parsed-q inputs execute)]
+             (db/cache-put-if-current store token k res)
+             res)))
+       (run-query parsed-q inputs execute))
+     (run-query parsed-q inputs execute))))
+
+(defn prepare-result-reader
+  "Retain query-invariant cache analysis and execution metadata. Input tokens,
+  function implementations, UDF bindings and database revisions stay dynamic."
+  [parsed-q]
+  (let [analysis (CacheAnalysis. (contains-nested-query? parsed-q)
+                                 (query-cache-deps parsed-q)
+                                 (query-uses-udf? parsed-q)
+                                 (boolean (seq (:qwhere-qualified-fns parsed-q))))
+        execute (qexec/query-runner parsed-q)]
+    (fn [inputs] (q-result parsed-q inputs analysis execute))))

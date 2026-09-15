@@ -202,7 +202,8 @@
       (try
         (let [wire-opts (.get wire-options)
               prepared-id (::prepared/id (meta msg))
-              enabled? (and prepared-id (:prepared-read? wire-opts))
+              enabled? (and prepared-id (:prepared-read? wire-opts)
+                            (or (not= :q (:type msg)) (:prepared-query? wire-opts)))
               id (when enabled? prepared-id)]
           (loop [register? (and enabled? (nil? (.get prepared-handles id)))]
             (let [wire-msg

@@ -52,6 +52,7 @@
   {:compression           [:zstd]
    :storage-read?         true
    :prepared-read?        true
+   :prepared-query?       true
    :compression-threshold (long c/*wire-compression-threshold*)})
 
 (defn ^:no-doc default-wire-opts
@@ -73,7 +74,9 @@
     (true? (:storage-read? peer-capabilities))
     (assoc :storage-read? true)
     (true? (:prepared-read? peer-capabilities))
-    (assoc :prepared-read? true)))
+    (assoc :prepared-read? true)
+    (true? (:prepared-query? peer-capabilities))
+    (assoc :prepared-query? true)))
 
 (defn- fmt-int ^long [fmt]
   (bit-and (long fmt) 0xFF))

@@ -1071,54 +1071,71 @@
       (:fallback execution) (assoc :fallback (:fallback execution)))))
 
 (defn q*
-  [parsed-q inputs]
-  (binding [timeout/*deadline* (timeout/effective-deadline
-                                 (:qtimeout parsed-q))]
-    (let [shape    (or (get parsed-q point-lookup-projection-key)
-                       (point-lookup-projection-shape parsed-q))
-          database (when shape (point-lookup-projection-db shape inputs))]
-      (if database
-        (execute-point-lookup-projection parsed-q shape database (second inputs))
-        (let [plans (discover-access-plans parsed-q inputs)]
-          (if (seq plans)
-            (let [planned-context (access-query-plan parsed-q inputs plans)
-                  alternative     (qo/selected-alternative planned-context)]
-              (if qplan/*explain*
-                (if (= :access (:kind alternative))
-                  (let [execution   (volatile! {:batches [] :subqueries []})
-                        result
-                        (binding [qplan/*explain*    nil
-                                  *access-execution* execution]
-                          (execute-alternative
-                            parsed-q inputs (:access-plans planned-context)
-                            alternative))
-                        actual-size (query-result-size parsed-q result)
-                        explained-context
-                        (assoc planned-context
-                               :run? true
-                               :explain-actual-result-size actual-size
-                               :access-path-execution
-                               (access-execution-plan
-                                 planned-context alternative @execution
-                                 actual-size))]
-                    (result-explain explained-context result)
-                    result)
-                  (let [deferred         (volatile! nil)
-                        result
-                        (binding [*deferred-result-explain* deferred]
-                          (execute-alternative
-                            parsed-q inputs (:access-plans planned-context)
-                            alternative))
-                        executed-context (:context @deferred)]
-                    (result-explain
-                      (assoc executed-context
-                             :property-memo (:property-memo planned-context))
-                      result)
-                    result))
-                (execute-alternative
-                  parsed-q inputs (:access-plans planned-context)
-                  alternative)))
-            (execute-query parsed-q inputs plans)))))))
+  ([parsed-q inputs] (q* parsed-q inputs nil))
+  ([parsed-q inputs point-reader]
+   (binding [timeout/*deadline* (timeout/effective-deadline
+                                  (:qtimeout parsed-q))]
+     (let [point-result
+           (if point-reader
+             (point-reader inputs)
+             (let [shape    (or (get parsed-q point-lookup-projection-key)
+                                (point-lookup-projection-shape parsed-q))
+                   database (when shape (point-lookup-projection-db shape inputs))]
+               (if database
+                 (execute-point-lookup-projection
+                   parsed-q shape database (second inputs))
+                 point-lookup/unsupported)))]
+       (if-not (identical? point-lookup/unsupported point-result)
+         point-result
+         (let [plans (discover-access-plans parsed-q inputs)]
+           (if (seq plans)
+             (let [planned-context (access-query-plan parsed-q inputs plans)
+                   alternative     (qo/selected-alternative planned-context)]
+               (if qplan/*explain*
+                 (if (= :access (:kind alternative))
+                   (let [execution   (volatile! {:batches [] :subqueries []})
+                         result
+                         (binding [qplan/*explain*    nil
+                                   *access-execution* execution]
+                           (execute-alternative
+                             parsed-q inputs (:access-plans planned-context)
+                             alternative))
+                         actual-size (query-result-size parsed-q result)
+                         explained-context
+                         (assoc planned-context
+                                :run? true
+                                :explain-actual-result-size actual-size
+                                :access-path-execution
+                                (access-execution-plan
+                                  planned-context alternative @execution
+                                  actual-size))]
+                     (result-explain explained-context result)
+                     result)
+                   (let [deferred         (volatile! nil)
+                         result
+                         (binding [*deferred-result-explain* deferred]
+                           (execute-alternative
+                             parsed-q inputs (:access-plans planned-context)
+                             alternative))
+                         executed-context (:context @deferred)]
+                     (result-explain
+                       (assoc executed-context
+                              :property-memo (:property-memo planned-context))
+                       result)
+                     result))
+                 (execute-alternative
+                   parsed-q inputs (:access-plans planned-context)
+                   alternative)))
+             (execute-query parsed-q inputs plans))))))))
+
+(defn query-runner
+  "Prepare query-shape decisions and point-projection layouts. General plans
+  continue to use the execution's inputs, sources and optimizer settings."
+  [parsed-q]
+  (let [shape        (or (get parsed-q point-lookup-projection-key)
+                         (point-lookup-projection-shape parsed-q))
+        point-reader (point-lookup/prepared-executor parsed-q shape)]
+    (fn [inputs] (q* parsed-q inputs point-reader))))
 
 (defn mark-parsing-finished!
   []

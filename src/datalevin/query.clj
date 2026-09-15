@@ -2,13 +2,16 @@
   "Datalog query entry points."
   (:require
    [datalevin.db :as db]
+   [datalevin.prepared :as prepared]
    [datalevin.query.cache :as qcache]
    [datalevin.query.execute :as qexec]
    [datalevin.query.plan :as qplan]
    [datalevin.query-optimizer :as qo]
-   [datalevin.interface :as i])
+   [datalevin.interface :as i]
+   [datalevin.util :refer [raise]])
   (:import
-   [datalevin.db DB]))
+   [datalevin.db DB]
+   [datalevin.parser BindScalar SrcVar]))
 
 (def ^:dynamic *cache?*
   "Whether query result caching is enabled.
@@ -87,6 +90,57 @@
   (if-let [[store inputs'] (only-remote-db inputs)]
     (i/q store query inputs')
     (apply perform query inputs)))
+
+(defn- prepared-query [query]
+  (let [parsed-q (with-query-runtime (qcache/parsed-q query))
+        source (first (:qin parsed-q))]
+    (when-not (and (instance? BindScalar source)
+                  (instance? SrcVar (:variable source)))
+      (raise "A prepared query requires a database source as its first :in binding"
+             {:error :prepared/query-inputs}))
+    parsed-q))
+
+(defn- check-query-inputs! [inputs expected]
+  (when-not (and (vector? inputs) (= expected (count inputs)))
+    (raise "Prepared query inputs must be a vector with " expected " values"
+           {:error :prepared/query-inputs :expected expected})))
+
+(defn- result-reader [parsed-q]
+  (let [execute (qcache/prepare-result-reader parsed-q)
+        expected (count (:qin parsed-q))]
+    (fn [db inputs _encoded?]
+      (check-query-inputs! inputs expected)
+      (with-query-runtime
+        (qexec/mark-parsing-finished!)
+        (execute (if (identical? db (nth inputs 0)) inputs (assoc inputs 0 db)))))))
+
+(defn query-reader
+  "Compile reusable query metadata. The source, remaining inputs, cache tokens,
+  deadlines and general physical plans are resolved for each execution."
+  [query]
+  (result-reader (prepared-query query)))
+
+(defn prepare-q
+  "Prepare a query bound to a local or remote DB view. Its first :in binding
+  must be a database source. Execute with a vector of the remaining inputs."
+  [^DB db query]
+  {:pre [(db/db? db)]}
+  (let [parsed-q (prepared-query query)
+        expected (dec (count (:qin parsed-q)))
+        store (.-store db)
+        remote (when (satisfies? i/IRemotePrepared store)
+                 (i/prepare-remote-read store :q [query nil]))
+        reader (when-not remote (result-reader parsed-q))]
+    (prepared/prepared-read
+      (fn [inputs]
+        (check-query-inputs! inputs expected)
+        (if remote
+          (do
+            (when (some db/-searchable? inputs)
+              (raise "Prepared remote queries require exactly one database source"
+                     {:error :prepared/query-sources}))
+            (remote (into [:remote-db-placeholder] inputs)))
+          (reader db (into [db] inputs) false))))))
 
 (defn ^:no-doc q-nested
   "Execute a query invoked by the query-language `q` function without sharing

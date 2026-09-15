@@ -107,6 +107,27 @@
       (is (= [99 99] (mapv :prepare-id (drop 2 @sent))))
       (finally (client/close conn)))))
 
+(deftest prepared-queries-negotiate-separately-from-prepared-point-reads
+  (let [{:keys [conn sent]} (test-connection (repeat 4 completed))
+        query '[:find ?name . :in $ ?key
+                :where [?e :key ?key] [?e :name ?name]]
+        message (fn [value]
+                  (with-meta {:type :q :args ["db" query [:remote-db-placeholder value]]
+                              :writing? false :ha-read-min-tx 17}
+                    {::prepared/id 101}))]
+    (try
+      (is (not (:prepared-query? (p/negotiate-wire-opts {:prepared-read? true}))))
+      (#'client/set-conn-wire-opts! conn (p/negotiate-wire-opts {:prepared-read? true}))
+      (doseq [value [1 2]] (client/send-n-receive conn (message value)))
+      (is (every? #(and (= :q (:type %)) (not (:prepare-id %)) (nil? (meta %))) @sent))
+      (#'client/set-conn-wire-opts! conn (p/negotiate-wire-opts (p/local-wire-capabilities)))
+      (doseq [value [3 4]] (client/send-n-receive conn (message value)))
+      (is (= 101 (:prepare-id (nth @sent 2))))
+      (is (= {:type :execute-prepared :handle 101 :value [:remote-db-placeholder 4]
+              :writing? false :ha-read-min-tx 17}
+             (nth @sent 3)))
+      (finally (client/close conn)))))
+
 (defn- with-connections [connections f]
   (let [pending (ConcurrentLinkedQueue. (mapv :conn connections))]
     (try

@@ -181,6 +181,23 @@ Only usable for debug output.
   Prepare from the transaction's DB view to read transaction-local changes."}
   prepare-pull dp/prepare-pull)
 
+(def ^{:arglists '([db query])
+       :doc "Prepare a reusable query for a local or remote DB view. Its first
+  :in binding must be a database source. Execute with a vector containing the
+  remaining inputs, in their declared order; use [] for no remaining inputs:
+
+      (def lookup (prepare-q db '[:find ?name . :in $ ?key
+                                 :where [?e :key ?key] [?e :name ?name]]))
+      (execute-prepared lookup [42])
+      (lookup [43])
+
+  Reuses parsing, cache dependency analysis and eligible projection metadata.
+  General planning still uses current inputs and database state. Results match
+  `q`. Remote preparations require exactly one database source; additional
+  collection sources are supported. Prepare from the transaction's DB view
+  for transaction-local reads."}
+  prepare-q dq/prepare-q)
+
 (def ^{:arglists '([kv dbi-name] [kv dbi-name k-type]
                    [kv dbi-name k-type v-type]
                    [kv dbi-name k-type v-type ignore-key?])
@@ -195,8 +212,9 @@ Only usable for debug output.
   prepare-get-value kv/prepare-get-value)
 
 (def ^{:arglists '([prepared input])
-       :doc "Execute a prepared KV read with a key, or a prepared pull with an
-  entity ID or lookup reference. Equivalent to invoking the prepared object.
+       :doc "Execute a prepared KV read with a key, a prepared pull with an
+  entity ID or lookup reference, or a prepared query with an input vector.
+  Equivalent to invoking the prepared object.
   Prepared reads can be shared across threads; transaction-bound reads retain
   their transaction's lifetime and thread restrictions. They hold no borrowed
   buffers or open read transactions and require no separate close operation."}
