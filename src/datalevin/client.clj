@@ -37,16 +37,51 @@
 (defonce ^:private ^ConcurrentHashMap connection-wire-opts
   (ConcurrentHashMap.))
 
-(defonce ^:private ^java.util.Map ha-preferred-endpoints
+(deftype ^:no-doc ClientState [^AtomicReference readers
+                               ^ConcurrentHashMap read-endpoints
+                               ^AtomicReference endpoint])
+
+(definterface IClientInternals
+  (^datalevin.client.ClientState clientState [])
+  (requestBound [req]))
+
+;; These weak registries support reset-client-state! and alternate IClient
+;; implementations. A Client reads its own state without consulting either.
+(defonce ^:private ^java.util.Map client-state-refs
   (Collections/synchronizedMap (WeakHashMap.)))
+
+(defonce ^:private ^java.util.Map fallback-client-states
+  (Collections/synchronizedMap (WeakHashMap.)))
+
+(defn- new-client-state
+  []
+  (let [state (ClientState. (AtomicReference.) (ConcurrentHashMap.)
+                            (AtomicReference.))]
+    (.put client-state-refs state true)
+    state))
+
+(defn- client-state ^ClientState
+  [client]
+  (when client
+    (if (instance? IClientInternals client)
+      (.clientState ^IClientInternals client)
+      (locking fallback-client-states
+        (or (.get fallback-client-states client)
+            (let [state (new-client-state)]
+              (.put fallback-client-states client state)
+              state))))))
+
+(defn- native-reader-cache ^ConcurrentHashMap
+  [client]
+  (let [^AtomicReference ref (.-readers (client-state client))]
+    (or (.get ref)
+        (let [readers (ConcurrentHashMap.)]
+          (if (.compareAndSet ref nil readers) readers (.get ref))))))
 
 (defonce ^:private ^java.util.Map ha-retry-clients
   (Collections/synchronizedMap (WeakHashMap.)))
 
 (defonce ^:private ^java.util.Map ha-known-db-endpoints
-  (Collections/synchronizedMap (WeakHashMap.)))
-
-(defonce ^:private ^java.util.Map ha-preferred-read-endpoints
   (Collections/synchronizedMap (WeakHashMap.)))
 
 (defonce ^:private ^java.util.Map ha-retry-open-targets
@@ -58,9 +93,6 @@
 (defonce ^:private ^java.util.Map ha-write-retry-settings
   (Collections/synchronizedMap (WeakHashMap.)))
 
-(defonce ^:private ^java.util.Map native-readers
-  (Collections/synchronizedMap (WeakHashMap.)))
-
 (defonce ^:private ^java.util.Map index-open-options
   (Collections/synchronizedMap (WeakHashMap.)))
 
@@ -69,23 +101,27 @@
   that need a clean slate or that exercise reconnect/retry behavior."
   []
   (.clear connection-wire-opts)
-  (doseq [^java.util.Map m [ha-preferred-endpoints ha-retry-clients
-                            ha-known-db-endpoints ha-preferred-read-endpoints
+  (locking client-state-refs
+    (doseq [^ClientState state (.keySet client-state-refs)]
+      (.set ^AtomicReference (.-readers state) nil)
+      (.clear ^ConcurrentHashMap (.-read-endpoints state))
+      (.set ^AtomicReference (.-endpoint state) nil)))
+  (doseq [^java.util.Map m [fallback-client-states ha-retry-clients
+                            ha-known-db-endpoints
                             ha-retry-open-targets ha-retry-disabled-clients
-                            ha-write-retry-settings native-readers
+                            ha-write-retry-settings
                             index-open-options]]
     (.clear m))
   nil)
 
 (defn- request-native-reader [client req]
-  (get (.get native-readers client) (or (:db-name req) (first (:args req)))))
+  (when-let [readers (.get ^AtomicReference (.-readers (client-state client)))]
+    (get readers (or (:db-name req) (first (:args req))))))
 
 (defn- inherit-native-readers! [client source]
   (when source
-    (locking native-readers
-      (let [readers (or (.get native-readers source) (ConcurrentHashMap.))]
-        (.put native-readers source readers)
-        (.put native-readers client readers))))
+    (.set ^AtomicReference (.-readers (client-state client))
+          (native-reader-cache source)))
   client)
 
 (defn- inherit-index-options! [client source]
@@ -641,95 +677,103 @@
 
 (deftype ^:no-doc Client [username password host port pool-size time-out
                           ^:volatile-mutable ^UUID id
-                          ^:volatile-mutable ^ConnectionPool pool]
+                          ^:volatile-mutable ^ConnectionPool pool
+                          ^ClientState state]
+  IClientInternals
+  (clientState [_] state)
+  (requestBound [client req]
+    (let [success? (volatile! false)
+          start    (System/currentTimeMillis)
+          read?    (and (not (:writing? req)) (cmd/read-only? (:type req)))]
+      (loop []
+        (let [^ConnectionPool pool' pool
+              ;; A read can retry after EOF; mutations still probe idle
+              ;; sockets before sending anything with an ambiguous outcome.
+              conn                 (if (and read? (instance? ConnectionPool pool'))
+                                     (borrow-connection pool' false)
+                                     (get-connection pool'))
+              response             (try
+                                     (send-n-receive conn req)
+                                     (catch Exception e
+                                       (close conn)
+                                       (when (or (nv/decoding-error? e)
+                                                 (write-indeterminate? e)
+                                                 (not (transport-replay-safe? req)))
+                                         (release-connection pool' conn)
+                                         (reject-unsafe-transport-replay!
+                                          req (str host ":" port) e))
+                                       nil))
+              res                  (try
+                                     (when-let [{:keys [type] :as result}
+                                                response]
+                                       (vreset! success? true)
+                                       (case type
+                                         :copy-out-response (copy-out conn req result)
+                                         :command-complete  result
+                                         :error-response    result
+                                         :reopen
+                                         (let [{:keys [db-name db-type]} result]
+                                           (vreset! success? false)
+                                           {:request-status :reopen
+                                            :db-name        db-name
+                                            :db-type        db-type})
+                                         :reconnect
+                                         (do
+                                           (close conn)
+                                           (vreset! success? false)
+                                           {:request-status :reconnect})))
+                                     (catch Exception e
+                                       (reject-unsafe-transport-replay!
+                                        req (str host ":" port) e)
+                                       (throw e))
+                                     (finally
+                                       (release-connection pool' conn)))
+              res'                 (case (:request-status res)
+                                     :reconnect
+                                     (do
+                                       ;; Several in-flight requests can learn
+                                       ;; that the same server session is stale.
+                                       ;; Only the request that still owns the
+                                       ;; observed pool should replace it.
+                                       (locking client
+                                         (when (identical? pool pool')
+                                           (let [client-id
+                                                 (authenticate
+                                                   host port username password
+                                                   time-out)
+                                                 new-pool
+                                                 (new-connectionpool
+                                                   host port client-id
+                                                   pool-size time-out)]
+                                             ;; Explicit field access is needed
+                                             ;; for mutable deftype fields inside
+                                             ;; the locking form.
+                                             (set! (.-id ^Client client) client-id)
+                                             (set! (.-pool ^Client client) new-pool)
+                                             (close-pool pool'))))
+                                       nil)
+
+                                     :reopen
+                                     (let [{:keys [db-name db-type]} res]
+                                       (open-database client db-name db-type)
+                                       nil)
+
+                                     res)]
+          ;; The deadline limits retries, not an already completed response.
+          (if @success?
+            res'
+            (if (>= (- (System/currentTimeMillis) start)
+                    ^long (.-time-out pool'))
+              (raise "Timeout in making request" {})
+              (recur)))))))
+
   IClient
   (request [client req]
-    (binding [nv/*wire-reader* (or (request-native-reader client req)
-                                 nv/*wire-reader*)]
-      (let [success? (volatile! false)
-            start    (System/currentTimeMillis)
-            read?    (and (not (:writing? req)) (cmd/read-only? (:type req)))]
-        (loop []
-          (let [^ConnectionPool pool' pool
-                ;; A read can retry after EOF; mutations still probe idle
-                ;; sockets before sending anything with an ambiguous outcome.
-                conn                 (if (and read? (instance? ConnectionPool pool'))
-                                       (borrow-connection pool' false)
-                                       (get-connection pool'))
-                response             (try
-                                       (send-n-receive conn req)
-                                       (catch Exception e
-                                         (close conn)
-                                         (when (or (nv/decoding-error? e)
-                                                   (write-indeterminate? e)
-                                                   (not (transport-replay-safe? req)))
-                                           (release-connection pool' conn)
-                                           (reject-unsafe-transport-replay!
-                                            req (str host ":" port) e))
-                                         nil))
-                res                  (try
-                                       (when-let [{:keys [type] :as result}
-                                                  response]
-                                         (vreset! success? true)
-                                         (case type
-                                           :copy-out-response (copy-out conn req result)
-                                           :command-complete  result
-                                           :error-response    result
-                                           :reopen
-                                           (let [{:keys [db-name db-type]} result]
-                                             (vreset! success? false)
-                                             {:request-status :reopen
-                                              :db-name        db-name
-                                              :db-type        db-type})
-                                           :reconnect
-                                           (do
-                                             (close conn)
-                                             (vreset! success? false)
-                                             {:request-status :reconnect})))
-                                       (catch Exception e
-                                         (reject-unsafe-transport-replay!
-                                          req (str host ":" port) e)
-                                         (throw e))
-                                       (finally
-                                         (release-connection pool' conn)))
-                res'                 (case (:request-status res)
-                                       :reconnect
-                                       (do
-                                         ;; Several in-flight requests can learn
-                                         ;; that the same server session is stale.
-                                         ;; Only the request that still owns the
-                                         ;; observed pool should replace it.
-                                         (locking client
-                                           (when (identical? pool pool')
-                                             (let [client-id
-                                                   (authenticate
-                                                     host port username password
-                                                     time-out)
-                                                   new-pool
-                                                   (new-connectionpool
-                                                     host port client-id
-                                                     pool-size time-out)]
-                                               ;; Explicit field access is needed
-                                               ;; for mutable deftype fields inside
-                                               ;; the locking form.
-                                               (set! (.-id ^Client client) client-id)
-                                               (set! (.-pool ^Client client) new-pool)
-                                               (close-pool pool'))))
-                                         nil)
-
-                                       :reopen
-                                       (let [{:keys [db-name db-type]} res]
-                                         (open-database client db-name db-type)
-                                         nil)
-
-                                       res)]
-            ;; The deadline limits retries, not an already completed response.
-            (if @success?
-              res'
-              (if (>= (- (System/currentTimeMillis) start)
-                      ^long (.-time-out pool'))
-                (raise "Timeout in making request" {})
-                (recur))))))))
+    (let [reader (or (request-native-reader client req) nv/*wire-reader*)]
+      (if (identical? reader nv/*wire-reader*)
+        (.requestBound client req)
+        (binding [nv/*wire-reader* reader]
+          (.requestBound client req)))))
 
   (copy-in [client req data batch-size]
     (binding [nv/*wire-reader* (or (request-native-reader client req)
@@ -750,11 +794,11 @@
       (finally
         (try
           (.remove ha-write-retry-settings client)
-          (.remove native-readers client)
+          (.set ^AtomicReference (.-readers state) nil)
           (.remove index-open-options client)
           (.remove ha-retry-disabled-clients client)
-          (.remove ha-preferred-endpoints client)
-          (.remove ha-preferred-read-endpoints client)
+          (.set ^AtomicReference (.-endpoint state) nil)
+          (.clear ^ConcurrentHashMap (.-read-endpoints state))
           (.remove ha-known-db-endpoints client)
           (disconnect-retry-clients! client disconnect)
           (finally
@@ -768,6 +812,12 @@
   (get-pool [client] pool)
 
   (get-id [client] id))
+
+#_{:clj-kondo/ignore [:redefined-var]}
+(defn ^:no-doc ->Client
+  [username password host port pool-size time-out id pool]
+  (Client. username password host port pool-size time-out id pool
+           (new-client-state)))
 
 (def ^:private minimum-ha-write-retry-timeout-ms 5000)
 (def ^:private default-ha-write-retry-delay-ms 100)
@@ -827,11 +877,8 @@
    (open-database client db-name db-type schema opts false))
   ([client db-name db-type schema opts return-db-info?]
    (let [_ (when-let [registry (get-in opts [:runtime-opts :udf-registry])]
-             (locking native-readers
-               (let [^ConcurrentHashMap readers
-                     (or (.get native-readers client) (ConcurrentHashMap.))]
-                 (.put readers db-name (udf/native-value-reader registry))
-                 (.put native-readers client readers))))
+             (.put (native-reader-cache client) db-name
+                   (udf/native-value-reader registry)))
          ;; Runtime handles belong to the caller and must never cross the wire.
          opts (dissoc (or opts (get (.get index-open-options client)
                                     [db-name db-type]))
@@ -1056,11 +1103,7 @@
 
 (defn- ^ConcurrentHashMap preferred-ha-read-endpoint-cache
   [client]
-  (locking ha-preferred-read-endpoints
-    (or (.get ha-preferred-read-endpoints client)
-        (let [cache (ConcurrentHashMap.)]
-          (.put ha-preferred-read-endpoints client cache)
-          cache))))
+  (.-read-endpoints (client-state client)))
 
 (defn- known-ha-db-endpoints
   [client db-name]
@@ -1093,7 +1136,7 @@
 (defn- read-preferred-ha-read-endpoint
   [client db-name]
   (when (and client (string? db-name))
-    (when-let [^ConcurrentHashMap cache (.get ha-preferred-read-endpoints client)]
+    (when-let [^ConcurrentHashMap cache (preferred-ha-read-endpoint-cache client)]
       (let [endpoint (.get cache db-name)]
         (when (and (string? endpoint) (not (s/blank? endpoint)))
           endpoint)))))
@@ -1103,7 +1146,7 @@
   (when (and client (string? db-name))
     (if (and (string? endpoint) (not (s/blank? endpoint)))
       (.put (preferred-ha-read-endpoint-cache client) db-name endpoint)
-      (when-let [^ConcurrentHashMap cache (.get ha-preferred-read-endpoints client)]
+      (when-let [^ConcurrentHashMap cache (preferred-ha-read-endpoint-cache client)]
         (.remove cache db-name))))
   client)
 
@@ -1198,15 +1241,16 @@
 
 (defn- read-preferred-ha-endpoint
   [client]
-  (let [endpoint (.get ha-preferred-endpoints client)]
+  (let [endpoint (when-let [state (client-state client)]
+                   (.get ^AtomicReference (.-endpoint state)))]
     (when (and (string? endpoint) (not (s/blank? endpoint)))
       endpoint)))
 
 (defn- set-preferred-ha-endpoint!
   [client endpoint]
-  (if (and (some? endpoint) (string? endpoint) (not (s/blank? endpoint)))
-    (.put ha-preferred-endpoints client endpoint)
-    (.remove ha-preferred-endpoints client)))
+  (when-let [state (client-state client)]
+    (.set ^AtomicReference (.-endpoint state)
+          (when (and (string? endpoint) (not (s/blank? endpoint))) endpoint))))
 
 (defn ^:no-doc clear-preferred-ha-endpoint!
   "Internal routing API: forget a client's preferred write endpoint. Used when

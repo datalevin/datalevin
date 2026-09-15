@@ -17,10 +17,12 @@
    [datalevin.native-value :as nv]
    [datalevin.util :refer [raise]]
    [datalevin.spill :as sp]
+   [taoensso.nippy :as nippy]
+   [taoensso.nippy.impl :as nippy-impl]
    [cognitect.transit :as transit])
   (:import
-   [java.io ByteArrayInputStream ByteArrayOutputStream]
-   [java.nio ByteBuffer]
+   [java.io ByteArrayInputStream ByteArrayOutputStream EOFException]
+   [java.nio ByteBuffer BufferOverflowException]
    [java.util UUID]
    [java.nio.channels SocketChannel Selector SelectionKey]
    [datalevin.io ByteBufferInputStream ByteBufferOutputStream]
@@ -80,23 +82,21 @@
   ^bytes [fmt msg]
   (case (short fmt)
     1 (write-transit-bytes msg)
-    2 (binding [nv/*wire-native-value* true]
+    ;; Establish the wire and Java serialization contexts in one binding.
+    ;; bits/serialize can then use the already installed allowlist.
+    2 (binding [nv/*wire-native-value* true
+                nippy/*freeze-serializable-allowlist* (b/serialization-allowlist)]
         (b/serialize msg))
     (raise "Unknown wire message format"
              {:format fmt
               :format-code (fmt-code fmt)})))
 
-(defn- deserialize-nippy
-  [payload]
-  (binding [nv/*wire-native-value* true]
-    (try (b/deserialize payload)
-         (catch Exception e
-           (throw (or (nv/decoding-error e) e))))))
-
 (defn- maybe-pack-zstd
   [fmt ^bytes payload wire-opts]
-  (let [{:keys [compression compression-threshold compression-level]}
-        (merge (default-wire-opts) wire-opts)
+  (let [{:keys [compression compression-threshold compression-level]
+         :or {compression-threshold c/*wire-compression-threshold*
+              compression-level c/*wire-compression-level*}}
+        wire-opts
         threshold ^long (long compression-threshold)]
     (if (and (= compression :zstd)
              (<= threshold (alength payload)))
@@ -155,11 +155,32 @@
     (catch Exception e
       (raise "Unable to write transit:" e {:value v}))))
 
-(defn read-nippy-bf
-  "Read from a ByteBuffer containing nippy encoded bytes, return a Clojure
-  value."
+(defn- thaw-nippy-bf
   [^ByteBuffer bf]
-  (deserialize-nippy (b/get-bytes bf)))
+  (let [pos (.position bf)]
+    (try
+      ;; Use the same read cache as fast-thaw. The general with-cache eagerly
+      ;; allocates writer maps that a decoder does not need (Nippy 3.9).
+      (nippy-impl/with-thaw-cache (nippy/thaw-from-bb! bf))
+      (catch Exception e
+        ;; Native reader failures must not be mistaken for legacy headers.
+        (when (nv/decoding-error e) (throw e))
+        (.position bf pos)
+        (nippy/thaw (b/get-bytes bf))))))
+
+(defn read-nippy-bf
+  "Read one Nippy value from the buffer, with legacy header fallback."
+  [^ByteBuffer bf]
+  (let [allowlist (b/serialization-allowlist)]
+    (try
+      (if (and nv/*wire-native-value*
+               (identical? allowlist nippy/*thaw-serializable-allowlist*))
+        (thaw-nippy-bf bf)
+        (binding [nv/*wire-native-value* true
+                  nippy/*thaw-serializable-allowlist* allowlist]
+          (thaw-nippy-bf bf)))
+      (catch Exception e
+        (throw (or (nv/decoding-error e) e))))))
 
 (defn read-transit-bf
   "Read from a ByteBuffer containing transit+json encoded bytes,
@@ -172,8 +193,19 @@
 (defn write-nippy-bf
   "Write a Clojure value as nippy encoded bytes into a ByteBuffer"
   [^ByteBuffer bf v]
-  (b/put-bytes bf (binding [nv/*wire-native-value* true]
-                    (b/serialize v))))
+  (when (instance? java.lang.Class v)
+    (raise "Unfreezable type: java.lang.Class" {}))
+  (binding [nv/*wire-native-value* true
+            nippy/*freeze-serializable-allowlist* (b/serialization-allowlist)]
+    (try
+      (nippy/with-cache (nippy/freeze-to-bb! bf v))
+      (catch EOFException e
+        ;; Nippy 3.9 translates buffer overflow to EOFException without a cause.
+        ;; Only translate that specific error; custom serializers can throw EOF.
+        (if (some-> (.getMessage e)
+                    (.startsWith "ByteBuffer overflow while freezing:"))
+          (throw (doto (BufferOverflowException.) (.initCause e)))
+          (throw e))))))
 
 (defn write-transit-bf
   "Write a Clojure value as transit+json encoded bytes into a ByteBuffer"
@@ -183,6 +215,31 @@
                                  {:handlers transit-write-handlers})
                  v))
 
+(defn- write-message-bytes-bf
+  [^ByteBuffer bf msg fmt wire-opts]
+  (let [payload ^bytes (serialize-value fmt msg)
+        [fmt' body]   (maybe-pack-zstd fmt payload wire-opts)]
+    (.put bf ^byte (unchecked-byte fmt'))
+    (.putInt bf (int (+ c/message-header-size (alength ^bytes body))))
+    (.put bf ^bytes body)))
+
+(defn- compress-message-bf!
+  [^ByteBuffer bf ^long start wire-opts]
+  (let [payload-start (+ start c/message-header-size)
+        end           (.position bf)
+        size          (- end payload-start)]
+    (when (and (= (:compression wire-opts) :zstd)
+               (<= (long (get wire-opts :compression-threshold
+                              c/*wire-compression-threshold*)) size))
+      (let [payload (b/get-bytes (doto (.duplicate bf)
+                                   (.limit end)
+                                   (.position payload-start)))
+            [fmt body] (maybe-pack-zstd c/message-format-nippy payload wire-opts)]
+        (when (zstd-compressed? fmt)
+          (.put bf (int start) (unchecked-byte fmt))
+          (.position bf payload-start)
+          (.put bf ^bytes body))))))
+
 (defn write-message-bf
   "Write a message to a ByteBuffer. First byte is format, then four bytes
   length of the whole message (include header), followed by message value"
@@ -191,13 +248,25 @@
   ([bf msg fmt]
    (write-message-bf bf msg fmt nil))
   ([^ByteBuffer bf msg fmt wire-opts]
-   (let [payload ^bytes  (serialize-value fmt msg)
-         [fmt' body]     (maybe-pack-zstd fmt payload wire-opts)
-         message-len      (int (+ c/message-header-size
-                                  (alength ^bytes body)))]
-     (.put bf ^byte (unchecked-byte fmt'))
-     (.putInt bf message-len)
-     (.put bf ^bytes body))))
+   (let [start (.position bf)]
+     (try
+       (if (= fmt c/message-format-nippy)
+         (try
+           (.put bf (unchecked-byte fmt))
+           (.putInt bf 0)
+           (write-nippy-bf bf msg)
+           (compress-message-bf! bf start wire-opts)
+           (.putInt bf (int (inc start)) (int (- (.position bf) start)))
+           (catch BufferOverflowException e
+             (.position bf start)
+             ;; A compressed frame may fit even when the raw value does not.
+             (if (= (:compression wire-opts) :zstd)
+               (write-message-bytes-bf bf msg fmt wire-opts)
+               (throw e))))
+         (write-message-bytes-bf bf msg fmt wire-opts))
+       (catch Throwable t
+         (.position bf start)
+         (throw t))))))
 
 (defn read-transit-bytes
   "Read transit+json encoded bytes into a Clojure value"
@@ -222,36 +291,64 @@
    (let [code      (fmt-code fmt)
          compressed? (zstd-compressed? fmt)
          payload   (if compressed?
-                     (let [{:keys [compression]}
-                           (merge (default-wire-opts) wire-opts)]
-                       (when-not (= compression :zstd)
+                     (do
+                       (when-not (= (:compression wire-opts) :zstd)
                          (raise "Received compressed wire message without negotiated support"
                                   {:compression-flag :zstd
                                    :wire-opts        wire-opts}))
-                       (unpack-zstd bs))
+                       (unpack-zstd (if (instance? ByteBuffer bs)
+                                      (b/get-bytes bs)
+                                      bs)))
                      bs)]
      (case (short code)
-       1 (read-transit-bytes payload)
-       2 (deserialize-nippy payload)
+       1 (if (instance? ByteBuffer payload)
+           (read-transit-bf payload)
+           (read-transit-bytes payload))
+       2 (read-nippy-bf (if (instance? ByteBuffer payload)
+                         payload
+                         (ByteBuffer/wrap payload)))
        (raise "Unknown wire message format"
                 {:format fmt
                  :format-code code})))))
 
+(deftype ^:no-doc RequestDecoder [native? reader])
+
+(defn ^:no-doc request-decoder
+  "Create native-value detection state owned by one connection's read loop.
+  It retains no request payloads and must not be used concurrently."
+  []
+  (let [native? (volatile! false)]
+    (RequestDecoder. native?
+                     (fn [_ _]
+                       (vreset! native? true)
+                       (UUID/randomUUID)))))
+
 (defn read-request
   "Read request routing fields without running native deserializers. Requests
   containing native values retain their bytes until authorized dispatch."
-  [fmt bs wire-opts]
-  (let [native? (volatile! false)
-        message (binding [nv/*wire-reader* (fn [_ _]
-                                            (vreset! native? true)
-                                            (UUID/randomUUID))]
-                  (read-value fmt bs wire-opts))]
-    (when-not (map? message)
-      (raise "Expected a request map" {}))
-    (let [message (vary-meta message dissoc ::native-request)]
-      (if @native?
-        (vary-meta message assoc ::native-request [fmt bs wire-opts])
-        message))))
+  ([fmt bs wire-opts]
+   (read-request fmt bs wire-opts (request-decoder)))
+  ([fmt bs wire-opts ^RequestDecoder decoder]
+   (let [native? (.-native? decoder)
+         pos     (when (instance? ByteBuffer bs) (.position ^ByteBuffer bs))]
+     (vreset! native? false)
+     (let [message (binding [nv/*wire-reader* (.-reader decoder)
+                             nv/*wire-native-value* true]
+                     (read-value fmt bs wire-opts))]
+       (when-not (map? message)
+         (raise "Expected a request map" {}))
+       ;; Only metadata supplied by this decoder can defer native decoding.
+       (let [message (if (contains? (meta message) ::native-request)
+                       (vary-meta message dissoc ::native-request)
+                       message)]
+         (if @native?
+           ;; The connection will compact/reuse its buffer before dispatch.
+           ;; Only deferred native requests need an owned copy of the frame.
+           (let [payload (if (instance? ByteBuffer bs)
+                           (b/get-bytes (doto ^ByteBuffer bs (.position (int pos))))
+                           bs)]
+             (vary-meta message assoc ::native-request [fmt payload wire-opts]))
+           message))))))
 
 (defn native-request?
   "True when read-request retained native values for authorized decoding."
@@ -350,11 +447,14 @@
    (receive-one-message read-bf nil))
   ([^ByteBuffer read-bf wire-opts]
    (let [pos (.position read-bf)]
-     (if (> pos c/message-header-size)
+     (if (>= pos c/message-header-size)
        (do (.flip read-bf)
            (let [available (.limit read-bf)
                  fmt       (.get read-bf)
                  length    ^int (.getInt read-bf)
+                 _         (when (< length c/message-header-size)
+                             (raise "Message corruption: length is less than header size"
+                                      {:length length}))
                  read-bf   (if (< (.capacity read-bf) length)
                              (let [^ByteBuffer bf
                                    (ByteBuffer/allocateDirect
@@ -368,14 +468,16 @@
                      (.limit (.capacity read-bf))
                      (.position pos))
                    [nil read-bf])
-               (let [ba  (byte-array (- length c/message-header-size))
-                     _   (.get read-bf ba)
-                     msg (read-value fmt ba wire-opts)]
-                 (if (= available length)
-                   (.clear read-bf)
-                   (doto read-bf
-                     (.position length)
-                     (.compact)))
+               (let [msg (try
+                           ;; The decoder cannot read into a following frame.
+                           (.limit read-bf length)
+                           (read-value fmt read-bf wire-opts)
+                           (finally
+                             (.limit read-bf available)
+                             (.position read-bf length)
+                             (if (= available length)
+                               (.clear read-bf)
+                               (.compact read-bf))))]
                  [msg read-bf]))))
        [nil read-bf]))))
 
@@ -468,31 +570,35 @@
            (.configureBlocking ch true)))))))
 
 (defn extract-message
-  "Segment the content of read buffer to extract a message and call msg-handler
-  on it. The message is a byte array. Message parsing will be done in the
-  msg-handler. In non-blocking mode, it should be handled by a worker thread,
-  so the main event loop is not hindered by slow parsing. Assume the message
-  is small enough for the buffer. Compact before handing off buffer ownership
-  to the handler. Return true if a complete message was extracted."
-  [^ByteBuffer read-bf msg-handler]
-  (let [pos (.position read-bf)]
-    (when (>= pos c/message-header-size)
-      (.flip read-bf)
-      (let [available (.limit read-bf)
-            fmt       (.get read-bf)
-            length    (.getInt read-bf)]
-        (if (< available length)
-          (do
-            (doto read-bf
-              (.limit (.capacity read-bf))
-              (.position pos))
-            false)
-          (let [cnt-len (- length c/message-header-size)]
-            (if (< cnt-len 0)
-              (raise "Message corruption: length is less than header size"
-                       {:length length})
-              (let [ba (byte-array cnt-len)]
-                (.get read-bf ba)
-                (.compact read-bf)
-                (msg-handler fmt ba)
-                true))))))))
+  "Extract a complete frame. The optional msg-reader decodes (fmt, buffer)
+  while the buffer is limited to the payload. It must not retain buffer views.
+  Compact before calling msg-handler with (fmt, decoded message), so handlers
+  can reuse the read buffer for bulk transfers. Without a reader, deliver an
+  owned byte array. Return true when a complete frame was extracted."
+  ([read-bf msg-handler]
+   (extract-message read-bf (fn [_ buffer] (b/get-bytes buffer)) msg-handler))
+  ([^ByteBuffer read-bf msg-reader msg-handler]
+   (let [pos (.position read-bf)]
+     (when (>= pos c/message-header-size)
+       (.flip read-bf)
+       (let [available (.limit read-bf)
+             fmt       (.get read-bf)
+             length    (.getInt read-bf)]
+         (when (< length c/message-header-size)
+           (raise "Message corruption: length is less than header size"
+                    {:length length}))
+         (if (< available length)
+           (do
+             (doto read-bf
+               (.limit (.capacity read-bf))
+               (.position pos))
+             false)
+           (let [message (try
+                           (.limit read-bf length)
+                           (msg-reader fmt read-bf)
+                           (finally
+                             (.limit read-bf available)
+                             (.position read-bf length)
+                             (.compact read-bf)))]
+             (msg-handler fmt message)
+             true)))))))

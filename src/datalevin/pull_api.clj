@@ -37,6 +37,31 @@
 
 (defrecord Context [db visitor])
 
+(deftype ^:no-doc FlatPattern [^objects names ^longs aids schema id?])
+(deftype ^:no-doc CachedPattern [schema pattern flat])
+
+(defn- flat-pattern
+  [schema ^PullPattern pattern]
+  (when (and (not (.-wildcard? pattern))
+             (empty? (.-reverse-attrs pattern))
+             (every? (fn [^PullAttr attr]
+                       (let [name (.-name attr)]
+                         (and (keyword? name)
+                              (= name (.-as attr))
+                              (nil? (.-default attr))
+                              (identical? identity (.-xform attr))
+                              (not (.-multival? attr))
+                              (not (.-ref? attr))
+                              (or (= name :db/id)
+                                  (integer? (:db/aid (get schema name)))))))
+                     (.-attrs pattern)))
+    (let [names (mapv :name (.-attrs pattern))
+          id?   (boolean (some #{:db/id} names))
+          names (filterv #(not= :db/id %) names)]
+      (FlatPattern. (object-array names)
+                    (long-array (map #(:db/aid (get schema %)) names))
+                    schema id?))))
+
 (defn visit [^Context context pattern e a v]
   (when-some [visitor (.-visitor context)]
     (visitor pattern e a v)))
@@ -290,37 +315,80 @@
       datoms
       id)))
 
+(defn- pull-flat
+  [^Context context ^PullPattern pattern ^FlatPattern flat eid]
+  (timeout/assert-time-left)
+  (let [^objects names (.-names flat)
+        ^longs aids (.-aids flat)
+        schema         (.-schema flat)
+        n              (alength names)
+        datoms (when (pos? n)
+                 (db/-range-datoms
+                   (.-db context) :eav
+                   (dd/datom eid (.-name ^PullAttr (.-first-attr pattern)) nil c/tx0)
+                   (dd/datom eid (.-name ^PullAttr (.-last-attr pattern)) nil c/txmax)))
+        result (loop [index  0
+                      datoms (seq datoms)
+                      acc    (if (.-id? flat)
+                               (transient {:db/id eid})
+                               (transient {}))]
+                 (if (and (< index n) datoms)
+                   (let [name (aget names index)
+                         ^Datom datom (first datoms)]
+                     (if (= name (.-a datom))
+                       (recur (inc index) (next datoms)
+                              (assoc! acc name (.-v datom)))
+                       ;; Matching attributes need no schema lookup. Compare
+                       ;; IDs only when skipping an absent or unrequested field.
+                       (if (< (aget aids index)
+                              (long (:db/aid (get schema (.-a datom)))))
+                         (recur (inc index) datoms acc)
+                         (recur index (next datoms) acc))))
+                   (not-empty (persistent! acc))))]
+    (timeout/assert-time-left)
+    result))
+
 (defn pull-impl [parsed-opts id]
   (let [{^Context context     :context
-         ^PullPattern pattern :pattern} parsed-opts]
+         ^PullPattern pattern :pattern
+         flat                 :flat} parsed-opts]
     (when-some [eid (db/entid (.-db context) id)]
-      (loop [stack (list (attrs-frame context #{} {} pattern eid))]
-        (timeout/assert-time-left)
-        (cond+
-          :let [last   (first-seq stack)
-                stack' (next-seq stack)]
+      (if (and flat (nil? (.-visitor context)))
+        (pull-flat context pattern flat eid)
+        (loop [stack (list (attrs-frame context #{} {} pattern eid))]
+          (timeout/assert-time-left)
+          (cond+
+            :let [last   (first-seq stack)
+                  stack' (next-seq stack)]
 
-          (not (instance? ResultFrame last))
-          (recur (reduce conj-seq stack' (-run last context)))
+            (not (instance? ResultFrame last))
+            (recur (reduce conj-seq stack' (-run last context)))
 
-          (nil? stack')
-          (.-value ^ResultFrame last)
+            (nil? stack')
+            (.-value ^ResultFrame last)
 
-          :let [penultimate (first-seq stack')
-                stack''     (next-seq stack')]
+            :let [penultimate (first-seq stack')
+                  stack''     (next-seq stack')]
 
-          :else
-          (recur (conj-seq stack'' (-merge penultimate last))))))))
+            :else
+            (recur (conj-seq stack'' (-merge penultimate last)))))))))
 
 (defn parse-opts
   ([^DB db pattern] (parse-opts db pattern nil))
   ([^DB db pattern {:keys [visitor]}]
-   {:pattern (let [^LRUCache c (.-pull-patterns db)]
-               (or (.get c pattern)
-                   (let [res (dpp/parse-pattern db pattern)]
-                     (.put c pattern res)
-                     res)))
-    :context (Context. db visitor)}))
+   (let [^LRUCache c (.-pull-patterns db)
+         schema (db/-schema db)
+         ^CachedPattern cached (.get c pattern)
+         ^CachedPattern cached
+         (if (and cached (identical? schema (.-schema cached)))
+           cached
+           (let [parsed (dpp/parse-pattern db pattern)
+                 res (CachedPattern. schema parsed (flat-pattern schema parsed))]
+             (.put c pattern res)
+             res))]
+     {:pattern (.-pattern cached)
+      :flat    (.-flat cached)
+      :context (Context. db visitor)})))
 
 (defn pull*
   "Supported opts:
@@ -333,9 +401,10 @@
   ([^DB db pattern id] (pull* db pattern id {}))
   ([^DB db pattern id {:keys [timeout] :as opts}]
    {:pre [(db/db? db)]}
-   (binding [timeout/*deadline* (timeout/to-deadline timeout)]
-     (let [parsed-opts (parse-opts db pattern opts)]
-       (pull-impl parsed-opts id)))))
+   (if (and (nil? timeout) (nil? timeout/*deadline*))
+     (pull-impl (parse-opts db pattern opts) id)
+     (binding [timeout/*deadline* (timeout/to-deadline timeout)]
+       (pull-impl (parse-opts db pattern opts) id)))))
 
 (defn pull
   ([db pattern id opts]

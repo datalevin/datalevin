@@ -37,6 +37,8 @@
    [datalevin.kv :as kv]
    [datalevin.replica :as replica]
    [datalevin.constants :as c]
+   [datalevin.command :as cmd]
+   [datalevin.server.context :as context]
    [datalevin.interface :as i]
    [taoensso.timbre :as log]
    [clojure.string :as s])
@@ -446,14 +448,17 @@
                   [db-name store])))
         (.-dbs server)))
 
+(defn- store-from-state
+  [m writing?]
+  (if writing?
+    (or (usable-store (:wstore m))
+        (runtime-db-store (:wdt-db m)))
+    (or (usable-store (:store m))
+        (runtime-db-store (:dt-db m)))))
+
 (defn- get-store
   ([^Server server db-name writing?]
-   (let [m (get (.-dbs server) db-name)]
-     (if writing?
-       (or (usable-store (:wstore m))
-           (runtime-db-store (:wdt-db m)))
-       (or (usable-store (:store m))
-           (runtime-db-store (:dt-db m))))))
+   (store-from-state (get (.-dbs server) db-name) writing?))
   ([server db-name]
    (get-store server db-name false)))
 
@@ -1159,34 +1164,28 @@
                   (throw t)))))]
      (attempt-add-store store 3))))
 
+(defn- db-from-state
+  [m writing?]
+  (if writing?
+    (:wdt-db m)
+    (or
+      (when (or (:ha-authority m) (:ha-role m) (:replica/read-only? m))
+        (when-let [store (store-from-state m false)]
+          (cpp/invalidate-thread-reader!
+            (kv/raw-lmdb
+              (if (instance? Store store) (.-lmdb ^Store store) store)))
+          ;; HA replay and promotion mutate the shared store outside normal
+          ;; transaction wrappers. Rebuild the view even on followers without
+          ;; a live authority object so reads cannot retain pre-replay data.
+          (db/refresh-cache store)
+          (new-runtime-db store (current-runtime-opts m))))
+      (:dt-db m))))
+
 (defn- get-db
   ([server db-name]
    (get-db server db-name false))
   ([^Server server db-name writing?]
-   (let [m (get (.-dbs server) db-name)]
-     (if writing?
-       (:wdt-db m)
-       (or
-       (when (or (:ha-authority m)
-                 (:ha-role m)
-                 (:replica/read-only? m))
-           (when-let [store (or (usable-store (:store m))
-                                (runtime-db-store (:dt-db m)))]
-            (cpp/invalidate-thread-reader!
-             (kv/raw-lmdb
-              (if (instance? Store store)
-                (.-lmdb ^Store store)
-                store)))
-            ;; HA replay and promotion mutate the shared store outside the
-            ;; normal query/transaction wrappers. Clear the shared store cache
-            ;; and build a fresh runtime DB view for HA reads whenever the DB
-            ;; is in HA role state, even if there is no live authority object
-            ;; on this node. Followers can continue serving reads after replay
-            ;; with only :ha-role/:store state, and falling back to a cached
-            ;; :dt-db there leaks stale pre-replay views into remote queries.
-            (db/refresh-cache store)
-            (new-runtime-db store (current-runtime-opts m))))
-        (:dt-db m))))))
+   (db-from-state (get (.-dbs server) db-name) writing?)))
 
 (defn- remove-store
   [^Server server db-name]
@@ -1236,11 +1235,14 @@
           (vswap! state assoc :write-bf (bf/allocate-buffer size))
           (write-message skey msg))))))
 
+(declare new-connection-context)
+
 (defn- ^:redef handle-accept
   [^Server server ^SelectionKey skey]
   (let [{:keys [connections connection-keys connection-threads]} (.-execution server)]
     (connection/accept! skey connections connection-keys connection-threads
-                        #(sdisp/handle-read dispatch-deps server %))))
+                        #(sdisp/handle-read dispatch-deps server %)
+                        #(new-connection-context server %))))
 
 (defn- copy-in
   "Continuously read batched data from the client"
@@ -2181,29 +2183,55 @@
     {:strict? true}))
 
 (defn- native-request-reader
-  [^Server server ^SelectionKey skey {:keys [args writing?] :as message}]
-  (let [context
-        (delay
-          (let [db-name (first args)
-                {:keys [client-id]} @(.attachment skey)
-                {:keys [permissions]} (get-client server client-id)
-                action (if (dha/ha-write-message? message) ::alter ::view)]
-            (when-not (and (string? db-name)
-                           permissions
-                           (has-permission? action ::database
-                                            (db-eid (.-sys-conn server) db-name)
-                                            permissions))
-              (raise "Don't have permission to decode native database values" {}))
-            ;; Resolving on the transaction runner observes pending registrations.
-            (lmdb server skey db-name writing?)))
-        readers (volatile! {})]
-    (fn [type-name payload]
-      (let [type-name (keyword (subs type-name 1))
-            reader (or (get @readers type-name)
-                       (let [r (:deserialize (custom/resolve-type @context type-name))]
-                         (vswap! readers assoc type-name r)
-                         r))]
-        (reader payload)))))
+  ([server skey message]
+   (native-request-reader handler-deps server skey message))
+  ([deps ^Server server ^SelectionKey skey {:keys [args writing?] :as message}]
+   (let [context
+         (delay
+           (let [db-name (first args)
+                 {:keys [client-id]} @(.attachment skey)
+                 {:keys [permissions]} ((:get-client deps) server client-id)
+                 action (if (dha/ha-write-message? message) ::alter ::view)]
+             (when-not (and (string? db-name)
+                            permissions
+                            (has-permission? action ::database
+                                             (db-eid (.-sys-conn server) db-name)
+                                             permissions))
+               (raise "Don't have permission to decode native database values" {}))
+             ;; Resolving on the transaction runner observes pending registrations.
+             ((:lmdb deps) server skey db-name writing?)))
+         readers (volatile! {})]
+     (fn [type-name payload]
+       (let [type-name (keyword (subs type-name 1))
+             reader (or (get @readers type-name)
+                        (let [r (:deserialize (custom/resolve-type @context type-name))]
+                          (vswap! readers assoc type-name r)
+                          r))]
+         (reader payload))))))
+
+(defn- new-connection-context
+  [server skey]
+  (context/create server skey handler-deps #'store-from-state #'db-from-state
+                  (fn [store]
+                    (if (instance? Store store) (.-lmdb ^Store store) store))))
+
+(defn- prepare-connection-context
+  [^Server server ^SelectionKey skey {:keys [type args db-name writing?]}]
+  (let [attachment (.attachment skey)
+        {:keys [client-id] :as connection} @attachment
+        shared (or (:context connection)
+                   ;; Legacy/test keys may not have gone through accept!.
+                   (let [shared (new-connection-context server skey)]
+                     (vswap! attachment assoc :context shared)
+                     shared))
+        name (or db-name (nth args 0 nil))
+        db-name (when (string? name) name)
+        snapshot? (and db-name (not writing?) (cmd/read-only? type)
+                       (not (cmd/runtime-read-access-exempt? type)))]
+    (context/prepare! (:context shared) client-id
+                      (when snapshot? (get-client server client-id)) db-name
+                      (when snapshot? (server-db-state server db-name)) snapshot?)
+    shared))
 
 (def ^:private message-handler-map
   (into {}
@@ -2211,13 +2239,19 @@
                [type
                 (fn [server skey message]
                   (try
-                    (if (or (p/native-request? message)
-                            ;; Native values can arrive in later copy-in batches.
-                            (= :copy-in (:mode message)))
-                      (binding [nv/*wire-reader* (native-request-reader server skey message)]
-                        (handler handler-deps server skey
-                                 (p/resolve-native-request message)))
-                      (handler handler-deps server skey message))
+                    (let [shared (prepare-connection-context server skey message)
+                          deps (:deps shared)]
+                      (try
+                        (if (or (p/native-request? message)
+                                ;; Native values may arrive in copy-in batches.
+                                (= :copy-in (:mode message)))
+                          (binding [nv/*wire-reader*
+                                    (native-request-reader deps server skey message)]
+                            (handler deps server skey
+                                     (p/resolve-native-request message)))
+                          (handler deps server skey message))
+                        (finally
+                          (context/clear! (:context shared)))))
                     (catch Exception e
                       (handle-message-error! skey e))))]))
         sh/handler-map))

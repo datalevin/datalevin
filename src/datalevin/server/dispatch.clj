@@ -102,14 +102,14 @@
 
 (defn- replica-read-only-error
   [deps server message]
-  (let [db-name (message-db-name message)
-        m       (and db-name (get ((:dbs-fn deps) server) db-name))]
-    (when (and (:replica/read-only? m)
-               (cmd/replica-write? (:type message)))
-      {:error :replica/read-only
-       :db-name db-name
-       :type (:type message)
-       :message "Replica is read-only"})))
+  (when (cmd/replica-write? (:type message))
+    (let [db-name (message-db-name message)
+          m       (and db-name (get ((:dbs-fn deps) server) db-name))]
+      (when (:replica/read-only? m)
+        {:error :replica/read-only
+         :db-name db-name
+         :type (:type message)
+         :message "Replica is read-only"}))))
 
 (defn client-disconnect?
   [e]
@@ -238,7 +238,8 @@
 
 (defn dispatch-message-with-ha-write-admission
   [deps server ^SelectionKey skey message]
-  (if (cmd/deferred-write? (:type message))
+  (if (or (cmd/deferred-write? (:type message))
+          (cmd/read-only? (:type message)))
     (dispatch-message deps server skey message)
     (let [type          (:type message)
           transaction   (cmd/transaction-control type)
@@ -339,11 +340,17 @@
 
 (defn- read-message
   [deps server ^SelectionKey skey fmt msg]
-  (let [wire-opts (:wire-opts @(.attachment skey))
-        {:keys [type] :as message} (p/read-request fmt msg wire-opts)]
-    (if (= type :set-client-id)
-      (do (dispatch-message deps server skey message) ::handled)
-      message)))
+  (try
+    (let [{:keys [wire-opts request-decoder]} @(.attachment skey)
+          {:keys [type] :as message}
+          (p/read-request fmt msg wire-opts (or request-decoder (p/request-decoder)))]
+      (if (= type :set-client-id)
+        (do (dispatch-message deps server skey message) ::handled)
+        message))
+    (catch InterruptedException e (throw e))
+    (catch Exception e
+      (handle-message-error! deps skey e)
+      ::handled)))
 
 (defn- transaction-message?
   [message]
@@ -371,12 +378,14 @@
 
 (defn handle-message
   "Decode, execute and reply on the connection's owning thread."
-  [deps server skey fmt msg]
-  (try
-    (handle-decoded-message deps server skey (read-message deps server skey fmt msg))
-    (catch InterruptedException e (throw e))
-    (catch Exception e
-      (handle-message-error! deps skey e))))
+  ([deps server skey message]
+   (try
+     (handle-decoded-message deps server skey message)
+     (catch InterruptedException e (throw e))
+     (catch Exception e
+       (handle-message-error! deps skey e))))
+  ([deps server skey fmt msg]
+   (handle-message deps server skey (read-message deps server skey fmt msg))))
 
 (defn- close-read-connection!
   [deps server skey]
@@ -402,7 +411,9 @@
         (when (and (.isOpen ch) (not (.isInterrupted (Thread/currentThread))))
           (let [^ByteBuffer read-bf (:read-bf @state)]
             (if (p/extract-message read-bf
-                                  #(handle-message deps server skey %1 %2))
+                                  #(read-message deps server skey %1 %2)
+                                  (fn [_ message]
+                                    (handle-message deps server skey message)))
               ;; Copy-in may have grown the shared buffer. Fetch it afresh.
               (recur)
               (let [^ByteBuffer read-bf

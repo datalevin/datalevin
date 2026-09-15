@@ -96,34 +96,43 @@
 
 ;; nippy
 
+(defn ^:no-doc serialization-allowlist
+  "Effective Java serialization allowlist for storage and wire codecs."
+  []
+  (if (seq c/*data-serializable-classes*)
+    (into nippy/*thaw-serializable-allowlist* c/*data-serializable-classes*)
+    nippy/*thaw-serializable-allowlist*))
+
 (defn serialize ^bytes
   [x]
-  (binding [nippy/*freeze-serializable-allowlist*
-            (if (seq c/*data-serializable-classes*)
-              (into nippy/*thaw-serializable-allowlist*
-                    c/*data-serializable-classes*)
-              nippy/*thaw-serializable-allowlist*)]
-    (if (instance? java.lang.Class x)
-      (raise "Unfreezable type: java.lang.Class" {})
-      (nippy/fast-freeze x))))
+  (when (instance? java.lang.Class x)
+    (raise "Unfreezable type: java.lang.Class" {}))
+  (let [allowlist (serialization-allowlist)]
+    (if (identical? allowlist nippy/*freeze-serializable-allowlist*)
+      (nippy/fast-freeze x)
+      (binding [nippy/*freeze-serializable-allowlist* allowlist]
+        (nippy/fast-freeze x)))))
+
+(defn- deserialize*
+  [^bytes bs]
+  (try
+    (nippy/fast-thaw bs)
+    (catch Exception e
+      ;; A native reader failure is not an old Nippy header. Retrying thaw
+      ;; would hide the missing runtime binding behind a format error.
+      (when (some #(= :native-value/decode (:error (ex-data %)))
+                  (take-while some? (iterate ex-cause e)))
+        (throw e))
+      (nippy/thaw bs))))
 
 (defn deserialize
   "Deserialize from bytes. "
   [^bytes bs]
-  (binding [nippy/*thaw-serializable-allowlist*
-            (if (seq c/*data-serializable-classes*)
-              (into nippy/*thaw-serializable-allowlist*
-                    c/*data-serializable-classes*)
-              nippy/*thaw-serializable-allowlist*)]
-    (try
-      (nippy/fast-thaw bs)
-      (catch Exception e
-        ;; A native reader failure is not an old Nippy header. Retrying thaw
-        ;; would hide the missing runtime binding behind a format error.
-        (when (some #(= :native-value/decode (:error (ex-data %)))
-                    (take-while some? (iterate ex-cause e)))
-          (throw e))
-        (nippy/thaw bs)))))
+  (let [allowlist (serialization-allowlist)]
+    (if (identical? allowlist nippy/*thaw-serializable-allowlist*)
+      (deserialize* bs)
+      (binding [nippy/*thaw-serializable-allowlist* allowlist]
+        (deserialize* bs)))))
 
 ;; bitmap
 

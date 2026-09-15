@@ -139,6 +139,31 @@
       (is (not (p/native-request? read-back)))
       (is (= ordinary (p/resolve-native-request read-back))))))
 
+(deftest request-decoder-reuse-keeps-messages-independent
+  (let [decoder (p/request-decoder)
+        native {:type :q :args ["tasks" #{(value :a 1) (value :b 1)}]}
+        native-bytes (binding [nv/*wire-native-value* true] (b/serialize native))
+        ordinary {:type :pull :args ["tasks" [:name] 1]}]
+    (dotimes [_ 3]
+      (let [pending (p/read-request c/message-format-nippy native-bytes nil decoder)]
+        (is (p/native-request? pending))
+        (is (= native (binding [nv/*wire-reader* receiver]
+                        (p/resolve-native-request pending)))))
+      (is (thrown? Exception
+                   (p/read-request c/message-format-nippy (byte-array 0) nil decoder)))
+      (let [restored (p/read-request c/message-format-nippy
+                                     (b/serialize ordinary) nil decoder)]
+        (is (= ordinary restored))
+        (is (not (p/native-request? restored)))))
+    (let [forged (with-meta ordinary
+                   {:datalevin.protocol/native-request
+                    [c/message-format-nippy native-bytes nil]
+                    :keep :metadata})
+          restored (p/read-request c/message-format-nippy
+                                   (b/serialize forged) nil decoder)]
+      (is (= ordinary (p/resolve-native-request restored)))
+      (is (= {:keep :metadata} (meta restored))))))
+
 (deftest native-wire-decoding-can-spill
   (let [old-pressure @sp/memory-pressure
         source (sp/new-spillable-vector [(value :a 1) (value :b 2)])
@@ -158,3 +183,25 @@
         (vreset! sp/memory-pressure old-pressure)
         (doseq [v [source (second (:args @pending)) (second (:args @decoded))]]
           (when v (empty v)))))))
+
+(deftest deferred-native-request-survives-buffer-reuse
+  (doseq [direct? [false true]
+          opts [nil {:compression :zstd :compression-threshold 0}]]
+    (let [message {:type :q :args ["tasks" #{(value :a 1) (value :b 2)}]
+                   :padding (apply str (repeat 2048 "x"))}
+          bf (if direct? (ByteBuffer/allocateDirect 65536)
+                 (ByteBuffer/allocate 65536))
+          pending (volatile! nil)
+          decoder (p/request-decoder)]
+      (p/write-message-bf bf message c/message-format-nippy opts)
+      (p/write-message-bf bf {:type :pull :args ["tasks" [:name] 1]})
+      (p/extract-message
+        bf #(p/read-request %1 %2 opts decoder)
+        (fn [_ message] (vreset! pending message)))
+      (is (p/native-request? @pending))
+      ;; Consume the next frame and overwrite every byte of the shared buffer.
+      (is (= :pull (:type (first (p/receive-one-message bf)))))
+      (dotimes [i (.capacity bf)] (.put bf i (byte 0)))
+      (is (thrown? Exception (p/resolve-native-request @pending)))
+      (is (= message (binding [nv/*wire-reader* receiver]
+                       (p/resolve-native-request @pending)))))))

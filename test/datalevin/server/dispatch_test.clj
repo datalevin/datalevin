@@ -283,8 +283,7 @@
       (let [{:keys [events response]}
             (dispatch-probe state {:type type :args ["db"]})]
         (is (nil? response))
-        (is (= [:runtime-enter :admission-enter [:handler type nil]
-                :admission-exit :runtime-exit] events)))))
+        (is (= [:runtime-enter [:handler type nil] :runtime-exit] events)))))
   (doseq [type local-writes]
     (let [{:keys [events response]}
           (dispatch-probe (assoc (leader-state) :ha-role :follower)

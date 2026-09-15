@@ -33,7 +33,9 @@
                                  [type (fn [srv key message]
                                          (when (or (:writing? message)
                                                    (= type :open-transact-kv))
-                                           (swap! calls conj [key (Thread/currentThread)]))
+                                           (swap! calls conj
+                                                  [key (Thread/currentThread)
+                                                   (:context @(.attachment ^SelectionKey key))]))
                                          (handler srv key message))]))
                           handlers)]
         (try
@@ -51,8 +53,10 @@
                  (is (= :before (d/get-value kv "data" :key)))
                  (when abort? (d/abort-transact-kv tx)))
                (is (<= 5 (count @calls)))
+               (is (some? (nth (first @calls) 2))
+                   "the connection context is present for transaction commands")
                (is (= 1 (count (set @calls)))
-                   "open, nested reads, writes, abort and close share one native owner")
+                   "open, reads, writes, abort and close share an owner and context")
                (is (= (if abort? :before :inside) (d/get-value kv "data" :key)))
                (d/transact-kv kv [[:put "data" :key :before]])))
           (finally (d/close-kv kv)))))))

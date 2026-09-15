@@ -47,38 +47,43 @@
 (defn accept!
   "Start one thread for an accepted socket. Publish its ID, key and thread
   before starting it; remove ownership only after the read loop and cleanup exit."
-  [^SelectionKey listener
-   ^Set connections ^ConcurrentHashMap connection-keys
-   ^ConcurrentHashMap connection-threads serve!]
-  (when-let [^SocketChannel ch (.accept ^ServerSocketChannel (.channel listener))]
-    (let [id (UUID/randomUUID)]
-      (try
-        (.configureBlocking ch true)
-        (let [key (connection-key ch)
-              thread (Thread.
-                       ^Runnable
-                       (fn []
-                         (try
-                           (serve! key)
-                           (finally
-                             (try (close! key)
-                                  (finally
-                                    (.remove connection-keys id)
-                                    (.remove connection-threads id))))))
-                       (str "datalevin-connection-" id))]
-          (.attach key (volatile! {:read-bf (bf/allocate-buffer c/+buffer-size+)
-                                   :write-bf (bf/allocate-buffer c/+buffer-size+)
-                                   :wire-opts (p/default-wire-opts)
-                                   :connection-id id
-                                   :connection-threads connection-threads
-                                   :connections connections}))
-          (.add connections ch)
-          (.put connection-keys id key)
-          (.put connection-threads id thread)
-          (.start thread))
-        (catch Throwable t
-          (resources/close-suppressing! t #(.close ch))
-          (.remove connections ch)
-          (.remove connection-keys id)
-          (.remove connection-threads id)
-          (throw t))))))
+  ([listener connections connection-keys connection-threads serve!]
+   (accept! listener connections connection-keys connection-threads serve!
+            (constantly nil)))
+  ([^SelectionKey listener
+    ^Set connections ^ConcurrentHashMap connection-keys
+    ^ConcurrentHashMap connection-threads serve! context-fn]
+   (when-let [^SocketChannel ch (.accept ^ServerSocketChannel (.channel listener))]
+     (let [id (UUID/randomUUID)]
+       (try
+         (.configureBlocking ch true)
+         (let [key (connection-key ch)
+               thread (Thread.
+                        ^Runnable
+                        (fn []
+                          (try
+                            (serve! key)
+                            (finally
+                              (try (close! key)
+                                   (finally
+                                     (.remove connection-keys id)
+                                     (.remove connection-threads id))))))
+                        (str "datalevin-connection-" id))]
+           (.attach key (volatile! {:read-bf (bf/allocate-buffer c/+buffer-size+)
+                                    :write-bf (bf/allocate-buffer c/+buffer-size+)
+                                    :wire-opts (p/default-wire-opts)
+                                    :request-decoder (p/request-decoder)
+                                    :context (context-fn key)
+                                    :connection-id id
+                                    :connection-threads connection-threads
+                                    :connections connections}))
+           (.add connections ch)
+           (.put connection-keys id key)
+           (.put connection-threads id thread)
+           (.start thread))
+         (catch Throwable t
+           (resources/close-suppressing! t #(.close ch))
+           (.remove connections ch)
+           (.remove connection-keys id)
+           (.remove connection-threads id)
+           (throw t)))))))

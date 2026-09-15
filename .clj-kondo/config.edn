@@ -36,6 +36,8 @@
   :unresolved-var
   {:exclude [taoensso.nippy/*freeze-serializable-allowlist*
              taoensso.nippy/*thaw-serializable-allowlist*
+             taoensso.nippy/cache
+             taoensso.nippy/with-cache
              pod.huahaiy.datalevin/defpodfn
              pod.huahaiy.datalevin/with-transaction
              pod.huahaiy.datalevin/with-transaction-kv

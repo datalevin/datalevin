@@ -4,6 +4,7 @@
    [datalevin.client :as client]
    [datalevin.command :as command]
    [datalevin.constants :as c]
+   [datalevin.native-value :as nv]
    [datalevin.protocol :as p])
   (:import
    [datalevin.client ConnectionPool]
@@ -123,6 +124,51 @@
                          (is (= :ok (deref result 1000 ::timeout)))
                          result)))]
         (is (= :ok (deref result 2000 ::timeout)))))))
+
+(deftest ordinary-client-requests-do-not-lock-global-state-test
+  (with-expired-request-budget
+    [{:type :command-complete :result :ok}]
+    (fn [base _]
+      (let [result (locking @#'client/client-state-refs
+                     (locking @#'client/fallback-client-states
+                       (let [result (future (client/normal-request base :doc-count ["db"]))]
+                         (is (= :ok (deref result 1000 ::timeout)))
+                         result)))]
+        (is (= :ok (deref result 2000 ::timeout)))))))
+
+(deftest client-native-readers-remain-shared-and-scoped-test
+  (let [conn (reify client/IConnection
+               (send-n-receive [_ _]
+                 {:type :command-complete :result nv/*wire-reader*})
+               (close [_] nil))
+        pool (reify client/IConnectionPool
+               (get-connection [_] conn)
+               (release-connection [_ _] nil)
+               (close-pool [_] nil)
+               (closed-pool? [_] false))
+        base (client/->Client "user" "password" "localhost" 19001 1 1000 nil pool)
+        target (client/->Client "user" "password" "localhost" 19002 1 1000 nil pool)
+        reader (fn [_ _] :database-reader)
+        outer (fn [_ _] :outer-reader)
+        request (fn [client db-name]
+                  (:result (client/request client {:type :pull :args [db-name]})))]
+    (#'client/inherit-native-readers! target base)
+    ;; Registrations made after inheritance must reach the retry/transaction client.
+    (.put ^java.util.concurrent.ConcurrentHashMap
+          (#'client/native-reader-cache base) "db" reader)
+    (binding [nv/*wire-reader* outer]
+      (is (identical? reader (request base "db")))
+      (is (identical? reader (request target "db")))
+      (is (identical? outer (request target "other-db")))
+      (is (identical? outer nv/*wire-reader*)))
+    (#'client/set-preferred-ha-endpoint! base "localhost:19003")
+    (#'client/set-preferred-ha-read-endpoint! base "db" "localhost:19004")
+    (is (= "localhost:19004" (#'client/preferred-ha-read-endpoint base "db")))
+    (is (= "localhost:19003" (#'client/preferred-ha-read-endpoint base "other-db")))
+    (client/reset-client-state!)
+    (is (nil? (request base "db")))
+    (is (nil? (request target "db")))
+    (is (nil? (#'client/preferred-ha-read-endpoint base "db")))))
 
 (deftest index-mutations-use-write-retries-without-selecting-a-transaction-test
   (doseq [op mutations
