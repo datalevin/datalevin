@@ -104,12 +104,12 @@
 
 (defn encode-giant-datom
   "Encode a datom for `datalevin/giants`.
-  Returns {:value x :vtype t} where t is :data or :raw."
+  Returns owned bytes as {:value bytes :vtype :raw}."
   [^Datom datom]
   (let [raw (b/serialize datom)]
-    (if-let [packed (maybe-compress-giant-datom-bytes raw)]
-      {:value packed :vtype :raw}
-      {:value datom :vtype :data})))
+    ;; The compression probe already serialized the datom. Reuse those bytes
+    ;; when compression is skipped instead of serializing it again in storage.
+    {:value (or (maybe-compress-giant-datom-bytes raw) raw) :vtype :raw}))
 
 (defn decode-giant-datom
   "Decode `datalevin/giants` value bytes (supports both legacy :data encoding
@@ -122,7 +122,7 @@
           compressed (byte-array (.remaining bb))]
       (.get bb compressed)
       (b/deserialize (Zstd/decompress compressed (long raw-len))))
-    (b/read-buffer (ByteBuffer/wrap bs) :data)))
+    (b/deserialize bs)))
 
 (defn index->k
   ([index schema datom high?] (index->k index nil schema datom high?))

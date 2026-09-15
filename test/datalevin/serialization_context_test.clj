@@ -14,6 +14,12 @@
     (p/write-message-bf buffer value c/message-format-nippy opts)
     (first (p/receive-one-message buffer opts))))
 
+(defn- storage-roundtrip [value]
+  (let [buffer (ByteBuffer/allocateDirect 65536)]
+    (b/put-buffer buffer value)
+    (.flip buffer)
+    (b/read-buffer buffer)))
+
 (deftest serialization-context-preserves-allowlists-and-legacy-data
   (let [payload {:data [1 2 "three"]}
         value (AtomicInteger. 42)
@@ -22,12 +28,14 @@
     (is (thrown? Exception (b/serialize AtomicInteger)))
     (binding [c/*data-serializable-classes* classes]
       (is (= 42 (.get ^AtomicInteger (b/deserialize (b/serialize value)))))
+      (is (= 42 (.get ^AtomicInteger (storage-roundtrip value))))
       (is (= 42 (.get ^AtomicInteger (wire-roundtrip value nil)))))
     ;; The storage contract derives the freeze policy from the current thaw
     ;; policy, even when a caller has installed a different freeze allowlist.
     (binding [c/*data-serializable-classes* nil
               nippy/*freeze-serializable-allowlist* #{}
               nippy/*thaw-serializable-allowlist* classes]
+      (is (= 42 (.get ^AtomicInteger (storage-roundtrip value))))
       (is (= 42 (.get ^AtomicInteger (wire-roundtrip value nil))))
       (is (= #{} nippy/*freeze-serializable-allowlist*)))))
 

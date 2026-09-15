@@ -184,10 +184,10 @@
     (try (f payload-dbi rtx)
          (finally (when-not writing? (i/return-rtx kv rtx))))))
 
-(defn- read-payload [payload-dbi rtx id]
+(defn- read-payload [payload-dbi rtx id deserialize]
   (l/put-key rtx id :id)
   (if-let [buffer (l/get-kv payload-dbi rtx)]
-    (b/read-buffer buffer :raw)
+    (deserialize buffer)
     (raise "Missing custom value payload"
            {:error :custom-type/missing-payload :id id})))
 
@@ -196,13 +196,13 @@
   [kv type ref]
   (with-snapshot kv
     (fn [payload-dbi rtx]
-      ((:deserialize type) (read-payload payload-dbi rtx (reference-id ref))))))
+      (read-payload payload-dbi rtx (reference-id ref) (:deserialize-bf type)))))
 
 (defn read-value-at
   "Resolve a reference using a caller-owned index snapshot."
   [kv type ref rtx]
-  ((:deserialize type)
-   (read-payload (i/get-dbi kv c/custom-values false) rtx (reference-id ref))))
+  (read-payload (i/get-dbi kv c/custom-values false) rtx (reference-id ref)
+                (:deserialize-bf type)))
 
 (defn value-reader
   "Prepare a payload decoder for a caller-owned snapshot. The returned function
@@ -210,8 +210,8 @@
   [kv type rtx]
   (require-store! kv)
   (let [dbi (i/get-dbi kv c/custom-values false)
-        deserialize (:deserialize type)]
-    (fn [ref] (deserialize (read-payload dbi rtx (reference-id ref))))))
+        deserialize (:deserialize-bf type)]
+    (fn [ref] (read-payload dbi rtx (reference-id ref) deserialize))))
 
 (defn- check-index! [kv {:keys [dbi position key]}]
   (when (or (not (string? dbi)) (= dbi c/custom-values) (= dbi c/kv-info)
@@ -265,9 +265,9 @@
   (reduce-index-at
    kv index [:closed (reference prefix min-id) (reference prefix max-id)]
    (fn [_ entry payload-dbi rtx]
-     (let [candidate ((:deserialize type)
-                      (read-payload payload-dbi rtx
-                                    (reference-id (:reference entry))))]
+     (let [candidate (read-payload payload-dbi rtx
+                                   (reference-id (:reference entry))
+                                   (:deserialize-bf type))]
        (when (= value candidate)
          (reduced (assoc entry :value candidate)))))
    nil payload-dbi rtx))

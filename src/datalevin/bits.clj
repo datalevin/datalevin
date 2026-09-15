@@ -16,13 +16,14 @@
    [datalevin.ints :as i]
    [datalevin.sparselist :as sl]
    [clojure.string :as s]
-   [taoensso.nippy :as nippy])
+   [taoensso.nippy :as nippy]
+   [taoensso.nippy.impl :as nippy-impl])
   (:import
    [java.util Arrays UUID Date Base64 Base64$Decoder Base64$Encoder]
    [java.util.regex Pattern]
    [java.math BigInteger BigDecimal]
-   [java.io Writer]
-   [java.nio ByteBuffer]
+   [java.io EOFException Writer]
+   [java.nio BufferOverflowException ByteBuffer]
    [java.nio.charset StandardCharsets]
    [java.lang String]
    [org.roaringbitmap RoaringBitmap RoaringBitmapWriter  FastAggregation]
@@ -113,6 +114,11 @@
       (binding [nippy/*freeze-serializable-allowlist* allowlist]
         (nippy/fast-freeze x)))))
 
+(defn- native-decoding-error?
+  [e]
+  (some #(= :native-value/decode (:error (ex-data %)))
+        (take-while some? (iterate ex-cause e))))
+
 (defn- deserialize*
   [^bytes bs]
   (try
@@ -120,9 +126,7 @@
     (catch Exception e
       ;; A native reader failure is not an old Nippy header. Retrying thaw
       ;; would hide the missing runtime binding behind a format error.
-      (when (some #(= :native-value/decode (:error (ex-data %)))
-                  (take-while some? (iterate ex-cause e)))
-        (throw e))
+      (when (native-decoding-error? e) (throw e))
       (nippy/thaw bs))))
 
 (defn deserialize
@@ -277,13 +281,97 @@
   [^ByteBuffer bf ^long post-v]
   (get-bytes bf (- (.remaining bf) post-v)))
 
+(defn serialize-bf
+  "Serialize directly into a ByteBuffer using the same bytes as serialize.
+  Preserves the caller's native-value context and isolates the value's cache."
+  [^ByteBuffer bb x]
+  (when (instance? java.lang.Class x)
+    (raise "Unfreezable type: java.lang.Class" {}))
+  (let [allowlist (serialization-allowlist)]
+    (try
+      (nippy/with-cache
+        (if (identical? allowlist nippy/*freeze-serializable-allowlist*)
+          (nippy/freeze-to-bb! bb x)
+          (binding [nippy/*freeze-serializable-allowlist* allowlist]
+            (nippy/freeze-to-bb! bb x))))
+      (catch EOFException e
+        ;; Nippy 3.9 rolls back the position, but reports overflow as EOF.
+        ;; Storage callers need BufferOverflowException to grow value buffers
+        ;; or reject oversized keys. Preserve unrelated custom serializer EOFs.
+        (if (some-> (.getMessage e)
+                    (.startsWith "ByteBuffer overflow while freezing:"))
+          (throw (doto (BufferOverflowException.) (.initCause e)))
+          (throw e))))))
+
+(defn- deserialize-bf*
+  [^ByteBuffer bb]
+  (let [pos (.position bb)]
+    (try
+      ;; Match fast-thaw's lightweight read cache, independently of any caller
+      ;; cache. A complete payload copy is needed only for legacy headers.
+      (nippy-impl/with-thaw-cache (nippy/thaw-from-bb! bb))
+      (catch Exception e
+        (when (native-decoding-error? e) (throw e))
+        (.position bb pos)
+        (nippy/thaw (get-bytes bb))))))
+
+(defn deserialize-bf
+  "Deserialize the remaining bytes, with legacy Nippy header fallback.
+  Consumes the entire buffer before its transaction or cursor can be reused."
+  [^ByteBuffer bb]
+  (let [limit     (.limit bb)
+        allowlist (serialization-allowlist)]
+    (try
+      (if (identical? allowlist nippy/*thaw-serializable-allowlist*)
+        (deserialize-bf* bb)
+        (binding [nippy/*thaw-serializable-allowlist* allowlist]
+          (deserialize-bf* bb)))
+      (finally (.position bb limit)))))
+
+(defn acquire-serialized-bf
+  "Serialize into a pooled heap buffer, growing as needed, ready for reading.
+  Return it with buffer/return-array-buffer after consuming it synchronously."
+  ^ByteBuffer [x]
+  (loop [^ByteBuffer bb (bf/get-array-buffer)]
+    (if (try
+          (serialize-bf bb x)
+          true
+          (catch BufferOverflowException e
+            (when (= (.capacity bb) Integer/MAX_VALUE)
+              (bf/return-array-buffer bb)
+              (throw e))
+            false)
+          (catch Throwable e
+            (bf/return-array-buffer bb)
+            (throw e)))
+      (.flip bb)
+      ;; Discard the undersized heap buffer so subsequent pool users do not
+      ;; repeatedly encounter the same overflow. No borrowed content escapes.
+      (recur (ByteBuffer/allocate
+               (int (min Integer/MAX_VALUE (* 2 (long (.capacity bb))))))))))
+
+(defmacro with-serialized-bf
+  "Bind a pooled serialized buffer for synchronous consumption in body.
+  Neither the buffer nor a lazy reader of it may escape this scope."
+  [[sym value] & body]
+  `(let [~(with-meta sym (assoc (meta sym) :tag 'java.nio.ByteBuffer))
+         (acquire-serialized-bf ~value)]
+     (try
+       ~@body
+       (finally (bf/return-array-buffer ~sym)))))
+
 (defn- get-data
   "Read data from a ByteBuffer"
   ([^ByteBuffer bb]
-   (when-let [bs (get-bytes bb)]
-     (deserialize bs)))
-  ([^ByteBuffer bb post-v]
-   (when-let [bs (get-bytes-val bb post-v)] (deserialize bs))))
+   (deserialize-bf bb))
+  ([^ByteBuffer bb ^long post-v]
+   (let [limit (.limit bb)]
+     (try
+       ;; Generic Datalog values are followed by index separators/giant flags.
+       ;; Neither the direct decoder nor its legacy fallback may read them.
+       (.limit bb (int (- limit post-v)))
+       (deserialize-bf bb)
+       (finally (.limit bb limit))))))
 
 (def ^:no-doc ^:const float-sign-idx 31)
 (def ^:no-doc ^:const double-sign-idx 63)
@@ -422,7 +510,7 @@
         ^int scale        (get-int bb)]
     (BigDecimal. value scale)))
 
-(defn- put-data [^ByteBuffer bb x] (put-bytes bb (serialize x)))
+(defn- put-data [^ByteBuffer bb x] (serialize-bf bb x))
 
 (defn- put-uuid
   [bf ^UUID val]
@@ -488,7 +576,7 @@
     (.remaining ^ByteBuffer x)
     (int? x)           8
     (instance? Byte x) 1
-    :else              (alength ^bytes (serialize x))))
+    :else              (with-serialized-bf [bb x] (.remaining bb))))
 
 (def ^:private ^bytes min-indexed-bytes
   ;; Indexed byte values are followed by a separator and a giant-value flag.

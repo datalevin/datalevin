@@ -61,8 +61,15 @@
                   (b/serialize (snapshot "another-runtime" ":app/task"
                                          (.payload ^NativeValue v)))))))
     (is (thrown? Exception (b/serialize v)))
+    (is (thrown? Exception (b/put-buffer (ByteBuffer/allocate 4096) v)))
     (is (thrown? Exception (p/read-nippy-bf (.duplicate bf))))
     (is (thrown? Exception (b/deserialize wire-bytes)))
+    (let [error (binding [nv/*wire-native-value* true]
+                  (try
+                    (b/read-buffer (.duplicate bf))
+                    nil
+                    (catch Exception e e)))]
+      (is (some? (nv/decoding-error error))))
     (is (thrown? Exception
                  (binding [nv/*spill-bindings* bindings]
                    (b/deserialize wire-bytes))))

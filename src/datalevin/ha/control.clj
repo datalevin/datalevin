@@ -933,14 +933,6 @@
        sort
        vec))
 
-(defn- bytebuffer->bytes
-  [^ByteBuffer bb]
-  (let [buf (.duplicate bb)
-        n   (.remaining buf)
-        out (byte-array n)]
-    (.get buf out)
-    out))
-
 (defn- freeze->base64
   [x]
   (.encodeToString (Base64/getUrlEncoder)
@@ -1511,8 +1503,7 @@
           (let [^ByteBuffer data (.getData iter)
                 done           (.done iter)
                 step           (try
-                                 (let [cmd (b/deserialize
-                                            (bytebuffer->bytes data))
+                                 (let [cmd (b/deserialize-bf (.duplicate data))
                                        {:keys [state result]}
                                        (apply-state-command state cmd)]
                                    {:state state

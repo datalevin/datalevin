@@ -12,8 +12,10 @@
    [datalevin.kv :as kv]
    [datalevin.lmdb :as l]
    [datalevin.udf :as udf]
-   [datalevin.util :as u :refer [raise]])
+   [datalevin.util :as u :refer [raise]]
+   [taoensso.nippy :as nippy])
   (:import
+   [java.nio ByteBuffer]
    [java.util Arrays Date Random UUID]
    [java.util.concurrent TimeUnit]))
 
@@ -190,6 +192,40 @@
 
 (defn- udf-desc [kind]
   {:udf/lang :test :udf/kind kind :udf/id :app/task :udf/version 1})
+
+(deftest nippy-payload-buffer-decoder-retains-value-ownership
+  (let [kv (open-kv "buffer-decoder")]
+    (d/register-type kv :app/task (task-type 0))
+    (let [type (custom/resolve-type kv :app/task)
+          value {:rank 3 :text "config" :bytes (byte-array [1 2 3])}]
+      (doseq [freeze [b/serialize nippy/freeze]]
+        (let [buffer (doto (ByteBuffer/allocateDirect 4096)
+                       (.put ^bytes (freeze value)) (.flip))
+              restored ((:deserialize-bf type) buffer)]
+          (is (= (.limit buffer) (.position buffer)))
+          (.clear buffer)
+          (while (.hasRemaining buffer) (.put buffer (byte 0)))
+          (is (= 3 (:rank restored)))
+          (is (= "config" (:text restored)))
+          (is (= [1 2 3] (vec (:bytes restored)))))))))
+
+(deftest custom-payload-buffer-decoder-keeps-the-byte-array-contract
+  (let [runtime (udf/create-registry)
+        kv (open-kv "owned-payload" {:runtime-opts {:udf-registry runtime}})]
+    (udf/register! runtime (udf-desc :serializer) identity)
+    (udf/register! runtime (udf-desc :deserializer) identity)
+    (d/register-type kv :app/task
+                     (assoc (task-type 0)
+                            :payload {:serialize (udf-desc :serializer)
+                                      :deserialize (udf-desc :deserializer)}))
+    (let [type (custom/resolve-type kv :app/task)
+          buffer (doto (ByteBuffer/allocateDirect 32)
+                   (.put (byte-array [1 2 3])) (.flip))
+          bytes ((:deserialize-bf type) buffer)]
+      (is (bytes? bytes))
+      (.clear buffer)
+      (.put buffer (byte-array [9 9 9]))
+      (is (= [1 2 3] (vec bytes))))))
 
 (deftest udf-bindings-and-runtime-options
   (let [runtime (udf/create-registry)

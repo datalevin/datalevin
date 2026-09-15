@@ -98,16 +98,17 @@
         (raise "Custom payload functions require both serialize and deserialize"
                {:error :custom-type/payload})))
     ;; A round trip validates captures and isolates mutable input from metadata.
-    (b/deserialize
-     (b/serialize
-      {:version version
-       :index {:type backing
-               :order-fn (normalize-callable (:order-fn index) :order-fn)}
-       :payload (if (= :nippy payload)
-                  :nippy
-                  {:serialize (normalize-callable (:serialize payload) :serializer)
-                   :deserialize (normalize-callable (:deserialize payload)
-                                                    :deserializer)})}))))
+    (b/with-serialized-bf
+      [buffer
+       {:version version
+        :index {:type backing
+                :order-fn (normalize-callable (:order-fn index) :order-fn)}
+        :payload (if (= :nippy payload)
+                   :nippy
+                   {:serialize (normalize-callable (:serialize payload) :serializer)
+                    :deserialize (normalize-callable (:deserialize payload)
+                                                     :deserializer)})}]
+      (b/deserialize-bf buffer))))
 
 (defn- same-source?
   "Compare persisted source/captures, including arrays and captured inter-fns."
@@ -353,7 +354,16 @@
                                           (:serialize payload) runtime-opts)))
         deserialize (delay (if (= :nippy payload) b/deserialize
                                (materialize kv type-name :deserializer
-                                            (:deserialize payload) runtime-opts)))]
+                                            (:deserialize payload) runtime-opts)))
+        deserialize-bf (delay b/deserialize-bf)
+        deserialize-value
+        (fn [payload]
+          (when-not (bytes? payload)
+            (raise "Custom deserializer requires a byte array"
+                   {:error :custom-type/payload :type-name type-name}))
+          (let [value (invoke-function deserialize type-name :deserializer payload)]
+            (check-native-type! type-name value)
+            value))]
     {:type-name type-name
      :definition definition
      :order-fn (fn [value]
@@ -371,13 +381,16 @@
                       (raise "Custom serializer must return a byte array"
                              {:error :custom-type/payload :type-name type-name}))
                     payload))
-     :deserialize (fn [payload]
-                    (when-not (bytes? payload)
-                      (raise "Custom deserializer requires a byte array"
-                             {:error :custom-type/payload :type-name type-name}))
-                    (let [value (invoke-function deserialize type-name :deserializer payload)]
-                      (check-native-type! type-name value)
-                      value))}))
+     :deserialize deserialize-value
+     ;; Storage consumes this decoder while the snapshot is still active.
+     ;; User-defined codecs retain their public owned byte-array contract.
+     :deserialize-bf
+     (if (= :nippy payload)
+       (fn [buffer]
+         (let [value (invoke-function deserialize-bf type-name :deserializer buffer)]
+           (check-native-type! type-name value)
+           value))
+       (fn [buffer] (deserialize-value (b/get-bytes buffer))))}))
 
 (defn- resolve-cached-type [kv type-name runtime-opts registry]
   (let [{:keys [revision types]} registry
