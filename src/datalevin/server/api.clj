@@ -19,6 +19,7 @@
    [datalevin.query :as q]
    [datalevin.query.resolve :as qresolve]
    [datalevin.search :as sc]
+   [datalevin.server.prepared :as prepared]
    [datalevin.util :refer [raise]]
    [datalevin.vector :as v])
   (:import
@@ -43,12 +44,16 @@
     (write-or-copy-result! write-message copy-out skey data)))
 
 (defn pull
-  [{:keys [get-db write-message copy-out]} server ^SelectionKey skey {:keys [args writing?]}]
+  [{:keys [get-db write-message copy-out]} server ^SelectionKey skey
+   {:keys [args writing?] :as message}]
   (let [[db-name pattern id opts] args
         db                        (get-db server db-name writing?)
-        data                      (if (get-in @(.attachment skey) [:wire-opts :storage-read?])
-                                    (pull/read-result db pattern id opts)
-                                    (d/pull db pattern id opts))]
+        reader                    (prepared/reader! skey message)
+        encoded?                  (get-in @(.attachment skey) [:wire-opts :storage-read?])
+        data                      (cond
+                                    reader (reader db id encoded?)
+                                    encoded? (pull/read-result db pattern id opts)
+                                    :else (d/pull db pattern id opts))]
     (write-or-copy-result! write-message copy-out skey data)))
 
 (defn pull-many

@@ -18,6 +18,7 @@
    [datalevin.datom :as dd]
    [datalevin.interface :as i]
    [datalevin.index :as idx]
+   [datalevin.prepared :as prepared]
    [datalevin.read-encode :as enc]
    [datalevin.storage :as storage]
    [datalevin.timeout :as timeout]
@@ -27,6 +28,7 @@
    [datalevin.utl LRUCache]
    [datalevin.datom Datom]
    [datalevin.storage Store]
+   [java.util.concurrent.atomic AtomicReference]
    [datalevin.pull_parser PullAttr PullPattern]))
 
 (declare pull-impl attrs-frame ref-frame ->ReverseAttrsFrame)
@@ -439,6 +441,62 @@
               #(storage/write-entity! store % eid (.-keys flat) (.-aids flat) (.-id? flat))))
           (pull-impl parsed id)))
       (pull db pattern id opts))))
+
+(deftype ^:no-doc PreparedPatternState [schema db parsed direct?])
+
+(defn pull-reader
+  "Prepare a pull's fixed pattern and options. Retain its parsed projection
+  and context while the schema and DB view match; never retain a snapshot."
+  [pattern {:keys [visitor timeout] :as opts}]
+  (let [state (AtomicReference.)]
+    (fn [^DB db id encoded?]
+      (let [store (.-store db)
+            _ (when (instance? Store store) (storage/maybe-ensure-current! store))
+            schema (db/-schema db)
+            ^PreparedPatternState previous (.get state)
+            ^PreparedPatternState current
+            (if (and previous (identical? db (.-db previous))
+                     (identical? schema (.-schema previous)))
+              previous
+              (let [parsed (if (and previous (identical? schema (.-schema previous)))
+                             (assoc (.-parsed previous) :context (Context. db visitor))
+                             (parse-opts db pattern opts))
+                    ^FlatPattern flat (:flat parsed)
+                    direct? (and flat (nil? visitor) (nil? timeout)
+                                 (< (alength ^objects (.-names flat))
+                                    (long c/+wire-datom-batch-size+))
+                                 (not-any? #(cd/custom-type?
+                                              (idx/value-type (get schema %)))
+                                           (.-names flat)))
+                    current (PreparedPatternState. schema db parsed direct?)]
+                (.set state current)
+                current))
+            parsed (.-parsed current)]
+        (if (and encoded? (.-direct? current) (instance? Store store)
+                 (nil? timeout/*deadline*) (not (db/pending-tx-cache? db)))
+          (when-some [eid (db/entid db id)]
+            (let [^FlatPattern flat (:flat parsed)]
+              (enc/read-result
+                #(storage/write-entity! store % eid (.-keys flat)
+                                        (.-aids flat) (.-id? flat)))))
+          (if (and (nil? timeout) (nil? timeout/*deadline*))
+            (pull-impl parsed id)
+            (binding [timeout/*deadline* (timeout/to-deadline timeout)]
+              (pull-impl parsed id))))))))
+
+(defn prepare-pull
+  "Prepare a reusable pull for a DB view. Execute it with an entity ID or
+  lookup reference. Schema changes refresh the projection automatically.
+  Options and result semantics are the same as `pull`."
+  ([db pattern] (prepare-pull db pattern nil))
+  ([^DB db pattern opts]
+   {:pre [(db/db? db)]}
+   (let [store (.-store db)]
+     (if (satisfies? i/IRemotePrepared store)
+       (i/prepare-remote-read store :pull [pattern nil opts])
+       (let [reader (pull-reader pattern opts)]
+         (parse-opts db pattern opts)
+         (prepared/prepared-read #(reader db % false)))))))
 
 (defn pull-many*
   ([^DB db pattern ids] (pull-many* db pattern ids {}))

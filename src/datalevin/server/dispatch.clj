@@ -18,6 +18,7 @@
    [datalevin.kv.txlog :as kvtx]
    [datalevin.protocol :as p]
    [datalevin.server.deps :as sdeps]
+   [datalevin.server.prepared :as prepared]
    [datalevin.txlog :as txlog]
    [datalevin.util :as u :refer [raise]]
    [taoensso.timbre :as log])
@@ -360,21 +361,22 @@
 (defn- handle-decoded-message
   [deps server skey message]
   (when-not (= ::handled message)
-    (log/debug "Message received:" (dissoc message :password :args))
-    (set-last-active deps server skey)
-    (if-let [err (when-not (and (not (:writing? message))
-                               (cmd/deferred-write? (:type message)))
-                  (replica-read-only-error deps server message))]
-      (error-response skey "Replica is read-only" err)
-      ;; Ownership and native transaction affinity also apply when a client
-      ;; omits :writing? on close/abort.
-      (if (transaction-message? message)
-        (handle-writing deps server skey message)
-        (let [dispatch! #(dispatch-message-with-ha-write-admission
-                          deps server skey message)]
-          (if (runtime-read-access-message? message)
-            ((:with-db-runtime-read-access-fn deps) server message dispatch!)
-            (dispatch!)))))))
+    (let [message (prepared/expand-message skey message)]
+      (log/debug "Message received:" (dissoc message :password :args :value))
+      (set-last-active deps server skey)
+      (if-let [err (when-not (and (not (:writing? message))
+                                (cmd/deferred-write? (:type message)))
+                    (replica-read-only-error deps server message))]
+        (error-response skey "Replica is read-only" err)
+        ;; Ownership and native transaction affinity also apply when a client
+        ;; omits :writing? on close/abort.
+        (if (transaction-message? message)
+          (handle-writing deps server skey message)
+          (let [dispatch! #(dispatch-message-with-ha-write-admission
+                            deps server skey message)]
+            (if (runtime-read-access-message? message)
+              ((:with-db-runtime-read-access-fn deps) server message dispatch!)
+              (dispatch!))))))))
 
 (defn handle-message
   "Decode, execute and reply on the connection's owning thread."

@@ -83,6 +83,17 @@
     :raw (write-bytes! out value)
     (write-value! out (b/read-buffer value v-type))))
 
+(defn buffer-writer
+  "Select the response encoder once for a prepared KV read."
+  [v-type]
+  (case v-type
+    (:data nil) write-data!
+    :string (fn [out ^ByteBuffer value] (.get value) (write-string! out value))
+    :bytes (fn [out ^ByteBuffer value] (.get value) (write-bytes! out value))
+    :raw write-bytes!
+    (let [decode (b/buffer-reader v-type)]
+      (fn [out value] (write-value! out (decode value))))))
+
 (defn write-avg!
   "Write an inline Datalog value, excluding its attribute ID and index trailer.
   Custom references and giant values must be resolved by the storage caller."

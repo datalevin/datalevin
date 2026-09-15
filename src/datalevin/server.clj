@@ -39,6 +39,7 @@
    [datalevin.constants :as c]
    [datalevin.command :as cmd]
    [datalevin.server.context :as context]
+   [datalevin.server.prepared :as prepared]
    [datalevin.interface :as i]
    [taoensso.timbre :as log]
    [clojure.string :as s])
@@ -2248,7 +2249,8 @@
                           (binding [nv/*wire-reader*
                                     (native-request-reader deps server skey message)]
                             (handler deps server skey
-                                     (p/resolve-native-request message)))
+                                     (prepared/expand-message
+                                       skey (p/resolve-native-request message))))
                           (handler deps server skey message))
                         (finally
                           (context/clear! (:context shared)))))

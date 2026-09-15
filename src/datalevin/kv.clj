@@ -10,9 +10,11 @@
 (ns ^:no-doc datalevin.kv
   "KV-layer helpers for txn-log APIs and floor-provider bookkeeping."
   (:require
+   [datalevin.bits :as b]
    [datalevin.constants :as c]
    [datalevin.custom-kv :as custom-kv]
    [datalevin.interface :as i]
+   [datalevin.prepared :as prepared]
    [datalevin.read-encode :as enc]
    [datalevin.scan :as scan]
    [datalevin.kv.snapshot :refer [list-snapshot-entries]]
@@ -52,7 +54,7 @@
    [datalevin.lmdb :as l]
    [datalevin.txlog :as txlog]
    [datalevin.util :refer [deftype+ raise]])
-  )
+  (:import [java.util.concurrent.atomic AtomicReference]))
 
 (declare ->KVLMDB)
 
@@ -619,6 +621,56 @@
       (i/get-value db dbi-name k k-type v-type ignore-key?)
       (enc/read-result
         #(scan/write-value! raw dbi-name k k-type v-type ignore-key? %)))))
+
+(deftype ^:no-doc ValueReaderState [raw dbis dbi custom?])
+
+(defn value-reader
+  "Compile fixed point-read arguments for local and server execution. A DBI
+  handle is retained only while its environment and DBI metadata are current."
+  [dbi-name k-type v-type ignore-key?]
+  (let [state (AtomicReference.)
+        decode (b/buffer-reader v-type)
+        encode (enc/buffer-writer v-type)]
+    (fn [db k encoded?]
+      (let [raw (raw-lmdb db)
+            _ (i/check-ready raw)
+            info @(i/kv-info raw)
+            dbis (:dbis info)
+            ^ValueReaderState previous (.get state)
+            ^ValueReaderState current
+            (if (and previous (identical? raw (.-raw previous))
+                     (identical? dbis (.-dbis previous)))
+              previous
+              (let [dbi (i/get-dbi raw dbi-name false)
+                    current (ValueReaderState.
+                              raw (:dbis @(i/kv-info raw)) dbi
+                              (contains? (:custom-dbis @(i/kv-info raw)) dbi-name))]
+                (.set state current)
+                current))]
+        (if (and (.-custom? current) (not l/*raw-kv?*))
+          (i/get-value db dbi-name k k-type v-type ignore-key?)
+          (if encoded?
+            (enc/read-result
+              #(scan/read-prepared-value raw (.-dbi current) k k-type
+                                         decode encode ignore-key? %))
+            (scan/read-prepared-value raw (.-dbi current) k k-type
+                                     decode encode ignore-key? nil)))))))
+
+(defn prepare-get-value
+  "Prepare a reusable KV point read. Execute it with a key using
+  `execute-prepared` or by invoking the returned object. DBI changes refresh
+  its metadata; transactions and buffers are acquired separately on each call."
+  ([db dbi-name] (prepare-get-value db dbi-name :data :data true))
+  ([db dbi-name k-type] (prepare-get-value db dbi-name k-type :data true))
+  ([db dbi-name k-type v-type]
+   (prepare-get-value db dbi-name k-type v-type true))
+  ([db dbi-name k-type v-type ignore-key?]
+   (if (satisfies? i/IRemotePrepared db)
+     (i/prepare-remote-read db :get-value [dbi-name nil k-type v-type ignore-key?])
+     (let [reader (value-reader dbi-name k-type v-type ignore-key?)]
+       (i/check-ready (raw-lmdb db))
+       (i/get-dbi (raw-lmdb db) dbi-name false)
+       (prepared/prepared-read #(reader db % false))))))
 
 (defn wrap-lmdb
   [db]

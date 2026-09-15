@@ -18,11 +18,13 @@
    [datalevin.udf :as udf]
    [clojure.string :as s]
    [datalevin.buffer :as bf]
-   [datalevin.protocol :as p])
+   [datalevin.protocol :as p]
+   [datalevin.prepared :as prepared])
   (:import
    [java.nio ByteBuffer BufferOverflowException]
    [java.nio.channels SocketChannel Selector SelectionKey]
-   [java.util UUID WeakHashMap Collections]
+   [java.util UUID WeakHashMap Collections LinkedHashMap]
+   [datalevin.prepared Request]
    [java.util.concurrent ConcurrentHashMap]
    [java.util.concurrent.atomic AtomicBoolean AtomicInteger AtomicReference]
    [java.net InetSocketAddress StandardSocketOptions URI]))
@@ -33,6 +35,9 @@
   (send-only [conn msg] "Send a message without waiting for a response")
   (receive [conn] "Receive a message, a blocking call")
   (close [conn]))
+
+(definterface IConnectionIO
+  (exchange [message wire-options]))
 
 (defonce ^:private ^ConcurrentHashMap connection-wire-opts
   ;; Lifecycle/reset registry only. I/O reads the connection's own reference.
@@ -171,27 +176,55 @@
                               read-selector
                               ^ByteBuffer probe-bf
                               ^AtomicReference wire-options
-                              receive-buffer]
+                              receive-buffer
+                              ^LinkedHashMap prepared-handles]
+  IConnectionIO
+  (exchange [_ msg wire-opts]
+    ;; The caller owns the connection monitor. Grow only before sending.
+    (loop []
+      (when-not (try
+                  (p/write-message-owned ch bf msg wire-opts)
+                  true
+                  (catch BufferOverflowException _ false))
+        (set! bf (bf/allocate-buffer
+                   (* ^long c/+buffer-grow-factor+ (.capacity bf))))
+        (recur)))
+    (.clear bf)
+    (vreset! receive-buffer bf)
+    (try
+      (p/receive-ch! ch receive-buffer wire-opts time-out
+                    (when-not (.isBlocking ch) read-selector))
+      (finally (set! bf @receive-buffer))))
+
   IConnection
   (send-n-receive [this msg]
     (locking this
       (try
-        (let [wire-opts (.get wire-options)]
-          ;; Grow before any bytes are sent; decoder failures must not resend.
-          (loop []
-            (when-not (try
-                        (p/write-message-owned ch bf msg wire-opts)
-                        true
-                        (catch BufferOverflowException _ false))
-              (set! bf (bf/allocate-buffer
-                         (* ^long c/+buffer-grow-factor+ (.capacity bf))))
-              (recur)))
-          (.clear bf)
-          (vreset! receive-buffer bf)
-          (try
-            (p/receive-ch! ch receive-buffer wire-opts time-out
-                          (when-not (.isBlocking ch) read-selector))
-            (finally (set! bf @receive-buffer))))
+        (let [wire-opts (.get wire-options)
+              prepared-id (::prepared/id (meta msg))
+              enabled? (and prepared-id (:prepared-read? wire-opts))
+              id (when enabled? prepared-id)]
+          (loop [register? (and enabled? (nil? (.get prepared-handles id)))]
+            (let [wire-msg
+                  (if enabled?
+                    (if register?
+                      (with-meta (assoc msg :prepare-id id) nil)
+                      (cond-> {:type :execute-prepared :handle id
+                               :value (nth (:args msg) 2)
+                               :writing? (:writing? msg)}
+                        (:ha-read-min-tx msg)
+                        (assoc :ha-read-min-tx (:ha-read-min-tx msg))))
+                    (if prepared-id (with-meta msg nil) msg))
+                  response (.exchange ^IConnectionIO this wire-msg wire-opts)]
+              (if (and enabled? (not register?)
+                       (= :error-response (:type response))
+                       (= :prepared/missing (get-in response [:err-data :error])))
+                (do (.remove prepared-handles id) (recur true))
+                (do
+                  (when (and register?
+                             (#{:command-complete :copy-out-response} (:type response)))
+                    (prepared/remember! prepared-handles id true))
+                  response)))))
         (catch Exception e
           (when (nv/decoding-error? e) (throw e))
           (raise "Error sending message and receiving response: "
@@ -247,12 +280,14 @@
   ([^SocketChannel ch time-out ^ByteBuffer bf]
    (let [options (AtomicReference. (p/default-wire-opts))
          conn (Connection. ch (long time-out) bf (volatile! nil)
-                           (ByteBuffer/allocate 1) options (volatile! bf))]
+                           (ByteBuffer/allocate 1) options (volatile! bf)
+                           (prepared/handle-cache))]
      (.put connection-wire-opts ch options)
      conn)))
 
 (defn- set-conn-wire-opts!
   [^Connection conn wire-opts]
+  (.clear ^LinkedHashMap (.-prepared-handles conn))
   (.set ^AtomicReference (.-wire-options conn) wire-opts))
 
 (defn- ^SocketChannel connect-socket
@@ -1854,12 +1889,18 @@
   ([client call args]
    (normal-request* client call args false))
   ([client call args writing?]
+   (normal-request* client call args writing? nil))
+  ([client call args writing? ^Request prepared-request]
    (let [write-route?        (or writing? (cmd/ha-write? call))
          read-route?         (and (not writing?) (cmd/read-only? call))
          read-min-tx         (when (and read-route?
                                        (integer? *ha-read-min-tx*))
                               (long *ha-read-min-tx*))
-         req                 (cond-> {:type call :args args :writing? writing?}
+         req                 (cond-> {:type call
+                                      :args args
+                                      :writing? writing?}
+                               prepared-request
+                               (with-meta (.-metadata prepared-request))
                                read-min-tx
                                (assoc :ha-read-min-tx read-min-tx))
          db-name             (request-db-name req)
@@ -1968,6 +2009,12 @@
                        "HA read target became unavailable")
                    (when db-name (known-ha-db-endpoints client db-name)))
                  (throw e)))))))))
+
+(defn ^:no-doc normal-prepared-request
+  "Use normal routing and replay rules with connection-local preparation."
+  [client call ^Request prepared-request value writing?]
+  (normal-request* client call (assoc (.-args prepared-request) 2 value)
+                   writing? prepared-request))
 
 (defn ^:no-doc normal-request
   "Send a command, routing mutations by command properties. `writing?` only

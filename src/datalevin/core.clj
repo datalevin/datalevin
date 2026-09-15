@@ -26,6 +26,7 @@
    [datalevin.lmdb :as l]
    [datalevin.pull-parser]
    [datalevin.pull-api :as dp]
+   [datalevin.prepared :as prepared]
    [datalevin.query :as dq]
    [datalevin.built-ins :as dbq]
    [datalevin.entity :as de]
@@ -168,6 +169,38 @@ Only usable for debug output.
              ; => [{:db/id 1, :name \"Ivan\"}
              ;     {:db/id 2, :name \"Oleg\"}]"}
   pull-many dp/pull-many)
+
+(def ^{:arglists '([db pattern] [db pattern opts])
+       :doc "Prepare a reusable pull for a local or remote DB view. The returned
+  object is callable with an entity ID or lookup reference:
+
+      (def read-person (prepare-pull db [:db/id :name :age]))
+      (execute-prepared read-person [:email \"a@example.org\"])
+
+  Options and results match `pull`. Schema changes refresh its metadata.
+  Prepare from the transaction's DB view to read transaction-local changes."}
+  prepare-pull dp/prepare-pull)
+
+(def ^{:arglists '([kv dbi-name] [kv dbi-name k-type]
+                   [kv dbi-name k-type v-type]
+                   [kv dbi-name k-type v-type ignore-key?])
+       :doc "Prepare a reusable point read for a local or remote KV store.
+  Execute the returned callable object with a key:
+
+      (def read-doc (prepare-get-value kv \"docs\" :long :data))
+      (execute-prepared read-doc 42)
+
+  Defaults and results match `get-value`. DBI changes refresh its metadata.
+  Prepare from the transaction's KV handle to read transaction-local changes."}
+  prepare-get-value kv/prepare-get-value)
+
+(def ^{:arglists '([prepared input])
+       :doc "Execute a prepared KV read with a key, or a prepared pull with an
+  entity ID or lookup reference. Equivalent to invoking the prepared object.
+  Prepared reads can be shared across threads; transaction-bound reads retain
+  their transaction's lifetime and thread restrictions. They hold no borrowed
+  buffers or open read transactions and require no separate close operation."}
+  execute-prepared prepared/execute)
 
 ;; Creating DB
 

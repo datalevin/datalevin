@@ -3,6 +3,7 @@
    [clojure.test :refer [deftest is testing]]
    [datalevin.client :as client]
    [datalevin.constants :as c]
+   [datalevin.prepared :as prepared]
    [datalevin.protocol :as p])
   (:import
    [datalevin.client Connection ConnectionPool ConnectionSlot]
@@ -65,6 +66,46 @@
            (.add frames frame))))
      (#'client/set-conn-wire-opts! conn (p/default-wire-opts))
      {:conn conn :channel channel :closed closed :sent sent})))
+
+(deftest prepared-requests-send-only-changing-values-after-registration
+  (let [{:keys [conn sent]} (test-connection
+                             [completed completed
+                              {:type :error-response :err-data {:error :prepared/missing}}
+                              completed completed])
+        message (fn [value]
+                  (with-meta {:type :get-value :args ["db" "docs" value :long :data true]
+                              :writing? false :ha-read-min-tx 17}
+                    {::prepared/id 42}))]
+    (try
+      (#'client/set-conn-wire-opts! conn (assoc (p/default-wire-opts) :prepared-read? true))
+      (doseq [value [1 2 3 4]]
+        (is (= completed (client/send-n-receive conn (message value)))))
+      (is (= [:get-value :execute-prepared :execute-prepared :get-value :execute-prepared]
+             (mapv :type @sent)))
+      (is (= 42 (:prepare-id (first @sent)) (:prepare-id (nth @sent 3))))
+      (is (= {:type :execute-prepared :handle 42 :value 2
+              :writing? false :ha-read-min-tx 17}
+             (second @sent)))
+      (is (= ["db" "docs" 3 :long :data true] (:args (nth @sent 3))))
+      (is (every? #(nil? (meta %)) @sent))
+      (finally (client/close conn)))))
+
+(deftest prepared-requests-fall-back-without-capability-and-reset-with-session
+  (let [{:keys [conn sent]} (test-connection (repeat 4 completed))
+        message (with-meta {:type :pull :args ["db" [:name] 1 nil] :writing? false}
+                  {::prepared/id 99})]
+    (try
+      (is (not (:prepared-read? (p/negotiate-wire-opts {}))))
+      (dotimes [_ 2] (is (= completed (client/send-n-receive conn message))))
+      (is (every? #(and (= :pull (:type %)) (not (:prepare-id %))
+                       (nil? (meta %))) @sent))
+      (#'client/set-conn-wire-opts! conn (assoc (p/default-wire-opts) :prepared-read? true))
+      (is (= completed (client/send-n-receive conn message)))
+      ;; A new authenticated session on the same socket starts with no handles.
+      (#'client/set-conn-wire-opts! conn (assoc (p/default-wire-opts) :prepared-read? true))
+      (is (= completed (client/send-n-receive conn message)))
+      (is (= [99 99] (mapv :prepare-id (drop 2 @sent))))
+      (finally (client/close conn)))))
 
 (defn- with-connections [connections f]
   (let [pending (ConcurrentLinkedQueue. (mapv :conn connections))]

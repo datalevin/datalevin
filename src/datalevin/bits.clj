@@ -1236,6 +1236,18 @@
                     {:error :custom-type/undeclared :type v-type}))
          (get-data bf))))))
 
+(defn buffer-reader
+  "Select a value decoder once for a prepared KV read."
+  [v-type]
+  (case v-type
+    (:data nil) get-data
+    :string (fn [bf] (get-byte bf) (get-string bf))
+    :bytes (fn [bf] (get-byte bf) (get-bytes bf))
+    :raw get-bytes
+    :long (fn [bf] (get-byte bf) (get-long bf))
+    :id get-long
+    (fn [bf] (read-buffer bf v-type))))
+
 ;; data validation
 
 (defn- valid-data*

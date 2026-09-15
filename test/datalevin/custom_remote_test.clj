@@ -118,6 +118,48 @@
           (finally (.put ^java.util.Map dbs "native-permissions" state))))
       (finally (d/close-kv kv) (client/disconnect admin)))))
 
+(deftest prepared-native-reads-reauthorize-and-observe-rebound-codecs
+  (let [admin (client/new-client (uri ""))
+        kv (d/open-kv (uri "prepared-native"))
+        decoded (atom 0)]
+    (native-registry *registry* "server")
+    (udf/register! *registry* (native-descriptor :deserializer)
+                   (fn [payload]
+                     (swap! decoded inc)
+                     (native-snapshot "server" ":app/native-task" payload)))
+    (try
+      (d/register-type kv :app/native-task native-definition)
+      (d/open-dbi kv "tasks" {:key-type :app/native-task})
+      (d/transact-kv kv "tasks" [[:put (native-task 1 "a") :a]
+                                [:put (native-task 2 "b") :b]])
+      (client/create-user admin "prepared-reader" "reader-password")
+      (client/create-role admin :prepared-reader)
+      (client/assign-role admin :prepared-reader "prepared-reader")
+      (client/grant-permission admin :prepared-reader :datalevin.server/view
+                               :datalevin.server/database "prepared-native")
+      (let [reader-kv (d/open-kv "dtlv://prepared-reader:reader-password@localhost/prepared-native"
+                                {:client-opts {:pool-size 1}})
+            read-task (d/prepare-get-value reader-kv "tasks")]
+        (try
+          (is (= :a (read-task (native-task 1 "a"))))
+          (is (= :b (read-task (native-task 2 "b"))))
+          (is (pos? @decoded))
+          (client/revoke-permission admin :prepared-reader :datalevin.server/view
+                                    :datalevin.server/database "prepared-native")
+          (reset! decoded 0)
+          (is (thrown-with-msg? Exception #"permission"
+                                (read-task (native-task 1 "a"))))
+          (is (zero? @decoded))
+          (client/grant-permission admin :prepared-reader :datalevin.server/view
+                                   :datalevin.server/database "prepared-native")
+          (is (= :b (read-task (native-task 2 "b"))))
+          (udf/unregister! *registry* (native-descriptor :deserializer))
+          (is (thrown? Exception (read-task (native-task 1 "a"))))
+          (native-registry *registry* "rebound")
+          (is (= :a (read-task (native-task 1 "a"))))
+          (finally (d/close-kv reader-kv))))
+      (finally (d/close-kv kv) (client/disconnect admin)))))
+
 (deftest remote-native-kv-readers-and-streams
   (let [registry (native-registry (udf/create-registry) "receiver")
         opts {:runtime-opts {:udf-registry registry}

@@ -16,6 +16,7 @@
    [datalevin.constants :as c]
    [datalevin.interface :as i]
    [datalevin.client :as cl]
+   [datalevin.prepared :as prepared]
    [datalevin.bits :as b]
    [datalevin.datom :as d]
    [datalevin.lmdb :as l :refer [IWriting]]
@@ -23,7 +24,7 @@
   (:import
    [datalevin.client Client]
    [datalevin.interface ICustomTypes ILMDB ITxLog IList IAdmin IStore
-    ISearchEngine IVectorIndex IRemoteDB IRemoteKV]
+    ISearchEngine IVectorIndex IRemoteDB IRemoteKV IRemotePrepared]
    [clojure.lang Seqable IReduceInit]
    [java.lang AutoCloseable]
    [java.util.concurrent ConcurrentHashMap]
@@ -312,6 +313,14 @@
       (binding [cl/*ha-read-min-tx* floor]
         (cl/normal-request client call args writing?)))))
 
+(defn- datalog-prepared-request
+  [^AtomicLong read-floor-tx client call request id writing?]
+  (let [floor (when-not writing? (current-read-floor-tx read-floor-tx))]
+    (if (= floor cl/*ha-read-min-tx*)
+      (cl/normal-prepared-request client call request id writing?)
+      (binding [cl/*ha-read-min-tx* floor]
+        (cl/normal-prepared-request client call request id writing?)))))
+
 (defn- remote-forward-method
   [request [mname args & flags]]
   (let [opts      (apply hash-map flags)
@@ -508,6 +517,16 @@
     (tail-filter [_ index pred high-datom low-datom] :serialize pred)
     (slice-filter [_ index pred low-datom high-datom] :serialize pred)
     (rslice-filter [_ index pred high-datom low-datom] :serialize pred))
+
+  IRemotePrepared
+  (prepare-remote-read [_ operation args]
+    (when-not (= operation :pull)
+      (raise "Unsupported prepared Datalog operation" {:operation operation}))
+    (let [request (prepared/request (into [db-name] args))]
+      (prepared/prepared-read
+        (fn [id]
+          (when (.get closed?) (raise "Database is closed" {:type :lmdb/closed}))
+          (datalog-prepared-request read-floor-tx client operation request id writing?)))))
 
   IRemoteDB
   (defremote-forward (datalog-request read-floor-tx client)
@@ -845,6 +864,16 @@
                   open-db-opts
                   owns-client?
                   ^AtomicBoolean closed?]
+  IRemotePrepared
+  (prepare-remote-read [_ operation args]
+    (when-not (= operation :get-value)
+      (raise "Unsupported prepared KV operation" {:operation operation}))
+    (let [request (prepared/request (into [db-name] args))]
+      (prepared/prepared-read
+        (fn [key]
+          (when (.get closed?) (raise "Database is closed" {:type :lmdb/closed}))
+          (cl/normal-prepared-request client operation request key writing?)))))
+
   IRemoteKV
   (remote-kv? [_] true)
   (remote-new-search-engine [this opts] (new-search-engine this opts))

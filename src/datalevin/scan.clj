@@ -62,6 +62,27 @@
         (enc/write-value! out nil))
       (finally (when-not writing? (i/return-rtx lmdb rtx))))))
 
+(defn read-prepared-value
+  "Read through an already resolved DBI. The caller checks the environment and
+  DBI metadata generation. Every invocation owns its current transaction."
+  [lmdb dbi k k-type decode-value encode-value ignore-key? out]
+  (let [writing? (l/writing? lmdb)
+        rtx (if writing? @(l/write-txn lmdb) (i/get-rtx lmdb))]
+    (try
+      (l/put-read-key dbi rtx k k-type)
+      (if-let [buffer (l/get-kv dbi rtx)]
+        (if out
+          (do
+            (when-not ignore-key?
+              (enc/start-pair! out)
+              (enc/write-value! out (b/expected-return k k-type)))
+            (encode-value out buffer))
+          (if ignore-key?
+            (decode-value buffer)
+            [(b/expected-return k k-type) (decode-value buffer)]))
+        (when out (enc/write-value! out nil)))
+      (finally (when-not writing? (i/return-rtx lmdb rtx))))))
+
 (defn get-rank
   [lmdb dbi-name k k-type]
   (i/check-ready lmdb)

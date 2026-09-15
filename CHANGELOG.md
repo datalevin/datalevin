@@ -6,7 +6,9 @@
   types, and this also works on Datalog. Details are in the [custom data
   documentation](/doc/custom-data.md).
   [#234](https://github.com/datalevin/datalevin/issues/234)
-- [Benchmark] added TPC-C, TPC-H and YCSB like benchmarks.
+- [Query] prepared variant of queries `prepared-pull`, `prepare-get-value`,
+  `prepared-execute` that are reusable.
+- [Benchmark] added TPC-C, TPC-H and YCSB benchmarks.
 
 ### Changed
 - [Storage] update dtlvnative to 1.1.1, which uses DLMDB data format version 2,
@@ -17,10 +19,12 @@
   Auto-migration from 0.9.27 and above will be conducted on DB open.
 
 ### Fixed
-- [Datalog] planner range conversion for `like`
+- [Datalog] planner range conversion for `like`.
 
 ### Improved
-- [Server] simplify, speedup and harden client/server lifecycle.
+- [Server] simplify, speedup and harden client/server lifecycle, by using
+one thread per connection.
+- [Server] avoid decode then re-encode KV point reads and scalar pulls.
 - [Datalog] always refresh giant id floor in transaction.
 
 ## 1.1.0 (2026-09-02)

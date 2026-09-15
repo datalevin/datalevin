@@ -27,6 +27,7 @@
    [datalevin.protocol :as p]
    [datalevin.server.client-op-cache :as op-cache]
    [datalevin.server.api :as sapi]
+   [datalevin.server.prepared :as prepared]
    [datalevin.server.auth :as auth
     :refer [view-act alter-act create-act control-act database-obj user-obj
             role-obj server-obj privileged-server-option-keys]]
@@ -793,7 +794,8 @@
      {:type              :set-client-id-ok
       :wire-capabilities (p/local-wire-capabilities)})
     (vswap! (skey-state skey)
-            assoc :client-id client-id :wire-opts wire-opts)))
+            #(-> % (dissoc :prepared-handles)
+                 (assoc :client-id client-id :wire-opts wire-opts)))))
 
 (defn create-user
   [deps server skey {:keys [args]}]
@@ -1737,15 +1739,18 @@
     (copying-kv-ops op)
     (copying-kv-handler op-fn)
     (= op :get-value)
-    (fn [deps server ^SelectionKey skey {:keys [args writing?]}]
-      (let [store (kv-store deps server skey (nth args 0) writing?)]
+    (fn [deps server ^SelectionKey skey {:keys [args writing?] :as message}]
+      (let [store (kv-store deps server skey (nth args 0) writing?)
+            reader (prepared/reader! skey message)
+            encoded? (get-in @(.attachment skey) [:wire-opts :storage-read?])]
         (write-result!
           deps skey
-          (if (and (= 6 (count args))
-                   (get-in @(.attachment skey) [:wire-opts :storage-read?]))
+          (cond
+            reader (reader store (nth args 2) encoded?)
+            (and (= 6 (count args)) encoded?)
             (kv/read-value-result store (nth args 1) (nth args 2)
                                   (nth args 3) (nth args 4) (nth args 5))
-            (apply op-fn store (rest args))))))
+            :else (apply op-fn store (rest args))))))
     :else (normal-kv-handler op-fn)))
 
 (defn- run-batch-kv-call

@@ -467,6 +467,10 @@ values;")
 ;; that `search`, `idoc`, `vector`, and `db` can dispatch to remote
 ;; implementations without depending on `datalevin.remote`.
 
+(defprotocol IRemotePrepared
+  (prepare-remote-read [store operation args]
+    "Prepare fixed operation arguments; execution supplies the key/entity ID."))
+
 (defprotocol IRemoteKV
   "Operations a remote KV store must provide to the local search/vector/idoc
   layers."
@@ -507,4 +511,3 @@ values;")
     (f dir schema opts)
     (throw (ex-info "Remote store support is not loaded"
                     {:dir dir}))))
-
