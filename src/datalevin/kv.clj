@@ -622,6 +622,17 @@
       (enc/read-result
         #(scan/write-value! raw dbi-name k k-type v-type ignore-key? %)))))
 
+(defn read-range-result
+  "An encoded range for negotiated remote reads below the copy-out threshold.
+  Declared custom DBIs retain their logical codecs and ordinary result path."
+  [db dbi-name k-range k-type v-type ignore-key?]
+  (let [raw (raw-lmdb db)]
+    (if (custom-kv/custom-dbi? raw dbi-name)
+      (i/get-range db dbi-name k-range k-type v-type ignore-key?)
+      (enc/read-result
+        #(scan/write-range! raw dbi-name k-range k-type v-type ignore-key?
+                            c/+wire-datom-batch-size+ %)))))
+
 (deftype ^:no-doc ValueReaderState [raw dbis dbi custom?])
 
 (defn value-reader

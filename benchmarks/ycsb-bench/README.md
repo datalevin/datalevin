@@ -99,6 +99,14 @@ pool waiting is included in latency. PostgreSQL can write different rows
 concurrently, while SQLite and shared Datalog handles serialize writes according
 to their normal transaction behavior. The harness adds no shared row lock.
 
+Datalevin prepares its Datalog scan query with `prepare-q` when opening each
+database handle, before load and warmup. The field projection is fixed in the
+query; executions supply only the lower and upper ID bounds. Remote handles
+register lazily on each connection and are reused across phases. With zero
+warmup, initial registration is included in measured latency. Reports identify
+this choice with `:storage :scan-api :prepare-q`.
+See the [prepared-scan validation and workload E comparison](results/2026-09-15-prepared-scans/README.md).
+
 | Durability profile | Datalevin | SQLite | PostgreSQL |
 | --- | --- | --- | --- |
 | `strict` | Strict WAL | WAL, `synchronous=FULL` | `synchronous_commit=on` |
@@ -231,8 +239,8 @@ fields of 100 bytes, excluding keys and database overhead.
   logical record, rather than a single serialized map.
 * **Datalog:** one entity per record, a unique long `:ycsb/id`, and string
   attributes `:ycsb/field0` through `:ycsb/field9` by default. Point reads use
-  `pull`; updates use `transact!`. Scans use a bounded ID-range Datalog query
-  with pull and sort its results by ID. Datalog's indexes and entity overhead
+  `pull`; updates use `transact!`. Scans execute a prepared bounded ID-range
+  Datalog query with pull and sort its results by ID. Datalog's indexes and entity overhead
   are part of the measurement. Background sampling is disabled.
 * **Durability:** WAL is enabled with `--durability strict` by default for both
   APIs and modes. `--durability relaxed` selects a separately labeled profile.

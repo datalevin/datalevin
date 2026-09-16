@@ -25,6 +25,7 @@
    [datalevin.kv.txlog :as kvtx]
    [datalevin.lmdb :as l]
    [datalevin.protocol :as p]
+   [datalevin.read-encode :as enc]
    [datalevin.server.client-op-cache :as op-cache]
    [datalevin.server.api :as sapi]
    [datalevin.server.prepared :as prepared]
@@ -1736,6 +1737,21 @@
 (defn- kv-handler
   [op op-fn]
   (cond
+    (= op :get-range)
+    (fn [deps server ^SelectionKey skey {:keys [args writing?]}]
+      (let [store (kv-store deps server skey (nth args 0) writing?)]
+        (if (and (= 6 (count args))
+                 (get-in @(.attachment skey) [:wire-opts :storage-read?]))
+          (try
+            (write-or-copy-result!
+              deps skey (apply kv/read-range-result store (rest args)))
+            (catch clojure.lang.ExceptionInfo e
+              (if (enc/copy-required? e)
+                ;; The frame is rolled back and its snapshot released before
+                ;; this fallback. Preserve the ordinary large-result protocol.
+                (write-or-copy-result! deps skey (apply op-fn store (rest args)))
+                (throw e))))
+          (write-or-copy-result! deps skey (apply op-fn store (rest args))))))
     (copying-kv-ops op)
     (copying-kv-handler op-fn)
     (= op :get-value)

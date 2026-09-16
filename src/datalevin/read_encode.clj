@@ -134,3 +134,30 @@
   "Write the Nippy header for a KV [key value] result."
   [^ByteBuffer out]
   (.put out (unchecked-byte nschema/id-vec-2)))
+
+(def ^:private spillable-vector-id (impl/coerce-custom-type-id :spillable-vec))
+
+(defn start-range!
+  "Reserve the existing spillable-vector wire header for a range result.
+  Return the count position, to be filled after consuming the cursor."
+  ^long [^ByteBuffer out]
+  (.put out (unchecked-byte nschema/id-prefixed-custom-md))
+  (.putShort out (short spillable-vector-id))
+  (let [position (.position out)]
+    (.putLong out 0)
+    position))
+
+(defn finish-range!
+  "Fill the range count, including zero for an empty result."
+  [^ByteBuffer out ^long position ^long count]
+  (.putLong out (int position) count))
+
+(defn require-copy!
+  "Abandon an unsent range frame so its caller can use batched copy-out."
+  []
+  (throw (ex-info "Range requires batched transfer" {::copy-required true})))
+
+(defn copy-required?
+  "Whether encoding stopped at the caller's batch threshold."
+  [error]
+  (true? (::copy-required (ex-data error))))

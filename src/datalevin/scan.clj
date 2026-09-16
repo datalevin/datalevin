@@ -258,6 +258,35 @@
            {:dbi    dbi-name :k-range k-range
             :k-type k-type   :v-type  v-type})))
 
+(defn write-range!
+  "Encode a range within its snapshot without materializing keys or values.
+  Counts at or above max-count request copy-out before any bytes are sent.
+  Overflow and copy-out signals propagate after cursor/transaction cleanup."
+  [lmdb dbi-name k-range k-type v-type ignore-key? max-count out]
+  (assert (not (and (= v-type :ignore) ignore-key?))
+          "Cannot ignore both key and value")
+  (let [encode-key (when-not ignore-key? (enc/buffer-writer k-type))
+        encode-value (if (= v-type :ignore)
+                       (fn [out _] (enc/write-value! out nil))
+                       (enc/buffer-writer v-type))
+        maximum (long max-count)]
+    (scan lmdb dbi-name
+      (with-open [^AutoCloseable iter
+                  (.iterator ^Iterable (l/iterate-kv dbi rtx cur k-range k-type v-type))]
+        (let [start (enc/start-range! out)]
+          (loop [n 0]
+            (if (.hasNext ^Iterator iter)
+              (do
+                (when (>= (inc n) maximum) (enc/require-copy!))
+                (let [kv (.next ^Iterator iter)]
+                  (when encode-key
+                    (enc/start-pair! out)
+                    (encode-key out (l/k kv)))
+                  (encode-value out (l/v kv)))
+                (recur (inc n)))
+              (enc/finish-range! out start n)))))
+      (throw e))))
+
 (defn- range-seq*
   [lmdb dbi rtx cur k-range k-type v-type ignore-key?
    {:keys [batch-size] :or {batch-size 100} :as opts}]

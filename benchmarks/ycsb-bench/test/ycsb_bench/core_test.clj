@@ -143,13 +143,23 @@
     (is (= [[1 values] [2 values]] (store/scan-records db 1 10)))
     (store/put-records! db [[3 values]])
     (is (= 4 (store/record-count db)))
-    (is (= [[2 values] [3 values]] (store/scan-records db 2 2))))
+    (is (= [[2 values] [3 values]] (store/scan-records db 2 2)))
+    (store/update-field! db 1 2 "zzzz")
+    (is (= [[1 ["aaaa" "bbbb" "zzzz"]]] (store/scan-records db 1 1)))
+    (is (empty? (store/scan-records db 4 1)))
+    ;; Callers continue checking this fixture after the shared adapter checks.
+    (store/update-field! db 1 2 "cccc"))
   {})
 
 (deftest adapter-semantics-test
   (doseq [api [:kv :datalog], mode [:embedded :remote]]
     (testing (str api " " mode)
-      (store/with-store (assoc small-options :api api :mode mode) check-adapter!))))
+      (store/with-store
+        (assoc small-options :api api :mode mode)
+        (fn [db]
+          (when (= api :datalog)
+            (is (= :prepare-q (:scan-api (store/storage-info db)))))
+          (check-adapter! db))))))
 
 (deftest comparison-selection-test
   (let [opts (runner/options {:system :all :api :datalog :workload :all})

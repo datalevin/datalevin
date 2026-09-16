@@ -145,6 +145,9 @@
           (is (= (->Observed 42) (d/get-value db "data" :key)))
           (is (= [(.getName (Thread/currentThread))] @thaw-threads))
           (reset! thaw-threads [])
+          (is (= [[:key (->Observed 42)]] (d/get-range db "data" [:all])))
+          (is (= [(.getName (Thread/currentThread))] @thaw-threads))
+          (reset! thaw-threads [])
           (is (= {:text "東京 👋" :tracked (->Observed 42)}
                  (d/pull @conn [:text :tracked] [:key "one"])))
           (is (= [(.getName (Thread/currentThread))] @thaw-threads))
@@ -160,8 +163,114 @@
                                   legacy {:type :get-value :writing? false
                                           :args ["kv" "data" :key :data :data true]}))))
                 (is (= 2 (count @thaw-threads)))
+                (reset! thaw-threads [])
+                (is (= [[:key (->Observed 42)]]
+                       (:result (client/send-n-receive
+                                  legacy {:type :get-range :writing? false
+                                          :args ["kv" "data" [:all] :data :data false]}))))
+                (is (= 2 (count @thaw-threads)))
                 (finally (client/close legacy)))))
           (finally (d/close-kv db) (d/close conn))))
+      (finally (server/stop srv) (u/delete-files root)))))
+
+(deftest range-read-codecs-bounds-direction-and-key-selection
+  (let [dir (u/tmp-dir (str "encoded-ranges-" (UUID/randomUUID)))
+        db (d/open-kv dir)]
+    (try
+      (doseq [[type values] [[:string ["" "東京 👋" (.repeat "x" 40000) "last"]]
+                             [:data [{:nested nil} false {:options {:enabled true} :data [1 :two]}
+                                     [(nippy/cache "same") (nippy/cache "same")]]]
+                             [:long [Long/MIN_VALUE -1 0 Long/MAX_VALUE]]
+                             [:bytes [(byte-array []) (byte-array [0 1 -1])]]
+                             [:raw [(byte-array []) (byte-array [0 1 -1])]]]
+              :let [dbi (name type)]]
+        (d/open-dbi db dbi)
+        (d/transact-kv db (mapv (fn [key value] [:put dbi key value :long type])
+                                (range) values))
+        (doseq [bounds [[:all] [:all-back] [:closed-open 0 2]
+                        [:open-closed 0 2] [:at-least 99]]
+                ignore-key? [false true]
+                selected-type [type :ignore]
+                :when (not (and ignore-key? (= selected-type :ignore)))]
+          (let [expected (d/get-range db dbi bounds :long selected-type ignore-key?)
+                result (kv/read-range-result db dbi bounds :long selected-type ignore-key?)
+                actual (decode-message (encode-message result nil 200000) nil)
+                normalize (if (#{:bytes :raw} selected-type)
+                            #(mapv (fn [row]
+                                     (if ignore-key? (vec row)
+                                         [(first row) (vec (second row))])) %)
+                            identity)]
+            (is (true? (= (normalize expected) (normalize actual)))
+                (str [type bounds ignore-key? selected-type])))))
+      (d/open-dbi db "keys")
+      (d/transact-kv db [[:put "keys" :a "one" :data :string]
+                         [:put "keys" :b "two" :data :string]])
+      (is (= [[:a "one"] [:b "two"]]
+             (decode-message
+               (encode-message (kv/read-range-result db "keys" [:all] :data :string false)
+                               nil 4096) nil)))
+      (finally (d/close-kv db) (u/delete-files dir)))))
+
+(deftest range-read-retries-release-snapshots-and-decode-only-at-receiver
+  (let [dir (u/tmp-dir (str "encoded-range-retry-" (UUID/randomUUID)))
+        db (d/open-kv dir)]
+    (try
+      (d/open-dbi db "data")
+      (d/transact-kv db [[:put "data" 1 {:tracked (->Observed 1)
+                                        :data (.repeat "x" 10000)} :long :data]])
+      (let [result (kv/read-range-result db "data" [:all] :long :data true)]
+        (reset! thaw-threads [])
+        (is (thrown? BufferOverflowException (encode-message result nil 32)))
+        (is (empty? @thaw-threads))
+        (d/transact-kv db [[:put "data" 2 (->Observed 2) :long :data]])
+        (doseq [options [nil {:compression :zstd :compression-threshold 0}]]
+          (let [frame (encode-message result options (if options 256 20000))]
+            (is (empty? @thaw-threads))
+            (let [[a b] (decode-message frame options)]
+              (is (= (->Observed 1) (:tracked a)))
+              (is (= (.repeat "x" 10000) (:data a)))
+              (is (= (->Observed 2) b)))
+            (is (= 2 (count @thaw-threads)))
+            (reset! thaw-threads []))))
+      (d/with-transaction-kv [tx db]
+        (d/transact-kv tx [[:put "data" 3 :uncommitted :long :data]])
+        (is (= [:uncommitted]
+               (decode-message
+                 (encode-message (kv/read-range-result tx "data" [:at-least 3]
+                                                       :long :data true) nil 4096) nil)))
+        (d/abort-transact-kv tx))
+      (is (empty? (d/get-range db "data" [:at-least 3] :long :data)))
+      (finally (d/close-kv db) (u/delete-files dir)))))
+
+(deftest remote-range-keeps-copy-out-threshold-and-connection-framing
+  (let [root (u/tmp-dir (str "encoded-range-server-" (UUID/randomUUID)))
+        port (allocate-port)
+        srv (server/create {:root root :port port})]
+    (try
+      (server/start srv)
+      (let [db (d/open-kv (str "dtlv://datalevin:datalevin@localhost:" port "/kv")
+                          {:client-opts {:pool-size 1}})]
+        (try
+          (d/open-dbi db "data")
+          (d/transact-kv db (mapv (fn [key] [:put "data" key (->Observed key) :long :data])
+                                  (range (inc c/+wire-datom-batch-size+))))
+          (doseq [n [(dec c/+wire-datom-batch-size+) c/+wire-datom-batch-size+
+                     (inc c/+wire-datom-batch-size+)]]
+            (reset! thaw-threads [])
+            (is (= (mapv ->Observed (range n))
+                   (vec (d/get-range db "data" [:closed-open 0 n] :long :data true))))
+            (is (= (if (< n c/+wire-datom-batch-size+) n (* 2 n))
+                   (count @thaw-threads)))
+            ;; A discarded partial encoding must not reach the next frame.
+            (is (= [[0 (->Observed 0)]]
+                   (d/get-range db "data" [:closed 0 0] :long :data false))))
+          (d/with-transaction-kv [tx db]
+            (d/transact-kv tx [[:put "data" 0 :uncommitted :long :data]])
+            (is (= [:uncommitted]
+                   (d/get-range tx "data" [:closed 0 0] :long :data true)))
+            (d/abort-transact-kv tx))
+          (is (= [(->Observed 0)] (d/get-range db "data" [:closed 0 0] :long :data true)))
+          (finally (d/close-kv db))))
       (finally (server/stop srv) (u/delete-files root)))))
 
 (deftest datalog-read-floor-restores-the-caller-binding

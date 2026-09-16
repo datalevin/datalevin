@@ -68,7 +68,7 @@
     {:node (let-node [(token 'dbi) (nil-node)
                       (token 'rtx) (nil-node)
                       (token 'cur) (nil-node)
-                      (token 'e) (nil-node)
+                      (token 'e) (api/list-node [(token 'Throwable.)])
                       (token '_) lmdb
                       (token '_) dbi-name]
                      body)}))

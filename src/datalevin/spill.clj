@@ -18,10 +18,14 @@
    [datalevin.interface :as i]
    [datalevin.native-value :as nv]
    [taoensso.nippy :as nippy]
+   [taoensso.nippy.impl :as nippy-impl]
+   [taoensso.nippy.io :as nio]
+   [taoensso.nippy.schema :as nschema]
    [clojure.set :as set])
   (:import
    [java.util Iterator List UUID NoSuchElementException Map Set Collection AbstractSet HashMap]
    [java.io DataInput DataOutput]
+   [java.nio ByteBuffer]
    [java.lang.ref Cleaner Cleaner$Cleanable]
    [java.lang.management ManagementFactory]
    [javax.management NotificationEmitter NotificationListener Notification]
@@ -33,6 +37,16 @@
     IPersistentMap MapEquivalence IObj IFn IPersistentSet]))
 
 (defonce memory-pressure (volatile! 0))
+
+(def ^:private vector-type-id (nippy-impl/coerce-custom-type-id :spillable-vec))
+(def ^:private map-type-id (nippy-impl/coerce-custom-type-id :spillable-map))
+(def ^:private set-type-id (nippy-impl/coerce-custom-type-id :spillable-set))
+
+(defn- write-custom-header!
+  "Retain the legacy Nippy extension tag while writing into its current buffer."
+  [^ByteBuffer out ^long type-id]
+  (.put out (unchecked-byte nschema/id-prefixed-custom-md))
+  (.putShort out (short type-id)))
 
 (defonce ^Runtime runtime (Runtime/getRuntime))
 
@@ -381,6 +395,18 @@
     (.writeLong out n)
     (dotimes [i n] (nippy/freeze-to-out! out (nth x i)))))
 
+;; Keep the DataOutput implementation for legacy callers. Buffer writers reuse
+;; the enclosing message's cache and adapter instead of streaming every item
+;; through another buffer. Nippy's IObj writer still handles outer metadata.
+(extend-type SpillableVector
+  nio/IWriteTypedNoMeta
+  (write-typed [x buffer dout_]
+    (let [^ByteBuffer out buffer
+          n (count x)]
+      (write-custom-header! out vector-type-id)
+      (.putLong out n)
+      (dotimes [i n] (nio/write-typed+meta (nth x i) out dout_)))))
+
 (nippy/extend-thaw
   :spillable-vec
   [^DataInput in]
@@ -616,6 +642,12 @@
   [^SpillableMap x ^DataOutput out]
   (nippy/freeze-to-out! out (into {} x)))
 
+(extend-type SpillableMap
+  nio/IWriteTypedNoMeta
+  (write-typed [x out dout_]
+    (write-custom-header! out map-type-id)
+    (nio/write-map out dout_ x false)))
+
 (nippy/extend-thaw
   :spillable-map
   [^DataInput in]
@@ -720,6 +752,12 @@
   [^SpillableSet x ^DataOutput out]
   (nippy/freeze-to-out! out (into #{} x)))
 
+(extend-type SpillableSet
+  nio/IWriteTypedNoMeta
+  (write-typed [x out dout_]
+    (write-custom-header! out set-type-id)
+    (nio/write-set out dout_ x)))
+
 (nippy/extend-thaw
   :spillable-set
   [^DataInput in]
@@ -729,3 +767,9 @@
   UniqueVectorSet :spillable-set
   [^UniqueVectorSet x ^DataOutput out]
   (nippy/freeze-to-out! out (into #{} x)))
+
+(extend-type UniqueVectorSet
+  nio/IWriteTypedNoMeta
+  (write-typed [x out dout_]
+    (write-custom-header! out set-type-id)
+    (nio/write-set out dout_ x)))

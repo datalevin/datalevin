@@ -84,13 +84,13 @@
   (let [record (d/pull @conn attributes [:ycsb/id id])]
     (mapv record attributes)))
 
-(def scan-query
-  '[:find ?id (pull ?e pattern)
-    :in $ ?lo ?hi pattern
-    :where [?e :ycsb/id ?id]
-    [(<= ?lo ?id)] [(< ?id ?hi)]])
+(defn scan-query [attributes]
+  [:find '?id (list 'pull '?e attributes)
+   :in '$ '?lo '?hi
+   :where '[?e :ycsb/id ?id]
+   '[(<= ?lo ?id)] '[(< ?id ?hi)]])
 
-(defrecord DatalogRecords [conn attributes]
+(defrecord DatalogRecords [conn attributes scan-reader]
   Records
   (put-records! [_ records]
     (d/transact! conn (mapv (fn [[id values]]
@@ -105,12 +105,13 @@
         (d/transact! tx [[:db/add [:ycsb/id id] (nth attributes field)
                          (w/modified-value (nth values field))]]))))
   (scan-records [_ start n]
-    (->> (d/q scan-query @conn start (+ (long start) (long n)) attributes)
+    (->> (scan-reader [start (+ (long start) (long n))])
          (sort-by first)
          (mapv (fn [[id record]] [id (mapv record attributes)]))))
   (record-count [_] (d/q '[:find (count ?e) . :where [?e :ycsb/id]] @conn))
   (storage-info [_]
-    (merge {:layout :entity :initial-mapsize-mb 4096 :atomic-rmw? true}
+    (merge {:layout :entity :initial-mapsize-mb 4096 :atomic-rmw? true
+            :scan-api :prepare-q}
            (wal-info (d/datalog-kv conn))))
   (close-store! [_] (d/close conn)))
 
@@ -138,11 +139,13 @@
           (let [attributes (mapv #(keyword "ycsb" (str "field" %)) (range field-count))
                 schema (assoc (zipmap attributes (repeat {:db/valueType :db.type/string}))
                               :ycsb/id {:db/valueType :db.type/long
-                                        :db/unique :db.unique/identity})]
-            (->DatalogRecords
-              (d/create-conn path schema (assoc common :kv-opts kv-opts
-                                               :background-sampling? false))
-              attributes)))]
+                                        :db/unique :db.unique/identity})
+                conn (d/create-conn path schema (assoc common :kv-opts kv-opts
+                                                       :background-sampling? false))]
+            (try
+              (->DatalogRecords conn attributes
+                                 (d/prepare-q @conn (scan-query attributes)))
+              (catch Throwable t (d/close conn) (throw t)))))]
     (try (verify-wal! store durability)
          (catch Throwable t
            (try (close-store! store) (catch Throwable cleanup (.addSuppressed t cleanup)))
