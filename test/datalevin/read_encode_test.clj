@@ -17,7 +17,7 @@
   (:import
    [datalevin NativeValue]
    [datalevin.remote KVStore]
-   [java.io DataInput DataOutput]
+   [java.io DataInput DataOutput EOFException]
    [java.net InetSocketAddress]
    [java.nio ByteBuffer BufferOverflowException]
    [java.nio.channels SocketChannel]
@@ -35,6 +35,26 @@
 
 (defn- decode-message [buffer options]
   (:result (first (p/receive-one-message buffer options))))
+
+(deftype BrokenReadValue [])
+
+(nippy/extend-freeze BrokenReadValue ::broken-read-value
+  [_value _out] (throw (EOFException. "custom read serializer failure")))
+
+(deftest materialized-read-values-preserve-overflow-and-custom-errors
+  (doseq [direct? [false true]]
+    (let [out (doto (if direct? (ByteBuffer/allocateDirect 8) (ByteBuffer/allocate 8))
+                (.putInt 42))]
+      (is (thrown? BufferOverflowException (enc/write-value! out Long/MAX_VALUE)))
+      (is (= 4 (.position out)))
+      (is (= 42 (.getInt out 0))))
+    (is (thrown-with-msg? EOFException #"custom read serializer failure"
+                         (enc/write-value! (ByteBuffer/allocate 4096) (BrokenReadValue.)))))
+  (let [value {:data (.repeat "x" 300000) :key Long/MAX_VALUE}
+        result (enc/read-result #(enc/write-value! % value))
+        options {:compression :zstd :compression-threshold 0}]
+    (is (true? (= value (b/deserialize (b/serialize result)))))
+    (is (true? (= value (decode-message (encode-message result options 1024) options))))))
 
 (deftest storage-codecs-produce-logical-nippy-values
   (doseq [direct? [false true]
@@ -240,6 +260,24 @@
                                                        :long :data true) nil 4096) nil)))
         (d/abort-transact-kv tx))
       (is (empty? (d/get-range db "data" [:at-least 3] :long :data)))
+      (finally (d/close-kv db) (u/delete-files dir)))))
+
+(deftest compressed-range-retries-nested-key-encoding
+  (let [dir (u/tmp-dir (str "encoded-range-compression-" (UUID/randomUUID)))
+        db (d/open-kv dir)
+        value (.repeat "x" 100)
+        options {:compression :zstd :compression-threshold 0}]
+    (try
+      (d/open-dbi db "records")
+      (d/transact-kv db (mapv (fn [key] [:put "records" key value :long :string])
+                              (range 1000)))
+      ;; These YCSB-sized ranges exceed the connection's initial 64 KiB buffer.
+      ;; Including keys exercises nested freeze-to-bb! at a buffer boundary.
+      (doseq [[lo hi] [[10 880] [0 999] [100 970]]]
+        (let [result (kv/read-range-result db "records" [:closed-open lo hi]
+                                           :long :string false)
+              actual (decode-message (encode-message result options 65536) options)]
+          (is (true? (= (mapv #(vector % value) (range lo hi)) actual)))))
       (finally (d/close-kv db) (u/delete-files dir)))))
 
 (deftest remote-range-keeps-copy-out-threshold-and-connection-framing

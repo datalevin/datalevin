@@ -315,3 +315,7 @@ For comparisons, use identical data, durability, heap, disk, and concurrency;
 increase warmup until results stabilize, repeat runs, and alternate case order
 using separate CLI invocations to reduce JVM/cache/order effects. Loading and
 warmup both touch the data, so this is not a cold-cache benchmark.
+
+The [September 15 comparison](results/2026-09-15-current/README.md) contains
+the current 36-case A–F matrix and sustained remote read controls, with frozen
+sources, validation results, and historical comparisons.

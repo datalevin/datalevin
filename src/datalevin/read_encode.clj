@@ -11,8 +11,8 @@
    [taoensso.nippy.io :as nio]
    [taoensso.nippy.schema :as nschema])
   (:import
-   [java.io DataInput]
-   [java.nio ByteBuffer]))
+   [java.io DataInput EOFException]
+   [java.nio ByteBuffer BufferOverflowException]))
 
 (deftype ReadResult [write]
   ;; Nippy 3.9's buffer writer protocol lets this stand in for the logical
@@ -29,9 +29,18 @@
   (ReadResult. write))
 
 (defn write-value!
-  "Write a materialized value in the enclosing message's Nippy cache scope."
+  "Write a materialized value in the enclosing message's Nippy cache scope.
+  Preserve the overflow signal used by enclosing Nippy and transport retries."
   [^ByteBuffer out value]
-  (nippy/freeze-to-bb! out value))
+  (try
+    (nippy/freeze-to-bb! out value)
+    (catch EOFException e
+      ;; A nested freeze-to-bb! translates overflow to EOF. Nippy's growing
+      ;; byte-array writer (used by compression) needs the original signal.
+      (if (some-> (.getMessage e)
+                  (.startsWith "ByteBuffer overflow while freezing:"))
+        (throw (doto (BufferOverflowException.) (.initCause e)))
+        (throw e)))))
 
 (def ^:private stored-data-id (impl/coerce-custom-type-id ::stored-data))
 
