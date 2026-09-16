@@ -339,8 +339,10 @@
         reader (fn [_ _]
                  (vreset! native? true)
                  (UUID/randomUUID))]
-    (RequestDecoder. native? {#'nv/*wire-reader* reader
-                             #'nv/*wire-native-value* true})))
+    (RequestDecoder. native?
+                     (context/cached-bindings
+                       {#'nv/*wire-reader* reader
+                        #'nv/*wire-native-value* true}))))
 
 (defn read-request
   "Read request routing fields without running native deserializers. Requests

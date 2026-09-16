@@ -7,10 +7,30 @@
             [datalevin.native-value :as nv]
             [taoensso.nippy :as nippy]
             [taoensso.nippy.impl :as impl])
-  (:import [taoensso.nippy.impl CacheState]
+  (:import [clojure.lang Associative ISeq]
+           [taoensso.nippy.impl CacheState]
            [java.util Map List]))
 
 (def ^:dynamic *context* nil)
+
+(deftype ^:no-doc CachedBindings [^Associative bindings ^ISeq entries]
+  Associative
+  (seq [_] entries)
+  (count [_] (.count bindings))
+  (empty [_] (.empty bindings))
+  (cons [_ value] (.cons bindings value))
+  (equiv [_ other] (.equiv bindings other))
+  (containsKey [_ key] (.containsKey bindings key))
+  (entryAt [_ key] (.entryAt bindings key))
+  (assoc [_ key value] (.assoc bindings key value))
+  (valAt [_ key] (.valAt bindings key))
+  (valAt [_ key not-found] (.valAt bindings key not-found)))
+
+(defn cached-bindings
+  "Cache the immutable entry traversal of a reused thread-binding map.
+  Var/pushThreadBindings still creates fresh binding cells on every call."
+  ^Associative [bindings]
+  (CachedBindings. bindings (seq (apply list bindings))))
 
 (defprotocol ICodecContext
   (bindings [context])
@@ -48,10 +68,12 @@
     (let [current (b/serialization-allowlist)]
       (when (or (nil? binding-map) (not (identical? current allowlist)))
         (set! allowlist current)
-        (set! binding-map {#'*context* this
-                          #'nv/*wire-native-value* true
-                          #'nippy/*freeze-serializable-allowlist* current
-                          #'nippy/*thaw-serializable-allowlist* current}))
+        (set! binding-map
+              (cached-bindings
+                {#'*context* this
+                 #'nv/*wire-native-value* true
+                 #'nippy/*freeze-serializable-allowlist* current
+                 #'nippy/*thaw-serializable-allowlist* current})))
       binding-map))
   (wire-bindings [_ mode current]
     ;; Server threads keep only *context* bound across requests. Wire mode and
@@ -64,8 +86,9 @@
                                    (get freeze-binding-map
                                         #'nippy/*freeze-serializable-allowlist*))))
           (set! freeze-binding-map
-                {#'nv/*wire-native-value* true
-                 #'nippy/*freeze-serializable-allowlist* current}))
+                (cached-bindings
+                  {#'nv/*wire-native-value* true
+                   #'nippy/*freeze-serializable-allowlist* current})))
         freeze-binding-map)
       :thaw
       (do
@@ -74,8 +97,9 @@
                                    (get thaw-binding-map
                                         #'nippy/*thaw-serializable-allowlist*))))
           (set! thaw-binding-map
-                {#'nv/*wire-native-value* true
-                 #'nippy/*thaw-serializable-allowlist* current}))
+                (cached-bindings
+                  {#'nv/*wire-native-value* true
+                   #'nippy/*thaw-serializable-allowlist* current})))
         thaw-binding-map)))
   (acquire-cache! [_]
     (if active?

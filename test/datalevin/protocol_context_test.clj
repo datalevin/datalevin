@@ -18,6 +18,74 @@
   (doto (ByteBuffer/allocate 100000)
     (p/write-nippy-bf value) (.flip)))
 
+(deftest cached-bindings-preserve-fresh-mutable-scopes
+  (let [ctx (context/create)
+        policy #{"java.util.concurrent.atomic.AtomicInteger"}]
+    (binding [nv/*wire-native-value* false
+              nippy/*freeze-serializable-allowlist* #{}
+              nippy/*thaw-serializable-allowlist* policy]
+      (let [captured (context/with-context ctx
+                       (set! nv/*wire-native-value* false)
+                       (set! nippy/*freeze-serializable-allowlist* #{"captured"})
+                       (bound-fn [] [nv/*wire-native-value*
+                                     nippy/*freeze-serializable-allowlist*]))]
+        (dotimes [_ 2]
+          (context/with-context ctx
+            (is (true? nv/*wire-native-value*))
+            (is (identical? policy nippy/*freeze-serializable-allowlist*))
+            (set! nippy/*freeze-serializable-allowlist* #{"later"})
+            (context/with-context ctx
+              (is (identical? policy nippy/*freeze-serializable-allowlist*)))
+            (is (= #{"later"} nippy/*freeze-serializable-allowlist*))))
+        (is (= [false #{"captured"}] (captured)))
+        (is (= [false #{"captured"}] @(future (captured)))))
+      (is (thrown-with-msg? Exception #"scope failure"
+                           (context/with-context ctx
+                             (set! nv/*wire-native-value* false)
+                             (throw (Exception. "scope failure")))))
+      (is (false? nv/*wire-native-value*))
+      (is (= #{} nippy/*freeze-serializable-allowlist*))
+      (is (identical? policy nippy/*thaw-serializable-allowlist*)))
+    (doseq [_ (range 2)]
+      (is (false? @(future
+                    (context/with-context ctx
+                      ;; set! must remain legal when the pool borrower changes.
+                      (set! nv/*wire-native-value* false))))))))
+
+(deftest codec-bindings-captured-by-future-do-not-change-on-reuse
+  (let [ctx (context/create)
+        resume (promise)
+        captured (context/with-context ctx
+                   (set! nippy/*freeze-serializable-allowlist* #{"captured"})
+                   (future
+                     @resume
+                     nippy/*freeze-serializable-allowlist*))]
+    (try
+      (context/with-context ctx
+        (set! nippy/*freeze-serializable-allowlist* #{"later"}))
+      (finally (deliver resume true)))
+    (is (= #{"captured"} (deref captured 2000 ::timeout)))))
+
+(def ^:dynamic *validated-binding* :initial)
+
+(deftest cached-bindings-still-run-current-var-validator
+  (let [bindings (context/cached-bindings {#'*validated-binding* :accepted})
+        calls (atom 0)]
+    (try
+      (set-validator! #'*validated-binding*
+                      (fn [_] (swap! calls inc) true))
+      (reset! calls 0)
+      (dotimes [_ 3]
+        (clojure.lang.Var/pushThreadBindings bindings)
+        (try (is (= :accepted *validated-binding*))
+             (finally (clojure.lang.Var/popThreadBindings))))
+      (is (= 3 @calls))
+      (set-validator! #'*validated-binding* #(not= :accepted %))
+      (is (thrown? IllegalStateException
+                   (clojure.lang.Var/pushThreadBindings bindings)))
+      (is (= :initial *validated-binding*))
+      (finally (set-validator! #'*validated-binding* nil)))))
+
 (defrecord NestedWire [value])
 (nippy/extend-freeze NestedWire ::nested-wire
   [wrapper ^DataOutput out]
