@@ -37,6 +37,8 @@
   :unresolved-var
   {:exclude [taoensso.nippy/*freeze-serializable-allowlist*
              taoensso.nippy/*thaw-serializable-allowlist*
+             taoensso.nippy/*shared-dict*
+             taoensso.nippy/shared-dict
              taoensso.nippy/cache
              taoensso.nippy/with-cache
              taoensso.nippy/*incl-metadata?*
@@ -50,6 +52,7 @@
              taoensso.nippy.schema/id-byte-array-lg
              taoensso.nippy.schema/id-map-lg
              taoensso.nippy.schema/id-vec-2
+             taoensso.nippy.schema/id-vec-sm_
              pod.huahaiy.datalevin/defpodfn
              pod.huahaiy.datalevin/with-transaction
              pod.huahaiy.datalevin/with-transaction-kv

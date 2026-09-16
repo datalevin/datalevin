@@ -15,6 +15,7 @@
    [datalevin.constants :as c]
    [datalevin.datom :as d]
    [datalevin.native-value :as nv]
+   [datalevin.protocol.context :as context]
    [datalevin.read-encode]
    [datalevin.util :refer [raise]]
    [datalevin.spill :as sp]
@@ -94,8 +95,7 @@
     1 (write-transit-bytes msg)
     ;; Establish the wire and Java serialization contexts in one binding.
     ;; bits/serialize can then use the already installed allowlist.
-    2 (binding [nv/*wire-native-value* true
-                nippy/*freeze-serializable-allowlist* (b/serialization-allowlist)]
+    2 (context/with-wire-bindings :freeze (b/serialization-allowlist)
         (b/serialize msg))
     (raise "Unknown wire message format"
              {:format fmt
@@ -171,7 +171,8 @@
     (try
       ;; Use the same read cache as fast-thaw. The general with-cache eagerly
       ;; allocates writer maps that a decoder does not need (Nippy 3.9).
-      (nippy-impl/with-thaw-cache (nippy/thaw-from-bb! bf))
+      (context/with-cache (nippy-impl/new-thaw-cache-state)
+        (nippy/thaw-from-bb! bf))
       (catch Exception e
         ;; Native reader failures must not be mistaken for legacy headers.
         (when (nv/decoding-error e) (throw e))
@@ -186,8 +187,7 @@
       (if (and nv/*wire-native-value*
                (identical? allowlist nippy/*thaw-serializable-allowlist*))
         (thaw-nippy-bf bf)
-        (binding [nv/*wire-native-value* true
-                  nippy/*thaw-serializable-allowlist* allowlist]
+        (context/with-wire-bindings :thaw allowlist
           (thaw-nippy-bf bf)))
       (catch Exception e
         (throw (or (nv/decoding-error e) e))))))
@@ -200,22 +200,30 @@
                                 :json
                                 {:handlers transit-read-handlers})))
 
+(defn- freeze-nippy-bf
+  [^ByteBuffer bf v]
+  (try
+    (context/with-cache (nippy-impl/new-cache-state)
+      (nippy/freeze-to-bb! bf v))
+    (catch EOFException e
+      ;; Nippy 3.9 translates buffer overflow to EOFException without a cause.
+      ;; Only translate that specific error; custom serializers can throw EOF.
+      (if (some-> (.getMessage e)
+                  (.startsWith "ByteBuffer overflow while freezing:"))
+        (throw (doto (BufferOverflowException.) (.initCause e)))
+        (throw e)))))
+
 (defn write-nippy-bf
   "Write a Clojure value as nippy encoded bytes into a ByteBuffer"
   [^ByteBuffer bf v]
   (when (instance? java.lang.Class v)
     (raise "Unfreezable type: java.lang.Class" {}))
-  (binding [nv/*wire-native-value* true
-            nippy/*freeze-serializable-allowlist* (b/serialization-allowlist)]
-    (try
-      (nippy/with-cache (nippy/freeze-to-bb! bf v))
-      (catch EOFException e
-        ;; Nippy 3.9 translates buffer overflow to EOFException without a cause.
-        ;; Only translate that specific error; custom serializers can throw EOF.
-        (if (some-> (.getMessage e)
-                    (.startsWith "ByteBuffer overflow while freezing:"))
-          (throw (doto (BufferOverflowException.) (.initCause e)))
-          (throw e))))))
+  (let [allowlist (b/serialization-allowlist)]
+    (if (and nv/*wire-native-value*
+             (identical? allowlist nippy/*freeze-serializable-allowlist*))
+      (freeze-nippy-bf bf v)
+      (context/with-wire-bindings :freeze allowlist
+        (freeze-nippy-bf bf v)))))
 
 (defn write-transit-bf
   "Write a Clojure value as transit+json encoded bytes into a ByteBuffer"
@@ -321,17 +329,18 @@
                 {:format fmt
                  :format-code code})))))
 
-(deftype ^:no-doc RequestDecoder [native? reader])
+(deftype ^:no-doc RequestDecoder [native? bindings])
 
 (defn ^:no-doc request-decoder
   "Create native-value detection state owned by one connection's read loop.
   It retains no request payloads and must not be used concurrently."
   []
-  (let [native? (volatile! false)]
-    (RequestDecoder. native?
-                     (fn [_ _]
-                       (vreset! native? true)
-                       (UUID/randomUUID)))))
+  (let [native? (volatile! false)
+        reader (fn [_ _]
+                 (vreset! native? true)
+                 (UUID/randomUUID))]
+    (RequestDecoder. native? {#'nv/*wire-reader* reader
+                             #'nv/*wire-native-value* true})))
 
 (defn read-request
   "Read request routing fields without running native deserializers. Requests
@@ -342,9 +351,10 @@
    (let [native? (.-native? decoder)
          pos     (when (instance? ByteBuffer bs) (.position ^ByteBuffer bs))]
      (vreset! native? false)
-     (let [message (binding [nv/*wire-reader* (.-reader decoder)
-                             nv/*wire-native-value* true]
-                     (read-value fmt bs wire-opts))]
+     (let [message (do
+                     (clojure.lang.Var/pushThreadBindings (.-bindings decoder))
+                     (try (read-value fmt bs wire-opts)
+                          (finally (clojure.lang.Var/popThreadBindings))))]
        (when-not (map? message)
          (raise "Expected a request map" {}))
        ;; Only metadata supplied by this decoder can defer native decoding.

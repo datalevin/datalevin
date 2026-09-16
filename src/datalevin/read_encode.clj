@@ -147,7 +147,7 @@
 (def ^:private spillable-vector-id (impl/coerce-custom-type-id :spillable-vec))
 
 (defn start-range!
-  "Reserve the existing spillable-vector wire header for a range result.
+  "Reserve the spillable-vector wire header for a range result.
   Return the count position, to be filled after consuming the cursor."
   ^long [^ByteBuffer out]
   (.put out (unchecked-byte nschema/id-prefixed-custom-md))
@@ -157,9 +157,21 @@
     position))
 
 (defn finish-range!
-  "Fill the range count, including zero for an empty result."
+  "Finish a native vector of at most 32 rows and 64 KiB of encoded values.
+  Larger results retain the spillable-vector format and receiver behavior."
   [^ByteBuffer out ^long position ^long count]
-  (.putLong out (int position) count))
+  (let [end (.position out)
+        payload (+ position 8)
+        size (- end payload)]
+    (if (and (<= count 32) (<= size 65536))
+      (do
+        ;; Compact only the bounded small reply. Absolute bulk put supports
+        ;; overlapping regions without allocating a copy or an adapter.
+        (.put out (int (- payload 9)) out (int payload) (int size))
+        (.put out (int (- position 3)) (unchecked-byte nschema/id-vec-sm_))
+        (.put out (int (- position 2)) (byte count))
+        (.position out (int (- end 9))))
+      (.putLong out (int position) count))))
 
 (defn require-copy!
   "Abandon an unsent range frame so its caller can use batched copy-out."

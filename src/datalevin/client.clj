@@ -19,6 +19,7 @@
    [clojure.string :as s]
    [datalevin.buffer :as bf]
    [datalevin.protocol :as p]
+   [datalevin.protocol.context :as context]
    [datalevin.prepared :as prepared])
   (:import
    [java.nio ByteBuffer BufferOverflowException]
@@ -174,6 +175,7 @@
                               ^long time-out
                               ^:volatile-mutable ^ByteBuffer bf
                               read-selector
+                              context
                               ^ByteBuffer probe-bf
                               ^AtomicReference wire-options
                               receive-buffer
@@ -181,20 +183,21 @@
   IConnectionIO
   (exchange [_ msg wire-opts]
     ;; The caller owns the connection monitor. Grow only before sending.
-    (loop []
-      (when-not (try
-                  (p/write-message-owned ch bf msg wire-opts)
-                  true
-                  (catch BufferOverflowException _ false))
-        (set! bf (bf/allocate-buffer
-                   (* ^long c/+buffer-grow-factor+ (.capacity bf))))
-        (recur)))
-    (.clear bf)
-    (vreset! receive-buffer bf)
-    (try
-      (p/receive-ch! ch receive-buffer wire-opts time-out
-                    (when-not (.isBlocking ch) read-selector))
-      (finally (set! bf @receive-buffer))))
+    (context/with-context context
+      (loop []
+        (when-not (try
+                    (p/write-message-owned ch bf msg wire-opts)
+                    true
+                    (catch BufferOverflowException _ false))
+          (set! bf (bf/allocate-buffer
+                     (* ^long c/+buffer-grow-factor+ (.capacity bf))))
+          (recur)))
+      (.clear bf)
+      (vreset! receive-buffer bf)
+      (try
+        (p/receive-ch! ch receive-buffer wire-opts time-out
+                      (when-not (.isBlocking ch) read-selector))
+        (finally (set! bf @receive-buffer)))))
 
   IConnection
   (send-n-receive [this msg]
@@ -234,25 +237,27 @@
   (send-only [this msg]
     (locking this
       (try
-        (loop []
-          (when-not (try
-                      (p/write-message-owned ch bf msg (.get wire-options))
-                      true
-                      (catch BufferOverflowException _ false))
-            (set! bf (bf/allocate-buffer
-                       (* ^long c/+buffer-grow-factor+ (.capacity bf))))
-            (recur)))
+        (context/with-context context
+          (loop []
+            (when-not (try
+                        (p/write-message-owned ch bf msg (.get wire-options))
+                        true
+                        (catch BufferOverflowException _ false))
+              (set! bf (bf/allocate-buffer
+                         (* ^long c/+buffer-grow-factor+ (.capacity bf))))
+              (recur))))
         (catch Exception e
           (raise "Error sending message: " e {:msg msg})))))
 
   (receive [this]
     (try
       (locking this
-        (vreset! receive-buffer bf)
-        (try
-          (p/receive-ch! ch receive-buffer (.get wire-options) time-out
-                        (when-not (.isBlocking ch) read-selector))
-          (finally (set! bf @receive-buffer))))
+        (context/with-context context
+          (vreset! receive-buffer bf)
+          (try
+            (p/receive-ch! ch receive-buffer (.get wire-options) time-out
+                          (when-not (.isBlocking ch) read-selector))
+            (finally (set! bf @receive-buffer)))))
       (catch Exception e
         (when (nv/decoding-error? e) (throw e))
         (raise "Error receiving data:" e {}))))
@@ -281,6 +286,7 @@
   ([^SocketChannel ch time-out ^ByteBuffer bf]
    (let [options (AtomicReference. (p/default-wire-opts))
          conn (Connection. ch (long time-out) bf (volatile! nil)
+                           (context/create)
                            (ByteBuffer/allocate 1) options (volatile! bf)
                            (prepared/handle-cache))]
      (.put connection-wire-opts ch options)

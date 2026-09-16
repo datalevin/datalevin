@@ -11,13 +11,16 @@
    [datalevin.read-encode :as enc]
    [datalevin.remote :as remote]
    [datalevin.server :as server]
+   [datalevin.spill :as spill]
    [datalevin.test.core :refer [allocate-port db-fixture]]
    [datalevin.util :as u]
    [taoensso.nippy :as nippy])
   (:import
+   [clojure.lang PersistentVector]
    [datalevin NativeValue]
    [datalevin.remote KVStore]
-   [java.io DataInput DataOutput EOFException]
+   [datalevin.spill SpillableVector]
+   [java.io ByteArrayInputStream DataInput DataInputStream DataOutput EOFException]
    [java.net InetSocketAddress]
    [java.nio ByteBuffer BufferOverflowException]
    [java.nio.channels SocketChannel]
@@ -35,6 +38,76 @@
 
 (defn- decode-message [buffer options]
   (:result (first (p/receive-one-message buffer options))))
+
+(defn- range-result [values]
+  (enc/read-result
+    (fn [out]
+      (let [position (enc/start-range! out)]
+        (doseq [value values] (enc/write-value! out value))
+        (enc/finish-range! out position (count values))))))
+
+(deftest small-range-vectors-preserve-stream-readers-caches-and-framing
+  (let [value (with-meta {:data [nil false "東京 👋"]} {:source :inner})
+        cached (nippy/cache value)]
+    (doseq [direct? [false true]
+            n [0 1 2 3 10 32 33 127 128]]
+      (let [out (if direct? (ByteBuffer/allocateDirect 65536) (ByteBuffer/allocate 65536))
+            result (range-result (repeat n cached))]
+        (.putInt out 42)
+        (p/write-message-bf out [cached result cached])
+        (p/write-message-bf out {:next :frame})
+        (.flip out)
+        (is (= 42 (.getInt out)))
+        (is (= c/message-format-nippy (.get out)))
+        (let [size (- (.getInt out) c/message-header-size)
+              bytes (byte-array size)
+              _ (.get out bytes)
+              ;; The existing streaming reader consumes both formats. The
+              ;; same message cache spans values before/inside/after the range.
+              [before actual after]
+              (with-open [in (DataInputStream. (ByteArrayInputStream. bytes))]
+                (nippy/with-cache (nippy/thaw-from-in! in)))]
+          (is (= (vec (repeat n value)) actual))
+          (is (= (<= n 32) (instance? PersistentVector actual)))
+          (is (= (> n 32) (instance? SpillableVector actual)))
+          (is (identical? before after))
+          (when (pos? n)
+            (is (identical? before (first actual)))
+            (is (= {:source :inner} (meta (first actual))))))
+        (is (= c/message-format-nippy (.get out)))
+        (let [size (- (.getInt out) c/message-header-size)
+              bytes (byte-array size)]
+          (.get out bytes)
+          (is (= {:next :frame} (nippy/fast-thaw bytes))))
+        (is (zero? (.remaining out)))))))
+
+(deftest small-range-byte-limit-and-buffer-growth
+  (doseq [direct? [false true]
+          length [65531 65532]]
+    (let [value (byte-array length)
+          out (if direct? (ByteBuffer/allocateDirect 70000) (ByteBuffer/allocate 70000))]
+      ;; The native byte-array header contributes five bytes to the payload.
+      (p/write-message-bf out {:result (range-result [value])})
+      (let [actual (decode-message out nil)]
+        (is (= (= length 65531) (instance? PersistentVector actual)))
+        (is (= (= length 65532) (instance? SpillableVector actual)))
+        (is (java.util.Arrays/equals value ^bytes (first actual))))))
+  (doseq [direct? [false true]]
+    (let [result (range-result (repeat 33 nil))
+          expected (encode-message result nil 4096)
+          ;; A spillable reply that does not fit must retain transport retries.
+          capacity (+ 4 (- (.position expected) 8))
+          out (if direct? (ByteBuffer/allocateDirect capacity) (ByteBuffer/allocate capacity))]
+      (.putInt out 42)
+      (is (thrown? BufferOverflowException
+                   (p/write-message-bf out {:type :command-complete :result result})))
+      (is (= 4 (.position out)))
+      (is (= 42 (.getInt out 0)))
+      (is (= (vec (repeat 33 nil)) (decode-message expected nil)))))
+  ;; Existing spillable frames still produce spillable vectors at small sizes.
+  (let [actual (decode-message (encode-message (spill/new-spillable-vector [1 2]) nil 4096) nil)]
+    (is (instance? SpillableVector actual))
+    (is (= [1 2] actual))))
 
 (deftype BrokenReadValue [])
 
@@ -292,11 +365,15 @@
           (d/open-dbi db "data")
           (d/transact-kv db (mapv (fn [key] [:put "data" key (->Observed key) :long :data])
                                   (range (inc c/+wire-datom-batch-size+))))
-          (doseq [n [(dec c/+wire-datom-batch-size+) c/+wire-datom-batch-size+
+          (doseq [n [0 1 10 32 33 (dec c/+wire-datom-batch-size+) c/+wire-datom-batch-size+
                      (inc c/+wire-datom-batch-size+)]]
             (reset! thaw-threads [])
-            (is (= (mapv ->Observed (range n))
-                   (vec (d/get-range db "data" [:closed-open 0 n] :long :data true))))
+            (let [actual (d/get-range db "data" [:closed-open 0 n] :long :data true)]
+              (is (= (mapv ->Observed (range n)) (vec actual)))
+              (is (= (or (<= n 32) (>= n c/+wire-datom-batch-size+))
+                     (instance? PersistentVector actual)))
+              (is (= (< 32 n c/+wire-datom-batch-size+)
+                     (instance? SpillableVector actual))))
             (is (= (if (< n c/+wire-datom-batch-size+) n (* 2 n))
                    (count @thaw-threads)))
             ;; A discarded partial encoding must not reach the next frame.

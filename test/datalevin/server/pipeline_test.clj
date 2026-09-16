@@ -3,7 +3,9 @@
    [clojure.test :refer [deftest is testing use-fixtures]]
    [datalevin.client :as client]
    [datalevin.constants :as c]
+   [datalevin.native-value :as nv]
    [datalevin.protocol :as p]
+   [datalevin.protocol.context :as codec]
    [datalevin.server :as server]
    [datalevin.test.core :refer [allocate-port db-fixture]]
    [datalevin.util :as u])
@@ -11,7 +13,7 @@
    [datalevin.server Server]
    [java.net InetSocketAddress]
    [java.nio ByteBuffer]
-   [java.nio.channels SocketChannel]
+   [java.nio.channels SelectionKey SocketChannel]
    [java.util UUID]
    [java.util.concurrent CountDownLatch Semaphore TimeUnit]))
 
@@ -102,6 +104,38 @@
           (is (= :set-client-id-ok (:type (receive!))))
           (dotimes [_ 3] (complete! (receive!)))
           (is (= {:type :command-complete :result :second} (receive!))))))))
+
+(deftest connection-codec-context-survives-errors-without-leaking-wire-mode-test
+  (with-server
+    (fn [_ observer port]
+      (let [seen (atom [])
+            handler (fn [_ ^SelectionKey key {:keys [value fail?]}]
+                      (swap! seen conj
+                             [codec/*context* (:codec-context @(.attachment key))
+                              nv/*wire-native-value*])
+                      (when fail? (throw (ex-info "Requested failure" {:error ::requested})))
+                      (#'server/write-message key {:type :command-complete :result value}))]
+        (with-redefs-fn
+          {#'server/message-handler-map (assoc @#'server/message-handler-map ::echo handler)}
+          #(dotimes [connection 2]
+             (with-open [ch (connect port)]
+               (let [receive! (receiver ch)]
+                 (send! ch [(handshake observer)
+                            {:type ::echo :value {:connection connection :data [:a :a]}}
+                            {:type ::echo :fail? true}
+                            {:type ::echo :value {:connection connection :data [:b :b]}}])
+                 (is (= :set-client-id-ok (:type (receive!))))
+                 (is (= {:connection connection :data [:a :a]} (:result (receive!))))
+                 (is (= :error-response (:type (receive!))))
+                 (is (= {:connection connection :data [:b :b]} (:result (receive!))))))))
+        (is (= 6 (count @seen)))
+        (doseq [[bound attached wire?] @seen]
+          (is (some? bound))
+          (is (identical? bound attached))
+          (is (false? wire?)))
+        (is (= 1 (count (set (map first (take 3 @seen))))))
+        (is (= 1 (count (set (map first (drop 3 @seen))))))
+        (is (not (identical? (ffirst @seen) (first (nth @seen 3)))))))))
 
 (deftest slow-request-retains-connection-until-handler-returns-test
   (with-server

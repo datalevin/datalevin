@@ -6,6 +6,7 @@
    [datalevin.buffer :as bf]
    [datalevin.constants :as c]
    [datalevin.protocol :as p]
+   [datalevin.protocol.context :as codec]
    [datalevin.server.resources :as resources])
   (:import
    [java.nio.channels SelectionKey ServerSocketChannel SocketChannel]
@@ -73,6 +74,7 @@
                                     :write-bf (bf/allocate-buffer c/+buffer-size+)
                                     :wire-opts (p/default-wire-opts)
                                     :request-decoder (p/request-decoder)
+                                    :codec-context (codec/create)
                                     :context (context-fn key)
                                     :connection-id id
                                     :connection-threads connection-threads

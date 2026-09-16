@@ -17,6 +17,7 @@
    [datalevin.constants :as c]
    [datalevin.kv.txlog :as kvtx]
    [datalevin.protocol :as p]
+   [datalevin.protocol.context :as codec]
    [datalevin.server.deps :as sdeps]
    [datalevin.server.prepared :as prepared]
    [datalevin.txlog :as txlog]
@@ -407,35 +408,43 @@
   reading the next request. No request queue or selector rearming is needed."
   [deps server ^SelectionKey skey]
   (let [state (.attachment skey)
+        codec-context (or (:codec-context @state)
+                          ;; Legacy/test keys may not have gone through accept!.
+                          (let [context (codec/create)]
+                            (vswap! state assoc :codec-context context)
+                            context))
         ^SocketChannel ch (.channel skey)
         read-message! #(read-message deps server skey %1 %2)
         handle-message! (fn [_ message]
                           (handle-message deps server skey message))]
-    (try
-      (loop []
-        (when (and (.isOpen ch) (not (.isInterrupted (Thread/currentThread))))
-          (let [^ByteBuffer read-bf (:read-bf @state)]
-            (if (p/extract-message read-bf read-message! handle-message!)
-              ;; Copy-in may have grown the shared buffer. Fetch it afresh.
-              (recur)
-              (let [^ByteBuffer read-bf
-                    (if (.hasRemaining read-bf)
-                      read-bf
-                      (let [buffer (bf/allocate-buffer
-                                     (* (long c/+buffer-grow-factor+)
-                                        (.capacity read-bf)))]
-                        (.flip read-bf)
-                        (bf/buffer-transfer read-bf buffer)
-                        (vswap! state assoc :read-bf buffer)
-                        buffer))
-                    ^int readn (p/read-ch ch read-bf)]
-                (when (pos? readn) (recur)))))))
-      (catch InterruptedException _ nil)
-      (catch Exception e
-        (when-not (client-disconnect? e)
-          (log/debug e "Closing failed client read")))
-      (finally
-        ;; Interrupts cancel transport waits; native abort still runs here on
-        ;; the same thread that opened the transaction.
-        (Thread/interrupted)
-        (close-read-connection! deps server skey)))))
+    ;; Binding only the cache context leaves handler/storage serialization policy
+    ;; and native readers untouched. Copy-in/out uses the same connection owner.
+    (binding [codec/*context* codec-context]
+      (try
+        (loop []
+          (when (and (.isOpen ch) (not (.isInterrupted (Thread/currentThread))))
+            (let [^ByteBuffer read-bf (:read-bf @state)]
+              (if (p/extract-message read-bf read-message! handle-message!)
+                ;; Copy-in may have grown the shared buffer. Fetch it afresh.
+                (recur)
+                (let [^ByteBuffer read-bf
+                      (if (.hasRemaining read-bf)
+                        read-bf
+                        (let [buffer (bf/allocate-buffer
+                                       (* (long c/+buffer-grow-factor+)
+                                          (.capacity read-bf)))]
+                          (.flip read-bf)
+                          (bf/buffer-transfer read-bf buffer)
+                          (vswap! state assoc :read-bf buffer)
+                          buffer))
+                      ^int readn (p/read-ch ch read-bf)]
+                  (when (pos? readn) (recur)))))))
+        (catch InterruptedException _ nil)
+        (catch Exception e
+          (when-not (client-disconnect? e)
+            (log/debug e "Closing failed client read")))
+        (finally
+          ;; Interrupts cancel transport waits; native abort still runs here on
+          ;; the same thread that opened the transaction.
+          (Thread/interrupted)
+          (close-read-connection! deps server skey))))))
