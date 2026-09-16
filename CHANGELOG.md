@@ -20,6 +20,7 @@
 
 ### Fixed
 - [Datalog] planner range conversion for `like`.
+- [KV] prefix overflow page deletion issue.
 
 ### Improved
 - [Server] simplify, speedup and harden client/server lifecycle, by using
