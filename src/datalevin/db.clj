@@ -47,7 +47,7 @@
             kv-info]])
   (:import
    [datalevin.datom Datom]
-   [datalevin.interface IStore]
+   [datalevin.interface IRemoteDB IRemotePrepared IStore]
    [datalevin.storage Store]
    [datalevin.utl LRUCache]
    [java.util Comparator]
@@ -137,25 +137,42 @@
 (defonce dbs (atom {}))
 
 ;; read caches
+(defn remote-store?
+  "Fast Datalog routing for built-in stores. Keep protocol extensions available
+  to other store implementations without paying their lookup cost locally."
+  [store]
+  (cond
+    (instance? Store store) false
+    (instance? IRemoteDB store) true
+    :else (satisfies? i/IRemoteDB store)))
+
+(defn remote-prepared-store?
+  "Whether a Datalog store provides remote prepared reads."
+  [store]
+  (cond
+    (instance? Store store) false
+    (instance? IRemotePrepared store) true
+    :else (satisfies? i/IRemotePrepared store)))
+
 (defonce ^:private caches (ConcurrentHashMap.))
 (defonce ^:private remote-cache-check-ms (ConcurrentHashMap.))
 (defonce ^:private remote-cache-max-tx (ConcurrentHashMap.))
 
 (defn- mark-remote-cache-check!
   [store]
-  (when (satisfies? i/IRemoteDB store)
+  (when (remote-store? store)
     (.put ^ConcurrentHashMap remote-cache-check-ms
           (dir store)
           (System/currentTimeMillis))))
 
 (defn- cached-remote-cache-max-tx
   [store]
-  (when (satisfies? i/IRemoteDB store)
+  (when (remote-store? store)
     (.get ^ConcurrentHashMap remote-cache-max-tx (dir store))))
 
 (defn- mark-remote-cache-max-tx!
   [store remote-max-tx]
-  (when (and (satisfies? i/IRemoteDB store)
+  (when (and (remote-store? store)
              (some? remote-max-tx))
     (.put ^ConcurrentHashMap remote-cache-max-tx
           (dir store)
@@ -163,17 +180,15 @@
 
 (defn- should-check-remote-cache?
   [store cache]
-  (if (satisfies? i/IRemoteDB store)
-    (let [interval-ms (long c/*remote-db-last-modified-check-interval-ms*)]
-      (or (nil? cache)
-          (not (pos? interval-ms))
-          (let [last-check-ms (.get ^ConcurrentHashMap remote-cache-check-ms
-                                    (dir store))]
-            (or (nil? last-check-ms)
-                (let [elapsed-ms (- (System/currentTimeMillis)
-                                    (long last-check-ms))]
-                  (>= elapsed-ms interval-ms))))))
-    true))
+  (let [interval-ms (long c/*remote-db-last-modified-check-interval-ms*)]
+    (or (nil? cache)
+        (not (pos? interval-ms))
+        (let [last-check-ms (.get ^ConcurrentHashMap remote-cache-check-ms
+                                  (dir store))]
+          (or (nil? last-check-ms)
+              (let [elapsed-ms (- (System/currentTimeMillis)
+                                  (long last-check-ms))]
+                (>= elapsed-ms interval-ms)))))))
 
 (defn refresh-cache
   ([store]
@@ -956,29 +971,33 @@
 ;;            :max-eid       max-eid
 ;;            :max-tx        max-tx}))))
 
+(defn- refresh-remote-cache!
+  [store]
+  (let [cache (.get ^ConcurrentHashMap caches (dir store))]
+    (when (should-check-remote-cache? store cache)
+      (let [{:keys [last-modified max-tx]} (i/db-info store)
+            target        (long (or last-modified 0))
+            cached-max-tx (cached-remote-cache-max-tx store)]
+        (if (or (nil? cache)
+                (< ^long (.target ^LRUCache cache) ^long target)
+                (and (some? max-tx)
+                     (some? cached-max-tx)
+                     (< (long cached-max-tx)
+                        (long max-tx))))
+          (refresh-cache store target max-tx)
+          (do
+            (mark-remote-cache-max-tx! store max-tx)
+            (mark-remote-cache-check! store)))))))
+
 (defn db?
   "Check if x is an instance of DB.
   For remote DBs, refresh the local cache when the server reports newer state.
   Local DB cache freshness is maintained by local transaction invalidation."
   [x]
   (when (-searchable? x)
-    (let [store  (.-store ^DB x)
-          cache  (.get ^ConcurrentHashMap caches (dir store))]
-      (when (and (satisfies? i/IRemoteDB store)
-                 (should-check-remote-cache? store cache))
-        (let [{:keys [last-modified max-tx]} (i/db-info store)
-              target        (long (or last-modified 0))
-              cached-max-tx (cached-remote-cache-max-tx store)]
-          (if (or (nil? cache)
-                  (< ^long (.target ^LRUCache cache) ^long target)
-                  (and (some? max-tx)
-                       (some? cached-max-tx)
-                       (< (long cached-max-tx)
-                          (long max-tx))))
-            (refresh-cache store target max-tx)
-            (do
-              (mark-remote-cache-max-tx! store max-tx)
-              (mark-remote-cache-check! store))))))
+    (let [store (.-store ^DB x)]
+      (when (remote-store? store)
+        (refresh-remote-cache! store)))
     true))
 
 (defn search-datoms [db e a v] (-search db [e a v]))
@@ -1055,7 +1074,7 @@
   ([^IStore store info] (new-db store info nil))
   ([^IStore store info ^DB previous]
    (let [info (or info
-                  (when (satisfies? i/IRemoteDB store)
+                  (when (remote-store? store)
                     (i/db-info store)))
          db   (map->DB
                 {:store         store
@@ -2011,7 +2030,7 @@
   (let [^DB db  (:db-before initial-report)
         store   (.-store db)
         tx-time (System/currentTimeMillis)]
-    (if (satisfies? i/IRemoteDB store)
+    (if (remote-store? store)
       (try
         (let [txs                                    (sequence
                                                       (mapcat
@@ -2058,7 +2077,7 @@
 (defn abort-transact
   [conn]
   (let [s (.-store ^DB (deref conn))]
-    (if (satisfies? i/IRemoteDB s)
+    (if (remote-store? s)
       (i/abort-transact s)
       (abort-transact-kv (.-lmdb ^Store s)))))
 

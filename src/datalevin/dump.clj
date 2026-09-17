@@ -461,7 +461,7 @@
               (u/tmp-dir (str "dtlv-re-index-" (System/currentTimeMillis))))]
      (if (conn/conn? db)
        (let [store (.-store ^DB @db)]
-         (if (satisfies? i/IRemoteDB store)
+         (if (db/remote-store? store)
            (do (i/re-index store schema opts) db)
            (do (when bk (copy @db bk true))
                (re-index-datalog db schema opts))))

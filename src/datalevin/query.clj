@@ -77,13 +77,19 @@
   and its backing store is a remote one, where the remote-db in the inputs is
   replaced by `:remote-db-placeholder, otherwise return `nil`"
   [inputs]
-  (let [dbs (filter db/-searchable? inputs)]
-    (when-let [rdb (first dbs)]
-      (let [rstore (.-store ^DB rdb)]
-        (when (and (= 1 (count dbs))
-                   (satisfies? i/IRemoteDB rstore)
-                   (db/db? rdb))
-          [rstore (vec (replace {rdb :remote-db-placeholder} inputs))])))))
+  (loop [remaining (seq inputs) idx 0 remote-db nil remote-idx nil]
+    (if remaining
+      (let [input (first remaining)]
+        (if (db/-searchable? input)
+          ;; A local source, or a second DB source, rules out remote execution.
+          ;; The usual embedded call exits at its first argument.
+          (when (and (nil? remote-db)
+                     (db/remote-store? (.-store ^DB input)))
+            (recur (next remaining) (inc idx) input idx))
+          (recur (next remaining) (inc idx) remote-db remote-idx)))
+      (when (and remote-db (db/db? remote-db))
+        [(.-store ^DB remote-db)
+         (assoc (vec inputs) remote-idx :remote-db-placeholder)]))))
 
 (defn q
   [query & inputs]
@@ -128,7 +134,7 @@
   (let [parsed-q (prepared-query query)
         expected (dec (count (:qin parsed-q)))
         store (.-store db)
-        remote (when (satisfies? i/IRemotePrepared store)
+        remote (when (db/remote-prepared-store? store)
                  (i/prepare-remote-read store :q [query nil]))
         reader (when-not remote (result-reader parsed-q))]
     (prepared/prepared-read

@@ -309,7 +309,7 @@
    (fulltext-datoms db query nil))
   ([^DB db query opts]
    (let [store (.-store db)]
-     (if (satisfies? i/IRemoteDB store)
+     (if (db/remote-store? store)
        (i/fulltext-datoms store query opts)
        (let [^FastList res (fulltext db query opts)]
          (mapv (fn [^objects t] [(aget t 0) (aget t 1) (aget t 2)])

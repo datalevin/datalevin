@@ -251,7 +251,7 @@
 (defn- map->ent
   [{:keys [db-name touched cache db/id]}]
   (let [db (let [^DB db (@db/dbs db-name)]
-             (when-not (satisfies? i/IRemoteDB (.-store db)) db))
+             (when-not (db/remote-store? (.-store db)) db))
         e  (entity db id)]
     (if touched
       (load-cache e cache)

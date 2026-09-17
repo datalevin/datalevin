@@ -427,7 +427,7 @@
 (defn pull
   ([db pattern id opts]
    (let [store (.-store ^DB db)]
-     (if (satisfies? i/IRemoteDB store)
+     (if (db/remote-store? store)
        (i/pull store pattern id opts)
        (pull* db pattern id opts))))
   ([db pattern id]
@@ -502,7 +502,7 @@
   ([^DB db pattern opts]
    {:pre [(db/db? db)]}
    (let [store (.-store db)]
-     (if (satisfies? i/IRemotePrepared store)
+     (if (db/remote-prepared-store? store)
        (i/prepare-remote-read store :pull [pattern nil opts])
        (let [reader (pull-reader pattern opts)]
          (parse-opts db pattern opts)
@@ -519,7 +519,7 @@
 (defn pull-many
   ([db pattern id opts]
    (let [store (.-store ^DB db)]
-     (if (satisfies? i/IRemoteDB store)
+     (if (db/remote-store? store)
        (i/pull-many store pattern id opts)
        (pull-many* db pattern id opts))))
   ([db pattern id]
