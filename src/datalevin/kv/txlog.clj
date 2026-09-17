@@ -18,6 +18,8 @@
    [datalevin.txlog :as txlog]
    [datalevin.util :as u :refer [raise]])
   (:import
+   [datalevin.binding.cpp Rtx]
+   [datalevin.cpp Txn]
    [datalevin.lmdb DatomKVTxData]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
@@ -2012,7 +2014,7 @@
 
 (defn txlog-rollout-mode
   [lmdb]
-  (let [opts (or (i/env-opts lmdb) {})
+  (let [opts (or (l/read-env-opts lmdb) {})
         rollout-specified? (contains? opts :wal-rollout-mode)
         rollback-specified? (contains? opts :wal-rollback?)
         rollback? (if (contains? opts :wal-rollback?)
@@ -2091,6 +2093,29 @@
 (defn- append-monotonic-payload-lsn-row
   [lmdb rows lsn]
   (append-payload-lsn-row rows (payload-marker-lsn lmdb lsn)))
+
+(defn- refresh-commit-metadata!
+  ^long [lmdb state ^Txn txn ^long txn-id]
+  (let [^longs cache (:lmdb-commit-metadata state)]
+    (if (and cache
+             (= (dec txn-id) (aget cache 0))
+             (not (.hasKvInfoChanges txn)))
+      (do
+        (vreset! (:marker-revision state) (aget cache 1))
+        (aget cache 2))
+      ;; A foreign/raw commit, or a metadata write in this transaction, may
+      ;; have advanced either marker. Read the writer's own snapshot so local
+      ;; metadata changes are included as well. Aborts never publish this cache.
+      (let [wdb (if (l/writing? lmdb) lmdb (l/mark-write lmdb))]
+        (refresh-runtime-marker-revision! wdb state)
+        (persisted-local-payload-lsn wdb)))))
+
+(defn- cache-commit-metadata!
+  [state txn-id marker-entry payload-lsn]
+  (when-let [^longs cache (:lmdb-commit-metadata state)]
+    (aset-long cache 0 (long txn-id))
+    (aset-long cache 1 (long (or (:revision marker-entry) -1)))
+    (aset-long cache 2 (long payload-lsn))))
 
 (defn- persisted-runtime-floor-lsn
   [lmdb]
@@ -2374,26 +2399,31 @@
                       (f {:operation :close-transact-kv}))
                   append-res (txlog/append-durable!
                               state pending txlog-append-hooks)
-                  state (refresh-runtime-marker-revision! lmdb state)
+                  ^Txn txn (.-txn ^Rtx @(l/write-txn lmdb))
+                  txn-id (.id txn)
+                  payload-lsn (max (long (:lsn append-res))
+                                   (refresh-commit-metadata!
+                                    lmdb state txn txn-id))
                   marker-entry (txlog/next-commit-marker-entry
                                 (:commit-marker? state)
                                 (long @(:marker-revision state))
                                 append-res)
-                  commit-rows (append-monotonic-payload-lsn-row
-                               lmdb
-                               nil
-                               (:lsn append-res))
+                  commit-rows (append-payload-lsn-row nil payload-lsn)
                   _ (when marker-entry
                       (.add ^FastList commit-rows (:row marker-entry)))
                   status
                   (try
                     (when (pos? (.size ^FastList commit-rows))
-                      (apply-lmdb-after-txlog-append! lmdb state
-                                                      commit-rows))
+                      ;; This is already the raw handle and open write txn.
+                      ;; No WAL option override is needed. A resize must retry
+                      ;; the whole transaction, including its payload rows.
+                      (i/transact-kv lmdb commit-rows))
                     (let [status (binding [cpp/*before-write-commit-fn* nil]
                                    (i/close-transact-kv lmdb))]
                       (when (= status :committed)
                         (txlog/commit-finished! state marker-entry)
+                        (cache-commit-metadata! state txn-id marker-entry
+                                                payload-lsn)
                         (txlog/note-commit-applied! state append-res))
                       (when-not (write-txn-open? lmdb)
                         (txlog-reset-pending! info-v))

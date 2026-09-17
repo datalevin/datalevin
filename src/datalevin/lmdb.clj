@@ -35,6 +35,15 @@
    [java.util.concurrent ScheduledExecutorService ScheduledFuture TimeUnit]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
+(defn read-env-opts
+  "Read the current environment options for internal lookups without copying
+  the local KV info map. The returned map can also contain runtime state;
+  use `env-opts` for reporting, persistence, or passing options to another env."
+  [db]
+  (if-let [info (kv-info db)]
+    @info
+    (env-opts db)))
+
 (defprotocol IBuffer
   (put-key [this data k-type] "put data in key buffer")
   (put-val [this data v-type] "put data in val buffer"))
@@ -291,7 +300,7 @@
 (defn- ensure-wal-open-kv-wrapper!
   [db]
   (when (and (identical? @open-kv-wrapper identity)
-             (true? (:wal? (env-opts db))))
+             (true? (:wal? (read-env-opts db))))
     (require 'datalevin.kv)))
 
 (defn wrap-open-kv

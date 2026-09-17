@@ -13,6 +13,7 @@
    [clojure.edn :as edn]
    [clojure.java.io :as io]
    [datalevin.interface :as i]
+   [datalevin.lmdb :as l]
    [datalevin.txlog :as txlog]
    [datalevin.util :as u]))
 
@@ -34,7 +35,7 @@
 
 (defn snapshot-root-dir
   [lmdb]
-  (let [opts (i/env-opts lmdb)]
+  (let [opts (l/read-env-opts lmdb)]
     (or (:snapshot-dir opts)
         (str (i/env-dir lmdb) u/+separator+ "snapshots"))))
 
@@ -48,7 +49,7 @@
 
 (defn snapshot-compact?
   [lmdb]
-  (let [opts (i/env-opts lmdb)]
+  (let [opts (l/read-env-opts lmdb)]
     (if (contains? opts :snapshot-compact?)
       (boolean (:snapshot-compact? opts))
       true)))
@@ -119,45 +120,45 @@
 
 (defn snapshot-scheduler-enabled?
   [lmdb]
-  (let [opts (or (i/env-opts lmdb) {})]
+  (let [opts (or (l/read-env-opts lmdb) {})]
     (if (contains? opts :snapshot-scheduler?)
       (boolean (:snapshot-scheduler? opts))
       false)))
 
 (defn snapshot-interval-ms
   [lmdb]
-  (let [opts (or (i/env-opts lmdb) {})]
+  (let [opts (or (l/read-env-opts lmdb) {})]
     (long (or (:snapshot-interval-ms opts)
               snapshot-default-interval-ms))))
 
 (defn snapshot-max-lsn-delta
   [lmdb]
-  (let [opts (or (i/env-opts lmdb) {})]
+  (let [opts (or (l/read-env-opts lmdb) {})]
     (long (or (:snapshot-max-lsn-delta opts)
               snapshot-default-max-lsn-delta))))
 
 (defn snapshot-max-log-bytes-delta
   [lmdb]
-  (let [opts (or (i/env-opts lmdb) {})]
+  (let [opts (or (l/read-env-opts lmdb) {})]
     (long (or (:snapshot-max-log-bytes-delta opts)
               snapshot-default-max-log-bytes-delta))))
 
 (defn snapshot-max-age-ms
   [lmdb]
-  (let [opts (or (i/env-opts lmdb) {})]
+  (let [opts (or (l/read-env-opts lmdb) {})]
     (long (or (:snapshot-max-age-ms opts)
               snapshot-default-max-age-ms))))
 
 (defn snapshot-defer-on-contention?
   [lmdb]
-  (let [opts (or (i/env-opts lmdb) {})]
+  (let [opts (or (l/read-env-opts lmdb) {})]
     (if (contains? opts :snapshot-defer-on-contention?)
       (boolean (:snapshot-defer-on-contention? opts))
       snapshot-default-defer-on-contention?)))
 
 (defn snapshot-contention-thresholds
   [lmdb]
-  (let [opts (or (i/env-opts lmdb) {})
+  (let [opts (or (l/read-env-opts lmdb) {})
         thresholds (merge snapshot-default-contention-thresholds
                           (or (:snapshot-contention-thresholds opts) {}))]
     {:commit-wait-p99-ms
@@ -169,19 +170,19 @@
 
 (defn- snapshot-contention-sample-max-age-ms
   [lmdb]
-  (let [opts (or (i/env-opts lmdb) {})]
+  (let [opts (or (l/read-env-opts lmdb) {})]
     (long (max 0 (long (or (:snapshot-contention-sample-max-age-ms opts)
                            snapshot-default-contention-sample-max-age-ms))))))
 
 (defn snapshot-defer-backoff-min-ms
   [lmdb]
-  (let [opts (or (i/env-opts lmdb) {})]
+  (let [opts (or (l/read-env-opts lmdb) {})]
     (long (max 0 (long (or (:snapshot-defer-backoff-min-ms opts)
                            snapshot-default-defer-backoff-min-ms))))))
 
 (defn snapshot-defer-backoff-max-ms
   [lmdb]
-  (let [opts (or (i/env-opts lmdb) {})
+  (let [opts (or (l/read-env-opts lmdb) {})
         min-ms (long (snapshot-defer-backoff-min-ms lmdb))
         requested (long (max 0 (long (or (:snapshot-defer-backoff-max-ms opts)
                                          snapshot-default-defer-backoff-max-ms))))]
@@ -231,7 +232,7 @@
 
 (defn snapshot-offpeak-windows
   [lmdb]
-  (let [opts (or (i/env-opts lmdb) {})]
+  (let [opts (or (l/read-env-opts lmdb) {})]
     (vec (keep parse-offpeak-window
                (or (:snapshot-offpeak-windows opts) [])))))
 

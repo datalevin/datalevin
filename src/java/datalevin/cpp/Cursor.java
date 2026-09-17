@@ -47,6 +47,10 @@ public class Cursor {
 
         Util.checkRc(DTLV.mdb_cursor_open(txn.get(), dbi.get(), ptr));
 
+        // A writable metadata cursor can mutate rows without Dbi.put/del.
+        // Conservatively invalidate on open, including cursors only used to read.
+        dbi.noteWrite(txn);
+
         return new Cursor(ptr, key, val);
     }
 
@@ -64,6 +68,7 @@ public class Cursor {
         DTLV.MDB_cursor ptr = new DTLV.MDB_cursor();
 
         Util.checkRc(DTLV.mdb_cursor_open(txn.get(), dbi.get(), ptr));
+        dbi.noteWrite(txn);
 
         return new Cursor(ptr, key, val, multipleVals, false);
     }

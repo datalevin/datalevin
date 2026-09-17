@@ -384,7 +384,7 @@
          (let [lmdb (.-lmdb ^Store store)]
            ;; In WAL mode, route through with-transaction-kv so transaction
            ;; boundaries are explicitly anchored to LMDB write transactions.
-           (and (not (true? (:wal? (i/env-opts lmdb))))
+           (and (not (true? (:wal? (l/read-env-opts lmdb))))
                 (not (l/writing? lmdb)))))))
 
 (defn- direct-local-transact!
@@ -578,7 +578,7 @@
         store (.-store db)]
     (and (instance? Store store)
          (let [lmdb (.-lmdb ^Store store)]
-           (and (true? (:wal? (i/env-opts lmdb)))
+           (and (true? (:wal? (l/read-env-opts lmdb)))
                 (not (l/writing? lmdb))
                 (not (current-thread-holds-store-write-lock? store)))))))
 
@@ -712,7 +712,7 @@
             (cond
               (instance? Store store)
               (wal-sync-queue-profile-from-opts
-                (i/env-opts (.-lmdb ^Store store)))
+                (l/read-env-opts (.-lmdb ^Store store)))
 
               (instance? DatalogStore store)
               (wal-sync-queue-profile-from-opts
@@ -1113,7 +1113,7 @@
   (let [db    ^DB @conn
         store (.-store db)]
     (when (and (instance? Store store)
-               (true? (:wal? (i/env-opts (.-lmdb ^Store store)))))
+               (true? (:wal? (l/read-env-opts (.-lmdb ^Store store)))))
       (let [n                 (int (.size requests))
             ^objects prepared (object-array n)]
         (loop [i 0]
@@ -1221,7 +1221,7 @@
   (let [db    ^DB @conn
         store (.-store db)]
     (when (and (instance? Store store)
-               (true? (:wal? (i/env-opts (.-lmdb ^Store store)))))
+               (true? (:wal? (l/read-env-opts (.-lmdb ^Store store)))))
       (let [n                 (int (.size requests))
             ^objects prepared (object-array n)
             seen              (HashSet.)]

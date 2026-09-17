@@ -11,9 +11,11 @@ public class Dbi {
     private IntPointer ptr;
     private int handle;
     private String name;
+    private final boolean kvInfo;
 
     public Dbi(Env env, String name, int flags) {
         this.name = name;
+        this.kvInfo = "datalevin/kv-info".equals(name);
         this.ptr = new IntPointer(1);
 
         Txn txn = Txn.create(env);
@@ -34,6 +36,7 @@ public class Dbi {
      */
     public Dbi(Txn txn, String name, int flags) {
         this.name = name;
+        this.kvInfo = "datalevin/kv-info".equals(name);
         this.ptr = new IntPointer(1);
         Util.checkRc(DTLV.mdb_dbi_open(txn.get(), name, flags, ptr));
         handle = (int) ptr.get();
@@ -71,11 +74,18 @@ public class Dbi {
         return name;
     }
 
+    /** Invalidate the transaction's metadata cache before a possible write. */
+    void noteWrite(Txn txn) {
+        if (kvInfo && !txn.isReadOnly()) txn.markKvInfoChanged();
+    }
+
     public void put(Txn txn, BufVal k, BufVal v, int mask) {
+        noteWrite(txn);
         Util.checkRc(DTLV.mdb_put(txn.get(), handle, k.ptr(), v.ptr(), mask));
     }
 
     public void del(Txn txn, BufVal k, BufVal v) {
+        noteWrite(txn);
         DTLV.MDB_val vp;
         if (v == null) {
             vp = null;

@@ -420,6 +420,9 @@
          :meta-last-flush-ms     (volatile! last-sync-ms)
          :marker-revision        (volatile! (or (:revision marker-cur)
                                                 -1))
+         ;; Last successful LMDB commit: transaction ID, marker revision,
+         ;; payload LSN. Accessed only while holding the environment write lock.
+         :lmdb-commit-metadata   (long-array [-1 -1 0])
          :commit-wait-ms         (long (commit-wait-ms info))
 
          :sync-manager (new-sync-manager

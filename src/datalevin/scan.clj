@@ -166,7 +166,7 @@
         sample
         (fn [^Iterator iter]
           (let [^SpillableVector holder
-                (sp/new-spillable-vector nil (:spill-opts (i/env-opts lmdb)))]
+                (sp/new-spillable-vector nil (:spill-opts (l/read-env-opts lmdb)))]
             (loop []
               (if (.hasNext iter)
                 (let [kv (.next iter)
@@ -219,7 +219,7 @@
                 (.iterator
                   ^Iterable (l/iterate-kv dbi rtx cur k-range k-type v-type))]
       (let [^SpillableVector holder
-            (sp/new-spillable-vector nil (:spill-opts (i/env-opts lmdb)))]
+            (sp/new-spillable-vector nil (:spill-opts (l/read-env-opts lmdb)))]
         (loop [i 0]
           (if (and (< i ^long n) (.hasNext ^Iterator iter))
             (let [kv (.next ^Iterator iter)
@@ -243,7 +243,7 @@
                 (.iterator
                   ^Iterable (l/iterate-kv dbi rtx cur k-range k-type v-type))]
       (let [^SpillableVector holder
-            (sp/new-spillable-vector nil (:spill-opts (i/env-opts lmdb)))]
+            (sp/new-spillable-vector nil (:spill-opts (l/read-env-opts lmdb)))]
         (loop []
           (if (.hasNext ^Iterator iter)
             (let [kv (.next ^Iterator iter)
@@ -367,7 +367,7 @@
                 (.iterator
                   ^Iterable (l/iterate-key dbi rtx cur k-range k-type))]
       (let [^SpillableVector holder
-            (sp/new-spillable-vector nil (:spill-opts (i/env-opts lmdb)))]
+            (sp/new-spillable-vector nil (:spill-opts (l/read-env-opts lmdb)))]
         (loop []
           (if (.hasNext ^Iterator iter)
             (let [kv (.next ^Iterator iter)]
@@ -429,7 +429,7 @@
           "Cannot ignore both key and value")
   (scan lmdb dbi-name
     (let [^SpillableVector holder
-          (sp/new-spillable-vector nil (:spill-opts (i/env-opts lmdb)))]
+          (sp/new-spillable-vector nil (:spill-opts (l/read-env-opts lmdb)))]
       (with-open [^AutoCloseable iter
                   (.iterator
                     ^Iterable (l/iterate-kv dbi rtx cur k-range k-type v-type))]
@@ -479,7 +479,7 @@
 (defn range-keep
   [lmdb dbi-name pred k-range k-type v-type raw-pred?]
   (scan lmdb dbi-name
-    (let [holder (sp/new-spillable-vector nil (:spill-opts (i/env-opts lmdb)))
+    (let [holder (sp/new-spillable-vector nil (:spill-opts (l/read-env-opts lmdb)))
 
           iterable (l/iterate-kv dbi rtx cur k-range k-type v-type)]
       (range-keep* iterable holder pred k-type v-type raw-pred?))
@@ -557,7 +557,7 @@
   [lmdb dbi-name k-range k-type v-range v-type]
   (scan lmdb dbi-name
     (let [^SpillableVector holder
-          (sp/new-spillable-vector nil (:spill-opts (i/env-opts lmdb)))]
+          (sp/new-spillable-vector nil (:spill-opts (l/read-env-opts lmdb)))]
       (with-open [^AutoCloseable iter
                   (.iterator
                     ^Iterable (l/iterate-list dbi rtx cur k-range k-type
@@ -589,7 +589,7 @@
   [lmdb dbi-name n k-range k-type v-range v-type]
   (scan lmdb dbi-name
     (let [^SpillableVector holder
-          (sp/new-spillable-vector nil (:spill-opts (i/env-opts lmdb)))]
+          (sp/new-spillable-vector nil (:spill-opts (l/read-env-opts lmdb)))]
       (with-open [^AutoCloseable iter
                   (.iterator
                     ^Iterable (l/iterate-list dbi rtx cur k-range k-type
@@ -608,7 +608,7 @@
   [lmdb dbi-name pred k-range k-type v-range v-type raw-pred?]
   (scan lmdb dbi-name
     (let [^SpillableVector holder
-          (sp/new-spillable-vector nil (:spill-opts (i/env-opts lmdb)))]
+          (sp/new-spillable-vector nil (:spill-opts (l/read-env-opts lmdb)))]
       (with-open [^AutoCloseable iter
                   (.iterator
                     ^Iterable (l/iterate-list dbi rtx cur k-range k-type
@@ -638,7 +638,7 @@
   [lmdb dbi-name pred k-range k-type v-range v-type raw-pred?]
   (scan lmdb dbi-name
     (let [^SpillableVector holder
-          (sp/new-spillable-vector nil (:spill-opts (i/env-opts lmdb)))
+          (sp/new-spillable-vector nil (:spill-opts (l/read-env-opts lmdb)))
           iterable (l/iterate-list dbi rtx cur k-range k-type
                                    v-range v-type)]
       (range-keep* iterable holder pred k-type v-type raw-pred?))
@@ -722,7 +722,7 @@
 (defn get-list*
   [lmdb iter k kt vt]
   (let [^SpillableVector holder
-        (sp/new-spillable-vector nil (:spill-opts (i/env-opts lmdb)))]
+        (sp/new-spillable-vector nil (:spill-opts (l/read-env-opts lmdb)))]
     (loop [next? (l/seek-key iter k kt)]
       (when next?
         (.cons holder (b/read-buffer (l/next-val iter) vt))

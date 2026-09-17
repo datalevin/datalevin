@@ -17,6 +17,7 @@ public class Txn {
 
     private DTLV.MDB_txn ptr;
     private final boolean readOnly;
+    private boolean kvInfoChanged;
 
     public Txn(DTLV.MDB_txn ptr, boolean readOnly) {
         this.ptr = ptr;
@@ -59,6 +60,22 @@ public class Txn {
      */
     public DTLV.MDB_txn get() {
         return ptr;
+    }
+
+    /** Return the snapshot ID, or the pending commit ID for a writer. */
+    public long id() {
+        checkReady();
+        return DTLV.mdb_txn_id(ptr);
+    }
+
+    /** Record a possible change to KV metadata within this transaction. */
+    void markKvInfoChanged() {
+        kvInfoChanged = true;
+    }
+
+    /** Whether cached metadata from the preceding commit needs a refresh. */
+    public boolean hasKvInfoChanges() {
+        return kvInfoChanged;
     }
 
     public void abort() {
