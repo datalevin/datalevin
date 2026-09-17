@@ -2,12 +2,15 @@
   (:require
    [clojure.test :refer [deftest is testing use-fixtures]]
    [datalevin.core :as d]
+   [datalevin.db :as db]
+   [datalevin.interface :as i]
    [datalevin.protocol :as p]
    [datalevin.pull-api :as pull]
    [datalevin.test.core :refer [db-fixture]]
    [datalevin.timeout :as timeout]
    [datalevin.util :as u])
-  (:import [java.nio ByteBuffer]
+  (:import [datalevin.db DB]
+           [java.nio ByteBuffer]
            [java.util UUID]))
 
 (use-fixtures :each db-fixture)
@@ -62,6 +65,100 @@
           (is (= (general-pull @tx fields 1) (encoded-pull @tx fields 1)))))
       (finally
         (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest pull-patterns-survive-data-transactions
+  (doseq [wal? [false true]]
+    (testing (str "WAL enabled: " wal?)
+      (let [dir (u/tmp-dir (str "pull-cache-" (random-uuid)))
+            conn (d/create-conn dir {:name {} :value {}}
+                                {:kv-opts {:wal? wal?}})]
+        (try
+          (d/transact! conn [{:db/id 1 :name "one" :value 0}])
+          (let [^DB before @conn
+                cache (.-pull-patterns before)
+                parsed (pull/parse-opts before [:name :value])
+                inside-plan (volatile! nil)]
+            (doseq [value (range 1 4)]
+              (d/transact! conn [[:db/add 1 :value value]])
+              (is (= {:name "one" :value value}
+                     (d/pull @conn [:name :value] 1)))
+              (let [current (pull/parse-opts @conn [:name :value])]
+                (is (identical? (:pattern parsed) (:pattern current)))
+                (is (identical? (:flat parsed) (:flat current)))))
+            (d/with-transaction [tx conn]
+              (d/transact! tx [[:db/add 1 :value 4]])
+              (is (= {:name "one" :value 4}
+                     (d/pull @tx [:name :value] 1)))
+              (vreset! inside-plan (pull/parse-opts @tx [:value]))
+              (d/with-transaction [nested tx]
+                (d/transact! nested [[:db/add 1 :value 5]])))
+            (is (identical? cache (.-pull-patterns ^DB @conn)))
+            (is (identical? (:pattern @inside-plan)
+                            (:pattern (pull/parse-opts @conn [:value]))))
+            (is (identical? (:pattern parsed)
+                            (:pattern (pull/parse-opts @conn [:name :value]))))
+            (let [visits (atom [])]
+              (is (= {:name "one" :value 5}
+                     (d/pull @conn [:name :value] 1
+                             {:visitor #(swap! visits conj [%1 %2 %3 %4])})))
+              (is (= #{:name :value} (set (map #(nth % 2) @visits)))))
+            (is (not (identical? (.-eavt before) (.-eavt ^DB @conn))))
+            (is (not (identical? (.-avet before) (.-avet ^DB @conn)))))
+          (finally
+            (d/close conn)
+            (u/delete-files dir)))))))
+
+(deftest shared-pull-cache-rechecks-schema-after-commit-and-abort
+  (let [dir (u/tmp-dir (str "pull-cache-schema-" (random-uuid)))
+        conn (d/create-conn dir {:value {}})]
+    (try
+      (d/transact! conn [{:db/id 1 :value 1}])
+      (let [cache (.-pull-patterns ^DB @conn)
+            original (pull/parse-opts @conn [:value])
+            aborted (volatile! nil)
+            committed (volatile! nil)]
+        (is (some? (:flat original)))
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"abort schema change"
+              (d/with-transaction [tx conn]
+                (d/update-schema tx {:value {:db/cardinality :db.cardinality/many}})
+                (d/transact! tx [[:db/add 1 :value 2]])
+                (is (= {:value [1 2]} (d/pull @tx [:value] 1)))
+                (vreset! aborted (pull/parse-opts @tx [:value]))
+                (throw (ex-info "abort schema change" {})))))
+        (is (= {:value 1} (d/pull @conn [:value] 1)))
+        (is (not (identical? (:pattern @aborted)
+                            (:pattern (pull/parse-opts @conn [:value])))))
+        (is (some? (:flat (pull/parse-opts @conn [:value]))))
+        (d/with-transaction [tx conn]
+          (d/update-schema tx {:value {:db/cardinality :db.cardinality/many}})
+          (d/transact! tx [[:db/add 1 :value 3]])
+          (vreset! committed (pull/parse-opts @tx [:value]))
+          (is (nil? (:flat @committed))))
+        (is (identical? cache (.-pull-patterns ^DB @conn)))
+        (is (identical? (:pattern @committed)
+                        (:pattern (pull/parse-opts @conn [:value]))))
+        (is (= {:value [1 3]} (d/pull @conn [:value] 1))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest fill-db-retains-pull-patterns
+  (let [dir (u/tmp-dir (str "pull-cache-fill-" (random-uuid)))
+        initial (d/empty-db dir {:value {}})]
+    (try
+      (let [before (d/fill-db initial [(d/datom 1 :value 1)])
+            parsed (pull/parse-opts before [:value])
+            after (d/fill-db before [(d/datom 2 :value 2)])]
+        (is (identical? (.-pull-patterns ^DB before)
+                        (.-pull-patterns ^DB after)))
+        (is (identical? (:pattern parsed)
+                        (:pattern (pull/parse-opts after [:value]))))
+        (is (= {:value 2} (d/pull after [:value] 2)))
+        (is (= 2 (:max-eid after)))
+        (is (= after (get @db/dbs (i/db-name (:store after))))))
+      (finally
+        (d/close-db initial)
         (u/delete-files dir)))))
 
 (deftest pull-plan-respects-schema-options-and-deadlines

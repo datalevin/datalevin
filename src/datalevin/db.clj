@@ -18,6 +18,7 @@
    [datalevin.constants :as c :refer [e0 emax v0 vmax]]
    [datalevin.datom :as d :refer [datom datom?]]
    [datalevin.custom-datalog :as cd]
+   [datalevin.db.range-cache :as range-cache]
    [datalevin.db.tx.common :as txcommon]
    [datalevin.db.tx.execute :as txexec]
    [datalevin.db.tx.prepare :as txprep]
@@ -180,9 +181,15 @@
   ([store target]
    (refresh-cache store target nil))
   ([store target remote-max-tx]
-   (let [target (long (or target 0))]
-     (.put ^ConcurrentHashMap caches (dir store)
-           (LRUCache. (:cache-limit (opts store)) target))
+   (let [target (long (or target 0))
+         old    ^LRUCache (.get ^ConcurrentHashMap caches (dir store))
+         cache  (LRUCache. (:cache-limit (opts store)) target)]
+     ;; Schema changes can replace the cache inside an explicit transaction.
+     ;; Keep it disabled until that transaction exits, so staged reads never
+     ;; enter the shared cache (including when the transaction aborts).
+     (when (and old (.isDisabled old))
+       (.disable cache))
+     (.put ^ConcurrentHashMap caches (dir store) cache)
      (mark-remote-cache-max-tx! store remote-max-tx)
      (mark-remote-cache-check! store))))
 
@@ -443,13 +450,7 @@
         (let [[_ a] k]
           (contains? attrs a))
 
-        :index-range
-        (let [[_ a start end] k]
-          (or (unresolved-pattern? nil start)
-              (unresolved-pattern? nil end)
-              (contains? attrs a)))
-
-        :index-range-size
+        (:index-range :index-range-size)
         (let [[_ a start end] k]
           (or (unresolved-pattern? nil start)
               (unresolved-pattern? nil end)
@@ -464,6 +465,16 @@
 
         true))
     true))
+
+(defn- remove-affected-cache-entries!
+  [store ^LRUCache cache touches tx-data]
+  (let [ranges (delay (range-cache/context
+                       (when (instance? Store store) (schema store)) tx-data))]
+    (doseq [k (.keys cache)
+            :when (if (and (instance? Store store) (range-cache/range-key? k))
+                    (range-cache/affected? @ranges k)
+                    (tx-affects-cache-key? touches k))]
+      (.remove cache k))))
 
 (defn- invalidate-cache
   ([store tx-data target]
@@ -482,9 +493,7 @@
              ;; check and acquiring the monitor. Handle that race normally.
              (when-not (.isEmpty cache)
                (let [touches (tx-touch-summary tx-data)]
-                 (doseq [k (.keys cache)
-                         :when (tx-affects-cache-key? touches k)]
-                   (.remove cache k)))))
+                 (remove-affected-cache-entries! store cache touches tx-data))))
            (let [touches (tx-touch-summary tx-data)]
              ;; Prevent a reader that started before this commit from publishing
              ;; its old snapshot after the affected entries have been removed.
@@ -492,9 +501,7 @@
              ;; keeps cache hits out of the invalidation window.
              (locking cache
                (.beginInvalidation cache (long (or target 0)))
-               (doseq [k (.keys cache)
-                       :when (tx-affects-cache-key? touches k)]
-                 (.remove cache k))))))
+               (remove-affected-cache-entries! store cache touches tx-data)))))
        (when-not (seq tx-data)
          (.setTarget cache (long (or target 0))))
        (mark-remote-cache-max-tx! store remote-max-tx))
@@ -1041,8 +1048,12 @@
          (Long/compare (d/datom-tx x) (d/datom-tx y)))))))
 
 (defn new-db
+  "Construct a current DB view. Rebuilds of the same database can supply
+  `previous` to retain its parsed pull patterns; pull checks schema identity
+  before using each entry. Transaction-local datom overlays are always fresh."
   ([^IStore store] (new-db store nil))
-  ([^IStore store info]
+  ([^IStore store info] (new-db store info nil))
+  ([^IStore store info ^DB previous]
    (let [info (or info
                   (when (satisfies? i/IRemoteDB store)
                     (i/db-info store)))
@@ -1052,7 +1063,9 @@
                  :max-tx        (if info (:max-tx info) (max-tx store))
                  :eavt          (TreeSortedSet. ^Comparator (tx-datom-comparator store :eav))
                  :avet          (TreeSortedSet. ^Comparator (tx-datom-comparator store :ave))
-                 :pull-patterns (LRUCache. 64)})]
+                 :pull-patterns (if previous
+                                  (.-pull-patterns previous)
+                                  (LRUCache. 64))})]
      (swap! dbs assoc (db-name store) db)
      (ensure-cache store
                    (if info (:last-modified info) (last-modified store))
@@ -1223,7 +1236,7 @@
       (when (instance? Store store)
         (s/mark-state-current! ^Store store target))
       (refresh-cache store target))
-    (carry-runtime-opts (new-db store) db)))
+    (carry-runtime-opts (new-db store nil db) db)))
 
 ;; ----------------------------------------------------------------------------
 
@@ -2016,7 +2029,7 @@
                               (:last-modified info)
                               (:max-tx info)))
           (cond-> (assoc initial-report
-                         :db-after (-> (carry-runtime-opts (new-db store info) db)
+                         :db-after (-> (carry-runtime-opts (new-db store info db) db)
                                        (assoc :max-eid (:max-eid info))
                                      (#(if simulated?
                                          (update % :max-tx u/long-inc)

@@ -337,7 +337,7 @@
                                    (finally
                                      (l/cancel-explicit-transaction-watchdog!
                                       @watchdog#)))))
-                     new-db# (db/carry-runtime-opts (db/new-db s#) db#)]
+                     new-db# (db/carry-runtime-opts (db/new-db s# nil db#) db#)]
                  (reset! orig-conn# new-db#)
                  res#))
              (let [kv#     (.-lmdb ^Store s#)
@@ -351,7 +351,7 @@
                                (vreset! s1# (.-store ^DB (deref conn1#)))
                                res#))
                    new-s#  (s/transfer (deref s1#) kv#)
-                   new-db# (db/carry-runtime-opts (db/new-db new-s#) db#)]
+                   new-db# (db/carry-runtime-opts (db/new-db new-s# nil db#) db#)]
                (reset! orig-conn# new-db#)
                res1#))
            (finally

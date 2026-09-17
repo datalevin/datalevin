@@ -39,6 +39,7 @@
    [datalevin.prepare :as prep]
    [datalevin.read-encode :as enc]
    [datalevin.query.predicate :as qpred]
+   [datalevin.query.plan-cache :as plan-cache]
    [datalevin.relation :as r]
    [datalevin.remote :as remote]
    [datalevin.scan :as scan]
@@ -2514,7 +2515,9 @@
           (emb/close-provider provider))
         (close-kv (.-lmdb this)))
       (finally
-        (.unlock wlock)))))
+        (try
+          (plan-cache/evict-store! this)
+          (finally (.unlock wlock)))))))
 
 (defn- release-shared-local-store!
   [^Store store]

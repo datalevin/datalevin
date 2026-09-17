@@ -14,6 +14,7 @@
    [clojure.set :as set]
    [datalevin.constants :as c]
    [datalevin.db :as db]
+   [datalevin.interface :as i]
    [datalevin.lmdb :as l]
    [datalevin.parser :as dp]
    [datalevin.query-util :as qu]
@@ -31,11 +32,14 @@
    [datalevin.query.optimizer.sampling
     :refer [-sample]]
    [datalevin.query.plan :as qplan]
+   [datalevin.query.plan-cache :as pc]
    [datalevin.query.predicate :as qpred]
    [datalevin.query.resolve :as qresolve]
+   [datalevin.udf :as udf]
    [datalevin.util :as u
     :refer [concatv map+]])
   (:import
+   [java.lang.ref WeakReference]
    [java.util HashMap HashSet IdentityHashMap List]
    [java.util.concurrent ConcurrentHashMap]
    [datalevin.db DB]
@@ -1629,7 +1633,9 @@
 
                sample-size
                (assoc :sample-size sample-size))]
-    (assoc step :result nil :sample nil)))
+    (cond-> (assoc step :result nil :sample nil)
+      (#{:or-join :not-join} (-type step))
+      (assoc :sources nil :rules nil))))
 
 (defn- strip-result
   [plans]
@@ -1638,6 +1644,82 @@
                                     (mapv strip-step-result steps)))
                 plan-vec))
         plans))
+
+(defn- source-bound-step?
+  [step]
+  (or (#{:or-join :not-join} (-type step))
+      (some source-bound-step? (:tgt-steps step))
+      (some source-bound-step? (:join-steps step))))
+
+(defn- bind-plan-sources
+  [plans sources rules]
+  (letfn [(bind-step [step]
+            (cond-> step
+              (#{:or-join :not-join} (-type step))
+              (assoc :sources sources :rules rules)
+              (contains? step :tgt-steps)
+              (update :tgt-steps #(mapv bind-step %))
+              (contains? step :join-steps)
+              (update :join-steps #(mapv bind-step %))))]
+    (mapv (fn [component]
+            (mapv #(update % :steps (fn [steps] (mapv bind-step steps)))
+                  component))
+          plans)))
+
+(defrecord ^:private PlanSource
+    [store-key owner schema opts runtime-opts udf-generation])
+
+(defn- plan-source
+  [^DB database]
+  (let [store (.-store database)]
+    (->PlanSource (pc/store-key store)
+                  ;; The shared info holder identifies this open environment,
+                  ;; and survives mark-write/transfer. Do not retain a writer
+                  ;; or a closed environment through a cached plan.
+                  (WeakReference. (i/kv-info (.-lmdb ^Store store)))
+                  (i/schema store) (i/opts store) (db/runtime-opts database)
+                  (udf/generation (db/udf-registry database)))))
+
+(defn- current-plan-source?
+  [^PlanSource saved ^DB database]
+  (let [store (.-store database)]
+    (and (not (i/closed? store))
+         (identical? (.get ^WeakReference (.-owner saved))
+                      (i/kv-info (.-lmdb ^Store store)))
+         (identical? (.-schema saved) (i/schema store))
+         (identical? (.-opts saved) (i/opts store))
+         (identical? (.-runtime-opts saved) (db/runtime-opts database))
+         (= (.-udf-generation saved)
+            (udf/generation (db/udf-registry database))))))
+
+(defn- plan-sources [sources]
+  (into {} (map (fn [[source database]]
+                  [source (when (instance? DB database)
+                            (plan-source database))]))
+        sources))
+
+(defn- current-plan-sources?
+  [saved sources]
+  (and (= (count saved) (count sources))
+       (reduce-kv
+         (fn [_ source state]
+           (let [database (get sources source)]
+             (if (and (contains? sources source)
+                      (if state
+                        (and (instance? DB database)
+                             (current-plan-source? state database))
+                        (not (instance? DB database))))
+               true
+               (reduced false))))
+         true saved)))
+
+(defn- plan-runtime-key [parsed-q rules]
+  (let [qualified (:qwhere-qualified-fns parsed-q)]
+    (if (or rules (seq qualified))
+      [qresolve/*resolver-mode* rules
+       (when-not (qresolve/server-safe-resolver?)
+         (into #{} (map #(some-> % resolve deref)) qualified))]
+      qresolve/*resolver-mode*)))
 
 (defn- assoc-source-plan
   [context src plans deferred attribute-group-planning]
@@ -1674,44 +1756,59 @@
   :result-set will be #{} if there is any clause that matches nothing."
   [{:keys [graph sources rules parsed-q] :as context}]
   (if graph
-    (unreduced
-      (reduce-kv
-        (fn [c src nodes]
-          (let [^DB db        (sources src)
-                required-vars (required-plan-vars context src)
-                projected-vars (set (dp/find-vars (:qfind parsed-q)))
-                k             [(.-store db) nodes required-vars
-                               projected-vars]]
-            (if-let [cached (.get ^LRUCache (plan-cache) k)]
-              (assoc-source-plan c src (:plans cached) (:deferred cached)
-                                 (:attribute-group-planning cached))
-              (let [nodes (update-nodes db nodes)]
-                ;; A zero count has already been verified against the actual
-                ;; index by zero-count-clause-size. Since every graph node is
-                ;; conjunctive, no base sampling or join enumeration can make
-                ;; this source component satisfiable.
-                (if (some #(zero? (long (:mcount %))) (vals nodes))
-                  (reduced (assoc c :result-set #{}))
-                  (let [{:keys [plans deferred attribute-group-planning]}
-                        (if (< 1 (count nodes))
-                          (build-plan* db sources rules nodes required-vars
-                                       projected-vars)
-                          {:plans [[(base-plan
-                                      db nodes (ffirst nodes) true true
-                                      (plan-materialized-vars
-                                        nodes required-vars))]]
-                           :deferred #{}
-                           :attribute-group-planning nil})]
-                    (if (some #(some nil? %) plans)
-                      (reduced (assoc c :result-set #{}))
-                      (do (.put ^LRUCache (plan-cache) k
-                                {:plans (strip-result plans)
-                                 :deferred deferred
-                                 :attribute-group-planning
-                                 attribute-group-planning})
-                          (assoc-source-plan c src plans deferred
-                                             attribute-group-planning)))))))))
-        context graph))
+    (let [runtime-key (plan-runtime-key parsed-q rules)]
+      (unreduced
+        (reduce-kv
+          (fn [c src nodes]
+            (let [^DB db        (sources src)
+                  required-vars (required-plan-vars context src)
+                  projected-vars (set (dp/find-vars (:qfind parsed-q)))
+                  k             [(pc/store-key (.-store db)) nodes required-vars
+                                 projected-vars runtime-key]
+                  cache         (plan-cache)
+                  cached        (.get ^LRUCache cache k)]
+              (if (and cached (current-plan-sources? (:sources cached) sources))
+                (assoc-source-plan c src
+                                   (if (:bind-sources? cached)
+                                     (bind-plan-sources (:plans cached) sources rules)
+                                     (:plans cached))
+                                   (:deferred cached)
+                                   (:attribute-group-planning cached))
+                (let [source-state (plan-sources sources)
+                      nodes (update-nodes db nodes)]
+                  ;; A zero count has already been verified against the actual
+                  ;; index by zero-count-clause-size. Since every graph node is
+                  ;; conjunctive, no base sampling or join enumeration can make
+                  ;; this source component satisfiable.
+                  (if (some #(zero? (long (:mcount %))) (vals nodes))
+                    (reduced (assoc c :result-set #{}))
+                    (let [{:keys [plans deferred attribute-group-planning]}
+                          (if (< 1 (count nodes))
+                            (build-plan* db sources rules nodes required-vars
+                                         projected-vars)
+                            {:plans [[(base-plan
+                                        db nodes (ffirst nodes) true true
+                                        (plan-materialized-vars
+                                          nodes required-vars))]]
+                             :deferred #{}
+                             :attribute-group-planning nil})]
+                      (if (some #(some nil? %) plans)
+                        (reduced (assoc c :result-set #{}))
+                        (do (pc/put! cache k
+                                  {:sources source-state
+                                   :store-keys (into [] (keep :store-key)
+                                                     (vals source-state))
+                                   :bind-sources?
+                                   (boolean (some source-bound-step?
+                                                  (mapcat :steps (mapcat identity plans))))
+                                   :plans (strip-result plans)
+                                   :deferred deferred
+                                   :attribute-group-planning
+                                   attribute-group-planning}
+                                  #(current-plan-sources? source-state sources))
+                            (assoc-source-plan c src plans deferred
+                                               attribute-group-planning)))))))))
+          context graph)))
     context))
 
 (defn- component-binds-vars?
