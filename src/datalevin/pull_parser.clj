@@ -22,6 +22,31 @@
 (def default-pattern-ref (map->PullPattern {:attrs (list default-db-id-attr)}))
 (def default-pattern-component (assoc default-pattern-ref :wildcard? true))
 
+(defn pattern-deps
+  "Attributes read by a parsed pattern. Wildcards (including implicit component
+  expansion) and arbitrary transforms require invalidation on every write.
+  Recursive refs reuse their containing pattern, whose attributes are already
+  visited here; reverse refs already carry their forward attribute name."
+  [^PullPattern pattern]
+  (letfn [(collect-attrs [attrs ^PullPattern pattern]
+            (if (.-wildcard? pattern)
+              nil
+              (reduce
+                (fn [attrs ^PullAttr attr]
+                  (let [name (.-name attr)]
+                    (if (or (not (keyword? name))
+                            (not (identical? identity (.-xform attr))))
+                      (reduced nil)
+                      (let [attrs (cond-> attrs (not= :db/id name) (conj name))]
+                        (if-let [nested (.-pattern attr)]
+                          (or (collect-attrs attrs nested) (reduced nil))
+                          attrs)))))
+                attrs (concat (.-attrs pattern) (.-reverse-attrs pattern)))))]
+    (let [attrs (collect-attrs #{} pattern)]
+      (if (nil? attrs)
+        {:all? true}
+        {:all? false :attrs attrs}))))
+
 (declare parse-pattern parse-attr-spec)
 
 ; pattern             = [(attr-spec | map-spec | '* | "*")+]

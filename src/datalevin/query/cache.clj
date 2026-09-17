@@ -10,16 +10,19 @@
 (ns ^:no-doc datalevin.query.cache
   "Query parsing and result cache."
   (:require
+   [datalevin.built-ins :as built-ins]
    [datalevin.constants :as c]
    [datalevin.db :as db]
    [datalevin.interface :refer [db-name dir]]
    [datalevin.lmdb :as l]
    [datalevin.parser :as dp]
+   [datalevin.pull-api :as pull]
    [datalevin.query.execute :as qexec]
    [datalevin.query.resolve :as qresolve])
   (:import
    [datalevin.db DB]
-   [datalevin.parser Constant Function Pattern]
+   [datalevin.parser Aggregate BindScalar Constant Function Pattern Predicate
+    RuleExpr SrcVar]
    [datalevin.storage Store]
    [datalevin.utl LRUCache]))
 
@@ -73,6 +76,70 @@
   [inputs]
   (mapv #(when (db/-searchable? %) (db/udf-cache-token %)) inputs))
 
+(defn- merge-deps [x y]
+  (if (or (:all? x) (:all? y))
+    {:all? true}
+    {:all? false :attrs (into (:attrs x #{}) (:attrs y #{}))}))
+
+(defn- pull-deps-reader
+  "Resolve literal or scalar-input pull patterns against their current source.
+  Rules and opaque calls retain the previous invalidate-on-any-write behavior."
+  [parsed-q]
+  (let [pulls (filterv dp/pull? (dp/find-elements (:qfind parsed-q)))]
+    (when (seq pulls)
+      (if (seq
+            (dp/collect
+              (fn [node]
+                (cond
+                  (instance? RuleExpr node) true
+                  (instance? Aggregate node)
+                  (not (contains? built-ins/aggregates (some-> node :fn :symbol)))
+                  (or (instance? Function node) (instance? Predicate node))
+                  (let [fname (some-> node :fn :symbol)]
+                    (or (not (contains? built-ins/query-fns fname))
+                        (#{'apply 'udf 'q} fname)
+                        (seq (dp/collect #(instance? SrcVar %) (:args node)))))))
+              [(:qwhere parsed-q) (:qfind parsed-q)]))
+        (constantly {:all? true})
+        (let [input-index (into {} (keep-indexed
+                                    (fn [idx binding]
+                                      (when (instance? BindScalar binding)
+                                        [(:variable binding) idx]))
+                                    (:qin parsed-q)))
+              readers (mapv
+                        (fn [{:keys [source pattern]}]
+                          (let [source-idx (get input-index source)
+                                pattern-idx (get input-index pattern)]
+                            (when (and source-idx
+                                       (or (instance? Constant pattern) pattern-idx))
+                              (fn [inputs]
+                                (let [source (nth inputs source-idx)
+                                      pattern (if pattern-idx
+                                                (nth inputs pattern-idx)
+                                                (:value pattern))]
+                                  (if (db/db? source)
+                                    ;; Pull roots and query joins can resolve
+                                    ;; lookup refs or idents. Until their exact
+                                    ;; provenance is known, retain dependencies
+                                    ;; on all possible identifying attributes.
+                                    (merge-deps
+                                      (pull/pattern-deps source pattern)
+                                      {:attrs (conj (db/-attrs-by source :db/unique)
+                                                    :db/ident)})
+                                    {:all? true}))))))
+                        pulls)]
+          (if (some nil? readers)
+            (constantly {:all? true})
+            (fn [inputs]
+              (try
+                (reduce (fn [deps reader]
+                          (let [deps (merge-deps deps (reader inputs))]
+                            (if (:all? deps) (reduced deps) deps)))
+                        {:all? false :attrs #{}} readers)
+                ;; Empty queries need not evaluate pull expressions. Preserve
+                ;; that behavior when a pattern cannot be resolved or parsed.
+                (catch Exception _ {:all? true})))))))))
+
 (defn- query-cache-deps
   "Extract conservative dependencies for query-result cache invalidation.
 
@@ -83,11 +150,6 @@
             (when (instance? Constant term)
               (let [v (:value ^Constant term)]
                 (when (keyword? v) v))))
-          (merge-deps [x y]
-            (if (or (:all? x) (:all? y))
-              {:all? true}
-              {:all? false
-               :attrs (into (:attrs x #{}) (:attrs y #{}))}))
           (pattern-deps [parsed-q]
             (let [patterns (dp/collect #(instance? Pattern %) (:qwhere parsed-q))]
               (loop [ps      patterns
@@ -123,10 +185,7 @@
                       acc)))
                 {:all? false :attrs #{}}
                 fns)))]
-    (let [find-elements (dp/find-elements (:qfind parsed-q))]
-      (if (some dp/pull? find-elements)
-        {:all? true}
-        (merge-deps (pattern-deps parsed-q) (tuple-fn-deps parsed-q))))))
+    (merge-deps (pattern-deps parsed-q) (tuple-fn-deps parsed-q))))
 
 (defn- store-write-context-token
   [store]
@@ -153,7 +212,7 @@
        (store-write-context-token store)])
     input))
 
-(deftype ^:no-doc CacheAnalysis [nested? deps udf? qualified?])
+(deftype ^:no-doc CacheAnalysis [nested? deps udf? qualified? pull-deps])
 
 (defn- single-input-store
   "A store's result cache tracks only its own writes. Multiple database sources
@@ -174,18 +233,26 @@
             (not (if analysis (.-nested? analysis)
                      (contains-nested-query? parsed-q))))
      (if-let [store (single-input-store inputs)]
-       (let [parsed-q' (if (and analysis (not (.-qualified? analysis)))
+       (let [;; Pull dependencies depend on schema. Capture the generation
+             ;; before analyzing them so a concurrent schema change cannot
+             ;; publish a result with dependencies from the previous schema.
+             token     (db/cache-token store)
+             parsed-q' (if (and analysis (not (.-qualified? analysis)))
                          parsed-q
                          (update parsed-q :qwhere-qualified-fns qualified-fn-cache-token))
              deps      (if analysis (.-deps analysis)
                            (query-cache-deps parsed-q'))
+             pull-deps (if analysis (.-pull-deps analysis)
+                           (pull-deps-reader parsed-q'))
+             deps      (if (and pull-deps (not (:all? deps)))
+                         (merge-deps deps (pull-deps inputs))
+                         deps)
              udf-token (when (if analysis (.-udf? analysis)
                                  (query-uses-udf? parsed-q'))
                          (udf-cache-token inputs))
              k         [:query-result deps :exact-window-v1
                         qresolve/*resolver-mode* parsed-q' udf-token
-                        (mapv cache-input-token inputs)]
-             token     (db/cache-token store)]
+                        (mapv cache-input-token inputs)]]
          (if-let [cached (db/cache-get store k)]
            cached
            (let [res (run-query parsed-q inputs execute)]
@@ -201,6 +268,7 @@
   (let [analysis (CacheAnalysis. (contains-nested-query? parsed-q)
                                  (query-cache-deps parsed-q)
                                  (query-uses-udf? parsed-q)
-                                 (boolean (seq (:qwhere-qualified-fns parsed-q))))
+                                 (boolean (seq (:qwhere-qualified-fns parsed-q)))
+                                 (pull-deps-reader parsed-q))
         execute (qexec/query-runner parsed-q)]
     (fn [inputs] (q-result parsed-q inputs analysis execute))))

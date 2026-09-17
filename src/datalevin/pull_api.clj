@@ -46,7 +46,7 @@
 (defrecord Context [db visitor])
 
 (deftype ^:no-doc FlatPattern [^objects names ^longs aids schema id? ^objects keys])
-(deftype ^:no-doc CachedPattern [schema pattern flat])
+(deftype ^:no-doc CachedPattern [schema pattern flat deps])
 
 (defn- flat-pattern
   [schema ^PullPattern pattern]
@@ -381,19 +381,29 @@
             :else
             (recur (conj-seq stack'' (-merge penultimate last)))))))))
 
+(defn- cached-pattern
+  ^CachedPattern [^DB db pattern]
+  (let [^LRUCache c (.-pull-patterns db)
+        schema (db/-schema db)
+        ^CachedPattern cached (.get c pattern)]
+    (if (and cached (identical? schema (.-schema cached)))
+      cached
+      (let [parsed (dpp/parse-pattern db pattern)
+            res (CachedPattern. schema parsed (flat-pattern schema parsed)
+                                (delay (dpp/pattern-deps parsed)))]
+        (.put c pattern res)
+        res))))
+
+(defn pattern-deps
+  "Reuse schema-checked pull parsing and dependency analysis without allocating
+  an execution context. Dependencies are realized only for query result caching."
+  [db pattern]
+  @(.-deps (cached-pattern db pattern)))
+
 (defn parse-opts
   ([^DB db pattern] (parse-opts db pattern nil))
   ([^DB db pattern {:keys [visitor]}]
-   (let [^LRUCache c (.-pull-patterns db)
-         schema (db/-schema db)
-         ^CachedPattern cached (.get c pattern)
-         ^CachedPattern cached
-         (if (and cached (identical? schema (.-schema cached)))
-           cached
-           (let [parsed (dpp/parse-pattern db pattern)
-                 res (CachedPattern. schema parsed (flat-pattern schema parsed))]
-             (.put c pattern res)
-             res))]
+   (let [cached (cached-pattern db pattern)]
      {:pattern (.-pattern cached)
       :flat    (.-flat cached)
       :context (Context. db visitor)})))
