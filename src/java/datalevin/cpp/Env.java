@@ -94,10 +94,9 @@ public class Env {
      * Get flags.
      */
     public int getFlags() {
-        try (IntPointer fPtr = new IntPointer(1)) {
-            Util.checkRc(DTLV.mdb_env_get_flags(env, fPtr));
-            return (int) fPtr.get();
-        }
+        int[] flags = new int[1];
+        Util.checkRc(DTLV.mdb_env_get_flags(env, flags));
+        return flags[0];
     }
 
     public void setMapSize(long size) {

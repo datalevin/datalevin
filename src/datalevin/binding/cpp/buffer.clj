@@ -23,6 +23,7 @@
    [datalevin.cpp BufVal Cursor Dbi Stat Txn UnsafeAccess Util]
    [java.nio BufferOverflowException ByteBuffer]
    [java.util ArrayDeque]
+   [java.util.concurrent ConcurrentHashMap]
    [java.util.function Supplier]
    [org.bytedeco.javacpp LongPointer]))
 
@@ -193,14 +194,20 @@
    0x800000 :nordahead
    0x1000000 :nomeminit})
 
+(def ^:private env-flag-mask (reduce bit-or 0 (keys env-flag-map)))
+(defonce ^:private ^ConcurrentHashMap env-flag-cache (ConcurrentHashMap.))
+
 (defn env-flag-keys
   [v]
-  (reduce-kv
-   (fn [s i k]
-     (if (not= 0 (bit-and ^int i ^int v))
-       (conj s k)
-       s))
-   #{} env-flag-map))
+  ;; Cache only the decoding, not the native flags. Masking unknown bits bounds
+  ;; the cache to the 2^11 combinations represented by env-flag-map.
+  (let [bits (bit-and (long v) (long env-flag-mask))]
+    (or (.get env-flag-cache bits)
+        (let [flags (reduce-kv
+                      (fn [s i k]
+                        (if (not= 0 (bit-and (long i) bits)) (conj s k) s))
+                      #{} env-flag-map)]
+          (or (.putIfAbsent env-flag-cache bits flags) flags)))))
 
 (defn put-bufval
   [^BufVal vp k kt compressor ^ByteBuffer cbf]
@@ -461,5 +468,4 @@
 (defn dbi-val-compressor
   [^DBI dbi]
   (.-value-codec dbi))
-
 
