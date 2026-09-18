@@ -17,7 +17,7 @@
           :threads 1 :pool-size nil :seed 17 :field-count 10 :field-length 100
           :scan-length 100 :batch-size 100 :distribution nil :durability :strict
           :timeout-ms 60000 :phase-timeout-ms 600000 :keep-db? false
-          :datalog-handles :shared :client-counts nil :repetitions 1
+          :datalog-handles :shared :sql-indexes :matched :client-counts nil :repetitions 1
           :warmup-ms nil :measurement-ms nil}))
 
 (defn options
@@ -31,6 +31,7 @@
                          :workload (conj (set (keys w/workloads)) :all)
                          :distribution #{nil :uniform :zipfian :latest}
                          :durability #{:strict :relaxed}
+                         :sql-indexes #{:matched :none :all :both}
                          :datalog-handles #{:shared :independent :both}
                          :server-mode #{:process :in-process}}]
       (when-not (contains? allowed (get opts k))
@@ -68,8 +69,8 @@
     opts))
 
 (defn cases
-  "Pair embedded Datalog with SQLite and remote Datalog with PostgreSQL.
-  SQL-only selections retain just their compatible API/mode combination."
+  "Pair each API with SQLite embedded or PostgreSQL remote. By default SQL
+  value indexes match the API: none for KV, all for Datalog."
   [opts]
   (let [expand (fn [k values] (if (= :all (get opts k)) values [(get opts k)]))
         selected
@@ -77,18 +78,23 @@
                    api (expand :api [:kv :datalog])
                    mode (expand :mode [:embedded :remote])
                    workload (expand :workload [:a :b :c :d :e :f])
-                   system (cond-> [:datalevin]
-                            (= api :datalog) (conj (if (= mode :embedded) :sqlite :postgres)))
+                   system [:datalevin (if (= mode :embedded) :sqlite :postgres)]
                    :when (or (= :all (:system opts)) (= system (:system opts)))
                    handles (if (and (= system :datalevin) (= api :datalog) (= mode :remote))
                              (if (= :both (:datalog-handles opts))
                                [:shared :independent] [(:datalog-handles opts)])
-                             [:shared])]
+                             [:shared])
+                   indexes (cond
+                             (= system :datalevin) [nil]
+                             (= :both (:sql-indexes opts)) [:none :all]
+                             :else [(sql/index-mode (assoc opts :api api))])]
                (cond-> (assoc opts :system system :api api :mode mode :workload workload
                                    :datalog-handles handles :client-counts nil :repetitions 1)
+                 (= system :datalevin) (dissoc :sql-indexes)
+                 indexes (assoc :sql-indexes indexes)
                  clients (assoc :threads clients :pool-size clients))))]
     (when (empty? selected)
-      (throw (ex-info "No compatible cases: SQLite needs embedded Datalog; PostgreSQL needs remote Datalog"
+      (throw (ex-info "No compatible cases: SQLite needs embedded mode; PostgreSQL needs remote mode"
                       (select-keys opts [:system :api :mode]))))
     (vec (mapcat (fn [trial]
                    (map #(assoc % :trial trial)
@@ -320,6 +326,9 @@
         _ (when (and (= :datalevin (:system opts)) (= :datalog (:api opts))
                      (= :remote (:mode opts)) (= :both (:datalog-handles opts)))
             (throw (ex-info "run-case! requires a single Datalog handle mode" {})))
+        opts (if (= :datalevin (:system opts))
+               (dissoc opts :sql-indexes)
+               (assoc opts :sql-indexes (sql/index-mode opts)))
         _ (cases opts)
         capacity (+ (:records opts) (:warmup opts) (:ops opts))
         cdf (when-not (= :uniform (:distribution opts))

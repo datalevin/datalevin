@@ -23,6 +23,7 @@
    [nil "--pool-size N" "Remote/SQL connection pool size (threads)" :parse-fn parse-long]
    [nil "--client-counts N,..." "Run matching worker/pool counts, e.g. 1,2,4,8,16" :parse-fn client-counts]
    [nil "--datalog-handles MODE" "Remote Datalog: shared, independent, both (shared)" :parse-fn choice]
+   [nil "--sql-indexes MODE" "SQL value indexes: matched, none, all, both (matched: KV none, Datalog all)" :parse-fn choice]
    [nil "--repetitions N" "Fresh trials, reversing case order each trial (1)" :parse-fn parse-long]
    [nil "--warmup-ms N" "Timed warmup; overrides --warmup" :parse-fn parse-long]
    [nil "--measurement-ms N" "Timed measurement; overrides --ops" :parse-fn parse-long]
@@ -63,7 +64,8 @@
          :ops-per-second {:median median :min (first rates) :max (peek rates)}}))
     (sort-by (comp pr-str key)
              (group-by #(select-keys (:configuration %)
-                                     [:system :api :mode :workload :threads :pool-size :datalog-handles])
+                                     [:system :api :mode :workload :threads :pool-size
+                                      :datalog-handles :sql-indexes])
                        results))))
 
 (defn run-benchmark
@@ -87,15 +89,17 @@
                            :processors (.availableProcessors (Runtime/getRuntime))}
              :results
              (vec
-               (for [{:keys [system api mode workload threads datalog-handles trial] :as case-opts} cases]
+               (for [{:keys [system api mode workload threads datalog-handles sql-indexes trial] :as case-opts} cases]
                  (let [result (runner/run-case! case-opts)
                        measured (:measured result)]
-                   (println (format "%s %s %s %s: %.1f ops/s, p99 %.1f us, %d records checked [trial %d, %d workers%s]"
+                   (println (format "%s %s %s %s: %.1f ops/s, p99 %.1f us, %d records checked [trial %d, %d workers%s%s]"
                                     (name system) (name api) (name mode) (str/upper-case (name workload))
                                     (:ops-per-second measured) (get-in measured [:latency-us :p99])
                                     (get-in result [:validation :records]) trial threads
                                     (if (and (= system :datalevin) (= api :datalog) (= mode :remote))
-                                      (str ", " (name datalog-handles) " handles") "")))
+                                      (str ", " (name datalog-handles) " handles") "")
+                                    (if sql-indexes
+                                      (str ", SQL indexes " (name sql-indexes)) "")))
                    result)))}]
         (assoc report :summary (summarize-trials (:results report)))))))
 

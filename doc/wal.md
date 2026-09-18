@@ -178,6 +178,18 @@ At a high level:
 WAL files are segmented and rolled by size/age limits; snapshot and floor metadata
 determine which older segments are safe to delete.
 
+Ordinary Datalog datom adds and retractions use a compact WAL operation: the
+entity ID and encoded attribute/value/giant pointer are stored once. Replay
+reconstructs both AVE and EAV mutations. Giant-value bodies, schema, metadata,
+custom data, and secondary-index jobs remain ordinary KV operations in the same
+transaction. The LMDB indexes and strict durability acknowledgment are unchanged.
+
+Compact datom operations use commit-payload format 2 (`DLTX`). The reader also
+accepts format 1, and transactions containing only ordinary KV operations still
+use format 1. Older binaries cannot read compact format 2 WAL; use an upgraded
+reader when recovering or transferring these WAL files. Physical replay rows
+remain available through the existing replay interface.
+
 ## Public WAL API
 
 The public WAL API is intentionally small:

@@ -12,13 +12,14 @@
   (:require
    [datalevin.bits :as b]
    [datalevin.constants :as c]
-   [datalevin.lmdb]
+   [datalevin.lmdb :as l]
    [datalevin.util :as u :refer [raise map+]])
   (:import
    [java.nio ByteBuffer ByteOrder BufferOverflowException]
    [java.nio.charset StandardCharsets]
    [java.util Arrays HashMap List Collection]
    [java.util.zip CRC32C]
+   [datalevin.lmdb DatomKVTxData]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
 (def ^:const record-header-size 14)
@@ -46,10 +47,13 @@
 (def ^:const op-kv-del (byte 0x11))
 (def ^:const op-kv-put-list (byte 0x16))
 (def ^:const op-kv-del-list (byte 0x17))
+(def ^:const op-datom-add (byte 0x18))
+(def ^:const op-datom-retract (byte 0x19))
 
 (def ^:const txlog-type-tuple-tag (byte 0x00))
 
-(def ^:private commit-payload-format-major 1)
+(def ^:private legacy-commit-payload-format-major 1)
+(def ^:private commit-payload-format-major 2)
 (def ^:private commit-payload-magic-bytes
   (byte-array [(byte 0x44) (byte 0x4c) (byte 0x54) (byte 0x58)])) ; DLTX
 (def ^:private commit-payload-lsn-offset 8)
@@ -819,6 +823,17 @@
    (write-kv-row! tl bf row nil))
   ([^ThreadLocal tl ^ByteBuffer bf row ^HashMap dbi-cache]
    (cond
+     (instance? DatomKVTxData row)
+     (let [^DatomKVTxData tx row
+           ^bytes avg (.-avg tx)]
+       ;; AVG already contains the encoded attribute, value and giant pointer.
+       ;; Blind-insert flags are deliberately omitted: replay is idempotent.
+       (-> bf
+           (bb-put-byte! tl (if (.-added? tx) op-datom-add op-datom-retract))
+           (bb-put-long! tl (.-e tx))
+           (bb-put-u16! tl (alength avg))
+           (bb-put-bytes! tl avg)))
+
      (instance? datalevin.lmdb.KVTxData row)
      (let [^datalevin.lmdb.KVTxData tx row]
        (write-kv-components! tl
@@ -931,9 +946,8 @@
            ranges))))
 
 (defn- decode-kv-row
-  [^ByteBuffer bf]
-  (let [opcode (int (bb-get-u8 bf {:field :opcode}))
-        dbi-len (bb-get-u16 bf {:field :dbi-len})
+  [^ByteBuffer bf opcode]
+  (let [dbi-len (bb-get-u16 bf {:field :dbi-len})
         dbi-bs (bb-get-bytes bf dbi-len {:field :dbi-bytes})
         dbi (String. ^bytes dbi-bs StandardCharsets/UTF_8)
         k-type (bb-read-type bf)
@@ -969,6 +983,38 @@
              {:type :txlog/corrupt
               :opcode opcode}))))
 
+(defn compact-replay-rows
+  "Reconstitute compact datoms from adjacent physical AVE/EAV replay rows.
+  Only exact, flag-free inverse pairs qualify; other KV rows retain their order."
+  ^FastList [rows]
+  (let [rows (vec rows)
+        n (count rows)
+        out (FastList. n)]
+    (loop [i 0]
+      (when (< i n)
+        (let [[op dbi avg value kt vt flags :as row] (nth rows i)
+              [op2 dbi2 e value2 kt2 vt2 flags2 :as row2]
+              (when (< (inc i) n) (nth rows (inc i)))
+              added? (= op :put)
+              pair? (and (or added? (= op :del-list))
+                         (= op op2) (= dbi c/ave) (= dbi2 c/eav)
+                         (= kt :raw) (= vt :id) (= kt2 :id) (= vt2 :raw)
+                         (= 6 (count row)) (= 6 (count row2))
+                         (nil? flags) (nil? flags2)
+                         (bytes? avg) (integer? e)
+                         (if added?
+                           (= value e)
+                           (and (vector? value) (= value [e])
+                                (vector? value2) (= 1 (count value2))))
+                         (let [other (if added? value2 (first value2))]
+                           (and (bytes? other)
+                                (Arrays/equals ^bytes avg ^bytes other))))]
+          (if pair?
+            (do (.add out (DatomKVTxData. (long e) avg added? false))
+                (recur (+ i 2)))
+            (do (.add out row) (recur (inc i)))))))
+    out))
+
 (defn encode-commit-row-payload
   "Encode canonical txn-log payload as raw binary bytes."
   ([lsn tx-time rows]
@@ -976,6 +1022,9 @@
   ([lsn tx-time rows {:keys [ha-term]}]
    (let [^FastList rowsv (ensure-fast-list rows)
          row-count (long (.size rowsv))
+         major (if (l/datom-kv-txs? rowsv)
+                 commit-payload-format-major
+                 legacy-commit-payload-format-major)
          parallel-rows? (use-parallel-row-encoding? row-count)
          ha-term (some-> ha-term long)
          flags (int (if (some? ha-term)
@@ -988,7 +1037,7 @@
          _ (when dbi-cache (.clear dbi-cache))
          ^ByteBuffer bf1 (-> bf0
                              (bb-put-bytes! tl commit-payload-magic-bytes)
-                             (bb-put-byte! tl commit-payload-format-major)
+                             (bb-put-byte! tl major)
                              (bb-put-byte! tl flags)
                              (bb-put-u16! tl 0)
                              (bb-put-long! tl (long lsn))
@@ -1044,7 +1093,8 @@
     (when-not (Arrays/equals magic ^bytes commit-payload-magic-bytes)
       (raise "Invalid txn-log payload magic"
              {:type :txlog/corrupt}))
-    (when-not (= major commit-payload-format-major)
+    (when-not (or (= major legacy-commit-payload-format-major)
+                  (= major commit-payload-format-major))
       (raise "Unsupported txn-log payload format major"
              {:type :txlog/corrupt
               :major major
@@ -1053,7 +1103,8 @@
       (raise "Txn-log payload op count overflow"
              {:type :txlog/corrupt
               :op-count op-count}))
-    {:lsn lsn
+    {:major major
+     :lsn lsn
      :ts tx-time
      :ha-term (some-> ha-term long)
      :op-count op-count}))
@@ -1073,12 +1124,29 @@
   "Decode raw binary txn-log payload bytes."
   [^bytes body]
   (let [bf (ByteBuffer/wrap body)
-        {:keys [lsn ts ha-term op-count]}
+        {:keys [major lsn ts ha-term op-count]}
         (decode-commit-row-payload-prefix bf)
         ops (loop [i (int 0)
                    acc []]
               (if (< i ^long op-count)
-                (recur (unchecked-inc-int i) (conj acc (decode-kv-row bf)))
+                (let [opcode (int (bb-get-u8 bf {:field :opcode}))]
+                  (if (and (= major commit-payload-format-major)
+                           (or (= opcode op-datom-add)
+                               (= opcode op-datom-retract)))
+                    (let [e (bb-get-long bf {:field :entity})
+                          n (bb-get-u16 bf {:field :avg-len})
+                          avg (bb-get-bytes bf n {:field :avg-bytes})
+                          added? (= opcode op-datom-add)]
+                      ;; Preserve the physical-row API used by recovery, HA,
+                      ;; and open-tx-log, including the original AVE/EAV order.
+                      (recur (unchecked-inc-int i)
+                             (if added?
+                               (conj acc [:put c/ave avg e :raw :id]
+                                     [:put c/eav e avg :id :raw])
+                               (conj acc [:del-list c/ave avg [e] :raw :id]
+                                     [:del-list c/eav e [avg] :id :raw]))))
+                    (recur (unchecked-inc-int i)
+                           (conj acc (decode-kv-row bf opcode)))))
                 acc))]
     (cond-> {:lsn lsn
              :ts ts

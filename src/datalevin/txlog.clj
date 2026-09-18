@@ -1090,7 +1090,7 @@
         near-roll? (near-roll-append? state offset)
         ^bytes body (:body prepared-payload)
         _ (patch-commit-row-payload-header! body lsn now)
-        append-res (append-record-at! ch offset body)
+        append-res (tseg/write-record-at! ch offset body)
         next-offset (+ offset (long (:size append-res)))]
     (when segment-offset
       (vreset! segment-offset next-offset))

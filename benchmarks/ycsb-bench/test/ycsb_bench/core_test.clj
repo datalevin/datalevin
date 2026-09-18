@@ -1,5 +1,6 @@
 (ns ycsb-bench.core-test
   (:require [clojure.test :refer [deftest is testing]]
+            [datalevin.core :as d]
             [datalevin-bench.host :as host]
             [ycsb-bench.core :as core]
             [ycsb-bench.runner :as runner]
@@ -97,7 +98,7 @@
   (doseq [bad [{:ops 0} {:warmup -1} {:threads 0} {:pool-size -1}
                {:records nil} {:field-length 0} {:seed 1.5}
                {:distribution :random} {:durability :off}
-               {:api :sql} {:records Integer/MAX_VALUE}]]
+               {:api :sql} {:records Integer/MAX_VALUE} {:sql-indexes :primary}]]
     (is (thrown? clojure.lang.ExceptionInfo (runner/options bad)) (str bad)))
   (is (= 3 (:pool-size (runner/options {:threads 3}))))
   (is (= 0 (:warmup (runner/options {:warmup 0})))))
@@ -131,7 +132,7 @@
 
 (defn check-adapter! [db]
   (let [values ["aaaa" "bbbb" "cccc"]]
-    (store/put-records! db (mapv #(vector % values) (range 3)))
+    (store/put-records! db (mapv #(vector % values) [2 0 1]))
     (is (= 3 (store/record-count db)))
     (is (= values (store/read-record db 1)))
     (store/update-field! db 0 1 "zzzz")
@@ -139,6 +140,8 @@
     (concurrent-modifications! db)
     (is (= ["uaaa" "zzzz" "cccc"] (store/read-record db 0))
         "Atomic RMW must not lose concurrent modifications")
+    (is (= [[0 ["uaaa" "zzzz" "cccc"]]] (store/scan-records db 0 1)))
+    (is (empty? (store/scan-records db 0 0)))
     (is (= [[1 values]] (store/scan-records db 1 1)))
     (is (= [[1 values] [2 values]] (store/scan-records db 1 10)))
     (store/put-records! db [[3 values]])
@@ -151,6 +154,37 @@
     (store/update-field! db 1 2 "cccc"))
   {})
 
+(defn- check-kv-record-layout! [db]
+  (let [handle (:handle (store/for-worker db 0))]
+    (is (= {:layout :record-value :key-type :long :value-type :data}
+           (select-keys (store/storage-info db) [:layout :key-type :value-type])))
+    (is (= 4 (d/entries handle "records")))
+    (is (= [0 1 2 3] (mapv first (d/get-range handle "records" [:all] :long :data))))
+    (is (= ["uaaa" "zzzz" "cccc"] (d/get-value handle "records" 0 :long :data)))
+    (store/put-records! db [[7 ["same" "same" "same"]]])
+    (is (= [[7 ["same" "same" "same"]]] (store/scan-records db 4 10)))
+    (let [executor (Executors/newFixedThreadPool 2)]
+      (try
+        (let [tasks (.invokeAll
+                      executor
+                      (mapv (fn [field]
+                              ^Callable
+                              (fn []
+                                (dotimes [step 20]
+                                  (store/update-field! db 7 field
+                                                       (format "%04d" (+ (* field 100) step))))))
+                            [0 1]))]
+          (doseq [^Future task tasks] (.get task)))
+        (finally
+          (.shutdownNow executor)
+          (.awaitTermination executor 30 TimeUnit/SECONDS))))
+    (is (= ["0019" "0119" "same"] (store/read-record db 7))
+        "Replacing a record must preserve concurrent writes to other fields")
+    (is (= ["0019" "0119" "same"] (d/get-value handle "records" 7 :long :data)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Missing KV record"
+                         (store/update-field! db 99 0 "oops")))
+    (is (= 5 (store/record-count db) (d/entries handle "records")))))
+
 (deftest adapter-semantics-test
   (doseq [api [:kv :datalog], mode [:embedded :remote]]
     (testing (str api " " mode)
@@ -158,8 +192,24 @@
         (assoc small-options :api api :mode mode)
         (fn [db]
           (when (= api :datalog)
-            (is (= :prepare-q (:scan-api (store/storage-info db)))))
-          (check-adapter! db))))))
+            (is (= :prepare-q (:scan-api (store/storage-info db))))
+            (is (= :db/id (:record-key (store/storage-info db)))))
+          (check-adapter! db)
+          (when (= api :kv)
+            (check-kv-record-layout! db))
+          (when (= api :datalog)
+            (let [conn (:conn (store/for-worker db 0))]
+              (is (= {:db/id 0 :ycsb/field0 "uaaa" :ycsb/field1 "zzzz"
+                      :ycsb/field2 "cccc"}
+                     (d/pull @conn '[*] 0))
+                  "Record keys are explicit entity IDs, including zero")
+              (is (= #{[0] [1] [2] [3]}
+                     (d/q '[:find ?e :where [?e :ycsb/field0]] @conn)))
+              (is (not (contains? (d/schema conn) :ycsb/id)))
+              (store/put-records! db [[7 ["dddd" "eeee" "ffff"]]])
+              (is (= [[7 ["dddd" "eeee" "ffff"]]] (store/scan-records db 4 10)))
+              (is (= 5 (store/record-count db)))))
+          {})))))
 
 (deftest comparison-selection-test
   (let [opts (runner/options {:system :all :api :datalog :workload :all})
@@ -168,7 +218,7 @@
     (is (= #{[:datalevin :embedded] [:sqlite :embedded]
              [:datalevin :remote] [:postgres :remote]}
            (set (map (juxt :system :mode) cases))))
-    (is (= 36 (count (runner/cases (assoc opts :api :all)))))
+    (is (= 48 (count (runner/cases (assoc opts :api :all)))))
     (is (= 6 (count (runner/cases (assoc opts :system :postgres))))))
   (is (thrown? clojure.lang.ExceptionInfo
                (runner/cases (runner/options {:system :postgres :mode :embedded})))))

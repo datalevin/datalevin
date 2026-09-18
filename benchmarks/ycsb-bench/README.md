@@ -1,8 +1,8 @@
 # YCSB-style KV and Datalog benchmark
 
 Runs the A–F operation mixes against both Datalevin APIs, either embedded or
-through a managed loopback server. It also compares embedded Datalog with
-SQLite and remote Datalog with PostgreSQL. This is a standalone Clojure harness using
+through a managed loopback server. It also compares both embedded APIs with
+SQLite and both remote APIs with PostgreSQL. This is a standalone Clojure harness using
 the checkout at `../..`; it adds no benchmark code or dependencies to production.
 It is inspired by the [YCSB core workloads](https://github.com/brianfrankcooper/YCSB/wiki/Core-Workloads),
 not an official YCSB binding or a directly comparable YCSB score.
@@ -41,18 +41,43 @@ other platforms perform no process control.
 
 ## SQL comparisons
 
-`--system all` runs each selected Datalog case followed by its SQL counterpart:
+`--system all` runs each selected Datalevin case followed by its SQL counterpart:
 
 | Mode | Pair |
 | --- | --- |
-| Embedded | Datalevin Datalog and SQLite |
-| Remote | Datalevin Datalog and PostgreSQL |
+| Embedded | Datalevin KV or Datalog and SQLite |
+| Remote | Datalevin KV or Datalog and PostgreSQL |
+
+The default `--sql-indexes matched` aligns SQL value indexes with the selected
+Datalevin API:
+
+| API | SQL value-index condition | Capabilities compared |
+| --- | --- | --- |
+| KV | `none` | Primary-key reads, writes, and scans |
+| Datalog | `all` | Primary-key access plus indexed lookup on every value field |
+
+The primary key remains indexed in both conditions. `--sql-indexes none` or
+`all` overrides the match; `--sql-indexes both` runs both SQL conditions for each
+selected API without duplicating Datalevin runs. Each SQL condition loads a fresh database.
+Console output, per-case configuration, storage settings, and trial summaries
+label the condition; repetitions never combine indexed and unindexed results.
+For SQL results, `:api` identifies the Datalevin API used for the comparison.
 
 ```sh
 # Embedded Datalog versus SQLite, all six workloads.
 clojure -M:jvm:bench --system all --api datalog --mode embedded \
   --workload all --records 100000 --ops 100000 --warmup 20000 --threads 8 \
   --output /tmp/datalevin-ycsb-sqlite.edn
+
+# Compare both APIs with their matching SQLite index conditions.
+clojure -M:jvm:bench --system all --api all --mode embedded \
+  --workload all --records 100000 --ops 100000 --warmup 20000 --threads 8 \
+  --output /tmp/datalevin-ycsb-sqlite-matched.edn
+
+# Run SQLite alone with and without value indexes.
+clojure -M:jvm:bench --system sqlite --api datalog --mode embedded \
+  --workload all --sql-indexes both \
+  --output /tmp/datalevin-ycsb-sqlite-indexes.edn
 
 # Remote Datalog versus PostgreSQL; use a disposable PostgreSQL database.
 export YCSB_PG_URL=jdbc:postgresql://127.0.0.1:5432/ycsb
@@ -70,8 +95,9 @@ clojure -M:jvm:bench --system all --api datalog --mode all --workload all \
 
 The default `--system datalevin` preserves Datalevin-only runs. `--system sqlite`
 and `--system postgres` run just the corresponding SQL cases, allowing separate
-process invocations and alternate engine ordering. KV cases remain Datalevin
-only; `--system all --api all --mode all --workload all` runs 36 cases.
+process invocations and alternate engine ordering.
+`--system all --api all --mode all --workload all` runs 48 cases with the default
+matched index conditions.
 
 PostgreSQL must already be running. `--pg-url` and `--pg-user` override
 `YCSB_PG_URL` and `YCSB_PG_USER`; the URL defaults to
@@ -84,11 +110,23 @@ it and records its name. JDBC URLs and usernames are omitted from reports.
 SQLite uses a fresh temporary file with the same retention rules as Datalevin.
 
 Both SQL adapters store one row per record: an integer primary key and one
-`TEXT NOT NULL` column per field. Only the primary key is indexed. This compares
-the same logical operations; it includes Datalog's additional index maintenance
-costs rather than giving SQL unused secondary indexes. Point reads select all
-fields, updates change one column, and scans use the same bounded ID interval
-with `ORDER BY id`. Initial batches and measured inserts are transactional.
+`TEXT NOT NULL` column per field. Inserts explicitly supply the benchmark's
+numeric record key. In the `all` condition, both SQLite and PostgreSQL maintain
+a separate non-unique index on every value column (`f0` through `f9` by default),
+providing the same single-field value lookup capability as Datalog's attribute
+indexes. These indexes are created before loading, so load, warmup, and measured
+writes all include their maintenance. The `none` condition has only the primary
+key index and matches KV's access capabilities. Reports record the resolved
+condition under `:configuration :sql-indexes` and
+`:storage :configuration :sql-indexes`, with index names and columns under
+`:storage :configuration :secondary-indexes` (empty for `none`). The comparison
+aligns lookup capabilities and logical operations; physical index layouts still
+differ. Published results predating these conditions indexed only the SQL
+primary key, including the earlier Datalog comparisons.
+
+Point reads select all fields, updates change one column, and scans use the
+same bounded ID interval with `ORDER BY id`. Initial batches and measured
+inserts are transactional.
 F performs a full-record read followed by the same character change inside one
 transaction: SQLite uses `BEGIN IMMEDIATE`, and PostgreSQL uses
 `SELECT ... FOR UPDATE` at `READ COMMITTED` isolation.
@@ -152,7 +190,7 @@ client and the normal dedicated transaction connection. `independent` creates
 one handle and one authenticated, single-connection client per worker; that
 connection also handles its transactions. Workers keep their assigned handles
 throughout each phase. `both` runs and labels both arrangements, with one SQL
-baseline per client count. Independent mode requires pool size to equal worker
+baseline per client count and selected SQL index condition. Independent mode requires pool size to equal worker
 count. This option applies to remote Datalevin Datalog only.
 
 One trial is the default. Optional repetitions reload fresh data and start a
@@ -181,9 +219,10 @@ included in the storage report. Format version 3 adds run options and trial
 summaries to the complete EDN report.
 
 `clojure -M:jvm:test` always tests SQLite. Set `YCSB_PG_URL` (plus credentials
-if needed) to include PostgreSQL integration checks. They check field
-preservation, concurrent atomic modifications, failed-batch rollback, and both
-durability profiles. Without the URL, the test runner prints an explicit skip.
+if needed) to include PostgreSQL integration checks. They check actual index
+definitions, field preservation, concurrent atomic modifications, failed-batch
+rollback, both value-index conditions, and both durability profiles. Without
+the URL, the test runner prints an explicit skip.
 
 ## Database lifecycle and defaults
 
@@ -232,16 +271,26 @@ The logical schema is identical for both APIs: a sequential numeric record ID
 and `--field-count` strings of `--field-length` ASCII bytes. Defaults are ten
 fields of 100 bytes, excluding keys and database overhead.
 
-* **KV:** one `:long` key per field, `record-id * field-count + field-index`,
-  with a `:string` value in the `records` DBI. A logical read is one bounded
-  range read, and a blind single-field update is one put. This avoids requiring
-  a read to preserve other fields. There are ten physical entries per default
-  logical record, rather than a single serialized map.
-* **Datalog:** one entity per record, a unique long `:ycsb/id`, and string
-  attributes `:ycsb/field0` through `:ycsb/field9` by default. Point reads use
-  `pull`; updates use `transact!`. Scans execute a prepared bounded ID-range
-  Datalog query with pull and sort its results by ID. Datalog's indexes and entity overhead
-  are part of the measurement. Background sampling is disabled.
+* **KV:** one `:long` key per record, equal to the numeric record ID, with all
+  field strings stored together as a vector encoded with `:data` in the
+  `records` DBI. A point read fetches one value. A field update reads the current
+  vector, replaces that field, and writes the whole vector inside one write
+  transaction, preserving concurrent changes to other fields. F uses the same
+  transaction boundary and derives the replacement from the selected field's
+  current value. Scans range over record IDs, and each physical entry counts as
+  one logical record. Reports identify this layout as `:record-value`.
+  Published results labeled `:field-keys` used the earlier per-field layout.
+* **Datalog:** one entity per record with an explicitly assigned `:db/id` equal
+  to the benchmark's numeric record key, starting at zero, and string attributes
+  `:ycsb/field0` through `:ycsb/field9` by default. There is no separate
+  `:ycsb/id` attribute or identity lookup. Point reads use `pull`; updates use
+  `transact!`, both with the entity ID. Scans execute a prepared Datalog query
+  that binds the requested dense ID interval with `range`, checks the mandatory
+  first field, pulls the records, and sorts the results by ID. Record counts
+  also use the mandatory first field. Reports identify the key with
+  `:storage :record-key :db/id`. Datalog's field indexes and entity overhead
+  are part of the measurement. Background sampling is disabled. Published
+  results predating this change used the separate `:ycsb/id` identity attribute.
 * **Durability:** WAL is enabled with `--durability strict` by default for both
   APIs and modes. `--durability relaxed` selects a separately labeled profile.
   The initial LMDB map size is 4096 MiB; normal automatic growth remains enabled.
@@ -317,5 +366,6 @@ using separate CLI invocations to reduce JVM/cache/order effects. Loading and
 warmup both touch the data, so this is not a cold-cache benchmark.
 
 The [September 15 comparison](results/2026-09-15-current/README.md) contains
-the current 36-case A–F matrix and sustained remote read controls, with frozen
-sources, validation results, and historical comparisons.
+the earlier 36-case A–F matrix and sustained remote read controls, with frozen
+sources, validation results, and historical comparisons. It predates explicit
+Datalog entity IDs and the matched SQL value-index conditions.

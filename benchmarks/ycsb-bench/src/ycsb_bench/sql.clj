@@ -12,6 +12,19 @@
 
 (set! *warn-on-reflection* true)
 
+(defn index-mode
+  "Resolve the SQL value-index condition for one comparison case."
+  [{:keys [api sql-indexes]}]
+  (case (or sql-indexes :matched)
+    :matched (case api
+               :kv :none
+               :datalog :all
+               (throw (ex-info "SQL index matching requires one API" {:api api})))
+    :none :none
+    :all :all
+    (throw (ex-info "SQL store requires one index condition: none or all"
+                    {:sql-indexes sql-indexes}))))
+
 (defn- execute-sql! [^Connection conn ^String sql]
   (with-open [stmt (.createStatement conn)] (.execute stmt sql)))
 
@@ -217,7 +230,8 @@
 (defn with-store
   "Own a fresh SQLite file or PostgreSQL schema for one benchmark case."
   [{:keys [system field-count pool-size timeout-ms keep-db?] :as opts} f]
-  (let [root (when (= system :sqlite)
+  (let [sql-indexes (index-mode opts)
+        root (when (= system :sqlite)
                (str (Files/createTempDirectory "datalevin-ycsb-sqlite-"
                                                (make-array FileAttribute 0))))
         schema (when (= system :postgres)
@@ -231,7 +245,12 @@
                            (configure! conn opts)
                            conn))
             ^Connection first-conn (open!)
-            table (if schema (str schema ".records") "records")]
+            table (if schema (str schema ".records") "records")
+            secondary-indexes (mapv (fn [field]
+                                      (let [column (str "f" field)]
+                                        {:name (str "records_" column "_idx")
+                                         :column column}))
+                                    (if (= sql-indexes :all) (range field-count) []))]
         (when schema
           (execute-sql! first-conn (str "CREATE SCHEMA " schema))
           (reset! created? true))
@@ -239,6 +258,9 @@
                       (str "CREATE TABLE " table " (id "
                            (if (= system :sqlite) "INTEGER" "BIGINT") " PRIMARY KEY,"
                            (str/join "," (map #(str "f" % " TEXT NOT NULL") (range field-count))) ")"))
+        (doseq [{:keys [name column]} secondary-indexes]
+          (execute-sql! first-conn
+                        (str "CREATE INDEX " name " ON " table " (" column ")")))
         (dotimes [_ (dec (long pool-size))] (open!))
         (let [pool (ArrayBlockingQueue. (int pool-size))
               metadata (.getMetaData first-conn)
@@ -247,7 +269,10 @@
                                       :transaction-connections :same-pool}
                     :engine system :engine-version (.getDatabaseProductVersion metadata)
                     :jdbc-driver-version (.getDriverVersion metadata)
-                    :pool-size pool-size :configuration (configure! first-conn opts)}
+                    :pool-size pool-size
+                    :configuration (assoc (configure! first-conn opts)
+                                          :sql-indexes sql-indexes
+                                          :secondary-indexes secondary-indexes)}
               info (cond-> info
                      (= system :postgres)
                      (assoc :server

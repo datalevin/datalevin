@@ -16,6 +16,7 @@
                                   write-snapshot-meta!]]
    [datalevin.lmdb :as l]
    [datalevin.txlog :as txlog]
+   [datalevin.txlog.codec :as tcodec]
    [datalevin.util :as u :refer [raise]])
   (:import
    [datalevin.binding.cpp Rtx]
@@ -1916,7 +1917,7 @@
       (when dbi-name
         (raise "Internal datom transaction cannot use an explicit DBI"
                {:dbi-name dbi-name}))
-      (l/add-datom-kv-txs! out t))
+      (.add out t))
     (let [tx (if (instance? datalevin.lmdb.KVTxData t)
                t
                (if dbi-name
@@ -1935,22 +1936,22 @@
                 (loop [i 0]
                   (if (< i n)
                     (let [x (.get lst i)]
-                      (if (instance? datalevin.lmdb.KVTxData x)
+                      (cond
+                        (instance? DatomKVTxData x)
+                        (if (nil? dbi-name) (recur (inc i)) false)
+
+                        (instance? datalevin.lmdb.KVTxData x)
                         (let [^datalevin.lmdb.KVTxData tx x]
                           (if (or (nil? dbi-name) (some? (.-dbi-name tx)))
                             (recur (inc i))
                             false))
-                        false))
+                        :else false))
                     true)))))]
     (if (canonical-kvtx-list? txs)
       txs
       (let [^FastList out
             (if (instance? java.util.Collection txs)
-              ;; An internal datom becomes one canonical AVE row and one EAV
-              ;; row in the transaction log. Size for that representation so
-              ;; ingestion batches do not repeatedly grow the backing array.
-              (let [n (.size ^java.util.Collection txs)]
-                (FastList. (int (if (l/datom-kv-txs? txs) (* 2 n) n))))
+              (FastList. (.size ^java.util.Collection txs))
               (FastList.))]
         (if (instance? java.util.List txs)
           (let [^java.util.List tx-list txs
@@ -2322,7 +2323,8 @@
                        append-res (binding [txlog/*commit-payload-ha-term*
                                             (some-> (:ha-term record) long)]
                                     (txlog/append-durable! state
-                                                           record-rows
+                                                           (tcodec/compact-replay-rows
+                                                            record-rows)
                                                            txlog-append-hooks))]
                    (when-not (= record-lsn (long (:lsn append-res)))
                      (raise "Follower replay appended unexpected txn-log LSN"

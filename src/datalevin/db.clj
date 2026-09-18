@@ -52,6 +52,7 @@
    [datalevin.utl LRUCache]
    [java.util Comparator]
    [java.util.concurrent ConcurrentHashMap]
+   [java.util.function Function]
    [org.eclipse.collections.impl.list.mutable FastList]
    [org.eclipse.collections.impl.set.sorted.mutable TreeSortedSet]))
 
@@ -158,6 +159,12 @@
 (defonce ^:private remote-cache-check-ms (ConcurrentHashMap.))
 (defonce ^:private remote-cache-max-tx (ConcurrentHashMap.))
 
+(declare cache-key-dependencies)
+
+(def ^:private cache-dependencies
+  (reify Function
+    (apply [_ k] (cache-key-dependencies k))))
+
 (defn- mark-remote-cache-check!
   [store]
   (when (remote-store? store)
@@ -198,7 +205,7 @@
   ([store target remote-max-tx]
    (let [target (long (or target 0))
          old    ^LRUCache (.get ^ConcurrentHashMap caches (dir store))
-         cache  (LRUCache. (:cache-limit (opts store)) target)]
+         cache  (LRUCache. (:cache-limit (opts store)) target cache-dependencies)]
      ;; Schema changes can replace the cache inside an explicit transaction.
      ;; Keep it disabled until that transaction exits, so staged reads never
      ;; enter the shared cache (including when the transaction aborts).
@@ -364,6 +371,69 @@
           (contains? attrs av)))
       attrs-v)))
 
+(defn- pattern-cache-dependencies
+  [e a v]
+  (cond
+    (unresolved-pattern? e v) [::all]
+    (some? e) [[::entity e]]
+    (some? a) [[::attribute a]]
+    :else [::all]))
+
+(defn- cache-key-dependencies
+  "Coarse candidate buckets, computed once when a key enters the LRU. Exact
+  invalidation still checks the key. Fixed-entity native ranges use the entity
+  index locally; remote range invalidation and broader ranges stay conservative."
+  [k]
+  (if (and (vector? k) (keyword? (first k)))
+    (case (first k)
+      (:search :search-tuples :first :count)
+      (let [[_ e a v] k] (pattern-cache-dependencies e a v))
+
+      (:populated? :datoms :seek :rseek)
+      (let [[_ index c1 c2 c3] k]
+        (if-some [[e a v] (index-components->pattern index c1 c2 c3)]
+          (pattern-cache-dependencies e a v)
+          [::all]))
+
+      :e-datoms
+      (pattern-cache-dependencies (get k 1) nil nil)
+
+      :av-datoms
+      (pattern-cache-dependencies nil (get k 1) (get k 2))
+
+      :range-datoms
+      (let [[_ index low high] k]
+        (if (and (#{:eav :ave} index)
+                 (instance? Datom low) (instance? Datom high)
+                 (= (.-e ^Datom low) (.-e ^Datom high)))
+          [::native-range [::entity (.-e ^Datom low)]]
+          [::all]))
+
+      (:init-tuples :sample-init-tuples :e-sample :default-ratio :cardinality)
+      [[::attribute (get k 1)]]
+
+      (:val-eq-scan-e :val-eq-filter-e)
+      [[::attribute (get k 3)]]
+
+      :eav-scan-v
+      (mapv (fn [av] [::attribute (if (sequential? av) (first av) av)])
+            (get k 3))
+
+      :query-result
+      (let [deps (get k 1)]
+        (if (and (map? deps) (not (:all? deps)))
+          (mapv (fn [a] [::attribute a]) (:attrs deps))
+          [::all]))
+
+      [::all])
+    [::all]))
+
+(defn- cache-invalidation-dependencies
+  [{:keys [eids attrs]} local?]
+  (into (if local? [::all] [::all ::native-range])
+        (concat (map (fn [e] [::entity e]) eids)
+                (map (fn [a] [::attribute a]) attrs))))
+
 (defn- tx-affects-cache-key?
   [touches k]
   (if (and (vector? k) (keyword? (first k)))
@@ -485,7 +555,8 @@
   [store ^LRUCache cache touches tx-data]
   (let [ranges (delay (range-cache/context
                        (when (instance? Store store) (schema store)) tx-data))]
-    (doseq [k (.keys cache)
+    (doseq [k (.candidateKeys cache (cache-invalidation-dependencies
+                                     touches (instance? Store store)))
             :when (if (and (instance? Store store) (range-cache/range-key? k))
                     (range-cache/affected? @ranges k)
                     (tx-affects-cache-key? touches k))]

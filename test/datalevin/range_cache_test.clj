@@ -100,6 +100,25 @@
           (check-write! conn readers txs)))
       (finally (d/close conn)))))
 
+(deftest fixed-entity-ranges-preserve-overlap-invalidation
+  (doseq [wal? [false true]]
+    (let [conn (d/create-conn nil {:a {:db/valueType :db.type/long}}
+                             {:kv-opts {:inmemory? true :wal? wal?}})]
+      (try
+        (d/update-schema conn {:b {:db/valueType :db.type/long}})
+        (d/update-schema conn {:outside {:db/valueType :db.type/long}})
+        (d/transact! conn [{:db/id 1 :a 10 :b 20} {:db/id 2 :a 30 :b 40}])
+        (let [readers (vec (for [index [:eav :ave], e [1 2]]
+                             (range-reader index (datom/datom e :a nil)
+                                           (datom/datom e :b nil))))]
+          (doseq [txs [[[:db/add 3 :a 50]]
+                       [[:db/add 1 :outside 60]]
+                       [[:db/add 1 :a 11]]
+                       [[:db/add 2 :b 41]]
+                       [[:db/retract 1 :a 11]]]]
+            (check-write! conn readers txs)))
+        (finally (d/close conn))))))
+
 (deftest range-comparisons-follow-native-value-encoding
   (doseq [[props values]
           [[{:db/valueType :db.type/string} ["a" "z" "\uE000" "\uD800\uDC00"]]

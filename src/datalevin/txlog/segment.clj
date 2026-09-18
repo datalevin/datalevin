@@ -67,6 +67,25 @@
      (get [_]
        (make-array ByteBuffer 2)))))
 
+(def ^:private ^:const record-buffer-initial-cap 8192)
+(def ^:private ^:const record-buffer-max-cap 65536)
+
+(def ^:private ^ThreadLocal tl-record-buffer
+  (ThreadLocal/withInitial
+    (reify java.util.function.Supplier
+      (get [_] (ByteBuffer/allocateDirect record-buffer-initial-cap)))))
+
+(defn- record-buffer
+  ^ByteBuffer [^long size]
+  (let [^ByteBuffer buffer (.get tl-record-buffer)]
+    (if (<= size (.capacity buffer))
+      buffer
+      (let [capacity (loop [capacity (.capacity buffer)]
+                       (if (< capacity size) (recur (* 2 capacity)) capacity))
+            buffer (ByteBuffer/allocateDirect capacity)]
+        (.set tl-record-buffer buffer)
+        buffer))))
+
 (def ^:private scan-segment-concurrent-shrink-retries 4)
 
 (defn segment-file-name [segment-id] (format "segment-%016d.wal" segment-id))
@@ -539,6 +558,37 @@
   ([^FileChannel ch ^bytes body opts]
    (let [offset (.size ch)]
      (append-record-at! ch offset body opts))))
+
+(defn write-record-at!
+  "Write a record using the WAL's tracked offset. The caller serializes appends
+  and tracks the end offset independently of the channel position. Records up
+  to 64 KiB use a reusable direct buffer and positioned writes, avoiding a seek
+  and gathering-I/O heap-buffer adapters. Larger records use the gathered path
+  so a large transaction does not grow the retained direct buffer."
+  ([^FileChannel ch ^long offset ^bytes body]
+   (write-record-at! ch offset body {}))
+  ([^FileChannel ch ^long offset ^bytes body
+    {:keys [compressed?] :or {compressed? false} :as opts}]
+   (let [body-len (codec/checked-record-body-len body)
+         total-size (+ codec/record-header-size (long body-len))]
+     (if (<= total-size record-buffer-max-cap)
+       (let [checksum (codec/current-record-checksum body-len (boolean compressed?) body)
+             ^ByteBuffer buffer (codec/write-record-header!
+                                  (record-buffer total-size) body-len
+                                  (boolean compressed?) checksum)]
+         (.limit buffer (int total-size))
+         (.position buffer codec/record-header-size)
+         (.put buffer body)
+         (.flip buffer)
+         (loop [position offset]
+           (when (.hasRemaining buffer)
+             (let [n (.write ch buffer position)]
+               (when-not (pos? n)
+                 (raise "Unable to progress while writing txn-log data"
+                        {:offset position :remaining (.remaining buffer)}))
+               (recur (+ position n)))))
+         {:offset offset :size total-size :checksum checksum})
+       (append-record-at! ch offset body opts)))))
 
 (defn force-segment!
   [_state ^FileChannel ch sync-mode]

@@ -63,6 +63,7 @@
     (let [output (with-out-str (core/-main "--help"))]
       (is (str/includes? output "YCSB-style Datalevin benchmark"))
       (is (str/includes? output "--system"))
+      (is (str/includes? output "--sql-indexes"))
       (is (str/includes? output "--output")))
     (with-report-path
       (fn [file]
@@ -98,6 +99,24 @@
     (check-report! report [:sqlite])
     (is (str/includes? output "sqlite datalog embedded C:"))
     (is (not (str/includes? output "Report:")))))
+
+(deftest cli-sql-index-conditions-report-test
+  (with-report-path
+    (fn [file]
+      (let [output (with-out-str
+                     (apply core/-main
+                            (concat small-args
+                                    ["--system" "sqlite" "--sql-indexes" "both"
+                                     "--output" (str file)])))
+            report (edn/read-string (slurp file))
+            results (:results report)]
+        (check-report! report [:sqlite :sqlite])
+        (is (= [:none :all] (mapv #(get-in % [:configuration :sql-indexes]) results)))
+        (is (= [:none :all] (mapv #(get-in % [:storage :configuration :sql-indexes]) results)))
+        (is (= [0 2] (mapv #(count (get-in % [:storage :configuration :secondary-indexes])) results)))
+        (is (= #{:none :all} (set (map #(get-in % [:configuration :sql-indexes]) (:summary report)))))
+        (is (str/includes? output "SQL indexes none"))
+        (is (str/includes? output "SQL indexes all"))))))
 
 (deftest failed-case-does-not-publish-report-test
   (doseq [existing? [false true]]

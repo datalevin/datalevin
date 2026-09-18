@@ -46,6 +46,39 @@
     (is (= {:median 20 :min 10 :max 90} (:ops-per-second (:shared summaries))))
     (is (= {:median 4.0 :min 3 :max 5} (:ops-per-second (:independent summaries))))))
 
+(deftest sql-index-condition-selection-test
+  (let [opts (runner/options {:system :all :api :all :mode :all :workload :a})
+        cases (runner/cases opts)
+        sql-cases (remove #(= :datalevin (:system %)) cases)]
+    (is (= 8 (count cases)))
+    (is (= #{[:sqlite :kv :none] [:postgres :kv :none]
+             [:sqlite :datalog :all] [:postgres :datalog :all]}
+           (set (map (juxt :system :api :sql-indexes) sql-cases))))
+    (is (every? #(not (contains? % :sql-indexes))
+                (filter #(= :datalevin (:system %)) cases)))
+    (doseq [mode [:none :all]]
+      (is (= #{mode}
+             (set (map :sql-indexes
+                       (runner/cases (assoc opts :system :sqlite :sql-indexes mode)))))))
+    (let [both (runner/cases (assoc opts :api :datalog :mode :embedded :sql-indexes :both))]
+      (is (= [[:datalevin nil] [:sqlite :none] [:sqlite :all]]
+             (mapv (juxt :system :sql-indexes) both)))
+      (is (= 6 (count (runner/cases (assoc opts :system :sqlite :api :kv
+                                         :sql-indexes :both :repetitions 3)))))))
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"one index condition"
+                       (runner/run-case! (assoc shared/small-options :system :sqlite
+                                                :api :kv :mode :embedded :sql-indexes :both)))))
+
+(deftest trial-summary-keeps-sql-index-conditions-separate-test
+  (let [results (for [mode [:none :all], rate (if (= mode :none) [10 20] [3 5])]
+                  {:configuration {:system :sqlite :api :datalog :sql-indexes mode}
+                   :measured {:ops-per-second rate}})
+        summaries (into {} (map (juxt #(get-in % [:configuration :sql-indexes]) identity)
+                                (core/summarize-trials results)))]
+    (is (= 2 (count summaries)))
+    (is (= {:median 15.0 :min 10 :max 20} (:ops-per-second (:none summaries))))
+    (is (= {:median 4.0 :min 3 :max 5} (:ops-per-second (:all summaries))))))
+
 (deftest wal-mismatch-rejects-case-test
   (doseq [actual [{:wal? false}
                   {:wal? true :write-path-enabled? false :durability-profile :strict}

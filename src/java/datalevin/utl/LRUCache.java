@@ -1,6 +1,7 @@
 package datalevin.utl;
 
 import java.util.*;
+import java.util.function.Function;
 
 public class LRUCache {
     int capacity;
@@ -12,21 +13,70 @@ public class LRUCache {
 
     boolean disabled;
 
+    private final Function<Object, ? extends Iterable<?>> dependencies;
+    private final Map<Object, List<Object>> keyDependencies;
+    private final Map<Object, Set<Object>> dependencyKeys;
+    private boolean indexReady;
+
     public LRUCache(int capacity) {
+        this(capacity, 0, null);
+    }
+
+    public LRUCache(int capacity, long target) {
+        this(capacity, target, null);
+    }
+
+    /** Optionally index immutable key dependencies for selective invalidation. */
+    public LRUCache(int capacity, long target,
+                    Function<Object, ? extends Iterable<?>> dependencies) {
         this.capacity = capacity;
+        this.target = target;
+        this.dependencies = dependencies;
+        keyDependencies = dependencies == null ? null : new HashMap<>();
+        dependencyKeys = dependencies == null ? null : new HashMap<>();
         disabled = false;
         map = Collections.synchronizedMap(new LinkedHashMap<Object, Object>(capacity,
                                                                             0.75f,
                                                                             true) {
                 protected boolean	removeEldestEntry(Map.Entry<Object, Object> oldest) {
-                    return size() > capacity;
+                    if (size() > capacity) {
+                        removeDependencies(oldest.getKey());
+                        return true;
+                    }
+                    return false;
                 }
             });
     }
 
-    public LRUCache(int capacity, long target) {
-        this(capacity);
-        this.target = target;
+    private void removeDependencies(Object key) {
+        if (!indexReady) return;
+        List<Object> tokens = keyDependencies.remove(key);
+        if (tokens == null) return;
+        for (Object token : tokens) {
+            Set<Object> keys = dependencyKeys.get(token);
+            if (keys != null) {
+                keys.remove(key);
+                if (keys.isEmpty()) dependencyKeys.remove(token);
+            }
+        }
+    }
+
+    private void addDependencies(Object key) {
+        // Classify before publishing either the value or its index entries.
+        List<Object> tokens = new ArrayList<>();
+        for (Object token : dependencies.apply(key)) tokens.add(token);
+        keyDependencies.put(key, tokens);
+        for (Object token : tokens) {
+            dependencyKeys.computeIfAbsent(token, ignored -> new HashSet<>())
+                .add(key);
+        }
+    }
+
+    private void putEntry(Object key, Object value) {
+        if (indexReady && !map.containsKey(key)) {
+            addDependencies(key);
+        }
+        map.put(key, value);
     }
 
     public synchronized boolean isDisabled() {
@@ -65,18 +115,38 @@ public class LRUCache {
 
     public synchronized void put(Object key, Object value) {
         if (disabled == true) return;
-        map.put(key, value);
+        putEntry(key, value);
     }
 
     public synchronized boolean putIfGeneration(Object key, Object value,
                                                 long expectedGeneration) {
         if (disabled == true || generation != expectedGeneration) return false;
-        map.put(key, value);
+        putEntry(key, value);
         return true;
     }
 
     public synchronized Object remove(Object key) {
+        removeDependencies(key);
         return map.remove(key);
+    }
+
+    /** Snapshot keys in the requested dependency buckets; does not affect LRU order. */
+    public synchronized Set<Object> candidateKeys(Iterable<?> tokens) {
+        if (dependencies == null) return keys();
+        // Read-only caches need no dependency bookkeeping. Build once, when
+        // the first invalidation needs candidates, under the cache monitor.
+        if (!indexReady) {
+            keyDependencies.clear();
+            dependencyKeys.clear();
+            for (Object key : map.keySet()) addDependencies(key);
+            indexReady = true;
+        }
+        Set<Object> candidates = new HashSet<>();
+        for (Object token : tokens) {
+            Set<Object> keys = dependencyKeys.get(token);
+            if (keys != null) candidates.addAll(keys);
+        }
+        return candidates;
     }
 
     public synchronized Set<Object> keys() {
@@ -93,5 +163,10 @@ public class LRUCache {
 
     public synchronized void clear() {
         map.clear();
+        if (dependencies != null) {
+            keyDependencies.clear();
+            dependencyKeys.clear();
+            indexReady = false;
+        }
     }
 }
