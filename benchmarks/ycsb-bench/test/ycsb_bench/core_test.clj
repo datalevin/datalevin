@@ -156,11 +156,11 @@
 
 (defn- check-kv-record-layout! [db]
   (let [handle (:handle (store/for-worker db 0))]
-    (is (= {:layout :record-value :key-type :long :value-type :data}
+    (is (= {:layout :record-value :key-type :id :value-type :data}
            (select-keys (store/storage-info db) [:layout :key-type :value-type])))
     (is (= 4 (d/entries handle "records")))
-    (is (= [0 1 2 3] (mapv first (d/get-range handle "records" [:all] :long :data))))
-    (is (= ["uaaa" "zzzz" "cccc"] (d/get-value handle "records" 0 :long :data)))
+    (is (= [0 1 2 3] (mapv first (d/get-range handle "records" [:all] :id :data))))
+    (is (= ["uaaa" "zzzz" "cccc"] (d/get-value handle "records" 0 :id :data)))
     (store/put-records! db [[7 ["same" "same" "same"]]])
     (is (= [[7 ["same" "same" "same"]]] (store/scan-records db 4 10)))
     (let [executor (Executors/newFixedThreadPool 2)]
@@ -180,7 +180,7 @@
           (.awaitTermination executor 30 TimeUnit/SECONDS))))
     (is (= ["0019" "0119" "same"] (store/read-record db 7))
         "Replacing a record must preserve concurrent writes to other fields")
-    (is (= ["0019" "0119" "same"] (d/get-value handle "records" 7 :long :data)))
+    (is (= ["0019" "0119" "same"] (d/get-value handle "records" 7 :id :data)))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Missing KV record"
                          (store/update-field! db 99 0 "oops")))
     (is (= 5 (store/record-count db) (d/entries handle "records")))))

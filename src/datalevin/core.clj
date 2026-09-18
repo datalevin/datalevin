@@ -2690,6 +2690,7 @@ to `[:or \"word1\" \"word2\" \"word3\"]` when using the default analyzer.
     - `:instant`, a `java.util.Date`
     - `:uuid`, a `java.util.UUID`
 
+  Tuple components also accept `:int` for signed 32-bit integers.
   No tuple element can be more than 255 bytes in size.
 
   If the value is to be put in a LMDB key buffer, it must be less than
@@ -2712,7 +2713,9 @@ one of the following scalar data types, a vector of these scalars to indicate a 
   - `:symbol`, EDN symbol
   - `:boolean`, `true` or `false`
   - `:instant`, timestamp, same as `java.util.Date`
-  - `:uuid`, UUID, same as `java.util.UUID`"}
+  - `:uuid`, UUID, same as `java.util.UUID`
+
+  Tuple components also accept `:int` for signed 32-bit integers."}
   read-buffer b/read-buffer)
 
 (def ^{:arglists '([input & opts])

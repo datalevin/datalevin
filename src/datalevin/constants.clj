@@ -165,6 +165,9 @@
 ;; value headers
 (def ^:no-doc ^:const type-long-neg   (unchecked-byte 0xC0))
 (def ^:no-doc ^:const type-long-pos   (unchecked-byte 0xC1))
+(def ^:no-doc ^:const type-int
+  "Signed 32-bit tuple component, with its payload sign bit flipped for ordering."
+  (unchecked-byte 0xC2))
 (def ^:no-doc ^:const type-custom     (unchecked-byte 0xF0))
 (def ^:no-doc ^:const type-bigint     (unchecked-byte 0xF1))
 (def ^:no-doc ^:const type-bigdec     (unchecked-byte 0xF2))

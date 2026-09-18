@@ -34,11 +34,11 @@
                 :last-committed-lsn :last-durable-lsn]))
 
 (defn- kv-read [handle id]
-  (or (d/get-value handle "records" id :long :data)
+  (or (d/get-value handle "records" id :id :data)
       (throw (ex-info "Missing KV record" {:id id}))))
 
 (defn- kv-put! [handle id values]
-  (d/transact-kv handle "records" [[:put id values]] :long :data))
+  (d/transact-kv handle "records" [[:put id values]] :id :data))
 
 (defrecord KVRecords [handle]
   Records
@@ -46,7 +46,7 @@
     (d/transact-kv
       handle "records"
       (mapv (fn [[id values]] [:put id (vec values)]) records)
-      :long :data))
+      :id :data))
   (read-record [_ id] (kv-read handle id))
   (update-field! [_ id field value]
     (d/with-transaction-kv [tx handle]
@@ -57,10 +57,10 @@
   (scan-records [_ start n]
     (vec (d/get-range handle "records"
                       [:closed-open start (+ (long start) (long n))]
-                      :long :data)))
+                      :id :data)))
   (record-count [_] (d/entries handle "records"))
   (storage-info [_]
-    (merge {:layout :record-value :key-type :long :value-type :data
+    (merge {:layout :record-value :key-type :id :value-type :data
             :initial-mapsize-mb 4096 :atomic-rmw? true}
            (wal-info handle)))
   (close-store! [_] (d/close-kv handle)))

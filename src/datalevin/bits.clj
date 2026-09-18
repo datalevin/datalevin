@@ -692,15 +692,19 @@
     :bigint  c/type-bigint
     :bigdec  c/type-bigdec
     :long    (long-header v)
+    :int     c/type-int
     nil))
 
-(def known-size-types #{:boolean :long :double :float :instant :uuid})
+(def known-size-types #{:boolean :long :int :double :float :instant :uuid})
 
 (defn- put-fixed
   [bf v hdr]
   (case (short hdr)
     -64 (put-long bf (wrap-extrema v Long/MIN_VALUE -1 v))
     -63 (put-long bf (wrap-extrema v 0 Long/MAX_VALUE v))
+    -62 (put-int bf (BitOps/intFlip
+                     (int (wrap-extrema v Integer/MIN_VALUE Integer/MAX_VALUE v))
+                     31))
     -11 (put-float bf (wrap-extrema v Float/NEGATIVE_INFINITY
                                     Float/POSITIVE_INFINITY v))
     -10 (put-double bf (wrap-extrema v Double/NEGATIVE_INFINITY
@@ -799,6 +803,7 @@
   [header]
   (case (short header)
     (-64 -63 -8) :long
+    -62          :int
     -15          :bigint
     -14          :bigdec
     -11          :float
@@ -947,6 +952,7 @@
    (case (short hdr)
      -64 (get-long bf)
      -63 (get-long bf)
+     -62 (BitOps/intFlip (get-int bf) 31)
      -16 (get-custom-reference bf post-v)
      -15 (get-bigint bf)
      -14 (get-bigdec bf)
@@ -1271,6 +1277,12 @@
       true)
     (if (identical? t :data) true false)))
 
+(defn- valid-tuple-component?
+  [x t]
+  (if (identical? t :int)
+    (and (int? x) (<= Integer/MIN_VALUE x Integer/MAX_VALUE))
+    (valid-data* x t)))
+
 (defn valid-data?
   "validate data type"
   [x t]
@@ -1280,8 +1292,8 @@
          (let [ct (count t)]
            (if (= 1 ct)
              (and (seq x)
-                  (let [t' (first t)] (every? #(valid-data* % t') x)))
+                  (let [t' (first t)] (every? #(valid-tuple-component? % t') x)))
              (and (= ct (count x))
                   (every? true?
-                          (map #(or (nil? %1) (valid-data* %1 %2)) x t))))))
+                          (map #(or (nil? %1) (valid-tuple-component? %1 %2)) x t))))))
     (valid-data* x t)))

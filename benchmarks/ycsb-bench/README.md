@@ -271,14 +271,16 @@ The logical schema is identical for both APIs: a sequential numeric record ID
 and `--field-count` strings of `--field-length` ASCII bytes. Defaults are ten
 fields of 100 bytes, excluding keys and database overhead.
 
-* **KV:** one `:long` key per record, equal to the numeric record ID, with all
-  field strings stored together as a vector encoded with `:data` in the
+* **KV:** one `:id` key per record, equal to the nonnegative numeric record ID,
+  with all field strings stored together as a vector encoded with `:data` in the
   `records` DBI. A point read fetches one value. A field update reads the current
   vector, replaces that field, and writes the whole vector inside one write
   transaction, preserving concurrent changes to other fields. F uses the same
   transaction boundary and derives the replacement from the selected field's
   current value. Scans range over record IDs, and each physical entry counts as
-  one logical record. Reports identify this layout as `:record-value`.
+  one logical record. The `:id` encoding uses eight bytes without a type header.
+  Reports identify this layout as `:record-value` and its key encoding as `:id`;
+  earlier single-vector results used `:long` keys, which include a type header.
   Published results labeled `:field-keys` used the earlier per-field layout.
 * **Datalog:** one entity per record with an explicitly assigned `:db/id` equal
   to the benchmark's numeric record key, starting at zero, and string attributes
