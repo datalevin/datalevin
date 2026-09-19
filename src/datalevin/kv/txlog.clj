@@ -1883,23 +1883,27 @@
         (create-snapshot-now! lmdb)))))
 
 (defn ensure-txlog-ready!
-  [lmdb]
-  (when-let [info-v (i/kv-info lmdb)]
-    (sanitize-kv-info! info-v)
-    (ensure-txlog-nosync-flag! lmdb info-v)
-    (when (and (txlog/enabled? @info-v)
-               (txlog-write-path-enabled? lmdb))
-      (let [state (or (txlog/state lmdb)
-                      (init-txlog-state! lmdb info-v))]
-        (when-not (:txlog-recovered? @info-v)
-          (txlog-recover-under-write-transaction! lmdb state)
-          (align-runtime-txlog-payload-floor! lmdb)
-          (ensure-snapshot-bootstrap! lmdb state)
-          (vswap! info-v assoc :txlog-recovered? true))
-        (txlog/refresh-shared-state! state false)
-        (align-runtime-txlog-payload-floor! lmdb)
-        (start-snapshot-scheduler-hook! lmdb)
-        (or (txlog/state lmdb) state)))))
+  ([lmdb] (ensure-txlog-ready! lmdb true))
+  ([lmdb align-floor?]
+   (when-let [info-v (i/kv-info lmdb)]
+     (sanitize-kv-info! info-v)
+     (ensure-txlog-nosync-flag! lmdb info-v)
+     (when (and (txlog/enabled? @info-v)
+                (txlog-write-path-enabled? lmdb))
+       (let [state (or (txlog/state lmdb)
+                       (init-txlog-state! lmdb info-v))]
+         (when-not (:txlog-recovered? @info-v)
+           (txlog-recover-under-write-transaction! lmdb state)
+           (align-runtime-txlog-payload-floor! lmdb)
+           (ensure-snapshot-bootstrap! lmdb state)
+           (vswap! info-v assoc :txlog-recovered? true))
+         (txlog/refresh-shared-state! state false)
+         ;; Explicit transactions defer the routine floor check until their
+         ;; native writer is acquired. Initial recovery still aligns above.
+         (when align-floor?
+           (align-runtime-txlog-payload-floor! lmdb))
+         (start-snapshot-scheduler-hook! lmdb)
+         (or (txlog/state lmdb) state))))))
 
 (defn- ensure-tx-dbi
   [dbi-name tx]
@@ -2112,11 +2116,18 @@
         (persisted-local-payload-lsn wdb)))))
 
 (defn- cache-commit-metadata!
-  [state txn-id marker-entry payload-lsn]
+  [state txn-id marker-entry payload-lsn metadata-changed?]
   (when-let [^longs cache (:lmdb-commit-metadata state)]
     (aset-long cache 0 (long txn-id))
     (aset-long cache 1 (long (or (:revision marker-entry) -1)))
-    (aset-long cache 2 (long payload-lsn))))
+    (aset-long cache 2 (long payload-lsn)))
+  (when-let [^longs cache (:lmdb-runtime-floor state)]
+    ;; Only the internal marker/payload rows changed recovery metadata. A user
+    ;; metadata write (including a deletion) requires a fresh read next time.
+    (when (and (not metadata-changed?)
+               (= (dec (long txn-id)) (aget cache 0)))
+      (aset-long cache 0 (long txn-id))
+      (aset-long cache 1 (max (aget cache 1) (long payload-lsn))))))
 
 (defn- persisted-runtime-floor-lsn
   [lmdb]
@@ -2125,42 +2136,79 @@
     (long (commit-marker-applied-lsn lmdb))
     (long (persisted-payload-floor-lsn lmdb)))))
 
+(defn- transaction-runtime-floor-lsn
+  ^long [lmdb state]
+  (let [^Txn txn (.-txn ^Rtx @(l/write-txn lmdb))
+        snapshot-id (dec (.id txn))
+        ^longs cache (:lmdb-runtime-floor state)
+        metadata-changed? (.hasKvInfoChanges txn)]
+    (if (and cache (not metadata-changed?)
+             (= snapshot-id (aget cache 0)))
+      (aget cache 1)
+      (let [floor-lsn (long (persisted-runtime-floor-lsn lmdb))]
+        ;; Read through the acquired writer, never a reader opened before it.
+        ;; Only committed metadata may be remembered across an abort.
+        (when (and cache (not metadata-changed?))
+          (aset-long cache 0 snapshot-id)
+          (aset-long cache 1 floor-lsn))
+        floor-lsn))))
+
 (defn align-runtime-txlog-payload-floor!
+  ([lmdb] (align-runtime-txlog-payload-floor! lmdb false))
+  ([lmdb transaction?]
+   (with-runtime-txlog-state-guard
+     lmdb
+     (fn []
+       (when (i/kv-info lmdb)
+         (when-let [state (txlog/state lmdb)]
+           (let [floor-lsn        (if transaction?
+                                   (transaction-runtime-floor-lsn lmdb state)
+                                   (long (persisted-runtime-floor-lsn lmdb)))
+                 target-next-lsn  (unchecked-inc floor-lsn)
+                 current-next-lsn (long @(:next-lsn state))]
+             (when (> target-next-lsn current-next-lsn)
+               ;; Snapshot-installed followers can restore LMDB payload state
+               ;; ahead of their local txlog files. Align the runtime cursor to
+               ;; the restored payload floor so the next mirrored HA record can
+               ;; append contiguously without inventing placeholder WAL rows.
+               (let [last-applied-v (:meta-last-applied-lsn state)
+                     _              (when (and last-applied-v
+                                               (> floor-lsn (long @last-applied-v)))
+                                      (vreset! last-applied-v floor-lsn))
+                     sync-manager   (:sync-manager state)
+                     now-ms         (System/currentTimeMillis)]
+                 (vreset! (:next-lsn state) target-next-lsn)
+                 (vreset! (:last-appended-lsn sync-manager) floor-lsn)
+                 (vreset! (:last-durable-lsn sync-manager) floor-lsn)
+                 (vreset! (:last-sync-ms sync-manager)
+                          (long (max now-ms
+                                     (long @(:last-sync-ms sync-manager)))))
+                 (vreset! (:unsynced-count sync-manager) 0)
+                 (vreset! (:pending-lsn-head sync-manager) 0)
+                 (vreset! (:pending-lsn-tail sync-manager) 0)
+                 (vreset! (:pending-lsn-size sync-manager) 0)
+                 (vreset! (:sync-requested? sync-manager) false)
+                 (vreset! (:sync-request-reason sync-manager) nil)
+                 (vreset! (:sync-in-progress? sync-manager) false)
+                 (vreset! (:healthy? sync-manager) true)
+                 (vreset! (:failure sync-manager) nil))))))))))
+
+(defn open-transact-with-txlog!
+  "Prepare WAL state and validate the recovery floor in the new writer snapshot.
+  The caller holds the environment write lock for the transaction lifetime."
   [lmdb]
-  (with-runtime-txlog-state-guard
-    lmdb
-    (fn []
-      (when (i/kv-info lmdb)
-        (when-let [state (txlog/state lmdb)]
-          (let [floor-lsn        (long (persisted-runtime-floor-lsn lmdb))
-                target-next-lsn  (unchecked-inc floor-lsn)
-                current-next-lsn (long @(:next-lsn state))]
-            (when (> target-next-lsn current-next-lsn)
-              ;; Snapshot-installed followers can restore LMDB payload state
-              ;; ahead of their local txlog files. Align the runtime cursor to
-              ;; the restored payload floor so the next mirrored HA record can
-              ;; append contiguously without inventing placeholder WAL rows.
-              (let [last-applied-v (:meta-last-applied-lsn state)
-                    _              (when (and last-applied-v
-                                              (> floor-lsn (long @last-applied-v)))
-                                     (vreset! last-applied-v floor-lsn))
-                    sync-manager   (:sync-manager state)
-                    now-ms         (System/currentTimeMillis)]
-                (vreset! (:next-lsn state) target-next-lsn)
-                (vreset! (:last-appended-lsn sync-manager) floor-lsn)
-                (vreset! (:last-durable-lsn sync-manager) floor-lsn)
-                (vreset! (:last-sync-ms sync-manager)
-                         (long (max now-ms
-                                    (long @(:last-sync-ms sync-manager)))))
-                (vreset! (:unsynced-count sync-manager) 0)
-                (vreset! (:pending-lsn-head sync-manager) 0)
-                (vreset! (:pending-lsn-tail sync-manager) 0)
-                (vreset! (:pending-lsn-size sync-manager) 0)
-                (vreset! (:sync-requested? sync-manager) false)
-                (vreset! (:sync-request-reason sync-manager) nil)
-                (vreset! (:sync-in-progress? sync-manager) false)
-                (vreset! (:healthy? sync-manager) true)
-                (vreset! (:failure sync-manager) nil)))))))))
+  (when (txlog-write-path-enabled? lmdb)
+    (ensure-txlog-ready! lmdb false))
+  (let [wdb (i/open-transact-kv lmdb)]
+    (try
+      (when (txlog-write-path-enabled? lmdb)
+        (txlog-reset-pending! (i/kv-info lmdb))
+        (align-runtime-txlog-payload-floor! wdb true))
+      wdb
+      (catch Throwable t
+        ;; The enclosing transaction macro has not received the writer yet.
+        (l/abort-open-transaction-kv! lmdb t)
+        (throw t)))))
 
 (defn apply-lmdb-after-txlog-append!
   [lmdb state rows]
@@ -2403,6 +2451,7 @@
                               state pending txlog-append-hooks)
                   ^Txn txn (.-txn ^Rtx @(l/write-txn lmdb))
                   txn-id (.id txn)
+                  metadata-changed? (.hasKvInfoChanges txn)
                   payload-lsn (max (long (:lsn append-res))
                                    (refresh-commit-metadata!
                                     lmdb state txn txn-id))
@@ -2425,7 +2474,7 @@
                       (when (= status :committed)
                         (txlog/commit-finished! state marker-entry)
                         (cache-commit-metadata! state txn-id marker-entry
-                                                payload-lsn)
+                                                payload-lsn metadata-changed?)
                         (txlog/note-commit-applied! state append-res))
                       (when-not (write-txn-open? lmdb)
                         (txlog-reset-pending! info-v))

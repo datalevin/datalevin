@@ -410,12 +410,7 @@
   i/ILMDB
   (open-transact-kv
     [_]
-    (when (txlog-write-path-enabled? db)
-      (ensure-txlog-ready! db))
-    (let [wdb (i/open-transact-kv db)]
-      (when (txlog-write-path-enabled? db)
-        (txlog-reset-pending! (i/kv-info db)))
-      (->KVLMDB wdb)))
+    (->KVLMDB (kvtx/open-transact-with-txlog! db)))
   (abort-transact-kv
     [_]
     (when (txlog-config-enabled? db)

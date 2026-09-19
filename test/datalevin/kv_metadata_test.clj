@@ -5,6 +5,7 @@
    [datalevin.core :as d]
    [datalevin.interface :as i]
    [datalevin.kv :as kv]
+   [datalevin.kv.txlog :as kvtx]
    [datalevin.lmdb :as l]
    [datalevin.txlog :as txlog]
    [datalevin.util :as u])
@@ -141,4 +142,108 @@
       (is (= 4000000 (payload-lsn db)))
       (put! db 2)
       (is (= 4000000 (payload-lsn db)))
+      (d/with-transaction-kv [tx db]
+        (is (= 4000001 @(:next-lsn (txlog/state tx)))))
+      (finally (d/close-kv db)))))
+
+(defn- explicit-put! [db n]
+  (d/with-transaction-kv [tx db] (put! tx n)))
+
+(deftest startup-floor-refreshes-after-raw-commits
+  (doseq [marker? [true false]]
+    (let [db (d/open-kv (str *dir* "/" marker?)
+                        (assoc opts :wal-commit-marker? marker?))]
+      (try
+        (d/open-dbi db "data")
+        (explicit-put! db 0)
+        (doseq [[key floor] [[c/wal-local-payload-lsn 1000000]
+                            [c/wal-snapshot-current-lsn 2000000]]]
+          (i/transact-kv (raw-db db)
+                         [[:put c/kv-info key floor :keyword :data]])
+          (d/with-transaction-kv [tx db]
+            (is (= (inc floor) @(:next-lsn (txlog/state tx))))
+            (put! tx floor))
+          (is (= (inc floor) (payload-lsn db)))
+          (explicit-put! db (inc floor))
+          (is (= (+ floor 2) (payload-lsn db))))
+        (when marker?
+          (let [floor 3000000]
+            (i/transact-kv
+             (raw-db db)
+             [[:put c/kv-info c/wal-marker-a
+               (txlog/encode-commit-marker-slot
+                (assoc (marker db) :revision 10000 :applied-lsn floor))
+               :keyword :bytes]])
+            (explicit-put! db floor)
+            (is (= (inc floor) (payload-lsn db)))
+            (is (= 10001 (:revision (marker db))))))
+        (finally (d/close-kv db))))))
+
+(deftest startup-floor-does-not-cache-uncommitted-snapshots
+  (let [db (d/open-kv *dir* opts)
+        rows [[:put c/kv-info c/wal-snapshot-current-lsn 1000000 :keyword :data]]]
+    (try
+      (d/open-dbi db "data")
+      (explicit-put! db 0)
+      (let [before (payload-lsn db)]
+        (d/with-transaction-kv [tx db]
+          (i/transact-kv (raw-db tx) rows)
+          (put! tx 1)
+          (d/abort-transact-kv tx))
+        (explicit-put! db 2)
+        (is (= (inc before) (payload-lsn db)))
+        (is (nil? (d/get-value db "data" 1 :long :long))))
+      (testing "metadata changed with a WAL payload refreshes next startup"
+        (d/with-transaction-kv [tx db]
+          (i/transact-kv (raw-db tx) rows)
+          (put! tx 3))
+        (explicit-put! db 4)
+        (is (= 1000001 (payload-lsn db))))
+      (testing "a metadata-only commit also refreshes next startup"
+        (d/with-transaction-kv [tx db]
+          (i/transact-kv (raw-db tx)
+                         [[:put c/kv-info c/wal-snapshot-current-lsn
+                           2000000 :keyword :data]]))
+        (explicit-put! db 5)
+        (is (= 2000001 (payload-lsn db))))
+      (finally (d/close-kv db)))))
+
+(deftest startup-floor-validates-after-writer-acquisition
+  (let [db (d/open-kv *dir* opts)
+        hooks @#'kvtx/snapshot-scheduler-hooks*
+        previous @hooks]
+    (try
+      (d/open-dbi db "data")
+      (explicit-put! db 0)
+      ;; The scheduler hook runs at the end of readiness, before acquiring the
+      ;; native writer. Commit new metadata in that gap, as another writer can.
+      (kvtx/set-snapshot-scheduler-hooks!
+       (fn [lmdb]
+         (i/transact-kv lmdb
+                        [[:put c/kv-info c/wal-snapshot-current-lsn
+                          1000000 :keyword :data]]))
+       (:stop previous))
+      (d/with-transaction-kv [tx db]
+        (is (= 1000001 @(:next-lsn (txlog/state tx))))
+        (put! tx 1))
+      (is (= 1000001 (payload-lsn db)))
+      (finally
+        (reset! hooks previous)
+        (d/close-kv db)))))
+
+(deftest startup-floor-failure-closes-new-writer
+  (let [db (d/open-kv *dir* opts)]
+    (try
+      (d/open-dbi db "data")
+      (explicit-put! db 0)
+      (i/transact-kv (raw-db db)
+                     [[:put c/kv-info c/wal-snapshot-current-lsn
+                       :invalid-floor :keyword :data]])
+      (is (thrown? ClassCastException
+                   (d/with-transaction-kv [_ db] nil)))
+      (is (nil? @(l/write-txn db)))
+      (i/transact-kv (raw-db db)
+                     [[:del c/kv-info c/wal-snapshot-current-lsn :keyword]])
+      (explicit-put! db 1)
+      (is (= 1 (d/get-value db "data" 1 :long :long)))
       (finally (d/close-kv db)))))
