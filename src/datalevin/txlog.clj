@@ -418,7 +418,8 @@
          :meta-revision          (volatile! (long (or (:revision meta-cur) -1)))
          :meta-flush-max-txs     (long (meta-flush-max-txs info))
          :meta-flush-max-ms      (long (meta-flush-max-ms info))
-         :meta-dirty-count       (volatile! 0)
+         :meta-dirty?            (volatile! false)
+         :meta-commits-since-flush (volatile! 0)
          :meta-last-flush-ms     (volatile! last-sync-ms)
          :marker-revision        (volatile! (or (:revision marker-cur)
                                                 -1))
@@ -954,14 +955,15 @@
 
 (defn- mark-meta-dirty!
   [state]
-  (when-let [dirty-v (:meta-dirty-count state)]
-    (vreset! dirty-v (inc (long @dirty-v)))))
+  (when-let [dirty-v (:meta-dirty? state)]
+    (vreset! dirty-v true)))
 
 (defn flush-meta!
   ([state] (flush-meta! state true))
   ([state force?]
-   (let [dirty-v (:meta-dirty-count state)
-         dirty (long (or (some-> dirty-v deref) 0))
+   (let [dirty-v (:meta-dirty? state)
+         commits-v (:meta-commits-since-flush state)
+         commits (long (or (some-> commits-v deref) 0))
          max-txs (long (or (:meta-flush-max-txs state) 0))
          max-ms (long (or (:meta-flush-max-ms state) 0))
          last-flush-v (:meta-last-flush-ms state)
@@ -970,14 +972,16 @@
                               ^long (long (or (some-> last-flush-v deref)
                                               now-ms))))
          txs-due? (and (pos? max-txs)
-                       (>= ^long dirty ^long max-txs))
+                       (>= ^long commits ^long max-txs))
          time-due? (and (pos? max-ms)
                         (>= ^long elapsed-ms ^long max-ms))]
-     (when (and (pos? dirty)
+     (when (and (some-> dirty-v deref)
                 (or force? txs-due? time-due?))
        (let [written (publish-meta-current! state)]
          (when dirty-v
-           (vreset! dirty-v 0))
+           (vreset! dirty-v false))
+         (when commits-v
+           (vreset! commits-v 0))
          (when last-flush-v
            (vreset! last-flush-v now-ms))
          written)))))
@@ -985,8 +989,12 @@
 (defn note-commit-applied!
   [state {:keys [lsn]}]
   (when-let [last-applied-v (:meta-last-applied-lsn state)]
-    (vreset! last-applied-v
-             (max (long @last-applied-v) (long lsn))))
+    (when (> (long lsn) (long @last-applied-v))
+      (vreset! last-applied-v (long lsn))
+      ;; Append and sync completion also dirty metadata. Count the applied
+      ;; transaction once, independently of those watermark changes.
+      (when-let [commits-v (:meta-commits-since-flush state)]
+        (vreset! commits-v (inc (long @commits-v))))))
   (mark-meta-dirty! state)
   (flush-meta! state false))
 

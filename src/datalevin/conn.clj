@@ -610,10 +610,28 @@
     (if (local-wal-transact-eligible? conn)
       (or (maybe-direct-local-wal-transact! conn tx-data tx-meta)
           (prepared-local-wal-transact! conn tx-data tx-meta))
-      (let [report (with-transaction [c conn]
-                     (assert (active-conn-structural? c))
-                     (with @c tx-data tx-meta))]
-        (assoc report :db-after @conn)))))
+      (let [store (.-store ^DB @conn)]
+        (if (and (instance? Store store)
+                 (l/writing? (.-lmdb ^Store store))
+                 (Thread/holdsLock (l/write-txn (.-lmdb ^Store store)))
+                 (db/cache-disabled? store)
+                 ;; Keep the nested watchdog when a global timeout is enabled.
+                 ;; An explicit outer timeout is still enforced by its owner.
+                 (nil? (l/explicit-transaction-timeout)))
+          (locking conn
+            ;; The enclosing transaction already owns this Store and writer.
+            ;; Only the mutable datom overlays need isolation for preparation;
+            ;; retain the resulting DB view for subsequent transaction-local
+            ;; reads and writes. The owner commits and publishes the base view.
+            (let [db     ^DB @conn
+                  report (with-isolated-tx-cache db tx-data tx-meta false)
+                  after  (db/carry-runtime-opts (:db-after report) db)]
+              (reset! conn after)
+              (assoc report :db-after after)))
+          (let [report (with-transaction [c conn]
+                         (assert (active-conn-structural? c))
+                         (with @c tx-data tx-meta))]
+            (assoc report :db-after @conn)))))))
 
 (defn- notify-listeners!
   [conn report]

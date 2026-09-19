@@ -29,6 +29,62 @@
                 :last-fsync-ms :commit-wait-sample-count
                 :commit-wait-count-by-reason]))
 
+(deftest metadata-publication-counts-applied-commits-once
+  (with-runtime
+    (fn [runtime]
+      (let [state (assoc runtime :meta-flush-max-txs 4 :meta-flush-max-ms 0)
+            revision @(:meta-revision state)]
+        (doseq [n (range 1 10)]
+          (let [record (wal/append-durable!
+                         state [[:put "dbi" n "v" :id :string]] {})]
+            ;; Append and durable completion dirty metadata without advancing
+            ;; the transaction threshold or publishing an unapplied commit.
+            (is (true? @(:meta-dirty? state)))
+            (is (= (mod (dec n) 4) @(:meta-commits-since-flush state)))
+            (is (= (+ revision (quot (dec n) 4)) @(:meta-revision state)))
+            (wal/note-commit-applied! state record)
+            (is (= (mod n 4) @(:meta-commits-since-flush state)))
+            (is (= (+ revision (quot n 4)) @(:meta-revision state)))
+            (is (= (not (zero? (mod n 4))) @(:meta-dirty? state)))
+            (when (zero? (mod n 4))
+              (is (= n (get-in (wal/read-meta-file (:meta-path state))
+                               [:current :last-applied-lsn]))))
+            ;; Repeated notification of the same LSN cannot spend the budget.
+            (wal/note-commit-applied! state record)
+            (is (= (mod n 4) @(:meta-commits-since-flush state)))))
+        (wal/flush-meta! state)
+        (is (false? @(:meta-dirty? state)))
+        (is (zero? @(:meta-commits-since-flush state)))))))
+
+(deftest metadata-publication-preserves-time-force-and-failure-behavior
+  (with-runtime
+    (fn [runtime]
+      (let [state (assoc runtime :meta-flush-max-txs 100 :meta-flush-max-ms 1)
+            record (wal/append-durable! state [[:put "dbi" 1 "v" :id :string]] {})]
+        ;; A sync-only watermark change must remain eligible for a timed flush,
+        ;; even though no applied transaction has been counted yet.
+        (vreset! (:meta-last-flush-ms state) 0)
+        (wal/flush-meta! state false)
+        (is (false? @(:meta-dirty? state)))
+        (is (= {:last-durable-lsn 1 :last-applied-lsn 0}
+               (select-keys (:current (wal/read-meta-file (:meta-path state)))
+                            [:last-durable-lsn :last-applied-lsn])))
+        (let [state (assoc state :meta-flush-max-ms 0)]
+          (wal/note-commit-applied! state record)
+          (let [last-flush @(:meta-last-flush-ms state)]
+            ;; Opening a directory as the lock file fails before publication.
+            ;; Exercise the actual I/O path even with direct linking enabled.
+            (is (thrown? IOException
+                         (wal/flush-meta! (assoc state :meta-lock-path (:dir state)))))
+            (is (true? @(:meta-dirty? state)))
+            (is (= 1 @(:meta-commits-since-flush state)))
+            (is (= last-flush @(:meta-last-flush-ms state))))
+          (wal/flush-meta! state)
+          (is (false? @(:meta-dirty? state)))
+          (is (zero? @(:meta-commits-since-flush state)))
+          (is (= 1 (get-in (wal/read-meta-file (:meta-path state))
+                           [:current :last-applied-lsn]))))))))
+
 (deftest private-refresh-can-omit-snapshots
   (with-runtime
     (fn [state]
@@ -96,7 +152,8 @@
                                (swap! seen conj begin))})]
                       (is (:synced? record))
                       (is (= [{:target-lsn 1 :reason reason}] @seen))
-                      (is (= 2 @(:meta-dirty-count state)))
+                      (is (true? @(:meta-dirty? state)))
+                      (is (zero? @(:meta-commits-since-flush state)))
                       (is (= 1 (:commit-wait-sample-count
                                  (wal/sync-manager-state manager))))
                       (manager-metrics state))))))]
