@@ -1070,7 +1070,7 @@
 
 (defn txlog-watermarks-map
   [lmdb state]
-  (txlog/refresh-shared-state! state)
+  (txlog/refresh-shared-state! state false)
   (let [sync-state (txlog/sync-manager-state (:sync-manager state))
         vec-summary (txlog-vector-checkpoint-summary lmdb)
         rollout-mode (txlog-rollout-mode lmdb)
@@ -1174,7 +1174,7 @@
 
 (defn txlog-recovery-context
   [lmdb state]
-  (txlog/refresh-shared-state! state)
+  (txlog/refresh-shared-state! state false)
   (let [marker-state (read-commit-marker-state lmdb)
         marker-applied-lsn
         (long (or (some-> marker-state :current :applied-lsn) 0))
@@ -1844,7 +1844,7 @@
   (txlog/with-recovery-lock
     state
     (fn []
-      (txlog/refresh-shared-state! state)
+      (txlog/refresh-shared-state! state false)
       (let [{:keys [last-record] :as recovery} (txlog-recover-on-open! lmdb)]
         (when last-record
           (txlog/publish-meta-commit! state
@@ -1896,7 +1896,7 @@
           (align-runtime-txlog-payload-floor! lmdb)
           (ensure-snapshot-bootstrap! lmdb state)
           (vswap! info-v assoc :txlog-recovered? true))
-        (txlog/refresh-shared-state! state)
+        (txlog/refresh-shared-state! state false)
         (align-runtime-txlog-payload-floor! lmdb)
         (start-snapshot-scheduler-hook! lmdb)
         (or (txlog/state lmdb) state)))))
@@ -2269,7 +2269,7 @@
                   {:type :txlog/ha-replay-missing-rows
                    :record (select-keys record [:lsn :segment-id :offset])}))
          (if-let [state (txlog-runtime-state lmdb)]
-           (let [_ (txlog/refresh-shared-state! state)
+           (let [_ (txlog/refresh-shared-state! state false)
                  record-lsn (long (:lsn record))
                  local-payload-lsn (long (persisted-local-payload-lsn lmdb))
                  expected-lsn0 (long @(:next-lsn state))

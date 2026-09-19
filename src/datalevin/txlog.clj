@@ -74,6 +74,7 @@
          append-sync-transition!
          begin-sync!
          complete-sync-success!
+         complete-sync-on-write!
          complete-sync-failure!
          await-durable-lsn!
          open-reusable-file-lock-channel!
@@ -1143,7 +1144,7 @@
           (throw e)))
       (if-let [lock-state (try-acquire-sync-lock! state)]
         (try
-          (refresh-shared-watermarks! state)
+          (refresh-shared-watermarks! state false)
           (let [reason (:reason sync-begin)
                 durable-before (long @(:last-durable-lsn sync-manager))]
             (if (<= ^long target-lsn ^long durable-before)
@@ -1184,7 +1185,7 @@
           (finally
             (release-sync-lock! lock-state)))
         (do
-          (refresh-shared-watermarks! state)
+          (refresh-shared-watermarks! state false)
           (defer-sync-attempt! sync-manager)
           nil)))))
 
@@ -1245,7 +1246,7 @@
      (loop [last-sync-ms nil
             last-sync-reason nil
             sync-begin initial-sync-begin]
-       (refresh-shared-watermarks! state)
+       (refresh-shared-watermarks! state false)
        (let [durable (long @(:last-durable-lsn sync-manager))]
          (if (<= ^long lsn ^long durable)
            {:sync-done-ms last-sync-ms
@@ -1301,7 +1302,7 @@
                                         sync-begin
                                         hooks))
         _ (when-not sync-res
-            (refresh-shared-watermarks! state))
+            (refresh-shared-watermarks! state false))
         synced? (or (some? sync-res)
                     (<= ^long lsn
                         ^long @(:last-durable-lsn sync-manager)))
@@ -1327,14 +1328,24 @@
           (append-record-under-lock! state prepared-payload hooks))
         sync-begin (append-sync-transition! sync-manager lsn append-start-ms
                                             {:force? true :begin-lsn lsn})
-        {:keys [sync-done-ms sync-reason]}
-        (wait-strict-durable! state ch sync-manager lsn timeout-ms hooks
-                              sync-begin)
-        done-ms (or sync-done-ms (System/currentTimeMillis))]
-    (record-commit-wait-ms! sync-manager
-                            (- (long done-ms) (long append-start-ms))
-                            sync-reason
-                            false)
+        done-ms
+        (if (and (:sync-on-write? state)
+                 (not (:wal-shared? state))
+                 (pos? timeout-ms)
+                 sync-begin)
+          ;; This caller owns sync completion and its DSYNC append has already
+          ;; returned. Shared WAL and another sync owner still use reconciliation
+          ;; and waiting below. Hooks remain outside both WAL/manager locks.
+          (complete-sync-on-write! state sync-manager sync-begin
+                                   append-start-ms hooks)
+          (let [{:keys [sync-done-ms sync-reason]}
+                (wait-strict-durable! state ch sync-manager lsn timeout-ms hooks
+                                      sync-begin)
+                done-ms (or sync-done-ms (System/currentTimeMillis))]
+            (record-commit-wait-ms! sync-manager
+                                  (- (long done-ms) (long append-start-ms))
+                                  sync-reason false)
+            done-ms))]
     (when near-roll?
       (record-append-near-roll-ms! state (- (long done-ms)
                                             (long append-start-ms))))
@@ -1349,7 +1360,7 @@
 
 (defn append-durable!
   [state rows hooks]
-  (refresh-shared-state! state)
+  (refresh-shared-state! state false)
   (maybe-roll-segment! state (System/currentTimeMillis))
   (if (per-tx-durable-profile-state? state)
     (append-durable-strict! state rows hooks)
@@ -1357,7 +1368,7 @@
 
 (defn force-sync!
   [state hooks]
-  (refresh-shared-state! state)
+  (refresh-shared-state! state false)
   (let [sync-manager (:sync-manager state)
         timeout-ms (long (:commit-wait-ms state))
         before (sync-manager-state sync-manager)
@@ -1629,31 +1640,33 @@
        (when snapshot?
          (sync-manager-state manager))))))
 
+(defn- record-commit-wait-under-monitor!
+  [manager duration-ms now reason]
+  (let [v (long (max 0 (long (or duration-ms 0))))
+        reason* (normalize-sync-reason
+                 (or reason @(:last-sync-reason manager) :unknown))
+        idx (sync-reason-idx reason*)
+        ^longs wait-totals (:commit-wait-ms-total-by-reason manager)
+        ^longs wait-counts (:commit-wait-count-by-reason manager)
+        total-v (:commit-wait-ms-total manager)
+        sample-count-v (:commit-wait-sample-count manager)]
+    (vreset! (:last-commit-wait-ms manager) v)
+    (vreset! (:last-commit-wait-at-ms manager) now)
+    (vreset! total-v (+ ^long @total-v v))
+    (vreset! sample-count-v (long (inc (long @sample-count-v))))
+    (aset-long wait-totals idx (+ ^long (aget wait-totals idx) v))
+    (aset-long wait-counts idx
+               (long (inc (long (aget wait-counts idx)))))))
+
 (defn record-commit-wait-ms!
   ([manager duration-ms]
    (record-commit-wait-ms! manager duration-ms nil true))
   ([manager duration-ms reason]
    (record-commit-wait-ms! manager duration-ms reason true))
   ([{:keys [monitor] :as manager} duration-ms reason snapshot?]
-   (let [v (long (max 0 (long (or duration-ms 0))))
-         now (now-ms)]
+   (let [now (now-ms)]
      (locking monitor
-       (let [reason* (normalize-sync-reason
-                      (or reason
-                          @(:last-sync-reason manager)
-                          :unknown))
-             idx (sync-reason-idx reason*)
-             ^longs wait-totals (:commit-wait-ms-total-by-reason manager)
-             ^longs wait-counts (:commit-wait-count-by-reason manager)
-             total-v (:commit-wait-ms-total manager)
-             sample-count-v (:commit-wait-sample-count manager)]
-         (vreset! (:last-commit-wait-ms manager) v)
-         (vreset! (:last-commit-wait-at-ms manager) now)
-         (vreset! total-v (+ ^long @total-v v))
-         (vreset! sample-count-v (long (inc (long @sample-count-v))))
-         (aset-long wait-totals idx (+ ^long (aget wait-totals idx) v))
-         (aset-long wait-counts idx
-                    (long (inc (long (aget wait-counts idx))))))
+       (record-commit-wait-under-monitor! manager duration-ms now reason)
        (when snapshot?
          (sync-manager-state manager))))))
 
@@ -1822,6 +1835,47 @@
                         (begin-sync-under-monitor! sync-manager begin-lsn))]
        sync-begin))))
 
+(defn- complete-sync-success-under-monitor!
+  [{:keys [monitor] :as manager} target-lsn now reason]
+  (let [last-durable-lsn (long @(:last-durable-lsn manager))
+        last-appended-lsn (long @(:last-appended-lsn manager))
+        sync-requested? (boolean @(:sync-requested? manager))
+        sync-request-reason @(:sync-request-reason manager)
+        target (long (or target-lsn last-appended-lsn last-durable-lsn))
+        durable (max ^long last-durable-lsn target)
+        pending-after (max 0 (- ^long last-appended-lsn ^long durable))
+        reason* (normalize-sync-reason
+                 (or reason
+                     @(:last-sync-reason manager)
+                     :forced))
+        reason-idx (sync-reason-idx reason*)
+        keep-request? (and sync-requested? (pos? pending-after))
+        next-request-reason (when keep-request?
+                              (or sync-request-reason :forced))]
+    (vreset! (:last-sync-reason manager) reason*)
+    (vreset! (:last-durable-lsn manager) durable)
+    (vreset! (:last-sync-ms manager) (long now))
+    (when (boolean (:track-trailing? manager))
+      (drop-pending-through! manager durable))
+    (vreset! (:unsynced-count manager) pending-after)
+    (vreset! (:sync-in-progress? manager) false)
+    (vreset! (:sync-requested? manager) keep-request?)
+    (vreset! (:sync-request-reason manager) next-request-reason)
+    (vreset! (:healthy? manager) true)
+    (vreset! (:failure manager) nil)
+    (let [^longs sync-count-by-reason (:sync-count-by-reason manager)]
+      (aset-long sync-count-by-reason
+                 reason-idx
+                 (long (inc (long (aget sync-count-by-reason reason-idx))))))
+    (when (or (= reason-idx sync-reason-batch-count-idx)
+              (= reason-idx sync-reason-batch-time-idx))
+      (vreset! (:batched-sync-count manager)
+               (long (inc (long @(:batched-sync-count manager))))))
+    (when (= reason-idx sync-reason-forced-idx)
+      (vreset! (:forced-sync-count manager)
+               (long (inc (long @(:forced-sync-count manager))))))
+    (.notifyAll monitor)))
+
 (defn complete-sync-success!
   ([manager] (complete-sync-success! manager nil (now-ms) nil true))
   ([manager target-lsn now]
@@ -1830,46 +1884,35 @@
    (complete-sync-success! manager target-lsn now reason true))
   ([{:keys [monitor] :as manager} target-lsn now reason snapshot?]
    (locking monitor
-     (let [last-durable-lsn (long @(:last-durable-lsn manager))
-           last-appended-lsn (long @(:last-appended-lsn manager))
-           sync-requested? (boolean @(:sync-requested? manager))
-           sync-request-reason @(:sync-request-reason manager)
-           target (long (or target-lsn last-appended-lsn last-durable-lsn))
-           durable (max ^long last-durable-lsn target)
-           pending-after (max 0 (- ^long last-appended-lsn ^long durable))
-           reason* (normalize-sync-reason
-                    (or reason
-                        @(:last-sync-reason manager)
-                        :forced))
-           reason-idx (sync-reason-idx reason*)
-           keep-request? (and sync-requested? (pos? pending-after))
-           next-request-reason (when keep-request?
-                                 (or sync-request-reason :forced))]
-       (vreset! (:last-sync-reason manager) reason*)
-       (vreset! (:last-durable-lsn manager) durable)
-       (vreset! (:last-sync-ms manager) (long now))
-       (when (boolean (:track-trailing? manager))
-         (drop-pending-through! manager durable))
-       (vreset! (:unsynced-count manager) pending-after)
-       (vreset! (:sync-in-progress? manager) false)
-       (vreset! (:sync-requested? manager) keep-request?)
-       (vreset! (:sync-request-reason manager) next-request-reason)
-       (vreset! (:healthy? manager) true)
-       (vreset! (:failure manager) nil)
-       (let [^longs sync-count-by-reason (:sync-count-by-reason manager)]
-         (aset-long sync-count-by-reason
-                    reason-idx
-                    (long (inc (long (aget sync-count-by-reason reason-idx))))))
-       (when (or (= reason-idx sync-reason-batch-count-idx)
-                 (= reason-idx sync-reason-batch-time-idx))
-         (vreset! (:batched-sync-count manager)
-                  (long (inc (long @(:batched-sync-count manager))))))
-       (when (= reason-idx sync-reason-forced-idx)
-         (vreset! (:forced-sync-count manager)
-                  (long (inc (long @(:forced-sync-count manager))))))
-       (.notifyAll monitor)
-       (when snapshot?
-         (sync-manager-state manager))))))
+     (complete-sync-success-under-monitor! manager target-lsn now reason)
+     (when snapshot?
+       (sync-manager-state manager)))))
+
+(defn- complete-sync-on-write!
+  "Complete an owned private-WAL DSYNC append without a durability wait loop."
+  [state manager sync-begin append-start-ms
+   {:keys [before-sync! mark-fatal!]}]
+  (try
+    (when before-sync!
+      (before-sync! state sync-begin))
+    (let [done-ms (System/currentTimeMillis)
+          reason (:reason sync-begin)]
+      (mark-meta-dirty! state)
+      (locking (:monitor manager)
+        (vreset! (:last-fsync-ms manager) 0)
+        (vreset! (:last-fsync-at-ms manager) done-ms)
+        (complete-sync-success-under-monitor!
+         manager (:target-lsn sync-begin) done-ms reason)
+        (record-commit-wait-under-monitor!
+         manager (- done-ms (long append-start-ms)) done-ms reason))
+      done-ms)
+    (catch Exception e
+      (try
+        (when mark-fatal!
+          (mark-fatal! state e))
+        (finally
+          (complete-sync-failure! manager e false)))
+      (throw e))))
 
 (defn complete-sync-failure!
   ([manager ex]
