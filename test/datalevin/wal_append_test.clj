@@ -134,3 +134,24 @@
                             ^bytes (:body record)))
                         (map-indexed vector records))))))
       (finally (u/delete-files dir)))))
+
+(deftest positioned-payload-buffer-handles-partial-and-failed-writes
+  (doseq [steps [[2 3 4] [5 0] [5 -1] [5 (IOException. "Disk failure")]]]
+    (let [bytes (byte-array [10 20 30 40])
+          body (ByteBuffer/wrap (byte-array [99 10 20 30 40 99]))
+          output (ByteArrayOutputStream.)
+          calls (atom [])
+          success? (= steps [2 3 4])]
+      (.position body 1)
+      (.limit body 5)
+      (with-open [ch (partial-channel (atom steps) output calls)]
+        (if success?
+          (do
+            (seg/write-record-at! ch 100 body)
+            (is (= [100 102 105 109] @calls))
+            (is (Arrays/equals (codec/encode-record bytes) (.toByteArray output))))
+          (do
+            (is (thrown? Exception (seg/write-record-at! ch 100 body)))
+            (is (= [100 105] @calls))
+            (is (= 5 (.size output)))))
+        (is (= 5 (.position body) (.limit body)))))))

@@ -132,8 +132,10 @@
   (.order bf ByteOrder/BIG_ENDIAN))
 
 (defn checked-record-body-len
-  [^bytes body]
-  (let [body-len (alength body)]
+  [body]
+  (let [body-len (if (instance? ByteBuffer body)
+                   (.remaining ^ByteBuffer body)
+                   (alength ^bytes body))]
     (when (neg? body-len)
       (raise "Invalid record body length" {:body-len body-len}))
     body-len))
@@ -156,8 +158,8 @@
 
 (defn record-checksum
   "Checksum a v2 record over header fields that are not the checksum slot plus
-  the record body."
-  [major flags body-len ^bytes body]
+  the record body. ByteBuffer input starts at its position, which is preserved."
+  [major flags body-len body]
   (let [^CRC32C crc (.get tl-crc32c)
         body-len (long body-len)]
     (.reset crc)
@@ -166,11 +168,19 @@
     (crc-update-byte! crc flags)
     (crc-update-u32! crc body-len)
     (when (pos? body-len)
-      (.update crc body 0 (int body-len)))
+      (if (instance? ByteBuffer body)
+        (let [^ByteBuffer body body]
+          (if (.hasArray body)
+            (.update crc (.array body)
+                     (+ (.arrayOffset body) (.position body)) (int body-len))
+            (let [view (.duplicate body)]
+              (.limit view (+ (.position view) (int body-len)))
+              (.update crc view))))
+        (.update crc ^bytes body 0 (int body-len))))
     (bit-and 0xffffffff (long (.getValue crc)))))
 
 (defn current-record-checksum
-  [body-len compressed? ^bytes body]
+  [body-len compressed? body]
   (record-checksum format-major
                    (if compressed? compressed-flag 0x00)
                    body-len
@@ -469,7 +479,7 @@
           ^ByteBuffer grown (ByteBuffer/allocate (int new-cap))]
       (.flip bf)
       (.put grown bf)
-      (.set tl grown)
+      (when tl (.set tl grown))
       grown)))
 
 (defn- next-capacity-at-least
@@ -1015,59 +1025,93 @@
             (do (.add out row) (recur (inc i)))))))
     out))
 
+(defn- encode-commit-row-payload-into
+  ^ByteBuffer [^ByteBuffer bf0 lsn tx-time rows {:keys [ha-term]}]
+  (let [^FastList rowsv (ensure-fast-list rows)
+        row-count (long (.size rowsv))
+        major (if (l/datom-kv-txs? rowsv)
+                commit-payload-format-major
+                legacy-commit-payload-format-major)
+        parallel-rows? (use-parallel-row-encoding? row-count)
+        ha-term (some-> ha-term long)
+        flags (int (if (some? ha-term)
+                     commit-payload-ha-term-flag
+                     0))
+        ;; A borrowed body is not reusable while encoding or awaiting append.
+        ^ThreadLocal tl nil
+        ^HashMap dbi-cache (when-not parallel-rows?
+                             (.get tl-dbi-name-cache))
+        _ (when dbi-cache (.clear dbi-cache))
+        ^ByteBuffer bf1 (-> bf0
+                            (bb-put-bytes! tl commit-payload-magic-bytes)
+                            (bb-put-byte! tl major)
+                            (bb-put-byte! tl flags)
+                            (bb-put-u16! tl 0)
+                            (bb-put-long! tl (long lsn))
+                            (bb-put-long! tl (long tx-time))
+                            (cond-> (some? ha-term)
+                              (bb-put-long! tl ha-term))
+                            (bb-put-u32! tl row-count))
+        ^ByteBuffer bfN (if parallel-rows?
+                          (append-parallel-kv-row-bytes! bf1
+                                                         tl
+                                                         rowsv
+                                                         row-count)
+                          (loop [i 0
+                                 ^ByteBuffer bf bf1]
+                            (if (< i row-count)
+                              (recur (unchecked-inc-int i)
+                                     (write-kv-row! tl bf (.get rowsv i)
+                                                    dbi-cache))
+                              bf)))]
+    (.flip bfN)
+    (maybe-shrink-bits-buffer!)
+    bfN))
+
+(defn release-commit-row-payload-buffer!
+  "Return a borrowed payload buffer on the thread that encoded it, after its
+  synchronous consumer has finished. The buffer must not be retained afterward."
+  [^ByteBuffer body]
+  (.set tl-commit-body-buffer body)
+  (maybe-shrink-threadlocal-buffer!
+   tl-commit-body-buffer body (.limit body) tl-commit-body-buffer-initial-cap)
+  nil)
+
+(defn encode-commit-row-payload-buffer
+  "Encode canonical WAL rows into a borrowed buffer, ready to read. Release it
+  with release-commit-row-payload-buffer! in finally. Nested encodes use another
+  buffer so hooks cannot overwrite a payload awaiting its synchronous append."
+  (^ByteBuffer [lsn tx-time rows]
+   (encode-commit-row-payload-buffer lsn tx-time rows {}))
+  (^ByteBuffer [lsn tx-time rows opts]
+   (let [^ByteBuffer body (or (.get tl-commit-body-buffer)
+                              (ByteBuffer/allocate tl-commit-body-buffer-initial-cap))]
+     (.set tl-commit-body-buffer nil)
+     (try
+       (encode-commit-row-payload-into (.clear body) lsn tx-time rows opts)
+       (catch Throwable t
+         (release-commit-row-payload-buffer! body)
+         (throw t))))))
+
 (defn encode-commit-row-payload
-  "Encode canonical txn-log payload as raw binary bytes."
+  "Encode canonical txn-log payload as independently owned binary bytes."
   ([lsn tx-time rows]
    (encode-commit-row-payload lsn tx-time rows {}))
-  ([lsn tx-time rows {:keys [ha-term]}]
-   (let [^FastList rowsv (ensure-fast-list rows)
-         row-count (long (.size rowsv))
-         major (if (l/datom-kv-txs? rowsv)
-                 commit-payload-format-major
-                 legacy-commit-payload-format-major)
-         parallel-rows? (use-parallel-row-encoding? row-count)
-         ha-term (some-> ha-term long)
-         flags (int (if (some? ha-term)
-                      commit-payload-ha-term-flag
-                      0))
-         ^ThreadLocal tl tl-commit-body-buffer
-         ^ByteBuffer bf0 (.clear ^ByteBuffer (.get tl))
-         ^HashMap dbi-cache (when-not parallel-rows?
-                              (.get tl-dbi-name-cache))
-         _ (when dbi-cache (.clear dbi-cache))
-         ^ByteBuffer bf1 (-> bf0
-                             (bb-put-bytes! tl commit-payload-magic-bytes)
-                             (bb-put-byte! tl major)
-                             (bb-put-byte! tl flags)
-                             (bb-put-u16! tl 0)
-                             (bb-put-long! tl (long lsn))
-                             (bb-put-long! tl (long tx-time))
-                             (cond-> (some? ha-term)
-                               (bb-put-long! tl ha-term))
-                             (bb-put-u32! tl row-count))
-         ^ByteBuffer bfN (if parallel-rows?
-                           (append-parallel-kv-row-bytes! bf1
-                                                          tl
-                                                          rowsv
-                                                          row-count)
-                           (loop [i 0
-                                  ^ByteBuffer bf bf1]
-                             (if (< i row-count)
-                               (recur (unchecked-inc-int i)
-                                      (write-kv-row! tl bf (.get rowsv i)
-                                                     dbi-cache))
-                               bf)))
-         len (.position bfN)
-         out (byte-array len)]
-     (.flip bfN)
-     (.get bfN out)
-     (maybe-shrink-threadlocal-buffer!
-      tl
-      bfN
-      len
-      tl-commit-body-buffer-initial-cap)
-     (maybe-shrink-bits-buffer!)
-     out)))
+  ([lsn tx-time rows opts]
+   (let [^ByteBuffer body (encode-commit-row-payload-buffer lsn tx-time rows opts)]
+     (try
+       (let [out (byte-array (.remaining body))]
+         (.get body out)
+         out)
+       (finally (release-commit-row-payload-buffer! body))))))
+
+(defn patch-commit-row-payload-buffer-header!
+  "Patch a writable payload at its current position without consuming it."
+  [^ByteBuffer body ^long lsn ^long tx-time]
+  (let [start (.position body)]
+    (.putLong body (+ start commit-payload-lsn-offset) lsn)
+    (.putLong body (+ start commit-payload-tx-time-offset) tx-time))
+  body)
 
 (defn patch-commit-row-payload-header!
   [^bytes body ^long lsn ^long tx-time]

@@ -212,10 +212,12 @@
                {:remaining (total-buffers-remaining bufs)})))))
 
 (defn- write-fully-record!
-  [^FileChannel ch ^ByteBuffer header-bf ^bytes body]
+  [^FileChannel ch ^ByteBuffer header-bf body]
   (let [^"[Ljava.nio.ByteBuffer;" bufs (.get tl-record-write-buffers)]
     (aset bufs 0 header-bf)
-    (aset bufs 1 (ByteBuffer/wrap body))
+    (aset bufs 1 (if (instance? ByteBuffer body)
+                   body
+                   (ByteBuffer/wrap ^bytes body)))
     (try
       (write-fully-buffers! ch bufs)
       (finally
@@ -533,9 +535,9 @@
          (throw e))))))
 
 (defn append-record-at!
-  ([^FileChannel ch ^long offset ^bytes body]
+  ([^FileChannel ch ^long offset body]
    (append-record-at! ch offset body {}))
-  ([^FileChannel ch ^long offset ^bytes body
+  ([^FileChannel ch ^long offset body
     {:keys [compressed?] :or {compressed? false}}]
    (let [body-len        (codec/checked-record-body-len body)
          checksum        (codec/current-record-checksum
@@ -553,9 +555,9 @@
      {:offset offset :size total-size :checksum checksum})))
 
 (defn append-record!
-  ([^FileChannel ch ^bytes body]
+  ([^FileChannel ch body]
    (append-record! ch body {}))
-  ([^FileChannel ch ^bytes body opts]
+  ([^FileChannel ch body opts]
    (let [offset (.size ch)]
      (append-record-at! ch offset body opts))))
 
@@ -564,10 +566,11 @@
   and tracks the end offset independently of the channel position. Records up
   to 64 KiB use a reusable direct buffer and positioned writes, avoiding a seek
   and gathering-I/O heap-buffer adapters. Larger records use the gathered path
-  so a large transaction does not grow the retained direct buffer."
-  ([^FileChannel ch ^long offset ^bytes body]
+  so a large transaction does not grow the retained direct buffer. A ByteBuffer
+  body is consumed from its position to its limit before returning."
+  ([^FileChannel ch ^long offset body]
    (write-record-at! ch offset body {}))
-  ([^FileChannel ch ^long offset ^bytes body
+  ([^FileChannel ch ^long offset body
     {:keys [compressed?] :or {compressed? false} :as opts}]
    (let [body-len (codec/checked-record-body-len body)
          total-size (+ codec/record-header-size (long body-len))]
@@ -578,7 +581,9 @@
                                   (boolean compressed?) checksum)]
          (.limit buffer (int total-size))
          (.position buffer codec/record-header-size)
-         (.put buffer body)
+         (if (instance? ByteBuffer body)
+           (.put buffer ^ByteBuffer body)
+           (.put buffer ^bytes body))
          (.flip buffer)
          (loop [position offset]
            (when (.hasRemaining buffer)

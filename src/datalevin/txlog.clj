@@ -23,6 +23,7 @@
    [taoensso.timbre :as log])
   (:import
    [java.io File]
+   [java.nio ByteBuffer]
    [java.nio.channels FileChannel FileLock OverlappingFileLockException]
    [java.nio.file StandardOpenOption]
    [java.util.concurrent.locks ReentrantLock]
@@ -1008,9 +1009,6 @@
 
 (def decode-commit-row-payload-header tcodec/decode-commit-row-payload-header)
 
-(def ^:private patch-commit-row-payload-header!
-  tcodec/patch-commit-row-payload-header!)
-
 (defn commit-marker-key-for-revision
   [revision]
   (if (zero? (bit-and (long revision) 0x1))
@@ -1069,7 +1067,7 @@
              {:type :txlog/not-enabled})))
 
 (defn- append-record-under-lock!
-  [state prepared-payload {:keys [throw-if-fatal! before-append!]}]
+  [state ^ByteBuffer body {:keys [throw-if-fatal! before-append!]}]
   (when throw-if-fatal!
     (throw-if-fatal! state))
   (when before-append!
@@ -1092,8 +1090,7 @@
                        (.size ch)))
         append-start-ms now
         near-roll? (near-roll-append? state offset)
-        ^bytes body (:body prepared-payload)
-        _ (patch-commit-row-payload-header! body lsn now)
+        _ (tcodec/patch-commit-row-payload-buffer-header! body lsn now)
         append-res (tseg/write-record-at! ch offset body)
         next-offset (+ offset (long (:size append-res)))]
     (when segment-offset
@@ -1111,6 +1108,17 @@
      :sid sid
      :sync-manager sync-manager
      :timeout-ms (long (:commit-wait-ms state))}))
+
+(defn- append-prepared-record!
+  [state rows hooks]
+  (let [^ByteBuffer body (tcodec/encode-commit-row-payload-buffer
+                         0 0 rows {:ha-term *commit-payload-ha-term*})
+        append-lock (or (:append-lock state) state)]
+    (try
+      (locking append-lock
+        (append-record-under-lock! state body hooks))
+      (finally
+        (tcodec/release-commit-row-payload-buffer! body)))))
 
 (defn- defer-sync-attempt!
   [{:keys [monitor] :as sync-manager}]
@@ -1291,12 +1299,9 @@
 
 (defn- append-durable-relaxed!
   [state rows {:keys [mark-fatal!] :as hooks}]
-  (let [prepared-payload {:body (encode-commit-row-payload 0 0 rows)}
-        append-lock (or (:append-lock state) state)
-        {:keys [append-res append-start-ms ch lsn near-roll?
+  (let [{:keys [append-res append-start-ms ch lsn near-roll?
                 sid sync-manager]}
-        (locking append-lock
-          (append-record-under-lock! state prepared-payload hooks))
+        (append-prepared-record! state rows hooks)
         sync-begin (append-sync-transition! sync-manager lsn append-start-ms)
         sync-res (when sync-begin
                    (perform-sync-round! state
@@ -1323,12 +1328,9 @@
 
 (defn- append-durable-strict!
   [state rows {:as hooks}]
-  (let [prepared-payload {:body (encode-commit-row-payload 0 0 rows)}
-        append-lock (or (:append-lock state) state)
-        {:keys [append-res append-start-ms ch lsn near-roll?
+  (let [{:keys [append-res append-start-ms ch lsn near-roll?
                 sid sync-manager timeout-ms]}
-        (locking append-lock
-          (append-record-under-lock! state prepared-payload hooks))
+        (append-prepared-record! state rows hooks)
         sync-begin (append-sync-transition! sync-manager lsn append-start-ms
                                             {:force? true :begin-lsn lsn})
         done-ms
