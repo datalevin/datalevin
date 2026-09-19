@@ -7,6 +7,7 @@
    [datalevin.constants :as c]
    [datalevin.custom-kv :as custom-kv]
    [datalevin.interface :as i]
+   [datalevin.kv.encoding :as encoding]
    [datalevin.kv.snapshot :refer [copy-dir-contents! list-snapshot-entries
                                   move-dir! snapshot-compact?
                                   snapshot-current-slot snapshot-max-age-ms
@@ -21,6 +22,7 @@
   (:import
    [datalevin.binding.cpp Rtx]
    [datalevin.cpp Txn]
+   [datalevin.kv.encoding WriteBatch]
    [datalevin.lmdb DatomKVTxData]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
@@ -966,7 +968,9 @@
 
 (defn txlog-reset-pending!
   [info-v]
-  (vswap! info-v assoc :txlog-pending-ops (FastList.)))
+  (vswap! info-v assoc :txlog-pending-ops (FastList.))
+  (when-let [arena (:kv-encode-buffer (:txlog-state @info-v))]
+    (encoding/reset-arena! arena)))
 
 (defn txlog-add-pending!
   [info-v rows]
@@ -2402,11 +2406,16 @@
   [lmdb state dbi-name txs k-type v-type]
   (let [datom-txs? (l/datom-kv-txs? txs)
         tx-data    (canonicalize-input-kvtxs dbi-name txs k-type v-type)
-        lmdb-txs   (if datom-txs? txs tx-data)]
+        ^WriteBatch batch (when (and (not datom-txs?)
+                                    (pos? (.size ^java.util.List tx-data))
+                                    (:kv-encode-buffer state))
+                            (encoding/write-batch tx-data (:kv-encode-buffer state)))
+        lmdb-txs   (or batch (if datom-txs? txs tx-data))
+        pending    (if batch (.-encoded batch) tx-data)]
     (if (pos? (.size ^java.util.List tx-data))
       (if (write-txn-open? lmdb)
         (let [res (i/transact-kv lmdb lmdb-txs)]
-          (txlog-add-pending! (i/kv-info lmdb) tx-data)
+          (txlog-add-pending! (i/kv-info lmdb) pending)
           res)
         (let [wdb (i/open-transact-kv lmdb)]
           (try
@@ -2415,7 +2424,7 @@
                 (raise "Unexpected LMDB transactional write result"
                        {:type :txlog/unexpected-transact-result
                         :result res}))
-              (txlog-add-pending! (i/kv-info lmdb) tx-data)
+              (txlog-add-pending! (i/kv-info lmdb) pending)
               (let [status (close-with-txlog! lmdb state)]
                 (when-not (= :committed status)
                   (raise "Unexpected LMDB transactional close result"
@@ -2429,6 +2438,8 @@
               (try
                 (i/close-transact-kv lmdb)
                 (catch Exception _))
+              (when-not (write-txn-open? lmdb)
+                (txlog-reset-pending! (i/kv-info lmdb)))
               (throw e)))))
       (i/transact-kv lmdb dbi-name txs k-type v-type))))
 

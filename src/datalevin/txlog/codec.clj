@@ -12,6 +12,7 @@
   (:require
    [datalevin.bits :as b]
    [datalevin.constants :as c]
+   [datalevin.kv.encoding]
    [datalevin.lmdb :as l]
    [datalevin.util :as u :refer [raise map+]])
   (:import
@@ -20,6 +21,7 @@
    [java.util Arrays HashMap List Collection]
    [java.util.zip CRC32C]
    [datalevin.lmdb DatomKVTxData]
+   [datalevin.kv.encoding EncodedKVTxData]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
 (def ^:const record-header-size 14)
@@ -828,11 +830,46 @@
               :op op
               :row row}))))
 
+(defn- bb-put-input-range!
+  ^ByteBuffer [^ByteBuffer bf ^ThreadLocal tl ^ByteBuffer input offset length]
+  (let [^ByteBuffer out (ensure-room! bf tl (long length))
+        start (.position out)]
+    ;; Absolute access also lets parallel WAL workers read the same arena.
+    (.put out start input (int offset) (int length))
+    (.position out (+ start (int length)))
+    out))
+
+(defn- write-encoded-kv-row!
+  ^ByteBuffer [^ThreadLocal tl ^ByteBuffer bf ^EncodedKVTxData row ^HashMap dbi-cache]
+  (let [^datalevin.lmdb.KVTxData tx (.-tx row)
+        ^bytes dbi-bs (dbi-name-bytes (.-dbi-name tx) dbi-cache)
+        put? (= :put (.-op tx))
+        ^ByteBuffer input (.-buffer row)
+        ^ByteBuffer out (-> bf
+                            (bb-put-byte! tl (int (if put? op-kv-put op-kv-del)))
+                            (bb-put-u16! tl (alength dbi-bs))
+                            (bb-put-bytes! tl dbi-bs)
+                            (bb-write-type! tl (or (.-kt tx) :data))
+                            (bb-put-u16! tl (.-key-length row))
+                            (bb-put-input-range! tl input (.-key-offset row)
+                                                 (.-key-length row)))
+        ^ByteBuffer out (if put?
+                          (-> out
+                              (bb-write-type! tl (or (.-vt tx) :data))
+                              (bb-put-u32! tl (.-value-length row))
+                              (bb-put-input-range! tl input (.-value-offset row)
+                                                   (.-value-length row)))
+                          out)]
+    (bb-write-flags! out tl (.-flags tx))))
+
 (defn- write-kv-row!
   ([^ThreadLocal tl ^ByteBuffer bf row]
    (write-kv-row! tl bf row nil))
   ([^ThreadLocal tl ^ByteBuffer bf row ^HashMap dbi-cache]
    (cond
+     (instance? EncodedKVTxData row)
+     (write-encoded-kv-row! tl bf row dbi-cache)
+
      (instance? DatomKVTxData row)
      (let [^DatomKVTxData tx row
            ^bytes avg (.-avg tx)]

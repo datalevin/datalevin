@@ -13,13 +13,15 @@
    [datalevin.binding.cpp.buffer]
    [datalevin.bits :as b]
    [datalevin.constants :as c]
+   [datalevin.kv.encoding :as encoding]
    [datalevin.lmdb :as l]
    [datalevin.util :refer [raise]]
    [datalevin.validate :as vld])
   (:import
    [datalevin.dtlvnative DTLV]
    [datalevin.cpp BufVal Cursor]
-   [datalevin.binding.cpp.buffer DBI IMultipleBuffer IWriteCursor]
+   [datalevin.binding.cpp.buffer DBI IEncodedInput IMultipleBuffer IWriteCursor]
+   [datalevin.kv.encoding WriteBatch]
    [datalevin.lmdb DatomKVTxData KVTxData]
    [datalevin.utl BitOps]
    [java.nio ByteBuffer]
@@ -73,6 +75,39 @@
                   (.del dbi txn false)
                   ;; mdb_del may mutate the native key if value is missing
                   (.reset kp)))))
+
+(defn- put-captured-tx
+  [^DBI dbi txn ^KVTxData tx ^WriteBatch batch]
+  (case (.-op tx)
+    :put
+    (do
+      (.put-key dbi (.-k tx) (.-kt tx))
+      (.put-val dbi (.-v tx) (.-vt tx))
+      (let [row (encoding/capture batch tx
+                                  (.encodedKeyInput ^IEncodedInput dbi)
+                                  (.encodedValueInput ^IEncodedInput dbi))]
+        (if-let [flags (.-flags tx)] (.put dbi txn flags) (.put dbi txn))
+        row))
+    :del
+    (do
+      (.put-key dbi (.-k tx) (.-kt tx))
+      (let [row (encoding/capture batch tx (.encodedKeyInput ^IEncodedInput dbi) nil)]
+        (.del dbi txn)
+        row))
+    ;; List operations encode a collection in WAL and individual elements in
+    ;; LMDB. Preserve that format and their existing per-element write behavior.
+    (do (put-tx dbi txn tx) tx)))
+
+(defn- transact-captured*
+  [^WriteBatch batch ^HashMap dbis txn]
+  (let [^List rows (.-rows batch)
+        ^FastList encoded (.-encoded batch)]
+    (dotimes [index (.size rows)]
+      (let [^KVTxData tx (.get rows index)
+            name (.-dbi-name tx)
+            ^DBI dbi (or (.get dbis name) (raise name " is not open" {}))]
+        (vld/validate-kv-tx-data tx (.-validate-data? dbi))
+        (.add encoded (put-captured-tx dbi txn tx batch))))))
 
 (defn- put-datom-tx
   [^DBI ave ^DBI eav txn ^DatomKVTxData tx]
@@ -444,7 +479,11 @@
 
 (defn transact*
   [txs ^HashMap dbis txn]
-  (if (instance? java.util.List txs)
+  (cond
+    (instance? WriteBatch txs)
+    (transact-captured* txs dbis txn)
+
+    (instance? java.util.List txs)
     (let [^java.util.List tx-list txs]
       (if (and (pos? (.size tx-list))
                (instance? DatomKVTxData (.get tx-list 0)))
@@ -457,6 +496,7 @@
                 validate? (.-validate-data? dbi)]
             (vld/validate-kv-tx-data tx validate?)
             (put-tx dbi txn tx)))))
+    :else
     (let [xs (seq txs)]
       (if (instance? DatomKVTxData (first xs))
         (transact-datom-seq* xs dbis txn)

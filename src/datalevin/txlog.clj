@@ -428,6 +428,7 @@
          ;; Committed LMDB snapshot ID and its full recovery floor, including
          ;; snapshot metadata. Also guarded by the environment write lock.
          :lmdb-runtime-floor    (long-array [-1 0])
+         :kv-encode-buffer      (volatile! nil)
          :commit-wait-ms         (long (commit-wait-ms info))
 
          :sync-manager (new-sync-manager

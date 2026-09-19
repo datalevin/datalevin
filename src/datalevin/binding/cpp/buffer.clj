@@ -52,6 +52,10 @@
   (^void putKeyId [^long id])
   (^void putValId [^long id]))
 
+(definterface IEncodedInput
+  (^java.nio.ByteBuffer encodedKeyInput [])
+  (^java.nio.ByteBuffer encodedValueInput []))
+
 (definterface ^:private IWriteCursor
   (^datalevin.cpp.Cursor writeCursor [^datalevin.cpp.Txn txn]))
 
@@ -292,6 +296,12 @@
   (dbi-key-codec [_] key-codec)
   (dbi-value-codec [_] value-codec)
 
+  IEncodedInput
+  ;; Valid until the next serialization on this DBI. Compression consumes the
+  ;; scratch buffer's position but leaves the raw bytes in [0, limit).
+  (encodedKeyInput [_] (if key-codec k-comp-bf (.inBuf kp)))
+  (encodedValueInput [_] (if value-codec v-comp-bf (.inBuf vp)))
+
   IMultipleBuffer
   (multipleValBuffer [_ size]
     (let [size             (long size)
@@ -468,4 +478,3 @@
 (defn dbi-val-compressor
   [^DBI dbi]
   (.-value-codec dbi))
-
