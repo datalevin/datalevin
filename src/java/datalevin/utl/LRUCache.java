@@ -88,6 +88,10 @@ public class LRUCache {
     }
 
     public synchronized void enable() {
+        // Invalidation can precede the native commit. Readers starting while
+        // disabled may capture that generation but still read the old snapshot.
+        // Reject their publications after caching resumes, retaining entries.
+        if (disabled) generation++;
         disabled = false;
     }
 

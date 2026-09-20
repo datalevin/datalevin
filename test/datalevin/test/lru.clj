@@ -68,6 +68,25 @@
     (is (.putIfGeneration l :current :new (.generation l)))
     (is (= :new (.get l :current)))))
 
+(deftest disabled-reader-cannot-publish-after-enable
+  (let [l (LRUCache. 4 1)]
+    (.put l :unaffected :keep)
+    (.disable l)
+    ;; Invalidation can precede the native transaction's commit. A reader
+    ;; starting here still sees the old data despite capturing this generation.
+    (.beginInvalidation l 2)
+    (let [generation (.generation l)]
+      (is (not (.putIfGeneration l :stale :old generation)))
+      (.enable l)
+      (is (not (.putIfGeneration l :stale :old generation)))
+      (is (nil? (.get l :stale))))
+    (is (= :keep (.get l :unaffected)))
+    (let [generation (.generation l)]
+      ;; Enabling an already enabled cache must not reject current readers.
+      (.enable l)
+      (is (.putIfGeneration l :current :new generation)))
+    (is (= :new (.get l :current)))))
+
 (deftest dependency-index-follows-lru-lifecycle
   (let [classified (atom [])
         l (LRUCache. 2 1
