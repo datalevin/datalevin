@@ -1,9 +1,10 @@
 (ns datalevin.wal-completion-test
   (:require [clojure.test :refer [deftest is testing]]
             [datalevin.txlog :as wal]
+            [datalevin.txlog.codec :as codec]
             [datalevin.txlog.meta :as meta]
             [datalevin.util :as u])
-  (:import [java.io Closeable IOException]))
+  (:import [java.io Closeable IOException RandomAccessFile]))
 
 (defn- with-runtime [f]
   (let [dir (u/tmp-dir (str "wal-completion-" (random-uuid)))
@@ -72,10 +73,10 @@
         (let [state (assoc state :meta-flush-max-ms 0)]
           (wal/note-commit-applied! state record)
           (let [last-flush @(:meta-last-flush-ms state)]
-            ;; Opening a directory as the lock file fails before publication.
+            ;; Opening a directory as the metadata file fails publication.
             ;; Exercise the actual I/O path even with direct linking enabled.
             (is (thrown? IOException
-                         (wal/flush-meta! (assoc state :meta-lock-path (:dir state)))))
+                         (wal/flush-meta! (assoc state :meta-path (:dir state)))))
             (is (true? @(:meta-dirty? state)))
             (is (= 1 @(:meta-commits-since-flush state)))
             (is (= last-flush @(:meta-last-flush-ms state))))
@@ -99,6 +100,69 @@
           (is (= {:last-committed-lsn 1 :last-durable-lsn 1 :last-applied-lsn 1}
                  (select-keys (refresh state)
                               [:last-committed-lsn :last-durable-lsn :last-applied-lsn]))))))))
+
+(deftest private-publication-preserves-live-sync-state-and-alternating-slots
+  (with-runtime
+    (fn [state]
+      (let [state (assoc state :meta-lock-path (:dir state))
+            manager (:sync-manager state)]
+        ;; A private publisher never opens the shared lock file. Force a real
+        ;; I/O error there to verify this even when direct linking is enabled.
+        (doseq [n [1 2]]
+          (let [record (wal/append-durable! state [[:put "dbi" n "v" :id :string]] {})]
+            (wal/note-commit-applied! state record)
+            (let [before (manager-metrics state)
+                  written (wal/flush-meta! state)]
+              (is (= before (manager-metrics state)))
+              (is (= (dec n) (:revision written)))
+              (is (= (if (= n 1) :a :b) (:slot written)))
+              (is (= [n n n]
+                     (mapv written [:last-committed-lsn :last-durable-lsn
+                                    :last-applied-lsn]))))))
+        (let [{:keys [slot-a slot-b]} (wal/read-meta-file (:meta-path state))]
+          (is (= [1 2] (mapv :last-applied-lsn [slot-a slot-b]))))
+        ;; A torn newest slot still leaves the preceding publication readable.
+        (with-open [file (RandomAccessFile. ^String (:meta-path state) "rw")]
+          (.seek file codec/meta-slot-size)
+          (.writeByte file 0))
+        (is (= 1 (get-in (wal/read-meta-file (:meta-path state))
+                         [:current :last-applied-lsn])))
+        (is (= 2 @(:last-durable-lsn manager)))))))
+
+(deftest private-publication-serializes-revisions
+  (with-runtime
+    (fn [state]
+      (let [start (promise)
+            n 16
+            jobs (mapv (fn [_]
+                         (future @start (meta/publish-meta-current! state)))
+                       (range n))]
+        (deliver start true)
+        (let [written (mapv #(deref % 5000 ::timeout) jobs)]
+          (is (every? map? written))
+          (is (= (range n) (sort (map :revision written))))
+          (is (= (dec n) @(:meta-revision state)))
+          (is (= (dec n) (get-in (wal/read-meta-file (:meta-path state))
+                                 [:current :revision]))))))))
+
+(deftest shared-current-publication-retains-locking-and-file-revision
+  (with-runtime
+    (fn [runtime]
+      (let [state (assoc runtime :wal-shared? true)
+            record (wal/append-durable! runtime [[:put "dbi" 1 "v" :id :string]] {})]
+        (wal/note-commit-applied! state record)
+        (is (thrown? IOException
+                     (wal/flush-meta! (assoc state :meta-lock-path (:dir state)))))
+        (is (true? @(:meta-dirty? state)))
+        (wal/write-meta-file! (:meta-path state)
+                              {:revision 20 :last-committed-lsn 1
+                               :last-durable-lsn 1 :last-applied-lsn 1
+                               :segment-id 1 :segment-offset (:size record)}
+                              {:sync-mode :none})
+        (is (= 21 (:revision (wal/flush-meta! state))))
+        (is (= 21 @(:meta-revision state)))
+        (is (= 21 (get-in (wal/read-meta-file (:meta-path state))
+                          [:current :revision])))))))
 
 (deftest shared-refresh-still-reconciles-without-snapshot
   (with-runtime

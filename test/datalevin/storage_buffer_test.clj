@@ -84,6 +84,22 @@
       (is (= c/separator (.get bf)))
       (is (= c/false-value (.get bf))))))
 
+(deftest storage-decode-retains-original-error
+  (let [payload (b/serialize {:data "truncated"})
+        truncated (java.util.Arrays/copyOf payload (dec (alength payload)))]
+    (doseq [decode [#(b/deserialize truncated)
+                   #(b/deserialize-bf (ByteBuffer/wrap truncated))
+                   #(b/deserialize-bf
+                      (doto (ByteBuffer/allocateDirect (alength truncated))
+                        (.put truncated) (.flip)))]]
+      (let [error (try (decode) nil (catch Exception e e))
+            original (some-> ^Throwable error .getSuppressed first)]
+        (is (some? error))
+        (is (re-find #"Thaw failed" (ex-message error)))
+        (is (some? original))
+        (is (some #(instance? EOFException %)
+                  (take-while some? (iterate ex-cause original))))))))
+
 (deftype BrokenStorageValue [])
 
 (nippy/extend-freeze BrokenStorageValue ::broken-storage-value

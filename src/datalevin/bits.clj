@@ -119,6 +119,16 @@
   (some #(= :native-value/decode (:error (ex-data %)))
         (take-while some? (iterate ex-cause e))))
 
+(defn- thaw-legacy
+  [^bytes bs ^Exception primary]
+  (try
+    (nippy/thaw bs)
+    (catch Exception fallback
+      ;; Headerless decode errors otherwise disappear behind Nippy's generic
+      ;; legacy-format error. Retain both failures without copying payloads.
+      (.addSuppressed fallback primary)
+      (throw fallback))))
+
 (defn- deserialize*
   [^bytes bs]
   (try
@@ -127,7 +137,7 @@
       ;; A native reader failure is not an old Nippy header. Retrying thaw
       ;; would hide the missing runtime binding behind a format error.
       (when (native-decoding-error? e) (throw e))
-      (nippy/thaw bs))))
+      (thaw-legacy bs e))))
 
 (defn deserialize
   "Deserialize from bytes. "
@@ -313,7 +323,7 @@
       (catch Exception e
         (when (native-decoding-error? e) (throw e))
         (.position bb pos)
-        (nippy/thaw (get-bytes bb))))))
+        (thaw-legacy (get-bytes bb) e)))))
 
 (defn deserialize-bf
   "Deserialize the remaining bytes, with legacy Nippy header fallback.

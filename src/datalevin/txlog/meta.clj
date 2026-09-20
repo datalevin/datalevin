@@ -467,18 +467,28 @@
 
 (defn publish-meta-current!
   [state]
-  (update-shared-meta!
-   state
-   (fn [current]
-     (let [base (base-meta-state state)]
-       (merge current
-              (select-keys
-               base
-               [:last-committed-lsn
-                :last-durable-lsn
-                :last-applied-lsn
-                :segment-id
-                :segment-offset]))))))
+  (if (false? (:wal-shared? state))
+    ;; A private WAL owns its metadata revision and append position. Serialize
+    ;; publishers with appends, but do not reread/reconcile shared state or
+    ;; write captured watermarks back into a concurrently progressing syncer.
+    (locking (or (:append-lock state) state)
+      (let [next-state (next-meta-state (base-meta-state state) identity)
+            written (write-meta-file! (:meta-path state) next-state
+                                      {:sync-mode :none})]
+        (vreset! (:meta-revision state) (long (:revision written)))
+        written))
+    (update-shared-meta!
+     state
+     (fn [current]
+       (let [base (base-meta-state state)]
+         (merge current
+                (select-keys
+                 base
+                 [:last-committed-lsn
+                  :last-durable-lsn
+                  :last-applied-lsn
+                  :segment-id
+                  :segment-offset])))))))
 
 (defn try-with-maintenance-lock
   [state f]

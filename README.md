@@ -49,7 +49,8 @@ query looks like in Datalevin:
 ## :question: Why
 
 The rationale is to have a simple, fast, versatile and open source Datalog query
-engine running on durable storage.
+engine running on durable storage. An extensive discussion of the rationale is
+at https://datalevin.org/
 
 It is our observation that many developers prefer
 the flavor of Datalog popularized by [Datomic®](https://www.datomic.com) over
