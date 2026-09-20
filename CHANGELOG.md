@@ -32,6 +32,7 @@ one thread per connection.
 - [KV] cheaper prefix cache operations.
 - [KV] reduce reader table scans.
 - [KV] allow `:int` as a tuple component.
+- [KV] `datalog-kv` works for remote server.
 
 ## 1.1.0 (2026-09-02)
 

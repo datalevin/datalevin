@@ -1326,6 +1326,14 @@
    (KVStore. uri db-name client tx-client write-txn writing? open-db-opts owns-client?
              closed?)))
 
+(defn datalog-kv
+  "Return a KV view sharing a remote Datalog store's clients and transaction."
+  [^DatalogStore store]
+  (->KVStore (.-uri store) (.-db-name store)
+             (.-client store) (.-tx-client store)
+             (.-write-txn store) (.-writing? store)
+             (.-open-db-info store) false (.-closed? store)))
+
 (defn open-kv
   "Open a remote kv store."
   ([uri-str]

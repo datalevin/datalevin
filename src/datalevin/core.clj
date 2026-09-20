@@ -1340,6 +1340,18 @@ Only usable for debug output.
         (d/transact-kv kv \"app-state\" [[:put \"k\" \"v\"]]
                        :string :string))
 
+  Inside [[with-transaction]], pass the transaction connection (or its DB)
+  to join KV operations to the same transaction, including for remote databases:
+
+      (d/with-transaction [tx conn]
+        (d/transact! tx [{:db/id 1 :status :ready}])
+        (d/transact-kv (d/datalog-kv tx) \"app-state\"
+                       [[:put \"status\" :ready]]))
+
+  Open application DBIs before starting the transaction. Use the transaction's
+  KV handle only inside its body; Datalog and KV writes commit or roll back
+  together. Use [[abort-transact]] on the transaction connection to abort both.
+
   The returned handle is owned by the Datalog connection. Do not close it
   separately; close the Datalog connection instead."}
   datalog-kv conn/datalog-kv)

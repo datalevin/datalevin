@@ -55,7 +55,7 @@
       (.-lmdb ^Store store)
 
       (instance? DatalogStore store)
-      store
+      (r/datalog-kv store)
 
       :else
       (raise "Datalog DB does not expose a KV handle"
