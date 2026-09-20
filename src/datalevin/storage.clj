@@ -1356,8 +1356,26 @@
       (sync-giant-id! store))
     (migrate-attr-values* store attr new-vt)))
 
+(def ^:private ^:const ft-ds-slot 0)
+(def ^:private ^:const vi-ds-slot 1)
+(def ^:private ^:const em-ds-slot 2)
+(def ^:private ^:const id-ds-slot 3)
+;; Keep asynchronous jobs grouped by index type when assigning ordinals.
+(def ^:private ^:const ft-jobs-slot 4)
+(def ^:private ^:const vi-jobs-slot 5)
+(def ^:private ^:const em-jobs-slot 6)
+
+(defn- add-index-work!
+  "Allocate a transaction's secondary-index list only on its first item."
+  [^objects work ^long slot item]
+  (let [^FastList items (or (aget work slot)
+                          (let [items (FastList.)]
+                            (aset work slot items)
+                            items))]
+    (.add items item)))
+
 (defn- collect-fulltext
-  [^Store store ^FastList ft-ds ^FastList ft-jobs attr props text ref job-op op]
+  [^Store store work attr props text ref job-op op]
   (when-not (str/blank? text)
     (doseq [domain (vec
                      (distinct
@@ -1369,12 +1387,12 @@
            (or (get-in (opts store) [:search-domains domain])
                (when (= c/default-domain domain) (:search-opts (opts store)))
                {}))
-        (.add ft-jobs {:type :fulltext
-                       :domain domain
-                       :op job-op
-                       :ref ref
-                       :value text})
-        (.add ft-ds [[domain] op])))))
+        (add-index-work! work ft-jobs-slot {:type :fulltext
+                                          :domain domain
+                                          :op job-op
+                                          :ref ref
+                                          :value text})
+        (add-index-work! work ft-ds-slot [[domain] op])))))
 
 (defn embedding-domain-config
   [^Store store domain]
@@ -1861,9 +1879,8 @@
         info)))
 
 (defn- insert-datom
-  [^Store store ^Datom d ^FastList txs ^FastList ft-ds ^FastList vi-ds
-   ^FastList ft-jobs ^FastList vi-jobs ^FastList em-ds ^FastList em-jobs
-   ^FastList id-ds ^HashMap giants ^HashMap attr-infos embedding-plan
+  [^Store store ^Datom d ^FastList txs work
+   ^HashMap giants ^HashMap attr-infos embedding-plan
    ^ByteBuffer avg-bf]
   (let [attr       (.-a d)
         e          (.-e d)
@@ -1898,24 +1915,25 @@
             domains (conjv (props :db.vec/domains) (v/attr-domain attr))]
         (doseq [domain domains]
           (if (async-vector-domain? store domain)
-            (.add vi-jobs {:type :vector
-                           :domain domain
-                           :op :add
-                           :ref ref
-                           :value v})
-            (.add vi-ds [[domain] op])))))
+            (add-index-work! work vi-jobs-slot {:type :vector
+                                              :domain domain
+                                              :op :add
+                                              :ref ref
+                                              :value v})
+            (add-index-work! work vi-ds-slot [[domain] op])))))
     (when embedding?
       (let [doc-ref     (if giant? [:g max-gt e aid] [e aid v])
             domain-vecs (some-> ^IdentityHashMap embedding-plan (.get d))]
         (doseq [domain (embedding-attr-domains attr props)]
           (if (async-embedding-domain? store domain)
-            (.add em-jobs {:type :embedding
-                           :domain domain
-                           :op :add
-                           :ref doc-ref
-                           :value v})
+            (add-index-work! work em-jobs-slot {:type :embedding
+                                              :domain domain
+                                              :op :add
+                                              :ref doc-ref
+                                              :value v})
             (when-let [vec-data (some-> ^HashMap domain-vecs (.get domain))]
-              (.add em-ds [domain [:a [doc-ref vec-data]]]))))))
+              (add-index-work! work em-ds-slot
+                               [domain [:a [doc-ref vec-data]]]))))))
     (when (identical? vt :db.type/idoc)
       (let [domain (or (props :db/domain) (u/keyword->string attr))
             op     (if giant?
@@ -1923,13 +1941,12 @@
                      [:a [e aid v]])
             patch  (some-> (meta d) :idoc/patch)
             op     (if patch (with-meta op {:idoc/patch patch}) op)]
-        (.add id-ds [domain op])))
+        (add-index-work! work id-ds-slot [domain op])))
     (when fulltext?
       (let [text (str v)
             ref  (if giant? [:g max-gt e aid] [e aid text])]
         (collect-fulltext store
-                          ft-ds
-                          ft-jobs
+                          work
                           attr
                           props
                           text
@@ -1938,9 +1955,8 @@
                           (if giant? [:g [e aid max-gt text]] [:a ref]))))))
 
 (defn- delete-datom
-  [^Store store ^Datom d ^FastList txs ^FastList ft-ds ^FastList vi-ds
-   ^FastList ft-jobs ^FastList vi-jobs ^FastList em-ds ^FastList em-jobs
-   ^FastList id-ds ^HashMap giants ^HashMap attr-infos ^ByteBuffer avg-bf]
+  [^Store store ^Datom d ^FastList txs work
+   ^HashMap giants ^HashMap attr-infos ^ByteBuffer avg-bf]
   (let [e          (.-e d)
         attr       (.-a d)
         v          (.-v d)
@@ -1970,8 +1986,7 @@
       (let [text (str v)
             ref  (if gt [:g gt e aid] [e aid text])]
         (collect-fulltext store
-                          ft-ds
-                          ft-jobs
+                          work
                           attr
                           props
                           text
@@ -1982,18 +1997,19 @@
       (let [doc-ref (if gt [:g gt e aid] [e aid v])]
         (doseq [domain (embedding-attr-domains attr props)]
           (if (async-embedding-domain? store domain)
-            (.add em-jobs {:type :embedding
-                           :domain domain
-                           :op :delete
-                           :ref doc-ref
-                           :value v})
-            (.add em-ds [domain [:d doc-ref]])))))
+            (add-index-work! work em-jobs-slot {:type :embedding
+                                              :domain domain
+                                              :op :delete
+                                              :ref doc-ref
+                                              :value v})
+            (add-index-work! work em-ds-slot [domain [:d doc-ref]])))))
     (when (identical? vt :db.type/idoc)
       (let [domain (or (props :db/domain) (u/keyword->string attr))]
-        (.add id-ds [domain
-                     (if gt
-                       [:r [e aid gt v]]
-                       [:d [e aid v]])])))
+        (add-index-work! work id-ds-slot
+                         [domain
+                          (if gt
+                            [:r [e aid gt v]]
+                            [:d [e aid v]])])))
     (let [ii (Indexable. nil aid v (.-f i) (.-b i) (or gt c/normal))]
       (.add txs (DatomKVTxData. e (b/indexable-bytes ii avg-bf) false false))
       (when gt
@@ -2005,12 +2021,12 @@
               domains (conjv (props :db.vec/domains) (v/attr-domain attr))]
           (doseq [domain domains]
             (if (async-vector-domain? store domain)
-              (.add vi-jobs {:type :vector
-                             :domain domain
-                             :op :delete
-                             :ref ref
-                             :value v})
-              (.add vi-ds [[domain] op]))))))))
+              (add-index-work! work vi-jobs-slot {:type :vector
+                                                :domain domain
+                                                :op :delete
+                                                :ref ref
+                                                :value v})
+              (add-index-work! work vi-ds-slot [[domain] op]))))))))
 
 (defn- prepare-datoms-kv-plan
   "Prepare KV write plan for a datom batch.
@@ -2023,21 +2039,8 @@
    ;; Datom operations lead the batch so LMDB can select the primitive-EID
    ;; executor once; generic giant, job, and metadata operations follow.
    (let [txs    (FastList. (+ 2 (count datoms) (count extra-kv-txs)))
-         ;; fulltext [:a d [e aid v]], [:d d [e aid v]],
-         ;; [:g d [e aid gt v]], or [:r d [e aid gt]]
-         ft-ds  (FastList.)
-         ft-jobs (FastList.)
-         ;; vector [:a d [e aid v]], [:d d [e aid v]],
-         ;; [:g d [e aid gt v]], or [:r d [e aid gt]]
-         vi-ds  (FastList.)
-         vi-jobs (FastList.)
-         ;; embedding [:a [doc-ref vec]], [:d doc-ref]
-         em-ds  (FastList.)
-         ;; durable async secondary index jobs
-         em-jobs (FastList.)
-         ;; idoc [:a d [e aid v]], [:d d [e aid v]],
-         ;; [:g d [e aid gt v]], or [:r d [e aid gt v]]
-         id-ds  (FastList.)
+         ;; Nil slots mean no work; each list is allocated on its first item.
+         work   (object-array 7)
          giants (HashMap.)
          attr-infos (HashMap.)
          avg-bf     (bf/get-array-buffer)]
@@ -2050,19 +2053,18 @@
              ((if (d/datom-added datom) cd/put-datom! cd/delete-datom!)
               (lmdb/mark-write (.-lmdb store)) (.-e datom) (aget ai 2) type (.-v datom))
              (if (d/datom-added datom)
-               (insert-datom store datom txs ft-ds vi-ds ft-jobs vi-jobs
-                             em-ds em-jobs id-ds giants attr-infos embedding-plan
+               (insert-datom store datom txs work giants attr-infos embedding-plan
                              avg-bf)
-               (delete-datom store datom txs ft-ds vi-ds ft-jobs vi-jobs em-ds
-                             em-jobs id-ds giants attr-infos avg-bf)))))
+               (delete-datom store datom txs work giants attr-infos avg-bf)))))
        (finally
          (bf/return-array-buffer avg-bf)))
-     (let [tx-id (long (.advance-max-tx store))
+     (let [ft-jobs (aget work ft-jobs-slot)
+           vi-jobs (aget work vi-jobs-slot)
+           em-jobs (aget work em-jobs-slot)
+           tx-id (long (.advance-max-tx store))
            modified-ms (long (or last-modified-ms
                                  (System/currentTimeMillis)))]
-       (when (or (not (.isEmpty ft-jobs))
-                 (not (.isEmpty vi-jobs))
-                 (not (.isEmpty em-jobs)))
+       (when (or ft-jobs vi-jobs em-jobs)
          (doseq [[ordinal job] (map-indexed vector
                                             (concat ft-jobs vi-jobs em-jobs))]
            (.add txs (si/job-tx (assoc job
@@ -2077,26 +2079,26 @@
      (doseq [tx extra-kv-txs]
        (.add txs tx))
      {:txs txs
-      :ft-ds ft-ds
-      :vi-ds vi-ds
-      :em-ds em-ds
-      :id-ds id-ds
-      :secondary-index-job-count (+ (.size ft-jobs)
-                                    (.size vi-jobs)
-                                    (.size em-jobs))})))
+      :ft-ds (aget work ft-ds-slot)
+      :vi-ds (aget work vi-ds-slot)
+      :em-ds (aget work em-ds-slot)
+      :id-ds (aget work id-ds-slot)
+      :secondary-index-job-count (+ (count (aget work ft-jobs-slot))
+                                    (count (aget work vi-jobs-slot))
+                                    (count (aget work em-jobs-slot)))})))
 
 (defn- commit-datoms-kv-plan!
   "Commit a prepared datom KV plan."
   [lmdb search-engines vector-indices embedding-indices idoc-indices
    {:keys [txs ft-ds vi-ds em-ds id-ds]}]
-  (when-not (.isEmpty ^FastList ft-ds)
+  (when ft-ds
     (fulltext-index search-engines ft-ds))
-  (when-not (.isEmpty ^FastList vi-ds)
+  (when vi-ds
     (vector-index vector-indices vi-ds))
-  (when-not (.isEmpty ^FastList em-ds)
+  (when em-ds
     (embedding-index embedding-indices em-ds))
-  (let [idoc-state-actions (when-not (.isEmpty ^FastList id-ds)
-                             (idoc-index idoc-indices id-ds txs))]
+  (let [idoc-state-actions (when id-ds
+                            (idoc-index idoc-indices id-ds txs))]
     (transact-kv lmdb txs)
     (idoc/apply-state-actions! idoc-state-actions)))
 

@@ -543,22 +543,32 @@
             (vld/validate-kv-tx-data tx validate?)
             (put-tx dbi txn tx)))))))
 
+(defn- prepared-add-only-datoms?
+  [^objects ops]
+  (let [n (alength ops)]
+    (loop [i 1]
+      (if (< i n)
+        (let [tx (aget ops i)]
+          (if (and (instance? DatomKVTxData tx)
+                   (not (.-added? ^DatomKVTxData tx)))
+            false
+            (recur (+ i 2))))
+        true))))
+
 (defn- prepared-datom-txs
   [^objects ops]
   (let [n            (alength ops)
         ^objects out (object-array (quot n 2))]
-    (loop [i          0
-           j          0
-           add-only?  true]
+    (loop [i 0
+           j 0]
       (if (< i n)
         (let [tx (aget ops (unchecked-inc i))]
           (if (instance? DatomKVTxData tx)
             (do
               (aset out j tx)
-              (recur (+ i 2) (unchecked-inc j)
-                     (and add-only? (.-added? ^DatomKVTxData tx))))
-            (recur (+ i 2) j add-only?)))
-        [out j add-only?]))))
+              (recur (+ i 2) (unchecked-inc j)))
+            (recur (+ i 2) j)))
+        [out j]))))
 
 (defn- transact-prepared-datom-ops-scalar!*
   [^objects ops ^HashMap dbis txn]
@@ -582,9 +592,10 @@
 
 (defn- transact-prepared-datom-ops*
   [^objects ops ^HashMap dbis txn]
-  (let [[^objects datoms n add-only?] (prepared-datom-txs ops)]
+  ;; Scalar updates consume ops directly; only index passes need a datom array.
+  (let [add-only? (prepared-add-only-datoms? ops)]
     (if (or c/*ordered-datom-writes?* add-only?)
-      (do
+      (let [[^objects datoms n] (prepared-datom-txs ops)]
         (transact-datom-index-passes* datoms n dbis txn add-only?)
         (loop [i 0]
           (when (< i (alength ops))
