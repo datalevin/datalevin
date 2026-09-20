@@ -13,6 +13,15 @@
 
 (deftype WriteBatch [^List rows ^FastList encoded arena])
 
+(deftype CommitMetadata [^longs fields ^ByteBuffer slot]
+  ;; Reused only under the environment write lock. Fields are revision,
+  ;; applied LSN, segment, offset, CRC, time, and the persisted payload floor.
+  ;; The floor can exceed this record's LSN after a raw metadata write.
+  clojure.lang.ILookup
+  (valAt [_ k] (when (= k :revision) (aget fields 0)))
+  (valAt [_ k not-found]
+    (if (= k :revision) (aget fields 0) not-found)))
+
 (defn write-batch
   [^List rows arena]
   (WriteBatch. rows (FastList. (.size rows)) arena))

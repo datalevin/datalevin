@@ -15,13 +15,14 @@
    [datalevin.constants :as c]
    [datalevin.kv.encoding :as encoding]
    [datalevin.lmdb :as l]
+   [datalevin.txlog.codec :as tcodec]
    [datalevin.util :refer [raise]]
    [datalevin.validate :as vld])
   (:import
    [datalevin.dtlvnative DTLV]
    [datalevin.cpp BufVal Cursor]
    [datalevin.binding.cpp.buffer DBI IEncodedInput IMultipleBuffer IWriteCursor]
-   [datalevin.kv.encoding WriteBatch]
+   [datalevin.kv.encoding CommitMetadata WriteBatch]
    [datalevin.lmdb DatomKVTxData KVTxData]
    [datalevin.utl BitOps]
    [java.nio ByteBuffer]
@@ -108,6 +109,36 @@
             ^DBI dbi (or (.get dbis name) (raise name " is not open" {}))]
         (vld/validate-kv-tx-data tx (.-validate-data? dbi))
         (.add encoded (put-captured-tx dbi txn tx batch))))))
+
+(defn- encoded-metadata-key
+  [key]
+  (let [buffer (ByteBuffer/allocate c/+max-key-size+)]
+    (b/put-buffer buffer key :keyword)
+    (.flip buffer)
+    (b/get-bytes buffer)))
+
+(def ^:private payload-lsn-key (encoded-metadata-key c/wal-local-payload-lsn))
+(def ^:private marker-a-key (encoded-metadata-key c/wal-marker-a))
+(def ^:private marker-b-key (encoded-metadata-key c/wal-marker-b))
+
+(defn- transact-commit-metadata*
+  [^CommitMetadata metadata ^HashMap dbis txn]
+  ;; Reuse the open DBI and its input buffers; kv-info is never compressed.
+  ;; Resolve once from the handle cache so drop/reopen cannot leave a stale DBI.
+  (let [^DBI dbi (or (.get dbis c/kv-info)
+                     (raise c/kv-info " is not open" {}))
+        ^longs fields (.-fields metadata)
+        revision (aget fields 0)]
+    (.put-key dbi payload-lsn-key :raw)
+    (.put-val dbi (aget fields 6) :data)
+    (.put dbi txn)
+    (when (not (neg? revision))
+      (let [^ByteBuffer slot (tcodec/write-commit-marker-slot!
+                              (.-slot metadata) fields)]
+        (.put-key dbi (if (zero? (bit-and revision 1)) marker-a-key marker-b-key)
+                  :raw)
+        (.put-val dbi (.array slot) :bytes)
+        (.put dbi txn)))))
 
 (defn- put-datom-tx
   [^DBI ave ^DBI eav txn ^DatomKVTxData tx]
@@ -480,6 +511,9 @@
 (defn transact*
   [txs ^HashMap dbis txn]
   (cond
+    (instance? CommitMetadata txs)
+    (transact-commit-metadata* txs dbis txn)
+
     (instance? WriteBatch txs)
     (transact-captured* txs dbis txn)
 

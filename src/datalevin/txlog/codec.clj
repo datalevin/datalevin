@@ -21,7 +21,7 @@
    [java.util Arrays HashMap List Collection]
    [java.util.zip CRC32C]
    [datalevin.lmdb DatomKVTxData]
-   [datalevin.kv.encoding EncodedKVTxData]
+   [datalevin.kv.encoding CommitMetadata EncodedKVTxData]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
 (def ^:const record-header-size 14)
@@ -367,6 +367,54 @@
          :segment-offset segment-offset
          :updated-ms updated-ms
          :checksum expected-check}))))
+
+(defn write-commit-marker-slot!
+  "Encode into a reusable big-endian heap buffer. Fields are revision, applied
+  LSN, segment ID, record offset, record CRC, and time. Includes reserved bytes
+  in the checksum, matching the existing 64-byte marker format."
+  [^ByteBuffer slot ^longs fields]
+  (.clear slot)
+  (.limit slot commit-marker-slot-size)
+  (.put slot ^bytes commit-marker-magic-bytes)
+  (.put slot (byte commit-marker-format-major))
+  (.put slot (byte 0))
+  (.putShort slot (short 0))
+  (.putLong slot (aget fields 0))
+  (.putLong slot (aget fields 1))
+  (.putLong slot (aget fields 2))
+  (.putLong slot (aget fields 3))
+  (put-u32 slot (aget fields 4))
+  (.putLong slot (aget fields 5))
+  ;; The original encoder zero-filled the unused tail of its 60-byte payload.
+  (.putLong slot 0)
+  (let [^CRC32C crc (.get tl-crc32c)]
+    (.reset crc)
+    (.update crc (.array slot) (.arrayOffset slot)
+             commit-marker-slot-payload-size)
+    (put-u32 slot (.getValue crc)))
+  (.flip slot))
+
+(defn new-commit-metadata
+  "Create the environment-owned scratch used by internal WAL metadata puts."
+  []
+  (CommitMetadata. (long-array 7) (ByteBuffer/allocate commit-marker-slot-size)))
+
+(defn prepare-commit-metadata!
+  "Prepare internal metadata under the environment write lock. A nil revision
+  disables the marker but still persists the payload floor. Consume before
+  preparing another commit; this scratch must never escape into WAL rows."
+  [^CommitMetadata metadata ^long payload-lsn revision append-info]
+  (let [^longs fields (.-fields metadata)]
+    (aset-long fields 6 payload-lsn)
+    (aset-long fields 0 (long (or revision -1)))
+    (when revision
+      (aset-long fields 1 (long (:lsn append-info)))
+      (aset-long fields 2 (long (:segment-id append-info)))
+      (aset-long fields 3 (long (:offset append-info)))
+      (aset-long fields 4 (long (or (:checksum append-info) 0)))
+      (aset-long fields 5 (long (or (:now-ms append-info)
+                                  (System/currentTimeMillis))))))
+  metadata)
 
 (defn encode-commit-marker-slot
   [{:keys [revision

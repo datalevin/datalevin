@@ -2466,20 +2466,17 @@
                   payload-lsn (max (long (:lsn append-res))
                                    (refresh-commit-metadata!
                                     lmdb state txn txn-id))
-                  marker-entry (txlog/next-commit-marker-entry
-                                (:commit-marker? state)
-                                (long @(:marker-revision state))
-                                append-res)
-                  commit-rows (append-payload-lsn-row nil payload-lsn)
-                  _ (when marker-entry
-                      (.add ^FastList commit-rows (:row marker-entry)))
+                  commit-metadata (tcodec/prepare-commit-metadata!
+                                    (:commit-metadata-write state) payload-lsn
+                                    (when (:commit-marker? state)
+                                      (inc (long @(:marker-revision state))))
+                                    append-res)
+                  marker-entry (when (:commit-marker? state) commit-metadata)
                   status
                   (try
-                    (when (pos? (.size ^FastList commit-rows))
-                      ;; This is already the raw handle and open write txn.
-                      ;; No WAL option override is needed. A resize must retry
-                      ;; the whole transaction, including its payload rows.
-                      (i/transact-kv lmdb commit-rows))
+                    ;; Keep the raw write wrapper's error and resize handling.
+                    ;; A resize retries the complete transaction and WAL payload.
+                    (i/transact-kv lmdb commit-metadata)
                     (let [status (binding [cpp/*before-write-commit-fn* nil]
                                    (i/close-transact-kv lmdb))]
                       (when (= status :committed)

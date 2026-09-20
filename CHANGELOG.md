@@ -28,7 +28,8 @@ one thread per connection.
 - [Server] avoid decode then re-encode KV point reads and scalar pulls.
 - [Datalog] always refresh giant id floor in transaction.
 - [WAL] simplify Datalog WAL record and use `:writemap` for DLMDB overlay.
-- [KV] Allow `:int` as a tuple component.
+- [KV] cheaper prefix cache operations.
+- [KV] allow `:int` as a tuple component.
 
 ## 1.1.0 (2026-09-02)
 

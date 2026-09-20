@@ -426,6 +426,7 @@
          ;; Last successful LMDB commit: transaction ID, marker revision,
          ;; payload LSN. Accessed only while holding the environment write lock.
          :lmdb-commit-metadata   (long-array [-1 -1 0])
+         :commit-metadata-write (tcodec/new-commit-metadata)
          ;; Committed LMDB snapshot ID and its full recovery floor, including
          ;; snapshot metadata. Also guarded by the environment write lock.
          :lmdb-runtime-floor    (long-array [-1 0])
