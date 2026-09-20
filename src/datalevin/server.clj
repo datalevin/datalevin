@@ -2073,7 +2073,7 @@
                        (fn [state]
                          (if (identical? runner (:runner state))
                            (dissoc state :runner :runner-skey :wlmdb
-                                   :wstore :wdt-db)
+                                   :wstore :wdt-db :notification-dirty?)
                            state)))
             (when lock
               (.release lock))))))))

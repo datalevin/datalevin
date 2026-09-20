@@ -32,6 +32,7 @@
    [datalevin.server.auth :as auth
     :refer [view-act alter-act create-act control-act database-obj user-obj
             role-obj server-obj privileged-server-option-keys]]
+   [datalevin.server.notifications :as notifications]
    [datalevin.storage :as st]
    [datalevin.util :as u :refer [raise]]
    [datalevin.validate :as vld]
@@ -99,7 +100,8 @@
         ((:update-db deps) server db-name
          (fn [m]
            (if (identical? runner (:runner m))
-             (dissoc m :runner :runner-skey :wlmdb :wstore :wdt-db)
+             (dissoc m :runner :runner-skey :wlmdb :wstore :wdt-db
+                      :notification-dirty?)
              m))))
       (.release lock))))
 
@@ -311,6 +313,48 @@
 (defn- write-result!
   [deps skey result]
   ((:write-message deps) skey {:type :command-complete :result result}))
+
+(defn- database-changed!
+  [deps server db-name writing?]
+  (let [state (db-state deps server db-name)]
+    (if writing?
+      (when-let [dirty? (:notification-dirty? state)]
+        (vreset! dirty? true))
+      (when-let [topic (:notifications state)]
+        (notifications/publish! topic)))))
+
+(defn db-changes
+  [deps server skey {:keys [args writing?]}]
+  (let [[db-name token timeout-ms] args]
+    (when (or (not (string? db-name)) writing?
+              (not (or (nil? token) (uuid? token)))
+              (not (and (integer? timeout-ms) (<= 0 timeout-ms 1000))))
+      (raise "Invalid database notification request"
+             {:error :notification/invalid-request}))
+    (with-permission!
+      deps server skey view-act database-obj
+      (auth/db-eid (sys-conn deps server) db-name)
+      "Don't have permission to subscribe to the database"
+      (fn []
+        (when-not ((:get-store deps) server db-name)
+          (raise "Notification database is not open"
+                 {:error :notification/database-closed :db-name db-name}))
+        (let [topic (or (:notifications (db-state deps server db-name))
+                        (:notifications
+                         ((:update-db deps) server db-name
+                          #(if (:notifications %) %
+                               (assoc % :notifications (notifications/topic))))))
+              result (notifications/await-change topic token timeout-ms)]
+          ;; Permissions may have changed while this connection was waiting.
+          (with-permission!
+            deps server skey view-act database-obj
+            (auth/db-eid (sys-conn deps server) db-name)
+            "Don't have permission to subscribe to the database"
+            (fn []
+              (when-not ((:get-store deps) server db-name)
+                (raise "Notification database is not open"
+                       {:error :notification/database-closed :db-name db-name}))
+              (write-result! deps skey (assoc result :db-name db-name)))))))))
 
 (defn- wire-safe-diagnostic
   [x]
@@ -1446,6 +1490,8 @@
              (fn [m]
                (assoc m (if writing? :wdt-db :dt-db) db1)))
         rp  (assoc-in rp [:tempids :max-eid] (:max-eid db1))]
+    (when (and (not s?) (seq (:tx-data rp)))
+      (database-changed! deps server db-name writing?))
     (cond-> (cond-> (select-keys rp [:tx-data :tempids])
               (:new-attributes rp)
               (assoc :new-attributes (:new-attributes rp)))
@@ -1812,7 +1858,8 @@
                       ((:open-write-txn-with-retry deps) server db-name)
                       _ (vreset! kv-store* kv-store)
                       tx-state
-                      (cond-> {:wlmdb wlmdb :release-slot! release-slot!}
+                      (cond-> {:wlmdb wlmdb :release-slot! release-slot!
+                               :notification-dirty? (volatile! false)}
                         datalog?
                         (merge
                           (let [wstore (st/transfer store wlmdb)
@@ -1856,11 +1903,14 @@
                   "Don't have permission to alter the database"
                   (fn []
                     (vreset! closing? true)
-                    (i/close-transact-kv kv-store)
-                    (when (= close-type :close-transact)
-                      ((:add-store deps)
-                       server db-name
-                       (st/transfer (:wstore db-state) kv-store)))
+                    (let [status (i/close-transact-kv kv-store)]
+                      (when (= close-type :close-transact)
+                        ((:add-store deps)
+                         server db-name
+                         (st/transfer (:wstore db-state) kv-store)))
+                      (when (and (= :committed status)
+                                 (some-> (:notification-dirty? db-state) deref))
+                        (database-changed! deps server db-name false)))
                     true))
                 (finally
                   ;; Permission denial can throw or send :reconnect without
@@ -1876,7 +1926,8 @@
             ((:halt-run deps) (:runner db-state))
             ((:update-db deps) server db-name
              (fn [m]
-               (cond-> (dissoc m :runner :runner-skey :wlmdb :wstore :wdt-db)
+               (cond-> (dissoc m :runner :runner-skey :wlmdb :wstore :wdt-db
+                                :notification-dirty?)
                  @aborted? (assoc :aborted-transaction-close marker))))
             (.release lock)))]
     (when (true? completed?)
@@ -2272,6 +2323,8 @@
                     (if client-op
                       (i/transact-kv kv-store txs)
                       (i/transact-kv kv-store dbi-name txs k-type v-type))
+                    (when (seq txs0)
+                      (database-changed! deps server db-name writing?))
                     response)))]
           (if (= :request mode)
             (write-result! deps skey response)
@@ -2451,6 +2504,7 @@
 
 (def ^:private base-handler-map
   {:authentication authentication
+   :db-changes db-changes
    :disconnect disconnect
    :set-client-id set-client-id
    :create-user create-user

@@ -1071,6 +1071,30 @@ Only usable for debug output.
        :doc      "Removes registered listener from connection. See also [[listen!]]."}
   unlisten! conn/unlisten!)
 
+(def ^{:arglists '([conn callback] [conn key callback])
+       :doc "Subscribe to committed changes to a remote Datalog database.
+
+  All subscribers to the same database on the server are notified, including
+  changes made through other connections and KV transactions. The callback runs
+  on a dedicated listener thread with {:type :db-changed :db-name name}.
+  Refresh queries in the callback to obtain the current data. Several commits
+  may coalesce into one event; this is an ephemeral notification, not a tx log.
+
+  Subscription is established before this call returns. Explicit transactions
+  notify only after commit; aborted and simulated writes do not notify.
+  A terminal subscription failure calls back with {:type :subscription-error
+  :db-name name :error exception}; register again to resume. Callback exceptions
+  are logged and do not affect transactions or other subscribers.
+
+  Returns a listener key. Registering the same key replaces its subscription.
+  [[unlisten-db!]] or closing the connection stops the subscription.
+  [[listen!]] retains its connection-local transaction-report behavior."}
+  listen-db! conn/listen-db!)
+
+(def ^{:arglists '([conn key])
+       :doc "Stop a database subscription registered with [[listen-db!]]."}
+  unlisten-db! conn/unlisten-db!)
+
 (def ^{:arglists '([conn])
        :doc      "Returns the underlying Datalog database object from a connection. Note that Datalevin does not have \"db as a value\" feature, the returned object is NOT a database value, but a reference to the database object. "}
   db conn/db)

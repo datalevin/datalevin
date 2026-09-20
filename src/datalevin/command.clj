@@ -67,6 +67,8 @@
   "Command classifications. Keep entries in server handler-table order so
   additions can be reviewed together; tests require the tables to agree."
   {:authentication unguarded-write
+   ;; Long polling must release the runtime-store lock while it waits.
+   :db-changes (assoc runtime-managed :db-type "datalog")
    :disconnect unguarded-write
    :set-client-id unguarded-write
    :create-user unguarded-write

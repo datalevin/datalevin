@@ -6,8 +6,11 @@
   types, and this also works on Datalog. Details are in the [custom data
   documentation](/doc/custom-data.md).
   [#234](https://github.com/datalevin/datalevin/issues/234)
+- [Server] `listen-db!` that provide `db-name` based change notifications across
+  connections.
 - [Query] prepared variant of queries `prepare-q`, `prepare-pull`,
-  `prepare-get-value`, `prepared-execute` that are reusable.
+  `prepare-get-value`, `execute-prepared` that reuse preparation and have lower
+  latency, similar to prepared statement in SQL DBs.
 - [Benchmark] added TPC-C, TPC-H and YCSB benchmarks.
 
 ### Changed

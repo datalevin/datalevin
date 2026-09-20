@@ -20,6 +20,7 @@
    [datalevin.bits :as b]
    [datalevin.datom :as d]
    [datalevin.lmdb :as l :refer [IWriting]]
+   [taoensso.timbre :as log]
    [clojure.string :as str])
   (:import
    [datalevin.client Client]
@@ -1333,6 +1334,60 @@
              (.-client store) (.-tx-client store)
              (.-write-txn store) (.-writing? store)
              (.-open-db-info store) false (.-closed? store)))
+
+(defn listen-db
+  "Start a dedicated database change subscription. Return its stop function."
+  [^DatalogStore store callback]
+  (when (or (.-writing? store) (.get ^AtomicBoolean (.-closed? store)))
+    (raise "Subscribe through an open connection outside a transaction"
+           {:error :notification/invalid-connection}))
+  (let [db-name (.-db-name store)
+        client (cl/new-client (.-uri store) {:pool-size 1 :time-out 5000})
+        running? (AtomicBoolean. true)
+        notify! (fn [event]
+                  (when (.get running?)
+                    (try
+                      (callback event)
+                      (catch Exception e
+                        (log/warn e "Database notification callback failed"
+                                  {:db-name db-name})))))
+        close! #(try (cl/close-client client)
+                     (catch Exception e
+                       (log/debug e "Closing database subscription")))]
+    (try
+      (let [initial (cl/normal-request client :db-changes [db-name nil 0])
+            thread (Thread.
+                    ^Runnable
+                    (fn []
+                      (try
+                        (loop [token (:token initial)]
+                          (when (.get running?)
+                            (let [result (cl/normal-request
+                                          client :db-changes [db-name token 1000])]
+                              (when (:changed? result)
+                                (notify! {:type :db-changed :db-name db-name}))
+                              (recur (:token result)))))
+                        (catch Exception e
+                          (notify! {:type :subscription-error :db-name db-name
+                                    :error e}))
+                        (finally
+                          (.set running? false)
+                          ;; Clear cancellation before sending the session cleanup.
+                          (Thread/interrupted)
+                          (close!))))
+                    (str "datalevin-db-listener-" db-name))]
+        (.setDaemon thread true)
+        (.start thread)
+        (fn []
+          (when (.compareAndSet running? true false)
+            ;; Let the bounded poll or an in-flight callback finish without
+            ;; interrupting application code running on the listener thread.
+            (when-not (identical? thread (Thread/currentThread))
+              (.join thread 2000)))
+          nil))
+      (catch Throwable t
+        (close!)
+        (throw t)))))
 
 (defn open-kv
   "Open a remote kv store."

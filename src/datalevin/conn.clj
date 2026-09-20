@@ -117,6 +117,7 @@
   {:pre [(db/db? db)]}
   (wrap-conn
    (atom db :meta {:listeners (atom {})
+                   :db-listeners (atom {})
                    :runtime-opts (db/runtime-opts db)
                    :sync-queue-pending (AtomicLong. 0)
                    :sync-queue-last-enqueue-ms (AtomicLong. 0)})))
@@ -203,6 +204,9 @@
   (when conn
     (let [detached? (volatile! false)]
     (try
+      (when-let [listeners (:db-listeners (meta conn))]
+        (doseq [[_ stop!] (first (reset-vals! listeners nil))]
+          (stop!)))
       (when-not (closed? conn)
         (when-let [store (.-store ^DB @conn)]
           (case (release-shared-local-store! store)
@@ -849,6 +853,37 @@
   [conn key]
   {:pre [(conn? conn) (atom? (:listeners (meta conn)))]}
   (swap! (:listeners (meta conn)) dissoc key))
+
+(defn listen-db!
+  ([conn callback] (listen-db! conn (random-uuid) callback))
+  ([conn key callback]
+   {:pre [(conn? conn) (ifn? callback)]}
+   (let [store (.-store ^DB @conn)
+         listeners (:db-listeners (meta conn))]
+     (when-not (instance? DatalogStore store)
+       (raise "Database subscriptions require a remote Datalog connection"
+              {:error :notification/remote-required}))
+     (when-not (atom? listeners)
+       (raise "Connection does not support database subscriptions" {}))
+     (let [stop! (r/listen-db store callback)]
+       (try
+         (let [[before _] (swap-vals!
+                           listeners
+                           #(if (nil? %)
+                              (raise "Connection is closed" {})
+                              (assoc % key stop!)))]
+           (when-let [previous (get before key)] (previous)))
+         (catch Throwable t
+           (stop!)
+           (throw t))))
+     key)))
+
+(defn unlisten-db!
+  [conn key]
+  (when-let [listeners (:db-listeners (meta conn))]
+    (let [[before _] (swap-vals! listeners #(when % (dissoc % key)))]
+      (when-let [stop! (get before key)] (stop!))))
+  nil)
 
 (defn db
   [conn]

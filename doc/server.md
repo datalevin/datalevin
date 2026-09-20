@@ -139,6 +139,41 @@ Exhausted transaction capacity and expired writer-slot waits return
 `:error :server/busy` with `:retryable? true` before the operation executes.
 Other connections, including transaction commit and abort, continue independently.
 
+## Database change notifications
+
+`listen-db!` subscribes to a remote database by the database name in its
+connection URI. Writes from any client connected to that database on the server
+can notify the subscriber:
+
+```clojure
+(def conn (d/create-conn "dtlv://datalevin:datalevin@localhost/app"))
+
+(d/listen-db! conn :refresh
+  (fn [{:keys [type db-name error]}]
+    (case type
+      :db-changed (refresh-view! db-name (d/q query @conn))
+      :subscription-error (report-error! error))))
+
+(d/unlisten-db! conn :refresh)
+```
+
+The subscription is ready when `listen-db!` returns. Its callback runs on a
+dedicated thread and may query through the original connection, even with a
+one-connection pool. Closing the connection stops its subscriptions. Registering
+the same key replaces the previous callback.
+
+Events contain `{:type :db-changed :db-name "app"}`. Datalog and KV transaction
+writes notify after commit, including mixed explicit transactions. Aborts,
+failed transactions, and simulated writes do not notify. Several commits may
+coalesce into one event; use it to refresh current state rather than count
+transactions. These subscriptions are ephemeral and scoped to one server, with
+no durable history or cross-node delivery guarantee. A terminal transport or
+authorization error produces a `:subscription-error` event and stops the
+subscription; register again to resume. Database view permission is required
+and is rechecked before delivery.
+
+`listen!` continues to provide transaction reports only for its own connection.
+
 ## Implementation
 
 The client/server mode is enabled with little changes to the Datalevin core library.
