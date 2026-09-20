@@ -101,20 +101,23 @@
   (when-let [f *before-write-commit-fn*]
     (f context)))
 
+;; Giant callbacks receive the caller's LMDB view so probes inside a write
+;; transaction see its uncommitted values as well as its index entries.
 (defprotocol ^:no-doc IListSeekBuffer
   (filter-list-id-int-prefix!
     [this cur in id-idx prefix out]
     "Filter sorted tuples by list values with an integer prefix. List keys are
     entity IDs; duplicate IDs are probed once and matching tuples are kept.")
   (list-avg-id?
-    [this cur aid value value-type id]
-    "Return true when an AVE list contains the exact entity ID.")
+    [this cur aid value value-type id giant-lmdb giant-match?]
+    "Return true when an AVE list contains the exact entity ID. Giant keys
+    delegate to (giant-match? lmdb indexable id) for complete-value equality.")
   (filter-list-avg-bound-id!
-    [this cur in value-idx aid value-type bound-id out]
+    [this cur in value-idx aid value-type bound-id out giant-lmdb giant-match?]
     "Filter tuples by an AVE key and a fixed entity ID, appending that ID to
     each matching tuple. Equal adjacent values are probed once.")
   (filter-list-avg-tuple-id!
-    [this cur in value-idx entity-idx aid value-type out]
+    [this cur in value-idx entity-idx aid value-type out giant-lmdb giant-match?]
     "Filter tuples by AVE keys and entity IDs stored in tuple columns. Equal
     adjacent keys reuse their encoding and equal adjacent pairs are probed
     once."))
@@ -179,17 +182,19 @@
             (recur (u/long-inc i) (long id) found? true))))
       out))
 
-  (list-avg-id? [_ cur aid value value-type id]
-    (let [^Cursor cur cur]
-      (buffer/put-bufval start-kp
-                  (b/indexable nil (long aid) value value-type nil)
-                  :avg (key-compressor lmdb) k-comp-bf)
-      (buffer/put-id-bufval start-vp (long id) nil v-comp-bf)
-      (boolean
-        (.get cur ^BufVal start-kp ^BufVal start-vp DTLV/MDB_GET_BOTH))))
+  (list-avg-id? [_ cur aid value value-type id giant-lmdb giant-match?]
+    (let [^Cursor cur cur
+          key (b/indexable nil (long aid) value value-type c/g0)]
+      (if (b/giant? key)
+        (giant-match? giant-lmdb key id)
+        (do
+          (buffer/put-bufval start-kp key :avg (key-compressor lmdb) k-comp-bf)
+          (buffer/put-id-bufval start-vp (long id) nil v-comp-bf)
+          (boolean
+            (.get cur ^BufVal start-kp ^BufVal start-vp DTLV/MDB_GET_BOTH))))))
 
   (filter-list-avg-bound-id!
-    [_ cur in value-idx aid value-type bound-id out]
+    [_ cur in value-idx aid value-type bound-id out giant-lmdb giant-match?]
     (let [^Cursor cur       cur
           ^List in         in
           ^Collection out  out
@@ -202,6 +207,7 @@
       (buffer/put-id-bufval start-vp bound-id value-compressor v-comp-bf)
       (loop [i           (long 0)
              last-value  nil
+             last-key    nil
              last-found? false
              have-last?  false]
         (when (< i nt)
@@ -210,12 +216,19 @@
                 same-value?    (and have-last?
                                     (or (identical? value last-value)
                                         (= value last-value)))
-                found?         (if same-value?
-                                 last-found?
+                key            (if same-value? last-key
+                                   (b/indexable nil aid value value-type c/g0))
+                found?         (cond
+                                 same-value? last-found?
+                                 (b/giant? key) (giant-match? giant-lmdb key bound-id)
+                                 :else
                                  (do
+                                   ;; A nested giant scan may reuse seek buffers.
+                                   (when (and last-key (b/giant? last-key))
+                                     (buffer/put-id-bufval
+                                       start-vp bound-id value-compressor v-comp-bf))
                                    (buffer/put-bufval
-                                     start-kp
-                                     (b/indexable nil aid value value-type nil)
+                                     start-kp key
                                      :avg key-compressor k-comp-bf)
                                    (boolean
                                      (.get cur
@@ -228,11 +241,11 @@
                                       tuple (int (inc tuple-size)))]
                 (aset joined tuple-size (Long/valueOf bound-id))
                 (.add out joined)))
-            (recur (u/long-inc i) value found? true))))
+            (recur (u/long-inc i) value key found? true))))
       out))
 
   (filter-list-avg-tuple-id!
-    [_ cur in value-idx entity-idx aid value-type out]
+    [_ cur in value-idx entity-idx aid value-type out giant-lmdb giant-match?]
     (let [^Cursor cur       cur
           ^List in         in
           ^Collection out  out
@@ -244,6 +257,7 @@
           value-compressor nil]
       (loop [i           (long 0)
              last-value  nil
+             last-key    nil
              last-id     (long 0)
              last-found? false
              have-last?  false]
@@ -255,15 +269,20 @@
                                     (or (identical? value last-value)
                                         (= value last-value)))
                 same-id?       (and have-last? (== id last-id))
-                same-probe?    (and same-value? same-id?)]
-            (when-not same-value?
-              (buffer/put-bufval start-kp
-                          (b/indexable nil aid value value-type nil)
-                          :avg key-compressor k-comp-bf))
-            (when-not same-id?
+                same-probe?    (and same-value? same-id?)
+                key            (if same-value? last-key
+                                   (b/indexable nil aid value value-type c/g0))
+                giant?         (b/giant? key)]
+            (when (and (not giant?) (not same-value?))
+              (buffer/put-bufval start-kp key :avg key-compressor k-comp-bf))
+            (when (and (not giant?)
+                       (or (not same-id?)
+                           (and last-key (b/giant? last-key))))
               (buffer/put-id-bufval start-vp id value-compressor v-comp-bf))
-            (let [found? (if same-probe?
-                           last-found?
+            (let [found? (cond
+                           same-probe? last-found?
+                           giant? (giant-match? giant-lmdb key id)
+                           :else
                            (boolean
                              (.get cur
                                    ^BufVal start-kp
@@ -271,7 +290,7 @@
                                    DTLV/MDB_GET_BOTH)))]
               (when found?
                 (.add out tuple))
-              (recur (u/long-inc i) value id found? true)))))
+              (recur (u/long-inc i) value key id found? true)))))
       out))
 
   IBuffer

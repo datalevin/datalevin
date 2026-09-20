@@ -18,7 +18,7 @@
    [datalevin.datom :as d]
    [datalevin.index :as idx
     :refer [datom->indexable index->ktype index->vtype gt->datom retrieved->v]]
-   [datalevin.interface
+   [datalevin.interface :as i
     :refer [visit-list-sample visit-list-key-range near-list get-list attrs]]
    [datalevin.lmdb :as lmdb]
    [datalevin.query.predicate :as qpred]
@@ -26,13 +26,13 @@
    [datalevin.scan :as scan :refer [visit-list*]]
    [datalevin.util :as u :refer [raise]])
   (:import
-   [java.util ArrayList List Comparator Collection HashMap]
+   [java.util ArrayList Arrays List Comparator Collection HashMap]
    [java.util.concurrent Callable ForkJoinPool ForkJoinWorkerThread Future]
    [java.nio ByteBuffer]
    [java.lang AutoCloseable]
    [org.eclipse.collections.impl.list.mutable FastList]
    [org.eclipse.collections.impl.map.mutable.primitive LongObjectHashMap]
-   [datalevin.bits Retrieved]))
+   [datalevin.bits Indexable Retrieved]))
 
 (defn e-aid-v->datom
   [store e-aid-v]
@@ -64,13 +64,37 @@
           v (b/read-buffer (lmdb/v kv) (index->vtype index))]
       (pred (retrieved->datom lmdb attrs [k v])))))
 
+(defn- giant-value-equal? [a b]
+  (if (bytes? a)
+    (and (bytes? b) (Arrays/equals ^bytes a ^bytes b))
+    (= a b)))
+
+(defn scan-giant-av
+  "Apply a list-range reader to complete-value matches across giant IDs.
+  The low key must use c/g0 as its giant ID.
+  Decode both cursor fields before the payload lookup can reuse native buffers."
+  ([lmdb scan-fn low] (scan-giant-av lmdb scan-fn low nil))
+  ([lmdb scan-fn ^Indexable low eid]
+   (let [v (.-v low)]
+     (scan-fn lmdb c/ave
+              (fn [r e]
+                (when (giant-value-equal? v (retrieved->v lmdb r)) e))
+              [:closed low
+               (Indexable. nil (.-a low) v (.-f low) (.-b low) c/gmax)]
+              :avg (if (some? eid) [:closed eid eid] [:all]) :id false))))
+
+(defn- giant-av-match? [lmdb key eid]
+  (boolean (scan-giant-av lmdb i/list-range-some key eid)))
+
 (defn av-entities [lmdb schema a v]
   (let [props (schema a)
         vt (idx/storage-type lmdb props)]
     (if (map? vt)
       (cd/exact-entities lmdb (:db/aid props) vt v)
-      (get-list lmdb c/ave (datom->indexable lmdb schema (d/datom c/e0 a v) false)
-                :avg :id))))
+      (let [key (datom->indexable lmdb schema (d/datom c/e0 a v) false)]
+        (if (b/giant? key)
+          (scan-giant-av lmdb i/list-range-keep key)
+          (get-list lmdb c/ave key :avg :id))))))
 
 (defn- ave-key-range
   [aid vt val-range]
@@ -85,26 +109,32 @@
       [:closed
        (b/indexable nil aid lv vt (if (= cl :closed) cv/min-id cv/max-id))
        (b/indexable nil aid hv vt (if (= ch :closed) cv/max-id cv/min-id))]
-      [op (b/indexable nil aid lv vt c/gmax) (b/indexable nil aid hv vt c/gmax)])))
+      [op (b/indexable nil aid lv vt
+                      (if (and (= cl ch :closed) (= lv hv)) c/g0 c/gmax))
+       (b/indexable nil aid hv vt c/gmax)])))
 
 (defn ave-tuples-scan*
   [lmdb aid vt val-ranges sample-indices work]
   (doseq [val-range val-ranges]
     (let [[[cl lv] [ch hv]] val-range
+          k-range (ave-key-range aid vt val-range)
           ;; Query equality is represented as a closed singleton range. The
           ;; order bucket alone cannot decide complete-value equality.
-          work (if (map? vt)
+          work (if (or (map? vt)
+                       (and (= cl ch :closed) (= lv hv)
+                            (b/giant? (second k-range))))
                  (fn [entry]
                    (let [entry (cd/copy-kv entry)]
                      (when (or (not (and (= cl ch :closed) (= lv hv)))
-                               (= lv (idx/avg-buffer->v lmdb (lmdb/k entry))))
+                               (giant-value-equal?
+                                 lv (idx/avg-buffer->v lmdb (lmdb/k entry))))
                        (work entry))))
                  work)]
       (if sample-indices
         (visit-list-sample
-         lmdb c/ave sample-indices work (ave-key-range aid vt val-range) :avg :id)
+         lmdb c/ave sample-indices work k-range :avg :id)
         (visit-list-key-range
-         lmdb c/ave work (ave-key-range aid vt val-range) :avg :id)))))
+         lmdb c/ave work k-range :avg :id)))))
 
 (defn ave-tuples-scan-need-v
   [lmdb ^Collection out aid vt val-ranges sample-indices]
@@ -198,7 +228,7 @@
               (.add out (r/conj-tuple tuple (long bound-id)))))
           out)
         (cpp/filter-list-avg-bound-id!
-          rtx cur in value-idx aid value-type bound-id out))
+          rtx cur in value-idx aid value-type bound-id out lmdb giant-av-match?))
       (raise "Fail to filter AVE by bound entity: " e
                {:value-idx value-idx :aid aid :bound-id bound-id}))))
 
@@ -215,7 +245,7 @@
               (.add out tuple)))
           out)
         (cpp/filter-list-avg-tuple-id!
-          rtx cur in value-idx entity-idx aid value-type out))
+          rtx cur in value-idx entity-idx aid value-type out lmdb giant-av-match?))
       (raise "Fail to filter AVE by tuple entity: " e
                {:value-idx value-idx :entity-idx entity-idx :aid aid}))))
 
@@ -382,10 +412,14 @@
     (let [ts (FastList.)]
       (if (map? vt)
         (doseq [e (cd/exact-entities lmdb aid vt v)] (.add ts (object-array [e])))
-        (visit-list* iter
-                     (fn [^ByteBuffer vb]
-                       (.add ts (object-array [(.getLong vb 0)])))
-                     (b/indexable nil aid v vt nil) :avg vt true))
+        (let [key (b/indexable nil aid v vt c/g0)]
+          (if (b/giant? key)
+            (doseq [e (scan-giant-av lmdb i/list-range-keep key)]
+              (.add ts (object-array [e])))
+            (visit-list* iter
+                         (fn [^ByteBuffer vb]
+                           (.add ts (object-array [(.getLong vb 0)])))
+                         key :avg vt true))))
       (if (.isEmpty ts)
         (.put seen v :no-result)
         (do (.put seen v ts)
@@ -395,14 +429,14 @@
   [lmdb rtx cur ^Collection out tuple aid v vt bound]
   (when (if (map? vt)
           (some #{bound} (cd/exact-entities lmdb aid vt v))
-          (cpp/list-avg-id? rtx cur aid v vt bound))
+          (cpp/list-avg-id? rtx cur aid v vt bound lmdb giant-av-match?))
     (.add out (r/conj-tuple tuple (long bound)))))
 
 (defn val-eq-filter-e*
   [lmdb rtx cur ^Collection out tuple aid v vt old-e]
   (when (if (map? vt)
           (some #{old-e} (cd/exact-entities lmdb aid vt v))
-          (cpp/list-avg-id? rtx cur aid v vt old-e))
+          (cpp/list-avg-id? rtx cur aid v vt old-e lmdb giant-av-match?))
     (.add out tuple)))
 
 (defn single-attrs?

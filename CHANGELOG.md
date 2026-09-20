@@ -11,7 +11,7 @@
 - [Benchmark] added TPC-C, TPC-H and YCSB benchmarks.
 
 ### Changed
-- [Storage] update dtlvnative to 1.1.1, which uses DLMDB data format version 2,
+- [Storage] update dtlvnative to 1.1.5, which uses DLMDB data format version 2,
   upgrade nippy to 3.9.0 and added rust bindings to dlmdb, usearch and
   llama.cpp, laying the foundation for a rust core of Datalevin, parallel to the
   Clojure one. Clojure will still be the source of new feature development and
@@ -20,6 +20,7 @@
 
 ### Fixed
 - [Datalog] planner range conversion for `like`.
+- [Datalog] false-negative giant AVE lookup.
 - [KV] prefix overflow page deletion issue.
 
 ### Improved
@@ -29,6 +30,7 @@ one thread per connection.
 - [Datalog] always refresh giant id floor in transaction.
 - [WAL] simplify Datalog WAL record and use `:writemap` for DLMDB overlay.
 - [KV] cheaper prefix cache operations.
+- [KV] reduce reader table scans.
 - [KV] allow `:int` as a tuple component.
 
 ## 1.1.0 (2026-09-02)

@@ -625,8 +625,10 @@
   (av-size [_ a v]
     (if (cd/custom-type? (:db/valueType (schema a)))
       (count (av-entities lmdb schema a v))
-      (list-count lmdb c/ave
-                  (datom->indexable lmdb schema (d/datom c/e0 a v) false) :avg)))
+      (let [key (datom->indexable lmdb schema (d/datom c/e0 a v) false)]
+        (if (b/giant? key)
+          (scans/scan-giant-av lmdb list-range-filter-count key)
+          (list-count lmdb c/ave key :avg)))))
 
   (av-range-size ^long [_ a lv hv]
     (key-range-list-count
@@ -720,22 +722,7 @@
       (let [^Indexable i
             (datom->indexable lmdb schema (d/datom c/e0 a v) false)]
         (if (b/giant? i)
-          ;; Giant AVE keys contain an allocated giant ID. Search the keys that
-          ;; share the logical value's truncated prefix, then compare the value
-          ;; loaded from the giants DB instead of assuming the first giant ID.
-          (list-range-some
-            lmdb c/ave
-            (fn [kv]
-              (let [^Retrieved r (b/read-buffer (lmdb/k kv) :avg)]
-                (when (= v (retrieved->v lmdb r))
-                  (b/read-buffer (lmdb/v kv) :id))))
-            [:closed
-             i
-             (Indexable. nil (.-a i) v (.-f i) (.-b i) c/gmax)]
-            :avg
-            [:all]
-            :id
-            true)
+          (scans/scan-giant-av lmdb list-range-some i)
           (get-value lmdb c/ave i :avg :id true)))))
 
   (av-first-datom [this a v]

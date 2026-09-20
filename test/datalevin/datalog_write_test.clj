@@ -34,7 +34,8 @@
                        (is (= (set expected)
                               (set (mapcat #(i/e-datoms store %) [1 2 3]))))
                        (doseq [datom expected]
-                         (is (= [datom] (i/slice store :ave datom datom)))))]
+                         (is (= [datom] (i/slice store :ave datom datom)))
+                         (is (= [datom] (i/av-datoms store (:a datom) (:v datom))))))]
           (try
             (i/load-datoms store before)
             (check! store before)
