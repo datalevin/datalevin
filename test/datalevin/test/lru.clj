@@ -87,6 +87,36 @@
       (is (.putIfGeneration l :current :new generation)))
     (is (= :new (.get l :current)))))
 
+(deftest generation-reader-progresses-during-invalidation
+  (let [l       (LRUCache. 4 1)
+        sampled (promise)
+        release (promise)
+        reader  (atom nil)]
+    (.put l :unaffected :keep)
+    (try
+      (locking l
+        (.disable l)
+        (.beginInvalidation l 2)
+        (reset! reader
+                (future
+                  (let [generation (.generation l)]
+                    (deliver sampled generation)
+                    (when (= ::timeout (deref release 5000 ::timeout))
+                      (throw (ex-info "Invalidation did not release reader" {})))
+                    (.putIfGeneration l :stale :old generation))))
+        ;; Capturing a token must progress while the invalidator owns the
+        ;; monitor. It does not grant permission to publish an old snapshot.
+        (is (= 1 (deref sampled 5000 ::timeout)))
+        (.enable l))
+      (deliver release true)
+      (is (false? (deref @reader 5000 ::timeout)))
+      (is (nil? (.get l :stale)))
+      (is (= :keep (.get l :unaffected)))
+      (is (.putIfGeneration l :current :new (.generation l)))
+      (finally
+        (deliver release true)
+        (when-let [task @reader] (future-cancel task))))))
+
 (deftest dependency-index-follows-lru-lifecycle
   (let [classified (atom [])
         l (LRUCache. 2 1

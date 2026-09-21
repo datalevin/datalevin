@@ -4,12 +4,14 @@ import java.util.*;
 import java.util.function.Function;
 
 public class LRUCache {
-    int capacity;
+    final int capacity;
     Map<Object, Object> map;
 
     long target;
 
-    long generation;
+    // Readers capture tokens without the cache monitor. Generation changes
+    // and conditional publication remain serialized by that monitor.
+    volatile long generation;
 
     boolean disabled;
 
@@ -46,6 +48,11 @@ public class LRUCache {
                     return false;
                 }
             });
+    }
+
+    /** Immutable entry limit, available without acquiring the cache monitor. */
+    public int capacity() {
+        return capacity;
     }
 
     private void removeDependencies(Object key) {
@@ -103,7 +110,8 @@ public class LRUCache {
         this.target = target;
     }
 
-    public synchronized long generation() {
+    /** A publication token, not a snapshot of the cache's mutable state. */
+    public long generation() {
         return generation;
     }
 

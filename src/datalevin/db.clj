@@ -275,11 +275,15 @@
   [store pattern body]
   `(let [store# ~store
          cache# ^LRUCache (.get ^ConcurrentHashMap caches (dir store#))
-         generation# (.generation cache#)]
-     (if-some [cached# (.get ^LRUCache cache# ~pattern)]
+         cache?# (pos? (.capacity cache#))
+         generation# (if cache?# (.generation cache#) 0)]
+     ;; A zero entry limit bypasses key construction and the LRU monitor as
+     ;; well as retention. Keep the native read and transaction-overlay paths.
+     (if-some [cached# (when cache?# (.get ^LRUCache cache# ~pattern))]
        cached#
        (let [res# ~body]
-         (.putIfGeneration cache# ~pattern res# generation#)
+         (when cache?#
+           (.putIfGeneration cache# ~pattern res# generation#))
          res#))))
 
 (defn- sample-init-cache-key

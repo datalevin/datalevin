@@ -7,7 +7,8 @@
             [datalevin.db.range-cache :as ranges]
             [datalevin.interface :as i]
             [datalevin.test.core :refer [db-fixture]])
-  (:import [java.util Date UUID]))
+  (:import [datalevin.utl LRUCache]
+           [java.util Date UUID]))
 
 (use-fixtures :each db-fixture)
 
@@ -39,6 +40,59 @@
                                    (datom/datom c/e0 attr start)
                                    (datom/datom c/emax attr end)))
     :normalize identity}])
+
+(deftest zero-capacity-range-reads-bypass-the-cache-monitor
+  (let [conn (d/create-conn nil {:n {:db/valueType :db.type/long}}
+                           {:cache-limit 0 :kv-opts {:inmemory? true}})
+        reader (atom nil)]
+    (try
+      (d/transact! conn [{:db/id 1 :n 10} {:db/id 2 :n 20}])
+      (let [database (db/transfer @conn (:store @conn))
+            [^LRUCache cache] (db/cache-token (:store database))
+            low (datom/datom 1 :n nil)
+            high (datom/datom 2 :n nil)]
+        (locking cache
+          (reset! reader
+                  (future
+                    [(normalize (db/-range-datoms database :eav low high))
+                     (d/pull database [:n] 1)]))
+          (is (= [[[1 :n 10] [2 :n 20]] {:n 10}]
+                 (deref @reader 5000 ::timeout))))
+        (is (.isEmpty cache))
+        ;; The same public limit setter can restore normal result caching.
+        (d/datalog-index-cache-limit @conn 8)
+        (let [rows (db/-range-datoms database :eav low high)]
+          (is (identical? rows (db/cache-get (:store database)
+                                [:range-datoms :eav low high])))))
+      (finally
+        (when-let [task @reader] (future-cancel task))
+        (d/close conn)))))
+
+(deftest zero-capacity-ranges-preserve-transaction-reads
+  (doseq [wal? [false true], abort? [false true]]
+    (let [conn (d/create-conn nil {:n {:db/valueType :db.type/long}}
+                             {:cache-limit 0 :kv-opts {:inmemory? true :wal? wal?}})
+          low (datom/datom 1 :n 0 c/tx0)
+          high (datom/datom 2 :n 100 c/txmax)
+          read #(normalize (db/-range-datoms % :eav low high))]
+      (try
+        (d/transact! conn [{:db/id 1 :n 10} {:db/id 2 :n 20}])
+        (let [database (db/transfer @conn (:store @conn))
+              simulated (:db-after (d/with database [[:db/add 1 :n 12]
+                                                    [:db/retract 2 :n 20]] nil true))]
+          (is (db/pending-tx-cache? simulated))
+          (is (= [[1 :n 12]] (read simulated)))
+          (is (= {:n 12} (d/pull simulated [:n] 1)))
+          (is (= [[1 :n 10] [2 :n 20]] (read @conn))))
+        (d/with-transaction [tx conn]
+          (d/transact! tx [[:db/add 1 :n 11] [:db/retract 2 :n 20]])
+          (is (= [[1 :n 11]] (read @tx)))
+          (is (= {:n 11} (d/pull @tx [:n] 1)))
+          (when abort? (d/abort-transact tx)))
+        (is (= (if abort? [[1 :n 10] [2 :n 20]] [[1 :n 11]]) (read @conn)))
+        (let [[^LRUCache cache] (db/cache-token (:store @conn))]
+          (is (.isEmpty cache)))
+        (finally (d/close conn))))))
 
 (defn- check-write! [conn readers txs]
   (let [contents (fn [reader database]

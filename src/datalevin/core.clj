@@ -434,8 +434,9 @@ Only usable for debug output.
 
 (def ^{:arglists '([db]
                    [db n])
-       :doc      "Get or set the cache limit of a Datalog DB. Default is 256. Set to 0 to
-   disable the cache, useful when transacting bulk data as it saves memory."}
+       :doc      "Get or set the index-result cache limit of a Datalog DB. Default is 512.
+   Set to 0 to bypass index-result caching, including its lookup and insertion
+   locks. Pull-pattern and query-plan caches remain enabled."}
   datalog-index-cache-limit db/datalog-index-cache-limit)
 
 (def ^{:arglists '([conn])
