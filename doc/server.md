@@ -515,13 +515,13 @@ dtlv serv -r /data/dtlv --idle-timeout 3600000
 
 #### Wire compression
 
-Set wire compression in the connection's `:client-opts`. It applies to both
-requests and responses and is retained when pooled connections are replaced,
+Connections use uncompressed transport by default. Enable wire compression in
+the connection's `:client-opts`. It applies to both requests and responses and
+is retained when pooled connections are replaced,
 authentication is renewed, or transaction and HA clients are created.
 
 ```clojure
-(d/open-kv "dtlv://user:password@host/database"
-           {:client-opts {:wire-compression :none}})
+(d/open-kv "dtlv://user:password@host/database")
 
 (d/create-conn "dtlv://user:password@host/database" schema
                {:client-opts {:wire-compression :zstd
@@ -529,7 +529,7 @@ authentication is renewed, or transaction and HA clients are created.
                               :wire-compression-level 3}})
 ```
 
-* `:wire-compression`: `:zstd` (default) or `:none`.
+* `:wire-compression`: `:none` (default) or `:zstd`.
 * `:wire-compression-threshold`: minimum **uncompressed serialized payload**
   size in bytes, excluding the five-byte message header. Compression is only
   sent when its output, including the four-byte original-length prefix, is
@@ -542,8 +542,9 @@ They affect only the wire protocol, independently of storage compression.
 
 The dynamic vars `datalevin.constants/*wire-compression-threshold*` (default
 `8192`) and `datalevin.constants/*wire-compression-level*` (default `3`) supply
-creation-time defaults. A current server accepts the client's settings for
-both directions. Older servers honor the on/off negotiation but use their own
+creation-time defaults when compression is enabled. A current server accepts
+the client's settings for both directions. Older servers honor the on/off
+negotiation but use their own
 threshold and level for responses; peers without compression support exchange
 uncompressed messages.
 

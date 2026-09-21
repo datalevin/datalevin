@@ -49,7 +49,7 @@
 (defn ^:no-doc client-wire-opts
   "Validate and capture connection policy before opening any sockets."
   [opts]
-  (let [compression (get opts :wire-compression :zstd)
+  (let [compression (get opts :wire-compression :none)
         threshold (get opts :wire-compression-threshold c/*wire-compression-threshold*)
         level (get opts :wire-compression-level c/*wire-compression-level*)]
     (when-not (#{:none :zstd} compression)
@@ -96,14 +96,17 @@
          {:wire-compression :zstd
           :wire-compression-threshold (:compression-threshold peer-capabilities)
           :wire-compression-level (:compression-level peer-capabilities)})
-       (client-wire-opts nil))))
+       ;; Accept a legacy peer's Zstd advertisement independently of the
+       ;; default policy for newly created clients.
+       (client-wire-opts {:wire-compression :zstd}))))
   ([peer-capabilities local-opts]
-   (cond-> (assoc local-opts :compression
-                  (when (and (= (:compression local-opts) :zstd)
-                             (peer-supports-zstd? peer-capabilities)) :zstd))
-     (true? (:storage-read? peer-capabilities)) (assoc :storage-read? true)
-     (true? (:prepared-read? peer-capabilities)) (assoc :prepared-read? true)
-     (true? (:prepared-query? peer-capabilities)) (assoc :prepared-query? true))))
+   ;; Validate the peer's advertisement even when local compression is off.
+   (let [peer-zstd? (peer-supports-zstd? peer-capabilities)]
+     (cond-> (assoc local-opts :compression
+                    (when (and (= (:compression local-opts) :zstd) peer-zstd?) :zstd))
+       (true? (:storage-read? peer-capabilities)) (assoc :storage-read? true)
+       (true? (:prepared-read? peer-capabilities)) (assoc :prepared-read? true)
+       (true? (:prepared-query? peer-capabilities)) (assoc :prepared-query? true)))))
 
 (defn- fmt-int ^long [fmt]
   (bit-and (long fmt) 0xFF))

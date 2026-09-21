@@ -1001,7 +1001,7 @@
   pool, default is 3.
   * `:time-out` specifies the time (milliseconds) before an exception is thrown
   when obtaining an open network connection, default is 60000.
-  * `:wire-compression` selects `:zstd` (default) or `:none`, in both directions.
+  * `:wire-compression` selects `:none` (default) or `:zstd`, in both directions.
   * `:wire-compression-threshold` sets the minimum serialized payload bytes.
   * `:wire-compression-level` sets the Zstd level (default 3).
   These settings are captured at creation and retained when connections reconnect.

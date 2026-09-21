@@ -33,6 +33,12 @@
     (p/read-value fmt bf opts)))
 
 (deftest negotiated-policy-and-legacy-peers
+  (is (= [] (:compression (p/local-wire-capabilities))))
+  (doseq [options [nil {} {:wire-compression-threshold 0 :wire-compression-level 1}]]
+    (let [policy (p/client-wire-opts options)]
+      (is (nil? (:compression policy)))
+      (is (nil? (:compression (p/negotiate-wire-opts (p/local-wire-capabilities policy)))))
+      (is (nil? (:compression (p/negotiate-wire-opts {:compression [:zstd]} policy))))))
   (doseq [compression [:none :zstd]]
     (let [policy (p/client-wire-opts {:wire-compression compression
                                     :wire-compression-threshold 12345
@@ -161,9 +167,11 @@
     (try
       (server/start srv)
       (with-redefs-fn {#'server/message-handler-map tracked}
-        #(doseq [mode [:none :zstd]]
-           (let [policy {:wire-compression mode :wire-compression-threshold 4321
-                         :wire-compression-level 1}
+        #(doseq [mode [nil :none :zstd]]
+           (let [policy (cond-> {:wire-compression-threshold 4321
+                                :wire-compression-level 1}
+                          mode (assoc :wire-compression mode))
+                 expected (assoc policy :wire-compression (or mode :none))
                  kv (d/open-kv uri {:client-opts (assoc policy :pool-size 2)})
                  base (.-client ^datalevin.remote.KVStore kv)
                  value (.repeat "data" 5000)]
@@ -181,12 +189,12 @@
                  (#'server/remove-client srv id)
                  (is (= value (d/get-value kv "data" 1 :id :data)))
                  (is (not= id (client/get-id base)))
-                 (is (= policy (client/wire-client-options base))))
+                 (is (= expected (client/wire-client-options base))))
                (d/with-transaction-kv [tx kv]
                  (is (= value (d/get-value tx "data" 1 :id :data))))
                (let [retry (#'client/new-client-for-endpoint
                              (#'client/client-routing-context base) "localhost" port)]
-                 (try (is (= policy (client/wire-client-options retry)))
+                 (try (is (= expected (client/wire-client-options retry)))
                       (finally (client/close-client retry))))
                (is (<= 4 (count @seen)))
                (is (every? (fn [actual]
