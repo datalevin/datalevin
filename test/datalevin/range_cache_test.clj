@@ -72,8 +72,8 @@
   (doseq [wal? [false true], abort? [false true]]
     (let [conn (d/create-conn nil {:n {:db/valueType :db.type/long}}
                              {:cache-limit 0 :kv-opts {:inmemory? true :wal? wal?}})
-          low (datom/datom 1 :n 0 c/tx0)
-          high (datom/datom 2 :n 100 c/txmax)
+          low (datom/datom 1 :n c/v0 c/tx0)
+          high (datom/datom 2 :n c/vmax c/txmax)
           read #(normalize (db/-range-datoms % :eav low high))]
       (try
         (d/transact! conn [{:db/id 1 :n 10} {:db/id 2 :n 20}])

@@ -19,7 +19,8 @@
   (:import
    [com.github.luben.zstd Zstd]
    [java.nio ByteBuffer]
-   [datalevin.bits Retrieved CustomReference]
+   [java.util Arrays]
+   [datalevin.bits Indexable Retrieved CustomReference]
    [datalevin.datom Datom]))
 
 (defn value-type
@@ -61,6 +62,36 @@
                "When v is known but a is unknown, v must be a :db.type/ref"
                {:v v}))
            (b/indexable e am vm :db.type/sysMin gm)))))))
+
+(defn datom-range-predicate
+  "Match the independent, inclusive entity and AVG bounds used by both native
+  indexes. Value bounds use native encoding, including sentinel and prefix
+  bucket semantics; transaction IDs do not participate in these ranges."
+  [lmdb schema low high]
+  (let [^Indexable low (datom->indexable lmdb schema low false)
+        ^Indexable high (datom->indexable lmdb schema high true)
+        le (long (.-e low))
+        he (long (.-e high))
+        la (.-a low)
+        ha (.-a high)
+        lo (b/indexable-bytes low)
+        hi (b/indexable-bytes high)]
+    (fn [^Datom datom]
+      (let [e   (.-e datom)
+            aid (:db/aid (schema (.-a datom)))]
+        (and (<= le e he)
+             (some? aid)
+             (<= la (long aid) ha)
+             (or (< la (long aid) ha)
+                 ;; Pending values have no persisted giant/custom payload ID.
+                 ;; The low encoder uses the minimum ID, which suffices here:
+                 ;; closed bounds include the entire matching prefix bucket.
+                 (let [bs (b/indexable-bytes
+                            (datom->indexable lmdb schema datom false))]
+                   (and (or (< la (long aid))
+                            (not (neg? (Arrays/compareUnsigned bs lo))))
+                        (or (< (long aid) ha)
+                            (not (pos? (Arrays/compareUnsigned bs hi))))))))))))
 
 (defonce index->dbi {:eav c/eav :ave c/ave})
 

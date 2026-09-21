@@ -23,6 +23,7 @@
    [datalevin.db.tx.execute :as txexec]
    [datalevin.db.tx.prepare :as txprep]
    [datalevin.idoc :as idoc]
+   [datalevin.index :as idx]
    [datalevin.util :as u
     :refer [ case-tree defrecord-updatable raise]]
    [datalevin.lmdb :as l]
@@ -50,6 +51,7 @@
    [datalevin.interface IRemoteDB IRemotePrepared IStore]
    [datalevin.storage Store]
    [datalevin.utl LRUCache]
+   [java.nio ByteBuffer]
    [java.util Comparator]
    [java.util.concurrent ConcurrentHashMap]
    [java.util.function Function]
@@ -615,13 +617,6 @@
   [db e]
   (filter #(= e (.-e ^Datom %)) (:eavt db)))
 
-(defn- tx-cache-bounded-datoms
-  [^TreeSortedSet datoms cmp start-datom end-datom]
-  (let [[start-datom end-datom] (if (pos? (long (cmp start-datom end-datom)))
-                                  [end-datom start-datom]
-                                  [start-datom end-datom])]
-    (.subSet datoms start-datom end-datom)))
-
 (defn- cmp-attrs-by-aid
   [schema a b]
   (let [aid-a (:db/aid (schema a))
@@ -647,39 +642,30 @@
     (Long/compare (d/datom-tx d1) (d/datom-tx d2))))
 
 (defn- tx-cache-index-comparator
-  ([db index] (tx-cache-index-comparator db index false))
-  ([db index buckets?]
-   (let [schema (-schema db)
-         store (:store db)
-         kv (when (instance? Store store) (.-lmdb ^Store store))
-         value-cmp ((if buckets? cd/order-comparator cd/value-comparator) kv (constantly schema))]
-     (case index
-       :eav #(cmp-datoms-eavt-schema schema value-cmp %1 %2)
-       :ave #(cmp-datoms-avet-schema schema value-cmp %1 %2)
-       nil))))
+  [db index]
+  (let [schema (-schema db)
+        store (:store db)
+        kv (when (instance? Store store) (.-lmdb ^Store store))
+        value-cmp (cd/value-comparator kv (constantly schema))]
+    (case index
+      :eav #(cmp-datoms-eavt-schema schema value-cmp %1 %2)
+      :ave #(cmp-datoms-avet-schema schema value-cmp %1 %2)
+      nil)))
 
 (defn- tx-cache-range-datoms
   [db index start-datom end-datom]
-  (if (cd/custom-schema? (-schema db))
-    (let [cmp (tx-cache-index-comparator db index true)
-          [lo hi] (if (pos? (long (cmp start-datom end-datom)))
-                    [end-datom start-datom] [start-datom end-datom])]
-      (filter #(and (not (neg? (long (cmp % lo))))
-                    (not (pos? (long (cmp % hi)))))
-              (case index :eav (:eavt db) :ave (:avet db))))
-    (case index
-      :eav (let [e (.-e ^Datom start-datom)]
-             (if (and (some? e) (= e (.-e ^Datom end-datom)))
-               (tx-cache-e-datoms db e)
-               (tx-cache-bounded-datoms
-                (:eavt db) d/cmp-datoms-eavt start-datom end-datom)))
-      :ave (tx-cache-bounded-datoms
-             (:avet db) d/cmp-datoms-avet start-datom end-datom)
-      nil)))
+  (let [store (:store db)
+        kv (when (instance? Store store) (.-lmdb ^Store store))]
+    (filter (idx/datom-range-predicate kv (-schema db) start-datom end-datom)
+            (case index :eav (:eavt db) :ave (:avet db) nil))))
 
 (defn- datom-eav-key
   [^Datom datom]
-  [(.-e datom) (.-a datom) (.-v datom)])
+  (let [v (.-v datom)]
+    ;; Native reads decode fresh arrays; retract them by content, not identity.
+    (if (bytes? v)
+      [(.-e datom) (.-a datom) ::bytes (ByteBuffer/wrap ^bytes v)]
+      [(.-e datom) (.-a datom) v])))
 
 (defn- merge-tx-cache-datoms
   [db index base cached]

@@ -24,7 +24,8 @@
 ### Fixed
 - [Datalog] planner range conversion for `like`.
 - [Datalog] false-negative giant AVE lookup.
-- [KV] prefix overflow page deletion issue.
+- [Datalog] simulated txn range bounds.
+- [KV] prefix overflow page deletion.
 
 ### Improved
 - [Server] simplify, speedup and harden client/server lifecycle, by using
