@@ -712,8 +712,10 @@
   (case (short hdr)
     -64 (put-long bf (wrap-extrema v Long/MIN_VALUE -1 v))
     -63 (put-long bf (wrap-extrema v 0 Long/MAX_VALUE v))
+    ;; Use an explicit checked cast even when *unchecked-math* is enabled.
     -62 (put-int bf (BitOps/intFlip
-                     (int (wrap-extrema v Integer/MIN_VALUE Integer/MAX_VALUE v))
+                     (clojure.lang.RT/intCast
+                       (wrap-extrema v Integer/MIN_VALUE Integer/MAX_VALUE v))
                      31))
     -11 (put-float bf (wrap-extrema v Float/NEGATIVE_INFINITY
                                     Float/POSITIVE_INFINITY v))

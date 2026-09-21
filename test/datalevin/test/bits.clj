@@ -57,9 +57,13 @@
                                   (Arrays/compareUnsigned a b)) encoded))))))
     (is (= 4 (- (alength ^bytes (tuple-bytes [0 "value"] [:long :string]))
                 (alength ^bytes (tuple-bytes [0 "value"] [:int :string])))))
-    (doseq [i [(dec (long Integer/MIN_VALUE)) (inc (long Integer/MAX_VALUE))]]
-      (is (not (b/valid-data? [i "value"] [:int :string])))
-      (is (thrown? ArithmeticException (tuple-bytes [i "value"] [:int :string]))))
+    (doseq [i [Long/MIN_VALUE (dec (long Integer/MIN_VALUE))
+               (inc (long Integer/MAX_VALUE)) Long/MAX_VALUE]
+            [value types] [[[i "value"] [:int :string]]
+                            [[i 0] [:int]]
+                            [[0 i] [:int]]]]
+      (is (not (b/valid-data? value types)))
+      (is (thrown? ArithmeticException (tuple-bytes value types))))
     (is (not (b/valid-data? [1.5 "value"] [:int :string])))
     (doseq [[sentinel value] [[:db.value/sysMin Integer/MIN_VALUE]
                               [:db.value/sysMax Integer/MAX_VALUE]]]
