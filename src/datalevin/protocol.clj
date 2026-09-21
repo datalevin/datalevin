@@ -27,7 +27,7 @@
    [java.nio ByteBuffer BufferOverflowException]
    [java.util UUID]
    [java.nio.channels SocketChannel Selector SelectionKey]
-   [datalevin.io ByteBufferInputStream ByteBufferOutputStream]
+   [datalevin.io ByteBufferInputStream ByteBufferOutputStream WireCompression]
    [datalevin.spill SpillableVector]
    [datalevin.datom Datom]
    [com.github.luben.zstd Zstd]))
@@ -46,15 +46,33 @@
                      "datalevin/SpillableVector"
                      (fn [v] (into [] v)))})
 
-(declare write-transit-bytes)
+(defn ^:no-doc client-wire-opts
+  "Validate and capture connection policy before opening any sockets."
+  [opts]
+  (let [compression (get opts :wire-compression :zstd)
+        threshold (get opts :wire-compression-threshold c/*wire-compression-threshold*)
+        level (get opts :wire-compression-level c/*wire-compression-level*)]
+    (when-not (#{:none :zstd} compression)
+      (raise "Expected :wire-compression to be :none or :zstd" {:value compression}))
+    (when-not (and (integer? threshold) (<= 0 threshold Integer/MAX_VALUE))
+      (raise "Invalid wire compression threshold" {:value threshold}))
+    (when-not (and (integer? level)
+                  (<= (Zstd/minCompressionLevel) level (Zstd/maxCompressionLevel)))
+      (raise "Invalid wire compression level" {:value level}))
+    {:compression (when (= compression :zstd) :zstd)
+     :compression-threshold (long threshold)
+     :compression-level (int level)}))
 
 (defn ^:no-doc local-wire-capabilities
-  []
-  {:compression           [:zstd]
-   :storage-read?         true
-   :prepared-read?        true
-   :prepared-query?       true
-   :compression-threshold (long c/*wire-compression-threshold*)})
+  ([] (local-wire-capabilities (client-wire-opts nil)))
+  ([opts]
+   {:compression (if (= (:compression opts) :zstd) [:zstd] [])
+    :compression-settings? true
+    :storage-read? true
+    :prepared-read? true
+    :prepared-query? true
+    :compression-threshold (:compression-threshold opts)
+    :compression-level (:compression-level opts)}))
 
 (defn ^:no-doc default-wire-opts
   []
@@ -68,16 +86,24 @@
     (contains? (set (:compression peer-capabilities)) :zstd)))
 
 (defn ^:no-doc negotiate-wire-opts
-  [peer-capabilities]
-  (cond-> (default-wire-opts)
-    (peer-supports-zstd? peer-capabilities)
-    (assoc :compression :zstd)
-    (true? (:storage-read? peer-capabilities))
-    (assoc :storage-read? true)
-    (true? (:prepared-read? peer-capabilities))
-    (assoc :prepared-read? true)
-    (true? (:prepared-query? peer-capabilities))
-    (assoc :prepared-query? true)))
+  ([peer-capabilities]
+   ;; Older peers advertised a threshold without negotiating it. Only the new
+   ;; settings capability requests a symmetric, per-connection policy.
+   (negotiate-wire-opts
+     peer-capabilities
+     (if (:compression-settings? peer-capabilities)
+       (client-wire-opts
+         {:wire-compression :zstd
+          :wire-compression-threshold (:compression-threshold peer-capabilities)
+          :wire-compression-level (:compression-level peer-capabilities)})
+       (client-wire-opts nil))))
+  ([peer-capabilities local-opts]
+   (cond-> (assoc local-opts :compression
+                  (when (and (= (:compression local-opts) :zstd)
+                             (peer-supports-zstd? peer-capabilities)) :zstd))
+     (true? (:storage-read? peer-capabilities)) (assoc :storage-read? true)
+     (true? (:prepared-read? peer-capabilities)) (assoc :prepared-read? true)
+     (true? (:prepared-query? peer-capabilities)) (assoc :prepared-query? true))))
 
 (defn- fmt-int ^long [fmt]
   (bit-and (long fmt) 0xFF))
@@ -88,60 +114,6 @@
 (defn- zstd-compressed?
   [fmt]
   (pos? (bit-and (fmt-int fmt) c/message-flag-zstd)))
-
-(defn- serialize-value
-  ^bytes [fmt msg]
-  (case (short fmt)
-    1 (write-transit-bytes msg)
-    ;; Establish the wire and Java serialization contexts in one binding.
-    ;; bits/serialize can then use the already installed allowlist.
-    2 (context/with-wire-bindings :freeze (b/serialization-allowlist)
-        (b/serialize msg))
-    (raise "Unknown wire message format"
-             {:format fmt
-              :format-code (fmt-code fmt)})))
-
-(defn- maybe-pack-zstd
-  [fmt ^bytes payload wire-opts]
-  (let [{:keys [compression compression-threshold compression-level]
-         :or {compression-threshold c/*wire-compression-threshold*
-              compression-level c/*wire-compression-level*}}
-        wire-opts
-        threshold ^long (long compression-threshold)]
-    (if (and (= compression :zstd)
-             (<= threshold (alength payload)))
-      (let [compressed ^bytes (Zstd/compress payload (int compression-level))
-            packed-len        (+ 4 (alength compressed))]
-        (if (< packed-len (alength payload))
-          (let [packed (byte-array packed-len)
-                bb     (ByteBuffer/wrap packed)]
-            (.putInt bb (alength payload))
-            (.put bb compressed)
-            [(unchecked-byte (bit-or (fmt-int fmt) c/message-flag-zstd))
-             packed])
-          [fmt payload]))
-      [fmt payload])))
-
-(defn- unpack-zstd
-  ^bytes [^bytes payload]
-  (when (< (alength payload) 4)
-    (raise "Wire message compression payload is corrupted"
-             {:reason :missing-uncompressed-length
-              :payload-bytes (alength payload)}))
-  (let [bb              (ByteBuffer/wrap payload)
-        uncompressed-len (.getInt bb)]
-    (when (neg? uncompressed-len)
-      (raise "Wire message compression payload is corrupted"
-               {:reason :negative-uncompressed-length
-                :uncompressed-length uncompressed-len}))
-    (let [compressed (byte-array (.remaining bb))]
-      (.get bb compressed)
-      (let [raw ^bytes (Zstd/decompress compressed (long uncompressed-len))]
-        (when-not (= uncompressed-len (alength raw))
-          (raise "Wire message decompression length mismatch"
-                   {:expected uncompressed-len
-                    :actual   (alength raw)}))
-        raw))))
 
 (defn read-transit-string
   "Read a transit+json encoded string into a Clojure value"
@@ -228,35 +200,63 @@
 (defn write-transit-bf
   "Write a Clojure value as transit+json encoded bytes into a ByteBuffer"
   [^ByteBuffer bf v]
-  (transit/write (transit/writer (ByteBufferOutputStream. bf)
-                                 :json
-                                 {:handlers transit-write-handlers})
-                 v))
+  (try
+    (transit/write (transit/writer (ByteBufferOutputStream. bf)
+                                   :json
+                                   {:handlers transit-write-handlers})
+                   v)
+    (catch RuntimeException e
+      ;; Transit wraps stream failures; expose overflow to the frame grow loop.
+      (if (instance? BufferOverflowException (.getCause e))
+        (throw (.getCause e))
+        (throw e)))))
 
-(defn- write-message-bytes-bf
+(defn- write-value-bf [^ByteBuffer bf msg fmt]
+  (case (short fmt)
+    1 (write-transit-bf bf msg)
+    2 (write-nippy-bf bf msg)
+    (raise "Unknown wire message format" {:format fmt :format-code (fmt-code fmt)})))
+
+(defn- compressible? [wire-opts size]
+  (and (= (:compression wire-opts) :zstd)
+       (<= (long (get wire-opts :compression-threshold
+                      c/*wire-compression-threshold*)) (long size))))
+
+(defn- compress-payload
+  ^ByteBuffer [^WireCompression codec ^ByteBuffer bf start size wire-opts]
+  (when (compressible? wire-opts size)
+    (.compress codec bf (int start) (int size)
+               (int (get wire-opts :compression-level c/*wire-compression-level*)))))
+
+(defn- write-overflow-message-bf
+  "A compressed frame can fit even when its raw encoding overflows. Grow a
+  reusable scratch buffer; never materialize the payload as a byte array."
   [^ByteBuffer bf msg fmt wire-opts]
-  (let [payload ^bytes (serialize-value fmt msg)
-        [fmt' body]   (maybe-pack-zstd fmt payload wire-opts)]
-    (.put bf ^byte (unchecked-byte fmt'))
-    (.putInt bf (int (+ c/message-header-size (alength ^bytes body))))
-    (.put bf ^bytes body)))
+  (context/with-compression [codec]
+    (let [^ByteBuffer raw
+          (loop [size (max 8192 (* 2 (long (.remaining bf))))]
+            (when (> size Integer/MAX_VALUE) (throw (BufferOverflowException.)))
+            (let [raw (.encodingBuffer ^WireCompression codec (int size))
+                  encoded? (try (write-value-bf raw msg fmt) true
+                                (catch BufferOverflowException _ false))]
+              (if encoded? (doto raw (.flip))
+                  (recur (* 2 (long (.capacity raw)))))))
+          packed (compress-payload codec raw 0 (.remaining raw) wire-opts)
+          ^ByteBuffer body (or packed raw)]
+      (.put bf (unchecked-byte (if packed (bit-or (fmt-int fmt) c/message-flag-zstd) fmt)))
+      (.putInt bf (int (+ c/message-header-size (.remaining body))))
+      (.put bf body))))
 
 (defn- compress-message-bf!
-  [^ByteBuffer bf ^long start wire-opts]
+  [^ByteBuffer bf ^long start fmt wire-opts]
   (let [payload-start (+ start c/message-header-size)
-        end           (.position bf)
-        size          (- end payload-start)]
-    (when (and (= (:compression wire-opts) :zstd)
-               (<= (long (get wire-opts :compression-threshold
-                              c/*wire-compression-threshold*)) size))
-      (let [payload (b/get-bytes (doto (.duplicate bf)
-                                   (.limit end)
-                                   (.position payload-start)))
-            [fmt body] (maybe-pack-zstd c/message-format-nippy payload wire-opts)]
-        (when (zstd-compressed? fmt)
-          (.put bf (int start) (unchecked-byte fmt))
+        size (- (.position bf) payload-start)]
+    (when (compressible? wire-opts size)
+      (context/with-compression [codec]
+        (when-let [packed (compress-payload codec bf payload-start size wire-opts)]
+          (.put bf (int start) (unchecked-byte (bit-or (fmt-int fmt) c/message-flag-zstd)))
           (.position bf payload-start)
-          (.put bf ^bytes body))))))
+          (.put bf ^ByteBuffer packed))))))
 
 (defn write-message-bf
   "Write a message to a ByteBuffer. First byte is format, then four bytes
@@ -268,20 +268,17 @@
   ([^ByteBuffer bf msg fmt wire-opts]
    (let [start (.position bf)]
      (try
-       (if (= fmt c/message-format-nippy)
-         (try
-           (.put bf (unchecked-byte fmt))
-           (.putInt bf 0)
-           (write-nippy-bf bf msg)
-           (compress-message-bf! bf start wire-opts)
-           (.putInt bf (int (inc start)) (int (- (.position bf) start)))
-           (catch BufferOverflowException e
-             (.position bf start)
-             ;; A compressed frame may fit even when the raw value does not.
-             (if (= (:compression wire-opts) :zstd)
-               (write-message-bytes-bf bf msg fmt wire-opts)
-               (throw e))))
-         (write-message-bytes-bf bf msg fmt wire-opts))
+       (try
+         (.put bf (unchecked-byte fmt))
+         (.putInt bf 0)
+         (write-value-bf bf msg fmt)
+         (compress-message-bf! bf start fmt wire-opts)
+         (.putInt bf (int (inc start)) (int (- (.position bf) start)))
+         (catch BufferOverflowException e
+           (.position bf start)
+           (if (= (:compression wire-opts) :zstd)
+             (write-overflow-message-bf bf msg fmt wire-opts)
+             (throw e))))
        (catch Throwable t
          (.position bf start)
          (throw t))))))
@@ -302,32 +299,26 @@
                    v)
     (.toByteArray baos)))
 
+(defn- read-payload [fmt ^ByteBuffer payload]
+  (case (short (fmt-code fmt))
+    1 (read-transit-bf payload)
+    2 (read-nippy-bf payload)
+    (raise "Unknown wire message format" {:format fmt :format-code (fmt-code fmt)})))
+
 (defn read-value
-  ([fmt bs]
-   (read-value fmt bs nil))
+  ([fmt bs] (read-value fmt bs nil))
   ([fmt bs wire-opts]
-   (let [code      (fmt-code fmt)
-         compressed? (zstd-compressed? fmt)
-         payload   (if compressed?
-                     (do
-                       (when-not (= (:compression wire-opts) :zstd)
-                         (raise "Received compressed wire message without negotiated support"
-                                  {:compression-flag :zstd
-                                   :wire-opts        wire-opts}))
-                       (unpack-zstd (if (instance? ByteBuffer bs)
-                                      (b/get-bytes bs)
-                                      bs)))
-                     bs)]
-     (case (short code)
-       1 (if (instance? ByteBuffer payload)
-           (read-transit-bf payload)
-           (read-transit-bytes payload))
-       2 (read-nippy-bf (if (instance? ByteBuffer payload)
-                         payload
-                         (ByteBuffer/wrap payload)))
-       (raise "Unknown wire message format"
-                {:format fmt
-                 :format-code code})))))
+   (let [^ByteBuffer payload (if (instance? ByteBuffer bs) bs (ByteBuffer/wrap bs))]
+     (if (zstd-compressed? fmt)
+       (do
+         (when-not (= (:compression wire-opts) :zstd)
+           (raise "Received compressed wire message without negotiated support"
+                  {:compression-flag :zstd :wire-opts wire-opts}))
+         ;; Keep the lease through thaw: a custom reader may recursively decode
+         ;; another message, whose scratch buffer must not overwrite this one.
+         (context/with-compression [codec]
+           (read-payload fmt (.decompress ^WireCompression codec payload))))
+       (read-payload fmt payload)))))
 
 (deftype ^:no-doc RequestDecoder [native? bindings])
 

@@ -132,7 +132,7 @@
       (fn [db]
         (let [info (store/storage-info db)
               stores (mapv #(store/for-worker db %) (range 3))
-              client-ids (mapv #(client/get-id (.-client ^DatalogStore (d/datalog-kv (:conn %)))) stores)
+              client-ids (mapv #(client/get-id (.-client ^DatalogStore (:store @(:conn %)))) stores)
               executor (Executors/newFixedThreadPool 3)]
           (reset! handles stores)
           (reset! pid (get-in info [:server :pid]))

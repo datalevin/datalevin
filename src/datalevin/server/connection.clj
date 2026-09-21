@@ -65,10 +65,15 @@
                           (try
                             (serve! key)
                             (finally
-                              (try (close! key)
-                                   (finally
-                                     (.remove connection-keys id)
-                                     (.remove connection-threads id))))))
+                              (try
+                                (close! key)
+                                (finally
+                                  (try
+                                    (.close ^java.io.Closeable
+                                            (:codec-context @(.attachment key)))
+                                    (finally
+                                      (.remove connection-keys id)
+                                      (.remove connection-threads id))))))))
                         (str "datalevin-connection-" id))]
            (.attach key (volatile! {:read-bf (bf/allocate-buffer c/+buffer-size+)
                                     :write-bf (bf/allocate-buffer c/+buffer-size+)

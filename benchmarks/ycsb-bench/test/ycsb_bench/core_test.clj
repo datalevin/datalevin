@@ -192,7 +192,7 @@
         (assoc small-options :api api :mode mode)
         (fn [db]
           (when (= api :datalog)
-            (is (= :prepare-q (:scan-api (store/storage-info db))))
+            (is (= :slice (:scan-api (store/storage-info db))))
             (is (= :db/id (:record-key (store/storage-info db)))))
           (check-adapter! db)
           (when (= api :kv)
@@ -208,7 +208,27 @@
               (is (not (contains? (d/schema conn) :ycsb/id)))
               (store/put-records! db [[7 ["dddd" "eeee" "ffff"]]])
               (is (= [[7 ["dddd" "eeee" "ffff"]]] (store/scan-records db 4 10)))
+              (is (empty? (store/scan-records db 4 3))
+                  "The upper entity bound is exclusive, including across gaps")
+              (is (= [[7 ["dddd" "eeee" "ffff"]]] (store/scan-records db 7 1)))
               (is (= 5 (store/record-count db)))))
+          {})))))
+
+(deftest datalog-scan-field-order-test
+  (doseq [mode [:embedded :remote]]
+    (testing (str mode)
+      (store/with-store
+        (assoc small-options :api :datalog :mode mode :field-count 12)
+        (fn [db]
+          (let [rows (mapv (fn [id]
+                             [id (mapv #(format "%02d%02d" id %) (range 12))])
+                           [0 2 3 7])]
+            (store/put-records! db rows)
+            (is (= (subvec rows 1 3) (store/scan-records db 1 3)))
+            (is (= rows (store/scan-records db 0 8)))
+            (store/update-field! db 2 10 "edit")
+            (is (= [[2 (assoc (second (nth rows 1)) 10 "edit")]]
+                   (store/scan-records db 2 1))))
           {})))))
 
 (deftest comparison-selection-test

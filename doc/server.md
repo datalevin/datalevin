@@ -515,15 +515,43 @@ dtlv serv -r /data/dtlv --idle-timeout 3600000
 
 #### Wire compression
 
-These dynamic vars tune client/server protocol compression (zstd):
+Set wire compression in the connection's `:client-opts`. It applies to both
+requests and responses and is retained when pooled connections are replaced,
+authentication is renewed, or transaction and HA clients are created.
 
-* `datalevin.constants/*wire-compression-threshold*` (default `8192` bytes):
-  minimum payload size before attempting compression.
-* `datalevin.constants/*wire-compression-level*` (default `3`): zstd
-  compression level.
+```clojure
+(d/open-kv "dtlv://user:password@host/database"
+           {:client-opts {:wire-compression :none}})
 
-Lower threshold and higher level can reduce bandwidth at the cost of more CPU.
-Set these on both client and server processes if you want symmetric behavior.
+(d/create-conn "dtlv://user:password@host/database" schema
+               {:client-opts {:wire-compression :zstd
+                              :wire-compression-threshold 8192
+                              :wire-compression-level 3}})
+```
+
+* `:wire-compression`: `:zstd` (default) or `:none`.
+* `:wire-compression-threshold`: minimum **uncompressed serialized payload**
+  size in bytes, excluding the five-byte message header. Compression is only
+  sent when its output, including the four-byte original-length prefix, is
+  smaller than the original payload.
+* `:wire-compression-level`: Zstd level; default `3`.
+
+These options can also be passed directly to `datalevin.client/new-client`.
+Different clients connecting to the same server can use different settings.
+They affect only the wire protocol, independently of storage compression.
+
+The dynamic vars `datalevin.constants/*wire-compression-threshold*` (default
+`8192`) and `datalevin.constants/*wire-compression-level*` (default `3`) supply
+creation-time defaults. A current server accepts the client's settings for
+both directions. Older servers honor the on/off negotiation but use their own
+threshold and level for responses; peers without compression support exchange
+uncompressed messages.
+
+Choose the threshold from the latency crossover for your payloads and network.
+Smaller output alone does not establish a latency benefit. The
+[loopback measurements](wire-compression-2026-09-20/README.md) found none through
+4 MiB of YCSB strings or 2 MiB of keyword-heavy documents; use `:none` for that
+workload.
 
 #### Runtime UDFs
 

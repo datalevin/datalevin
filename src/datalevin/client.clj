@@ -262,22 +262,25 @@
         (when (nv/decoding-error? e) (throw e))
         (raise "Error receiving data:" e {}))))
 
-  (close [_]
+  (close [this]
     ;; Closing the channel wakes an in-flight read. Serialize only lazy
     ;; selector creation/closure, never the blocking receive itself.
-    (locking read-selector
-      (let [^Selector selector @read-selector]
-        (try
+    (try
+      (locking read-selector
+        (let [^Selector selector @read-selector]
           (try
-            (.close ch)
-            (catch Throwable t
-              (when selector
-                (cleanup-after-failure! t #(.close selector)))
-              (throw t)))
-          (when selector (.close selector))
-          (finally
-            (vreset! read-selector nil)
-            (clear-conn-wire-opts! ch)))))))
+            (try
+              (.close ch)
+              (catch Throwable t
+                (when selector
+                  (cleanup-after-failure! t #(.close selector)))
+                (throw t)))
+            (when selector (.close selector))
+            (finally
+              (vreset! read-selector nil)
+              (clear-conn-wire-opts! ch)))))
+      (finally
+        (locking this (.close ^java.io.Closeable context))))))
 
 #_{:clj-kondo/ignore [:redefined-var]}
 (defn ^:no-doc ->Connection
@@ -358,14 +361,14 @@
          (throw t))))))
 
 (defn- set-client-id
-  [conn client-id]
+  [conn client-id wire-options]
   (let [{:keys [type message wire-capabilities]}
         (send-n-receive conn {:type              :set-client-id
                               :client-id         client-id
-                              :wire-capabilities (p/local-wire-capabilities)})]
+                              :wire-capabilities (p/local-wire-capabilities wire-options)})]
     (when-not (= type :set-client-id-ok) (raise message {}))
     (set-conn-wire-opts! conn
-                         (p/negotiate-wire-opts wire-capabilities))))
+                         (p/negotiate-wire-opts wire-capabilities wire-options))))
 
 (defn- cleanup-after-failure!
   [^Throwable failure cleanup]
@@ -377,10 +380,10 @@
 
 (defn- new-registered-connection
   "Own a new connection until registration succeeds and a pool can adopt it."
-  [host port client-id time-out]
+  [host port client-id time-out wire-options]
   (let [conn (new-connection host port time-out)]
     (try
-      (set-client-id conn client-id)
+      (set-client-id conn client-id wire-options)
       conn
       (catch Throwable t
         (cleanup-after-failure! t #(close conn))
@@ -417,7 +420,7 @@
 
 (declare borrow-connection)
 
-(deftype ^:no-doc ConnectionPool [host port client-id pool-size time-out
+(deftype ^:no-doc ConnectionPool [host port client-id pool-size time-out wire-options
                                   ^objects slots
                                   ^ConcurrentHashMap owners
                                   ^ThreadLocal preferred
@@ -453,6 +456,11 @@
 
   (closed-pool? [_]
     (.get closed?)))
+
+(defn- pool-wire-options [pool]
+  (if (instance? ConnectionPool pool)
+    (.-wire-options ^ConnectionPool pool)
+    (p/client-wire-opts nil)))
 
 (defn- check-pool-open!
   [^ConnectionPool pool]
@@ -511,7 +519,7 @@
   (close conn)
   (let [replacement (new-registered-connection
                       (.-host pool) (.-port pool) (.-client-id pool)
-                      (.-time-out pool))]
+                      (.-time-out pool) (.-wire-options pool))]
     (try
       ;; Registration can block. Only publication and shutdown share a monitor.
       (locking pool
@@ -546,15 +554,17 @@
         (throw t)))))
 
 (defn- connection-pool
-  [host port client-id pool-size time-out]
-  (->ConnectionPool host port client-id pool-size time-out
-                     (into-array ConnectionSlot
-                                 (repeatedly pool-size
-                                             #(ConnectionSlot.
-                                                (AtomicReference.)
-                                                (AtomicBoolean. false))))
-                     (ConcurrentHashMap.) (ThreadLocal.) (AtomicBoolean. false)
-                     (AtomicInteger. 0)))
+  ([host port client-id pool-size time-out]
+   (connection-pool host port client-id pool-size time-out (p/client-wire-opts nil)))
+  ([host port client-id pool-size time-out wire-options]
+   (->ConnectionPool host port client-id pool-size time-out wire-options
+                      (into-array ConnectionSlot
+                                  (repeatedly pool-size
+                                              #(ConnectionSlot.
+                                                 (AtomicReference.)
+                                                 (AtomicBoolean. false))))
+                      (ConcurrentHashMap.) (ThreadLocal.) (AtomicBoolean. false)
+                      (AtomicInteger. 0))))
 
 (defn- authenticate
   "Send an authenticate message to server, and wait to receive the response.
@@ -582,22 +592,24 @@
     client-id))
 
 (defn- new-connectionpool
-  [host port client-id pool-size time-out]
-  (assert (> ^long pool-size 0)
-          "Number of connections must be greater than zero")
-  (let [^ConnectionPool pool (connection-pool
-                              host port client-id pool-size time-out)
-        ^objects slots (.-slots pool)]
-    (try
-      (dotimes [i pool-size]
-        (let [conn (new-registered-connection host port client-id time-out)]
-          (install-pool-connection! pool (aget slots i) conn)))
-      pool
-      (catch Throwable t
-        ;; A server can disappear while the initial pool is being populated.
-        ;; Do not leak connections that were established earlier in the loop.
-        (cleanup-after-failure! t #(close-pool pool))
-        (throw t)))))
+  ([host port client-id pool-size time-out]
+   (new-connectionpool host port client-id pool-size time-out (p/client-wire-opts nil)))
+  ([host port client-id pool-size time-out wire-options]
+   (assert (> ^long pool-size 0)
+           "Number of connections must be greater than zero")
+   (let [^ConnectionPool pool (connection-pool
+                               host port client-id pool-size time-out wire-options)
+         ^objects slots (.-slots pool)]
+     (try
+       (dotimes [i pool-size]
+         (let [conn (new-registered-connection host port client-id time-out wire-options)]
+           (install-pool-connection! pool (aget slots i) conn)))
+       pool
+       (catch Throwable t
+         ;; A server can disappear while the initial pool is being populated.
+         ;; Do not leak connections that were established earlier in the loop.
+         (cleanup-after-failure! t #(close-pool pool))
+         (throw t))))))
 
 (defprotocol ^:no-doc IClient
   (request [client req]
@@ -800,7 +812,8 @@
                                                  new-pool
                                                  (new-connectionpool
                                                    host port client-id
-                                                   pool-size time-out)]
+                                                   pool-size time-out
+                                                   (pool-wire-options pool'))]
                                              ;; Explicit field access is needed
                                              ;; for mutable deftype fields inside
                                              ;; the locking form.
@@ -988,6 +1001,10 @@
   pool, default is 3.
   * `:time-out` specifies the time (milliseconds) before an exception is thrown
   when obtaining an open network connection, default is 60000.
+  * `:wire-compression` selects `:zstd` (default) or `:none`, in both directions.
+  * `:wire-compression-threshold` sets the minimum serialized payload bytes.
+  * `:wire-compression-level` sets the Zstd level (default 3).
+  These settings are captured at creation and retained when connections reconnect.
   * `:ha-write-retry-timeout-ms` bounds extra HA failover retry time after a
   retryable write rejection. By default it is derived from HA lease/promotion
   timing and capped by `:time-out`.
@@ -1000,16 +1017,26 @@
              :as   opts
              :or   {pool-size c/default-connection-pool-size
                     time-out  c/default-connection-timeout}}]
-   (let [uri                         (URI. uri-str)
+   (let [wire-options                (p/client-wire-opts opts)
+         uri                         (URI. uri-str)
          {:keys [username password]} (parse-user-info uri)
 
          host      (.getHost uri)
          port      (parse-port uri)
          client-id (authenticate host port username password time-out)
-         pool      (new-connectionpool host port client-id pool-size time-out)]
+         pool      (new-connectionpool host port client-id pool-size time-out wire-options)]
      (-> (->Client username password host port pool-size time-out
                    client-id pool)
          (set-client-ha-write-retry-settings! time-out opts)))))
+
+(defn ^:no-doc wire-client-options
+  "Connection policy expressed as client options, for derived clients."
+  [client]
+  (when (instance? Client client)
+    (let [opts (pool-wire-options (get-pool client))]
+      {:wire-compression (or (:compression opts) :none)
+       :wire-compression-threshold (:compression-threshold opts)
+       :wire-compression-level (:compression-level opts)})))
 
 (defn close-client
   "Close a remote client and release its connection pool. Safe to call more
@@ -1031,7 +1058,8 @@
               time-out  (.-time-out client)
               ha-settings (client-ha-write-retry-settings client)
               client-id (authenticate host port username password time-out)
-              pool      (new-connectionpool host port client-id 1 time-out)]
+              pool      (new-connectionpool host port client-id 1 time-out
+                                            (pool-wire-options (get-pool client)))]
           (-> (->Client username password host port 1 time-out
                         client-id pool)
               (set-client-ha-write-retry-settings! time-out ha-settings)
@@ -1287,7 +1315,8 @@
        :time-out  (.-time-out ^Client client)
        :host      (.-host ^Client client)
        :port      (.-port ^Client client)
-       :client    client}
+       :client    client
+       :wire-options (pool-wire-options (get-pool client))}
       (client-ha-write-retry-settings client))))
 
 (defn- ^:redef client-retry-context
@@ -1322,10 +1351,11 @@
       endpoint)))
 
 (defn- new-client-for-endpoint
-  [{:keys [username password pool-size time-out]
+  [{:keys [username password pool-size time-out wire-options]
     :as   retry-context} host port]
   (let [client-id (authenticate host port username password time-out)
-        pool      (new-connectionpool host port client-id pool-size time-out)]
+        pool      (new-connectionpool host port client-id pool-size time-out
+                                      (or wire-options (p/client-wire-opts nil)))]
     (-> (->Client username password host port pool-size time-out
                   client-id pool)
         (inherit-native-readers! (:client retry-context))

@@ -137,13 +137,13 @@ pool waiting is included in latency. PostgreSQL can write different rows
 concurrently, while SQLite and shared Datalog handles serialize writes according
 to their normal transaction behavior. The harness adds no shared row lock.
 
-Datalevin prepares its Datalog scan query with `prepare-q` when opening each
-database handle, before load and warmup. The field projection is fixed in the
-query; executions supply only the lower and upper ID bounds. Remote handles
-register lazily on each connection and are reused across phases. With zero
-warmup, initial registration is included in measured latency. Reports identify
-this choice with `:storage :scan-api :prepare-q`.
-See the [prepared-scan validation and workload E comparison](results/2026-09-15-prepared-scans/README.md).
+Datalevin's Datalog scans use the storage `slice` operation on the EAV index,
+bounded by the requested entity-ID interval. A remote scan sends both bounds to
+the server in one range request. The adapter groups the returned datoms by
+entity and assembles field vectors in column order; EAV supplies entity order.
+Reports identify this choice with `:storage :scan-api :slice`. Earlier results
+using `:prepare-q` measured a Datalog query with pull instead of a direct range
+scan.
 
 | Durability profile | Datalevin | SQLite | PostgreSQL |
 | --- | --- | --- | --- |

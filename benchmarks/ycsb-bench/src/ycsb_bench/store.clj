@@ -1,6 +1,7 @@
 (ns ycsb-bench.store
   "KV and Datalog implementations of the same logical record operations."
   (:require [datalevin.core :as d]
+            [datalevin.interface :as i]
             [datalevin.kv :as kv]
             [datalevin.server :as server]
             [datalevin.util :as u]
@@ -69,15 +70,24 @@
   (let [record (d/pull @conn attributes id)]
     (mapv record attributes)))
 
-(defn scan-query [attributes]
-  ;; The keyspace is dense. Bind only the requested entity IDs so a scan
-  ;; does not enumerate every record to filter on its entity ID.
-  [:find '?e (list 'pull '?e attributes)
-   :in '$ '?lo '?hi
-   :where '[(range ?lo ?hi) [?e ...]]
-   ['?e (first attributes)]])
+(defn- datalog-scan [conn attribute-positions start n]
+  (if (pos? (long n))
+    (let [datoms (i/slice (:store @conn) :eav
+                          (d/datom start nil nil)
+                          (d/datom (dec (+ (long start) (long n))) nil nil))
+          field-count (count attribute-positions)]
+      ;; EAV already orders the entities. Attribute IDs need not follow the
+      ;; benchmark's field order, so place each value in its declared column.
+      (mapv (fn [entity-datoms]
+              (let [values (object-array field-count)]
+                (doseq [datom entity-datoms]
+                  (aset values (int (attribute-positions (d/datom-a datom)))
+                        (d/datom-v datom)))
+                [(d/datom-e (first entity-datoms)) (vec values)]))
+            (partition-by d/datom-e datoms)))
+    []))
 
-(defrecord DatalogRecords [conn attributes scan-reader]
+(defrecord DatalogRecords [conn attributes attribute-positions]
   Records
   (put-records! [_ records]
     (d/transact! conn (mapv (fn [[id values]]
@@ -92,13 +102,11 @@
         (d/transact! tx [[:db/add id (nth attributes field)
                          (w/modified-value (nth values field))]]))))
   (scan-records [_ start n]
-    (->> (scan-reader [start (+ (long start) (long n))])
-         (sort-by first)
-         (mapv (fn [[id record]] [id (mapv record attributes)]))))
+    (datalog-scan conn attribute-positions start n))
   (record-count [_] (d/q '[:find (count ?e) . :where [?e :ycsb/field0]] @conn))
   (storage-info [_]
     (merge {:layout :entity :initial-mapsize-mb 4096 :atomic-rmw? true
-            :record-key :db/id :scan-api :prepare-q}
+            :record-key :db/id :scan-api :slice}
            (wal-info (d/datalog-kv conn))))
   (close-store! [_] (d/close conn)))
 
@@ -129,7 +137,7 @@
                                                        :background-sampling? false))]
             (try
               (->DatalogRecords conn attributes
-                                 (d/prepare-q @conn (scan-query attributes)))
+                                (zipmap attributes (range field-count)))
               (catch Throwable t (d/close conn) (throw t)))))]
     (try (verify-wal! store durability)
          (catch Throwable t

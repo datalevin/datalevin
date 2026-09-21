@@ -837,7 +837,7 @@
         wire-opts         (p/negotiate-wire-opts wire-capabilities)]
     ((:write-message deps) skey
      {:type              :set-client-id-ok
-      :wire-capabilities (p/local-wire-capabilities)})
+      :wire-capabilities (p/local-wire-capabilities wire-opts)})
     (vswap! (skey-state skey)
             #(-> % (dissoc :prepared-handles)
                  (assoc :client-id client-id :wire-opts wire-opts)))))

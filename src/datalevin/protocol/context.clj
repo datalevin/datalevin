@@ -8,6 +8,7 @@
             [taoensso.nippy :as nippy]
             [taoensso.nippy.impl :as impl])
   (:import [clojure.lang Associative ISeq]
+           [datalevin.io WireCompression]
            [taoensso.nippy.impl CacheState]
            [java.util Map List]))
 
@@ -36,7 +37,9 @@
   (bindings [context])
   (wire-bindings [context mode allowlist])
   (acquire-cache! [context])
-  (release-cache! [context cache]))
+  (release-cache! [context cache])
+  (acquire-compression! [context])
+  (release-compression! [context compression]))
 
 (defn- cache-size ^long [^CacheState cache]
   (max (max (.size ^Map (.-freeze-idxs cache)) (.size ^Map (.-kw-idxs cache)))
@@ -60,8 +63,24 @@
                       ^:unsynchronized-mutable allowlist
                       ^:unsynchronized-mutable binding-map
                       ^:unsynchronized-mutable freeze-binding-map
-                      ^:unsynchronized-mutable thaw-binding-map]
+                      ^:unsynchronized-mutable thaw-binding-map
+                      ^:unsynchronized-mutable ^WireCompression compression
+                      ^:unsynchronized-mutable compression-active?]
+  java.io.Closeable
+  (close [_]
+    (when compression (.close compression)))
   ICodecContext
+  (acquire-compression! [_]
+    (if compression-active?
+      (WireCompression.)
+      (do
+        (when-not compression (set! compression (WireCompression.)))
+        (set! compression-active? true)
+        compression)))
+  (release-compression! [_ state]
+    (if (identical? compression state)
+      (set! compression-active? false)
+      (.close ^WireCompression state)))
   (bindings [this]
     ;; Security policy follows the current caller, even when a pool connection
     ;; moves between threads or databases. Do not capture native readers here.
@@ -119,7 +138,15 @@
         (clear-cache! cache))
       (set! active? false))))
 
-(defn create [] (CodecContext. nil false nil nil nil nil))
+(defn create [] (CodecContext. nil false nil nil nil nil nil false))
+
+(defmacro with-compression [[state] & body]
+  `(let [context# *context*
+         ~state (if context# (acquire-compression! context#) (WireCompression.))]
+     (try ~@body
+          (finally
+            (if context# (release-compression! context# ~state)
+                (.close ^WireCompression ~state))))))
 
 (defmacro with-wire-bindings [mode allowlist & body]
   `(let [allowlist# ~allowlist

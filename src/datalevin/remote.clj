@@ -1342,7 +1342,9 @@
     (raise "Subscribe through an open connection outside a transaction"
            {:error :notification/invalid-connection}))
   (let [db-name (.-db-name store)
-        client (cl/new-client (.-uri store) {:pool-size 1 :time-out 5000})
+        client (cl/new-client (.-uri store)
+                              (merge (cl/wire-client-options (.-client store))
+                                     {:pool-size 1 :time-out 5000}))
         running? (AtomicBoolean. true)
         notify! (fn [event]
                   (when (.get running?)

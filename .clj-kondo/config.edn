@@ -1,6 +1,7 @@
 {:hooks
  {:analyze-call
   {datalevin.scan/scan hooks.datalevin/scan
+   datalevin.protocol.context/with-compression hooks.datalevin/with-binding
    datalevin.search/candidate-array hooks.datalevin/candidate-array
    datalevin.util/cond+ hooks.datalevin/cond-plus
    datalevin.util/defcomp hooks.datalevin/defcomp
