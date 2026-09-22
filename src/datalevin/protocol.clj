@@ -16,6 +16,7 @@
    [datalevin.datom :as d]
    [datalevin.native-value :as nv]
    [datalevin.protocol.context :as context]
+   [datalevin.pull-wire]
    [datalevin.read-encode]
    [datalevin.util :refer [raise]]
    [datalevin.spill :as sp]
@@ -71,6 +72,7 @@
     :storage-read? true
     :prepared-read? true
     :prepared-query? true
+    :prepared-pull? true
     :compression-threshold (:compression-threshold opts)
     :compression-level (:compression-level opts)}))
 
@@ -106,7 +108,11 @@
                     (when (and (= (:compression local-opts) :zstd) peer-zstd?) :zstd))
        (true? (:storage-read? peer-capabilities)) (assoc :storage-read? true)
        (true? (:prepared-read? peer-capabilities)) (assoc :prepared-read? true)
-       (true? (:prepared-query? peer-capabilities)) (assoc :prepared-query? true)))))
+       (true? (:prepared-query? peer-capabilities)) (assoc :prepared-query? true)
+       (and (true? (:prepared-pull? peer-capabilities))
+            (true? (:prepared-read? peer-capabilities))
+            (true? (:storage-read? peer-capabilities)))
+       (assoc :prepared-pull? true)))))
 
 (defn- fmt-int ^long [fmt]
   (bit-and (long fmt) 0xFF))

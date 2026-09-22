@@ -7,6 +7,16 @@ the checkout at `../..`; it adds no benchmark code or dependencies to production
 It is inspired by the [YCSB core workloads](https://github.com/brianfrankcooper/YCSB/wiki/Core-Workloads),
 not an official YCSB binding or a directly comparable YCSB score.
 
+Remote writes use one request per logical operation. KV updates and RMW use
+`update-kv`; Datalog RMW invokes a stored transaction function. Both RMW paths
+read all fields and modify one field on the server while holding the writer.
+The Datalog function is installed before timing at entity ID 2147483647,
+outside the benchmark record keyspace. The server loads the benchmark's value
+transformation helper. Embedded RMW keeps its explicit local transaction.
+Results identify this choice with `:rmw-execution` in storage settings.
+SQL RMW continues to read the full row and compute the replacement on the
+client within a transaction; these results compare those application API paths.
+
 ## Run
 
 From this directory, using the Clojure CLI and the repository's supported JDK:

@@ -178,7 +178,7 @@
                :txs      :tx-data
                :txs+info :tx-data+db-info
                :load-datoms)
-         client-op-id (when (and writing? tx?)
+         client-op-id (when (and tx? (not simulated?))
                         (cop/new-client-op-id))
          client-op-hash (when client-op-id
                           (cop/request-hash
@@ -877,6 +877,28 @@
 
   IRemoteKV
   (remote-kv? [_] true)
+  (remote-update-kv [_ dbi-name k f k-type v-type args]
+    (let [args       [db-name dbi-name k (b/serialize f) k-type v-type (vec args)]
+          req        {:type :update-kv
+                      :writing? writing?
+                      :args args
+                      :client-op-id (cop/new-client-op-id)
+                      :client-op-hash (cop/request-hash [:update-kv args])
+                      :client-op-response-kind cop/kv-result-response-kind}
+          request-fn (fn [client req] (cl/request client req))
+          {:keys [type message result err-data]}
+          (try
+            (request-fn client req)
+            (catch Exception e
+              (or (retry-ha-transport-failure
+                    client req request-fn
+                    (cached-ha-member-endpoints open-db-opts) e)
+                  (throw e))))]
+      (if (= type :error-response)
+        (if (:resized err-data)
+          (raise message err-data)
+          (cl/retry-ha-write-request client req message err-data request-fn))
+        result)))
   (remote-new-search-engine [this opts] (new-search-engine this opts))
   (remote-batch-get-values [this dbi-name ks k-type v-type ignore-key?]
     (get-values this dbi-name ks k-type v-type ignore-key?))

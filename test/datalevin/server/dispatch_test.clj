@@ -40,7 +40,7 @@
   #{:set-schema :register-type :datalog-register-type
     :swap-attr :del-attr :rename-attr :load-datoms :tx-data :tx-data+db-info
     :open-transact :close-transact :abort-transact
-    :open-transact-kv :close-transact-kv :abort-transact-kv :transact-kv
+    :open-transact-kv :close-transact-kv :abort-transact-kv :transact-kv :update-kv
     :open-dbi :clear-dbi :drop-dbi :set-env-flags :analyze
     :add-doc :remove-doc :clear-docs :search-re-index
     :add-vec :remove-vec :persist-vecs :close-vecs :clear-vecs :vec-re-index
@@ -69,7 +69,7 @@
          (set (filter cmd/ha-write? (keys handlers/handler-map)))))
   (is (= (into (into database-writes local-writes) index-opens)
          (set (filter cmd/replica-write? (keys handlers/handler-map)))))
-  (is (= #{:tx-data :tx-data+db-info :transact-kv}
+  (is (= #{:tx-data :tx-data+db-info :transact-kv :update-kv}
          (set (filter cmd/supports-client-op? (keys handlers/handler-map)))))
   (doseq [type (keys handlers/handler-map)]
     (is (= (contains? (into database-writes index-opens) type)

@@ -10,7 +10,7 @@
   (:import [clojure.lang Associative ISeq]
            [datalevin.io WireCompression]
            [taoensso.nippy.impl CacheState]
-           [java.util Map List]))
+           [java.util Map List LinkedHashMap]))
 
 (def ^:dynamic *context* nil)
 
@@ -38,6 +38,7 @@
   (wire-bindings [context mode allowlist])
   (acquire-cache! [context])
   (release-cache! [context cache])
+  (prepared-handles [context])
   (acquire-compression! [context])
   (release-compression! [context compression]))
 
@@ -65,11 +66,13 @@
                       ^:unsynchronized-mutable freeze-binding-map
                       ^:unsynchronized-mutable thaw-binding-map
                       ^:unsynchronized-mutable ^WireCompression compression
-                      ^:unsynchronized-mutable compression-active?]
+                      ^:unsynchronized-mutable compression-active?
+                      ^LinkedHashMap handles]
   java.io.Closeable
   (close [_]
     (when compression (.close compression)))
   ICodecContext
+  (prepared-handles [_] handles)
   (acquire-compression! [_]
     (if compression-active?
       (WireCompression.)
@@ -138,7 +141,9 @@
         (clear-cache! cache))
       (set! active? false))))
 
-(defn create [] (CodecContext. nil false nil nil nil nil nil false))
+(defn create
+  ([] (create nil))
+  ([handles] (CodecContext. nil false nil nil nil nil nil false handles)))
 
 (defmacro with-compression [[state] & body]
   `(let [context# *context*

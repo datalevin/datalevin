@@ -19,6 +19,7 @@
    [datalevin.interface :as i]
    [datalevin.index :as idx]
    [datalevin.prepared :as prepared]
+   [datalevin.pull-wire :as wire]
    [datalevin.read-encode :as enc]
    [datalevin.storage :as storage]
    [datalevin.timeout :as timeout]
@@ -45,7 +46,7 @@
 
 (defrecord Context [db visitor])
 
-(deftype ^:no-doc FlatPattern [^objects names ^longs aids schema id? ^objects keys])
+(deftype ^:no-doc FlatPattern [^objects names ^longs aids schema id? ^objects keys layout])
 (deftype ^:no-doc CachedPattern [schema pattern flat deps])
 
 (defn- flat-pattern
@@ -68,7 +69,8 @@
           names (filterv #(not= :db/id %) names)]
       (FlatPattern. (object-array names)
                     (long-array (map #(:db/aid (get schema %)) names))
-                    schema id? (object-array (map b/serialize names))))))
+                    schema id? (object-array (map b/serialize names))
+                    (wire/layout (into (if id? [:db/id] []) names))))))
 
 (defn visit [^Context context pattern e a v]
   (when-some [visitor (.-visitor context)]
@@ -457,42 +459,46 @@
 (defn pull-reader
   "Prepare a pull's fixed pattern and options. Retain its parsed projection
   and context while the schema and DB view match; never retain a snapshot."
-  [pattern {:keys [visitor timeout] :as opts}]
-  (let [state (AtomicReference.)]
-    (fn [^DB db id encoded?]
-      (let [store (.-store db)
-            _ (when (instance? Store store) (storage/maybe-ensure-current! store))
-            schema (db/-schema db)
-            ^PreparedPatternState previous (.get state)
-            ^PreparedPatternState current
-            (if (and previous (identical? db (.-db previous))
-                     (identical? schema (.-schema previous)))
-              previous
-              (let [parsed (if (and previous (identical? schema (.-schema previous)))
-                             (assoc (.-parsed previous) :context (Context. db visitor))
-                             (parse-opts db pattern opts))
-                    ^FlatPattern flat (:flat parsed)
-                    direct? (and flat (nil? visitor) (nil? timeout)
-                                 (< (alength ^objects (.-names flat))
-                                    (long c/+wire-datom-batch-size+))
-                                 (not-any? #(cd/custom-type?
-                                              (idx/value-type (get schema %)))
-                                           (.-names flat)))
-                    current (PreparedPatternState. schema db parsed direct?)]
-                (.set state current)
-                current))
-            parsed (.-parsed current)]
-        (if (and encoded? (.-direct? current) (instance? Store store)
-                 (nil? timeout/*deadline*) (not (db/pending-tx-cache? db)))
-          (when-some [eid (db/entid db id)]
-            (let [^FlatPattern flat (:flat parsed)]
-              (enc/read-result
-                #(storage/write-entity! store % eid (.-keys flat)
-                                        (.-aids flat) (.-id? flat)))))
-          (if (and (nil? timeout) (nil? timeout/*deadline*))
-            (pull-impl parsed id)
-            (binding [timeout/*deadline* (timeout/to-deadline timeout)]
-              (pull-impl parsed id))))))))
+  ([pattern opts] (pull-reader pattern opts nil))
+  ([pattern {:keys [visitor timeout] :as opts} response-writer]
+   (let [state (AtomicReference.)]
+     (fn [^DB db id encoded?]
+       (when response-writer (wire/begin-response! response-writer))
+       (let [store (.-store db)
+             _ (when (instance? Store store) (storage/maybe-ensure-current! store))
+             schema (db/-schema db)
+             ^PreparedPatternState previous (.get state)
+             ^PreparedPatternState current
+             (if (and previous (identical? db (.-db previous))
+                      (identical? schema (.-schema previous)))
+               previous
+               (let [parsed (if (and previous (identical? schema (.-schema previous)))
+                              (assoc (.-parsed previous) :context (Context. db visitor))
+                              (parse-opts db pattern opts))
+                     ^FlatPattern flat (:flat parsed)
+                     direct? (and flat (nil? visitor) (nil? timeout)
+                                  (< (alength ^objects (.-names flat))
+                                     (long c/+wire-datom-batch-size+))
+                                  (not-any? #(cd/custom-type?
+                                               (idx/value-type (get schema %)))
+                                            (.-names flat)))
+                     current (PreparedPatternState. schema db parsed direct?)]
+                 (.set state current)
+                 current))
+             parsed (.-parsed current)]
+         (if (and encoded? (.-direct? current) (instance? Store store)
+                  (nil? timeout/*deadline*) (not (db/pending-tx-cache? db)))
+           (when-some [eid (db/entid db id)]
+             (let [^FlatPattern flat (:flat parsed)
+                   writer (when (.-layout flat) response-writer)]
+               (when writer (wire/select-layout! writer (.-layout flat)))
+               (enc/read-result
+                 #(storage/write-entity! store % eid (.-keys flat)
+                                         (.-aids flat) (.-id? flat) writer))))
+           (if (and (nil? timeout) (nil? timeout/*deadline*))
+             (pull-impl parsed id)
+             (binding [timeout/*deadline* (timeout/to-deadline timeout)]
+               (pull-impl parsed id)))))))))
 
 (defn prepare-pull
   "Prepare a reusable pull for a DB view. Execute it with an entity ID or

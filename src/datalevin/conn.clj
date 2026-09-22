@@ -607,6 +607,21 @@
           (when-not old
             (db/enable-cache (.-store ^DB @conn))))))))
 
+(defn- standalone-remote-transaction?
+  [conn]
+  (let [store (.-store ^DB @conn)]
+    (and (instance? DatalogStore store) (not (l/writing? store)))))
+
+(defn- direct-remote-transact!
+  [conn tx-data tx-meta]
+  (locking conn
+    (assert (active-conn-structural? conn))
+    (let [db     ^DB @conn
+          report (with-isolated-tx-cache db tx-data tx-meta false)
+          after  (db/carry-runtime-opts (:db-after report) db)]
+      (reset! conn after)
+      (assoc report :db-after after))))
+
 (defn- -transact! [conn tx-data tx-meta]
   (if (local-direct-transact-eligible? conn)
     (or (maybe-direct-local-blind-transact! conn tx-data tx-meta)
@@ -762,67 +777,79 @@
               (queue-pending-dec-by! conn 1)))
           [false nil])))))
 
+(defn- transact-local-or-explicit!
+  [conn tx-data tx-meta]
+  (let [profile (txlog-sync-queue-profile conn)]
+    (cond
+      (nil? profile)
+      (do
+        (observe-txlog-sync-path! :direct-no-wal)
+        (run-transact-now! conn tx-data tx-meta))
+
+      (= :strict profile)
+      ;; Strict durability can take the idle direct fast path when there is no
+      ;; queue pressure, but falls back to the sync queue adaptively once work
+      ;; is already pending.
+      (let [[direct? report]
+            (try-direct-wal-transact-when-idle! conn tx-data tx-meta)]
+        (if direct?
+          (do
+            (observe-txlog-sync-path! :direct-wal-idle-strict)
+            report)
+          (do
+            (observe-txlog-sync-path! :queued-strict)
+            (queued-transact! conn tx-data tx-meta))))
+
+      (= :relaxed profile)
+      ;; Txn-log group commit batches relaxed durability independently of the
+      ;; Datalog request queue. Avoid the queue handoff while idle, but retain
+      ;; its transaction combining once concurrent requests create pressure.
+      (let [[direct? report]
+            (try-direct-wal-transact-when-idle! conn tx-data tx-meta)]
+        (if direct?
+          (do
+            (observe-txlog-sync-path! :direct-wal-idle-relaxed)
+            report)
+          (do
+            (observe-txlog-sync-path! :queued-relaxed)
+            (queued-transact! conn tx-data tx-meta))))
+
+      (= :extra profile)
+      ;; Extra durability follows the same adaptive dispatch as strict, with a
+      ;; stricter sync primitive on the durability side.
+      (let [[direct? report]
+            (try-direct-wal-transact-when-idle! conn tx-data tx-meta)]
+        (if direct?
+          (do
+            (observe-txlog-sync-path! :direct-wal-idle-extra)
+            report)
+          (do
+            (observe-txlog-sync-path! :queued-extra)
+            (queued-transact! conn tx-data tx-meta))))
+
+      :else
+      (let [[direct? report]
+            (try-direct-wal-transact-when-idle! conn tx-data tx-meta)]
+        (if direct?
+          (do
+            (observe-txlog-sync-path! :direct-wal-idle-other)
+            report)
+          (do
+            (observe-txlog-sync-path! :queued-other)
+            (queued-transact! conn tx-data tx-meta)))))))
+
 (defn transact!
   ([conn tx-data] (transact! conn tx-data nil))
   ([conn tx-data tx-meta]
-   (let [profile (txlog-sync-queue-profile conn)]
-     (cond
-       (nil? profile)
-       (do
-         (observe-txlog-sync-path! :direct-no-wal)
-         (run-transact-now! conn tx-data tx-meta))
-
-       (= :strict profile)
-       ;; Strict durability can take the idle direct fast path when there is no
-       ;; queue pressure, but falls back to the sync queue adaptively once work
-       ;; is already pending.
-       (let [[direct? report]
-             (try-direct-wal-transact-when-idle! conn tx-data tx-meta)]
-         (if direct?
-           (do
-             (observe-txlog-sync-path! :direct-wal-idle-strict)
-             report)
-           (do
-             (observe-txlog-sync-path! :queued-strict)
-             (queued-transact! conn tx-data tx-meta))))
-
-       (= :relaxed profile)
-       ;; Txn-log group commit batches relaxed durability independently of the
-       ;; Datalog request queue. Avoid the queue handoff while idle, but retain
-       ;; its transaction combining once concurrent requests create pressure.
-       (let [[direct? report]
-             (try-direct-wal-transact-when-idle! conn tx-data tx-meta)]
-         (if direct?
-           (do
-             (observe-txlog-sync-path! :direct-wal-idle-relaxed)
-             report)
-           (do
-             (observe-txlog-sync-path! :queued-relaxed)
-             (queued-transact! conn tx-data tx-meta))))
-
-       (= :extra profile)
-       ;; Extra durability follows the same adaptive dispatch as strict, with a
-       ;; stricter sync primitive on the durability side.
-       (let [[direct? report]
-             (try-direct-wal-transact-when-idle! conn tx-data tx-meta)]
-         (if direct?
-           (do
-             (observe-txlog-sync-path! :direct-wal-idle-extra)
-             report)
-           (do
-             (observe-txlog-sync-path! :queued-extra)
-             (queued-transact! conn tx-data tx-meta))))
-
-       :else
-       (let [[direct? report]
-             (try-direct-wal-transact-when-idle! conn tx-data tx-meta)]
-         (if direct?
-           (do
-             (observe-txlog-sync-path! :direct-wal-idle-other)
-             report)
-           (do
-             (observe-txlog-sync-path! :queued-other)
-             (queued-transact! conn tx-data tx-meta))))))))
+   ;; Remote preparation must run under the server's writer, including when
+   ;; callers share a connection. Client-side simulated batching could otherwise
+   ;; race transactions submitted by another client between prepare and commit.
+   (if (standalone-remote-transaction? conn)
+     (let [report (direct-remote-transact! conn tx-data tx-meta)]
+       (observe-txlog-sync-path! :direct-remote)
+       (notify-listeners! conn report)
+       report)
+     (transact-local-or-explicit! conn tx-data tx-meta))))
 
 (defn reset-conn!
   ([conn db] (reset-conn! conn db nil))

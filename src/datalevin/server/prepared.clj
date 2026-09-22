@@ -6,12 +6,13 @@
   (:require [datalevin.kv :as kv]
             [datalevin.prepared :as prepared]
             [datalevin.pull-api :as pull]
+            [datalevin.pull-wire :as wire]
             [datalevin.query :as q]
             [datalevin.util :refer [raise]])
   (:import [java.nio.channels SelectionKey]
            [java.util LinkedHashMap]))
 
-(deftype Entry [type args reader])
+(deftype Entry [type args reader response-writer])
 
 (defn- enabled? [^SelectionKey skey]
   (true? (get-in @(.attachment skey) [:wire-opts :prepared-read?])))
@@ -61,15 +62,31 @@
                                          [:wire-opts :prepared-query?])))
                   false)
         (raise "Unsupported prepared read" {:error :prepared/unsupported :type type}))
-      (let [reader (case type
+      (let [response-writer (when (and (= type :pull)
+                                       (true? (get-in @(.attachment skey)
+                                                      [:wire-opts :prepared-pull?])))
+                              (wire/writer prepare-id))
+            reader (case type
                      :get-value (kv/value-reader (nth args 1) (nth args 3)
                                                  (nth args 4) (nth args 5))
-                     :pull (pull/pull-reader (nth args 1) (nth args 3))
+                     :pull (pull/pull-reader (nth args 1) (nth args 3) response-writer)
                      :q (q/query-reader (nth args 1)))
             attachment (.attachment skey)
             ^LinkedHashMap cache (or (:prepared-handles @attachment)
                                      (let [cache (prepared/handle-cache)]
                                        (vswap! attachment assoc :prepared-handles cache)
                                        cache))]
-        (prepared/remember! cache prepare-id (Entry. type (assoc args 2 nil) reader))
+        (prepared/remember! cache prepare-id
+                            (Entry. type (assoc args 2 nil) reader response-writer))
         reader))))
+
+(defn response-written!
+  "Acknowledge a layout only after writing the complete response frame."
+  [^SelectionKey skey message]
+  (when-let [^Entry entry (or (::entry (meta message))
+                              (when-let [id (:prepare-id message)]
+                                (when-let [^LinkedHashMap cache
+                                           (:prepared-handles @(.attachment skey))]
+                                  (.get cache id))))]
+    (when-let [writer (.-response-writer entry)]
+      (wire/response-written! writer))))

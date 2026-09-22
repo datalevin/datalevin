@@ -1462,9 +1462,22 @@
   (try
     ;; db0 is published to concurrent pull/query handlers. Give the writer
     ;; private mutable overlays while retaining db0 as the report's before DB.
-    (db/transact-tx-data
-      (db/->TxReport db0 (db/transfer db0 (:store db0)) [] {} (or tx-meta {}))
-      txs s?)
+    (let [transact (fn [db]
+                     (db/transact-tx-data
+                       (db/->TxReport db (db/transfer db (:store db))
+                                      [] {} (or tx-meta {}))
+                       txs s?))]
+      (if (or writing? s?)
+        (transact db0)
+        ;; Acquire the native writer before evaluating transaction functions.
+        ;; Publish the new Store/DB only after commit; exceptions also roll back
+        ;; schema changes and :db/ensure failures within this request.
+        (let [conn   (atom db0)
+              report (d/with-transaction [tx conn]
+                       (let [report (transact @tx)]
+                         (reset! tx (:db-after report))
+                         report))]
+          (assoc report :db-before db0 :db-after @conn))))
     (catch Exception e
       (when (:resized (ex-data e))
         (let [new-db (db/carry-runtime-opts
@@ -1488,7 +1501,9 @@
         db1 (:db-after rp)
         _   ((:update-db deps) server db-name
              (fn [m]
-               (assoc m (if writing? :wdt-db :dt-db) db1)))
+               (cond-> (assoc m (if writing? :wdt-db :dt-db) db1)
+                 (and (not writing?) (not s?))
+                 (assoc :store (:store db1)))))
         rp  (assoc-in rp [:tempids :max-eid] (:max-eid db1))]
     (when (and (not s?) (seq (:tx-data rp)))
       (database-changed! deps server db-name writing?))
@@ -2330,6 +2345,38 @@
             (write-result! deps skey response)
             (write-complete! deps skey)))))))
 
+(defn update-kv
+  [deps server skey {:keys [args writing?] :as message}]
+  (let [[db-name dbi-name k serialized-f k-type v-type f-args] args]
+    (db-alter-permission!
+      deps server skey db-name
+      "Don't have permission to alter the database"
+      (fn []
+        (let [response
+              (with-direct-db-transaction-slot
+                deps server db-name writing?
+                (fn []
+                  (:response
+                    (with-idempotent-client-op
+                      deps server skey db-name writing? message
+                      (fn [client-op]
+                        (let [store (kv-store deps server skey db-name writing?)
+                              f     (b/deserialize serialized-f)]
+                          (l/with-transaction-kv [tx store]
+                            (apply kv/update-kv tx dbi-name k f k-type v-type f-args)
+                            (when client-op
+                              (i/transact-kv
+                                tx [(cop/committed-record-tx
+                                      (:client-op-id client-op)
+                                      (cop/committed-record
+                                        (:request-type client-op)
+                                        (:request-hash client-op)
+                                        (:response-kind client-op)
+                                        :transacted))])))
+                          (database-changed! deps server db-name writing?)
+                          :transacted))))))]
+          (write-result! deps skey response))))))
+
 (defn q
   [deps server skey {:keys [args writing?] :as message}]
   (let [db-name (nth args 0)
@@ -2615,6 +2662,7 @@
    :close-transact-kv close-transact-kv
    :abort-transact-kv abort-transact-kv
    :transact-kv transact-kv
+   :update-kv update-kv
    :batch-kv batch-kv
    :visit-key-range (deserialized-normal-kv-handler 2 i/visit-key-range)
    :get-some (deserialized-normal-kv-handler 2 i/get-some)

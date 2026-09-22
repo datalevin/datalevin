@@ -29,6 +29,7 @@
    [clojure.string :as s])
   (:import
    [clojure.lang AFn]
+   [java.util LinkedHashMap]
    [java.io DataInput DataOutput Writer]))
 
 (def ^:no-doc user-facing-ns
@@ -528,12 +529,50 @@
   (validate-inter-fn-code! src)
   src)
 
+(def ^:dynamic ^:no-doc *inter-fn-cache*
+  "Optional connection-owned compiler cache. Only compiled templates are retained;
+  deserialized capture values are supplied afresh on every call."
+  nil)
+
+(defn ^:no-doc inter-fn-cache
+  "Create a bounded compiler cache for a single connection owner."
+  []
+  (LinkedHashMap. 16 (float 0.75) true))
+
+(defn- cached-inter-fn
+  [src ^LinkedHashMap cache]
+  (let [captured? (literal-let-source-form? src)
+        bindings  (when captured? (partition 2 (second src)))
+        ;; Compile a factory over the captured locals, not the captured values.
+        ;; In particular, mutable quoted data must not survive from an earlier
+        ;; deserialization just because the function's code is the same.
+        template  (if captured?
+                    (list 'fn (mapv first bindings) (nth src 2))
+                    src)
+        ;; A redefined Var is dereferenced by SCI at invocation. Replacing or
+        ;; hiding the Var itself must instead resolve a new interpreter context.
+        host-vars (mapv resolve-public-host-var (sort (host-var-symbols template)))
+        cache-key [template host-vars]
+        compiled  (or (.get cache cache-key)
+                      (let [f (sci/eval-form (inter-fn-context template) template)]
+                        (.put cache cache-key f)
+                        (when (> (.size cache) 64)
+                          (let [entries (.iterator (.keySet cache))]
+                            (.next entries)
+                            (.remove entries)))
+                        f))]
+    (if captured?
+      (apply compiled (map (comp second second) bindings))
+      compiled)))
+
 (defn ^:no-doc compile-inter-fn-source
   "Compile validated inter-fn source with the restricted inter-fn interpreter."
   [src]
   (let [src (validate-inter-fn-source! src)]
     (with-meta
-      (sci/eval-form (inter-fn-context src) src)
+      (if *inter-fn-cache*
+        (cached-inter-fn src *inter-fn-cache*)
+        (sci/eval-form (inter-fn-context src) src))
       {:type   :datalevin/inter-fn
        :source src})))
 

@@ -180,6 +180,7 @@
    :close-transact-kv transaction-close
    :abort-transact-kv transaction-abort
    :transact-kv client-op-write
+   :update-kv client-op-write
    :batch-kv unguarded
    :visit-key-range unguarded
    :get-some unguarded

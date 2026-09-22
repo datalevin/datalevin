@@ -8,6 +8,8 @@
   [#234](https://github.com/datalevin/datalevin/issues/234)
 - [Server] `listen-db!` that provide `db-name` based change notifications across
   connections.
+- [Server] `update-kv` that read one value, apply a function, and write the
+  result atomically on server.
 - [Query] prepared variant of queries `prepare-q`, `prepare-pull`,
   `prepare-get-value`, `execute-prepared` that reuse preparation and have lower
   latency, similar to prepared statement in SQL DBs.

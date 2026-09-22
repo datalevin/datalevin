@@ -163,7 +163,32 @@ JavaScript exposes KV `withTransaction(fn, { timeoutMs })` and
 `setExplicitTransactionTimeout`. JavaScript Datalog transaction callbacks remain
 unsupported because the Node JVM bridge can deadlock on callback re-entry.
 
-Datalog functions such as `transact!` use `with-transaction` internally.
+Small standalone remote `transact!` calls execute and commit on the server in
+one request; bulk transactions continue to use streaming. This includes
+transaction functions: their reads and resulting writes run under the server's
+writer lock. Calls inside `with-transaction` join the existing explicit
+transaction and commit when its outer scope finishes.
+
+### Atomic KV updates
+
+`update-kv` reads one value, applies a function, and writes its replacement in
+the same transaction. Remote calls execute on the server in one request:
+
+```clojure
+(require '[datalevin.interpret :as inter])
+
+(def increment-counter
+  (inter/inter-fn [old amount] (+ (long (or old 0)) (long amount))))
+
+(d/update-kv kv "counters" :visits increment-counter :data :long 1)
+```
+
+The function receives nil for a missing key. Its result must be a non-nil value
+of the specified type; an exception or invalid value aborts the update. The
+return value is `:transacted`. This API supports single-valued DBIs, not dupsort
+lists. Functions must be free of side effects because a map resize can retry
+them. Embedded calls also accept ordinary Clojure functions. Inside
+`with-transaction-kv`, the update joins that transaction, including its rollback.
 
 ## Transaction Functions in Datalog Store
 

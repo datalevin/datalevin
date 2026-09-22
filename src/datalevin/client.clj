@@ -227,7 +227,10 @@
                 (do
                   (when (and register?
                              (#{:command-complete :copy-out-response} (:type response)))
-                    (prepared/remember! prepared-handles id true))
+                    ;; A compact pull decoder may already have installed the
+                    ;; result layout in this same bounded handle cache.
+                    (prepared/remember! prepared-handles id
+                                        (or (.get prepared-handles id) true)))
                   response)))))
         (catch Exception e
           (when (nv/decoding-error? e) (throw e))
@@ -288,10 +291,11 @@
    (->Connection ch c/default-connection-timeout bf))
   ([^SocketChannel ch time-out ^ByteBuffer bf]
    (let [options (AtomicReference. (p/default-wire-opts))
+         handles (prepared/handle-cache)
          conn (Connection. ch (long time-out) bf (volatile! nil)
-                           (context/create)
+                           (context/create handles)
                            (ByteBuffer/allocate 1) options (volatile! bf)
-                           (prepared/handle-cache))]
+                           handles)]
      (.put connection-wire-opts ch options)
      conn)))
 
@@ -1364,6 +1368,7 @@
 
 (def ^:private ha-kv-retry-request-types
   #{:transact-kv
+    :update-kv
     :open-transact-kv
     :close-transact-kv
     :abort-transact-kv

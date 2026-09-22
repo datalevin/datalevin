@@ -967,6 +967,11 @@ Only usable for debug output.
        :doc      "Synchronously applies transaction to the underlying Datalog database of a
   connection.
 
+  Standalone remote calls execute and commit on the server, including reads in
+  transaction functions. Small transactions use one request/response; bulk
+  payloads use the streaming protocol. Calls inside [[with-transaction]] join
+  its existing transaction instead.
+
   Returns a transaction report, a map:
 
        { :db-before ...
@@ -1514,6 +1519,25 @@ Only usable for debug output.
 
 See also: [[open-kv]], [[sync]]"}
   transact-kv i/transact-kv)
+
+(def ^{:arglists '([db dbi-name k f]
+                  [db dbi-name k f k-type]
+                  [db dbi-name k f k-type v-type & args])
+       :doc "Atomically replace the value at `k` with `(apply f old-value args)`.
+  The key and value types default to `:data`. Missing keys pass nil to `f`.
+  Returns `:transacted`. The result must be a valid non-nil value for `v-type`;
+  invalid results abort the update.
+  The DBI must be single-valued (not dupsort).
+
+  In client/server mode the entire update executes in one request. Define `f`
+  with [[datalevin.interpret/inter-fn]] so it can execute on the server.
+  In embedded mode ordinary Clojure functions are also supported. The function
+  must be free of side effects because a map resize may retry it.
+
+  Inside [[with-transaction-kv]], this operation joins the existing transaction.
+
+      (update-kv kv \"counters\" :visits (fnil inc 0))"}
+  update-kv kv/update-kv)
 
 (def ^{:arglists '([db])
        :doc      "Rollback writes of the transaction from inside

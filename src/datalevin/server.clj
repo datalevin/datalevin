@@ -18,6 +18,9 @@
    [datalevin.udf :as udf]
    [datalevin.custom-data :as custom]
    [datalevin.native-value :as nv]
+   ;; Programmatic servers must register serialized function readers too;
+   ;; the CLI loading the interpreter is not sufficient for embedded servers.
+   [datalevin.interpret]
    [datalevin.lmdb :as l]
    [datalevin.binding.cpp :as cpp]
    [datalevin.protocol :as p]

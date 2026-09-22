@@ -15,6 +15,7 @@
    [datalevin.buffer :as bf]
    [datalevin.command :as cmd]
    [datalevin.constants :as c]
+   [datalevin.interpret :as inter]
    [datalevin.kv.txlog :as kvtx]
    [datalevin.protocol :as p]
    [datalevin.protocol.context :as codec]
@@ -419,7 +420,8 @@
                           (handle-message deps server skey message))]
     ;; Binding only the cache context leaves handler/storage serialization policy
     ;; and native readers untouched. Copy-in/out uses the same connection owner.
-    (binding [codec/*context* codec-context]
+    (binding [codec/*context* codec-context
+              inter/*inter-fn-cache* (inter/inter-fn-cache)]
       (try
         (loop []
           (when (and (.isOpen ch) (not (.isInterrupted (Thread/currentThread))))

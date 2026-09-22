@@ -662,6 +662,23 @@
             (scan/read-prepared-value raw (.-dbi current) k k-type
                                      decode encode ignore-key? nil)))))))
 
+(defn update-kv
+  "Atomically replace the value at `k` with `(apply f old-value args)`.
+  Missing keys pass nil to `f`. Returns :transacted. Only ordinary, single-value
+  DBIs are supported. Remote functions must be serializable inter-fn functions.
+  The function must be free of side effects: a map resize can retry it."
+  ([db dbi-name k f] (update-kv db dbi-name k f :data :data))
+  ([db dbi-name k f k-type] (update-kv db dbi-name k f k-type :data))
+  ([db dbi-name k f k-type v-type & args]
+   (if (satisfies? i/IRemoteKV db)
+     (i/remote-update-kv db dbi-name k f k-type v-type args)
+     (l/with-transaction-kv [tx db]
+       (when (i/list-dbi? tx dbi-name)
+         (raise "update-kv requires a single-value DBI" {:dbi-name dbi-name}))
+       (let [value (apply f (i/get-value tx dbi-name k k-type v-type) args)]
+         (i/transact-kv tx dbi-name [[:put k value]] k-type v-type)
+         :transacted)))))
+
 (defn prepare-get-value
   "Prepare a reusable KV point read. Execute it with a key using
   `execute-prepared` or by invoking the returned object. DBI changes refresh

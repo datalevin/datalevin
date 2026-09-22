@@ -3,7 +3,9 @@
   (:require [clojure.edn :as edn]
             [clojure.java.io :as io]
             [clojure.string :as str]
-            [datalevin.server :as server])
+            [datalevin.server :as server]
+            ;; Trusted value transformation used by the stored RMW function.
+            [ycsb-bench.workload])
   (:import [datalevin.server Server]
            [java.lang ProcessHandle]
            [java.net InetSocketAddress]

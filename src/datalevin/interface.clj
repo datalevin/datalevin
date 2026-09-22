@@ -476,6 +476,8 @@ values;")
   layers."
   (remote-kv? [store] "true for stores backed by a remote connection")
   (remote-new-search-engine [store opts])
+  (remote-update-kv [store dbi-name k f k-type v-type args]
+    "Atomically update one value on the server.")
   (remote-batch-get-values [store dbi-name ks k-type v-type ignore-key?])
   (remote-new-vector-index [store opts]))
 

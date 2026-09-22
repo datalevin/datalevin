@@ -57,7 +57,8 @@
                                     reader (reader db id encoded?)
                                     encoded? (pull/read-result db pattern id opts)
                                     :else (d/pull db pattern id opts))]
-    (write-or-copy-result! write-message copy-out skey data)))
+    (write-or-copy-result! write-message copy-out skey data)
+    (prepared/response-written! skey message)))
 
 (defn pull-many
   [{:keys [get-db write-message copy-out]} server skey
