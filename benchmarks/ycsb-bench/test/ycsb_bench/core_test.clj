@@ -1,6 +1,7 @@
 (ns ycsb-bench.core-test
   (:require [clojure.test :refer [deftest is testing]]
             [datalevin.core :as d]
+            [datalevin.pull-api :as pull]
             [datalevin-bench.host :as host]
             [ycsb-bench.core :as core]
             [ycsb-bench.runner :as runner]
@@ -224,12 +225,49 @@
         (assoc small-options :api :datalog :mode mode)
         (fn [db]
           (let [record (store/for-worker db 0)
-                conn (:conn record)
-                attributes (:attributes record)]
-            (is (identical? (w/rmw-reader @conn attributes)
-                            (w/rmw-reader @conn attributes))
-                "RMW preparation is created once per store and attribute set"))
+                attributes (:attributes record)
+                prepare d/prepare-pull
+                parse pull/parse-opts
+                preparations (atom 0)
+                parses (atom 0)]
+            (store/put-records! db [[1 ["aaaa" "bbbb" "cccc"]]])
+            (store/modify-field! db 1 0)
+            (with-redefs [d/prepare-pull
+                          (fn [& args]
+                            (swap! preparations inc)
+                            (apply prepare args))
+                          pull/parse-opts
+                          (fn [view pattern opts]
+                            (when (= pattern attributes) (swap! parses inc))
+                            (parse view pattern opts))]
+              (dotimes [_ 5] (store/modify-field! db 1 0)))
+            (is (zero? @preparations)
+                "Successive transactions reuse the preparation wrapper")
+            (is (zero? @parses)
+                "Successive transaction views retain the parsed RMW pattern")
+            (is (= ["gaaa" "bbbb" "cccc"] (store/read-record db 1))
+                "Every reused read sees the current transaction's value"))
           {})))))
+
+(deftest rmw-reader-reuse-after-rollback-test
+  (store/with-store
+    (assoc small-options :api :datalog :mode :embedded)
+    (fn [db]
+      (let [{:keys [conn attributes]} (store/for-worker db 0)
+            reader (atom nil)]
+        (store/put-records! db [[1 ["aaaa" "bbbb" "cccc"]]])
+        (d/with-transaction [tx conn]
+          (reset! reader (w/rmw-reader @tx attributes))
+          (d/transact! tx [[:db/add 1 :ycsb/field0 "xxxx"]])
+          (is (= "xxxx" (:ycsb/field0 (d/execute-prepared @reader @tx 1))))
+          (d/abort-transact tx))
+        (d/with-transaction [tx conn]
+          (is (identical? @reader (w/rmw-reader @tx attributes)))
+          (is (= "aaaa" (:ycsb/field0 (d/execute-prepared @reader @tx 1))))
+          (d/transact! tx [[:db/add 1 :ycsb/field0 "yyyy"]])
+          (is (= "yyyy" (:ycsb/field0 (d/execute-prepared @reader @tx 1)))))
+        (is (= ["yyyy" "bbbb" "cccc"] (store/read-record db 1))))
+      {})))
 
 (deftest datalog-scan-field-order-test
   (doseq [mode [:embedded :remote]]

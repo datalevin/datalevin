@@ -73,11 +73,14 @@
       (testing "an intervening raw transaction is detected by its native ID"
         (put! db 1)
         (is (= 1001 (:revision (marker db))))
-        (is (= 1000000 (payload-lsn db))))
-      (testing "subsequent cached commits preserve the higher payload floor"
+        ;; Strict groups align the next WAL LSN at transaction startup.
+        (is (= 1000001 (:applied-lsn (marker db))))
+        (is (= 1000001 (payload-lsn db))))
+      (testing "subsequent cached commits advance from the refreshed payload floor"
         (put! db 2)
         (is (= 1002 (:revision (marker db))))
-        (is (= 1000000 (payload-lsn db))))
+        (is (= 1000002 (:applied-lsn (marker db))))
+        (is (= 1000002 (payload-lsn db))))
       (finally (d/close-kv db)))))
 
 (deftest metadata-writes-in-current-transaction
@@ -140,10 +143,13 @@
             (finally (.close cur))))
         (put! tx 1))
       (is (= 4000000 (payload-lsn db)))
+      ;; The cursor write preserves the floor in its transaction; the next
+      ;; strict group starts above that now-committed floor.
       (put! db 2)
-      (is (= 4000000 (payload-lsn db)))
+      (is (= 4000001 (:applied-lsn (marker db))))
+      (is (= 4000001 (payload-lsn db)))
       (d/with-transaction-kv [tx db]
-        (is (= 4000001 @(:next-lsn (txlog/state tx)))))
+        (is (= 4000002 @(:next-lsn (txlog/state tx)))))
       (finally (d/close-kv db)))))
 
 (defn- explicit-put! [db n]

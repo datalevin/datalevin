@@ -17,7 +17,10 @@
    [datalevin.util :refer [raise]]
    [datalevin.validate :as vld])
   (:import
-   [java.nio ByteBuffer]))
+   [datalevin.cpp BufVal Env Txn Util]
+   [datalevin.dtlvnative DTLV]
+   [java.nio ByteBuffer]
+   [org.bytedeco.javacpp IntPointer]))
 
 (defn- raw-header-type
   "Like `b/header->type`, but returns nil for unrecognized headers so the
@@ -59,6 +62,33 @@
                        {:key k
                         :key-type key-type
                         :raw-val-type val-type}))))))))
+
+(defn persisted-wal?
+  "Read WAL enablement before selecting the environment's immutable flags.
+   The caller owns the probe environment and the local-open reservation."
+  [^Env env]
+  (with-open [^Txn txn (Txn/createReadOnly env)
+              dbi (IntPointer. 1)
+              key (BufVal. c/+max-key-size+)
+              value (BufVal. 0)]
+    (let [rc (DTLV/mdb_dbi_open (.get txn) c/kv-info 0 dbi)]
+      (Util/checkRc rc)
+      (when-not (= rc DTLV/MDB_NOTFOUND)
+        (letfn [(lookup [key-type]
+                  (let [bf (.inBuf key)]
+                    (b/put-buffer (.clear bf) :wal? key-type)
+                    (.flip bf)
+                    (.reset key)
+                    (let [rc (DTLV/mdb_get (.get txn) (.get dbi)
+                                           (.ptr key) (.ptr value))]
+                      (Util/checkRc rc)
+                      (when-not (= rc DTLV/MDB_NOTFOUND)
+                        (let [bf (.outBuf value)]
+                          (decode-kv-info-buffer
+                            bf (raw-header-type (.get bf 0))))))))]
+          ;; Typed keyword rows sort after legacy :data keys in kv-info, so
+          ;; prefer them just as load-info-from-kv does. Preserve false.
+          (true? (if-some [wal? (lookup :keyword)] wal? (lookup :data))))))))
 
 (defn load-info-from-kv
   [lmdb]

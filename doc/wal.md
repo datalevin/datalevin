@@ -65,6 +65,26 @@ every append. If multiple Datalevin processes intentionally share one WAL
 directory, open the store with `:wal-shared? true` so each process reconciles
 against the shared files before appending or reporting watermarks.
 
+### LMDB flags
+
+Persistent WAL environments default to `:writemap` when opening without an
+explicit `:flags` option. This applies to KV and Datalog, embedded and remote,
+including reopening a database whose persisted settings enable WAL. WAL also
+enables LMDB's `:nosync`; durability follows the selected WAL profile, and
+checkpoints explicitly sync LMDB.
+
+To override the writable-map default, supply the complete flag set on open:
+
+```clojure
+(d/open-kv "/tmp/my-kv-db"
+  {:wal? true :flags #{:nordahead :notls}})
+
+(d/create-conn "/tmp/my-datalog-db" {}
+  {:wal? true :kv-opts {:flags #{:nordahead :notls}}})
+```
+
+Stores without WAL keep the ordinary LMDB defaults.
+
 ## Durability Profiles
 
 WAL supports three durability profiles in WAL:

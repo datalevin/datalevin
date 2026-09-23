@@ -118,7 +118,8 @@
   "Default LMDB env flags are `#{:nordahead :notls}`. See
   [[datalevin.core/set-env-flags]] for a full list of flags.
 
-  Passed as `:flags` option value to `open-kv` function."
+  Persistent WAL environments add `:writemap` when `:flags` is omitted.
+  Passing `:flags` explicitly to `open-kv` overrides that default."
   #{:nordahead :notls})
 
 (def default-dbi-flags

@@ -1326,6 +1326,21 @@
                      1024 1024)
           flags (cond-> flags
                   inmemory? (conj :nosync))
+          ;; WRITEMAP cannot be enabled after mdb_env_open. For an implicit
+          ;; reopen, inspect only uncompressed kv-info through a read-only
+          ;; environment, before allocating DBIs, buffers, or WAL runtime state.
+          ;; The local-open reservation above also covers this short probe.
+          wal-default? (and (not temp?) (not inmemory?)
+                            (not (contains? opts :flags))
+                            (if (contains? opts :wal?)
+                              (true? (:wal? opts))
+                              (when (.exists ^File db-file)
+                                (with-open [probe (Env/create
+                                                   env-path mapsize max-readers max-dbs
+                                                   (buffer/kv-flags
+                                                     (conj flags :rdonly-env)))]
+                                  (open/persisted-wal? probe)))))
+          flags (cond-> flags wal-default? (conj :writemap))
           ^Env env (Env/create env-path mapsize max-readers max-dbs
                                (buffer/kv-flags flags))
           info (cond-> (merge opts {:dir dir
