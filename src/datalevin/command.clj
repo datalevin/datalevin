@@ -145,6 +145,9 @@
    :populated? unguarded
    :size unguarded
    :a-size unguarded
+   :e-size unguarded
+   :av-size unguarded
+   :v-size unguarded
    :head unguarded
    :tail unguarded
    :slice unguarded

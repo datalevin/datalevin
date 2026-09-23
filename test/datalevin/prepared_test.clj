@@ -160,6 +160,11 @@
             (is (= {:name "two" :value 2} (puller [:key "two"])))
             (is (= 2 (d/count-datoms @conn nil :name nil)))
             (is (= 2 (d/count-datoms @conn nil :value nil)))
+            (testing "remote counts forward to the matching storage size"
+              (is (= 3 (d/count-datoms @conn 1 nil nil)))
+              (is (= 1 (d/count-datoms @conn nil :name "one")))
+              (is (= 1 (d/count-datoms @conn nil :value 1)))
+              (is (= 0 (d/count-datoms @conn nil nil "one"))))
             (let [[id entry] (first (server-handles srv db))]
               (is (some? id))
               (is (= {:value :two} (reader 2)))
@@ -206,7 +211,10 @@
               (is (= {:name "one" :value [1 3]} (puller [:key "one"])))
               (testing "a forwarded remote attribute count reflects committed writes"
                 (is (= 2 (d/count-datoms @conn nil :name nil)))
-                (is (= 3 (d/count-datoms @conn nil :value nil))))
+                (is (= 3 (d/count-datoms @conn nil :value nil)))
+                (is (= 4 (d/count-datoms @conn 1 nil nil)))
+                (is (= 1 (d/count-datoms @conn nil :value 3)))
+                (is (= 0 (d/count-datoms @conn nil nil "one"))))
               (d/with-transaction-kv [tx db]
                 (let [tx-reader (d/prepare-get-value tx "docs" :long :data)]
                   (is (= :recreated (tx-reader 1)))

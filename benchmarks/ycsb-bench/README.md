@@ -303,8 +303,8 @@ fields of 100 bytes, excluding keys and database overhead.
   created when each store opens and call `execute-prepared` with the entity ID;
   updates use `transact!`. Embedded RMW prepares against its transaction's DB
   view. Scans use an EAV slice over the requested entity ID interval and assemble
-  each record's fields in benchmark order. Record counts
-  also use the mandatory first field. Reports identify the key with
+  each record's fields in benchmark order. Record counts use `count-datoms` on
+  the mandatory first field. Reports identify the key with
   `:storage :record-key :db/id`. Datalog's field indexes and entity overhead
   are part of the measurement. Index-result caching is bypassed with
   `:cache-limit 0` in both embedded and remote modes; reports include the

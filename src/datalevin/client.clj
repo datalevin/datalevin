@@ -1395,6 +1395,9 @@
     :populated?
     :size
     :a-size
+    :e-size
+    :av-size
+    :v-size
     :head
     :tail
     :slice
