@@ -1,7 +1,28 @@
 (ns datalevin.inter-fn-cache-test
   (:require [clojure.test :refer [deftest is]]
             [datalevin.bits :as b]
+            [datalevin.core :as d]
             [datalevin.interpret :as inter]))
+
+(deftest serialized-prepared-pull-keeps-transaction-visibility
+  (let [conn (d/create-conn nil {:value {:db/valueType :db.type/long}}
+                            {:kv-opts {:inmemory? true}})
+        source (inter/inter-fn [db id]
+                 (let [reader (d/prepare-pull db [:value])]
+                   (d/execute-prepared reader id)))]
+    (try
+      (binding [inter/*inter-fn-cache* (inter/inter-fn-cache)]
+        (let [read-value (b/deserialize (b/serialize source))]
+          (d/transact! conn [{:db/id 1 :value 10}])
+          (is (= {:value 10} (read-value @conn 1)))
+          (d/transact! conn [[:db/add 1 :value 20]])
+          (is (= {:value 20} (read-value @conn 1)))
+          (d/with-transaction [tx conn]
+            (d/transact! tx [[:db/add 1 :value 30]])
+            (is (= {:value 30} (read-value @tx 1)))
+            (d/abort-transact tx))
+          (is (= {:value 20} (read-value @conn 1)))))
+      (finally (d/close conn)))))
 
 (deftest cached-functions-rebind-captured-values
   (let [cache (inter/inter-fn-cache)

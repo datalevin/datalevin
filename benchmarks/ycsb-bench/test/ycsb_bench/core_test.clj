@@ -192,6 +192,7 @@
         (assoc small-options :api api :mode mode)
         (fn [db]
           (when (= api :datalog)
+            (is (= 0 (:cache-limit (store/storage-info db))))
             (is (= :slice (:scan-api (store/storage-info db))))
             (is (= :db/id (:record-key (store/storage-info db)))))
           (check-adapter! db)
@@ -224,9 +225,13 @@
                              [id (mapv #(format "%02d%02d" id %) (range 12))])
                            [0 2 3 7])]
             (store/put-records! db rows)
+            (doseq [[id values] rows]
+              (is (= values (store/read-record db id))))
             (is (= (subvec rows 1 3) (store/scan-records db 1 3)))
             (is (= rows (store/scan-records db 0 8)))
             (store/update-field! db 2 10 "edit")
+            (is (= (assoc (second (nth rows 1)) 10 "edit")
+                   (store/read-record db 2)))
             (is (= [[2 (assoc (second (nth rows 1)) 10 "edit")]]
                    (store/scan-records db 2 1))))
           {})))))

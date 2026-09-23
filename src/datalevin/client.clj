@@ -1394,6 +1394,7 @@
     :fetch
     :populated?
     :size
+    :a-size
     :head
     :tail
     :slice

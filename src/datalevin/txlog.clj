@@ -431,6 +431,7 @@
          ;; snapshot metadata. Also guarded by the environment write lock.
          :lmdb-runtime-floor    (long-array [-1 0])
          :kv-encode-buffer      (volatile! nil)
+         :write-groups          (java.util.concurrent.ConcurrentHashMap.)
          :commit-wait-ms         (long (commit-wait-ms info))
 
          :sync-manager (new-sync-manager

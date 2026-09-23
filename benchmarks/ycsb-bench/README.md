@@ -11,7 +11,9 @@ Remote writes use one request per logical operation. KV updates and RMW use
 `update-kv`; Datalog RMW invokes a stored transaction function. Both RMW paths
 read all fields and modify one field on the server while holding the writer.
 The Datalog function is installed before timing at entity ID 2147483647,
-outside the benchmark record keyspace. The server loads the benchmark's value
+outside the benchmark record keyspace. It uses `prepare-pull` and
+`execute-prepared` against the transaction DB passed to each invocation.
+The server loads the benchmark's value
 transformation helper. Embedded RMW keeps its explicit local transaction.
 Results identify this choice with `:rmw-execution` in storage settings.
 SQL RMW continues to read the full row and compute the replacement on the
@@ -283,7 +285,9 @@ fields of 100 bytes, excluding keys and database overhead.
 
 * **KV:** one `:id` key per record, equal to the nonnegative numeric record ID,
   with all field strings stored together as a vector encoded with `:data` in the
-  `records` DBI. A point read fetches one value. A field update reads the current
+  `records` DBI. Point reads reuse a `prepare-get-value` created when each store
+  opens and call `execute-prepared` with the key. Embedded update and RMW reads
+  prepare against their transaction's handle. A field update reads the current
   vector, replaces that field, and writes the whole vector inside one write
   transaction, preserving concurrent changes to other fields. F uses the same
   transaction boundary and derives the replacement from the selected field's
@@ -295,13 +299,17 @@ fields of 100 bytes, excluding keys and database overhead.
 * **Datalog:** one entity per record with an explicitly assigned `:db/id` equal
   to the benchmark's numeric record key, starting at zero, and string attributes
   `:ycsb/field0` through `:ycsb/field9` by default. There is no separate
-  `:ycsb/id` attribute or identity lookup. Point reads use `pull`; updates use
-  `transact!`, both with the entity ID. Scans execute a prepared Datalog query
-  that binds the requested dense ID interval with `range`, checks the mandatory
-  first field, pulls the records, and sorts the results by ID. Record counts
+  `:ycsb/id` attribute or identity lookup. Point reads reuse a `prepare-pull`
+  created when each store opens and call `execute-prepared` with the entity ID;
+  updates use `transact!`. Embedded RMW prepares against its transaction's DB
+  view. Scans use an EAV slice over the requested entity ID interval and assemble
+  each record's fields in benchmark order. Record counts
   also use the mandatory first field. Reports identify the key with
   `:storage :record-key :db/id`. Datalog's field indexes and entity overhead
-  are part of the measurement. Background sampling is disabled. Published
+  are part of the measurement. Index-result caching is bypassed with
+  `:cache-limit 0` in both embedded and remote modes; reports include the
+  effective limit. Pull-pattern and query-plan caches remain enabled.
+  Background sampling is disabled. Published
   results predating this change used the separate `:ycsb/id` identity attribute.
 * **Durability:** WAL is enabled with `--durability strict` by default for both
   APIs and modes. `--durability relaxed` selects a separately labeled profile.

@@ -11,6 +11,7 @@
   "KV-layer helpers for txn-log APIs and floor-provider bookkeeping."
   (:require
    [datalevin.bits :as b]
+   [datalevin.binding.cpp :as cpp]
    [datalevin.constants :as c]
    [datalevin.custom-kv :as custom-kv]
    [datalevin.interface :as i]
@@ -53,12 +54,47 @@
                                         with-write-txn-lock-before-runtime-txlog-state]]
    [datalevin.lmdb :as l]
    [datalevin.txlog :as txlog]
+   [datalevin.tx-group :as group]
    [datalevin.util :refer [deftype+ raise]])
-  (:import [java.util.concurrent.atomic AtomicReference]))
+  (:import [java.util.concurrent.atomic AtomicReference]
+           [java.util.concurrent ConcurrentHashMap]
+           [java.util.function Function]))
 
 (declare ->KVLMDB)
 
 (declare raw-lmdb)
+
+(defn strict-write-group
+  "Return the shared admission queue for eligible standalone strict writes.
+  Explicit transactions, HA, and shared-WAL stores retain their current path."
+  [db kind]
+  (when (and group/*enabled?*
+             (nil? cpp/*before-write-commit-fn*)
+             (nil? kvtx/*after-txlog-append-fn*)
+             (not (l/writing? db))
+             (not (Thread/holdsLock (l/write-txn db))))
+    (let [info @(i/kv-info db)
+          state (:txlog-state info)]
+      (when (and state (= :strict (:durability-profile state))
+                 (not (:wal-shared? state))
+                 (nil? (:ha-mode info))
+                 (kvtx/txlog-write-path-enabled? db))
+        (let [^ConcurrentHashMap groups (:write-groups state)]
+          (.computeIfAbsent groups kind
+                            (reify Function
+                              (apply [_ _]
+                                (group/create (txlog/group-commit info))))))))))
+
+(defn grouped-write!
+  "Execute a standalone KV operation in a strict durable group when eligible."
+  [db op]
+  (if-let [g (strict-write-group db :kv)]
+    (group/submit! g
+                   (fn [requests]
+                     (l/with-transaction-kv [tx db]
+                       (group/execute requests tx)))
+                   op)
+    (l/with-transaction-kv [tx db] (op tx))))
 
 (def ensure-txlog-ready! kvtx/ensure-txlog-ready!)
 
@@ -518,16 +554,22 @@
     (.transact-kv this dbi-name txs k-type :data))
   (transact-kv
     [this dbi-name txs k-type v-type]
-    (if (custom-kv/custom-txs? db dbi-name txs)
-      (custom-kv/transact! this db dbi-name txs k-type v-type)
-      (with-write-txn-lock-before-runtime-txlog-state
-        db
-        (fn []
-          (if (txlog-write-path-enabled? db)
-            (if-let [state (txlog-runtime-state db)]
-              (transact-with-txlog! db state dbi-name txs k-type v-type)
-              (i/transact-kv db dbi-name txs k-type v-type))
-            (i/transact-kv db dbi-name txs k-type v-type))))))
+    (if-let [g (strict-write-group db :kv)]
+      (group/submit! g
+                     (fn [requests]
+                       (l/with-transaction-kv [tx this]
+                         (group/execute requests tx)))
+                     #(i/transact-kv % dbi-name txs k-type v-type))
+      (if (custom-kv/custom-txs? db dbi-name txs)
+        (custom-kv/transact! this db dbi-name txs k-type v-type)
+        (with-write-txn-lock-before-runtime-txlog-state
+          db
+          (fn []
+            (if (txlog-write-path-enabled? db)
+              (if-let [state (txlog-runtime-state db)]
+                (transact-with-txlog! db state dbi-name txs k-type v-type)
+                (i/transact-kv db dbi-name txs k-type v-type))
+              (i/transact-kv db dbi-name txs k-type v-type)))))))
   (val-compressor [_] (i/val-compressor db))
 
   (def-read-kv-forwarders this db
@@ -666,18 +708,22 @@
   "Atomically replace the value at `k` with `(apply f old-value args)`.
   Missing keys pass nil to `f`. Returns :transacted. Only ordinary, single-value
   DBIs are supported. Remote functions must be serializable inter-fn functions.
-  The function must be free of side effects: a map resize can retry it."
+  The function must be free of side effects: map resize or an aborted commit
+  group can retry it. Concurrent standalone strict writes may execute on another
+  submitting thread, with Clojure dynamic bindings preserved."
   ([db dbi-name k f] (update-kv db dbi-name k f :data :data))
   ([db dbi-name k f k-type] (update-kv db dbi-name k f k-type :data))
   ([db dbi-name k f k-type v-type & args]
    (if (satisfies? i/IRemoteKV db)
      (i/remote-update-kv db dbi-name k f k-type v-type args)
-     (l/with-transaction-kv [tx db]
-       (when (i/list-dbi? tx dbi-name)
-         (raise "update-kv requires a single-value DBI" {:dbi-name dbi-name}))
-       (let [value (apply f (i/get-value tx dbi-name k k-type v-type) args)]
-         (i/transact-kv tx dbi-name [[:put k value]] k-type v-type)
-         :transacted)))))
+     (grouped-write!
+       db
+       (fn [tx]
+         (when (i/list-dbi? tx dbi-name)
+           (raise "update-kv requires a single-value DBI" {:dbi-name dbi-name}))
+         (let [value (apply f (i/get-value tx dbi-name k k-type v-type) args)]
+           (i/transact-kv tx dbi-name [[:put k value]] k-type v-type)
+           :transacted))))))
 
 (defn prepare-get-value
   "Prepare a reusable KV point read. Execute it with a key using

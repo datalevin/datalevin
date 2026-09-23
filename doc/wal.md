@@ -82,10 +82,24 @@ Dispatch policy differs by profile:
 
 * `:strict`: prefers a direct fast path for idle single-thread local writes,
   and falls back to the sync queue when work is already pending.
-* `:relaxed`: always goes through the sync queue so durability batching stays
-  effective and predictable.
+* `:relaxed`: uses the same adaptive local Datalog queue, with WAL durability
+  batching independent of request batching.
 * `:extra`: follows the same adaptive direct-or-queued dispatch as `:strict`,
   but with stricter durability on the sync side.
+
+Standalone private-WAL `:strict` KV writes and remote KV/Datalog transactions
+also collect requests waiting for the writer. The next submitting thread
+executes up to `:wal-group-commit` requests in one native transaction and WAL
+record. Every caller waits for durable WAL and successful native commit;
+readers cannot see a partially executed group. There is no deliberate batching
+delay, and `:wal-group-commit-ms` does not delay these strict requests.
+
+This shares commit costs while retaining LMDB's single writer. Explicit
+transaction bodies, shared-WAL stores, and writes with HA/commit hooks retain
+their existing paths. A body failure aborts the group and retries requests
+individually; commit or durability failures are propagated without that retry.
+Update functions must remain free of side effects and may execute on another
+submitting thread, with their Clojure dynamic bindings preserved.
 
 Local Datalog WAL specializes common single-form writes before using the
 general transaction planner. A simple cardinality-one `:db.fn/patchIdoc` with

@@ -972,6 +972,11 @@ Only usable for debug output.
   payloads use the streaming protocol. Calls inside [[with-transaction]] join
   its existing transaction instead.
 
+  Concurrent standalone remote strict transactions can share one durable commit.
+  Transaction functions must be free of side effects: an aborted group can retry
+  requests individually. Every successful caller still waits for WAL durability
+  and native commit.
+
   Returns a transaction report, a map:
 
        { :db-before ...
@@ -1532,7 +1537,10 @@ See also: [[open-kv]], [[sync]]"}
   In client/server mode the entire update executes in one request. Define `f`
   with [[datalevin.interpret/inter-fn]] so it can execute on the server.
   In embedded mode ordinary Clojure functions are also supported. The function
-  must be free of side effects because a map resize may retry it.
+  must be free of side effects because a map resize or aborted commit group may
+  retry it. Concurrent standalone strict writes may execute on another submitting
+  thread, with Clojure dynamic bindings preserved. Every successful caller waits
+  for its group's durable commit.
 
   Inside [[with-transaction-kv]], this operation joins the existing transaction.
 

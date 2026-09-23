@@ -144,6 +144,7 @@
    :fetch unguarded
    :populated? unguarded
    :size unguarded
+   :a-size unguarded
    :head unguarded
    :tail unguarded
    :slice unguarded

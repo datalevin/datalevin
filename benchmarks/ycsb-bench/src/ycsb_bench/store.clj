@@ -35,8 +35,8 @@
                [:wal? :write-path-enabled? :durability-profile
                 :last-committed-lsn :last-durable-lsn]))
 
-(defn- kv-read [handle id]
-  (or (d/get-value handle "records" id :id :data)
+(defn- kv-read [reader id]
+  (or (d/execute-prepared reader id)
       (throw (ex-info "Missing KV record" {:id id}))))
 
 (def ^:private replace-field
@@ -51,7 +51,8 @@
 
 (def ^:private datalog-rmw
   (inter/inter-fn [db attributes id field]
-    (let [record (datalevin.core/pull db attributes id)
+    (let [reader (datalevin.core/prepare-pull db attributes)
+          record (datalevin.core/execute-prepared reader id)
           values (mapv record attributes)]
       [[:db/add id (nth attributes field)
         (ycsb-bench.workload/modified-value (nth values field))]])))
@@ -60,27 +61,31 @@
 ;; callable outside that dense keyspace so scans and record counts stay intact.
 (def ^:private rmw-function-eid Integer/MAX_VALUE)
 
-(defrecord KVRecords [handle remote?]
+(defrecord KVRecords [handle value-reader remote?]
   Records
   (put-records! [_ records]
     (d/transact-kv
       handle "records"
       (mapv (fn [[id values]] [:put id (vec values)]) records)
       :id :data))
-  (read-record [_ id] (kv-read handle id))
+  (read-record [_ id] (kv-read value-reader id))
   (update-field! [_ id field value]
     (if remote?
       (d/update-kv handle "records" id replace-field :id :data field value)
       (d/with-transaction-kv [tx handle]
-        (d/transact-kv tx "records"
-                       [[:put id (assoc (kv-read tx id) field value)]] :id :data))))
+        (let [reader (d/prepare-get-value tx "records" :id :data)
+              values (kv-read reader id)]
+          (d/transact-kv tx "records"
+                         [[:put id (assoc values field value)]] :id :data)))))
   (modify-field! [_ id field]
     (if remote?
       (d/update-kv handle "records" id modify-field :id :data field)
       (d/with-transaction-kv [tx handle]
-        (d/transact-kv tx "records"
-                       [[:put id (update (kv-read tx id) field w/modified-value)]]
-                       :id :data))))
+        (let [reader (d/prepare-get-value tx "records" :id :data)
+              values (kv-read reader id)]
+          (d/transact-kv tx "records"
+                         [[:put id (update values field w/modified-value)]]
+                         :id :data)))))
   (scan-records [_ start n]
     (vec (d/get-range handle "records"
                       [:closed-open start (+ (long start) (long n))]
@@ -88,13 +93,14 @@
   (record-count [_] (d/entries handle "records"))
   (storage-info [_]
     (merge {:layout :record-value :key-type :id :value-type :data
+            :read-api :prepare-get-value
             :rmw-execution (if remote? :server-function :client-transaction)
             :initial-mapsize-mb 4096 :atomic-rmw? true}
            (wal-info handle)))
   (close-store! [_] (d/close-kv handle)))
 
-(defn- datalog-read [conn attributes id]
-  (let [record (d/pull @conn attributes id)]
+(defn- datalog-read [reader attributes id]
+  (let [record (d/execute-prepared reader id)]
     (mapv record attributes)))
 
 (defn- datalog-scan [conn attribute-positions start n]
@@ -114,29 +120,32 @@
             (partition-by d/datom-e datoms)))
     []))
 
-(defrecord DatalogRecords [conn attributes attribute-positions remote?]
+(defrecord DatalogRecords [conn attributes attribute-positions pull-reader remote?]
   Records
   (put-records! [_ records]
     (d/transact! conn (mapv (fn [[id values]]
                              (assoc (zipmap attributes values) :db/id id))
                            records)))
-  (read-record [_ id] (datalog-read conn attributes id))
+  (read-record [_ id] (datalog-read pull-reader attributes id))
   (update-field! [_ id field value]
     (d/transact! conn [[:db/add id (nth attributes field) value]]))
   (modify-field! [_ id field]
     (if remote?
       (d/transact! conn [[:ycsb/rmw attributes id field]])
       (d/with-transaction [tx conn]
-        (let [values (datalog-read tx attributes id)]
+        ;; The shared reader belongs to the committed view, not this transaction.
+        (let [reader (d/prepare-pull @tx attributes)
+              values (datalog-read reader attributes id)]
           (d/transact! tx [[:db/add id (nth attributes field)
                            (w/modified-value (nth values field))]])))))
   (scan-records [_ start n]
     (datalog-scan conn attribute-positions start n))
-  (record-count [_] (d/q '[:find (count ?e) . :where [?e :ycsb/field0]] @conn))
+  (record-count [_] (d/count-datoms @conn nil :ycsb/field0 nil))
   (storage-info [_]
     (merge {:layout :entity :initial-mapsize-mb 4096 :atomic-rmw? true
             :rmw-execution (if remote? :server-function :client-transaction)
-            :record-key :db/id :scan-api :slice}
+            :cache-limit (d/datalog-index-cache-limit @conn)
+            :record-key :db/id :read-api :prepare-pull :scan-api :slice}
            (wal-info (d/datalog-kv conn))))
   (close-store! [_] (d/close conn)))
 
@@ -158,13 +167,15 @@
           :kv (let [handle (d/open-kv path (merge kv-opts common))]
                 (try
                   (d/open-dbi handle "records")
-                  (->KVRecords handle (u/dtlv-uri? path))
+                  (->KVRecords handle (d/prepare-get-value handle "records" :id :data)
+                               (u/dtlv-uri? path))
                   (catch Throwable t (d/close-kv handle) (throw t))))
           :datalog
           (let [attributes (mapv #(keyword "ycsb" (str "field" %)) (range field-count))
                 schema (zipmap attributes (repeat {:db/valueType :db.type/string}))
                 remote? (u/dtlv-uri? path)
                 conn (d/create-conn path schema (assoc common :kv-opts kv-opts
+                                                       :cache-limit 0
                                                        :background-sampling? false))]
             (try
               (when (and remote?
@@ -172,7 +183,8 @@
                 (d/transact! conn [{:db/id rmw-function-eid
                                     :db/ident :ycsb/rmw :db/fn datalog-rmw}]))
               (->DatalogRecords conn attributes
-                                (zipmap attributes (range field-count)) remote?)
+                                (zipmap attributes (range field-count))
+                                (d/prepare-pull @conn attributes) remote?)
               (catch Throwable t (d/close conn) (throw t)))))]
     (try (verify-wal! store durability)
          (catch Throwable t

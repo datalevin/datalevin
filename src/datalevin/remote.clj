@@ -477,6 +477,7 @@
     (fetch [_ datom])
     (populated? [_ index low-datom high-datom])
     (size [_ index low-datom high-datom])
+    (a-size [_ a])
     (head [_ index low-datom high-datom])
     (tail [_ index high-datom low-datom])
     (slice [_ index low-datom high-datom])

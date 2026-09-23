@@ -430,7 +430,8 @@ reach as soon as we can. We may adjust the priorities based on feedback.
 * 2.0.0 data compression; KV TTL.
 * 2.1.0 entity-level security.
 * 2.2.0 provenance annotation.
-* 3.0.0 local sharding.
+* 3.0.0 local sharding. [Earlier delivery is under consideration](doc/local-sharding.md),
+  following the [strict group-commit measurements](doc/strict-group-commit-2026-09-21/README.md).
 * 3.1.0 data distribution.
 
 ## :arrows_clockwise: Contact

@@ -158,6 +158,8 @@
             (is (= {:value :one} (reader 1)))
             (is (= {:name "one" :value 1} (puller [:key "one"])))
             (is (= {:name "two" :value 2} (puller [:key "two"])))
+            (is (= 2 (d/count-datoms @conn nil :name nil)))
+            (is (= 2 (d/count-datoms @conn nil :value nil)))
             (let [[id entry] (first (server-handles srv db))]
               (is (some? id))
               (is (= {:value :two} (reader 2)))
@@ -202,6 +204,9 @@
               (d/update-schema conn {:value {:db/cardinality :db.cardinality/many}})
               (d/transact! conn [[:db/add 1 :value 3]])
               (is (= {:name "one" :value [1 3]} (puller [:key "one"])))
+              (testing "a forwarded remote attribute count reflects committed writes"
+                (is (= 2 (d/count-datoms @conn nil :name nil)))
+                (is (= 3 (d/count-datoms @conn nil :value nil))))
               (d/with-transaction-kv [tx db]
                 (let [tx-reader (d/prepare-get-value tx "docs" :long :data)]
                   (is (= :recreated (tx-reader 1)))

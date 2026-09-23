@@ -240,8 +240,10 @@
      entid
      entity
      entity-db
+     execute-prepared
      explain
      max-eid
+     prepare-pull
      pull
      pull-many
      q

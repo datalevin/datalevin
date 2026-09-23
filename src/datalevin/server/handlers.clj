@@ -13,6 +13,7 @@
   (:require
    [clojure.string :as s]
    [datalevin.bits :as b]
+   [datalevin.binding.cpp :as cpp]
    [datalevin.client-op :as cop]
    [datalevin.constants :as c]
    [datalevin.core :as d]
@@ -34,6 +35,7 @@
             role-obj server-obj privileged-server-option-keys]]
    [datalevin.server.notifications :as notifications]
    [datalevin.storage :as st]
+   [datalevin.tx-group :as group]
    [datalevin.util :as u :refer [raise]]
    [datalevin.validate :as vld]
    [taoensso.timbre :as log])
@@ -1457,6 +1459,29 @@
 
               (raise "Missing :mode when loading datoms" {}))))))))
 
+(def ^:dynamic ^:private *datalog-write-group* nil)
+
+(defn- server-strict-write-group
+  [deps server db-name store kind]
+  (when-not (ha-runtime-read-state? (db-state deps server db-name))
+    ;; Dispatch installs these per-database HA guards even on ordinary stores.
+    ;; Keep the leader's guards around the physical commit; only omit them from
+    ;; the eligibility check for a database without HA state. Embedded callers
+    ;; with their own commit hooks must stay on their original path.
+    (binding [cpp/*before-write-commit-fn* nil
+              kvtx/*after-txlog-append-fn* nil]
+      (kv/strict-write-group store kind))))
+
+(defn- with-datalog-transaction-slot
+  [deps server skey db-name writing? simulated? f]
+  (if-let [g (when (and (not writing?) (not simulated?))
+               (let [store (dt-store deps server skey db-name false)]
+                 (when (instance? Store store)
+                   (server-strict-write-group deps server db-name
+                                              (.-lmdb ^Store store) :server-datalog))))]
+    (binding [*datalog-write-group* g] (f))
+    (with-direct-db-transaction-slot deps server db-name writing? f)))
+
 (defn- transact*
   [deps db0 txs tx-meta s? server db-name writing?]
   (try
@@ -1467,11 +1492,38 @@
                        (db/->TxReport db (db/transfer db (:store db))
                                       [] {} (or tx-meta {}))
                        txs s?))]
-      (if (or writing? s?)
+      (cond
+        *datalog-write-group*
+        (group/submit!
+          *datalog-write-group*
+          (fn [requests]
+            (with-direct-db-transaction-slot
+              deps server db-name false
+              (fn []
+                (let [conn (atom (:dt-db (db-state deps server db-name)))
+                      results (d/with-transaction [tx conn]
+                                (group/execute requests tx))
+                      db-after @conn]
+                  ((:update-db deps) server db-name
+                   #(assoc % :dt-db db-after :store (:store db-after)))
+                  results))))
+          (fn [conn]
+            (let [report (transact @conn)
+                  db-after (:db-after report)]
+              (reset! conn db-after)
+              ;; Keep each request's logical counters, matching its persisted
+              ;; replay response. Capture the timestamp before another request
+              ;; advances it. Response construction must not read this private
+              ;; writing Store after the group's native transaction closes.
+              (assoc report ::group-committed? true
+                            ::group-last-modified (i/last-modified (:store db-after))))))
+
+        (or writing? s?)
         (transact db0)
         ;; Acquire the native writer before evaluating transaction functions.
         ;; Publish the new Store/DB only after commit; exceptions also roll back
         ;; schema changes and :db/ensure failures within this request.
+        :else
         (let [conn   (atom db0)
               report (d/with-transaction [tx conn]
                        (let [report (transact @tx)]
@@ -1499,11 +1551,12 @@
         s?  (last args)
         rp  (transact* deps db0 txs tx-meta s? server db-name writing?)
         db1 (:db-after rp)
-        _   ((:update-db deps) server db-name
-             (fn [m]
-               (cond-> (assoc m (if writing? :wdt-db :dt-db) db1)
-                 (and (not writing?) (not s?))
-                 (assoc :store (:store db1)))))
+        _   (when-not (::group-committed? rp)
+              ((:update-db deps) server db-name
+               (fn [m]
+                 (cond-> (assoc m (if writing? :wdt-db :dt-db) db1)
+                   (and (not writing?) (not s?))
+                   (assoc :store (:store db1))))))
         rp  (assoc-in rp [:tempids :max-eid] (:max-eid db1))]
     (when (and (not s?) (seq (:tx-data rp)))
       (database-changed! deps server db-name writing?))
@@ -1511,13 +1564,16 @@
               (:new-attributes rp)
               (assoc :new-attributes (:new-attributes rp)))
       include-db-info?
-      (assoc :db-info {:max-eid       (:max-eid db1)
-                       :max-tx        (i/max-tx
-                                       (dt-store deps server skey db-name
-                                                 writing?))
-                       :last-modified (i/last-modified
-                                       (dt-store deps server skey db-name
-                                                 writing?))}))))
+      (assoc :db-info
+             (if (::group-committed? rp)
+               {:max-eid (:max-eid db1)
+                :max-tx (:max-tx db1)
+                :last-modified (::group-last-modified rp)}
+               {:max-eid       (:max-eid db1)
+                :max-tx        (i/max-tx
+                                (dt-store deps server skey db-name writing?))
+                :last-modified (i/last-modified
+                                (dt-store deps server skey db-name writing?))})))))
 
 (defn tx-data
   [deps server skey {:keys [mode args writing?] :as message}]
@@ -1526,11 +1582,13 @@
       deps server skey db-name
       "Don't have permission to alter the database"
       (fn []
-        (with-direct-db-transaction-slot
+        (with-datalog-transaction-slot
           deps
           server
+          skey
           db-name
           writing?
+          (last args)
           (fn []
             (let [{:keys [response replay?]}
                   (with-idempotent-client-op
@@ -1573,11 +1631,13 @@
       deps server skey db-name
       "Don't have permission to alter the database"
       (fn []
-        (with-direct-db-transaction-slot
+        (with-datalog-transaction-slot
           deps
           server
+          skey
           db-name
           writing?
+          (last args)
           (fn []
             (let [{:keys [response replay?]}
                   (with-idempotent-client-op
@@ -2335,9 +2395,22 @@
                                         (:request-hash client-op)
                                         response-kind
                                         response))))]
-                    (if client-op
-                      (i/transact-kv kv-store txs)
-                      (i/transact-kv kv-store dbi-name txs k-type v-type))
+                    (let [op (fn [tx]
+                               (if client-op
+                                 (i/transact-kv tx txs)
+                                 (i/transact-kv tx dbi-name txs k-type v-type)))]
+                      (if-let [g (when (and (not writing?) (= :request mode))
+                                   (server-strict-write-group deps server db-name
+                                                              kv-store :server-kv))]
+                        (group/submit!
+                          g
+                          (fn [requests]
+                            (with-direct-db-transaction-slot
+                              deps server db-name false
+                              #(l/with-transaction-kv [tx kv-store]
+                                 (group/execute requests tx))))
+                          op)
+                        (op kv-store)))
                     (when (seq txs0)
                       (database-changed! deps server db-name writing?))
                     response)))]
@@ -2353,28 +2426,40 @@
       "Don't have permission to alter the database"
       (fn []
         (let [response
-              (with-direct-db-transaction-slot
-                deps server db-name writing?
-                (fn []
-                  (:response
-                    (with-idempotent-client-op
-                      deps server skey db-name writing? message
-                      (fn [client-op]
-                        (let [store (kv-store deps server skey db-name writing?)
-                              f     (b/deserialize serialized-f)]
-                          (l/with-transaction-kv [tx store]
-                            (apply kv/update-kv tx dbi-name k f k-type v-type f-args)
-                            (when client-op
-                              (i/transact-kv
-                                tx [(cop/committed-record-tx
-                                      (:client-op-id client-op)
-                                      (cop/committed-record
-                                        (:request-type client-op)
-                                        (:request-hash client-op)
-                                        (:response-kind client-op)
-                                        :transacted))])))
-                          (database-changed! deps server db-name writing?)
-                          :transacted))))))]
+              (:response
+                (with-idempotent-client-op
+                  deps server skey db-name writing? message
+                  (fn [client-op]
+                    (let [store (kv-store deps server skey db-name writing?)
+                          f     (b/deserialize serialized-f)
+                          op    (fn [tx]
+                                  (apply kv/update-kv tx dbi-name k f k-type v-type f-args)
+                                  (when client-op
+                                    (i/transact-kv
+                                      tx [(cop/committed-record-tx
+                                            (:client-op-id client-op)
+                                            (cop/committed-record
+                                              (:request-type client-op)
+                                              (:request-hash client-op)
+                                              (:response-kind client-op)
+                                              :transacted))]))
+                                  :transacted)]
+                      (if-let [g (when-not writing?
+                                   (server-strict-write-group deps server db-name
+                                                              store :server-kv))]
+                        (group/submit!
+                          g
+                          (fn [requests]
+                            (with-direct-db-transaction-slot
+                              deps server db-name false
+                              #(l/with-transaction-kv [tx store]
+                                 (group/execute requests tx))))
+                          op)
+                        (with-direct-db-transaction-slot
+                          deps server db-name writing?
+                          #(l/with-transaction-kv [tx store] (op tx))))
+                      (database-changed! deps server db-name writing?)
+                      :transacted))))]
           (write-result! deps skey response))))))
 
 (defn q
@@ -2627,6 +2712,7 @@
    :fetch (normal-dt-handler i/fetch)
    :populated? (normal-dt-handler i/populated?)
    :size (normal-dt-handler i/size)
+   :a-size (normal-dt-handler i/a-size)
    :head (normal-dt-handler i/head)
    :tail (normal-dt-handler i/tail)
    :slice (copying-dt-handler i/slice)
