@@ -479,6 +479,12 @@ job atomically. An in-process worker applies the vector index update after the
 commit and after DB open recovery. Queries over async vector indexes are
 eventually consistent until the worker catches up.
 
+Async vector and embedding domains allow concurrent local `transact!` calls to
+share commits when all other active secondary domains also use async indexing.
+Queued index jobs roll back with the source transaction if a batch fails.
+Synchronous domains keep general requests in separate transactions. Idoc domains
+can also opt into [async indexing](idoc.md#indexing-mode).
+
 #### Embedding domains and providers
 
 Embedding domains are configured separately from vector domains. Each embedding

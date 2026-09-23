@@ -702,7 +702,8 @@
                          ^long max-tx
                          ^TreeSortedSet eavt
                          ^TreeSortedSet avet
-                         pull-patterns]
+                         pull-patterns
+                         pull-readers]
 
   ISearchable
   (-searchable? [_] true)
@@ -1145,6 +1146,9 @@
                  :avet          (TreeSortedSet. ^Comparator (tx-datom-comparator store :ave))
                  :pull-patterns (if previous
                                   (.-pull-patterns previous)
+                                  (LRUCache. 64))
+                 :pull-readers  (if previous
+                                  (.-pull-readers previous)
                                   (LRUCache. 64))})]
      (swap! dbs assoc (db-name store) db)
      (ensure-cache store
@@ -1166,7 +1170,8 @@
          (.-max-tx old)
          (TreeSortedSet. ^Comparator (tx-datom-comparator store :eav))
          (TreeSortedSet. ^Comparator (tx-datom-comparator store :ave))
-         (.-pull-patterns old))
+         (.-pull-patterns old)
+         (.-pull-readers old))
     old))
 
 (defn ^:no-doc adopt-current-db!

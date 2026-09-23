@@ -1174,20 +1174,6 @@
   ;; db-after to the final shared connection snapshot.
   (assoc report :db-after db-after))
 
-(defn- prepare-sync-queued-batch-reports!
-  [conn ^FastList requests ^objects reports]
-  (let [n (alength ^objects reports)]
-    (loop [i 0
-           db ^DB @conn]
-      (when (< i n)
-        (let [^SyncQueuedReq req (.get requests i)
-              ^TxReport report (with db
-                                 (.-tx-data req)
-                                 (.-tx-meta req)
-                                 true)]
-          (aset reports i report)
-          (recur (inc i) (:db-after report)))))))
-
 (defn- prepare-sync-queued-patch-idoc-batch
   [conn ^FastList requests]
   (let [db    ^DB @conn
@@ -1400,14 +1386,50 @@
               (when-not old
                 (db/enable-cache (.-store ^DB @conn))))))))))
 
-(defn- commit-sync-queued-batch-reports!
-  [conn ^objects reports]
-  (let [n (alength ^objects reports)]
-    (with-transaction [c conn]
-      (assert (active-conn-structural? c))
-      (dotimes [i n]
-        (let [^TxReport report (aget reports i)]
-          (db/commit-prepared-tx-data! @c (:tx-data report) report))))))
+(defn- transact-sync-queued-individually!
+  [conn ^FastList requests ^objects reports]
+  (dotimes [i (alength reports)]
+    (let [^SyncQueuedReq req (.get requests i)]
+      (aset reports i
+            (try
+              (-transact! conn (.-tx-data req) (.-tx-meta req))
+              (catch Throwable e e))))))
+
+(defn- general-sync-queued-batch-safe?
+  [^DB db]
+  ;; Synchronous secondary engines share mutable state across Store wrappers;
+  ;; a later failed request cannot roll it back with LMDB. Async indexing only
+  ;; enqueues jobs in the same native transaction, so batching remains atomic.
+  (not (s/synchronous-secondary-indexing? (.-store db))))
+
+(defn- transact-sync-queued-batch!
+  [conn ^FastList requests ^objects reports]
+  (locking conn
+    (let [n (alength reports)
+          before ^DB @conn]
+      (if-not (general-sync-queued-batch-safe? before)
+        (transact-sync-queued-individually! conn requests reports)
+        (do
+          (with-transaction [c conn]
+            (assert (active-conn-structural? c))
+            (dotimes [i n]
+              (let [^SyncQueuedReq req (.get requests i)
+                    ;; Apply each request before preparing the next. Simulated
+                    ;; reports cannot be chained: preparation clears their
+                    ;; mutable overlays before a transaction function reads.
+                    ^TxReport report (with-isolated-tx-cache
+                                       @c (.-tx-data req) (.-tx-meta req) false)]
+                (reset! c (:db-after report))
+                (aset reports i report))))
+          ;; Returned reports must not retain a Store bound to the closed writer.
+          (let [store (.-store ^DB @conn)]
+            (dotimes [i n]
+              (let [^TxReport report (aget reports i)]
+                (aset reports i
+                      (assoc report :db-before
+                             (if (zero? i)
+                               before
+                               (db/transfer (:db-before report) store))))))))))))
 
 (defn- run-sync-queued-dl-batch!
   [conn ^FastList requests]
@@ -1426,7 +1448,7 @@
             (catch Throwable e
               (deliver-sync-queued-error! req e)))
           nil)
-        ;; Batch queued requests in a single write txn for throughput.
+        ;; Combine eligible requests in a single write transaction.
         (let [^objects reports (object-array n)]
           (try
             (binding [*sync-queue-worker?* true]
@@ -1443,22 +1465,16 @@
                       (and prepared
                            (try-commit-sync-queued-blind-batch!
                              conn requests prepared reports))
-                      ;; General preparation allocates concrete entids/tx ids.
-                      ;; Keep it under the same connection lock as commit so
-                      ;; concurrent direct writes cannot advance the shared
-                      ;; snapshot mid-batch.
-                      (locking conn
-                        (prepare-sync-queued-batch-reports!
-                          conn requests reports)
-                        (commit-sync-queued-batch-reports!
-                          conn reports)))))))
+                      (transact-sync-queued-batch!
+                        conn requests reports))))))
             (let [db-after @conn]
               (dotimes [i n]
-                (deliver-sync-queued-success!
-                  (.get requests i)
-                  (finalize-sync-queued-report
-                    ^TxReport (aget reports i)
-                    db-after))))
+                (let [result (aget reports i)]
+                  (if (instance? Throwable result)
+                    (deliver-sync-queued-error! (.get requests i) result)
+                    (deliver-sync-queued-success!
+                      (.get requests i)
+                      (finalize-sync-queued-report result db-after))))))
             (catch Throwable e
               (dotimes [i n]
                 (deliver-sync-queued-error! (.get requests i) e))))

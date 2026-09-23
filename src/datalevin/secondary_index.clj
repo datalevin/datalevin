@@ -81,10 +81,12 @@
       (raise "Unsupported secondary index job type"
                {:type type
                 :expected supported-job-types}))
-    (when-not (supported-job-ops op)
+    (when-not (or (supported-job-ops op)
+                  (and (= type :idoc) (= op :transact)))
       (raise "Unsupported secondary index job op"
                {:op op
-                :expected supported-job-ops}))
+                :expected (cond-> supported-job-ops
+                            (= type :idoc) (conj :transact))}))
     {:job/id         [type domain tx ordinal]
      :job/type       type
      :job/domain     domain

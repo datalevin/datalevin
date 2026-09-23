@@ -87,7 +87,7 @@
    [datalevin.validate :as vld]
    [datalevin.vector :as v])
   (:import
-   [java.util List Collection HashMap IdentityHashMap UUID]
+   [java.util List Collection HashMap HashSet IdentityHashMap UUID]
    [java.util.concurrent TimeUnit ScheduledExecutorService ConcurrentHashMap ScheduledFuture]
    [java.util.concurrent.locks ReentrantReadWriteLock]
    [java.nio ByteBuffer]
@@ -1359,6 +1359,7 @@
 (def ^:private ^:const ft-jobs-slot 4)
 (def ^:private ^:const vi-jobs-slot 5)
 (def ^:private ^:const em-jobs-slot 6)
+(def ^:private ^:const id-jobs-slot 7)
 
 (defn- add-index-work!
   "Allocate a transaction's secondary-index list only on its first item."
@@ -1369,6 +1370,13 @@
                             items))]
     (.add items item)))
 
+(defn- search-domain-config
+  [^Store store domain]
+  (let [store-opts (opts store)]
+    (or (get-in store-opts [:search-domains domain])
+        (when (= c/default-domain domain) (:search-opts store-opts))
+        {})))
+
 (defn- collect-fulltext
   [^Store store work attr props text ref job-op op]
   (when-not (str/blank? text)
@@ -1378,10 +1386,7 @@
                                    [c/default-domain])
                          (props :db.fulltext/autoDomain)
                          (conj (u/keyword->string attr)))))]
-      (if (si/async-indexing?
-           (or (get-in (opts store) [:search-domains domain])
-               (when (= c/default-domain domain) (:search-opts (opts store)))
-               {}))
+      (if (si/async-indexing? (search-domain-config store domain))
         (add-index-work! work ft-jobs-slot {:type :fulltext
                                           :domain domain
                                           :op job-op
@@ -1407,6 +1412,59 @@
   [^Store store domain]
   (si/async-indexing? (vector-domain-config store domain)))
 
+(defn- idoc-domain-indexing-opts
+  [^Store store domain]
+  (let [store-opts (opts store)
+        domain-opts (get-in store-opts [:idoc-domains domain])]
+    ;; Idoc domain options merge over the defaults, including when a domain
+    ;; overrides only its indexed paths and inherits the indexing mode.
+    (if (contains? domain-opts :indexing-mode)
+      domain-opts
+      (:idoc-opts store-opts))))
+
+(defn ^:no-doc async-idoc-domain?
+  [^Store store domain]
+  (si/async-indexing? (idoc-domain-indexing-opts store domain)))
+
+(defn ^:no-doc async-idoc-cache-token
+  "Track worker progress independently of source transactions for query caching."
+  [^Store store]
+  (when (seq (store-idoc-indices store))
+    (not-empty
+      (reduce-kv (fn [versions domain index]
+                   (if (async-idoc-domain? store domain)
+                     (assoc versions domain (idoc/index-version index))
+                     versions))
+                 {} (store-idoc-indices store)))))
+
+(defn- collect-idoc
+  [^Store store work domain op]
+  (add-index-work! work
+                   (if (async-idoc-domain? store domain)
+                     id-jobs-slot id-ds-slot)
+                   [domain op]))
+
+(defn- synchronous-index-domain?
+  [store indices domain-config]
+  (loop [domains (seq indices)]
+    (when domains
+      (or (si/sync-indexing? (domain-config store (key (first domains))))
+          (recur (next domains))))))
+
+(defn ^:no-doc synchronous-secondary-indexing?
+  "True when writes can mutate secondary engine state before LMDB commits.
+   Async domains only enqueue transactional jobs."
+  [^Store store]
+  (boolean
+    (or (synchronous-index-domain? store (store-idoc-indices store)
+                                   idoc-domain-indexing-opts)
+        (synchronous-index-domain? store (.-search-engines store)
+                                   search-domain-config)
+        (synchronous-index-domain? store (.-vector-indices store)
+                                   vector-domain-config)
+        (synchronous-index-domain? store (.-embedding-indices store)
+                                   embedding-domain-config))))
+
 (defn embedding-provider
   [^Store store domain]
   (or (get-in (opts store) [:embedding-domain-providers domain])
@@ -1418,16 +1476,23 @@
 
 (defn secondary-index-jobs
   [^Store store]
-  (mapv second
-        (get-range (.-lmdb store)
-                   c/secondary-index-jobs
-                   [:all]
-                   :data
-                   :data)))
+  ;; Closing LMDB takes this same monitor. A worker's earlier closed? check
+  ;; cannot protect mapped buffers while a job snapshot is being decoded.
+  (locking (.-write-txn store)
+    (if (closed? store)
+      []
+      (mapv second
+            (get-range (.-lmdb store)
+                       c/secondary-index-jobs
+                       [:all]
+                       :data
+                       :data)))))
 
 (defn- secondary-index-job
   [^Store store job-id]
-  (get-value (.-lmdb store) c/secondary-index-jobs job-id :data :data))
+  (locking (.-write-txn store)
+    (when-not (closed? store)
+      (get-value (.-lmdb store) c/secondary-index-jobs job-id :data :data))))
 
 (defn secondary-index-status
   [^Store store]
@@ -1534,12 +1599,32 @@
                {:op (:job/op job)
                 :job job}))))
 
+(defn- idoc-job-application
+  [^Store store job]
+  (let [domain (:job/domain job)
+        index (or ((store-idoc-indices store) domain)
+                  (raise "Idoc index is not initialized" {:domain domain :job job}))]
+    (when-not (= :transact (:job/op job))
+      (raise "Unsupported idoc secondary index op" {:job job}))
+    (fn []
+      (let [ops (FastList.)
+            txs (FastList.)]
+        (doseq [[op patch] (:job/value job)]
+          (.add ops [domain (cond-> op patch (with-meta {:idoc/patch patch}))]))
+        (let [actions (idoc-index {domain index} ops txs)]
+          ;; Index changes and acknowledgement are one durable transaction.
+          ;; A retry after a crash cannot apply an already committed delta.
+          (.add txs (si/job-tx (si/completed-job job)))
+          (transact-kv (.-lmdb store) txs)
+          (idoc/apply-state-actions! actions))))))
+
 (defn- secondary-index-job-application
   [^Store store job]
   (case (:job/type job)
     :fulltext (fulltext-job-application store job)
     :vector (vector-job-application store job)
     :embedding (embedding-job-application store job)
+    :idoc (idoc-job-application store job)
     (raise "Unsupported secondary index job type"
              {:type (:job/type job)
               :job job})))
@@ -1581,7 +1666,8 @@
     (when-let [current (secondary-index-job store (:job/id job))]
       (when (claimed-secondary-index-job? current owner)
         (apply-job!)
-        (update-secondary-index-job! store (si/completed-job current))
+        (when-not (= :idoc (:job/type current))
+          (update-secondary-index-job! store (si/completed-job current)))
         true))))
 
 (defn- fail-claimed-secondary-index-job!
@@ -1615,10 +1701,9 @@
                                                        retry-due-only?
                                                        reclaim-failed-running?
                                                        %)
-         jobs (take (long max-jobs)
-                    (filter #(and (secondary-index-job-matches? job-opts %)
-                                  (processable? %))
-                            (secondary-index-jobs store)))
+         jobs (sort-by (juxt :job/type :job/domain :job/tx :job/ordinal)
+                       (secondary-index-jobs store))
+         blocked-idoc-domains (HashSet.)
          result (volatile! {:processed-count 0
                             :claimed-count 0
                             :completed-count 0
@@ -1626,31 +1711,61 @@
                             :skipped-count 0})
          inc-result! (fn [k]
                        (vswap! result update k (fnil u/long-inc 0)))]
-     (doseq [job jobs]
-       (inc-result! :processed-count)
-       (if-let [claimed (claim-secondary-index-job! store
-                                                    job
-                                                    owner
-                                                    lease-ms
-                                                    retry-failed?
-                                                    retry-due-only?
-                                                    reclaim-failed-running?)]
-         (do
-           (inc-result! :claimed-count)
-           (try
-             (let [apply-job! (secondary-index-job-application store claimed)]
-               (if (complete-claimed-secondary-index-job! store
-                                                          claimed
-                                                          owner
-                                                          apply-job!)
-                 (inc-result! :completed-count)
-                 (inc-result! :skipped-count)))
-             (catch Throwable e
-               (if (fail-claimed-secondary-index-job! store claimed owner e)
-                 (inc-result! :failed-count)
-                 (inc-result! :skipped-count)))))
-         (inc-result! :skipped-count)))
-     (assoc @result :status (secondary-index-status store)))))
+     ;; Sort decoded keys: :data encoding does not preserve numeric tx order.
+     ;; An idoc delta must not overtake an earlier failed or leased delta
+     ;; in its domain.
+     (doseq [job jobs
+             :while (< (long (:processed-count @result)) (long max-jobs))
+             :when (secondary-index-job-matches? job-opts job)]
+       (let [idoc? (= :idoc (:job/type job))
+             domain (:job/domain job)]
+         (when-not (and idoc? (.contains blocked-idoc-domains domain))
+           (let [run (fn []
+                       (let [job (if idoc?
+                                   (secondary-index-job store (:job/id job))
+                                   job)]
+                         (if (processable? job)
+                           (do
+                             (inc-result! :processed-count)
+                             (if-let [claimed (claim-secondary-index-job!
+                                                store job owner lease-ms retry-failed?
+                                                retry-due-only? reclaim-failed-running?)]
+                               (do
+                                 (inc-result! :claimed-count)
+                                 (try
+                                   (let [apply-job! (secondary-index-job-application store claimed)]
+                                     (if (complete-claimed-secondary-index-job!
+                                           store claimed owner apply-job!)
+                                       (do (inc-result! :completed-count) true)
+                                       (do (inc-result! :skipped-count) false)))
+                                   (catch Throwable e
+                                     (if (fail-claimed-secondary-index-job! store claimed owner e)
+                                       (inc-result! :failed-count)
+                                       (inc-result! :skipped-count))
+                                     false)))
+                               (do (inc-result! :skipped-count) false)))
+                           (si/completed-job? job))))
+                 ;; Unlike embedding, idoc has no external provider call.
+                 ;; Serialize claim through completion so another processor
+                 ;; cannot skip its in-flight head and apply a later delta.
+                 completed? (if idoc?
+                              (locking (.-write-txn store) (run))
+                              (run))]
+             (when (and idoc? (not completed?))
+               (.add blocked-idoc-domains domain))))))
+     (cond-> (assoc @result :status (secondary-index-status store))
+       (not (.isEmpty blocked-idoc-domains))
+       (assoc :blocked-idoc-domains (set blocked-idoc-domains))))))
+
+(defn- runnable-secondary-index-pending?
+  [{:keys [status blocked-idoc-domains]}]
+  (some (fn [[[type domain] stats]]
+          (and (pos? (long (:pending-count stats)))
+               (not (and (= type :idoc)
+                         (contains? blocked-idoc-domains domain)
+                         (or (pos? (long (:failed-count stats)))
+                             (pos? (long (:running-count stats))))))))
+        (:by-domain status)))
 
 (defn- unfinished-secondary-index-jobs
   [^Store store opts]
@@ -1726,8 +1841,9 @@
         ;; Fast local transactions enqueue this work while their outer LMDB
         ;; transaction is still open. Wait for that commit before looking for
         ;; jobs, otherwise an empty pre-commit read can consume the only wakeup.
-        ;; Do not retain this monitor while processing: job claiming takes the
-        ;; Store lock before writing LMDB, so retaining it would invert locks.
+        ;; Release the monitor before processing so external embedding provider
+        ;; calls do not hold up source writes. Job reads lock it again to protect
+        ;; their mapped buffers against concurrent close.
         (locking (lmdb/write-txn (.-lmdb store)) nil)
         (when (and (a/running? exe)
                    (not (closed? store)))
@@ -1736,7 +1852,7 @@
                           store
                           (async-secondary-index-worker-opts store))
                   status (:status result)
-                  pending? (pos? (long (or (:pending-count status) 0)))
+                  pending? (runnable-secondary-index-pending? result)
                   next-retry-ms (:next-retry-ms status)
                   next-lease-ms (:next-lease-ms status)]
               (cond
@@ -1936,7 +2052,7 @@
                      [:a [e aid v]])
             patch  (some-> (meta d) :idoc/patch)
             op     (if patch (with-meta op {:idoc/patch patch}) op)]
-        (add-index-work! work id-ds-slot [domain op])))
+        (collect-idoc store work domain op)))
     (when fulltext?
       (let [text (str v)
             ref  (if giant? [:g max-gt e aid] [e aid text])]
@@ -2000,11 +2116,8 @@
             (add-index-work! work em-ds-slot [domain [:d doc-ref]])))))
     (when (identical? vt :db.type/idoc)
       (let [domain (or (props :db/domain) (u/keyword->string attr))]
-        (add-index-work! work id-ds-slot
-                         [domain
-                          (if gt
-                            [:r [e aid gt v]]
-                            [:d [e aid v]])])))
+        (collect-idoc store work domain
+                      (if gt [:r [e aid gt v]] [:d [e aid v]]))))
     (let [ii (Indexable. nil aid v (.-f i) (.-b i) (or gt c/normal))]
       (.add txs (DatomKVTxData. e (b/indexable-bytes ii avg-bf) false false))
       (when gt
@@ -2035,7 +2148,7 @@
    ;; executor once; generic giant, job, and metadata operations follow.
    (let [txs    (FastList. (+ 2 (count datoms) (count extra-kv-txs)))
          ;; Nil slots mean no work; each list is allocated on its first item.
-         work   (object-array 7)
+         work   (object-array 8)
          giants (HashMap.)
          attr-infos (HashMap.)
          avg-bf     (bf/get-array-buffer)]
@@ -2056,17 +2169,30 @@
      (let [ft-jobs (aget work ft-jobs-slot)
            vi-jobs (aget work vi-jobs-slot)
            em-jobs (aget work em-jobs-slot)
+           id-jobs (when-let [ops (aget work id-jobs-slot)]
+                     (mapv (fn [[domain changes]]
+                             {:type :idoc :domain domain :op :transact
+                              ;; Carry old/new documents, including giants, and
+                              ;; preserve patch hints without relying on Nippy
+                              ;; metadata settings. No source lookup on replay.
+                              :value (mapv (fn [[_ op]]
+                                             [(with-meta op nil)
+                                              (:idoc/patch (meta op))])
+                                           changes)})
+                           (group-by first ops)))
            tx-id (long (.advance-max-tx store))
            modified-ms (long (or last-modified-ms
                                  (System/currentTimeMillis)))]
-       (when (or ft-jobs vi-jobs em-jobs)
+       (when (or ft-jobs vi-jobs em-jobs id-jobs)
          (doseq [[ordinal job] (map-indexed vector
-                                            (concat ft-jobs vi-jobs em-jobs))]
+                                            (concat ft-jobs vi-jobs em-jobs id-jobs))]
            (.add txs (si/job-tx (assoc job
                                        :tx tx-id
                                        :ordinal ordinal
                                        :created-ms modified-ms
                                        :updated-ms modified-ms)))))
+       ;; Only used to decide whether to wake the worker after staging writes.
+       (when id-jobs (aset work id-jobs-slot id-jobs))
        (.add txs (lmdb/kv-tx :put c/meta :max-tx tx-id :attr :long))
        (.add txs (lmdb/kv-tx :put c/meta :last-modified
                               modified-ms
@@ -2080,7 +2206,8 @@
       :id-ds (aget work id-ds-slot)
       :secondary-index-job-count (+ (count (aget work ft-jobs-slot))
                                     (count (aget work vi-jobs-slot))
-                                    (count (aget work em-jobs-slot)))})))
+                                    (count (aget work em-jobs-slot))
+                                    (count (aget work id-jobs-slot)))})))
 
 (defn- commit-datoms-kv-plan!
   "Commit a prepared datom KV plan."

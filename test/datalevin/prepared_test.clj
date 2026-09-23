@@ -68,6 +68,31 @@
         (is (thrown? Exception (read-doc 1))))
       (finally (d/close-kv db) (u/delete-files dir)))))
 
+(deftest prepared-reads-execute-against-explicit-views
+  (let [dir (u/tmp-dir (str "prepared-view-" (UUID/randomUUID)))
+        kv-dir (str dir "-kv")
+        conn (d/create-conn dir {:name {} :value {}})
+        kv (d/open-kv kv-dir)]
+    (try
+      (d/open-dbi kv "docs")
+      (d/transact! conn [{:db/id 1 :name "one" :value 1}])
+      (d/transact-kv kv [[:put "docs" 1 :committed :long :data]])
+      (let [puller (d/prepare-pull @conn [:name :value])
+            reader (d/prepare-get-value kv "docs" :long :data)]
+        (is (= {:name "one" :value 1} (d/execute-prepared puller 1)))
+        (is (= :committed (d/execute-prepared reader 1)))
+        (is (= {:name "one" :value 1} (d/execute-prepared puller @conn 1)))
+        (d/with-transaction [tx conn]
+          (d/transact! tx [[:db/add 1 :name "tx"]])
+          (is (= {:name "tx" :value 1} (d/execute-prepared puller @tx 1))))
+        (d/with-transaction-kv [tx kv]
+          (d/transact-kv tx [[:put "docs" 1 :tx :long :data]])
+          (is (= :tx (d/execute-prepared reader tx 1))))
+        (is (= {:name "tx" :value 1} (d/execute-prepared puller @conn 1)))
+        (is (= :tx (d/execute-prepared reader 1))))
+      (finally (d/close-kv kv) (d/close conn)
+               (u/delete-files dir) (u/delete-files kv-dir)))))
+
 (deftest prepared-pull-refreshes-schema-and-preserves-options
   (let [dir (u/tmp-dir (str "prepared-pull-" (UUID/randomUUID)))
         conn (d/create-conn dir {:key {:db/unique :db.unique/identity}

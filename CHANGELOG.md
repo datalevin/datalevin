@@ -22,6 +22,11 @@
   Clojure one. Clojure will still be the source of new feature development and
   serves JVM, while rust one serves the native embedded/client in the future.
   Auto-migration from 0.9.27 and above will be conducted on DB open.
+- [WAL] standalone transactions in `:strict` profile also uses group commit
+  similar to PostgreSQL, while keeping durability guarantees (i.e. only durable
+  commit is acknowledged). Such batching is disabled if synchronous secondary
+  indexing (idoc, fulltext, vector, and embedding) is requested, asynchronous
+  secondary indexing is unaffected.
 
 ### Fixed
 - [Datalog] planner range conversion for `like`.

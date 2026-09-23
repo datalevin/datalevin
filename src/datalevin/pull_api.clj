@@ -503,16 +503,25 @@
 (defn prepare-pull
   "Prepare a reusable pull for a DB view. Execute it with an entity ID or
   lookup reference. Schema changes refresh the projection automatically.
-  Options and result semantics are the same as `pull`."
+  Options and result semantics are the same as `pull`.
+  Repeated preparations with the same pattern and options share one reader,
+  so a preparation made outside a transaction can be reused inside one
+  without re-parsing."
   ([db pattern] (prepare-pull db pattern nil))
   ([^DB db pattern opts]
    {:pre [(db/db? db)]}
    (let [store (.-store db)]
      (if (db/remote-prepared-store? store)
        (i/prepare-remote-read store :pull [pattern nil opts])
-       (let [reader (pull-reader pattern opts)]
-         (parse-opts db pattern opts)
-         (prepared/prepared-read #(reader db % false)))))))
+       (let [^LRUCache cache (.-pull-readers db)
+             k              [pattern opts]
+             reader         (or (.get cache k)
+                                (let [r (pull-reader pattern opts)]
+                                  (parse-opts db pattern opts)
+                                  (.put cache k r)
+                                  r))]
+         (prepared/prepared-read #(reader db % false)
+                                 #(reader %1 %2 false)))))))
 
 (defn pull-many*
   ([^DB db pattern ids] (pull-many* db pattern ids {}))

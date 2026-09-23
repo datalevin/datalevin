@@ -211,10 +211,15 @@ Only usable for debug output.
   Prepare from the transaction's KV handle to read transaction-local changes."}
   prepare-get-value kv/prepare-get-value)
 
-(def ^{:arglists '([prepared input])
+(def ^{:arglists '([prepared input] [prepared view input])
        :doc "Execute a prepared KV read with a key, a prepared pull with an
   entity ID or lookup reference, or a prepared query with an input vector.
   Equivalent to invoking the prepared object.
+  The three-argument arity executes a local preparation against an explicit
+  view: pass the current transaction's DB view (`@tx`) for a prepared pull or
+  the transaction KV handle (`tx`) for a prepared KV read. A preparation made
+  outside a transaction can therefore be reused inside it without re-parsing.
+  Remote preparations do not accept an explicit view.
   Prepared reads can be shared across threads; transaction-bound reads retain
   their transaction's lifetime and thread restrictions. They hold no borrowed
   buffers or open read transactions and require no separate close operation."}

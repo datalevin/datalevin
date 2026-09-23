@@ -1165,6 +1165,11 @@
               :where where
               :domain domain
               :config config}))
+  (when-let [mode (:indexing-mode config)]
+    (when-not (si/supported-indexing-modes mode)
+      (raise "Idoc indexing mode is not supported"
+               {:error :store/validation :where where :domain domain
+                :indexing-mode mode :expected si/supported-indexing-modes})))
   (doseq [k [:indexed-paths :excluded-paths]]
     (when (contains? config k)
       (validate-idoc-path-selectors where k (get config k)))))

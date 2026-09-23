@@ -191,6 +191,8 @@
       (store/with-store
         (assoc small-options :api api :mode mode)
         (fn [db]
+          (is (= (if (= mode :remote) :server-function :transaction-function)
+                 (:rmw-execution (store/storage-info db))))
           (when (= api :datalog)
             (is (= 0 (:cache-limit (store/storage-info db))))
             (is (= :slice (:scan-api (store/storage-info db))))
@@ -213,6 +215,20 @@
                   "The upper entity bound is exclusive, including across gaps")
               (is (= [[7 ["dddd" "eeee" "ffff"]]] (store/scan-records db 7 1)))
               (is (= 5 (store/record-count db)))))
+          {})))))
+
+(deftest rmw-reader-reuse-test
+  (doseq [mode [:embedded :remote]]
+    (testing (str mode)
+      (store/with-store
+        (assoc small-options :api :datalog :mode mode)
+        (fn [db]
+          (let [record (store/for-worker db 0)
+                conn (:conn record)
+                attributes (:attributes record)]
+            (is (identical? (w/rmw-reader @conn attributes)
+                            (w/rmw-reader @conn attributes))
+                "RMW preparation is created once per store and attribute set"))
           {})))))
 
 (deftest datalog-scan-field-order-test

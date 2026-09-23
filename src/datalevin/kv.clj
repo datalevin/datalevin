@@ -739,7 +739,8 @@
      (let [reader (value-reader dbi-name k-type v-type ignore-key?)]
        (i/check-ready (raw-lmdb db))
        (i/get-dbi (raw-lmdb db) dbi-name false)
-       (prepared/prepared-read #(reader db % false))))))
+       (prepared/prepared-read #(reader db % false)
+                               #(reader %1 %2 false))))))
 
 (defn wrap-lmdb
   [db]

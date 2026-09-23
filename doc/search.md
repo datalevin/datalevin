@@ -328,8 +328,13 @@ eventually consistent until the worker catches up. A worker claims a job with a
 lease before applying it; if the process exits or the worker stalls long enough
 for the lease to expire, a later worker run can reclaim the job and retry it.
 
-Async worker lifecycle and retry settings are shared by fulltext, vector, and
-embedding secondary indexes:
+Concurrent local `transact!` calls can share a commit when all active secondary
+domains use async indexing. Their queued index jobs commit or roll back with the
+source datoms. A synchronous domain keeps general requests in separate
+transactions. Idoc domains can also opt into [async indexing](idoc.md#indexing-mode).
+
+Async worker lifecycle and retry settings are shared by fulltext, vector,
+embedding, and idoc secondary indexes:
 
 ```Clojure
 {:async-secondary-index-worker-max-jobs 100

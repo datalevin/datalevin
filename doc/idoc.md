@@ -54,6 +54,53 @@ defaults to every idoc domain, and `:idoc-domains` overrides a named domain:
                 :excluded-paths [[:profile :raw]]}}})
 ```
 
+### Indexing mode
+
+Idoc indexing defaults to `:sync`: source documents and their index entries are
+updated in the same transaction. To move index maintenance to the background,
+set `:indexing-mode :async` in the default idoc options or a named domain:
+
+```clojure
+;; All idoc domains use async indexing unless overridden.
+(d/create-conn dir schema {:idoc-opts {:indexing-mode :async}})
+
+;; Only the profiles domain uses async indexing.
+(d/create-conn dir schema
+  {:idoc-domains {"profiles" {:indexing-mode :async}}})
+```
+
+Domain options override the defaults; a domain that only specifies path controls
+inherits the default indexing mode.
+
+Async writes commit the source datoms and durable index jobs atomically. Pulls,
+ordinary datom reads, and `:db.fn/patchIdoc` see the committed document immediately.
+`idoc-match` is eventually consistent: results may be stale or missing until the
+worker catches up. A replaced or deleted giant document is omitted if its old
+index entry still refers to source bytes that are no longer present.
+
+The worker resumes pending jobs on database open. It applies updates in source
+transaction order within each domain, retaining the old and new documents and
+patch hints in the job. Index changes and job completion commit together. A
+failed or leased job blocks later jobs in that domain until it can be completed.
+The worker uses the same retry and lease settings as other async secondary
+indexes.
+
+For a local connection, inspect progress or wait for index updates through a
+source transaction:
+
+```clojure
+(d/secondary-index-status conn)
+(d/wait-for-secondary-index conn
+  {:type :idoc :domain "profiles" :timeout-ms 5000})
+;; Check :caught-up? in the returned map; a timeout returns false.
+```
+
+Concurrent local `transact!` calls can share a commit when all active secondary
+domains use async indexing. Their jobs commit or roll back with the source
+datoms. A synchronous secondary domain retains the restriction on batching
+general transactions. Drain pending jobs before changing an async domain to
+synchronous indexing.
+
 ### Transact idoc values
 
 Idoc values must be maps whose keys are keywords or strings, i.e. top level of
@@ -302,10 +349,11 @@ when the path traverses arrays.
     synchronized per idoc index.
   * **path dictionary**: `path -> path-id` with stable numeric ids.
   * **inverted index**: `(path-id, typed-value) -> [doc-id ...]`.
-* **Indexing**: During transactions, idoc indices are updated synchronously.
-  There is no multi-step indexing process. If selective path indexing is
-  configured, only selected leaf paths are entered in the path dictionary and
-  inverted index.
+* **Indexing**: By default, idoc indices are updated synchronously with source
+  datoms. Async domains enqueue durable jobs in the source transaction; a worker
+  commits the index changes and job completion together. If selective path
+  indexing is configured, only selected leaf paths are entered in the path
+  dictionary and inverted index.
 * **Large values**: Values that exceed the index key size are indexed by a
   truncated prefix (same scheme used by core indices). This can introduce
   extra candidates, but exact matches are verified against the full document

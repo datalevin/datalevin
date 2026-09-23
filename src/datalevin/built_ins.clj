@@ -467,6 +467,7 @@
     {:index     index
      :query     query
      :domain    domain
+     :async?    (st/async-idoc-domain? store domain)
      :ids       ids
      :exact?    exact?
      :verify    verify
@@ -476,9 +477,17 @@
      :lmdb      lmdb}))
 
 (defn- idoc-match-tuple
-  [{:keys [^IdocIndex index query exact? verify verify? emit lmdb]}
+  [{:keys [^IdocIndex index query exact? verify verify? emit lmdb async?]}
    doc-id doc-ref]
   (cond
+    ;; A queued delete may still leave a candidate whose giant source value
+    ;; has already disappeared. Never pass that missing value to the emitter.
+    (and async? (qtuple/giant-doc-ref? doc-ref))
+    [(when-some [doc (idoc/doc-ref->doc lmdb doc-ref)]
+       (when (or exact? (idoc/matches-doc? index doc query))
+         (emit doc-ref doc)))
+     true]
+
     exact?
     [(emit doc-ref) false]
 

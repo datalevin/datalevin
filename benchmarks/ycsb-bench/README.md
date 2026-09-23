@@ -13,8 +13,11 @@ read all fields and modify one field on the server while holding the writer.
 The Datalog function is installed before timing at entity ID 2147483647,
 outside the benchmark record keyspace. It uses `prepare-pull` and
 `execute-prepared` against the transaction DB passed to each invocation.
-The server loads the benchmark's value
-transformation helper. Embedded RMW keeps its explicit local transaction.
+The server loads the benchmark's value transformation helper. Embedded KV
+updates and RMW use `update-kv` with compiled Clojure callbacks. Embedded Datalog
+RMW submits a compiled transaction function through `transact!`. These standalone
+calls allow concurrent requests to share commits while preserving atomic RMW and
+the selected durability profile.
 Results identify this choice with `:rmw-execution` in storage settings.
 SQL RMW continues to read the full row and compute the replacement on the
 client within a transaction; these results compare those application API paths.
@@ -286,8 +289,8 @@ fields of 100 bytes, excluding keys and database overhead.
 * **KV:** one `:id` key per record, equal to the nonnegative numeric record ID,
   with all field strings stored together as a vector encoded with `:data` in the
   `records` DBI. Point reads reuse a `prepare-get-value` created when each store
-  opens and call `execute-prepared` with the key. Embedded update and RMW reads
-  prepare against their transaction's handle. A field update reads the current
+  opens and call `execute-prepared` with the key. Updates and RMW use `update-kv`
+  in both modes. A field update reads the current
   vector, replaces that field, and writes the whole vector inside one write
   transaction, preserving concurrent changes to other fields. F uses the same
   transaction boundary and derives the replacement from the selected field's
@@ -301,8 +304,9 @@ fields of 100 bytes, excluding keys and database overhead.
   `:ycsb/field0` through `:ycsb/field9` by default. There is no separate
   `:ycsb/id` attribute or identity lookup. Point reads reuse a `prepare-pull`
   created when each store opens and call `execute-prepared` with the entity ID;
-  updates use `transact!`. Embedded RMW prepares against its transaction's DB
-  view. Scans use an EAV slice over the requested entity ID interval and assemble
+  updates use `transact!`. RMW submits a transaction function through `transact!`
+  and executes a reusable prepared pull against the supplied transaction DB.
+  Scans use an EAV slice over the requested entity ID interval and assemble
   each record's fields in benchmark order. Record counts use `count-datoms` on
   the mandatory first field. Reports identify the key with
   `:storage :record-key :db/id`. Datalog's field indexes and entity overhead

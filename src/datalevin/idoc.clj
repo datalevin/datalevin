@@ -926,6 +926,11 @@
                (.-range-cache old)
                (.-index-version old)))
 
+(defn ^:no-doc index-version
+  "Generation of the applied document index, shared by transaction wrappers."
+  ^long [^IdocIndex index]
+  (.get ^AtomicLong (.-index-version index)))
+
 (defn- invalidate-range-cache!
   [^IdocIndex index]
   (.incrementAndGet ^AtomicLong (.-index-version index))

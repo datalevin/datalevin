@@ -1,22 +1,30 @@
 (ns datalevin.strict-group-test
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [datalevin.binding.cpp :as cpp]
+            [datalevin.built-ins :as bi]
             [datalevin.client :as client]
             [datalevin.client-op :as cop]
+            [datalevin.conn :as conn]
             [datalevin.core :as d]
             [datalevin.constants :as c]
+            [datalevin.embedding :as emb]
             [datalevin.interpret :as inter]
             [datalevin.kv :as kv]
             [datalevin.kv.txlog :as kvtx]
+            [datalevin.lmdb :as l]
             [datalevin.server :as server]
+            [datalevin.storage :as s]
             [datalevin.test.core :refer [allocate-port db-fixture]]
             [datalevin.txlog :as wal]
             [datalevin.util :as u])
   (:import [datalevin.tx_group Group]
+           [datalevin.conn SyncQueuedResult]
            [datalevin.remote DatalogStore]
            [datalevin.storage Store]
            [java.io IOException]
-           [java.util.concurrent ConcurrentLinkedQueue]))
+           [java.util.concurrent ConcurrentLinkedQueue]
+           [java.util.concurrent.atomic AtomicLong]
+           [org.eclipse.collections.impl.list.mutable FastList]))
 
 (use-fixtures :each db-fixture)
 
@@ -25,6 +33,286 @@
            :flags (conj c/default-env-flags :writemap)})
 
 (def ^:dynamic *submitted-value* nil)
+
+(defn- local-datalog-batch! [db txs]
+  ;; Submit a complete group directly so visibility checks do not depend on
+  ;; whether the background worker happens to combine concurrent callers.
+  (let [results (mapv (fn [_] (promise)) txs)
+        requests (FastList.)
+        ^AtomicLong pending (#'conn/sync-queue-pending-counter db)]
+    (doseq [[idx tx result] (map vector (range) txs results)]
+      (.add requests (conn/->SyncQueuedReq tx {:request idx} result)))
+    (.addAndGet pending (count txs))
+    (#'conn/run-sync-queued-dl-batch! db requests)
+    (is (zero? (.get pending)))
+    (mapv (fn [result]
+            (let [^SyncQueuedResult result @result]
+              {:report (.-report result) :error (.-error result)}))
+          results)))
+
+(deftest local-datalog-group-observes-preceding-writes
+  (doseq [prepare? [false true]
+          cache-limit [0 16]]
+    (binding [c/*use-prepare-path* prepare?]
+      (let [path (u/tmp-dir (str "local-group-rmw-" (random-uuid)))
+            db (d/create-conn path {:counter {:db/valueType :db.type/long}}
+                              (assoc opts :cache-limit cache-limit))]
+        (try
+          (d/transact! db [{:db/id 1 :counter 0}])
+          (let [before (:last-committed-lsn (d/txlog-watermarks (d/datalog-kv db)))
+                observed (atom [])
+                increment (fn [tx-db]
+                            (let [value (:counter (d/pull tx-db [:counter] 1))]
+                              (swap! observed conj value)
+                              ;; Preparing a group must not mutate the overlays
+                              ;; of the DB published to concurrent readers.
+                              (is (empty? (:eavt @db)))
+                              (is (empty? (:avet @db)))
+                              (is (= 0 (deref (future (:counter (d/pull @db [:counter] 1)))
+                                               5000 ::timeout)))
+                              [[:db/add 1 :counter (inc value)]]))
+                results (local-datalog-batch!
+                          db (repeat 3 [[:db.fn/call increment]]))
+                reports (mapv :report results)
+                after (d/txlog-watermarks (d/datalog-kv db))]
+            (is (every? nil? (map :error results)))
+            (is (= [0 1 2] @observed))
+            (is (= 3 (:counter (d/pull @db [:counter] 1))))
+            (is (= [{:request 0} {:request 1} {:request 2}]
+                   (mapv :tx-meta reports)))
+            (is (apply < (map #(get-in % [:tempids :db/current-tx]) reports)))
+            (doseq [report reports]
+              (is (not (l/writing? (.-lmdb ^Store (:store (:db-before report))))))
+              (is (= 3 (:counter (d/pull (:db-before report) [:counter] 1))))
+              (is (identical? @db (:db-after report)))
+              (is (= 3 (:counter (d/pull (:db-after report) [:counter] 1)))))
+            (is (= (inc before) (:last-committed-lsn after)))
+            (is (= (:last-committed-lsn after) (:last-durable-lsn after))))
+          (finally (d/close db) (u/delete-files path)))))))
+
+(deftest local-datalog-group-resolves-new-entities-and-retractions
+  (let [path (u/tmp-dir (str "local-group-entities-" (random-uuid)))
+        schema {:key {:db/unique :db.unique/identity}
+                :counter {:db/valueType :db.type/long}}
+        db (d/create-conn path schema opts)]
+    (try
+      (let [results
+            (local-datalog-batch!
+              db [[[:db.fn/call
+                    (fn [_] [{:db/id -1 :key "one" :counter 0}])]]
+                  [[:db.fn/call
+                    (fn [tx-db]
+                      (is (= 0 (:counter (d/pull tx-db [:counter] [:key "one"]))))
+                      [[:db/add [:key "one"] :counter 1]
+                       {:db/id -1 :key "two" :counter 10}])]]
+                  [[:db.fn/call
+                    (fn [tx-db]
+                      (is (= 1 (:counter (d/pull tx-db [:counter] [:key "one"]))))
+                      (is (= 10 (:counter (d/pull tx-db [:counter] [:key "two"]))))
+                      [[:db/retractEntity [:key "one"]]
+                       [:db/add [:key "two"] :counter 11]])]]])
+            reports (mapv :report results)]
+        (is (every? nil? (map :error results)))
+        (is (< (get-in reports [0 :tempids -1]) (get-in reports [1 :tempids -1])))
+        (is (= #{["two" 11]}
+               (d/q '[:find ?key ?n :where [?e :key ?key] [?e :counter ?n]] @db))))
+      (d/close db)
+      (let [reopened (d/create-conn path)]
+        (try
+          (is (nil? (d/pull @reopened [:counter] [:key "one"])))
+          (is (= 11 (:counter (d/pull @reopened [:counter] [:key "two"]))))
+          (finally (d/close reopened))))
+      (finally (d/close db) (u/delete-files path)))))
+
+(deftest local-datalog-group-rolls-back-on-function-error
+  (let [path (u/tmp-dir (str "local-group-abort-" (random-uuid)))
+        db (d/create-conn path {:counter {:db/valueType :db.type/long}} opts)]
+    (try
+      (d/transact! db [{:db/id 1 :counter 0}])
+      (let [before (:last-committed-lsn (d/txlog-watermarks (d/datalog-kv db)))
+            failure (ex-info "failed transaction function" {})
+            results (local-datalog-batch!
+                      db [[[:db/add 1 :counter 1]]
+                          [[:db.fn/call (fn [_] (throw failure))]]])]
+        (is (every? #(some? (:error %)) results))
+        (is (every? #(nil? (:report %)) results))
+        (is (= 0 (:counter (d/pull @db [:counter] 1))))
+        (is (= before (:last-committed-lsn (d/txlog-watermarks (d/datalog-kv db)))))
+        (d/transact! db [[:db/add 1 :counter 2]])
+        (is (= 2 (:counter (d/pull @db [:counter] 1)))))
+      (finally (d/close db) (u/delete-files path)))))
+
+(deftest local-datalog-secondary-engines-retain-individual-transactions
+  (let [path (u/tmp-dir (str "local-group-secondary-" (random-uuid)))
+        schema {:text {:db/valueType :db.type/string :db/fulltext true}
+                :doc {:db/valueType :db.type/idoc :db/domain "docs"}}
+        db (d/create-conn path schema opts)
+        matches #(into #{} (map first) (bi/fulltext @db % nil))
+        idoc-q '[:find [?e ...] :in $ ?query
+                 :where [(idoc-match $ :doc ?query nil) [[?e _]]]]]
+    (try
+      (d/transact! db [{:db/id 1 :text "red fox" :doc {:counter 0}}])
+      (is (= #{1} (matches "red")))
+      (let [before (:last-committed-lsn (d/txlog-watermarks (d/datalog-kv db)))
+            results
+            (local-datalog-batch!
+              db [[[:db/add 1 :text "blue bird"] [:db/add 1 :doc {:counter 1}]]
+                  [[:db.fn/call (fn [_] (throw (ex-info "abort" {})))]]
+                  [[:db.fn/call
+                    (fn [tx-db]
+                      (is (= {:text "blue bird" :doc {:counter 1}}
+                             (d/pull tx-db [:text :doc] 1)))
+                      [[:db/add 1 :text "green frog"]
+                       [:db/add 1 :doc {:counter 2}]])]]])]
+        (is (= [false true false] (mapv #(some? (:error %)) results)))
+        (is (= [true false true] (mapv #(some? (:report %)) results)))
+        (is (= (+ before 2)
+               (:last-committed-lsn (d/txlog-watermarks (d/datalog-kv db)))))
+        (is (= #{1} (matches "green")))
+        (is (empty? (matches "red")))
+        (is (empty? (matches "blue")))
+        (is (= [1] (d/q idoc-q @db {:counter 2})))
+        (is (empty? (d/q idoc-q @db {:counter 0})))
+        (is (empty? (d/q idoc-q @db {:counter 1}))))
+      (finally (d/close db) (u/delete-files path)))))
+
+(defn- group-embedding-provider []
+  (reify emb/IEmbeddingProvider
+    (embedding [_ items _] (mapv (fn [_] (float-array [1.0 0.0])) items))
+    (embedding-metadata [_]
+      {:embedding/provider {:kind :test :id :strict-group}
+       :embedding/output {:dimensions 2}})
+    (embedding-dimensions [_] 2)
+    (close-provider [_] nil)))
+
+(deftest local-datalog-async-secondary-engines-share-atomic-commits
+  (doseq [kind [:fulltext :vector :embedding :idoc]
+          named? [false true]]
+    (testing (str kind ", domain options " named?)
+      (let [path (u/tmp-dir (str "local-group-async-" (random-uuid)))
+            domain (if (or (= kind :vector) (and (= kind :idoc) (not named?)))
+                     "value" (if named? "docs" c/default-domain))
+            domain-opts (cond-> {:indexing-mode :async}
+                          (#{:vector :embedding} kind) (assoc :dimensions 2))
+            value-schema
+            (case kind
+              :fulltext (cond-> {:db/valueType :db.type/string :db/fulltext true}
+                          named? (assoc :db.fulltext/domains [domain]))
+              :vector {:db/valueType :db.type/vec}
+              :embedding (cond-> {:db/valueType :db.type/string :db/embedding true}
+                           named? (assoc :db.embedding/domains [domain]))
+              :idoc (cond-> {:db/valueType :db.type/idoc}
+                      named? (assoc :db/domain domain)))
+            option-key (case [kind named?]
+                         [:fulltext false] :search-opts
+                         [:fulltext true] :search-domains
+                         [:vector false] :vector-opts
+                         [:vector true] :vector-domains
+                         [:embedding false] :embedding-opts
+                         [:embedding true] :embedding-domains
+                         [:idoc false] :idoc-opts
+                         [:idoc true] :idoc-domains)
+            store-opts (cond-> (assoc opts option-key
+                                     (if named? {domain domain-opts} domain-opts))
+                         (= kind :embedding)
+                         (assoc :embedding-providers {:default (group-embedding-provider)}))
+            db (d/create-conn path {:counter {:db/valueType :db.type/long}
+                                    :value value-schema} store-opts)
+            increment (fn [tx-db]
+                        (let [n (inc (:counter (d/pull tx-db [:counter] 1)))
+                              value (case kind
+                                      :idoc {:counter n}
+                                      :vector (float-array [n 1.0])
+                                      (nth ["red fox" "blue bird" "green frog" "amber fish"]
+                                           (dec n)))]
+                          [[:db/add 1 :counter n] [:db/add 1 :value value]]))]
+        (try
+          (d/transact! db [{:db/id 1 :counter 0}])
+          ;; Block job claiming while counting source commits and inspecting
+          ;; queued jobs. The normal worker runs after this lock is released.
+          (locking (.-write-txn ^Store (:store @db))
+            (let [before (:last-committed-lsn (d/txlog-watermarks (d/datalog-kv db)))
+                  results (local-datalog-batch! db (repeat 3 [[:db.fn/call increment]]))
+                  after (d/txlog-watermarks (d/datalog-kv db))
+                  jobs (s/secondary-index-jobs (:store @db))]
+              (is (every? nil? (map :error results)))
+              (is (= 3 (:counter (d/pull @db [:counter] 1))))
+              (is (= (inc before) (:last-committed-lsn after)))
+              (is (= (:last-committed-lsn after) (:last-durable-lsn after)))
+              (is (= (if (= kind :idoc) 3 5) (count jobs)))
+              (is (= #{kind} (set (map :job/type jobs))))
+              (is (= #{:pending} (set (map :job/status jobs))))
+              (is (= 3 (count (set (map :job/tx jobs)))))
+              (let [failed (local-datalog-batch!
+                             db [[[:db.fn/call increment]]
+                                 [[:db.fn/call (fn [_] (throw (ex-info "abort" {})))]]])]
+                (is (every? #(some? (:error %)) failed))
+                (is (= 3 (:counter (d/pull @db [:counter] 1))))
+                (is (= (:last-committed-lsn after)
+                       (:last-committed-lsn (d/txlog-watermarks (d/datalog-kv db)))))
+                (is (= (mapv :job/id jobs)
+                       (mapv :job/id (s/secondary-index-jobs (:store @db))))))))
+          (is (:caught-up? (d/wait-for-secondary-index db {:timeout-ms 5000 :poll-ms 10})))
+          (let [rows (case kind
+                       :fulltext (bi/fulltext @db "green" {:domains [domain]})
+                       :vector (bi/vec-neighbors @db :value (float-array [3.0 1.0]) {:top 10})
+                       :embedding (bi/embedding-neighbors @db "green frog"
+                                                          {:domains [domain] :top 10})
+                       :idoc (bi/idoc-match @db :value {:counter 3} nil))]
+            (is (= [[1 :value]] (mapv #(vec (take 2 %)) rows))))
+          (finally (d/close db) (u/delete-files path)))))))
+
+(deftest local-datalog-async-idoc-patches-share-commit
+  (let [path (u/tmp-dir (str "local-group-async-patch-" (random-uuid)))
+        db (d/create-conn path {:doc {:db/valueType :db.type/idoc}}
+                          (assoc opts :idoc-opts {:indexing-mode :async}))]
+    (try
+      (d/transact! db [{:db/id 1 :doc {:n 0}}])
+      (is (:caught-up? (d/wait-for-secondary-index db {:timeout-ms 5000})))
+      (locking (.-write-txn ^Store (:store @db))
+        (let [before (:last-committed-lsn (d/txlog-watermarks (d/datalog-kv db)))
+              results (local-datalog-batch!
+                        db (repeat 3 [[:db.fn/patchIdoc 1 :doc
+                                       [[:update [:n] :inc]]]]))]
+          (is (every? nil? (map :error results)))
+          (is (= {:n 3} (:doc (d/pull @db [:doc] 1))))
+          (is (= (inc before)
+                 (:last-committed-lsn (d/txlog-watermarks (d/datalog-kv db)))))
+          (is (= [[1 :doc {:n 0}]] (mapv vec (bi/idoc-match @db :doc {:n 0} nil))))))
+      (is (:caught-up? (d/wait-for-secondary-index db {:timeout-ms 5000})))
+      (is (= [[1 :doc {:n 3}]] (mapv vec (bi/idoc-match @db :doc {:n 3} nil))))
+      (is (empty? (bi/idoc-match @db :doc {:n 0} nil)))
+      (finally (d/close db) (u/delete-files path)))))
+
+(deftest local-datalog-mixed-indexing-modes-retain-individual-commits
+  (doseq [[value-schema domain-opts]
+          [[{:db/valueType :db.type/string :db/fulltext true :db.fulltext/autoDomain true}
+            {:search-opts {:indexing-mode :async}}]
+           [{:db/valueType :db.type/string :db/fulltext true
+             :db.fulltext/domains ["async" "sync"]}
+            {:search-domains {"async" {:indexing-mode :async} "sync" {}}}]
+           [{:db/valueType :db.type/vec}
+            {:vector-opts {:dimensions 2 :indexing-mode :async}
+             :vector-domains {"value" {:dimensions 2 :indexing-mode :sync}}}]
+           [{:db/valueType :db.type/idoc :db/domain "docs"}
+            {:idoc-opts {:indexing-mode :async}
+             :idoc-domains {"docs" {:indexing-mode :sync}}}]]]
+    (let [path (u/tmp-dir (str "local-group-mixed-" (random-uuid)))
+          db (d/create-conn path {:counter {:db/valueType :db.type/long}
+                                  :value value-schema} (merge opts domain-opts))]
+      (try
+        (d/transact! db [{:db/id 1 :counter 0}])
+        (let [before (:last-committed-lsn (d/txlog-watermarks (d/datalog-kv db)))
+              results (local-datalog-batch!
+                        db (repeat 2 [[:db.fn/call
+                                       (fn [tx-db]
+                                         [[:db/add 1 :counter
+                                           (inc (:counter (d/pull tx-db [:counter] 1)))]])]]))]
+          (is (every? nil? (map :error results)))
+          (is (= 2 (:counter (d/pull @db [:counter] 1))))
+          (is (= (+ before 2)
+                 (:last-committed-lsn (d/txlog-watermarks (d/datalog-kv db))))))
+        (finally (d/close db) (u/delete-files path))))))
 
 (defn- await! [pred]
   (let [deadline (+ (System/nanoTime) 10000000000)]

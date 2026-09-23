@@ -1,8 +1,25 @@
 (ns ycsb-bench.workload
   "Logical records and seeded YCSB-style request generators."
+  (:require [datalevin.core :as d])
   (:import [java.util Random]))
 
 (set! *warn-on-reflection* true)
+
+;; Reusable RMW preparation, keyed by store and attribute set. The reader is
+;; created on first use and executed against the current transaction view, so
+;; preparation is not repeated for every operation. This namespace is loaded by
+;; the owned server, so the stored remote RMW function shares the cache.
+(def ^:private rmw-readers (atom {}))
+
+(defn rmw-reader
+  "Return a prepared pull for the store behind `db` and `attributes`,
+  creating and caching it on first use."
+  [db attributes]
+  (let [k [(:store db) attributes]]
+    (or (get @rmw-readers k)
+        (let [reader (d/prepare-pull db attributes)]
+          (swap! rmw-readers assoc k reader)
+          reader))))
 
 (def workloads
   {:a {:mix [[:read 50] [:update 50]] :distribution :zipfian}

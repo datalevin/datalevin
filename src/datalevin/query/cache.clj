@@ -18,7 +18,8 @@
    [datalevin.parser :as dp]
    [datalevin.pull-api :as pull]
    [datalevin.query.execute :as qexec]
-   [datalevin.query.resolve :as qresolve])
+   [datalevin.query.resolve :as qresolve]
+   [datalevin.storage :as s])
   (:import
    [datalevin.db DB]
    [datalevin.parser Aggregate BindScalar Constant Function Pattern Predicate
@@ -209,7 +210,8 @@
       [:db-input
        (db-name store)
        (dir store)
-       (store-write-context-token store)])
+       (store-write-context-token store)
+       (when (instance? Store store) (s/async-idoc-cache-token store))])
     input))
 
 (deftype ^:no-doc CacheAnalysis [nested? deps udf? qualified? pull-deps])
