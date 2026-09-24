@@ -835,20 +835,44 @@
 
 (defn- top-k-pushdown-query
   [parsed-q inputs plan]
-  (let [find-vars (dp/find-vars (:qfind parsed-q))
+  (let [find-elements (dp/find-elements (:qfind parsed-q))
+        deferred-pull? (some dp/pull? find-elements)
+        ;; Select distinct entity/value tuples before pulling. Deduplicating
+        ;; pulled maps here would collapse different entities with equal data.
+        candidate-find (when deferred-pull?
+                         (dp/->FindRel
+                           (mapv #(if (dp/pull? %) (:variable %) %)
+                                 find-elements)))
+        candidate-query (if deferred-pull?
+                          (assoc parsed-q :qfind candidate-find
+                                 :qorig-find (vec (dp/find-vars candidate-find)))
+                          parsed-q)
+        plan (cond-> plan
+               deferred-pull?
+               (update :residual-query assoc
+                       :qfind candidate-find
+                       :qorig-find (:qorig-find candidate-query)))
+        pull-context (when deferred-pull?
+                       (qresolve/resolve-ins
+                         (qplan/make-context parsed-q false) inputs))
+        find-vars (dp/find-vars (:qfind parsed-q))
         demand    (:demand plan)
         order     (:ordering demand)
         limit     (:limit demand)
         offset    (:offset demand)
         path      (:path (:source plan))]
     (pushdown-query
-      parsed-q inputs plan
+      candidate-query inputs plan
       {:scanned-by    :tuples
        :done?         (fn [rows frontier window-end]
                         (past-top-k-boundary?
                           path demand find-vars order rows frontier window-end))
        :finish        (fn [rows]
-                        (order-result find-vars rows order limit offset))
+                        (let [selected (order-result find-vars rows order
+                                                     limit offset)]
+                          (if deferred-pull?
+                            (vec (pull find-elements pull-context selected))
+                            selected)))
        :retry-empty?  false
        :empty-window? false})))
 

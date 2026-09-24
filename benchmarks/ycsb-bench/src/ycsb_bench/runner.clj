@@ -1,6 +1,7 @@
 (ns ycsb-bench.runner
   "Closed-loop concurrent execution, latency measurements and validation."
   (:require [ycsb-bench.store :as store]
+            [ycsb-bench.audit :as audit]
             [ycsb-bench.server :as server]
             [ycsb-bench.sql :as sql]
             [ycsb-bench.workload :as w])
@@ -15,10 +16,10 @@
   (merge server/defaults
          {:system :datalevin :api :all :mode :all :workload :a :records 10000 :ops 10000 :warmup 1000
           :threads 1 :pool-size nil :seed 17 :field-count 10 :field-length 100
-          :scan-length 100 :batch-size 100 :distribution nil :durability :strict
+          :scan-length 100 :batch-size 100 :distribution nil :zipfian-keyspace nil :durability :strict
           :timeout-ms 60000 :phase-timeout-ms 600000 :keep-db? false
           :datalog-handles :shared :sql-indexes :matched :client-counts nil :repetitions 1
-          :warmup-ms nil :measurement-ms nil}))
+          :warmup-ms nil :measurement-ms nil :value-audit? false}))
 
 (defn options
   "Normalize and validate options before allocating resources."
@@ -64,8 +65,13 @@
       (throw (ex-info "Independent Datalog handles require one connection per worker: pool-size must equal threads" {})))
     (when-not (and (integer? (:seed opts)) (<= Long/MIN_VALUE (:seed opts) Long/MAX_VALUE))
       (throw (ex-info "seed must be a 64-bit integer" {})))
-    (when (> (+ (:records opts) (:ops opts) (:warmup opts)) Integer/MAX_VALUE)
-      (throw (ex-info "records + ops + warmup must fit a 32-bit integer" {})))
+    (when-not (boolean? (:value-audit? opts))
+      (throw (ex-info "value-audit? must be boolean" {})))
+    (when (> (+ (:records opts) (max (:ops opts) (:warmup opts))) Integer/MAX_VALUE)
+      (throw (ex-info "records + the larger phase operation count must fit a 32-bit integer" {})))
+    (when-let [n (:zipfian-keyspace opts)]
+      (when-not (and (integer? n) (<= (:records opts) n Integer/MAX_VALUE))
+        (throw (ex-info "zipfian-keyspace must be at least records and fit a 32-bit integer" {}))))
     opts))
 
 (defn cases
@@ -101,9 +107,12 @@
                         (if (odd? trial) selected (reverse selected))))
                  (range 1 (inc (long (:repetitions opts))))))))
 
-(defn- ascii-field? [value ^long field-length]
+(defn- field-shape? [value ^long field-length]
   (and (string? value)
-       (= (.length ^String value) field-length)
+       (= (.length ^String value) field-length)))
+
+(defn- ascii-field? [value ^long field-length]
+  (and (field-shape? value field-length)
        (loop [i 0]
          (if (= i field-length)
            true
@@ -111,32 +120,72 @@
                 (recur (inc i)))))))
 
 (defn validate-record!
-  "Validate field count and fixed ASCII byte lengths."
+  "Validate field count and fixed ASCII byte lengths outside measured phases."
   [values {:keys [field-count field-length]}]
   (when-not (and (= (count values) field-count)
                  (every? #(ascii-field? % field-length) values))
     (throw (ex-info "Missing or malformed record" {:field-count (count values)}))))
+
+(defn- validate-record-shape!
+  "Check materialized fields without walking their characters in timed reads."
+  [values {:keys [field-count field-length]}]
+  (when-not (and (= (count values) field-count)
+                 (every? #(field-shape? % field-length) values))
+    (throw (ex-info "Missing or malformed record" {:field-count (count values)}))))
+
+(defn- validate-key-page!
+  "Timed checks for a page starting at an existing key. Exact membership is
+  checked against sorted generated keys after writers have stopped."
+  [rows start n opts]
+  (let [keys (mapv first rows)]
+    (when-not (and (<= 1 (count rows) n)
+                   (= start (first keys))
+                   (every? string? keys)
+                   (every? neg? (map compare keys (next keys))))
+      (throw (ex-info "Incorrect application-key page"
+                      {:start start :limit n :keys keys})))
+    (doseq [[_ values] rows] (validate-record-shape! values opts))))
+
+(defn- record-key [opts ordinal]
+  (if (= :e (:workload opts))
+    (w/application-key ordinal)
+    (let [key (w/fnvhash64 ordinal)]
+      (when (neg? key)
+        (throw (ex-info "Generated record key is not a nonnegative entity ID" {:key key})))
+      key)))
 
 (defn- execute!
   [db space ^Random rng cdf {:keys [field-count field-length scan-length
                                    distribution] :as opts} operation]
   (if (= operation :insert)
     (let [id (w/reserve-key! space)]
-      (store/put-records! db [[id (w/record-values rng opts)]])
+      (store/put-records! db [[(record-key opts id) (w/record-values rng opts)]])
       (w/acknowledge-key! space id))
     (let [visible (:visible @space)
           cdf     (if (instance? clojure.lang.IAtom cdf) (w/grow-cdf! cdf visible) cdf)
-          id      (w/choose-key rng distribution cdf visible)]
+          ordinal (w/choose-key rng distribution cdf visible)
+          id      (record-key opts ordinal)]
       (case operation
-        :read (validate-record! (store/read-record db id) opts)
+        :read (validate-record-shape! (store/read-record db id) opts)
         :update (store/update-field! db id (.nextInt rng field-count)
                                       (w/random-value rng field-length))
-        :rmw (store/modify-field! db id (.nextInt rng field-count))
-        :scan (let [n (min (inc (.nextInt rng scan-length)) (- (long visible) id))
-                    rows (store/scan-records db id n)]
-                (when-not (= (mapv first rows) (vec (range id (+ id n))))
-                  (throw (ex-info "Scan returned incorrect IDs" {:start id :count n})))
-                (doseq [[_ values] rows] (validate-record! values opts)))))))
+        :rmw (let [field (.nextInt rng field-count)
+                   value (w/random-value rng field-length)]
+               ;; CoreWorkload generates an independent replacement, then calls
+               ;; read and update separately. There is no encompassing transaction.
+               (validate-record-shape! (store/read-record db id) opts)
+               (store/update-field! db id field value))
+        :scan (if (= :e (:workload opts))
+                (let [n (inc (.nextInt rng scan-length))
+                      rows (store/scan-records db id n)]
+                  ;; Inserts can appear anywhere in string-key order, including
+                  ;; between two records that were visible at request generation.
+                  (validate-key-page! rows id n opts))
+                (let [n (min (inc (.nextInt rng scan-length)) (- (long visible) ordinal))
+                      rows (store/scan-records db id n)]
+                  (when-not (= (mapv first rows) (vec (range id (+ id n))))
+                    (throw (ex-info "Scan returned incorrect IDs" {:start id :count n})))
+                  (doseq [[_ values] rows] (validate-record-shape! values opts))))))))
 
 (defn latency-summary!
   "Exact nearest-rank percentiles in microseconds; sorts the supplied array in place."
@@ -301,26 +350,98 @@
 (defn- load! [db {:keys [records batch-size seed] :as opts}]
   (let [t0 (System/nanoTime)]
     (doseq [ids (partition-all batch-size (range records))]
-      (store/put-records! db (mapv (fn [id] [id (w/initial-values seed id opts)]) ids)))
+      (store/put-records! db (mapv (fn [id] [(record-key opts id) (w/initial-values seed id opts)]) ids)))
     (let [elapsed (- (System/nanoTime) t0)]
       {:records records :seconds (/ elapsed 1e9)
        :records-per-second (/ (* (double records) 1e9) elapsed)})))
 
-(defn- validate-database! [db expected opts]
-  (let [actual (store/record-count db)]
-    (when-not (= actual expected)
-      (throw (ex-info "Incorrect final record count" {:expected expected :actual actual})))
-    (doseq [start (range 0 expected 1000)]
-      (let [n (min 1000 (- (long expected) (long start)))
-            rows (store/scan-records db start n)]
-        (when-not (= (mapv first rows) (vec (range start (+ start n))))
-          (throw (ex-info "Missing or unordered records" {:start start :count n})))
-        (doseq [[_ values] rows] (validate-record! values opts))))
-    {:status :passed :records actual :all-records-checked? true}))
+(defn- validate-database!
+  ([db expected opts] (validate-database! db expected opts nil))
+  ([db expected opts value-index]
+   (let [actual (store/record-count db)
+         check! (fn [id values]
+                  (validate-record! values opts)
+                  (when value-index
+                    (audit/check-values! value-index id values Long/MAX_VALUE Long/MAX_VALUE)))]
+     (when-not (= actual expected)
+       (throw (ex-info "Incorrect final record count" {:expected expected :actual actual})))
+     (if (= :e (:workload opts))
+       (doseq [keys (partition-all (:scan-length opts)
+                                   (sort (map w/application-key (range expected))))]
+         (let [rows (store/scan-records db (first keys) (count keys))]
+           (when-not (= (vec keys) (mapv first rows))
+             (throw (ex-info "Missing or unordered application keys"
+                             {:expected (vec keys) :actual (mapv first rows)})))
+           (doseq [[id values] rows] (check! id values))))
+       ;; A/B/C/D/F validate their known hashed keys; no dense numeric interval
+       ;; represents that set. This work runs after the measurement has ended.
+       (doseq [ordinal (range expected)]
+         (let [id (record-key opts ordinal)]
+           (check! id (store/read-record db id)))))
+     {:status :passed :records actual :all-records-checked? true
+      :scope (if value-index :structure-and-observed-values :structure)
+      :value-checks (if value-index :passed :not-performed)
+      :character-checks :post-measurement})))
+
+(defn- phase-duration [opts phase]
+  (get opts (if (= phase :warmup) :warmup-ms :measurement-ms)))
+
+(defn- request-state [opts phase n]
+  (case (:distribution opts)
+    :uniform nil
+    :zipfian (:zipfian-keyspace opts)
+    :latest (let [table (w/zipf-cdf (+ (:records opts) n))]
+              (if (some? (phase-duration opts phase)) (atom table) table))))
+
+(defn- predicted-keyspace [opts n]
+  (let [insert-percent (get (into {} (get-in w/workloads [(:workload opts) :mix])) :insert 0)]
+    ;; Each phase has its own dataset. Only that phase's inserts need headroom.
+    (inc (+ (:records opts) (quot (* n insert-percent 2) 100)))))
+
+(defn- run-dataset!
+  "Load and execute one phase on a fresh store, with its own sampler and audit."
+  [db opts phase n]
+  (let [load-result (load! db opts)
+        starting-records (store/record-count db)
+        _ (when-not (= (:records opts) starting-records)
+            (throw (ex-info "Incorrect starting record count"
+                            {:phase phase :expected (:records opts) :actual starting-records})))
+        space (w/keyspace (:records opts))
+        cdf (request-state opts phase n)
+        history (when (:value-audit? opts) (audit/history))
+        phase-db (if history (audit/->AuditedRecords db history) db)
+        result (run-phase! phase-db space cdf opts phase n)
+        expected (+ (:records opts) (get-in result [:by-operation :insert :count] 0))
+        events (when history (audit/events history))
+        value-index (when history (audit/prepare events opts #(record-key opts %)))
+        value-checks (when history
+                       (audit/check-observations! value-index events #(validate-record! % opts)))]
+    (when-not (= expected (:visible @space) (:next @space))
+      (throw (ex-info "Unacknowledged insert IDs" {:phase phase :keyspace @space})))
+    {:storage (store/storage-info db)
+     :load load-result
+     :result (cond-> (assoc result :starting-records starting-records)
+               (= :zipfian (:distribution opts)) (assoc :zipfian-keyspace (:zipfian-keyspace opts)))
+     :validation (cond-> (validate-database! db expected opts value-index)
+                   history (assoc :value-checks (assoc value-checks :final-records expected)))}))
 
 (defn run-case! [provided]
   (let [opts (options provided)
+        opts (cond-> opts
+               (= :e (:workload opts)) (assoc :workload-model :application-key-range-v1)
+               (= :f (:workload opts)) (assoc :workload-model :ycsb-read-update-v1
+                                             :rmw-execution :client-read-update
+                                             :atomic-rmw? false))
         opts (update opts :distribution #(or % (get-in w/workloads [(:workload opts) :distribution])))
+        opts (assoc opts :key-generator :ycsb-fnv64 :insert-order :hashed
+                         :warmup-isolation :separate-database
+                         :request-generator (if (= :zipfian (:distribution opts))
+                                              :ycsb-scrambled-zipfian :committed-prefix))
+        opts (if (= :zipfian (:distribution opts))
+               (assoc opts :zipfian-keyspace
+                      (or (:zipfian-keyspace opts)
+                          (predicted-keyspace opts (:ops opts))))
+               (dissoc opts :zipfian-keyspace))
         _ (when (some #{:all} ((juxt :system :api :mode :workload) opts))
             (throw (ex-info "run-case! requires a single system, API, mode and workload" {})))
         _ (when (and (= :datalevin (:system opts)) (= :datalog (:api opts))
@@ -330,26 +451,25 @@
                (dissoc opts :sql-indexes)
                (assoc opts :sql-indexes (sql/index-mode opts)))
         _ (cases opts)
-        capacity (+ (:records opts) (:warmup opts) (:ops opts))
-        cdf (when-not (= :uniform (:distribution opts))
-              (let [table (w/zipf-cdf capacity)]
-                (if (or (:warmup-ms opts) (:measurement-ms opts)) (atom table) table)))]
-    ((if (= :datalevin (:system opts)) store/with-store sql/with-store)
+        warmup-opts (cond-> opts
+                      (= :zipfian (:distribution opts))
+                      (assoc :zipfian-keyspace (or (:zipfian-keyspace provided)
+                                                  (predicted-keyspace opts (:warmup opts)))))
+        warmup? (pos? (long (or (phase-duration opts :warmup) (:warmup opts))))]
+    ((if (= :datalevin (:system opts)) store/with-stores sql/with-stores)
       opts
-      (fn [db]
-        (let [load-result (load! db opts)
-              space (w/keyspace (:records opts))
-              warmup (run-phase! db space cdf opts :warmup (:warmup opts))
-              measured (run-phase! db space cdf opts :measured (:ops opts))
-              expected (+ (:records opts)
-                          (get-in warmup [:by-operation :insert :count] 0)
-                          (get-in measured [:by-operation :insert :count] 0))]
-          (when-not (= expected (:visible @space) (:next @space))
-            (throw (ex-info "Unacknowledged insert IDs" {:keyspace @space})))
-          {:configuration (cond-> (dissoc opts :pg-url :pg-user :client-counts :repetitions)
-                            (not (and (= :datalevin (:system opts))
-                                      (= :datalog (:api opts)) (= :remote (:mode opts))))
-                            (dissoc :datalog-handles))
-           :storage (store/storage-info db)
-           :load load-result :warmup warmup :measured measured
-           :validation (validate-database! db expected opts)})))))
+      (fn [with-fresh-store]
+        (let [warmup (when warmup?
+                       (with-fresh-store #(run-dataset! % warmup-opts :warmup (:warmup opts))))
+              measured (with-fresh-store #(run-dataset! % opts :measured (:ops opts)))]
+          (-> measured
+              (dissoc :result)
+              (assoc :configuration
+                     (cond-> (dissoc opts :pg-url :pg-user :client-counts :repetitions)
+                       (not (and (= :datalevin (:system opts))
+                                 (= :datalog (:api opts)) (= :remote (:mode opts))))
+                       (dissoc :datalog-handles))
+                     :warmup (if warmup
+                               (merge (:result warmup) (dissoc warmup :result))
+                               (assoc (summarize (long-array 0) (byte-array 0) 0) :skipped? true))
+                     :measured (:result measured))))))))

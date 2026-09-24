@@ -784,6 +784,22 @@ Only usable for debug output.
        (->> (index-range db :age 18 60) (map :e))"}
   index-range db/-index-range)
 
+(def ^{:arglists '([db start end])
+       :doc "Return existing entity IDs in ascending order from `start` (inclusive)
+  to `end` (exclusive). Bounds are nonnegative 64-bit integers; an empty or
+  reversed interval returns []. Missing IDs are skipped. Scans EAV keys without
+  reading attribute values or constructing datoms.
+
+  Also available as `entity-range` inside Datalog queries:
+
+      [:find ?e ?name :in $ ?start ?end
+       :where [(entity-range $ ?start ?end) [?e ...]]
+              [?e :name ?name]
+       :order-by ?e]
+
+  Local and remote DBs, including transaction views, are supported."}
+  entity-range db/entity-range)
+
 
 ;; Conn
 (def ^{:arglists '([conn])

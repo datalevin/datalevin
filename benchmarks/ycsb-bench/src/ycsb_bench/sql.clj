@@ -2,8 +2,7 @@
   "Prepared JDBC operations for the SQLite and PostgreSQL comparisons."
   (:require [clojure.string :as str]
             [datalevin.util :as u]
-            [ycsb-bench.store :as store]
-            [ycsb-bench.workload :as w])
+            [ycsb-bench.store :as store])
   (:import [java.nio.file Files]
            [java.nio.file.attribute FileAttribute]
            [java.sql Connection DriverManager PreparedStatement ResultSet Statement]
@@ -92,12 +91,16 @@
   (let [opts (assoc opts :system :postgres)]
     (with-open [conn (connect (postgres-url opts) opts)] (configure! conn opts))))
 
-(defn- transaction! [^Connection conn f]
-  ;; Xerial starts BEGIN IMMEDIATE here, acquiring the writer slot before
-  ;; a read. PostgreSQL locks the selected row with SELECT ... FOR UPDATE.
+(defn- transaction! [^Connection conn system f]
+  ;; Explicit transactions are used for insert batches. F's read and update
+  ;; each complete in autocommit, without using this wrapper.
   (.setAutoCommit conn false)
   (try
-    (let [result (f)] (.commit conn) result)
+    (let [result (f)]
+      ;; Xerial's commit() immediately starts another BEGIN IMMEDIATE.
+      ;; Enabling auto-commit commits without reacquiring the writer slot.
+      (if (= system :sqlite) (.setAutoCommit conn true) (.commit conn))
+      result)
     (catch Throwable t
       (try
         (.rollback conn)
@@ -118,7 +121,7 @@
                (vreset! failure t)))))
     (when-let [t @failure] (throw t))))
 
-(defn- prepare-session [^Connection conn table fields timeout-ms system]
+(defn- prepare-session [^Connection conn table fields timeout-ms]
   (let [columns (str/join "," (map #(str "f" %) (range fields)))
         select (str "SELECT " columns " FROM " table " WHERE id=?")
         prepare (fn [^String sql]
@@ -129,7 +132,6 @@
     ;; an exception during construction. The owner registers it first.
     {:connection conn
      :read (prepare select)
-     :read-for-update (prepare (str select (when (= system :postgres) " FOR UPDATE")))
      :scan (prepare (str "SELECT id," columns " FROM " table
                          " WHERE id>=? AND id<? ORDER BY id"))
      :count (prepare (str "SELECT count(*) FROM " table))
@@ -140,6 +142,20 @@
 
 (defn- row-values [^ResultSet rs fields offset]
   (mapv #(.getString rs (int (+ (long offset) (long %)))) (range fields)))
+
+(defn- prepare-application-key-session [^Connection conn table fields timeout-ms]
+  (let [columns (str/join "," (map #(str "f" %) (range fields)))
+        prepare (fn [^String sql]
+                  (doto (.prepareStatement conn sql)
+                    (.setQueryTimeout (int (max 1 (quot (+ (long timeout-ms) 999) 1000))))))]
+    {:connection conn
+     :read (prepare (str "SELECT " columns " FROM " table
+                         " WHERE record_key=?"))
+     :scan (prepare (str "SELECT record_key," columns " FROM " table
+                         " WHERE record_key>=? ORDER BY record_key LIMIT ?"))
+     :count (prepare (str "SELECT count(*) FROM " table))
+     :insert (prepare (str "INSERT INTO " table " (record_key," columns ") VALUES ("
+                           (str/join "," (repeat (inc (long fields)) "?")) ")"))}))
 
 (defn- read-row [^PreparedStatement stmt id fields]
   (.setLong stmt 1 (long id))
@@ -183,30 +199,29 @@
     (with-session
       pool timeout-ms
       (fn [{:keys [connection insert]}]
-        (let [^PreparedStatement stmt insert]
-          (try
-            (transaction!
-              connection
-              (fn []
-                (doseq [[id values] records]
-                  (.setLong stmt 1 (long id))
-                  (doseq [[field value] (map-indexed vector values)]
-                    (.setString stmt (+ 2 (long field)) value))
-                  (.addBatch stmt))
-                (doseq [n (.executeBatch stmt)]
-                  (when-not (or (= n 1) (= n Statement/SUCCESS_NO_INFO))
-                    (throw (ex-info "SQL insert batch failed" {:update-count n}))))))
-            (finally (.clearBatch stmt)))))))
+        (let [^PreparedStatement stmt insert
+              bind! (fn [[id values]]
+                      (.setLong stmt 1 (long id))
+                      (doseq [[field value] (map-indexed vector values)]
+                        (.setString stmt (+ 2 (long field)) value)))]
+          (if (= 1 (count records))
+            (do
+              (bind! (first records))
+              (when-not (= 1 (.executeUpdate stmt))
+                (throw (ex-info "SQL insert failed" {}))))
+            (try
+              (transaction!
+                connection (:engine info)
+                (fn []
+                  (doseq [record records] (bind! record) (.addBatch stmt))
+                  (doseq [n (.executeBatch stmt)]
+                    (when-not (or (= n 1) (= n Statement/SUCCESS_NO_INFO))
+                      (throw (ex-info "SQL insert batch failed" {:update-count n}))))))
+              (finally (.clearBatch stmt))))))))
   (read-record [_ id]
     (with-session pool timeout-ms #(read-row (:read %) id fields)))
   (update-field! [_ id field value]
     (with-session pool timeout-ms #(update-row! % id field value)))
-  (modify-field! [_ id field]
-    (with-session pool timeout-ms
-      (fn [session]
-        (transaction! (:connection session)
-          #(let [values (read-row (:read-for-update session) id fields)]
-             (update-row! session id field (w/modified-value (nth values field))))))))
   (scan-records [_ start n]
     (with-session pool timeout-ms
       (fn [session]
@@ -227,10 +242,70 @@
   (storage-info [_] info)
   (close-store! [_] (close-connections! connections)))
 
+(defrecord ApplicationSQLRecords [pool connections fields timeout-ms info]
+  store/Records
+  (put-records! [_ records]
+    (with-session
+      pool timeout-ms
+      (fn [{:keys [connection insert]}]
+        (let [^PreparedStatement stmt insert
+              bind! (fn [[key values]]
+                      (.setString stmt 1 key)
+                      (doseq [[field value] (map-indexed vector values)]
+                        (.setString stmt (+ 2 (long field)) value)))]
+          (if (= 1 (count records))
+            (do
+              (bind! (first records))
+              (when-not (= 1 (.executeUpdate stmt))
+                (throw (ex-info "Record insert failed" {}))))
+            (try
+              (transaction!
+                connection (:engine info)
+                (fn []
+                  (doseq [record records] (bind! record) (.addBatch stmt))
+                  (doseq [n (.executeBatch stmt)]
+                    (when-not (or (= n 1) (= n Statement/SUCCESS_NO_INFO))
+                      (throw (ex-info "Record insert batch failed" {:update-count n}))))))
+              (finally (.clearBatch stmt))))))))
+  (read-record [_ key]
+    (with-session
+      pool timeout-ms
+      (fn [{:keys [read]}]
+        (let [^PreparedStatement stmt read]
+          (.setString stmt 1 key)
+          (with-open [rs (.executeQuery stmt)]
+            (if (.next rs)
+              (row-values rs fields 1)
+              (throw (ex-info "Missing SQL record" {:key key}))))))))
+  (update-field! [_ _ _ _] (throw (UnsupportedOperationException. "E does not update records")))
+  (record-count [_]
+    (with-session pool timeout-ms
+      (fn [session]
+        (with-open [rs (.executeQuery ^PreparedStatement (:count session))]
+          (.next rs)
+          (.getLong rs 1)))))
+  (storage-info [_] info)
+  (close-store! [_] (close-connections! connections))
+  (scan-records [_ start n]
+    (if (pos? (long n))
+      (with-session
+        pool timeout-ms
+        (fn [session]
+          (let [^PreparedStatement stmt (:scan session)]
+            (.setString stmt 1 start)
+            (.setInt stmt 2 (int n))
+            (with-open [rs (.executeQuery stmt)]
+              (loop [rows (transient [])]
+                (if (.next rs)
+                  (recur (conj! rows [(.getString rs 1) (row-values rs fields 2)]))
+                  (persistent! rows)))))))
+      [])))
+
 (defn with-store
   "Own a fresh SQLite file or PostgreSQL schema for one benchmark case."
-  [{:keys [system field-count pool-size timeout-ms keep-db?] :as opts} f]
+  [{:keys [system field-count pool-size timeout-ms keep-db? workload] :as opts} f]
   (let [sql-indexes (index-mode opts)
+        string-key? (= workload :e)
         root (when (= system :sqlite)
                (str (Files/createTempDirectory "datalevin-ycsb-sqlite-"
                                                (make-array FileAttribute 0))))
@@ -246,25 +321,31 @@
                            conn))
             ^Connection first-conn (open!)
             table (if schema (str schema ".records") "records")
-            secondary-indexes (mapv (fn [field]
-                                      (let [column (str "f" field)]
-                                        {:name (str "records_" column "_idx")
-                                         :column column}))
-                                    (if (= sql-indexes :all) (range field-count) []))]
+            secondary-indexes (mapv (fn [column]
+                                      {:name (str "records_" column "_idx") :column column})
+                                    (if (= sql-indexes :all)
+                                      (mapv #(str "f" %) (range field-count))
+                                      []))]
         (when schema
           (execute-sql! first-conn (str "CREATE SCHEMA " schema))
           (reset! created? true))
-        (execute-sql! first-conn
-                      (str "CREATE TABLE " table " (id "
-                           (if (= system :sqlite) "INTEGER" "BIGINT") " PRIMARY KEY,"
-                           (str/join "," (map #(str "f" % " TEXT NOT NULL") (range field-count))) ")"))
+        (execute-sql!
+          first-conn
+          (str "CREATE TABLE " table
+               (if string-key?
+                 (str " (record_key TEXT COLLATE "
+                      (if (= system :sqlite) "BINARY" "\"C\"") " PRIMARY KEY NOT NULL,")
+                 (str " (id " (if (= system :sqlite) "INTEGER" "BIGINT") " PRIMARY KEY,"))
+               (str/join "," (map #(str "f" % " TEXT NOT NULL") (range field-count)))
+               ")"
+               (when (and string-key? (= system :sqlite)) " WITHOUT ROWID")))
         (doseq [{:keys [name column]} secondary-indexes]
           (execute-sql! first-conn
                         (str "CREATE INDEX " name " ON " table " (" column ")")))
         (dotimes [_ (dec (long pool-size))] (open!))
         (let [pool (ArrayBlockingQueue. (int pool-size))
               metadata (.getMetaData first-conn)
-              info {:layout :sql-row :atomic-rmw? true
+              info {:layout :sql-row :atomic-rmw? false :rmw-execution :client-read-update
                     :client-topology {:handles :pooled :read-connections pool-size
                                       :transaction-connections :same-pool}
                     :engine system :engine-version (.getDatabaseProductVersion metadata)
@@ -274,6 +355,11 @@
                                           :sql-indexes sql-indexes
                                           :secondary-indexes secondary-indexes)}
               info (cond-> info
+                     string-key?
+                     (merge (dissoc store/application-key-info :initial-mapsize-mb)
+                            {:scan-api :prepared-select :scan-selection :attribute-value-range
+                             :key-collation (if (= system :sqlite) "BINARY" "C")
+                             :without-rowid? (= system :sqlite)})
                      (= system :postgres)
                      (assoc :server
                             {:placement :separate-process
@@ -289,8 +375,12 @@
                                     "max_connections" "wal_sync_method" "checkpoint_timeout"
                                     "max_wal_size" "autovacuum" "max_parallel_workers_per_gather"])}))]
           (doseq [conn @connections]
-            (.add pool (prepare-session conn table field-count timeout-ms system)))
-          (cond-> (f (->SQLRecords pool @connections field-count timeout-ms info))
+            (.add pool (if string-key?
+                         (prepare-application-key-session conn table field-count timeout-ms)
+                         (prepare-session conn table field-count timeout-ms))))
+          (cond-> (f (if string-key?
+                       (->ApplicationSQLRecords pool @connections field-count timeout-ms info)
+                       (->SQLRecords pool @connections field-count timeout-ms info)))
             (and keep-db? root) (assoc :database-directory root)
             (and keep-db? schema) (assoc :database-schema schema))))
       (finally
@@ -306,3 +396,9 @@
                   (configure! conn opts)
                   (execute-sql! conn (str "DROP SCHEMA " schema " CASCADE"))))
               (finally (when (and root (not keep-db?)) (u/delete-files root))))))))))
+
+(defn with-stores
+  "Use a fresh SQLite file or PostgreSQL schema for each phase callback.
+  JVM/JDBC and the PostgreSQL server stay running between phases."
+  [opts f]
+  (f (fn [callback] (with-store opts callback))))

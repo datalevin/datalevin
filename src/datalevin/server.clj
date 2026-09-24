@@ -2078,6 +2078,9 @@
                            (dissoc state :runner :runner-skey :wlmdb
                                    :wstore :wdt-db :notification-dirty?)
                            state)))
+            ;; Restore the shared cache before another writer takes the lock.
+            ;; The caller may halt again; releasing the owner is idempotent.
+            (halt-run runner)
             (when lock
               (.release lock))))))))
 

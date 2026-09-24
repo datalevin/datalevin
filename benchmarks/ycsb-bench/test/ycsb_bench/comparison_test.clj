@@ -114,12 +114,13 @@
   (let [result (runner/run-case!
                  (assoc shared/small-options :system :sqlite :api :datalog :mode :embedded
                         :workload :d :records 2 :warmup 0 :ops 1
-                        :warmup-ms 100 :measurement-ms 200))
-        inserts (+ (get-in result [:warmup :by-operation :insert :count] 0)
-                   (get-in result [:measured :by-operation :insert :count] 0))]
+                        :warmup-ms 100 :measurement-ms 200 :value-audit? true))
+        inserts (get-in result [:measured :by-operation :insert :count] 0)]
     (is (>= (get-in result [:warmup :seconds]) 0.1))
     (is (>= (get-in result [:measured :seconds]) 0.2))
     (is (> inserts 2))
+    (is (= 2 (get-in result [:measured :starting-records])))
+    (is (= :passed (get-in result [:validation :value-checks :status])))
     (is (= (+ 2 inserts) (get-in result [:validation :records])))))
 
 (deftest separate-process-independent-datalog-test
@@ -127,15 +128,25 @@
         handles (atom [])
         opts (assoc shared/small-options :api :datalog :mode :remote
                     :server-mode :process :server-heap-mb 512 :datalog-handles :independent)]
-    (store/with-store
+    (store/with-stores
       opts
-      (fn [db]
+      (fn [with-fresh-store]
+        (let [warmup-info (with-fresh-store
+                            (fn [db]
+                              (store/put-records! db [[0 ["warm" "warm" "warm"]]])
+                              (store/storage-info db)))]
+        (with-fresh-store
+        (fn [db]
         (let [info (store/storage-info db)
               stores (mapv #(store/for-worker db %) (range 3))
               client-ids (mapv #(client/get-id (.-client ^DatalogStore (:store @(:conn %)))) stores)
               executor (Executors/newFixedThreadPool 3)]
           (reset! handles stores)
           (reset! pid (get-in info [:server :pid]))
+          (is (= 0 (store/record-count db)))
+          (is (= (get-in warmup-info [:server :pid]) @pid))
+          (is (= (get-in warmup-info [:server :port]) (get-in info [:server :port])))
+          (is (not= (:database-name warmup-info) (:database-name info)))
           (is (not= (.pid (ProcessHandle/current)) @pid))
           (is (= :separate-process (get-in info [:server :placement])))
           (is (= :connection-thread (get-in info [:server :configuration :request-execution])))
@@ -151,17 +162,22 @@
           (store/put-records! db [[0 ["aaaa" "bbbb" "cccc"]]])
           (try
             (let [tasks (.invokeAll executor
-                                   (mapv (fn [handle]
-                                           ^Callable (fn [] (dotimes [_ 20] (store/modify-field! handle 0 0))))
-                                         stores))]
+                                   (mapv (fn [handle field]
+                                           ^Callable
+                                           (fn []
+                                             (dotimes [i 20]
+                                               (store/read-record handle 0)
+                                               (store/update-field! handle 0 field
+                                                                    (format "%02d%02d" field i)))))
+                                         stores (range 3)))]
               (doseq [^Future task tasks] (.get task)))
             (doseq [handle stores]
-              (is (= ["iaaa" "bbbb" "cccc"] (store/read-record handle 0))
-                  "Independent clients must not lose atomic updates"))
+              (is (= ["0019" "0119" "0219"] (store/read-record handle 0))
+                  "Independent clients preserve concurrent writes to other fields"))
             (finally
               (.shutdownNow executor)
               (.awaitTermination executor 30 TimeUnit/SECONDS))))
-        {}))
+        {})))))
     (is (every? #(d/closed? (:conn %)) @handles))
     (is (not (.isPresent (ProcessHandle/of @pid))))))
 

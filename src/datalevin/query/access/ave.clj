@@ -156,6 +156,24 @@
   [limit]
   (and (some? limit) (not= -1 limit)))
 
+(defn- ordered-projection?
+  [find-elements order input-values]
+  ;; Pull may be deferred until after selection only when ordering reads
+  ;; ordinary projected values. Its pattern must also be available without
+  ;; evaluating the residual where clauses.
+  (and (every? #(or (instance? Variable %)
+                   (and (dp/pull? %)
+                        (let [pattern (:pattern %)]
+                          (or (instance? Constant pattern)
+                              (contains? @input-values (:symbol pattern))))))
+               find-elements)
+       (every? (fn [order-var]
+                 (instance? Variable
+                            (first (filter #(= order-var
+                                                (first (dp/-find-vars %)))
+                                           find-elements))))
+               (take-nth 2 order))))
+
 (defn- first-order-key
   [order]
   (when-let [order-var (first order)]
@@ -227,7 +245,10 @@
   (let [find          (:qfind parsed-q)
         find-elements (dp/find-elements find)
         limit         (:qlimit parsed-q)
-        dbs           (filterv db/db? inputs)]
+        dbs           (filterv db/db? inputs)
+        values        (delay (access/planning-input-values
+                               {:parsed-q parsed-q :inputs inputs
+                                :input-values input-values}))]
     (if (and (instance? FindRel find)
              (finite-limit? limit)
              (pos? (long limit))
@@ -235,21 +256,13 @@
              (nil? (:qwith parsed-q))
              (empty? (:qhaving parsed-q))
              (nil? (:qreturn-map parsed-q))
-             (not-any? #(or (dp/aggregate? %) (dp/find-expr? %)
-                            (dp/pull? %))
-                       find-elements)
+             (ordered-projection? find-elements (:qorder parsed-q) values)
              (= 1 (count dbs))
              (not (db/pending-tx-cache? (first dbs))))
       (if-let [[order-var direction] (first-order-key (:qorder parsed-q))]
         (if-let [ranked (ranked-pattern parsed-q order-var)]
           (if-some [start-value
-                    (ordered-range-start
-                      parsed-q
-                      (access/planning-input-values
-                        {:parsed-q parsed-q
-                         :inputs inputs
-                         :input-values input-values})
-                      order-var direction)]
+                    (ordered-range-start parsed-q @values order-var direction)]
             (let [expr
                   (access/map->AccessExpr
                     {:method     :ave
@@ -275,9 +288,18 @@
                       (db/-index-range-size (first dbs) (:attr ranked)
                                             start-value nil)))
                   required-count (long (:required-count demand))
+                  ;; A plain range does not need a thousand-row planning
+                  ;; sample to return a small page. Keep larger samples for
+                  ;; joins and other residual clauses whose yield is unknown.
+                  range-only? (and (= 2 (count (:qwhere parsed-q)))
+                                   (some #(instance? Predicate %)
+                                         (:qwhere parsed-q)))
+                  batch-size (if range-only?
+                               (min required-count default-batch-size)
+                               default-batch-size)
                   rows
                   (long (min range-rows
-                             (max required-count default-batch-size)))
+                             (max required-count batch-size)))
                   estimate
                   (assoc
                     (access/->AccessEstimate 1.0 1.0 rows
@@ -286,7 +308,7 @@
               [(access/->AccessPlan
                  expr path (access/source-bounds)
                  (access/->AccessWork
-                   nil default-batch-size nil nil 0)
+                   (when range-only? batch-size) batch-size nil nil 0)
                  estimate)])
             [])
           [])

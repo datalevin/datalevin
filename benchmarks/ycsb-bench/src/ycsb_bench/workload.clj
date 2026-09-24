@@ -1,27 +1,8 @@
 (ns ycsb-bench.workload
   "Logical records and seeded YCSB-style request generators."
-  (:require [datalevin.core :as d])
-  (:import [datalevin.db DB]
-           [datalevin.utl LRUCache]
-           [java.util Random]))
+  (:import [java.util Random]))
 
 (set! *warn-on-reflection* true)
-
-(defn rmw-reader
-  "Reuse a prepared pull across transaction views. Execute it with the current
-  transaction DB via execute-prepared's explicit-view arity."
-  [^DB db attributes]
-  ;; Transaction Store wrappers change on each commit. The DB's bounded reader
-  ;; cache is shared across those views and belongs to this database's lifetime.
-  ;; A namespaced key keeps these wrappers distinct from core pull readers.
-  (let [^LRUCache cache (.-pull-readers db)
-        k [::rmw-reader attributes]]
-    (or (.get cache k)
-        (locking cache
-          (or (.get cache k)
-              (let [reader (d/prepare-pull db attributes)]
-                (.put cache k reader)
-                reader))))))
 
 (def workloads
   {:a {:mix [[:read 50] [:update 50]] :distribution :zipfian}
@@ -33,6 +14,44 @@
 
 (def operations [:read :update :insert :scan :rmw])
 (def operation-code (zipmap operations (range)))
+
+(defn fnvhash64
+  "YCSB Utils.fnvhash64: eight low-to-high bytes, signed long overflow, abs.
+  See https://github.com/brianfrankcooper/YCSB/blob/master/core/src/main/java/site/ycsb/Utils.java"
+  ^long [^long value]
+  (loop [value value, hash -3750763034362895579, i 0]
+    (if (= i 8)
+      (Math/abs (long hash))
+      (recur (bit-shift-right value 8)
+             (unchecked-multiply (bit-xor hash (bit-and value 255)) 1099511628211)
+             (inc i)))))
+
+(defn application-key
+  "YCSB CoreWorkload's default hashed key name (zeropadding=1)."
+  ^String [^long ordinal]
+  (str "user" (fnvhash64 ordinal)))
+
+;; Upstream ScrambledZipfianGenerator uses an inclusive [0, 10^10] source
+;; range with this precomputed zeta, then hashes the draw modulo a fixed
+;; destination keyspace. Keep that modulus stable as inserts commit.
+(def ^:private scrambled-items 10000000001)
+(def ^:private scrambled-zeta 26.46902820178302)
+(def ^:private zipf-theta 0.99)
+(def ^:private zipf-alpha (/ 1.0 (- 1.0 zipf-theta)))
+(def ^:private zipf-second (Math/pow 0.5 zipf-theta))
+(def ^:private scrambled-eta
+  (/ (- 1.0 (Math/pow (/ 2.0 scrambled-items) (- 1.0 zipf-theta)))
+     (- 1.0 (/ (+ 1.0 zipf-second) scrambled-zeta))))
+
+(defn scrambled-rank
+  "Upstream Gray/Zipfian inverse approximation for one uniform [0,1) draw."
+  ^long [^double u]
+  (let [uz (* u scrambled-zeta)]
+    (cond (< uz 1.0) 0
+          (< uz (+ 1.0 zipf-second)) 1
+          :else (long (* scrambled-items
+                         (Math/pow (+ (- (* scrambled-eta u) scrambled-eta) 1.0)
+                                   zipf-alpha))))))
 
 (defn choose-operation [^Random rng mix]
   (loop [draw (.nextInt rng 100), [[operation weight] & more] mix]
@@ -57,12 +76,6 @@
 (defn initial-values [seed id options]
   (record-values (Random. (unchecked-add (long seed) (long id))) options))
 
-(defn modified-value
-  "Derive a replacement from the value read, preserving its byte length."
-  [^String value]
-  (str (char (+ 97 (mod (inc (- (int (.charAt value 0)) 97)) 26)))
-       (.substring value 1)))
-
 (defn zipf-cdf
   "Finite Zipf weights, exponent 0.99. Setup is outside measured phases."
   [capacity]
@@ -75,13 +88,21 @@
     cdf))
 
 (defn choose-key
-  "Sample only the contiguous prefix of committed records. Zipfian favors
-  low IDs; latest reverses the sampled rank to favor newly committed IDs."
-  [^Random rng distribution ^doubles cdf visible]
+  "Select a committed ordinal. Zipfian uses upstream's scrambled generator
+  and rejects uncommitted ordinals without changing its fixed modulus.
+  Latest reverses finite Zipf ranks over the committed prefix."
+  [^Random rng distribution state visible]
   (let [n (long visible)]
-    (if (= distribution :uniform)
-      (long (.nextInt rng (int n)))
-      (let [draw (* (.nextDouble rng) (aget cdf (dec n)))
+    (case distribution
+      :uniform (long (.nextInt rng (int n)))
+      :zipfian
+      (let [keyspace (long state)]
+        (loop []
+          (let [id (rem (fnvhash64 (scrambled-rank (.nextDouble rng))) keyspace)]
+            (if (< -1 id n) id (recur)))))
+      :latest
+      (let [^doubles cdf state
+            draw (* (.nextDouble rng) (aget cdf (dec n)))
             rank (loop [lo 0, hi (dec n)]
                    (if (= lo hi)
                      lo
@@ -89,7 +110,7 @@
                        (if (< draw (aget cdf mid))
                          (recur lo mid)
                          (recur (inc mid) hi)))))]
-        (if (= distribution :latest) (- n 1 rank) rank)))))
+        (- n 1 rank)))))
 
 (defn grow-cdf!
   "Grow a timed phase's Zipf table as inserts extend the visible keyspace.

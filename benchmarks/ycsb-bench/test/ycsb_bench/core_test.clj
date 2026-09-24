@@ -49,8 +49,7 @@
     (is (= values (w/initial-values 17 4 small-options)))
     (is (not= values (w/initial-values 18 4 small-options)))
     (is (= [4 4 4] (mapv count values)))
-    (is (every? #(re-matches #"[a-z]+" %) values))
-    (is (= "aaaa" (w/modified-value "zaaa")))))
+    (is (every? #(re-matches #"[a-z]+" %) values))))
 
 (deftest committed-keyspace-test
   (let [space (w/keyspace 3)
@@ -67,12 +66,13 @@
     (doseq [distribution [:uniform :zipfian :latest]
             n [1 7 100]]
       (let [rng (Random. 17)
-            keys (repeatedly 2000 #(w/choose-key rng distribution cdf n))]
+            keys (repeatedly 2000 #(w/choose-key rng distribution
+                                                 (if (= distribution :zipfian) n cdf) n))]
         (is (every? #(<= 0 % (dec n)) keys))))
     (let [rng (Random. 17)
-          keys (repeatedly 10000 #(w/choose-key rng :zipfian cdf 100))]
-      (is (> (count (filter #(< % 10) keys))
-             (* 5 (count (filter #(>= % 90) keys)))))))
+          keys (repeatedly 100000 #(w/choose-key rng :zipfian 100000 100000))]
+      (is (< (count (filter #(< % 1000) keys)) 5000)
+          "The lowest 1% of numeric IDs must not receive most Zipfian requests")))
   (doseq [[workload {:keys [mix]}] w/workloads]
     (let [rng (Random. 42)
           counts (frequencies (repeatedly 10000 #(w/choose-operation rng mix)))]
@@ -99,7 +99,8 @@
   (doseq [bad [{:ops 0} {:warmup -1} {:threads 0} {:pool-size -1}
                {:records nil} {:field-length 0} {:seed 1.5}
                {:distribution :random} {:durability :off}
-               {:api :sql} {:records Integer/MAX_VALUE} {:sql-indexes :primary}]]
+               {:api :sql} {:records Integer/MAX_VALUE} {:sql-indexes :primary}
+               {:value-audit? :yes}]]
     (is (thrown? clojure.lang.ExceptionInfo (runner/options bad)) (str bad)))
   (is (= 3 (:pool-size (runner/options {:threads 3}))))
   (is (= 0 (:warmup (runner/options {:warmup 0})))))
@@ -117,19 +118,47 @@
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Missing or malformed record"
                          (runner/validate-record! [value "bbbb" "cccc"] small-options)))))
 
-(defn- concurrent-modifications! [db]
-  (let [executor (Executors/newFixedThreadPool 2)]
-    (try
-      (let [tasks (.invokeAll executor
-                              (vec (repeat 2
-                                           ^Callable
-                                           (fn []
-                                             (dotimes [_ 10]
-                                               (store/modify-field! db 0 0))))))]
-        (doseq [^Future task tasks] (.get task)))
-      (finally
-        (.shutdownNow executor)
-        (.awaitTermination executor 30 TimeUnit/SECONDS)))))
+(deftest character-validation-after-timing-test
+  (doseq [operation [:read :scan]
+          timed? [false true]
+          [expected values] [[:valid ["aaaa"]] [:characters ["éaaa"]]
+                             [:shape nil] [:shape [42]] [:shape ["aaa"]]
+                             [:shape ["aaaa" "bbbb"]]]]
+    (testing (str operation " duration-based=" timed? " values=" (pr-str values))
+      (let [completed (atom [])
+            run-phase runner/run-phase!
+            db (reify store/Records
+                 (put-records! [_ _] nil)
+                 (read-record [_ _] values)
+                 (scan-records [_ start n]
+                   (mapv #(vector % values) (range start (+ start n))))
+                 (record-count [_] 1)
+                 (storage-info [_] {}))
+            opts (cond-> {:api :kv :mode :embedded :workload :c
+                          :distribution :uniform :records 1 :warmup 2 :ops 3
+                          :threads 1 :field-count 1 :field-length 4 :scan-length 1}
+                   timed? (assoc :warmup-ms 10 :measurement-ms 10))
+            result (with-redefs [store/with-stores (fn [_ f] (f (fn [callback] (callback db))))
+                                 w/choose-operation (fn [_ _] operation)
+                                 runner/run-phase!
+                                 (fn [db space cdf opts phase n]
+                                   (let [result (run-phase db space cdf opts phase n)]
+                                     (swap! completed conj phase)
+                                     result))]
+                     (try (runner/run-case! opts) (catch Exception e e)))]
+        (is (= (case expected :shape [] :characters [:warmup] [:warmup :measured]) @completed))
+        (case expected
+          :valid
+          (is (= {:status :passed :records 1 :all-records-checked? true
+                  :scope :structure :value-checks :not-performed
+                  :character-checks :post-measurement}
+                 (:validation result)))
+          :characters
+          (do (is (instance? clojure.lang.ExceptionInfo result))
+              (is (= "Missing or malformed record" (ex-message result))))
+          :shape
+          (do (is (instance? ExecutionException result))
+              (is (= "Missing or malformed record" (ex-message (ex-cause result))))))))))
 
 (defn check-adapter! [db]
   (let [values ["aaaa" "bbbb" "cccc"]]
@@ -138,9 +167,9 @@
     (is (= values (store/read-record db 1)))
     (store/update-field! db 0 1 "zzzz")
     (is (= ["aaaa" "zzzz" "cccc"] (store/read-record db 0)))
-    (concurrent-modifications! db)
+    (store/update-field! db 0 0 "uaaa")
     (is (= ["uaaa" "zzzz" "cccc"] (store/read-record db 0))
-        "Atomic RMW must not lose concurrent modifications")
+        "Updating a field preserves the other fields")
     (is (= [[0 ["uaaa" "zzzz" "cccc"]]] (store/scan-records db 0 1)))
     (is (empty? (store/scan-records db 0 0)))
     (is (= [[1 values]] (store/scan-records db 1 1)))
@@ -192,11 +221,14 @@
       (store/with-store
         (assoc small-options :api api :mode mode)
         (fn [db]
-          (is (= (if (= mode :remote) :server-function :transaction-function)
-                 (:rmw-execution (store/storage-info db))))
+          (is (every? (:env-flags (store/storage-info db)) [:writemap :nosync])
+              "The standard WAL adapter must inherit the effective native defaults")
+          (is (= :client-read-update (:rmw-execution (store/storage-info db))))
+          (is (false? (:atomic-rmw? (store/storage-info db))))
           (when (= api :datalog)
             (is (= 0 (:cache-limit (store/storage-info db))))
-            (is (= :slice (:scan-api (store/storage-info db))))
+            (is (= :pull-many (:scan-api (store/storage-info db))))
+            (is (= :known-ids (:scan-selection (store/storage-info db))))
             (is (= :db/id (:record-key (store/storage-info db)))))
           (check-adapter! db)
           (when (= api :kv)
@@ -218,7 +250,7 @@
               (is (= 5 (store/record-count db)))))
           {})))))
 
-(deftest rmw-reader-reuse-test
+(deftest read-update-preparation-reuse-test
   (doseq [mode [:embedded :remote]]
     (testing (str mode)
       (store/with-store
@@ -231,7 +263,7 @@
                 preparations (atom 0)
                 parses (atom 0)]
             (store/put-records! db [[1 ["aaaa" "bbbb" "cccc"]]])
-            (store/modify-field! db 1 0)
+            (store/read-record db 1)
             (with-redefs [d/prepare-pull
                           (fn [& args]
                             (swap! preparations inc)
@@ -240,34 +272,16 @@
                           (fn [view pattern opts]
                             (when (= pattern attributes) (swap! parses inc))
                             (parse view pattern opts))]
-              (dotimes [_ 5] (store/modify-field! db 1 0)))
+              (dotimes [i 5]
+                (store/read-record db 1)
+                (store/update-field! db 1 0 (format "%04d" i))))
             (is (zero? @preparations)
-                "Successive transactions reuse the preparation wrapper")
+                "Successive reads reuse the preparation wrapper")
             (is (zero? @parses)
-                "Successive transaction views retain the parsed RMW pattern")
-            (is (= ["gaaa" "bbbb" "cccc"] (store/read-record db 1))
-                "Every reused read sees the current transaction's value"))
+                "Reads after writes retain the parsed pull pattern")
+            (is (= ["0004" "bbbb" "cccc"] (store/read-record db 1))
+                "Every reused read sees the latest committed value"))
           {})))))
-
-(deftest rmw-reader-reuse-after-rollback-test
-  (store/with-store
-    (assoc small-options :api :datalog :mode :embedded)
-    (fn [db]
-      (let [{:keys [conn attributes]} (store/for-worker db 0)
-            reader (atom nil)]
-        (store/put-records! db [[1 ["aaaa" "bbbb" "cccc"]]])
-        (d/with-transaction [tx conn]
-          (reset! reader (w/rmw-reader @tx attributes))
-          (d/transact! tx [[:db/add 1 :ycsb/field0 "xxxx"]])
-          (is (= "xxxx" (:ycsb/field0 (d/execute-prepared @reader @tx 1))))
-          (d/abort-transact tx))
-        (d/with-transaction [tx conn]
-          (is (identical? @reader (w/rmw-reader @tx attributes)))
-          (is (= "aaaa" (:ycsb/field0 (d/execute-prepared @reader @tx 1))))
-          (d/transact! tx [[:db/add 1 :ycsb/field0 "yyyy"]])
-          (is (= "yyyy" (:ycsb/field0 (d/execute-prepared @reader @tx 1)))))
-        (is (= ["yyyy" "bbbb" "cccc"] (store/read-record db 1))))
-      {})))
 
 (deftest datalog-scan-field-order-test
   (doseq [mode [:embedded :remote]]
@@ -308,7 +322,10 @@
     (is (= 7 (get-in result [:warmup :operations])))
     (is (= 11 (get-in result [:measured :operations])))
     (is (= 11 (get-in result [:measured :by-operation :read :count])))
-    (is (= {:status :passed :records 4 :all-records-checked? true} (:validation result)))
+    (is (= {:status :passed :records 4 :all-records-checked? true
+            :scope :structure :value-checks :not-performed
+            :character-checks :post-measurement}
+           (:validation result)))
     (is (pos? (get-in result [:measured :ops-per-second])))))
 
 (deftest worker-failure-invalidates-run-test

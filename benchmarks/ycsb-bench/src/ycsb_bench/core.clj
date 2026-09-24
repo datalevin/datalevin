@@ -41,12 +41,14 @@
    [nil "--scan-length N" "Maximum scan length; uniform 1..N (100)" :parse-fn parse-long]
    [nil "--batch-size N" "Records per initial load transaction (100)" :parse-fn parse-long]
    [nil "--distribution NAME" "uniform, zipfian, latest (workload default)" :parse-fn choice]
+   [nil "--zipfian-keyspace N" "Fixed scrambled keyspace; default predicts inserts with 2x headroom" :parse-fn parse-long]
    [nil "--durability NAME" "WAL profile: strict, relaxed (strict)" :parse-fn choice]
    [nil "--timeout-ms N" "Remote request / SQL timeout (60000)" :parse-fn parse-long]
    [nil "--phase-timeout-ms N" "Cancel an overdue phase after N ms (600000)" :parse-fn parse-long]
    [nil "--pg-url URL" "PostgreSQL JDBC URL (YCSB_PG_URL or localhost:5432/postgres)"]
    [nil "--pg-user USER" "PostgreSQL user (YCSB_PG_USER or driver default)"]
    [nil "--keep-db" "Keep generated databases / PostgreSQL schemas" :id :keep-db?]
+   [nil "--value-audit" "Record and check values; timings include audit overhead" :id :value-audit?]
    [nil "--output FILE" "Write a complete EDN report after successful validation"]
    ["-h" "--help" "Show usage"]])
 
@@ -65,7 +67,9 @@
     (sort-by (comp pr-str key)
              (group-by #(select-keys (:configuration %)
                                      [:system :api :mode :workload :threads :pool-size
-                                      :datalog-handles :sql-indexes])
+                                      :datalog-handles :sql-indexes :workload-model
+                                      :key-generator :insert-order :request-generator :zipfian-keyspace
+                                      :value-audit? :warmup-isolation])
                        results))))
 
 (defn run-benchmark
@@ -92,10 +96,13 @@
                (for [{:keys [system api mode workload threads datalog-handles sql-indexes trial] :as case-opts} cases]
                  (let [result (runner/run-case! case-opts)
                        measured (:measured result)]
-                   (println (format "%s %s %s %s: %.1f ops/s, p99 %.1f us, %d records checked [trial %d, %d workers%s%s]"
+                   (println (format "%s %s %s %s: %.1f ops/s, p99 %.1f us, %d records checked (%s) [trial %d, %d workers%s%s]"
                                     (name system) (name api) (name mode) (str/upper-case (name workload))
                                     (:ops-per-second measured) (get-in measured [:latency-us :p99])
-                                    (get-in result [:validation :records]) trial threads
+                                    (get-in result [:validation :records])
+                                    (if (:value-audit? case-opts)
+                                      "value audit; timings include recording" "structure only")
+                                    trial threads
                                     (if (and (= system :datalevin) (= api :datalog) (= mode :remote))
                                       (str ", " (name datalog-handles) " handles") "")
                                     (if sql-indexes

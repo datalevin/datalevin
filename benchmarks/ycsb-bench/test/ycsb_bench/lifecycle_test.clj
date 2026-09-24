@@ -19,6 +19,7 @@
         result (promise)
         db (reify store/Records
              (put-records! [_ _] nil)
+             (record-count [_] 1)
              (read-record [_ _]
                (.incrementAndGet active)
                (try

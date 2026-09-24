@@ -875,7 +875,9 @@
                                (pos? range-rows))
           sample-size     (if sample?
                             (long (min range-rows
-                                       (long c/init-exec-size-threshold)))
+                                       (long c/init-exec-size-threshold)
+                                       (long (or (:sample-size work)
+                                                 c/init-exec-size-threshold))))
                             0)
           bounded-sample? (and sample?
                                (number? sample-cost-budget)

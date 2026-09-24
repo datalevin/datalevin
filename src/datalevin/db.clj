@@ -1066,6 +1066,28 @@
 
 (defn count-datoms [db e a v] (-count db [e a v] nil))
 
+(defn entity-range
+  "Return existing entity IDs, once each and in ascending order, in [start, end).
+  Scan only EAV keys. Simulated transaction views also account for entities
+  created or fully retracted in their pending datoms."
+  [^DB db start end]
+  (doseq [bound [start end]]
+    (when-not (and (integer? bound) (<= 0 bound c/emax))
+      (raise "Entity range bounds must be nonnegative 64-bit integers"
+             {:error :entity-range/bounds :start start :end end})))
+  (if (< (long start) (long end))
+    (let [ids (i/entity-range (.-store db) start end)]
+      (if (pending-tx-cache? db)
+        (let [changed (into #{} (comp (map d/datom-e)
+                                      (filter #(<= (long start) (long %) (dec (long end)))))
+                            (.-eavt db))]
+          (->> (into (set ids) changed)
+               (filter #(or (not (contains? changed %)) (seq (-e-datoms db %))))
+               sort
+               vec))
+        ids))
+    []))
+
 (defn seek-datoms
   ([db index]
    (-seek-datoms db index nil nil nil))

@@ -376,6 +376,8 @@ values;")
     "Return the approximate number of datoms within the given range (inclusive). On list-backed indexes, this may ignore the value portion of the range.")
   (e-size [this e]
     "Return the numbers of datoms with the given e value")
+  (entity-range [this start end]
+    "Return existing entity IDs in ascending order in [start, end).")
   (a-size [this a]
     "Return the number of datoms with the given attribute, an estimate")
   (start-sampling [this])

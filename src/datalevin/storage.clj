@@ -560,6 +560,11 @@
 
   (e-size [_ e] (list-count lmdb c/eav e :id))
 
+  (entity-range [_ start end]
+    (if (< (long start) (long end))
+      (vec (i/key-range lmdb c/eav [:closed-open start end] :id))
+      []))
+
   (a-size [this a]
     (if (:db/aid (schema a))
       (when-not (.closed? this)

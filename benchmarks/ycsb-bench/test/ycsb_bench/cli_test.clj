@@ -52,7 +52,9 @@
     (is (= 0 (get-in result [:warmup :operations])))
     (is (= 5 (get-in result [:measured :by-operation :read :count])))
     (is (number? (get-in result [:measured :latency-us :p99])))
-    (is (= {:status :passed :records 4 :all-records-checked? true}
+    (is (= {:status :passed :records 4 :all-records-checked? true
+            :scope :structure :value-checks :not-performed
+            :character-checks :post-measurement}
            (:validation result)))
     (is (not-any? #(contains? (:configuration result) %)
                   [:output :help :pg-url :pg-user]))))
@@ -99,6 +101,17 @@
     (check-report! report [:sqlite])
     (is (str/includes? output "sqlite datalog embedded C:"))
     (is (not (str/includes? output "Report:")))))
+
+(deftest cli-value-audit-report-test
+  (let [output (with-out-str
+                 (apply core/-main (concat small-args ["--system" "sqlite" "--value-audit"])))
+        report (edn/read-string (subs output (str/index-of output "{")))
+        result (first (:results report))]
+    (is (true? (get-in result [:configuration :value-audit?])))
+    (is (= :structure-and-observed-values (get-in result [:validation :scope])))
+    (is (= :passed (get-in result [:validation :value-checks :status])))
+    (is (= 5 (get-in result [:validation :value-checks :point-reads])))
+    (is (str/includes? output "timings include recording"))))
 
 (deftest cli-sql-index-conditions-report-test
   (with-report-path

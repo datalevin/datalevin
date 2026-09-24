@@ -484,6 +484,7 @@
     (head [_ index low-datom high-datom])
     (tail [_ index high-datom low-datom])
     (slice [_ index low-datom high-datom])
+    (entity-range [_ start end])
     (rslice [_ index high-datom low-datom])
     (e-datoms [_ e])
     (e-first-datom [_ e]))

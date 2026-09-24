@@ -398,8 +398,22 @@ clause using `:display :refs+scores` can provide the same descending property
 when the score variable is the leading order term. A single-domain
 `vec-neighbors` or `embedding-neighbors` clause using
 `:display :refs+dists` similarly provides ascending distance order. Aggregates,
-pull expressions, `:with`, `:having`, result maps, and other unsafe batching
-shapes use complete or normal execution.
+`:with`, `:having`, result maps, and other unsafe batching shapes use complete
+or normal execution. AVE access also supports `pull` projections with literal
+or scalar-input patterns when every order term refers to an ordinary projected
+variable. It selects the entity/value
+tuples first, then pulls only the selected page; distinct entities with identical
+pulled values remain separate results. Fulltext and vector access still exclude
+pull projections.
+
+For a query consisting of one attribute pattern and its one-sided inequality,
+the AVE planning sample and scan batch are bounded by `:offset + :limit`, up to
+the normal batch size. The storage operation is a count-limited `seek-datoms`
+(or `rseek-datoms` for descending order), implemented by `list-range-first-n`.
+The cursor reads an extra entry to check the boundary and can request further
+batches when ties, an exclusive bound, or distinct projection require them.
+Queries with additional joins or filters retain larger samples to estimate
+how many candidates will survive.
 
 The optimized path walks the AVE index, fixed fulltext result stream, or fixed
 approximate vector result stream in candidate batches. It replaces the covered

@@ -83,7 +83,7 @@
   ((:get-lock deps) server db-name))
 
 (defn- cleanup-failed-open-transaction!
-  [deps server db-name runner kv-store ^Semaphore lock]
+  [deps server db-name runner kv-store ^Semaphore lock release-slot!]
   (let [dbs    ((:dbs deps) server)
         owned? (or (nil? runner)
                    (identical? runner (get-in dbs [db-name :runner])))]
@@ -105,7 +105,9 @@
              (dissoc m :runner :runner-skey :wlmdb :wstore :wdt-db
                       :notification-dirty?)
              m))))
-      (.release lock))))
+      (try
+        (release-slot!)
+        (finally (.release lock))))))
 
 (defn- with-permission!
   [deps server ^SelectionKey skey req-act req-obj req-tgt denied-message f]
@@ -1922,7 +1924,15 @@
     deps server skey db-name
     "Don't have permission to alter the database"
     (fn []
-      (let [release-slot! ((:acquire-transaction-slot! deps) server)]
+      (let [release-capacity! ((:acquire-transaction-slot! deps) server)
+            cache-store       (atom nil)
+            ;; Owner cleanup covers commit, abort and disconnect. Restore the
+            ;; current cache once, including replacements after schema writes.
+            release-slot!     (fn []
+                                (try
+                                  (when-let [store (first (reset-vals! cache-store nil))]
+                                    (db/enable-cache store))
+                                  (finally (release-capacity!))))]
         (try
           (let [^Semaphore lock (db-lock deps server db-name)]
             (acquire-db-transaction-slot! deps server db-name lock)
@@ -1937,7 +1947,13 @@
                                :notification-dirty? (volatile! false)}
                         datalog?
                         (merge
-                          (let [wstore (st/transfer store wlmdb)
+                          (let [_ (when-not (db/cache-disabled? store)
+                                    ;; Index and query caches are shared with
+                                    ;; committed readers. Never retain staged
+                                    ;; reads, even when the transaction aborts.
+                                    (db/disable-cache store)
+                                    (reset! cache-store store))
+                                wstore (st/transfer store wlmdb)
                                 opts ((:current-runtime-opts deps)
                                       ((:db-state deps) server db-name))]
                             {:wstore wstore
@@ -1949,7 +1965,7 @@
                   (write-complete! deps skey))
                 (catch Throwable t
                   (cleanup-failed-open-transaction!
-                    deps server db-name @runner* @kv-store* lock)
+                    deps server db-name @runner* @kv-store* lock release-slot!)
                   (throw t)))))
           (catch Throwable t
             (release-slot!)
@@ -2719,6 +2735,7 @@
    :head (normal-dt-handler i/head)
    :tail (normal-dt-handler i/tail)
    :slice (copying-dt-handler i/slice)
+   :entity-range (copying-dt-handler i/entity-range)
    :rslice (copying-dt-handler i/rslice)
    :start-sampling (sampling-dt-handler i/start-sampling)
    :stop-sampling (sampling-dt-handler i/stop-sampling)

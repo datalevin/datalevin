@@ -8,6 +8,109 @@
            [java.util.concurrent ArrayBlockingQueue]
            [org.postgresql PGResultSetMetaData]))
 
+(defn- writer-available? [^Connection conn]
+  (try
+    (#'sql/execute-sql! conn "BEGIN IMMEDIATE")
+    (#'sql/execute-sql! conn "ROLLBACK")
+    true
+    (catch SQLException e
+      (if (= 5 (.getErrorCode e)) false (throw e)))))
+
+(deftest sqlite-transaction-releases-writer-at-commit-test
+  (sql/with-store
+    (assoc shared/small-options :system :sqlite :api :kv :pool-size 2)
+    (fn [db]
+      (let [^ArrayBlockingQueue pool (:pool db)
+            session (.remove pool)
+            ^Connection owner (:connection session)
+            ^Connection contender (:connection (.remove pool))
+            completed (atom 0)
+            after-commit! (fn []
+                            (swap! completed inc)
+                            (is (writer-available? contender)
+                                "Commit must release the writer without reacquiring it"))
+            observed (reify Connection
+                       (setAutoCommit [_ enabled]
+                         (.setAutoCommit owner enabled)
+                         (if enabled
+                           (after-commit!)
+                           (is (not (writer-available? contender))
+                               "The writer must be acquired before the insert batch")))
+                       (commit [_] (.commit owner) (after-commit!))
+                       (rollback [_] (.rollback owner))
+                       (close [_] (.close owner))
+                       (isClosed [_] (.isClosed owner)))]
+        (#'sql/execute-sql! contender "PRAGMA busy_timeout=1")
+        (.add pool (assoc session :connection observed))
+        (doseq [[label operation]
+                [[:load #(store/put-records! db [[0 ["aaaa" "bbbb" "cccc"]]
+                                                [1 ["dddd" "eeee" "ffff"]]])]
+                 [:load-batch #(store/put-records! db [[2 ["gggg" "hhhh" "iiii"]]
+                                                      [3 ["jjjj" "kkkk" "llll"]]])]]]
+          (testing (name label)
+            (reset! completed 0)
+            (operation)
+            (is (pos? @completed))
+            (is (.getAutoCommit owner))
+            (is (= 1 (.size pool)))))
+        (is (= [[0 ["aaaa" "bbbb" "cccc"]]
+                [1 ["dddd" "eeee" "ffff"]]
+                [2 ["gggg" "hhhh" "iiii"]]
+                [3 ["jjjj" "kkkk" "llll"]]]
+               (store/scan-records db 0 4)))))))
+
+(deftest single-record-insert-autocommit-test
+  (doseq [system (cond-> [:sqlite] (System/getenv "YCSB_PG_URL") (conj :postgres))
+          workload [:d :e]
+          durability [:strict :relaxed]]
+    (testing (str system " " workload " " durability)
+      (sql/with-store
+        (assoc shared/small-options :system system :api :datalog
+               :workload workload :durability durability :pool-size 2)
+        (fn [db]
+          (let [^ArrayBlockingQueue pool (:pool db)
+                observer (.remove pool)
+                session (.remove pool)
+                ^Connection conn (:connection session)
+                ^PreparedStatement insert (:insert session)
+                ^PreparedStatement read (:read observer)
+                calls (atom [])
+                observed (reify PreparedStatement
+                           (setLong [_ index value] (.setLong insert index value))
+                           (setString [_ index value] (.setString insert index value))
+                           (executeUpdate [_]
+                             (swap! calls conj :execute-update)
+                             (.executeUpdate insert))
+                           (addBatch [_] (swap! calls conj :add-batch) (.addBatch insert))
+                           (executeBatch [_] (swap! calls conj :execute-batch) (.executeBatch insert))
+                           (clearBatch [_] (swap! calls conj :clear-batch) (.clearBatch insert)))
+                keys (if (= workload :e) ["user1" "user2"] [1 2])
+                values ["aaaa" "bbbb" "cccc"]]
+            (.add pool (assoc session :insert observed))
+            (with-redefs-fn
+              {#'sql/transaction! (fn [& _] (throw (ex-info "Unexpected insert transaction wrapper" {})))}
+              (fn []
+                (doseq [key keys]
+                  (reset! calls [])
+                  (store/put-records! db [[key values]])
+                  (is (= [:execute-update] @calls))
+                  (is (.getAutoCommit conn))
+                  (if (= workload :e)
+                    (.setString read 1 key)
+                    (.setLong read 1 (long key)))
+                  (with-open [rs (.executeQuery read)]
+                    (is (.next rs) "The insert is committed before returning")
+                    (is (= values (mapv #(.getString rs (int %)) [1 2 3]))))
+                  (reset! calls [])
+                  (is (thrown? SQLException
+                               (store/put-records! db [[key ["xxxx" "yyyy" "zzzz"]]])))
+                  (is (= [:execute-update] @calls))
+                  (is (.getAutoCommit conn))
+                  (is (= 1 (.size pool)) "A rejected insert leaves the session reusable")
+                  (is (= values (store/read-record db key))))))
+            (is (= 2 (store/record-count db))))
+          {})))))
+
 (deftest rollback-failure-discards-closed-session-test
   (let [failure (SQLException. "Operation failed")
         rollback (SQLException. "Rollback failed")
@@ -26,7 +129,7 @@
                     (try
                       (#'sql/with-session pool 10
                         (fn [{:keys [connection]}]
-                          (#'sql/transaction! connection #(throw failure))))
+                          (#'sql/transaction! connection :sqlite #(throw failure))))
                       (catch Throwable t t))))
     (is (= [rollback] (vec (.getSuppressed failure))))
     (is @closed?)
@@ -37,6 +140,29 @@
     (dotimes [_ 2]
       (is (identical? healthy (#'sql/with-session pool 10 identity))))
     (is (= [healthy] (vec (.toArray pool))))))
+
+(deftest sqlite-commit-failure-discards-session-test
+  (sql/with-store
+    (assoc shared/small-options :system :sqlite :api :kv :pool-size 2)
+    (fn [db]
+      (let [^ArrayBlockingQueue pool (:pool db)
+            ^Connection contender (:connection (.remove pool))
+            ^Connection owner (:connection (.peek pool))]
+        (#'sql/execute-sql! owner "PRAGMA foreign_keys=ON")
+        (#'sql/execute-sql! owner
+          "CREATE TABLE child (id INTEGER REFERENCES records(id) DEFERRABLE INITIALLY DEFERRED)")
+        (is (thrown-with-msg?
+              SQLException #"FOREIGN KEY constraint failed"
+              (#'sql/with-session pool 10
+                (fn [{:keys [connection]}]
+                  (#'sql/transaction! connection :sqlite
+                    #(#'sql/execute-sql! connection "INSERT INTO child VALUES (-1)"))))))
+        ;; Xerial changes its auto-commit flag before attempting COMMIT.
+        ;; A commit failure leaves uncertain state, so discard the connection.
+        (is (.isClosed owner))
+        (is (.isEmpty pool))
+        (is (= "0" (#'sql/scalar contender "SELECT count(*) FROM child")))
+        (is (writer-available? contender))))))
 
 (deftest session-state-check-failure-test
   (doseq [operation-fails? [false true]]
@@ -134,8 +260,7 @@
                                        :api :datalog :mode :embedded :workload :d
                                        :ops 200 :warmup 50
                                        :pg-url "not-used-secret" :pg-user "not-reported"))
-        inserted (+ (get-in result [:warmup :by-operation :insert :count] 0)
-                    (get-in result [:measured :by-operation :insert :count] 0))]
+        inserted (get-in result [:measured :by-operation :insert :count] 0)]
     (is (pos? inserted))
     (is (= (+ 4 inserted) (get-in result [:validation :records])))
     (is (= 200 (get-in result [:measured :operations])))
