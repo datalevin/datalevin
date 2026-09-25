@@ -39,9 +39,9 @@ clojure -J-Xms4g -J-Xmx4g -M:jvm:bench \
   --ops 100000 --warmup 20000 --threads 8 --seed 17 \
   --output /tmp/datalevin-ycsb-a.edn
 
-# Read-only Datalog over TCP, with an explicit connection pool size.
+# Read-only Datalog over TCP, with one connection per worker.
 clojure -M:jvm:bench --api datalog --mode remote --workload C \
-  --threads 8 --pool-size 8 --distribution uniform
+  --threads 8 --distribution uniform
 
 clojure -M:jvm:bench --help
 ```
@@ -62,19 +62,12 @@ other platforms perform no process control.
 | Embedded | Datalevin KV or Datalog and SQLite |
 | Remote | Datalevin KV or Datalog and PostgreSQL |
 
-The default `--sql-indexes matched` aligns SQL value indexes with the selected
-Datalevin API:
-
-| API | SQL value-index condition | Capabilities compared |
-| --- | --- | --- |
-| KV | `none` | Primary-key reads, writes, and scans |
-| Datalog | `all` | Primary-key access plus indexed lookup on every value field |
-
-The primary key remains indexed in both conditions. `--sql-indexes none` or
-`all` overrides the match; `--sql-indexes both` runs both SQL conditions for each
-selected API without duplicating Datalevin runs. Each SQL condition loads a fresh database.
-Console output, per-case configuration, storage settings, and trial summaries
-label the condition; repetitions never combine indexed and unindexed results.
+All stores index the application key and leave payload fields unindexed,
+matching upstream YCSB's SQL schema. Datalog payload attributes use
+`:db/noindex true`; `:ycsb/key` retains its unique AVE index for point lookups and
+ordered scans. Reads and scans pull the payload fields from EAV. KV stores the
+payload in each record's value, and SQL creates only the primary-key index.
+There is one index policy for all comparisons; `--sql-indexes` has been removed.
 For SQL results, `:api` identifies the Datalevin API used for the comparison.
 
 ```sh
@@ -83,15 +76,10 @@ clojure -M:jvm:bench --system all --api datalog --mode embedded \
   --workload all --records 100000 --ops 100000 --warmup 20000 --threads 8 \
   --output /tmp/datalevin-ycsb-sqlite.edn
 
-# Compare both APIs with their matching SQLite index conditions.
+# Compare both APIs with SQLite.
 clojure -M:jvm:bench --system all --api all --mode embedded \
   --workload all --records 100000 --ops 100000 --warmup 20000 --threads 8 \
-  --output /tmp/datalevin-ycsb-sqlite-matched.edn
-
-# Run SQLite alone with and without value indexes.
-clojure -M:jvm:bench --system sqlite --api datalog --mode embedded \
-  --workload all --sql-indexes both \
-  --output /tmp/datalevin-ycsb-sqlite-indexes.edn
+  --output /tmp/datalevin-ycsb-sqlite-both-apis.edn
 
 # Remote Datalog versus PostgreSQL; use a disposable PostgreSQL database.
 export YCSB_PG_URL=jdbc:postgresql://127.0.0.1:5432/ycsb
@@ -110,8 +98,7 @@ clojure -M:jvm:bench --system all --api datalog --mode all --workload all \
 The default `--system datalevin` preserves Datalevin-only runs. `--system sqlite`
 and `--system postgres` run just the corresponding SQL cases, allowing separate
 process invocations and alternate engine ordering.
-`--system all --api all --mode all --workload all` runs 48 cases with the default
-matched index conditions.
+`--system all --api all --mode all --workload all` runs 48 cases.
 
 PostgreSQL must already be running. `--pg-url` and `--pg-user` override
 `YCSB_PG_URL` and `YCSB_PG_USER`; the URL defaults to
@@ -123,39 +110,83 @@ tables, and drops only that schema on completion or failure. `--keep-db` retains
 it and records its name. JDBC URLs and usernames are omitted from reports.
 SQLite uses a fresh temporary file with the same retention rules as Datalevin.
 
-For A/B/C/D/F, both SQL adapters store one row per record: an integer primary key and one
-`TEXT NOT NULL` column per field. Inserts explicitly supply the benchmark's
-numeric record key. In the `all` condition, both SQLite and PostgreSQL maintain
-a separate non-unique index on every value column (`f0` through `f9` by default),
-providing the same single-field value lookup capability as Datalog's attribute
-indexes. These indexes are created before loading, so load, warmup, and measured
-writes all include their maintenance. The `none` condition has only the primary
-key index and matches KV's access capabilities. Reports record the resolved
-condition under `:configuration :sql-indexes` and
-`:storage :configuration :sql-indexes`, with index names and columns under
-`:storage :configuration :secondary-indexes` (empty for `none`). The comparison
-aligns lookup capabilities and logical operations; physical index layouts still
-differ. Published results predating these conditions indexed only the SQL
-primary key, including the earlier Datalog comparisons.
+The SQL binding follows upstream YCSB JDBC at commit
+[`66302f3`](https://github.com/brianfrankcooper/YCSB/tree/66302f301b13f60d4bcb2f29f478586bb1d6f2e0/jdbc).
+All six SQL workloads use client-generated `user` + decimal FNV64 string keys,
+`YCSB_KEY VARCHAR(255) PRIMARY KEY`, and nullable `field0` through `field9` TEXT
+columns by default. SQLite uses an ordinary rowid table. Collation is the
+database default, as in upstream's reference schema; use a PostgreSQL database
+whose collation orders the generated ASCII keys lexically.
 
-Point reads select all fields and updates change one column. Known-record
-validation reads run outside measurement. Single-record inserts use one
-autocommit prepared INSERT, matching the default
-[upstream JDBC insert path](https://github.com/brianfrankcooper/YCSB/blob/master/jdbc/src/main/java/site/ycsb/db/JdbcDBClient.java).
-Multi-record load batches use an explicit transaction.
-F issues an ordinary full-record SELECT and then an autocommit UPDATE. There is
-no `SELECT ... FOR UPDATE`, explicit BEGIN, or transaction spanning the pair.
-SQLite commits explicit insert batches by restoring JDBC autocommit directly; calling `commit()` first
-would make the Xerial driver start another empty `BEGIN IMMEDIATE` transaction.
+Reports record `:payload-indexes :none` in each case's configuration and storage
+information. SQL also reports an empty `:storage :configuration :secondary-indexes`
+list. Earlier results with indexed Datalog payloads or SQL payload indexes need
+fresh baselines for this schema.
 
-SQL connections and prepared statements are created before load/warmup and
-reused across phases. `--pool-size` (default `--threads`) bounds each SQL pool;
-pool waiting is included in latency. PostgreSQL can write different rows
-concurrently, while SQLite and shared Datalog handles serialize writes according
-to their normal transaction behavior. The harness adds no shared row lock.
+Point reads use `SELECT *`; updates change one field. Scans use the upstream
+inclusive start, key ordering and row limit (`LIMIT ?` for SQLite,
+`FETCH FIRST ? ROWS ONLY` for PostgreSQL). Reads extract all named payload fields,
+equivalent to calling upstream JDBC with an explicit field set. Upstream's
+null-field path skips value extraction; this harness supplies fields so both
+SQL and Datalevin return complete records for the common validation contract.
+This is a result-handling difference from stock CoreWorkload defaults
+(`readallfields=true`, `readallfieldsbyname=false`). Upstream ordinary reads
+can pass the full field set with `readallfieldsbyname=true`, but its scan and
+RMW paths do not honor that switch at the pinned revision. Our scans also
+extract the key for `[key values]` results and key-order validation; upstream's
+explicit-field scan returns only the requested payload fields. The SQL
+statements match in either case, but client materialization work is different.
 
-E uses the application-key schema and query below. A/B/C/D/F validate known
-hashed numeric keys with prepared point reads after measurement.
+Every INSERT uses `executeUpdate()` in autocommit, including initial loading.
+SQL does not use the Datalevin `--batch-size`: a later duplicate insert leaves
+earlier inserts committed. F's SELECT and UPDATE commit separately, with no
+row lock or transaction spanning the pair. There is no explicit SQL transaction
+wrapper or SQLite `BEGIN IMMEDIATE` configuration.
+
+Each worker owns one JDBC connection and caches prepared statements lazily,
+as upstream does. F's read and update use the same worker connection.
+`--threads` determines SQL connection count; `--pool-size` controls only remote
+Datalevin connections. The load and final validation use worker zero while
+workers are stopped. Warmup and measurement have separate fresh databases and
+connections. The shared durability profiles, timeouts, request generators and
+timing/validation policy below still apply to every engine.
+As in upstream JDBC, prepared statements do not set `Statement.setQueryTimeout`.
+In the [SQLite driver](https://github.com/xerial/sqlite-jdbc/blob/3.51.1.0/src/main/java/org/sqlite/jdbc3/JDBC3Statement.java#L451)
+that setting adds a native busy-timeout change and restore around every execution.
+The harness configures SQLite's busy timeout and
+PostgreSQL's statement and lock timeouts once per connection instead.
+
+Reports identify this SQL binding with `:sql-binding-model :upstream-jdbc-v1`
+in configuration and `:binding-model`, `:upstream-revision`, `:read-fields`, and
+`:client-topology` in storage information. Older SQL results using numeric keys,
+connection pooling, explicit load transactions, or SQLite `WITHOUT ROWID` need
+fresh baselines. Point workloads validate their known keys after measurement.
+
+### D: reads of recently inserted string keys
+
+D uses upstream's client-generated `user` + decimal FNV64 hash string for load,
+inserts, and reads. The client selects a committed insertion ordinal with the
+latest distribution, converts it to this string, and supplies it to the store.
+Recency is based on insertion order, independently of the hashed key's ordering.
+
+KV stores the string as its record key. Datalog stores it in the unique
+`:ycsb/key` attribute and assigns internal entity IDs independently. SQL uses
+the upstream `YCSB_KEY VARCHAR(255)` primary key.
+Its prepared point read is `SELECT * FROM records WHERE YCSB_KEY = ?`;
+single-record inserts bind that string plus every payload field and execute in
+autocommit. The key remains a primary key; it is supplied by the client, not
+generated by the SQL database. D does not execute range scans during measurement.
+
+Inserts reject existing keys in every adapter and workload. KV uses `:nooverwrite`;
+Datalog uses `:db.unique/value` on `:ycsb/key` and allocates a new entity for
+each insert; SQL uses a plain INSERT into its primary key. Rejection leaves the
+existing record unchanged. Datalevin aborts the insert batch; SQL commits each
+record independently, so earlier successful inserts remain. Reports record
+`:insert-semantics :reject-duplicates`.
+
+Reports mark D with `:workload-model :application-key-latest-v1` and
+`:key-generator :ycsb-fnv64-decimal`. Earlier D results used numeric primary keys
+and direct Datalog entity IDs, so comparisons need fresh baselines.
 
 ### E: ordered ranges on an application key
 
@@ -171,17 +202,15 @@ using the configured request distribution and converts it to that string key.
 
 * **KV:** the `records` DBI uses a `:string` key and a payload vector encoded as
   `:data`. `get-first-n` starts at `[:at-least start]` and returns at most N entries.
-* **Datalog:** `:ycsb/key` is a string attribute with `:db.unique/identity`.
+* **Datalog:** `:ycsb/key` is a string attribute with `:db.unique/value`.
   Internal entity IDs are assigned by Datalevin. The prepared query filters
   `:ycsb/key >= start`, orders by that attribute, limits the result, and pulls
   the payload fields. One query per supported page size is prepared before
   loading and reused because `:limit` requires a literal. Remote E executes
   the query and pulls in one request.
-* **SQL:** `record_key TEXT` is the primary key. SQLite uses `COLLATE BINARY`
-  and `WITHOUT ROWID`; PostgreSQL uses `COLLATE "C"`. These order the generated
-  ASCII keys identically. The `none` condition has no secondary indexes;
-  `all` indexes every payload column (ten by default). Single-record inserts
-  use an autocommit prepared INSERT; load batches use an explicit transaction.
+* **SQL:** `YCSB_KEY VARCHAR(255)` is the primary key, using the database's
+  default collation and ordinary table layout. There are no secondary indexes.
+  Every insert, including loading, is an individual autocommit statement.
 
 For a page of ten records, the prepared Datalog query is:
 
@@ -198,10 +227,10 @@ For a page of ten records, the prepared Datalog query is:
 The SQL equivalent is:
 
 ```sql
-SELECT record_key, f0, f1, f2, f3, f4, f5, f6, f7, f8, f9
+SELECT *
 FROM records
-WHERE record_key >= ?
-ORDER BY record_key
+WHERE YCSB_KEY >= ?
+ORDER BY YCSB_KEY
 LIMIT ?;
 ```
 
@@ -243,9 +272,9 @@ For a remote Datalevin concurrency sweep:
 ```sh
 clojure -J-Xms4g -J-Xmx4g -M:jvm:bench \
   --system datalevin --api all --mode remote --workload c \
-  --client-counts 1,2,4,8 --datalog-handles shared --repetitions 1 \
+  --client-counts 1,2,4,8 --repetitions 1 \
   --records 100000 --warmup-ms 10000 --measurement-ms 30000 \
-  --server-workers 16 --server-heap-mb 4096 --durability strict \
+  --server-transaction-threads 16 --server-heap-mb 4096 --durability strict \
   --output /tmp/datalevin-ycsb-comparison.edn
 ```
 
@@ -256,30 +285,37 @@ datalog` when a new PostgreSQL baseline is needed. KV has a different physical
 layout.
 
 `--client-counts` expands the cases with matching worker and pool sizes.
-`--datalog-handles shared` gives workers one Datalog handle with a pooled read
-client and the normal dedicated transaction connection. `independent` creates
-one handle and one authenticated, single-connection client per worker; that
-connection also handles its transactions. Workers keep their assigned handles
-throughout each phase. `both` runs and labels both arrangements, with one SQL
-baseline per client count and selected SQL index condition. Independent mode requires pool size to equal worker
-count. This option applies to remote Datalevin Datalog only.
+`--datalog-handles independent` is the default. Each worker owns one Datalog
+handle and one authenticated connection for reads and transactions, matching
+SQL's connection-per-worker topology. Workers keep their assigned handles
+throughout each phase. `shared` gives workers one Datalog handle with a pooled
+read client and the normal dedicated transaction connection. `both` runs and
+labels both arrangements, with one SQL baseline per client count.
+Independent mode requires pool size to equal worker count;
+the default pool size already follows `--threads`. This option applies to remote
+Datalevin Datalog only.
 
 One trial is the default. Optional repetitions reload fresh data and start a
 fresh owned Datalevin server each time.
 Even-numbered repetitions reverse the full case order. Results retain every
-trial and summarize median/min/max throughput separately for each topology.
+trial and summarize median/min/max throughput for identical effective
+configurations, excluding only the trial number. Durability, dataset size,
+field size, and measurement duration remain separate conditions.
 Timed phases run for the requested duration, then finish in-flight operations;
 `--warmup-ms` and `--measurement-ms` override their respective operation counts.
 Every latency sample is retained, and percentile calculation is outside phase
-timing. Timed inserts grow the Zipf table as necessary, with growth included in
-timing. The phase timeout must exceed the requested duration.
+timing. The timed latest sampler starts with the loaded record count and grows
+as inserts commit; growth is included in timing. Overridden operation counts
+do not determine its initial allocation. The phase timeout must exceed the
+requested duration.
 
 The default Datalevin server uses a fixed 4096 MiB heap, one thread per connection,
 a limit of 16 explicit transactions, 4 background threads, and a 1000 ms writer
 slot timeout. KV and Datalog handles with pooled clients have one additional
-connection for explicit transactions. Legacy `--server-workers` and
-`--server-queue-size` options remain accepted, but requests no longer use those
-pools or queues. Corresponding `--server-*` options appear in
+connection for explicit transactions. The unused `--server-workers` and
+`--server-queue-size` flags have been removed. `--server-transaction-threads`
+sets the explicit transaction limit, and `--server-background-threads` sets
+the background pool size. These options appear in
 `--help`. `--server-mode in-process` is available for diagnostic controls and
 is explicitly labeled in reports. Child startup, readiness, and shutdown are
 outside phase timing. A startup failure or timeout terminates the child;
@@ -291,8 +327,9 @@ summaries to the complete EDN report.
 
 `clojure -M:jvm:test` always tests SQLite. Set `YCSB_PG_URL` (plus credentials
 if needed) to include PostgreSQL integration checks. They check actual index
-definitions, field preservation, interleaving between F's read and update, failed-batch
-rollback, both value-index conditions, and both durability profiles. Without
+definitions, upstream key/schema layout, worker-owned connections, field preservation,
+interleaving between F's read and update, per-record insert commits, unindexed
+payload fields, and both durability profiles. Without
 the URL, the test runner prints an explicit skip.
 
 ## Database lifecycle and defaults
@@ -308,8 +345,10 @@ Without arguments, the harness runs workload A for both APIs in both modes:
 10,000 initial records, 1,000 warmup operations, 10,000 measured operations,
 one worker, seed 17. Operation counts are **totals across workers**, not counts
 per worker. `--workload all` selects A–F; workload names are case-insensitive.
-The load batch size defaults to 100 records; measured writes each commit one
-logical record operation.
+All engines load one record per transaction by default, matching upstream JDBC's
+individual autocommit inserts. `--batch-size N` can explicitly enable larger
+Datalevin load transactions; SQL continues to commit each insert separately.
+Measured writes commit one record each.
 
 ## Workloads
 
@@ -344,11 +383,12 @@ the run before sending the update.
 
 ## Data and execution choices
 
-For A/B/C/D/F, the logical schema is identical for both APIs: a hashed numeric record key
-and `--field-count` strings of `--field-length` ASCII bytes. Defaults are ten
+All six workloads use the same logical schema across KV, Datalog, and SQL:
+a `user` + decimal FNV64 string key and `--field-count` strings of
+`--field-length` ASCII bytes. Defaults are ten
 fields of 100 bytes, excluding keys and database overhead.
 
-* **KV:** one `:id` key per record, equal to the nonnegative numeric record ID,
+* **KV:** one `:string` key per record,
   with all field strings stored together as a vector encoded with `:data` in the
   `records` DBI. Point reads reuse a `prepare-get-value` created when each store
   opens and call `execute-prepared` with the key. Field updates use `update-kv`
@@ -357,38 +397,45 @@ fields of 100 bytes, excluding keys and database overhead.
   transaction, preserving concurrent changes to other fields. F first performs
   a separate prepared point read, then uses this ordinary update with an
   independently generated replacement. Each physical entry counts as one logical record.
-  The `:id` encoding uses eight bytes without a type header.
-  Reports identify this layout as `:record-value` and its key encoding as `:id`;
-  earlier single-vector results used `:long` keys, which include a type header.
+  Inserts use `:nooverwrite`; updates reject missing keys.
+  Reports identify this layout as `:record-value` and its key encoding as `:string`.
+  Earlier A/B/C/F results used numeric `:id` or `:long` keys.
   Published results labeled `:field-keys` used the earlier per-field layout.
-* **Datalog:** one entity per record with an explicitly assigned `:db/id` equal
-  to the benchmark's numeric FNV64 key, and string attributes
-  `:ycsb/field0` through `:ycsb/field9` by default. There is no separate
-  `:ycsb/id` attribute or identity lookup. Point reads reuse a `prepare-pull`
-  created when each store opens and call `execute-prepared` with the entity ID;
+* **Datalog:** one entity per record with an automatically assigned internal
+  entity ID, a unique `:ycsb/key` string, and string attributes
+  `:ycsb/field0` through `:ycsb/field9` by default. Payload attributes declare
+  `:db/noindex true`, so only the application key participates in AVE.
+  Point reads reuse a `prepare-pull`
+  created when each store opens and call `execute-prepared` with `[:ycsb/key key]`;
   local executions pass the current connection DB to retain preparation across
-  writes. Updates use `transact!`. F performs that prepared read followed by an
+  writes. Updates use `transact!` with the same lookup reference, resolved inside
+  the transaction. A missing key fails without creating a partial entity.
+  The key's `:db.unique/value` constraint rejects duplicate inserts.
+  F performs that prepared read followed by an
   ordinary `transact!` update; no encompassing transaction is opened.
-  Untimed validation reuses prepared reads for known hashed IDs and arranges
+  Untimed point validation reuses prepared reads for known string keys and arranges
   each record's fields in benchmark order. Record counts use `count-datoms` on
-  the mandatory first field. Reports identify the key with
-  `:storage :record-key :db/id`. Datalog's field indexes and entity overhead
+  `:ycsb/key`. Reports identify the key with
+  `:storage :record-key :ycsb/key`. Datalog's entity storage and key-index overhead
   are part of the measurement. Index-result caching is bypassed with
   `:cache-limit 0` in both embedded and remote modes; reports include the
   effective limit. Pull-pattern and query-plan caches remain enabled.
-  Background sampling is disabled. Published
-  results predating this change used the separate `:ycsb/id` identity attribute.
+  E prepares its scan queries before timing; point workloads prepare them only
+  if a diagnostic scan is requested.
+  Background sampling is disabled. Earlier A/B/C/F results used direct numeric
+  entity IDs; those measurements need fresh baselines with the string-key lookup.
 * **Durability:** WAL is enabled with `--durability strict` by default for both
   APIs and modes. `--durability relaxed` selects a separately labeled profile.
   The adapters inherit the WAL-backed LMDB defaults, including `:writemap`
   and `:nosync`; reports record the effective flags under `:storage :env-flags`.
   The initial LMDB map size is 4096 MiB; normal automatic growth remains enabled.
 * **Remote:** a new server process binds to `127.0.0.1` on an OS-assigned port for
-  each case. Workers share one remote handle by default; independent Datalog
-  handles can be selected explicitly. The connection pool's default size equals
-  `--threads`. Datalog's shared handle also uses its standard dedicated
-  transaction client when the pool has more than one connection. Server worker
-  counts stay fixed independently of client concurrency. Debug
+  each case. Datalog workers own independent handles and one connection each by
+  default. `--datalog-handles shared` selects the shared-handle option. KV workers
+  share a pooled client whose default pool size equals `--threads`. Shared
+  handles also use the standard dedicated transaction client when the pool has
+  more than one connection. The transaction limit and background pool size
+  stay fixed independently of client concurrency. Debug
   request logging is disabled. The server uses its normal initial credentials,
   honoring `DATALEVIN_DEFAULT_PASSWORD`. Credentials are not included in reports.
   This measures TCP, encoding, pooling, and server dispatch with separate
@@ -414,12 +461,11 @@ if new inserts should remain eligible; ordinals beyond the fixed keyspace are
 not selected. The report records the actual modulus. No growing CDF is needed
 for scrambled Zipfian selection.
 
-Stored keys are hashed separately using upstream `Utils.fnvhash64`. A/B/C/D/F
-keep numeric keys in both Datalevin and SQL; E uses upstream's `user` + decimal
-hash string, with the default zero-padding of one. The numeric representation
-is a harness choice and sorts differently from strings, but insertion locality
-is no longer sequential. `:key-generator`, `:insert-order`, and
-`:request-generator` distinguish these results from old contiguous-key runs.
+Stored keys are hashed separately using upstream `Utils.fnvhash64`. All engines
+and workloads use upstream's `user` + decimal hash string, with default
+zero-padding of one. Reports use `:key-generator :ycsb-fnv64-decimal`;
+`:insert-order` and `:request-generator` also distinguish these results from
+older numeric or contiguous-key runs.
 
 `--distribution uniform` samples the committed ordinal prefix. `latest` retains
 the harness's finite inverse-CDF Zipf weights over that prefix, reversing ranks
@@ -443,7 +489,8 @@ A zero-length warmup skips its database entirely.
 
 Reports record `:warmup-isolation :separate-database` and each phase's verified
 `:starting-records`. Top-level load and validation describe the measured
-database. Warmup includes its own load, storage, and validation results. Final
+database. Warmup includes its own load, storage, and validation results, with
+checks marked `:post-warmup`. Final
 measured counts include only measured inserts. With `--keep-db`, both datasets
 are retained and their locations/names appear in the report. Older results
 that carried warmup mutations into measurement need fresh baselines; summaries
@@ -484,9 +531,10 @@ from older harness versions that timed ASCII checks need to be rerun before
 comparing throughput or latency with this version. These are structural checks,
 not a linearizability oracle or crash-durability test. Missing reads, malformed
 scans, worker failures, and phase timeouts fail the run; failed batches do not
-produce a success report. `--timeout-ms` controls remote request timeout.
-For SQL it also controls pool waits, statement timeouts,
-and database lock waits (JDBC timeout resolution is whole seconds).
+produce a success report. `--timeout-ms` controls remote request timeout,
+SQLite lock waits, and PostgreSQL statement and lock timeouts. PostgreSQL JDBC
+connection and socket timeouts round up to whole seconds. SQLite's busy timeout
+does not impose a wall-clock limit on queries that are not waiting for locks.
 `--phase-timeout-ms` triggers cancellation of an overdue warmup/measured phase.
 
 Use `--value-audit` for a correctness investigation with the same workload and
@@ -524,10 +572,11 @@ reported after workers have stopped.
 Smoke results establish that the harness works, not a performance ranking.
 For comparisons, use identical data, durability, heap, disk, and concurrency;
 increase warmup until results stabilize, repeat runs, and alternate case order
-using separate CLI invocations to reduce JVM/cache/order effects. Loading and
-warmup both touch the data, so this is not a cold-cache benchmark.
+using separate CLI invocations to reduce JVM/cache/order effects. Loading touches
+the measured data and warmup exercises the engine, so this is not a cold-cache
+benchmark.
 
 The [September 15 comparison](results/2026-09-15-current/README.md) contains
 the earlier 36-case A–F matrix and sustained remote read controls, with frozen
-sources, validation results, and historical comparisons. It predates explicit
-Datalog entity IDs and the matched SQL value-index conditions.
+sources, validation results, and historical comparisons. It predates the current
+application-key adapters and unindexed payload schema.

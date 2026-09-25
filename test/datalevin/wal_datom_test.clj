@@ -105,6 +105,38 @@
 (defn- datoms [conn index]
   (set (map (juxt :e :a :v) (d/datoms @conn index))))
 
+(deftest noindex-backfill-wal-recovery
+  (let [dir (u/tmp-dir (str "wal-noindex-" (random-uuid)))
+        source (str dir "/source")
+        baseline (str dir "/baseline.mdb")
+        baseline-meta (str dir "/baseline-meta")
+        schema {:body {:db/valueType :db.type/string :db/noindex true}}
+        giant (apply str (repeat 1000 "payload"))]
+    (try
+      (let [conn (d/create-conn source schema opts)]
+        (try
+          (d/transact! conn [{:db/id 1 :body "initial"}])
+          (is (empty? (d/datoms @conn :ave)))
+          (finally (d/close conn))))
+      (copy-file! (str source "/data.mdb") baseline)
+      (copy-file! (txlog/meta-path (str source "/txlog")) baseline-meta)
+      (let [conn (d/create-conn source nil opts)]
+        (try
+          (d/transact! conn [{:db/id 1 :body giant}])
+          (d/index-attr conn :body)
+          (d/transact! conn [{:db/id 2 :body "indexed"}])
+          (finally (d/close conn))))
+      (copy-file! baseline (str source "/data.mdb"))
+      (copy-file! baseline-meta (txlog/meta-path (str source "/txlog")))
+      (let [conn (d/create-conn source nil opts)]
+        (try
+          (is (nil? (get-in (d/schema conn) [:body :db/noindex])))
+          (is (= #{[1 :body giant] [2 :body "indexed"]}
+                 (datoms conn :eav) (datoms conn :ave)))
+          (is (= #{[1]} (d/q '[:find ?e :in $ ?v :where [?e :body ?v]] @conn giant)))
+          (finally (d/close conn))))
+      (finally (u/delete-files dir)))))
+
 (deftest compact-wal-recovery-and-follower-mirroring
   (let [dir (u/tmp-dir (str "wal-datoms-" (random-uuid)))
         source (str dir "/source")

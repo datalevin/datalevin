@@ -354,7 +354,11 @@
                                             ~@body)]
                                (vreset! s1# (.-store ^DB (deref conn1#)))
                                res#))
-                   new-s#  (s/transfer (deref s1#) kv#)
+                   ;; A schema mutation may have been rolled back explicitly.
+                   ;; Only adopt the schema that survived the transaction.
+                   new-s#  (if (identical? (i/schema s#) (i/schema (deref s1#)))
+                             (s/transfer (deref s1#) kv#)
+                             (s/transfer-after-schema-change (deref s1#) kv#))
                    new-db# (db/carry-runtime-opts (db/new-db new-s# nil db#) db#)]
                (reset! orig-conn# new-db#)
                res1#))
@@ -967,6 +971,15 @@
      ;; the normal Datalog transaction cache invalidation path.
      (db/refresh-cache store)
      result)))
+
+(defn index-attr
+  [conn attr]
+  {:pre [(conn? conn)]}
+  (locking conn
+    (let [store (.-store ^DB (db conn))
+          result (i/index-attr store attr)]
+      (db/refresh-cache store)
+      result)))
 
 (defonce ^:private connections (atom {}))
 (defonce ^:private transact-async-executor-atom (atom nil))

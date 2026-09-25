@@ -44,10 +44,12 @@
    [datalevin.query.tuple :as qtuple]
    [datalevin.relation :as r]
    [datalevin.rules :as rules]
-   [datalevin.util :as u :refer [raise concatv]])
+   [datalevin.storage :as storage]
+   [datalevin.util :as u :refer [raise concatv]]
+   [datalevin.validate :as vld])
   (:import
    [java.util HashMap HashSet IdentityHashMap List]
-   [datalevin.parser BindColl BindIgnore BindScalar BindTuple RulesVar SrcVar]
+   [datalevin.parser BindColl BindIgnore BindScalar BindTuple Constant Pattern RulesVar SrcVar]
    [datalevin.relation Relation]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
@@ -183,6 +185,27 @@
       (reduce j/hash-join
               (map #(in->rel %1 %2) (:bindings binding) coll)))))
 
+(defn- validate-pattern-indexes
+  [{:keys [sources parsed-q] :as context}]
+  ;; Avoid walking clauses for the default, fully indexed schema.
+  (when (some #(and (db/db? %) (seq (db/-attrs-by % :db/noindex)))
+              (vals sources))
+    (doseq [database (vals sources) :when (db/db? database)]
+      (storage/maybe-ensure-current! (:store database)))
+    (doseq [{:keys [source pattern]}
+            (dp/collect #(instance? Pattern %) (:qwhere parsed-q))
+            :let [database (get sources (or (:symbol source) '$))
+                  a (second pattern)]
+            :when (db/db? database)]
+      (if (instance? Constant a)
+        (vld/validate-indexed-attr (db/-schema database) (:value a))
+        (when-let [rel (rel-with-attr context (:symbol a))]
+          (let [idx (get (:attrs rel) (:symbol a))]
+            (doseq [tuple (:tuples rel)]
+              (vld/validate-indexed-attr (db/-schema database)
+                                         (nth tuple idx))))))))
+  context)
+
 (defn resolve-ins
   [context values]
   (loop [context  context
@@ -209,7 +232,7 @@
         (recur context
                (next bindings)
                (when values (next values))))
-      context)))
+      (validate-pattern-indexes context))))
 
 (defn dot-form [f]
   (when (and (symbol? f) (str/starts-with? (name f) "."))

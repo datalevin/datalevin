@@ -13,9 +13,8 @@
   (:require
    [datalevin.constants :as c]
    [datalevin.custom-datalog :as cd]
-   [datalevin.datom :as d]
    [datalevin.inline :refer [update assoc]]
-   [datalevin.interface :refer [transact-kv get-range populated?]]
+   [datalevin.interface :refer [transact-kv get-range]]
    [datalevin.lmdb :as lmdb]
    [datalevin.util :as u :refer [conjs raise]]
    [datalevin.validate :as vld]))
@@ -90,6 +89,8 @@
              (identical? :db.type/ref v)) [:db.type/ref]
         (and (identical? :db/isComponent k)
              (true? v))                   [:db/isComponent]
+        (and (identical? :db/noindex k)
+             (true? v))                   [:db/noindex]
         (and (identical? :db.attr/preds k)
              (some? v))                   [:db.attr/preds]
         :else                             []))))
@@ -112,6 +113,7 @@
    :db.cardinality/many => #{attr ...}
    :db.type/ref         => #{attr ...}
    :db/isComponent      => #{attr ...}
+   :db/noindex          => #{attr ...}
    :db.attr/preds       => #{attr ...}
    :db.type/tuple       => #{attr ...}
    :db/tupleAttr        => #{attr ...}
@@ -195,6 +197,8 @@
           schema       (prepare-schema-update old-schema schema)
           full-schema  (merge old-schema schema)]
       (vld/validate-schema full-schema)
+      (doseq [[attr props] schema]
+        (vld/validate-noindex-change lmdb attr (old-schema attr) props))
       (cd/validate-schema! lmdb full-schema)
       (cd/initialize! lmdb full-schema)
       (when (schema-update-required? old-schema schema)
@@ -295,6 +299,4 @@
 
 (defn populated-attr?
   [store attr]
-  (populated? store :ave
-              (d/datom c/e0 attr c/v0)
-              (d/datom c/emax attr c/vmax)))
+  (vld/populated-attribute? store attr))

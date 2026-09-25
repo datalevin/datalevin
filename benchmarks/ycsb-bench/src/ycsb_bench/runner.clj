@@ -16,14 +16,16 @@
   (merge server/defaults
          {:system :datalevin :api :all :mode :all :workload :a :records 10000 :ops 10000 :warmup 1000
           :threads 1 :pool-size nil :seed 17 :field-count 10 :field-length 100
-          :scan-length 100 :batch-size 100 :distribution nil :zipfian-keyspace nil :durability :strict
+          :scan-length 100 :batch-size 1 :distribution nil :zipfian-keyspace nil :durability :strict
           :timeout-ms 60000 :phase-timeout-ms 600000 :keep-db? false
-          :datalog-handles :shared :sql-indexes :matched :client-counts nil :repetitions 1
+          :datalog-handles :independent :client-counts nil :repetitions 1
           :warmup-ms nil :measurement-ms nil :value-audit? false}))
 
 (defn options
   "Normalize and validate options before allocating resources."
   [provided]
+  (when (contains? provided :sql-indexes)
+    (throw (ex-info "sql-indexes is no longer supported; payload fields are unindexed for every API" {})))
   (let [opts (merge defaults provided)
         opts (update opts :pool-size #(or % (:threads opts)))]
     (doseq [[k allowed] {:system #{:all :datalevin :sqlite :postgres}
@@ -32,14 +34,13 @@
                          :workload (conj (set (keys w/workloads)) :all)
                          :distribution #{nil :uniform :zipfian :latest}
                          :durability #{:strict :relaxed}
-                         :sql-indexes #{:matched :none :all :both}
                          :datalog-handles #{:shared :independent :both}
                          :server-mode #{:process :in-process}}]
       (when-not (contains? allowed (get opts k))
         (throw (ex-info (str "Invalid " (name k)) {:value (get opts k)}))))
     (doseq [k [:records :ops :threads :pool-size :field-count :field-length
                :scan-length :batch-size :timeout-ms :phase-timeout-ms :repetitions
-               :server-heap-mb :server-workers :server-queue-size
+               :server-heap-mb
                :server-transaction-threads :server-background-threads
                :server-startup-timeout-ms]]
       (when-not (and (integer? (get opts k)) (<= 1 (get opts k) Integer/MAX_VALUE))
@@ -59,8 +60,11 @@
                     (= (count counts) (count (distinct counts)))
                     (every? #(and (integer? %) (<= 1 % Integer/MAX_VALUE)) counts))
         (throw (ex-info "client-counts must contain distinct positive integers" {}))))
-    (when (and (= :datalevin (:system opts)) (= :datalog (:api opts))
-               (= :remote (:mode opts)) (= :independent (:datalog-handles opts))
+    ;; Check expanded selections before starting any case. Client-count sweeps
+    ;; override both counts with the same value when the cases are expanded.
+    (when (and (#{:datalevin :all} (:system opts)) (#{:datalog :all} (:api opts))
+               (#{:remote :all} (:mode opts)) (#{:independent :both} (:datalog-handles opts))
+               (nil? (:client-counts opts))
                (not= (:pool-size opts) (:threads opts)))
       (throw (ex-info "Independent Datalog handles require one connection per worker: pool-size must equal threads" {})))
     (when-not (and (integer? (:seed opts)) (<= Long/MIN_VALUE (:seed opts) Long/MAX_VALUE))
@@ -75,8 +79,8 @@
     opts))
 
 (defn cases
-  "Pair each API with SQLite embedded or PostgreSQL remote. By default SQL
-  value indexes match the API: none for KV, all for Datalog."
+  "Pair each API with SQLite embedded or PostgreSQL remote. All stores index
+  the application key and leave payload fields unindexed."
   [opts]
   (let [expand (fn [k values] (if (= :all (get opts k)) values [(get opts k)]))
         selected
@@ -89,15 +93,9 @@
                    handles (if (and (= system :datalevin) (= api :datalog) (= mode :remote))
                              (if (= :both (:datalog-handles opts))
                                [:shared :independent] [(:datalog-handles opts)])
-                             [:shared])
-                   indexes (cond
-                             (= system :datalevin) [nil]
-                             (= :both (:sql-indexes opts)) [:none :all]
-                             :else [(sql/index-mode (assoc opts :api api))])]
+                             [:shared])]
                (cond-> (assoc opts :system system :api api :mode mode :workload workload
                                    :datalog-handles handles :client-counts nil :repetitions 1)
-                 (= system :datalevin) (dissoc :sql-indexes)
-                 indexes (assoc :sql-indexes indexes)
                  clients (assoc :threads clients :pool-size clients))))]
     (when (empty? selected)
       (throw (ex-info "No compatible cases: SQLite needs embedded mode; PostgreSQL needs remote mode"
@@ -146,25 +144,17 @@
                       {:start start :limit n :keys keys})))
     (doseq [[_ values] rows] (validate-record-shape! values opts))))
 
-(defn- record-key [opts ordinal]
-  (if (= :e (:workload opts))
-    (w/application-key ordinal)
-    (let [key (w/fnvhash64 ordinal)]
-      (when (neg? key)
-        (throw (ex-info "Generated record key is not a nonnegative entity ID" {:key key})))
-      key)))
-
 (defn- execute!
   [db space ^Random rng cdf {:keys [field-count field-length scan-length
                                    distribution] :as opts} operation]
   (if (= operation :insert)
     (let [id (w/reserve-key! space)]
-      (store/put-records! db [[(record-key opts id) (w/record-values rng opts)]])
+      (store/put-records! db [[(w/application-key id) (w/record-values rng opts)]])
       (w/acknowledge-key! space id))
     (let [visible (:visible @space)
           cdf     (if (instance? clojure.lang.IAtom cdf) (w/grow-cdf! cdf visible) cdf)
           ordinal (w/choose-key rng distribution cdf visible)
-          id      (record-key opts ordinal)]
+          id      (w/application-key ordinal)]
       (case operation
         :read (validate-record-shape! (store/read-record db id) opts)
         :update (store/update-field! db id (.nextInt rng field-count)
@@ -175,17 +165,11 @@
                ;; read and update separately. There is no encompassing transaction.
                (validate-record-shape! (store/read-record db id) opts)
                (store/update-field! db id field value))
-        :scan (if (= :e (:workload opts))
-                (let [n (inc (.nextInt rng scan-length))
-                      rows (store/scan-records db id n)]
-                  ;; Inserts can appear anywhere in string-key order, including
-                  ;; between two records that were visible at request generation.
-                  (validate-key-page! rows id n opts))
-                (let [n (min (inc (.nextInt rng scan-length)) (- (long visible) ordinal))
-                      rows (store/scan-records db id n)]
-                  (when-not (= (mapv first rows) (vec (range id (+ id n))))
-                    (throw (ex-info "Scan returned incorrect IDs" {:start id :count n})))
-                  (doseq [[_ values] rows] (validate-record-shape! values opts))))))))
+        :scan (let [n (inc (.nextInt rng scan-length))
+                    rows (store/scan-records db id n)]
+                ;; Inserts can appear anywhere in string-key order, including
+                ;; between two records that were visible at request generation.
+                (validate-key-page! rows id n opts))))))
 
 (defn latency-summary!
   "Exact nearest-rank percentiles in microseconds; sorts the supplied array in place."
@@ -350,7 +334,7 @@
 (defn- load! [db {:keys [records batch-size seed] :as opts}]
   (let [t0 (System/nanoTime)]
     (doseq [ids (partition-all batch-size (range records))]
-      (store/put-records! db (mapv (fn [id] [(record-key opts id) (w/initial-values seed id opts)]) ids)))
+      (store/put-records! db (mapv (fn [id] [(w/application-key id) (w/initial-values seed id opts)]) ids)))
     (let [elapsed (- (System/nanoTime) t0)]
       {:records records :seconds (/ elapsed 1e9)
        :records-per-second (/ (* (double records) 1e9) elapsed)})))
@@ -373,10 +357,10 @@
              (throw (ex-info "Missing or unordered application keys"
                              {:expected (vec keys) :actual (mapv first rows)})))
            (doseq [[id values] rows] (check! id values))))
-       ;; A/B/C/D/F validate their known hashed keys; no dense numeric interval
-       ;; represents that set. This work runs after the measurement has ended.
+       ;; Point validation runs after measurement and uses the same string keys
+       ;; as loading and timed requests.
        (doseq [ordinal (range expected)]
-         (let [id (record-key opts ordinal)]
+         (let [id (w/application-key ordinal)]
            (check! id (store/read-record db id)))))
      {:status :passed :records actual :all-records-checked? true
       :scope (if value-index :structure-and-observed-values :structure)
@@ -390,8 +374,11 @@
   (case (:distribution opts)
     :uniform nil
     :zipfian (:zipfian-keyspace opts)
-    :latest (let [table (w/zipf-cdf (+ (:records opts) n))]
-              (if (some? (phase-duration opts phase)) (atom table) table))))
+    :latest (if (some? (phase-duration opts phase))
+              ;; Operation counts are overridden by the timer. Grow only as
+              ;; committed inserts extend the visible prefix.
+              (atom (w/zipf-cdf (:records opts)))
+              (w/zipf-cdf (+ (:records opts) n)))))
 
 (defn- predicted-keyspace [opts n]
   (let [insert-percent (get (into {} (get-in w/workloads [(:workload opts) :mix])) :insert 0)]
@@ -413,7 +400,7 @@
         result (run-phase! phase-db space cdf opts phase n)
         expected (+ (:records opts) (get-in result [:by-operation :insert :count] 0))
         events (when history (audit/events history))
-        value-index (when history (audit/prepare events opts #(record-key opts %)))
+        value-index (when history (audit/prepare events opts w/application-key))
         value-checks (when history
                        (audit/check-observations! value-index events #(validate-record! % opts)))]
     (when-not (= expected (:visible @space) (:next @space))
@@ -423,17 +410,20 @@
      :result (cond-> (assoc result :starting-records starting-records)
                (= :zipfian (:distribution opts)) (assoc :zipfian-keyspace (:zipfian-keyspace opts)))
      :validation (cond-> (validate-database! db expected opts value-index)
-                   history (assoc :value-checks (assoc value-checks :final-records expected)))}))
+                   history (assoc :value-checks (assoc value-checks :final-records expected))
+                   (= phase :warmup) (assoc :character-checks :post-warmup)
+                   (and history (= phase :warmup))
+                   (assoc-in [:value-checks :comparisons] :post-warmup))}))
 
 (defn run-case! [provided]
   (let [opts (options provided)
-        opts (cond-> opts
-               (= :e (:workload opts)) (assoc :workload-model :application-key-range-v1)
-               (= :f (:workload opts)) (assoc :workload-model :ycsb-read-update-v1
-                                             :rmw-execution :client-read-update
+        opts (cond-> (assoc opts :workload-model (w/workload-model (:workload opts)))
+               (= :f (:workload opts)) (assoc :rmw-execution :client-read-update
                                              :atomic-rmw? false))
         opts (update opts :distribution #(or % (get-in w/workloads [(:workload opts) :distribution])))
-        opts (assoc opts :key-generator :ycsb-fnv64 :insert-order :hashed
+        opts (assoc opts :key-generator :ycsb-fnv64-decimal
+                         :payload-indexes :none
+                         :insert-order :hashed
                          :warmup-isolation :separate-database
                          :request-generator (if (= :zipfian (:distribution opts))
                                               :ycsb-scrambled-zipfian :committed-prefix))
@@ -447,9 +437,9 @@
         _ (when (and (= :datalevin (:system opts)) (= :datalog (:api opts))
                      (= :remote (:mode opts)) (= :both (:datalog-handles opts)))
             (throw (ex-info "run-case! requires a single Datalog handle mode" {})))
-        opts (if (= :datalevin (:system opts))
-               (dissoc opts :sql-indexes)
-               (assoc opts :sql-indexes (sql/index-mode opts)))
+        opts (cond-> opts
+               (not= :datalevin (:system opts))
+               (assoc :batch-size 1 :sql-binding-model :upstream-jdbc-v1))
         _ (cases opts)
         warmup-opts (cond-> opts
                       (= :zipfian (:distribution opts))
@@ -466,6 +456,8 @@
               (dissoc :result)
               (assoc :configuration
                      (cond-> (dissoc opts :pg-url :pg-user :client-counts :repetitions)
+                       (#{:sqlite :postgres} (:system opts))
+                       (dissoc :pool-size)
                        (not (and (= :datalevin (:system opts))
                                  (= :datalog (:api opts)) (= :remote (:mode opts))))
                        (dissoc :datalog-handles))

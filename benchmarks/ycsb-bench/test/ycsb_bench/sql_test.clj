@@ -1,194 +1,112 @@
 (ns ycsb-bench.sql-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
             [ycsb-bench.core-test :as shared]
             [ycsb-bench.runner :as runner]
             [ycsb-bench.sql :as sql]
             [ycsb-bench.store :as store])
-  (:import [java.sql Connection PreparedStatement SQLException]
-           [java.util.concurrent ArrayBlockingQueue]
+  (:import [java.sql Connection PreparedStatement ResultSetMetaData SQLException]
+           [java.util HashMap]
            [org.postgresql PGResultSetMetaData]))
 
-(defn- writer-available? [^Connection conn]
-  (try
-    (#'sql/execute-sql! conn "BEGIN IMMEDIATE")
-    (#'sql/execute-sql! conn "ROLLBACK")
-    true
-    (catch SQLException e
-      (if (= 5 (.getErrorCode e)) false (throw e)))))
+(defn- systems []
+  (cond-> [:sqlite] (System/getenv "YCSB_PG_URL") (conj :postgres)))
 
-(deftest sqlite-transaction-releases-writer-at-commit-test
-  (sql/with-store
-    (assoc shared/small-options :system :sqlite :api :kv :pool-size 2)
-    (fn [db]
-      (let [^ArrayBlockingQueue pool (:pool db)
-            session (.remove pool)
-            ^Connection owner (:connection session)
-            ^Connection contender (:connection (.remove pool))
-            completed (atom 0)
-            after-commit! (fn []
-                            (swap! completed inc)
-                            (is (writer-available? contender)
-                                "Commit must release the writer without reacquiring it"))
-            observed (reify Connection
-                       (setAutoCommit [_ enabled]
-                         (.setAutoCommit owner enabled)
-                         (if enabled
-                           (after-commit!)
-                           (is (not (writer-available? contender))
-                               "The writer must be acquired before the insert batch")))
-                       (commit [_] (.commit owner) (after-commit!))
-                       (rollback [_] (.rollback owner))
-                       (close [_] (.close owner))
-                       (isClosed [_] (.isClosed owner)))]
-        (#'sql/execute-sql! contender "PRAGMA busy_timeout=1")
-        (.add pool (assoc session :connection observed))
-        (doseq [[label operation]
-                [[:load #(store/put-records! db [[0 ["aaaa" "bbbb" "cccc"]]
-                                                [1 ["dddd" "eeee" "ffff"]]])]
-                 [:load-batch #(store/put-records! db [[2 ["gggg" "hhhh" "iiii"]]
-                                                      [3 ["jjjj" "kkkk" "llll"]]])]]]
-          (testing (name label)
-            (reset! completed 0)
-            (operation)
-            (is (pos? @completed))
-            (is (.getAutoCommit owner))
-            (is (= 1 (.size pool)))))
-        (is (= [[0 ["aaaa" "bbbb" "cccc"]]
-                [1 ["dddd" "eeee" "ffff"]]
-                [2 ["gggg" "hhhh" "iiii"]]
-                [3 ["jjjj" "kkkk" "llll"]]]
-               (store/scan-records db 0 4)))))))
+(deftest worker-connections-and-lazy-statements-test
+  (doseq [system (systems)]
+    (sql/with-store
+      (assoc shared/small-options :system system :api :kv :threads 2 :pool-size 1)
+      (fn [group]
+        (let [first-worker (store/for-worker group 0)
+              second-worker (store/for-worker group 1)
+              first-cache ^HashMap (:statements first-worker)
+              second-cache ^HashMap (:statements second-worker)
+              values ["aaaa" "bbbb" "cccc"]]
+          (is (= 2 (count (:stores group))))
+          (is (identical? first-worker (store/for-worker group 0)))
+          (is (not (identical? (:connection first-worker) (:connection second-worker))))
+          (is (.isEmpty first-cache))
+          (is (.isEmpty second-cache))
+          (store/put-records! group [["user1" values]])
+          (is (= #{:insert} (set (.keySet first-cache))))
+          (doseq [worker [first-worker second-worker]]
+            (is (.getAutoCommit ^Connection (:connection worker)))
+            (is (= values (store/read-record worker "user1"))))
+          (let [prepared (.get first-cache :read)]
+            (store/read-record first-worker "user1")
+            (is (identical? prepared (.get first-cache :read)))
+            (is (not (identical? prepared (.get second-cache :read)))))
+          (is (= {:handles :per-worker :read-connections 2 :transaction-connections :same-worker}
+                 (:client-topology (store/storage-info group)))))
+        {}))))
 
-(deftest single-record-insert-autocommit-test
-  (doseq [system (cond-> [:sqlite] (System/getenv "YCSB_PG_URL") (conj :postgres))
-          workload [:d :e]
-          durability [:strict :relaxed]]
-    (testing (str system " " workload " " durability)
+(deftest inserts-use-autocommit-execute-update-test
+  (doseq [system (systems), workload [:a :d :e :f], durability [:strict :relaxed]]
+    (testing (str [system workload durability])
       (sql/with-store
-        (assoc shared/small-options :system system :api :datalog
-               :workload workload :durability durability :pool-size 2)
-        (fn [db]
-          (let [^ArrayBlockingQueue pool (:pool db)
-                observer (.remove pool)
-                session (.remove pool)
-                ^Connection conn (:connection session)
-                ^PreparedStatement insert (:insert session)
-                ^PreparedStatement read (:read observer)
+        (assoc shared/small-options :system system :api :datalog :threads 2
+               :workload workload :durability durability)
+        (fn [group]
+          (let [db (store/for-worker group 0)
+                observer (store/for-worker group 1)
+                ^PreparedStatement insert (#'sql/statement db :insert)
                 calls (atom [])
-                observed (reify PreparedStatement
-                           (setLong [_ index value] (.setLong insert index value))
+                prepared (reify PreparedStatement
                            (setString [_ index value] (.setString insert index value))
                            (executeUpdate [_]
+                             (is (.getAutoCommit ^Connection (:connection db)))
                              (swap! calls conj :execute-update)
-                             (.executeUpdate insert))
-                           (addBatch [_] (swap! calls conj :add-batch) (.addBatch insert))
-                           (executeBatch [_] (swap! calls conj :execute-batch) (.executeBatch insert))
-                           (clearBatch [_] (swap! calls conj :clear-batch) (.clearBatch insert)))
-                keys (if (= workload :e) ["user1" "user2"] [1 2])
+                             (.executeUpdate insert)))
                 values ["aaaa" "bbbb" "cccc"]]
-            (.add pool (assoc session :insert observed))
-            (with-redefs-fn
-              {#'sql/transaction! (fn [& _] (throw (ex-info "Unexpected insert transaction wrapper" {})))}
-              (fn []
-                (doseq [key keys]
-                  (reset! calls [])
-                  (store/put-records! db [[key values]])
-                  (is (= [:execute-update] @calls))
-                  (is (.getAutoCommit conn))
-                  (if (= workload :e)
-                    (.setString read 1 key)
-                    (.setLong read 1 (long key)))
-                  (with-open [rs (.executeQuery read)]
-                    (is (.next rs) "The insert is committed before returning")
-                    (is (= values (mapv #(.getString rs (int %)) [1 2 3]))))
-                  (reset! calls [])
-                  (is (thrown? SQLException
-                               (store/put-records! db [[key ["xxxx" "yyyy" "zzzz"]]])))
-                  (is (= [:execute-update] @calls))
-                  (is (.getAutoCommit conn))
-                  (is (= 1 (.size pool)) "A rejected insert leaves the session reusable")
-                  (is (= values (store/read-record db key))))))
-            (is (= 2 (store/record-count db))))
+            (.put ^HashMap (:statements db) :insert prepared)
+            (store/put-records! db [["user1" values] ["user2" values]])
+            (is (= [:execute-update :execute-update] @calls))
+            (is (= values (store/read-record observer "user1")))
+            (is (= values (store/read-record observer "user2")))
+            ;; A later duplicate does not roll back an earlier committed row.
+            (is (thrown? SQLException
+                         (store/put-records! db [["user3" values] ["user1" ["xxxx" "yyyy" "zzzz"]]])))
+            (is (= values (store/read-record observer "user3")))
+            (is (= values (store/read-record observer "user1")))
+            (is (= 3 (store/record-count observer)))
+            (is (.getAutoCommit ^Connection (:connection db))))
           {})))))
 
-(deftest rollback-failure-discards-closed-session-test
-  (let [failure (SQLException. "Operation failed")
-        rollback (SQLException. "Rollback failed")
-        closed? (atom false)
-        auto-commit (atom [])
-        broken (reify Connection
-                 (setAutoCommit [_ enabled] (swap! auto-commit conj enabled))
-                 (rollback [_] (throw rollback))
-                 (close [_] (reset! closed? true))
-                 (isClosed [_] @closed?))
-        healthy {:connection (reify Connection (isClosed [_] false))}
-        pool (ArrayBlockingQueue. 2)]
-    (.add pool {:connection broken})
-    (.add pool healthy)
-    (is (identical? failure
-                    (try
-                      (#'sql/with-session pool 10
-                        (fn [{:keys [connection]}]
-                          (#'sql/transaction! connection :sqlite #(throw failure))))
-                      (catch Throwable t t))))
-    (is (= [rollback] (vec (.getSuppressed failure))))
-    (is @closed?)
-    (is (= [false] @auto-commit)
-        "An uncertain transaction must not be switched back to auto-commit")
-    (is (= [healthy] (vec (.toArray pool)))
-        "Only the healthy connection is available to subsequent workers")
-    (dotimes [_ 2]
-      (is (identical? healthy (#'sql/with-session pool 10 identity))))
-    (is (= [healthy] (vec (.toArray pool))))))
-
-(deftest sqlite-commit-failure-discards-session-test
-  (sql/with-store
-    (assoc shared/small-options :system :sqlite :api :kv :pool-size 2)
-    (fn [db]
-      (let [^ArrayBlockingQueue pool (:pool db)
-            ^Connection contender (:connection (.remove pool))
-            ^Connection owner (:connection (.peek pool))]
-        (#'sql/execute-sql! owner "PRAGMA foreign_keys=ON")
-        (#'sql/execute-sql! owner
-          "CREATE TABLE child (id INTEGER REFERENCES records(id) DEFERRABLE INITIALLY DEFERRED)")
-        (is (thrown-with-msg?
-              SQLException #"FOREIGN KEY constraint failed"
-              (#'sql/with-session pool 10
-                (fn [{:keys [connection]}]
-                  (#'sql/transaction! connection :sqlite
-                    #(#'sql/execute-sql! connection "INSERT INTO child VALUES (-1)"))))))
-        ;; Xerial changes its auto-commit flag before attempting COMMIT.
-        ;; A commit failure leaves uncertain state, so discard the connection.
-        (is (.isClosed owner))
-        (is (.isEmpty pool))
-        (is (= "0" (#'sql/scalar contender "SELECT count(*) FROM child")))
-        (is (writer-available? contender))))))
-
-(deftest session-state-check-failure-test
-  (doseq [operation-fails? [false true]]
-    (let [failure (SQLException. "Operation failed")
-          inspection (SQLException. "Connection state unavailable")
-          pool (ArrayBlockingQueue. 1)]
-      (.add pool {:connection (reify Connection (isClosed [_] (throw inspection)))})
-      (is (identical? (if operation-fails? failure inspection)
-                      (try
-                        (#'sql/with-session pool 10
-                          (fn [_] (when operation-fails? (throw failure))))
-                        (catch Throwable t t))))
-      (when operation-fails?
-        (is (= [inspection] (vec (.getSuppressed failure)))))
-      (is (.isEmpty pool) "A session with unknown state must not be reused"))))
+(deftest upstream-schema-and-select-test
+  (doseq [system (systems), workload [:a :b :c :d :e :f]]
+    (sql/with-store
+      (assoc shared/small-options :system system :api :kv :workload workload)
+      (fn [group]
+        (let [db (store/for-worker group 0)
+              stmt (#'sql/statement db :read)
+              metadata (.getMetaData stmt)]
+          (is (= 4 (.getColumnCount metadata)) "SELECT * includes the string primary key")
+          (is (= ["YCSB_KEY" "FIELD0" "FIELD1" "FIELD2"]
+                 (mapv #(str/upper-case (.getColumnName metadata (int %))) (range 1 5))))
+          (is (= "VARCHAR" (str/upper-case (.getColumnTypeName metadata 1))))
+          (doseq [column (range 2 5)]
+            (is (= ResultSetMetaData/columnNullable (.isNullable metadata (int column)))))
+          (when (= system :sqlite)
+            (let [^Connection conn (:connection db)
+                  ddl (#'sql/scalar conn "SELECT sql FROM sqlite_master WHERE name='records'")]
+              (is (not (str/includes? ddl "WITHOUT ROWID")))
+              (is (not (str/includes? ddl "COLLATE")))
+              (store/put-records! db [["user10" ["aaaa" "bbbb" "cccc"]]])
+              (is (= "text" (#'sql/scalar conn "SELECT typeof(YCSB_KEY) FROM records")))
+              (is (= "1" (#'sql/scalar conn "SELECT rowid FROM records"))))))
+        {}))))
 
 (defn- field-indexes [db]
-  (let [^Connection conn (first (:connections db))
-        ^PreparedStatement read-statement (:read (.peek ^ArrayBlockingQueue (:pool db)))
+  (let [db (store/for-worker db 0)
+        ^Connection conn (:connection db)
+        ^PreparedStatement read-statement (#'sql/statement db :read)
         schema (when (= :postgres (:engine (store/storage-info db)))
                  (.getBaseSchemaName ^PGResultSetMetaData (.getMetaData read-statement) 1))]
     (with-open [rs (.getIndexInfo (.getMetaData conn) nil schema "records" false false)]
       (loop [indexes #{}]
         (if (.next rs)
           (let [column (.getString rs "COLUMN_NAME")]
-            (recur (if (or (nil? column) (= "id" column))
+            (recur (if (or (nil? column) (= "ycsb_key" (str/lower-case column)))
                      indexes
                      (conj indexes {:name (.getString rs "INDEX_NAME")
                                     :column column
@@ -196,59 +114,56 @@
                                     :position (.getShort rs "ORDINAL_POSITION")}))))
           indexes)))))
 
-(defn- check-field-indexes! [db field-count mode]
-  (let [expected (mapv (fn [field]
-                        {:name (str "records_f" field "_idx") :column (str "f" field)})
-                      (if (= mode :all) (range field-count) []))]
-    (is (= (set (map #(assoc % :non-unique? true :position 1) expected))
-           (field-indexes db))
-        "The database has exactly the value indexes selected for this condition")
-    (is (= mode (get-in (store/storage-info db) [:configuration :sql-indexes])))
-    (is (= expected (get-in (store/storage-info db) [:configuration :secondary-indexes]))
-        "Reports describe the indexes maintained during the benchmark")))
+(defn- check-field-indexes! [db]
+  (is (empty? (field-indexes db)) "Upstream SQL has no payload indexes")
+  (is (= :none (:payload-indexes (store/storage-info db))))
+  (is (= [] (get-in (store/storage-info db) [:configuration :secondary-indexes]))
+      "Reports describe the indexes maintained during the benchmark"))
 
 (defn- check-sql! [opts]
   (sql/with-store
     opts
     (fn [db]
-      (check-field-indexes! db (:field-count opts) (:sql-indexes opts))
-      (shared/check-adapter! db)
-      (testing "A failed insert batch rolls back completely and releases its connection"
-        (is (thrown? SQLException
-                     (store/put-records! db [[4 ["dddd" "eeee" "ffff"]]
-                                            [0 ["aaaa" "bbbb" "cccc"]]])))
-        (is (= 4 (store/record-count db)))
-        (is (= [] (store/scan-records db 4 1)))
-        (store/update-field! db 1 0 "xxxx")
-        (is (= ["xxxx" "bbbb" "cccc"] (store/read-record db 1))))
+      (check-field-indexes! db)
+      (let [values ["aaaa" "bbbb" "cccc"]]
+        (store/put-records! db [["user2" values] ["user0" values] ["user10" values]])
+        (is (= values (store/read-record db "user10")))
+        (store/update-field! db "user10" 0 "xxxx")
+        (store/update-field! db "user10" 2 "zzzz")
+        (is (= ["xxxx" "bbbb" "zzzz"] (store/read-record db "user10")))
+        (is (= [["user10" ["xxxx" "bbbb" "zzzz"]] ["user2" values]]
+               (store/scan-records db "user1" 2)))
+        (is (= [["user2" values]] (store/scan-records db "user11" 10)))
+        (is (empty? (store/scan-records db "user3" 1)))
+        (is (empty? (store/scan-records db "user0" 0)))
+        (is (thrown? clojure.lang.ExceptionInfo (store/read-record db "absent")))
+        (is (= 3 (store/record-count db))))
       {:storage (store/storage-info db)})))
 
-(deftest value-index-field-count-test
-  (doseq [system (cond-> [:sqlite] (System/getenv "YCSB_PG_URL") (conj :postgres))
-          [api mode] [[:kv :none] [:datalog :all]]
+(deftest unindexed-payload-field-count-test
+  (doseq [system (systems)
+          api [:kv :datalog]
           field-count [1 10]]
     (testing (str system " " api " with " field-count " value columns")
       (sql/with-store
         (assoc shared/small-options :system system :api api :field-count field-count)
         (fn [db]
-          (check-field-indexes! db field-count mode)
+          (check-field-indexes! db)
           {})))))
 
 (deftest sqlite-semantics-and-durability-test
-  (doseq [durability [:strict :relaxed], sql-indexes [:none :all]]
+  (doseq [durability [:strict :relaxed]]
     (let [result (check-sql! (assoc shared/small-options :system :sqlite
-                                   :api :datalog :mode :embedded :durability durability
-                                   :sql-indexes sql-indexes))]
+                                   :api :datalog :mode :embedded :durability durability))]
       (is (= "wal" (get-in result [:storage :configuration :journal-mode])))
       (is (= (if (= durability :strict) "2" "1")
              (get-in result [:storage :configuration :synchronous]))))))
 
 (deftest postgres-semantics-and-durability-test
   (if (System/getenv "YCSB_PG_URL")
-    (doseq [durability [:strict :relaxed], sql-indexes [:none :all]]
+    (doseq [durability [:strict :relaxed]]
       (let [result (check-sql! (assoc shared/small-options :system :postgres
-                                     :api :datalog :mode :remote :durability durability
-                                     :sql-indexes sql-indexes))]
+                                     :api :datalog :mode :remote :durability durability))]
         (is (= "on" (get-in result [:storage :configuration :fsync])))
         (is (= "on" (get-in result [:storage :configuration :full-page-writes])))
         (is (= (if (= durability :strict) "on" "off")
@@ -274,7 +189,29 @@
             clojure.lang.ExceptionInfo #"Injected benchmark failure"
             (sql/with-store (assoc shared/small-options :system system :api :datalog)
               (fn [db]
-                (reset! connections (:connections db))
+                (reset! connections (mapv :connection (:stores db)))
                 (throw (ex-info "Injected benchmark failure" {}))))))
       (is (= 3 (count @connections)))
       (is (every? #(.isClosed ^Connection %) @connections)))))
+
+(deftest cleanup-preserves-primary-failure-test
+  (doseq [failed? [false true]]
+    (let [primary (when failed? (ex-info "Benchmark failed" {}))
+          close-error (ex-info "Close failed" {})
+          drop-error (ex-info "Drop failed" {})
+          calls (atom [])
+          result (try
+                   (#'sql/cleanup!
+                     primary
+                     [#(do (swap! calls conj :close) (throw close-error))
+                      #(do (swap! calls conj :drop) (throw drop-error))
+                      #(swap! calls conj :files)])
+                   (catch Exception e e))]
+      (is (= [:close :drop :files] @calls))
+      (if primary
+        (do
+          (is (nil? result))
+          (is (= [close-error drop-error] (vec (.getSuppressed primary)))))
+        (do
+          (is (identical? close-error result))
+          (is (= [drop-error] (vec (.getSuppressed close-error)))))))))

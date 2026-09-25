@@ -15,14 +15,11 @@
 
 (def defaults
   {:server-mode :process :server-heap-mb 4096
-   :server-workers 16 :server-queue-size 1024
    :server-transaction-threads 16 :server-background-threads 4
    :server-transaction-lock-timeout-ms 1000 :server-startup-timeout-ms 120000})
 
 (defn server-options [root opts]
   {:root (str root "/server") :host "127.0.0.1" :port 0 :verbose false
-   :worker-threads (:server-workers opts)
-   :worker-queue-size (:server-queue-size opts)
    :transaction-threads (:server-transaction-threads opts)
    :background-threads (:server-background-threads opts)
    :transaction-lock-timeout-ms (:server-transaction-lock-timeout-ms opts)})

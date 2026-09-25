@@ -1432,6 +1432,17 @@
                  (dt-store deps server skey (nth args 0) writing?)
                  (rest args)))))))
 
+(defn index-attr
+  [deps server skey {:keys [args writing?]}]
+  (let [[db-name attr] args]
+    (db-alter-permission!
+      deps server skey db-name
+      "Don't have permission to alter the database"
+      (fn []
+        (write-result! deps skey
+                       (i/index-attr (dt-store deps server skey db-name writing?)
+                                     attr))))))
+
 (defn load-datoms
   [deps server skey {:keys [mode args writing?]}]
   (let [db-name (nth args 0)]
@@ -2687,6 +2698,7 @@
    :schema (normal-dt-handler i/schema)
    :rschema (normal-dt-handler i/rschema)
    :set-schema set-schema
+   :index-attr index-attr
    :datalog-register-type register-type
    :init-max-eid (normal-dt-handler i/init-max-eid)
    :max-tx (normal-dt-handler i/max-tx)

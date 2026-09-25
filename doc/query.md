@@ -1321,3 +1321,21 @@ database management system." SIGMOD. 1979.
 
 [15] Zhao, H., et al. "I Can’t Believe It’s Not Yannakakis: Pragmatic Bitmap
 Filters in Microsoft SQL Server.", CIDR, 2026.
+## Attributes without an AVE index
+
+Attributes participate in AVE by default. Declare `:db/noindex true` in an
+attribute's schema before storing its values to omit it from AVE. Its values
+remain in EAV and are available through `entity`, `pull`, and EAV datom reads.
+Full-text, vector, and document indexes retain their own schema settings.
+
+Datalog patterns naming an unindexed attribute throw an error, including
+patterns with a bound entity or an input-bound attribute. Use pull to project
+these values from entities selected by indexed attributes. Unique and reference
+attributes cannot have `:db/noindex true`.
+
+To query the attribute later, call `(d/index-attr conn :document/body)`.
+This scans EAV and atomically adds its existing values to AVE and removes
+`:db/noindex` from the schema. Subsequent writes maintain AVE normally. The
+operation holds the database write transaction while building the index, works
+locally and remotely, and returns the updated schema. Calling it again is safe.
+Direct schema changes to `:db/noindex` require an empty attribute.

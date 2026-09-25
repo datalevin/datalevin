@@ -185,6 +185,16 @@ Here is a simple Clojure code example using Datalevin:
 ;; repeating a completed deletion or rename is safe.
 ;; (d/update-schema conn {:name {:db/unique :db/retract}})
 
+;; All attributes are indexed by default. For values read only through entity
+;; access or pull, declare :db/noindex true before storing data to omit AVE:
+;; (d/update-schema conn {:document/body {:db/valueType :db.type/string
+;;                                       :db/noindex true}})
+;; Query conditions on that attribute throw an error. To enable them later,
+;; atomically backfill AVE and remove :db/noindex, including on a remote DB:
+;; (d/index-attr conn :document/body)
+;; Unique and reference attributes cannot opt out. Directly changing
+;; :db/noindex on a populated attribute is rejected; use index-attr to enable it.
+
 ;; Transact some data
 ;; `:nation` is not defined in schema, so it will be treated as an EDN blob
 (d/transact! conn

@@ -35,6 +35,38 @@
 
 ;; ---- Storage / schema validators ----
 
+(defn validate-indexed-attr
+  "Reject attribute conditions that require an opted-out AVE index."
+  [schema attr]
+  (when (:db/noindex (schema attr))
+    (raise "Attribute " attr " has :db/noindex true; call index-attr to enable queries, or use entity access or pull"
+           {:error :query/unindexed-attribute :attribute attr})))
+
+(defn populated-attribute?
+  "Check for stored values, including attributes absent from AVE."
+  [store attr]
+  (if (:db/noindex ((schema store) attr))
+    (boolean (i/head-filter store :eav #(= attr (:a %))
+                           (d/datom c/e0 nil nil)
+                           (d/datom c/emax nil nil)))
+    (populated? store :ave (d/datom c/e0 attr c/v0)
+                (d/datom c/emax attr c/vmax))))
+
+(defn validate-noindex-change
+  "Changing AVE participation requires an empty attribute, also on reopen."
+  [lmdb attr old-props new-props]
+  (when (and old-props
+             (not= (true? (:db/noindex old-props))
+                   (true? (:db/noindex new-props))))
+    (let [aid (:db/aid old-props)]
+      (when (i/list-range-some
+              lmdb c/eav
+              (fn [kv]
+                (= aid (.-a ^Retrieved (b/read-buffer (lmdb/v kv) :avg))))
+              [:all] :id [:all] :avg true)
+        (raise "Changing :db/noindex is not allowed when data exist; use index-attr to enable indexing"
+               {:error :schema/validation :attribute attr :key :db/noindex})))))
+
 (defn validate-closed-schema
   "Validate that attribute is defined in schema when :closed-schema? is true."
   [schema opts attr value]
@@ -47,11 +79,9 @@
   [store attr old new]
   (when (and (identical? old :db.cardinality/many)
              (identical? new :db.cardinality/one))
-    (let [low-datom  (d/datom c/e0 attr c/v0)
-          high-datom (d/datom c/emax attr c/vmax)]
-      (when (populated? store :ave low-datom high-datom)
-        (raise "Cardinality change is not allowed when data exist"
-                 {:attribute attr})))))
+    (when (populated-attribute? store attr)
+      (raise "Cardinality change is not allowed when data exist"
+             {:attribute attr}))))
 
 (defn validate-value-type-change
   "Validate value type change when data exist.
@@ -61,11 +91,9 @@
     (when-let [props ((schema store) attr)]
       (let [old-vt (idx/value-type props)]
         (when (or (not (identical? old-vt :data)) (cd/custom-type? new))
-          (let [low-datom  (d/datom c/e0 attr c/v0)
-                high-datom (d/datom c/emax attr c/vmax)]
-            (when (populated? store :ave low-datom high-datom)
-              (raise "Value type change is not allowed when data exist"
-                       {:attribute attr}))))))))
+          (when (populated-attribute? store attr)
+            (raise "Value type change is not allowed when data exist"
+                   {:attribute attr})))))))
 
 (defn violate-unique?
   "Check if adding uniqueness to an attribute would violate existing data."
@@ -115,12 +143,6 @@
 (def ^:private idoc-index-schema-keys
   [:db.idoc/indexedPaths :db.idoc/excludedPaths])
 
-(defn- populated-attribute?
-  [store attr]
-  (let [low-datom  (d/datom c/e0 attr c/v0)
-        high-datom (d/datom c/emax attr c/vmax)]
-    (populated? store :ave low-datom high-datom)))
-
 (defn- validate-embedding-schema-change
   [store attr old-props new-props]
   (when-let [k (some (fn [k]
@@ -144,6 +166,7 @@
 (defn validate-schema-mutation
   "Validate schema attribute changes (cardinality, value type, uniqueness)."
   [store lmdb attr old-props new-props]
+  (validate-noindex-change lmdb attr old-props new-props)
   (doseq [k [:db/cardinality :db/valueType :db/unique]
           :let [v' (old-props k)
                 v  (new-props k)]
@@ -1233,6 +1256,12 @@
                          #{:db.cardinality/one :db.cardinality/many})
     (validate-schema-key a :db/fulltext (:db/fulltext kv)
                          #{true false})
+    (validate-schema-key a :db/noindex (:db/noindex kv) #{true false})
+    (when (and (:db/noindex kv)
+               (or (:db/unique kv)
+                   (identical? :db.type/ref (:db/valueType kv))))
+      (raise "Cannot use :db/noindex on unique or reference attributes"
+             {:error :schema/validation :attribute a :key :db/noindex}))
     (validate-schema-key a :db/embedding (:db/embedding kv)
                          #{true false})
     (validate-schema-key a :db/idocFormat (:db/idocFormat kv)

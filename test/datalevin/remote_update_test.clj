@@ -28,6 +28,25 @@
 
 (defn- uri [] (str *base-uri* (random-uuid)))
 
+(deftest remote-index-attr
+  (let [conn (d/create-conn (uri)
+                            {:body {:db/valueType :db.type/string :db/noindex true}})
+        query '[:find ?e :where [?e :body "text"]]
+        prepared (d/prepare-q @conn query)]
+    (try
+      (d/transact! conn [{:db/id 1 :body "text"}])
+      (is (= {:body "text"} (d/pull @conn [:body] 1)))
+      (is (thrown-with-msg? Exception #"index-attr" (d/q query @conn)))
+      (is (thrown-with-msg? Exception #"index-attr" (prepared [])))
+      (d/index-attr conn :body)
+      (is (nil? (get-in (d/schema conn) [:body :db/noindex])))
+      (is (= #{[1]} (d/q query @conn)))
+      (is (= #{[1]} (prepared [])))
+      (d/transact! conn [{:db/id 2 :body "text"}])
+      (is (= #{[1] [2]} (d/q query @conn)))
+      (is (= (d/schema conn) (d/index-attr conn :body)))
+      (finally (d/close conn)))))
+
 (defn- trace-requests [f]
   (let [calls (atom [])
         handlers @#'server/message-handler-map

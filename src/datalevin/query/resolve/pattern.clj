@@ -18,7 +18,8 @@
    [datalevin.query.predicate :as qpred]
    [datalevin.query.resolve.context :refer [rel-with-attr]]
    [datalevin.relation :as r]
-   [datalevin.util :as u])
+   [datalevin.util :as u]
+   [datalevin.validate :as vld])
   (:import
    [java.util HashSet List]
    [org.eclipse.collections.impl.list.mutable FastList]))
@@ -75,6 +76,7 @@
 (defn resolve-pattern-lookup-refs [source pattern]
   (if (db/-searchable? source)
     (let [[e a v] pattern
+          _       (vld/validate-indexed-attr (db/-schema source) a)
           e'      (if (or (qu/lookup-ref? e) (keyword? e))
                     (db/entid-strict source e)
                     e)
@@ -388,6 +390,7 @@
 
 (defn lookup-pattern-db
   [context db pattern]
+  (vld/validate-indexed-attr (db/-schema db) (second pattern))
   (let [[e a v]           pattern
         search-pattern    (delay
                             (->> pattern

@@ -453,6 +453,7 @@
     (schema [_])
     (rschema [_])
     (set-schema [_ new-schema del-attrs rename-map])
+    (index-attr [_ attr])
     (init-max-eid [_])
     (max-tx [_]))
 

@@ -20,9 +20,12 @@
   (doseq [bad [{:repetitions 0} {:client-counts []} {:client-counts [1 1]}
                {:client-counts [1 0]} {:measurement-ms 0} {:warmup-ms -1}
                {:measurement-ms 100 :phase-timeout-ms 100}
-               {:server-workers 0} {:server-mode :thread} {:datalog-handles :global}
+               {:server-background-threads 0} {:server-mode :thread} {:datalog-handles :global}
                {:system :datalevin :api :datalog :mode :remote
-                :datalog-handles :independent :threads 3 :pool-size 1}]]
+                :datalog-handles :independent :threads 3 :pool-size 1}
+               {:system :all :api :all :mode :all :threads 3 :pool-size 1}
+               {:api :datalog :mode :remote :datalog-handles :both
+                :threads 3 :pool-size 1}]]
     (is (thrown? clojure.lang.ExceptionInfo (runner/options bad)) (pr-str bad)))
   (let [cases (runner/cases (runner/options {:system :all :api :datalog :mode :remote
                                             :workload :a :client-counts [1 8]
@@ -34,8 +37,15 @@
            (reverse (map #(dissoc % :trial) (second trials)))))
     (doseq [opts cases]
       (is (= (:threads opts) (:pool-size opts)))
-      (is (= 16 (:worker-threads (server/server-options "/tmp/unused" opts)))))
+      (is (= 16 (:transaction-threads (server/server-options "/tmp/unused" opts)))))
     (is (= 6 (count (filter #(= :postgres (:system %)) cases))))))
+
+(deftest client-count-sweep-overrides-base-pool-size-test
+  (let [cases (runner/cases (runner/options {:system :all :api :datalog :mode :remote
+                                            :threads 3 :pool-size 1 :client-counts [2 4]}))]
+    (is (= [[2 2] [2 2] [4 4] [4 4]] (mapv (juxt :threads :pool-size) cases)))
+    (is (every? #(= :independent (:datalog-handles %))
+                (filter #(= :datalevin (:system %)) cases)))))
 
 (deftest trial-summary-test
   (let [results (for [mode [:shared :independent], rate (if (= mode :shared) [10 20 90] [3 5])]
@@ -46,38 +56,35 @@
     (is (= {:median 20 :min 10 :max 90} (:ops-per-second (:shared summaries))))
     (is (= {:median 4.0 :min 3 :max 5} (:ops-per-second (:independent summaries))))))
 
-(deftest sql-index-condition-selection-test
+(deftest trial-summary-keeps-measurement-settings-separate-test
+  (doseq [[setting a b] [[:durability :strict :relaxed]
+                          [:records 100 10000]
+                          [:field-length 100 1000]
+                          [:payload-indexes :none :all]
+                          [:measurement-ms 1000 10000]]]
+    (let [results (for [[trial value rate] [[1 a 10.0] [2 a 20.0] [1 b 50.0]]]
+                    {:configuration {:workload :a :trial trial setting value}
+                     :measured {:ops-per-second rate}})
+          summaries (core/summarize-trials results)]
+      (is (= 2 (count summaries)))
+      (is (= #{1 2} (set (map :trials summaries))))
+      (is (every? #(not (contains? (:configuration %) :trial)) summaries)))))
+
+(deftest comparison-case-selection-test
   (let [opts (runner/options {:system :all :api :all :mode :all :workload :a})
         cases (runner/cases opts)
         sql-cases (remove #(= :datalevin (:system %)) cases)]
     (is (= 8 (count cases)))
-    (is (= #{[:sqlite :kv :none] [:postgres :kv :none]
-             [:sqlite :datalog :all] [:postgres :datalog :all]}
-           (set (map (juxt :system :api :sql-indexes) sql-cases))))
-    (is (every? #(not (contains? % :sql-indexes))
-                (filter #(= :datalevin (:system %)) cases)))
-    (doseq [mode [:none :all]]
-      (is (= #{mode}
-             (set (map :sql-indexes
-                       (runner/cases (assoc opts :system :sqlite :sql-indexes mode)))))))
-    (let [both (runner/cases (assoc opts :api :datalog :mode :embedded :sql-indexes :both))]
-      (is (= [[:datalevin nil] [:sqlite :none] [:sqlite :all]]
-             (mapv (juxt :system :sql-indexes) both)))
-      (is (= 6 (count (runner/cases (assoc opts :system :sqlite :api :kv
-                                         :sql-indexes :both :repetitions 3)))))))
-  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"one index condition"
-                       (runner/run-case! (assoc shared/small-options :system :sqlite
-                                                :api :kv :mode :embedded :sql-indexes :both)))))
-
-(deftest trial-summary-keeps-sql-index-conditions-separate-test
-  (let [results (for [mode [:none :all], rate (if (= mode :none) [10 20] [3 5])]
-                  {:configuration {:system :sqlite :api :datalog :sql-indexes mode}
-                   :measured {:ops-per-second rate}})
-        summaries (into {} (map (juxt #(get-in % [:configuration :sql-indexes]) identity)
-                                (core/summarize-trials results)))]
-    (is (= 2 (count summaries)))
-    (is (= {:median 15.0 :min 10 :max 20} (:ops-per-second (:none summaries))))
-    (is (= {:median 4.0 :min 3 :max 5} (:ops-per-second (:all summaries))))))
+    (is (= #{[:sqlite :kv] [:postgres :kv] [:sqlite :datalog] [:postgres :datalog]}
+           (set (map (juxt :system :api) sql-cases))))
+    (is (every? #(not (contains? % :sql-indexes)) cases))
+    (is (= [:datalevin :sqlite]
+           (mapv :system (runner/cases (assoc opts :api :datalog :mode :embedded)))))
+    (is (= 3 (count (runner/cases (assoc opts :system :sqlite :api :kv
+                                        :repetitions 3))))))
+  (doseq [mode [:matched :none :all :both]]
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"sql-indexes is no longer supported"
+                         (runner/options {:sql-indexes mode})))))
 
 (deftest wal-mismatch-rejects-case-test
   (doseq [actual [{:wal? false}
@@ -123,61 +130,61 @@
     (is (= :passed (get-in result [:validation :value-checks :status])))
     (is (= (+ 2 inserts) (get-in result [:validation :records])))))
 
-(deftest separate-process-independent-datalog-test
+(deftest separate-process-default-datalog-test
   (let [pid (atom nil)
         handles (atom [])
         opts (assoc shared/small-options :api :datalog :mode :remote
-                    :server-mode :process :server-heap-mb 512 :datalog-handles :independent)]
+                    :server-mode :process :server-heap-mb 512)]
     (store/with-stores
       opts
       (fn [with-fresh-store]
         (let [warmup-info (with-fresh-store
                             (fn [db]
-                              (store/put-records! db [[0 ["warm" "warm" "warm"]]])
+                              (store/put-records! db [["user0" ["warm" "warm" "warm"]]])
                               (store/storage-info db)))]
-        (with-fresh-store
-        (fn [db]
-        (let [info (store/storage-info db)
-              stores (mapv #(store/for-worker db %) (range 3))
-              client-ids (mapv #(client/get-id (.-client ^DatalogStore (:store @(:conn %)))) stores)
-              executor (Executors/newFixedThreadPool 3)]
-          (reset! handles stores)
-          (reset! pid (get-in info [:server :pid]))
-          (is (= 0 (store/record-count db)))
-          (is (= (get-in warmup-info [:server :pid]) @pid))
-          (is (= (get-in warmup-info [:server :port]) (get-in info [:server :port])))
-          (is (not= (:database-name warmup-info) (:database-name info)))
-          (is (not= (.pid (ProcessHandle/current)) @pid))
-          (is (= :separate-process (get-in info [:server :placement])))
-          (is (= :connection-thread (get-in info [:server :configuration :request-execution])))
-          (is (= :connection-thread (get-in info [:server :configuration :transaction-execution])))
-          (is (not-any? #{:routing :transactions} (get-in info [:server :execution-keys])))
-          (doseq [[path origin] (get-in info [:server :source-resources])]
-            (is (= (str (io/resource path)) origin) path))
-          (is (= {:handles :independent :handle-count 3 :read-connections 3
-                  :dedicated-transaction-connections 0} (:client-topology info)))
-          (is (= 3 (count (distinct client-ids))))
-          (is (= {:wal? true :write-path-enabled? true :durability-profile :strict}
-                 (select-keys info [:wal? :write-path-enabled? :durability-profile])))
-          (store/put-records! db [[0 ["aaaa" "bbbb" "cccc"]]])
-          (try
-            (let [tasks (.invokeAll executor
-                                   (mapv (fn [handle field]
-                                           ^Callable
-                                           (fn []
-                                             (dotimes [i 20]
-                                               (store/read-record handle 0)
-                                               (store/update-field! handle 0 field
-                                                                    (format "%02d%02d" field i)))))
-                                         stores (range 3)))]
-              (doseq [^Future task tasks] (.get task)))
-            (doseq [handle stores]
-              (is (= ["0019" "0119" "0219"] (store/read-record handle 0))
-                  "Independent clients preserve concurrent writes to other fields"))
-            (finally
-              (.shutdownNow executor)
-              (.awaitTermination executor 30 TimeUnit/SECONDS))))
-        {})))))
+          (with-fresh-store
+            (fn [db]
+              (let [info (store/storage-info db)
+                    stores (mapv #(store/for-worker db %) (range 3))
+                    client-ids (mapv #(client/get-id (.-client ^DatalogStore (:store @(:conn %)))) stores)
+                    executor (Executors/newFixedThreadPool 3)]
+                (reset! handles stores)
+                (reset! pid (get-in info [:server :pid]))
+                (is (= 0 (store/record-count db)))
+                (is (= (get-in warmup-info [:server :pid]) @pid))
+                (is (= (get-in warmup-info [:server :port]) (get-in info [:server :port])))
+                (is (not= (:database-name warmup-info) (:database-name info)))
+                (is (not= (.pid (ProcessHandle/current)) @pid))
+                (is (= :separate-process (get-in info [:server :placement])))
+                (is (= :connection-thread (get-in info [:server :configuration :request-execution])))
+                (is (= :connection-thread (get-in info [:server :configuration :transaction-execution])))
+                (is (not-any? #{:routing :transactions} (get-in info [:server :execution-keys])))
+                (doseq [[path origin] (get-in info [:server :source-resources])]
+                  (is (= (str (io/resource path)) origin) path))
+                (is (= {:handles :independent :handle-count 3 :read-connections 3
+                        :dedicated-transaction-connections 0} (:client-topology info)))
+                (is (= 3 (count (distinct client-ids))))
+                (is (= {:wal? true :write-path-enabled? true :durability-profile :strict}
+                       (select-keys info [:wal? :write-path-enabled? :durability-profile])))
+                (store/put-records! db [["user0" ["aaaa" "bbbb" "cccc"]]])
+                (try
+                  (let [tasks (.invokeAll executor
+                                         (mapv (fn [handle field]
+                                                 ^Callable
+                                                 (fn []
+                                                   (dotimes [i 20]
+                                                     (store/read-record handle "user0")
+                                                     (store/update-field! handle "user0" field
+                                                                          (format "%02d%02d" field i)))))
+                                               stores (range 3)))]
+                    (doseq [^Future task tasks] (.get task)))
+                  (doseq [handle stores]
+                    (is (= ["0019" "0119" "0219"] (store/read-record handle "user0"))
+                        "Independent clients preserve concurrent writes to other fields"))
+                  (finally
+                    (.shutdownNow executor)
+                    (.awaitTermination executor 30 TimeUnit/SECONDS))))
+              {})))))
     (is (every? #(d/closed? (:conn %)) @handles))
     (is (not (.isPresent (ProcessHandle/of @pid))))))
 

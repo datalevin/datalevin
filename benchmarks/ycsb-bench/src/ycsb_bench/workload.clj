@@ -31,6 +31,15 @@
   ^String [^long ordinal]
   (str "user" (fnvhash64 ordinal)))
 
+(defn workload-model
+  "Report the operation model; all workloads use YCSB string keys."
+  [workload]
+  (case workload
+    :d :application-key-latest-v1
+    :e :application-key-range-v1
+    :f :ycsb-read-update-v1
+    :application-key-point-v1))
+
 ;; Upstream ScrambledZipfianGenerator uses an inclusive [0, 10^10] source
 ;; range with this precomputed zeta, then hashes the draw modulo a fixed
 ;; destination keyspace. Keep that modulus stable as inserts commit.

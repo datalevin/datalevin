@@ -98,8 +98,7 @@
    [datalevin.datom Datom]
    [datalevin.interface IStore]
    [datalevin.async IAsyncWork]
-   [datalevin.bits Retrieved Indexable]
-   [datalevin.lmdb DatomKVTxData]))
+   [datalevin.bits Retrieved Indexable]))
 
 (declare with-open-opts close-store-resources! release-shared-local-store!
          enqueue-secondary-index-work! enqueue-secondary-index-work-if-needed!
@@ -424,6 +423,61 @@
 
   (attrs [_] attrs)
 
+  (index-attr [this attr]
+    (vld/validate-attr attr 'index-attr)
+    (locking (lmdb/write-txn lmdb)
+      (if-not (lmdb/writing? lmdb)
+        (let [result (lmdb/with-transaction-kv [tx-lmdb lmdb]
+                       (i/index-attr (transfer-current this tx-lmdb) attr))]
+          (set! schema result)
+          (set! rschema (schema->rschema result))
+          (set! attrs (init-attrs result))
+          (set! max-aid (init-max-aid result))
+          (mark-state-current! this (init-state-sync-ms lmdb))
+          result)
+        (let [current-schema (load-schema lmdb)]
+          ;; Explicit transactions may start from an older connection wrapper.
+          ;; Preserve every schema property committed before this write lock.
+          (when-not (= schema current-schema)
+            (set! schema current-schema)
+            (set! rschema (schema->rschema schema))
+            (set! attrs (init-attrs schema))
+            (set! max-aid (init-max-aid schema)))
+          (if-let [props (schema attr)]
+            (if-not (:db/noindex props)
+              schema
+              (let [aid (:db/aid props)
+                    txs (FastList.)
+                    batch-size (max 1 (long c/*fill-db-batch-size*))
+                    modified-ms (max (inc (init-state-sync-ms lmdb))
+                                     (System/currentTimeMillis))
+                    props (dissoc props :db/noindex)]
+                ;; Copy encoded AVGs, preserving giant IDs and custom references.
+                ;; Both the backfill and schema publication share this write txn.
+                (i/visit-list-range
+                  lmdb c/eav
+                  (fn [kv]
+                    (let [^ByteBuffer avg (lmdb/v kv)]
+                      (when (= aid (.getInt avg 0))
+                        (.add txs (lmdb/kv-tx :put c/ave
+                                              (b/read-buffer avg :raw)
+                                              (b/read-buffer (lmdb/k kv) :id)
+                                              :raw :id))
+                        (when (>= (.size txs) batch-size)
+                          (transact-kv lmdb txs)
+                          (.clear txs)))))
+                  [:all] :id [:all] :avg)
+                (.add txs (lmdb/kv-tx :put c/schema attr props :attr :data))
+                (.add txs (lmdb/kv-tx :put c/meta :last-modified
+                                      modified-ms :attr :long))
+                (transact-kv lmdb txs)
+                (set! schema (assoc schema attr props))
+                (set! rschema (schema->rschema schema))
+                (mark-state-current! this (init-state-sync-ms lmdb))
+                schema))
+            (raise "Cannot index missing attribute " attr
+                   {:error :schema/missing-attribute :attribute attr}))))))
+
   (init-max-eid [_]
     (let [e (volatile! c/e0)]
       (scan/visit-key-range
@@ -460,8 +514,7 @@
       (if-let [props (schema attr)]
         (do
           (vld/validate-attr-deletable
-            (.populated?
-              this :ave (d/datom c/e0 attr c/v0) (d/datom c/emax attr c/vmax)))
+            (populated-attr? this attr))
           (let [aid (props :db/aid)]
             (transact-kv
               lmdb [(lmdb/kv-tx :del c/schema attr :attr)
@@ -1283,9 +1336,14 @@
         props  (s attr)
         old-vt (idx/storage-type lmdb props)
         aid    (props :db/aid)
-        datoms (.slice store :ave
-                       (d/datom c/e0 attr c/v0)
-                       (d/datom c/emax attr c/vmax))]
+        noindex? (:db/noindex props)
+        datoms (if noindex?
+                 (.slice-filter store :eav #(when (= attr (:a %)) %)
+                                (d/datom c/e0 nil nil)
+                                (d/datom c/emax nil nil))
+                 (.slice store :ave
+                         (d/datom c/e0 attr c/v0)
+                         (d/datom c/emax attr c/vmax)))]
     (when (seq datoms)
       (let [errors  (volatile! [])
             coerced (mapv
@@ -1324,7 +1382,8 @@
                                0)]
                          (.-g r)))
                   ii (Indexable. e aid v (.-f i) (.-b i) (or gt c/normal))]
-              (.add txs (lmdb/kv-tx :del-list c/ave ii [e] :avg :id))
+              (when-not noindex?
+                (.add txs (lmdb/kv-tx :del-list c/ave ii [e] :avg :id)))
               (.add txs (lmdb/kv-tx :del-list c/eav e [ii] :id :avg))
               (when gt
                 (.add txs (lmdb/kv-tx :del c/giants gt :id)))))
@@ -1334,7 +1393,8 @@
                   cur-gt (max-gt store)
                   i      (b/indexable e aid new-v new-vt cur-gt)
                   giant? (b/giant? i)]
-              (.add txs (lmdb/kv-tx :put c/ave i e :avg :id))
+              (when-not noindex?
+                (.add txs (lmdb/kv-tx :put c/ave i e :avg :id)))
               (.add txs (lmdb/kv-tx :put c/eav e i :id :avg))
               (when giant?
                 (.advance-max-gt store)
@@ -2010,21 +2070,23 @@
         max-gt     (max-gt store)
         i          (b/indexable nil aid v vt max-gt)
         giant?     (b/giant? i)]
-    (.add txs (DatomKVTxData.
+    (.add txs (lmdb/datom-kv-tx
                 e
                 (b/indexable-bytes i avg-bf)
                 true
                 (boolean
                   (and *enforce-blind-unique-inserts?*
                        (identical? (:db/unique props)
-                                   :db.unique/identity)))))
+                                   :db.unique/identity)))
+                (:db/noindex props)))
     (when giant?
       (.advance-max-gt store)
       (let [gd [e attr v]
             {:keys [value vtype]} (encode-giant-datom (apply d/datom gd))]
         (.put giants gd max-gt)
         (.add txs (lmdb/kv-tx :put c/giants max-gt value
-                              :id vtype [:append]))))
+                              :id vtype (when-not (:db/noindex props)
+                                          [:append])))))
     (when (identical? vt :db.type/vec)
       (let [ref     (if giant? [:g max-gt e aid] [e aid v])
             op      (if giant? [:g [e aid max-gt v]] [:a [e aid v]])
@@ -2124,7 +2186,8 @@
         (collect-idoc store work domain
                       (if gt [:r [e aid gt v]] [:d [e aid v]]))))
     (let [ii (Indexable. nil aid v (.-f i) (.-b i) (or gt c/normal))]
-      (.add txs (DatomKVTxData. e (b/indexable-bytes ii avg-bf) false false))
+      (.add txs (lmdb/datom-kv-tx e (b/indexable-bytes ii avg-bf)
+                                 false false (:db/noindex props)))
       (when gt
         (when gt-cur (.remove giants d-eav))
         (.add txs (lmdb/kv-tx :del c/giants gt :id)))
@@ -2149,9 +2212,15 @@
   ([^Store store datoms embedding-plan]
    (prepare-datoms-kv-plan store datoms embedding-plan nil nil))
   ([^Store store datoms embedding-plan extra-kv-txs last-modified-ms]
+   ;; Another connection may have enabled AVE since this wrapper was created.
+   ;; The caller holds the write lock, so index participation cannot change
+   ;; between this refresh and the commit.
+   (when (seq (:db/noindex (rschema store)))
+     (ensure-current! store))
    ;; Datom operations lead the batch so LMDB can select the primitive-EID
    ;; executor once; generic giant, job, and metadata operations follow.
    (let [txs    (FastList. (+ 2 (count datoms) (count extra-kv-txs)))
+         unindexed-txs (when (seq (:db/noindex (rschema store))) (FastList.))
          ;; Nil slots mean no work; each list is allocated on its first item.
          work   (object-array 8)
          giants (HashMap.)
@@ -2161,16 +2230,22 @@
        (doseq [^Datom datom datoms]
          (let [^objects ai (write-attr-info store attr-infos (.-a datom) (.-v datom)
                                            (d/datom-added datom))
-               vt (aget ai 1)]
+               vt (aget ai 1)
+               noindex? (:db/noindex (aget ai 0))
+               datom-txs (if noindex? unindexed-txs txs)]
            (if-let [type (when (map? vt) (:custom/type vt))]
              ((if (d/datom-added datom) cd/put-datom! cd/delete-datom!)
-              (lmdb/mark-write (.-lmdb store)) (.-e datom) (aget ai 2) type (.-v datom))
+              (lmdb/mark-write (.-lmdb store)) (.-e datom) (aget ai 2) type
+              (.-v datom) noindex?)
              (if (d/datom-added datom)
-               (insert-datom store datom txs work giants attr-infos embedding-plan
+               (insert-datom store datom datom-txs work giants attr-infos embedding-plan
                              avg-bf)
-               (delete-datom store datom txs work giants attr-infos avg-bf)))))
+               (delete-datom store datom datom-txs work giants attr-infos avg-bf)))))
        (finally
          (bf/return-array-buffer avg-bf)))
+     ;; Keep primitive datom operations first for native executor selection.
+     ;; Attribute IDs are disjoint, so the EAV-only writes can follow them.
+     (when unindexed-txs (.addAll txs ^FastList unindexed-txs))
      (let [ft-jobs (aget work ft-jobs-slot)
            vi-jobs (aget work vi-jobs-slot)
            em-jobs (aget work em-jobs-slot)
@@ -2187,7 +2262,10 @@
                            (group-by first ops)))
            tx-id (long (.advance-max-tx store))
            modified-ms (long (or last-modified-ms
-                                 (System/currentTimeMillis)))]
+                                 ;; Do not undo index-attr's schema publication
+                                 ;; timestamp when a write follows in the same ms.
+                                 (max (long (observed-state-sync-ms store))
+                                      (System/currentTimeMillis))))]
        (when (or ft-jobs vi-jobs em-jobs id-jobs)
          (doseq [[ordinal job] (map-indexed vector
                                             (concat ft-jobs vi-jobs em-jobs id-jobs))]
@@ -2593,6 +2671,15 @@
   mutation."
   [^Store old lmdb]
   (transfer-with-schema old lmdb (load-schema lmdb) false))
+
+(defn ^:no-doc transfer-after-schema-change
+  "Keep committed schema identity for prepared readers, but discard schema
+  changes from an explicitly aborted transaction."
+  [^Store old lmdb]
+  (let [schema* (load-schema lmdb)]
+    (if (= schema* (schema old))
+      (transfer old lmdb)
+      (transfer-with-schema old lmdb schema* false))))
 
 (defn with-open-opts
   "Return a Store wrapper over the same open LMDB state but with different

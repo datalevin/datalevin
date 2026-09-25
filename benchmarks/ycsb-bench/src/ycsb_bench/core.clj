@@ -20,18 +20,15 @@
    [nil "--ops N" "Measured operations, total across workers (10000)" :parse-fn parse-long]
    [nil "--warmup N" "Warmup operations, total across workers (1000)" :parse-fn parse-long]
    [nil "--threads N" "Concurrent worker threads (1)" :parse-fn parse-long]
-   [nil "--pool-size N" "Remote/SQL connection pool size (threads)" :parse-fn parse-long]
+   [nil "--pool-size N" "Remote Datalevin pool size (threads); SQL has one connection per worker" :parse-fn parse-long]
    [nil "--client-counts N,..." "Run matching worker/pool counts, e.g. 1,2,4,8,16" :parse-fn client-counts]
-   [nil "--datalog-handles MODE" "Remote Datalog: shared, independent, both (shared)" :parse-fn choice]
-   [nil "--sql-indexes MODE" "SQL value indexes: matched, none, all, both (matched: KV none, Datalog all)" :parse-fn choice]
+   [nil "--datalog-handles MODE" "Remote Datalog: shared, independent, both (independent)" :parse-fn choice]
    [nil "--repetitions N" "Fresh trials, reversing case order each trial (1)" :parse-fn parse-long]
    [nil "--warmup-ms N" "Timed warmup; overrides --warmup" :parse-fn parse-long]
    [nil "--measurement-ms N" "Timed measurement; overrides --ops" :parse-fn parse-long]
    [nil "--server-mode MODE" "process or in-process (process)" :parse-fn choice]
    [nil "--server-heap-mb N" "Separate server's fixed JVM heap (4096)" :parse-fn parse-long]
-   [nil "--server-workers N" "Fixed server worker count (16)" :parse-fn parse-long]
-   [nil "--server-queue-size N" "Fixed server worker queue capacity (1024)" :parse-fn parse-long]
-   [nil "--server-transaction-threads N" "Fixed server transaction threads (16)" :parse-fn parse-long]
+   [nil "--server-transaction-threads N" "Server concurrent explicit transaction limit (16)" :parse-fn parse-long]
    [nil "--server-background-threads N" "Fixed server background threads (4)" :parse-fn parse-long]
    [nil "--server-transaction-lock-timeout-ms N" "Server write-slot timeout (1000)" :parse-fn parse-long]
    [nil "--server-startup-timeout-ms N" "Separate server readiness timeout (120000)" :parse-fn parse-long]
@@ -39,7 +36,7 @@
    [nil "--field-count N" "Fields per record (10)" :parse-fn parse-long]
    [nil "--field-length N" "ASCII bytes per field (100)" :parse-fn parse-long]
    [nil "--scan-length N" "Maximum scan length; uniform 1..N (100)" :parse-fn parse-long]
-   [nil "--batch-size N" "Records per initial load transaction (100)" :parse-fn parse-long]
+   [nil "--batch-size N" "Datalevin records per load transaction (1); SQL commits each insert" :parse-fn parse-long]
    [nil "--distribution NAME" "uniform, zipfian, latest (workload default)" :parse-fn choice]
    [nil "--zipfian-keyspace N" "Fixed scrambled keyspace; default predicts inserts with 2x headroom" :parse-fn parse-long]
    [nil "--durability NAME" "WAL profile: strict, relaxed (strict)" :parse-fn choice]
@@ -53,7 +50,8 @@
    ["-h" "--help" "Show usage"]])
 
 (defn summarize-trials
-  "Report the median and spread of complete trials, without pooling latencies."
+  "Group identical effective configurations, excluding the trial number, and
+  report median and spread without pooling latencies."
   [results]
   (mapv
     (fn [[configuration trials]]
@@ -65,11 +63,7 @@
         {:configuration configuration :trials n
          :ops-per-second {:median median :min (first rates) :max (peek rates)}}))
     (sort-by (comp pr-str key)
-             (group-by #(select-keys (:configuration %)
-                                     [:system :api :mode :workload :threads :pool-size
-                                      :datalog-handles :sql-indexes :workload-model
-                                      :key-generator :insert-order :request-generator :zipfian-keyspace
-                                      :value-audit? :warmup-isolation])
+             (group-by #(dissoc (:configuration %) :trial)
                        results))))
 
 (defn run-benchmark
@@ -93,10 +87,10 @@
                            :processors (.availableProcessors (Runtime/getRuntime))}
              :results
              (vec
-               (for [{:keys [system api mode workload threads datalog-handles sql-indexes trial] :as case-opts} cases]
+               (for [{:keys [system api mode workload threads datalog-handles trial] :as case-opts} cases]
                  (let [result (runner/run-case! case-opts)
                        measured (:measured result)]
-                   (println (format "%s %s %s %s: %.1f ops/s, p99 %.1f us, %d records checked (%s) [trial %d, %d workers%s%s]"
+                   (println (format "%s %s %s %s: %.1f ops/s, p99 %.1f us, %d records checked (%s) [trial %d, %d workers%s]"
                                     (name system) (name api) (name mode) (str/upper-case (name workload))
                                     (:ops-per-second measured) (get-in measured [:latency-us :p99])
                                     (get-in result [:validation :records])
@@ -104,9 +98,7 @@
                                       "value audit; timings include recording" "structure only")
                                     trial threads
                                     (if (and (= system :datalevin) (= api :datalog) (= mode :remote))
-                                      (str ", " (name datalog-handles) " handles") "")
-                                    (if sql-indexes
-                                      (str ", SQL indexes " (name sql-indexes)) "")))
+                                      (str ", " (name datalog-handles) " handles") "")))
                    result)))}]
         (assoc report :summary (summarize-trials (:results report)))))))
 

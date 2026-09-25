@@ -103,6 +103,7 @@
    :schema unguarded
    :rschema unguarded
    :set-schema db-write
+   :index-attr db-write
    :datalog-register-type db-write
    :init-max-eid unguarded
    :max-tx unguarded

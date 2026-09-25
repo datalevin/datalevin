@@ -1387,6 +1387,7 @@
     :schema
     :rschema
     :set-schema
+    :index-attr
     :datalog-register-type
     :init-max-eid
     :max-tx

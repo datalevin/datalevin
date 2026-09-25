@@ -361,6 +361,8 @@ values;")
               [this new-schema del-attrs rename-map]
     "Update the schema of open storage, return updated schema")
   (attrs [this] "Return the aid -> attr map")
+  (index-attr [this attr]
+    "Backfill AVE and clear :db/noindex atomically; return updated schema")
   (init-max-eid [this] "Initialize and return the max entity id")
   (datom-count [this index] "Return the number of datoms in the index")
   (swap-attr [this attr f] [this attr f x] [this attr f x y]

@@ -807,6 +807,7 @@
   (-search
     [_ pattern]
     (let [[e a v _] pattern]
+      (when (nil? e) (vld/validate-indexed-attr (schema store) a))
       (wrap-cache
         store [:search e a v]
         (case-tree
@@ -831,6 +832,7 @@
   (-search-tuples
     [_ pattern]
     (let [[e a v _] pattern]
+      (vld/validate-indexed-attr (schema store) a)
       (wrap-cache
         store [:search-tuples e a v]
         (case-tree
@@ -850,6 +852,7 @@
   (-first
     [_ pattern]
     (let [[e a v _] pattern]
+      (when (nil? e) (vld/validate-indexed-attr (schema store) a))
       (wrap-cache
         store [:first e a v]
         (case-tree
@@ -877,6 +880,7 @@
   (-count
     [_ pattern cap]
     (let [[e a v] pattern]
+      (when (nil? e) (vld/validate-indexed-attr (schema store) a))
       (wrap-cache
         store [:count e a v cap]
         (case-tree
@@ -943,6 +947,7 @@
 
   (-av-datoms
     [_ attr v]
+    (vld/validate-indexed-attr (schema store) attr)
     (wrap-cache store [:av-datoms attr v] (av-datoms store attr v)))
 
   (-range-datoms
@@ -989,11 +994,13 @@
 
   (-cardinality
     [_ attr]
+    (vld/validate-indexed-attr (schema store) attr)
     (wrap-cache store [:cardinality attr]
                 (cardinality store attr)))
 
   (-index-range
     [db attr start end]
+    (vld/validate-indexed-attr (schema store) attr)
     (wrap-cache
       store [:index-range attr start end]
       (do (vld/validate-attr attr (list '-index-range 'db attr start end))
@@ -1002,6 +1009,7 @@
 
   (-index-range-size
     [_ attr start end]
+    (vld/validate-indexed-attr (schema store) attr)
     (wrap-cache
       store [:index-range-size attr start end]
       (av-range-size store attr start end))))
@@ -1362,6 +1370,8 @@
 
 (defn- components->pattern
   [db index c0 c1 c2 default-e default-v]
+  (when (identical? index :ave)
+    (vld/validate-indexed-attr (-schema db) c0))
   (case index
     :eav (resolve-datom db c0 c1 c2 default-e default-v)
     :ave (resolve-datom db c2 c0 c1 default-e default-v)))

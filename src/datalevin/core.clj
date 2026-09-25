@@ -1163,6 +1163,10 @@ Only usable for debug output.
        :doc      "Update the schema of an open connection to a Datalog db.
 
   * `schema-update` is a map from attribute keywords to property patches.
+  `:db/noindex true` omits an attribute from AVE while retaining entity/pull
+  access. Query conditions on it throw; [[index-attr]] enables indexing later.
+  Unique and reference attributes cannot opt out. Changing `:db/noindex`
+  directly requires an empty attribute.
   Properties omitted from an existing attribute are preserved. Set a property
   to `:db/retract` to remove it explicitly. The internal `:db/aid` property is
   ignored when supplied and cannot be changed by a schema update.
@@ -1190,6 +1194,15 @@ Only usable for debug output.
                             #{:old/attr1 :old/attr2})
         (update-schema conn nil nil {:old/attr :new/attr}) "}
   update-schema conn/update-schema)
+
+(def ^{:arglists '([conn attr])
+       :doc "Enable AVE indexing for an attribute declared with `:db/noindex true`.
+  Atomically backfill existing values and remove `:db/noindex` from its schema.
+  Subsequent writes maintain AVE normally. Return the updated schema.
+  Already indexed attributes are unchanged; unknown attributes throw.
+
+      (index-attr conn :document/body)"}
+  index-attr conn/index-attr)
 
 (def ^{:arglists '([dir] [dir schema] [dir schema opts])
        :doc      "Obtain an open connection to a Datalog database. `dir` could be a local directory path or a dtlv connection URI string. Create the database if it does not exist. Reuse the same connection if a connection to the same database already exists. Open the database if it is closed. Return the connection.

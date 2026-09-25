@@ -130,8 +130,7 @@
             db (reify store/Records
                  (put-records! [_ _] nil)
                  (read-record [_ _] values)
-                 (scan-records [_ start n]
-                   (mapv #(vector % values) (range start (+ start n))))
+                 (scan-records [_ start _n] [[start values]])
                  (record-count [_] 1)
                  (storage-info [_] {}))
             opts (cond-> {:api :kv :mode :embedded :workload :c
@@ -162,37 +161,38 @@
 
 (defn check-adapter! [db]
   (let [values ["aaaa" "bbbb" "cccc"]]
-    (store/put-records! db (mapv #(vector % values) [2 0 1]))
+    (store/put-records! db (mapv #(vector % values) ["user2" "user0" "user1"]))
     (is (= 3 (store/record-count db)))
-    (is (= values (store/read-record db 1)))
-    (store/update-field! db 0 1 "zzzz")
-    (is (= ["aaaa" "zzzz" "cccc"] (store/read-record db 0)))
-    (store/update-field! db 0 0 "uaaa")
-    (is (= ["uaaa" "zzzz" "cccc"] (store/read-record db 0))
+    (is (= values (store/read-record db "user1")))
+    (store/update-field! db "user0" 1 "zzzz")
+    (is (= ["aaaa" "zzzz" "cccc"] (store/read-record db "user0")))
+    (store/update-field! db "user0" 0 "uaaa")
+    (is (= ["uaaa" "zzzz" "cccc"] (store/read-record db "user0"))
         "Updating a field preserves the other fields")
-    (is (= [[0 ["uaaa" "zzzz" "cccc"]]] (store/scan-records db 0 1)))
-    (is (empty? (store/scan-records db 0 0)))
-    (is (= [[1 values]] (store/scan-records db 1 1)))
-    (is (= [[1 values] [2 values]] (store/scan-records db 1 10)))
-    (store/put-records! db [[3 values]])
+    (is (= [["user0" ["uaaa" "zzzz" "cccc"]]] (store/scan-records db "user0" 1)))
+    (is (empty? (store/scan-records db "user0" 0)))
+    (is (= [["user1" values]] (store/scan-records db "user1" 1)))
+    (is (= [["user1" values] ["user2" values]] (store/scan-records db "user1" 3)))
+    (store/put-records! db [["user3" values]])
     (is (= 4 (store/record-count db)))
-    (is (= [[2 values] [3 values]] (store/scan-records db 2 2)))
-    (store/update-field! db 1 2 "zzzz")
-    (is (= [[1 ["aaaa" "bbbb" "zzzz"]]] (store/scan-records db 1 1)))
-    (is (empty? (store/scan-records db 4 1)))
+    (is (= [["user2" values] ["user3" values]] (store/scan-records db "user2" 2)))
+    (store/update-field! db "user1" 2 "zzzz")
+    (is (= [["user1" ["aaaa" "bbbb" "zzzz"]]] (store/scan-records db "user1" 1)))
+    (is (empty? (store/scan-records db "user4" 1)))
     ;; Callers continue checking this fixture after the shared adapter checks.
-    (store/update-field! db 1 2 "cccc"))
+    (store/update-field! db "user1" 2 "cccc"))
   {})
 
 (defn- check-kv-record-layout! [db]
   (let [handle (:handle (store/for-worker db 0))]
-    (is (= {:layout :record-value :key-type :id :value-type :data}
+    (is (= {:layout :record-value :key-type :string :value-type :data}
            (select-keys (store/storage-info db) [:layout :key-type :value-type])))
     (is (= 4 (d/entries handle "records")))
-    (is (= [0 1 2 3] (mapv first (d/get-range handle "records" [:all] :id :data))))
-    (is (= ["uaaa" "zzzz" "cccc"] (d/get-value handle "records" 0 :id :data)))
-    (store/put-records! db [[7 ["same" "same" "same"]]])
-    (is (= [[7 ["same" "same" "same"]]] (store/scan-records db 4 10)))
+    (is (= ["user0" "user1" "user2" "user3"]
+           (mapv first (d/get-range handle "records" [:all] :string :data))))
+    (is (= ["uaaa" "zzzz" "cccc"] (d/get-value handle "records" "user0" :string :data)))
+    (store/put-records! db [["user7" ["same" "same" "same"]]])
+    (is (= [["user7" ["same" "same" "same"]]] (store/scan-records db "user4" 3)))
     (let [executor (Executors/newFixedThreadPool 2)]
       (try
         (let [tasks (.invokeAll
@@ -201,18 +201,18 @@
                               ^Callable
                               (fn []
                                 (dotimes [step 20]
-                                  (store/update-field! db 7 field
+                                  (store/update-field! db "user7" field
                                                        (format "%04d" (+ (* field 100) step))))))
                             [0 1]))]
           (doseq [^Future task tasks] (.get task)))
         (finally
           (.shutdownNow executor)
           (.awaitTermination executor 30 TimeUnit/SECONDS))))
-    (is (= ["0019" "0119" "same"] (store/read-record db 7))
+    (is (= ["0019" "0119" "same"] (store/read-record db "user7"))
         "Replacing a record must preserve concurrent writes to other fields")
-    (is (= ["0019" "0119" "same"] (d/get-value handle "records" 7 :id :data)))
+    (is (= ["0019" "0119" "same"] (d/get-value handle "records" "user7" :string :data)))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Missing KV record"
-                         (store/update-field! db 99 0 "oops")))
+                         (store/update-field! db "user99" 0 "oops")))
     (is (= 5 (store/record-count db) (d/entries handle "records")))))
 
 (deftest adapter-semantics-test
@@ -227,26 +227,30 @@
           (is (false? (:atomic-rmw? (store/storage-info db))))
           (when (= api :datalog)
             (is (= 0 (:cache-limit (store/storage-info db))))
-            (is (= :pull-many (:scan-api (store/storage-info db))))
-            (is (= :known-ids (:scan-selection (store/storage-info db))))
-            (is (= :db/id (:record-key (store/storage-info db)))))
+            (is (= :prepare-q (:scan-api (store/storage-info db))))
+            (is (= :attribute-value-range (:scan-selection (store/storage-info db))))
+            (is (= :ycsb/key (:record-key (store/storage-info db)))))
           (check-adapter! db)
           (when (= api :kv)
             (check-kv-record-layout! db))
           (when (= api :datalog)
             (let [conn (:conn (store/for-worker db 0))]
-              (is (= {:db/id 0 :ycsb/field0 "uaaa" :ycsb/field1 "zzzz"
+              (is (= {:ycsb/key "user0" :ycsb/field0 "uaaa" :ycsb/field1 "zzzz"
                       :ycsb/field2 "cccc"}
-                     (d/pull @conn '[*] 0))
-                  "Record keys are explicit entity IDs, including zero")
-              (is (= #{[0] [1] [2] [3]}
-                     (d/q '[:find ?e :where [?e :ycsb/field0]] @conn)))
+                     (dissoc (d/pull @conn '[*] [:ycsb/key "user0"]) :db/id))
+                  "The application key is independent of the internal entity ID")
+              (is (= #{["user0"] ["user1"] ["user2"] ["user3"]}
+                     (d/q '[:find ?key :where [?e :ycsb/key ?key]] @conn)))
               (is (not (contains? (d/schema conn) :ycsb/id)))
-              (store/put-records! db [[7 ["dddd" "eeee" "ffff"]]])
-              (is (= [[7 ["dddd" "eeee" "ffff"]]] (store/scan-records db 4 10)))
-              (is (empty? (store/scan-records db 4 3))
-                  "The upper entity bound is exclusive, including across gaps")
-              (is (= [[7 ["dddd" "eeee" "ffff"]]] (store/scan-records db 7 1)))
+              (doseq [attr (:attributes (store/for-worker db 0))]
+                (is (true? (get-in (d/schema conn) [attr :db/noindex]))))
+              (is (not (get-in (d/schema conn) [:ycsb/key :db/noindex])))
+              (is (= #{:ycsb/key} (set (map :a (d/datoms @conn :ave))))
+                  "Only application keys belong in AVE after inserts and updates")
+              (store/put-records! db [["user7" ["dddd" "eeee" "ffff"]]])
+              (is (= [["user7" ["dddd" "eeee" "ffff"]]] (store/scan-records db "user4" 3))
+                  "The page counts existing records across key gaps")
+              (is (= [["user7" ["dddd" "eeee" "ffff"]]] (store/scan-records db "user7" 1)))
               (is (= 5 (store/record-count db)))))
           {})))))
 
@@ -262,8 +266,8 @@
                 parse pull/parse-opts
                 preparations (atom 0)
                 parses (atom 0)]
-            (store/put-records! db [[1 ["aaaa" "bbbb" "cccc"]]])
-            (store/read-record db 1)
+            (store/put-records! db [["user1" ["aaaa" "bbbb" "cccc"]]])
+            (store/read-record db "user1")
             (with-redefs [d/prepare-pull
                           (fn [& args]
                             (swap! preparations inc)
@@ -273,13 +277,13 @@
                             (when (= pattern attributes) (swap! parses inc))
                             (parse view pattern opts))]
               (dotimes [i 5]
-                (store/read-record db 1)
-                (store/update-field! db 1 0 (format "%04d" i))))
+                (store/read-record db "user1")
+                (store/update-field! db "user1" 0 (format "%04d" i))))
             (is (zero? @preparations)
                 "Successive reads reuse the preparation wrapper")
             (is (zero? @parses)
                 "Reads after writes retain the parsed pull pattern")
-            (is (= ["0004" "bbbb" "cccc"] (store/read-record db 1))
+            (is (= ["0004" "bbbb" "cccc"] (store/read-record db "user1"))
                 "Every reused read sees the latest committed value"))
           {})))))
 
@@ -287,21 +291,21 @@
   (doseq [mode [:embedded :remote]]
     (testing (str mode)
       (store/with-store
-        (assoc small-options :api :datalog :mode mode :field-count 12)
+        (assoc small-options :api :datalog :mode mode :field-count 12 :scan-length 8)
         (fn [db]
           (let [rows (mapv (fn [id]
-                             [id (mapv #(format "%02d%02d" id %) (range 12))])
+                             [(str "user" id) (mapv #(format "%02d%02d" id %) (range 12))])
                            [0 2 3 7])]
             (store/put-records! db rows)
             (doseq [[id values] rows]
               (is (= values (store/read-record db id))))
-            (is (= (subvec rows 1 3) (store/scan-records db 1 3)))
-            (is (= rows (store/scan-records db 0 8)))
-            (store/update-field! db 2 10 "edit")
+            (is (= (subvec rows 1 4) (store/scan-records db "user1" 3)))
+            (is (= rows (store/scan-records db "user0" 8)))
+            (store/update-field! db "user2" 10 "edit")
             (is (= (assoc (second (nth rows 1)) 10 "edit")
-                   (store/read-record db 2)))
-            (is (= [[2 (assoc (second (nth rows 1)) 10 "edit")]]
-                   (store/scan-records db 2 1))))
+                   (store/read-record db "user2")))
+            (is (= [["user2" (assoc (second (nth rows 1)) 10 "edit")]]
+                   (store/scan-records db "user2" 1))))
           {})))))
 
 (deftest comparison-selection-test

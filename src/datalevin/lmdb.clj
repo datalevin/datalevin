@@ -201,6 +201,16 @@
   ([op dbi k v kt vt f]
    (KVTxData. op dbi k v kt vt f)))
 
+(defn ^:no-doc datom-kv-tx
+  "Use ordinary EAV operations for unindexed attributes so WAL replay and
+   native batches preserve the same index participation."
+  [e avg added? no-overwrite? noindex?]
+  (if noindex?
+    (if added?
+      (kv-tx :put c/eav e avg :id :raw)
+      (kv-tx :del-list c/eav e [avg] :id :raw))
+    (DatomKVTxData. (long e) avg (boolean added?) (boolean no-overwrite?))))
+
 (defn ^:no-doc datom-kv-txs?
   [txs]
   (if (instance? java.util.List txs)

@@ -20,8 +20,7 @@
             [datalevin.util :refer [raise]])
   (:import [java.util Arrays HashMap IdentityHashMap]
            [java.nio ByteBuffer]
-           [datalevin.bits Indexable Retrieved CustomReference]
-           [datalevin.lmdb DatomKVTxData]))
+           [datalevin.bits Indexable Retrieved CustomReference]))
 
 ;; AVG adds a four-byte attribute ID and its usual two-byte inline trailer.
 (def ^:const reference-budget (- c/+max-key-size+ 6))
@@ -178,7 +177,7 @@
      [:closed (indexable nil aid (cv/reference prefix cv/min-id))
       (indexable nil aid (cv/reference prefix cv/max-id))] :avg true)))
 
-(defn put-datom! [kv e aid type value]
+(defn put-datom! [kv e aid type value noindex?]
   (let [payload ((:serialize type) value)
         prefix (cv/order-prefix type value reference-budget)
         old (match-reference kv e aid type value)
@@ -187,15 +186,15 @@
                             {:id id :txs [(l/kv-tx :put c/custom-values id payload :id :raw)]})
                           (cv/allocate-payload kv payload))
         ref (or old (cv/reference prefix id))]
-    (cv/transact! kv (into [(DatomKVTxData. (long e)
-                                           (b/indexable-bytes (indexable e aid ref))
-                                           true false)] txs))))
+    (cv/transact! kv (into [(l/datom-kv-tx
+                             e (b/indexable-bytes (indexable e aid ref))
+                             true false noindex?)] txs))))
 
-(defn delete-datom! [kv e aid type value]
+(defn delete-datom! [kv e aid type value noindex?]
   (when-let [ref (match-reference kv e aid type value)]
-    (cv/transact! kv [(DatomKVTxData. (long e)
-                                     (b/indexable-bytes (indexable e aid ref))
-                                     false false)
+    (cv/transact! kv [(l/datom-kv-tx
+                       e (b/indexable-bytes (indexable e aid ref))
+                       false false noindex?)
                      (cv/delete-payload-tx ref)])))
 
 (defn exact-entities

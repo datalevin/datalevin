@@ -43,9 +43,9 @@
   (is (pos? (get-in report [:environment :processors])))
   (is (= systems (mapv #(get-in % [:configuration :system]) (:results report))))
   (doseq [result (:results report)]
-    (is (= {:api :datalog :mode :embedded :workload :c :records 4 :ops 5
-            :warmup 0 :threads 2 :pool-size 2 :field-count 2 :field-length 4
-            :seed 23}
+    (is (= (cond-> {:api :datalog :mode :embedded :workload :c :records 4 :ops 5
+                    :warmup 0 :threads 2 :field-count 2 :field-length 4 :seed 23}
+             (= :datalevin (get-in result [:configuration :system])) (assoc :pool-size 2))
            (select-keys (:configuration result)
                         [:api :mode :workload :records :ops :warmup :threads
                          :pool-size :field-count :field-length :seed])))
@@ -57,7 +57,11 @@
             :character-checks :post-measurement}
            (:validation result)))
     (is (not-any? #(contains? (:configuration result) %)
-                  [:output :help :pg-url :pg-user]))))
+                  [:output :help :pg-url :pg-user :sql-indexes]))
+    (is (= :none (get-in result [:configuration :payload-indexes])))
+    (is (= :none (get-in result [:storage :payload-indexes])))
+    (when (= :sqlite (get-in result [:configuration :system]))
+      (is (= [] (get-in result [:storage :configuration :secondary-indexes]))))))
 
 (deftest help-and-invalid-arguments-test
   (with-redefs [runner/run-case! (fn [_] (throw (AssertionError. "Unexpected benchmark run")))
@@ -65,12 +69,13 @@
     (let [output (with-out-str (core/-main "--help"))]
       (is (str/includes? output "YCSB-style Datalevin benchmark"))
       (is (str/includes? output "--system"))
-      (is (str/includes? output "--sql-indexes"))
+      (is (not (str/includes? output "--sql-indexes")))
       (is (str/includes? output "--output")))
     (with-report-path
       (fn [file]
         (doseq [args [["--unknown-option"] ["unexpected-argument"]
                       ["--ops"] ["--ops" "not-a-number"] ["--ops" "0"]
+                      ["--sql-indexes" "all"]
                       ["--system" "postgres" "--mode" "embedded"]]]
           (is (thrown? clojure.lang.ExceptionInfo
                        (apply core/-main (concat ["--output" (str file)] args)))
@@ -113,24 +118,6 @@
     (is (= 5 (get-in result [:validation :value-checks :point-reads])))
     (is (str/includes? output "timings include recording"))))
 
-(deftest cli-sql-index-conditions-report-test
-  (with-report-path
-    (fn [file]
-      (let [output (with-out-str
-                     (apply core/-main
-                            (concat small-args
-                                    ["--system" "sqlite" "--sql-indexes" "both"
-                                     "--output" (str file)])))
-            report (edn/read-string (slurp file))
-            results (:results report)]
-        (check-report! report [:sqlite :sqlite])
-        (is (= [:none :all] (mapv #(get-in % [:configuration :sql-indexes]) results)))
-        (is (= [:none :all] (mapv #(get-in % [:storage :configuration :sql-indexes]) results)))
-        (is (= [0 2] (mapv #(count (get-in % [:storage :configuration :secondary-indexes])) results)))
-        (is (= #{:none :all} (set (map #(get-in % [:configuration :sql-indexes]) (:summary report)))))
-        (is (str/includes? output "SQL indexes none"))
-        (is (str/includes? output "SQL indexes all"))))))
-
 (deftest failed-case-does-not-publish-report-test
   (doseq [existing? [false true]]
     (with-report-path
@@ -166,7 +153,7 @@
                (concat small-args
                        ["--system" "sqlite" "--client-counts" "1,2"
                         "--repetitions" "2" "--warmup-ms" "0" "--measurement-ms" "20"
-                        "--server-workers" "12" "--output" (str file)])))
+                        "--server-background-threads" "12" "--output" (str file)])))
       (let [report (edn/read-string (slurp file))
             results (:results report)]
         (is (= 4 (count results)))

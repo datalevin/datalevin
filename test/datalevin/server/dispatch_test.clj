@@ -37,7 +37,7 @@
 ;; An independent inventory of mutations: changing a property to read-only
 ;; must not silently remove a handler from the guard tests below.
 (def ^:private database-writes
-  #{:set-schema :register-type :datalog-register-type
+  #{:set-schema :index-attr :register-type :datalog-register-type
     :swap-attr :del-attr :rename-attr :load-datoms :tx-data :tx-data+db-info
     :open-transact :close-transact :abort-transact
     :open-transact-kv :close-transact-kv :abort-transact-kv :transact-kv :update-kv
