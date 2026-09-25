@@ -1,0 +1,117 @@
+;;
+;; Copyright (c) Huahai Yang. All rights reserved.
+;; The use and distribution terms for this software are covered by the
+;; Eclipse Public License 2.0 (https://opensource.org/license/epl-2-0)
+;; which can be found in the file LICENSE at the root of this distribution.
+;; By using this software in any fashion, you are agreeing to be bound by
+;; the terms of this license.
+;; You must not remove this notice, or any other, from this software.
+;;
+(ns ^:no-doc datalevin.storage.entity
+  "Entity maps read directly from EAV under a shared cursor and snapshot."
+  (:require [datalevin.bits :as b]
+            [datalevin.constants :as c]
+            [datalevin.custom-datalog :as cd]
+            [datalevin.index :as idx]
+            [datalevin.lmdb :as l]
+            [datalevin.scan :as scan]
+            [datalevin.timeout :as timeout])
+  (:import [java.lang AutoCloseable]
+           [java.nio ByteBuffer]
+           [java.util Iterator]))
+
+(defn range-entities
+  "Read existing entities in [start, end), including :db/id. Cardinality-many
+  values are vectors in EAV order; references remain stored entity IDs."
+  [lmdb attrs schema start end]
+  (if (< (long start) (long end))
+    (cd/with-snapshot lmdb
+      (let [pending (volatile! (transient []))
+            result
+            (scan/scan lmdb c/eav
+              (with-open [^AutoCloseable iter
+                          (.iterator ^Iterable
+                                     (l/iterate-list-key-range-val-full
+                                       dbi rtx cur [:closed-open start end] :id))]
+                (loop [previous nil
+                       entity   nil
+                       result   (transient [])]
+                  (timeout/assert-time-left)
+                  (if (.hasNext ^Iterator iter)
+                    (let [kv     (.next ^Iterator iter)
+                          eid    (.getLong ^ByteBuffer (l/k kv) 0)
+                          buffer (l/v kv)
+                          attr   (attrs (b/avg->aid buffer))
+                          props  (schema attr)
+                          many?  (= :db.cardinality/many (:db/cardinality props))
+                          same?  (= eid previous)
+                          result (if (and entity (not same?))
+                                   (conj! result (persistent! entity)) result)
+                          entity (if same? entity (transient {:db/id eid}))
+                          values (when many? (get entity attr []))
+                          external? (or (not= c/normal (b/avg->giant-id buffer))
+                                        (cd/custom-type? (idx/value-type props)))
+                          value (if external?
+                                  (do
+                                    (vswap! pending conj!
+                                            [(cond-> [(count result) attr]
+                                               many? (conj (count values)))
+                                             (b/read-buffer buffer :avg)])
+                                    nil)
+                                  (idx/avg-buffer->v lmdb buffer))]
+                      (recur eid (assoc! entity attr
+                                         (if many? (conj values value) value))
+                             result))
+                    (persistent! (if entity
+                                   (conj! result (persistent! entity)) result)))))
+              (throw e))
+            ;; Giant/custom lookups reuse transaction key and range buffers.
+            ;; Decode their owned references after closing the EAV cursor,
+            ;; in the same snapshot, so they cannot disturb iteration.
+            result (reduce (fn [entities [path retrieved]]
+                             (timeout/assert-time-left)
+                             (assoc-in entities path (idx/retrieved->v lmdb retrieved)))
+                           result (persistent! @pending))]
+        (timeout/assert-time-left)
+        result))
+    []))
+
+(defn- projected-entity
+  [lmdb iter eid ^objects names ^longs aids id?]
+  (timeout/assert-time-left)
+  (when-some [eid eid]
+    (let [n (alength names)
+          result
+          (loop [index 0
+                 next? (and (pos? n) (l/seek-key iter eid :id))
+                 entity (transient (if id? {:db/id eid} {}))]
+            (if (and next? (< index n))
+              (let [buffer (l/next-val iter)
+                    aid (b/avg->aid buffer)
+                    index (long (loop [j (long index)]
+                                  (if (and (< j n) (< (aget aids j) aid))
+                                    (recur (inc j)) j)))
+                    match? (and (< index n) (= aid (aget aids index)))
+                    entity (if match?
+                             (assoc! entity (aget names index)
+                                     (idx/avg-buffer->v lmdb buffer))
+                             entity)
+                    index (if match? (inc index) index)]
+                (recur index (and (< index n) (l/has-next-val iter)) entity))
+              (not-empty (persistent! entity))))]
+      (timeout/assert-time-left)
+      result)))
+
+(defn select-entities
+  "Project scalar attributes for resolved IDs with one reusable EAV cursor.
+  Names and aids are parallel arrays ordered by aid. Preserve order, duplicates
+  and nil lookup results, including pull's :db/id behavior for missing IDs."
+  [lmdb ids names aids id?]
+  (if (seq ids)
+    (cd/with-snapshot lmdb
+      (scan/scan lmdb c/eav
+        (with-open [^AutoCloseable iter
+                    (l/val-iterator (l/iterate-list-val-full dbi rtx cur))]
+          (mapv #(projected-entity lmdb iter % names aids id?) ids))
+        (throw e)))
+    []))

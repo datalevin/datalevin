@@ -45,6 +45,7 @@
    [datalevin.remote :as remote]
    [datalevin.scan :as scan]
    [datalevin.secondary-index :as si]
+   [datalevin.storage.entity :as entity]
    [datalevin.storage.domains
     :refer [embedding-attr-domains ensure-embedding-vector!
             init-embedding-indices init-embedding-providers init-engines
@@ -614,9 +615,10 @@
   (e-size [_ e] (list-count lmdb c/eav e :id))
 
   (entity-range [_ start end]
-    (if (< (long start) (long end))
-      (vec (i/key-range lmdb c/eav [:closed-open start end] :id))
-      []))
+    (entity/range-entities lmdb attrs schema start end))
+
+  (entity-range [_ ids names aids id?]
+    (entity/select-entities lmdb ids names aids id?))
 
   (a-size [this a]
     (if (:db/aid (schema a))

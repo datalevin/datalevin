@@ -486,6 +486,7 @@
     (tail [_ index high-datom low-datom])
     (slice [_ index low-datom high-datom])
     (entity-range [_ start end])
+    (entity-range [_ ids names aids id?])
     (rslice [_ index high-datom low-datom])
     (e-datoms [_ e])
     (e-first-datom [_ e]))

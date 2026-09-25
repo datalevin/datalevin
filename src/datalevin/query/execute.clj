@@ -40,7 +40,7 @@
             point-lookup-projection-key point-lookup-projection-shape]]
    [datalevin.query.execute.result :as result
     :refer [*deferred-result-explain* adaptive-limit-query?
-            indexed-unique-result-set order-comps order-result pull
+            indexed-unique-result-set order-comps order-result pull pull-many
             query-result-size result-window spillable-result-set tuple-get
             ;; Resolved here by query-resolve-test in the sibling test project.
             #_{:clj-kondo/ignore [:unused-referred-var]}
@@ -871,7 +871,7 @@
                         (let [selected (order-result find-vars rows order
                                                      limit offset)]
                           (if deferred-pull?
-                            (vec (pull find-elements pull-context selected))
+                            (pull-many find-elements pull-context selected)
                             selected)))
        :retry-empty?  false
        :empty-window? false})))

@@ -67,6 +67,34 @@
         (d/close conn)
         (u/delete-files dir)))))
 
+(deftest cursor-pull-many-preserves-pull-semantics
+  (let [conn (d/create-conn nil
+                           {:key {:db/unique :db.unique/identity}
+                            :a {} :z {} :flag {} :absent {}
+                            :friend {:db/valueType :db.type/ref}
+                            :tags {:db/cardinality :db.cardinality/many}}
+                           {:kv-opts {:inmemory? true}})
+        ids [3 1 [:key "two"] 99 [:key "absent"] 1]
+        patterns [[:z :a] [:flag :absent] [:db/id :a :z] [] [:db/id]
+                  [:unknown] '[*] '[:tags {:friend [:a]}]
+                  '[[:absent :default false]]]]
+    (try
+      (d/transact! conn [{:db/id 1 :key "one" :a 10 :z (.repeat "x" 3000)
+                         :flag false :friend 2 :tags [:a :b]}
+                        {:db/id 2 :key "two" :a 20}
+                        {:db/id 3 :key "three" :z [1 2 3]}])
+      (doseq [pattern patterns]
+        (is (= (mapv #(general-pull @conn pattern %) ids)
+               (d/pull-many @conn pattern ids)) (str pattern))
+        (is (= [] (d/pull-many @conn pattern []))))
+      (let [pending (:db-after (d/tx-data->simulated-report
+                                @conn [[:db/retractEntity 2]
+                                       [:db/add 1 :a 11]]))]
+        (doseq [pattern patterns]
+          (is (= (mapv #(general-pull pending pattern %) ids)
+                 (d/pull-many pending pattern ids)) (str "pending " pattern))))
+      (finally (d/close conn)))))
+
 (deftest pull-patterns-survive-data-transactions
   (doseq [wal? [false true]]
     (testing (str "WAL enabled: " wal?)

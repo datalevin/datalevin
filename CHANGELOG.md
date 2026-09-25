@@ -16,6 +16,8 @@
 - [Datalog] added `:db/noindex` to attribute schema property, to disable AVE
   index for that attribute. `index-attr` function to backfill index for an
   attribute.
+- [Datalog] added `entity-range` function to return entities within a range of
+  entity ids.
 - [Benchmark] added TPC-C, TPC-H and YCSB benchmarks.
 
 ### Changed
@@ -34,7 +36,7 @@
 ### Fixed
 - [Datalog] planner range conversion for `like`.
 - [Datalog] false-negative giant AVE lookup.
-- [Datalog] simulated txn range bounds.
+- [Datalog] simulated transaction range bounds.
 - [KV] prefix overflow page deletion.
 
 ### Improved

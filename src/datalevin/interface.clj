@@ -378,8 +378,10 @@ values;")
     "Return the approximate number of datoms within the given range (inclusive). On list-backed indexes, this may ignore the value portion of the range.")
   (e-size [this e]
     "Return the numbers of datoms with the given e value")
-  (entity-range [this start end]
-    "Return existing entity IDs in ascending order in [start, end).")
+  (entity-range [this start end] [this ids names aids id?]
+    "Read entity maps with one EAV cursor. The range form returns all stored
+     attributes and :db/id for existing entities in [start, end). The ID-batch
+     form projects scalar names/aids arrays in ID input order for pull-many.")
   (a-size [this a]
     "Return the number of datoms with the given attribute, an estimate")
   (start-sampling [this])

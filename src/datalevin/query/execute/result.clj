@@ -201,6 +201,24 @@
         resolved
         tuple))))
 
+(defn pull-many
+  "Materialize pulls for an already selected result window, preserving the
+  tuple order and multiplicity. Each pull expression receives one ID batch."
+  [find-elements context resultset]
+  (if (seq resultset)
+    (reduce-kv
+      (fn [rows index find]
+        (if (dp/pull? find)
+          (let [db      (qagg/-context-resolve (:source find) context)
+                pattern (qagg/-context-resolve (:pattern find) context)
+                ids     (mapv #(nth % index) rows)
+                pulled  (dpa/pull-many db pattern ids)]
+            (mapv #(assoc %1 index %2) rows pulled))
+          rows))
+      (mapv vec resultset)
+      (vec find-elements))
+    []))
+
 (defn result-explain
   ([context result]
    (if *deferred-result-explain*

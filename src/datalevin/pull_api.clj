@@ -527,9 +527,15 @@
   ([^DB db pattern ids] (pull-many* db pattern ids {}))
   ([^DB db pattern ids {:keys [timeout] :as opts}]
    {:pre [(db/db? db)]}
-   (binding [timeout/*deadline* (timeout/to-deadline timeout)]
-     (let [parsed-opts (parse-opts db pattern opts)]
-       (mapv #(pull-impl parsed-opts %) ids)))))
+   (binding [timeout/*deadline* (timeout/effective-deadline timeout)]
+     (let [store (.-store db)
+           _ (when (instance? Store store) (storage/maybe-ensure-current! store))
+           {^FlatPattern flat :flat :as parsed-opts} (parse-opts db pattern opts)]
+       (if (and flat (nil? (:visitor opts)) (instance? Store store)
+                (not (db/pending-tx-cache? db)))
+         (i/entity-range store (mapv #(db/entid db %) ids)
+                         (.-names flat) (.-aids flat) (.-id? flat))
+         (mapv #(pull-impl parsed-opts %) ids))))))
 
 (defn pull-many
   ([db pattern id opts]

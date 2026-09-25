@@ -785,16 +785,19 @@ Only usable for debug output.
   index-range db/-index-range)
 
 (def ^{:arglists '([db start end])
-       :doc "Return existing entity IDs in ascending order from `start` (inclusive)
+       :doc "Return entity maps in ascending entity ID order from `start` (inclusive)
   to `end` (exclusive). Bounds are nonnegative 64-bit integers; an empty or
-  reversed interval returns []. Missing IDs are skipped. Scans EAV keys without
-  reading attribute values or constructing datoms.
+  reversed interval returns []. Missing IDs are skipped. Each map contains
+  :db/id and all stored attributes, read directly with one EAV cursor.
+  Cardinality-many values are vectors in EAV order. References remain entity
+  IDs; this operation does not expand references or component entities.
 
   Also available as `entity-range` inside Datalog queries:
 
       [:find ?e ?name :in $ ?start ?end
-       :where [(entity-range $ ?start ?end) [?e ...]]
-              [?e :name ?name]
+       :where [(entity-range $ ?start ?end) [?entity ...]]
+              [(get ?entity :db/id) ?e]
+              [(get ?entity :name) ?name]
        :order-by ?e]
 
   Local and remote DBs, including transaction views, are supported."}
