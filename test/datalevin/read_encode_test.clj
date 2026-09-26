@@ -5,14 +5,18 @@
    [datalevin.client :as client]
    [datalevin.constants :as c]
    [datalevin.core :as d]
+   [datalevin.db :as db]
    [datalevin.kv :as kv]
+   [datalevin.lmdb :as lmdb]
    [datalevin.native-value :as nv]
    [datalevin.protocol :as p]
    [datalevin.query :as q]
    [datalevin.read-encode :as enc]
    [datalevin.remote :as remote]
+   [datalevin.scan :as scan]
    [datalevin.server :as server]
    [datalevin.spill :as spill]
+   [datalevin.storage :as storage]
    [datalevin.test.core :refer [allocate-port db-fixture]]
    [datalevin.util :as u]
    [taoensso.nippy :as nippy])
@@ -22,6 +26,7 @@
    [datalevin.remote DatalogStore KVStore]
    [datalevin.spill SpillableVector]
    [java.io ByteArrayInputStream DataInput DataInputStream DataOutput EOFException]
+   [java.lang AutoCloseable]
    [java.net InetSocketAddress]
    [java.nio ByteBuffer BufferOverflowException]
    [java.nio.channels SocketChannel]
@@ -119,6 +124,59 @@
               (is (= (seq (b/serialize [42 value])) (seq (b/serialize actual)))
                   (str type opts)))))
         (finally (d/close conn))))))
+
+(deftest tuple-projection-uses-one-scan-and-owns-cursor-values
+  (let [attrs (mapv #(keyword (str "field" %)) (range 12))
+        conn (d/create-conn nil (zipmap attrs (repeat {:db/valueType :db.type/string}))
+                           {:wal? false :cache-limit 0})]
+    (try
+      (let [schema (db/-schema @conn)
+            ascending (vec (sort-by #(get-in schema [% :db/aid]) attrs))
+            descending (vec (reverse ascending))
+            ;; Reversed field order and repeated columns must not rescan EAV.
+            projection (into descending [(first descending) (last descending)])
+            indexes (zipmap ascending (range))
+            aids (long-array (map #(get-in schema [% :db/aid]) ascending))
+            row (zipmap attrs (map #(str "payload-" %) (range 12)))
+            partial-row (dissoc row (first descending))
+            writer (storage/prepare-tuple-writer schema projection)
+            store (.-store ^datalevin.db.DB @conn)
+            kv (d/datalog-kv conn)]
+        (d/transact! conn [(assoc row :db/id 1) (assoc partial-row :db/id 2)])
+        (doseq [[eid expected] [[1 (mapv row projection)] [2 nil]]]
+          (let [seeks (atom 0)
+                visits (atom 0)
+                values
+                (scan/scan kv c/eav
+                  (with-open [^AutoCloseable iterator
+                              (lmdb/val-iterator (lmdb/iterate-list-val-full dbi rtx cur))]
+                    (let [scratch (ByteBuffer/allocate 1024)]
+                      (#'storage/tuple-field-buffers
+                        (reify
+                          lmdb/IListRandKeyValIterator
+                          (seek-key [_ key type]
+                            (swap! seeks inc)
+                            (lmdb/seek-key iterator key type))
+                          (has-next-val [_] (lmdb/has-next-val iterator))
+                          (next-val [_]
+                            (swap! visits inc)
+                            (.clear scratch)
+                            (.put scratch ^ByteBuffer (lmdb/next-val iterator))
+                            (.flip scratch)))
+                        eid aids)))
+                  #_{:clj-kondo/ignore [:type-mismatch]}
+                  (throw e))]
+            (is (= 1 @seeks))
+            (is (<= @visits (count attrs)))
+            ;; Decode only after closing the cursor: copied fields must own
+            ;; their bytes even when every visit reused one mutable buffer.
+            (is (= expected
+                   (when values
+                     (mapv #(b/avg->inline-value (aget ^objects values (int (indexes %))))
+                           projection))))
+            (is (= expected (b/deserialize
+                              (b/serialize (enc/read-result #(writer store % eid)))))))))
+      (finally (d/close conn)))))
 
 (deftest small-range-byte-limit-and-buffer-growth
   (doseq [direct? [false true]

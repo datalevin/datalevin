@@ -356,10 +356,13 @@
       (let [last-modified-ms (init-state-sync-ms lmdb)]
         (when (< ^long state-sync-ms ^long last-modified-ms)
           (let [schema* (load-schema lmdb)]
-            (set! schema schema*)
-            (set! rschema (schema->rschema schema*))
-            (set! attrs (init-attrs schema*))
-            (set! max-aid (init-max-aid schema*))
+            ;; Data-only commits must retain schema identity so prepared
+            ;; readers can keep their compiled attribute layouts.
+            (when-not (= schema schema*)
+              (set! schema schema*)
+              (set! rschema (schema->rschema schema*))
+              (set! attrs (init-attrs schema*))
+              (set! max-aid (init-max-aid schema*)))
             (set! idoc-indices
                   (merge-missing-idoc-indices lmdb idoc-indices schema* opts))
             (mark-state-current! this last-modified-ms)))))
@@ -1218,52 +1221,47 @@
          #_{:clj-kondo/ignore [:type-mismatch]} ; scan's lint hook binds e to nil
          (throw e))))))
 
-(defn- entity-has-attrs?
+(defn- tuple-field-buffers
   [iter eid ^longs aids]
-  (let [n (alength aids)]
+  (let [n (alength aids)
+        values (object-array n)]
     (loop [index 0 next? (lmdb/seek-key iter eid :id)]
       (cond
-        (= index n) true
-        (not next?) false
+        (= index n) values
+        (not next?) nil
         :else
-        (let [aid (b/avg->aid (lmdb/next-val iter))
+        (let [^ByteBuffer value (lmdb/next-val iter)
+              aid (b/avg->aid value)
               target (aget aids index)]
           (cond
-            (> aid target) false
-            (= aid target) (recur (inc index) (lmdb/has-next-val iter))
+            (> aid target) nil
+            (= aid target)
+            (do
+              ;; Cursor and decompression buffers can be reused on the next
+              ;; move. Own the bytes until all required fields are present.
+              (aset values index (ByteBuffer/wrap (b/get-bytes value)))
+              (recur (inc index) (and (< (inc index) n) (lmdb/has-next-val iter))))
             :else (recur index (lmdb/has-next-val iter))))))))
 
 (defn- write-tuple!
-  [^Store store ^ByteBuffer out eid ^longs aids ^longs presence-aids]
+  [^Store store ^ByteBuffer out eid ^longs aids ^ints field-indexes]
   (let [lmdb (.-lmdb store)
-        n (alength aids)]
+        n (alength field-indexes)]
     (scan/scan lmdb c/eav
       (with-open [^AutoCloseable iter
                   (lmdb/val-iterator (lmdb/iterate-list-val-full dbi rtx cur))]
-        ;; Every clause is required. Check presence in the same snapshot before
-        ;; emitting any values: rewinding a partial tuple could leave dangling
-        ;; references in the enclosing Nippy cache (e.g. from a giant value).
-        (if (entity-has-attrs? iter eid presence-aids)
+        ;; Gather required fields in one forward EAV pass, then encode in find
+        ;; order. Emit nothing until the row is complete: discarding a partial
+        ;; tuple could invalidate the enclosing Nippy cache's references.
+        (if-let [^objects values (tuple-field-buffers iter eid aids)]
           (do
             (enc/start-tuple! out n)
-            (loop [index 0 next? (lmdb/seek-key iter eid :id)]
-              (when (and next? (< index n))
-                (let [value (lmdb/next-val iter)
-                      aid (b/avg->aid value)]
-                  (if (= aid (aget aids index))
-                    (let [giant-id (b/avg->giant-id value)
-                          next-index (inc index)]
-                      (if (= giant-id c/normal)
-                        (enc/write-avg! out value)
-                        (write-giant-value! lmdb rtx giant-id out))
-                      (when (< next-index n)
-                        ;; Find order need not match attribute-ID order. The
-                        ;; usual ascending projection consumes one forward pass.
-                        (recur next-index
-                               (if (<= (aget aids next-index) aid)
-                                 (lmdb/seek-key iter eid :id)
-                                 (lmdb/has-next-val iter)))))
-                    (recur index (lmdb/has-next-val iter)))))))
+            (dotimes [index n]
+              (let [value (aget values (aget field-indexes index))
+                    giant-id (b/avg->giant-id value)]
+                (if (= giant-id c/normal)
+                  (enc/write-avg! out value)
+                  (write-giant-value! lmdb rtx giant-id out)))))
           (enc/write-value! out nil)))
       #_{:clj-kondo/ignore [:type-mismatch]}
       (throw e))))
@@ -1278,9 +1276,11 @@
                              (not= :db.cardinality/many (:db/cardinality props))
                              (not (cd/custom-type? (value-type props)))))
                      attributes))
-    (let [aids (long-array (map #(:db/aid (schema %)) attributes))
-          presence-aids (long-array (sort (distinct (seq aids))))]
-      (fn [store out eid] (write-tuple! store out eid aids presence-aids)))))
+    (let [find-aids (mapv #(:db/aid (schema %)) attributes)
+          aids (long-array (sort (distinct find-aids)))
+          indexes (zipmap (seq aids) (range))
+          field-indexes (int-array (map indexes find-aids))]
+      (fn [store out eid] (write-tuple! store out eid aids field-indexes)))))
 
 (defn e-sample*
   [^Store store a aid]
