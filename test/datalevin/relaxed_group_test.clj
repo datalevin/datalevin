@@ -152,9 +152,9 @@
         (kv/force-txlog-sync! db)
         (let [before (metrics db)
               txs (mapv (fn [n]
-                          (if (= path :general)
-                            [[:db/add n :body (str "text" n)]]
-                            [{:key n :body (str "text" n)}])) [1 2])]
+                          (if (= path :blind)
+                            [{:key n :body (str "text" n)}]
+                            [[:db/add n :body (str "text" n)]])) [1 2])]
           (datalog-batch! cn txs)
           (let [after (metrics db)
                 records (if (= path :individual) 2 1)]
