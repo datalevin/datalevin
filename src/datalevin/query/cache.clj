@@ -240,7 +240,8 @@
      (if (and (cache-enabled?)
               (not (if analysis (.-nested? analysis)
                        (contains-nested-query? parsed-q))))
-       (if-let [store (single-input-store inputs)]
+       (if-let [store (when-let [store (single-input-store inputs)]
+                        (when (db/cache-active? store) store))]
          (let [;; Pull dependencies depend on schema. Capture the generation
                ;; before analyzing them so a concurrent schema change cannot
                ;; publish a result with dependencies from the previous schema.

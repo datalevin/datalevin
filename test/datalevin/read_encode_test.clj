@@ -8,6 +8,7 @@
    [datalevin.kv :as kv]
    [datalevin.native-value :as nv]
    [datalevin.protocol :as p]
+   [datalevin.query :as q]
    [datalevin.read-encode :as enc]
    [datalevin.remote :as remote]
    [datalevin.server :as server]
@@ -18,7 +19,7 @@
   (:import
    [clojure.lang PersistentVector]
    [datalevin NativeValue]
-   [datalevin.remote KVStore]
+   [datalevin.remote DatalogStore KVStore]
    [datalevin.spill SpillableVector]
    [java.io ByteArrayInputStream DataInput DataInputStream DataOutput EOFException]
    [java.net InetSocketAddress]
@@ -80,6 +81,44 @@
           (.get out bytes)
           (is (= {:next :frame} (nippy/fast-thaw bytes))))
         (is (zero? (.remaining out)))))))
+
+(deftest tuple-vector-headers-and-encoding-preserve-value-types
+  (doseq [width [0 1 2 3 10 127 128 256]]
+    (let [result (enc/read-result
+                   (fn [out]
+                     (enc/start-tuple! out width)
+                     (dotimes [i width] (enc/write-value! out i))))]
+      (is (= (vec (range width)) (b/deserialize (b/serialize result))))))
+  (doseq [[type value] [[:db.type/string "東京 👋"]
+                        [:db.type/string (.repeat "x" 10000)]
+                        [:db.type/long Long/MIN_VALUE]
+                        [:db.type/float (float 1.25)]
+                        [:db.type/double -2.5]
+                        [:db.type/boolean false]
+                        [:db.type/instant (java.util.Date. -1234)]
+                        [:db.type/uuid (UUID/randomUUID)]
+                        [:db.type/keyword :app/option]
+                        [:db.type/symbol 'app/value]
+                        [:db.type/bytes (byte-array [0 1 -1])]
+                        [:db.type/bytes (byte-array 10000)]
+                        [nil {:nested [false "東京 👋"]}]]]
+    (let [conn (d/create-conn nil {:key {:db/unique :db.unique/identity}
+                                   :a (cond-> {:db/noindex true}
+                                        type (assoc :db/valueType type))
+                                   :b {:db/valueType :db.type/long :db/noindex true}}
+                             {:wal? false :cache-limit 0})
+          query '[:find [?b ?a] :in $ ?key
+                  :where [?e :key ?key] [?e :a ?a] [?e :b ?b]]
+          reader (q/query-reader query)]
+      (try
+        (d/transact! conn [{:key "one" :a value :b 42}])
+        (let [result (reader @conn [@conn "one"] true)]
+          (is (instance? datalevin.read_encode.ReadResult result))
+          (doseq [opts [nil {:compression :zstd :compression-threshold 0}]]
+            (let [actual (decode-message (encode-message result opts 30000) opts)]
+              (is (= (seq (b/serialize [42 value])) (seq (b/serialize actual)))
+                  (str type opts)))))
+        (finally (d/close conn))))))
 
 (deftest small-range-byte-limit-and-buffer-growth
   (doseq [direct? [false true]
@@ -229,7 +268,7 @@
                                 {:key {:db/unique :db.unique/identity}
                                  :text {:db/valueType :db.type/string}
                                  :tracked {}}
-                                {:client-opts {:pool-size 1}})]
+                                {:cache-limit 0 :client-opts {:pool-size 1}})]
         (try
           (d/open-dbi db "data")
           (d/transact-kv db [[:put "data" :key (->Observed 42)]])
@@ -244,6 +283,13 @@
           (is (= {:text "東京 👋" :tracked (->Observed 42)}
                  (d/pull @conn [:text :tracked] [:key "one"])))
           (is (= [(.getName (Thread/currentThread))] @thaw-threads))
+          (let [query '[:find [?text ?tracked] :in $ ?key
+                        :where [?e :key ?key] [?e :text ?text] [?e :tracked ?tracked]]
+                reader (d/prepare-q @conn query)]
+            (dotimes [_ 2]
+              (reset! thaw-threads [])
+              (is (= ["東京 👋" (->Observed 42)] (reader ["one"])))
+              (is (= [(.getName (Thread/currentThread))] @thaw-threads))))
           ;; A peer that did not advertise storage reads receives ordinary values.
           (with-open [channel (SocketChannel/open (InetSocketAddress. "localhost" (int port)))]
             (let [legacy (client/->Connection channel 2000 (ByteBuffer/allocate 4096))]
@@ -262,6 +308,21 @@
                                   legacy {:type :get-range :writing? false
                                           :args ["kv" "data" [:all] :data :data false]}))))
                 (is (= 2 (count @thaw-threads)))
+                ;; Prepared query dispatch also works without storage encoding.
+                (client/send-n-receive
+                  legacy {:type :set-client-id
+                          :client-id (client/get-id (.-client ^DatalogStore (:store @conn)))
+                          :wire-capabilities {:prepared-read? true :prepared-query? true}})
+                (let [query '[:find [?tracked ?text] :in $ ?key
+                              :where [?e :key ?key] [?e :text ?text] [?e :tracked ?tracked]]]
+                  (doseq [request [{:type :q :prepare-id 77 :writing? false
+                                   :args ["dl" query [:remote-db-placeholder "one"]]}
+                                  {:type :execute-prepared :handle 77 :writing? false
+                                   :value [:remote-db-placeholder "one"]}]]
+                    (reset! thaw-threads [])
+                    (is (= [(->Observed 42) "東京 👋"]
+                           (:result (client/send-n-receive legacy request))))
+                    (is (= 2 (count @thaw-threads)))))
                 (finally (client/close legacy)))))
           (finally (d/close-kv db) (d/close conn))))
       (finally (server/stop srv) (u/delete-files root)))))

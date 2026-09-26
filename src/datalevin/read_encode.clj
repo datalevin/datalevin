@@ -144,6 +144,16 @@
   [^ByteBuffer out]
   (.put out (unchecked-byte nschema/id-vec-2)))
 
+(defn start-tuple!
+  "Write the ordinary Nippy vector header for a fixed-width query tuple."
+  [^ByteBuffer out ^long width]
+  (if (<= width Byte/MAX_VALUE)
+    (do (.put out (unchecked-byte nschema/id-vec-sm_))
+        (.put out (byte width)))
+    (do (.put out (unchecked-byte #_{:clj-kondo/ignore [:unresolved-var]}
+                                  nschema/id-vec-lg))
+        (.putInt out (int width)))))
+
 (def ^:private spillable-vector-id (impl/coerce-custom-type-id :spillable-vec))
 
 (defn start-range!

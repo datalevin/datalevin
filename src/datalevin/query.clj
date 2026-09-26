@@ -5,6 +5,7 @@
    [datalevin.prepared :as prepared]
    [datalevin.query.cache :as qcache]
    [datalevin.query.execute :as qexec]
+   [datalevin.query.execute.point-lookup :as point]
    [datalevin.query.plan :as qplan]
    [datalevin.query-optimizer :as qo]
    [datalevin.interface :as i]
@@ -113,12 +114,18 @@
 
 (defn- result-reader [parsed-q]
   (let [execute (qcache/prepare-result-reader parsed-q)
+        encoded-execute (point/prepared-executor
+                          parsed-q (point/point-lookup-projection-shape parsed-q) true)
         expected (count (:qin parsed-q))]
-    (fn [db inputs _encoded?]
+    (fn [db inputs encoded?]
       (check-query-inputs! inputs expected)
-      (with-query-runtime
-        (qexec/mark-parsing-finished!)
-        (execute (if (identical? db (nth inputs 0)) inputs (assoc inputs 0 db)))))))
+      (let [inputs (if (identical? db (nth inputs 0)) inputs (assoc inputs 0 db))
+            result (if encoded? (encoded-execute inputs) point/unsupported)]
+        (if (identical? result point/unsupported)
+          (with-query-runtime
+            (qexec/mark-parsing-finished!)
+            (execute inputs))
+          result)))))
 
 (defn query-reader
   "Compile reusable result processing and eligible access paths. Sources,

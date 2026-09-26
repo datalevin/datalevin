@@ -20,6 +20,32 @@
 (defn- ave-attrs [conn]
   (set (map :a (d/datoms @conn :ave))))
 
+(deftest unindexed-simulated-values-stay-in-the-eav-overlay
+  (doseq [wal? [false true]
+          prepare? [false true]]
+    (binding [c/*use-prepare-path* prepare?]
+      (let [conn (d/create-conn nil schema
+                                {:wal? wal? :kv-opts {:inmemory? true}})]
+        (try
+          (d/transact! conn [{:db/id 1 :name "one" :body "stored" :tags ["old"]}])
+          (let [report (d/tx-data->simulated-report
+                         @conn [[:db/add 1 :body "pending"]
+                                [:db/retract 1 :tags "old"]
+                                [:db/add 1 :tags "new"]
+                                {:db/id 2 :name "two" :body "fresh"}])
+                pending (:db-after report)]
+            (is (= #{:name :body :tags} (set (map :a (:eavt pending)))))
+            (is (= [[2 :name "two"]]
+                   (mapv datom/datom-eav (:avet pending))))
+            (is (= {:body "pending" :tags ["new"]}
+                   (d/pull pending [:body :tags] 1)))
+            (is (= {:name "two" :body "fresh"}
+                   (d/pull pending [:name :body] 2)))
+            (is (= {:body "stored" :tags ["old"]}
+                   (d/pull @conn [:body :tags] 1)))
+            (is (nil? (d/pull @conn [:name :body] 2))))
+          (finally (d/close conn)))))))
+
 (deftest unindexed-writes-and-backfill
   (doseq [wal? [false true]
           ordered? [false true]]

@@ -128,7 +128,8 @@
   (if (datom-added datom)
     (do
       (.add ^TreeSortedSet (:eavt db) datom)
-      (.add ^TreeSortedSet (:avet db) datom)
+      (when-not (txcommon/is-attr? db (.-a datom) :db/noindex)
+        (.add ^TreeSortedSet (:avet db) datom))
       (advance-max-eid db (.-e datom)))
     (if (.isEmpty
           (.subSet ^TreeSortedSet (:eavt db)
@@ -137,7 +138,8 @@
       db
       (do
         (.remove ^TreeSortedSet (:eavt db) datom)
-        (.remove ^TreeSortedSet (:avet db) datom)
+        (when-not (txcommon/is-attr? db (.-a datom) :db/noindex)
+          (.remove ^TreeSortedSet (:avet db) datom))
         db))))
 
 (declare effective-attr-value)
@@ -259,9 +261,13 @@
          ^Datom old-datom
          (if multival?
            (or (cached-eav-first-datom db e a v')
-               (first (fetch store (datom e a v'))))
+               (when-not (new-eid? (:db-before report) e)
+                 (first (fetch store (datom e a v')))))
            (or (cached-ea-first-datom db e a)
-               (ea-first-datom store e a)))]
+               ;; Allocation advances db-after, but the persisted EAV range
+               ;; is empty above db-before's max-eid throughout this tx.
+               (when-not (new-eid? (:db-before report) e)
+                 (ea-first-datom store e a))))]
      (cond
        (nil? old-datom)
        (transact-report report new-datom)

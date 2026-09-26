@@ -99,7 +99,7 @@
   (-e-sample [db a])
   (-default-ratio [db a])
   (-eav-scan-v [db in out eid-idx attrs-v])
-  (-eav-scan-v-list [db in eid-idx attrs-v])
+  (-eav-scan-v-list [db in eid-idx attrs-v] [db in eid-idx attrs-v prepared])
   (-eav-filter-presence-list [db in eid-idx attr])
   (-val-eq-scan-e [db in out v-idx attr] [db in out v-idx attr bound])
   (-val-eq-scan-e-list [db in v-idx attr] [db in v-idx attr bound])
@@ -240,6 +240,12 @@
   [store]
   (.isDisabled ^LRUCache (.get ^ConcurrentHashMap caches (dir store))))
 
+(defn ^:no-doc cache-active?
+  "Whether results can be retained. Zero capacity avoids the LRU monitor."
+  [store]
+  (let [cache ^LRUCache (.get ^ConcurrentHashMap caches (dir store))]
+    (and (pos? (.capacity cache)) (not (.isDisabled cache)))))
+
 (defn disable-cache
   [store]
   (.disable ^LRUCache (.get ^ConcurrentHashMap caches (dir store))))
@@ -277,7 +283,7 @@
   [store pattern body]
   `(let [store# ~store
          cache# ^LRUCache (.get ^ConcurrentHashMap caches (dir store#))
-         cache?# (pos? (.capacity cache#))
+         cache?# (and (pos? (.capacity cache#)) (not (.isDisabled cache#)))
          generation# (if cache?# (.generation cache#) 0)]
      ;; A zero entry limit bypasses key construction and the LRU monitor as
      ;; well as retention. Keep the native read and transaction-overlay paths.
@@ -768,6 +774,14 @@
     (wrap-cache
       store [:eav-scan-v in eid-idx attrs-v]
       (eav-scan-v-list store in eid-idx attrs-v)))
+
+  (-eav-scan-v-list
+    [_ in eid-idx attrs-v prepared]
+    (wrap-cache
+      store [:eav-scan-v in eid-idx attrs-v]
+      (if (instance? Store store)
+        (prepared (.-lmdb ^Store store) in eid-idx)
+        (eav-scan-v-list store in eid-idx attrs-v))))
 
   (-eav-filter-presence-list
     [_ in eid-idx attr]
@@ -1496,10 +1510,12 @@
 
 (defn- mark-simulated-tx-cache!
   [report]
-  (let [db (:db-after report)]
-    (doseq [datom (:tx-data report)]
+  (let [db      (:db-after report)
+        noindex (:db/noindex (rschema (:store db)))]
+    (doseq [^Datom datom (:tx-data report)]
       (.add ^TreeSortedSet (:eavt db) datom)
-      (.add ^TreeSortedSet (:avet db) datom))
+      (when-not (contains? noindex (.-a datom))
+        (.add ^TreeSortedSet (:avet db) datom)))
     report))
 
 (defn- local-transact-tx-data
@@ -1638,7 +1654,8 @@
 ;; ordinary resolver. Enable it from two entities onward so small batches avoid
 ;; the old ingestion-sized discontinuity without regressing the single-record
 ;; OLTP path. WAL may still opt a single entity into this path and specialize a
-;; simple cardinality-one identity upsert.
+;; simple cardinality-one identity upsert. Value-unique inserts reject duplicates
+;; instead of upserting, so they can use the blind path at any batch size.
 (def ^:private ^:const ^long blind-unique-write-threshold 2)
 
 (def ^:private blind-unique-value-types
@@ -1672,8 +1689,9 @@
        (not (reverse-ref? attr))
        (not (identical? (:db/valueType props) :db.type/ref))
        (or (nil? (:db/unique props))
-           (and allow-unique?
-                (identical? (:db/unique props) :db.unique/identity)
+           (and (or (identical? (:db/unique props) :db.unique/value)
+                    (and allow-unique?
+                         (identical? (:db/unique props) :db.unique/identity)))
                 (contains? blind-unique-value-types (:db/valueType props))))
        (not (:db.attr/preds props))
        (not (contains? props :db/tupleAttrs))
@@ -1701,7 +1719,7 @@
                     (vld/validate-val value entity)
                     (prepare/correct-value-with-props
                       store-opts props attr value))
-          unique? (identical? (:db/unique props) :db.unique/identity)
+          unique? (some? (:db/unique props))
           _        (when unique? (vreset! has-unique? true))
           av       (when (and unique? collect-unique-avs?) [attr value'])]
       (if (and unique?
@@ -1743,15 +1761,20 @@
                             supported-values?
                             (if (blind-write-multiple-values?
                                   props unique-identity-attrs raw-value)
-                              (loop [values (seq raw-value)]
-                                (if-some [value (first values)]
-                                  (if (append-blind-value!
-                                        attrs unique-avs seen-avs
-                                        collect-unique-avs? has-unique?
-                                        store-opts props attr entity value)
-                                    (recur (next values))
-                                    false)
-                                  true))
+                              (let [seen-values (java.util.HashSet.)]
+                                (loop [values (seq raw-value)]
+                                  (if-some [value (first values)]
+                                    (if (and (append-blind-value!
+                                               attrs unique-avs seen-avs
+                                               collect-unique-avs? has-unique?
+                                               store-opts props attr entity value)
+                                             ;; Repeated values need the resolver's
+                                             ;; set semantics before EAV append.
+                                             (.add seen-values
+                                                   (.get attrs (dec (.size attrs)))))
+                                      (recur (next values))
+                                      false)
+                                    true)))
                               (append-blind-value!
                                 attrs unique-avs seen-avs collect-unique-avs?
                                 has-unique? store-opts props attr entity
@@ -1778,8 +1801,7 @@
                 (if (< j (.size attrs))
                   (let [attr (.get attrs j)
                         value (.get attrs (unchecked-inc j))]
-                    (if (identical? (:db/unique (store-schema attr))
-                                    :db.unique/identity)
+                    (if (:db/unique (store-schema attr))
                       (let [av [attr value]]
                         (if (.add seen av)
                           (do (.add avs av) (recur (+ j 2)))
@@ -1870,8 +1892,8 @@
                           identity-upsert-av)))))
 
 (defn ^:no-doc blind-local-tx-unique-values-absent?
-  "Check a prepared batch's identity values against the current store snapshot.
-   The connection invokes this after opening its LMDB write transaction, so all
+  "Check a prepared batch's unique values against the current store snapshot.
+   The caller invokes this after opening its LMDB write transaction, so all
    probes share that transaction and no concurrent insert can race the check."
   [^DB db ^PreparedBlindTx prepared]
   (let [^FastList avs (:unique-avs prepared)
@@ -1899,9 +1921,13 @@
               props (store-schema attr)]
           ;; Cardinality-many map values are additive and need exact EAV
           ;; membership checks. Leave those, and entities with ambiguous
-          ;; identities, to the general transaction engine.
+          ;; identities or additional uniqueness constraints, to the general
+          ;; transaction engine.
           (cond
             (identical? (:db/cardinality props) :db.cardinality/many)
+            nil
+
+            (identical? (:db/unique props) :db.unique/value)
             nil
 
             (identical? (:db/unique props) :db.unique/identity)

@@ -194,6 +194,52 @@
     (fn [chunk]
       (eav-filter-presence-chunk lmdb chunk eid-idx aid))))
 
+(defn prepare-eav-scan-v-list
+  "Compile schema-dependent EAV scan metadata. The returned reader accepts
+  [lmdb tuples entity-column]; snapshots, cursors and predicate state remain
+  execution-local. Rebuild this reader when the schema changes."
+  [schema attrs-v]
+  (when (seq attrs-v)
+    (let [attr->aid   #(:db/aid (schema %))
+          get-aid     (comp attr->aid first)
+          attrs-v     (sort-by get-aid attrs-v)
+          aids        (mapv get-aid attrs-v)
+          na          (count aids)
+          maps        (mapv peek attrs-v)
+          nvs         (count (remove :skip? maps))
+          skips       (boolean-array (map :skip? maps))
+          preds       (object-array (map :pred maps))
+          parallel?   (every? qpred/forkable-predicate? preds)
+          has-fidx?   (boolean (some :fidx maps))
+          cache-eids? (and (not has-fidx?)
+                           (not-any? #(false? (:cache-eids? %)) maps))
+          fidxs       (object-array (map :fidx maps))
+          aids        (int-array aids)
+          presence-only?
+          (and (== 1 na)
+               (zero? nvs)
+               (aget ^booleans skips 0)
+               (nil? (aget ^objects preds 0))
+               (nil? (aget ^objects fidxs 0)))
+          single?     (and (not presence-only?) (single-attrs? schema attrs-v))
+          gcounts     (when (and (not presence-only?) (not single?))
+                        (int-array (group-counts aids)))
+          gstarts     (when gcounts (group-starts gcounts))]
+      (fn [lmdb in eid-idx]
+        (let [in (sort-tuples-by-eid in eid-idx)]
+          (if presence-only?
+            (eav-filter-presence-list* lmdb in eid-idx (long (aget ^ints aids 0)))
+            (let [scan-chunk
+                  (fn [chunk]
+                    (eav-scan-v-list-chunk
+                      lmdb chunk eid-idx attrs-v single? na nvs aids preds fidxs
+                      skips cache-eids? gstarts gcounts))]
+              ;; Generated predicates create independent chunk-local instances.
+              ;; Opaque predicates stay serial.
+              (if parallel?
+                (scan-list-in-chunks lmdb in scan-chunk)
+                (scan-chunk in)))))))))
+
 (defn- ave-filter-bound-id-list*
   [lmdb ^List in value-idx aid value-type bound-id]
   (scan-list-in-chunks
@@ -935,47 +981,8 @@
           (recur)))))
 
   (eav-scan-v-list [_ in eid-idx attrs-v]
-    (when (seq attrs-v)
-      (let [attr->aid #(:db/aid (schema %))
-            get-aid   (comp attr->aid first)
-            attrs-v   (sort-by get-aid attrs-v)
-            aids      (mapv get-aid attrs-v)
-            na        (count aids)
-            in        (sort-tuples-by-eid in eid-idx)
-            maps      (mapv peek attrs-v)
-            nvs       (count (remove :skip? maps))
-            skips     (boolean-array (map :skip? maps))
-            preds     (object-array (map :pred maps))
-            parallel? (every? qpred/forkable-predicate? preds)
-            has-fidx?   (boolean (some :fidx maps))
-            cache-eids? (and (not has-fidx?)
-                             (not-any? #(false? (:cache-eids? %)) maps))
-            fidxs       (object-array (map :fidx maps))
-            aids        (int-array aids)
-            presence-only?
-            (and (== 1 na)
-                 (zero? nvs)
-                 (aget ^booleans skips 0)
-                 (nil? (aget ^objects preds 0))
-                 (nil? (aget ^objects fidxs 0)))
-            single?   (and (not presence-only?)
-                           (single-attrs? schema attrs-v))
-            gcounts   (when (and (not presence-only?) (not single?))
-                        (int-array (group-counts aids)))
-            gstarts   (when gcounts (group-starts gcounts))]
-        (if presence-only?
-          (eav-filter-presence-list*
-            lmdb in eid-idx (long (aget ^ints aids 0)))
-          (let [scan-chunk
-                (fn [chunk]
-                  (eav-scan-v-list-chunk
-                    lmdb chunk eid-idx attrs-v single? na nvs aids preds fidxs
-                    skips cache-eids? gstarts gcounts))]
-            ;; Generated query predicates carry factories for independent
-            ;; chunk-local instances. Opaque predicates stay serial.
-            (if parallel?
-              (scan-list-in-chunks lmdb in scan-chunk)
-              (scan-chunk in)))))))
+    (when-let [reader (prepare-eav-scan-v-list schema attrs-v)]
+      (reader lmdb in eid-idx)))
 
   (val-eq-scan-e [_ in out v-idx attr]
     (if attr
@@ -1175,6 +1182,70 @@
          ;; Preserve Nippy's overflow exception for transport growth/retry.
          #_{:clj-kondo/ignore [:type-mismatch]} ; scan's lint hook binds e to nil
          (throw e))))))
+
+(defn- entity-has-attrs?
+  [iter eid ^longs aids]
+  (let [n (alength aids)]
+    (loop [index 0 next? (lmdb/seek-key iter eid :id)]
+      (cond
+        (= index n) true
+        (not next?) false
+        :else
+        (let [aid (b/avg->aid (lmdb/next-val iter))
+              target (aget aids index)]
+          (cond
+            (> aid target) false
+            (= aid target) (recur (inc index) (lmdb/has-next-val iter))
+            :else (recur index (lmdb/has-next-val iter))))))))
+
+(defn- write-tuple!
+  [^Store store ^ByteBuffer out eid ^longs aids ^longs presence-aids]
+  (let [lmdb (.-lmdb store)
+        n (alength aids)]
+    (scan/scan lmdb c/eav
+      (with-open [^AutoCloseable iter
+                  (lmdb/val-iterator (lmdb/iterate-list-val-full dbi rtx cur))]
+        ;; Every clause is required. Check presence in the same snapshot before
+        ;; emitting any values: rewinding a partial tuple could leave dangling
+        ;; references in the enclosing Nippy cache (e.g. from a giant value).
+        (if (entity-has-attrs? iter eid presence-aids)
+          (do
+            (enc/start-tuple! out n)
+            (loop [index 0 next? (lmdb/seek-key iter eid :id)]
+              (when (and next? (< index n))
+                (let [value (lmdb/next-val iter)
+                      aid (b/avg->aid value)]
+                  (if (= aid (aget aids index))
+                    (let [giant-id (b/avg->giant-id value)
+                          next-index (inc index)]
+                      (if (= giant-id c/normal)
+                        (enc/write-avg! out value)
+                        (write-giant-value! lmdb rtx giant-id out))
+                      (when (< next-index n)
+                        ;; Find order need not match attribute-ID order. The
+                        ;; usual ascending projection consumes one forward pass.
+                        (recur next-index
+                               (if (<= (aget aids next-index) aid)
+                                 (lmdb/seek-key iter eid :id)
+                                 (lmdb/has-next-val iter)))))
+                    (recur index (lmdb/has-next-val iter)))))))
+          (enc/write-value! out nil)))
+      #_{:clj-kondo/ignore [:type-mismatch]}
+      (throw e))))
+
+(defn prepare-tuple-writer
+  "Prepare direct encoding of required scalar attributes in find order. The
+  writer opens its own snapshot on every invocation, including buffer retries."
+  [schema attributes]
+  (when (and (< (count attributes) (long c/+wire-datom-batch-size+))
+             (every? #(let [props (schema %)]
+                        (and (:db/aid props)
+                             (not= :db.cardinality/many (:db/cardinality props))
+                             (not (cd/custom-type? (value-type props)))))
+                     attributes))
+    (let [aids (long-array (map #(:db/aid (schema %)) attributes))
+          presence-aids (long-array (sort (distinct (seq aids))))]
+      (fn [store out eid] (write-tuple! store out eid aids presence-aids)))))
 
 (defn e-sample*
   [^Store store a aid]
@@ -2077,8 +2148,7 @@
                 true
                 (boolean
                   (and *enforce-blind-unique-inserts?*
-                       (identical? (:db/unique props)
-                                   :db.unique/identity)))
+                       (:db/unique props)))
                 (:db/noindex props)))
     (when giant?
       (.advance-max-gt store)

@@ -1495,16 +1495,31 @@
     (binding [*datalog-write-group* g] (f))
     (with-direct-db-transaction-slot deps server db-name writing? f)))
 
+(defn- transact-blind-insert
+  [db txs tx-meta]
+  (when-let [prepared (db/prepare-blind-local-tx db txs true)]
+    ;; The caller already holds the native writer. Probe before mutating the
+    ;; store: a late unique collision cannot be retried inside a shared group
+    ;; or an explicit transaction without rolling back preceding requests.
+    (when (db/blind-local-tx-unique-values-absent? db prepared)
+      (let [report (db/stamp-blind-local-tx db prepared tx-meta)]
+        (binding [c/*ordered-datom-writes?* true]
+          (assoc report :db-after
+                 (db/commit-prepared-tx-data!
+                   (:db-after report) (:tx-data report) report)))))))
+
 (defn- transact*
   [deps db0 txs tx-meta s? server db-name writing?]
   (try
     ;; db0 is published to concurrent pull/query handlers. Give the writer
     ;; private mutable overlays while retaining db0 as the report's before DB.
     (let [transact (fn [db]
-                     (db/transact-tx-data
-                       (db/->TxReport db (db/transfer db (:store db))
-                                      [] {} (or tx-meta {}))
-                       txs s?))]
+                     (or (when-not s?
+                           (transact-blind-insert db txs (or tx-meta {})))
+                         (db/transact-tx-data
+                           (db/->TxReport db (db/transfer db (:store db))
+                                          [] {} (or tx-meta {}))
+                           txs s?)))]
       (cond
         *datalog-write-group*
         (group/submit!

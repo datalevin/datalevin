@@ -1,13 +1,20 @@
 (ns datalevin.prepared-query-test
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [datalevin.core :as d]
+            [datalevin.bits :as bits]
+            [datalevin.db :as db]
+            [datalevin.interpret :as inter]
+            [datalevin.protocol :as protocol]
             [datalevin.query :as q]
             [datalevin.query.cache :as cache]
             [datalevin.server :as server]
             [datalevin.test.core :refer [allocate-port db-fixture]]
             [datalevin.timeout :as timeout]
             [datalevin.udf :as udf]
-            [datalevin.util :as u]))
+            [datalevin.util :as u])
+  (:import [datalevin.read_encode ReadResult]
+           [datalevin.utl LRUCache]
+           [java.nio ByteBuffer BufferOverflowException]))
 
 (use-fixtures :each db-fixture)
 
@@ -191,3 +198,117 @@
         (is (= #{["ONE"] ["TWO"]} (d/q query @a @b)))
         (is (= #{["ONE"] ["TWO"]} (reader [@b]))))
       (finally (d/close a) (d/close b)))))
+
+(def ^:private tuple-query
+  '[:find [?name ?value] :in $ ?key
+    :where [?e :key ?key] [?e :name ?name] [?e :value ?value]])
+
+(deftest zero-capacity-queries-skip-cache-keys-and-monitor
+  (let [conn (d/create-conn nil schema {:cache-limit 0 :wal? false})
+        task (atom nil)
+        unhashable (reify Object
+                     (hashCode [_] (throw (ex-info "Must not hash query input" {}))))
+        query '[:find ?name :in $ ?unused :where [_ :name ?name]]]
+    (try
+      (d/transact! conn rows)
+      (let [database @conn
+            reader (d/prepare-q database query)
+            [^LRUCache lru] (db/cache-token (:store database))]
+        (locking lru
+          (reset! task (future [(d/q query database unhashable)
+                               (reader [unhashable])]))
+          (is (= [#{["ONE"] ["TWO"]} #{["ONE"] ["TWO"]}]
+                 (deref @task 5000 ::timeout))))
+        (is (.isEmpty lru))
+        (d/datalog-index-cache-limit database 16)
+        (is (db/cache-active? (:store database)))
+        (let [result (reader [nil])]
+          (is (identical? result (reader [nil]))))
+        (db/disable-cache (:store database))
+        (try
+          (is (not (db/cache-active? (:store database))))
+          (is (= #{["ONE"] ["TWO"]} (reader [unhashable])))
+          (finally (db/enable-cache (:store database))))
+        (d/transact! conn [[:db/add 1 :name "changed"]])
+        (is (= #{["changed"] ["TWO"]} (reader [nil]))))
+      (finally
+        (when-let [f @task] (future-cancel f))
+        (d/close conn)))))
+
+(deftest prepared-tuples-encode-required-fields-in-find-order
+  (let [conn (d/create-conn nil (merge schema {:name {:db/noindex true}
+                                             :value {:db/noindex true}})
+                           {:cache-limit 0 :wal? false})
+        reordered '[:find [?value ?name] :in $ ?key
+                    :where [?e :key ?key] [?e :name ?name] [?e :value ?value]]
+        repeated '[:find [?a ?b] :in $ ?key
+                   :where [?e :key ?key] [?e :name ?a] [?e :name ?b]]
+        single '[:find [?name] :in $ ?key
+                 :where [?e :key ?key] [?e :name ?name]]]
+    (try
+      (d/transact! conn (into rows [{:key "no-name" :value 30}
+                                  {:key "no-value" :name "missing"}]))
+      (doseq [query [tuple-query reordered repeated single]]
+        (let [reader (q/query-reader query)]
+          (doseq [key ["one" "two" "no-name" "no-value" "absent"]]
+            (let [result (reader @conn [@conn key] true)]
+              (when (not= key "absent") (is (instance? ReadResult result)))
+              (is (= (d/q query @conn key)
+                     (bits/deserialize (bits/serialize result))))))
+          (d/transact! conn [[:db/add 1 :name "updated"]])
+          (is (= (d/q query @conn "one")
+                 (bits/deserialize (bits/serialize (reader @conn [@conn "one"] true)))))))
+      (let [reader (q/query-reader tuple-query)
+            decode #(bits/deserialize (bits/serialize (reader % [% "one"] true)))]
+        (is (= ["updated" 10] (decode @conn)))
+        (let [pending (:db-after (d/tx-data->simulated-report
+                                  @conn [[:db/add 1 :name "overlay"]]))]
+          (is (not (instance? ReadResult (reader pending [pending "one"] true))))
+          (is (= ["overlay" 10] (decode pending))))
+        (d/with-transaction [tx conn]
+          (d/transact! tx [[:db/add 1 :name "inside"]])
+          (is (= ["inside" 10] (decode @tx)))
+          (d/abort-transact tx))
+        (is (= ["updated" 10] (decode @conn)))
+        (d/update-schema conn {:value {:db/cardinality :db.cardinality/many}})
+        (d/transact! conn [[:db/add 1 :value 11]])
+        (is (not (instance? ReadResult (reader @conn [@conn "one"] true))))
+        (is (= (d/q tuple-query @conn "one") (decode @conn))))
+      (finally (d/close conn)))))
+
+(deftest prepared-tuple-encoding-retries-and-deadlines
+  (let [conn (d/create-conn nil schema {:cache-limit 0 :wal? false})
+        reader (q/query-reader tuple-query)]
+    (try
+      (d/transact! conn [{:key "one" :name (.repeat "x" 10000) :value 10}])
+      (let [result (reader @conn [@conn "one"] true)
+            small (ByteBuffer/allocate 32)
+            large (ByteBuffer/allocate 20000)]
+        (is (instance? ReadResult result))
+        (is (thrown? BufferOverflowException
+                     (protocol/write-message-bf small {:result result})))
+        ;; Reusing an unsent writer acquires a new snapshot, including after
+        ;; overflow. No cursor or borrowed storage buffer survives the call.
+        (d/transact! conn [[:db/add [:key "one"] :name "new snapshot"]])
+        (protocol/write-message-bf large {:result result})
+        (is (= ["new snapshot" 10]
+               (:result (first (protocol/receive-one-message large))))))
+      (binding [timeout/*deadline* 1]
+        (is (thrown? Exception (reader @conn [@conn "one"] true))))
+      (let [timed (q/query-reader (conj tuple-query :timeout 10000))]
+        (is (= ["new snapshot" 10] (timed @conn [@conn "one"] true))))
+      (finally (d/close conn)))))
+
+(deftest prepared-tuple-custom-values-use-materialized-execution
+  (let [conn (d/create-conn nil {} {:wal? false :cache-limit 0})]
+    (try
+      (d/register-type conn :app/ranked
+                       {:index {:type :long :order-fn (inter/inter-fn [v] (:rank v))}})
+      (d/update-schema conn {:key {:db/unique :db.unique/identity}
+                             :name {} :value {:db/valueType :app/ranked}})
+      (d/transact! conn [{:key "one" :name "ONE" :value {:rank 42 :label "value"}}])
+      (let [reader (q/query-reader tuple-query)
+            result (reader @conn [@conn "one"] true)]
+        (is (= ["ONE" {:rank 42 :label "value"}] result))
+        (is (= result (d/q tuple-query @conn "one"))))
+      (finally (d/close conn)))))

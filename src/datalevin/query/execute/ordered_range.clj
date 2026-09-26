@@ -18,6 +18,7 @@
    [datalevin.query.access.ave :as ave]
    [datalevin.query.execute.point-lookup :refer [unsupported]]
    [datalevin.query.execute.result :as result]
+   [datalevin.storage :as storage]
    [datalevin.timeout :as timeout])
   (:import
    [datalevin.parser BindScalar Constant DefaultSrc FindRel Pattern Predicate
@@ -118,7 +119,7 @@
       rows pulls)
     []))
 
-(deftype ^:private FieldLayout [schema attrs-v projection])
+(deftype ^:private FieldLayout [schema attrs-v projection scan])
 
 (defn- field-layout [schema fields projection]
   (when (every? #(and (some? (get-in schema [% :db/aid]))
@@ -128,11 +129,13 @@
     (let [ordered (vec (sort-by #(get-in schema [% :db/aid]) fields))
           ;; Field scans retain an ordinal beside [eid key] so the existing
           ;; EAV scan may sort by eid without changing the selected key order.
-          indexes (zipmap ordered (range 3 (+ 3 (count ordered))))]
+          indexes (zipmap ordered (range 3 (+ 3 (count ordered))))
+          attrs-v (mapv #(vector % {:skip? false}) ordered)]
       (FieldLayout. schema
-                    (mapv #(vector % {:skip? false}) ordered)
+                    attrs-v
                     (mapv #(if (< % 2) % (indexes (nth fields (- % 2))))
-                          projection)))))
+                          projection)
+                    (storage/prepare-eav-scan-v-list schema attrs-v)))))
 
 (defn- select-key-page
   [database path demand accepts? start-value strict?]
@@ -159,7 +162,8 @@
 (defn- project-key-page [database ^FieldLayout layout ^List selected]
   (if (.isEmpty selected)
     #{}
-    (let [^List tuples (db/-eav-scan-v-list database selected 0 (.-attrs-v layout))
+    (let [^List tuples (db/-eav-scan-v-list database selected 0 (.-attrs-v layout)
+                                         (.-scan layout))
           n (.size selected)]
       ;; Missing fields make these clauses filters. Let general execution
       ;; handle that case; this access path never refills its limited key page.

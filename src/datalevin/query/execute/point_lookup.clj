@@ -17,9 +17,14 @@
    [datalevin.query.execute.result
     :refer [query-result-size result-explain tuple->persistent-vector]]
    [datalevin.query.plan :as qplan]
-   [datalevin.spill :as sp])
+   [datalevin.read-encode :as enc]
+   [datalevin.spill :as sp]
+   [datalevin.storage :as storage]
+   [datalevin.timeout :as timeout])
   (:import
    [clojure.lang IPersistentCollection]
+   [datalevin.db DB]
+   [datalevin.storage Store]
    [java.util List]
    [java.util.concurrent.atomic AtomicReference]
    [datalevin.parser BindScalar Constant DefaultSrc FindRel FindTuple Pattern SrcVar Variable]
@@ -34,7 +39,8 @@
         find-elements (dp/find-elements find)
         find-symbols  (when (and (or (instance? FindRel find)
                                      (instance? FindTuple find))
-                                 (<= 2 (count find-elements))
+                                 (<= (if (instance? FindTuple find) 1 2)
+                                     (count find-elements))
                                  (every? #(instance? Variable %) find-elements))
                         (mapv :symbol find-elements))
         in            (:qin parsed-q)
@@ -194,7 +200,8 @@
             :selected-plan-alternative summary
             :recommended-plan-alternative summary)))
 
-(deftype ^:no-doc ProjectionLayout [schema attrs-v ^ints result-indexes])
+(deftype ^:no-doc ProjectionLayout
+  [schema attrs-v ^ints result-indexes scan encode])
 
 (defn- projection-layout [shape schema]
   (let [scan-projections (vec
@@ -211,18 +218,25 @@
                                 (:projections shape)))
         attrs-v         (mapv (fn [{:keys [attr]}] [attr {:skip? false}])
                                scan-projections)]
-    (ProjectionLayout. schema attrs-v result-indexes)))
+    (ProjectionLayout.
+      schema attrs-v result-indexes
+      (storage/prepare-eav-scan-v-list schema attrs-v)
+      (when (= :tuple (:find-type shape))
+        (storage/prepare-tuple-writer schema (mapv :attr (:projections shape)))))))
 
 (defn- execute-projection
   [parsed-q shape database lookup-value ^ProjectionLayout layout]
+  (timeout/assert-time-left)
   (begin-point-lookup-projection-explain!)
   (let [tuples
         (if-some [eid (db/entid database [(:identity shape) lookup-value])]
           (let [input (doto (FastList.) (.add (object-array [eid])))]
-            (or (db/-eav-scan-v-list database input 0 (.-attrs-v layout))
+            (or (db/-eav-scan-v-list database input 0 (.-attrs-v layout)
+                                   (.-scan layout))
                 (FastList.)))
           (FastList.))
         result (point-projection-result shape tuples (.-result-indexes layout))]
+    (timeout/assert-time-left)
     (explain-point-lookup-projection! parsed-q shape result)
     result))
 
@@ -235,30 +249,46 @@
 
 (defn prepared-executor
   "Compile the projection layout by schema identity. General or transaction
-  overlay queries return unsupported so their ordinary planner can run."
-  [parsed-q shape]
-  (if shape
-    (let [state (AtomicReference.)]
-      (fn [inputs]
-        (let [database (first inputs)]
-          (if (and (= 2 (count inputs)) (db/db? database)
-                   (not (db/pending-tx-cache? database)))
-            (let [schema (db/-schema database)
-                  ^ProjectionLayout previous (.get state)
-                  ^ProjectionLayout layout
-                  (if (and previous (identical? schema (.-schema previous)))
-                    previous
-                    (let [identity-schema (get schema (:identity shape))
-                          usable? (and (:db/unique identity-schema)
-                                       (not= :db.type/ref (:db/valueType identity-schema))
-                                       (every? #(some? (get-in schema [(:attr %) :db/aid]))
-                                               (:projections shape)))
-                          layout (if usable? (projection-layout shape schema)
-                                     (ProjectionLayout. schema nil nil))]
-                      (.set state layout)
-                      layout))]
-              (if (.-attrs-v layout)
-                (execute-projection parsed-q shape database (second inputs) layout)
-                unsupported))
-            unsupported))))
-    (constantly unsupported)))
+  overlay queries return unsupported so their ordinary planner can run.
+  Encoded readers emit eligible scalar tuples directly from storage."
+  ([parsed-q shape] (prepared-executor parsed-q shape false))
+  ([parsed-q shape encoded?]
+    (if shape
+      (let [state (AtomicReference.)]
+        (fn [inputs]
+          (let [database (first inputs)]
+            (if (and (= 2 (count inputs)) (db/db? database)
+                     (or (not encoded?)
+                         (and (instance? Store (.-store ^DB database))
+                              (nil? (:qtimeout parsed-q))
+                              (nil? timeout/*deadline*)
+                              (not qplan/*explain*)))
+                     (not (db/pending-tx-cache? database)))
+              (let [_ (when encoded?
+                        (storage/maybe-ensure-current! (.-store ^DB database)))
+                    schema (db/-schema database)
+                    ^ProjectionLayout previous (.get state)
+                    ^ProjectionLayout layout
+                    (if (and previous (identical? schema (.-schema previous)))
+                      previous
+                      (let [identity-schema (get schema (:identity shape))
+                            usable? (and (:db/unique identity-schema)
+                                         (not= :db.type/ref (:db/valueType identity-schema))
+                                         (every? #(some? (get-in schema [(:attr %) :db/aid]))
+                                                 (:projections shape)))
+                            layout (if usable? (projection-layout shape schema)
+                                       (ProjectionLayout. schema nil nil nil nil))]
+                        (.set state layout)
+                        layout))]
+                (cond
+                  (nil? (.-attrs-v layout)) unsupported
+                  (not encoded?)
+                  (execute-projection parsed-q shape database (second inputs) layout)
+                  (.-encode layout)
+                  (when-some [eid (db/entid database [(:identity shape) (second inputs)])]
+                    (let [store (.-store ^DB database)
+                          write (.-encode layout)]
+                      (enc/read-result #(write store % eid))))
+                  :else unsupported))
+              unsupported))))
+      (constantly unsupported))))

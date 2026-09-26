@@ -1352,7 +1352,7 @@
                 (l/with-transaction-kv [kv1 kv]
                   (let [store1 ^Store (s/transfer ^Store store kv1)
                         db1    ^DB    (db/transfer db store1)]
-                    ;; Side-effect-free prepared requests enforce identity
+                    ;; Side-effect-free prepared requests enforce attribute
                     ;; uniqueness in the eventual AVE put. Other requests keep
                     ;; the preflight probe because a late collision must not
                     ;; occur after updating a secondary engine.
