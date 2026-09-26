@@ -853,9 +853,12 @@
                                  nv/*wire-reader*)]
       (let [conn (get-connection pool)]
         (try
-          (let [{:keys [type]} (send-n-receive conn req)]
-            (if (= type :copy-in-response)
-              (copy-in* conn req data batch-size)
+          (let [{:keys [type] :as response} (send-n-receive conn req)]
+            (case type
+              :copy-in-response (copy-in* conn req data batch-size)
+              ;; A retry can complete from its saved result before the server
+              ;; asks for the payload again. Admission can also reject it here.
+              (:command-complete :error-response) response
               (raise "Server refuses to accept copy in" {:req req})))
           (finally (release-connection pool conn))))))
 
@@ -1430,6 +1433,7 @@
     :db-info
     :tx-data
     :tx-data+db-info
+    :tx-data-ack
     :open-transact
     :close-transact
     :abort-transact

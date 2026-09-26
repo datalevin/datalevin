@@ -1069,6 +1069,25 @@ Only usable for debug output.
                        [:db/add 296 :friend -1]])"}
   transact! conn/transact!)
 
+(def ^{:arglists '([conn tx-data] [conn tx-data tx-meta])
+       :doc "Synchronously transact and return `:transacted` on success.
+
+  Accepts the same transaction data and optional metadata as [[transact!]],
+  with the same validation, uniqueness checks, and durability policy. Updates
+  `conn` in place. Errors throw. Use [[transact!]] when you need datoms or tempids.
+
+  Standalone remote calls without transaction listeners persist and return only
+  an acknowledgement and DB metadata for retry replay, then clear the client's
+  read cache. Requires a server supporting `transact-ack!`.
+
+  Registered transaction listeners still receive full reports, including
+  `tx-meta`. Local calls and calls inside [[with-transaction]] use the regular
+  transaction path and discard its report. Inside [[with-transaction]], success
+  means staged; the enclosing transaction controls commit or abort.
+
+      (transact-ack! conn [{:name \"Ivan\"}]) ; => :transacted"}
+  transact-ack! conn/transact-ack!)
+
 (def ^{:arglists '([conn db]
                    [conn db tx-meta])
        :doc      "Forces underlying `conn` value to become a Datalog `db`. Will generate a tx-report that will remove everything from old value and insert everything from the new one."}

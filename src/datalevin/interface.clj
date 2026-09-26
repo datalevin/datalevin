@@ -495,6 +495,8 @@ values;")
     "Fetch all DB initialization info in a single round trip")
   (tx-data [store data simulated?]
     "Send to remote server the data from call to `db/transact-tx-data`")
+  (tx-data-ack [store data]
+    "Transact remotely, returning only acknowledgement and DB metadata.")
   (open-transact [store])
   (abort-transact [store])
   (close-transact [store]))

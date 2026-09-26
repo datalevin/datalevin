@@ -855,6 +855,22 @@
        report)
      (transact-local-or-explicit! conn tx-data tx-meta))))
 
+(defn transact-ack!
+  ([conn tx-data] (transact-ack! conn tx-data nil))
+  ([conn tx-data tx-meta]
+   (if (standalone-remote-transaction? conn)
+     (let [report (locking conn
+                    (assert (active-conn-structural? conn))
+                    (if (seq (some-> (:listeners (meta conn)) deref))
+                      (direct-remote-transact! conn tx-data tx-meta)
+                      (do (reset! conn (db/transact-ack @conn tx-data))
+                          nil)))]
+       (observe-txlog-sync-path! :direct-remote)
+       (when report (notify-listeners! conn report)))
+     ;; Retain local queueing and explicit transaction/watchdog semantics.
+     (transact! conn tx-data tx-meta))
+   :transacted))
+
 (defn reset-conn!
   ([conn db] (reset-conn! conn db nil))
   ([conn db tx-meta]
@@ -877,7 +893,10 @@
   ([conn callback] (listen! conn (rand) callback))
   ([conn key callback]
    {:pre [(conn? conn) (atom? (:listeners (meta conn)))]}
-   (swap! (:listeners (meta conn)) assoc key callback)
+   ;; Registration after an acknowledgement-only transaction begins applies
+   ;; to the next transaction, which can fetch a report for this listener.
+   (locking conn
+     (swap! (:listeners (meta conn)) assoc key callback))
    key))
 
 (defn unlisten!

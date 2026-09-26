@@ -28,6 +28,7 @@
 
 (def ^:const tx-data-response-kind :tx-data)
 (def ^:const tx-data+db-info-response-kind :tx-data+db-info)
+(def ^:const tx-data-ack-response-kind :tx-data-ack)
 (def ^:const kv-result-response-kind :kv-result)
 (def ^:const command-complete-response-kind :command-complete)
 

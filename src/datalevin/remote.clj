@@ -173,10 +173,11 @@
   ([client db-name datoms datom-type simulated? writing?]
    (load-datoms* client db-name datoms datom-type simulated? writing? nil))
   ([client db-name datoms datom-type simulated? writing? ha-source]
-   (let [tx? (#{:txs :txs+info} datom-type)
+   (let [tx? (#{:txs :txs+info :txs-ack} datom-type)
          t   (case datom-type
                :txs      :tx-data
                :txs+info :tx-data+db-info
+               :txs-ack  :tx-data-ack
                :load-datoms)
          client-op-id (when (and tx? (not simulated?))
                         (cop/new-client-op-id))
@@ -185,6 +186,7 @@
                            (cop/tx-request-payload t db-name datoms
                                                    simulated?)))
          response-kind (case t
+                         :tx-data-ack cop/tx-data-ack-response-kind
                          :tx-data+db-info cop/tx-data+db-info-response-kind
                          :tx-data cop/tx-data-response-kind
                          nil)
@@ -263,6 +265,7 @@
 (def fulltext-datoms i/fulltext-datoms)
 (def db-info i/db-info)
 (def tx-data i/tx-data)
+(def tx-data-ack i/tx-data-ack)
 (def open-transact i/open-transact)
 (def abort-transact i/abort-transact)
 (def close-transact i/close-transact)
@@ -557,6 +560,12 @@
 
   (tx-data [_ data simulated?]
     (let [result (load-datoms* client db-name data :txs+info simulated?
+                               writing? open-db-info)]
+      (update-read-floor-tx! read-floor-tx (get-in result [:db-info :max-tx]))
+      result))
+
+  (tx-data-ack [_ data]
+    (let [result (load-datoms* client db-name data :txs-ack false
                                writing? open-db-info)]
       (update-read-floor-tx! read-floor-tx (get-in result [:db-info :max-tx]))
       result))

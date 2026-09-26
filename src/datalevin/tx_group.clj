@@ -4,19 +4,22 @@
   "Collect synchronous writes before acquiring the native writer. A group is
   executed in one native transaction and acknowledged only after durable commit."
   (:refer-clojure :exclude [run!])
-  (:import [java.util.concurrent ConcurrentLinkedQueue]
+  (:import [java.util.concurrent ConcurrentLinkedQueue Semaphore]
+           [java.util.concurrent.atomic AtomicBoolean]
            [java.util.concurrent.locks ReentrantLock]
            [org.eclipse.collections.impl.list.mutable FastList]))
 
 (def ^:dynamic *enabled?* true)
 
-(deftype Request [op result])
-(deftype Group [^ReentrantLock lock ^ConcurrentLinkedQueue queue ^long limit])
+(deftype Request [op result ^Semaphore ready])
+(deftype Group [^ReentrantLock lock ^ConcurrentLinkedQueue queue ^long limit
+                ^AtomicBoolean active])
 
 (defn create
   "Create one bounded-batch admission queue for a store and execution path."
   [limit]
-  (Group. (ReentrantLock. true) (ConcurrentLinkedQueue.) (max 1 (long limit))))
+  (Group. (ReentrantLock. true) (ConcurrentLinkedQueue.) (max 1 (long limit))
+          (AtomicBoolean. false)))
 
 (defn execute
   "Evaluate a group's requests against a private writing context. Tag only
@@ -38,7 +41,8 @@
   (dotimes [idx (.size requests)]
     (let [^Request request (.get requests idx)]
       (vreset! (.-result request)
-               (if error [false error] [true (aget ^objects results idx)])))))
+               (if error [false error] [true (aget ^objects results idx)]))
+      (.release ^Semaphore (.-ready request)))))
 
 (defn- run!
   [run-group ^FastList requests]
@@ -55,29 +59,61 @@
             (run! run-group (doto (FastList. 1) (.add (.get requests idx))))))
         (complete! requests nil t)))))
 
+(defn- handoff!
+  [^Group group]
+  (let [^ConcurrentLinkedQueue queue (.-queue group)
+        ^AtomicBoolean active (.-active group)]
+    (if-let [^Request request (.peek queue)]
+      ;; Keep leadership reserved while waking exactly one queued caller.
+      (.release ^Semaphore (.-ready request))
+      (do
+        (.set active false)
+        ;; An enqueue may have raced with relinquishing leadership. Either
+        ;; its submitter claims the idle group, or we wake its next leader.
+        (when (and (not (.isEmpty queue))
+                   (.compareAndSet active false true))
+          (.release ^Semaphore (.-ready ^Request (.peek queue))))))))
+
+(defn- lead!
+  [^Group group run-group result]
+  (let [^ConcurrentLinkedQueue queue (.-queue group)
+        ^ReentrantLock lock (.-lock group)]
+    (try
+      ;; A delayed submitter can claim an idle group after another leader has
+      ;; already completed its request. It only needs to pass leadership on.
+      (when-not @result
+        (.lock lock)
+        (try
+          (loop []
+            (when-not @result
+              (let [requests (FastList.)]
+                (loop [n 0]
+                  (when (< n (.-limit group))
+                    (when-let [request (.poll queue)]
+                      (.add requests request)
+                      (recur (inc n)))))
+                (run! run-group requests)
+                (recur))))
+          (finally (.unlock lock))))
+      (finally (handoff! group)))))
+
 (defn submit!
   "Run op in a durable group, preserving the submitting thread's bindings.
   run-group owns native transaction lifetime and publishes state before return.
-  No timer, worker handoff, or early acknowledgment is involved. The next caller
-  holding the admission lock drains requests accumulated during the prior commit."
+  Only the elected leader acquires admission. Other callers wait for their own
+  completion signal or a leadership handoff, without a timer or worker thread."
   [^Group group run-group op]
   (let [result (volatile! nil)
-        request (Request. (bound-fn [context] (op context)) result)
-        queue (.-queue group)
-        lock (.-lock group)]
-    (.add queue request)
-    (.lock lock)
-    (try
-      (loop []
+        ready (Semaphore. 0)
+        request (Request. (bound-fn [context] (op context)) result ready)]
+    (.add ^ConcurrentLinkedQueue (.-queue group) request)
+    (if (.compareAndSet ^AtomicBoolean (.-active group) false true)
+      (lead! group run-group result)
+      (do
+        ;; Like ReentrantLock.lock, waiting does not cancel an enqueued write
+        ;; on interruption, and preserves the caller's interrupted status.
+        (.acquireUninterruptibly ready)
         (when-not @result
-          (let [requests (FastList.)]
-            (loop [n 0]
-              (when (< n (.-limit group))
-                (when-let [request (.poll queue)]
-                  (.add requests request)
-                  (recur (inc n)))))
-            (run! run-group requests)
-            (recur))))
-      (finally (.unlock lock)))
+          (lead! group run-group result))))
     (let [[ok? value] @result]
       (if ok? value (throw ^Throwable value)))))
