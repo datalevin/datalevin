@@ -27,6 +27,21 @@ public final class DatabaseValue {
         return DatalevinInterop.databaseEntid(this, eid);
     }
 
+    /** Prepares a reusable pull against this view, including simulated changes. */
+    public PreparedRead preparePull(Object selector) {
+        return Datalevin.preparePull(this, selector);
+    }
+
+    /** Prepares a reusable pull with options against this database view. */
+    public PreparedRead preparePull(Object selector, java.util.Map<?, ?> opts) {
+        return Datalevin.preparePull(this, selector, opts);
+    }
+
+    /** Prepares a reusable query against this database view. */
+    public PreparedRead prepareQuery(Object query) {
+        return Datalevin.prepareQuery(this, query);
+    }
+
     /**
      * Returns a Java handle for a lazy entity id or lookup ref.
      */

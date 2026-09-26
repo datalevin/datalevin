@@ -86,15 +86,10 @@
 (def ^:private pull-db auth/pull-db)
 (def ^:private user-eid auth/user-eid)
 (def ^:private db-eid auth/db-eid)
-(def ^:private role-eid auth/role-eid)
 (def ^:private user-roles auth/user-roles)
 (def ^:private perm-tgt-name auth/perm-tgt-name)
 (def ^:private user-permissions auth/user-permissions)
-(def ^:private role-permissions auth/role-permissions)
 (def ^:private user-role-key auth/user-role-key)
-(def ^:private transact-new-role auth/transact-new-role)
-(def ^:private transact-role-permission auth/transact-role-permission)
-(def ^:private transact-revoke-permission auth/transact-revoke-permission)
 (def ^:private transact-new-db auth/transact-new-db)
 (defn- close-store
   [store]
@@ -706,8 +701,6 @@
   consensus-ha-opts)
 
 (def ^:private ha-runtime-option-key-set sha/ha-runtime-option-key-set)
-(def ^:private with-default-ha-control-raft-dir
-  sha/with-default-ha-control-raft-dir)
 (def ^:private start-ha-authority sha/start-ha-authority)
 (def ^:private stop-ha-authority sha/stop-ha-authority)
 
@@ -734,11 +727,6 @@
 (def ^:private ha-follower-loop-sleep-ms sha/ha-follower-loop-sleep-ms)
 (def ^:private sleep-ha-loop! sha/sleep-ha-loop!)
 (def ^:private ha-loop-error-backoff! sha/ha-loop-error-backoff!)
-
-(defn- publish-ha-renew-state!
-  [^Server server db-name expected-state next-state ^AtomicBoolean running?]
-  (sha/publish-ha-renew-state!
-   ha-deps server db-name expected-state next-state running?))
 
 (declare log-ha-loop-crash!)
 
@@ -1008,10 +996,6 @@
 
 (declare db-write-admission-lock)
 
-(defn- ha-write-admission-error
-  [^Server server message]
-  (sha/ha-write-admission-error ha-deps server message))
-
 (defn- ha-write-commit-check-fn
   [^Server server message]
   (sha/ha-write-commit-check-fn ha-deps server message))
@@ -1266,9 +1250,6 @@
   "Stream a copied LMDB file to client as raw binary chunks with checksum."
   [^SelectionKey skey path copy-meta]
   (scopy/copy-file-out copy-deps skey path copy-meta))
-
-(def ^:private ^:redef cleanup-copy-tmp-dir-fn*
-  scopy/cleanup-copy-tmp-dir-fn*)
 
 (defn- cleanup-copy-tmp-dir!
   [tf]

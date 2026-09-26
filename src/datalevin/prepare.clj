@@ -76,52 +76,12 @@
                   (i/attrs store)
                   nil)))
 
-;; ---- Stage boundary function shells ----
-;; Each stage accepts a context map and returns it unchanged (pass-through).
-;; Stages will be filled in subsequent steps.
-
-(defn normalize
-  "Expand/normalize entities and tx forms.
-   Currently a pass-through shell."
-  [ctx entities]
-  entities)
-
-(defn resolve-ids
-  "Resolve tempids/upserts/refs to fixed point.
-   Currently a pass-through shell."
-  [ctx entities]
-  entities)
-
-(defn apply-op-semantics
-  "Apply :db/add, retract, CAS, patchIdoc, etc.
-   Currently a pass-through shell."
-  [ctx entities]
-  entities)
-
-(defn plan-delta
-  "Plan datom delta with cardinality/uniqueness rules.
-   Currently a pass-through shell."
-  [ctx entities]
-  entities)
-
-(defn build-side-index-ops
-  "Build side-index overlay deltas, allocate IDs.
-   Currently a pass-through shell."
-  [ctx entities]
-  entities)
-
-(defn finalize
-  "Check-value-tempids, deterministic ordering, produce PreparedTx.
-   Currently a pass-through shell."
-  [ctx entities]
-  entities)
-
 ;; ---- Top-level entry point ----
 
 (defn prepare-tx
-  "Run the full prepare pipeline. Returns a PreparedTx.
+  "Execute the transaction loop and wrap its report in a PreparedTx.
    execute-fn: (fn [entities tx-time] -> report) runs the transaction loop."
-  [ctx entities tx-time execute-fn]
+  [_ctx entities tx-time execute-fn]
   (let [report (execute-fn entities tx-time)]
     (->PreparedTx
       (:tx-data report)

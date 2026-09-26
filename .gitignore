@@ -2,7 +2,13 @@ dtlv
 dtlv-test0
 dtlv-test1
 test-jar/test-jar
-benchmarks/JOB-bench/db/data.mdb
+# Local benchmark databases, including complete LMDB environments and backups.
+/benchmarks/*/db/
+/benchmarks/*/db.bak-*/
+/benchmarks/*/db-w*/
+/benchmarks/*/sqlite.db*
+data.mdb
+lock.mdb
 benchmarks/openrulebench/data/downloaded/
 .classpath
 .dir-locals.el
@@ -49,6 +55,14 @@ web/target-cljs
 .cpcache
 dev/playground.clj
 .DS_Store
+# Local tool caches, scratch output, and editor swap files.
+/.m2/
+/.clj-config/
+/tmp/
+/dtlv:/
+__pycache__/
+*.py[cod]
+*.swp
 TODO.txt
 .cljs_node_repl
 node_modules

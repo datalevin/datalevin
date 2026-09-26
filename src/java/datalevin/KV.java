@@ -1223,6 +1223,26 @@ public class KV extends HandleResource {
     /**
      * Returns the value for {@code key} from the named DBI.
      */
+    public PreparedRead prepareGetValue(String dbi) {
+        return Datalevin.prepareGetValue(this, dbi);
+    }
+
+    /** Prepares a point read with an explicit key type. */
+    public PreparedRead prepareGetValue(String dbi, Object kType) {
+        return Datalevin.prepareGetValue(this, dbi, kType);
+    }
+
+    /** Prepares a point read with explicit key and value types. */
+    public PreparedRead prepareGetValue(String dbi, Object kType, Object vType) {
+        return Datalevin.prepareGetValue(this, dbi, kType, vType);
+    }
+
+    /** Prepares a point read, optionally including the key in the result. */
+    public PreparedRead prepareGetValue(String dbi, Object kType, Object vType, boolean ignoreKey) {
+        return Datalevin.prepareGetValue(this, dbi, kType, vType, ignoreKey);
+    }
+
+    /** Returns the value for a key from the named DBI. */
     public Object getValue(String dbi, Object key) {
         return ClojureRuntime.core("get-value",
                                   resource(),

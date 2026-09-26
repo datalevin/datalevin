@@ -534,7 +534,7 @@
               (let [aid (:db/aid props)
                     txs (FastList.)
                     batch-size (max 1 (long c/*fill-db-batch-size*))
-                    modified-ms (max (inc (init-state-sync-ms lmdb))
+                    modified-ms (max (inc (long (init-state-sync-ms lmdb)))
                                      (System/currentTimeMillis))
                     props (dissoc props :db/noindex)]
                 ;; Copy encoded AVGs, preserving giant IDs and custom references.

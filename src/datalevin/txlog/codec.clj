@@ -1194,8 +1194,8 @@
   "Patch a writable payload at its current position without consuming it."
   [^ByteBuffer body ^long lsn ^long tx-time]
   (let [start (.position body)]
-    (.putLong body (+ start commit-payload-lsn-offset) lsn)
-    (.putLong body (+ start commit-payload-tx-time-offset) tx-time))
+    (.putLong body (+ start (int commit-payload-lsn-offset)) lsn)
+    (.putLong body (+ start (int commit-payload-tx-time-offset)) tx-time))
   body)
 
 (defn patch-commit-row-payload-header!

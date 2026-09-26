@@ -52,7 +52,7 @@
                            (if (>= capacity needed)
                              capacity
                              (recur (* 2 capacity))))]
-            (when (> capacity Integer/MAX_VALUE)
+            (when (> (long capacity) Integer/MAX_VALUE)
               (raise "Encoded KV row is too large" {:size needed}))
             ;; Earlier rows retain their old chunks. Never overwrite or copy
             ;; those chunks while the transaction may still append them to WAL.

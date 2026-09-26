@@ -1311,7 +1311,7 @@
                 (recur last-sync-ms last-sync-reason nil))))))))))
 
 (defn- append-durable-relaxed!
-  [state rows {:keys [mark-fatal!] :as hooks}]
+  [state rows hooks]
   (let [{:keys [append-res append-start-ms ch lsn near-roll?
                 sid sync-manager]}
         (append-prepared-record! state rows hooks)
@@ -1353,7 +1353,7 @@
         done-ms
         (if (and (:sync-on-write? state)
                  (not (:wal-shared? state))
-                 (pos? timeout-ms)
+                 (pos? (long timeout-ms))
                  sync-begin)
           ;; This caller owns sync completion and its DSYNC append has already
           ;; returned. Shared WAL and another sync owner still use reconciliation

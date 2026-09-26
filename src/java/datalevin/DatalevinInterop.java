@@ -51,6 +51,37 @@ public final class DatalevinInterop {
         return ClojureRuntime.core(function, normalizeArgs(args));
     }
 
+    /** Creates an opaque reusable pull handle for bridge runtimes. */
+    public static PreparedRead preparePull(Object db, Object selector, Map<?, ?> opts) {
+        return Datalevin.preparePull(db, selector, opts);
+    }
+
+    /** Creates an opaque reusable query handle for bridge runtimes. */
+    public static PreparedRead prepareQuery(Object db, Object query) {
+        return Datalevin.prepareQuery(db, query);
+    }
+
+    /** Creates an opaque reusable KV point-read handle for bridge runtimes. */
+    public static PreparedRead prepareGetValue(Object kv, String dbi, Object kType,
+                                               Object vType, boolean ignoreKey) {
+        return Datalevin.prepareGetValue(kv, dbi, kType, vType, ignoreKey);
+    }
+
+    /** Transacts using the acknowledgement-only core API, preserving listeners. */
+    public static Object connectionTransactAck(Object conn, Object txData, Map<?, ?> txMeta) {
+        Object data = DatalevinForms.txDataInput(txData);
+        return txMeta == null
+                ? ClojureRuntime.core("transact-ack!", rawResource(conn), data)
+                : ClojureRuntime.core("transact-ack!", rawResource(conn), data,
+                                      ClojureCodec.runtimeInput(txMeta));
+    }
+
+    /** Atomically backfills an unindexed attribute and returns its updated schema. */
+    public static Object connectionIndexAttr(Object conn, Object attr) {
+        return ClojureRuntime.core("index-attr", rawResource(conn),
+                                   DatalevinForms.datalogAttrInput(attr));
+    }
+
     /**
      * Invokes a Datalevin core function and normalizes the result for bridge
      * runtimes.

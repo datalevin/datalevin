@@ -13,13 +13,9 @@
    [datalevin.constants :as c]
    [datalevin.query.optimizer.access-plan :as qaccess]
    [datalevin.query.optimizer.bound-patterns :as qbound]
-   [datalevin.query.optimizer.estimates :refer [estimate-hash-join-cost]]
-   [datalevin.query.optimizer.plan-build :as qpb
-    :refer [build-plan* merge-pred-options multi-key-result-size]]
-   [datalevin.query.optimizer.plan-cost :as qcost
-    :refer [estimate-scan-v-cost]]
-   [datalevin.query.optimizer.properties :as qprops
-    :refer [alternative-satisfies?]]
+   [datalevin.query.optimizer.plan-build :as qpb]
+   [datalevin.query.optimizer.plan-cost :as qcost]
+   [datalevin.query.optimizer.properties :as qprops]
    [datalevin.query.optimizer.rewrite :as qrewrite]
    [datalevin.query.optimizer.selective :as qselective])
   (:import

@@ -490,19 +490,6 @@
        :reason :write-transaction-open
        :db-name db-name})))
 
-(defn- with-copy-db-transaction-slot
-  [deps server db-name f]
-  (let [^Semaphore lock (db-lock deps server db-name)]
-    (if (.tryAcquire lock)
-      (try
-        (f)
-        (finally
-          (.release lock)))
-      (raise
-       "Cannot copy database while a write transaction is active; retry later"
-       {:error :db/copy-write-transaction-active
-        :db-name db-name}))))
-
 (defn- acquire-db-transaction-slot!
   [deps server db-name ^Semaphore lock]
   (let [timeout-ms (long ((:transaction-lock-timeout-ms deps) server))]

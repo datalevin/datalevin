@@ -244,7 +244,7 @@
          report    (if (or (contains? (::new-attributes report) a) props)
                      report
                      (update report ::new-attributes u/conjv a))
-         e         (txcommon/entid-strict db e)
+         e         (long (txcommon/entid-strict db e))
          _         (validate-installed-callable-write report db e a v ent)
          ref?      (identical? (:db/valueType props) :db.type/ref)
          v         (if ref? (txcommon/entid-strict db v) v)

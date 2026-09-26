@@ -409,6 +409,11 @@ public final class Schema {
             return this;
         }
 
+        /** Omits the attribute from AVE until Connection.indexAttr backfills it. */
+        public Attribute noIndex(boolean noIndex) {
+            return prop(":db/noindex", noIndex);
+        }
+
         /**
          * Returns a mutable property map suitable for schema assembly.
          */

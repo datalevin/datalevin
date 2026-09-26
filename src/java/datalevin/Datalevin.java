@@ -34,6 +34,82 @@ public final class Datalevin {
     /** Database type constant for engine databases. */
     public static final String DB_ENGINE = "engine";
 
+    /** Prepares a reusable pull against a database value or connection. */
+    public static PreparedRead preparePull(Object db, Object selector) {
+        return preparePull(db, selector, null);
+    }
+
+    /** Prepares a reusable pull with the same options as the Clojure pull API. */
+    public static PreparedRead preparePull(Object db, Object selector, Map<?, ?> opts) {
+        Object view = PreparedRead.view(db);
+        Object pattern = DatalevinForms.pullSelectorInput(selector);
+        Object prepared = opts == null
+                ? ClojureRuntime.core("prepare-pull", view, pattern)
+                : ClojureRuntime.core("prepare-pull", view, pattern, DatalevinForms.optionsInput(opts));
+        return new PreparedRead(prepared, DatalevinForms::lookupRefInput, false);
+    }
+
+    /**
+     * Prepares a query from EDN text, a form, or a typed builder. Execute with
+     * a list of the remaining :in values, excluding the initial database.
+     */
+    public static PreparedRead prepareQuery(Object db, Object query) {
+        Object form = query instanceof DatalogQuery typed
+                ? typed.buildForm() : DatalevinForms.queryFormInput(query);
+        return new PreparedRead(ClojureRuntime.core("prepare-q", PreparedRead.view(db), form),
+                                PreparedRead.queryInput(query), true);
+    }
+
+    /** Prepares a KV point read with the default data types and value-only result. */
+    public static PreparedRead prepareGetValue(Object kv, String dbi) {
+        return prepareGetValue(kv, dbi, null, null, true);
+    }
+
+    /** Prepares a KV point read with an explicit key type. */
+    public static PreparedRead prepareGetValue(Object kv, String dbi, Object kType) {
+        return prepareGetValue(kv, dbi, kType, null, true);
+    }
+
+    /** Prepares a KV point read with explicit key and value types. */
+    public static PreparedRead prepareGetValue(Object kv, String dbi, Object kType, Object vType) {
+        return prepareGetValue(kv, dbi, kType, vType, true);
+    }
+
+    /** Prepares a KV point read, optionally returning both the key and value. */
+    public static PreparedRead prepareGetValue(Object kv, String dbi, Object kType,
+                                               Object vType, boolean ignoreKey) {
+        Object keyType = DatalevinForms.typeInput(kType == null ? "data" : kType);
+        Object valueType = DatalevinForms.typeInput(vType == null ? "data" : vType);
+        Object prepared = ClojureRuntime.core("prepare-get-value", PreparedRead.view(kv),
+                                              dbi, keyType, valueType, ignoreKey);
+        return new PreparedRead(prepared, key -> DatalevinForms.kvInput(key, keyType), false);
+    }
+
+    /** Executes a prepared pull, query, or KV point read. */
+    public static Object executePrepared(PreparedRead prepared, Object input) {
+        return prepared.execute(input);
+    }
+
+    /** Executes a local prepared pull or KV read against an explicit view. */
+    public static Object executePrepared(PreparedRead prepared, Object view, Object input) {
+        return prepared.execute(view, input);
+    }
+
+    /** Transacts synchronously and returns :transacted instead of a report. */
+    public static Object transactAck(Connection conn, Object txData) {
+        return conn.transactAck(txData);
+    }
+
+    /** Transacts synchronously with metadata and returns :transacted. */
+    public static Object transactAck(Connection conn, Object txData, Map<?, ?> txMeta) {
+        return conn.transactAck(txData, txMeta);
+    }
+
+    /** Atomically backfills AVE indexing for a :db/noindex attribute. */
+    public static Map<?, ?> indexAttr(Connection conn, Object attr) {
+        return conn.indexAttr(attr);
+    }
+
     private Datalevin() {
     }
 

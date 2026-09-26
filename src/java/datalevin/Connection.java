@@ -45,6 +45,39 @@ public final class Connection extends HandleResource {
         return (Map<?, ?>) ClojureRuntime.core("schema", resource());
     }
 
+    /** Atomically backfills AVE indexing and removes :db/noindex from the schema. */
+    public Map<?, ?> indexAttr(Object attr) {
+        return (Map<?, ?>) DatalevinInterop.connectionIndexAttr(resource(), attr);
+    }
+
+    /** Prepares a pull using this connection's current database view. */
+    public PreparedRead preparePull(Object selector) {
+        return Datalevin.preparePull(db(), selector);
+    }
+
+    /** Prepares a pull with options using this connection's current database view. */
+    public PreparedRead preparePull(Object selector, Map<?, ?> opts) {
+        return Datalevin.preparePull(db(), selector, opts);
+    }
+
+    /** Prepares a query using this connection's current database view. */
+    public PreparedRead prepareQuery(Object query) {
+        return Datalevin.prepareQuery(db(), query);
+    }
+
+    /** Transacts synchronously and returns :transacted instead of a report. */
+    public Object transactAck(Object txData) {
+        return transactAck(txData, null);
+    }
+
+    /**
+     * Transacts with optional metadata and returns :transacted. Listeners still
+     * receive full reports; inside an explicit transaction success means staged.
+     */
+    public Object transactAck(Object txData, Map<?, ?> txMeta) {
+        return DatalevinInterop.connectionTransactAck(resource(), txData, txMeta);
+    }
+
     /**
      * Registers a database-wide custom type and returns its keyword name.
      * Attribute schemas select it with {@code :db/valueType}. The registration

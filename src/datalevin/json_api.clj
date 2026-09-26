@@ -27,17 +27,21 @@
   []
   (shared/new-session-state))
 
-(defn- register!
+(defn ^:no-doc register!
+  "Register a handle for the Java JSON bridge. Java callers resolve this var
+  by name through ClojureRuntime.jsonApi."
   ([prefix type obj]
    (shared/register! prefix type obj))
   ([session prefix type obj]
    (shared/register! session prefix type obj)))
 
-(defn- rebind!
-  ([h type new-obj]
-   (shared/rebind! h type new-obj))
-  ([session h type new-obj]
-   (shared/rebind! session h type new-obj)))
+(defn ^:no-doc unregister!
+  "Remove a Java JSON bridge handle without closing its resource. The owning
+  Java HandleResource controls the resource lifetime."
+  ([h]
+   (shared/unregister! h))
+  ([session h]
+   (shared/unregister! session h)))
 
 (defn- current-session-state
   []
@@ -68,59 +72,6 @@
        (shared/unregister! session h)
        (close-handle-resource! entry))
      true)))
-
-(defn- unregister!
-  ([h]
-   (shared/unregister! h))
-  ([session h]
-   (shared/unregister! session h)))
-
-(defn- resolve-entry
-  ([h]
-   (shared/resolve-entry h))
-  ([session h]
-   (shared/resolve-entry session h)))
-
-(defn- resolve-handle
-  ([h]
-   (shared/resolve-handle h))
-  ([session h]
-   (shared/resolve-handle session h)))
-
-(defn- resolve-typed-handle
-  [h expected-type]
-  (let [{:keys [type obj]} (shared/resolve-entry h)]
-    (if (= type expected-type)
-      obj
-      (throw (ex-info (str "Invalid or expired handle: " h)
-                      (cond-> {:code   :invalid-handle
-                               :handle h}
-                        expected-type (assoc :expected expected-type)
-                        type (assoc :actual type)))))))
-
-(defn- resolve-conn
-  [h]
-  (resolve-typed-handle h :conn))
-
-(defn- resolve-kv
-  [h]
-  (resolve-typed-handle h :kv))
-
-(defn- resolve-client
-  [h]
-  (resolve-typed-handle h :client))
-
-(defn- resolve-search
-  [h]
-  (resolve-typed-handle h :search))
-
-(defn- resolve-search-writer
-  [h]
-  (resolve-typed-handle h :search-writer))
-
-(defn- resolve-vec
-  [h]
-  (resolve-typed-handle h :vec))
 
 (defn ^:no-doc clear-handles!
   ([]

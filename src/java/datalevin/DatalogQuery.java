@@ -310,6 +310,19 @@ public final class DatalogQuery {
                             requiresDb);
     }
 
+    java.util.function.Function<List<?>, List<?>> preparedInputs() {
+        if (rules == null) {
+            return values -> values;
+        }
+        int index = indexOfToken("%");
+        Object ruleInput = rules.asInput();
+        return values -> {
+            ArrayList<Object> prepared = new ArrayList<>(values);
+            prepared.add(index < 0 || index > prepared.size() ? prepared.size() : index, ruleInput);
+            return prepared;
+        };
+    }
+
     private void injectRulesInput(List<Object> prepared) {
         if (rules == null) {
             return;

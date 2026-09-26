@@ -21,7 +21,7 @@
 - [Datalog] added `transact-ack!` function to return `:transacted` on success,
   this improves write throughput, particularly on server, for cases when `listen!`
   is not used.
-- [Benchmark] added TPC-C, TPC-H and YCSB benchmarks.
+- [Benchmark] added YCSB benchmark.
 
 ### Changed
 - [Storage] update dtlvnative to 1.1.5, which uses DLMDB data format version 2,

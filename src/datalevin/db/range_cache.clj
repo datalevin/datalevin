@@ -57,8 +57,8 @@
   (let [schema (.-schema context)
         le (long (or (.-e low) c/e0))
         he (long (or (.-e high) c/emax))
-        la (bound-aid schema low false)
-        ha (bound-aid schema high true)
+        la (long (bound-aid schema low false))
+        ha (long (bound-aid schema high true))
         ;; Reuse bounds for all changed datoms in this range. Most invalidation
         ;; checks finish using entity/attribute IDs and never encode values.
         lo (delay (b/indexable-bytes (idx/datom->indexable schema low false)))

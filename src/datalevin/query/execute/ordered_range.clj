@@ -94,7 +94,7 @@
                (= (:symbol value) (first qorder))
                (or (and (= :asc direction) forward?)
                    (and (= :desc direction) reverse?))
-               (or (symbol? qlimit) (and (integer? qlimit) (pos? qlimit)))
+               (or (symbol? qlimit) (and (integer? qlimit) (pos? (long qlimit))))
                (nil? qwith) (empty? qhaving) (nil? qreturn-map)
                (every? #(or (instance? Variable %) (dp/pull? %)) elements)
                (every? some? projection)
@@ -133,7 +133,10 @@
           attrs-v (mapv #(vector % {:skip? false}) ordered)]
       (FieldLayout. schema
                     attrs-v
-                    (mapv #(if (< % 2) % (indexes (nth fields (- % 2))))
+                    (mapv (fn [^long index]
+                            (if (< index 2)
+                              index
+                              (indexes (nth fields (- index 2)))))
                           projection)
                     (storage/prepare-eav-scan-v-list schema attrs-v)))))
 
@@ -191,8 +194,8 @@
           order (result/prepare-order find-vars (:qorder parsed-q))
           primary-index (.indexOf ^List find-vars (first (:qorder parsed-q)))
           accepts? (if (= :asc direction)
-                     (if strict? pos? #(not (neg? %)))
-                     (if strict? neg? #(not (pos? %))))]
+                     (if strict? pos? #(not (neg? (long %))))
+                     (if strict? neg? #(not (pos? (long %)))))]
       (fn [resolved-q inputs]
         (let [database (first inputs)
               start-value (start inputs)
