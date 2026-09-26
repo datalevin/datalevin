@@ -13,6 +13,8 @@
 - [Query] prepared variant of queries `prepare-q`, `prepare-pull`,
   `prepare-get-value`, `execute-prepared` that reuse preparation and have lower
   latency, similar to prepared statement in SQL DBs.
+- [Query] `:limit` and `:offset` may name a scalar `:in` binding, so one
+  prepared query serves many result windows without re-preparing per size.
 - [Datalog] added `:db/noindex` to attribute schema property, to disable AVE
   index for that attribute. `index-attr` function to backfill index for an
   attribute.

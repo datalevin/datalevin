@@ -860,7 +860,17 @@
     (when (and (seq rule-exprs)
                (empty? rules-vars))
       (raise "Missing rules var '%' in :in"
-             {:error :parser/query, :form form}))))
+             {:error :parser/query, :form form})))
+
+  ;; A dynamic :limit or :offset names a scalar :in binding. Its value is
+  ;; substituted at execution so one prepared query can serve many windows.
+  (let [in-syms (set (map :symbol (collect-vars (:qin q))))]
+    (doseq [[k label] [[:qlimit "limit"] [:qoffset "offset"]]
+            :let [v (get q k)]
+            :when (symbol? v)]
+      (when-not (contains? in-syms v)
+        (raise "Dynamic " label " variable must be bound in :in"
+               {:error :parser/query :variable v :form form})))))
 
 (defn parse-timeout [t]
   (cond
@@ -874,6 +884,8 @@
   (cond
     (nil? t)        nil
     (pos-int? t)    t
+    ;; A query variable is resolved from an :in scalar binding at execution.
+    (symbol? t)     t
     (sequential? t) (recur (first t))
     (neg-int? t)    -1
     :else           (raise "Unsupported limit format"
@@ -884,6 +896,8 @@
     (nil? t)        nil
     (pos-int? t)    t
     (= t 0)         t
+    ;; A query variable is resolved from an :in scalar binding at execution.
+    (symbol? t)     t
     (sequential? t) (recur (first t))
     :else           (raise "Unsupported offset format"
                            {:error :parser/query :form t})))

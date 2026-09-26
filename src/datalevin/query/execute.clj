@@ -54,7 +54,7 @@
    [datalevin.util :as u :refer [concatv map+ raise]])
   (:import
    [java.util Collection HashSet List]
-   [datalevin.parser FindColl FindRel FindScalar FindTuple Variable]
+   [datalevin.parser BindScalar FindColl FindRel FindScalar FindTuple Variable]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
 (declare access-batch-query access-outer-query
@@ -1094,12 +1094,53 @@
          :subqueries            (vec (:subqueries execution))}
       (:fallback execution) (assoc :fallback (:fallback execution)))))
 
+(defn- window-input-index
+  [qin sym]
+  (loop [i 0, bindings (seq qin)]
+    (when bindings
+      (let [binding (first bindings)]
+        (if (and (instance? BindScalar binding)
+                 (= sym (:symbol (:variable binding))))
+          i
+          (recur (inc i) (next bindings)))))))
+
+(defn resolve-window
+  "Substitute dynamic :limit/:offset variables from :in scalar inputs.
+  Returns the parsed query unchanged when both are integer literals."
+  [parsed-q inputs]
+  (let [limit  (:qlimit parsed-q)
+        offset (:qoffset parsed-q)]
+    (if (or (symbol? limit) (symbol? offset))
+      (let [resolve
+            (fn [v label positive?]
+              (if (symbol? v)
+                (let [idx (window-input-index (:qin parsed-q) v)
+                      x   (when idx (nth inputs idx nil))]
+                  (when-not idx
+                    (raise "Dynamic window variable must be a scalar :in binding"
+                           {:error :prepared/query-inputs :variable v}))
+                  (when-not (and (integer? x)
+                                 (if positive?
+                                   (pos? (long x))
+                                   (<= 0 (long x))))
+                    (raise (str "Dynamic " label " must be "
+                                (if positive? "a positive" "a nonnegative")
+                                " integer")
+                           {:error :prepared/query-inputs :variable v :value x}))
+                  (long x))
+                v))]
+        (assoc parsed-q
+               :qlimit (resolve limit "limit" true)
+               :qoffset (resolve offset "offset" false)))
+      parsed-q)))
+
 (defn q*
   ([parsed-q inputs] (q* parsed-q inputs nil))
   ([parsed-q inputs point-reader]
    (binding [timeout/*deadline* (timeout/effective-deadline
                                   (:qtimeout parsed-q))]
-     (let [point-result
+     (let [parsed-q (resolve-window parsed-q inputs)
+           point-result
            (if point-reader
              (point-reader inputs)
              (let [shape    (or (get parsed-q point-lookup-projection-key)
@@ -1171,7 +1212,8 @@
   [parsed-q inputs]
   (binding [timeout/*deadline* (timeout/effective-deadline
                                  (:qtimeout parsed-q))]
-    (let [plans             (discover-access-plans parsed-q inputs)
+    (let [parsed-q          (resolve-window parsed-q inputs)
+          plans             (discover-access-plans parsed-q inputs)
           [parsed-q inputs] (plugin-inputs parsed-q inputs)]
       (prepare-context parsed-q inputs plans false))))
 

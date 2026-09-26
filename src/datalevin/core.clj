@@ -193,7 +193,9 @@ Only usable for debug output.
 
   Reuses parsing, cache dependency analysis and eligible projection metadata.
   General planning still uses current inputs and database state. Results match
-  `q`. Remote preparations require exactly one database source; additional
+  `q`. `:limit` and `:offset` may name a scalar `:in` binding, so one
+  preparation serves many result windows without re-preparing for each size.
+  Remote preparations require exactly one database source; additional
   collection sources are supported. Prepare from the transaction's DB view
   for transaction-local reads."}
   prepare-q dq/prepare-q)
@@ -462,7 +464,7 @@ Only usable for debug output.
 (def ^{:arglists '([query & inputs])
        :doc      "Executes a Datalog query, which supports [Datomic Query Format](https://docs.datomic.com/query/query-data-reference.html).
 
-  In addition, when `:find` spec is a relation, `:order-by` clause is supported, which can be followed by a single variable or a vector. The vector includes one or more variables, each optionally followed by a keyword `:asc` or `:desc`, specifying ascending or descending order, respectively. The default is `:asc`. `:limit` is also supported to specify the number of tuples to be returned.
+  In addition, when `:find` spec is a relation, `:order-by` clause is supported, which can be followed by a single variable or a vector. The vector includes one or more variables, each optionally followed by a keyword `:asc` or `:desc`, specifying ascending or descending order, respectively. The default is `:asc`. `:limit` is also supported to specify the number of tuples to be returned; both `:limit` and `:offset` may name a scalar `:in` binding and are resolved for each execution.
 
   Nested queries can be used as derived relations. Bind a nested relation
   result with a relation binding such as `[[?key ?weight]]`; its columns then

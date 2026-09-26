@@ -239,37 +239,38 @@
 (defn q-result
   ([parsed-q inputs] (q-result parsed-q inputs nil nil))
   ([parsed-q inputs ^CacheAnalysis analysis execute]
-   (if (and (cache-enabled?)
-            (not (if analysis (.-nested? analysis)
-                     (contains-nested-query? parsed-q))))
-     (if-let [store (single-input-store inputs)]
-       (let [;; Pull dependencies depend on schema. Capture the generation
-             ;; before analyzing them so a concurrent schema change cannot
-             ;; publish a result with dependencies from the previous schema.
-             token     (db/cache-token store)
-             parsed-q' (if (and analysis (not (.-qualified? analysis)))
-                         parsed-q
-                         (update parsed-q :qwhere-qualified-fns qualified-fn-cache-token))
-             deps      (if analysis (.-deps analysis)
-                           (query-cache-deps parsed-q'))
-             pull-deps (if analysis (.-pull-deps analysis)
-                           (pull-deps-reader parsed-q'))
-             deps      (if (and pull-deps (not (:all? deps)))
-                         (merge-deps deps (pull-deps inputs))
-                         deps)
-             udf-token (when (if analysis (.-udf? analysis)
-                                 (query-uses-udf? parsed-q'))
-                         (udf-cache-token inputs))
-             k         [:query-result deps :exact-window-v1
-                        qresolve/*resolver-mode* parsed-q' udf-token
-                        (mapv cache-input-token inputs)]]
-         (if-let [cached (db/cache-get store k)]
-           cached
-           (let [res (run-query parsed-q inputs execute)]
-             (db/cache-put-if-current store token k res)
-             res)))
-       (run-query parsed-q inputs execute))
-     (run-query parsed-q inputs execute))))
+   (let [parsed-q (qexec/resolve-window parsed-q inputs)]
+     (if (and (cache-enabled?)
+              (not (if analysis (.-nested? analysis)
+                       (contains-nested-query? parsed-q))))
+       (if-let [store (single-input-store inputs)]
+         (let [;; Pull dependencies depend on schema. Capture the generation
+               ;; before analyzing them so a concurrent schema change cannot
+               ;; publish a result with dependencies from the previous schema.
+               token     (db/cache-token store)
+               parsed-q' (if (and analysis (not (.-qualified? analysis)))
+                           parsed-q
+                           (update parsed-q :qwhere-qualified-fns qualified-fn-cache-token))
+               deps      (if analysis (.-deps analysis)
+                             (query-cache-deps parsed-q'))
+               pull-deps (if analysis (.-pull-deps analysis)
+                             (pull-deps-reader parsed-q'))
+               deps      (if (and pull-deps (not (:all? deps)))
+                           (merge-deps deps (pull-deps inputs))
+                           deps)
+               udf-token (when (if analysis (.-udf? analysis)
+                                   (query-uses-udf? parsed-q'))
+                           (udf-cache-token inputs))
+               k         [:query-result deps :exact-window-v1
+                          qresolve/*resolver-mode* parsed-q' udf-token
+                          (mapv cache-input-token inputs)]]
+           (if-let [cached (db/cache-get store k)]
+             cached
+             (let [res (run-query parsed-q inputs execute)]
+               (db/cache-put-if-current store token k res)
+               res)))
+         (run-query parsed-q inputs execute))
+       (run-query parsed-q inputs execute)))))
 
 (defn prepare-result-reader
   "Retain query-invariant cache analysis and execution metadata. Input tokens,

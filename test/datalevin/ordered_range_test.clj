@@ -125,3 +125,62 @@
                            :where [?e :rank ?rank] [(>= ?rank 2000)]
                            :order-by [?rank :asc ?e :asc] :limit 5]]]
             (is (false? (:access-path-selected? (d/explain {} query database))))))))))
+
+(deftest dynamic-window-inputs-test
+  (with-records
+    (fn [_ database]
+      (let [dynamic '{:find [?e ?rank]
+                      :in [$ ?start ?limit]
+                      :where [[?e :rank ?rank] [(>= ?rank ?start)]]
+                      :order-by [?rank] :limit ?limit}
+            reader (d/prepare-q database dynamic)
+            dynamic+off '{:find [?e ?rank]
+                          :in [$ ?start ?offset ?limit]
+                          :where [[?e :rank ?rank] [(>= ?rank ?start)]]
+                          :order-by [?rank] :offset ?offset :limit ?limit}
+            reader+off (d/prepare-q database dynamic+off)]
+        (doseq [start [0 2000 4998 6000]
+                limit [1 5 17]]
+          (let [literal (assoc dynamic :in '[$ ?start] :limit limit)]
+            (is (= (d/q dynamic database start limit) (reader [start limit])))
+            (is (= (d/q literal database start) (reader [start limit])))
+            (is (= (conventional literal database start)
+                   (reader [start limit])))))
+        (doseq [offset [0 3 9]
+                limit [1 5]]
+          (is (= (d/q dynamic+off database 2000 offset limit)
+                 (reader+off [2000 offset limit]))))
+        (testing "the resolved window drives access planning"
+          (let [explain (d/explain {:run? true} dynamic database 2000 4)]
+            (is (true? (:access-path-selected? explain)))
+            (is (= 4 (get-in explain [:plan :candidate-count])))
+            (is (= 4 (count (:result explain))))))
+        (testing "invalid dynamic values are rejected"
+          (doseq [bad [0 -1 1.5 "3" nil [2]]]
+            (is (thrown-with-msg? Exception
+                                  #"Dynamic limit must be a positive integer"
+                                  (reader [2000 bad]))))
+          (is (thrown-with-msg? Exception
+                                #"Dynamic offset must be a nonnegative integer"
+                                (reader+off [2000 -1 5]))))
+        (testing "the window variable must be a scalar :in binding"
+          (let [unbound (assoc dynamic :in '[$ ?start])]
+            (is (thrown-with-msg? Exception
+                                  #"Dynamic \"limit\" variable must be bound in :in"
+                                  (d/q unbound database 0)))))))))
+
+(deftest dynamic-window-result-cache-test
+  (let [dir (u/tmp-dir (str "ordered-window-cache-" (random-uuid)))
+        conn (d/get-conn dir {:rank {:db/valueType :db.type/long}}
+                         {:cache-limit 512})]
+    (try
+      (d/transact! conn (mapv (fn [n] {:rank n}) (range 1000)))
+      (let [q '{:find [?e ?rank]
+                :in [$ ?start ?limit]
+                :where [[?e :rank ?rank] [(>= ?rank ?start)]]
+                :order-by [?rank] :limit ?limit}]
+        (is (= 3 (count (d/q q @conn 100 3))))
+        (is (= 8 (count (d/q q @conn 100 8))))
+        (is (= 3 (count (d/q q @conn 100 3))))
+        (is (= 8 (count (d/q q @conn 100 8)))))
+      (finally (d/close conn) (u/delete-files dir)))))

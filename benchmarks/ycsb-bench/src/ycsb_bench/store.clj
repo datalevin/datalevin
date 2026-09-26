@@ -53,14 +53,15 @@
 
 (defn scan-query
   "Select an application key range and return an ordered page with pulls.
-  LIMIT is a query literal; stores prepare and reuse each configured page size."
-  [attributes limit]
+  The page size is a scalar query input, so one prepared query serves every
+  configured limit instead of one preparation per page size."
+  [attributes]
   {:find ['?key (list 'pull '?entity attributes)]
-   :in '[$ ?start]
+   :in '[$ ?start ?limit]
    :where '[[?entity :ycsb/key ?key]
             [(>= ?key ?start)]]
    :order-by '[?key]
-   :limit limit})
+   :limit '?limit})
 
 (defn application-key-info [workload]
   {:workload-model (w/workload-model workload)
@@ -94,7 +95,7 @@
            (wal-info handle)))
   (close-store! [_] (d/close-kv handle)))
 
-(defrecord DatalogRecords [conn attributes reader scan-readers workload local?]
+(defrecord DatalogRecords [conn attributes reader scan-reader workload local?]
   Records
   (put-records! [_ records]
     (d/transact! conn
@@ -110,10 +111,8 @@
     (d/transact! conn [[:db/add [:ycsb/key key] (nth attributes field) value]]))
   (scan-records [_ start n]
     (if (pos? (long n))
-      (let [query (or (get scan-readers n)
-                      (throw (ex-info "Page size exceeds configured scan-length" {:limit n})))]
-        (mapv (fn [[key record]] [key (mapv record attributes)])
-              (d/execute-prepared @query [start])))
+      (mapv (fn [[key record]] [key (mapv record attributes)])
+            (d/execute-prepared @scan-reader [start n]))
       []))
   (record-count [_] (d/count-datoms @conn nil :ycsb/key nil))
   (storage-info [_]
@@ -125,7 +124,7 @@
   (close-store! [_] (d/close conn)))
 
 (defn- open-application-key-store!
-  [api path {:keys [field-count scan-length workload] :as opts}]
+  [api path {:keys [field-count workload] :as opts}]
   (let [common (select-keys opts [:wal? :wal-durability-profile :client-opts])]
     (case api
       :kv
@@ -144,14 +143,13 @@
             conn (d/create-conn path schema (assoc common :kv-opts {:mapsize 4096}
                                                   :cache-limit 0 :background-sampling? false))]
         (try
-          (let [scan-readers (into [nil]
-                                   (map #(delay (d/prepare-q @conn (scan-query attributes %))))
-                                   (range 1 (inc (long scan-length))))]
-            ;; E prepares every page size before timing. Point workloads do not
-            ;; register unused queries; diagnostic scans prepare on first use.
-            (when (= workload :e) (run! force (next scan-readers)))
+          (let [scan-reader (delay (d/prepare-q @conn (scan-query attributes)))]
+            ;; E prepares its single scan query before timing. Point workloads
+            ;; do not register an unused query; diagnostic scans prepare on
+            ;; first use.
+            (when (= workload :e) (force scan-reader))
             (->DatalogRecords conn attributes (d/prepare-pull @conn attributes)
-                              scan-readers workload (not (u/dtlv-uri? path))))
+                              scan-reader workload (not (u/dtlv-uri? path))))
           (catch Throwable t (d/close conn) (throw t)))))))
 
 (defn- verify-wal! [store durability]

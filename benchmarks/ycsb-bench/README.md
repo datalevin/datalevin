@@ -205,8 +205,9 @@ using the configured request distribution and converts it to that string key.
 * **Datalog:** `:ycsb/key` is a string attribute with `:db.unique/value`.
   Internal entity IDs are assigned by Datalevin. The prepared query filters
   `:ycsb/key >= start`, orders by that attribute, limits the result, and pulls
-  the payload fields. One query per supported page size is prepared before
-  loading and reused because `:limit` requires a literal. Remote E executes
+  the payload fields. The page size is a scalar query input and feeds the
+  literal window, so one prepared query per store serves every requested limit;
+  the planner still sees a concrete limit for each execution. Remote E executes
   the query and pulls in one request.
 * **SQL:** `YCSB_KEY VARCHAR(255)` is the primary key, using the database's
   default collation and ordinary table layout. There are no secondary indexes.
@@ -217,11 +218,11 @@ For a page of ten records, the prepared Datalog query is:
 ```clojure
 {:find [?key (pull ?entity [:ycsb/field0 :ycsb/field1 ; ...all configured fields
                             :ycsb/field9])]
- :in [$ ?start]
+ :in [$ ?start ?limit]
  :where [[?entity :ycsb/key ?key]
          [(>= ?key ?start)]]
  :order-by [?key]
- :limit 10}
+ :limit ?limit}
 ```
 
 The SQL equivalent is:
@@ -420,8 +421,9 @@ fields of 100 bytes, excluding keys and database overhead.
   are part of the measurement. Index-result caching is bypassed with
   `:cache-limit 0` in both embedded and remote modes; reports include the
   effective limit. Pull-pattern and query-plan caches remain enabled.
-  E prepares its scan queries before timing; point workloads prepare them only
-  if a diagnostic scan is requested.
+  E prepares its single scan query before timing and passes the page size as an
+  input; point workloads prepare their scan query only if a diagnostic scan is
+  requested.
   Background sampling is disabled. Earlier A/B/C/F results used direct numeric
   entity IDs; those measurements need fresh baselines with the string-key lookup.
 * **Durability:** WAL is enabled with `--durability strict` by default for both
