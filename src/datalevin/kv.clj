@@ -90,9 +90,9 @@
   [db op]
   (if-let [g (strict-write-group db :kv)]
     (group/submit! g
-                   (fn [requests]
+                   (fn [execute]
                      (l/with-transaction-kv [tx db]
-                       (group/execute requests tx)))
+                       (execute tx)))
                    op)
     (l/with-transaction-kv [tx db] (op tx))))
 
@@ -556,9 +556,9 @@
     [this dbi-name txs k-type v-type]
     (if-let [g (strict-write-group db :kv)]
       (group/submit! g
-                     (fn [requests]
+                     (fn [execute]
                        (l/with-transaction-kv [tx this]
-                         (group/execute requests tx)))
+                         (execute tx)))
                      #(i/transact-kv % dbi-name txs k-type v-type))
       (if (custom-kv/custom-txs? db dbi-name txs)
         (custom-kv/transact! this db dbi-name txs k-type v-type)

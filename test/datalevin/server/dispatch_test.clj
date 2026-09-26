@@ -38,7 +38,7 @@
 ;; must not silently remove a handler from the guard tests below.
 (def ^:private database-writes
   #{:set-schema :index-attr :register-type :datalog-register-type
-    :swap-attr :del-attr :rename-attr :load-datoms :tx-data :tx-data+db-info
+    :swap-attr :del-attr :rename-attr :load-datoms :tx-data :tx-data+db-info :tx-data-ack
     :open-transact :close-transact :abort-transact
     :open-transact-kv :close-transact-kv :abort-transact-kv :transact-kv :update-kv
     :open-dbi :clear-dbi :drop-dbi :set-env-flags :analyze
@@ -69,7 +69,7 @@
          (set (filter cmd/ha-write? (keys handlers/handler-map)))))
   (is (= (into (into database-writes local-writes) index-opens)
          (set (filter cmd/replica-write? (keys handlers/handler-map)))))
-  (is (= #{:tx-data :tx-data+db-info :transact-kv :update-kv}
+  (is (= #{:tx-data :tx-data+db-info :tx-data-ack :transact-kv :update-kv}
          (set (filter cmd/supports-client-op? (keys handlers/handler-map)))))
   (doseq [type (keys handlers/handler-map)]
     (is (= (contains? (into database-writes index-opens) type)

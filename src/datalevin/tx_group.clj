@@ -45,9 +45,9 @@
       (.release ^Semaphore (.-ready request)))))
 
 (defn- run!
-  [run-group ^FastList requests]
+  [run-transaction ^FastList requests]
   (try
-    (complete! requests (run-group requests) nil)
+    (complete! requests (run-transaction #(execute requests %)) nil)
     (catch Throwable t
       (if (::body-failure (ex-data t))
         (if (= 1 (.size requests))
@@ -56,7 +56,7 @@
           ;; it cannot fail unrelated callers. User update functions already
           ;; have the same side-effect-free requirement as map-resize retries.
           (dotimes [idx (.size requests)]
-            (run! run-group (doto (FastList. 1) (.add (.get requests idx))))))
+            (run! run-transaction (doto (FastList. 1) (.add (.get requests idx))))))
         (complete! requests nil t)))))
 
 (defn- handoff!
@@ -75,7 +75,7 @@
           (.release ^Semaphore (.-ready ^Request (.peek queue))))))))
 
 (defn- lead!
-  [^Group group run-group result]
+  [^Group group run-transaction result]
   (let [^ConcurrentLinkedQueue queue (.-queue group)
         ^ReentrantLock lock (.-lock group)]
     (try
@@ -92,28 +92,45 @@
                     (when-let [request (.poll queue)]
                       (.add requests request)
                       (recur (inc n)))))
-                (run! run-group requests)
+                (run! run-transaction requests)
                 (recur))))
           (finally (.unlock lock))))
       (finally (handoff! group)))))
 
-(defn submit!
-  "Run op in a durable group, preserving the submitting thread's bindings.
-  run-group owns native transaction lifetime and publishes state before return.
-  Only the elected leader acquires admission. Other callers wait for their own
-  completion signal or a leadership handoff, without a timer or worker thread."
-  [^Group group run-group op]
+(defn- submit-queued!
+  [^Group group run-transaction op leader?]
   (let [result (volatile! nil)
         ready (Semaphore. 0)
         request (Request. (bound-fn [context] (op context)) result ready)]
     (.add ^ConcurrentLinkedQueue (.-queue group) request)
-    (if (.compareAndSet ^AtomicBoolean (.-active group) false true)
-      (lead! group run-group result)
+    (if (or leader? (.compareAndSet ^AtomicBoolean (.-active group) false true))
+      (lead! group run-transaction result)
       (do
         ;; Like ReentrantLock.lock, waiting does not cancel an enqueued write
         ;; on interruption, and preserves the caller's interrupted status.
         (.acquireUninterruptibly ready)
         (when-not @result
-          (lead! group run-group result))))
+          (lead! group run-transaction result))))
     (let [[ok? value] @result]
       (if ok? value (throw ^Throwable value)))))
+
+(defn submit!
+  "Run op in a durable transaction, batching contended callers.
+  run-transaction receives a function of the private writing context, returns
+  its result, and owns commit and state publication. An idle caller passes op
+  directly, without queue or batch allocations. Queued operations capture the
+  submitting thread's bindings and wait for completion or a leadership handoff."
+  [^Group group run-transaction op]
+  (if (.compareAndSet ^AtomicBoolean (.-active group) false true)
+    (let [^ReentrantLock lock (.-lock group)]
+      ;; Claim leadership before checking the queue, so an already enqueued
+      ;; request cannot be overtaken by a new direct operation.
+      (if (and (.isEmpty ^ConcurrentLinkedQueue (.-queue group))
+               (.tryLock lock))
+        (try
+          (try
+            (run-transaction op)
+            (finally (.unlock lock)))
+          (finally (handoff! group)))
+        (submit-queued! group run-transaction op true)))
+    (submit-queued! group run-transaction op false)))

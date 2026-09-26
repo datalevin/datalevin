@@ -1546,15 +1546,15 @@
             (cond-> (if (= response-kind cop/tx-data-ack-response-kind)
                       {:result :transacted}
                       {:tx-data (mapv (fn [datom]
-                                      [(d/datom-e datom)
-                                       (d/datom-a datom)
-                                       (d/datom-v datom)
-                                       (d/datom-tx datom)
-                                       (d/datom-added datom)])
-                                    (:tx-data report))
-                     :tempids (assoc (:tempids report)
-                                     :max-eid
-                                     (:max-eid db-after))})
+                                       [(d/datom-e datom)
+                                        (d/datom-a datom)
+                                        (d/datom-v datom)
+                                        (d/datom-tx datom)
+                                        (d/datom-added datom)])
+                                     (:tx-data report))
+                       :tempids (assoc (:tempids report)
+                                       :max-eid
+                                       (:max-eid db-after))})
               (and (not= response-kind cop/tx-data-ack-response-kind)
                    (:new-attributes report))
               (assoc :new-attributes (:new-attributes report))
@@ -2172,6 +2172,7 @@
   "Transact on a remote store without fetching a transaction report.
    Return the refreshed DB view after clearing cached reads."
   [^DB db tx-data]
+  (vld/validate-tx-data-shape tx-data)
   (let [store (.-store db)
         txs (sequence (mapcat expand-transactable-entity) tx-data)
         response (i/tx-data-ack store txs)
@@ -2179,7 +2180,16 @@
     (when-not (= :transacted (:result response))
       (raise "Invalid transaction acknowledgement" {:response response}))
     ;; Without changed datoms we cannot selectively invalidate cached reads.
-    (refresh-cache store (:last-modified info) (:max-tx info))
+    ;; Reuse the cache's capacity without an extra remote `opts` request, and
+    ;; advance its generation so pre-commit readers cannot repopulate it.
+    (if-some [^LRUCache cache (.get ^ConcurrentHashMap caches (dir store))]
+      (do
+        (locking cache
+          (.beginInvalidation cache (long (:last-modified info)))
+          (.clear cache))
+        (mark-remote-cache-max-tx! store (:max-tx info))
+        (mark-remote-cache-check! store))
+      (refresh-cache store (:last-modified info) (:max-tx info)))
     (carry-runtime-opts (new-db store info db) db)))
 
 (defn tx-data->simulated-report

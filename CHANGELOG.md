@@ -18,6 +18,9 @@
 - [Datalog] added `:db/noindex` to attribute schema property, to disable AVE
   index for that attribute. `index-attr` function to backfill index for an
   attribute.
+- [Datalog] added `transact-ack!` function to return `:transacted` on success,
+  this improves write throughput, particularly on server, for cases when `listen!`
+  is not used.
 - [Benchmark] added TPC-C, TPC-H and YCSB benchmarks.
 
 ### Changed

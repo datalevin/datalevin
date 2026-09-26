@@ -35,6 +35,30 @@ LMDB suggests that:
 > by newer write transactions, thus the database can grow quickly. Write
 > transactions prevent other write transactions, since writes are serialized.
 
+## Acknowledgement without a transaction report
+
+Use `transact-ack!` when the caller only needs to know that a Datalog transaction
+succeeded:
+
+```clojure
+(d/transact-ack! conn [{:user/name "Ivan"}]) ; => :transacted
+```
+
+It accepts the same transaction data and optional `tx-meta` as `transact!`,
+updates the connection, and throws on failure. Validation, uniqueness checks,
+and the configured durability policy still apply. Use `transact!` to obtain
+changed datoms or allocated entity IDs.
+
+For standalone remote transactions without transaction listeners, the server
+atomically saves a compact acknowledgement for retries and returns it with DB
+metadata. The client clears its read cache. This avoids saving and transmitting
+the changed datoms a second time and requires a server supporting this API.
+With transaction listeners, a full report is fetched for their callbacks.
+
+Local calls and calls inside `with-transaction` use the regular transaction path
+and discard its report. Inside `with-transaction`, `:transacted` means the write
+has been staged; the enclosing transaction controls commit or abort.
+
 ## Additional Transaction Mechanisms
 
 By default, each write transaction in LMDB flushes to disk when it commits,

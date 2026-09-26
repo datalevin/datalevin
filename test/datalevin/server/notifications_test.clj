@@ -59,7 +59,7 @@
           (is (= :a (d/listen-db! a :a #(.offer qa %))))
           (d/listen-db! b :b #(.offer qb %))
           (d/listen-db! other :other #(.offer qo %))
-          (d/transact! writer [{:db/id 1 :value :committed}])
+          (is (= :transacted (d/transact-ack! writer [{:db/id 1 :value :committed}])))
           (is (= expected (event qa)))
           (is (= expected (event qb)))
           (is (quiet? qo))

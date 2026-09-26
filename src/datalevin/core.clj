@@ -1096,7 +1096,7 @@ Only usable for debug output.
 (def ^{:arglists '([conn callback]
                    [conn key callback])
        :doc      "Listen for changes on the given connection to a Datalog db. Whenever a transaction is applied
-  to the database via [[transact!]], the callback is called with the transaction
+  to the database via [[transact!]] or [[transact-ack!]], the callback is called with the transaction
   report. `key` is any opaque unique value.
 
   Idempotent. Calling [[listen!]] with the same key twice will override old

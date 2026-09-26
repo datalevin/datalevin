@@ -515,7 +515,8 @@
             before (:last-committed-lsn (d/txlog-watermarks lmdb))
             clients (mapv #(.-client ^DatalogStore (:store @%)) @handles)
             messages (mapv (fn [idx]
-                             (let [kind (if (even? idx) :tx-data :tx-data+db-info)
+                             (let [kind (nth [:tx-data :tx-data+db-info :tx-data-ack]
+                                             (mod idx 3))
                                    txs [[:db/add (inc idx) :counter idx]]]
                                {:type kind :mode :request :writing? false
                                 :args ["dl" txs false]
@@ -546,8 +547,10 @@
                                       (cop/kv-info-key (:client-op-id message))
                                       :string :data)
                   replay (client/request (clients idx) message)
-                  metadata #(select-keys % [:tempids :db-info :new-attributes])]
+                  metadata #(select-keys % [:result :tempids :db-info :new-attributes])]
               (is (= :command-complete (:type response) (:type replay)))
+              (when (= :tx-data-ack (:type message))
+                (is (= #{:result :db-info} (set (keys (:result response))))))
               (is (= (metadata (:result response))
                      (metadata (cop/record-response record))
                      (metadata (:result replay))))))))

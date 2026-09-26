@@ -1524,13 +1524,13 @@
         *datalog-write-group*
         (group/submit!
           *datalog-write-group*
-          (fn [requests]
+          (fn [execute]
             (with-direct-db-transaction-slot
               deps server db-name false
               (fn []
                 (let [conn (atom (:dt-db (db-state deps server db-name)))
                       results (d/with-transaction [tx conn]
-                                (group/execute requests tx))
+                                (execute tx))
                       db-after @conn]
                   ((:update-db deps) server db-name
                    #(assoc % :dt-db db-after :store (:store db-after)))
@@ -1569,7 +1569,7 @@
       (throw e))))
 
 (defn- build-tx-response
-  [deps server skey db-name mode args writing? tx-meta include-db-info?]
+  [deps server skey db-name mode args writing? tx-meta response-kind]
   (let [txs (case mode
               :copy-in ((:copy-in deps) server skey)
               :request (nth args 1)
@@ -1585,13 +1585,15 @@
                  (cond-> (assoc m (if writing? :wdt-db :dt-db) db1)
                    (and (not writing?) (not s?))
                    (assoc :store (:store db1))))))
-        rp  (assoc-in rp [:tempids :max-eid] (:max-eid db1))]
+        ack? (= response-kind cop/tx-data-ack-response-kind)
+        rp  (if ack? rp (assoc-in rp [:tempids :max-eid] (:max-eid db1)))]
     (when (and (not s?) (seq (:tx-data rp)))
       (database-changed! deps server db-name writing?))
-    (cond-> (cond-> (select-keys rp [:tx-data :tempids])
-              (:new-attributes rp)
+    (cond-> (cond-> (if ack? {:result :transacted}
+                       (select-keys rp [:tx-data :tempids]))
+              (and (not ack?) (:new-attributes rp))
               (assoc :new-attributes (:new-attributes rp)))
-      include-db-info?
+      (not= response-kind cop/tx-data-response-kind)
       (assoc :db-info
              (if (::group-committed? rp)
                {:max-eid (:max-eid db1)
@@ -1603,13 +1605,20 @@
                 :last-modified (i/last-modified
                                 (dt-store deps server skey db-name writing?))})))))
 
-(defn tx-data
-  [deps server skey {:keys [mode args writing?] :as message}]
+(defn- transact-response
+  [deps server skey {:keys [mode args writing?] :as message} response-kind]
   (let [db-name (nth args 0)]
     (db-alter-permission!
       deps server skey db-name
       "Don't have permission to alter the database"
       (fn []
+        (when (and (= response-kind cop/tx-data-ack-response-kind)
+                   (or (last args)
+                       (and (:client-op-response-kind message)
+                            (not= response-kind
+                                  (:client-op-response-kind message)))))
+          (raise "Invalid transaction acknowledgement request"
+                 {:error :ha/client-op-invalid-request}))
         (with-datalog-transaction-slot
           deps
           server
@@ -1636,10 +1645,14 @@
                             (:request-type client-op)
                             (:request-hash client-op)
                             (:response-kind client-op)))
-                        false)))]
-              (if replay?
+                        response-kind)))]
+              (if (or replay? (= response-kind cop/tx-data-ack-response-kind))
                 (write-result! deps skey response)
                 (write-tx-response! deps skey response)))))))))
+
+(defn tx-data
+  [deps server skey message]
+  (transact-response deps server skey message cop/tx-data-response-kind))
 
 (defn db-info
   [deps server skey {:keys [args writing?] :as message}]
@@ -1653,42 +1666,12 @@
                     :opts          (i/opts dt-store)})))
 
 (defn tx-data+db-info
-  [deps server skey {:keys [mode args writing?] :as message}]
-  (let [db-name (nth args 0)]
-    (db-alter-permission!
-      deps server skey db-name
-      "Don't have permission to alter the database"
-      (fn []
-        (with-datalog-transaction-slot
-          deps
-          server
-          skey
-          db-name
-          writing?
-          (last args)
-          (fn []
-            (let [{:keys [response replay?]}
-                  (with-idempotent-client-op
-                    deps server skey db-name writing? message
-                    (fn [client-op]
-                      (build-tx-response
-                        deps
-                        server
-                        skey
-                        db-name
-                        mode
-                        args
-                        writing?
-                        (when client-op
-                          (cop/tx-meta
-                            (:client-op-id client-op)
-                            (:request-type client-op)
-                            (:request-hash client-op)
-                            (:response-kind client-op)))
-                        true)))]
-              (if replay?
-                (write-result! deps skey response)
-                (write-tx-response! deps skey response)))))))))
+  [deps server skey message]
+  (transact-response deps server skey message cop/tx-data+db-info-response-kind))
+
+(defn tx-data-ack
+  [deps server skey message]
+  (transact-response deps server skey message cop/tx-data-ack-response-kind))
 
 (defn open-kv
   [deps server skey message]
@@ -2446,11 +2429,11 @@
                                                               kv-store :server-kv))]
                         (group/submit!
                           g
-                          (fn [requests]
+                          (fn [execute]
                             (with-direct-db-transaction-slot
                               deps server db-name false
                               #(l/with-transaction-kv [tx kv-store]
-                                 (group/execute requests tx))))
+                                 (execute tx))))
                           op)
                         (op kv-store)))
                     (when (seq txs0)
@@ -2491,11 +2474,11 @@
                                                               store :server-kv))]
                         (group/submit!
                           g
-                          (fn [requests]
+                          (fn [execute]
                             (with-direct-db-transaction-slot
                               deps server db-name false
                               #(l/with-transaction-kv [tx store]
-                                 (group/execute requests tx))))
+                                 (execute tx))))
                           op)
                         (with-direct-db-transaction-slot
                           deps server db-name writing?
@@ -2725,6 +2708,7 @@
    :tx-data tx-data
    :db-info db-info
    :tx-data+db-info tx-data+db-info
+   :tx-data-ack tx-data-ack
    :open-transact open-transact
    :close-transact close-transact
    :abort-transact abort-transact

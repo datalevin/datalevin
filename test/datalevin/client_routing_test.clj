@@ -322,7 +322,7 @@
 
 (deftest replay-safe-requests-can-recover-a-lost-reply-test
   (doseq [req (cons {:type :doc-count :args ["db"]}
-                   (for [op [:tx-data :tx-data+db-info :transact-kv]]
+                   (for [op [:tx-data :tx-data+db-info :tx-data-ack :transact-kv]]
                      (merge client-op
                             {:type op :args ["db"]
                              :client-op-response-kind
