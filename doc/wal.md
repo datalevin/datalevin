@@ -107,12 +107,13 @@ Dispatch policy differs by profile:
 * `:extra`: follows the same adaptive direct-or-queued dispatch as `:strict`,
   but with stricter durability on the sync side.
 
-Standalone private-WAL `:strict` KV writes and remote KV/Datalog transactions
+Standalone private-WAL `:strict` and `:relaxed` KV writes and remote KV/Datalog transactions
 also collect requests waiting for the writer. The next submitting thread
 executes up to `:wal-group-commit` requests in one native transaction and WAL
-record. Every caller waits for durable WAL and successful native commit;
-readers cannot see a partially executed group. There is no deliberate batching
-delay, and `:wal-group-commit-ms` does not delay these strict requests.
+record. Every caller waits for successful native commit; strict callers also
+wait for durable WAL. Relaxed callers retain the configured deferred-sync policy.
+Readers cannot see a partially executed group. There is no deliberate batching
+delay, and `:wal-group-commit-ms` does not delay admission to either group.
 
 This shares commit costs while retaining LMDB's single writer. Explicit
 transaction bodies, shared-WAL stores, and writes with HA/commit hooks retain
@@ -139,10 +140,20 @@ In `:relaxed`, an untimely crash can lose a recent tail of transactions that wer
 appended but not yet durably synced to disk. The `:relaxed` crash-risk window is
 bounded by two thresholds:
 
-* count threshold: `:wal-group-commit` (max writes per durability batch)
+* count threshold: `:wal-group-commit` (logical requests per durability batch
+  for automatically grouped private-WAL writes)
 * time threshold: `:wal-group-commit-ms` (max milliseconds per durability batch)
 
 Batch durability is triggered when either threshold is reached first.
+
+A group of N requests consumes N units of the count threshold, even though it
+produces one WAL record. This also applies to the local Datalog request queue.
+An explicitly submitted transaction or shared-WAL append retains its existing
+one-record count. Group failures that retry requests individually count only
+the records actually appended. Recovery and replication still use physical
+LSNs: `:pending-count` reports pending WAL records, while `:unsynced-count` in
+sync statistics includes the logical request weights. Finishing a sync removes
+only the weights covered by its durable LSN.
 
 Defaults come from dynamic vars:
 

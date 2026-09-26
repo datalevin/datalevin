@@ -18,6 +18,7 @@
    [datalevin.remote :as r]
    [datalevin.util :as u :refer [raise]]
    [datalevin.interface :as i]
+   [datalevin.tx-group :as group]
    [datalevin.validate :as vld])
   (:import
    [datalevin.db DB TxReport]
@@ -1281,13 +1282,14 @@
                       db1    ^DB    (db/transfer db store1)
                       dbn    ^DB    (prepare-sync-queued-patch-idoc-reports!
                                       db1 requests prepared reports)]
-                  (loop [i       0
-                         current db1]
-                    (when (< i n)
-                      (let [^TxReport report (aget reports i)]
-                        (db/commit-prepared-tx-data!
-                          current (:tx-data report) report)
-                        (recur (unchecked-inc i) (:db-after report)))))
+                  (db/execute-write-group
+                    (atom db1)
+                    (fn [tx]
+                      (dotimes [i n]
+                        (let [^TxReport report (aget reports i)]
+                          (db/commit-prepared-tx-data!
+                            @tx (:tx-data report) report)
+                          (reset! tx (:db-after report))))))
                   (vreset! final-db dbn)))
               (let [final-db ^DB @final-db
                     new-store ^Store
@@ -1382,23 +1384,24 @@
                                      (db/blind-local-tx-unique-values-absent?
                                        db1 tx)))
                           (sync-queued-blind-fallback!))))
-                    (loop [i 0
-                           current db1]
-                      (if (< i n)
-                        (let [^SyncQueuedReq req (.get requests i)
-                              prepared-tx (aget prepared i)
-                              ^TxReport report
-                              (db/stamp-blind-local-tx
-                                current prepared-tx (.-tx-meta req))]
-                          (binding [s/*enforce-blind-unique-inserts?*
-                                    (boolean
-                                      (:fuse-unique-inserts? prepared-tx))
-                                    c/*ordered-datom-writes?* true]
-                            (db/commit-prepared-tx-data!
-                              current (:tx-data report) report))
-                          (aset reports i report)
-                          (recur (unchecked-inc i) (:db-after report)))
-                        (vreset! final-db current)))))
+                    (db/execute-write-group
+                      (atom db1)
+                      (fn [tx]
+                        (dotimes [i n]
+                          (let [^SyncQueuedReq req (.get requests i)
+                                prepared-tx (aget prepared i)
+                                ^TxReport report
+                                (db/stamp-blind-local-tx
+                                  @tx prepared-tx (.-tx-meta req))]
+                            (binding [s/*enforce-blind-unique-inserts?*
+                                      (boolean
+                                        (:fuse-unique-inserts? prepared-tx))
+                                      c/*ordered-datom-writes?* true]
+                              (db/commit-prepared-tx-data!
+                                @tx (:tx-data report) report))
+                            (aset reports i report)
+                            (reset! tx (:db-after report))))
+                        (vreset! final-db @tx)))))
                 (let [final-db ^DB @final-db
                       new-store ^Store
                       (s/transfer ^Store (.-store final-db) kv)
@@ -1420,12 +1423,13 @@
 
 (defn- transact-sync-queued-individually!
   [conn ^FastList requests ^objects reports]
-  (dotimes [i (alength reports)]
-    (let [^SyncQueuedReq req (.get requests i)]
-      (aset reports i
-            (try
-              (-transact! conn (.-tx-data req) (.-tx-meta req))
-              (catch Throwable e e))))))
+  (binding [group/*request-count* 1]
+    (dotimes [i (alength reports)]
+      (let [^SyncQueuedReq req (.get requests i)]
+        (aset reports i
+              (try
+                (-transact! conn (.-tx-data req) (.-tx-meta req))
+                (catch Throwable e e)))))))
 
 (defn- general-sync-queued-batch-safe?
   [^DB db]
@@ -1444,15 +1448,18 @@
         (do
           (with-transaction [c conn]
             (assert (active-conn-structural? c))
-            (dotimes [i n]
-              (let [^SyncQueuedReq req (.get requests i)
-                    ;; Apply each request before preparing the next. Simulated
-                    ;; reports cannot be chained: preparation clears their
-                    ;; mutable overlays before a transaction function reads.
-                    ^TxReport report (with-isolated-tx-cache
-                                       @c (.-tx-data req) (.-tx-meta req) false)]
-                (reset! c (:db-after report))
-                (aset reports i report))))
+            (db/execute-write-group
+              c
+              (fn [tx]
+                (dotimes [i n]
+                  (let [^SyncQueuedReq req (.get requests i)
+                        ;; Apply each request before preparing the next. Simulated
+                        ;; reports cannot be chained: preparation clears their
+                        ;; mutable overlays before a transaction function reads.
+                        ^TxReport report (with-isolated-tx-cache
+                                           @tx (.-tx-data req) (.-tx-meta req) false)]
+                    (reset! tx (:db-after report))
+                    (aset reports i report))))))
           ;; Returned reports must not retain a Store bound to the closed writer.
           (let [store (.-store ^DB @conn)]
             (dotimes [i n]
@@ -1470,7 +1477,8 @@
       (if (= n 1)
         (let [^SyncQueuedReq req (.get requests 0)]
           (try
-            (binding [*sync-queue-worker?* true]
+            (binding [*sync-queue-worker?* true
+                      group/*request-count* 1]
               (let [^TxReport report (-transact! conn
                                                  (.-tx-data req)
                                                  (.-tx-meta req))]
@@ -1483,7 +1491,8 @@
         ;; Combine eligible requests in a single write transaction.
         (let [^objects reports (object-array n)]
           (try
-            (binding [*sync-queue-worker?* true]
+            (binding [*sync-queue-worker?* true
+                      group/*request-count* n]
               (let [patches (when *local-wal-patch-idoc?*
                               (prepare-sync-queued-patch-idoc-batch
                                 conn requests))]

@@ -7,8 +7,10 @@
             [datalevin.conn :as conn]
             [datalevin.core :as d]
             [datalevin.constants :as c]
+            [datalevin.db :as db]
             [datalevin.embedding :as emb]
             [datalevin.interpret :as inter]
+            [datalevin.interface :as i]
             [datalevin.kv :as kv]
             [datalevin.kv.txlog :as kvtx]
             [datalevin.lmdb :as l]
@@ -16,6 +18,7 @@
             [datalevin.storage :as s]
             [datalevin.test.core :refer [allocate-port db-fixture]]
             [datalevin.txlog :as wal]
+            [datalevin.txlog.segment :as segment]
             [datalevin.util :as u])
   (:import [datalevin.tx_group Group]
            [datalevin.conn SyncQueuedResult]
@@ -34,6 +37,16 @@
 
 (def ^:dynamic *submitted-value* nil)
 
+(defn- metadata-writes-after [lmdb lsn]
+  (let [state (wal/state lmdb)]
+    (->> (:records (segment/scan-segment (wal/segment-path (:dir state) 1)))
+         (map #(wal/decode-commit-row-payload (:body %)))
+         (filter #(> (:lsn %) lsn))
+         (mapv (fn [record]
+                 (filterv #(and (= :put (first %)) (= c/meta (second %))
+                                (#{:max-tx :last-modified} (nth % 2)))
+                          (:ops record)))))))
+
 (defn- local-datalog-batch! [db txs]
   ;; Submit a complete group directly so visibility checks do not depend on
   ;; whether the background worker happens to combine concurrent callers.
@@ -49,6 +62,49 @@
             (let [^SyncQueuedResult result @result]
               {:report (.-report result) :error (.-error result)}))
           results)))
+
+(deftest local-datalog-group-consolidates-metadata-and-cache-invalidation
+  (doseq [prepared? [false true]]
+    (let [path (u/tmp-dir (str "local-group-bookkeeping-" (random-uuid)))
+          conn (d/create-conn path {:counter {:db/valueType :db.type/long}}
+                              opts)]
+      (try
+        (d/transact! conn [{:db/id 100 :counter 100}])
+        (let [store (:store @conn)
+              lmdb (d/datalog-kv conn)
+              before (:last-committed-lsn (d/txlog-watermarks lmdb))
+              token (db/cache-token store)
+              unchanged [:e-datoms 100]
+              affected [:e-datoms 1]
+              _ (db/cache-put store unchanged :retain)
+              _ (db/cache-put store affected :discard)
+              txs (mapv (fn [n]
+                          (if prepared?
+                            [{:db/id n :counter n}]
+                            [[:db.fn/call
+                              (fn [tx-db]
+                                (when (> n 1)
+                                  (is (= (dec n)
+                                         (:counter (d/pull tx-db [:counter] (dec n))))))
+                                [{:db/id n :counter n}])]]))
+                        (range 1 4))
+              results (local-datalog-batch! conn txs)
+              after (db/cache-token (:store @conn))
+              writes (metadata-writes-after lmdb before)]
+          (is (every? nil? (map :error results)))
+          (is (= [[[:put c/meta :max-tx (:max-tx @conn) :attr :long]
+                   [:put c/meta :last-modified (i/last-modified (:store @conn))
+                    :attr :long]]]
+                 writes))
+          (is (identical? (first token) (first after)))
+          ;; One invalidation plus the fence when caching is re-enabled.
+          (is (= (+ 2 (second token)) (second after)))
+          (is (= :retain (db/cache-get store unchanged)))
+          (is (nil? (db/cache-get store affected)))
+          (is (false? (db/cache-put-if-current store token affected :stale)))
+          (is (= #{[1] [2] [3] [100]}
+                 (d/q '[:find ?n :where [_ :counter ?n]] @conn))))
+        (finally (d/close conn) (u/delete-files path))))))
 
 (deftest local-datalog-group-observes-preceding-writes
   (doseq [prepare? [false true]
@@ -337,7 +393,7 @@
 (deftest queued-rmw-shares-a-durable-commit-and-preserves-every-update
   (with-kv
     (fn [db path]
-      (let [g (kv/strict-write-group db :kv)
+      (let [g (kv/write-group db :kv)
             entered (promise)
             release (promise)
             before (:last-committed-lsn (d/txlog-watermarks db))
@@ -378,7 +434,7 @@
 (deftest bad-request-rolls-back-group-and-does-not-fail-other-callers
   (with-kv
     (fn [db _]
-      (let [g (kv/strict-write-group db :kv)
+      (let [g (kv/write-group db :kv)
             entered (promise) release (promise)
             first-job (future (d/update-kv db "counter" 1
                                           (fn [old] (deliver entered true)
@@ -407,11 +463,11 @@
       (let [before (atom 0) after (atom [])]
         (binding [cpp/*before-write-commit-fn* (fn [_] (swap! before inc))
                   kvtx/*after-txlog-append-fn* #(swap! after conj (:txlog-lsn %))]
-          (is (nil? (kv/strict-write-group db :kv)))
+          (is (nil? (kv/write-group db :kv)))
           (is (= :transacted (d/update-kv db "counter" 1 inc :id :long))))
         (is (= 1 @before (count @after))))
       (d/with-transaction-kv [tx db]
-        (is (nil? (kv/strict-write-group tx :kv)))
+        (is (nil? (kv/write-group tx :kv)))
         (d/update-kv tx "counter" 1 inc :id :long)
         (d/abort-transact-kv tx))
       (is (= 1 (d/get-value db "counter" 1 :id :long))))))
@@ -511,9 +567,13 @@
                     (range 4)))
       (let [store ^Store (#'server/get-store srv "dl" false)
             lmdb (.-lmdb store)
-            g (kv/strict-write-group lmdb :server-datalog)
+            g (kv/write-group lmdb :server-datalog)
             before (:last-committed-lsn (d/txlog-watermarks lmdb))
             clients (mapv #(.-client ^DatalogStore (:store @%)) @handles)
+            _ (client/request (clients 0) {:type :db-changes :writing? false
+                                           :args ["dl" nil 0]})
+            topic (:notifications (#'server/server-db-state srv "dl"))
+            published (atom [])
             messages (mapv (fn [idx]
                              (let [kind (nth [:tx-data :tx-data+db-info :tx-data-ack]
                                              (mod idx 3))
@@ -526,6 +586,13 @@
                                 :client-op-response-kind kind}))
                            (range 4))
             first? (atom true)]
+        (add-watch topic ::group-notifications
+                   (fn [_ _ _ _]
+                     (let [db (:dt-db (#'server/server-db-state srv "dl"))]
+                       (swap! published conj
+                              {:max-tx (:max-tx db)
+                               :persisted-max-tx (d/get-value lmdb c/meta :max-tx :attr :long)
+                               :lsn (:last-committed-lsn (d/txlog-watermarks lmdb))}))))
         (kvtx/set-storage-fault-hook!
           (fn [{:keys [stage]}]
             (when (and (= stage :txlog-sync)
@@ -537,9 +604,13 @@
         (doseq [idx (range 1 4)]
           (swap! jobs conj (future (client/request (clients idx) (messages idx))))
           (is (await! #(= idx (queued g)))))
+        (is (empty? @published))
         (deliver release true)
         (let [responses (mapv #(deref % 10000 ::timeout) @jobs)]
           (is (= (+ before 2) (:last-committed-lsn (d/txlog-watermarks lmdb))))
+          (is (= [2 2] (mapv count (metadata-writes-after lmdb before))))
+          (is (= [(inc before) (+ before 2)] (mapv :lsn @published)))
+          (is (every? #(= (:max-tx %) (:persisted-max-tx %)) @published))
           (doseq [idx (range 4)]
             (let [response (responses idx)
                   message (messages idx)
@@ -553,7 +624,8 @@
                 (is (= #{:result :db-info} (set (keys (:result response))))))
               (is (= (metadata (:result response))
                      (metadata (cop/record-response record))
-                     (metadata (:result replay))))))))
+                     (metadata (:result replay))))))
+          (is (= 2 (count @published)))))
       (finally
         (deliver release true)
         (doseq [job @jobs] (deref job 10000 nil))

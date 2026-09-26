@@ -269,6 +269,35 @@
     (ensure-current! this)
     this))
 
+(deftype ^:no-doc WriteGroup [lmdb owner ^longs metadata ^FastList datoms])
+
+(def ^:dynamic *write-group* nil)
+
+(defn ^:no-doc current-write-group
+  "Return bookkeeping for this thread's private writing handle, if grouped."
+  [lmdb]
+  (when-let [^WriteGroup group *write-group*]
+    (when (and (identical? lmdb (.-lmdb group))
+               (identical? (Thread/currentThread) (.-owner group)))
+      group)))
+
+(defn ^:no-doc write-group
+  "Create bookkeeping scoped to one native writing transaction."
+  [lmdb]
+  {:pre [(lmdb/writing? lmdb)]}
+  (WriteGroup. lmdb (Thread/currentThread) (long-array [-1 0]) (FastList.)))
+
+(defn ^:no-doc flush-write-group!
+  "Stage the final metadata pair in the group's existing native transaction."
+  [^WriteGroup group]
+  (let [^longs metadata (.-metadata group)
+        tx-id (aget metadata 0)]
+    (when-not (neg? tx-id)
+      (transact-kv (.-lmdb group)
+                   [(lmdb/kv-tx :put c/meta :max-tx tx-id :attr :long)
+                    (lmdb/kv-tx :put c/meta :last-modified
+                                (aget metadata 1) :attr :long)]))))
+
 (defn- merge-missing-idoc-indices
   [lmdb idoc-indices schema opts]
   (let [missing (into {}
@@ -385,7 +414,13 @@
 
   (closed? [_] (or local-closed? (closed-kv? lmdb)))
 
-  (last-modified [_] (get-value lmdb c/meta :last-modified :attr :long))
+  (last-modified [_]
+    (if-let [^WriteGroup group (current-write-group lmdb)]
+      (let [^longs metadata (.-metadata group)]
+        (if (neg? (aget metadata 0))
+          (get-value lmdb c/meta :last-modified :attr :long)
+          (aget metadata 1)))
+      (get-value lmdb c/meta :last-modified :attr :long)))
 
   (max-gt [_] max-gt)
 
@@ -2347,10 +2382,15 @@
                                        :updated-ms modified-ms)))))
        ;; Only used to decide whether to wake the worker after staging writes.
        (when id-jobs (aset work id-jobs-slot id-jobs))
-       (.add txs (lmdb/kv-tx :put c/meta :max-tx tx-id :attr :long))
-       (.add txs (lmdb/kv-tx :put c/meta :last-modified
-                              modified-ms
-                              :attr :long)))
+       (if-let [^WriteGroup group (current-write-group (.-lmdb store))]
+         (let [^longs metadata (.-metadata group)]
+           (aset metadata 0 tx-id)
+           (aset metadata 1 modified-ms))
+         (do
+           (.add txs (lmdb/kv-tx :put c/meta :max-tx tx-id :attr :long))
+           (.add txs (lmdb/kv-tx :put c/meta :last-modified
+                                  modified-ms
+                                  :attr :long)))))
      (doseq [tx extra-kv-txs]
        (.add txs tx))
      {:txs txs

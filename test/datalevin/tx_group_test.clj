@@ -31,13 +31,17 @@
         caller (Thread/currentThread)
         context (Object.)]
     (doseq [value [nil false :done (object-array [1 2])]]
-      (binding [*submitted-value* value]
+      (binding [*submitted-value* value
+                group/*request-count* 17
+                group/*batched?* true]
         (let [op (fn [tx]
+                   (is (= 1 group/*request-count*))
                    (is (identical? context tx))
                    (is (identical? caller (Thread/currentThread)))
                    *submitted-value*)
               result (group/submit! g (fn [execute]
                                        (is (identical? op execute))
+                                       (is (false? group/*batched?*))
                                        (execute context))
                                     op)]
           (is (identical? value result)))))

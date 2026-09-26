@@ -2188,6 +2188,7 @@
                           (long (max now-ms
                                      (long @(:last-sync-ms sync-manager)))))
                  (vreset! (:unsynced-count sync-manager) 0)
+                 (txlog/reset-group-counts! sync-manager)
                  (vreset! (:pending-lsn-head sync-manager) 0)
                  (vreset! (:pending-lsn-tail sync-manager) 0)
                  (vreset! (:pending-lsn-size sync-manager) 0)

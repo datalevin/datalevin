@@ -49,7 +49,7 @@
   (:import
    [datalevin.datom Datom]
    [datalevin.interface IRemoteDB IRemotePrepared IStore]
-   [datalevin.storage Store]
+   [datalevin.storage Store WriteGroup]
    [datalevin.utl LRUCache]
    [java.nio ByteBuffer]
    [java.util Comparator]
@@ -604,6 +604,22 @@
          (.setTarget cache (long (or target 0))))
        (mark-remote-cache-max-tx! store remote-max-tx))
      (refresh-cache store target remote-max-tx))))
+
+(defn ^:no-doc execute-write-group
+  "Execute logical writes on a private writing connection with caching disabled.
+  Flush final metadata and invalidate combined dependencies before native commit."
+  [conn execute]
+  (let [^Store store (:store @conn)
+        ^WriteGroup group (s/write-group (.-lmdb store))]
+    (assert (cache-disabled? store))
+    (binding [s/*write-group* group]
+      (let [result (execute conn)
+            ^FastList datoms (.-datoms group)
+            ^longs metadata (.-metadata group)]
+        (s/flush-write-group! group)
+        (when-not (neg? (aget metadata 0))
+          (invalidate-cache (:store @conn) datoms (aget metadata 1)))
+        {:result result :changed? (not (.isEmpty datoms))}))))
 
 (defn- tx-cache-empty?
   [db]
@@ -1609,10 +1625,11 @@
              (run-report-ensures! (transfer (:db-after report) store)
                                   report))
            (s/mark-state-current! ^Store store commit-ms)
-           ;; The commit persisted this exact value. Reuse it for cache
-           ;; invalidation instead of opening a post-commit LMDB read txn only
-           ;; to fetch :last-modified again.
-           (invalidate-cache store tx-data commit-ms)
+           (if-let [^WriteGroup group
+                    (s/current-write-group (.-lmdb ^Store store))]
+             (doseq [datom tx-data] (.add ^FastList (.-datoms group) datom))
+             ;; Reuse the persisted timestamp without a post-commit read txn.
+             (invalidate-cache store tx-data commit-ms))
            db)
          (do
            (load-datoms store tx-data)

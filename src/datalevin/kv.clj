@@ -64,8 +64,8 @@
 
 (declare raw-lmdb)
 
-(defn strict-write-group
-  "Return the shared admission queue for eligible standalone strict writes.
+(defn write-group
+  "Return the admission queue for eligible standalone strict or relaxed writes.
   Explicit transactions, HA, and shared-WAL stores retain their current path."
   [db kind]
   (when (and group/*enabled?*
@@ -75,7 +75,7 @@
              (not (Thread/holdsLock (l/write-txn db))))
     (let [info @(i/kv-info db)
           state (:txlog-state info)]
-      (when (and state (= :strict (:durability-profile state))
+      (when (and state (#{:strict :relaxed} (:durability-profile state))
                  (not (:wal-shared? state))
                  (nil? (:ha-mode info))
                  (kvtx/txlog-write-path-enabled? db))
@@ -86,9 +86,9 @@
                                 (group/create (txlog/group-commit info))))))))))
 
 (defn grouped-write!
-  "Execute a standalone KV operation in a strict durable group when eligible."
+  "Execute a standalone KV operation in a group under its durability policy."
   [db op]
-  (if-let [g (strict-write-group db :kv)]
+  (if-let [g (write-group db :kv)]
     (group/submit! g
                    (fn [execute]
                      (l/with-transaction-kv [tx db]
@@ -554,7 +554,7 @@
     (.transact-kv this dbi-name txs k-type :data))
   (transact-kv
     [this dbi-name txs k-type v-type]
-    (if-let [g (strict-write-group db :kv)]
+    (if-let [g (write-group db :kv)]
       (group/submit! g
                      (fn [execute]
                        (l/with-transaction-kv [tx this]

@@ -15,6 +15,7 @@
    [datalevin.constants :as c]
    [datalevin.interface :as i]
    [datalevin.lmdb]
+   [datalevin.tx-group :as group]
    [datalevin.txlog.codec :as tcodec]
    [datalevin.txlog.meta :as tmeta]
    [datalevin.txlog.recovery :as trec]
@@ -26,6 +27,7 @@
    [java.nio ByteBuffer]
    [java.nio.channels FileChannel FileLock OverlappingFileLockException]
    [java.nio.file StandardOpenOption]
+   [java.util ArrayDeque]
    [java.util.concurrent.locks ReentrantLock]
    [org.eclipse.collections.impl.list.mutable FastList]
 ))
@@ -1313,7 +1315,11 @@
   (let [{:keys [append-res append-start-ms ch lsn near-roll?
                 sid sync-manager]}
         (append-prepared-record! state rows hooks)
-        sync-begin (append-sync-transition! sync-manager lsn append-start-ms)
+        request-count (long (if (:wal-shared? state) 1 group/*request-count*))
+        sync-begin (if (= request-count 1)
+                     (append-sync-transition! sync-manager lsn append-start-ms)
+                     (append-sync-transition! sync-manager lsn append-start-ms
+                                              {:request-count request-count}))
         sync-res (when sync-begin
                    (perform-sync-round! state
                                         ch
@@ -1558,6 +1564,10 @@
    :forced-sync-count (volatile! 0)
    :last-sync-reason (volatile! nil)
    :unsynced-count (volatile! pending0)
+   ;; Physical LSNs remain unchanged. Only grouped private-WAL appends need
+   ;; extra weights, retained until their own LSN is durably synced.
+   :pending-group-counts (ArrayDeque.)
+   :pending-group-extra-count (volatile! 0)
    :pending-lsn-queue (volatile! (long-array pending-lsn-queue-initial-capacity))
    :pending-lsn-head (volatile! 0)
    :pending-lsn-tail (volatile! 0)
@@ -1718,8 +1728,27 @@
            {:type :txlog/unhealthy
             :failure @(:failure manager)})))
 
+(defn reset-group-counts!
+  "Clear logical request weights when resetting the WAL recovery floor.
+  The caller owns the sync manager or the runtime state guard."
+  [manager]
+  (.clear ^ArrayDeque (:pending-group-counts manager))
+  (vreset! (:pending-group-extra-count manager) 0))
+
+(defn- drop-durable-group-counts!
+  [manager ^long durable-lsn]
+  (let [^ArrayDeque queue (:pending-group-counts manager)
+        extra-count (:pending-group-extra-count manager)]
+    (loop [remaining (long @extra-count)]
+      (if-let [^longs entry (.peekFirst queue)]
+        (if (<= (aget entry 0) durable-lsn)
+          (do (.removeFirst queue)
+              (recur (- remaining (aget entry 1))))
+          (vreset! extra-count remaining))
+        (vreset! extra-count remaining)))))
+
 (defn- request-sync-on-append-under-monitor!
-  [manager lsn now]
+  [manager lsn now request-count]
   (ensure-sync-manager-healthy! manager)
   (let [last-appended-lsn (long @(:last-appended-lsn manager))
         unsynced-count (long @(:unsynced-count manager))
@@ -1730,7 +1759,9 @@
         lsn* (long lsn)
         new-appended (max last-appended-lsn lsn*)
         appended-delta (max 0 (- ^long new-appended ^long last-appended-lsn))
-        unsynced-after (+ ^long unsynced-count ^long appended-delta)
+        extra-count (if (pos? appended-delta)
+                      (max 0 (dec (long request-count))) 0)
+        unsynced-after (+ unsynced-count appended-delta extra-count)
         elapsed (max 0 (- ^long (long now) ^long last-sync-ms))
         count? (>= ^long unsynced-after ^long group-commit)
         time? (and (pos? unsynced-after)
@@ -1740,6 +1771,11 @@
                  count? :batch-count
                  time? :batch-time
                  :else nil)]
+    (when (pos? extra-count)
+      (.addLast ^ArrayDeque (:pending-group-counts manager)
+                (long-array [lsn* extra-count]))
+      (vreset! (:pending-group-extra-count manager)
+               (+ (long @(:pending-group-extra-count manager)) extra-count)))
     (vreset! (:last-appended-lsn manager) new-appended)
     (vreset! (:unsynced-count manager) unsynced-after)
     (when (and reason (not sync-requested?))
@@ -1752,7 +1788,7 @@
   ([manager lsn] (request-sync-on-append! manager lsn (now-ms)))
   ([{:keys [monitor] :as manager} lsn now]
    (locking monitor
-     (request-sync-on-append-under-monitor! manager lsn now))))
+     (request-sync-on-append-under-monitor! manager lsn now 1))))
 
 (defn request-sync-if-needed!
   ([manager] (request-sync-if-needed! manager (now-ms)))
@@ -1834,17 +1870,19 @@
 
 (defn append-sync-transition!
   "Run append-side sync-manager transitions under one monitor lock.
+   :request-count weights this record's logical requests for the sync threshold.
    Returns the optional begin-sync payload for the caller to perform fsync."
   ([sync-manager lsn now]
    (append-sync-transition! sync-manager lsn now {}))
   ([{:keys [monitor] :as sync-manager} lsn now
-    {:keys [force? begin-lsn]
-     :or {force? false begin-lsn nil}}]
+    {:keys [force? begin-lsn request-count]
+     :or {force? false begin-lsn nil request-count 1}}]
    (locking monitor
      (let [requested? (boolean
                        (request-sync-on-append-under-monitor! sync-manager
                                                               lsn
-                                                              now))
+                                                              now
+                                                              request-count))
            _ (when force?
                (request-sync-now-under-monitor! sync-manager))
            sync-begin (when (or force? requested?)
@@ -1859,7 +1897,9 @@
         sync-request-reason @(:sync-request-reason manager)
         target (long (or target-lsn last-appended-lsn last-durable-lsn))
         durable (max ^long last-durable-lsn target)
-        pending-after (max 0 (- ^long last-appended-lsn ^long durable))
+        _ (drop-durable-group-counts! manager durable)
+        pending-after (+ (max 0 (- last-appended-lsn durable))
+                         (long @(:pending-group-extra-count manager)))
         reason* (normalize-sync-reason
                  (or reason
                      @(:last-sync-reason manager)

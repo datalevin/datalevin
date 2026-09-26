@@ -230,7 +230,7 @@
                            :client-opts {:pool-size 3}})
             client (.-client ^DatalogStore (:store @conn))
             store ^Store (#'server/get-store srv "items" false)
-            g ^Group (kv/strict-write-group (.-lmdb store) :server-datalog)]
+            g ^Group (kv/write-group (.-lmdb store) :server-datalog)]
         (try
           (is (some? g))
           ;; Hold admission until all requests queue, forcing one shared native

@@ -2,7 +2,8 @@
 ;; Distributed under the Eclipse Public License 2.0.
 (ns ^:no-doc datalevin.tx-group
   "Collect synchronous writes before acquiring the native writer. A group is
-  executed in one native transaction and acknowledged only after durable commit."
+  executed in one native transaction and acknowledged after native commit and
+  the configured WAL durability policy."
   (:refer-clojure :exclude [run!])
   (:import [java.util.concurrent ConcurrentLinkedQueue Semaphore]
            [java.util.concurrent.atomic AtomicBoolean]
@@ -10,6 +11,15 @@
            [org.eclipse.collections.impl.list.mutable FastList]))
 
 (def ^:dynamic *enabled?* true)
+(def ^:dynamic *batched?*
+  "Whether the transaction runner is executing queued requests."
+  false)
+
+(def ^:dynamic *request-count*
+  "Logical requests in the current physical transaction, for WAL sync counts.
+  Bound around run-transaction so it covers commit after the request bodies
+  restore their submitting threads' bindings."
+  1)
 
 (deftype Request [op result ^Semaphore ready])
 (deftype Group [^ReentrantLock lock ^ConcurrentLinkedQueue queue ^long limit
@@ -47,7 +57,11 @@
 (defn- run!
   [run-transaction ^FastList requests]
   (try
-    (complete! requests (run-transaction #(execute requests %)) nil)
+    (complete! requests
+               (binding [*batched?* true
+                         *request-count* (.size requests)]
+                 (run-transaction #(execute requests %)))
+               nil)
     (catch Throwable t
       (if (::body-failure (ex-data t))
         (if (= 1 (.size requests))
@@ -115,7 +129,7 @@
       (if ok? value (throw ^Throwable value)))))
 
 (defn submit!
-  "Run op in a durable transaction, batching contended callers.
+  "Run op in a transaction under its durability policy, batching contended callers.
   run-transaction receives a function of the private writing context, returns
   its result, and owns commit and state publication. An idle caller passes op
   directly, without queue or batch allocations. Queued operations capture the
@@ -129,7 +143,11 @@
                (.tryLock lock))
         (try
           (try
-            (run-transaction op)
+            (if (and (= 1 *request-count*) (not *batched?*))
+              (run-transaction op)
+              (binding [*request-count* 1
+                        *batched?* false]
+                (run-transaction op)))
             (finally (.unlock lock)))
           (finally (handoff! group)))
         (submit-queued! group run-transaction op true)))

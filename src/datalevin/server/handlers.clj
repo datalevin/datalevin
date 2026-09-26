@@ -1474,7 +1474,7 @@
 
 (def ^:dynamic ^:private *datalog-write-group* nil)
 
-(defn- server-strict-write-group
+(defn- server-write-group
   [deps server db-name store kind]
   (when-not (ha-runtime-read-state? (db-state deps server db-name))
     ;; Dispatch installs these per-database HA guards even on ordinary stores.
@@ -1483,14 +1483,14 @@
     ;; with their own commit hooks must stay on their original path.
     (binding [cpp/*before-write-commit-fn* nil
               kvtx/*after-txlog-append-fn* nil]
-      (kv/strict-write-group store kind))))
+      (kv/write-group store kind))))
 
 (defn- with-datalog-transaction-slot
   [deps server skey db-name writing? simulated? f]
   (if-let [g (when (and (not writing?) (not simulated?))
                (let [store (dt-store deps server skey db-name false)]
                  (when (instance? Store store)
-                   (server-strict-write-group deps server db-name
+                   (server-write-group deps server db-name
                                               (.-lmdb ^Store store) :server-datalog))))]
     (binding [*datalog-write-group* g] (f))
     (with-direct-db-transaction-slot deps server db-name writing? f)))
@@ -1529,12 +1529,18 @@
               deps server db-name false
               (fn []
                 (let [conn (atom (:dt-db (db-state deps server db-name)))
-                      results (d/with-transaction [tx conn]
-                                (execute tx))
+                      outcome (d/with-transaction [tx conn]
+                                (if group/*batched?*
+                                  (db/execute-write-group tx execute)
+                                  (let [report (execute tx)]
+                                    {:result report
+                                     :changed? (boolean (seq (:tx-data report)))})))
                       db-after @conn]
                   ((:update-db deps) server db-name
                    #(assoc % :dt-db db-after :store (:store db-after)))
-                  results))))
+                  (when (:changed? outcome)
+                    (database-changed! deps server db-name false))
+                  (:result outcome)))))
           (fn [conn]
             (let [report (transact @conn)
                   db-after (:db-after report)]
@@ -1587,7 +1593,7 @@
                    (assoc :store (:store db1))))))
         ack? (= response-kind cop/tx-data-ack-response-kind)
         rp  (if ack? rp (assoc-in rp [:tempids :max-eid] (:max-eid db1)))]
-    (when (and (not s?) (seq (:tx-data rp)))
+    (when (and (not s?) (not (::group-committed? rp)) (seq (:tx-data rp)))
       (database-changed! deps server db-name writing?))
     (cond-> (cond-> (if ack? {:result :transacted}
                        (select-keys rp [:tx-data :tempids]))
@@ -2425,7 +2431,7 @@
                                  (i/transact-kv tx txs)
                                  (i/transact-kv tx dbi-name txs k-type v-type)))]
                       (if-let [g (when (and (not writing?) (= :request mode))
-                                   (server-strict-write-group deps server db-name
+                                   (server-write-group deps server db-name
                                                               kv-store :server-kv))]
                         (group/submit!
                           g
@@ -2470,7 +2476,7 @@
                                               :transacted))]))
                                   :transacted)]
                       (if-let [g (when-not writing?
-                                   (server-strict-write-group deps server db-name
+                                   (server-write-group deps server db-name
                                                               store :server-kv))]
                         (group/submit!
                           g

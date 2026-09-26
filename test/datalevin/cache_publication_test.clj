@@ -13,8 +13,8 @@
   (into #{} (map #(aget ^objects % 0)) tuples))
 
 (deftest disabled-reader-cannot-cache-a-pre-commit-snapshot
-  (doseq [wal? [false true], abort? [false true]]
-    (testing (str "wal=" wal? ", abort=" abort?)
+  (doseq [wal? [false true], abort? [false true], grouped? [false true]]
+    (testing (str "wal=" wal? ", abort=" abort? ", grouped=" grouped?)
       (let [dir     (u/tmp-dir (str "cache-publication-" (UUID/randomUUID)))
             conn    (d/create-conn dir {:value {:db/valueType :db.type/long}}
                                    {:wal? wal?})
@@ -27,8 +27,13 @@
         (try
           (d/transact! conn [{:db/id 1 :value 100}])
           (d/with-transaction [cn conn]
-            (d/with-transaction [nested cn]
-              (d/transact! nested [{:db/id 2 :value 101}]))
+            (let [write (fn [tx]
+                          (d/with-transaction [nested tx]
+                            (d/transact! nested [{:db/id 2 :value 101}])
+                            (d/transact! nested [{:db/id 2 :value 102}])))]
+              (if grouped?
+                (db/execute-write-group cn write)
+                (write cn)))
             ;; Nested completion must leave caching disabled until the outer
             ;; native transaction commits or rolls back.
             (is (db/cache-disabled? store))
