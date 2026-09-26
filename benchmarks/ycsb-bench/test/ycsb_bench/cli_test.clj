@@ -4,7 +4,8 @@
             [clojure.test :refer [deftest is use-fixtures]]
             [datalevin-bench.host :as host]
             [ycsb-bench.core :as core]
-            [ycsb-bench.runner :as runner])
+            [ycsb-bench.runner :as runner]
+            [ycsb-bench.sql :as sql])
   (:import [java.nio.file Files]
            [java.nio.file.attribute FileAttribute]
            [java.time Instant]))
@@ -82,6 +83,16 @@
               (pr-str args))
           (is (not (.exists file))))))))
 
+(deftest timed-zipfian-inserts-fail-before-preflight-test
+  (with-redefs [sql/check-postgres! (fn [_] (throw (AssertionError. "Unexpected PostgreSQL connection")))
+                runner/run-case! (fn [_] (throw (AssertionError. "Unexpected benchmark run")))
+                host/pause! (fn [] (throw (AssertionError. "Unexpected host control")))]
+    (doseq [workload ["e" "all"]
+            timer ["--warmup-ms" "--measurement-ms"]]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"require an explicit --zipfian-keyspace"
+                           (core/-main "--system" "all" "--api" "datalog" "--mode" "remote"
+                                       "--workload" workload timer "10"))))))
+
 (deftest cli-file-report-test
   (with-report-path
     (fn [file]
@@ -144,6 +155,23 @@
           (if existing?
             (is (= previous (slurp file)))
             (is (not (.exists file)))))))))
+
+(deftest timed-zipfian-cli-report-test
+  (let [output (with-out-str
+                 (apply core/-main
+                        (concat small-args
+                                ["--system" "sqlite" "--workload" "e"
+                                 "--warmup-ms" "10" "--measurement-ms" "20"
+                                 "--zipfian-keyspace" "32" "--value-audit"])))
+        report (edn/read-string (subs output (str/index-of output "{")))
+        result (first (:results report))]
+    (is (= 32 (get-in result [:configuration :zipfian-keyspace])
+           (get-in result [:warmup :zipfian-keyspace])
+           (get-in result [:measured :zipfian-keyspace])))
+    (is (>= (get-in result [:warmup :seconds]) 0.01))
+    (is (>= (get-in result [:measured :seconds]) 0.02))
+    (is (= :passed (get-in result [:warmup :validation :value-checks :status])
+           (get-in result [:validation :value-checks :status])))))
 
 (deftest timed-repeated-cli-report-test
   (with-report-path

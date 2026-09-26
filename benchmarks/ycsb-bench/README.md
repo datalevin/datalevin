@@ -65,7 +65,7 @@ other platforms perform no process control.
 All stores index the application key and leave payload fields unindexed,
 matching upstream YCSB's SQL schema. Datalog payload attributes use
 `:db/noindex true`; `:ycsb/key` retains its unique AVE index for point lookups and
-ordered scans. Reads and scans pull the payload fields from EAV. KV stores the
+ordered scans. Point reads pull payload fields from EAV; scans project them with `prepare-q`. KV stores the
 payload in each record's value, and SQL creates only the primary-key index.
 There is one index policy for all comparisons; `--sql-indexes` has been removed.
 For SQL results, `:api` identifies the Datalevin API used for the comparison.
@@ -203,24 +203,34 @@ using the configured request distribution and converts it to that string key.
 * **KV:** the `records` DBI uses a `:string` key and a payload vector encoded as
   `:data`. `get-first-n` starts at `[:at-least start]` and returns at most N entries.
 * **Datalog:** `:ycsb/key` is a string attribute with `:db.unique/value`.
-  Internal entity IDs are assigned by Datalevin. The prepared query filters
-  `:ycsb/key >= start`, orders by that attribute, limits the result, and pulls
-  the payload fields. The page size is a scalar query input and feeds the
-  literal window, so one prepared query per store serves every requested limit;
+  Internal entity IDs are assigned by Datalevin. The prepared access path scans
+  `:ycsb/key >= start` in key order and applies the page limit in AVE, then
+  projects all payload fields with EAV. The page size is a scalar query input
+  and feeds the literal window, so one prepared query per store serves every requested limit;
   the planner still sees a concrete limit for each execution. Remote E executes
-  the query and pulls in one request.
+  the prepared query in one request.
 * **SQL:** `YCSB_KEY VARCHAR(255)` is the primary key, using the database's
   default collation and ordinary table layout. There are no secondary indexes.
   Every insert, including loading, is an individual autocommit statement.
 
-For a page of ten records, the prepared Datalog query is:
+With the default ten payload fields, the prepared Datalog query is:
 
 ```clojure
-{:find [?key (pull ?entity [:ycsb/field0 :ycsb/field1 ; ...all configured fields
-                            :ycsb/field9])]
+{:find [?key ?field0 ?field1 ?field2 ?field3 ?field4
+        ?field5 ?field6 ?field7 ?field8 ?field9]
  :in [$ ?start ?limit]
  :where [[?entity :ycsb/key ?key]
-         [(>= ?key ?start)]]
+         [(>= ?key ?start)]
+         [?entity :ycsb/field0 ?field0]
+         [?entity :ycsb/field1 ?field1]
+         [?entity :ycsb/field2 ?field2]
+         [?entity :ycsb/field3 ?field3]
+         [?entity :ycsb/field4 ?field4]
+         [?entity :ycsb/field5 ?field5]
+         [?entity :ycsb/field6 ?field6]
+         [?entity :ycsb/field7 ?field7]
+         [?entity :ycsb/field8 ?field8]
+         [?entity :ycsb/field9 ?field9]]
  :order-by [?key]
  :limit ?limit}
 ```
@@ -242,9 +252,15 @@ and checks exact page membership and every payload character outside timing.
 
 Reports mark E with `:workload-model :application-key-range-v1`. Historical E
 scores using entity-ID intervals or conversation keys need fresh baselines.
-The current planner probe uses ordered AVE access and ten pulls for a limit of
-ten, with 500 eligible keys. The benchmark submits the declarative query above.
-See the [plan and distribution probes](../../doc/ycsb-application-key-2026-09-24/README.md).
+The prepared access-path plan applies the page limit in the ordered AVE key
+scan, then projects fields for those selected entities with one EAV scan. Fields
+stay unindexed, and scans return tuples without pull or entity-range
+materialization. Reports identify this with
+`:storage :scan-projection :fields`. The
+[older plan and distribution probes](../../doc/ycsb-application-key-2026-09-24/README.md)
+used pull projection and are historical measurements. See the
+[prepared field scan probe](../../doc/ycsb-e-prepared-fields-2026-09-26/README.md)
+for the current access path and a comparison with prepared pull.
 
 | Durability profile | Datalevin | SQLite | PostgreSQL |
 | --- | --- | --- | --- |
@@ -304,6 +320,11 @@ configurations, excluding only the trial number. Durability, dataset size,
 field size, and measurement duration remain separate conditions.
 Timed phases run for the requested duration, then finish in-flight operations;
 `--warmup-ms` and `--measurement-ms` override their respective operation counts.
+Timed workloads that insert with Zipfian selection require an explicit
+`--zipfian-keyspace N`. This includes default E, `--workload all`, and D with
+`--distribution zipfian`. The requirement applies to either a timed measurement
+or a positive-duration warmup; a zero-duration warmup is skipped. Missing
+keyspaces are rejected before any databases or servers are opened.
 Every latency sample is retained, and percentile calculation is outside phase
 timing. The timed latest sampler starts with the loaded record count and grows
 as inserts commit; growth is included in timing. Overridden operation counts
@@ -454,13 +475,18 @@ The default Zipfian selection follows upstream
 theta 0.99, the Gray inverse approximation over the inclusive `[0, 10^10]`
 source range, its precomputed zeta, then FNV64 modulo a fixed destination
 keyspace. Uncommitted ordinals are rejected and redrawn. Popular records remain
-scattered without moving when inserts commit. The default fixed keyspace is
+scattered without moving when inserts commit. For operation-count phases, the
+default fixed keyspace is
 `records + floor(2 * ops * insert-proportion) + 1` for measurement. Warmup uses
 its own prediction from `warmup` operations. `--zipfian-keyspace N` overrides
 both. Changing warmup duration or count does not change the measured modulus.
-For duration-based runs, set the same sufficiently large keyspace on all engines
-if new inserts should remain eligible; ordinals beyond the fixed keyspace are
-not selected. The report records the actual modulus. No growing CDF is needed
+Duration-based phases cannot predict inserts from an overridden operation count,
+so workloads with Zipfian inserts require this override. For example, with
+`--records 100000 --zipfian-keyspace 200000`, ordinals 0 through 199999 can be
+selected after they commit. Set the same keyspace on every compared engine,
+large enough to include the inserts of interest. Later ordinals cannot be
+selected as scan starts, although those records may appear in scan results.
+The report records the actual modulus for each phase. No growing CDF is needed
 for scrambled Zipfian selection.
 
 Stored keys are hashed separately using upstream `Utils.fnvhash64`. All engines

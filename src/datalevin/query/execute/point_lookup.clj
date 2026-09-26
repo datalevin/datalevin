@@ -17,8 +17,7 @@
    [datalevin.query.execute.result
     :refer [query-result-size result-explain tuple->persistent-vector]]
    [datalevin.query.plan :as qplan]
-   [datalevin.spill :as sp]
-   [datalevin.validate :as vld])
+   [datalevin.spill :as sp])
   (:import
    [clojure.lang IPersistentCollection]
    [java.util List]
@@ -116,8 +115,6 @@
                  (not= :db.type/ref (:db/valueType identity-schema))
                  (every? #(some? (get-in schema [(:attr %) :db/aid]))
                          (:projections shape)))
-        (doseq [{:keys [attr]} (:projections shape)]
-          (vld/validate-indexed-attr schema attr))
         database))))
 
 (defn- point-projection-row
@@ -200,8 +197,6 @@
 (deftype ^:no-doc ProjectionLayout [schema attrs-v ^ints result-indexes])
 
 (defn- projection-layout [shape schema]
-  (doseq [{:keys [attr]} (:projections shape)]
-    (vld/validate-indexed-attr schema attr))
   (let [scan-projections (vec
                            (sort-by #(get-in schema [(:attr %) :db/aid])
                                     (:projections shape)))

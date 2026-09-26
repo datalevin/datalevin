@@ -38,7 +38,7 @@
    [nil "--scan-length N" "Maximum scan length; uniform 1..N (100)" :parse-fn parse-long]
    [nil "--batch-size N" "Datalevin records per load transaction (1); SQL commits each insert" :parse-fn parse-long]
    [nil "--distribution NAME" "uniform, zipfian, latest (workload default)" :parse-fn choice]
-   [nil "--zipfian-keyspace N" "Fixed scrambled keyspace; default predicts inserts with 2x headroom" :parse-fn parse-long]
+   [nil "--zipfian-keyspace N" "Fixed scrambled keyspace; required for timed Zipfian inserts" :parse-fn parse-long]
    [nil "--durability NAME" "WAL profile: strict, relaxed (strict)" :parse-fn choice]
    [nil "--timeout-ms N" "Remote request / SQL timeout (60000)" :parse-fn parse-long]
    [nil "--phase-timeout-ms N" "Cancel an overdue phase after N ms (600000)" :parse-fn parse-long]

@@ -121,8 +121,8 @@
         (execute (if (identical? db (nth inputs 0)) inputs (assoc inputs 0 db)))))))
 
 (defn query-reader
-  "Compile reusable query metadata. The source, remaining inputs, cache tokens,
-  deadlines and general physical plans are resolved for each execution."
+  "Compile reusable result processing and eligible access paths. Sources,
+  inputs, cache tokens, deadlines and general plans stay execution-local."
   [query]
   (result-reader (prepared-query query)))
 

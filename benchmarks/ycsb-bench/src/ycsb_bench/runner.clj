@@ -73,9 +73,20 @@
       (throw (ex-info "value-audit? must be boolean" {})))
     (when (> (+ (:records opts) (max (:ops opts) (:warmup opts))) Integer/MAX_VALUE)
       (throw (ex-info "records + the larger phase operation count must fit a 32-bit integer" {})))
-    (when-let [n (:zipfian-keyspace opts)]
+    (when-some [n (:zipfian-keyspace opts)]
       (when-not (and (integer? n) (<= (:records opts) n Integer/MAX_VALUE))
         (throw (ex-info "zipfian-keyspace must be at least records and fit a 32-bit integer" {}))))
+    ;; A duration supplies no operation count from which to predict inserts.
+    ;; Check every selected workload before opening any comparison resources.
+    (when (and (nil? (:zipfian-keyspace opts))
+               (or (some? (:measurement-ms opts)) (pos? (or (:warmup-ms opts) 0))))
+      (doseq [workload (if (= :all (:workload opts)) (keys w/workloads) [(:workload opts)])
+              :let [spec (w/workloads workload)]
+              :when (and (= :zipfian (or (:distribution opts) (:distribution spec)))
+                         (some (fn [[op weight]] (and (= :insert op) (pos? weight)))
+                               (:mix spec)))]
+        (throw (ex-info "Timed workloads with Zipfian inserts require an explicit --zipfian-keyspace"
+                        {:workload workload}))))
     opts))
 
 (defn cases

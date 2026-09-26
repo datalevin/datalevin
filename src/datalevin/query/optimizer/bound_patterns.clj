@@ -190,6 +190,9 @@
                                  context source attr-value false v-sym)))]
                   (when (and (db/-searchable? source)
                              input-bound?
+                             (or e-bound?
+                                 (not (get-in (db/-schema source)
+                                              [attr-value :db/noindex])))
                              (not unresolved-ref?))
                     {:clause-idx   clause-idx
                      :source       source
@@ -248,6 +251,7 @@
                (fn [{:keys [source attr entity-sym value-sym
                             entity-bound? value-bound?]}]
                  (and entity-bound?
+                      (not (db/pending-tx-cache? source))
                       (not value-bound?)
                       (qu/binding-var? entity-sym)
                       (qu/binding-var? value-sym)
@@ -497,7 +501,9 @@
               (when-let [source (get sources
                                      (clause-source-symbol
                                        (:source parsed-clause)))]
-                (when (db/-searchable? source)
+                (when (and (db/-searchable? source)
+                           (not (get-in (db/-schema source)
+                                        [(:value attr) :db/noindex])))
                   {:clause-idx clause-idx
                    :source     source
                    :pattern    (qresolve/resolve-pattern-lookup-refs

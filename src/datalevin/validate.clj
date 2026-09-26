@@ -39,7 +39,7 @@
   "Reject attribute conditions that require an opted-out AVE index."
   [schema attr]
   (when (:db/noindex (schema attr))
-    (raise "Attribute " attr " has :db/noindex true; call index-attr to enable queries, or use entity access or pull"
+    (raise "Attribute " attr " has :db/noindex true; call index-attr to enable value searches, or bind the entity before reading the attribute"
            {:error :query/unindexed-attribute :attribute attr})))
 
 (defn populated-attribute?

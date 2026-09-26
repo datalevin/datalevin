@@ -147,7 +147,6 @@
    :size unguarded
    :a-size unguarded
    :e-size unguarded
-   :entity-range unguarded
    :av-size unguarded
    :v-size unguarded
    :head unguarded

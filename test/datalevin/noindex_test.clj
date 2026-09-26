@@ -84,13 +84,9 @@
       (doseq [[query inputs]
               [['[:find ?e :where [?e :body "text"]] []]
                ['[:find ?e :where [?e :body ?v]] []]
-               ['[:find ?v :where [1 :body ?v]] []]
-               ['[:find ?e :where [?e :name "one"] [?e :body "text"]] []]
-               ['[:find ?v :in $ ?name :where [?e :name ?name] [?e :body ?v]] ["one"]]
                ['[:find ?e :in $ ?a :where [?e ?a "text"]] [:body]]
                ['[:find ?e :in $ [?a ...] :where [?e ?a "text"]] [[:name :body]]]
                ['[:find ?e :where (or [?e :body "text"] [?e :name "one"])] []]
-               ['[:find ?e :where [?e :name _] (not [?e :body "absent"])] []]
                ['[:find ?e :in $ % :where (has-body ?e)]
                 ['[[(has-body ?e) [?e :body "text"]]]]]]]
         (testing (str query)
@@ -199,3 +195,49 @@
       (is (= #{[1 "one"] [2 "two"]}
              (set (map (juxt :e :v) (d/datoms @conn :ave :body)))))
       (finally (d/close other) (d/close conn) (u/delete-files dir)))))
+
+(deftest bound-unindexed-patterns
+  (let [conn (d/create-conn nil schema {:wal? false :cache-limit 0})]
+    (try
+      (d/transact! conn [{:db/id 1 :name "one" :body "text" :tags ["a" "b"]}
+                         {:db/id 2 :name "two" :body "other" :tags ["b"]}
+                         {:db/id 3 :name "three"}])
+      (doseq [[query inputs expected]
+              [['[:find ?v :where [1 :body ?v]] [] #{["text"]}]
+               ['[:find ?v :where [[:name "one"] :body ?v]] [] #{["text"]}]
+               ['[:find ?e :where [?e :name "one"] [?e :body "text"]] [] #{[1]}]
+               ['[:find ?v :in $ ?name :where [?e :body ?v] [?e :name ?name]]
+                ["one"] #{["text"]}]
+               ['[:find ?v :where [?e :body ?v] [(ground 1) ?e]] [] #{["text"]}]
+               ['[:find ?e ?v :in $ [?e ...] :where [?e :body ?v]]
+                [[1 2 3 99]] #{[1 "text"] [2 "other"]}]
+               ['[:find ?e ?v :in $ [?e ...] [?v ...] :where [?e :body ?v]]
+                [[1 2 3] ["text" "missing"]] #{[1 "text"]}]
+               ['[:find ?e :in $ [?e ...] :where [?e :body _]] [[1 2 3]] #{[1] [2]}]
+               ['[:find ?v :in $ ?e ?a :where [?e ?a ?v]] [1 :body] #{["text"]}]
+               ['[:find ?a ?v :in $ ?e [?a ...] :where [?e ?a ?v]]
+                [1 [:body :tags]] #{[:body "text"] [:tags "a"] [:tags "b"]}]
+               ['[:find ?e ?v :in $ [?e ...] :where [?e :tags ?v]]
+                [[1 2 3]] #{[1 "a"] [1 "b"] [2 "b"]}]
+               ['[:find ?e :where [?e :name _] (not [?e :body "text"])]
+                [] #{[2] [3]}]
+               ['[:find ?e :where [?e :name _] (not-join [?e] [?e :body "text"])]
+                [] #{[2] [3]}]
+               ['[:find ?v :where [?e :name "one"]
+                  (or [?e :body ?v] [?e :tags ?v])]
+                [] #{["text"] ["a"] ["b"]}]
+               ['[:find ?v :in $ [?e ...] :where [?e :body ?v]] [[]] #{}]
+               ['[:find ?body ?tag :in $ ?name
+                  :where [?e :name ?name] [?e :body ?body] [?e :tags ?tag]]
+                ["one"] #{["text" "a"] ["text" "b"]}]]]
+        (testing (str query)
+          (is (= expected (apply d/q query @conn inputs)))
+          (is (= expected (set ((d/prepare-q @conn query) inputs))))))
+      (testing "prepared bound reads survive writes and index backfill"
+        (let [query '[:find ?v :in $ ?e :where [?e :body ?v]]
+              reader (d/prepare-q @conn query)]
+          (d/transact! conn [[:db/add 1 :body "changed"]])
+          (is (= #{["changed"]} (set (reader [1]))))
+          (d/index-attr conn :body)
+          (is (= #{["changed"]} (set (reader [1]))))))
+      (finally (d/close conn)))))

@@ -13,7 +13,8 @@
 
 (def ^:private schema
   {:key {:db/unique :db.unique/identity}
-   :name {} :value {} :friend {:db/valueType :db.type/ref}})
+   :name {} :value {:db/valueType :db.type/long}
+   :friend {:db/valueType :db.type/ref}})
 
 (def ^:private rows
   [{:db/id 1 :key "one" :name "ONE" :value 10 :friend 2}
@@ -22,6 +23,12 @@
 (def ^:private projection
   '[:find ?name ?value :in $ ?key
     :where [?e :key ?key] [?e :name ?name] [?e :value ?value]])
+
+(def ^:private range-query
+  '{:find [?value (pull ?e ?pattern)]
+    :in [$ ?start ?limit ?pattern]
+    :where [[?e :value ?value] [(>= ?value ?start)]]
+    :order-by [?value] :limit ?limit})
 
 (defn- check-query-results [conn]
   (doseq [[query inputs]
@@ -56,15 +63,21 @@
       (doseq [params inputs]
         (is (= (apply d/q query db params) (d/execute-prepared reader params))
             (str query " " params)))))
-  (let [reader (d/prepare-q @conn projection)]
+  (let [reader (d/prepare-q @conn projection)
+        range-reader (d/prepare-q @conn range-query)]
+    (doseq [inputs [[0 1 [:name]] [15 3 [:name :value]] [30 2 [:name]]]]
+      (is (= (apply d/q range-query @conn inputs) (range-reader inputs))))
     (is (= #{["ONE" 10]} (reader ["one"])))
     (is (= #{["TWO" 20]} (apply reader [["two"]])))
     (d/transact! conn [[:db/add 1 :name "updated"]])
     (is (= #{["updated" 10]} (reader ["one"])))
+    (is (= [[10 {:name "updated"}]] (range-reader [0 1 [:name]])))
     (d/update-schema conn {:value {:db/cardinality :db.cardinality/many}})
     (d/transact! conn [[:db/add 1 :value 11]])
     (is (= #{["updated" 10] ["updated" 11]} (reader ["one"])))
     (is (= (d/q projection @conn "one") (reader ["one"])))
+    (is (= (d/q range-query @conn 0 3 [:name :value])
+           (range-reader [0 3 [:name :value]])))
     (is (every? #(= #{["TWO" 20]} %)
                 (mapv deref (repeatedly 4 #(future (reader ["two"]))))))
     (doseq [bad [nil "one" '("one") [] ["one" "two"]]]

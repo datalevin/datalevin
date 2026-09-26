@@ -52,16 +52,18 @@
   {:ycsb/key {:db/valueType :db.type/string :db/unique :db.unique/value}})
 
 (defn scan-query
-  "Select an application key range and return an ordered page with pulls.
+  "Select an application key range and project its payload fields directly.
   The page size is a scalar query input, so one prepared query serves every
   configured limit instead of one preparation per page size."
   [attributes]
-  {:find ['?key (list 'pull '?entity attributes)]
-   :in '[$ ?start ?limit]
-   :where '[[?entity :ycsb/key ?key]
-            [(>= ?key ?start)]]
-   :order-by '[?key]
-   :limit '?limit})
+  (let [fields (mapv #(symbol (str "?field" %)) (range (count attributes)))]
+    {:find (into ['?key] fields)
+     :in '[$ ?start ?limit]
+     :where (into '[[?entity :ycsb/key ?key]
+                    [(>= ?key ?start)]]
+                  (map (fn [attribute field] ['?entity attribute field]) attributes fields))
+     :order-by '[?key]
+     :limit '?limit}))
 
 (defn application-key-info [workload]
   {:workload-model (w/workload-model workload)
@@ -111,7 +113,7 @@
     (d/transact! conn [[:db/add [:ycsb/key key] (nth attributes field) value]]))
   (scan-records [_ start n]
     (if (pos? (long n))
-      (mapv (fn [[key record]] [key (mapv record attributes)])
+      (mapv (fn [row] [(first row) (subvec row 1)])
             (d/execute-prepared @scan-reader [start n]))
       []))
   (record-count [_] (d/count-datoms @conn nil :ycsb/key nil))
@@ -119,6 +121,7 @@
     (merge (application-key-info workload)
            {:layout :entity :read-api :prepare-pull
             :scan-api :prepare-q :scan-selection :attribute-value-range
+            :scan-projection :fields
             :cache-limit (d/datalog-index-cache-limit @conn)}
            (wal-info (d/datalog-kv conn))))
   (close-store! [_] (d/close conn)))

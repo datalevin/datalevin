@@ -382,6 +382,20 @@
         (result-window (sort cmp result) limit offset)))
     result))
 
+(defn prepare-order
+  "Retain column indexes and comparators, while accepting a fresh result and
+  window on every execution. Both internal arrays and public tuples are valid."
+  [find-vars order]
+  (let [vector-cmp (delay (order-comps get find-vars order))
+        array-cmp  (delay (order-comps typed-aget find-vars order))]
+    (fn [result limit offset]
+      (if (seq result)
+        (let [cmp (if (u/array? (first result)) @array-cmp @vector-cmp)]
+          (if (finite-limit? limit)
+            (top-k-result cmp result limit offset)
+            (result-window (sort cmp result) limit offset)))
+        result))))
+
 (defn query-result-size
   [parsed-q result]
   (let [find (:qfind parsed-q)]

@@ -106,24 +106,37 @@
         first-ready (next ready))
       first-ready)))
 
+(defn- bound-field-deps
+  [sources clause]
+  (let [source (get sources (if (qu/source? (first clause))
+                             (first clause) '$))
+        [entity attr] (strip-clause-source clause)]
+    (cond-> (late-clause-deps clause)
+      (and (vector? clause) source (db/-searchable? source)
+           (keyword? attr) (qu/binding-var? entity)
+           (get-in (db/-schema source) [attr :db/noindex]))
+      (assoc :requires #{entity}))))
+
 (defn sort-late-clauses
-  [initial-bound rules clauses]
-  (let [entries (mapv #(assoc (late-clause-deps %) :clause %) clauses)]
-    (loop [bound initial-bound
-           todo  entries
-           acc   []]
-      (if (empty? todo)
-        (mapv :clause acc)
-        (if-let [ready (seq (keep-indexed
-                              (fn [i entry]
-                                (when (late-clause-ready? bound entry) i))
-                              todo))]
-          (let [idx   (best-ready-late-clause bound rules todo ready)
-                entry (nth todo idx)]
-            (recur (into bound (:provides entry))
-                   (u/vec-remove todo idx)
-                   (conj acc entry)))
-          (mapv :clause (into acc todo)))))))
+  ([initial-bound rules clauses]
+   (sort-late-clauses initial-bound rules clauses {}))
+  ([initial-bound rules clauses sources]
+   (let [entries (mapv #(assoc (bound-field-deps sources %) :clause %) clauses)]
+     (loop [bound initial-bound
+            todo  entries
+            acc   []]
+       (if (empty? todo)
+         (mapv :clause acc)
+         (if-let [ready (seq (keep-indexed
+                               (fn [i entry]
+                                 (when (late-clause-ready? bound entry) i))
+                               todo))]
+           (let [idx   (best-ready-late-clause bound rules todo ready)
+                 entry (nth todo idx)]
+             (recur (into bound (:provides entry))
+                    (u/vec-remove todo idx)
+                    (conj acc entry)))
+           (mapv :clause (into acc todo))))))))
 
 (defn- planned-step-vars
   [step]
@@ -146,7 +159,7 @@
     (seq late-clauses)
     (assoc :late-clauses
            (sort-late-clauses (planned-bound-vars context) rules
-                              late-clauses))))
+                              late-clauses (:sources context)))))
 
 (defn- context-bound-values
   [context sym]
@@ -521,6 +534,7 @@
                  source-db
                  (db/-searchable? source-db)
                  attr-schema
+                 (not (:db/noindex attr-schema))
                  (not (contains? bound value))
                  (qor/exact-inequality-range?
                    (idx/value-type attr-schema))
@@ -596,6 +610,7 @@
           values (context-bound-values context value)]
       (when (and source
                  (db/-searchable? source)
+                 (not (get-in (db/-schema source) [(:attr producer) :db/noindex]))
                  (not (contains? bound entity))
                  (contains? bound value)
                  (some? values))
@@ -604,7 +619,8 @@
 (defn- union-producer-estimate
   [context {:keys [source attr producers] :as union}]
   (when-let [source-db (get (:sources context) source)]
-    (when (db/-searchable? source-db)
+    (when (and (db/-searchable? source-db)
+               (not (get-in (db/-schema source-db) [attr :db/noindex])))
       (let [{:keys [probes output]}
             (reduce
               (fn [{:keys [^long probes ^long output]} producer]

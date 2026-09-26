@@ -533,8 +533,8 @@
            {^FlatPattern flat :flat :as parsed-opts} (parse-opts db pattern opts)]
        (if (and flat (nil? (:visitor opts)) (instance? Store store)
                 (not (db/pending-tx-cache? db)))
-         (i/entity-range store (mapv #(db/entid db %) ids)
-                         (.-names flat) (.-aids flat) (.-id? flat))
+         (storage/select-entities store (mapv #(db/entid db %) ids)
+                                  (.-names flat) (.-aids flat) (.-id? flat))
          (mapv #(pull-impl parsed-opts %) ids))))))
 
 (defn pull-many

@@ -13,6 +13,7 @@
    [clojure.set :as set]
    [datalevin.db :as db]
    [datalevin.index :as idx]
+   [datalevin.parser :as dp]
    [datalevin.query.optimizer.range :as qor]
    [datalevin.query-util :as qu]
    [datalevin.util :as u :refer [raise]])
@@ -71,6 +72,20 @@
   [source]
   (if (instance? DefaultSrc source) '$ (:symbol source)))
 
+(defn- unindexed-pattern?
+  [sources clause]
+  (when (instance? Pattern clause)
+    (let [source (get sources (clause-source-symbol (:source clause)))
+          attr (second (:pattern clause))]
+      (and source (db/-searchable? source)
+           (instance? Constant attr)
+           (get-in (db/-schema source) [(:value attr) :db/noindex])))))
+
+(defn- contains-unindexed-pattern?
+  [sources clause]
+  (some #(unindexed-pattern? sources %)
+        (dp/collect #(instance? Pattern %) clause)))
+
 (defn- not-join-optimizable?
   "Conservative check for planner-handled not-join."
   [sources parsed-clause orig-clause]
@@ -87,7 +102,8 @@
           all-vars-used?   (set/subset? (set vars) body-vars)
           searchable-src?  (when-let [db (get sources src)]
                              (db/-searchable? db))]
-      (when (and searchable-src?
+      (when (and (not (contains-unindexed-pattern? sources parsed-clause))
+                 searchable-src?
                  (seq vars)
                  pattern-only?
                  (= 1 (count clause-sources))
@@ -97,7 +113,8 @@
 
 (defn- optimizable?
   [sources resolved clause]
-  (when (instance? Pattern clause)
+  (when (and (instance? Pattern clause)
+             (not (unindexed-pattern? sources clause)))
     (let [{:keys [pattern]} clause]
       (when (and (instance? Constant (second pattern))
                  (not-any? resolved (map :symbol pattern)))
@@ -213,7 +230,8 @@
 
 (defn- or-join-optimizable?
   [sources resolved clause pattern-entity-vars rule-derived-vars]
-  (when (or-join-clause? clause)
+  (when (and (or-join-clause? clause)
+             (not (contains-unindexed-pattern? sources clause)))
     (let [vars          (get-or-join-vars clause)
           will-be-bound (set/union resolved pattern-entity-vars)
           bound-vars    (filterv will-be-bound vars)

@@ -1328,12 +1328,25 @@ attribute's schema before storing its values to omit it from AVE. Its values
 remain in EAV and are available through `entity`, `pull`, and EAV datom reads.
 Full-text, vector, and document indexes retain their own schema settings.
 
-Datalog patterns naming an unindexed attribute throw an error, including
-patterns with a bound entity or an input-bound attribute. Use pull to project
-these values from entities selected by indexed attributes. Unique and reference
-attributes cannot have `:db/noindex true`.
+Datalog patterns can read an unindexed attribute when the entity is bound by
+an input, a constant, or another clause. For example, the indexed name selects
+entities before their unindexed bodies are read from EAV:
 
-To query the attribute later, call `(d/index-attr conn :document/body)`.
+```clojure
+(d/q '[:find ?body
+       :in $ ?name
+       :where [?e :document/name ?name]
+              [?e :document/body ?body]]
+     db "notes")
+```
+
+This also works with `prepare-q`. Missing attributes produce no matching row,
+and cardinality-many attributes produce one match per value. An unindexed
+attribute cannot select entities by itself: `[?e :document/body "text"]`
+requires an entity binding or throws an error. Unique and reference attributes
+cannot have `:db/noindex true`.
+
+To search the attribute without an entity binding, call `(d/index-attr conn :document/body)`.
 This scans EAV and atomically adds its existing values to AVE and removes
 `:db/noindex` from the schema. Subsequent writes maintain AVE normally. The
 operation holds the database write transaction while building the index, works

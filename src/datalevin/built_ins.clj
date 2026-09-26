@@ -1166,7 +1166,6 @@
    'array-map     array-map,
    'count         count,
    'range         range,
-   'entity-range  db/entity-range,
    'not-empty     not-empty,
    'empty?        empty?,
    'contains?     contains?,

@@ -18,8 +18,6 @@
 - [Datalog] added `:db/noindex` to attribute schema property, to disable AVE
   index for that attribute. `index-attr` function to backfill index for an
   attribute.
-- [Datalog] added `entity-range` function to return entities within a range of
-  entity ids.
 - [Benchmark] added TPC-C, TPC-H and YCSB benchmarks.
 
 ### Changed

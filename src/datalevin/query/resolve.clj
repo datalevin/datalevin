@@ -45,11 +45,10 @@
    [datalevin.relation :as r]
    [datalevin.rules :as rules]
    [datalevin.storage :as storage]
-   [datalevin.util :as u :refer [raise concatv]]
-   [datalevin.validate :as vld])
+   [datalevin.util :as u :refer [raise concatv]])
   (:import
    [java.util HashMap HashSet IdentityHashMap List]
-   [datalevin.parser BindColl BindIgnore BindScalar BindTuple Constant Pattern RulesVar SrcVar]
+   [datalevin.parser BindColl BindIgnore BindScalar BindTuple RulesVar SrcVar]
    [datalevin.relation Relation]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
@@ -185,25 +184,14 @@
       (reduce j/hash-join
               (map #(in->rel %1 %2) (:bindings binding) coll)))))
 
-(defn- validate-pattern-indexes
-  [{:keys [sources parsed-q] :as context}]
-  ;; Avoid walking clauses for the default, fully indexed schema.
-  (when (some #(and (db/db? %) (seq (db/-attrs-by % :db/noindex)))
-              (vals sources))
-    (doseq [database (vals sources) :when (db/db? database)]
-      (storage/maybe-ensure-current! (:store database)))
-    (doseq [{:keys [source pattern]}
-            (dp/collect #(instance? Pattern %) (:qwhere parsed-q))
-            :let [database (get sources (or (:symbol source) '$))
-                  a (second pattern)]
-            :when (db/db? database)]
-      (if (instance? Constant a)
-        (vld/validate-indexed-attr (db/-schema database) (:value a))
-        (when-let [rel (rel-with-attr context (:symbol a))]
-          (let [idx (get (:attrs rel) (:symbol a))]
-            (doseq [tuple (:tuples rel)]
-              (vld/validate-indexed-attr (db/-schema database)
-                                         (nth tuple idx))))))))
+(defn- refresh-query-schemas
+  [{:keys [sources] :as context}]
+  ;; Another connection may have enabled an attribute's index. Index validation
+  ;; happens at lookup time, when the entity bindings are known.
+  (doseq [database (vals sources)
+          :when (and (db/db? database)
+                     (seq (db/-attrs-by database :db/noindex)))]
+    (storage/maybe-ensure-current! (:store database)))
   context)
 
 (defn resolve-ins
@@ -232,7 +220,7 @@
         (recur context
                (next bindings)
                (when values (next values))))
-      (validate-pattern-indexes context))))
+      (refresh-query-schemas context))))
 
 (defn dot-form [f]
   (when (and (symbol? f) (str/starts-with? (name f) "."))

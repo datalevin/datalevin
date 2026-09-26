@@ -2747,7 +2747,6 @@
    :head (normal-dt-handler i/head)
    :tail (normal-dt-handler i/tail)
    :slice (copying-dt-handler i/slice)
-   :entity-range (copying-dt-handler i/entity-range)
    :rslice (copying-dt-handler i/rslice)
    :start-sampling (sampling-dt-handler i/start-sampling)
    :stop-sampling (sampling-dt-handler i/stop-sampling)

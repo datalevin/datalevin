@@ -73,7 +73,9 @@
                     (let [source-sym (clause-source-symbol
                                        (:source parsed-clause))]
                       (when-let [source (get sources source-sym)]
-                        (when (db/-searchable? source)
+                        (when (and (db/-searchable? source)
+                                   (not (get-in (db/-schema source)
+                                                [(:value attr) :db/noindex])))
                           (let [pattern (qresolve/resolve-pattern-lookup-refs
                                           source
                                           (pattern-form orig-clause))

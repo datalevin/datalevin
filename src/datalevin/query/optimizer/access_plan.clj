@@ -61,7 +61,8 @@
               attr (when (instance? Constant a) (:value ^Constant a))
               evar (when (instance? Variable e) (:symbol ^Variable e))
               vvar (when (instance? Variable v) (:symbol ^Variable v))]
-          (when (and evar (keyword? attr))
+          (when (and evar (keyword? attr)
+                     (not (get-in (db/-schema db) [attr :db/noindex])))
             (let [val  (when (instance? Constant v) (:value ^Constant v))
                   rows (fast-clause-count db nil {:attr attr :val val}
                                           Long/MAX_VALUE)]

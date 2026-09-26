@@ -184,14 +184,11 @@
                 (fn [acc ^Function f]
                   (let [fname (some-> (:fn f) :symbol)
                         args  (:args f)]
-                    (cond
-                      ;; Entity existence can change through any attribute.
-                      (= fname 'entity-range) {:all? true}
-                      (contains? qresolve/tuple-producing-fns fname)
+                    (if (contains? qresolve/tuple-producing-fns fname)
                       (if-let [a (keyword-constant (nth args 1 nil))]
                         (merge-deps acc {:all? false :attrs #{a}})
                         {:all? true})
-                      :else acc)))
+                      acc)))
                 {:all? false :attrs #{}}
                 fns)))]
     (merge-deps (pattern-deps parsed-q) (tuple-fn-deps parsed-q))))

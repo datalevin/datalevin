@@ -54,8 +54,6 @@
         (doseq [opts [{} {:timeout 10000}]]
           (is (thrown-with-msg? clojure.lang.ExceptionInfo #"took too long"
                                (pull/pull-many @conn [:name] [1] opts))))
-        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"took too long"
-                             (d/entity-range @conn 0 2)))
         (is (= 1 timeout/*deadline*)))
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"took too long"
                            (pull/pull-many @conn [:name] [1] {:timeout -1})))

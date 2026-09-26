@@ -191,8 +191,9 @@ Only usable for debug output.
       (execute-prepared lookup [42])
       (lookup [43])
 
-  Reuses parsing, cache dependency analysis and eligible projection metadata.
-  General planning still uses current inputs and database state. Results match
+  Reuses parsing, cache dependency analysis, result processing metadata and
+  eligible point and ordered range access paths. General planning still uses
+  current inputs and database state. Results match
   `q`. `:limit` and `:offset` may name a scalar `:in` binding, so one
   preparation serves many result windows without re-preparing for each size.
   Remote preparations require exactly one database source; additional
@@ -785,25 +786,6 @@ Only usable for debug output.
        ; find all entities with age in a specific range (inclusive)
        (->> (index-range db :age 18 60) (map :e))"}
   index-range db/-index-range)
-
-(def ^{:arglists '([db start end])
-       :doc "Return entity maps in ascending entity ID order from `start` (inclusive)
-  to `end` (exclusive). Bounds are nonnegative 64-bit integers; an empty or
-  reversed interval returns []. Missing IDs are skipped. Each map contains
-  :db/id and all stored attributes, read directly with one EAV cursor.
-  Cardinality-many values are vectors in EAV order. References remain entity
-  IDs; this operation does not expand references or component entities.
-
-  Also available as `entity-range` inside Datalog queries:
-
-      [:find ?e ?name :in $ ?start ?end
-       :where [(entity-range $ ?start ?end) [?entity ...]]
-              [(get ?entity :db/id) ?e]
-              [(get ?entity :name) ?name]
-       :order-by ?e]
-
-  Local and remote DBs, including transaction views, are supported."}
-  entity-range db/entity-range)
 
 
 ;; Conn

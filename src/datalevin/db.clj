@@ -832,7 +832,7 @@
   (-search-tuples
     [_ pattern]
     (let [[e a v _] pattern]
-      (vld/validate-indexed-attr (schema store) a)
+      (when (nil? e) (vld/validate-indexed-attr (schema store) a))
       (wrap-cache
         store [:search-tuples e a v]
         (case-tree
@@ -1073,42 +1073,6 @@
 (defn search-datoms [db e a v] (-search db [e a v]))
 
 (defn count-datoms [db e a v] (-count db [e a v] nil))
-
-(defn entity-range
-  "Return entity maps in ascending entity ID order in [start, end). Read EAV
-  values with one cursor. Simulated transaction views include pending changes."
-  [^DB db start end]
-  (doseq [bound [start end]]
-    (when-not (and (integer? bound) (<= 0 bound c/emax))
-      (raise "Entity range bounds must be nonnegative 64-bit integers"
-             {:error :entity-range/bounds :start start :end end})))
-  (if (< (long start) (long end))
-    (let [store    (s/maybe-ensure-current! (.-store db))
-          entities (i/entity-range store start end)]
-      (if (pending-tx-cache? db)
-        (let [schema  (-schema db)
-              changed (into #{} (comp (map d/datom-e)
-                                      (filter #(<= (long start) (long %) (dec (long end)))))
-                            (.-eavt db))]
-          (-> (reduce
-                (fn [entities eid]
-                  (if-let [datoms (seq (-e-datoms db eid))]
-                    (assoc entities eid
-                           (reduce (fn [entity ^Datom datom]
-                                     (let [attr (.-a datom)
-                                           value (.-v datom)]
-                                       (assoc entity attr
-                                              (if (= :db.cardinality/many
-                                                     (:db/cardinality (schema attr)))
-                                                (conj (get entity attr []) value)
-                                                value))))
-                                   {:db/id eid} datoms))
-                    (dissoc entities eid)))
-                (into (sorted-map) (map (juxt :db/id identity)) entities)
-                changed)
-              vals vec))
-        entities))
-    []))
 
 (defn seek-datoms
   ([db index]

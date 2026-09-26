@@ -8,7 +8,7 @@
 ;; You must not remove this notice, or any other, from this software.
 ;;
 (ns ^:no-doc datalevin.storage.entity
-  "Entity maps read directly from EAV under a shared cursor and snapshot."
+  "Scalar entity projections from EAV under a shared cursor and snapshot."
   (:require [datalevin.bits :as b]
             [datalevin.constants :as c]
             [datalevin.custom-datalog :as cd]
@@ -16,65 +16,7 @@
             [datalevin.lmdb :as l]
             [datalevin.scan :as scan]
             [datalevin.timeout :as timeout])
-  (:import [java.lang AutoCloseable]
-           [java.nio ByteBuffer]
-           [java.util Iterator]))
-
-(defn range-entities
-  "Read existing entities in [start, end), including :db/id. Cardinality-many
-  values are vectors in EAV order; references remain stored entity IDs."
-  [lmdb attrs schema start end]
-  (if (< (long start) (long end))
-    (cd/with-snapshot lmdb
-      (let [pending (volatile! (transient []))
-            result
-            (scan/scan lmdb c/eav
-              (with-open [^AutoCloseable iter
-                          (.iterator ^Iterable
-                                     (l/iterate-list-key-range-val-full
-                                       dbi rtx cur [:closed-open start end] :id))]
-                (loop [previous nil
-                       entity   nil
-                       result   (transient [])]
-                  (timeout/assert-time-left)
-                  (if (.hasNext ^Iterator iter)
-                    (let [kv     (.next ^Iterator iter)
-                          eid    (.getLong ^ByteBuffer (l/k kv) 0)
-                          buffer (l/v kv)
-                          attr   (attrs (b/avg->aid buffer))
-                          props  (schema attr)
-                          many?  (= :db.cardinality/many (:db/cardinality props))
-                          same?  (= eid previous)
-                          result (if (and entity (not same?))
-                                   (conj! result (persistent! entity)) result)
-                          entity (if same? entity (transient {:db/id eid}))
-                          values (when many? (get entity attr []))
-                          external? (or (not= c/normal (b/avg->giant-id buffer))
-                                        (cd/custom-type? (idx/value-type props)))
-                          value (if external?
-                                  (do
-                                    (vswap! pending conj!
-                                            [(cond-> [(count result) attr]
-                                               many? (conj (count values)))
-                                             (b/read-buffer buffer :avg)])
-                                    nil)
-                                  (idx/avg-buffer->v lmdb buffer))]
-                      (recur eid (assoc! entity attr
-                                         (if many? (conj values value) value))
-                             result))
-                    (persistent! (if entity
-                                   (conj! result (persistent! entity)) result)))))
-              (throw e))
-            ;; Giant/custom lookups reuse transaction key and range buffers.
-            ;; Decode their owned references after closing the EAV cursor,
-            ;; in the same snapshot, so they cannot disturb iteration.
-            result (reduce (fn [entities [path retrieved]]
-                             (timeout/assert-time-left)
-                             (assoc-in entities path (idx/retrieved->v lmdb retrieved)))
-                           result (persistent! @pending))]
-        (timeout/assert-time-left)
-        result))
-    []))
+  (:import [java.lang AutoCloseable]))
 
 (defn- projected-entity
   [lmdb iter eid ^objects names ^longs aids id?]

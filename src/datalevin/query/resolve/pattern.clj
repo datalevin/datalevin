@@ -76,7 +76,6 @@
 (defn resolve-pattern-lookup-refs [source pattern]
   (if (db/-searchable? source)
     (let [[e a v] pattern
-          _       (vld/validate-indexed-attr (db/-schema source) a)
           e'      (if (or (qu/lookup-ref? e) (keyword? e))
                     (db/entid-strict source e)
                     e)
@@ -388,9 +387,21 @@
               (add-bounded-match! acc entity-originals value-originals))))))
     acc))
 
+(declare lookup-pattern-coll)
+
+(defn- lookup-bound-overlay
+  [context database pattern entity-values]
+  (let [pattern (resolve-pattern-lookup-refs
+                  database (substitute-constants context pattern))
+        pairs (resolve-entity-pairs database
+                                    (or entity-values [(first pattern)]))
+        datoms (for [[entity eid] pairs
+                     datom (db/-e-datoms database eid)]
+                 [entity (:a datom) (:v datom)])]
+    (lookup-pattern-coll datoms pattern)))
+
 (defn lookup-pattern-db
   [context db pattern]
-  (vld/validate-indexed-attr (db/-schema db) (second pattern))
   (let [[e a v]           pattern
         search-pattern    (delay
                             (->> pattern
@@ -407,22 +418,41 @@
                                      (not= e v)
                                      (keyword? a))
                             (bound-values context v))
+        unindexed?       (get-in (db/-schema db) [a :db/noindex])
+        ;; An unindexed attribute is readable only from an EAV-bound entity.
+        ;; Validate bound attribute variables too, before a generic wildcard
+        ;; lookup could turn them into an unrestricted scan.
+        _                (when (and (nil? entity-values)
+                                    (nil? (first @search-pattern)))
+                           (if (qu/binding-var? a)
+                             (when-let [rel (rel-with-attr context a)]
+                               (doseq [tuple (:tuples rel)]
+                                 (vld/validate-indexed-attr
+                                   (db/-schema db) (nth tuple ((:attrs rel) a)))))
+                             (vld/validate-indexed-attr (db/-schema db) a)))
         use-bounded-both? (and entity-values value-values)
         use-entity-multi? (and (not use-bounded-both?)
                                entity-values
-                               (multi-lookup-cheaper?
-                                 (long (.size ^HashSet entity-values))
-                                 @scan-count))
+                               (or unindexed?
+                                   (multi-lookup-cheaper?
+                                     (long (.size ^HashSet entity-values))
+                                     @scan-count)))
         use-value-multi?  (and (not use-bounded-both?)
+                               (not unindexed?)
                                value-values
                                (multi-lookup-cheaper?
                                  (long (.size ^HashSet value-values))
                                  @scan-count))]
     (cond
+      (and unindexed? (db/pending-tx-cache? db))
+      (lookup-bound-overlay context db pattern entity-values)
+
       use-bounded-both?
       (r/relation! {e 0, v 1}
-                   (lookup-pattern-bounded-both db pattern entity-values
-                                                value-values))
+                   ((if unindexed?
+                      lookup-pattern-domain-filtered-entity
+                      lookup-pattern-bounded-both)
+                    db pattern entity-values value-values))
 
       use-entity-multi?
       (let [resolved-pattern (resolve-pattern-lookup-refs db pattern)
@@ -486,11 +516,13 @@
         eid-idx         (when tuples (long ((:attrs rel) e)))
         bound-count     (when tuples (.size tuples))]
     (when (and bound-count
+               (not (db/pending-tx-cache? db))
                (> ^long bound-count 1)
                (integer-tuple-column? tuples eid-idx)
-               (multi-lookup-cheaper?
-                 (long bound-count)
-                 (long (db/-count db [nil a nil]))))
+               (or (get-in (db/-schema db) [a :db/noindex])
+                   (multi-lookup-cheaper?
+                     (long bound-count)
+                     (long (db/-count db [nil a nil])))))
       (let [tuples   (db/-eav-filter-presence-list db tuples eid-idx a)
             filtered (assoc rel :tuples tuples)]
         (assoc context :rels

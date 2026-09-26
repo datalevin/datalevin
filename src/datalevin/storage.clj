@@ -614,12 +614,6 @@
 
   (e-size [_ e] (list-count lmdb c/eav e :id))
 
-  (entity-range [_ start end]
-    (entity/range-entities lmdb attrs schema start end))
-
-  (entity-range [_ ids names aids id?]
-    (entity/select-entities lmdb ids names aids id?))
-
   (a-size [this a]
     (if (:db/aid (schema a))
       (when-not (.closed? this)
@@ -1093,6 +1087,11 @@
           embedding-providers counts opts schema rschema attrs max-aid max-gt
           max-tx state-sync-ms scheduled-sampling write-txn sampling-lock
           local-closed? shared-dir-key))
+
+(defn ^:no-doc select-entities
+  "Project scalar attributes for resolved IDs in input order with one EAV cursor."
+  [^Store store ids names aids id?]
+  (entity/select-entities (.-lmdb store) ids names aids id?))
 
 (defn ^:no-doc ref-attr-adjacency
   "Scan a ref-valued AVE attribute directly into a primitive adjacency map.

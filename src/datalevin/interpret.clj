@@ -246,7 +246,6 @@
      prepare-pull
      pull
      pull-many
-     entity-range
      q
      k
      read-buffer

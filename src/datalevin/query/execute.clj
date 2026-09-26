@@ -38,6 +38,7 @@
     :refer [execute-point-lookup-projection
             explain-point-lookup-projection-plan! point-lookup-projection-db
             point-lookup-projection-key point-lookup-projection-shape]]
+   [datalevin.query.execute.ordered-range :as ordered-range]
    [datalevin.query.execute.result :as result
     :refer [*deferred-result-explain* adaptive-limit-query?
             indexed-unique-result-set order-comps order-result pull pull-many
@@ -76,11 +77,16 @@
                             :idoc     qidoc/access-method
                             :vector   qvector/access-method}))
 
-(def ^:dynamic *access-methods*
-  "Physical access methods considered during query planning."
+(def ^:private default-access-methods
   [qave/access-method function-access-method])
 
+(def ^:dynamic *access-methods*
+  "Physical access methods considered during query planning."
+  default-access-methods)
+
 (def ^:dynamic ^:private *access-execution* nil)
+
+(def ^:dynamic ^:private *result-processor* nil)
 
 (def ^:dynamic ^:no-doc *terminal-result-collection?* true)
 
@@ -923,39 +929,57 @@
               :post-top-k-enrichment diagnostic)])
     [parsed-q context]))
 
-(defn- finish-query
-  [parsed-q context]
-  (let [[parsed-q context] (apply-post-top-k-enrichment parsed-q context)
-        find          (:qfind parsed-q)
+(defn- result-processor
+  [parsed-q]
+  (let [find          (:qfind parsed-q)
         find-elements (dp/find-elements find)
         result-arity  (count find-elements)
         with          (:qwith parsed-q)
         having        (:qhaving parsed-q)
         find-vars     (dp/find-vars find)
         all-vars      (concatv find-vars (map :symbol with))
-        context       (collect context all-vars)
-        result
-        (cond->> (:result-set context)
-          with (mapv #(subvec % 0 result-arity))
+        aggregate?    (some #(or (dp/aggregate? %) (dp/find-expr? %)) find-elements)
+        pull?         (some dp/pull? find-elements)
+        return-map    (:qreturn-map parsed-q)
+        order         (when (:qorder parsed-q)
+                        (result/prepare-order find-vars (:qorder parsed-q)))]
+    (fn [parsed-q context]
+      (let [context (collect context all-vars)
+            result
+            (cond->> (:result-set context)
+              with (mapv #(subvec % 0 result-arity))
 
-          (some #(or (dp/aggregate? %) (dp/find-expr? %)) find-elements)
-          (qagg/aggregate find-elements context)
+              aggregate?
+              (qagg/aggregate find-elements context)
 
-          (seq having)
-          (qagg/apply-having having find-elements)
+              (seq having)
+              (qagg/apply-having having find-elements)
 
-          (some dp/pull? find-elements)
-          (pull find-elements context)
+              pull?
+              (pull find-elements context)
 
-          true
-          (-post-process find (:qreturn-map parsed-q)))]
-    (result-explain context result)
-    (if (instance? FindRel find)
-      (if-let [order (:qorder parsed-q)]
-        (order-result find-vars result order
-                      (:qlimit parsed-q) (:qoffset parsed-q))
-        (result-window result (:qlimit parsed-q) (:qoffset parsed-q)))
-      result)))
+              true
+              (-post-process find return-map))]
+        (result-explain context result)
+        (if (instance? FindRel find)
+          (if order
+            (order result (:qlimit parsed-q) (:qoffset parsed-q))
+            (result-window result (:qlimit parsed-q) (:qoffset parsed-q)))
+          result)))))
+
+(defn- finish-query
+  [parsed-q context]
+  (let [[parsed-q context] (apply-post-top-k-enrichment parsed-q context)
+        [original process] *result-processor*
+        ;; Rewrites and access subqueries can change the projection. Only the
+        ;; matching result shape may reuse this processor; windows stay dynamic.
+        reusable? (and process
+                       (identical? (:qfind original) (:qfind parsed-q))
+                       (identical? (:qwith original) (:qwith parsed-q))
+                       (identical? (:qhaving original) (:qhaving parsed-q))
+                       (identical? (:qreturn-map original) (:qreturn-map parsed-q))
+                       (identical? (:qorder original) (:qorder parsed-q)))]
+    ((if reusable? process (result-processor parsed-q)) parsed-q context)))
 
 (defn- run-planned-context
   [{:keys [result-set sources] :as context}]
@@ -1194,13 +1218,25 @@
              (execute-query parsed-q inputs plans))))))))
 
 (defn query-runner
-  "Prepare query-shape decisions and point-projection layouts. General plans
-  continue to use the execution's inputs, sources and optimizer settings."
+  "Retain result processing, point projections and simple ordered range plans.
+  General plans continue to use current inputs, sources and optimizer settings."
   [parsed-q]
   (let [shape        (or (get parsed-q point-lookup-projection-key)
                          (point-lookup-projection-shape parsed-q))
-        point-reader (point-lookup/prepared-executor parsed-q shape)]
-    (fn [inputs] (q* parsed-q inputs point-reader))))
+        point-reader (point-lookup/prepared-executor parsed-q shape)
+        range-reader (ordered-range/prepared-executor parsed-q)
+        processor    [parsed-q (result-processor parsed-q)]]
+    (fn [inputs]
+      (binding [timeout/*deadline* (timeout/effective-deadline (:qtimeout parsed-q))
+                *result-processor* processor]
+        (let [parsed-q (resolve-window parsed-q inputs)
+              result (if (and range-reader (not qplan/*explain*)
+                              (= default-access-methods *access-methods*))
+                       (range-reader parsed-q inputs)
+                       point-lookup/unsupported)]
+          (if (identical? result point-lookup/unsupported)
+            (q* parsed-q inputs point-reader)
+            result))))))
 
 (defn mark-parsing-finished!
   []
