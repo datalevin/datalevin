@@ -11,7 +11,7 @@
    [org.eclipse.collections.impl.set.sorted.mutable TreeSortedSet]))
 
 (defn- execute-with-reads
-  [schema stored entities]
+  [schema stored entities & [cached-max-eid]]
   (let [reads   (atom [])
         rschema (schema/schema->rschema schema)
         store   (reify i/IStore
@@ -19,6 +19,7 @@
                   (schema [_] schema)
                   (rschema [_] rschema)
                   (attrs [_] {})
+                  (init-max-eid [_] (reduce max c/e0 (map :e stored)))
                   (ea-first-datom [_ e a]
                     (swap! reads conj [:ea e a])
                     (some #(when (and (= e (:e %)) (= a (:a %))) %)
@@ -31,7 +32,7 @@
                     (some #(when (and (= a (:a %)) (= v (:v %))) (:e %))
                           stored)))
         db      {:store   store
-                 :max-eid (reduce max c/e0 (map :e stored))
+                 :max-eid (or cached-max-eid (reduce max c/e0 (map :e stored)))
                  :max-tx  c/tx0
                  :eavt    (TreeSortedSet. ^Comparator d/cmp-datoms-eavt)
                  :avet    (TreeSortedSet. ^Comparator d/cmp-datoms-avet)}
@@ -97,6 +98,41 @@
             [10 :value "old" false]
             [10 :value "updated" true]]
            (mapv (juxt :e :a :v d/datom-added) (:tx-data report))))))
+
+(deftest stale-entity-boundary-still-reads-persisted-values
+  (let [[report reads]
+        (execute-with-reads
+          {:value {} :tags {:db/cardinality :db.cardinality/many}}
+          [(d/datom 5 :tags "a") (d/datom 10 :value "old")]
+          [[:db/add 10 :value "updated"]
+           [:db/add 5 :tags "a"]]
+          0)]
+    (is (= [[:ea 10 :value] [:eav 5 :tags "a"]] reads))
+    (is (= [[10 :value "old" false] [10 :value "updated" true]]
+           (mapv (juxt :e :a :v d/datom-added) (:tx-data report))))
+    (is (= 0 (get-in report [:db-before :max-eid])))))
+
+(deftest stale-entity-boundary-allocates-above-persisted-entities
+  (let [[report reads]
+        (execute-with-reads
+          {:value {}}
+          [(d/datom 10 :value "old")]
+          [[:db/add -1 :value "new"]]
+          0)]
+    (is (empty? reads))
+    (is (= 11 (get-in report [:tempids -1])))
+    (is (= [[11 :value "new"]] (mapv d/datom-eav (:tx-data report))))))
+
+(deftest entity-boundary-preserves-uncommitted-allocations
+  (let [[report reads]
+        (execute-with-reads
+          {:value {}}
+          [(d/datom 10 :value "old")]
+          [[:db/add -1 :value "new"]]
+          20)]
+    (is (empty? reads))
+    (is (= 21 (get-in report [:tempids -1])))
+    (is (= 21 (get-in report [:db-after :max-eid])))))
 
 (deftest new-tempid-can-upsert-an-existing-entity
   (doseq [prepare? [false true]]

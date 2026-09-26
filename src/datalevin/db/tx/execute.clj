@@ -17,7 +17,7 @@
    [datalevin.idoc :as idoc]
    [datalevin.index :as idx]
    [datalevin.interface :refer [av-first-e ea-first-v ea-first-datom
-                                fetch slice e-datoms
+                                fetch slice e-datoms init-max-eid
                                 v-datoms opts schema]]
    [datalevin.prepare :as coreprep]
    [datalevin.storage :as s]
@@ -261,12 +261,12 @@
          ^Datom old-datom
          (if multival?
            (or (cached-eav-first-datom db e a v')
-               (when-not (new-eid? (:db-before report) e)
+               (when (<= e ^long (::max-eid-before report))
                  (first (fetch store (datom e a v')))))
            (or (cached-ea-first-datom db e a)
-               ;; Allocation advances db-after, but the persisted EAV range
-               ;; is empty above db-before's max-eid throughout this tx.
-               (when-not (new-eid? (:db-before report) e)
+               ;; Use the store boundary captured before allocation: another
+               ;; connection may have advanced past db-before's cached max-eid.
+               (when (<= e ^long (::max-eid-before report))
                  (ea-first-datom store e a))))]
      (cond
        (nil? old-datom)
@@ -412,6 +412,7 @@
         report    (-> report
                       (dissoc-present ::upserted-tempids)
                       (dissoc-present ::reverse-tempids)
+                      (dissoc-present ::max-eid-before)
                       (dissoc-present ::new-attributes))
         tx-id     (current-tx report)
         report    (update report :tempids
@@ -822,14 +823,20 @@
 
 (defn execute-tx-loop
   [initial-report initial-es tx-time]
-  (let [initial-report' (update initial-report :db-after clear-tx-cache)
-        db              (:db-before initial-report)
+  (let [db              (:db-before initial-report)
+        store           (:store db)
+        max-eid-before  (max (long (:max-eid db))
+                             (long (init-max-eid store)))
+        initial-report' (-> initial-report
+                            (assoc ::max-eid-before max-eid-before)
+                            (update :db-after
+                                    #(-> % clear-tx-cache
+                                         (advance-max-eid max-eid-before))))
         initial-es'     (if (seq (txcommon/attrs-by db :db.type/tuple))
                           (sequence
                             (mapcat vector)
                             initial-es (repeat ::flush-tuples))
                           initial-es)
-        store           (:store db)
         schema          (schema store)
         store-opts      (opts store)]
     (loop [report initial-report'

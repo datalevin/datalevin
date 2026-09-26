@@ -15,7 +15,7 @@ SQLite use the same two-call sequence locally.
 
 The individual KV update uses `update-kv` to preserve other fields in the stored
 vector; embedded calls use a compiled Clojure callback, and remote updates run
-the replacement callback on the server. Datalog updates use `transact!`, and
+the replacement callback on the server. Datalog updates use `transact-ack!`, and
 SQL updates use an autocommit prepared UPDATE. These are the same update paths
 used by A/B. Reports identify F with `:workload-model :ycsb-read-update-v1`,
 `:rmw-execution :client-read-update`, and `:atomic-rmw? false`. Earlier atomic F
@@ -430,11 +430,14 @@ fields of 100 bytes, excluding keys and database overhead.
   Point reads reuse a `prepare-pull`
   created when each store opens and call `execute-prepared` with `[:ycsb/key key]`;
   local executions pass the current connection DB to retain preparation across
-  writes. Updates use `transact!` with the same lookup reference, resolved inside
-  the transaction. A missing key fails without creating a partial entity.
+  writes. Inserts and updates use synchronous `transact-ack!`, retaining the same
+  validation and durability policy while avoiding transaction reports over the
+  wire. Reports identify this path with `:write-api :transact-ack!`. Updates use
+  the same lookup reference, resolved inside the transaction. A missing key fails
+  without creating a partial entity.
   The key's `:db.unique/value` constraint rejects duplicate inserts.
   F performs that prepared read followed by an
-  ordinary `transact!` update; no encompassing transaction is opened.
+  ordinary `transact-ack!` update; no encompassing transaction is opened.
   Untimed point validation reuses prepared reads for known string keys and arranges
   each record's fields in benchmark order. Record counts use `count-datoms` on
   `:ycsb/key`. Reports identify the key with

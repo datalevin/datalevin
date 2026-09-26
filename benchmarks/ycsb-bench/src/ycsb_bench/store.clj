@@ -100,17 +100,17 @@
 (defrecord DatalogRecords [conn attributes reader scan-reader workload local?]
   Records
   (put-records! [_ records]
-    (d/transact! conn
-                  (mapv (fn [[key values]]
-                          (assoc (zipmap attributes values) :ycsb/key key))
-                        records)))
+    (d/transact-ack! conn
+                     (mapv (fn [[key values]]
+                             (assoc (zipmap attributes values) :ycsb/key key))
+                           records)))
   (read-record [_ key]
     (mapv (if local?
             (d/execute-prepared reader @conn [:ycsb/key key])
             (d/execute-prepared reader [:ycsb/key key]))
           attributes))
   (update-field! [_ key field value]
-    (d/transact! conn [[:db/add [:ycsb/key key] (nth attributes field) value]]))
+    (d/transact-ack! conn [[:db/add [:ycsb/key key] (nth attributes field) value]]))
   (scan-records [_ start n]
     (if (pos? (long n))
       (mapv (fn [row] [(first row) (subvec row 1)])
@@ -119,7 +119,7 @@
   (record-count [_] (d/count-datoms @conn nil :ycsb/key nil))
   (storage-info [_]
     (merge (application-key-info workload)
-           {:layout :entity :read-api :prepare-pull
+           {:layout :entity :read-api :prepare-pull :write-api :transact-ack!
             :scan-api :prepare-q :scan-selection :attribute-value-range
             :scan-projection :fields
             :cache-limit (d/datalog-index-cache-limit @conn)}
