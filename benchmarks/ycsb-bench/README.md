@@ -65,8 +65,9 @@ other platforms perform no process control.
 All stores index the application key and leave payload fields unindexed,
 matching upstream YCSB's SQL schema. Datalog payload attributes use
 `:db/noindex true`; `:ycsb/key` retains its unique AVE index for point lookups and
-ordered scans. Point reads pull payload fields from EAV; scans project them with `prepare-q`. KV stores the
-payload in each record's value, and SQL creates only the primary-key index.
+ordered scans. Point reads and scans project payload fields from EAV with
+`prepare-q`. KV stores the payload in each record's value, and SQL creates only
+the primary-key index.
 There is one index policy for all comparisons; `--sql-indexes` has been removed.
 For SQL results, `:api` identifies the Datalevin API used for the comparison.
 
@@ -427,10 +428,12 @@ fields of 100 bytes, excluding keys and database overhead.
   entity ID, a unique `:ycsb/key` string, and string attributes
   `:ycsb/field0` through `:ycsb/field9` by default. Payload attributes declare
   `:db/noindex true`, so only the application key participates in AVE.
-  Point reads reuse a `prepare-pull`
-  created when each store opens and call `execute-prepared` with `[:ycsb/key key]`;
-  local executions pass the current connection DB to retain preparation across
-  writes. Inserts and updates use synchronous `transact-ack!`, retaining the same
+  Point reads reuse a tuple `prepare-q` created when each store opens and call
+  `execute-prepared` with `[key]`. The query anchors on `:ycsb/key` and projects
+  every payload field in benchmark order through the point-projection access
+  path, including direct tuple encoding for eligible remote responses. Reports
+  identify this path with `:read-api :prepare-q` and `:read-projection :fields`.
+  Inserts and updates use synchronous `transact-ack!`, retaining the same
   validation and durability policy while avoiding transaction reports over the
   wire. Reports identify this path with `:write-api :transact-ack!`. Updates use
   the same lookup reference, resolved inside the transaction. A missing key fails
@@ -438,13 +441,13 @@ fields of 100 bytes, excluding keys and database overhead.
   The key's `:db.unique/value` constraint rejects duplicate inserts.
   F performs that prepared read followed by an
   ordinary `transact-ack!` update; no encompassing transaction is opened.
-  Untimed point validation reuses prepared reads for known string keys and arranges
-  each record's fields in benchmark order. Record counts use `count-datoms` on
+  Untimed point validation reuses the same prepared query for known string keys.
+  Record counts use `count-datoms` on
   `:ycsb/key`. Reports identify the key with
   `:storage :record-key :ycsb/key`. Datalog's entity storage and key-index overhead
   are part of the measurement. Index-result caching is bypassed with
   `:cache-limit 0` in both embedded and remote modes; reports include the
-  effective limit. Pull-pattern and query-plan caches remain enabled.
+  effective limit. Query-plan caches remain enabled.
   E prepares its single scan query before timing and passes the page size as an
   input; point workloads prepare their scan query only if a diagnostic scan is
   requested.

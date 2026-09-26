@@ -1,7 +1,8 @@
 (ns ycsb-bench.core-test
   (:require [clojure.test :refer [deftest is testing]]
             [datalevin.core :as d]
-            [datalevin.pull-api :as pull]
+            [datalevin.read-encode :as enc]
+            [datalevin.storage :as storage]
             [datalevin-bench.host :as host]
             [ycsb-bench.core :as core]
             [ycsb-bench.runner :as runner]
@@ -227,6 +228,8 @@
           (is (false? (:atomic-rmw? (store/storage-info db))))
           (when (= api :datalog)
             (is (= 0 (:cache-limit (store/storage-info db))))
+            (is (= :prepare-q (:read-api (store/storage-info db))))
+            (is (= :fields (:read-projection (store/storage-info db))))
             (is (= :prepare-q (:scan-api (store/storage-info db))))
             (is (= :attribute-value-range (:scan-selection (store/storage-info db))))
             (is (= :ycsb/key (:record-key (store/storage-info db)))))
@@ -255,36 +258,54 @@
           {})))))
 
 (deftest read-update-preparation-reuse-test
-  (doseq [mode [:embedded :remote]]
-    (testing (str mode)
+  (doseq [mode [:embedded :remote], field-count [1 12]]
+    (testing (str [mode field-count])
       (store/with-store
-        (assoc small-options :api :datalog :mode mode)
+        (assoc small-options :api :datalog :mode mode :field-count field-count
+               :threads 2 :pool-size 2)
         (fn [db]
           (let [record (store/for-worker db 0)
+                other (store/for-worker db 1)
                 attributes (:attributes record)
-                prepare d/prepare-pull
-                parse pull/parse-opts
-                preparations (atom 0)
-                parses (atom 0)]
-            (store/put-records! db [["user1" ["aaaa" "bbbb" "cccc"]]])
-            (store/read-record db "user1")
-            (with-redefs [d/prepare-pull
-                          (fn [& args]
-                            (swap! preparations inc)
-                            (apply prepare args))
-                          pull/parse-opts
-                          (fn [view pattern opts]
-                            (when (= pattern attributes) (swap! parses inc))
-                            (parse view pattern opts))]
+                fields (mapv #(format "%04d" %) (range field-count))
+                prepare-scan storage/prepare-eav-scan-v-list
+                prepare-writer storage/prepare-tuple-writer
+                start-tuple enc/start-tuple!
+                encoded (atom 0)]
+            (store/put-records! record [["user1" fields]])
+            (is (= fields (store/read-record record "user1")))
+            (is (= {:kind :point-lookup-projection}
+                   (:selected-plan-alternative
+                     (d/explain {} (store/point-query attributes) @(:conn record) "user1"))))
+            (with-redefs [d/prepare-q
+                          (fn [& _] (throw (AssertionError. "Reprepared inside point read")))
+                          storage/prepare-eav-scan-v-list
+                          (fn [schema attrs-v]
+                            (when (= (set attributes) (set (map first attrs-v)))
+                              (throw (AssertionError. "Rebuilt point EAV scan after write")))
+                            (prepare-scan schema attrs-v))
+                          storage/prepare-tuple-writer
+                          (fn [schema attrs]
+                            (when (= attributes attrs)
+                              (throw (AssertionError. "Rebuilt point tuple writer after write")))
+                            (prepare-writer schema attrs))
+                          enc/start-tuple!
+                          (fn [out ^long width]
+                            (when (= field-count width) (swap! encoded inc))
+                            (start-tuple out width))]
               (dotimes [i 5]
-                (store/read-record db "user1")
-                (store/update-field! db "user1" 0 (format "%04d" i))))
-            (is (zero? @preparations)
-                "Successive reads reuse the preparation wrapper")
-            (is (zero? @parses)
-                "Reads after writes retain the parsed pull pattern")
-            (is (= ["0004" "bbbb" "cccc"] (store/read-record db "user1"))
-                "Every reused read sees the latest committed value"))
+                (let [value (format "%04d" (+ 100 i))]
+                  (store/update-field! other "user1" (dec field-count) value)
+                  (is (= (assoc fields (dec field-count) value)
+                         (store/read-record record "user1"))
+                      "Reused queries see other handles' writes in field order")))
+              (store/put-records! other [["user2" fields]])
+              (is (= fields (store/read-record record "user2"))))
+            (if (= mode :remote)
+              (is (<= 6 @encoded) "Remote point reads encode tuples directly from storage")
+              (is (zero? @encoded)))
+            (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Missing or incomplete Datalog record"
+                                 (store/read-record record "absent"))))
           {})))))
 
 (deftest datalog-scan-field-order-test

@@ -51,6 +51,15 @@
 (def application-key-schema
   {:ycsb/key {:db/valueType :db.type/string :db/unique :db.unique/value}})
 
+(defn point-query
+  "Project one record's payload directly into a tuple in benchmark field order."
+  [attributes]
+  (let [fields (mapv #(symbol (str "?field" %)) (range (count attributes)))]
+    {:find [fields]
+     :in '[$ ?key]
+     :where (into '[[?entity :ycsb/key ?key]]
+                  (map (fn [attribute field] ['?entity attribute field]) attributes fields))}))
+
 (defn scan-query
   "Select an application key range and project its payload fields directly.
   The page size is a scalar query input, so one prepared query serves every
@@ -97,7 +106,7 @@
            (wal-info handle)))
   (close-store! [_] (d/close-kv handle)))
 
-(defrecord DatalogRecords [conn attributes reader scan-reader workload local?]
+(defrecord DatalogRecords [conn attributes reader scan-reader workload]
   Records
   (put-records! [_ records]
     (d/transact-ack! conn
@@ -105,10 +114,8 @@
                              (assoc (zipmap attributes values) :ycsb/key key))
                            records)))
   (read-record [_ key]
-    (mapv (if local?
-            (d/execute-prepared reader @conn [:ycsb/key key])
-            (d/execute-prepared reader [:ycsb/key key]))
-          attributes))
+    (or (d/execute-prepared reader [key])
+        (throw (ex-info "Missing or incomplete Datalog record" {:id key}))))
   (update-field! [_ key field value]
     (d/transact-ack! conn [[:db/add [:ycsb/key key] (nth attributes field) value]]))
   (scan-records [_ start n]
@@ -119,7 +126,8 @@
   (record-count [_] (d/count-datoms @conn nil :ycsb/key nil))
   (storage-info [_]
     (merge (application-key-info workload)
-           {:layout :entity :read-api :prepare-pull :write-api :transact-ack!
+           {:layout :entity :read-api :prepare-q :read-projection :fields
+            :write-api :transact-ack!
             :scan-api :prepare-q :scan-selection :attribute-value-range
             :scan-projection :fields
             :cache-limit (d/datalog-index-cache-limit @conn)}
@@ -151,8 +159,8 @@
             ;; do not register an unused query; diagnostic scans prepare on
             ;; first use.
             (when (= workload :e) (force scan-reader))
-            (->DatalogRecords conn attributes (d/prepare-pull @conn attributes)
-                              scan-reader workload (not (u/dtlv-uri? path))))
+            (->DatalogRecords conn attributes (d/prepare-q @conn (point-query attributes))
+                              scan-reader workload))
           (catch Throwable t (d/close conn) (throw t)))))))
 
 (defn- verify-wal! [store durability]
