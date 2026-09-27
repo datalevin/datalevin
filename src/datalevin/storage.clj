@@ -1282,6 +1282,39 @@
           field-indexes (int-array (map indexes find-aids))]
       (fn [store out eid] (write-tuple! store out eid aids field-indexes)))))
 
+(defn prepare-encoded-field-reader
+  "Compile a reader that returns, for each entity id in order, the required
+  scalar fields as owned storage buffers in `attributes` order under one EAV
+  snapshot. Returns nil when an entity lacks a field or holds a giant value, so
+  the caller can fall back to the general executor. Buffers are owned copies
+  and may be written after the snapshot closes."
+  [schema attributes]
+  (when (and (seq attributes)
+             (< (count attributes) (long c/+wire-datom-batch-size+))
+             (every? #(let [props (schema %)]
+                        (and (:db/aid props)
+                             (not= :db.cardinality/many (:db/cardinality props))
+                             (not (cd/custom-type? (value-type props)))))
+                     attributes))
+    (let [aids (long-array (map #(:db/aid (schema %)) attributes))]
+      (fn [^Store store eids]
+        (let [lmdb (.-lmdb store)]
+          (scan/scan lmdb c/eav
+            (with-open [^AutoCloseable iter
+                        (lmdb/val-iterator (lmdb/iterate-list-val-full dbi rtx cur))]
+              (loop [es (seq eids) out (transient [])]
+                (if es
+                  (when-let [^objects values
+                             (tuple-field-buffers iter (long (first es)) aids)]
+                    (if (some (fn [^ByteBuffer v]
+                                (not= c/normal (b/avg->giant-id v)))
+                              values)
+                      nil
+                      (recur (next es) (conj! out values))))
+                  (persistent! out))))
+            (throw e)))))))
+
+
 (defn e-sample*
   [^Store store a aid]
   (when-not (.closed? store)

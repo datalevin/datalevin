@@ -18,11 +18,16 @@
    [datalevin.query.access.ave :as ave]
    [datalevin.query.execute.point-lookup :refer [unsupported]]
    [datalevin.query.execute.result :as result]
+   [datalevin.query.plan :as qplan]
+   [datalevin.read-encode :as enc]
    [datalevin.storage :as storage]
    [datalevin.timeout :as timeout])
   (:import
+   [datalevin.db DB]
    [datalevin.parser BindScalar Constant DefaultSrc FindRel Pattern Predicate
     SrcVar Variable]
+   [datalevin.storage Store]
+   [java.nio ByteBuffer]
    [java.util List]
    [java.util.concurrent.atomic AtomicReference]
    [org.eclipse.collections.impl.list.mutable FastList]))
@@ -119,7 +124,7 @@
       rows pulls)
     []))
 
-(deftype ^:private FieldLayout [schema attrs-v projection scan])
+(deftype ^:private FieldLayout [schema attrs-v projection scan reader slots])
 
 (defn- field-layout [schema fields projection]
   (when (every? #(and (some? (get-in schema [% :db/aid]))
@@ -130,15 +135,24 @@
           ;; Field scans retain an ordinal beside [eid key] so the existing
           ;; EAV scan may sort by eid without changing the selected key order.
           indexes (zipmap ordered (range 3 (+ 3 (count ordered))))
-          attrs-v (mapv #(vector % {:skip? false}) ordered)]
-      (FieldLayout. schema
-                    attrs-v
-                    (mapv (fn [^long index]
-                            (if (< index 2)
-                              index
-                              (indexes (nth fields (- index 2)))))
-                          projection)
-                    (storage/prepare-eav-scan-v-list schema attrs-v)))))
+          attrs-v (mapv #(vector % {:skip? false}) ordered)
+          eav-projection (mapv (fn [^long index]
+                                 (if (< index 2)
+                                   index
+                                   (indexes (nth fields (- index 2)))))
+                               projection)
+          ;; Direct transport encoding writes find-order columns from the key
+          ;; and owned field buffers: -1 is the entity, -2 the ordered value,
+          ;; and n >= 0 is the buffer index among the aid-sorted fields.
+          slots (mapv (fn [^long index]
+                        (cond (zero? index) -1
+                              (= 1 index)   -2
+                              :else         (- index 3)))
+                      eav-projection)]
+      (FieldLayout. schema attrs-v eav-projection
+                    (storage/prepare-eav-scan-v-list schema attrs-v)
+                    (storage/prepare-encoded-field-reader schema ordered)
+                    slots))))
 
 (defn- select-key-page
   [database path demand accepts? start-value strict?]
@@ -264,3 +278,89 @@
                           (recur rows))))
                     (finally (access/close-cursor cursor))))))
             unsupported))))))
+
+(defn- encoded-row-writer
+  "Encode one find-order tuple from the ordered value, entity id and field
+  buffers read by the compiled field reader."
+  [^longs slots]
+  (let [width (alength slots)]
+    (fn [^ByteBuffer out key eid ^objects row]
+      (enc/start-tuple! out width)
+      (dotimes [i width]
+        (let [slot (aget slots i)]
+          (cond
+            (== slot -1) (enc/write-value! out eid)
+            (== slot -2) (enc/write-value! out key)
+            :else        (enc/write-avg! out (aget row (int slot)))))))))
+
+(defn prepared-encoded-executor
+  "Compile an executor that writes eligible field-only ordered range results
+  directly into the transport buffer as a Nippy vector of rows. Returns nil when
+  the query shape is not eligible. The returned function yields a read-encode
+  ReadResult, or `unsupported` when the data must use the general executor."
+  [parsed-q]
+  (when-let [{:keys [attr direction start strict? projection pulls fields]}
+             (range-shape parsed-q)]
+    (when (and (seq fields) (empty? pulls))
+      (let [layout-cache (AtomicReference.)
+            path-template (ave/ordered-path nil attr direction nil)
+            accepts? (if (= :asc direction)
+                       (if strict? pos? #(not (neg? (long %))))
+                       (if strict? neg? #(not (pos? (long %)))))]
+        (fn [resolved-q inputs]
+          (let [database (first inputs)
+                start-value (start inputs)
+                schema (when (db/db? database) (db/-schema database))
+                ^FieldLayout cached (.get layout-cache)
+                ^FieldLayout layout
+                (when schema
+                  (if (and cached (identical? schema (.-schema cached)))
+                    cached
+                    (let [layout (field-layout schema fields projection)]
+                      (.set layout-cache layout)
+                      layout)))]
+            (if (and layout
+                     (not (get-in schema [attr :db/noindex]))
+                     (get-in schema [attr :db/unique])
+                     (zero? (long (or (:qoffset resolved-q) 0)))
+                     (instance? Store (.-store ^DB database))
+                     (not (db/pending-tx-cache? database))
+                     (nil? (:qtimeout resolved-q))
+                     (nil? timeout/*deadline*)
+                     (not qplan/*explain*)
+                     (not-any? db/-searchable? (rest inputs))
+                     (#{:db.type/long :db.type/string :db.type/keyword
+                        :db.type/symbol :db.type/float :db.type/double
+                        :db.type/instant :db.type/uuid}
+                      (get-in schema [attr :db/valueType]))
+                     (some? start-value)
+                     (some? (.-reader layout)))
+              (let [demand (access/top-k-demand (:qorder resolved-q)
+                                               (:qoffset resolved-q)
+                                               (:qlimit resolved-q))
+                    path (assoc-in path-template [:options :start-value] start-value)
+                    selected (select-key-page database path demand accepts?
+                                              start-value strict?)]
+                (if (.isEmpty ^FastList selected)
+                  (enc/read-result
+                    (fn [^ByteBuffer out] (enc/start-tuple! out 0)))
+                  (let [store (.-store ^DB database)
+                        reader (.-reader layout)
+                        n (count selected)
+                        keys (object-array n)
+                        eids (object-array n)]
+                    (dotimes [i n]
+                      (let [tuple ^objects (.get ^FastList selected i)]
+                        (aset keys i (aget tuple 1))
+                        (aset eids i (aget tuple 0))))
+                    (if-let [rows (reader store (vec eids))]
+                      (let [write-row (encoded-row-writer
+                                        (long-array (.-slots layout)))]
+                        (enc/read-result
+                          (fn [^ByteBuffer out]
+                            (enc/start-tuple! out n)
+                            (dotimes [i n]
+                              (write-row out (aget keys i) (aget eids i)
+                                         ^objects (nth rows i))))))
+                      unsupported))))
+              unsupported)))))))

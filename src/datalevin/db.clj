@@ -635,8 +635,10 @@
 
 (defn- tx-cache-empty?
   [db]
-  (and (.isEmpty ^TreeSortedSet (:eavt db))
-       (.isEmpty ^TreeSortedSet (:avet db))))
+  (let [^TreeSortedSet eavt (:eavt db)
+        ^TreeSortedSet avet (:avet db)]
+    (and (or (nil? eavt) (.isEmpty eavt))
+         (or (nil? avet) (.isEmpty avet)))))
 
 (defn- tx-cache-active?
   [db]

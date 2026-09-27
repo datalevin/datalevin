@@ -2457,6 +2457,8 @@
             ;; append and suppress the lower-level duplicate invocation. The
             ;; post-append publish hook runs only after LMDB close commits below,
             ;; so authority watermarks never advertise uncommitted local state.
+            ;; HA runners collect confirmation here and wait only after commit
+            ;; execution has released its monitors and server transaction slot.
             (let [_ (when-let [f cpp/*before-write-commit-fn*]
                       (f {:operation :close-transact-kv}))
                   append-res (txlog/append-durable!

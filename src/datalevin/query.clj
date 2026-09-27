@@ -5,6 +5,7 @@
    [datalevin.prepared :as prepared]
    [datalevin.query.cache :as qcache]
    [datalevin.query.execute :as qexec]
+   [datalevin.query.execute.ordered-range :as ordered-range]
    [datalevin.query.execute.point-lookup :as point]
    [datalevin.query.plan :as qplan]
    [datalevin.query-optimizer :as qo]
@@ -115,13 +116,22 @@
 
 (defn- result-reader [parsed-q]
   (let [execute (qcache/prepare-result-reader parsed-q)
-        encoded-execute (point/prepared-executor
-                          parsed-q (point/point-lookup-projection-shape parsed-q) true)
+        encoded-point (point/prepared-executor
+                        parsed-q (point/point-lookup-projection-shape parsed-q) true)
+        encoded-range (ordered-range/prepared-encoded-executor parsed-q)
         expected (count (:qin parsed-q))]
     (fn [db inputs encoded?]
       (check-query-inputs! inputs expected)
       (let [inputs (if (identical? db (nth inputs 0)) inputs (assoc inputs 0 db))
-            result (if encoded? (encoded-execute inputs) point/unsupported)]
+            result (if encoded?
+                     (if encoded-range
+                       (let [resolved (qexec/resolve-window parsed-q inputs)
+                             range-result (encoded-range resolved inputs)]
+                         (if (identical? range-result point/unsupported)
+                           (encoded-point inputs)
+                           range-result))
+                       (encoded-point inputs))
+                     point/unsupported)]
         (if (identical? result point/unsupported)
           (with-query-runtime
             (qexec/mark-parsing-finished!)

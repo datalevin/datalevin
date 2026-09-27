@@ -579,6 +579,35 @@
             (observe-local-wal-tx-path! :blind-insert)
             report))))))
 
+(defn- single-identity-entity?
+  "Cheap gate for the single-entity identity-upsert specialization: exactly one
+   map entity naming a unique-identity attribute. Avoids blind preparation on
+   the common write shapes that cannot use the specialization."
+  [^DB db tx-data]
+  (let [entities (seq tx-data)
+        entity   (first entities)]
+    (and entities
+         (nil? (next entities))
+         (map? entity)
+         (boolean (some #(db/-is-attr? db % :db.unique/identity)
+                        (keys entity))))))
+
+(defn- maybe-direct-local-identity-transact!
+  "Try the simple single-entity identity-upsert fast path for a store that is
+   not on the WAL direct path. Returns the transaction report, or nil so the
+   caller can continue with blind or general resolution."
+  [conn tx-data tx-meta]
+  (when (and *local-wal-identity-upsert?*
+             (single-identity-entity? @conn tx-data))
+    (when-let [prepared (db/prepare-blind-local-tx
+                          ^DB @conn tx-data true false)]
+      (when (:identity-upsert-av prepared)
+        (when-let [[report upsert?]
+                   (direct-local-identity-transact! conn prepared tx-meta)]
+          (observe-local-wal-tx-path!
+            (if upsert? :identity-upsert :blind-insert))
+          report)))))
+
 (declare current-thread-holds-store-write-lock?)
 
 (defn- local-wal-transact-eligible?
@@ -629,7 +658,8 @@
 
 (defn- -transact! [conn tx-data tx-meta]
   (if (local-direct-transact-eligible? conn)
-    (or (maybe-direct-local-blind-transact! conn tx-data tx-meta)
+    (or (maybe-direct-local-identity-transact! conn tx-data tx-meta)
+        (maybe-direct-local-blind-transact! conn tx-data tx-meta)
         (direct-local-transact! conn tx-data tx-meta))
     (if (local-wal-transact-eligible? conn)
       (or (maybe-direct-local-wal-transact! conn tx-data tx-meta)

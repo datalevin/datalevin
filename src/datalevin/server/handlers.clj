@@ -502,12 +502,14 @@
   [deps server db-name writing? f]
   (if writing?
     (f)
-    (let [^Semaphore lock (db-lock deps server db-name)]
-      (acquire-db-transaction-slot! deps server db-name lock)
-      (try
-        (f)
-        (finally
-          (.release lock))))))
+    (group/with-confirmation
+      (fn []
+        (let [^Semaphore lock (db-lock deps server db-name)]
+          (acquire-db-transaction-slot! deps server db-name lock)
+          (try
+            (f)
+            (finally
+              (.release lock))))))))
 
 (defn- transient-runtime-store-error?
   [e]
@@ -762,6 +764,18 @@
                 :timeout-ms   client-op-await-timeout-ms})
       result)))
 
+(defn- confirm-client-op-replay!
+  [deps server skey db-name writing?]
+  (when (and (not writing?) kvtx/*after-txlog-append-fn*
+             (ha-runtime-read-state? (db-state deps server db-name)))
+    ;; A locally committed record can be visible while its original caller is
+    ;; still confirming. Cover the applied watermark read AFTER the record;
+    ;; presence in LMDB alone is not sufficient to acknowledge a replay.
+    (let [store (kv-store deps server skey db-name false)
+          lsn (:last-applied-lsn (kv/txlog-watermarks store))]
+      (kvtx/*after-txlog-append-fn*
+        {:operation :client-op-replay :txlog-lsn lsn}))))
+
 (defn- with-idempotent-client-op
   [deps server skey db-name writing? message exec-fn]
   (if-let [request (client-op-request message)]
@@ -772,9 +786,11 @@
                                (read-committed-client-op-record
                                 deps server skey db-name writing?)
                                (validate-client-op-record! request))]
-        {:replay?       true
-         :response-kind response-kind
-         :response      (cop/record-response record)}
+        (do
+          (confirm-client-op-replay! deps server skey db-name writing?)
+          {:replay?       true
+           :response-kind response-kind
+           :response      (cop/record-response record)})
         (let [result-promise (promise)
               pending-entry  {:request request
                               :result-promise result-promise}
@@ -1437,27 +1453,22 @@
       deps server skey db-name
       "Don't have permission to alter the database"
       (fn []
-        (with-direct-db-transaction-slot
-          deps
-          server
-          db-name
-          writing?
-          (fn []
-            (case mode
-              :copy-in
-              (let [dt-store (dt-store deps server skey db-name writing?)]
-                (i/load-datoms dt-store ((:copy-in deps) server skey))
-                (write-complete! deps skey))
-
-              :request
-              (write-result!
-                deps
-                skey
-                (apply i/load-datoms
-                       (dt-store deps server skey db-name writing?)
-                       (rest args)))
-
-              (raise "Missing :mode when loading datoms" {}))))))))
+        (let [result
+              (with-direct-db-transaction-slot
+                deps server db-name writing?
+                (fn []
+                  (case mode
+                    :copy-in
+                    (i/load-datoms (dt-store deps server skey db-name writing?)
+                                  ((:copy-in deps) server skey))
+                    :request
+                    (apply i/load-datoms
+                           (dt-store deps server skey db-name writing?)
+                           (rest args))
+                    (raise "Missing :mode when loading datoms" {}))))]
+          (if (= mode :copy-in)
+            (write-complete! deps skey)
+            (write-result! deps skey result)))))))
 
 (def ^:dynamic ^:private *datalog-write-group* nil)
 
@@ -1471,7 +1482,7 @@
     (when (or (not (ha-runtime-read-state? state)) ha-guarded?)
       ;; Only omit the dispatch guards while selecting the queue. The runner
       ;; retains them around the physical commit: cached lease admission before
-      ;; WAL append, then one LSN-publishing renewal before releasing any caller.
+      ;; WAL append, then shared LSN confirmation before acknowledging callers.
       (binding [cpp/*before-write-commit-fn* nil
                 kvtx/*after-txlog-append-fn* nil]
         (kv/write-group store kind ha-guarded?)))))
@@ -1576,6 +1587,7 @@
         s?  (last args)
         rp  (transact* deps db0 txs tx-meta s? server db-name writing?)
         db1 (:db-after rp)
+        ;; Simulated overlays belong only to the report, never to later requests.
         _   (when-not (or s? (::group-committed? rp))
               ((:update-db deps) server db-name
                (fn [m]
@@ -1616,36 +1628,25 @@
                                   (:client-op-response-kind message)))))
           (raise "Invalid transaction acknowledgement request"
                  {:error :ha/client-op-invalid-request}))
-        (with-datalog-transaction-slot
-          deps
-          server
-          skey
-          db-name
-          writing?
-          (last args)
-          (fn []
-            (let [{:keys [response replay?]}
-                  (with-idempotent-client-op
-                    deps server skey db-name writing? message
-                    (fn [client-op]
+        (let [{:keys [response replay?]}
+              (with-idempotent-client-op
+                deps server skey db-name writing? message
+                (fn [client-op]
+                  (with-datalog-transaction-slot
+                    deps server skey db-name writing? (last args)
+                    (fn []
                       (build-tx-response
-                        deps
-                        server
-                        skey
-                        db-name
-                        mode
-                        args
-                        writing?
+                        deps server skey db-name mode args writing?
                         (when client-op
                           (cop/tx-meta
                             (:client-op-id client-op)
                             (:request-type client-op)
                             (:request-hash client-op)
                             (:response-kind client-op)))
-                        response-kind)))]
-              (if (or replay? (= response-kind cop/tx-data-ack-response-kind))
-                (write-result! deps skey response)
-                (write-tx-response! deps skey response)))))))))
+                        response-kind)))))]
+          (if (or replay? (= response-kind cop/tx-data-ack-response-kind))
+            (write-result! deps skey response)
+            (write-tx-response! deps skey response)))))))
 
 (defn tx-data
   [deps server skey message]
@@ -1681,11 +1682,11 @@
       deps server skey db-name
       "Don't have permission to register a custom type in the database"
       (fn []
-        (with-direct-db-transaction-slot
-          deps server db-name writing?
-          (fn []
-            (write-result!
-              deps skey
+        (write-result!
+          deps skey
+          (with-direct-db-transaction-slot
+            deps server db-name writing?
+            (fn []
               (d/register-type
                 (kv-store deps server skey db-name writing?)
                 type-name (b/deserialize definition)))))))))
@@ -1991,42 +1992,44 @@
         aborted?        (volatile! false)
         marker          (aborted-transaction-close-marker skey close-type)
         completed?
-        (try
-          (if commit?
-            (let [closing? (volatile! false)]
-              (try
-                (db-alter-permission!
-                  deps server skey db-name
-                  "Don't have permission to alter the database"
-                  (fn []
-                    (vreset! closing? true)
-                    (let [status (i/close-transact-kv kv-store)]
-                      (when (= close-type :close-transact)
-                        ((:add-store deps)
-                         server db-name
-                         (st/transfer (:wstore db-state) kv-store)))
-                      (when (and (= :committed status)
-                                 (some-> (:notification-dirty? db-state) deref))
-                        (database-changed! deps server db-name false)))
-                    true))
-                (finally
-                  ;; Permission denial can throw or send :reconnect without
-                  ;; calling the commit callback. Both paths need rollback.
-                  (when-not @closing?
-                    (i/abort-transact-kv kv-store)
-                    (i/close-transact-kv kv-store)))))
-            (do
-              (i/abort-transact-kv kv-store)
-              (i/close-transact-kv kv-store)
-              (vreset! aborted? true)))
-          (finally
-            ((:halt-run deps) (:runner db-state))
-            ((:update-db deps) server db-name
-             (fn [m]
-               (cond-> (dissoc m :runner :runner-skey :wlmdb :wstore :wdt-db
-                                :notification-dirty?)
-                 @aborted? (assoc :aborted-transaction-close marker))))
-            (.release lock)))]
+        (group/with-confirmation
+          (fn []
+            (try
+              (if commit?
+                (let [closing? (volatile! false)]
+                  (try
+                    (db-alter-permission!
+                      deps server skey db-name
+                      "Don't have permission to alter the database"
+                      (fn []
+                        (vreset! closing? true)
+                        (let [status (i/close-transact-kv kv-store)]
+                          (when (= close-type :close-transact)
+                            ((:add-store deps)
+                             server db-name
+                             (st/transfer (:wstore db-state) kv-store)))
+                          (when (and (= :committed status)
+                                     (some-> (:notification-dirty? db-state) deref))
+                            (database-changed! deps server db-name false)))
+                        true))
+                    (finally
+                      ;; Permission denial can throw or send :reconnect without
+                      ;; calling the commit callback. Both paths need rollback.
+                      (when-not @closing?
+                        (i/abort-transact-kv kv-store)
+                        (i/close-transact-kv kv-store)))))
+                (do
+                  (i/abort-transact-kv kv-store)
+                  (i/close-transact-kv kv-store)
+                  (vreset! aborted? true)))
+              (finally
+                ((:halt-run deps) (:runner db-state))
+                ((:update-db deps) server db-name
+                 (fn [m]
+                   (cond-> (dissoc m :runner :runner-skey :wlmdb :wstore :wdt-db
+                                    :notification-dirty?)
+                     @aborted? (assoc :aborted-transaction-close marker))))
+                (.release lock)))))]
     (when (true? completed?)
       (write-complete! deps skey))))
 
@@ -2432,7 +2435,8 @@
                               #(l/with-transaction-kv [tx kv-store]
                                  (execute tx))))
                           op)
-                        (op kv-store)))
+                        (with-direct-db-transaction-slot
+                          deps server db-name writing? #(op kv-store))))
                     (when (seq txs0)
                       (database-changed! deps server db-name writing?))
                     response)))]

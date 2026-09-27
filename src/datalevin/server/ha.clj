@@ -20,6 +20,7 @@
    [datalevin.ha.replication :as drep]
    [datalevin.ha.util :as hu]
    [datalevin.server.deps :as sdeps]
+   [datalevin.tx-group :as group]
    [datalevin.util :as u :refer [raise]]
    [taoensso.timbre :as log])
   (:import
@@ -1138,7 +1139,10 @@
                              (max commit-lsn
                                   (long (or (:ha-leader-last-applied-lsn current)
                                             0))))))))
-             (when-not (:ok? result)
+             (when-not (and (:ok? result)
+                            (ha-write-commit-confirmed?
+                              db-name expected-state
+                              (get ((:dbs-fn deps) server) db-name) txlog-lsn))
                (raise "HA write commit confirmation failed"
                       (ha-write-commit-confirmation-error
                         db-name commit-lsn state result))))))))))
@@ -1149,8 +1153,20 @@
         expected-state (get ((:dbs-fn deps) server) db-name)]
     (fn [{:keys [txlog-lsn]}]
       (when db-name
-        (publish-ha-write-commit-lsn! deps server db-name txlog-lsn
-                                     expected-state)))))
+        ;; Record only locally applied progress here, under the commit locks.
+        ;; Confirmation can then coalesce later commits without mistaking this
+        ;; watermark for proof that the authority has confirmed them.
+        (when (and (satisfies? ctrl/ILeaseAuthority (:ha-authority expected-state))
+                   (integer? txlog-lsn) (pos? (long txlog-lsn)))
+          ((:transform-db-state-when-fn deps)
+           server db-name
+           #(and (leader-authority-state? %)
+                 (nil? (ha-write-context-error db-name expected-state %)))
+           #(update % :ha-leader-last-applied-lsn
+                    (fn [lsn] (max (long (or lsn 0)) (long txlog-lsn))))))
+        (group/confirm-after-commit!
+          #(publish-ha-write-commit-lsn! deps server db-name txlog-lsn
+                                         expected-state))))))
 
 (defn with-ha-write-admission
   [deps server message f]

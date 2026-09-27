@@ -2,6 +2,8 @@
   (:require
    [clojure.test :refer [deftest is testing use-fixtures]]
    [datalevin.binding.cpp :as cpp]
+   [datalevin.client-op :as cop]
+   [datalevin.constants :as c]
    [datalevin.core :as d]
    [datalevin.db :as db]
    [datalevin.ha :as dha]
@@ -17,7 +19,8 @@
    [datalevin.util :as u])
   (:import
    [datalevin.tx_group Group]
-   [java.util.concurrent ConcurrentHashMap ConcurrentLinkedQueue]))
+   [java.util.concurrent ConcurrentHashMap ConcurrentLinkedQueue Semaphore]
+   [java.util.function BiFunction]))
 
 (use-fixtures :each db-fixture)
 
@@ -72,7 +75,9 @@
         (> (System/nanoTime) deadline) false
         :else (do (Thread/sleep 1) (recur))))))
 
-(defn- authority-probe [outcome]
+(defn- authority-probe
+  ([outcome] (authority-probe outcome (fn [])))
+  ([outcome on-renew]
   (let [now (System/currentTimeMillis)
         lease (atom {:db-identity "db" :leader-node-id 1 :term 1
                      :leader-endpoint "127.0.0.1:19001"
@@ -90,6 +95,7 @@
           (read-membership-hash [_] nil)
           (read-voters [_] [])
           (renew-lease [_ req]
+            (on-renew)
             (swap! renews conj (:leader-last-applied-lsn req))
             (when (= 1 (count @renews))
               (deliver entered true)
@@ -131,12 +137,14 @@
                   {:updated? updated? :state (.get dbs name)}))
               :transform-db-state-when-fn
               (fn [_ name pred f]
-                (let [state (.get dbs name)]
-                  (when (pred state) (.put dbs name (f state))))
+                (.compute dbs name
+                          (reify BiFunction
+                            (apply [_ _ state]
+                              (if (pred state) (f state) state))))
                 {:state (.get dbs name)})}]
     {:deps deps :dbs dbs :reads reads :renews renews
      :entered entered :release release
-     :confirming confirming :confirmed confirmed}))
+     :confirming confirming :confirmed confirmed})))
 
 (deftest confirmed-group-skips-renewal-and-admission-lock
   (let [{:keys [deps reads renews release confirmed] :as probe}
@@ -261,9 +269,9 @@
       (is (= 42 (get-in (.get dbs "db")
                        [:ha-authority-lease :leader-last-applied-lsn]))))))
 
-(deftest ha-groups-share-authority-checks-and-confirm-before-completion
+(deftest ha-groups-commit-while-earlier-confirmation-waits
   (doseq [api [:kv :datalog]
-          outcome [:ok :rejected :indeterminate]]
+          outcome [:ok :indeterminate]]
     (testing (str api " " outcome)
       (let [path (u/tmp-dir (str "datalevin-ha-group-" (random-uuid)))
             opts {:wal? true :wal-durability-profile :strict :wal-shared? false
@@ -272,41 +280,55 @@
                    (d/create-conn path {:counter {:db/valueType :db.type/long}}
                                   opts))
             store (if conn (d/datalog-kv conn) (d/open-kv path opts))
+            monitors (atom [])
             {:keys [deps dbs reads renews entered release confirming confirmed]}
-            (authority-probe outcome)
+            (authority-probe
+              outcome
+              #(swap! monitors conj [(Thread/holdsLock (l/write-txn store))
+                                     (Thread/holdsLock (i/kv-info store))]))
+            slot (Semaphore. 1)
+            deps (assoc deps :get-lock (fn [_ _] slot)
+                             :transaction-lock-timeout-ms (constantly 10000))
             message {:type (if conn :tx-data :update-kv) :args ["db"]}
+            committing (promise) commit-release (promise)
+            commits (atom 0) second-commit (promise) third-commit (promise)
             jobs (atom [])]
         (try
           (if conn
             (d/transact! conn [{:db/id 1 :counter 0}])
             (do (d/open-dbi store "counter")
                 (d/transact-kv store [[:put "counter" 1 0 :id :long]])))
-          ;; Install runtime HA after store initialization, without starting a
-          ;; background authority loop. The real server commit guards run below.
           (vswap! (i/kv-info store) assoc :ha-mode :consensus-lease)
           (is (nil? (kv/write-group store :kv)))
-          (is (nil? (#'handlers/server-write-group
-                      deps nil "db" store api)))
+          (is (nil? (#'handlers/server-write-group deps nil "db" store api)))
           (binding [cpp/*before-write-commit-fn*
-                    (ha/ha-write-commit-check-fn deps nil message)
+                    (let [check (ha/ha-write-commit-check-fn deps nil message)]
+                      (fn [ctx]
+                        (check ctx)
+                        (case (long (swap! commits inc))
+                          1 (do (deliver committing true)
+                                (assert (deref commit-release 10000 false)))
+                          2 (assert (deref entered 10000 false))
+                          nil)))
                     kvtx/*after-txlog-append-fn*
                     (let [publish (ha/ha-write-commit-publish-fn deps nil message)]
-                      (fn [context]
-                        (publish context)
-                        (when (= outcome :rejected)
-                          (.put ^ConcurrentHashMap dbs "db"
-                                (assoc (.get ^ConcurrentHashMap dbs "db")
-                                       :ha-role :follower)))))]
+                      (fn [ctx]
+                        (publish ctx)
+                        (case (long @commits)
+                          2 (deliver second-commit true)
+                          3 (deliver third-commit true)
+                          nil)))]
             (let [g (#'handlers/server-write-group deps nil "db" store api)
                   before (long (:last-committed-lsn (d/txlog-watermarks store)))
-                  run-tx (if conn
-                           (fn [execute]
-                             (d/with-transaction [tx conn]
-                               (if group/*batched?*
-                                 (:result (db/execute-write-group tx execute))
-                                 (execute tx))))
-                           (fn [execute]
-                             (l/with-transaction-kv [tx store] (execute tx))))
+                  run-tx (fn [execute]
+                           (#'handlers/with-direct-db-transaction-slot
+                             deps nil "db" false
+                             #(if conn
+                                (d/with-transaction [tx conn]
+                                  (if group/*batched?*
+                                    (:result (db/execute-write-group tx execute))
+                                    (execute tx)))
+                                (l/with-transaction-kv [tx store] (execute tx)))))
                   op (if conn
                        (fn [tx]
                          (d/transact! tx [[:db/add 1 :counter
@@ -314,43 +336,163 @@
                        #(d/update-kv % "counter" 1 inc :id :long))
                   submit #(future
                             (try (group/submit! g run-tx op) :ok
-                                 (catch Throwable t (ex-data t))))]
+                                 (catch Throwable t t)))]
               (is (some? g))
               (swap! jobs conj (submit))
-              (is (deref entered 10000 false))
+              (is (deref committing 10000 false))
               (dotimes [idx 3]
                 (swap! jobs conj (submit))
                 (is (await-queued! g (inc idx))))
+              (deliver commit-release true)
+              (is (deref entered 10000 false))
+              ;; A second physical group commits while the first renewal waits.
+              (is (deref second-commit 10000 false))
+              (is (= (+ before 2) (:last-applied-lsn (d/txlog-watermarks store))))
               (is (not-any? realized? @jobs))
               (deliver release true)
-              (when-not (= outcome :rejected)
-                (is (deref confirming 10000 false))
-                (is (not-any? realized? (rest @jobs)))
-                (deliver confirmed true))
+              (is (deref confirming 10000 false))
+              (is (= :ok (deref (first @jobs) 10000 ::timeout)))
+              (is (not-any? realized? (rest @jobs)))
+              ;; The queued leader also hands off before waiting. The next
+              ;; direct caller can commit, but needs its own higher LSN proof.
+              (swap! jobs conj (submit))
+              (is (deref third-commit 10000 false))
+              (is (= (+ before 3) (:last-applied-lsn (d/txlog-watermarks store))))
+              (let [acquired? (.tryAcquire slot 10 java.util.concurrent.TimeUnit/SECONDS)]
+                (is acquired?)
+                (when acquired? (.release slot)))
+              (is (not-any? realized? (rest @jobs)))
+              (deliver confirmed true)
               (let [results (mapv #(deref % 10000 ::timeout) @jobs)
-                    marks (d/txlog-watermarks store)
-                    rejected? (= outcome :rejected)]
-                (is (= :ok (first results)))
-                (is (zero? @reads))
-                (is (= (if rejected? 1 2) (count @renews)))
-                (is (= (+ before (if rejected? 1 2)) (:last-committed-lsn marks)))
-                (is (= (:last-committed-lsn marks) (:last-durable-lsn marks)))
-                (is (= (if rejected? 1 4)
-                       (if conn (:counter (d/pull @conn [:counter] 1))
-                           (d/get-value store "counter" 1 :id :long))))
+                    batch (subvec results 1 4)]
+                (is (= :ok (last results)))
                 (if (= outcome :ok)
                   (is (every? #{:ok} results))
-                  (is (every? #(= (if rejected? :ha/write-rejected
-                                                  :ha/write-indeterminate)
-                                  (:error %))
-                              (rest results)))))
+                  (do
+                    (is (every? #(= :ha/write-indeterminate (:error (ex-data %))) batch))
+                    (is (identical? (first batch) (second batch)))
+                    (is (identical? (first batch) (last batch)))))
+                (is (= [false false] (first @monitors)))
+                (is (every? #{[false false]} @monitors))
+                (is (= (mapv #(+ before (long %)) [1 2 3]) @renews))
+                (is (= 3 @commits))
+                (is (zero? @reads))
+                (is (= 5 (if conn (:counter (d/pull @conn [:counter] 1))
+                             (d/get-value store "counter" 1 :id :long)))))
               (.put ^ConcurrentHashMap dbs "db"
                     (assoc (.get ^ConcurrentHashMap dbs "db") :ha-role :follower))
               (is (nil? (#'handlers/server-write-group deps nil "db" store api)))))
           (finally
+            (deliver commit-release true)
             (deliver release true)
             (deliver confirmed true)
             (doseq [job @jobs] (deref job 10000 nil))
             (vswap! (i/kv-info store) dissoc :ha-mode)
             (if conn (d/close conn) (d/close-kv store))
             (u/delete-files path)))))))
+
+(deftest successful-renewal-requires-current-covered-lease
+  (doseq [patch [#(assoc % :ha-role :follower)
+                 #(assoc % :ha-leader-term 2 :ha-authority-term 2)
+                 #(assoc % :ha-renew-loop-running? (Object.))]]
+    (let [{:keys [deps entered release] :as probe} (authority-probe :ok)
+          ^ConcurrentHashMap dbs (:dbs probe)
+          publish (ha/ha-write-commit-publish-fn
+                    deps nil {:type :tx-data :args ["db"]})
+          job (future (try (publish {:txlog-lsn 42}) :ok
+                           (catch Throwable t (ex-data t))))]
+      (try
+        (is (deref entered 10000 false))
+        (.put dbs "db" (patch (.get dbs "db")))
+        (deliver release true)
+        (is (= :ha/write-indeterminate (:error (deref job 10000 nil))))
+        (finally (deliver release true) (deref job 10000 nil))))))
+
+(deftest direct-writes-and-client-op-replays-wait-outside-the-writer-slot
+  (let [path (u/tmp-dir (str "datalevin-ha-direct-" (random-uuid)))
+        store (d/open-kv path {:wal? true :wal-durability-profile :strict
+                              :wal-shared? false :wal-segment-prealloc? false
+                              :snapshot-bootstrap-force? false})
+        slot (Semaphore. 1)
+        monitors (atom [])
+        {:keys [deps entered release confirmed renews] :as probe}
+        (authority-probe
+          :ok #(swap! monitors conj [(Thread/holdsLock (l/write-txn store))
+                                    (Thread/holdsLock (i/kv-info store))]))
+        ^ConcurrentHashMap dbs (:dbs probe)
+        deps (assoc deps :get-lock (fn [_ _] slot)
+                         :transaction-lock-timeout-ms (constantly 10000)
+                         :lmdb (fn [_ _ _ _] store)
+                         :update-db (:update-db-fn deps))
+        message {:type :transact-kv :args ["db"]
+                 :client-op-id "pending" :client-op-hash "hash"
+                 :client-op-response-kind cop/command-complete-response-kind}
+        record (cop/committed-record :transact-kv "hash"
+                                      cop/command-complete-response-kind :transacted)
+        replay-entered (promise)
+        jobs (atom [])]
+    (try
+      (d/open-dbi store c/ha-client-ops)
+      (binding [cpp/*before-write-commit-fn*
+                (ha/ha-write-commit-check-fn deps nil message)
+                kvtx/*after-txlog-append-fn*
+                (ha/ha-write-commit-publish-fn deps nil message)]
+        (swap! jobs conj
+               (future
+                 (#'handlers/with-direct-db-transaction-slot
+                   deps nil "db" false
+                   #(d/transact-kv store [(cop/committed-record-tx "pending" record)]))))
+        (is (deref entered 10000 false))
+        (is (= [[false false]] @monitors))
+        (is (= 1 (.availablePermits slot)))
+        (is (not (realized? (first @jobs))))
+        (let [publish kvtx/*after-txlog-append-fn*]
+          (swap! jobs conj
+                 (future
+                   (binding [kvtx/*after-txlog-append-fn*
+                             (fn [ctx]
+                               (deliver replay-entered (:txlog-lsn ctx))
+                               (publish ctx))]
+                     (#'handlers/with-idempotent-client-op
+                       deps nil nil "db" false message
+                       (fn [_] (throw (AssertionError. "Replay executed twice"))))))))
+        (is (= (first @renews) (deref replay-entered 10000 ::timeout)))
+        (is (not-any? realized? @jobs))
+        (deliver release true)
+        (is (= :transacted (deref (first @jobs) 10000 ::timeout)))
+        (is (= {:replay? true :response-kind cop/command-complete-response-kind
+                :response :transacted}
+               (deref (second @jobs) 10000 ::timeout)))
+        (is (= 1 (count @renews)))
+        (is (= (first @renews)
+               (get-in (.get dbs "db") [:ha-authority-lease :leader-last-applied-lsn]))))
+      (finally
+        (deliver release true)
+        (deliver confirmed true)
+        (doseq [job @jobs] (deref job 10000 nil))
+        (d/close-kv store)
+        (u/delete-files path)))))
+
+(deftest waiting-confirmations-coalesce-local-commit-progress
+  (let [{:keys [deps entered release confirmed renews]} (authority-probe :ok)
+        publish (ha/ha-write-commit-publish-fn
+                  deps nil {:type :tx-data :args ["db"]})
+        registered (repeatedly 2 promise)
+        jobs (atom [(future (publish {:txlog-lsn 42}))])]
+    (try
+      (is (deref entered 10000 false))
+      (doseq [[lsn ready] (map vector [43 44] registered)]
+        (swap! jobs conj
+               (future
+                 (group/with-confirmation
+                   #(do (publish {:txlog-lsn lsn}) (deliver ready true)))))
+        (is (deref ready 10000 false)))
+      (is (not-any? realized? @jobs))
+      (deliver confirmed true)
+      (deliver release true)
+      (doseq [job @jobs] (is (not= ::timeout (deref job 10000 ::timeout))))
+      (is (= [42 44] @renews))
+      (finally
+        (deliver release true)
+        (deliver confirmed true)
+        (doseq [job @jobs] (deref job 10000 nil))))))

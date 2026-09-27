@@ -3,7 +3,7 @@
 (ns ^:no-doc datalevin.tx-group
   "Collect synchronous writes before acquiring the native writer. A group is
   executed in one native transaction and acknowledged after native commit and
-  the configured WAL durability policy."
+  the configured WAL durability policy and commit confirmations."
   (:refer-clojure :exclude [run!])
   (:import [java.util.concurrent ConcurrentLinkedQueue Semaphore]
            [java.util.concurrent.atomic AtomicBoolean]
@@ -24,6 +24,44 @@
 (deftype Request [op result ^Semaphore ready])
 (deftype Group [^ReentrantLock lock ^ConcurrentLinkedQueue queue ^long limit
                 ^AtomicBoolean active])
+(deftype Committed [value confirmation])
+
+(def ^:dynamic ^:private *confirmations* nil)
+
+(defn confirm-after-commit!
+  "Register confirmation of an already committed write. Transaction runners
+  collect these callbacks and wait after releasing execution resources. Outside
+  a runner, retain synchronous confirmation. Failures must never retry a write."
+  [f]
+  (if *confirmations*
+    (vswap! *confirmations* conj f)
+    (f)))
+
+(defn- capture-commit
+  [f]
+  (let [confirmations (volatile! nil)
+        value (binding [*confirmations* confirmations] (f))]
+    (if-let [callbacks @confirmations]
+      ;; Delay shares both success and failure among all callers in a physical
+      ;; group. No executor or background task can outlive the waiting callers.
+      (Committed. value (delay (doseq [confirm (reverse callbacks)] (confirm))))
+      value)))
+
+(defn- await-commit
+  [value]
+  (if (instance? Committed value)
+    (let [^Committed committed value]
+      @(.-confirmation committed)
+      (.-value committed))
+    value))
+
+(defn with-confirmation
+  "Run f, then confirm its commits after f has released its resources. Nested
+  runners leave confirmation to the outer owner. f must not acknowledge writes."
+  [f]
+  (if *confirmations*
+    (f)
+    (await-commit (capture-commit f))))
 
 (defn create
   "Create one bounded-batch admission queue for a store and execution path."
@@ -48,11 +86,15 @@
 
 (defn- complete!
   [^FastList requests results error]
-  (dotimes [idx (.size requests)]
-    (let [^Request request (.get requests idx)]
-      (vreset! (.-result request)
-               (if error [false error] [true (aget ^objects results idx)]))
-      (.release ^Semaphore (.-ready request)))))
+  (let [confirmation (when (instance? Committed results)
+                       (.-confirmation ^Committed results))
+        results (if confirmation (.-value ^Committed results) results)]
+    (dotimes [idx (.size requests)]
+      (let [^Request request (.get requests idx)]
+        (vreset! (.-result request)
+                 (if error [false error]
+                     [true (aget ^objects results idx) confirmation]))
+        (.release ^Semaphore (.-ready request))))))
 
 (defn- run!
   [run-transaction ^FastList requests]
@@ -60,7 +102,7 @@
     (complete! requests
                (binding [*batched?* true
                          *request-count* (.size requests)]
-                 (run-transaction #(execute requests %)))
+                 (capture-commit #(run-transaction (fn [ctx] (execute requests ctx)))))
                nil)
     (catch Throwable t
       (if (::body-failure (ex-data t))
@@ -125,8 +167,10 @@
         (.acquireUninterruptibly ready)
         (when-not @result
           (lead! group run-transaction result))))
-    (let [[ok? value] @result]
-      (if ok? value (throw ^Throwable value)))))
+    (let [[ok? value confirmation] @result]
+      (if ok?
+        (do (when confirmation @confirmation) value)
+        (throw ^Throwable value)))))
 
 (defn submit!
   "Run op in a transaction under its durability policy, batching contended callers.
@@ -141,14 +185,16 @@
       ;; request cannot be overtaken by a new direct operation.
       (if (and (.isEmpty ^ConcurrentLinkedQueue (.-queue group))
                (.tryLock lock))
-        (try
+        (await-commit
           (try
-            (if (and (= 1 *request-count*) (not *batched?*))
-              (run-transaction op)
-              (binding [*request-count* 1
-                        *batched?* false]
-                (run-transaction op)))
-            (finally (.unlock lock)))
-          (finally (handoff! group)))
+            (try
+              (capture-commit
+                #(if (and (= 1 *request-count*) (not *batched?*))
+                   (run-transaction op)
+                   (binding [*request-count* 1
+                             *batched?* false]
+                     (run-transaction op))))
+              (finally (.unlock lock)))
+            (finally (handoff! group))))
         (submit-queued! group run-transaction op true)))
     (submit-queued! group run-transaction op false)))
