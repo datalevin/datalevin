@@ -389,15 +389,23 @@
 
 (declare lookup-pattern-coll)
 
-(defn- lookup-bound-overlay
+(defn- lookup-overlay
   [context database pattern entity-values]
   (let [pattern (resolve-pattern-lookup-refs
                   database (substitute-constants context pattern))
-        pairs (resolve-entity-pairs database
-                                    (or entity-values [(first pattern)]))
-        datoms (for [[entity eid] pairs
-                     datom (db/-e-datoms database eid)]
-                 [entity (:a datom) (:v datom)])]
+        entity (first pattern)
+        entities (or entity-values
+                     (when-not (or (qu/free-var? entity) (= entity '_))
+                       [entity]))
+        datoms (if entities
+                 (for [[entity eid] (resolve-entity-pairs database entities)
+                       datom (db/-e-datoms database eid)]
+                   [entity (:a datom) (:v datom)])
+                 (for [datom (db/-search database
+                                        (mapv #(when-not (or (qu/free-var? %)
+                                                            (= % '_)) %)
+                                              pattern))]
+                   [(:e datom) (:a datom) (:v datom)]))]
     (lookup-pattern-coll datoms pattern)))
 
 (defn lookup-pattern-db
@@ -444,8 +452,8 @@
                                  (long (.size ^HashSet value-values))
                                  @scan-count))]
     (cond
-      (and unindexed? (db/pending-tx-cache? db))
-      (lookup-bound-overlay context db pattern entity-values)
+      (db/pending-tx-cache? db)
+      (lookup-overlay context db pattern entity-values)
 
       use-bounded-both?
       (r/relation! {e 0, v 1}

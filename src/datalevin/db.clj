@@ -236,6 +236,18 @@
            (mark-remote-cache-check! store)))
        (refresh-cache store target remote-max-tx)))))
 
+(defn refresh-cache-if-stale
+  "Refresh a local read cache only when the store has advanced past its target.
+  Writers already invalidate affected entries and advance that target. Empty
+  capacity and transaction-disabled caches need no read-side validation."
+  [store]
+  (if-some [^LRUCache cache (.get ^ConcurrentHashMap caches (dir store))]
+    (when (and (pos? (.capacity cache)) (not (.isDisabled cache)))
+      (let [target (long (or (last-modified store) 0))]
+        (when (< (.target cache) target)
+          (refresh-cache store target))))
+    (refresh-cache store)))
+
 (defn cache-disabled?
   [store]
   (.isDisabled ^LRUCache (.get ^ConcurrentHashMap caches (dir store))))
@@ -719,6 +731,18 @@
         (merge-tx-cache-datoms db :eav base cached)
         base))))
 
+(defn- with-tx-cache-search
+  [db [e a v] base]
+  (if-not (tx-cache-active? db)
+    base
+    (let [value? (when (some? v) (s/vpred v))
+          cached (filter (fn [^Datom datom]
+                           (and (or (nil? e) (= e (.-e datom)))
+                                (or (nil? a) (= a (.-a datom)))
+                                (or (nil? value?) (value? (.-v datom)))))
+                         (:eavt db))]
+      (merge-tx-cache-datoms db :eav base cached))))
+
 (defrecord-updatable DB [^IStore store
                          ^long max-eid
                          ^long max-tx
@@ -835,29 +859,31 @@
 
   ISearch
   (-search
-    [_ pattern]
+    [db pattern]
     (let [[e a v _] pattern]
       (when (nil? e) (vld/validate-indexed-attr (schema store) a))
-      (wrap-cache
-        store [:search e a v]
-        (case-tree
-          [e a (some? v)]
-          [(fetch store (datom e a v)) ; e a v
-           (slice store :eav (datom e a c/v0) (datom e a c/vmax)) ; e a _
-           (slice-filter store :eav
-                         (fn [^Datom d] (when ((s/vpred v) (.-v d)) d))
-                         (datom e nil nil)
-                         (datom e nil nil))  ; e _ v
-           (e-datoms store e) ; e _ _
-           (av-datoms store a v) ; _ a v
-           (mapv #(datom (aget ^objects % 0) a (aget ^objects % 1))
-                 (ave-tuples-list
-                   store a [[[:closed c/v0] [:closed c/vmax]]] nil true)) ; _ a _
-           (slice-filter store :eav
-                         (fn [^Datom d] (when ((s/vpred v) (.-v d)) d))
-                         (datom e0 nil nil)
-                         (datom emax nil nil)) ; _ _ v
-           (slice store :eav (datom e0 nil nil) (datom emax nil nil))])))) ; _ _ _
+      (with-tx-cache-search
+        db pattern
+        (wrap-cache
+          store [:search e a v]
+          (case-tree
+            [e a (some? v)]
+            [(fetch store (datom e a v)) ; e a v
+             (slice store :eav (datom e a c/v0) (datom e a c/vmax)) ; e a _
+             (slice-filter store :eav
+                           (fn [^Datom d] (when ((s/vpred v) (.-v d)) d))
+                           (datom e nil nil)
+                           (datom e nil nil))  ; e _ v
+             (e-datoms store e) ; e _ _
+             (av-datoms store a v) ; _ a v
+             (mapv #(datom (aget ^objects % 0) a (aget ^objects % 1))
+                   (ave-tuples-list
+                     store a [[[:closed c/v0] [:closed c/vmax]]] nil true)) ; _ a _
+             (slice-filter store :eav
+                           (fn [^Datom d] (when ((s/vpred v) (.-v d)) d))
+                           (datom e0 nil nil)
+                           (datom emax nil nil)) ; _ _ v
+             (slice store :eav (datom e0 nil nil) (datom emax nil nil))]))))) ; _ _ _
 
   (-search-tuples
     [_ pattern]
@@ -880,29 +906,31 @@
            (s/all-tuples store)])))) ; _ _ _
 
   (-first
-    [_ pattern]
-    (let [[e a v _] pattern]
-      (when (nil? e) (vld/validate-indexed-attr (schema store) a))
-      (wrap-cache
-        store [:first e a v]
-        (case-tree
-          [e a (some? v)]
-          [(first (fetch store (datom e a v))) ; e a v
-           (ea-first-datom store e a) ; e a _
-           (head-filter store :eav
-                        (fn [^Datom d]
-                          (when ((s/vpred v) (.-v d)) d))
-                        (datom e nil nil)
-                        (datom e nil nil))  ; e _ v
-           (e-first-datom store e) ; e _ _
-           (av-first-datom store a v) ; _ a v
-           (head store :ave (datom e0 a nil) (datom emax a nil)) ; _ a _
-           (head-filter store :eav
-                        (fn [^Datom d]
-                          (when ((s/vpred v) (.-v d)) d))
-                        (datom e0 nil nil)
-                        (datom emax nil nil)) ; _ _ v
-           (head store :eav (datom e0 nil nil) (datom emax nil nil))])))) ; _ _ _
+    [db pattern]
+    (if (tx-cache-active? db)
+      (first (-search db pattern))
+      (let [[e a v _] pattern]
+        (when (nil? e) (vld/validate-indexed-attr (schema store) a))
+        (wrap-cache
+          store [:first e a v]
+          (case-tree
+            [e a (some? v)]
+            [(first (fetch store (datom e a v))) ; e a v
+             (ea-first-datom store e a) ; e a _
+             (head-filter store :eav
+                          (fn [^Datom d]
+                            (when ((s/vpred v) (.-v d)) d))
+                          (datom e nil nil)
+                          (datom e nil nil))  ; e _ v
+             (e-first-datom store e) ; e _ _
+             (av-first-datom store a v) ; _ a v
+             (head store :ave (datom e0 a nil) (datom emax a nil)) ; _ a _
+             (head-filter store :eav
+                          (fn [^Datom d]
+                            (when ((s/vpred v) (.-v d)) d))
+                          (datom e0 nil nil)
+                          (datom emax nil nil)) ; _ _ v
+             (head store :eav (datom e0 nil nil) (datom emax nil nil))]))))) ; _ _ _
 
   (-count
     [db pattern]

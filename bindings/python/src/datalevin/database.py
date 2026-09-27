@@ -29,6 +29,16 @@ class Database:
 
         return self._handle
 
+    def prepare_pull(self, selector, opts=None):
+        """Prepare a pull against this database view."""
+        from .prepared import prepare_pull
+        return prepare_pull(self, selector, opts)
+
+    def prepare_query(self, query):
+        """Prepare a query against this database view."""
+        from .prepared import prepare_query
+        return prepare_query(self, query)
+
     def entid(self, eid):
         """Resolve an entity id or lookup ref to an entity id."""
 

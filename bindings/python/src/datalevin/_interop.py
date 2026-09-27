@@ -42,6 +42,23 @@ class InteropBindings:
     def core_invoke(self, function: str, args=None):
         return call_java(classes().interop.coreInvoke, function, to_java(list(args or ())))
 
+    def prepare_pull(self, db, selector, opts=None):
+        return call_java(classes().interop.preparePull, db, selector, to_java(opts))
+
+    def prepare_query(self, db, query):
+        return call_java(classes().interop.prepareQuery, db, query)
+
+    def prepare_get_value(self, kv, dbi_name, k_type, v_type, ignore_key):
+        return call_java(classes().interop.prepareGetValue, kv, dbi_name,
+                         to_java(k_type), to_java(v_type), bool(ignore_key))
+
+    def connection_transact_ack(self, conn, tx_data, tx_meta=None):
+        return call_java(classes().interop.connectionTransactAck, conn,
+                         to_java(tx_data), to_java(tx_meta))
+
+    def connection_index_attr(self, conn, attr):
+        return call_java(classes().interop.connectionIndexAttr, conn, to_java(attr))
+
     def client_invoke(self, function: str, args=None):
         return call_java(classes().interop.clientInvoke, function, to_java(list(args or ())))
 
@@ -888,6 +905,7 @@ def schema_attr(
     cardinality=None,
     unique=None,
     index=None,
+    no_index=None,
     fulltext=None,
     is_component=None,
     no_history=None,
@@ -919,6 +937,8 @@ def schema_attr(
         spec[":db/unique"] = unique
     if index is not None:
         spec[":db/index"] = bool(index)
+    if no_index is not None:
+        spec[":db/noindex"] = bool(no_index)
     if fulltext is not None:
         spec[":db/fulltext"] = bool(fulltext)
     if is_component is not None:

@@ -1221,7 +1221,7 @@ public class KV extends HandleResource {
     }
 
     /**
-     * Returns the value for {@code key} from the named DBI.
+     * Prepares a reusable point read with default data types.
      */
     public PreparedRead prepareGetValue(String dbi) {
         return Datalevin.prepareGetValue(this, dbi);

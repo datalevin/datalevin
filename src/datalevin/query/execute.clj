@@ -231,37 +231,42 @@
       (qaccess/complete-demand
         ordering (:qoffset parsed-q) finite-limit :exact required-vars))))
 
+(defn- pending-inputs?
+  [inputs]
+  (some #(and (db/db? %) (db/pending-tx-cache? %)) inputs))
+
 (defn- discover-access-plans
   [parsed-q inputs]
-  (let [root-demand  (root-access-demand parsed-q)
-        input-values (delay (qaccess/scalar-input-values parsed-q inputs))
-        planning-context
-        {:parsed-q    parsed-q
-         :inputs      inputs
-         :input-values input-values
-         :demand      root-demand}
-        plans (mapv (fn [{:keys [expr path bounds work] :as plan}]
-                      (let [bounds (or bounds (qaccess/source-bounds))
-                            access-source
-                            (or (:access-source plan)
-                                (qaccess/resolve-source
-                                  @input-values (:source expr))
-                                (get-in path [:options :db]))]
-                        (cond->
-                          (assoc plan
-                                 :demand root-demand
-                                 :bounds bounds
-                                 :access-source access-source
-                                 :query parsed-q
-                                 :inputs inputs)
-                        (empty? (:requires expr))
-                        (assoc :step
-                               (qplan/access-step
-                                 expr path root-demand bounds work []
-                                 access-source)))))
-                    (qaccess/access-plans
-                      *access-methods* planning-context))]
-    plans))
+  (when-not (pending-inputs? inputs)
+    (let [root-demand  (root-access-demand parsed-q)
+          input-values (delay (qaccess/scalar-input-values parsed-q inputs))
+          planning-context
+          {:parsed-q    parsed-q
+           :inputs      inputs
+           :input-values input-values
+           :demand      root-demand}
+          plans (mapv (fn [{:keys [expr path bounds work] :as plan}]
+                        (let [bounds (or bounds (qaccess/source-bounds))
+                              access-source
+                              (or (:access-source plan)
+                                  (qaccess/resolve-source
+                                    @input-values (:source expr))
+                                  (get-in path [:options :db]))]
+                          (cond->
+                            (assoc plan
+                                   :demand root-demand
+                                   :bounds bounds
+                                   :access-source access-source
+                                   :query parsed-q
+                                   :inputs inputs)
+                          (empty? (:requires expr))
+                          (assoc :step
+                                 (qplan/access-step
+                                   expr path root-demand bounds work []
+                                   access-source)))))
+                      (qaccess/access-plans
+                        *access-methods* planning-context))]
+      plans)))
 
 (defn- prepare-access-plans
   [context plans]
@@ -1000,17 +1005,31 @@
   "Run the shared context preparation pipeline. `execute?` selects execution
    vs planning mode for `make-context` and `-q`."
   [parsed-q inputs access-plans execute?]
-  (-> (qplan/make-context parsed-q execute?)
-      (attach-access-plans access-plans)
-      (qresolve/resolve-ins inputs)
-      (materialize-input-bound-patterns)
-      (resolve-redudants)
-      (rules/rewrite)
-      (push-down-equality-disjunctions)
-      (rewrite-unused-vars)
-      (materialize-selective-value-lookups)
-      (materialize-selective-rule-anchors)
-      (-q execute?)))
+  (let [context (-> (qplan/make-context parsed-q execute?)
+                    (attach-access-plans access-plans)
+                    (qresolve/resolve-ins inputs))]
+    (if (pending-inputs? inputs)
+      ;; Native tuple plans and their statistics see only the store. Resolve
+      ;; simulated changes through the DB's merged datoms instead.
+      (let [context (rules/rewrite context)
+            clauses (sort-late-clauses
+                      (qresolve/bound-vars context) (:rules context)
+                      (get-in context [:parsed-q :qorig-where]) (:sources context))
+            context (assoc context :late-clauses clauses)]
+        (binding [qu/*implicit-source* (get (:sources context) '$)
+                  qresolve/*singleton-domain-scan?* false]
+          (if execute?
+            (reduce qresolve/resolve-clause context clauses)
+            context)))
+      (-> context
+          (materialize-input-bound-patterns)
+          (resolve-redudants)
+          (rules/rewrite)
+          (push-down-equality-disjunctions)
+          (rewrite-unused-vars)
+          (materialize-selective-value-lookups)
+          (materialize-selective-rule-anchors)
+          (-q execute?)))))
 
 (defn- execute-query
   ([parsed-q inputs]

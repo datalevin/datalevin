@@ -85,6 +85,7 @@
           ;; A local source, or a second DB source, rules out remote execution.
           ;; The usual embedded call exits at its first argument.
           (when (and (nil? remote-db)
+                     (not (db/pending-tx-cache? input))
                      (db/remote-store? (.-store ^DB input)))
             (recur (next remaining) (inc idx) input idx))
           (recur (next remaining) (inc idx) remote-db remote-idx)))
@@ -141,7 +142,8 @@
   (let [parsed-q (prepared-query query)
         expected (dec (count (:qin parsed-q)))
         store (.-store db)
-        remote (when (db/remote-prepared-store? store)
+        remote (when (and (db/remote-prepared-store? store)
+                          (not (db/pending-tx-cache? db)))
                  (i/prepare-remote-read store :q [query nil]))
         reader (when-not remote (result-reader parsed-q))]
     (prepared/prepared-read

@@ -20,6 +20,12 @@ test("typed system query inputs preserve literal strings", async () => {
 });
 
 test("public surface stays importable without starting the JVM", () => {
+  for (const name of ["PreparedRead", "preparePull", "prepareQuery", "prepareGetValue",
+    "executePrepared", "transactAck", "indexAttr"]) {
+    assert.equal(typeof datalevin[name], "function", name);
+  }
+  assert.deepEqual(datalevin.schemaAttr({ noIndex: true }), { ":db/noindex": true });
+  assert.deepEqual(datalevin.schemaAttr({ noIndex: false }), { ":db/noindex": false });
   assert.equal(typeof datalevin.abortTransact, "function");
   assert.equal(typeof datalevin.analyze, "function");
   assert.equal(typeof datalevin.apiInfo, "function");

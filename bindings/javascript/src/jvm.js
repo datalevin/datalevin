@@ -310,6 +310,7 @@ export async function classes() {
       linkedHashSet: load("java.util.LinkedHashSet"),
       arrayList: load("java.util.ArrayList"),
       longClass: load("java.lang.Long"),
+      doubleClass: load("java.lang.Double"),
       uuid: load("java.util.UUID"),
       instant: load("java.time.Instant"),
       date: load("java.util.Date"),

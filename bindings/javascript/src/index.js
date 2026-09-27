@@ -1,6 +1,15 @@
 export { Client } from "./client.js";
 export { Connection } from "./connection.js";
 export { Database } from "./database.js";
+export {
+  PreparedRead,
+  executePrepared,
+  indexAttr,
+  prepareGetValue,
+  preparePull,
+  prepareQuery,
+  transactAck
+} from "./prepared.js";
 export { Entity } from "./entity.js";
 export {
   DatalevinConfigurationError,

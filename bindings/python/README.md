@@ -64,6 +64,45 @@ mutable structural container. `q.kw()` and `q.sym()` tokens use Python value
 equality and hashing. Non-structural objects such as backend handles are treated
 as atomic values.
 
+## Prepared reads and acknowledgement-only writes
+
+`Connection` and `Database` expose `prepare_pull(selector, opts=None)` and
+`prepare_query(query)`. `KV` and `KVTransaction` expose
+`prepare_get_value(dbi_name, k_type=None, v_type=None, ignore_key=True)`.
+The same names are available as top-level helpers, with the connection,
+database, or KV handle as their first argument.
+
+```python
+read_person = conn.prepare_pull([":name", ":age"])
+person = read_person.execute([":name", "Ada"])
+lookup = conn.prepare_query(
+    "[:find ?age . :in $ ?name :where [?e :name ?name] [?e :age ?age]]"
+)
+age = lookup(["Ada"])
+```
+
+Prepared queries accept EDN or typed `q` forms. Execute with a list of the
+remaining `:in` values, excluding the database, or `[]` when there are none.
+Results and input conversion match ordinary queries, including dynamic
+`:limit` and `:offset` bindings. Prepared objects can also be called directly
+or passed to `execute_prepared(prepared, input)`.
+
+A local prepared pull or KV read accepts `execute(view, input)`, also exposed
+as `execute_prepared(prepared, view, input)`, to read an explicit transaction
+view. Prepared queries and remote preparations do not accept explicit views;
+prepare them from the transaction handle instead. Keep the owning store open.
+Prepared reads require no separate close, and transaction-bound reads retain
+the transaction's lifetime and thread restrictions.
+
+`conn.transact_ack(tx_data, tx_meta=None)` and `transact_ack(conn, ...)` return
+`":transacted"` on success. Validation and durability match `transact`, and
+listeners still receive full reports. Inside an explicit transaction, success
+means staged; the surrounding transaction controls commit or abort.
+
+Use `schema_attr(no_index=True)` for `:db/noindex`. Reads by entity and pull
+remain available; query conditions on that attribute require
+`conn.index_attr(attr)` (or `index_attr(conn, attr)`) to atomically backfill AVE.
+
 ## Composing Queries
 
 Use normal Python control flow to assemble clauses. Variables, attributes,

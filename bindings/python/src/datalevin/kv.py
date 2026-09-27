@@ -350,6 +350,11 @@ class KV(ResourceWrapper):
                 args.append(_BINDINGS.kv_type(v_type))
         return to_python(_BINDINGS.core_invoke("transact-kv", args))
 
+    def prepare_get_value(self, dbi_name, k_type=None, v_type=None, ignore_key=True):
+        """Prepare a reusable point read; inherited by explicit KV transactions."""
+        from .prepared import prepare_get_value
+        return prepare_get_value(self, dbi_name, k_type, v_type, ignore_key)
+
     def get_value(self, dbi_name, key, k_type=None, v_type=None, ignore_key=False):
         args = [self.raw_handle(), dbi_name, to_java(key)]
         if (k_type is None) != (v_type is None):

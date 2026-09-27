@@ -58,6 +58,15 @@ class FakeClientBindings:
         return ("edn", value)
 
 
+def test_prepared_public_surface_and_noindex_schema():
+    for name in ("PreparedRead", "prepare_pull", "prepare_query", "prepare_get_value",
+                 "execute_prepared", "transact_ack", "index_attr"):
+        assert callable(getattr(datalevin, name))
+        assert name in datalevin.__all__
+    assert datalevin.schema_attr(no_index=True) == {":db/noindex": True}
+    assert datalevin.schema_attr(no_index=False) == {":db/noindex": False}
+
+
 class FakeInteropBindings:
     def __init__(self) -> None:
         self.exec_response = json.dumps({"ok": True, "result": {"status": "ok"}})

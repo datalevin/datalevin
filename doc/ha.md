@@ -161,11 +161,9 @@ Datalevin write leader.
 
 ## Main Design Idea
 
-Datalevin does not ask the control plane to approve every user write. That
-would make the write path much more expensive. Instead, the control plane grants
-a time-bounded lease to one node. That node renews the lease periodically and
-caches the result locally. The write path is then guarded by the cached lease
-state:
+The control plane grants a time-bounded lease to one node. That node renews
+the lease periodically and caches the result locally. Request admission checks
+the cached lease state:
 
 * local role must be `:leader`
 * cached lease owner must still be the local node
@@ -175,8 +173,32 @@ state:
 
 If any of those checks fail, writes are rejected.
 
-That gives Datalevin a fast local write path in the healthy case, while still
-failing closed when leadership becomes uncertain.
+Before appending WAL data, the server checks the cached lease again, including
+observation freshness and the local lease deadline with its admission margin.
+This check does not issue a `readIndex` request. After committing locally under
+the configured WAL durability policy, the server renews the lease with that
+commit's LSN. The renewal checks the authoritative owner and term and publishes
+the watermark before returning success. A queued transaction cannot cross into
+a different local runtime or lease term. If confirmation fails after the local
+commit, the result is indeterminate because the commit has already happened.
+
+Eligible concurrent KV and Datalog requests share the server's write-group
+queue. Each physical group performs cached admission, one WAL/native commit,
+and one LSN-publishing lease renewal, then releases its callers. This amortizes
+local durability and authority costs across the group. The renewal follows
+local commit so it never advertises uncommitted state; acknowledgments wait for
+the renewal, not for the next periodic timer tick.
+Explicit transactions, shared-WAL stores, `:extra` durability, and embedded HA
+writes retain their individual paths. An uncontended server write still pays
+one authority renewal.
+
+The periodic renew loop remains active, including when there are no writes.
+Write groups also renew the lease immediately to confirm their committed
+`leader-last-applied-lsn`. This publication preserves the promotion floor when
+the old leader cannot be reached. It does not replicate WAL data: with the
+default zero promotion-lag limit, a published higher watermark can block
+promotion until a sufficiently caught-up candidate is available. A nonzero
+promotion-lag allowance explicitly permits promotion behind that known floor.
 
 ## Normal Operation
 
@@ -198,18 +220,23 @@ degraded state instead of guessing.
 A leader does two jobs at once:
 
 * serve normal reads and writes
-* renew its lease and publish fresh `leader-last-applied-lsn`
+* periodically renew its lease and publish fresh `leader-last-applied-lsn`
 
 If lease renew fails, the owner/term changes, membership becomes inconsistent,
 or the renew loop stalls too long, the node stops admitting writes and demotes.
 
 ### Read behavior
 
-Reads are simpler than writes:
+Consensus-lease Datalog reads require a fresh cached authority observation,
+local leader ownership, and an unexpired lease. They also enforce any client
+transaction floor. A rejected read includes leader/retry endpoints; a consensus
+follower does not serve these reads as if it were the leader. Standalone replicas
+without a consensus authority can serve reads through the normal client APIs.
 
-* reads can go to the leader
-* reads can also go directly to a follower or replica
-* the normal client APIs are sufficient for follower reads
+The read guard preserves the Datalog cache while its target is current. Normal
+writes invalidate affected entries, and follower replay refreshes the cache
+after applying a batch. Reads refresh only a stale cache; zero-capacity caches
+skip the cache validation and allocation work.
 
 There is no separate "read-only replica client" API. If you want read-only
 enforcement for a user, use RBAC and grant only
@@ -332,26 +359,26 @@ to auto-promote.
 ### Write acknowledgement and RPO
 
 Consensus-lease HA uses asynchronous pull replication. A successful write means
-the current leader accepted and applied the transaction locally under an active
-lease. It does not mean a quorum of data nodes has durably replicated that
-transaction.
+the current leader applied the transaction locally under an active lease and
+confirmed its physical group's LSN with the authority. It does not mean a
+quorum of data nodes has durably replicated that transaction.
 
-The control-plane lease records `leader-last-applied-lsn`, but the leader
-publishes that value on lease renew, not on every write. If the leader is lost
-permanently before any surviving follower has pulled its latest records, the
-next leader starts from the maximum LSN proven by the authority lease and
-reachable member watermarks. Writes only present on the lost leader can be
-absent after failover. This is the intended availability/latency tradeoff of
-the current HA design, not quorum-write replication.
+The control-plane lease records `leader-last-applied-lsn`. Each committed server
+write group publishes that value through one lease renewal before acknowledging
+its requests; the periodic loop also renews during idle periods. Promotion uses
+the maximum LSN proven by the authority lease and reachable member watermarks.
+With the default zero promotion-lag allowance, losing the only copy of an
+acknowledged write blocks automatic promotion instead of permitting a leader
+behind that floor. Replication lag therefore affects failover availability.
 
-The exposure is bounded operationally by:
+Durability and failover still depend on:
 
-* the leader lease-renew interval (`:ha-lease-renew-ms`, default `5000`)
 * follower pull lag, visible through `:ha-follower-source-last-applied-lsn` and
   local `ha-watermark`/`txlog-watermarks`
-* local WAL durability profile. HA defaults to `:strict`; using `:relaxed`
-  allows a single-node power loss to lose the unsynced group-commit tail
-  described in `doc/wal.md`
+* the promotion-lag allowance: a nonzero `:ha-max-promotion-lag-lsn` permits
+  promotion behind the known floor, with possible loss of acknowledged writes
+* local WAL durability and storage survival. Consensus-lease HA requires
+  `:strict` or `:extra` durability; `:relaxed` is rejected by option validation
 
 When a former leader rejoins as a follower and its local WAL is ahead of the
 authority-confirmed LSN, `ha-watermark` reports a conservative upper bound:

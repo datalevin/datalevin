@@ -229,7 +229,8 @@
     (if inputs
       (let [input (first inputs)]
         (if (db/-searchable? input)
-          (when-not store (recur (next inputs) (.-store ^DB input)))
+          (when-not (or store (db/pending-tx-cache? input))
+            (recur (next inputs) (.-store ^DB input)))
           (recur (next inputs) store)))
       store)))
 

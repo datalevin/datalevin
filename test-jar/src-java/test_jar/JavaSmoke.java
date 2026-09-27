@@ -7,7 +7,9 @@ import datalevin.DatalogQuery;
 import datalevin.KV;
 import datalevin.KVType;
 import datalevin.PullSelector;
+import datalevin.PreparedRead;
 import datalevin.RangeSpec;
+import datalevin.Rules;
 import datalevin.Schema;
 import datalevin.Tx;
 import datalevin.UdfDescriptor;
@@ -439,9 +441,111 @@ public final class JavaSmoke {
                 }
             }
 
+            preparedApis(dir);
             System.out.println("Java jar test succeeded!");
         } finally {
             deleteRecursively(dir);
+        }
+    }
+
+    private static void preparedApis(Path dir) {
+        Schema schema = Datalevin.schema()
+                .attr("key", Schema.attribute().valueType(Schema.ValueType.LONG)
+                        .unique(Schema.Unique.IDENTITY))
+                .attr("name", Schema.attribute().valueType(Schema.ValueType.STRING))
+                .attr("body", Schema.attribute().valueType(Schema.ValueType.STRING).noIndex(true));
+        try (Connection conn = Datalevin.createConn(dir.resolve("prepared").toString(), schema)) {
+            List<Map<?, ?>> reports = new ArrayList<>();
+            Object listener = conn.listen(reports::add);
+            preparedEquals(Datalevin.kw("transacted"), Datalevin.transactAck(conn,
+                    Datalevin.tx().entity(Tx.entity(1).put("key", 1L)
+                            .put("name", ":literal").put("body", "hidden")),
+                    Map.of("source", "test")));
+            conn.unlisten(listener);
+            preparedEquals(1, reports.size());
+            preparedEquals(Map.of("source", "test"), reports.get(0).get(Datalevin.kw("tx-meta")));
+            PreparedRead pull = conn.preparePull(Datalevin.pull().attr("name").attr("body"), Map.of());
+            preparedEquals(Map.of(Datalevin.kw("name"), ":literal", Datalevin.kw("body"), "hidden"),
+                    Datalevin.executePrepared(pull, List.of(":key", 1L)));
+            preparedEquals(Map.of(Datalevin.kw("name"), ":literal"),
+                    Datalevin.preparePull(conn, "[:name]").execute(1L));
+            PreparedRead query = conn.prepareQuery("[:find ?name . :in $ ?key :where "
+                    + "[?e :key ?key] [?e :name ?name]]");
+            preparedEquals(":literal", query.execute(List.of(1L)));
+            preparedEquals(null, query.execute(List.of(2L)));
+            PreparedRead typed = Datalevin.prepareQuery(conn, Datalevin.query()
+                    .findScalar("?e").in("$", "?name")
+                    .whereDatom(Datalevin.var("e"), "name", Datalevin.var("name")));
+            preparedEquals(1L, typed.execute(List.of(":literal")));
+            Rules rules = Datalevin.rules().rule("named", "?key", "?name")
+                    .whereClause("[?e :key ?key]").whereClause("[?e :name ?name]").end();
+            DatalogQuery ruleQuery = Datalevin.query().findScalar("?name")
+                    .in("$", "%", "?key").rules(rules)
+                    .whereRule("named", Datalevin.var("key"), Datalevin.var("name"));
+            PreparedRead ruleRead = conn.prepareQuery(ruleQuery);
+            preparedEquals(":literal", ruleRead.execute(List.of(1L)));
+            ruleQuery.in("?unused");
+            preparedEquals(":literal", ruleRead.execute(List.of(1L)));
+            PreparedRead window = conn.prepareQuery("[:find ?key :in $ ?start ?limit ?offset "
+                    + ":where [?e :key ?key] [(>= ?key ?start)] "
+                    + ":order-by ?key :limit ?limit :offset ?offset]");
+            preparedEquals(List.of(List.of(1L)), window.execute(List.of(0L, 1L, 0L)));
+            preparedEquals(List.of(), window.execute(List.of(0L, 1L, 1L)));
+            conn.transactAck(List.of(List.of(":db/add", 1L, ":name", "updated")));
+            preparedEquals("updated", query.execute(List.of(1L)));
+            preparedEquals("updated", ((Map<?, ?>) pull.execute(1L)).get(Datalevin.kw("name")));
+            Object simulated = Datalevin.txDataToSimulatedReport(conn,
+                    List.of(List.of(":db/add", 1L, ":name", "simulated"))).get(Datalevin.kw("db-after"));
+            preparedEquals("simulated", ((Map<?, ?>) Datalevin.executePrepared(pull, simulated, 1L))
+                    .get(Datalevin.kw("name")));
+            String simulatedQuery = "[:find ?name . :where [1 :name ?name]]";
+            preparedEquals("updated", conn.query(simulatedQuery));
+            preparedEquals("simulated", DatalevinInterop.coreInvoke("q",
+                    List.of(DatalevinInterop.readEdn(simulatedQuery), simulated)));
+            preparedEquals("simulated", Datalevin.prepareQuery(simulated, simulatedQuery).execute(List.of()));
+            preparedEquals("updated", conn.query(simulatedQuery));
+            conn.withTransaction(tx -> {
+                preparedEquals(Datalevin.kw("transacted"), tx.transactAck(
+                        List.of(List.of(":db/add", 1L, ":name", "staged"))));
+                preparedEquals("staged", ((Map<?, ?>) pull.execute(tx, 1L)).get(Datalevin.kw("name")));
+                preparedEquals("staged", tx.prepareQuery("[:find ?name . :where [1 :name ?name]]")
+                        .execute(List.of()));
+                tx.abortTransact();
+                return null;
+            });
+            preparedEquals("updated", query.execute(List.of(1L)));
+            boolean rejected = false;
+            try { conn.query("[:find ?e :where [?e :body \"hidden\"]]"); }
+            catch (RuntimeException expected) { rejected = true; }
+            if (!rejected) throw new IllegalStateException("Unindexed query unexpectedly succeeded");
+            Map<?, ?> indexed = Datalevin.indexAttr(conn, "body");
+            preparedEquals(null, ((Map<?, ?>) indexed.get(Datalevin.kw("body"))).get(Datalevin.kw("db/noindex")));
+            preparedEquals(indexed, conn.indexAttr("body"));
+            preparedEquals(1L, conn.query("[:find ?e . :where [?e :body \"hidden\"]]"));
+        }
+        try (KV kv = Datalevin.openKV(dir.resolve("prepared-kv").toString())) {
+            kv.openDbi("data");
+            kv.openDbi("typed");
+            kv.transact(List.of(List.of(":put", "data", "key", "value"),
+                    List.of(":put", "typed", Datalevin.kw("key"), "old", ":keyword", ":string")));
+            preparedEquals("value", Datalevin.prepareGetValue(kv, "data").execute("key"));
+            preparedEquals("value", kv.prepareGetValue("data", KVType.DATA).execute("key"));
+            PreparedRead read = kv.prepareGetValue("typed", KVType.KEYWORD, KVType.STRING, false);
+            preparedEquals(List.of(Datalevin.kw("key"), "old"), read.execute(Datalevin.kw("key")));
+            preparedEquals(null, read.execute(Datalevin.kw("missing")));
+            try (var tx = kv.beginTransaction()) {
+                tx.transact(List.of(List.of(":put", "typed", Datalevin.kw("key"), "staged", ":keyword", ":string")));
+                preparedEquals(List.of(Datalevin.kw("key"), "staged"), read.execute(tx, Datalevin.kw("key")));
+                preparedEquals("staged", tx.prepareGetValue("typed", ":keyword", ":string").execute(Datalevin.kw("key")));
+                tx.abort();
+            }
+            preparedEquals(List.of(Datalevin.kw("key"), "old"), read.execute(Datalevin.kw("key")));
+        }
+    }
+
+    private static void preparedEquals(Object expected, Object actual) {
+        if (!java.util.Objects.equals(expected, actual)) {
+            throw new IllegalStateException("Prepared API expected " + expected + ", got " + actual);
         }
     }
 

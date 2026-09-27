@@ -59,6 +59,15 @@ from ._raw import interop
 from .client import Client
 from .connection import Connection
 from .database import Database
+from .prepared import (
+    PreparedRead,
+    execute_prepared,
+    index_attr,
+    prepare_get_value,
+    prepare_pull,
+    prepare_query,
+    transact_ack,
+)
 from .entity import Entity
 from .errors import (
     DatalevinConfigurationError,
@@ -97,6 +106,13 @@ from .transaction import LookupRef, PatchOp, TxData
 from .vector import VectorIndex
 
 __all__ = [
+    "PreparedRead",
+    "execute_prepared",
+    "index_attr",
+    "prepare_get_value",
+    "prepare_pull",
+    "prepare_query",
+    "transact_ack",
     "Client",
     "Connection",
     "Database",

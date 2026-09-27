@@ -66,24 +66,26 @@
 
 (defn write-group
   "Return the admission queue for eligible standalone strict or relaxed writes.
-  Explicit transactions, HA, and shared-WAL stores retain their current path."
-  [db kind]
-  (when (and group/*enabled?*
-             (nil? cpp/*before-write-commit-fn*)
-             (nil? kvtx/*after-txlog-append-fn*)
-             (not (l/writing? db))
-             (not (Thread/holdsLock (l/write-txn db))))
-    (let [info @(i/kv-info db)
-          state (:txlog-state info)]
-      (when (and state (#{:strict :relaxed} (:durability-profile state))
-                 (not (:wal-shared? state))
-                 (nil? (:ha-mode info))
-                 (kvtx/txlog-write-path-enabled? db))
-        (let [^ConcurrentHashMap groups (:write-groups state)]
-          (.computeIfAbsent groups kind
-                            (reify Function
-                              (apply [_ _]
-                                (group/create (txlog/group-commit info))))))))))
+  The server may opt HA stores in when it retains both HA guards around the
+  physical commit. Embedded HA, explicit transactions and shared WAL stay out."
+  ([db kind] (write-group db kind false))
+  ([db kind ha-guarded?]
+   (when (and group/*enabled?*
+              (nil? cpp/*before-write-commit-fn*)
+              (nil? kvtx/*after-txlog-append-fn*)
+              (not (l/writing? db))
+              (not (Thread/holdsLock (l/write-txn db))))
+     (let [info @(i/kv-info db)
+           state (:txlog-state info)]
+       (when (and state (#{:strict :relaxed} (:durability-profile state))
+                  (not (:wal-shared? state))
+                  (or (nil? (:ha-mode info)) ha-guarded?)
+                  (kvtx/txlog-write-path-enabled? db))
+         (let [^ConcurrentHashMap groups (:write-groups state)]
+           (.computeIfAbsent groups kind
+                             (reify Function
+                               (apply [_ _]
+                                 (group/create (txlog/group-commit info)))))))))))
 
 (defn grouped-write!
   "Execute a standalone KV operation in a group under its durability policy."

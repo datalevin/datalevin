@@ -17,9 +17,12 @@ Status key:
 | --- | --- | --- | --- | --- |
 | Open local Datalog connection | Yes | Yes | Yes | Yes |
 | Query, pull, explain | Yes | Yes | Yes | Yes |
+| Prepared query / pull / execution | Yes, `prepare-q` / `prepare-pull` / `execute-prepared` | Yes, `prepareQuery` / `preparePull` / `executePrepared` | Yes, `prepare_query` / `prepare_pull` / `execute_prepared` | Yes, `prepareQuery` / `preparePull` / `executePrepared` |
 | Idiomatic, composable query forms | N/A, native data | Partial, `DatalogQuery` / `QueryClause` | Yes, pure `q` forms | Yes, pure `q` forms |
 | Multiple source databases in `q` / `explain` | Yes | Yes, pass `Connection` sources | Yes, pass `Connection` sources | Yes, pass `Connection` sources |
 | Synchronous transaction | Yes | Yes | Yes | Yes |
+| Acknowledgement-only transaction | Yes, `transact-ack!` | Yes, `transactAck` | Yes, `transact_ack` | Yes, `transactAck` |
+| Unindexed attributes and index backfill | Yes, `:db/noindex` / `index-attr` | Yes, `noIndex` / `indexAttr` | Yes, `no_index` / `index_attr` | Yes, `noIndex` / `indexAttr` |
 | Async transaction | Yes | Yes, `CompletableFuture` | Yes, `Future` | Yes, `Promise` |
 | Simulated transaction report from tx data | Yes | Yes | Yes | Yes |
 | Transaction listeners: `listen!` / `unlisten!` | Yes | Yes | Yes | Yes |
@@ -90,6 +93,7 @@ strings beginning with `:` or `?`.
 | Capability | Clojure | Java | Python | JavaScript |
 | --- | --- | --- | --- | --- |
 | Open KV store | Yes | Yes | Yes | Yes |
+| Prepared KV point reads | Yes, `prepare-get-value` | Yes, `prepareGetValue` | Yes, `prepare_get_value` | Yes, `prepareGetValue` |
 | Open/list/clear/drop DBIs | Yes | Yes | Yes | Yes |
 | Entries and basic get/range reads | Yes | Yes | Yes | Yes |
 | KV transaction data writes | Yes | Yes | Yes | Yes |

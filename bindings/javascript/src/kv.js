@@ -423,6 +423,11 @@ export class KV extends ResourceWrapper {
     return toJsResult(await _BINDINGS.coreInvoke("gc-txlog-segments!", args));
   }
 
+  async prepareGetValue(dbiName, opts = {}) {
+    const { prepareGetValue } = await import("./prepared.js");
+    return prepareGetValue(this, dbiName, opts);
+  }
+
   async transact(txs, { dbiName = null, kType = null, vType = null } = {}) {
     if (dbiName === null && (kType !== null || vType !== null)) {
       throw new TypeError("kType and vType require dbiName for KV transact().");

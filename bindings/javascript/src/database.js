@@ -1,5 +1,6 @@
 import { toEdnForm, toJava } from "./convert.js";
 import { _BINDINGS } from "./interop.js";
+import { preparePull, prepareQuery } from "./prepared.js";
 import { callJavaMethod } from "./jvm.js";
 import { toJsResult } from "./result.js";
 import { currentNativeRegistry, nativeMethods } from "./native.js";
@@ -27,6 +28,14 @@ export class Database {
 
   rawHandle() {
     return this._handle;
+  }
+
+  async preparePull(selector, opts = null) {
+    return preparePull(this, selector, opts);
+  }
+
+  async prepareQuery(query) {
+    return prepareQuery(this, query);
   }
 
   toString() {

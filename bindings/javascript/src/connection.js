@@ -7,6 +7,7 @@ import {
 } from "./convert.js";
 import { txReportToJs } from "./database.js";
 import { Form } from "./form.js";
+import { preparePull, prepareQuery } from "./prepared.js";
 import { _BINDINGS } from "./interop.js";
 import { callJavaMethod, javaBridgeModule } from "./jvm.js";
 import { ResourceWrapper } from "./resource.js";
@@ -129,6 +130,22 @@ export class Connection extends ResourceWrapper {
 
   async schema() {
     return toJsResult(await _BINDINGS.coreInvoke("schema", [this.rawHandle()]));
+  }
+
+  async indexAttr(attr) {
+    return toJsResult(await _BINDINGS.connectionIndexAttr(this.rawHandle(), attr), { bridge: true });
+  }
+
+  async preparePull(selector, opts = null) {
+    return preparePull(this, selector, opts);
+  }
+
+  async prepareQuery(query) {
+    return prepareQuery(this, query);
+  }
+
+  async transactAck(txData, txMeta = null) {
+    return toJsResult(await _BINDINGS.connectionTransactAck(this.rawHandle(), txData, txMeta));
   }
 
   async opts() {

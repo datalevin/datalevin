@@ -69,7 +69,8 @@ public final class DatalevinInterop {
 
     /** Transacts using the acknowledgement-only core API, preserving listeners. */
     public static Object connectionTransactAck(Object conn, Object txData, Map<?, ?> txMeta) {
-        Object data = DatalevinForms.txDataInput(txData);
+        Object data = txData instanceof TxData typed
+                ? typed.buildForm() : DatalevinForms.txDataInput(txData);
         return txMeta == null
                 ? ClojureRuntime.core("transact-ack!", rawResource(conn), data)
                 : ClojureRuntime.core("transact-ack!", rawResource(conn), data,

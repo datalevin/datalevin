@@ -109,6 +109,34 @@ class InteropBindings {
     );
   }
 
+  async preparePull(db, selector, opts = null) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "preparePull", db, selector, await toJava(opts));
+  }
+
+  async prepareQuery(db, query) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "prepareQuery", db, query);
+  }
+
+  async prepareGetValue(kv, dbiName, kType, vType, ignoreKey) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "prepareGetValue", kv, dbiName,
+      await toJava(kType), await toJava(vType), ignoreKey);
+  }
+
+  async connectionTransactAck(conn, txData, txMeta = null) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "connectionTransactAck", await unwrapInteropHandle(conn),
+      await toJava(txData), await toJava(txMeta));
+  }
+
+  async connectionIndexAttr(conn, attr) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "connectionIndexAttr", await unwrapInteropHandle(conn),
+      await toJava(attr));
+  }
+
   async clientInvoke(functionName, args = null) {
     const cls = await classes();
     return callJavaMethod(
@@ -1613,6 +1641,7 @@ export function schemaAttr({
   cardinality = null,
   unique = null,
   index = null,
+  noIndex = null,
   fulltext = null,
   isComponent = null,
   noHistory = null,
@@ -1646,6 +1675,9 @@ export function schemaAttr({
   }
   if (index !== null && index !== undefined) {
     spec[":db/index"] = Boolean(index);
+  }
+  if (noIndex !== null && noIndex !== undefined) {
+    spec[":db/noindex"] = Boolean(noIndex);
   }
   if (fulltext !== null && fulltext !== undefined) {
     spec[":db/fulltext"] = Boolean(fulltext);

@@ -188,10 +188,10 @@
            (hu/long-max3 authority-lsn leader-lsn max-local-member-lsn)
 
            :else
-           ;; The authority LSN is advanced only after write commit
-           ;; confirmation, so endpoint watermarks must not lower it. A
+           ;; Periodic renewal publishes the leader's committed LSN, so
+           ;; endpoint watermarks must not lower that known floor. A
            ;; restarted former leader can briefly report a stale local
-           ;; watermark while the lease still records acknowledged writes.
+           ;; watermark while the lease still records a newer committed batch.
            (hu/long-max2 authority-lsn max-local-member-lsn))]
      {:effective-lease (assoc observed-lease
                               :leader-last-applied-lsn effective-lsn)

@@ -69,6 +69,44 @@ identity comparison; the immutable snapshot, rather than structural `===`, is th
 composition contract. Non-structural objects such as backend handles are
 treated as atomic values.
 
+## Prepared reads and acknowledgement-only writes
+
+`Connection` and `Database` expose `preparePull(selector, opts = null)` and
+`prepareQuery(query)`. `KV` and `KVTransaction` expose
+`prepareGetValue(dbiName, { kType, vType, ignoreKey = true })`; omitted types
+default to `data`. The same names are exported as top-level helpers with the
+connection, database, or KV handle as their first argument.
+
+```js
+const readPerson = await conn.preparePull([":name", ":age"]);
+const person = await readPerson.execute([":name", "Ada"]);
+const lookup = await conn.prepareQuery(
+  "[:find ?age . :in $ ?name :where [?e :name ?name] [?e :age ?age]]"
+);
+const age = await lookup.execute(["Ada"]);
+```
+
+Prepared queries accept EDN or typed `q` forms. Execute with an array of the
+remaining `:in` values, excluding the database, or `[]` when there are none.
+Results and input conversion match ordinary queries, including dynamic
+`:limit` and `:offset` bindings. `executePrepared(prepared, input)` is an
+equivalent top-level helper.
+
+A local prepared pull or KV read accepts `execute(view, input)`, also exposed
+as `executePrepared(prepared, view, input)`, to read an explicit view. Prepared
+queries and remote preparations do not accept explicit views. Use a KV
+transaction's `prepareGetValue` for transaction-bound reads. Keep the owning
+store open; prepared reads require no separate close. Transaction-bound reads
+retain the transaction's lifetime and thread restrictions.
+
+`conn.transactAck(txData, txMeta = null)` and `transactAck(conn, ...)` return
+`":transacted"` on success. Validation and durability match `transact`, and
+listeners still receive full reports.
+
+Use `schemaAttr({ noIndex: true })` for `:db/noindex`. Reads by entity and pull
+remain available; query conditions on that attribute require
+`await conn.indexAttr(attr)` (or `indexAttr(conn, attr)`) to atomically backfill AVE.
+
 ## Composing Queries
 
 Use normal JavaScript control flow to assemble clauses. Variables, attributes,

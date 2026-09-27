@@ -304,7 +304,7 @@
                       :ha-retry-endpoints
                       (ha-read-retry-endpoints state)}))))
       (when (ha-runtime-read-state? state)
-        (db/refresh-cache dt-store)))))
+        (db/refresh-cache-if-stale dt-store)))))
 
 (defn- kv-store
   [deps server skey db-name writing?]
@@ -1463,14 +1463,18 @@
 
 (defn- server-write-group
   [deps server db-name store kind]
-  (when-not (ha-runtime-read-state? (db-state deps server db-name))
-    ;; Dispatch installs these per-database HA guards even on ordinary stores.
-    ;; Keep the leader's guards around the physical commit; only omit them from
-    ;; the eligibility check for a database without HA state. Embedded callers
-    ;; with their own commit hooks must stay on their original path.
-    (binding [cpp/*before-write-commit-fn* nil
-              kvtx/*after-txlog-append-fn* nil]
-      (kv/write-group store kind))))
+  (let [state (db-state deps server db-name)
+        ha-guarded? (and (= :leader (:ha-role state))
+                         (satisfies? ctrl/ILeaseAuthority (:ha-authority state))
+                         (some? cpp/*before-write-commit-fn*)
+                         (some? kvtx/*after-txlog-append-fn*))]
+    (when (or (not (ha-runtime-read-state? state)) ha-guarded?)
+      ;; Only omit the dispatch guards while selecting the queue. The runner
+      ;; retains them around the physical commit: cached lease admission before
+      ;; WAL append, then one LSN-publishing renewal before releasing any caller.
+      (binding [cpp/*before-write-commit-fn* nil
+                kvtx/*after-txlog-append-fn* nil]
+        (kv/write-group store kind ha-guarded?)))))
 
 (defn- with-datalog-transaction-slot
   [deps server skey db-name writing? simulated? f]

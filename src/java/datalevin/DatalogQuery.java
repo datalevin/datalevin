@@ -314,7 +314,7 @@ public final class DatalogQuery {
         if (rules == null) {
             return values -> values;
         }
-        int index = indexOfToken("%");
+        int index = renderedInputs().indexOf(ClojureCodec.symbol("%")) - 1;
         Object ruleInput = rules.asInput();
         return values -> {
             ArrayList<Object> prepared = new ArrayList<>(values);

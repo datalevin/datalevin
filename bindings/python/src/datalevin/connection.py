@@ -117,6 +117,24 @@ class Connection(ResourceWrapper):
     def schema(self):
         return to_python(_BINDINGS.core_invoke("schema", [self.raw_handle()]))
 
+    def index_attr(self, attr):
+        """Atomically backfill AVE and remove :db/noindex for this attribute."""
+        return to_python(_BINDINGS.connection_index_attr(self.raw_handle(), attr))
+
+    def prepare_pull(self, selector, opts=None):
+        """Prepare a pull using this connection's current database view."""
+        from .prepared import prepare_pull
+        return prepare_pull(self, selector, opts)
+
+    def prepare_query(self, query):
+        """Prepare a query using this connection's current database view."""
+        from .prepared import prepare_query
+        return prepare_query(self, query)
+
+    def transact_ack(self, tx_data, tx_meta=None):
+        """Return :transacted on success; an enclosing transaction controls commit."""
+        return to_python(_BINDINGS.connection_transact_ack(self.raw_handle(), tx_data, tx_meta))
+
     def register_type(self, type_name, definition):
         """Register a database-wide type for use as an attribute's ``:db/valueType``.
 
