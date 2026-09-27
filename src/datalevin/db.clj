@@ -133,6 +133,11 @@
    attr
    ops])
 
+(defrecord PreparedScalarUpdate
+  [schema-epoch
+   opts-epoch
+   entries])
+
 ;; (defmethod print-method TxReport [^TxReport rp, ^java.io.Writer w]
 ;;   (binding [*out* w]
 ;;     (pr {:datoms-transacted (count (:tx-data rp))})))
@@ -2177,6 +2182,113 @@
    (when (local-patch-idoc-tx-valid? db prepared)
      (entid-strict db (:e prepared))
      (stamp-local-patch-idoc-doc db prepared tx-meta old-doc))))
+
+(def ^:private scalar-update-value-types
+  #{:db.type/long :db.type/string :db.type/keyword :db.type/symbol
+    :db.type/float :db.type/double :db.type/boolean :db.type/instant
+    :db.type/uuid :db.type/bytes :db.type/bigint :db.type/bigdec})
+
+(defn- scalar-update-entity-id
+  "Resolve an existing entity id for a scalar update, or nil to fall back.
+  Uses the in-memory max entity id so the fast path does not read store state."
+  ^Long [^DB db e]
+  (let [eid (cond
+              (integer? e)
+              (when (pos? (long e)) (long e))
+
+              (and (sequential? e) (= 2 (count e)))
+              (try (txcommon/entid db e) (catch Throwable _ nil))
+
+              (keyword? e)
+              (try (txcommon/entid db e) (catch Throwable _ nil))
+
+              :else nil)]
+    (when (and eid (pos? (long eid)) (<= (long eid) (long (:max-eid db))))
+      (long eid))))
+
+(defn ^:no-doc prepare-scalar-update-tx
+  "Recognize a transaction made only of ordinary scalar [:db/add eid attr value]
+  updates to existing entities with simple cardinality-one, non-unique,
+  non-reference attributes. The caller must stamp it against the current LMDB
+  write snapshot before committing. Returns nil for shapes that retain the
+  general transaction path."
+  [^DB db initial-es]
+  (let [store        (.-store db)
+        store-schema (schema store)
+        store-opts   (opts store)]
+    (loop [es      (seq initial-es)
+           seen    (java.util.HashSet.)
+           entries (transient [])]
+      (if es
+        (let [entity (first es)]
+          (if (and (sequential? entity)
+                   (= 4 (count entity))
+                   (identical? :db/add (nth entity 0)))
+            (let [[_ e attr value] entity
+                  props            (store-schema attr)
+                  vt               (:db/valueType props)]
+              (when (and (keyword? attr)
+                         props
+                         (not= "db" (namespace attr))
+                         (some? (:db/aid props))
+                         (not (identical? (:db/cardinality props)
+                                          :db.cardinality/many))
+                         (nil? (:db/unique props))
+                         (nil? (:db/tupleAttrs props))
+                         (nil? (:db/tupleType props))
+                         (nil? (:db/tupleTypes props))
+                         (nil? (:db.attr/preds props))
+                         (or (nil? vt) (contains? scalar-update-value-types vt))
+                         (some? value))
+                (let [eid (scalar-update-entity-id db e)]
+                  (when (and eid (.add seen [eid attr]))
+                    (vld/validate-attr attr entity)
+                    (vld/validate-val value entity)
+                    (let [v (prepare/correct-value-with-props
+                              store-opts props attr value)]
+                      (recur (next es) seen (conj! entries [eid attr v])))))))
+            nil))
+        (when (pos? (count entries))
+          (->PreparedScalarUpdate (schema store) (opts store)
+                                  (persistent! entries)))))))
+
+(defn ^:no-doc scalar-update-tx-valid?
+  [^DB db ^PreparedScalarUpdate prepared]
+  (let [store (.-store db)]
+    (and (identical? (:schema-epoch prepared) (schema store))
+         (identical? (:opts-epoch prepared) (opts store)))))
+
+(defn ^:no-doc stamp-scalar-update-tx
+  "Stamp a prepared scalar-update batch against the current store snapshot.
+  Returns a TxReport without mutable index overlays, or nil when its immutable
+  schema/options epochs are stale."
+  [^DB db ^PreparedScalarUpdate prepared tx-meta]
+  (when (scalar-update-tx-valid? db prepared)
+    (let [store   (.-store db)
+          tx-id   (inc (long (:max-tx db)))
+          entries (:entries prepared)
+          n       (count entries)
+          tx-data
+          (loop [i 0, out (transient [])]
+            (if (< i n)
+              (let [[e attr value] (nth entries i)
+                    ^Datom old      (ea-first-datom store e attr)]
+                (cond
+                  (nil? old)
+                  (recur (unchecked-inc i)
+                         (conj! out (datom e attr value tx-id)))
+
+                  (= (.-v old) value)
+                  (recur (unchecked-inc i) out)
+
+                  :else
+                  (recur (unchecked-inc i)
+                         (-> out
+                             (conj! (datom e attr (.-v old) tx-id false))
+                             (conj! (datom e attr value tx-id))))))
+              (persistent! out)))
+          db-after (assoc db :max-tx tx-id)]
+      (->TxReport db db-after tx-data {:db/current-tx tx-id} tx-meta))))
 
 (defn transact-tx-data
   [initial-report initial-es simulated?]

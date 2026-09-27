@@ -324,7 +324,8 @@
   check fails, or nil when a required attribute is missing."
   [lmdb iter na nvs ^objects tuple eid-idx ^ints aids ^objects preds
    ^objects fidxs ^booleans skips]
-  (let [te ^long (aget tuple eid-idx)
+  (let [na (long na)
+        te ^long (aget tuple eid-idx)
         vs (when (pos? ^long nvs) (object-array (int nvs)))]
     (loop [next? (lmdb/seek-key iter te :id)
            ai    0
@@ -367,7 +368,8 @@
   Avoids a separate values array when the entity is not repeated."
   [lmdb iter na nvs ^objects tuple eid-idx ^ints aids ^objects preds
    ^objects fidxs ^booleans skips]
-  (let [te ^long (aget tuple eid-idx)
+  (let [na (long na)
+        te ^long (aget tuple eid-idx)
         base (alength tuple)
         res (when (pos? ^long nvs) (object-array (+ base (int nvs))))]
     (when res (System/arraycopy tuple 0 res 0 base))

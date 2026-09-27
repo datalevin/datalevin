@@ -196,24 +196,30 @@
       (long file-bytes))))
 
 (defn- txlog-segment-records
-  [segment start-offset scan-bytes]
+  [segment start-offset scan-bytes upto]
   (let [{:keys [id file]} segment
         segment-id (long id)
         path (.getPath ^java.io.File file)
         start-offset (long (max 0 (long (or start-offset 0))))
         scan-bytes (long (max start-offset (long (or scan-bytes 0))))
-        acc (FastList.)]
-    (txlog/scan-segment
-     path
-     {:allow-preallocated-tail? true
-      :start-offset start-offset
-      :max-offset scan-bytes
-      :collect-records? false
-      :on-record (fn [record]
-                   (.add acc
-                         (txlog-record-entry
-                          segment-id path record false)))})
-    (vec acc)))
+        acc (FastList.)
+        scan (txlog/scan-segment
+               path
+               {:allow-preallocated-tail? true
+                :start-offset start-offset
+                :max-offset scan-bytes
+                :collect-records? false
+                :on-record
+                (fn [record]
+                  (let [entry (txlog-record-entry segment-id path record false)]
+                    (.add acc entry)
+                    ;; Keep one successor for sequence validation, but do not
+                    ;; read the rest of the segment just to index a small page.
+                    (when (and (some? upto) (> (long (:lsn entry)) (long upto)))
+                      (reduced nil))))})]
+    {:records (vec acc)
+     :scan-bytes (if (:stopped? scan) (:valid-end scan) scan-bytes)
+     :bounded? (boolean (:stopped? scan))}))
 
 (defn- txlog-records-cache-max-segments
   []
@@ -221,26 +227,31 @@
     (if (neg? n) 0 n)))
 
 (defn- limit-txlog-records-cache-map
-  [cache]
-  (let [cache (or cache {})
-        max-segments (long (txlog-records-cache-max-segments))]
-    (cond
-      (zero? max-segments)
-      {}
+  ([cache] (limit-txlog-records-cache-map cache nil))
+  ([cache preferred-id]
+   (let [cache (or cache {})
+         max-segments (long (txlog-records-cache-max-segments))]
+     (cond
+       (zero? max-segments)
+       {}
 
-      (<= (long (count cache)) max-segments)
-      cache
+       (<= (long (count cache)) max-segments)
+       cache
 
-      :else
-      (let [keep-ids (into #{}
-                           (take-last (int max-segments)
-                                      (sort (keys cache))))]
-        (reduce-kv (fn [acc sid entry]
-                     (if (contains? keep-ids sid)
-                       (assoc acc sid entry)
-                       acc))
-                   {}
-                   cache)))))
+       :else
+       (let [preferred? (contains? cache preferred-id)
+             keep-ids (cond-> (into #{}
+                                    (take-last
+                                      (int (if preferred? (dec max-segments)
+                                               max-segments))
+                                      (remove #{preferred-id} (sort (keys cache)))))
+                        preferred? (conj preferred-id))]
+         (reduce-kv (fn [acc sid entry]
+                      (if (contains? keep-ids sid)
+                        (assoc acc sid entry)
+                        acc))
+                    {}
+                    cache))))))
 
 (defn- txlog-segment-cache-valid?
   [entry path file-bytes modified-ms active-segment? active-offset]
@@ -262,16 +273,21 @@
           (= modified-ms (long (:modified-ms entry)))))))
 
 (defn- txlog-segment-cache-extendable?
-  [entry path file-bytes active-segment? active-offset]
-  (let [target-scan-bytes (when (and active-segment? (some? active-offset))
-                            (long (min (long file-bytes)
-                                       (long active-offset))))
+  [entry path file-bytes modified-ms active-segment? active-offset]
+  (let [active? (and active-segment? (some? active-offset))
+        target-scan-bytes (if active?
+                            (long (min (long file-bytes) (long active-offset)))
+                            (long file-bytes))
         scan-bytes (some-> (:scan-bytes entry) long)
         records (:records entry)
         last-next-offset (some-> records peek :next-offset long)]
     (and entry
-         active-segment?
-         (some? target-scan-bytes)
+         (or active?
+             ;; A bounded prefix of an unchanged closed segment is also safe
+             ;; to extend. Never mistake that prefix for a complete index.
+             (and (:bounded? entry)
+                  (= file-bytes (:file-bytes entry))
+                  (= modified-ms (:modified-ms entry))))
          (= path (:path entry))
          (some? scan-bytes)
          (<= ^long scan-bytes ^long target-scan-bytes)
@@ -280,23 +296,22 @@
              (= ^long scan-bytes ^long (or last-next-offset -1))))))
 
 (defn- txlog-segment-cache-entry
-  [state segment]
+  [state segment upto]
   (let [{:keys [id file]} segment
         path (.getPath ^java.io.File file)
         file-bytes (long (.length ^java.io.File file))
         modified-ms (long (.lastModified ^java.io.File file))
         scan-bytes (txlog-segment-scan-bytes state (long id) file-bytes)
-        records (txlog-segment-records segment 0 scan-bytes)]
-    {:segment-id (long id)
-     :path path
-     :file-bytes file-bytes
-     :modified-ms modified-ms
-     :scan-bytes scan-bytes
-     :min-lsn (some-> records first :lsn long)
-     :records records}))
+        scan (txlog-segment-records segment 0 scan-bytes upto)]
+    (assoc scan
+           :segment-id (long id)
+           :path path
+           :file-bytes file-bytes
+           :modified-ms modified-ms
+           :min-lsn (some-> scan :records first :lsn long))))
 
 (defn- txlog-extend-segment-cache-entry
-  [state segment cached]
+  [state segment cached upto]
   (let [{:keys [id file]} segment
         segment-id (long id)
         path (.getPath ^java.io.File file)
@@ -304,54 +319,63 @@
         modified-ms (long (.lastModified ^java.io.File file))
         scan-bytes (txlog-segment-scan-bytes state segment-id file-bytes)
         cached-scan-bytes (long (:scan-bytes cached))
-        tail-records (if (< ^long cached-scan-bytes ^long scan-bytes)
-                       (txlog-segment-records
-                        segment cached-scan-bytes scan-bytes)
-                       [])
-        records (into (vec (:records cached)) tail-records)]
-    {:segment-id segment-id
-     :path path
-     :file-bytes file-bytes
-     :modified-ms modified-ms
-     :scan-bytes scan-bytes
-     :min-lsn (some-> records first :lsn long)
-     :records records}))
+        scan (if (< ^long cached-scan-bytes ^long scan-bytes)
+               (txlog-segment-records segment cached-scan-bytes scan-bytes upto)
+               {:records [] :scan-bytes scan-bytes :bounded? false})
+        records (into (vec (:records cached)) (:records scan))]
+    (assoc scan
+           :segment-id segment-id
+           :path path
+           :file-bytes file-bytes
+           :modified-ms modified-ms
+           :min-lsn (some-> records first :lsn long)
+           :records records)))
 
 (defn- txlog-segment-records-entry
-  [state segment cache-v]
-  (if cache-v
-    (let [{:keys [id file]} segment
-          segment-id (long id)
-          path (.getPath ^java.io.File file)
-          file-bytes (long (.length ^java.io.File file))
-          modified-ms (long (.lastModified ^java.io.File file))
-          active-segment-id (some-> state :segment-id deref long)
-          active-segment-offset (some-> state :segment-offset deref long)
-          active-segment? (and (some? active-segment-id)
-                               (= segment-id active-segment-id))
-          cache0 (or @cache-v {})
-          cached (get cache0 segment-id)]
-      (if (txlog-segment-cache-valid? cached
-                                      path
-                                      file-bytes
-                                      modified-ms
-                                      active-segment?
-                                      active-segment-offset)
-        cached
-        (let [entry (if (txlog-segment-cache-extendable?
-                         cached
-                         path
-                         file-bytes
-                         active-segment?
-                         active-segment-offset)
-                      (txlog-extend-segment-cache-entry
-                       state segment cached)
-                      (txlog-segment-cache-entry state segment))]
-          (vreset! cache-v
-                   (limit-txlog-records-cache-map
-                    (assoc cache0 segment-id entry)))
-          entry)))
-    (txlog-segment-cache-entry state segment)))
+  ([state segment cache-v upto]
+   (txlog-segment-records-entry state segment cache-v upto true))
+  ([state segment cache-v upto cache-result?]
+   (if cache-v
+     (let [{:keys [id file]} segment
+           segment-id (long id)
+           path (.getPath ^java.io.File file)
+           file-bytes (long (.length ^java.io.File file))
+           modified-ms (long (.lastModified ^java.io.File file))
+           active-segment-id (some-> state :segment-id deref long)
+           active-segment-offset (some-> state :segment-offset deref long)
+           active-segment? (and (some? active-segment-id)
+                                (= segment-id active-segment-id))
+           cache0 (or @cache-v {})
+           cached (get cache0 segment-id)
+           extendable? (txlog-segment-cache-extendable?
+                         cached path file-bytes modified-ms
+                         active-segment? active-segment-offset)]
+       (if (or (txlog-segment-cache-valid? cached
+                                         path
+                                         file-bytes
+                                         modified-ms
+                                         active-segment?
+                                         active-segment-offset)
+               (and extendable? (some? upto)
+                    (some? (:min-lsn cached))
+                    (> (long (:lsn (peek (:records cached)))) (long upto))))
+         cached
+         (let [entry (if extendable?
+                       (txlog-extend-segment-cache-entry
+                        state segment cached upto)
+                       (txlog-segment-cache-entry state segment upto))]
+           ;; A follower may be far behind the newest cached segments. Keep its
+           ;; working prefix instead of evicting it immediately by segment ID.
+           (when (and cache-result?
+                      ;; A segment strictly beyond the page supplies only a
+                      ;; validation successor, just like a boundary probe.
+                      (or (nil? upto) (nil? (:min-lsn entry))
+                          (<= (long (:min-lsn entry)) (long upto))))
+             (vreset! cache-v
+                      (limit-txlog-records-cache-map
+                        (assoc cache0 segment-id entry) segment-id)))
+           entry)))
+     (txlog-segment-cache-entry state segment upto))))
 
 (defn- prune-txlog-records-cache!
   [cache-v segments]
@@ -384,16 +408,6 @@
             (recur lo mid)))
         lo))))
 
-(defn- txlog-records-validation-tail
-  [records from]
-  (let [records (if (vector? records) records (vec records))
-        n (long (count records))]
-    (if (zero? ^long n)
-      records
-      (let [idx (long (txlog-record-lower-bound-index records from))
-            start (long (if (pos? ^long idx) (dec ^long idx) 0))]
-        (subvec records start n)))))
-
 (defn- txlog-safe-inc-lsn
   [lsn]
   (if (= (long lsn) Long/MAX_VALUE)
@@ -408,7 +422,7 @@
         start (long (if include-predecessor?
                       (if (pos? ^long start0) (dec ^long start0) 0)
                       start0))
-        end0 (long (if (some? upto)
+        end0 (long (if (and (some? upto) (< (long upto) Long/MAX_VALUE))
                      (txlog-record-lower-bound-index
                       records
                       (txlog-safe-inc-lsn upto))
@@ -419,17 +433,50 @@
         end (long (if (< ^long end ^long start) start end))]
     (subvec records start end)))
 
+(defn- txlog-segments-through
+  [state segments cache-v upto]
+  ;; Segment starts are ordered by LSN, including copied rollover boundaries.
+  ;; Probe only the first record, retaining the first segment above the bound
+  ;; so sequence validation can still see a successor across a segment boundary.
+  (let [n (count segments)
+        starts (volatile! {})
+        next-start (fn [index]
+                     (loop [index (long index)]
+                       (when (< index n)
+                         (let [lsn (if (contains? @starts index)
+                                     (get @starts index)
+                                     (let [entry (txlog-segment-records-entry
+                                                   state (nth segments index)
+                                                   cache-v 0 false)
+                                           lsn (:min-lsn entry)]
+                                       ;; Probes must not evict the follower's
+                                       ;; working segment from a small cache.
+                                       (vswap! starts assoc index lsn)
+                                       lsn))]
+                           (if lsn
+                             [index lsn]
+                             (recur (inc index)))))))
+        end (loop [lo (long 0) hi (long n)]
+              (if (< lo hi)
+                (let [mid (quot (+ lo hi) 2)
+                      [index lsn] (next-start mid)]
+                  (if (and lsn (<= (long lsn) (long upto)))
+                    (recur (inc (long index)) hi)
+                    (recur lo mid)))
+                lo))]
+    (if-let [[index] (next-start end)]
+      (subvec segments 0 (inc (long index)))
+      segments)))
+
 (defn- collect-txlog-records
-  ([state segments cache-v from]
-   (collect-txlog-records state segments cache-v from true))
-  ([state segments cache-v from trim-terminal?]
+  [state segments cache-v from upto trim-terminal?]
   (let [from (long from)]
     (loop [remaining (seq (rseq segments))
            collected '()
            earliest-collected-lsn nil]
       (if-let [segment (first remaining)]
         (let [{:keys [records]}
-              (txlog-segment-records-entry state segment cache-v)
+              (txlog-segment-records-entry state segment cache-v upto)
               records' (if (and (seq records)
                                 (some? earliest-collected-lsn))
                          ;; Segment rollover and snapshot fallback can retain an
@@ -437,18 +484,15 @@
                          ;; newer segment. Keep the newer copy and trim the
                          ;; older prefix so sequence validation still catches
                          ;; real gaps without failing on duplicate boundaries.
-                         (->> records
-                              (take-while
-                               #(< (long (:lsn %))
-                                   ^long earliest-collected-lsn))
-                              vec)
+                         (subvec records 0 (txlog-record-lower-bound-index
+                                             records earliest-collected-lsn))
                          records)
               earliest' (or (some-> records' first :lsn long)
                             earliest-collected-lsn)
               terminal? (and (some? earliest')
                              (<= ^long earliest' from))
-              records'' (if (and trim-terminal? terminal? (seq records'))
-                          (txlog-records-validation-tail records' from)
+              records'' (if trim-terminal?
+                          (txlog-record-window records' from upto true true)
                           records')
               collected' (if (seq records')
                            (cons records'' collected)
@@ -456,7 +500,7 @@
           (if terminal?
             (mapcat identity collected')
             (recur (next remaining) collected' earliest')))
-        (mapcat identity collected))))))
+        (mapcat identity collected)))))
 
 (defn- validate-txlog-record-sequence!
   [records]
@@ -554,8 +598,11 @@
     (loop [retries-left (if cache-v 1 0)]
       (let [segments (vec (txlog/segment-files dir))
             _ (prune-txlog-records-cache! cache-v segments)
+            selected-segments (if (some? upto)
+                                (txlog-segments-through state segments cache-v upto)
+                                segments)
             raw-records (vec (collect-txlog-records
-                              state segments cache-v from
+                              state selected-segments cache-v from upto
                               (not recovery?)))
             ;; `from-lsn` is inclusive for the public txn-log APIs. Recovery
             ;; keeps the retained segment prefix so marker references and

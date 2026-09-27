@@ -429,18 +429,24 @@
                                    :body        body}
                           record* (assoc record
                                          :offset offset
-                                         :next-offset next-offset)]
-                      (when on-record
-                        (on-record record*))
-                      (recur next-offset
-                             (if collect-records?
-                               (conj records record*)
-                               records))))))))))
+                                         :next-offset next-offset)
+                          result (when on-record (on-record record*))
+                          records (if collect-records?
+                                    (conj records record*)
+                                    records)]
+                      (if (reduced? result)
+                        {:records records
+                         :valid-end next-offset
+                         :size size
+                         :partial-tail? false
+                         :stopped? true}
+                        (recur next-offset records))))))))))
       (finally
         (bf/return-array-buffer read-bf)))))
 
 (defn scan-segment
-  "Scan a txn-log segment."
+  "Scan a txn-log segment. An :on-record callback may return a reduced value
+  to stop after that record; :stopped? distinguishes this from reaching EOF."
   ([^String path] (scan-segment path {}))
   ([^String path {:keys [allow-preallocated-tail? collect-records?
                          max-offset start-offset on-record]

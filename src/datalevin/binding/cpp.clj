@@ -690,7 +690,7 @@
                            ;; leaking a native handle.
                            (do
                              (.open-transact-kv this)
-                             (let [native-dbi (Dbi/open (.-txn @write-txn)
+                             (let [native-dbi (Dbi/open (.-txn ^Rtx @write-txn)
                                                         dbi-name
                                                         (buffer/kv-flags flags))]
                                (try

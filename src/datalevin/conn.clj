@@ -554,9 +554,53 @@
   (when (fn? *local-wal-tx-path-observer*)
     (*local-wal-tx-path-observer* path)))
 
+(defn- direct-local-scalar-update!
+  "Commit a prepared simple scalar-update batch directly against one LMDB write
+  transaction, without mutable index overlays or per-form report updates."
+  [conn prepared tx-meta]
+  (locking conn
+    (let [db    ^DB (deref conn)
+          store ^Store (.-store db)]
+      (when (db/scalar-update-tx-valid? db prepared)
+        (let [old (db/cache-disabled? store)]
+          (db/disable-cache store)
+          (try
+            (let [kv             (.-lmdb store)
+                  prepared-store (volatile! nil)
+                  result
+                  (l/with-transaction-kv [kv1 kv]
+                    (let [store1 ^Store (s/transfer store kv1)
+                          db1    ^DB    (db/transfer db store1)]
+                      (when-let [report (db/stamp-scalar-update-tx
+                                          db1 prepared tx-meta)]
+                        (vreset! prepared-store store1)
+                        (db/commit-prepared-tx-data!
+                          db1 (:tx-data report) report)
+                        report)))]
+              (when result
+                (let [report    result
+                      new-store ^Store (s/transfer ^Store @prepared-store kv)
+                      new-db    (-> (:db-after report)
+                                    (db/transfer new-store)
+                                    (db/carry-runtime-opts db)
+                                    (db/adopt-current-db!))]
+                  (reset! conn new-db)
+                  (assoc report :db-after @conn))))
+            (finally
+              (when-not old
+                (db/enable-cache (.-store ^DB @conn))))))))))
+
+(defn- maybe-direct-local-scalar-update!
+  [conn tx-data tx-meta]
+  (when-let [prepared (db/prepare-scalar-update-tx ^DB @conn tx-data)]
+    (when-let [report (direct-local-scalar-update! conn prepared tx-meta)]
+      (observe-local-wal-tx-path! :scalar-update)
+      report)))
+
 (defn- maybe-direct-local-wal-transact!
   [conn tx-data tx-meta]
   (or
+    (maybe-direct-local-scalar-update! conn tx-data tx-meta)
     (when *local-wal-patch-idoc?*
       (when-let [prepared (db/prepare-local-patch-idoc-tx ^DB @conn tx-data)]
         (when-let [report (direct-local-patch-idoc-transact!
@@ -659,6 +703,7 @@
 (defn- -transact! [conn tx-data tx-meta]
   (if (local-direct-transact-eligible? conn)
     (or (maybe-direct-local-identity-transact! conn tx-data tx-meta)
+        (maybe-direct-local-scalar-update! conn tx-data tx-meta)
         (maybe-direct-local-blind-transact! conn tx-data tx-meta)
         (direct-local-transact! conn tx-data tx-meta))
     (if (local-wal-transact-eligible? conn)
