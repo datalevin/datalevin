@@ -404,11 +404,24 @@
           (contains? attrs av)))
       attrs-v)))
 
+(defn- exact-cache-value?
+  "Whether an exact pattern value can own a value-level dependency bucket.
+   Immutable values have stable equality and hashing; ranges, lookup refs and
+   mutable containers stay on their broader attribute bucket."
+  [v]
+  (or (string? v)
+      (number? v)
+      (boolean? v)
+      (symbol? v)
+      (uuid? v)
+      (and (vector? v) (every? exact-cache-value? v))))
+
 (defn- pattern-cache-dependencies
   [e a v]
   (cond
     (unresolved-pattern? e v) [::all]
     (some? e) [[::entity e]]
+    (and (some? a) (exact-cache-value? v)) [[::attribute-value a v]]
     (some? a) [[::attribute a]]
     :else [::all]))
 
@@ -462,10 +475,14 @@
     [::all]))
 
 (defn- cache-invalidation-dependencies
-  [{:keys [eids attrs]} local?]
+  [{:keys [eids attrs values-by-attr]} local?]
   (into (if local? [::all] [::all ::native-range])
         (concat (map (fn [e] [::entity e]) eids)
-                (map (fn [a] [::attribute a]) attrs))))
+                (map (fn [a] [::attribute a]) attrs)
+                (for [[a vs] values-by-attr
+                      v     vs
+                      :when (exact-cache-value? v)]
+                  [::attribute-value a v]))))
 
 (defn- tx-affects-cache-key?
   [touches k]
@@ -1573,19 +1590,6 @@
         (.add ^TreeSortedSet (:avet db) datom)))
     report))
 
-(defn- local-transact-tx-data
-  ([initial-report initial-es tx-time]
-   (local-transact-tx-data initial-report initial-es tx-time false))
-  ([initial-report initial-es tx-time simulated?]
-   (let [report (txexec/local-transact-tx-data
-                  initial-report initial-es tx-time)]
-     (if simulated?
-       (mark-simulated-tx-cache! report)
-       (assoc report
-              :db-after
-              (commit-prepared-tx-data!
-                (:db-after report) (:tx-data report) report))))))
-
 (defn- committed-client-op-response
   [report last-modified-ms]
   (let [tx-meta (:tx-meta report)
@@ -1652,7 +1656,10 @@
              db)))
        (if (instance? Store store)
          (let [embedding-plan (s/prepare-embedding-plan ^Store store tx-data)
-               commit-ms      (System/currentTimeMillis)
+               ;; Schema publication may have advanced beyond the wall clock.
+               ;; Keep its version visible to retained readers after this write.
+               commit-ms      (max (long (s/observed-state-sync-ms store))
+                                   (System/currentTimeMillis))
                extra-kv-tx    (some-> report
                                       (committed-client-op-response commit-ms))
                commit-opts    (cond-> {:last-modified-ms commit-ms}
@@ -2240,11 +2247,24 @@
     (when (and eid (pos? (long eid)) (<= (long eid) (long (:max-eid db))))
       (long eid))))
 
+(defn- scalar-update-entity-reads
+  [store-schema entries]
+  (when (>= (count entries) scalar-entity-read-min-attrs)
+    (into {}
+          (keep (fn [[eid entries]]
+                  (when-let [layout
+                             (prepare-scalar-entity-read
+                               store-schema (map second entries))]
+                    [eid layout])))
+          (group-by first entries))))
+
 (defn- prepare-scalar-update-tx*
-  [^DB db initial-es]
+  [^DB db initial-es defer-entity-resolution?]
   (let [store        (.-store db)
         store-schema (schema store)
-        store-opts   (opts store)]
+        store-opts   (opts store)
+        tuple-source-attrs (:db/attrTuples (rschema store))]
+    (when-not (:auto-entity-time? store-opts)
     (loop [es      (seq initial-es)
            seen    (java.util.HashSet.)
            entries (transient [])]
@@ -2266,10 +2286,15 @@
                          (nil? (:db/tupleAttrs props))
                          (nil? (:db/tupleType props))
                          (nil? (:db/tupleTypes props))
+                         (not (contains? tuple-source-attrs attr))
                          (nil? (:db.attr/preds props))
                          (or (nil? vt) (contains? scalar-update-value-types vt))
                          (some? value))
-                (let [eid (scalar-update-entity-id db e)]
+                (let [eid (if (and defer-entity-resolution?
+                                   (or (keyword? e)
+                                       (and (sequential? e) (= 2 (count e)))))
+                            e
+                            (scalar-update-entity-id db e))]
                   (when (and eid (.add seen [eid attr]))
                     (vld/validate-attr attr entity)
                     (vld/validate-val value entity)
@@ -2279,27 +2304,26 @@
             nil))
         (when (pos? (count entries))
           (let [entries (persistent! entries)
-                entity-reads
-                (when (>= (count entries) scalar-entity-read-min-attrs)
-                  (into {}
-                        (keep (fn [[eid entries]]
-                                (when-let [layout
-                                           (prepare-scalar-entity-read
-                                             store-schema (map second entries))]
-                                  [eid layout])))
-                        (group-by first entries)))]
-            (->PreparedScalarUpdate (schema store) (opts store)
-                                    entries entity-reads)))))))
+                deferred? (and defer-entity-resolution?
+                               (some #(not (integer? (first %))) entries))]
+            (cond-> (->PreparedScalarUpdate
+                      store-schema store-opts entries
+                      (when-not deferred?
+                        (scalar-update-entity-reads store-schema entries)))
+              deferred? (assoc :deferred-entity-resolution? true)))))))))
 
 (defn ^:no-doc prepare-scalar-update-tx
   "Recognize a transaction made only of ordinary scalar [:db/add eid attr value]
   updates to existing entities with simple cardinality-one, non-unique,
   non-reference attributes. The caller must stamp it against the current LMDB
   write snapshot before committing. Returns nil for shapes that retain the
-  general transaction path."
-  [db initial-es]
-  (txcommon/with-lookup-ref-cache db
-    (prepare-scalar-update-tx* db initial-es)))
+  general transaction path. With :defer-entity-resolution?, lookup references
+  and idents are resolved when stamping, for callers preparing before the writer."
+  ([db initial-es]
+   (prepare-scalar-update-tx db initial-es nil))
+  ([db initial-es {:keys [defer-entity-resolution?]}]
+   (txcommon/with-lookup-ref-cache db
+     (prepare-scalar-update-tx* db initial-es defer-entity-resolution?))))
 
 (defn ^:no-doc scalar-update-tx-valid?
   [^DB db ^PreparedScalarUpdate prepared]
@@ -2307,12 +2331,34 @@
     (and (identical? (:schema-epoch prepared) (schema store))
          (identical? (:opts-epoch prepared) (opts store)))))
 
+(defn- resolve-scalar-update-entities
+  [db prepared]
+  (if (:deferred-entity-resolution? prepared)
+    (txcommon/with-lookup-ref-cache db
+      (let [seen (java.util.HashSet.)
+            entries
+            (reduce (fn [entries [e attr value]]
+                      (if-let [eid (scalar-update-entity-id db e)]
+                        ;; Distinct lookup references can alias the same entity.
+                        ;; Repeated updates to one attribute need general ordering.
+                        (if (.add seen [eid attr])
+                          (conj entries [eid attr value])
+                          (reduced nil))
+                        (reduced nil)))
+                    [] (:entries prepared))]
+        (when entries
+          (assoc prepared :entries entries
+                 :entity-reads (scalar-update-entity-reads
+                                 (:schema-epoch prepared) entries)))))
+    prepared))
+
 (defn ^:no-doc stamp-scalar-update-tx
   "Stamp a prepared scalar-update batch against the current store snapshot.
   Returns a TxReport without mutable index overlays, or nil when its immutable
   schema/options epochs are stale."
   [^DB db ^PreparedScalarUpdate prepared tx-meta]
-  (when (scalar-update-tx-valid? db prepared)
+  (when-let [prepared (when (scalar-update-tx-valid? db prepared)
+                        (resolve-scalar-update-entities db prepared))]
     (let [store   (.-store db)
           tx-id   (inc (long (:max-tx db)))
           entries (:entries prepared)
@@ -2345,6 +2391,16 @@
               (persistent! out)))
           db-after (assoc db :max-tx tx-id)]
       (->TxReport db db-after tx-data {:db/current-tx tx-id} tx-meta))))
+
+(defn ^:no-doc prepare-local-tx-data
+  "Resolve local transaction data without committing or constructing the final
+  simulated view. The report retains datoms, tempids and commit-time ensures;
+  its db-after is internal preparation state, not a public queryable snapshot."
+  ([initial-report initial-es]
+   (prepare-local-tx-data initial-report initial-es (System/currentTimeMillis)))
+  ([initial-report initial-es tx-time]
+   (let [entities (prepare-entities (:db-before initial-report) initial-es tx-time)]
+     (txexec/local-transact-tx-data initial-report entities tx-time))))
 
 (defn transact-tx-data
   [initial-report initial-es simulated?]
@@ -2380,8 +2436,12 @@
             simulated? mark-simulated-tx-cache!))
         (catch Exception e
           (throw e)))
-      (let [entities (prepare-entities db initial-es tx-time)]
-        (local-transact-tx-data initial-report entities tx-time simulated?)))))
+      (let [report (prepare-local-tx-data initial-report initial-es tx-time)]
+        (if simulated?
+          (mark-simulated-tx-cache! report)
+          (assoc report :db-after
+                 (commit-prepared-tx-data!
+                   (:db-after report) (:tx-data report) report)))))))
 
 (defn transact-ack
   "Transact on a remote store without fetching a transaction report.

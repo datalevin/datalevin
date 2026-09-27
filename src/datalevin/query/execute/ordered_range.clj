@@ -310,6 +310,10 @@
         (fn [resolved-q inputs]
           (let [database (first inputs)
                 start-value (start inputs)
+                ;; Encoded execution bypasses run-query's source refresh.
+                _ (when (and (db/db? database)
+                             (not (db/pending-tx-cache? database)))
+                    (storage/maybe-ensure-current! (.-store ^DB database)))
                 schema (when (db/db? database) (db/-schema database))
                 ^FieldLayout cached (.get layout-cache)
                 ^FieldLayout layout

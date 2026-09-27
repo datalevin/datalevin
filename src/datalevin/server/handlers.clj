@@ -1497,27 +1497,64 @@
     (binding [*datalog-write-group* g] (f))
     (with-direct-db-transaction-slot deps server db-name writing? f)))
 
+(defn- commit-stamped-report
+  [report ordered?]
+  (when report
+    (binding [c/*ordered-datom-writes?* ordered?
+              st/*enforce-blind-unique-inserts?* false]
+      (assoc report :db-after
+             (db/commit-prepared-tx-data!
+               (:db-after report) (:tx-data report) report)))))
+
 (defn- transact-blind-insert
-  [db txs tx-meta]
-  (when-let [prepared (db/prepare-blind-local-tx db txs true)]
+  ([db txs tx-meta]
+   (transact-blind-insert db txs tx-meta (db/prepare-blind-local-tx db txs true)))
+  ([db _txs tx-meta prepared]
+   (when (and prepared (db/blind-local-tx-valid? db prepared))
     ;; The caller already holds the native writer. Probe before mutating the
     ;; store: a late unique collision cannot be retried inside a shared group
     ;; or an explicit transaction without rolling back preceding requests.
     (when (db/blind-local-tx-unique-values-absent? db prepared)
-      (let [report (db/stamp-blind-local-tx db prepared tx-meta)]
-        (binding [c/*ordered-datom-writes?* true]
-          (assoc report :db-after
-                 (db/commit-prepared-tx-data!
-                   (:db-after report) (:tx-data report) report)))))))
+      (commit-stamped-report (db/stamp-blind-local-tx db prepared tx-meta) true)))))
+
+(defn- ^:redef prepare-server-tx
+  [db txs]
+  (try
+    (or (when-let [prepared (db/prepare-scalar-update-tx
+                             db txs {:defer-entity-resolution? true})]
+          [:scalar-update prepared])
+        (when-let [prepared (db/prepare-blind-local-tx db txs true)]
+          [:blind prepared]))
+    ;; Preparation uses the published schema/options. Let the general engine
+    ;; validate against the writer's current state if that snapshot rejects it.
+    (catch Exception _ nil)))
+
+(defn- ^:redef transact-prepared
+  [db [kind prepared] tx-meta]
+  (case kind
+    :scalar-update
+    (commit-stamped-report (db/stamp-scalar-update-tx db prepared tx-meta) false)
+
+    :blind
+    (when (db/blind-local-tx-valid? db prepared)
+      (if (:identity-upsert-av prepared)
+        (when-let [[report upsert?] (db/stamp-blind-local-identity-tx db prepared tx-meta)]
+          (commit-stamped-report report (not upsert?)))
+        (transact-blind-insert db nil tx-meta prepared)))
+
+    nil))
 
 (defn- transact*
-  [deps db0 txs tx-meta s? server db-name writing?]
+  ([deps db0 txs tx-meta s? server db-name writing?]
+   (transact* deps db0 txs tx-meta s? server db-name writing?
+              (when-not s? (prepare-server-tx db0 txs))))
+  ([deps db0 txs tx-meta s? server db-name writing? prepared]
   (try
     ;; db0 is published to concurrent pull/query handlers. Give the writer
     ;; private mutable overlays while retaining db0 as the report's before DB.
     (let [transact (fn [db]
                      (or (when-not s?
-                           (transact-blind-insert db txs (or tx-meta {})))
+                           (transact-prepared db prepared (or tx-meta {})))
                          (db/transact-tx-data
                            (db/->TxReport db (db/transfer db (:store db))
                                           [] {} (or tx-meta {}))
@@ -1574,18 +1611,14 @@
           ((:update-db deps) server db-name
            (fn [m]
              (assoc m (if writing? :wdt-db :dt-db) new-db)))))
-      (throw e))))
+      (throw e)))))
 
 (defn- build-tx-response
-  [deps server skey db-name mode args writing? tx-meta response-kind]
-  (let [txs (case mode
-              :copy-in ((:copy-in deps) server skey)
-              :request (nth args 1)
-              (raise "Missing :mode when transact data" {}))
-        db0 (get-in (db-state deps server db-name)
+  [deps server skey db-name txs args writing? tx-meta response-kind prepared]
+  (let [db0 (get-in (db-state deps server db-name)
                     [(if writing? :wdt-db :dt-db)])
         s?  (last args)
-        rp  (transact* deps db0 txs tx-meta s? server db-name writing?)
+        rp  (transact* deps db0 txs tx-meta s? server db-name writing? prepared)
         db1 (:db-after rp)
         ;; Simulated overlays belong only to the report, never to later requests.
         _   (when-not (or s? (::group-committed? rp))
@@ -1632,18 +1665,27 @@
               (with-idempotent-client-op
                 deps server skey db-name writing? message
                 (fn [client-op]
+                  (let [txs (case mode
+                              :copy-in ((:copy-in deps) server skey)
+                              :request (nth args 1)
+                              (raise "Missing :mode when transact data" {}))
+                        prepared
+                        (when-not (last args)
+                          (prepare-server-tx
+                            (get (db-state deps server db-name)
+                                 (if writing? :wdt-db :dt-db)) txs))]
                   (with-datalog-transaction-slot
                     deps server skey db-name writing? (last args)
                     (fn []
                       (build-tx-response
-                        deps server skey db-name mode args writing?
+                        deps server skey db-name txs args writing?
                         (when client-op
                           (cop/tx-meta
                             (:client-op-id client-op)
                             (:request-type client-op)
                             (:request-hash client-op)
                             (:response-kind client-op)))
-                        response-kind)))))]
+                        response-kind prepared))))))]
           (if (or replay? (= response-kind cop/tx-data-ack-response-kind))
             (write-result! deps skey response)
             (write-tx-response! deps skey response)))))))

@@ -312,7 +312,7 @@
              (merge-idoc-path-option (:excluded-paths a)
                                      (:excluded-paths b)))))
 
-(defn init-idoc-domains
+(defn- compute-idoc-domains
   [schema opts]
   (let [default-opts (:idoc-opts opts)
         domain-opts  (:idoc-domains opts)]
@@ -337,6 +337,28 @@
           dms))
       {}
       schema)))
+
+(def ^:private idoc-domains-cache
+  ;; Schema and options maps are stable per open store, so identity is the right
+  ;; key: an equality probe would walk the whole (possibly large) schema.
+  (java.util.Collections/synchronizedMap (java.util.IdentityHashMap.)))
+
+(defn init-idoc-domains
+  "Document-index domains derived from the schema and options. Cached by the
+  identity of both maps so unchanged writes do not rescan the schema."
+  [schema opts]
+  (let [per-schema (or (.get idoc-domains-cache schema)
+                       (let [m (java.util.Collections/synchronizedMap
+                                 (java.util.IdentityHashMap.))]
+                         (.put idoc-domains-cache schema m)
+                         m))]
+    (if-some [cached (.get per-schema opts)]
+      cached
+      (let [domains (compute-idoc-domains schema opts)]
+        (when (> (.size idoc-domains-cache) 256)
+          (.clear idoc-domains-cache))
+        (.put per-schema opts domains)
+        domains))))
 
 (defn init-idoc-indices
   [lmdb domains]

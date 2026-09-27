@@ -12,7 +12,7 @@
    [org.eclipse.collections.impl.set.sorted.mutable TreeSortedSet]))
 
 (defn- execute-with-reads
-  [schema stored entities & [cached-max-eid]]
+  [schema stored entities & [cached-max-eid initial-tx-data]]
   (let [reads   (atom [])
         rschema (schema/schema->rschema schema)
         store   (reify i/IStore
@@ -28,6 +28,16 @@
                   (fetch [_ datom]
                     (swap! reads conj [:eav (:e datom) (:a datom) (:v datom)])
                     (filter #(= datom %) stored))
+                  (slice [_ index low high]
+                    (assert (= :eav index))
+                    (assert (= [(:e low) (:a low)] [(:e high) (:a high)]))
+                    (filter #(and (= (:e low) (:e %)) (= (:a low) (:a %)))
+                            stored))
+                  (e-datoms [_ e] (filter #(= e (:e %)) stored))
+                  (v-datoms [_ e]
+                    (filter #(and (= e (:v %))
+                                  (= :db.type/ref (get-in schema [(:a %) :db/valueType])))
+                            stored))
                   (av-first-e [_ a v]
                     (swap! reads conj [:av a v])
                     (some #(when (and (= a (:a %)) (= v (:v %))) (:e %))
@@ -38,7 +48,8 @@
                  :eavt    (TreeSortedSet. ^Comparator d/cmp-datoms-eavt)
                  :avet    (TreeSortedSet. ^Comparator d/cmp-datoms-avet)}
         report  (execute/execute-tx-loop
-                  {:db-before db :db-after db :tx-data [] :tempids {}}
+                  {:db-before db :db-after db :tx-data (or initial-tx-data [])
+                   :tempids {}}
                   entities 0)]
     [report @reads]))
 
@@ -85,6 +96,107 @@
            (mapv (juxt :e :a :v d/datom-added) (:tx-data report))))
     (is (= #{[1 :value "third"] [1 :tags "a"] [1 :tags "b"]}
            (set (map d/datom-eav (get-in report [:db-after :eavt])))))))
+
+(deftest redundant-adds-preserve-retract-and-readd-semantics
+  (doseq [retract [[:db/retract 1 :value false]
+                   [:db/retract 1 :value]
+                   [:db/retractEntity 1]]
+          add [[:db/add 1 :value false]
+               [:db/cas 1 :value false false]]]
+    (let [[report _]
+          (execute-with-reads
+            {:value {}} [(d/datom 1 :value false)]
+            [add retract (with-meta add {:readded true}) add])]
+      (is (= [[1 :value false false]
+              [1 :value false true]
+              [1 :value false true]]
+             (mapv (juxt :e :a :v d/datom-added) (:tx-data report))))
+      (is (= {:readded true} (meta (second (:tx-data report)))))
+      (is (not (contains? report ::execute/tx-retracted)))))
+  (testing "implicit replacement also records the old value"
+    (doseq [add [[:db/add 1 :value "old"]
+                 [:db/cas 1 :value "old" "old"]]]
+      (let [[report _]
+            (execute-with-reads
+              {:value {}} [(d/datom 1 :value "old")]
+              [[:db/add 1 :value "new"]
+               [:db/add 1 :value "old"] add])]
+        (is (= [["old" false] ["new" true] ["new" false]
+                ["old" true] ["old" true]]
+               (mapv (juxt :v d/datom-added) (:tx-data report))))))))
+
+(deftest retraction-membership-distinguishes-entity-attribute-and-value
+  (let [[report _]
+        (execute-with-reads
+          {:tags {:db/cardinality :db.cardinality/many}
+           :other {}}
+          [(d/datom 1 :tags "removed") (d/datom 1 :tags "kept")
+           (d/datom 1 :other "removed") (d/datom 2 :tags "removed")]
+          [[:db/retract 1 :tags "removed"]
+           [:db/add 1 :tags "kept"]
+           [:db/add 1 :other "removed"]
+           [:db/add 2 :tags "removed"]
+           [:db/add 1 :tags "removed"]
+           [:db/add 1 :tags "removed"]])]
+    (is (= [[1 :tags "removed" false]
+            [1 :tags "removed" true]
+            [1 :tags "removed" true]]
+           (mapv (juxt :e :a :v d/datom-added) (:tx-data report))))))
+
+(deftest retraction-membership-is-local-to-each-attempt
+  (testing "upsert retry discards the abandoned attempt's retractions"
+    (doseq [prepare? [false true]]
+      (binding [c/*use-prepare-path* prepare?]
+        (let [attempt (atom 0)
+              [report _]
+              (execute-with-reads
+                {:name {:db/unique :db.unique/identity} :value {}}
+                [(d/datom 10 :name "existing") (d/datom 10 :value "old")]
+                [[:db/add -1 :value "old"]
+                 [:db.fn/call (fn [_]
+                                (when (= 1 (swap! attempt inc))
+                                  [[:db/retract 10 :value "old"]]))]
+                 [:db/add 10 :value "old"]
+                 [:db/add -1 :name "existing"]
+                 [:db/add 10 :value "old"]])]
+          (is (= 2 @attempt))
+          (is (empty? (:tx-data report)))
+          (is (not (contains? report ::execute/tx-retracted)))))))
+  (testing "a supplied transaction prefix seeds the membership"
+    (let [retracted (d/datom 1 :value 1 c/tx0 false)
+          [report _] (execute-with-reads
+                       {:value {}} [(d/datom 1 :value 1)]
+                       [[:db/add 1 :value 1N]] nil [retracted])]
+      (is (= [[1 false] [1 true]]
+             (mapv (juxt :v d/datom-added) (:tx-data report)))))))
+
+;; Count value equality checks without relying on wall-clock timing. Tree index
+;; comparisons use compareTo, while the former retraction scan uses equals.
+(deftype EqualityCountedValue [^long n comparisons]
+  Object
+  (equals [_ other]
+    (swap! comparisons inc)
+    (and (instance? EqualityCountedValue other)
+         (== n (.-n ^EqualityCountedValue other))))
+  (hashCode [_] (hash n))
+  Comparable
+  (compareTo [_ other] (Long/compare n (.-n ^EqualityCountedValue other))))
+
+(deftest unchanged-values-do-not-rescan-transaction-history
+  (doseq [op [:db/add :db/cas]]
+    (let [n 256
+          comparisons (atom 0)
+          values (mapv #(EqualityCountedValue. % comparisons) (range n))
+          value (peek values)
+          changes (mapv #(vector :db/add 1 :value %) values)
+          no-op (if (= op :db/add)
+                  [:db/add 1 :value value]
+                  [:db/cas 1 :value value value])
+          [report _] (execute-with-reads
+                       {:value {}} [] (into changes (repeat n no-op)))]
+      (is (= (dec (* 2 n)) (count (:tx-data report))))
+      (is (< @comparisons (* 8 n))
+          (str op " compared values " @comparisons " times")))))
 
 (deftest existing-entities-still-read-persisted-values
   (let [[report reads]

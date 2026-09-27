@@ -28,8 +28,22 @@
 (defn custom-type? [t]
   (and (qualified-keyword? t) (not (c/datalog-value-types t))))
 
-(defn custom-schema? [schema]
-  (boolean (some #(custom-type? (:db/valueType %)) (vals schema))))
+(def ^:private custom-schema-cache
+  ;; Schema maps are stable per open store; key on identity rather than value so
+  ;; a write does not rescan a large schema.
+  (java.util.Collections/synchronizedMap (IdentityHashMap.)))
+
+(defn custom-schema?
+  "Whether the schema declares at least one custom value type. Cached by schema
+  identity."
+  [schema]
+  (if-some [cached (.get custom-schema-cache schema)]
+    cached
+    (let [v (boolean (some #(custom-type? (:db/valueType %)) (vals schema)))]
+      (when (> (.size custom-schema-cache) 256)
+        (.clear custom-schema-cache))
+      (.put custom-schema-cache schema v)
+      v)))
 
 (defn validate-schema! [kv schema]
   (doseq [[attr props] schema

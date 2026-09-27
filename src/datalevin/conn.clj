@@ -675,7 +675,12 @@
         (let [report (u/repeat-try-catch
                        c/+in-tx-overflow-times+
                        l/resized?
-                       (with-isolated-tx-cache db tx-data tx-meta true))]
+                       ;; Only datoms and report metadata cross into the writer.
+                       ;; Keep preparation isolated without building a simulated
+                       ;; read view that the commit path immediately discards.
+                       (db/prepare-local-tx-data
+                         (db/->TxReport db (db/transfer db store) [] {} tx-meta)
+                         tx-data))]
           (with-transaction [c conn]
             (assert (active-conn-structural? c))
             (db/commit-prepared-tx-data! @c (:tx-data report) report))

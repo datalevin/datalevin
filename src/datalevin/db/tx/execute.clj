@@ -164,13 +164,20 @@
     queue
     tuples))
 
+(defn- track-retraction
+  [report datom]
+  (if (and (not (datom-added datom)) (::tx-retracted report))
+    (update report ::tx-retracted conj! datom)
+    report))
+
 (defn- transact-report
   [report ^Datom datom]
   (let [db      (:db-after report)
         a       (.-a datom)
         report' (-> report
                     (assoc :db-after (with-datom db datom))
-                    (update :tx-data conj datom))]
+                    (update :tx-data conj datom)
+                    (track-retraction datom))]
     (if (txcommon/tuple-source? db a)
       (let [e      (.-e datom)
             v      (if (datom-added datom) (.-v datom) nil)
@@ -179,6 +186,23 @@
             queue' (queue-tuples queue tuples report' db e a v)]
         (update report' ::queued-tuples assoc e queue'))
       report')))
+
+(defn- transact-same-value
+  [report datom]
+  ;; Build membership on the first redundant operation, then maintain it as
+  ;; retractions are emitted. Transactions without redundant values avoid it.
+  ;; Keep even re-added values; Datom equivalence ignores tx, added? and metadata.
+  (let [report (if (::tx-retracted report)
+                 report
+                 (assoc report ::tx-retracted
+                        (reduce (fn [retracted d]
+                                  (if (datom-added d)
+                                    retracted
+                                    (conj! retracted d)))
+                                (transient #{}) (:tx-data report))))]
+    (if (contains? (::tx-retracted report) datom)
+      (transact-report report datom)
+      (update report ::tx-redundant conjv datom))))
 
 (defn- pending-attr-state
   [report e a]
@@ -273,10 +297,7 @@
        (transact-report report new-datom)
 
        (= (.-v old-datom) v')
-       (if (some #(and (not (datom-added %)) (= % new-datom))
-                 (:tx-data report))
-         (transact-report report new-datom)
-         (update report ::tx-redundant conjv new-datom))
+       (transact-same-value report new-datom)
 
        :else
        (let [report' (transact-report report
@@ -305,10 +326,7 @@
       (transact-report report new-datom)
 
       (= (.-v old-datom) nv')
-      (if (some #(and (not (datom-added %)) (= % new-datom))
-                (:tx-data report))
-        (transact-report report new-datom)
-        (update report ::tx-redundant conjv new-datom))
+      (transact-same-value report new-datom)
 
       :else
       (let [report' (transact-report report
@@ -413,6 +431,7 @@
                       (dissoc-present ::upserted-tempids)
                       (dissoc-present ::reverse-tempids)
                       (dissoc-present ::max-eid-before)
+                      (dissoc-present ::tx-retracted)
                       (dissoc-present ::new-attributes))
         tx-id     (current-tx report)
         report    (update report :tempids
@@ -828,6 +847,7 @@
         max-eid-before  (max (long (:max-eid db))
                              (long (init-max-eid store)))
         initial-report' (-> initial-report
+                            (dissoc-present ::tx-retracted)
                             (assoc ::max-eid-before max-eid-before)
                             (update :db-after
                                     #(-> % clear-tx-cache

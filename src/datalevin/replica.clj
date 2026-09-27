@@ -160,7 +160,7 @@
 
 (defn report-floor!
   [{:keys [store]} opts applied-lsn]
-  (kv/txlog-update-replica-floor!
+  (i/txlog-update-replica-floor!
    store
    (:replica/id (normalized-opts opts))
    (long applied-lsn)))

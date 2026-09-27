@@ -59,6 +59,7 @@
             claimed-secondary-index-job? embedding-job-item
             finalize-secondary-index-status secondary-index-job-matches?
             secondary-index-status-init]]
+   [datalevin.storage.metadata :as metadata]
    [datalevin.storage.options :as options
     :refer [apply-option-mutations async-secondary-index-option-keys
             normalize-ha-open-opts raw-persist-open-opts-key
@@ -362,9 +363,11 @@
               (set! schema schema*)
               (set! rschema (schema->rschema schema*))
               (set! attrs (init-attrs schema*))
-              (set! max-aid (init-max-aid schema*)))
-            (set! idoc-indices
-                  (merge-missing-idoc-indices lmdb idoc-indices schema* opts))
+              (set! max-aid (init-max-aid schema*))
+              ;; Only a schema change can introduce new document domains, so
+              ;; unchanged writes skip the schema-wide discovery.
+              (set! idoc-indices
+                    (merge-missing-idoc-indices lmdb idoc-indices schema* opts)))
             (mark-state-current! this last-modified-ms)))))
     this)
 
@@ -534,8 +537,7 @@
               (let [aid (:db/aid props)
                     txs (FastList.)
                     batch-size (max 1 (long c/*fill-db-batch-size*))
-                    modified-ms (max (inc (long (init-state-sync-ms lmdb)))
-                                     (System/currentTimeMillis))
+                    modified-ms (metadata/next-last-modified lmdb)
                     props (dissoc props :db/noindex)]
                 ;; Copy encoded AVGs, preserving giant IDs and custom references.
                 ;; Both the backfill and schema publication share this write txn.
@@ -604,7 +606,7 @@
             (transact-kv
               lmdb [(lmdb/kv-tx :del c/schema attr :attr)
                     (lmdb/kv-tx :put c/meta :last-modified
-                                (System/currentTimeMillis) :attr :long)])
+                                (metadata/next-last-modified lmdb) :attr :long)])
             (set! schema (dissoc schema attr))
             (set! rschema (schema->rschema schema))
             (set! attrs (dissoc attrs aid))
@@ -632,7 +634,7 @@
               lmdb [(lmdb/kv-tx :del c/schema attr :attr)
                     (lmdb/kv-tx :put c/schema new-attr props :attr)
                     (lmdb/kv-tx :put c/meta :last-modified
-                                (System/currentTimeMillis) :attr :long)])
+                                (metadata/next-last-modified lmdb) :attr :long)])
             (set! schema (-> schema (dissoc attr) (assoc new-attr props)))
             (set! rschema (schema->rschema schema))
             (set! attrs (assoc attrs (props :db/aid) new-attr))
@@ -1121,17 +1123,19 @@
           (ave-filter-tuple-id-list*
             lmdb in v-idx f-idx aid vt))))))
 
-(defn- make-store
-  "Build a Store from a field map, avoiding long positional constructor calls.
+(defmacro ^:private make-store
+  "Build a Store from a literal field map without allocating the map at runtime.
    Keys mirror the `Store` deftype fields."
-  [{:keys [lmdb search-engines vector-indices embedding-indices idoc-indices
-           embedding-providers counts opts schema rschema attrs max-aid max-gt
-           max-tx state-sync-ms scheduled-sampling write-txn sampling-lock
-           local-closed? shared-dir-key]}]
-  (Store. lmdb search-engines vector-indices embedding-indices idoc-indices
-          embedding-providers counts opts schema rschema attrs max-aid max-gt
-          max-tx state-sync-ms scheduled-sampling write-txn sampling-lock
-          local-closed? shared-dir-key))
+  [fields]
+  (assert (map? fields) "make-store requires a literal field map")
+  (let [{:keys [lmdb search-engines vector-indices embedding-indices idoc-indices
+               embedding-providers counts opts schema rschema attrs max-aid max-gt
+               max-tx state-sync-ms scheduled-sampling write-txn sampling-lock
+               local-closed? shared-dir-key]} fields]
+    `(Store. ~lmdb ~search-engines ~vector-indices ~embedding-indices ~idoc-indices
+             ~embedding-providers ~counts ~opts ~schema ~rschema ~attrs ~max-aid
+             ~max-gt ~max-tx ~state-sync-ms ~scheduled-sampling ~write-txn
+             ~sampling-lock ~local-closed? ~shared-dir-key)))
 
 (defn ^:no-doc select-entities
   "Project scalar attributes for resolved IDs in input order with one EAV cursor."
@@ -2762,10 +2766,12 @@
                        (max-gt old))
         opts*        (opts old)
         idoc-indices (transfer-idoc-indices (store-idoc-indices old) lmdb)
-        idoc-indices (if writing?
-                       idoc-indices
+        ;; Reusing the derived schema state means the schema is identical, so
+        ;; its document domains are already reflected in idoc-indices.
+        idoc-indices (if (and (not writing?) (not reuse-derived-schema-state?))
                        (merge-missing-idoc-indices
-                         lmdb idoc-indices schema* opts*))]
+                         lmdb idoc-indices schema* opts*)
+                       idoc-indices)]
     (make-store
       {:lmdb lmdb
        :search-engines (transfer-engines (.-search-engines old) lmdb)
@@ -2833,24 +2839,31 @@
   ([^Store old new-opts {:keys [search-engines vector-indices
                                 embedding-indices idoc-indices
                                 embedding-providers]}]
-    (let [schema* (schema old)]
+    (let [schema*   (schema old)
+          new-opts* (store-visible-opts new-opts)
+          lmdb      (.-lmdb old)
+          idoc*     (if (= new-opts* (opts old))
+                      (or idoc-indices (store-idoc-indices old))
+                      (merge-missing-idoc-indices
+                        lmdb (or idoc-indices (store-idoc-indices old))
+                        schema* new-opts*))]
       (make-store
-        {:lmdb (.-lmdb old)
+        {:lmdb lmdb
          :search-engines (or search-engines (.-search-engines old))
          :vector-indices (or vector-indices (.-vector-indices old))
          :embedding-indices (or embedding-indices (.-embedding-indices old))
-         :idoc-indices (or idoc-indices (store-idoc-indices old))
+         :idoc-indices idoc*
          :embedding-providers (or embedding-providers
                                   (.-embedding-providers old))
          :counts (.-counts old)
-         :opts (store-visible-opts new-opts)
+         :opts new-opts*
          :schema schema*
          :rschema (schema->rschema schema*)
          :attrs (init-attrs schema*)
          :max-aid (init-max-aid schema*)
          :max-gt (max-gt old)
          :max-tx (max-tx old)
-         :state-sync-ms (init-state-sync-ms (.-lmdb old))
+         :state-sync-ms (init-state-sync-ms lmdb)
          :scheduled-sampling (.-scheduled-sampling old)
          :write-txn (.-write-txn old)
          :sampling-lock (.-sampling-lock old)

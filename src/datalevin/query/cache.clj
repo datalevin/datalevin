@@ -33,10 +33,11 @@
 
 (defn- run-query
   [parsed-q inputs execute]
-  ;; A prepared query can retain a Store from before index-attr (including
-  ;; across explicit transactions that replace the connection's DB wrapper).
+  ;; Prepared access paths inspect schema before reading data. A retained Store
+  ;; may predate any schema change, including cardinality changes on indexed
+  ;; fields. Preserve the private schema of simulated transaction overlays.
   (doseq [input inputs
-          :when (and (db/db? input) (seq (db/-attrs-by input :db/noindex)))]
+          :when (and (db/db? input) (not (db/pending-tx-cache? input)))]
     (s/maybe-ensure-current! (.-store ^DB input)))
   (if execute (execute inputs) (qexec/q* parsed-q inputs)))
 

@@ -16,6 +16,7 @@
    [datalevin.inline :refer [update assoc]]
    [datalevin.interface :refer [transact-kv get-range]]
    [datalevin.lmdb :as lmdb]
+   [datalevin.storage.metadata :as metadata]
    [datalevin.util :as u :refer [conjs raise]]
    [datalevin.validate :as vld]))
 
@@ -135,12 +136,13 @@
 
 (defn transact-schema
   [lmdb schema]
-  (transact-kv
-    lmdb
-    (conj (for [[attr props] schema]
-            (lmdb/kv-tx :put c/schema attr props :attr :data))
-          (lmdb/kv-tx :put c/meta :last-modified
-                      (System/currentTimeMillis) :attr :long))))
+  (locking (lmdb/write-txn lmdb)
+    (transact-kv
+      lmdb
+      (conj (for [[attr props] schema]
+              (lmdb/kv-tx :put c/schema attr props :attr :data))
+            (lmdb/kv-tx :put c/meta :last-modified
+                        (metadata/next-last-modified lmdb) :attr :long)))))
 
 (defn load-schema
   [lmdb]

@@ -18,6 +18,7 @@
             set-env-flags]]
    [datalevin.kv :as kv]
    [datalevin.lmdb :as lmdb]
+   [datalevin.storage.metadata :as metadata]
    [datalevin.util :as u :refer [raise]]
    [datalevin.validate :as vld])
   (:import
@@ -153,19 +154,20 @@
   persisted. Does not refresh a Store's cached options: rollback callers must
   reopen the store after this call."
   [lmdb opts]
-  (let [opts (persistable-opts opts)
-        current (some-> (load-opts lmdb) persistable-opts)]
-    (when (not= current opts)
-      (when (true? (:wal? opts))
-        (let [flags (or (get-env-flags lmdb) #{})]
-          (when (and (not (contains? flags :nosync))
-                     (not (contains? flags :rdonly)))
-            (set-env-flags lmdb #{:nosync} true))))
-      (transact-kv
-        lmdb (conj (for [[k v] opts]
-                     (lmdb/kv-tx :put c/opts k v :attr :data))
-                   (lmdb/kv-tx :put c/meta :last-modified
-                               (System/currentTimeMillis) :attr :long))))))
+  (locking (lmdb/write-txn lmdb)
+    (let [opts (persistable-opts opts)
+          current (some-> (load-opts lmdb) persistable-opts)]
+      (when (not= current opts)
+        (when (true? (:wal? opts))
+          (let [flags (or (get-env-flags lmdb) #{})]
+            (when (and (not (contains? flags :nosync))
+                       (not (contains? flags :rdonly)))
+              (set-env-flags lmdb #{:nosync} true))))
+        (transact-kv
+          lmdb (conj (for [[k v] opts]
+                       (lmdb/kv-tx :put c/opts k v :attr :data))
+                     (lmdb/kv-tx :put c/meta :last-modified
+                                 (metadata/next-last-modified lmdb) :attr :long)))))))
 
 (defn- raw-lmdb
   [db]
@@ -173,21 +175,22 @@
 
 (defn transact-opts-raw
   [lmdb opts]
-  (let [opts (persistable-opts opts)
-        current (some-> (load-opts lmdb) persistable-opts)
-        raw-db (raw-lmdb lmdb)]
-    (when (not= current opts)
-      (when (true? (:wal? opts))
-        (let [flags (or (get-env-flags raw-db) #{})]
-          (when (and (not (contains? flags :nosync))
-                     (not (contains? flags :rdonly)))
-            (set-env-flags raw-db #{:nosync} true))))
-      (kv/transact-kv-without-txlog!
-        raw-db
-        (conj (for [[k v] opts]
-                (lmdb/kv-tx :put c/opts k v :attr :data))
-              (lmdb/kv-tx :put c/meta :last-modified
-                          (System/currentTimeMillis) :attr :long))))))
+  (locking (lmdb/write-txn lmdb)
+    (let [opts (persistable-opts opts)
+          current (some-> (load-opts lmdb) persistable-opts)
+          raw-db (raw-lmdb lmdb)]
+      (when (not= current opts)
+        (when (true? (:wal? opts))
+          (let [flags (or (get-env-flags raw-db) #{})]
+            (when (and (not (contains? flags :nosync))
+                       (not (contains? flags :rdonly)))
+              (set-env-flags raw-db #{:nosync} true))))
+        (kv/transact-kv-without-txlog!
+          raw-db
+          (conj (for [[k v] opts]
+                  (lmdb/kv-tx :put c/opts k v :attr :data))
+                (lmdb/kv-tx :put c/meta :last-modified
+                            (metadata/next-last-modified raw-db) :attr :long)))))))
 
 (defn- normalize-legacy-ha-nil-sentinels
   [opts]
