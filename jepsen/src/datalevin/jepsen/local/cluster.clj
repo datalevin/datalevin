@@ -470,15 +470,17 @@
    (create-conn-with-timeout! uri schema {} timeout-ms))
   ([uri schema opts timeout-ms]
    (let [timeout-ms (long timeout-ms)
+         ;; Startup may need an election and membership commit. Give socket
+         ;; I/O the caller's budget as well as bounding the whole open below.
+         client-opts (assoc conn-client-opts :time-out timeout-ms)
          timed-out? (atom false)
          result-f   (future
                       (try
                         (let [create-conn (var-get #'d/create-conn)
                               conn (create-conn uri
                                                 schema
-                                                (assoc opts
-                                                       :client-opts
-                                                       conn-client-opts))]
+                                                (assoc opts :client-opts
+                                                            client-opts))]
                           (if @timed-out?
                             (do
                               (safe-close-conn! conn)

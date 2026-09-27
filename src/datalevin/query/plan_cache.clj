@@ -7,7 +7,7 @@
 
 ;; Include dynamically bound caches without keeping them alive after their
 ;; callers release them. Registration happens only when a plan is published.
-(defonce ^:private caches (WeakHashMap.))
+(defonce ^:private ^WeakHashMap caches (WeakHashMap.))
 
 (defn store-key [store]
   [(i/dir store) (i/db-name store)])

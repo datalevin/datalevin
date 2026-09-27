@@ -147,11 +147,12 @@
 
 (defmacro with-compression [[state] & body]
   `(let [context# *context*
-         ~state (if context# (acquire-compression! context#) (WireCompression.))]
+         ~(with-meta state (assoc (meta state) :tag 'datalevin.io.WireCompression))
+         (if context# (acquire-compression! context#) (WireCompression.))]
      (try ~@body
           (finally
             (if context# (release-compression! context# ~state)
-                (.close ^WireCompression ~state))))))
+                (.close ~state))))))
 
 (defmacro with-wire-bindings [mode allowlist & body]
   `(let [allowlist# ~allowlist

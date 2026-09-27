@@ -160,11 +160,29 @@
   (is (not (lcluster/transient-ha-open-failure?
             (ex-info "not a HA gap" {:error :unrelated})))))
 
-(deftest open-ha-conn-retries-transient-ha-gap-open-failure-test
-  (let [attempts (atom 0)]
+(deftest connection-open-uses-requested-timeout-test
+  (let [calls (atom [])
+        schema {:value {:db/valueType :db.type/long}}]
     (with-redefs [d/create-conn
-                  (fn [_uri _schema _opts]
-                    (if (= 1 (swap! attempts inc))
+                  (fn [uri schema opts]
+                    (swap! calls conj [uri schema opts])
+                    ::conn)]
+      (doseq [timeout-ms [1000 45000]]
+        (is (= ::conn
+               (lcluster/create-conn-with-timeout!
+                 "dtlv://localhost/db" schema {:wal? true} timeout-ms)))
+        (is (= ["dtlv://localhost/db" schema
+                {:wal? true :client-opts {:pool-size 1 :time-out timeout-ms}}]
+               (last @calls))))
+      (is (= ::conn
+             (lcluster/create-conn-with-timeout! "dtlv://localhost/db" schema)))
+      (is (= 10000 (get-in (last @calls) [2 :client-opts :time-out]))))))
+
+(deftest open-ha-conn-retries-transient-ha-gap-open-failure-test
+  (let [attempts (atom [])]
+    (with-redefs [d/create-conn
+                  (fn [_uri _schema opts]
+                    (if (= 1 (count (swap! attempts conj opts)))
                       (throw (ex-info "Txn-log is not enabled for this LMDB"
                                       {:type :txlog/not-enabled}))
                       ::conn))]
@@ -176,7 +194,10 @@
               nil
               {:wal? true}
               1000)))
-      (is (= 2 @attempts)))))
+      (is (= 2 (count @attempts)))
+      (let [[first-ms second-ms] (map #(get-in % [:client-opts :time-out]) @attempts)]
+        (is (< 0 second-ms first-ms))
+        (is (<= first-ms 1000))))))
 
 (defn- restart-node-test-cluster
   [node]
@@ -530,6 +551,7 @@
         release-path (str dir u/+separator+ "child.release")
         opts         {:wal? true
                       :wal-commit-marker? true
+                      :wal-shared? true
                       :snapshot-bootstrap-force? false
                       :wal-durability-profile :strict}]
     (try
@@ -549,11 +571,12 @@
               (let [{:keys [ok? result output]}
                     (child-process-result child wal-child-process-timeout-ms)]
                 (is ok? output)
+                ;; DBI registration precedes the two data transactions.
                 (is (= {:status :ok
-                        :lsns [1 2]
-                        :applied-lsn 2}
+                        :lsns [1 2 3]
+                        :applied-lsn 3}
                        result))
-                (is (= [1 2]
+                (is (= [1 2 3]
                        (mapv :lsn (kv/open-tx-log db1 1))))
                 (is (= :v1
                        (d/get-value db1 "a" :k1)))

@@ -1466,6 +1466,16 @@
                                    (db/carry-runtime-opts db)
                                    (db/adopt-current-db!))]
                   (reset! conn new-db)
+                  ;; Returned reports must not retain a Store bound to the
+                  ;; closed transaction-local writer.
+                  (dotimes [i n]
+                    (let [^TxReport report (aget reports i)]
+                      (aset reports i
+                            (assoc report :db-before
+                                   (if (zero? i)
+                                     db
+                                     (db/transfer (:db-before report)
+                                                  new-store))))))
                   true)
                 (catch clojure.lang.ExceptionInfo e
                   (if (or (= sync-queued-blind-fallback-type

@@ -332,19 +332,31 @@
       (if (and next? (< ^long ai ^long na))
         (let [vb ^ByteBuffer (lmdb/next-val iter)
               a  (.getInt vb 0)]
-          (if (== ^int a ^int (aget aids ai))
-            (let [v    (idx/avg-buffer->v lmdb vb)
-                  pred (aget preds ai)
-                  fidx (aget fidxs ai)]
-              (if (and (or (nil? pred) (pred v))
-                       (or (nil? fidx) (= v (aget tuple (int fidx)))))
-                (if (aget skips ai)
-                  (recur (lmdb/has-next-val iter) (u/long-inc ai) vi)
-                  (do (aset ^objects vs (int vi) v)
-                      (recur (lmdb/has-next-val iter) (u/long-inc ai)
-                             (u/long-inc vi))))
-                :reject))
-            (recur (lmdb/has-next-val iter) ai vi)))
+          (cond
+            (== ^int a ^int (aget aids ai))
+            (let [pred (aget preds ai)
+                  fidx (aget fidxs ai)
+                  skip (aget skips ai)]
+              (if (and skip (nil? pred) (nil? fidx))
+                ;; Presence-only attribute: the value is never needed.
+                (recur (and (< (inc ai) na) (lmdb/has-next-val iter))
+                       (u/long-inc ai) vi)
+                (let [v (idx/avg-buffer->v lmdb vb)]
+                  (if (and (or (nil? pred) (pred v))
+                           (or (nil? fidx) (= v (aget tuple (int fidx)))))
+                    (if skip
+                      (recur (and (< (inc ai) na) (lmdb/has-next-val iter))
+                             (u/long-inc ai) vi)
+                      (do (aset ^objects vs (int vi) v)
+                          ;; Stop moving the cursor after the final match.
+                          (recur (and (< (inc ai) na)
+                                      (lmdb/has-next-val iter))
+                                 (u/long-inc ai) (u/long-inc vi))))
+                    :reject))))
+            (< ^int a ^int (aget aids ai))
+            (recur (lmdb/has-next-val iter) ai vi)
+            ;; Past a required attribute: it is missing, so stop walking.
+            :else nil))
         (when (== ^long ai ^long na)
           (if (zero? ^long nvs) :skip vs))))))
 
@@ -365,19 +377,31 @@
       (if (and next? (< ^long ai ^long na))
         (let [vb ^ByteBuffer (lmdb/next-val iter)
               a  (.getInt vb 0)]
-          (if (== ^int a ^int (aget aids ai))
-            (let [v    (idx/avg-buffer->v lmdb vb)
-                  pred (aget preds ai)
-                  fidx (aget fidxs ai)]
-              (if (and (or (nil? pred) (pred v))
-                       (or (nil? fidx) (= v (aget tuple (int fidx)))))
-                (if (aget skips ai)
-                  (recur (lmdb/has-next-val iter) (u/long-inc ai) vi)
-                  (do (aset ^objects res (+ base vi) v)
-                      (recur (lmdb/has-next-val iter) (u/long-inc ai)
-                             (u/long-inc vi))))
-                :reject))
-            (recur (lmdb/has-next-val iter) ai vi)))
+          (cond
+            (== ^int a ^int (aget aids ai))
+            (let [pred (aget preds ai)
+                  fidx (aget fidxs ai)
+                  skip (aget skips ai)]
+              (if (and skip (nil? pred) (nil? fidx))
+                ;; Presence-only attribute: the value is never needed.
+                (recur (and (< (inc ai) na) (lmdb/has-next-val iter))
+                       (u/long-inc ai) vi)
+                (let [v (idx/avg-buffer->v lmdb vb)]
+                  (if (and (or (nil? pred) (pred v))
+                           (or (nil? fidx) (= v (aget tuple (int fidx)))))
+                    (if skip
+                      (recur (and (< (inc ai) na) (lmdb/has-next-val iter))
+                             (u/long-inc ai) vi)
+                      (do (aset ^objects res (+ base vi) v)
+                          ;; Stop moving the cursor after the final match.
+                          (recur (and (< (inc ai) na)
+                                      (lmdb/has-next-val iter))
+                                 (u/long-inc ai) (u/long-inc vi))))
+                    :reject))))
+            (< ^int a ^int (aget aids ai))
+            (recur (lmdb/has-next-val iter) ai vi)
+            ;; Past a required attribute: it is missing, so stop walking.
+            :else nil))
         (when (== ^long ai ^long na)
           (if (zero? ^long nvs) :skip res))))))
 

@@ -1041,7 +1041,7 @@
            ranges))))
 
 (defn- decode-kv-row
-  [^ByteBuffer bf opcode]
+  [^ByteBuffer bf ^long opcode]
   (let [dbi-len (bb-get-u16 bf {:field :dbi-len})
         dbi-bs (bb-get-bytes bf dbi-len {:field :dbi-bytes})
         dbi (String. ^bytes dbi-bs StandardCharsets/UTF_8)
