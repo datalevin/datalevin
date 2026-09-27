@@ -1012,10 +1012,12 @@
       ;; Native tuple plans and their statistics see only the store. Resolve
       ;; simulated changes through the DB's merged datoms instead.
       (let [context (rules/rewrite context)
+            _ (build-explain)
             clauses (sort-late-clauses
                       (qresolve/bound-vars context) (:rules context)
                       (get-in context [:parsed-q :qorig-where]) (:sources context))
             context (assoc context :late-clauses clauses)]
+        (plan-explain)
         (binding [qu/*implicit-source* (get (:sources context) '$)
                   qresolve/*singleton-domain-scan?* false]
           (if execute?

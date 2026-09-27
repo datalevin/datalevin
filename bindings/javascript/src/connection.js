@@ -69,24 +69,6 @@ function fulltextOpts(opts = null, { limit = null, offset = 0, pagingCachePages 
   return (mapOpts ? merged.size === 0 : Object.keys(merged).length === 0) ? null : merged;
 }
 
-let listenerProxyEventLoopDepth = 0;
-let listenerProxyEventLoopPrevious = false;
-
-async function retainListenerProxyEventLoop() {
-  const bridge = await javaBridgeModule();
-  if (listenerProxyEventLoopDepth === 0) {
-    listenerProxyEventLoopPrevious = bridge.config.runEventLoopWhenInterfaceProxyIsActive;
-    bridge.config.runEventLoopWhenInterfaceProxyIsActive = true;
-  }
-  listenerProxyEventLoopDepth += 1;
-  return () => {
-    listenerProxyEventLoopDepth -= 1;
-    if (listenerProxyEventLoopDepth === 0) {
-      bridge.config.runEventLoopWhenInterfaceProxyIsActive = listenerProxyEventLoopPrevious;
-    }
-  };
-}
-
 async function createConsumerProxy(fn) {
   if (typeof fn !== "function") {
     throw new TypeError("callback must be a function.");
@@ -121,9 +103,8 @@ export class Connection extends ResourceWrapper {
   }
 
   _resetListenerProxies() {
-    for (const { proxy, release } of this._listenerProxies.values()) {
+    for (const { proxy } of this._listenerProxies.values()) {
       proxy.reset?.();
-      release?.();
     }
     this._listenerProxies.clear();
   }
@@ -322,11 +303,9 @@ export class Connection extends ResourceWrapper {
     }
     const previous = this._listenerProxies.get(registeredKey);
     previous?.proxy.reset?.();
-    previous?.release?.();
-    this._listenerProxies.set(registeredKey, {
-      proxy,
-      release: await retainListenerProxyEventLoop()
-    });
+    // Transactions use async Java calls, so callbacks need no reentrant event
+    // loop. Enabling java-bridge's experimental loop can race proxy cleanup.
+    this._listenerProxies.set(registeredKey, { proxy });
     return registeredKey;
   }
 
@@ -334,7 +313,6 @@ export class Connection extends ResourceWrapper {
     await _BINDINGS.connectionUnlisten(this.rawHandle(), key);
     const existing = this._listenerProxies.get(key);
     existing?.proxy.reset?.();
-    existing?.release?.();
     this._listenerProxies.delete(key);
   }
 

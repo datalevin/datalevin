@@ -176,24 +176,32 @@ If any of those checks fail, writes are rejected.
 Before appending WAL data, the server checks the cached lease again, including
 observation freshness and the local lease deadline with its admission margin.
 This check does not issue a `readIndex` request. After committing locally under
-the configured WAL durability policy, the server renews the lease with that
-commit's LSN. The renewal checks the authoritative owner and term and publishes
-the watermark before returning success. A queued transaction cannot cross into
-a different local runtime or lease term. If confirmation fails after the local
+the configured WAL durability policy, the server confirms that commit's LSN
+with the authority. Normally it renews the lease, checking the authoritative
+owner and term and publishing the watermark before returning success. A queued
+transaction cannot cross into a different local runtime or lease term. If
+confirmation fails after the local
 commit, the result is indeterminate because the commit has already happened.
 
 Eligible concurrent KV and Datalog requests share the server's write-group
 queue. Each physical group performs cached admission, one WAL/native commit,
-and one LSN-publishing lease renewal, then releases its callers. This amortizes
-local durability and authority costs across the group. The renewal follows
+and at most one LSN-publishing lease renewal, then releases its callers. This
+amortizes local durability and authority costs across the group. The renewal follows
 local commit so it never advertises uncommitted state; acknowledgments wait for
 the renewal, not for the next periodic timer tick.
 Explicit transactions, shared-WAL stores, `:extra` durability, and embedded HA
 writes retain their individual paths. An uncontended server write still pays
-one authority renewal.
+one authority renewal unless its LSN is already confirmed.
+
+If a fresh cached authority observation already covers the committed LSN under
+the same database identity, local owner, term, and runtime, the group skips the
+renewal and its admission lock. It rechecks this condition after acquiring the
+lock as well, allowing a publication completed while it was waiting to cover
+the group. All cached lease admission checks still apply. A fresh lease alone,
+or a local applied watermark ahead of the authority watermark, is insufficient.
 
 The periodic renew loop remains active, including when there are no writes.
-Write groups also renew the lease immediately to confirm their committed
+Write groups also renew the lease when needed to confirm their committed
 `leader-last-applied-lsn`. This publication preserves the promotion floor when
 the old leader cannot be reached. It does not replicate WAL data: with the
 default zero promotion-lag limit, a published higher watermark can block
@@ -364,8 +372,9 @@ confirmed its physical group's LSN with the authority. It does not mean a
 quorum of data nodes has durably replicated that transaction.
 
 The control-plane lease records `leader-last-applied-lsn`. Each committed server
-write group publishes that value through one lease renewal before acknowledging
-its requests; the periodic loop also renews during idle periods. Promotion uses
+write group ensures that this watermark covers its LSN before acknowledging its
+requests, reusing a valid cached confirmation or publishing through one lease
+renewal. The periodic loop also renews during idle periods. Promotion uses
 the maximum LSN proven by the authority lease and reachable member watermarks.
 With the default zero promotion-lag allowance, losing the only copy of an
 acknowledged write blocks automatic promotion instead of permitting a leader

@@ -63,6 +63,14 @@
                  (d/q '[:find ?before ?after :in $before $after
                         :where [$before 1 :name ?before] [$after 1 :name ?after]]
                       @conn simulated)))
+          (is (= #{[1 "simulated"] [2 "kept"] [4 "added"]}
+                 (:result (d/explain {:run? true}
+                                    '[:find ?e ?name :where [?e :name ?name]]
+                                    simulated))))
+          (is (seq (:late-clauses
+                     (d/explain {:run? false}
+                                '[:find ?e ?name :where [?e :name ?name]]
+                                simulated))))
           (is (= {:name "before"} (d/pull @conn [:name] 1)))
           (is (= {:name "simulated"} (d/pull simulated [:name] 1))))
         (finally (d/close conn))))))

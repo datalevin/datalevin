@@ -113,9 +113,7 @@ export async function toJava(value) {
 
   if (typeof value === "number") {
     if (!Number.isInteger(value)) {
-      // Object parameters need a boxed double, including generated listener keys.
-      const cls = await classes();
-      return new cls.doubleClass(String(value));
+      return value;
     }
     if (!Number.isSafeInteger(value)) {
       throw new RangeError("Unsafe integer number; use bigint for Datalevin integer values.");

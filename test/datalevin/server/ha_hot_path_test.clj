@@ -138,6 +138,93 @@
      :entered entered :release release
      :confirming confirming :confirmed confirmed}))
 
+(deftest confirmed-group-skips-renewal-and-admission-lock
+  (let [{:keys [deps reads renews release confirmed] :as probe}
+        (authority-probe :ok)
+        ^ConcurrentHashMap dbs (:dbs probe)
+        locks (atom 0)
+        lock-fn (:db-write-admission-lock-fn deps)
+        deps (assoc deps :db-write-admission-lock-fn
+                    (fn [server db-name]
+                      (swap! locks inc)
+                      (lock-fn server db-name)))
+        publish (ha/ha-write-commit-publish-fn
+                  deps nil {:type :tx-data :args ["db"]})]
+    (deliver release true)
+    (deliver confirmed true)
+    (is (nil? (publish {:txlog-lsn 42})))
+    (is (= [42] @renews))
+    (doseq [lsn [41 42]]
+      (is (nil? (publish {:txlog-lsn lsn}))))
+    (is (= [42] @renews))
+    (is (= 1 @locks))
+    ;; Local progress alone cannot justify skipping authority publication.
+    (.put dbs "db" (assoc (.get dbs "db") :ha-leader-last-applied-lsn 100))
+    (is (nil? (publish {:txlog-lsn 43})))
+    (is (= [42 100] @renews))
+    (is (= 2 @locks))
+    (is (zero? @reads))))
+
+(deftest confirmation-is-rechecked-after-waiting-for-admission-lock
+  (let [{:keys [deps reads renews release] :as probe} (authority-probe :ok)
+        ^ConcurrentHashMap dbs (:dbs probe)
+        state (assoc (.get dbs "db") :ha-leader-last-applied-lsn 42)
+        gate (Object.)
+        waiting (promise)
+        deps (assoc deps :db-write-admission-lock-fn
+                    (fn [_ _] (deliver waiting true) gate))]
+    (.put dbs "db" state)
+    (deliver release true)
+    (let [publish (ha/ha-write-commit-publish-fn
+                    deps nil {:type :tx-data :args ["db"]})
+          job (locking gate
+                (let [job (future (publish {:txlog-lsn 42}))]
+                  (is (deref waiting 10000 false))
+                  ;; The periodic path publishes while the foreground caller
+                  ;; waits. Only that background renewal should reach authority.
+                  (let [next-state (dha/ha-renew-step "db" state)]
+                    (ha/publish-ha-renew-state!
+                      deps nil "db" state next-state nil))
+                  job))]
+      (is (nil? (deref job 10000 ::timeout)))
+      (is (= [42] @renews))
+      (is (zero? @reads)))))
+
+(deftest covered-watermark-requires-fresh-matching-lease-proof
+  (doseq [[label patch reason]
+          [[:stale #(assoc % :ha-last-authority-refresh-ms 0) nil]
+           [:unknown-age #(dissoc % :ha-last-authority-refresh-ms) nil]
+           [:read-failed #(assoc % :ha-authority-read-ok? false) nil]
+           [:expired #(assoc % :ha-lease-local-deadline-nanos 0) nil]
+           [:wrong-owner #(assoc-in % [:ha-authority-lease :leader-node-id] 2) nil]
+           [:wrong-term #(assoc-in % [:ha-authority-lease :term] 0) nil]
+           [:wrong-db #(assoc-in % [:ha-authority-lease :db-identity] "other") nil]
+           [:follower #(assoc % :ha-role :follower) :not-leader]
+           [:new-term #(-> % (assoc :ha-leader-term 2 :ha-authority-term 2)
+                           (assoc-in [:ha-authority-lease :term] 2))
+            :leadership-changed]
+           [:new-runtime #(assoc % :ha-renew-loop-running? (Object.))
+            :leadership-changed]]]
+    (testing (name label)
+      (let [{:keys [deps reads renews release confirmed] :as probe}
+            (authority-probe :ok)
+            ^ConcurrentHashMap dbs (:dbs probe)
+            publish (ha/ha-write-commit-publish-fn
+                      deps nil {:type :tx-data :args ["db"]})]
+        (deliver release true)
+        (deliver confirmed true)
+        (publish {:txlog-lsn 42})
+        (.put dbs "db" (patch (.get dbs "db")))
+        (let [error (try (publish {:txlog-lsn 42}) nil
+                         (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+          (if reason
+            (do (is (= :ha/write-indeterminate (:error error)))
+                (is (= reason (:reason error)))
+                (is (= [42] @renews)))
+            (do (is (nil? error))
+                (is (= [42 42] @renews)))))
+        (is (zero? @reads))))))
+
 (deftest cached-commit-admission-fails-closed-without-authority-io
   (doseq [[patch reason]
           [[{:ha-role :follower} :not-leader]

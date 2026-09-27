@@ -1576,7 +1576,7 @@
         s?  (last args)
         rp  (transact* deps db0 txs tx-meta s? server db-name writing?)
         db1 (:db-after rp)
-        _   (when-not (::group-committed? rp)
+        _   (when-not (or s? (::group-committed? rp))
               ((:update-db deps) server db-name
                (fn [m]
                  (cond-> (assoc m (if writing? :wdt-db :dt-db) db1)
