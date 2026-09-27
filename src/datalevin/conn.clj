@@ -1375,6 +1375,14 @@
   (raise "Queued blind transaction requires full resolution"
                   {:type sync-queued-blind-fallback-type}))
 
+(defn- identity-upsert-prepared?
+  "Whether a prepared queued request may use the identity-upsert stamper. The
+   batch already required distinct unique values, so each eligible request is
+   independent and can resolve insert versus upsert in request order."
+  [prepared]
+  (and *local-wal-identity-upsert?*
+       (some? (:identity-upsert-av prepared))))
+
 (defn- prepared-blind-batch-valid?
   [^DB db ^objects prepared]
   (let [n (alength prepared)]
@@ -1404,12 +1412,15 @@
                   (let [store1 ^Store (s/transfer ^Store store kv1)
                         db1    ^DB    (db/transfer db store1)]
                     ;; Side-effect-free prepared requests enforce attribute
-                    ;; uniqueness in the eventual AVE put. Other requests keep
-                    ;; the preflight probe because a late collision must not
-                    ;; occur after updating a secondary engine.
+                    ;; uniqueness in the eventual AVE put. Identity-upsert
+                    ;; requests may match an existing row and are stamped in
+                    ;; order instead. Other requests keep the preflight probe
+                    ;; because a late collision must not occur after updating a
+                    ;; secondary engine.
                     (dotimes [i n]
                       (let [tx (aget prepared i)]
-                        (when (and (not (:fuse-unique-inserts? tx))
+                        (when (and (not (identity-upsert-prepared? tx))
+                                   (not (:fuse-unique-inserts? tx))
                                    (not
                                      (db/blind-local-tx-unique-values-absent?
                                        db1 tx)))
@@ -1420,15 +1431,30 @@
                         (dotimes [i n]
                           (let [^SyncQueuedReq req (.get requests i)
                                 prepared-tx (aget prepared i)
-                                ^TxReport report
-                                (db/stamp-blind-local-tx
-                                  @tx prepared-tx (.-tx-meta req))]
+                                identity?   (identity-upsert-prepared?
+                                              prepared-tx)
+                                [^TxReport report upsert?]
+                                (if identity?
+                                  (db/stamp-blind-local-identity-tx
+                                    @tx prepared-tx (.-tx-meta req))
+                                  [(db/stamp-blind-local-tx
+                                     @tx prepared-tx (.-tx-meta req))
+                                   false])]
+                            (when-not report
+                              (sync-queued-blind-fallback!))
                             (binding [s/*enforce-blind-unique-inserts?*
-                                      (boolean
-                                        (:fuse-unique-inserts? prepared-tx))
-                                      c/*ordered-datom-writes?* true]
+                                      (and (not identity?)
+                                           (boolean
+                                             (:fuse-unique-inserts?
+                                               prepared-tx)))
+                                      c/*ordered-datom-writes?* (not upsert?)]
                               (db/commit-prepared-tx-data!
                                 @tx (:tx-data report) report))
+                            (when identity?
+                              (observe-local-wal-tx-path!
+                                (if upsert?
+                                  :identity-upsert
+                                  :blind-insert)))
                             (aset reports i report)
                             (reset! tx (:db-after report))))
                         (vreset! final-db @tx)))))

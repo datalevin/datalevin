@@ -1700,13 +1700,13 @@
   [^DB db entities tx-time]
   (txprep/prepare-entities db entities tx-time))
 
-;; Identity probes in the blind path share the LMDB write transaction. For a
-;; single non-WAL entity, preparing and probing first costs more than the
-;; ordinary resolver. Enable it from two entities onward so small batches avoid
-;; the old ingestion-sized discontinuity without regressing the single-record
-;; OLTP path. WAL may still opt a single entity into this path and specialize a
-;; simple cardinality-one identity upsert. Value-unique inserts reject duplicates
-;; instead of upserting, so they can use the blind path at any batch size.
+;; Identity probes in the blind path share the LMDB write transaction. Large
+;; batches enable them from two entities onward so ingestion avoids the old
+;; discontinuity. A single entity is routed to the identity-upsert
+;; specialization when it names a unique-identity attribute, on both the WAL
+;; and non-WAL direct paths, so simple upserts avoid the ordinary resolver.
+;; Value-unique inserts reject duplicates instead of upserting, so they can use
+;; the blind path at any batch size.
 (def ^:private ^:const ^long blind-unique-write-threshold 2)
 
 (def ^:private blind-unique-value-types

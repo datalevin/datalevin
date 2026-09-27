@@ -318,6 +318,113 @@
   [counts]
   (int-array (->> counts (reductions +) butlast (into [0]))))
 
+(defn read-entity-values
+  "Read and filter one entity's scalar attributes in aid order. Returns a values
+  array, :skip when no values are requested, :reject when a predicate or fidx
+  check fails, or nil when a required attribute is missing."
+  [lmdb iter na nvs ^objects tuple eid-idx ^ints aids ^objects preds
+   ^objects fidxs ^booleans skips]
+  (let [te ^long (aget tuple eid-idx)
+        vs (when (pos? ^long nvs) (object-array (int nvs)))]
+    (loop [next? (lmdb/seek-key iter te :id)
+           ai    0
+           vi    0]
+      (if (and next? (< ^long ai ^long na))
+        (let [vb ^ByteBuffer (lmdb/next-val iter)
+              a  (.getInt vb 0)]
+          (if (== ^int a ^int (aget aids ai))
+            (let [v    (idx/avg-buffer->v lmdb vb)
+                  pred (aget preds ai)
+                  fidx (aget fidxs ai)]
+              (if (and (or (nil? pred) (pred v))
+                       (or (nil? fidx) (= v (aget tuple (int fidx)))))
+                (if (aget skips ai)
+                  (recur (lmdb/has-next-val iter) (u/long-inc ai) vi)
+                  (do (aset ^objects vs (int vi) v)
+                      (recur (lmdb/has-next-val iter) (u/long-inc ai)
+                             (u/long-inc vi))))
+                :reject))
+            (recur (lmdb/has-next-val iter) ai vi)))
+        (when (== ^long ai ^long na)
+          (if (zero? ^long nvs) :skip vs))))))
+
+(defn read-entity-joined
+  "Read one entity's scalar attributes directly into a new tuple prefixed by the
+  input tuple. Returns the tuple, :skip when no values are requested, :reject on
+  a failed predicate/fidx check, or nil when a required attribute is missing.
+  Avoids a separate values array when the entity is not repeated."
+  [lmdb iter na nvs ^objects tuple eid-idx ^ints aids ^objects preds
+   ^objects fidxs ^booleans skips]
+  (let [te ^long (aget tuple eid-idx)
+        base (alength tuple)
+        res (when (pos? ^long nvs) (object-array (+ base (int nvs))))]
+    (when res (System/arraycopy tuple 0 res 0 base))
+    (loop [next? (lmdb/seek-key iter te :id)
+           ai    0
+           vi    0]
+      (if (and next? (< ^long ai ^long na))
+        (let [vb ^ByteBuffer (lmdb/next-val iter)
+              a  (.getInt vb 0)]
+          (if (== ^int a ^int (aget aids ai))
+            (let [v    (idx/avg-buffer->v lmdb vb)
+                  pred (aget preds ai)
+                  fidx (aget fidxs ai)]
+              (if (and (or (nil? pred) (pred v))
+                       (or (nil? fidx) (= v (aget tuple (int fidx)))))
+                (if (aget skips ai)
+                  (recur (lmdb/has-next-val iter) (u/long-inc ai) vi)
+                  (do (aset ^objects res (+ base vi) v)
+                      (recur (lmdb/has-next-val iter) (u/long-inc ai)
+                             (u/long-inc vi))))
+                :reject))
+            (recur (lmdb/has-next-val iter) ai vi)))
+        (when (== ^long ai ^long na)
+          (if (zero? ^long nvs) :skip res))))))
+
+(defn read-entity-many-values
+  "Read and group one entity's multi-valued attributes. Returns the many-tuples
+  result or nil when a required attribute has no matching value."
+  [lmdb iter na ^objects tuple eid-idx ^ints aids ^objects preds ^objects fidxs
+   ^booleans skips ^ints gstarts ^ints gcounts]
+  (let [te ^long (aget tuple eid-idx)
+        vs (object-array na)
+        fa ^int (aget aids 0)
+        la ^int (aget aids (dec ^long na))]
+    (dotimes [i na] (aset vs i (FastList.)))
+    (loop [next? (lmdb/seek-key iter te :id)
+           gi    0
+           pa    (int (aget aids 0))
+           in?   false]
+      (when next?
+        (let [vb ^ByteBuffer (lmdb/next-val iter)
+              a  (.getInt vb 0)]
+          (cond
+            (neg? (Integer/compare a fa))
+            (recur (lmdb/has-next-val iter) gi pa false)
+            (not (pos? (Integer/compare a la)))
+            (let [gi (if (== pa ^int a)
+                       gi
+                       (if in? (inc gi) gi))
+                  s  (aget gstarts gi)]
+              (if (== ^int a ^int (aget aids s))
+                (let [v (idx/avg-buffer->v lmdb vb)]
+                  (dotimes [i (aget gcounts gi)]
+                    (let [aj   (+ s i)
+                          pred (aget preds aj)
+                          fidx (aget fidxs aj)]
+                      (when (and (or (nil? pred) (pred v))
+                                 (or (nil? fidx)
+                                     (= v (aget tuple (int fidx)))))
+                        (.add ^FastList (aget vs aj) v))))
+                  (recur (lmdb/has-next-val iter) gi (int a) true))
+                (recur (lmdb/has-next-val iter) gi pa false)))
+            :else :done))))
+    (when-not (some #(.isEmpty ^FastList %) vs)
+      (r/many-tuples (sequence
+                       (comp (map (fn [v s] (when-not s v)))
+                          (remove nil?))
+                       vs skips)))))
+
 (defn eav-scan-v-single*
   [lmdb iter na nvs ^Collection out ^objects tuple eid-idx
    ^LongObjectHashMap seen ^ints aids ^objects preds ^objects fidxs
@@ -328,32 +435,17 @@
       (if (identical? ts :skip)
         (.add out tuple)
         (.add out (r/join-tuples tuple ts)))
-      (let [vs (object-array (int nvs))]
-        (loop [next? (lmdb/seek-key iter te :id)
-               ai    0
-               vi    0]
-          (if (and next? (< ^long ai ^long na))
-            (let [vb ^ByteBuffer (lmdb/next-val iter)
-                  a  (.getInt vb 0)]
-              (if (== ^int a ^int (aget aids ai))
-                (let [v    (idx/avg-buffer->v lmdb vb)
-                      pred (aget preds ai)
-                      fidx (aget fidxs ai)]
-                  (if (and (or (nil? pred) (pred v))
-                           (or (nil? fidx) (= v (aget tuple (int fidx)))))
-                    (if (aget skips ai)
-                      (recur (lmdb/has-next-val iter) (u/long-inc ai) vi)
-                      (do (aset vs (int vi) v)
-                          (recur (lmdb/has-next-val iter) (u/long-inc ai)
-                                 (u/long-inc vi))))
-                    :reject))
-                (recur (lmdb/has-next-val iter) ai vi)))
-            (when (== ^long ai ^long na)
-              (if (zero? ^long nvs)
-                (do (when seen (.put seen te :skip))
-                    (.add out tuple))
-                (do (when seen (.put seen te vs))
-                    (.add out (r/join-tuples tuple vs)))))))))))
+      (let [x (read-entity-values lmdb iter na nvs tuple eid-idx aids preds
+                                  fidxs skips)]
+        (cond
+          (identical? x :reject) nil
+          (nil? x) nil
+          (identical? x :skip)
+          (do (when seen (.put seen te :skip))
+              (.add out tuple))
+          :else
+          (do (when seen (.put seen te x))
+              (.add out (r/join-tuples tuple x))))))))
 
 (defn eav-scan-v-multi*
   [lmdb iter na ^Collection out ^objects tuple eid-idx
@@ -363,46 +455,11 @@
         ts (when seen (.get seen te))]
     (if ts
       (.addAll out (r/prod-tuples (r/single-tuples tuple) ts))
-      (let [vs (object-array na)
-            fa ^int (aget aids 0)
-            la ^int (aget aids (dec ^long na))]
-        (dotimes [i na] (aset vs i (FastList.)))
-        (loop [next? (lmdb/seek-key iter te :id)
-               gi    0
-               pa    (int (aget aids 0))
-               in?   false]
-          (when next?
-            (let [vb ^ByteBuffer (lmdb/next-val iter)
-                  a  (.getInt vb 0)]
-              (cond
-                (neg? (Integer/compare a fa))
-                (recur (lmdb/has-next-val iter) gi pa false)
-                (not (pos? (Integer/compare a la)))
-                (let [gi (if (== pa ^int a)
-                           gi
-                           (if in? (inc gi) gi))
-                      s  (aget gstarts gi)]
-                  (if (== ^int a ^int (aget aids s))
-                    (let [v (idx/avg-buffer->v lmdb vb)]
-                      (dotimes [i (aget gcounts gi)]
-                        (let [aj   (+ s i)
-                              pred (aget preds aj)
-                              fidx (aget fidxs aj)]
-                          (when (and (or (nil? pred) (pred v))
-                                     (or (nil? fidx)
-                                         (= v (aget tuple (int fidx)))))
-                            (.add ^FastList (aget vs aj) v))))
-                      (recur (lmdb/has-next-val iter) gi (int a) true))
-                    (recur (lmdb/has-next-val iter) gi pa false)))
-                :else :done))))
-        (when-not (some #(.isEmpty ^FastList %) vs)
-          (let [vst (r/many-tuples (sequence
-                                     (comp (map (fn [v s] (when-not s v)))
-                                        (remove nil?))
-                                     vs skips))]
-            (when seen (.put seen te vst))
-            (.addAll out (r/prod-tuples (r/single-tuples tuple)
-                                        vst))))))))
+      (let [vst (read-entity-many-values lmdb iter na tuple eid-idx aids preds
+                                         fidxs skips gstarts gcounts)]
+        (when vst
+          (when seen (.put seen te vst))
+          (.addAll out (r/prod-tuples (r/single-tuples tuple) vst)))))))
 
 (defn val-eq-scan-e*
   [lmdb iter ^Collection out tuple ^HashMap seen aid v vt]
@@ -452,7 +509,12 @@
    ^objects fidxs ^booleans skips cache-eids? ^ints gstarts ^ints gcounts]
   (let [nt       (.size in)
         out      (FastList. nt)
-        seen     (when cache-eids? (LongObjectHashMap. nt))
+        ;; Batch input is sorted by entity id, so equal ids are adjacent. A
+        ;; one-slot cache replaces the per-batch hash map where caching is
+        ;; permitted, avoiding its allocation and hashing.
+        last-eid (when cache-eids? (long-array 1))
+        last-val (when cache-eids? (object-array 1))
+        cached?  (when cache-eids? (boolean-array 1))
         preds    (qpred/fork-predicates preds)
         dbi-name c/eav]
     (scan/scan lmdb dbi-name
@@ -461,13 +523,55 @@
                     (lmdb/iterate-list-val-full dbi rtx cur))]
         (if single?
           (dotimes [i nt]
-            (eav-scan-v-single*
-              lmdb iter na nvs out (.get in i) eid-idx seen aids preds fidxs
-              skips))
+            (let [^objects tuple (.get in i)
+                  te      (long (aget tuple eid-idx))
+                  hit?    (and cached? (aget ^booleans cached? 0)
+                               (== te (aget ^longs last-eid 0)))
+                  repeat? (and (not hit?) cached?
+                               (< (inc i) nt)
+                               (== te (long (aget ^objects
+                                                  (.get in (inc i)) eid-idx))))
+                  direct? (not (or hit? repeat?))
+                  x       (cond
+                            hit? (aget ^objects last-val 0)
+                            repeat?
+                            (let [x (read-entity-values
+                                      lmdb iter na nvs tuple eid-idx aids preds
+                                      fidxs skips)]
+                              (when (and cached?
+                                         (or (identical? x :skip)
+                                             (and (some? x)
+                                                  (not (keyword? x)))))
+                                (aset ^longs last-eid 0 te)
+                                (aset ^objects last-val 0 x)
+                                (aset ^booleans cached? 0 true))
+                              x)
+                            :else
+                            (read-entity-joined
+                              lmdb iter na nvs tuple eid-idx aids preds fidxs
+                              skips))]
+              (cond
+                (identical? x :reject) nil
+                (nil? x) nil
+                (identical? x :skip) (.add out tuple)
+                direct? (.add out x)
+                :else (.add out (r/join-tuples tuple x)))))
           (dotimes [i nt]
-            (eav-scan-v-multi*
-              lmdb iter na out (.get in i) eid-idx seen aids preds fidxs skips
-              gstarts gcounts))))
+            (let [^objects tuple (.get in i)
+                  te (long (aget tuple eid-idx))
+                  x  (if (and cached? (aget ^booleans cached? 0)
+                              (== te (aget ^longs last-eid 0)))
+                       (aget ^objects last-val 0)
+                       (let [x (read-entity-many-values
+                                 lmdb iter na tuple eid-idx aids preds fidxs
+                                 skips gstarts gcounts)]
+                         (when (and cached? (some? x))
+                           (aset ^longs last-eid 0 te)
+                           (aset ^objects last-val 0 x)
+                           (aset ^booleans cached? 0 true))
+                         x))]
+              (when (some? x)
+                (.addAll out (r/prod-tuples (r/single-tuples tuple) x)))))))
       (raise "Fail to eav-scan-v: " e
                {:eid-idx eid-idx :attrs-v attrs-v}))
     out))
