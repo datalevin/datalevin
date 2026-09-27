@@ -10,6 +10,7 @@
    [datalevin.kv :as kv]
    [datalevin.test.core :refer [db-fixture]]
    [datalevin.txlog :as wal]
+   [datalevin.txlog.transfer :as transfer]
    [datalevin.util :as u])
   (:import [datalevin.db DB]
            [datalevin.storage Store]
@@ -36,7 +37,7 @@
     (binding [wal/*commit-payload-ha-term* 7]
       (doseq [value values]
         (d/transact-kv source [[:put "data" :value value]])))
-    (vec (kv/open-tx-log source from))))
+    (transfer/decode-batch (kv/open-tx-log-batch source from Long/MAX_VALUE))))
 
 (defn- payload-floor [db]
   (long (or (i/get-value db c/kv-info c/wal-local-payload-lsn :keyword :data) 0)))
@@ -74,7 +75,8 @@
           (is (= last-lsn (:last-durable-lsn
                            (wal/sync-manager-state (:sync-manager state)))))
           (is (= 15 (d/get-value target "data" :value)))
-          (let [identity #(select-keys % [:lsn :tx-time :ha-term :checksum :rows :ops])]
+          (let [identity #(select-keys (assoc % :rows (or (:rows %) (:ops %)))
+                                       [:lsn :tx-time :ha-term :checksum :rows])]
             (is (= (mapv identity records)
                    (mapv identity (kv/open-tx-log target (:lsn (first records)))))))
           (testing "repeating a fetched page cannot regress state or consume LSNs"
@@ -173,7 +175,9 @@
       (let [store (.-store ^DB @target)
             target-kv (.-lmdb ^Store store)
             source-kv (.-lmdb ^Store (.-store ^DB @source))
-            records (vec (kv/open-tx-log source-kv @(:next-lsn (wal/state target-kv))))
+            records (transfer/decode-batch
+                      (kv/open-tx-log-batch source-kv @(:next-lsn (wal/state target-kv))
+                                            Long/MAX_VALUE))
             commits (atom 0)]
         (is (= 3 (count records)))
         (binding [cpp/*before-write-commit-fn* (fn [_] (swap! commits inc))]
@@ -206,7 +210,9 @@
       (doseq [v [3 4]] (d/transact! source [{:item/key 1 :item/next v}]))
       (let [source-kv (.-lmdb ^Store (.-store ^DB @source))
             target-kv (.-lmdb ^Store @target-store)
-            records (vec (kv/open-tx-log source-kv @(:next-lsn (wal/state target-kv))))
+            records (transfer/decode-batch
+                      (kv/open-tx-log-batch source-kv @(:next-lsn (wal/state target-kv))
+                                            Long/MAX_VALUE))
             next-state (repl/apply-ha-follower-txlog-records!
                         {:store @target-store} records)]
         (vreset! target-store (:store next-state))

@@ -20,6 +20,7 @@
    [datalevin.txlog.meta :as tmeta]
    [datalevin.txlog.recovery :as trec]
    [datalevin.txlog.segment :as tseg]
+   [datalevin.txlog.transfer :as transfer]
    [datalevin.util :as u :refer [raise]]
    [taoensso.timbre :as log])
   (:import
@@ -459,6 +460,7 @@
          :retention-backpressure-blocked-since-ms (volatile! nil)
          :segment-summaries-cache                 (volatile! {})
          :txlog-records-cache                     (volatile! txlog-records-cache)
+         :txlog-transfer-cache                    (transfer/create-cache)
          :retention-total-bytes                   (volatile! total-bytes)
          ;; Preserve the tail record summary so a clean reopen can validate the
          ;; current commit marker without walking the full retained WAL again.

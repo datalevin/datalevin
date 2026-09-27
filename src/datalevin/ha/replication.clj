@@ -1543,11 +1543,8 @@
       (cache/with-cached-ha-client
         m uri db-name client-opts
         (fn [client]
-          (cache/ha-client-request
-           client
-           :open-tx-log-rows
-           [db-name (long from-lsn) (long upto-lsn)]
-           false))))
+          (r/fetch-tx-log-rows client db-name from-lsn upto-lsn
+                               cache/ha-client-request))))
     (raise "Invalid HA leader endpoint for txlog fetch"
              {:error :ha/follower-invalid-leader-endpoint
               :leader-endpoint leader-endpoint})))

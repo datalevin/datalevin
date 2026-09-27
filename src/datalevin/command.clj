@@ -127,6 +127,7 @@
    :txlog-watermarks unguarded
    :open-tx-log unguarded
    :open-tx-log-rows unguarded
+   :open-tx-log-batch (assoc unguarded :db-type "kv")
    :read-commit-marker unguarded
    :verify-commit-marker! unguarded
    :force-txlog-sync! local-write

@@ -54,6 +54,7 @@
                                         with-write-txn-lock-before-runtime-txlog-state]]
    [datalevin.lmdb :as l]
    [datalevin.txlog :as txlog]
+   [datalevin.txlog.transfer :as transfer]
    [datalevin.tx-group :as group]
    [datalevin.util :refer [deftype+ raise]])
   (:import [java.util.concurrent.atomic AtomicReference]
@@ -84,10 +85,12 @@
            state (:txlog-state info)]
        (when (and (or (nil? (:ha-mode info)) ha-guarded?)
                   (or (and state
-                           (#{:strict :relaxed} (:durability-profile state))
+                           (or (#{:strict :relaxed} (:durability-profile state))
+                               (and (vector? kind) (= :datalog (first kind))
+                                    (= :extra (:durability-profile state))))
                            (not (:wal-shared? state))
                            (kvtx/txlog-write-path-enabled? db))
-                      (and (#{:kv :datalog} kind)
+                      (and (#{:kv :datalog} (if (vector? kind) (first kind) kind))
                            (not (:wal? info))
                            (not (:temp? info))
                            (not-any? #{:nosync :nometasync :mapasync :inmemory}
@@ -150,6 +153,19 @@
         (txlog-records (txlog/enabled-state db) from-lsn upto-lsn)
         from-lsn
         upto-lsn)))))
+
+(defn ^:no-doc open-tx-log-batch
+  "Serve encoded records for internal replication without materializing rows."
+  [db from-lsn upto-lsn]
+  (if-let [state (or (txlog/state db)
+                     (when (txlog-write-path-enabled? db)
+                       (ensure-txlog-ready! db)))]
+    (do
+      (txlog/refresh-shared-state! state)
+      (kvtx/txlog-record-batch state from-lsn upto-lsn))
+    (if (txlog-config-enabled? db)
+      (transfer/encode-batch [])
+      (kvtx/txlog-record-batch (txlog/enabled-state db) from-lsn upto-lsn))))
 
 (defn force-txlog-sync!
   [db]

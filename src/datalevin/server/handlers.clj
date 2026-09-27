@@ -2763,6 +2763,7 @@
    :txlog-watermarks (normal-kv-handler kv/txlog-watermarks)
    :open-tx-log (normal-kv-handler kv/open-tx-log)
    :open-tx-log-rows (normal-kv-handler kv/open-tx-log-rows)
+   :open-tx-log-batch (normal-kv-handler kv/open-tx-log-batch)
    :read-commit-marker (normal-kv-handler kv/read-commit-marker)
    :verify-commit-marker! (normal-kv-handler kv/verify-commit-marker!)
    :force-txlog-sync! force-txlog-sync!

@@ -31,7 +31,7 @@
    [java.util.concurrent Executors LinkedBlockingQueue ConcurrentHashMap
     ThreadPoolExecutor ArrayBlockingQueue ThreadPoolExecutor$CallerRunsPolicy
     TimeUnit]
-   [java.util.concurrent.atomic AtomicBoolean AtomicLong]))
+   [java.util.concurrent.atomic AtomicBoolean]))
 
 (declare close closed? remove-conn shutdown-transact-async-executor!
          shutdown-transact-async-executor-if-idle!)
@@ -120,9 +120,7 @@
   (wrap-conn
    (atom db :meta {:listeners (atom {})
                    :db-listeners (atom {})
-                   :runtime-opts (db/runtime-opts db)
-                   :sync-queue-pending (AtomicLong. 0)
-                   :sync-queue-last-enqueue-ms (AtomicLong. 0)})))
+                   :runtime-opts (db/runtime-opts db)})))
 
 (defn conn-from-datoms
   ([datoms] (conn-from-db (db/init-db datoms)))
@@ -706,6 +704,43 @@
       (reset! conn after)
       (assoc report :db-after after))))
 
+(defn- commit-writing-report!
+  [db report ordered? path]
+  ;; The enclosing transaction owns commit/abort. Probe uniqueness before
+  ;; staging blind inserts: a late fused collision could poison that writer.
+  (binding [s/*enforce-blind-unique-inserts?* false
+            c/*ordered-datom-writes?* ordered?]
+    (db/commit-prepared-tx-data! (:db-after report) (:tx-data report) report))
+  (observe-local-wal-tx-path! path)
+  (assoc report :db-before db))
+
+(defn- ^:redef transact-local-in-write-txn!
+  "Apply one request to an already owned local writer. Prepare and resolve
+  against preceding writes, retaining the general interpreter for other shapes."
+  [^DB db tx-data tx-meta]
+  ;; General preparation leaves mutable overlays on its report. Always give
+  ;; the next request fresh overlays, including when it uses a stamper.
+  (let [db1 (db/transfer db (.-store db))]
+    (or
+      (when-let [prepared (db/prepare-scalar-update-tx db1 tx-data)]
+        (when-let [report (db/stamp-scalar-update-tx db1 prepared tx-meta)]
+          (commit-writing-report! db report false :scalar-update)))
+      (when *local-wal-patch-idoc?*
+        (when-let [prepared (db/prepare-local-patch-idoc-tx db1 tx-data)]
+          (when-let [{:keys [report]}
+                     (db/stamp-local-patch-idoc-tx db1 prepared tx-meta)]
+            (commit-writing-report! db report false :patch-idoc))))
+      (when-let [prepared (db/prepare-blind-local-tx db1 tx-data true)]
+        (if (and *local-wal-identity-upsert?* (:identity-upsert-av prepared))
+          (when-let [[report upsert?]
+                     (db/stamp-blind-local-identity-tx db1 prepared tx-meta)]
+            (commit-writing-report! db report (not upsert?)
+                                   (if upsert? :identity-upsert :blind-insert)))
+          (when (db/blind-local-tx-unique-values-absent? db1 prepared)
+            (commit-writing-report! db (db/stamp-blind-local-tx db1 prepared tx-meta)
+                                   true :blind-insert))))
+      (db/transact-tx-data (db/->TxReport db db1 [] {} tx-meta) tx-data false))))
+
 (defn- -transact! [conn tx-data tx-meta]
   (if (local-direct-transact-eligible? conn)
     (or (maybe-direct-local-identity-transact! conn tx-data tx-meta)
@@ -729,13 +764,15 @@
             ;; retain the resulting DB view for subsequent transaction-local
             ;; reads and writes. The owner commits and publishes the base view.
             (let [db     ^DB @conn
-                  report (with-isolated-tx-cache db tx-data tx-meta false)
+                  report (transact-local-in-write-txn! db tx-data tx-meta)
                   after  (db/carry-runtime-opts (:db-after report) db)]
               (reset! conn after)
               (assoc report :db-after after)))
           (let [report (with-transaction [c conn]
                          (assert (active-conn-structural? c))
-                         (with @c tx-data tx-meta))]
+                         (if (instance? Store (.-store ^DB @c))
+                           (transact-local-in-write-txn! @c tx-data tx-meta)
+                           (with @c tx-data tx-meta)))]
             (assoc report :db-after @conn)))))))
 
 (defn- notify-listeners!
@@ -749,47 +786,12 @@
     (notify-listeners! conn report)
     report))
 
-(def ^:dynamic *sync-queue-worker?* false)
 (def ^:dynamic *txlog-sync-path-observer* nil)
 
 (defn- observe-txlog-sync-path!
   [path]
   (when (fn? *txlog-sync-path-observer*)
     (*txlog-sync-path-observer* path)))
-
-(defn- ensure-sync-queue-state!
-  [conn]
-  (let [m (meta conn)
-        queued-pending (:sync-queue-pending m)
-        last-enqueue-ms (:sync-queue-last-enqueue-ms m)
-        pending* (if (instance? AtomicLong queued-pending)
-                   queued-pending
-                   (AtomicLong. 0))
-        last-enqueue-ms* (if (instance? AtomicLong last-enqueue-ms)
-                           last-enqueue-ms
-                           (AtomicLong. 0))]
-    (when (or (not (identical? pending* queued-pending))
-              (not (identical? last-enqueue-ms* last-enqueue-ms)))
-      (alter-conn-meta! conn assoc
-                        :sync-queue-pending pending*
-                        :sync-queue-last-enqueue-ms last-enqueue-ms*))
-    {:queued-pending pending*
-     :last-enqueue-ms last-enqueue-ms*}))
-
-(defn- sync-queue-pending-counter
-  [conn]
-  ^AtomicLong (:queued-pending (ensure-sync-queue-state! conn)))
-
-(defn- sync-queue-last-enqueue-ms-counter
-  [conn]
-  ^AtomicLong (:last-enqueue-ms (ensure-sync-queue-state! conn)))
-
-(defn- queue-pending-dec-by!
-  [conn n]
-  (let [^AtomicLong pending (sync-queue-pending-counter conn)
-        after (.addAndGet pending (- (long n)))]
-    (when (neg? after)
-      (.set pending 0))))
 
 (defn- current-thread-holds-store-write-lock?
   [store]
@@ -801,149 +803,55 @@
         (when-let [lmdb-write-lock (l/write-txn (.-lmdb ^Store store))]
           (Thread/holdsLock lmdb-write-lock))))))
 
-(defn- wal-sync-queue-profile-from-opts
-  [opts]
-  (let [opts    (c/canonicalize-wal-opts opts)
-        profile (or (:wal-durability-profile opts)
-                    c/*wal-durability-profile*)]
-    (when (and (true? (:wal? opts)) profile)
-      profile)))
-
-(defn- cached-remote-store-opts
-  [conn ^DatalogStore store]
-  (if-some [entry (find (meta conn) :remote-store-opts-cache)]
-    (val entry)
-    (let [opts (c/canonicalize-wal-opts (i/opts store))]
-      (alter-conn-meta! conn assoc :remote-store-opts-cache opts)
-      opts)))
-
-(defn- txlog-sync-queue-profile
-  [conn]
-  (when (and (not *sync-queue-worker?*)
-             (instance? clojure.lang.IDeref conn))
-    (let [db @conn]
-      ;; `conn?` refreshes remote cache state via `last-modified`, which is
-      ;; unnecessary for picking the local sync path and can stall writes
-      ;; during HA failover when leadership is still converging.
-      (when (instance? DB db)
-        (let [store (.-store ^DB db)]
-          (when (and (not (current-thread-holds-store-write-lock? store))
-                     (or (and (instance? Store store)
-                              (not (l/writing? (.-lmdb ^Store store))))
-                         (and (instance? DatalogStore store)
-                              (not (l/writing? store)))))
-            (cond
-              (instance? Store store)
-              (wal-sync-queue-profile-from-opts
-                (l/read-env-opts (.-lmdb ^Store store)))
-
-              (instance? DatalogStore store)
-              (wal-sync-queue-profile-from-opts
-                (cached-remote-store-opts conn store))
-
-              :else nil)))))))
-
-(declare queued-transact!)
-
-(def ^:private wal-idle-direct-cooldown-ms
-  5)
-
-(defn- try-direct-wal-transact-when-idle!
-  [conn tx-data tx-meta]
-  (let [now-ms (System/currentTimeMillis)
-        ^AtomicLong last-enqueue-ms (sync-queue-last-enqueue-ms-counter conn)]
-    (if (< (- now-ms (.get last-enqueue-ms))
-           (long wal-idle-direct-cooldown-ms))
-      [false nil]
-      (let [^AtomicLong pending (sync-queue-pending-counter conn)]
-        (if (.compareAndSet pending 0 1)
-          (try
-            [true (run-transact-now! conn tx-data tx-meta)]
-            (finally
-              (queue-pending-dec-by! conn 1)))
-          [false nil])))))
-
-(defn- transact-local-or-explicit!
-  [conn tx-data tx-meta]
-  (let [profile (txlog-sync-queue-profile conn)]
-    (cond
-      (nil? profile)
-      (do
-        (observe-txlog-sync-path! :direct-no-wal)
-        (run-transact-now! conn tx-data tx-meta))
-
-      (= :strict profile)
-      ;; Strict durability can take the idle direct fast path when there is no
-      ;; queue pressure, but falls back to the sync queue adaptively once work
-      ;; is already pending.
-      (let [[direct? report]
-            (try-direct-wal-transact-when-idle! conn tx-data tx-meta)]
-        (if direct?
-          (do
-            (observe-txlog-sync-path! :direct-wal-idle-strict)
-            report)
-          (do
-            (observe-txlog-sync-path! :queued-strict)
-            (queued-transact! conn tx-data tx-meta))))
-
-      (= :relaxed profile)
-      ;; Txn-log group commit batches relaxed durability independently of the
-      ;; Datalog request queue. Avoid the queue handoff while idle, but retain
-      ;; its transaction combining once concurrent requests create pressure.
-      (let [[direct? report]
-            (try-direct-wal-transact-when-idle! conn tx-data tx-meta)]
-        (if direct?
-          (do
-            (observe-txlog-sync-path! :direct-wal-idle-relaxed)
-            report)
-          (do
-            (observe-txlog-sync-path! :queued-relaxed)
-            (queued-transact! conn tx-data tx-meta))))
-
-      (= :extra profile)
-      ;; Extra durability follows the same adaptive dispatch as strict, with a
-      ;; stricter sync primitive on the durability side.
-      (let [[direct? report]
-            (try-direct-wal-transact-when-idle! conn tx-data tx-meta)]
-        (if direct?
-          (do
-            (observe-txlog-sync-path! :direct-wal-idle-extra)
-            report)
-          (do
-            (observe-txlog-sync-path! :queued-extra)
-            (queued-transact! conn tx-data tx-meta))))
-
-      :else
-      (let [[direct? report]
-            (try-direct-wal-transact-when-idle! conn tx-data tx-meta)]
-        (if direct?
-          (do
-            (observe-txlog-sync-path! :direct-wal-idle-other)
-            report)
-          (do
-            (observe-txlog-sync-path! :queued-other)
-            (queued-transact! conn tx-data tx-meta)))))))
-
 (defn- embedded-write-group
   [conn]
-  (when-not (or *sync-queue-worker?* (Thread/holdsLock conn))
+  (when-not (Thread/holdsLock conn)
     (let [store (.-store ^DB @conn)]
       (when (and (instance? Store store)
                  (not (s/synchronous-secondary-indexing? store)))
-        (let [lmdb (.-lmdb ^Store store)
-              opts (l/read-env-opts lmdb)]
-          ;; Retain the specialized adaptive WAL runner unless an idle
-          ;; collection window was requested. Non-WAL stores now collect
-          ;; contended callers as well, without an executor handoff.
-          (when (or (not (:wal? opts))
-                    (pos? (kv/write-batch-delay-nanos lmdb)))
-            (kv/write-group lmdb :datalog)))))))
+        ;; A runner publishes only its owning connection. Connections can share
+        ;; the environment while retaining different runtime options.
+        (kv/write-group (.-lmdb ^Store store) [:datalog (conn-state conn)])))))
+
+(defn- observe-embedded-path!
+  [profile batched?]
+  (observe-txlog-sync-path!
+   (case profile
+     :strict (if batched? :queued-strict :direct-wal-idle-strict)
+     :relaxed (if batched? :queued-relaxed :direct-wal-idle-relaxed)
+     :extra (if batched? :queued-extra :direct-wal-idle-extra)
+     (if batched? :queued-no-wal :direct-no-wal))))
+
+(defn- ensure-group-secondary-safe!
+  [store]
+  ;; Recheck under the native writer: indexing options can change after queue
+  ;; admission. Retry individual requests before any secondary side effects.
+  (when (and (> (long group/*request-count*) 1)
+             (s/synchronous-secondary-indexing? store))
+    (throw (ex-info "Secondary indexing requires individual commits"
+                    {::group/body-failure true}))))
+
+(deftype ^:no-doc GroupedTx [tx-data tx-meta])
+
+(declare try-commit-prepared-group!)
+
+(defn- prepared-group-candidate?
+  [tx-data]
+  ;; Transaction functions and ordinary operation vectors use the bound general
+  ;; runner. Only inserts and patches need metadata for whole-batch preparation.
+  (when (or (sequential? tx-data) (instance? java.util.List tx-data))
+    (let [form (first tx-data)]
+      (or (map? form)
+          (and (sequential? form) (= :db.fn/patchIdoc (first form)))))))
 
 (defn- transact-embedded-group!
   [g conn tx-data tx-meta]
   (let [lmdb (.-lmdb ^Store (.-store ^DB @conn))
         opts (l/read-env-opts lmdb)
         profile (when (:wal? opts) (:wal-durability-profile opts))
+        op (fn [[tx batched?]]
+             (observe-embedded-path! profile batched?)
+             (-transact! tx tx-data tx-meta))
         report
         (group/submit!
          g
@@ -953,8 +861,11 @@
              (locking conn
                (let [before @conn
                      ^objects reports
-                     (with-transaction [tx conn]
-                       (:result (db/execute-write-group tx #(execute [% true]))))
+                     (or (when (:wal? opts)
+                           (try-commit-prepared-group! conn execute profile))
+                         (with-transaction [tx conn]
+                           (ensure-group-secondary-safe! (.-store ^DB @tx))
+                           (:result (db/execute-write-group tx #(execute [% true])))))
                      after @conn
                      store (.-store ^DB after)]
                  ;; The native writer is closed. Return readable Store views,
@@ -968,13 +879,9 @@
                                                               store))
                                   :db-after after))))
                  reports))))
-         (fn [[tx batched?]]
-           (observe-txlog-sync-path!
-            (case profile
-              :strict (if batched? :queued-strict :direct-wal-idle-strict)
-              :relaxed (if batched? :queued-relaxed :direct-wal-idle-relaxed)
-              (if batched? :queued-no-wal :direct-no-wal)))
-           (-transact! tx tx-data tx-meta))
+         (if (and profile (prepared-group-candidate? tx-data))
+           (with-meta op {::group/data (->GroupedTx tx-data tx-meta)})
+           op)
          (kv/write-batch-delay-nanos lmdb))]
     (notify-listeners! conn report)
     report))
@@ -992,7 +899,15 @@
        report)
      (if-let [g (embedded-write-group conn)]
        (transact-embedded-group! g conn tx-data tx-meta)
-       (transact-local-or-explicit! conn tx-data tx-meta)))))
+       (do
+         (let [store (.-store ^DB @conn)
+               opts (when (and (instance? Store store)
+                               (not (l/writing? (.-lmdb ^Store store)))
+                               (not (current-thread-holds-store-write-lock? store)))
+                      (l/read-env-opts (.-lmdb ^Store store)))]
+           (observe-embedded-path!
+            (when (:wal? opts) (:wal-durability-profile opts)) false))
+         (run-transact-now! conn tx-data tx-meta))))))
 
 (defn transact-ack!
   ([conn tx-data] (transact-ack! conn tx-data nil))
@@ -1253,20 +1168,11 @@
        (let [~(first spec) conn#] ~@body)
        (finally (close conn#)))))
 
-(declare dl-tx-combine
-         transact!
-         sync-queued-dl-tx-combine
-         run-sync-queued-dl-batch!)
+(declare dl-tx-combine)
 
 (defn- dl-work-key* [db-name] (->> db-name hash (str "tx") keyword))
 
 (def ^:no-doc dl-work-key (memoize dl-work-key*))
-(defn- sync-queued-dl-work-key* [db-name] (->> db-name hash (str "tx-sync") keyword))
-(def ^:private sync-queued-dl-work-key (memoize sync-queued-dl-work-key*))
-
-(deftype ^:no-doc SyncQueuedReq [tx-data tx-meta result-promise])
-(deftype ^:no-doc SyncQueuedResult [report error])
-
 (defn- tx-data-size
   ^long [tx-data]
   (if (instance? java.util.Collection tx-data)
@@ -1283,13 +1189,6 @@
   IBoundedAsyncWork
   (batch-weight [_] (tx-data-size tx-data))
   (max-batch-weight [_] c/*datalog-async-batch-max-forms*))
-
-(deftype ^:no-doc SyncQueuedDLTx [conn requests]
-  IAsyncWork
-  (work-key [_] (->> (.-store ^DB @conn) i/db-name sync-queued-dl-work-key))
-  (do-work [_] (run-sync-queued-dl-batch! conn requests))
-  (combine [_] sync-queued-dl-tx-combine)
-  (callback [_] nil))
 
 (defn- add-combined-tx-data!
   [^FastList out tx-data]
@@ -1316,36 +1215,7 @@
                      (.-tx-meta fw)
                      (.-cb fw))))))
 
-(defn- sync-queued-dl-tx-combine
-  [coll]
-  (let [^SyncQueuedDLTx fw (first coll)]
-    (if (nil? (next coll))
-      fw
-      (let [capacity (reduce (fn [^long n ^SyncQueuedDLTx work]
-                               (+ n (.size ^java.util.Collection
-                                           (.-requests work))))
-                             0
-                             coll)
-            ^FastList out (FastList. (int capacity))]
-        (doseq [^SyncQueuedDLTx work coll]
-          (.addAll out ^java.util.Collection (.-requests work)))
-        (->SyncQueuedDLTx (.-conn fw) out)))))
-
-(defn- deliver-sync-queued-error!
-  [^SyncQueuedReq req ^Throwable e]
-  (deliver (.-result-promise req) (->SyncQueuedResult nil e)))
-
-(defn- deliver-sync-queued-success!
-  [^SyncQueuedReq req report]
-  (deliver (.-result-promise req) (->SyncQueuedResult report nil)))
-
-(defn- finalize-sync-queued-report
-  [^TxReport report db-after]
-  ;; Preserve any extra tx report keys (e.g. :new-attributes) while updating
-  ;; db-after to the final shared connection snapshot.
-  (assoc report :db-after db-after))
-
-(defn- prepare-sync-queued-patch-idoc-batch
+(defn- prepare-grouped-patch-idoc-batch
   [conn ^FastList requests]
   (let [db    ^DB @conn
         store (.-store db)]
@@ -1355,7 +1225,7 @@
             ^objects prepared (object-array n)]
         (loop [i 0]
           (if (< i n)
-            (let [^SyncQueuedReq req (.get requests i)
+            (let [^GroupedTx req (.get requests i)
                   tx (db/prepare-local-patch-idoc-tx db (.-tx-data req))]
               (if tx
                 (do
@@ -1372,14 +1242,14 @@
           (and (db/local-patch-idoc-tx-valid? db (aget prepared i))
                (recur (unchecked-inc i)))))))
 
-(defn- prepare-sync-queued-patch-idoc-reports!
+(defn- prepare-grouped-patch-idoc-reports!
   [^DB db ^FastList requests ^objects prepared ^objects reports]
   (let [n (alength prepared)]
     (loop [i       0
            current db
            docs    {}]
       (if (< i n)
-        (let [^SyncQueuedReq req (.get requests i)
+        (let [^GroupedTx req (.get requests i)
               patch             (aget prepared i)
               doc-key           [(:e patch) (:attr patch)]
               stamped           (if (contains? docs doc-key)
@@ -1399,7 +1269,7 @@
                  (assoc docs doc-key (:doc stamped))))
         current))))
 
-(defn- try-commit-sync-queued-patch-idoc-batch!
+(defn- try-commit-grouped-patch-idoc-batch!
   [conn ^FastList requests ^objects prepared ^objects reports]
   (locking conn
     (let [db    ^DB @conn
@@ -1418,7 +1288,8 @@
               (l/with-transaction-kv [kv1 kv]
                 (let [store1 ^Store (s/transfer ^Store store kv1)
                       db1    ^DB    (db/transfer db store1)
-                      dbn    ^DB    (prepare-sync-queued-patch-idoc-reports!
+                      _             (ensure-group-secondary-safe! store1)
+                      dbn    ^DB    (prepare-grouped-patch-idoc-reports!
                                       db1 requests prepared reports)]
                   (db/execute-write-group
                     (atom db1)
@@ -1454,7 +1325,7 @@
           false)
         true))))
 
-(defn- prepare-sync-queued-blind-batch
+(defn- prepare-grouped-blind-batch
   [conn ^FastList requests]
   (let [db    ^DB @conn
         store (.-store db)]
@@ -1465,7 +1336,7 @@
             seen              (HashSet.)]
         (loop [i 0]
           (if (< i n)
-            (let [^SyncQueuedReq req (.get requests i)
+            (let [^GroupedTx req (.get requests i)
                   tx (db/prepare-blind-local-tx
                        db (.-tx-data req) true)]
               (if (and tx (add-distinct-blind-unique-values! seen tx))
@@ -1475,13 +1346,13 @@
                 nil))
             prepared))))))
 
-(def ^:private sync-queued-blind-fallback-type
-  ::sync-queued-blind-fallback)
+(def ^:private grouped-blind-fallback-type
+  ::grouped-blind-fallback)
 
-(defn- sync-queued-blind-fallback!
+(defn- grouped-blind-fallback!
   []
   (raise "Queued blind transaction requires full resolution"
-                  {:type sync-queued-blind-fallback-type}))
+                  {:type grouped-blind-fallback-type}))
 
 (defn- identity-upsert-prepared?
   "Whether a prepared queued request may use the identity-upsert stamper. The
@@ -1499,7 +1370,7 @@
           (and (db/blind-local-tx-valid? db (aget prepared i))
                (recur (unchecked-inc i)))))))
 
-(defn- try-commit-sync-queued-blind-batch!
+(defn- try-commit-grouped-blind-batch!
   [conn ^FastList requests ^objects prepared ^objects reports]
   (locking conn
     (let [db    ^DB @conn
@@ -1519,6 +1390,7 @@
                 (l/with-transaction-kv [kv1 kv]
                   (let [store1 ^Store (s/transfer ^Store store kv1)
                         db1    ^DB    (db/transfer db store1)]
+                    (ensure-group-secondary-safe! store1)
                     ;; Side-effect-free prepared requests enforce attribute
                     ;; uniqueness in the eventual AVE put. Identity-upsert
                     ;; requests may match an existing row and are stamped in
@@ -1532,12 +1404,12 @@
                                    (not
                                      (db/blind-local-tx-unique-values-absent?
                                        db1 tx)))
-                          (sync-queued-blind-fallback!))))
+                          (grouped-blind-fallback!))))
                     (db/execute-write-group
                       (atom db1)
                       (fn [tx]
                         (dotimes [i n]
-                          (let [^SyncQueuedReq req (.get requests i)
+                          (let [^GroupedTx req (.get requests i)
                                 prepared-tx (aget prepared i)
                                 identity?   (identity-upsert-prepared?
                                               prepared-tx)
@@ -1549,7 +1421,7 @@
                                      @tx prepared-tx (.-tx-meta req))
                                    false])]
                             (when-not report
-                              (sync-queued-blind-fallback!))
+                              (grouped-blind-fallback!))
                             (binding [s/*enforce-blind-unique-inserts?*
                                       (and (not identity?)
                                            (boolean
@@ -1586,7 +1458,7 @@
                                                   new-store))))))
                   true)
                 (catch clojure.lang.ExceptionInfo e
-                  (if (or (= sync-queued-blind-fallback-type
+                  (if (or (= grouped-blind-fallback-type
                              (:type (ex-data e)))
                           (l/blind-unique-collision? e))
                     false
@@ -1595,130 +1467,20 @@
               (when-not old
                 (db/enable-cache (.-store ^DB @conn))))))))))
 
-(defn- transact-sync-queued-individually!
-  [conn ^FastList requests ^objects reports]
-  (binding [group/*request-count* 1]
-    (dotimes [i (alength reports)]
-      (let [^SyncQueuedReq req (.get requests i)]
-        (aset reports i
-              (try
-                (-transact! conn (.-tx-data req) (.-tx-meta req))
-                (catch Throwable e e)))))))
-
-(defn- general-sync-queued-batch-safe?
-  [^DB db]
-  ;; Synchronous secondary engines share mutable state across Store wrappers;
-  ;; a later failed request cannot roll it back with LMDB. Async indexing only
-  ;; enqueues jobs in the same native transaction, so batching remains atomic.
-  (not (s/synchronous-secondary-indexing? (.-store db))))
-
-(defn- transact-sync-queued-batch!
-  [conn ^FastList requests ^objects reports]
-  (locking conn
-    (let [n (alength reports)
-          before ^DB @conn]
-      (if-not (general-sync-queued-batch-safe? before)
-        (transact-sync-queued-individually! conn requests reports)
-        (do
-          (with-transaction [c conn]
-            (assert (active-conn-structural? c))
-            (db/execute-write-group
-              c
-              (fn [tx]
-                (dotimes [i n]
-                  (let [^SyncQueuedReq req (.get requests i)
-                        ;; Apply each request before preparing the next. Simulated
-                        ;; reports cannot be chained: preparation clears their
-                        ;; mutable overlays before a transaction function reads.
-                        ^TxReport report (with-isolated-tx-cache
-                                           @tx (.-tx-data req) (.-tx-meta req) false)]
-                    (reset! tx (:db-after report))
-                    (aset reports i report))))))
-          ;; Returned reports must not retain a Store bound to the closed writer.
-          (let [store (.-store ^DB @conn)]
-            (dotimes [i n]
-              (let [^TxReport report (aget reports i)]
-                (aset reports i
-                      (assoc report :db-before
-                             (if (zero? i)
-                               before
-                               (db/transfer (:db-before report) store))))))))))))
-
-(defn- run-sync-queued-dl-batch!
-  [conn ^FastList requests]
-  (let [n (int (.size requests))]
-    (try
-      (if (= n 1)
-        (let [^SyncQueuedReq req (.get requests 0)]
-          (try
-            (binding [*sync-queue-worker?* true
-                      group/*request-count* 1]
-              (let [^TxReport report (-transact! conn
-                                                 (.-tx-data req)
-                                                 (.-tx-meta req))]
-                (deliver-sync-queued-success!
-                  req
-                  (finalize-sync-queued-report report @conn))))
-            (catch Throwable e
-              (deliver-sync-queued-error! req e)))
-          nil)
-        ;; Combine eligible requests in a single write transaction.
-        (let [^objects reports (object-array n)]
-          (try
-            (binding [*sync-queue-worker?* true
-                      group/*request-count* n]
-              (let [patches (when *local-wal-patch-idoc?*
-                              (prepare-sync-queued-patch-idoc-batch
-                                conn requests))]
-                (when-not
-                  (and patches
-                       (try-commit-sync-queued-patch-idoc-batch!
-                         conn requests patches reports))
-                  (let [prepared
-                        (prepare-sync-queued-blind-batch conn requests)]
-                    (when-not
-                      (and prepared
-                           (try-commit-sync-queued-blind-batch!
-                             conn requests prepared reports))
-                      (transact-sync-queued-batch!
-                        conn requests reports))))))
-            (let [db-after @conn]
-              (dotimes [i n]
-                (let [result (aget reports i)]
-                  (if (instance? Throwable result)
-                    (deliver-sync-queued-error! (.get requests i) result)
-                    (deliver-sync-queued-success!
-                      (.get requests i)
-                      (finalize-sync-queued-report result db-after))))))
-            (catch Throwable e
-              (dotimes [i n]
-                (deliver-sync-queued-error! (.get requests i) e))))
-          nil))
-      (finally
-        (queue-pending-dec-by! conn n)))))
-
-(defn- queued-transact!
-  [conn tx-data tx-meta]
-  (let [^AtomicLong pending (sync-queue-pending-counter conn)
-        ^AtomicLong last-enqueue-ms (sync-queue-last-enqueue-ms-counter conn)
-        _ (.set last-enqueue-ms (System/currentTimeMillis))
-        _ (.incrementAndGet pending)
-        result-promise (promise)
-        requests       (doto (FastList. 1)
-                         (.add (->SyncQueuedReq tx-data tx-meta result-promise)))]
-    (try
-      (a/exec-noresult (a/get-executor)
-                       (->SyncQueuedDLTx conn requests))
-      (catch Throwable e
-        ;; Worker did not run, so rollback pending queue count locally.
-        (queue-pending-dec-by! conn 1)
-        (throw e)))
-    (let [^SyncQueuedResult result @result-promise]
-      (if-let [e (.-error result)]
-        (throw ^Throwable e)
-        (let [report (.-report result)]
-          (notify-listeners! conn report)
-          report)))))
+(defn- try-commit-prepared-group!
+  [conn execute profile]
+  (when-let [^FastList requests (group/batch-data execute)]
+    (let [n (.size requests)
+          reports (object-array n)
+          patches (when *local-wal-patch-idoc?*
+                    (prepare-grouped-patch-idoc-batch conn requests))]
+      (when (or (and patches
+                     (try-commit-grouped-patch-idoc-batch!
+                      conn requests patches reports))
+                (when-let [prepared (prepare-grouped-blind-batch conn requests)]
+                  (try-commit-grouped-blind-batch! conn requests prepared reports)))
+        (dotimes [_ n] (observe-embedded-path! profile true))
+        reports))))
 
 (defn transact-async
   ([conn tx-data] (transact-async conn tx-data nil))

@@ -18,6 +18,7 @@
    [datalevin.lmdb :as l]
    [datalevin.txlog :as txlog]
    [datalevin.txlog.codec :as tcodec]
+   [datalevin.txlog.transfer :as transfer]
    [datalevin.util :as u :refer [raise]])
   (:import
    [datalevin.binding.cpp Rtx]
@@ -535,9 +536,9 @@
                                     :path])}))))
 
 (defn- hydrate-txlog-record-group
-  [records]
+  [records encoded?]
   (let [records (vec records)]
-    (if (every? #(contains? % :rows) records)
+    (if (and (not encoded?) (every? #(contains? % :rows) records))
       records
       (let [{:keys [path offset]} (first records)
             end-offset (:next-offset (peek records))
@@ -563,8 +564,11 @@
             :on-record
             (fn [record]
               (when-let [summary (get by-offset (long (:offset record)))]
-                (let [hydrated (txlog-record-entry
-                                (long segment-id) path record true)]
+                (let [hydrated (cond-> (txlog-record-entry
+                                        (long segment-id) path record (not encoded?))
+                                encoded? (assoc :body (:body record)
+                                                :major (:major record)
+                                                :flags (:flags record)))]
                   (assert-hydrated-record-matches-summary!
                    summary hydrated)
                   (.add acc hydrated))))})
@@ -578,14 +582,15 @@
             hydrated))))))
 
 (defn- hydrate-txlog-records
-  [records]
-  (->> records
-       (partition-by (juxt :segment-id :path))
-       (mapcat hydrate-txlog-record-group)
-       vec))
+  ([records] (hydrate-txlog-records records false))
+  ([records encoded?]
+   (->> records
+        (partition-by (juxt :segment-id :path))
+        (mapcat #(hydrate-txlog-record-group % encoded?))
+        vec)))
 
 (defn- txlog-records-read
-  [state from-lsn upto-lsn recovery?]
+  [state from-lsn upto-lsn recovery? hydrate]
   (let [dir (:dir state)
         cache-v (:txlog-records-cache state)
         from (long (max 0 (long (or from-lsn 0))))
@@ -619,7 +624,7 @@
             [records error] (try
                               (validate-txlog-record-sequence!
                                validation-records)
-                              [(hydrate-txlog-records selected-records) nil]
+                              [(hydrate selected-records) nil]
                               (catch clojure.lang.ExceptionInfo e
                                 [nil e]))]
         (if error
@@ -643,11 +648,24 @@
   ([state from-lsn]
    (txlog-records state from-lsn nil))
   ([state from-lsn upto-lsn]
-   (txlog-records-read state from-lsn upto-lsn false)))
+   (txlog-records-read state from-lsn upto-lsn false hydrate-txlog-records)))
+
+(defn txlog-record-batch
+  "Read a bounded, encoded WAL batch. Validate the current retained record
+  window before cache lookup so reuse cannot conceal retention or truncation."
+  [state from-lsn upto-lsn]
+  (when-not (integer? upto-lsn)
+    (raise "WAL transfer requires an upper LSN bound" {:type :txlog/invalid-range}))
+  (txlog-records-read
+    state from-lsn upto-lsn false
+    (fn [records]
+      (transfer/cached-batch
+        (:txlog-transfer-cache state) records
+        #(transfer/encode-batch (hydrate-txlog-records records true))))))
 
 (defn txlog-records-for-recovery
   [state from-lsn]
-  (txlog-records-read state from-lsn nil true))
+  (txlog-records-read state from-lsn nil true hydrate-txlog-records))
 
 (defn txlog-watermarks
   [db]

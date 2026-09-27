@@ -5,6 +5,7 @@
    [datalevin.constants :as c]
    [datalevin.kv.txlog :as sut]
    [datalevin.txlog :as txlog]
+   [datalevin.txlog.transfer :as transfer]
    [datalevin.util :as u])
   (:import
    [java.io RandomAccessFile]
@@ -27,7 +28,8 @@
     (.length (io/file path))))
 
 (defn- state []
-  {:dir *dir* :txlog-records-cache (volatile! {})})
+  {:dir *dir* :txlog-records-cache (volatile! {})
+   :txlog-transfer-cache (transfer/create-cache)})
 
 (defn- lsns [state from upto]
   (mapv :lsn (sut/txlog-records state from upto)))
@@ -144,7 +146,10 @@
 (deftest bounded-reader-includes-maximum-lsn
   (append! 1 [(dec Long/MAX_VALUE) Long/MAX_VALUE])
   (is (= [(dec Long/MAX_VALUE) Long/MAX_VALUE]
-         (lsns (state) (dec Long/MAX_VALUE) Long/MAX_VALUE))))
+         (lsns (state) (dec Long/MAX_VALUE) Long/MAX_VALUE)))
+  (is (= [(dec Long/MAX_VALUE) Long/MAX_VALUE]
+         (mapv :lsn (transfer/decode-batch
+                      (sut/txlog-record-batch (state) (dec Long/MAX_VALUE) Long/MAX_VALUE))))))
 
 (deftest scan-callback-can-stop-without-reporting-a-partial-tail
   (append! 1 [1 2 3])
@@ -162,3 +167,56 @@
       (is (false? (:partial-tail? result)))
       (is (= (:next-offset (first @seen)) (:valid-end result)))
       (is (< (:valid-end result) (:size result))))))
+
+(deftest encoded-batches-share-payloads-without-changing-the-row-api
+  (append! 1 (range 1 11))
+  (append! 2 (range 11 21))
+  (let [state (state)
+        batch (sut/txlog-record-batch state 8 13)]
+    (is (identical? batch (sut/txlog-record-batch state 8 13)))
+    (is (= (txlog/select-open-record-rows (sut/txlog-records state 8 13) 8 13)
+           (transfer/decode-batch batch)))))
+
+(deftest encoded-batch-cache-observes-append-truncation-and-retention
+  (let [offset (append! 1 [1 2 3 4])
+        state (assoc (state) :segment-id (volatile! 1)
+                             :segment-offset (volatile! offset))
+        prefix (sut/txlog-record-batch state 1 2)
+        tail (sut/txlog-record-batch state 3 8)]
+    (vreset! (:segment-offset state) (append! 1 [5 6]))
+    (is (identical? prefix (sut/txlog-record-batch state 1 2)))
+    (is (= [3 4] (mapv :lsn (transfer/decode-batch tail))))
+    (is (= [3 4 5 6] (mapv :lsn (transfer/decode-batch
+                                (sut/txlog-record-batch state 3 8)))))
+    (let [end (-> @(:txlog-records-cache state) (get 1) :records second :next-offset)]
+      (with-open [raf (RandomAccessFile. ^String (txlog/segment-path *dir* 1) "rw")]
+        (.setLength raf end))
+      (vreset! (:segment-offset state) end))
+    (is (= [] (transfer/decode-batch (sut/txlog-record-batch state 3 8))))
+    (io/delete-file (txlog/segment-path *dir* 1))
+    (is (= [] (transfer/decode-batch (sut/txlog-record-batch state 1 2))))))
+
+(deftest encoded-batch-cache-does-not-hide-a-replaced-segment
+  (append! 1 [1 2 3])
+  (let [state (state)
+        batch (sut/txlog-record-batch state 1 2)
+        path (txlog/segment-path *dir* 1)
+        modified (.lastModified (io/file path))]
+    (io/delete-file path)
+    (append! 1 [1 3 4])
+    (.setLastModified (io/file path) (+ modified 1000))
+    (is (= [1 2] (mapv :lsn (transfer/decode-batch batch))))
+    (is (= :txlog/corrupt
+           (try (sut/txlog-record-batch state 1 2) nil
+                (catch clojure.lang.ExceptionInfo e (:type (ex-data e))))))))
+
+(deftest encoded-serving-does-not-decode-rows-on-the-source
+  (let [body (txlog/encode-commit-row-payload 1 1 [[:put "dbi" 1 1]])]
+    ;; Preserve a valid payload header but make its row opcode invalid. The
+    ;; source verifies the WAL framing/checksum; only the receiver decodes ops.
+    (aset-byte body 28 (unchecked-byte 0xff))
+    (with-open [^FileChannel ch (txlog/open-segment-channel (txlog/segment-path *dir* 1))]
+      (txlog/append-record! ch body))
+    (let [batch (sut/txlog-record-batch (state) 1 1)]
+      (is (bytes? (:data batch)))
+      (is (thrown? clojure.lang.ExceptionInfo (transfer/decode-batch batch))))))

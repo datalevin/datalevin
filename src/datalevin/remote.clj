@@ -17,6 +17,7 @@
    [datalevin.interface :as i]
    [datalevin.client :as cl]
    [datalevin.prepared :as prepared]
+   [datalevin.txlog.transfer :as transfer]
    [datalevin.bits :as b]
    [datalevin.datom :as d]
    [datalevin.lmdb :as l :refer [IWriting]]
@@ -28,11 +29,37 @@
     ISearchEngine IVectorIndex IRemoteDB IRemoteKV IRemotePrepared]
    [clojure.lang Seqable IReduceInit]
    [java.lang AutoCloseable]
+   [java.util Collections WeakHashMap Map]
    [java.util.concurrent ConcurrentHashMap]
    [java.util.concurrent.atomic AtomicBoolean AtomicLong]
    [java.nio.file Files Paths StandardOpenOption LinkOption]
    [java.security MessageDigest]
    [java.net URI]))
+
+(defonce ^:private ^Map legacy-txlog-clients
+  (Collections/synchronizedMap (WeakHashMap.)))
+
+(defn fetch-tx-log-rows
+  "Prefer encoded WAL transfer, falling back once per client for older servers.
+  request-fn uses the normal client request signature, including HA pooling."
+  ([client db-name from-lsn upto-lsn]
+   (fetch-tx-log-rows client db-name from-lsn upto-lsn cl/normal-request))
+  ([client db-name from-lsn upto-lsn request-fn]
+   (let [args [db-name (long from-lsn) (long upto-lsn)]
+         legacy #(request-fn client :open-tx-log-rows args false)]
+     (if (.containsKey legacy-txlog-clients client)
+       (legacy)
+       (let [result (try
+                      (request-fn client :open-tx-log-batch args false)
+                      (catch clojure.lang.ExceptionInfo e
+                        (if (str/includes? (or (:server-message (ex-data e))
+                                               (ex-message e) "")
+                                           "Unknown message type :open-tx-log-batch")
+                          (do (.put legacy-txlog-clients client true) ::legacy)
+                          (throw e))))]
+         (if (= ::legacy result)
+           (legacy)
+           (transfer/decode-batch result)))))))
 
 (def ^:dynamic *chatty-kv-detect-threshold*
   "Minimum streak length before recording a chatty remote point-read detection."

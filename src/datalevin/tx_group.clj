@@ -21,7 +21,7 @@
   restore their submitting threads' bindings."
   1)
 
-(deftype Request [op result ^Semaphore ready])
+(deftype Request [op result ^Semaphore ready data bindings])
 (deftype Group [^ReentrantLock lock ^ConcurrentLinkedQueue queue ^long limit
                 ^AtomicBoolean active])
 (deftype Committed [value confirmation])
@@ -84,6 +84,23 @@
                             (assoc (ex-data t) ::body-failure true) t))))))
     results))
 
+(defn batch-data
+  "Return operation metadata (::data) for a specialized batch runner, only when
+  every request has the runner's submitting-thread bindings. Otherwise execute
+  the bound operations normally. Direct operations have no batch metadata."
+  [execute]
+  (when-let [^FastList requests (::requests (meta execute))]
+    (let [bindings (::bindings (meta execute))
+          data (FastList. (.size requests))]
+      (loop [idx 0]
+        (if (= idx (.size requests))
+          data
+          (let [^Request request (.get requests idx)]
+            (when (and (some? (.-data request))
+                       (= bindings (.-bindings request)))
+              (.add data (.-data request))
+              (recur (inc idx)))))))))
+
 (defn- complete!
   [^FastList requests results error]
   (let [confirmation (when (instance? Committed results)
@@ -99,11 +116,16 @@
 (defn- run!
   [run-transaction ^FastList requests]
   (try
-    (complete! requests
-               (binding [*batched?* true
-                         *request-count* (.size requests)]
-                 (capture-commit #(run-transaction (fn [ctx] (execute requests ctx)))))
-               nil)
+    (let [execute (fn [ctx] (execute requests ctx))
+          execute (if (some? (.-data ^Request (.get requests 0)))
+                    (with-meta execute
+                      {::requests requests ::bindings (get-thread-bindings)})
+                    execute)]
+      (complete! requests
+                 (binding [*batched?* true
+                           *request-count* (.size requests)]
+                   (capture-commit #(run-transaction execute)))
+                 nil))
     (catch Throwable t
       (if (::body-failure (ex-data t))
         (if (= 1 (.size requests))
@@ -175,7 +197,9 @@
   [^Group group run-transaction op leader? delay-nanos]
   (let [result (volatile! nil)
         ready (Semaphore. 0)
-        request (Request. (bound-fn [context] (op context)) result ready)]
+        data (::data (meta op))
+        request (Request. (bound-fn [context] (op context)) result ready
+                          data (when (some? data) (get-thread-bindings)))]
     (.add ^ConcurrentLinkedQueue (.-queue group) request)
     (if (or leader? (.compareAndSet ^AtomicBoolean (.-active group) false true))
       (do

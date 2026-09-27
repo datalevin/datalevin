@@ -615,6 +615,14 @@
   *wal-records-cache-segments* 64)
 
 (def ^{:dynamic true
+       :doc "Maximum retained bytes, including index key estimates, for encoded WAL transfer batches. Zero disables reuse."}
+  *wal-transfer-cache-bytes* (* 16 1024 1024))
+
+(def ^{:dynamic true
+       :doc "Maximum encoded WAL transfer batches retained per open WAL runtime."}
+  *wal-transfer-cache-batches* 32)
+
+(def ^{:dynamic true
        :doc     "Replica heartbeat TTL in milliseconds for WAL retention floor computation."}
   *wal-replica-floor-ttl-ms* 30000)
 

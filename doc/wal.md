@@ -98,14 +98,12 @@ WAL supports three durability profiles in WAL:
 * `:extra`: each transaction waits for stricter durability than `:strict`,
   on macOS, that is `fcntl(F_FULLSYNC)`.
 
-Dispatch policy differs by profile:
-
-* `:strict`: prefers a direct fast path for idle single-thread local writes,
-  and falls back to the sync queue when work is already pending.
-* `:relaxed`: uses the same adaptive local Datalog queue, with WAL durability
-  batching independent of request batching.
-* `:extra`: follows the same adaptive direct-or-queued dispatch as `:strict`,
-  but with stricter durability on the sync side.
+Embedded Datalog writes use the same admission collector as embedded KV writes,
+for both WAL and durable non-WAL stores. Idle writes take the direct fast path;
+under contention, a submitting thread executes the next group. Synchronous
+Datalog writes do not hand off to a separate executor or use a queue cooldown.
+WAL sync policy remains independent of request collection: `:strict` and
+`:extra` wait for their required sync; `:relaxed` retains deferred syncing.
 
 Standalone private-WAL `:strict` and `:relaxed` KV writes and remote KV/Datalog transactions
 also collect requests waiting for the writer. The next submitting thread
@@ -131,9 +129,10 @@ microseconds and trades isolated-write latency for sharing commit costs across
 nearby requests. A single synchronous producer still needs one durable commit
 per call. Actual wakeup time depends on the OS scheduler.
 
-The idle collection window works with private WAL `:strict`/`:relaxed` and
-durable non-WAL stores. Native commit and, in strict WAL mode, WAL sync finish
-before any caller or transaction listener receives success. Relaxed WAL retains
+The idle collection window works with private WAL `:strict`/`:relaxed`,
+`:extra` Datalog writes, and durable non-WAL stores. Native commit and, in strict
+or extra WAL mode, WAL sync finish before any caller or transaction listener
+receives success. Relaxed WAL retains
 its explicitly selected durability policy. Embedded Datalog stores with
 synchronous secondary indexes retain their existing path so a failed batch
 cannot leave an index ahead of its LMDB data.
@@ -149,8 +148,10 @@ Local Datalog WAL specializes common single-form writes before using the
 general transaction planner. A simple cardinality-one `:db.fn/patchIdoc` with
 a numeric entity id can be stamped against the active LMDB write snapshot;
 homogeneous queued patches are prepared in logical order and committed in one
-physical WAL transaction. Each request still receives its own transaction id
-and report. Lookup refs, cardinality-many or unique IDoc attributes, attribute
+physical WAL transaction. These batch specializations run through the shared
+collector when callers have matching dynamic bindings; other groups execute
+each bound operation through the general runner. Each request still receives
+its own transaction id and report. Lookup refs, cardinality-many or unique IDoc attributes, attribute
 predicates, automatic entity timestamps, and mixed transaction forms retain
 the general path and its full validation semantics.
 
@@ -285,6 +286,20 @@ Each record is a map including at least `:lsn`, `:tx-time`, `:rows`, and
 (d/open-tx-log kv 1)         ; from LSN 1
 (d/open-tx-log kv 1 1000)    ; range [1, 1000]
 ```
+
+HA followers and read replicas use an internal encoded batch request when the
+source supports it. The source sends WAL payload bytes without decoding rows;
+the receiver verifies the record checksums and decodes the rows for replay.
+Older sources fall back to the decoded row request.
+
+Each open WAL runtime reuses matching encoded batches across followers, with
+default limits of 32 batches and a 16 MiB budget for payloads and estimated index
+key storage. Concurrent fetches of the same window share one payload load.
+Current record windows and their sequence boundaries are validated before cache
+lookup, so retention and truncation still affect subsequent fetches. The cache
+has its own short monitor; payload reads and waits do not hold it or a writer
+lock. This changes the replication transport, not the on-disk WAL format or
+the public `open-tx-log` result.
 
 ### `create-snapshot!`
 

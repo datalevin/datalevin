@@ -142,10 +142,7 @@
 
 (defn fetch-records
   [{^KVStore store :store} from-lsn upto-lsn]
-  (vec (cl/normal-request (.-client store)
-                          :open-tx-log-rows
-                          [(.-db-name store) from-lsn upto-lsn]
-                          false)))
+  (vec (r/fetch-tx-log-rows (.-client store) (.-db-name store) from-lsn upto-lsn)))
 
 (defn validate-contiguous-records!
   [records from-lsn upto-lsn]
