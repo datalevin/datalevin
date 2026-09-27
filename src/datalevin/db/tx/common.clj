@@ -15,7 +15,7 @@
    [datalevin.interface :refer [av-first-e rschema]]
    [datalevin.validate :as vld])
   (:import
-   [java.util SortedSet]
+   [java.util HashMap SortedSet]
    [org.eclipse.collections.impl.set.sorted.mutable TreeSortedSet]))
 
 (defn- sf [^SortedSet s] (when-not (.isEmpty s) (.first s)))
@@ -66,6 +66,43 @@
 
 (declare entid-strict)
 
+(deftype LookupRefCache [store owner ^HashMap entries])
+
+(def ^:dynamic *lookup-ref-cache* nil)
+
+(defmacro with-lookup-ref-cache
+  "Reuse persisted identity reads within one transaction attempt. Always check
+  the changing AVET overlay first; retries and nested transactions get a fresh
+  cache, and conveyed bindings must not share it with another thread."
+  [db & body]
+  `(binding [*lookup-ref-cache*
+             (LookupRefCache. (:store ~db) (Thread/currentThread) (HashMap.))]
+     ~@body))
+
+(defn- immutable-lookup-value?
+  [value]
+  (or (string? value) (keyword? value) (symbol? value) (number? value)
+      (boolean? value) (uuid? value)
+      (and (vector? value) (every? immutable-lookup-value? value))))
+
+(defn- stored-entid
+  [db attr value]
+  (let [store (:store db)
+        ^LookupRefCache cache *lookup-ref-cache*]
+    (if (and cache (identical? store (.-store cache))
+             (identical? (Thread/currentThread) (.-owner cache))
+             ;; Dates, byte arrays and custom values may change in user code.
+             (immutable-lookup-value? value))
+      (let [^HashMap entries (.-entries cache)
+            key [attr value]
+            cached (.getOrDefault entries key ::uncached)]
+        (if-not (identical? cached ::uncached)
+          cached
+          (let [eid (av-first-e store attr value)]
+            (.put entries key eid)
+            eid)))
+      (av-first-e store attr value))))
+
 (defn entid
   [db eid]
   (cond
@@ -88,13 +125,13 @@
         (or (:e (sf (.subSet ^TreeSortedSet (:avet db)
                              (datom e0 attr value tx0)
                              (datom emax attr value txmax))))
-            (av-first-e (:store db) attr value))))
+            (stored-entid db attr value))))
 
     (keyword? eid)
     (or (:e (sf (.subSet ^TreeSortedSet (:avet db)
                          (datom e0 :db/ident eid tx0)
                          (datom emax :db/ident eid txmax))))
-        (av-first-e (:store db) :db/ident eid))
+        (stored-entid db :db/ident eid))
 
     :else
     (vld/validate-entity-id-syntax eid)))

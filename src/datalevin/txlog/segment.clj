@@ -601,6 +601,35 @@
          {:offset offset :size total-size :checksum checksum})
        (append-record-at! ch offset body opts)))))
 
+(defn write-records-at!
+  "Write independently framed records with gathering I/O at the tracked offset.
+  The caller serializes appends. Bodies must be independently owned buffers or
+  byte arrays; buffers are consumed. Partial writes are retried, including when
+  the OS limits the number of gathered buffers per write."
+  [^FileChannel ch ^long offset bodies]
+  (let [^"[Ljava.nio.ByteBuffer;" buffers (make-array ByteBuffer (* 2 (count bodies)))
+        results
+        (loop [remaining (seq bodies) position offset i 0 out []]
+          (if-let [body (first remaining)]
+            (let [body-len (codec/checked-record-body-len body)
+                  checksum (codec/current-record-checksum body-len false body)
+                  size (+ codec/record-header-size (long body-len))
+                  ^ByteBuffer header (codec/write-record-header!
+                           (ByteBuffer/allocate codec/record-header-size)
+                           body-len false checksum)]
+              (aset buffers i header)
+              (aset buffers (inc i) (if (instance? ByteBuffer body)
+                                     body
+                                     (ByteBuffer/wrap ^bytes body)))
+              (recur (next remaining) (+ position size) (+ i 2)
+                     (conj out {:offset position :size size
+                                :checksum checksum})))
+            out))]
+    (when (seq results)
+      (.position ch offset)
+      (write-fully-buffers! ch buffers))
+    results))
+
 (defn force-segment!
   [_state ^FileChannel ch sync-mode]
   (force-channel! ch sync-mode))

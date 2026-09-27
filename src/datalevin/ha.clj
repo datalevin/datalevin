@@ -648,6 +648,7 @@
    :ha-follower-last-batch-estimated-bytes
    :ha-follower-requested-batch-records
    :ha-follower-last-sync-ms
+   :ha-follower-replica-floor-report
    :ha-follower-leader-endpoint
    :ha-follower-source-endpoint
    :ha-follower-source-order

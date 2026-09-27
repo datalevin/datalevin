@@ -821,7 +821,7 @@
       :else
       (vld/validate-tx-op op entity))))
 
-(defn execute-tx-loop
+(defn- execute-tx-loop*
   [initial-report initial-es tx-time]
   (let [db              (:db-before initial-report)
         store           (:store db)
@@ -888,6 +888,11 @@
 
         :else
         (vld/validate-tx-entity-type entity)))))
+
+(defn execute-tx-loop
+  [initial-report initial-es tx-time]
+  (txcommon/with-lookup-ref-cache (:db-before initial-report)
+    (execute-tx-loop* initial-report initial-es tx-time)))
 
 (defn local-transact-tx-data
   [initial-report initial-es tx-time]

@@ -220,6 +220,22 @@ A follower continuously tries to converge on the leader:
 4. Publish replica-floor progress so retention stays safe.
 5. If WAL is missing, switch to snapshot bootstrap and then resume WAL replay.
 
+Consecutive new data records from a fetch share a WAL write group and one LMDB
+transaction. Each record retains its own LSN, term, and WAL framing. Under strict
+durability the whole group reaches durable WAL before LMDB materialization;
+the applied floor advances only after the LMDB transaction commits. A restart
+can recover durable records left ahead of that floor. Schema and catalog changes,
+existing local LSNs, and shared-WAL stores use individual replay. A batch may
+extend a segment beyond its configured size limit, as a single large record can.
+
+Replica-floor progress reports normally run at most once per second.
+Idle followers send a heartbeat every ten seconds, shortened to one third of
+the leader's replica-floor TTL when expiration is enabled. This heartbeat
+interval also caps the progress-report interval. A leader endpoint or term
+change, or a backward local-floor reset, triggers an immediate report.
+Failed or skipped updates remain eligible for
+retry. Older leaders that do not return their TTL retain reporting on every poll.
+
 If there is no valid WAL or snapshot source, the follower enters an explicit
 degraded state instead of guessing.
 

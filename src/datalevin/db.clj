@@ -121,7 +121,8 @@
    unique-avs
    has-unique?
    fuse-unique-inserts?
-   identity-upsert-av])
+   identity-upsert-av
+   identity-upsert-read])
 
 (deftype ^:private PreparedBlindEntity [tempid ^FastList attrs])
 
@@ -136,7 +137,10 @@
 (defrecord PreparedScalarUpdate
   [schema-epoch
    opts-epoch
-   entries])
+   entries
+   entity-reads])
+
+(deftype ^:private ScalarEntityRead [^objects names ^longs aids])
 
 ;; (defmethod print-method TxReport [^TxReport rp, ^java.io.Writer w]
 ;;   (binding [*out* w]
@@ -1870,6 +1874,22 @@
 
 (declare blind-identity-upsert-av)
 
+(def ^:private ^:const scalar-entity-read-min-attrs 4)
+
+(defn- prepare-scalar-entity-read
+  [store-schema attributes]
+  ;; Point seeks avoid walking unrelated attributes on narrow updates. Retain
+  ;; the projection layout so wider updates pay for just one selective scan
+  ;; inside the write transaction.
+  (when (>= (count attributes) scalar-entity-read-min-attrs)
+    (let [names (sort-by #(:db/aid (store-schema %)) attributes)]
+      (ScalarEntityRead. (object-array names)
+                         (long-array (map #(:db/aid (store-schema %)) names))))))
+
+(defn- read-scalar-entity
+  [store eid ^ScalarEntityRead layout]
+  (first (s/select-entities store [eid] (.-names layout) (.-aids layout) false)))
+
 (defn ^:no-doc prepare-blind-local-tx
   ([^DB db initial-es]
    (prepare-blind-local-tx db initial-es false true))
@@ -1945,7 +1965,18 @@
                           unique-avs
                           @has-unique?
                           fuse-unique-inserts?
-                          identity-upsert-av)))))
+                          identity-upsert-av
+                          (when identity-upsert-av
+                            (let [^PreparedBlindEntity entity
+                                  (.get ^FastList entities 0)
+                                  ^FastList attrs (.-attrs entity)
+                                  identity-attr (first identity-upsert-av)]
+                              (prepare-scalar-entity-read
+                                store-schema
+                                (for [index (range 0 (.size attrs) 2)
+                                      :let [attr (.get attrs index)]
+                                      :when (not= attr identity-attr)]
+                                  attr)))))))))
 
 (defn ^:no-doc blind-local-tx-unique-values-absent?
   "Check a prepared batch's unique values against the current store snapshot.
@@ -2000,6 +2031,8 @@
         ^PreparedBlindEntity entity (.get entities 0)
         tx-id           (inc (long (:max-tx db)))
         ^FastList attrs (.-attrs entity)
+        layout          (:identity-upsert-read prepared)
+        old-values      (when layout (read-scalar-entity (.-store db) eid layout))
         tx-data
         (loop [i       0
                tx-data (transient [])]
@@ -2008,21 +2041,22 @@
                   value (.get attrs (unchecked-inc i))]
               (if (= attr identity-attr)
                 (recur (+ i 2) tx-data)
-                (let [^Datom old-datom
-                      (ea-first-datom (.-store db) eid attr)]
+                (let [old-value (if layout
+                                  (get old-values attr)
+                                  (i/ea-first-v (.-store db) eid attr))]
                   (cond
-                    (nil? old-datom)
+                    (nil? old-value)
                     (recur (+ i 2)
                            (conj! tx-data
                                   (d/datom eid attr value tx-id)))
 
-                    (= (.-v old-datom) value)
+                    (= old-value value)
                     (recur (+ i 2) tx-data)
 
                     :else
                     (recur (+ i 2)
                            (-> tx-data
-                               (conj! (d/datom eid attr (.-v old-datom)
+                               (conj! (d/datom eid attr old-value
                                                tx-id false))
                                (conj! (d/datom eid attr value tx-id))))))))
             (persistent! tx-data)))
@@ -2206,12 +2240,7 @@
     (when (and eid (pos? (long eid)) (<= (long eid) (long (:max-eid db))))
       (long eid))))
 
-(defn ^:no-doc prepare-scalar-update-tx
-  "Recognize a transaction made only of ordinary scalar [:db/add eid attr value]
-  updates to existing entities with simple cardinality-one, non-unique,
-  non-reference attributes. The caller must stamp it against the current LMDB
-  write snapshot before committing. Returns nil for shapes that retain the
-  general transaction path."
+(defn- prepare-scalar-update-tx*
   [^DB db initial-es]
   (let [store        (.-store db)
         store-schema (schema store)
@@ -2249,8 +2278,28 @@
                       (recur (next es) seen (conj! entries [eid attr v])))))))
             nil))
         (when (pos? (count entries))
-          (->PreparedScalarUpdate (schema store) (opts store)
-                                  (persistent! entries)))))))
+          (let [entries (persistent! entries)
+                entity-reads
+                (when (>= (count entries) scalar-entity-read-min-attrs)
+                  (into {}
+                        (keep (fn [[eid entries]]
+                                (when-let [layout
+                                           (prepare-scalar-entity-read
+                                             store-schema (map second entries))]
+                                  [eid layout])))
+                        (group-by first entries)))]
+            (->PreparedScalarUpdate (schema store) (opts store)
+                                    entries entity-reads)))))))
+
+(defn ^:no-doc prepare-scalar-update-tx
+  "Recognize a transaction made only of ordinary scalar [:db/add eid attr value]
+  updates to existing entities with simple cardinality-one, non-unique,
+  non-reference attributes. The caller must stamp it against the current LMDB
+  write snapshot before committing. Returns nil for shapes that retain the
+  general transaction path."
+  [db initial-es]
+  (txcommon/with-lookup-ref-cache db
+    (prepare-scalar-update-tx* db initial-es)))
 
 (defn ^:no-doc scalar-update-tx-valid?
   [^DB db ^PreparedScalarUpdate prepared]
@@ -2268,23 +2317,30 @@
           tx-id   (inc (long (:max-tx db)))
           entries (:entries prepared)
           n       (count entries)
+          layouts (:entity-reads prepared)
+          old-values (reduce-kv
+                       (fn [values eid layout]
+                         (assoc values eid (read-scalar-entity store eid layout)))
+                       {} layouts)
           tx-data
           (loop [i 0, out (transient [])]
             (if (< i n)
               (let [[e attr value] (nth entries i)
-                    ^Datom old      (ea-first-datom store e attr)]
+                    old-value (if (contains? layouts e)
+                                (get (get old-values e) attr)
+                                (i/ea-first-v store e attr))]
                 (cond
-                  (nil? old)
+                  (nil? old-value)
                   (recur (unchecked-inc i)
                          (conj! out (datom e attr value tx-id)))
 
-                  (= (.-v old) value)
+                  (= old-value value)
                   (recur (unchecked-inc i) out)
 
                   :else
                   (recur (unchecked-inc i)
                          (-> out
-                             (conj! (datom e attr (.-v old) tx-id false))
+                             (conj! (datom e attr old-value tx-id false))
                              (conj! (datom e attr value tx-id))))))
               (persistent! out)))
           db-after (assoc db :max-tx tx-id)]

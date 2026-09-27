@@ -2450,6 +2450,79 @@
                      append-res)))))
            (replay-txlog-rows! lmdb materialize-rows (:lsn record))))))))
 
+(defn batchable-replay-record?
+  "Whether replay can share a transaction without refreshing store metadata."
+  [record]
+  (let [rows (or (:rows record) (:ops record))]
+    (and (sequential? rows)
+         (every? (fn [[op dbi]]
+                   (and (#{:put :del :put-list :del-list} op)
+                        (not (#{c/kv-info c/schema c/opts} dbi))))
+                 rows))))
+
+(defn ^:no-doc mirror-replayed-txlog-records!
+  "Mirror new data records with one WAL append group and one LMDB transaction.
+  `preapply-fn` receives the writing KV handle and each record, so cleanup reads
+  see preceding records in this transaction. Existing LSNs, shared WALs and
+  catalog changes retain single-record replay and its divergence checks."
+  [lmdb records preapply-fn]
+  (with-write-txn-lock-before-runtime-txlog-state
+    lmdb
+    (fn []
+      (let [records (mapv #(assoc % :rows (or (:rows %) (:ops %))) records)
+            state (txlog-runtime-state lmdb)]
+        (when state
+          (txlog/refresh-shared-state! state false)
+          (when (and (seq records)
+                     (> (long (:lsn (first records)))
+                        (long @(:next-lsn state))))
+            (align-runtime-txlog-payload-floor! lmdb)))
+        (if (and state (> (count records) 1)
+                 (not (:wal-shared? state))
+                 (not (write-txn-open? lmdb))
+                 (every? batchable-replay-record? records)
+                 (= (long (:lsn (first records))) (long @(:next-lsn state))))
+          (do
+            (with-runtime-txlog-rollback
+              lmdb
+              #(txlog-prepare-replay-dbis!
+                lmdb records (dec (long (:lsn (first records))))))
+            (let [append-res (txlog/append-replay-batch!
+                              state records txlog-append-hooks)
+                  state (refresh-runtime-marker-revision! lmdb state)
+                  marker-entry (txlog/next-commit-marker-entry
+                                 (:commit-marker? state)
+                                 (long @(:marker-revision state)) append-res)]
+              (try
+                (binding [l/*raw-kv?* true]
+                  (with-runtime-txlog-rollback
+                    lmdb
+                    (fn []
+                      ;; Resize retries repeat materialization only. The WAL
+                      ;; group already owns its LSNs and must not be appended twice.
+                      (l/with-transaction-kv [writing lmdb]
+                        (doseq [record records]
+                          (let [cleanup (when preapply-fn
+                                          (preapply-fn writing record))
+                                rows (into (rows-vector cleanup) (:rows record))]
+                            (i/transact-kv writing rows)))
+                        (let [^FastList rows (append-monotonic-payload-lsn-row
+                                              writing [] (:lsn append-res))]
+                          (when marker-entry (.add rows (:row marker-entry)))
+                          (i/transact-kv writing rows))))))
+                (catch Exception e
+                  (txlog-mark-fatal! state e)
+                  (throw e)))
+              (txlog/commit-finished! state marker-entry)
+              (txlog/note-commit-applied! state append-res)
+              append-res))
+          (reduce (fn [_ record]
+                    (mirror-replayed-txlog-record!
+                     lmdb record
+                     (when preapply-fn #(preapply-fn lmdb record))
+                     {:replay-skipped? true}))
+                  nil records))))))
+
 (defn transact-with-txlog!
   [lmdb state dbi-name txs k-type v-type]
   (let [datom-txs? (l/datom-kv-txs? txs)
@@ -2765,16 +2838,20 @@
 
 (defn txlog-update-replica-floor-state!
   [lmdb replica-id applied-lsn]
-  (update-kv-info-map-plan!
-   lmdb
-   c/wal-replica-floors
-   (fn [entries]
-     (txlog/replica-floor-update-plan
-      replica-id
-      applied-lsn
-      (System/currentTimeMillis)
-      entries
-      c/wal-replica-floors))))
+  (assoc
+   (update-kv-info-map-plan!
+    lmdb
+    c/wal-replica-floors
+    (fn [entries]
+      (txlog/replica-floor-update-plan
+       replica-id
+       applied-lsn
+       (System/currentTimeMillis)
+       entries
+       c/wal-replica-floors)))
+   ;; Followers must schedule heartbeats against the leader's retention TTL.
+   :ttl-ms (long (or (:wal-replica-floor-ttl-ms @(i/kv-info lmdb))
+                     c/*wal-replica-floor-ttl-ms*))))
 
 (defn txlog-clear-replica-floor-state!
   [lmdb replica-id]

@@ -1907,6 +1907,41 @@
                {:error  :ha/follower-invalid-record
                 :record record}))))
 
+(defn ^:redef apply-ha-follower-txlog-records!
+  "Replay consecutive data records together, refreshing schema between groups."
+  [m records]
+  (reduce
+   (fn [m records]
+     (if (or (= 1 (count records))
+             (not (kv/batchable-replay-record? (first records)))
+             (ha-replay-debug-enabled?))
+       (reduce apply-ha-follower-txlog-record! m records)
+       (let [store (:store m)
+             kv-store (raw-local-kv-store m)]
+         (when-not kv-store
+           (raise "Follower txlog replay requires a local KV store"
+                  {:error :ha/follower-missing-store}))
+         (doseq [record records] (assert-ha-follower-record-term! m record))
+         (kv/mirror-replayed-txlog-records!
+          kv-store records
+          (fn [writing record]
+            (ha-cardinality-one-eav-cleanup-rows store writing (:rows record))))
+         (when (instance? IStore store)
+           (let [[max-gt max-tx]
+                 (reduce (fn [[^long gt ^long tx] [op dbi k v]]
+                           (cond
+                             (and (= op :put) (= dbi c/giants) (integer? k))
+                             [(long-max2 gt (inc (long k))) tx]
+                             (and (= op :put) (= dbi c/meta)
+                                  (= k :max-tx) (integer? v))
+                             [gt (long-max2 tx (long v))]
+                             :else [gt tx]))
+                         [0 0] (mapcat #(or (:rows %) (:ops %)) records))]
+             (when (pos? (long max-gt)) (st/sync-max-gt-floor! store max-gt))
+             (when (pos? (long max-tx)) (st/sync-max-tx-floor! store max-tx))))
+         (dissoc m :ha-follower-last-apply-readback))))
+   m (partition-by kv/batchable-replay-record? records)))
+
 (def ^:dynamic *ha-follower-apply-record-fn* nil)
 
 (defn- ha-follower-stale-state-error?
@@ -2038,11 +2073,80 @@
   (with-store-runtime-bindings
     #(boot/install-ha-local-snapshot! m snapshot-dir)))
 
+(defn- replica-floor-report-due?
+  [m leader-endpoint leader-term applied-lsn now-nanos]
+  (let [applied-lsn (long applied-lsn)
+        now-nanos (long now-nanos)
+        {:keys [ttl-ms reported-at-nanos] :as previous}
+        (:ha-follower-replica-floor-report m)]
+    (or (nil? previous)
+        (not= leader-endpoint (:leader-endpoint previous))
+        (not= leader-term (:leader-term previous))
+        (< applied-lsn (long (:applied-lsn previous)))
+        ;; Older leaders do not advertise their TTL. Keep reporting each poll
+        ;; rather than risk expiring a floor under an unknown retention policy.
+        (nil? ttl-ms)
+        (let [heartbeat-ms (if (pos? (long ttl-ms))
+                             (max 1 (min 10000 (quot (long ttl-ms) 3)))
+                             10000)
+              interval-ms (if (> applied-lsn (long (:applied-lsn previous)))
+                            (min 1000 heartbeat-ms)
+                            heartbeat-ms)
+              elapsed-nanos (- now-nanos (long reported-at-nanos))]
+          (or (neg? elapsed-nanos)
+              (>= (quot elapsed-nanos 1000000) interval-ms))))))
+
+(defn- maybe-report-ha-replica-floor
+  [db-name m leader-endpoint leader-term applied-lsn]
+  (let [now-nanos (long (ha-now-nanos))]
+    (if-not (replica-floor-report-due?
+             m leader-endpoint leader-term (long applied-lsn) now-nanos)
+      m
+      (try
+        (let [result
+              (try
+                (report-ha-replica-floor! db-name m leader-endpoint applied-lsn)
+                (catch Exception e
+                  (if (ha-replica-floor-reset-required? e)
+                    (do
+                      (log/info "HA follower cleared stale leader replica floor after local reset"
+                                {:db-name db-name
+                                 :ha-node-id (:ha-node-id m)
+                                 :leader-endpoint leader-endpoint
+                                 :applied-lsn applied-lsn})
+                      (clear-ha-replica-floor! db-name m leader-endpoint)
+                      (report-ha-replica-floor!
+                       db-name m leader-endpoint applied-lsn))
+                    (throw e))))]
+          ;; Busy writers and store swaps can skip the update without throwing.
+          ;; Only an acknowledged report can postpone the next attempt.
+          (if (:ok? result)
+            (assoc m :ha-follower-replica-floor-report
+                   {:leader-endpoint leader-endpoint
+                    :leader-term leader-term
+                    :applied-lsn applied-lsn
+                    :reported-at-nanos now-nanos
+                    :ttl-ms (:ttl-ms result)})
+            m))
+        (catch Exception e
+          (if (ha-replica-floor-transport-failure? e)
+            (log/debug "HA follower skipped replica-floor update because the leader endpoint is unavailable"
+                       {:db-name db-name
+                        :ha-node-id (:ha-node-id m)
+                        :leader-endpoint leader-endpoint
+                        :applied-lsn applied-lsn
+                        :message (ex-message e)})
+            (log/warn e "HA follower failed to update leader replica floor"
+                      {:db-name db-name
+                       :ha-node-id (:ha-node-id m)
+                       :leader-endpoint leader-endpoint
+                       :applied-lsn applied-lsn}))
+          m)))))
+
 (defn- sync-ha-follower-batch
   [db-name m lease next-lsn now-ms]
   (let [m (reopen-ha-local-store-if-needed m)
         leader-endpoint (ha-leader-endpoint m lease)
-        local-node-id (:ha-node-id m)
         requested-batch-records (long (ha-follower-request-batch-records m))]
     (when (or (nil? leader-endpoint) (s/blank? leader-endpoint))
       (raise "HA follower is missing leader endpoint for txlog sync"
@@ -2072,9 +2176,9 @@
               source-last-applied-lsn-known?
               :source-last-applied-lsn
               (some-> source-last-applied-lsn long)})
-          apply-record-fn (or *ha-follower-apply-record-fn*
-                              apply-ha-follower-txlog-record!)
-          next-m (reduce apply-record-fn m records)
+          next-m (if *ha-follower-apply-record-fn*
+                   (reduce *ha-follower-apply-record-fn* m records)
+                   (apply-ha-follower-txlog-records! m records))
           _ (when (and (seq records)
                        (instance? IStore (:store next-m)))
               ;; Follower replay writes raw KV rows and bypasses the normal
@@ -2114,36 +2218,9 @@
           next-m (if (seq records)
                    (maybe-persist-ha-follower-local-applied-lsn
                     next-m applied-lsn now-ms)
-                   next-m)]
-      (try
-        (try
-          (report-ha-replica-floor!
-           db-name next-m leader-endpoint applied-lsn)
-          (catch Exception e
-            (if (ha-replica-floor-reset-required? e)
-              (do
-                (log/info "HA follower cleared stale leader replica floor after local reset"
-                          {:db-name db-name
-                           :ha-node-id local-node-id
-                           :leader-endpoint leader-endpoint
-                           :applied-lsn applied-lsn})
-                (clear-ha-replica-floor! db-name next-m leader-endpoint)
-                (report-ha-replica-floor!
-                 db-name next-m leader-endpoint applied-lsn))
-              (throw e))))
-        (catch Exception e
-          (if (ha-replica-floor-transport-failure? e)
-            (log/debug "HA follower skipped replica-floor update because the leader endpoint is unavailable"
-                       {:db-name db-name
-                        :ha-node-id local-node-id
-                        :leader-endpoint leader-endpoint
-                        :applied-lsn applied-lsn
-                        :message (ex-message e)})
-            (log/warn e "HA follower failed to update leader replica floor"
-                      {:db-name db-name
-                       :ha-node-id local-node-id
-                       :leader-endpoint leader-endpoint
-                       :applied-lsn applied-lsn}))))
+                   next-m)
+          next-m (maybe-report-ha-replica-floor
+                  db-name next-m leader-endpoint (:term lease) applied-lsn)]
       {:records records
        :applied-lsn applied-lsn
        :leader-endpoint leader-endpoint

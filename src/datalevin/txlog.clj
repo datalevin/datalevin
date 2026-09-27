@@ -1311,10 +1311,10 @@
                 (recur last-sync-ms last-sync-reason nil))))))))))
 
 (defn- append-durable-relaxed!
-  [state rows hooks]
+  [state append hooks]
   (let [{:keys [append-res append-start-ms ch lsn near-roll?
                 sid sync-manager]}
-        (append-prepared-record! state rows hooks)
+        append
         request-count (long (if (:wal-shared? state) 1 group/*request-count*))
         sync-begin (if (= request-count 1)
                      (append-sync-transition! sync-manager lsn append-start-ms)
@@ -1344,10 +1344,10 @@
            :synced? synced?)))
 
 (defn- append-durable-strict!
-  [state rows {:as hooks}]
+  [state append {:as hooks}]
   (let [{:keys [append-res append-start-ms ch lsn near-roll?
                 sid sync-manager timeout-ms]}
-        (append-prepared-record! state rows hooks)
+        append
         sync-begin (append-sync-transition! sync-manager lsn append-start-ms
                                             {:force? true :begin-lsn lsn})
         done-ms
@@ -1384,9 +1384,69 @@
   [state rows hooks]
   (refresh-shared-state! state false)
   (maybe-roll-segment! state (System/currentTimeMillis))
-  (if (per-tx-durable-profile-state? state)
-    (append-durable-strict! state rows hooks)
-    (append-durable-relaxed! state rows hooks)))
+  (let [append (append-prepared-record! state rows hooks)]
+    (if (per-tx-durable-profile-state? state)
+      (append-durable-strict! state append hooks)
+      (append-durable-relaxed! state append hooks))))
+
+(defn append-replay-batch!
+  "Append consecutive source records to a private WAL, sharing its durability
+  boundary while retaining each LSN and term. Returns the final record's append
+  info. The caller holds the store writer lock through materialization. Segment
+  size is a soft limit: a fetched batch, like a single record, can cross it."
+  [state records {:keys [throw-if-fatal! before-append! mark-fatal!] :as hooks}]
+  (when (:wal-shared? state)
+    (raise "Batched replay requires a private WAL" {:type :txlog/shared-replay-batch}))
+  (when (seq records)
+    (maybe-roll-segment! state (System/currentTimeMillis))
+    (let [append
+          (locking (or (:append-lock state) state)
+            (when throw-if-fatal! (throw-if-fatal! state))
+            (let [first-lsn (long @(:next-lsn state))
+                  now (System/currentTimeMillis)
+                  bodies
+                  (mapv (fn [^long index record]
+                          (let [lsn (+ first-lsn index)]
+                            (when-not (= lsn (long (:lsn record)))
+                              (raise "Follower replay batch has a nonconsecutive LSN"
+                                     {:type :txlog/ha-replay-lsn-mismatch
+                                      :expected-lsn lsn :record-lsn (:lsn record)}))
+                            (tcodec/encode-commit-row-payload
+                             lsn (long (or (:tx-time record) (:ts record) now))
+                             (tcodec/compact-replay-rows (:rows record))
+                             {:ha-term (:ha-term record)})))
+                        (range (count records)) records)
+                  ^FileChannel ch @(:segment-channel state)
+                  sid (long @(:segment-id state))
+                  offset (long @(:segment-offset state))
+                  manager (:sync-manager state)]
+              (when-not (and ch manager)
+                (raise "Txn-log replay runtime is not available"
+                       {:type :txlog/no-replay-runtime}))
+              (when before-append! (before-append! state))
+              (let [results (try
+                              (tseg/write-records-at! ch offset bodies)
+                              (catch Exception e
+                                ;; A partial gathered write may contain complete
+                                ;; records. Only recovery may reuse this tail.
+                                (when mark-fatal! (mark-fatal! state e))
+                                (throw e)))
+                    last-result (peek results)
+                    end (+ (long (:offset last-result))
+                           (long (:size last-result)))
+                    lsn (long (:lsn (peek records)))]
+                (vreset! (:segment-offset state) end)
+                (when-let [total (:retention-total-bytes state)]
+                  (vreset! total (+ (long @total) (- end offset))))
+                (vreset! (:next-lsn state) (inc lsn))
+                (mark-meta-dirty! state)
+                {:append-res last-result :append-start-ms now :ch ch :lsn lsn
+                 :near-roll? (near-roll-append? state offset) :sid sid
+                 :sync-manager manager
+                 :timeout-ms (long (:commit-wait-ms state))})))]
+      (if (per-tx-durable-profile-state? state)
+        (append-durable-strict! state append hooks)
+        (append-durable-relaxed! state append hooks)))))
 
 (defn force-sync!
   [state hooks]

@@ -103,6 +103,8 @@
 (def transact-kv-without-txlog! kvtx/transact-kv-without-txlog!)
 
 (def mirror-replayed-txlog-record! kvtx/mirror-replayed-txlog-record!)
+(def mirror-replayed-txlog-records! kvtx/mirror-replayed-txlog-records!)
+(def batchable-replay-record? kvtx/batchable-replay-record?)
 
 (def replay-txlog-rows! kvtx/replay-txlog-rows!)
 

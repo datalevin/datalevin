@@ -385,7 +385,10 @@
 
 (defn- cached-pattern
   ^CachedPattern [^DB db pattern]
-  (let [^LRUCache c (.-pull-patterns db)
+  (let [store  (.-store db)
+        _      (when (instance? Store store)
+                 (storage/maybe-ensure-current! store))
+        ^LRUCache c (.-pull-patterns db)
         schema (db/-schema db)
         ^CachedPattern cached (.get c pattern)]
     (if (and cached (identical? schema (.-schema cached)))

@@ -3,6 +3,7 @@
    [clojure.test :refer [deftest is testing]]
    [datalevin.constants :as c]
    [datalevin.datom :as d]
+   [datalevin.db.tx.common :as common]
    [datalevin.db.tx.execute :as execute]
    [datalevin.interface :as i]
    [datalevin.storage.schema :as schema])
@@ -157,3 +158,69 @@
           {:key {:db/unique :db.unique/value}}
           [(d/datom 10 :key "existing")]
           [[:db/add -1 :key "existing"]]))))
+
+(deftest repeated-lookup-refs-read-the-identity-once
+  (doseq [entity [[:key "existing"] :existing]]
+    (let [fields (mapv #(keyword (str "field" %)) (range 10))
+          [report reads]
+          (execute-with-reads
+            (assoc (zipmap fields (repeat {}))
+                   :key {:db/unique :db.unique/identity}
+                   :db/ident {:db/unique :db.unique/identity})
+            [(d/datom 10 :key "existing") (d/datom 10 :db/ident :existing)]
+            (mapv #(vector :db/add entity % "updated") fields))]
+      (is (= 10 (count (:tx-data report))))
+      (is (every? #(= 10 (:e %)) (:tx-data report)))
+      (is (= 1 (count (filter #(= :av (first %)) reads)))))))
+
+(deftest lookup-cache-preserves-overlays-and-attempt-boundaries
+  (let [reads (atom [])
+        store (reify i/IStore
+                (rschema [_] {:db/unique #{:key :db/ident}})
+                (av-first-e [_ attr value]
+                  (swap! reads conj [attr value])
+                  (when (= "stored" value) 1)))
+        db {:store store :avet (TreeSortedSet. ^Comparator d/cmp-datoms-avet)}]
+    (common/with-lookup-ref-cache db
+      (dotimes [_ 2]
+        (is (= 1 (common/entid db [:key "stored"])))
+        (is (nil? (common/entid db [:key "new"]))))
+      (is (= [[:key "stored"] [:key "new"]] @reads))
+      ;; Cached storage hits and misses must both yield to the current overlay.
+      (.add ^TreeSortedSet (:avet db) (d/datom 2 :key "stored"))
+      (.add ^TreeSortedSet (:avet db) (d/datom 3 :key "new"))
+      (is (= 2 (common/entid db [:key "stored"])))
+      (is (= 3 (common/entid db [:key "new"])))
+      (.clear ^TreeSortedSet (:avet db))
+      (is (= 1 (common/entid db [:key "stored"])))
+      (is (nil? (common/entid db [:key "new"])))
+      (is (= 2 (count @reads)))
+      (common/with-lookup-ref-cache db
+        (is (= 1 (common/entid db [:key "stored"]))))
+      (is (= 3 (count @reads))))
+    (is (= 1 (common/entid db [:key "stored"])))
+    (is (= 4 (count @reads)))
+    (common/with-lookup-ref-cache db
+      (is (= 1 (common/entid db [:key "stored"]))))
+    (is (= 5 (count @reads)))))
+
+(deftest lookup-cache-does-not-cross-stores-threads-or-mutable-values
+  (let [reads (atom 0)
+        store (fn [eid]
+                (reify i/IStore
+                  (rschema [_] {:db/unique #{:key}})
+                  (av-first-e [_ _ _] (swap! reads inc) eid)))
+        db {:store (store 1) :avet (TreeSortedSet. ^Comparator d/cmp-datoms-avet)}
+        other (assoc db :store (store 2))]
+    (common/with-lookup-ref-cache db
+      (is (= 1 (common/entid db [:key "same"])))
+      (is (= 2 (common/entid other [:key "same"])))
+      (is (= 2 (common/entid other [:key "same"])))
+      (is (= [1 1] @(future [(common/entid db [:key "same"])
+                             (common/entid db [:key "same"])])))
+      (is (= 5 @reads))
+      (let [value (byte-array [1 2])]
+        (is (= 1 (common/entid db [:key value])))
+        (aset-byte value 0 (byte 3))
+        (is (= 1 (common/entid db [:key value])))
+        (is (= 7 @reads))))))
