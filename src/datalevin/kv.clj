@@ -64,8 +64,13 @@
 
 (declare raw-lmdb)
 
+(defn write-batch-delay-nanos
+  "Optional idle collection window, shared by embedded KV and Datalog writes."
+  ^long [db]
+  (* 1000 (long (or (:write-batch-delay-us (l/read-env-opts db)) 0))))
+
 (defn write-group
-  "Return the admission queue for eligible standalone strict or relaxed writes.
+  "Return the admission queue for eligible standalone writes.
   The server may opt HA stores in when it retains both HA guards around the
   physical commit. Embedded HA, explicit transactions and shared WAL stay out."
   ([db kind] (write-group db kind false))
@@ -77,15 +82,24 @@
               (not (Thread/holdsLock (l/write-txn db))))
      (let [info @(i/kv-info db)
            state (:txlog-state info)]
-       (when (and state (#{:strict :relaxed} (:durability-profile state))
-                  (not (:wal-shared? state))
-                  (or (nil? (:ha-mode info)) ha-guarded?)
-                  (kvtx/txlog-write-path-enabled? db))
-         (let [^ConcurrentHashMap groups (:write-groups state)]
+       (when (and (or (nil? (:ha-mode info)) ha-guarded?)
+                  (or (and state
+                           (#{:strict :relaxed} (:durability-profile state))
+                           (not (:wal-shared? state))
+                           (kvtx/txlog-write-path-enabled? db))
+                      (and (#{:kv :datalog} kind)
+                           (not (:wal? info))
+                           (not (:temp? info))
+                           (not-any? #{:nosync :nometasync :mapasync :inmemory}
+                                     (:flags info)))))
+         (let [^ConcurrentHashMap groups (if state (:write-groups state)
+                                            (:write-groups info))]
            (.computeIfAbsent groups kind
                              (reify Function
                                (apply [_ _]
-                                 (group/create (txlog/group-commit info)))))))))))
+                                 (group/create
+                                  (or (:write-batch-size info)
+                                      (txlog/group-commit info))))))))))))
 
 (defn grouped-write!
   "Execute a standalone KV operation in a group under its durability policy."
@@ -95,7 +109,8 @@
                    (fn [execute]
                      (l/with-transaction-kv [tx db]
                        (execute tx)))
-                   op)
+                   op
+                   (write-batch-delay-nanos db))
     (l/with-transaction-kv [tx db] (op tx))))
 
 (def ensure-txlog-ready! kvtx/ensure-txlog-ready!)
@@ -563,7 +578,8 @@
                      (fn [execute]
                        (l/with-transaction-kv [tx this]
                          (execute tx)))
-                     #(i/transact-kv % dbi-name txs k-type v-type))
+                     #(i/transact-kv % dbi-name txs k-type v-type)
+                     (write-batch-delay-nanos db))
       (if (custom-kv/custom-txs? db dbi-name txs)
         (custom-kv/transact! this db dbi-name txs k-type v-type)
         (with-write-txn-lock-before-runtime-txlog-state

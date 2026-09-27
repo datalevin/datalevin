@@ -2827,9 +2827,12 @@
   changes from an explicitly aborted transaction."
   [^Store old lmdb]
   (let [schema* (load-schema lmdb)]
-    (if (= schema* (schema old))
-      (transfer old lmdb)
-      (transfer-with-schema old lmdb schema* false))))
+    ;; Schema updates on a writing handle defer document-index initialization
+    ;; until commit. Even when the committed schema equals the in-memory one,
+    ;; refresh its derived state so newly added document domains are opened.
+    (transfer-with-schema old lmdb
+                          (if (= schema* (schema old)) (schema old) schema*)
+                          false)))
 
 (defn with-open-opts
   "Return a Store wrapper over the same open LMDB state but with different

@@ -18,6 +18,7 @@
    [datalevin.remote :as r]
    [datalevin.util :as u :refer [raise]]
    [datalevin.interface :as i]
+   [datalevin.kv :as kv]
    [datalevin.tx-group :as group]
    [datalevin.validate :as vld])
   (:import
@@ -923,6 +924,61 @@
             (observe-txlog-sync-path! :queued-other)
             (queued-transact! conn tx-data tx-meta)))))))
 
+(defn- embedded-write-group
+  [conn]
+  (when-not (or *sync-queue-worker?* (Thread/holdsLock conn))
+    (let [store (.-store ^DB @conn)]
+      (when (and (instance? Store store)
+                 (not (s/synchronous-secondary-indexing? store)))
+        (let [lmdb (.-lmdb ^Store store)
+              opts (l/read-env-opts lmdb)]
+          ;; Retain the specialized adaptive WAL runner unless an idle
+          ;; collection window was requested. Non-WAL stores now collect
+          ;; contended callers as well, without an executor handoff.
+          (when (or (not (:wal? opts))
+                    (pos? (kv/write-batch-delay-nanos lmdb)))
+            (kv/write-group lmdb :datalog)))))))
+
+(defn- transact-embedded-group!
+  [g conn tx-data tx-meta]
+  (let [lmdb (.-lmdb ^Store (.-store ^DB @conn))
+        opts (l/read-env-opts lmdb)
+        profile (when (:wal? opts) (:wal-durability-profile opts))
+        report
+        (group/submit!
+         g
+         (fn [execute]
+           (if-not group/*batched?*
+             (execute [conn false])
+             (locking conn
+               (let [before @conn
+                     ^objects reports
+                     (with-transaction [tx conn]
+                       (:result (db/execute-write-group tx #(execute [% true]))))
+                     after @conn
+                     store (.-store ^DB after)]
+                 ;; The native writer is closed. Return readable Store views,
+                 ;; retaining each request's logical transaction and tempids.
+                 (dotimes [idx (alength reports)]
+                   (let [report (aget reports idx)]
+                     (aset reports idx
+                           (assoc report
+                                  :db-before (if (zero? idx) before
+                                                 (db/transfer (:db-before report)
+                                                              store))
+                                  :db-after after))))
+                 reports))))
+         (fn [[tx batched?]]
+           (observe-txlog-sync-path!
+            (case profile
+              :strict (if batched? :queued-strict :direct-wal-idle-strict)
+              :relaxed (if batched? :queued-relaxed :direct-wal-idle-relaxed)
+              (if batched? :queued-no-wal :direct-no-wal)))
+           (-transact! tx tx-data tx-meta))
+         (kv/write-batch-delay-nanos lmdb))]
+    (notify-listeners! conn report)
+    report))
+
 (defn transact!
   ([conn tx-data] (transact! conn tx-data nil))
   ([conn tx-data tx-meta]
@@ -934,7 +990,9 @@
        (observe-txlog-sync-path! :direct-remote)
        (notify-listeners! conn report)
        report)
-     (transact-local-or-explicit! conn tx-data tx-meta))))
+     (if-let [g (embedded-write-group conn)]
+       (transact-embedded-group! g conn tx-data tx-meta)
+       (transact-local-or-explicit! conn tx-data tx-meta)))))
 
 (defn transact-ack!
   ([conn tx-data] (transact-ack! conn tx-data nil))

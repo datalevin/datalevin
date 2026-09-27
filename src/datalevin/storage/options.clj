@@ -211,6 +211,8 @@
 (defn sync-wal-runtime-opts!
   [lmdb opts]
   (let [opts (c/canonicalize-wal-opts opts)]
+    (when-let [info (kv-info lmdb)]
+      (vswap! info merge (select-keys opts [:write-batch-size :write-batch-delay-us])))
     (when (true? (:wal? opts))
       (let [runtime-opts (or (env-opts lmdb) {})
             info-v       (kv-info lmdb)
@@ -246,7 +248,9 @@
         txlog-opts (into {}
                          (keep (fn [[k v]]
                                  (let [k' (c/canonical-wal-option-key k)]
-                                   (when (and (c/wal-option-key? k)
+                                   (when (and (or (c/wal-option-key? k)
+                                                  (#{:write-batch-size
+                                                     :write-batch-delay-us} k))
                                               (not (contains? kv-opts k')))
                                      [k' v]))))
                          opts)]

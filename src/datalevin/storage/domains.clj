@@ -338,7 +338,7 @@
       {}
       schema)))
 
-(def ^:private idoc-domains-cache
+(def ^:private ^java.util.Map idoc-domains-cache
   ;; Schema and options maps are stable per open store, so identity is the right
   ;; key: an equality probe would walk the whole (possibly large) schema.
   (java.util.Collections/synchronizedMap (java.util.IdentityHashMap.)))
@@ -347,11 +347,12 @@
   "Document-index domains derived from the schema and options. Cached by the
   identity of both maps so unchanged writes do not rescan the schema."
   [schema opts]
-  (let [per-schema (or (.get idoc-domains-cache schema)
-                       (let [m (java.util.Collections/synchronizedMap
-                                 (java.util.IdentityHashMap.))]
-                         (.put idoc-domains-cache schema m)
-                         m))]
+  (let [^java.util.Map per-schema
+        (or (.get idoc-domains-cache schema)
+            (let [m (java.util.Collections/synchronizedMap
+                      (java.util.IdentityHashMap.))]
+              (.put idoc-domains-cache schema m)
+              m))]
     (if-some [cached (.get per-schema opts)]
       cached
       (let [domains (compute-idoc-domains schema opts)]

@@ -18,7 +18,7 @@
             [datalevin.lmdb :as l]
             [datalevin.udf :as udf]
             [datalevin.util :refer [raise]])
-  (:import [java.util Arrays HashMap IdentityHashMap]
+  (:import [java.util Arrays HashMap IdentityHashMap Map]
            [java.nio ByteBuffer]
            [datalevin.bits Indexable Retrieved CustomReference]))
 
@@ -28,7 +28,7 @@
 (defn custom-type? [t]
   (and (qualified-keyword? t) (not (c/datalog-value-types t))))
 
-(def ^:private custom-schema-cache
+(def ^:private ^Map custom-schema-cache
   ;; Schema maps are stable per open store; key on identity rather than value so
   ;; a write does not rescan a large schema.
   (java.util.Collections/synchronizedMap (IdentityHashMap.)))

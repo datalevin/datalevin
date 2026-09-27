@@ -19,6 +19,7 @@
    [datalevin.binding.cpp.write :as write]
    [datalevin.bits :as b]
    [datalevin.util :as u :refer [raise]]
+   [datalevin.validate :as vld]
    [datalevin.constants :as c]
    [datalevin.compress :as cp]
    [datalevin.buffer :as bf]
@@ -623,7 +624,8 @@
   (kv-info [_] info)
 
   (env-opts [_] (dissoc @info :compression :dbis :custom-dbis :types :custom-types-revision :custom-value-id
-                       :custom-type-cache :custom-payload-dbi-open? :runtime-opts))
+                       :custom-type-cache :custom-payload-dbi-open? :runtime-opts
+                       :write-groups))
 
   (dbi-opts [_ dbi-name] (get-in @info [:dbis dbi-name]))
 
@@ -1298,6 +1300,9 @@
                               flags c/default-env-flags
                               temp? false}
                          :as opts}]
+  (doseq [k [:write-batch-size :write-batch-delay-us]
+          :when (contains? opts k)]
+    (vld/validate-option-mutation k (get opts k)))
   (let [runtime-opts      (:runtime-opts opts)
         opts             (dissoc opts :runtime-opts :compression)
         opened           (volatile! nil)
@@ -1410,6 +1415,7 @@
         ;; handle is published. It is shared by marked-write views and omitted
         ;; from env-opts and stored metadata.
         (vswap! (.-info lmdb) assoc :custom-type-cache (atom {})
+                :write-groups (ConcurrentHashMap.)
                 :runtime-opts runtime-opts)
         (lifecycle/register-local-kv-handle! local-handle-key (l/wrap-open-kv lmdb)))
       (catch Exception e

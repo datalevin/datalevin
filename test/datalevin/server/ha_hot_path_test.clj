@@ -8,6 +8,7 @@
    [datalevin.db :as db]
    [datalevin.ha :as dha]
    [datalevin.ha.control :as ctrl]
+   [datalevin.ha.publisher :as publisher]
    [datalevin.interface :as i]
    [datalevin.kv :as kv]
    [datalevin.kv.txlog :as kvtx]
@@ -84,6 +85,7 @@
                      :lease-until-ms (+ now 600000)
                      :leader-last-applied-lsn 0})
         reads (atom 0)
+        version (atom 0)
         renews (atom [])
         entered (promise) release (promise)
         confirming (promise) confirmed (promise)
@@ -91,7 +93,7 @@
         (reify ctrl/ILeaseAuthority
           (read-lease [_ _]
             (swap! reads inc)
-            {:lease @lease :version 1})
+            {:lease @lease :version @version})
           (read-membership-hash [_] nil)
           (read-voters [_] [])
           (renew-lease [_ req]
@@ -106,12 +108,15 @@
             (let [ok? (not (and (= outcome :indeterminate)
                                 (= 2 (count @renews))))]
               (when ok?
+                (swap! version inc)
                 (swap! lease assoc :leader-last-applied-lsn
                        (:leader-last-applied-lsn req)))
               {:ok? ok? :reason (when-not ok? :timeout)
-               :lease @lease :version 1
+               :lease @lease :version @version
                :authority-now-ms (System/currentTimeMillis)})))
         state {:ha-authority authority :ha-role :leader :ha-node-id 1
+               :ha-renewal-publisher (publisher/create)
+               :ha-authority-version 0
                :ha-db-identity "db" :ha-authority-lease @lease
                :ha-authority-owner-node-id 1
                :ha-leader-term 1 :ha-authority-term 1
@@ -165,38 +170,54 @@
     (doseq [lsn [41 42]]
       (is (nil? (publish {:txlog-lsn lsn}))))
     (is (= [42] @renews))
-    (is (= 1 @locks))
+    (is (zero? @locks))
     ;; Local progress alone cannot justify skipping authority publication.
     (.put dbs "db" (assoc (.get dbs "db") :ha-leader-last-applied-lsn 100))
     (is (nil? (publish {:txlog-lsn 43})))
     (is (= [42 100] @renews))
-    (is (= 2 @locks))
+    (is (zero? @locks))
     (is (zero? @reads))))
 
-(deftest confirmation-is-rechecked-after-waiting-for-admission-lock
-  (let [{:keys [deps reads renews release] :as probe} (authority-probe :ok)
-        ^ConcurrentHashMap dbs (:dbs probe)
-        state (assoc (.get dbs "db") :ha-leader-last-applied-lsn 42)
-        gate (Object.)
-        waiting (promise)
-        deps (assoc deps :db-write-admission-lock-fn
-                    (fn [_ _] (deliver waiting true) gate))]
-    (.put dbs "db" state)
-    (deliver release true)
-    (let [publish (ha/ha-write-commit-publish-fn
+(deftest periodic-and-write-confirmation-share-inflight-renewal
+  (doseq [first-caller [:periodic :write]]
+    (let [{:keys [deps reads renews entered release] :as probe} (authority-probe :ok)
+          ^ConcurrentHashMap dbs (:dbs probe)
+          state (assoc (.get dbs "db") :ha-leader-last-applied-lsn 42)
+          publication (:ha-renewal-publisher state)
+          joined (promise)
+          periodic #(let [next-state (dha/ha-renew-step "db" state)]
+                      (ha/publish-ha-renew-state!
+                        deps nil "db" state next-state nil)
+                      next-state)
+          _ (.put dbs "db" state)
+          publish (ha/ha-write-commit-publish-fn
                     deps nil {:type :tx-data :args ["db"]})
-          job (locking gate
-                (let [job (future (publish {:txlog-lsn 42}))]
-                  (is (deref waiting 10000 false))
-                  ;; The periodic path publishes while the foreground caller
-                  ;; waits. Only that background renewal should reach authority.
-                  (let [next-state (dha/ha-renew-step "db" state)]
-                    (ha/publish-ha-renew-state!
-                      deps nil "db" state next-state nil))
-                  job))]
-      (is (nil? (deref job 10000 ::timeout)))
-      (is (= [42] @renews))
-      (is (zero? @reads)))))
+          write #(publish {:txlog-lsn 42})
+          first-job (future ((if (= first-caller :periodic) periodic write)))
+          jobs (atom [first-job])]
+      (try
+        (is (deref entered 10000 false))
+        (add-watch publication ::joined
+                   (fn [_ _ old new]
+                     (when (and (:pending old)
+                                (identical? (:pending old) (:pending new)))
+                       (deliver joined true))))
+        (swap! jobs conj (future ((if (= first-caller :periodic) write periodic))))
+        (is (deref joined 10000 false))
+        (is (not-any? realized? @jobs))
+        (is (= [42] @renews))
+        (deliver release true)
+        (doseq [job @jobs] (is (not= ::timeout (deref job 10000 ::timeout))))
+        (is (= [42] @renews))
+        (is (zero? @reads))
+        (let [outcomes (mapv deref @jobs)
+              periodic-state (nth outcomes (if (= first-caller :periodic) 0 1))]
+          (is (= (:ha-lease-local-deadline-nanos periodic-state)
+                 (:ha-lease-local-deadline-nanos (.get dbs "db")))))
+        (finally
+          (remove-watch publication ::joined)
+          (deliver release true)
+          (doseq [job @jobs] (deref job 10000 nil)))))))
 
 (deftest covered-watermark-requires-fresh-matching-lease-proof
   (doseq [[label patch reason]
@@ -496,3 +517,85 @@
         (deliver release true)
         (deliver confirmed true)
         (doseq [job @jobs] (deref job 10000 nil))))))
+
+(deftest periodic-renewal-reuses-recent-write-proof-without-extending-deadlines
+  (let [{:keys [deps release renews] :as probe} (authority-probe :ok)
+        ^ConcurrentHashMap dbs (:dbs probe)
+        publish (ha/ha-write-commit-publish-fn deps nil {:type :tx-data :args ["db"]})]
+    (deliver release true)
+    (publish {:txlog-lsn 42})
+    (let [before (.get dbs "db")
+          after (dha/ha-renew-step "db" before)]
+      (is (= [42] @renews))
+      (is (= (select-keys before [:ha-authority-version :ha-last-authority-refresh-ms
+                                  :ha-lease-local-deadline-ms :ha-lease-local-deadline-nanos])
+             (select-keys after [:ha-authority-version :ha-last-authority-refresh-ms
+                                 :ha-lease-local-deadline-ms :ha-lease-local-deadline-nanos]))))))
+
+(deftest waiting-publisher-samples-progress-before-its-next-command
+  (let [{:keys [deps entered release confirming confirmed renews] :as probe}
+        (authority-probe :ok)
+        ^ConcurrentHashMap dbs (:dbs probe)
+        publish (ha/ha-write-commit-publish-fn deps nil {:type :tx-data :args ["db"]})
+        publication (:ha-renewal-publisher (.get dbs "db"))
+        joined (promise)
+        jobs (atom [(future (publish {:txlog-lsn 42}))])]
+    (try
+      (is (deref entered 10000 false))
+      (add-watch publication ::joined
+                 (fn [_ _ _ new]
+                   (when (= 43 (:wanted-lsn new)) (deliver joined true))))
+      (swap! jobs conj (future (publish {:txlog-lsn 43})))
+      (is (deref joined 10000 false))
+      ;; A later physical commit has recorded progress but its confirmation
+      ;; callback has not joined the publisher yet.
+      (.compute dbs "db"
+                (reify BiFunction
+                  (apply [_ _ m] (assoc m :ha-leader-last-applied-lsn 44))))
+      (deliver release true)
+      (is (deref confirming 10000 false))
+      (is (= [42 44] @renews))
+      (is (not (realized? (second @jobs))))
+      (deliver confirmed true)
+      (doseq [job @jobs] (is (nil? (deref job 10000 ::timeout))))
+      (finally
+        (remove-watch publication ::joined)
+        (deliver release true)
+        (deliver confirmed true)
+        (doseq [job @jobs] (deref job 10000 nil))))))
+
+(deftest publication-waiter-timeout-does-not-cancel-the-owner
+  (let [{:keys [entered release renews] :as probe} (authority-probe :ok)
+        state (.get ^ConcurrentHashMap (:dbs probe) "db")
+        owner (future (publisher/renew! state 42 5000))]
+    (try
+      (is (deref entered 10000 false))
+      (is (= :ha/control-timeout
+             (try (publisher/renew! state 42 1) nil
+                  (catch clojure.lang.ExceptionInfo e (:error (ex-data e))))))
+      (is (not (realized? owner)))
+      (is (= [42] @renews))
+      (deliver release true)
+      (is (true? (get-in (deref owner 10000 nil) [:result :ok?])))
+      (finally (deliver release true) (deref owner 10000 nil)))))
+
+(deftest late-periodic-result-preserves-newer-proof-and-clock-pause
+  (let [{:keys [deps release confirmed renews] :as probe} (authority-probe :ok)
+        ^ConcurrentHashMap dbs (:dbs probe)
+        before (assoc (.get dbs "db") :ha-leader-last-applied-lsn 42)]
+    (.put dbs "db" before)
+    (deliver release true)
+    (deliver confirmed true)
+    (let [periodic (dha/ha-renew-step "db" before)
+          publish (ha/ha-write-commit-publish-fn deps nil {:type :tx-data :args ["db"]})]
+      (publish {:txlog-lsn 43})
+      (let [newer (.get dbs "db")]
+        (ha/publish-ha-renew-state!
+          deps nil "db" before (assoc periodic :ha-clock-skew-paused? true) nil)
+        (let [current (.get dbs "db")]
+          (is (= [42 43] @renews))
+          (is (= (:ha-authority-lease newer) (:ha-authority-lease current)))
+          (is (= (:ha-authority-version newer) (:ha-authority-version current)))
+          (is (= (:ha-lease-local-deadline-nanos newer)
+                 (:ha-lease-local-deadline-nanos current)))
+          (is (true? (:ha-clock-skew-paused? current))))))))

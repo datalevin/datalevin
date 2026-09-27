@@ -1237,7 +1237,10 @@
 (defn new-db
   "Construct a current DB view. Rebuilds of the same database can supply
   `previous` to retain its parsed pull patterns; pull checks schema identity
-  before using each entry. Transaction-local datom overlays are always fresh."
+  before using each entry. Transaction-local datom overlays are always fresh.
+  Secondary-index recovery is owned by store open, and newly queued jobs wake
+  the worker in `load-datoms-with-plan!`; publishing a transaction must not
+  rescan the durable job table."
   ([^IStore store] (new-db store nil))
   ([^IStore store info] (new-db store info nil))
   ([^IStore store info ^DB previous]
@@ -1261,8 +1264,6 @@
                    (if info (:last-modified info) (last-modified store))
                    (when info (:max-tx info)))
      (start-sampling store)
-     (when (instance? Store store)
-       (s/enqueue-secondary-index-work-if-needed! ^Store store))
      db)))
 
 (defn transfer

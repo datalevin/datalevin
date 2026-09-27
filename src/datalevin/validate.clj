@@ -198,7 +198,8 @@
     :ha-demotion-drain-ms})
 
 (def ^:private positive-int-opts
-  #{:wal-commit-wait-ms
+  #{:write-batch-size
+    :wal-commit-wait-ms
     :async-secondary-index-worker-max-jobs
     :async-secondary-index-worker-lease-ms
     :async-secondary-index-retry-base-ms
@@ -808,6 +809,11 @@
       (when-not (or (true? v) (false? v))
         (raise "Option " k " expects a boolean, got " v
                  {:option k :value v}))
+
+      (= k :write-batch-delay-us)
+      (when-not (and (integer? v) (<= 0 (long v) 1000000))
+        (raise "Option :write-batch-delay-us expects an integer from 0 to 1000000"
+               {:option k :value v}))
 
       (non-negative-int-opts k)
       (when-not (and (integer? v) (not (neg? ^long v)))

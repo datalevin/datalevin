@@ -113,7 +113,30 @@ executes up to `:wal-group-commit` requests in one native transaction and WAL
 record. Every caller waits for successful native commit; strict callers also
 wait for durable WAL. Relaxed callers retain the configured deferred-sync policy.
 Readers cannot see a partially executed group. There is no deliberate batching
-delay, and `:wal-group-commit-ms` does not delay admission to either group.
+delay by default, and `:wal-group-commit-ms` does not delay admission to either group.
+
+Embedded KV and Datalog writes also collect concurrent requests when `:wal?`
+is false and LMDB uses its normal durable commit settings. This avoids opening
+and committing a native transaction for every waiting request. Temporary,
+in-memory, and explicitly asynchronous LMDB environments keep their existing
+write path.
+
+For bursts arriving at an idle embedded writer, set `:write-batch-delay-us` to
+a short collection window, for example `50`. Its default is `0`, with no
+intentional delay. Collection happens before acquiring the native writer and
+ends when `:write-batch-size` requests arrive or the window expires. The size
+defaults to `:wal-group-commit` (normally 128); both options can be passed to
+`open-kv` or as top-level `create-conn` options. The delay accepts 0–1,000,000
+microseconds and trades isolated-write latency for sharing commit costs across
+nearby requests. A single synchronous producer still needs one durable commit
+per call. Actual wakeup time depends on the OS scheduler.
+
+The idle collection window works with private WAL `:strict`/`:relaxed` and
+durable non-WAL stores. Native commit and, in strict WAL mode, WAL sync finish
+before any caller or transaction listener receives success. Relaxed WAL retains
+its explicitly selected durability policy. Embedded Datalog stores with
+synchronous secondary indexes retain their existing path so a failed batch
+cannot leave an index ahead of its LMDB data.
 
 This shares commit costs while retaining LMDB's single writer. Explicit
 transaction bodies, shared-WAL stores, and writes with HA/commit hooks retain

@@ -402,8 +402,15 @@ quorum of data nodes has durably replicated that transaction.
 The control-plane lease records `leader-last-applied-lsn`. Each committed server
 write group ensures that this watermark covers its LSN before acknowledging its
 requests, reusing a valid cached confirmation or publishing through one lease
-renewal. The periodic loop also renews during idle periods. Promotion uses
-the maximum LSN proven by the authority lease and reachable member watermarks.
+renewal. Write confirmation and periodic renewal share one in-flight publication
+per leader runtime and term. Requests for higher LSNs coalesce into the next
+publication; each write waits for proof covering its own LSN. The periodic loop
+can reuse a successful publication from within the renew interval, retaining
+its original observation time and local lease deadline, and renews during idle
+periods.
+
+Promotion uses the maximum LSN proven by the authority lease and reachable
+member watermarks.
 With the default zero promotion-lag allowance, losing the only copy of an
 acknowledged write blocks automatic promotion instead of permitting a leader
 behind that floor. Replication lag therefore affects failover availability.

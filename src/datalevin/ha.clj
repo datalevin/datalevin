@@ -19,6 +19,7 @@
    [datalevin.ha.control :as ctrl]
    [datalevin.ha.lease :as lease]
    [datalevin.ha.promotion :as promo]
+   [datalevin.ha.publisher :as publisher]
    [datalevin.ha.replication :as repl]
    [datalevin.ha.snapshot :as snap]
    [datalevin.ha.util :as hu]
@@ -484,7 +485,7 @@
                           now-ms)))
     (if (:ok? result)
       (let [{:keys [lease version authority-now-ms]} result
-            observed-at-ms (ha-now-ms)]
+            observed-at-ms (or (:observed-at-ms result) (ha-now-ms))]
         (-> m
             apply-authority-read-success
             (assoc :ha-authority-lease lease
@@ -525,18 +526,12 @@
               term (:ha-leader-term m)]
           (if-not (and (integer? term) (pos? ^long term))
             (demote-ha-leader db-name m :missing-leader-term nil local-start-ms)
-            (let [result (ctrl/renew-lease
-                          (:ha-authority m)
-                          {:db-identity (:ha-db-identity m)
-                           :leader-node-id (:ha-node-id m)
-                           :leader-endpoint (:ha-local-endpoint m)
-                           :term term
-                           :lease-renew-ms (:ha-lease-renew-ms m)
-                           :lease-timeout-ms (:ha-lease-timeout-ms m)
-                           :leader-last-applied-lsn
-                           (long (or (:ha-leader-last-applied-lsn m) 0))
-                           :now-ms local-start-ms
-                           :timeout-ms renew-timeout-ms})]
+            (let [{:keys [result local-start-ms local-start-nanos]}
+                  (publisher/renew!
+                    m (long (or (:ha-leader-last-applied-lsn m) 0))
+                    renew-timeout-ms
+                    {:reuse-ms (long (or (:ha-lease-renew-ms m) c/*ha-lease-renew-ms*))
+                     :current-state-fn #(or (repl/*ha-current-state-fn*) m)})]
               (finish-ha-leader-renew
                db-name
                m
@@ -581,6 +576,7 @@
 
 (def ^:private ha-runtime-config-clear-keys
   [:ha-authority
+   :ha-renewal-publisher
    :ha-db-identity
    :ha-membership-hash
    :ha-authority-membership-hash
@@ -1045,6 +1041,7 @@
                      :term (:term lease)
                      :lease-until-ms (:lease-until-ms lease)}))
         (cond-> {:ha-authority authority
+                 :ha-renewal-publisher (publisher/create)
                  :ha-db-identity db-identity
                  :ha-membership-hash derived-hash
                  :ha-authority-membership-hash (:membership-hash init-result)

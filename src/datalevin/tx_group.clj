@@ -7,7 +7,7 @@
   (:refer-clojure :exclude [run!])
   (:import [java.util.concurrent ConcurrentLinkedQueue Semaphore]
            [java.util.concurrent.atomic AtomicBoolean]
-           [java.util.concurrent.locks ReentrantLock]
+           [java.util.concurrent.locks LockSupport ReentrantLock]
            [org.eclipse.collections.impl.list.mutable FastList]))
 
 (def ^:dynamic *enabled?* true)
@@ -153,14 +153,35 @@
           (finally (.unlock lock))))
       (finally (handoff! group)))))
 
+(defn- collect-idle-batch!
+  [^Group group ^long delay-nanos]
+  (let [started (System/nanoTime)
+        interrupted? (volatile! (Thread/interrupted))]
+    (try
+      (loop []
+        (let [remaining (- delay-nanos (- (System/nanoTime) started))]
+          (when (and (pos? remaining)
+                     (< (.size ^ConcurrentLinkedQueue (.-queue group))
+                        (.-limit group)))
+            ;; Keep the native writer free while collecting an idle burst.
+            ;; Poll briefly so a full batch need not wait for the deadline.
+            (LockSupport/parkNanos (min remaining 50000))
+            (when (Thread/interrupted) (vreset! interrupted? true))
+            (recur))))
+      (finally
+        (when @interrupted? (.interrupt (Thread/currentThread)))))))
+
 (defn- submit-queued!
-  [^Group group run-transaction op leader?]
+  [^Group group run-transaction op leader? delay-nanos]
   (let [result (volatile! nil)
         ready (Semaphore. 0)
         request (Request. (bound-fn [context] (op context)) result ready)]
     (.add ^ConcurrentLinkedQueue (.-queue group) request)
     (if (or leader? (.compareAndSet ^AtomicBoolean (.-active group) false true))
-      (lead! group run-transaction result)
+      (do
+        (when (pos? (long delay-nanos))
+          (collect-idle-batch! group (long delay-nanos)))
+        (lead! group run-transaction result))
       (do
         ;; Like ReentrantLock.lock, waiting does not cancel an enqueued write
         ;; on interruption, and preserves the caller's interrupted status.
@@ -175,26 +196,34 @@
 (defn submit!
   "Run op in a transaction under its durability policy, batching contended callers.
   run-transaction receives a function of the private writing context, returns
-  its result, and owns commit and state publication. An idle caller passes op
-  directly, without queue or batch allocations. Queued operations capture the
-  submitting thread's bindings and wait for completion or a leadership handoff."
-  [^Group group run-transaction op]
-  (if (.compareAndSet ^AtomicBoolean (.-active group) false true)
-    (let [^ReentrantLock lock (.-lock group)]
-      ;; Claim leadership before checking the queue, so an already enqueued
-      ;; request cannot be overtaken by a new direct operation.
-      (if (and (.isEmpty ^ConcurrentLinkedQueue (.-queue group))
-               (.tryLock lock))
-        (await-commit
-          (try
-            (try
-              (capture-commit
-                #(if (and (= 1 *request-count*) (not *batched?*))
-                   (run-transaction op)
-                   (binding [*request-count* 1
-                             *batched?* false]
-                     (run-transaction op))))
-              (finally (.unlock lock)))
-            (finally (handoff! group))))
-        (submit-queued! group run-transaction op true)))
-    (submit-queued! group run-transaction op false)))
+  its result, and owns commit and state publication. Without a collection window,
+  an idle caller passes op directly, without queue or batch allocations. The
+  optional delay-nanos bounds collection before the writer is acquired. Queued
+  operations capture the submitting thread's bindings and wait for completion
+  or a leadership handoff."
+  ([^Group group run-transaction op]
+   (if (.compareAndSet ^AtomicBoolean (.-active group) false true)
+     (let [^ReentrantLock lock (.-lock group)]
+       ;; Claim leadership before checking the queue, so an already enqueued
+       ;; request cannot be overtaken by a new direct operation.
+       (if (and (.isEmpty ^ConcurrentLinkedQueue (.-queue group))
+                (.tryLock lock))
+         (await-commit
+           (try
+             (try
+               (capture-commit
+                 #(if (and (= 1 *request-count*) (not *batched?*))
+                    (run-transaction op)
+                    (binding [*request-count* 1
+                              *batched?* false]
+                      (run-transaction op))))
+               (finally (.unlock lock)))
+             (finally (handoff! group))))
+         (submit-queued! group run-transaction op true 0)))
+     (submit-queued! group run-transaction op false 0)))
+  ([^Group group run-transaction op delay-nanos]
+   (if (and (pos? (long delay-nanos)) (> (.-limit group) 1))
+     (let [leader? (.compareAndSet ^AtomicBoolean (.-active group) false true)]
+       (submit-queued! group run-transaction op leader?
+                       (if leader? delay-nanos 0)))
+     (submit! group run-transaction op))))

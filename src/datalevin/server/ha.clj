@@ -16,6 +16,7 @@
    [datalevin.ha :as dha]
    [datalevin.ha.authority :as auth]
    [datalevin.ha.control :as ctrl]
+   [datalevin.ha.publisher :as publisher]
    [datalevin.interface :as i]
    [datalevin.ha.replication :as drep]
    [datalevin.ha.util :as hu]
@@ -61,6 +62,7 @@
     :engine
     :index
     :ha-authority
+    :ha-renewal-publisher
     :ha-renew-loop-running?
     :ha-renew-loop-future
     :ha-renew-loop-stopped-latch
@@ -190,6 +192,11 @@
        (= (:ha-membership-hash current-state)
           (:ha-membership-hash expected-state))))
 
+(defn- older-authority-version?
+  [version current-version]
+  (and (integer? version) (integer? current-version)
+       (< (long version) (long current-version))))
+
 (defn same-ha-runtime-state?
   [current-state expected-state running-key]
   (and (identical? (get current-state running-key)
@@ -233,7 +240,18 @@
             current-state
             expected-state
             :ha-renew-loop-running?))
-    (apply-state-patch current-state patch)
+    ;; A shared renewal can finish before another publication, yet its periodic
+    ;; caller may merge later. Never roll back newer lease proof or leadership.
+    ;; Clock checks are independent and must still be allowed to pause writes.
+    (apply-state-patch
+      current-state
+      (if (older-authority-version?
+            (get patch :ha-authority-version (:ha-authority-version expected-state))
+            (:ha-authority-version current-state))
+        (select-keys patch [:ha-clock-skew-paused? :ha-clock-skew-refresh-future
+                            :ha-clock-skew-refresh-pending? :ha-clock-skew-last-check-ms
+                            :ha-clock-skew-last-observed-ms :ha-clock-skew-last-result])
+        patch))
     current-state))
 
 (defn merge-ha-renew-promotion-state-patch
@@ -1079,79 +1097,65 @@
               (not (ha-write-commit-confirmed?
                      db-name expected-state
                      (get ((:dbs-fn deps) server) db-name) txlog-lsn)))
-     ;; A completed background renewal may already cover this physical commit.
-     ;; Otherwise serialize confirmation and recheck after acquiring the lock:
-     ;; publication may have completed while this caller was waiting for it.
-     (locking ((:db-write-admission-lock-fn deps) server db-name)
-       (let [state (get ((:dbs-fn deps) server) db-name)
-             txlog-lsn (long (or txlog-lsn 0))
-             err (or (when-not (pos? txlog-lsn)
-                       {:reason :invalid-txlog-lsn})
-                     (ha-write-context-error db-name expected-state state)
-                     (when-not (leader-authority-state? state)
-                       {:reason :not-leader}))]
-         (when err
-           (raise "HA write commit confirmation failed"
-                  (assoc err :error :ha/write-indeterminate
-                             :indeterminate? true :retryable? false
-                             :db-name db-name
-                             :leader-last-applied-lsn txlog-lsn)))
-         (when-not (ha-write-commit-confirmed?
-                     db-name expected-state state txlog-lsn)
-           (let [local-start-ms (System/currentTimeMillis)
-                 local-start-nanos (System/nanoTime)
-                 commit-lsn (max txlog-lsn
-                                 (long (or (:ha-leader-last-applied-lsn state) 0))
-                                 (long (or (get-in state [:ha-authority-lease
-                                                          :leader-last-applied-lsn])
-                                           0)))
-                 result (try
-                          (ctrl/renew-lease
-                            (:ha-authority state)
-                            {:db-identity (:ha-db-identity state)
-                             :leader-node-id (:ha-node-id state)
-                             :leader-endpoint (:ha-local-endpoint state)
-                             :term (:ha-leader-term state)
-                             :lease-renew-ms (:ha-lease-renew-ms state)
-                             :lease-timeout-ms (:ha-lease-timeout-ms state)
-                             :leader-last-applied-lsn commit-lsn
-                             :now-ms local-start-ms
-                             :timeout-ms
-                             (hu/ha-request-timeout-ms
-                               state (or (get-in state [:ha-control-plane
-                                                        :operation-timeout-ms])
-                                         5000))})
-                          (catch Exception e
-                            (throw
-                              (ex-info "HA write commit confirmation failed"
-                                       (ha-write-commit-confirmation-error
-                                         db-name commit-lsn state
-                                         {:ok? false :reason :exception})
-                                       e))))
-                 observation (when (auth/control-result-authority-observation? result)
-                               (auth/control-result-authority-observation
-                                 state local-start-ms local-start-nanos result))]
-             (when observation
-               ((:transform-db-state-when-fn deps)
-                server db-name
-                #(and (leader-authority-state? %)
-                      (nil? (ha-write-context-error db-name state %)))
-                (fn [current]
-                  (-> current
-                      (auth/apply-authority-observation
-                        observation (System/currentTimeMillis))
-                      auth/apply-authority-read-success
-                      (assoc :ha-leader-last-applied-lsn
-                             (max commit-lsn
-                                  (long (or (:ha-leader-last-applied-lsn current)
-                                            0))))))))
-             (when-not (and (:ok? result)
-                            (ha-write-commit-confirmed?
-                              db-name expected-state
-                              (get ((:dbs-fn deps) server) db-name) txlog-lsn))
-               (raise "HA write commit confirmation failed"
-                      (ha-write-commit-confirmation-error
-                        db-name commit-lsn state result))))))))))
+     (let [state (get ((:dbs-fn deps) server) db-name)
+           txlog-lsn (long (or txlog-lsn 0))
+           err (or (when-not (pos? txlog-lsn)
+                     {:reason :invalid-txlog-lsn})
+                   (ha-write-context-error db-name expected-state state)
+                   (when-not (leader-authority-state? state)
+                     {:reason :not-leader}))]
+       (when err
+         (raise "HA write commit confirmation failed"
+                (assoc err :error :ha/write-indeterminate
+                           :indeterminate? true :retryable? false
+                           :db-name db-name
+                           :leader-last-applied-lsn txlog-lsn)))
+       (when-not (ha-write-commit-confirmed?
+                   db-name expected-state state txlog-lsn)
+         (let [commit-lsn (max txlog-lsn
+                               (long (or (:ha-leader-last-applied-lsn state) 0))
+                               (long (or (get-in state [:ha-authority-lease
+                                                        :leader-last-applied-lsn])
+                                         0)))
+               {:keys [result local-start-ms local-start-nanos]}
+               (try
+                 (publisher/renew!
+                   state commit-lsn
+                   (hu/ha-request-timeout-ms
+                     state (or (get-in state [:ha-control-plane
+                                              :operation-timeout-ms]) 5000))
+                   {:current-state-fn #(get ((:dbs-fn deps) server) db-name)})
+                 (catch Exception e
+                   (throw
+                     (ex-info "HA write commit confirmation failed"
+                              (ha-write-commit-confirmation-error
+                                db-name commit-lsn state
+                                {:ok? false :reason :exception}) e))))
+               observation (when (auth/control-result-authority-observation? result)
+                             (auth/control-result-authority-observation
+                               state local-start-ms local-start-nanos result))]
+           (when observation
+             ((:transform-db-state-when-fn deps)
+              server db-name
+              #(and (leader-authority-state? %)
+                    (nil? (ha-write-context-error db-name state %))
+                    (not (older-authority-version? (:version observation)
+                                                    (:ha-authority-version %))))
+              (fn [current]
+                (-> current
+                    (auth/apply-authority-observation
+                      observation (System/currentTimeMillis))
+                    auth/apply-authority-read-success
+                    (assoc :ha-leader-last-applied-lsn
+                           (max commit-lsn
+                                (long (or (:ha-leader-last-applied-lsn current) 0))))))))
+           (when-not (and (:ok? result)
+                          (ha-write-commit-confirmed?
+                            db-name expected-state
+                            (get ((:dbs-fn deps) server) db-name) txlog-lsn))
+             (raise "HA write commit confirmation failed"
+                    (ha-write-commit-confirmation-error
+                      db-name commit-lsn state result)))))))))
 
 (defn ha-write-commit-publish-fn
   [deps server message]
