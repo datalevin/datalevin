@@ -658,9 +658,14 @@
                         (not (identical? running?
                                          (:ha-renew-loop-running? state))))
                   (.set running? false)
-                  ((:sleep-ha-loop-fn deps)
-                   running?
-                   ((:ha-loop-sleep-ms-fn deps) state))))))
+                  (do
+                    (when-not (or (:ha-clock-skew-paused? state)
+                                  (:ha-membership-mismatch? state)
+                                  (:ha-db-identity-mismatch? state))
+                      (ctrl/align-leadership! (:ha-authority state)))
+                    ((:sleep-ha-loop-fn deps)
+                     running?
+                     ((:ha-loop-sleep-ms-fn deps) state)))))))
           (catch Throwable t
             ((:log-ha-loop-crash!-fn deps)
              "HA renew loop crashed; retrying after backoff"

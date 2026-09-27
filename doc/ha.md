@@ -125,6 +125,18 @@ All HA options are per database.
   :operation-timeout-ms 5000}}
 ```
 
+The HA maintenance loop prefers to place the control-plane Raft leader on the
+data leader's voter. This removes command forwarding between the two leaders;
+Raft quorum replication is still required. Alignment uses the committed lease
+and the `:ha-node-id` mapping above, and runs outside write publication.
+
+Transfers are best effort: the target must be a live current voter, and the
+lease must have more than two election timeouts plus the clock-skew budget
+remaining. Attempts are at least three election timeouts apart (minimum one
+second). Alignment is skipped if active leases in one control group have
+different owners. JRaft may briefly interrupt command processing during a
+transfer; the existing command retries handle that transition.
+
 The options that matter most for understanding the design are:
 
 * `:db-identity`

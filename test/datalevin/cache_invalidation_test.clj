@@ -92,3 +92,39 @@
     (.put cache unknown :unknown)
     (is (= #{broad unknown}
            (set (.candidateKeys cache (#'db/cache-invalidation-dependencies touches true)))))))
+
+(deftest exact-value-lookups-avoid-unrelated-cache-entries
+  (testing "a point value write selects just that value from a full cache"
+    (let [cache (indexed-cache 512)]
+      (doseq [v (range 1 513)] (.put cache [:av-datoms :a v] v))
+      (let [touches (#'db/tx-touch-summary [(d/datom 42 :a 10)])]
+        (is (= #{[:av-datoms :a 10]}
+               (set (.candidateKeys cache (#'db/cache-invalidation-dependencies
+                                            touches false))))))))
+  (testing "unresolved values and range windows stay on the attribute bucket"
+    (let [cache          (indexed-cache 8)
+          exact          [:av-datoms :a 10]
+          other-value    [:av-datoms :a 20]
+          range          [:av-datoms :a nil]
+          lookup         [:av-datoms :a :ident]
+          seek-same-attr [:seek :eav nil :a 10]
+          seek-other     [:seek :eav nil :b 20]
+          seek-unresolved [:seek :eav nil :a [:id "one"]]
+          seek-entity    [:seek :eav 1 :a 10]
+          touches        (#'db/tx-touch-summary [(d/datom 42 :a 10)])]
+      (doseq [k [exact other-value range lookup
+                 seek-same-attr seek-other seek-unresolved seek-entity]]
+        (.put cache k k))
+      (let [candidates (set (.candidateKeys
+                              cache (#'db/cache-invalidation-dependencies
+                                      touches false)))]
+        (is (contains? candidates exact))
+        (is (not (contains? candidates other-value)))
+        (is (contains? candidates range))
+        (is (contains? candidates lookup))
+        ;; Seek windows ignore the window value and remain attribute-wide.
+        (is (contains? candidates seek-same-attr))
+        (is (not (contains? candidates seek-other)))
+        (is (contains? candidates seek-unresolved))
+        (is (not (contains? candidates seek-entity)))))))
+

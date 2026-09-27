@@ -34,7 +34,8 @@
    [java.nio ByteBuffer]
    [java.nio.file AtomicMoveNotSupportedException Files Paths
     StandardCopyOption]
-   [java.util Base64]))
+   [java.util Base64]
+   [java.util.concurrent TimeUnit]))
 
 (defprotocol ILeaseAuthority
   (start-authority! [this] "Start authority lifecycle resources.")
@@ -1562,7 +1563,8 @@
                                     operation-timeout-ms raft-dir
                                     clock-skew-budget-ms
                                     fsm-state node-v group-service-v
-                                    rpc-client-v running-v]
+                                    rpc-client-v running-v
+                                    leadership-transfer-state]
   ILeaseAuthority
   (start-authority! [this]
     (locking this
@@ -1591,6 +1593,7 @@
                   _                  (reset! fsm-state
                                       (assoc (blank-state)
                                              :voters (vec (sort peer-ids))))
+                  _                  (reset! leadership-transfer-state nil)
                   fsm                (new-jraft-fsm fsm-state)
                   ^NodeOptions opts  (doto (NodeOptions.)
                                        (.setFsm fsm)
@@ -1825,6 +1828,76 @@
 
   )
 
+(defn- preferred-leader-peer
+  [{:keys [voters fsm-state election-timeout-ms clock-skew-budget-ms]} now-ms]
+  (let [active-leases (->> (:leases @fsm-state)
+                           vals
+                           (keep :lease)
+                           (filter #(< (long now-ms)
+                                       (long (:lease-until-ms %)))))
+        owners (set (map :leader-node-id active-leases))
+        ;; Allow a transfer timeout and another election before lease expiry.
+        margin (+ (* 2 (long election-timeout-ms))
+                  (long (or clock-skew-budget-ms 0)))]
+    ;; A shared control group cannot follow conflicting data leaders.
+    (when (and (= 1 (count owners))
+               (every? #(< margin (- (long (:lease-until-ms %))
+                                    (long now-ms)))
+                       active-leases))
+      (let [owner (first owners)
+            targets (filter #(and (= owner (:ha-node-id %))
+                                  (true? (:promotable? %))) voters)]
+        (when (= 1 (count targets))
+          (parse-peer-id! (:peer-id (first targets)) :preferred-leader))))))
+
+(defn align-leadership!
+  "Best-effort control leadership alignment with the committed data lease.
+  Called by HA maintenance, outside publication and FSM apply. Only the current
+  Raft leader initiates a transfer to a live voter. JRaft completes it
+  asynchronously; failed attempts are rate-limited using monotonic time."
+  [authority]
+  (when (instance? SofaJraftLeaseAuthority authority)
+    (let [{:keys [node-v running-v local-peer-id election-timeout-ms
+                  leadership-transfer-state]} authority]
+      (when (and leadership-transfer-state (running? running-v))
+        (try
+          (when-let [^Node node @node-v]
+            (when (.isLeader node)
+              (locking leadership-transfer-state
+                (let [now-nanos (System/nanoTime)
+                      previous-nanos (:attempt-nanos @leadership-transfer-state)
+                      cooldown-nanos (.toNanos TimeUnit/MILLISECONDS
+                                               (max 1000 (* 3 (long election-timeout-ms))))]
+                  (when (or (nil? previous-nanos)
+                            (>= (- now-nanos (long previous-nanos)) cooldown-nanos))
+                    (let [now-ms (long (control-now-ms))
+                          ^PeerId target (preferred-leader-peer authority now-ms)]
+                      (when (and target
+                                 (not= target (parse-peer-id! local-peer-id :local-peer-id))
+                                 (some #(= target %) (.listPeers node))
+                                 (some #(= target %) (.listAlivePeers node)))
+                        (let [attempt {:attempt-ms now-ms
+                                       :attempt-nanos now-nanos
+                                       :target-peer-id (peer-id-string target)}
+                              result (try
+                                       (let [^Status status (.transferLeadershipTo node target)]
+                                         (assoc attempt
+                                                :accepted? (.isOk status)
+                                                :status (status-data status)))
+                                       (catch Exception e
+                                         (assoc attempt :accepted? false
+                                                :error (ex-message e))))]
+                          (reset! leadership-transfer-state result)
+                          (when (:accepted? result)
+                            (log/info "Aligning HA control leadership with data leader"
+                                      {:group-id (:group-id authority)
+                                       :peer-id local-peer-id
+                                       :target-peer-id (:target-peer-id result)}))
+                          (dissoc result :attempt-nanos)))))))))
+          (catch Exception e
+            ;; Alignment must never turn successful maintenance into a failure.
+            (log/debug e "Could not align HA control leadership")))))))
+
 (defn authority-diagnostics
   "Best-effort runtime snapshot for HA control authorities."
   [authority]
@@ -1835,7 +1908,7 @@
                     rpc-timeout-ms election-timeout-ms
                     operation-timeout-ms clock-skew-budget-ms
                     fsm-state node-v
-                    running-v]} authority
+                    running-v leadership-transfer-state]} authority
             snapshot @fsm-state
             ^Node node @node-v
             leader-id (when node
@@ -1876,6 +1949,8 @@
                                    (safe-node-value
                                      #(.getLastAppliedLogIndex node)))
          :leader-peer-id leader-id
+         :leadership-transfer (some-> leadership-transfer-state deref
+                                      (dissoc :attempt-nanos))
          :node-peer-ids peer-ids
          :alive-peer-ids alive-peer-ids})
 
@@ -1973,7 +2048,8 @@
                                (volatile! nil)
                                (volatile! nil)
                                (volatile! nil)
-                               (volatile! false))))
+                               (volatile! false)
+                               (atom nil))))
 
 (defn new-authority
   "Create an authority adapter by backend keyword."

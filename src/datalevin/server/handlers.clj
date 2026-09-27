@@ -1511,11 +1511,11 @@
    (transact-blind-insert db txs tx-meta (db/prepare-blind-local-tx db txs true)))
   ([db _txs tx-meta prepared]
    (when (and prepared (db/blind-local-tx-valid? db prepared))
-    ;; The caller already holds the native writer. Probe before mutating the
-    ;; store: a late unique collision cannot be retried inside a shared group
-    ;; or an explicit transaction without rolling back preceding requests.
-    (when (db/blind-local-tx-unique-values-absent? db prepared)
-      (commit-stamped-report (db/stamp-blind-local-tx db prepared tx-meta) true)))))
+     ;; The caller already holds the native writer. Probe before mutating the
+     ;; store: a late unique collision cannot be retried inside a shared group
+     ;; or an explicit transaction without rolling back preceding requests.
+     (when (db/blind-local-tx-unique-values-absent? db prepared)
+       (commit-stamped-report (db/stamp-blind-local-tx db prepared tx-meta) true)))))
 
 (defn- ^:redef prepare-server-tx
   [db txs]
@@ -1549,69 +1549,69 @@
    (transact* deps db0 txs tx-meta s? server db-name writing?
               (when-not s? (prepare-server-tx db0 txs))))
   ([deps db0 txs tx-meta s? server db-name writing? prepared]
-  (try
-    ;; db0 is published to concurrent pull/query handlers. Give the writer
-    ;; private mutable overlays while retaining db0 as the report's before DB.
-    (let [transact (fn [db]
-                     (or (when-not s?
-                           (transact-prepared db prepared (or tx-meta {})))
-                         (db/transact-tx-data
-                           (db/->TxReport db (db/transfer db (:store db))
-                                          [] {} (or tx-meta {}))
-                           txs s?)))]
-      (cond
-        *datalog-write-group*
-        (group/submit!
-          *datalog-write-group*
-          (fn [execute]
-            (with-direct-db-transaction-slot
-              deps server db-name false
-              (fn []
-                (let [conn (atom (:dt-db (db-state deps server db-name)))
-                      outcome (d/with-transaction [tx conn]
-                                (if group/*batched?*
-                                  (db/execute-write-group tx execute)
-                                  (let [report (execute tx)]
-                                    {:result report
-                                     :changed? (boolean (seq (:tx-data report)))})))
-                      db-after @conn]
-                  ((:update-db deps) server db-name
-                   #(assoc % :dt-db db-after :store (:store db-after)))
-                  (when (:changed? outcome)
-                    (database-changed! deps server db-name false))
-                  (:result outcome)))))
-          (fn [conn]
-            (let [report (transact @conn)
-                  db-after (:db-after report)]
-              (reset! conn db-after)
-              ;; Keep each request's logical counters, matching its persisted
-              ;; replay response. Capture the timestamp before another request
-              ;; advances it. Response construction must not read this private
-              ;; writing Store after the group's native transaction closes.
-              (assoc report ::group-committed? true
-                            ::group-last-modified (i/last-modified (:store db-after))))))
+   (try
+     ;; db0 is published to concurrent pull/query handlers. Give the writer
+     ;; private mutable overlays while retaining db0 as the report's before DB.
+     (let [transact (fn [db]
+                      (or (when-not s?
+                            (transact-prepared db prepared (or tx-meta {})))
+                          (db/transact-tx-data
+                            (db/->TxReport db (db/transfer db (:store db))
+                                           [] {} (or tx-meta {}))
+                            txs s?)))]
+       (cond
+         *datalog-write-group*
+         (group/submit!
+           *datalog-write-group*
+           (fn [execute]
+             (with-direct-db-transaction-slot
+               deps server db-name false
+               (fn []
+                 (let [conn (atom (:dt-db (db-state deps server db-name)))
+                       outcome (d/with-transaction [tx conn]
+                                 (if group/*batched?*
+                                   (db/execute-write-group tx execute)
+                                   (let [report (execute tx)]
+                                     {:result report
+                                      :changed? (boolean (seq (:tx-data report)))})))
+                       db-after @conn]
+                   ((:update-db deps) server db-name
+                    #(assoc % :dt-db db-after :store (:store db-after)))
+                   (when (:changed? outcome)
+                     (database-changed! deps server db-name false))
+                   (:result outcome)))))
+           (fn [conn]
+             (let [report (transact @conn)
+                   db-after (:db-after report)]
+               (reset! conn db-after)
+               ;; Keep each request's logical counters, matching its persisted
+               ;; replay response. Capture the timestamp before another request
+               ;; advances it. Response construction must not read this private
+               ;; writing Store after the group's native transaction closes.
+               (assoc report ::group-committed? true
+                             ::group-last-modified (i/last-modified (:store db-after))))))
 
-        (or writing? s?)
-        (transact db0)
-        ;; Acquire the native writer before evaluating transaction functions.
-        ;; Publish the new Store/DB only after commit; exceptions also roll back
-        ;; schema changes and :db/ensure failures within this request.
-        :else
-        (let [conn   (atom db0)
-              report (d/with-transaction [tx conn]
-                       (let [report (transact @tx)]
-                         (reset! tx (:db-after report))
-                         report))]
-          (assoc report :db-before db0 :db-after @conn))))
-    (catch Exception e
-      (when (:resized (ex-data e))
-        (let [new-db (db/carry-runtime-opts
-                      (db/new-db ((:get-store deps) server db-name writing?))
-                      db0)]
-          ((:update-db deps) server db-name
-           (fn [m]
-             (assoc m (if writing? :wdt-db :dt-db) new-db)))))
-      (throw e)))))
+         (or writing? s?)
+         (transact db0)
+         ;; Acquire the native writer before evaluating transaction functions.
+         ;; Publish the new Store/DB only after commit; exceptions also roll back
+         ;; schema changes and :db/ensure failures within this request.
+         :else
+         (let [conn   (atom db0)
+               report (d/with-transaction [tx conn]
+                        (let [report (transact @tx)]
+                          (reset! tx (:db-after report))
+                          report))]
+           (assoc report :db-before db0 :db-after @conn))))
+     (catch Exception e
+       (when (:resized (ex-data e))
+         (let [new-db (db/carry-runtime-opts
+                       (db/new-db ((:get-store deps) server db-name writing?))
+                       db0)]
+           ((:update-db deps) server db-name
+            (fn [m]
+              (assoc m (if writing? :wdt-db :dt-db) new-db)))))
+       (throw e)))))
 
 (defn- build-tx-response
   [deps server skey db-name txs args writing? tx-meta response-kind prepared]
@@ -1674,18 +1674,18 @@
                           (prepare-server-tx
                             (get (db-state deps server db-name)
                                  (if writing? :wdt-db :dt-db)) txs))]
-                  (with-datalog-transaction-slot
-                    deps server skey db-name writing? (last args)
-                    (fn []
-                      (build-tx-response
-                        deps server skey db-name txs args writing?
-                        (when client-op
-                          (cop/tx-meta
-                            (:client-op-id client-op)
-                            (:request-type client-op)
-                            (:request-hash client-op)
-                            (:response-kind client-op)))
-                        response-kind prepared))))))]
+                    (with-datalog-transaction-slot
+                      deps server skey db-name writing? (last args)
+                      (fn []
+                        (build-tx-response
+                          deps server skey db-name txs args writing?
+                          (when client-op
+                            (cop/tx-meta
+                              (:client-op-id client-op)
+                              (:request-type client-op)
+                              (:request-hash client-op)
+                              (:response-kind client-op)))
+                          response-kind prepared))))))]
           (if (or replay? (= response-kind cop/tx-data-ack-response-kind))
             (write-result! deps skey response)
             (write-tx-response! deps skey response)))))))

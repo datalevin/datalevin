@@ -417,16 +417,20 @@
       (and (vector? v) (every? exact-cache-value? v))))
 
 (defn- pattern-cache-dependencies
-  [e a v]
-  (cond
-    (unresolved-pattern? e v) [::all]
-    (some? e) [[::entity e]]
-    (and (some? a) (exact-cache-value? v)) [[::attribute-value a v]]
-    (some? a) [[::attribute a]]
-    :else [::all]))
+  ([e a v] (pattern-cache-dependencies e a v true))
+  ([e a v exact?]
+   (cond
+     (unresolved-pattern? e v) [::all]
+     (some? e) [[::entity e]]
+     (and exact? (some? a) (exact-cache-value? v))
+     [[::attribute-value a v]]
+     (some? a) [[::attribute a]]
+     :else [::all])))
 
 (defn- cache-key-dependencies
-  "Coarse candidate buckets, computed once when a key enters the LRU. Exact
+  "Candidate buckets, computed once when a key enters the LRU. Exact immutable
+  patterns bucket by attribute and value; ranges, unresolved patterns and
+  mutable values stay on their coarser attribute/entity/all bucket. Exact
   invalidation still checks the key. Fixed-entity native ranges use the entity
   index locally; remote range invalidation and broader ranges stay conservative."
   [k]
@@ -435,10 +439,18 @@
       (:search :search-tuples :first :count)
       (let [[_ e a v] k] (pattern-cache-dependencies e a v))
 
-      (:populated? :datoms :seek :rseek)
+      (:populated? :datoms)
       (let [[_ index c1 c2 c3] k]
         (if-some [[e a v] (index-components->pattern index c1 c2 c3)]
           (pattern-cache-dependencies e a v)
+          [::all]))
+
+      ;; Seek ranges start at the given components; any later value for the
+      ;; attribute can enter the window, so they stay attribute-wide.
+      (:seek :rseek)
+      (let [[_ index c1 c2 c3] k]
+        (if-some [[e a v] (index-components->pattern index c1 c2 c3)]
+          (pattern-cache-dependencies e a v false)
           [::all]))
 
       :e-datoms
@@ -2231,7 +2243,7 @@
 
 (defn- scalar-update-entity-id
   "Resolve an existing entity id for a scalar update, or nil to fall back.
-  Uses the in-memory max entity id so the fast path does not read store state."
+  Numeric ids use the in-memory maximum; lookup references and idents read db."
   ^Long [^DB db e]
   (let [eid (cond
               (integer? e)
@@ -2265,52 +2277,52 @@
         store-opts   (opts store)
         tuple-source-attrs (:db/attrTuples (rschema store))]
     (when-not (:auto-entity-time? store-opts)
-    (loop [es      (seq initial-es)
-           seen    (java.util.HashSet.)
-           entries (transient [])]
-      (if es
-        (let [entity (first es)]
-          (if (and (sequential? entity)
-                   (= 4 (count entity))
-                   (identical? :db/add (nth entity 0)))
-            (let [[_ e attr value] entity
-                  props            (store-schema attr)
-                  vt               (:db/valueType props)]
-              (when (and (keyword? attr)
-                         props
-                         (not= "db" (namespace attr))
-                         (some? (:db/aid props))
-                         (not (identical? (:db/cardinality props)
-                                          :db.cardinality/many))
-                         (nil? (:db/unique props))
-                         (nil? (:db/tupleAttrs props))
-                         (nil? (:db/tupleType props))
-                         (nil? (:db/tupleTypes props))
-                         (not (contains? tuple-source-attrs attr))
-                         (nil? (:db.attr/preds props))
-                         (or (nil? vt) (contains? scalar-update-value-types vt))
-                         (some? value))
-                (let [eid (if (and defer-entity-resolution?
-                                   (or (keyword? e)
-                                       (and (sequential? e) (= 2 (count e)))))
-                            e
-                            (scalar-update-entity-id db e))]
-                  (when (and eid (.add seen [eid attr]))
-                    (vld/validate-attr attr entity)
-                    (vld/validate-val value entity)
-                    (let [v (prepare/correct-value-with-props
-                              store-opts props attr value)]
-                      (recur (next es) seen (conj! entries [eid attr v])))))))
-            nil))
-        (when (pos? (count entries))
-          (let [entries (persistent! entries)
-                deferred? (and defer-entity-resolution?
-                               (some #(not (integer? (first %))) entries))]
-            (cond-> (->PreparedScalarUpdate
-                      store-schema store-opts entries
-                      (when-not deferred?
-                        (scalar-update-entity-reads store-schema entries)))
-              deferred? (assoc :deferred-entity-resolution? true)))))))))
+      (loop [es      (seq initial-es)
+             seen    (java.util.HashSet.)
+             entries (transient [])]
+        (if es
+          (let [entity (first es)]
+            (if (and (sequential? entity)
+                     (= 4 (count entity))
+                     (identical? :db/add (nth entity 0)))
+              (let [[_ e attr value] entity
+                    props            (store-schema attr)
+                    vt               (:db/valueType props)]
+                (when (and (keyword? attr)
+                           props
+                           (not= "db" (namespace attr))
+                           (some? (:db/aid props))
+                           (not (identical? (:db/cardinality props)
+                                            :db.cardinality/many))
+                           (nil? (:db/unique props))
+                           (nil? (:db/tupleAttrs props))
+                           (nil? (:db/tupleType props))
+                           (nil? (:db/tupleTypes props))
+                           (not (contains? tuple-source-attrs attr))
+                           (nil? (:db.attr/preds props))
+                           (or (nil? vt) (contains? scalar-update-value-types vt))
+                           (some? value))
+                  (let [eid (if (and defer-entity-resolution?
+                                     (or (keyword? e)
+                                         (and (sequential? e) (= 2 (count e)))))
+                              e
+                              (scalar-update-entity-id db e))]
+                    (when (and eid (.add seen [eid attr]))
+                      (vld/validate-attr attr entity)
+                      (vld/validate-val value entity)
+                      (let [v (prepare/correct-value-with-props
+                                store-opts props attr value)]
+                        (recur (next es) seen (conj! entries [eid attr v])))))))
+              nil))
+          (when (pos? (count entries))
+            (let [entries (persistent! entries)
+                  deferred? (and defer-entity-resolution?
+                                 (some #(not (integer? (first %))) entries))]
+              (cond-> (->PreparedScalarUpdate
+                        store-schema store-opts entries
+                        (when-not deferred?
+                          (scalar-update-entity-reads store-schema entries)))
+                deferred? (assoc :deferred-entity-resolution? true)))))))))
 
 (defn ^:no-doc prepare-scalar-update-tx
   "Recognize a transaction made only of ordinary scalar [:db/add eid attr value]
@@ -2354,8 +2366,8 @@
 
 (defn ^:no-doc stamp-scalar-update-tx
   "Stamp a prepared scalar-update batch against the current store snapshot.
-  Returns a TxReport without mutable index overlays, or nil when its immutable
-  schema/options epochs are stale."
+  Returns a TxReport without mutable index overlays, or nil when schema/options
+  epochs are stale or entity references require general transaction resolution."
   [^DB db ^PreparedScalarUpdate prepared tx-meta]
   (when-let [prepared (when (scalar-update-tx-valid? db prepared)
                         (resolve-scalar-update-entities db prepared))]

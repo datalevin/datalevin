@@ -110,3 +110,36 @@
         (is (some #(and (= (fields 3) (:a %)) (= "intervening" (:v %))
                         (not (datom/datom-added %)))
                   (:tx-data report)))))))
+
+(deftest deferred-scalar-preparation-resolves-identities-only-when-stamping
+  (with-conn [conn true]
+    (d/transact! conn [(initial-entity "first") (initial-entity "second")])
+    (let [first-eid (d/entid @conn [:item/key "first"])
+          second-eid (d/entid @conn [:item/key "second"])
+          store (:store @conn)
+          schema-only (reify i/IStore
+                        (schema [_] (i/schema store))
+                        (opts [_] (i/opts store))
+                        (rschema [_] (i/rschema store))
+                        (av-first-e [_ _ _] (throw (ex-info "early identity read" {}))))
+          txs (mapv #(vector :db/add [:item/key "first"] % "updated")
+                    [(fields 0) (fields 2) (fields 3) (fields 4)])
+          prepared (db/prepare-scalar-update-tx (assoc @conn :store schema-only)
+                                                txs {:defer-entity-resolution? true})]
+      (is (:deferred-entity-resolution? prepared))
+      (d/transact! conn [[:db/retract first-eid :item/key "first"]])
+      (d/transact! conn [[:db/add second-eid :item/key "first"]])
+      (let [report (db/stamp-scalar-update-tx @conn prepared nil)]
+        (is (some? report))
+        (is (= #{second-eid} (set (map :e (:tx-data report)))))))))
+
+(deftest deferred-scalar-aliases-retain-general-update-ordering
+  (with-conn [conn true]
+    (d/transact! conn [(initial-entity "one")])
+    (let [eid (d/entid @conn [:item/key "one"])
+          prepared (db/prepare-scalar-update-tx
+                     @conn [[:db/add eid (fields 0) "first"]
+                            [:db/add [:item/key "one"] (fields 0) "last"]]
+                     {:defer-entity-resolution? true})]
+      (is (some? prepared))
+      (is (nil? (db/stamp-scalar-update-tx @conn prepared nil))))))
