@@ -19,7 +19,7 @@
    [datalevin.util :as u :refer [raise]]
    [datalevin.interface :as i]
    [datalevin.kv :as kv]
-   [datalevin.tx-group :as group]
+   [datalevin.tx-group.compat :as group]
    [datalevin.validate :as vld])
   (:import
    [datalevin.db DB TxReport]
@@ -739,7 +739,10 @@
           (when (db/blind-local-tx-unique-values-absent? db1 prepared)
             (commit-writing-report! db (db/stamp-blind-local-tx db1 prepared tx-meta)
                                    true :blind-insert))))
-      (db/transact-tx-data (db/->TxReport db db1 [] {} tx-meta) tx-data false))))
+      (let [report (db/transact-tx-data (db/->TxReport db db1 [] {} tx-meta)
+                                        tx-data false)]
+        (observe-local-wal-tx-path! :general)
+        report))))
 
 (defn- -transact! [conn tx-data tx-meta]
   (if (local-direct-transact-eligible? conn)
@@ -826,10 +829,10 @@
   [store]
   ;; Recheck under the native writer: indexing options can change after queue
   ;; admission. Retry individual requests before any secondary side effects.
-  (when (and (> (long group/*request-count*) 1)
+  (when (and (> (group/request-count) 1)
              (s/synchronous-secondary-indexing? store))
     (throw (ex-info "Secondary indexing requires individual commits"
-                    {::group/body-failure true}))))
+                    {:datalevin.tx-group/body-failure true}))))
 
 (deftype ^:no-doc GroupedTx [tx-data tx-meta])
 
@@ -856,16 +859,21 @@
         (group/submit!
          g
          (fn [execute]
-           (if-not group/*batched?*
+           (if-not (group/batched?)
              (execute [conn false])
              (locking conn
                (let [before @conn
                      ^objects reports
-                     (or (when (:wal? opts)
-                           (try-commit-prepared-group! conn execute profile))
-                         (with-transaction [tx conn]
-                           (ensure-group-secondary-safe! (.-store ^DB @tx))
-                           (:result (db/execute-write-group tx #(execute [% true])))))
+                     (locking (l/write-txn lmdb)
+                       (or (when (:wal? opts)
+                             (try-commit-prepared-group! conn execute profile))
+                           (with-transaction [tx conn]
+                             (group/collect! execute)
+                             (when (s/synchronous-secondary-indexing? (.-store ^DB @tx))
+                               (group/collect! execute true))
+                             (ensure-group-secondary-safe! (.-store ^DB @tx))
+                             (:result (db/execute-write-group
+                                       tx #(execute [% (> (group/request-count) 1)]))))))
                      after @conn
                      store (.-store ^DB after)]
                  ;; The native writer is closed. Return readable Store views,
@@ -1479,7 +1487,7 @@
                       conn requests patches reports))
                 (when-let [prepared (prepare-grouped-blind-batch conn requests)]
                   (try-commit-grouped-blind-batch! conn requests prepared reports)))
-        (dotimes [_ n] (observe-embedded-path! profile true))
+        (dotimes [_ n] (observe-embedded-path! profile (> n 1)))
         reports))))
 
 (defn transact-async

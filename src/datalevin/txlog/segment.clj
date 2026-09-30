@@ -54,6 +54,12 @@
 
 (def ^:private sync-mode-values #{:fsync :fdatasync :extra :none})
 
+(defn ^:redef phase!
+  "Fault seam for record I/O. Existing buffers/channels are passed through so
+  the disabled observer creates no per-write event payload."
+  [_event _context]
+  nil)
+
 (def ^:private ^ThreadLocal tl-record-header-buffer
   (ThreadLocal/withInitial
    (reify java.util.function.Supplier
@@ -185,7 +191,9 @@
     (let [n (.write ch bf)]
       (when-not (pos? n)
         (raise "Unable to progress while writing txn-log data"
-               {:remaining (.remaining bf)})))))
+               {:remaining (.remaining bf)}))
+      (when (.hasRemaining bf)
+        (phase! :record-bytes-partly-written bf)))))
 
 (defn- buffers-remaining?
   [^"[Ljava.nio.ByteBuffer;" bufs]
@@ -209,7 +217,9 @@
     (let [n (.write ch bufs)]
       (when-not (pos? n)
         (raise "Unable to progress while writing txn-log data"
-               {:remaining (total-buffers-remaining bufs)})))))
+               {:remaining (total-buffers-remaining bufs)}))
+      (when (buffers-remaining? bufs)
+        (phase! :record-bytes-partly-written bufs)))))
 
 (defn- write-fully-record!
   [^FileChannel ch ^ByteBuffer header-bf body]
@@ -558,6 +568,7 @@
      (if (pos? (long body-len))
        (write-fully-record! ch hdr body)
        (write-fully! ch hdr))
+     (phase! :record-bytes-completely-written ch)
      {:offset offset :size total-size :checksum checksum})))
 
 (defn append-record!
@@ -566,6 +577,19 @@
   ([^FileChannel ch body opts]
    (let [offset (.size ch)]
      (append-record-at! ch offset body opts))))
+
+(defn- write-buffer-at!
+  [^FileChannel ch ^long offset ^ByteBuffer buffer]
+  (loop [position offset]
+    (when (.hasRemaining buffer)
+      (let [n (.write ch buffer position)]
+        (when-not (pos? n)
+          (raise "Unable to progress while writing txn-log data"
+                 {:offset position :remaining (.remaining buffer)}))
+        (when (.hasRemaining buffer)
+          (phase! :record-bytes-partly-written buffer))
+        (recur (+ position n)))))
+  (phase! :record-bytes-completely-written ch))
 
 (defn write-record-at!
   "Write a record using the WAL's tracked offset. The caller serializes appends
@@ -591,21 +615,55 @@
            (.put buffer ^ByteBuffer body)
            (.put buffer ^bytes body))
          (.flip buffer)
-         (loop [position offset]
-           (when (.hasRemaining buffer)
-             (let [n (.write ch buffer position)]
-               (when-not (pos? n)
-                 (raise "Unable to progress while writing txn-log data"
-                        {:offset position :remaining (.remaining buffer)}))
-               (recur (+ position n)))))
+         (write-buffer-at! ch offset buffer)
          {:offset offset :size total-size :checksum checksum})
        (append-record-at! ch offset body opts)))))
 
-(defn write-records-at!
-  "Write independently framed records with gathering I/O at the tracked offset.
-  The caller serializes appends. Bodies must be independently owned buffers or
-  byte arrays; buffers are consumed. Partial writes are retried, including when
-  the OS limits the number of gathered buffers per write."
+(defn write-prepared-record-at!
+  "Frame a validated commit-row group directly from its owned row regions.
+  Small records assemble once in the bounded direct buffer. Large records
+  gather a stamped header and slices of the original payloads without joining
+  them. The caller serializes append ownership; inputs remain unchanged."
+  [^FileChannel ch offset group lsn tx-time]
+  (let [offset (long offset)
+        body-size (long (:body-size group))
+        total-size (+ codec/record-header-size body-size)]
+    (if (<= total-size record-buffer-max-cap)
+      (let [^ByteBuffer buffer (record-buffer total-size)]
+        (.clear buffer)
+        (.position buffer codec/record-header-size)
+        (codec/write-commit-row-group! buffer group)
+        (.limit buffer (int total-size))
+        (.position buffer codec/record-header-size)
+        (codec/patch-commit-row-payload-buffer-header! buffer lsn tx-time)
+        (let [checksum (codec/current-record-checksum body-size false buffer)]
+          ;; Header writing resets the limit; the already assembled body stays
+          ;; in place and becomes visible again when the record limit is set.
+          (codec/write-record-header! buffer body-size false checksum)
+          (.limit buffer (int total-size))
+          (write-buffer-at! ch offset buffer)
+          {:offset offset :size total-size :checksum checksum}))
+      (let [bodies (:bodies group)
+            header-size (int (:header-size group))
+            ^ByteBuffer payload-header (ByteBuffer/allocate header-size)
+            ^"[Ljava.nio.ByteBuffer;" buffers (make-array ByteBuffer (+ 2 (count bodies)))]
+        (codec/write-commit-row-group-header! payload-header group)
+        (.flip payload-header)
+        (codec/patch-commit-row-payload-buffer-header! payload-header lsn tx-time)
+        (aset buffers 1 payload-header)
+        (dotimes [idx (count bodies)]
+          (let [^bytes body (nth bodies idx)]
+            (aset buffers (+ idx 2)
+                  (ByteBuffer/wrap body header-size (- (alength body) header-size)))))
+        (let [checksum (codec/current-record-parts-checksum body-size (next (seq buffers)))]
+          (aset buffers 0 (codec/write-record-header!
+                           (.get tl-record-header-buffer) body-size false checksum))
+          (.position ch offset)
+          (write-fully-buffers! ch buffers)
+          (phase! :record-bytes-completely-written ch)
+          {:offset offset :size total-size :checksum checksum})))))
+
+(defn- write-records-gathered-at!
   [^FileChannel ch ^long offset bodies]
   (let [^"[Ljava.nio.ByteBuffer;" buffers (make-array ByteBuffer (* 2 (count bodies)))
         results
@@ -627,12 +685,56 @@
             out))]
     (when (seq results)
       (.position ch offset)
-      (write-fully-buffers! ch buffers))
+      (write-fully-buffers! ch buffers)
+      (phase! :record-bytes-completely-written ch))
     results))
+
+(defn write-records-at!
+  "Write independently framed records at the tracked offset. Batches up to
+  64 KiB share the single-record path's reusable direct buffer and positioned
+  write; larger batches use gathering I/O without growing retained buffers.
+  The caller serializes appends. ByteBuffer bodies are consumed; short writes
+  are retried in both paths. Each record retains its own checksum and offset."
+  [^FileChannel ch ^long offset bodies]
+  (let [size (reduce (fn [^long n body]
+                       (+ n codec/record-header-size (long (codec/checked-record-body-len body))))
+                     0 bodies)]
+    (if (> (long size) record-buffer-max-cap)
+      (write-records-gathered-at! ch offset bodies)
+      (let [^ByteBuffer buffer (record-buffer size)
+            _ (.clear buffer)
+            results
+            (mapv (fn [body]
+                    (let [body-len (codec/checked-record-body-len body)
+                          checksum (codec/current-record-checksum body-len false body)
+                          position (+ offset (.position buffer))
+                          ^ByteBuffer header (codec/write-record-header!
+                                              (.get tl-record-header-buffer)
+                                              body-len false checksum)]
+                      (.put buffer header)
+                      (if (instance? ByteBuffer body)
+                        (.put buffer ^ByteBuffer body)
+                        (.put buffer ^bytes body))
+                      {:offset position :size (+ codec/record-header-size (long body-len))
+                       :checksum checksum})) bodies)]
+        (.flip buffer)
+        (loop [position offset]
+          (when (.hasRemaining buffer)
+            (let [n (.write ch buffer position)]
+              (when-not (pos? n)
+                (raise "Unable to progress while writing txn-log data"
+                       {:offset position :remaining (.remaining buffer)}))
+              (when (.hasRemaining buffer)
+                (phase! :record-bytes-partly-written buffer))
+              (recur (+ position n)))))
+        (phase! :record-bytes-completely-written ch)
+        results))))
 
 (defn force-segment!
   [_state ^FileChannel ch sync-mode]
-  (force-channel! ch sync-mode))
+  (phase! :force-started ch)
+  (force-channel! ch sync-mode)
+  (phase! :force-completed ch))
 
 (defn prepare-segment!
   "Create and preallocate a segment at `tmp-path`."

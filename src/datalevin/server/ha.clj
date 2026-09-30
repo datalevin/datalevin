@@ -21,7 +21,7 @@
    [datalevin.ha.replication :as drep]
    [datalevin.ha.util :as hu]
    [datalevin.server.deps :as sdeps]
-   [datalevin.tx-group :as group]
+   [datalevin.tx-group.compat :as group]
    [datalevin.util :as u :refer [raise]]
    [taoensso.timbre :as log])
   (:import

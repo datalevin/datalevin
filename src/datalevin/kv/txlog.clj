@@ -1,6 +1,7 @@
 (ns ^:no-doc datalevin.kv.txlog
   "Txn-log record reading, caching, recovery, append, and retention support."
   (:require
+   [datalevin.tx-group.compat :as group]
    [clojure.java.io :as io]
    [clojure.string :as str]
    [datalevin.binding.cpp :as cpp]
@@ -16,7 +17,9 @@
                                   snapshot-slot-path update-snapshot-slot-meta!
                                   write-snapshot-meta!]]
    [datalevin.lmdb :as l]
+   [datalevin.tx-state :as tx-state]
    [datalevin.txlog :as txlog]
+   [datalevin.txlog.append :as append]
    [datalevin.txlog.codec :as tcodec]
    [datalevin.txlog.transfer :as transfer]
    [datalevin.util :as u :refer [raise]])
@@ -677,6 +680,10 @@
         (if (txlog-config-enabled? db)
           (txlog-rollout-watermarks db (txlog-rollout-mode db))
           {:wal? false})))))
+
+(def ^:dynamic *commit-payload-ha-term*
+  "Compatibility API context. The low-level WAL receives :ha-term explicitly."
+  nil)
 
 (def ^:dynamic *after-txlog-append-fn*
   nil)
@@ -1839,11 +1846,13 @@
                         :row-types (mapv class rows)
                         :rows rows})))
               (i/transact-kv
-                lmdb (append-monotonic-payload-lsn-row lmdb rows (long lsn))))))]
+                lmdb (encoding/storage-rows
+                      (append-monotonic-payload-lsn-row lmdb rows (long lsn)))))))]
     (custom-kv/initialize! lmdb lmdb)
     result))
 
 (defn txlog-replay-record!
+  "Materialize an existing WAL record without entering the local append path."
   [lmdb state record]
   (let [append-res {:lsn (:lsn record)
                     :segment-id (:segment-id record)
@@ -1863,7 +1872,12 @@
                                    :txlog-replay
                                    {:lsn (:lsn record)
                                     :segment-id (:segment-id record)})
-    (i/transact-kv lmdb rows)
+    ;; A KV wrapper must apply these physical rows directly, preserving their
+    ;; storage validation marker instead of encoding and appending them again.
+    (binding [l/*raw-kv?* true]
+      (with-runtime-txlog-rollback
+        lmdb
+        #(i/transact-kv lmdb (encoding/storage-rows rows))))
     (txlog/commit-finished! state marker-entry)
     record))
 
@@ -2198,6 +2212,73 @@
       (aset-long cache 0 (long txn-id))
       (aset-long cache 1 (max (aget cache 1) (long payload-lsn))))))
 
+(defn apply-appended-range!
+  "Apply one sealed WAL prefix directly in one native transaction. All records
+  already own LSNs; resize retries repeat only these immutable rows. This seam
+  does not enter a collector, append WAL, or wait for WAL durability."
+  [lmdb runtime entries token]
+  (let [state (:wal runtime)
+        first-lsn (long @(:lsn (first entries)))
+        last-entry (peek entries)
+        last-lsn (long @(:lsn last-entry))
+        range-rows (let [rows (FastList.)]
+                     (doseq [entry entries row @(:rows entry)] (.add rows row))
+                     rows)
+        append-res (append/commit-info @(:append-batch last-entry) last-lsn)
+        committed? (volatile! false)
+        commit-attempted? (volatile! false)]
+    (when (or (Thread/holdsLock (:append-lock state))
+              (not (instance? datalevin.binding.cpp.CppLMDB lmdb)))
+      (throw (ex-info "WAL application requires the raw native adapter outside insertion"
+                      {:error :txlog/invalid-application-context :applied? false})))
+    (try
+      (locking (l/write-txn lmdb)
+        (let [metadata
+              (cpp/apply-native-range!
+               lmdb
+               (fn [wdb]
+                 (vreset! commit-attempted? false)
+                 (tx-state/phase! :native-writer-acquired token)
+                 (let [^Txn txn (.-txn ^Rtx @(l/write-txn lmdb))
+                       txn-id (.id txn)
+                       before (long (refresh-commit-metadata! wdb state txn txn-id))]
+                   (when-not (= before (dec first-lsn))
+                     (throw (ex-info "Native application prefix does not match the WAL range"
+                                     {:error :txlog/application-prefix-mismatch
+                                      :expected (dec first-lsn) :applied-lsn before
+                                      :applied? false})))
+                   (i/transact-kv wdb (encoding/storage-rows range-rows))
+                   (let [metadata-changed? (.hasKvInfoChanges txn)
+                         payload-lsn last-lsn
+                         commit-metadata
+                         (tcodec/prepare-commit-metadata!
+                          (:commit-metadata-write state) payload-lsn
+                          (when (:commit-marker? state)
+                            (inc (long @(:marker-revision state)))) append-res)
+                         marker-entry (when (:commit-marker? state) commit-metadata)]
+                     (i/transact-kv wdb commit-metadata)
+                     (tx-state/phase! :before-native-commit token)
+                     {:txn-id txn-id :marker-entry marker-entry
+                      :payload-lsn payload-lsn :metadata-changed? metadata-changed?})))
+               (fn [_] (vreset! commit-attempted? true)))]
+            ;; The native commit contains both data and the applied marker.
+            ;; Metadata/cache publication can fail without undoing that commit.
+          (vreset! committed? true)
+          (txlog/commit-finished! state (:marker-entry metadata))
+          (cache-commit-metadata! state (:txn-id metadata) (:marker-entry metadata)
+                                  (:payload-lsn metadata) (:metadata-changed? metadata))))
+        ;; The external hint may flush a metadata file. Native ownership has
+        ;; ended; only the application turn remains reserved for this prefix.
+      (txlog/note-commit-applied! state append-res)
+      :applied
+      (catch Throwable e
+        (throw (ex-info "Failed to apply an already appended WAL range"
+                        (assoc (ex-data e) :applied?
+                               (cond @committed? true
+                                     (l/resized? e) false
+                                     @commit-attempted? :unknown
+                                     :else false)) e))))))
+
 (defn- persisted-runtime-floor-lsn
   [lmdb]
   (long
@@ -2438,12 +2519,10 @@
                        (if (seq preapply-rows)
                          (rows-vector materialize-rows)
                          record-rows)
-                       append-res (binding [txlog/*commit-payload-ha-term*
-                                            (some-> (:ha-term record) long)]
-                                    (txlog/append-durable! state
-                                                           (tcodec/compact-replay-rows
-                                                            record-rows)
-                                                           txlog-append-hooks))]
+                       append-res (txlog/append-durable!
+                                   state (tcodec/compact-replay-rows record-rows)
+                                   (assoc txlog-append-hooks
+                                          :ha-term (some-> (:ha-term record) long)))]
                    (when-not (= record-lsn (long (:lsn append-res)))
                      (raise "Follower replay appended unexpected txn-log LSN"
                             {:type :txlog/ha-replay-lsn-mismatch
@@ -2600,7 +2679,10 @@
             (let [_ (when-let [f cpp/*before-write-commit-fn*]
                       (f {:operation :close-transact-kv}))
                   append-res (txlog/append-durable!
-                              state pending txlog-append-hooks)
+                              state pending
+                              (assoc txlog-append-hooks
+                                     :ha-term *commit-payload-ha-term*
+                                     :request-count (group/request-count)))
                   ^Txn txn (.-txn ^Rtx @(l/write-txn lmdb))
                   txn-id (.id txn)
                   metadata-changed? (.hasKvInfoChanges txn)

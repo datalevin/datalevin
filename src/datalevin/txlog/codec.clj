@@ -158,17 +158,19 @@
     (crc-update-byte! crc (unsigned-bit-shift-right x 8))
     (crc-update-byte! crc x)))
 
-(defn record-checksum
-  "Checksum a v2 record over header fields that are not the checksum slot plus
-  the record body. ByteBuffer input starts at its position, which is preserved."
-  [major flags body-len body]
-  (let [^CRC32C crc (.get tl-crc32c)
-        body-len (long body-len)]
+(defn- begin-record-checksum
+  ^CRC32C [major flags body-len]
+  (let [^CRC32C crc (.get tl-crc32c)]
     (.reset crc)
     (.update crc ^bytes magic-bytes 0 (alength ^bytes magic-bytes))
     (crc-update-byte! crc major)
     (crc-update-byte! crc flags)
     (crc-update-u32! crc body-len)
+    crc))
+
+(defn- update-record-checksum!
+  [^CRC32C crc body body-len]
+  (let [body-len (long body-len)]
     (when (pos? body-len)
       (if (instance? ByteBuffer body)
         (let [^ByteBuffer body body]
@@ -178,7 +180,14 @@
             (let [view (.duplicate body)]
               (.limit view (+ (.position view) (int body-len)))
               (.update crc view))))
-        (.update crc ^bytes body 0 (int body-len))))
+        (.update crc ^bytes body 0 (int body-len))))))
+
+(defn record-checksum
+  "Checksum a v2 record over header fields that are not the checksum slot plus
+  the record body. ByteBuffer input starts at its position, which is preserved."
+  [major flags body-len body]
+  (let [crc (begin-record-checksum major flags body-len)]
+    (update-record-checksum! crc body body-len)
     (bit-and 0xffffffff (long (.getValue crc)))))
 
 (defn current-record-checksum
@@ -187,6 +196,15 @@
                    (if compressed? compressed-flag 0x00)
                    body-len
                    body))
+
+(defn current-record-parts-checksum
+  "Checksum one uncompressed record across prepared body regions without
+  joining them. Buffer positions/limits are preserved for the subsequent I/O."
+  [body-len parts]
+  (let [crc (begin-record-checksum format-major 0 body-len)]
+    (doseq [^ByteBuffer part parts]
+      (update-record-checksum! crc part (.remaining part)))
+    (bit-and 0xffffffff (long (.getValue crc)))))
 
 (defn record-checksum-for-major
   [major flags body-len ^bytes body]
@@ -1248,6 +1266,69 @@
              :op-count op-count}
       (some? ha-term)
       (assoc :ha-term ha-term))))
+
+(defrecord CommitRowGroup [bodies header-size body-size row-count major])
+
+(defn prepare-commit-row-group
+  "Validate prepared payload headers and describe their ordered row regions.
+  Retain owned inputs without allocating or copying a combined payload. Equal
+  HA terms imply equal header sizes, including for mixed format-1/format-2 rows."
+  [bodies]
+  (when (empty? bodies)
+    (throw (IllegalArgumentException. "A WAL group cannot be empty")))
+  (let [bodies (vec bodies)
+        ^bytes first-body (first bodies)
+        bf (ByteBuffer/wrap first-body)
+        first-header (decode-commit-row-payload-prefix bf)
+        header-size (.position bf)]
+    (loop [index 1 size (long (alength first-body))
+           row-count (long (:op-count first-header)) major (long (:major first-header))]
+      (when (or (> size Integer/MAX_VALUE) (> row-count Integer/MAX_VALUE))
+        (raise "Prepared WAL group exceeds the record size limit"
+               {:type :txlog/payload-overflow :outcome :not-committed}))
+      (if (< index (count bodies))
+        (let [^bytes body (nth bodies index)
+              bf (ByteBuffer/wrap body)
+              header (decode-commit-row-payload-prefix bf)]
+          (when-not (= (:ha-term first-header) (:ha-term header))
+            (raise "Prepared WAL group contains different HA terms"
+                   {:type :txlog/mixed-terms :outcome :not-committed}))
+          (recur (inc index) (+ size (- (alength body) header-size))
+                 (+ row-count (long (:op-count header)))
+                 (max major (long (:major header)))))
+        (->CommitRowGroup bodies header-size size row-count major)))))
+
+(defn write-commit-row-group-header!
+  "Write a combined payload header at the current position, advancing it.
+  Input payloads stay unchanged; the insertion owner stamps this output only."
+  [^ByteBuffer out group]
+  (let [start (.position out) size (int (:header-size group))]
+    (.put out ^bytes (first (:bodies group)) 0 size)
+    ;; Format 2 also accepts all ordinary format-1 KV opcodes.
+    (.put out (+ start 4) (byte (:major group)))
+    (.putInt out (+ start (- size 4)) (int (:row-count group))))
+  out)
+
+(defn write-commit-row-group!
+  "Assemble a prepared group directly into its final write buffer. Advance the
+  output position without joining or copying input rows into an intermediate."
+  [^ByteBuffer out group]
+  (write-commit-row-group-header! out group)
+  (let [start (int (:header-size group))]
+    (doseq [^bytes body (:bodies group)]
+      (.put out body start (- (alength body) start))))
+  out)
+
+(defn combine-commit-row-payloads
+  "Materialize prepared payloads as ordinary owned bytes for callers that need
+  them. Insertion uses the group regions directly; a single input is reused."
+  ^bytes [bodies]
+  (if (= 1 (count bodies))
+    (first bodies)
+    (let [group (prepare-commit-row-group bodies)
+          out (byte-array (int (:body-size group)))]
+      (write-commit-row-group! (ByteBuffer/wrap out) group)
+      out)))
 
 (defn decode-commit-row-payload
   "Decode raw binary txn-log payload bytes."

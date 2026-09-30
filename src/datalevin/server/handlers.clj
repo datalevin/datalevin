@@ -35,7 +35,7 @@
             role-obj server-obj privileged-server-option-keys]]
    [datalevin.server.notifications :as notifications]
    [datalevin.storage :as st]
-   [datalevin.tx-group :as group]
+   [datalevin.tx-group.compat :as group]
    [datalevin.util :as u :refer [raise]]
    [datalevin.validate :as vld]
    [taoensso.timbre :as log])
@@ -1569,7 +1569,7 @@
                (fn []
                  (let [conn (atom (:dt-db (db-state deps server db-name)))
                        outcome (d/with-transaction [tx conn]
-                                 (if group/*batched?*
+                                 (if (group/batched?)
                                    (db/execute-write-group tx execute)
                                    (let [report (execute tx)]
                                      {:result report

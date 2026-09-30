@@ -22,7 +22,7 @@
    [datalevin.dtlvnative DTLV]
    [datalevin.cpp BufVal Cursor]
    [datalevin.binding.cpp.buffer DBI IEncodedInput IMultipleBuffer IWriteCursor]
-   [datalevin.kv.encoding CommitMetadata WriteBatch]
+   [datalevin.kv.encoding CommitMetadata WriteBatch StorageRows]
    [datalevin.lmdb DatomKVTxData KVTxData]
    [datalevin.utl BitOps]
    [java.nio ByteBuffer]
@@ -510,7 +510,9 @@
 
 (defn transact*
   [txs ^HashMap dbis txn]
-  (cond
+  (let [storage? (instance? StorageRows txs)
+        txs (if storage? (.-rows ^StorageRows txs) txs)]
+   (cond
     (instance? CommitMetadata txs)
     (transact-commit-metadata* txs dbis txn)
 
@@ -528,7 +530,9 @@
                 ^DBI dbi (or (.get dbis dbi-name)
                              (raise dbi-name " is not open" {}))
                 validate? (.-validate-data? dbi)]
-            (vld/validate-kv-tx-data tx validate?)
+            (if storage?
+              (vld/validate-storage-tx-data tx validate?)
+              (vld/validate-kv-tx-data tx validate?))
             (put-tx dbi txn tx)))))
     :else
     (let [xs (seq txs)]
@@ -540,8 +544,10 @@
                 ^DBI dbi (or (.get dbis dbi-name)
                              (raise dbi-name " is not open" {}))
                 validate? (.-validate-data? dbi)]
-            (vld/validate-kv-tx-data tx validate?)
-            (put-tx dbi txn tx)))))))
+            (if storage?
+              (vld/validate-storage-tx-data tx validate?)
+              (vld/validate-kv-tx-data tx validate?))
+            (put-tx dbi txn tx))))))))
 
 (defn- prepared-add-only-datoms?
   [^objects ops]

@@ -909,6 +909,38 @@
                                    {:input vi})))))
       :del      nil)))
 
+(defn validate-encoded-key
+  "LMDB keys and duplicate values contain between 1 and 511 encoded bytes."
+  [value]
+  (when-not (and (bytes? value) (<= 1 (alength ^bytes value) c/+max-key-size+))
+    (raise "Encoded key or duplicate value must contain 1 to 511 bytes"
+           {:error :kv/invalid-encoded-size})))
+
+(defn validate-storage-tx-data
+  "Validate physical WAL rows without interpreting their :raw bytes as user
+  data types. Typed metadata retains its ordinary validation."
+  [^KVTxData tx validate-data?]
+  (let [op (.-op tx) k (.-k tx) kt (.-kt tx) v (.-v tx) vt (.-vt tx)]
+    (validate-kv-op op)
+    (if (= kt :raw)
+      (validate-encoded-key k)
+      (do (validate-kv-key k kt validate-data?) (validate-key-size k kt)))
+    (let [validate-value (fn [v]
+                           (if (= vt :raw)
+                             (if (#{:put-list :del-list} op)
+                               (validate-encoded-key v)
+                               (when-not (bytes? v)
+                                 (raise "Physical WAL value must contain encoded bytes" {})))
+                             (validate-kv-value v vt validate-data?)))]
+      (case op
+        :put (validate-value v)
+        (:put-list :del-list)
+        (do
+          (when-not (or (sequential? v) (instance? java.util.List v))
+            (raise "Physical WAL list value must be a sequential collection" {}))
+          (doseq [value v] (validate-value value)))
+        :del nil))))
+
 ;; ---- DB validators ----
 
 (defn validate-schema-key

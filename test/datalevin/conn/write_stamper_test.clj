@@ -74,9 +74,11 @@
                                cpp/*before-write-commit-fn* (fn [_] (swap! commits inc))]
                        (exercise-explicit fast))]
           (is (= expected actual))
+          ;; The observer records general fallbacks as well as specialized stamps.
           (is (= [:identity-upsert :identity-upsert :identity-upsert
-                  :scalar-update :scalar-update :blind-insert :scalar-update
-                  :identity-upsert :blind-insert] @paths))
+                  :scalar-update :general :scalar-update :blind-insert
+                  :scalar-update :general :identity-upsert :blind-insert]
+                 @paths))
           (is (= 1 @commits))
           (is (= 9 (get (d/entity @fast 1) (fields 0))))
           (is (= 8 (get (d/entity @fast [:item/key "two"]) (fields 0))))
@@ -126,7 +128,7 @@
           (d/update-schema tx {(fields 2) {:db/cardinality :db.cardinality/many}})
           (d/transact! tx [[:db/add 1 (fields 2) 5]])
           (is (= #{4 5} (get (d/entity @tx 1) (fields 2))))))
-      (is (= [:scalar-update] @paths))
+      (is (= [:general :general :scalar-update :general] @paths))
       (is (= [2 3] (:item/pair (d/entity @conn 1))))
       (is (= #{4 5} (get (d/entity @conn 1) (fields 2)))))))
 
@@ -155,7 +157,7 @@
           (d/transact! tx [{:db/id 1 :doc {:counter 1}}])
           (d/transact! tx [[:db.fn/patchIdoc 1 :doc [[:set [:counter] 2]]]])
           (is (= {:counter 2} (:doc (d/entity @tx 1))))))
-      (is (= [:patch-idoc] @paths))
+      (is (= [:general :patch-idoc] @paths))
       (is (= #{1} (set (d/q '[:find [?e ...] :in $ ?query :where
                               [(idoc-match $ :doc ?query) [[?e ?a ?v]]]]
                             @conn {:counter 2})))))))
@@ -201,7 +203,8 @@
                     [{:item/key "new" (fields 0) 3}]
                     [[:db/add [:item/key "new"] (fields 0) 4]]]))]
       (is (every? nil? (map :error results)))
-      (is (= [:blind-insert :scalar-update :identity-upsert :scalar-update] @paths))
+      (is (= [:blind-insert :scalar-update :general :identity-upsert
+              :scalar-update] @paths))
       (is (= (inc (long before))
              (:last-committed-lsn (d/txlog-watermarks (d/datalog-kv conn)))))
       (is (= [nil 0 1 2 3]

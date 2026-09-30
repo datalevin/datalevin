@@ -21,7 +21,6 @@
    [datalevin.protocol.context :as codec]
    [datalevin.server.deps :as sdeps]
    [datalevin.server.prepared :as prepared]
-   [datalevin.txlog :as txlog]
    [datalevin.util :as u :refer [raise]]
    [taoensso.timbre :as log])
   (:import
@@ -218,7 +217,7 @@
 
 (defn- call-with-write-guards
   [deps server message f]
-  (binding [txlog/*commit-payload-ha-term*
+  (binding [kvtx/*commit-payload-ha-term*
             (current-ha-txlog-term deps server (first (:args message)))
             cpp/*before-write-commit-fn*
             ((:ha-write-commit-check-fn-fn deps) server message)

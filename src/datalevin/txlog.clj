@@ -15,7 +15,8 @@
    [datalevin.constants :as c]
    [datalevin.interface :as i]
    [datalevin.lmdb]
-   [datalevin.tx-group :as group]
+   [datalevin.tx-state.lifetime :as lifetime]
+   [datalevin.txlog.append :as append]
    [datalevin.txlog.codec :as tcodec]
    [datalevin.txlog.meta :as tmeta]
    [datalevin.txlog.recovery :as trec]
@@ -29,7 +30,7 @@
    [java.nio.channels FileChannel FileLock OverlappingFileLockException]
    [java.nio.file StandardOpenOption]
    [java.util ArrayDeque]
-   [java.util.concurrent.locks ReentrantLock]
+   [java.util.concurrent.locks LockSupport ReentrantLock]
    [org.eclipse.collections.impl.list.mutable FastList]
 ))
 
@@ -49,10 +50,12 @@
 (def ^:const commit-marker-slot-payload-size 60)
 (def ^:const commit-marker-slot-size (+ commit-marker-slot-payload-size 4))
 (def ^:const commit-marker-format-major 1)
-(def ^:dynamic *commit-payload-ha-term*
-  nil)
-
 (def ^:private segment-prealloc-mode-values #{:native :none})
+
+(defmacro ^:private with-wal-use [state & body]
+  `(if-let [guard# (:io-lifetime (some-> (:application-hooks ~state) deref))]
+     (lifetime/with-use guard# ~@body)
+     (do ~@body)))
 
 (declare segment-files
          append-near-roll-sample-max
@@ -81,12 +84,15 @@
          complete-sync-on-write!
          complete-sync-failure!
          await-durable-lsn!
+         await-sync-collection!
+         more-work-predicate
          open-reusable-file-lock-channel!
          now-ms
          sync-manager-state
          record-fsync-ms!
          record-commit-wait-ms!
          request-sync-now!
+         ensure-sync-manager-healthy!
          classify-record-kind
          decode-commit-row-payload
          decode-commit-row-payload-header
@@ -150,6 +156,16 @@
   (if (contains? info :wal-sync-adaptive?)
     (boolean (:wal-sync-adaptive? info))
     c/*wal-sync-adaptive?*))
+
+(def sync-collect-window-ns
+  "Upper bound on adaptive sync collection for a decoupled buffered private
+  force. The engine's pending-work predicate ends the wait as soon as the
+  collector is idle; this bound only guards a stuck predicate."
+  1000000)
+
+(def sync-collect-stall-ns
+  "Park slice between re-checks of the engine's pending-work predicate."
+  20000)
 
 (defn wal-shared?
   [info]
@@ -404,6 +420,7 @@
          :segment-channel        (volatile! ch)
          :segment-offset         (volatile! active-offset)
          :append-lock            (Object.)
+         :application-hooks      (volatile! nil)
          :segment-roll-lock      (ReentrantLock.)
          :next-lsn               (volatile! (inc last-committed))
          :segment-max-bytes      (long (segment-max-bytes info))
@@ -444,6 +461,13 @@
                           :group-commit      (long (group-commit info))
                           :group-commit-ms   (long (group-commit-ms info))
                           :sync-adaptive?    (sync-adaptive? info)
+                          ;; Buffered private fsync can combine adjacent
+                          ;; records in one force. DSYNC already pays the
+                          ;; durability cost at append, and shared WAL defers
+                          ;; ownership, so neither collects here.
+                          :collect-window-ns (if (or sync-on-write?
+                                                     (wal-shared? info))
+                                               0 sync-collect-window-ns)
                           :track-trailing?   (not= :relaxed profile)})
 
          :segment-roll-count                      (volatile! 0)
@@ -1056,9 +1080,8 @@
 
 (defn encode-commit-row-payload
   "Encode canonical txn-log payload as raw binary bytes."
-  [lsn tx-time rows]
-  (tcodec/encode-commit-row-payload
-   lsn tx-time rows {:ha-term *commit-payload-ha-term*}))
+  ([lsn tx-time rows] (tcodec/encode-commit-row-payload lsn tx-time rows))
+  ([lsn tx-time rows opts] (tcodec/encode-commit-row-payload lsn tx-time rows opts)))
 
 (defn prepare-commit-rows
   [commit-state append-info rows]
@@ -1081,8 +1104,17 @@
       (raise "Txn-log is not enabled for this LMDB"
              {:type :txlog/not-enabled})))
 
+(defn- notify-runtime-failure! [state error]
+  (when-let [failed (:on-failure! (some-> (:application-hooks state) deref))]
+    (failed error)))
+
 (defn- append-record-under-lock!
-  [state ^ByteBuffer body {:keys [throw-if-fatal! before-append!]}]
+  [state ^ByteBuffer body {:keys [throw-if-fatal! before-append! mark-fatal!]}]
+  (when-let [check (:check-admission! (some-> (:application-hooks state) deref))]
+    (check))
+  (when-let [failure (some-> (:fatal-error state) deref)]
+    (throw (ex-info "Txn-log runtime is in fatal state" {:type :txlog/fatal}
+                    failure)))
   (when throw-if-fatal!
     (throw-if-fatal! state))
   (when before-append!
@@ -1094,6 +1126,7 @@
         _ (when-not sync-manager
             (raise "Txn-log sync manager is not available"
                    {:type :txlog/no-sync-manager}))
+        _ (ensure-sync-manager-healthy! sync-manager)
         ^long sid @(:segment-id state)
         ^FileChannel ch @(:segment-channel state)
         _ (when-not ch
@@ -1106,7 +1139,15 @@
         append-start-ms now
         near-roll? (near-roll-append? state offset)
         _ (tcodec/patch-commit-row-payload-buffer-header! body lsn now)
-        append-res (tseg/write-record-at! ch offset body)
+        append-res (try
+                     (tseg/write-record-at! ch offset body)
+                     (catch Throwable e
+                       ;; A partial record cannot be reused by another caller.
+                       ;; Recovery owns the tail once any append I/O fails.
+                       (when-let [fatal (:fatal-error state)] (vreset! fatal e))
+                       (notify-runtime-failure! state e)
+                       (when mark-fatal! (mark-fatal! state e))
+                       (throw e)))
         next-offset (+ offset (long (:size append-res)))]
     (when segment-offset
       (vreset! segment-offset next-offset))
@@ -1115,23 +1156,41 @@
                                 ^long (:size append-res))))
     (vreset! lsn-v (inc lsn))
     (mark-meta-dirty! state)
-    {:append-res append-res
-     :append-start-ms append-start-ms
-     :ch ch
-     :lsn lsn
-     :near-roll? near-roll?
-     :sid sid
-     :sync-manager sync-manager
-     :timeout-ms (long (:commit-wait-ms state))}))
+    (append/create lsn sid ch sync-manager append-start-ms
+                   (lifetime/deadline (:commit-wait-ms state))
+                   (:commit-wait-ms state) near-roll? [append-res])))
+
+(defn- register-append!
+  [state batch request-count]
+  ;; Publish under the insertion lock, before rotation or another appender can
+  ;; observe the new tail. Durability ownership is claimed after handoff.
+  (append-sync-transition!
+   (append/sync-manager batch) (append/last-lsn batch) (append/started-ms batch)
+   {:force? (not= :relaxed (:durability-profile state))
+    :begin? false
+    :request-count (long (if (or (:wal-shared? state)
+                                (not= :relaxed (:durability-profile state)))
+                           1 request-count))})
+  batch)
 
 (defn- append-prepared-record!
   [state rows hooks]
   (let [^ByteBuffer body (tcodec/encode-commit-row-payload-buffer
-                         0 0 rows {:ha-term *commit-payload-ha-term*})
+                         0 0 rows {:ha-term (:ha-term hooks)})
         append-lock (or (:append-lock state) state)]
     (try
       (locking append-lock
-        (append-record-under-lock! state body hooks))
+        (let [batch (append-record-under-lock! state body hooks)]
+          ;; Engine-owned pending state must become visible before another
+          ;; caller can capture this LSN in a flush target. No durability or
+          ;; native work is permitted in this callback.
+          (try
+            (when-let [publish (:register-append! hooks)] (publish state batch))
+            (register-append! state batch (long (or (:request-count hooks) 1)))
+            (catch Throwable e
+              (when-let [fatal (:fatal-error state)] (vreset! fatal e))
+              (notify-runtime-failure! state e)
+              (throw e)))))
       (finally
         (tcodec/release-commit-row-payload-buffer! body)))))
 
@@ -1141,16 +1200,42 @@
     (vreset! (:sync-in-progress? sync-manager) false)
     (.notifyAll monitor)))
 
-(defn- perform-sync-round!
+(defn- before-sync-round! [state round hook]
+  (when-let [f (:before-sync! (some-> (:application-hooks state) deref))]
+    (f state round))
+  (when hook (hook state round)))
+
+(defn- after-sync-round! [state round hook]
+  (when-let [f (:after-sync! (some-> (:application-hooks state) deref))]
+    (f state round))
+  (when hook (hook state round)))
+
+(defn- capture-sync-round-prefix
+  [state ch round]
+  (if-let [capture (:capture-sync-prefix!
+                    (some-> (:application-hooks state) deref))]
+    (let [target (long (capture state round ch))]
+      (when (or (< target (long (:target-lsn round)))
+                (> target (long @(:last-appended-lsn (:sync-manager state)))))
+        (raise "Sync prefix is outside the appended range"
+               {:type :txlog/invalid-sync-prefix
+                :target-lsn target :claimed-lsn (:target-lsn round)}))
+      (if (= target (long (:target-lsn round)))
+        round
+        (assoc round :target-lsn target)))
+    round))
+
+(defn- perform-sync-round*
   [state ^FileChannel ch sync-manager sync-begin
-   {:keys [mark-fatal! before-sync!]}]
-  (when-let [target-lsn (:target-lsn sync-begin)]
+   {:keys [mark-fatal! before-sync! after-sync!]}]
+  (when (:target-lsn sync-begin)
     (if (:sync-on-write? state)
       (try
-        (let [reason (:reason sync-begin)
+        (let [sync-begin (capture-sync-round-prefix state ch sync-begin)
+              target-lsn (:target-lsn sync-begin)
+              reason (:reason sync-begin)
               done-ms (System/currentTimeMillis)]
-          (when before-sync!
-            (before-sync! state sync-begin))
+          (before-sync-round! state sync-begin before-sync!)
           (mark-meta-dirty! state)
           (record-fsync-ms! sync-manager 0 false)
           (complete-sync-success! sync-manager
@@ -1158,20 +1243,24 @@
                                   done-ms
                                   reason
                                   false)
+          (after-sync-round! state sync-begin after-sync!)
           {:target-lsn target-lsn
            :sync-done-ms done-ms
            :sync-reason reason})
-        (catch Exception e
+        (catch Throwable e
           (try
             (when mark-fatal!
               (mark-fatal! state e))
             (finally
-              (complete-sync-failure! sync-manager e false)))
+              (complete-sync-failure! sync-manager e false)
+              (notify-runtime-failure! state e)))
           (throw e)))
       (if-let [lock-state (try-acquire-sync-lock! state)]
         (try
           (refresh-shared-watermarks! state false)
-          (let [reason (:reason sync-begin)
+          (let [sync-begin (capture-sync-round-prefix state ch sync-begin)
+                target-lsn (:target-lsn sync-begin)
+                reason (:reason sync-begin)
                 durable-before (long @(:last-durable-lsn sync-manager))]
             (if (<= ^long target-lsn ^long durable-before)
               (let [done-ms (System/currentTimeMillis)]
@@ -1180,12 +1269,12 @@
                                         done-ms
                                         reason
                                         false)
+                (after-sync-round! state sync-begin after-sync!)
                 {:target-lsn target-lsn
                  :sync-done-ms done-ms
                  :sync-reason reason})
               (do
-                (when before-sync!
-                  (before-sync! state sync-begin))
+                (before-sync-round! state sync-begin before-sync!)
                 (let [force-start-ms (System/currentTimeMillis)]
                   (force-segment! state ch (:sync-mode state))
                   (let [force-end-ms (System/currentTimeMillis)]
@@ -1198,15 +1287,17 @@
                                             force-end-ms
                                             reason
                                             false)
+                    (after-sync-round! state sync-begin after-sync!)
                     {:target-lsn target-lsn
                      :sync-done-ms force-end-ms
                      :sync-reason reason})))))
-          (catch Exception e
+          (catch Throwable e
             (try
               (when mark-fatal!
                 (mark-fatal! state e))
               (finally
-                (complete-sync-failure! sync-manager e false)))
+                (complete-sync-failure! sync-manager e false)
+                (notify-runtime-failure! state e)))
             (throw e))
           (finally
             (release-sync-lock! lock-state)))
@@ -1215,14 +1306,31 @@
           (defer-sync-attempt! sync-manager)
           nil)))))
 
+(defn- perform-sync-round!
+  [state ^FileChannel ch sync-manager round hooks]
+  ;; Collection and request preparation happen before append publication. A
+  ;; durability owner only flushes the appended prefix; it never runs arbitrary
+  ;; later request bodies or waits for a collector leader to finish them.
+  (try
+    (when-let [check (:check-admission! (some-> (:application-hooks state) deref))]
+      (check))
+    (catch Throwable e
+      (try
+        (when-let [mark (:mark-fatal! hooks)] (mark state e))
+        (finally
+          (complete-sync-failure! sync-manager e false)
+          (notify-runtime-failure! state e)))
+      (throw e)))
+  (perform-sync-round* state ch sync-manager round hooks))
+
 (defn- commit-timeout?
   [e]
   (= :txlog/commit-timeout (:type (ex-data e))))
 
 (defn- await-durable-or-sync-available!
-  [{:keys [monitor] :as manager} lsn timeout-ms start-ms]
+  [{:keys [monitor] :as manager} lsn timeout-ms deadline-ns]
   (locking monitor
-    (loop [deadline (+ ^long start-ms (max 0 ^long timeout-ms))]
+    (loop []
       (let [last-durable-lsn (long @(:last-durable-lsn manager))
             healthy? (boolean @(:healthy? manager))
             failure @(:failure manager)
@@ -1241,12 +1349,11 @@
           {:durable? false :last-durable-lsn last-durable-lsn}
 
           :else
-          (let [now (now-ms)
-                remaining (- ^long deadline ^long now)]
+          (let [remaining (- (long deadline-ns) (lifetime/nano-time))]
             (if (pos? remaining)
               (do
-                (.wait monitor remaining)
-                (recur deadline))
+                (.wait monitor (max 1 (quot remaining 1000000)))
+                (recur))
               (raise "Timed out waiting for durable LSN"
                               {:type :txlog/commit-timeout
                                :lsn lsn
@@ -1267,61 +1374,88 @@
   ([state ^FileChannel ch sync-manager lsn timeout-ms hooks initial-sync-begin]
    (let [lsn (long lsn)
          timeout-ms (long timeout-ms)
-         start-ms (System/currentTimeMillis)
-         deadline (+ ^long start-ms (max 0 timeout-ms))]
-     (loop [last-sync-ms nil
-            last-sync-reason nil
-            sync-begin initial-sync-begin]
-       (refresh-shared-watermarks! state false)
-       (let [durable (long @(:last-durable-lsn sync-manager))]
-         (if (<= ^long lsn ^long durable)
-           {:sync-done-ms last-sync-ms
-            :sync-reason (or last-sync-reason @(:last-sync-reason sync-manager))}
-           (let [now (System/currentTimeMillis)
-                 remaining (- ^long deadline ^long now)]
-             (when-not (pos? remaining)
-               (raise "Timed out waiting for durable LSN"
-                               {:type :txlog/commit-timeout
-                                :lsn lsn
-                                :timeout-ms timeout-ms}))
-            (if-let [sync-begin* (or sync-begin
-                                     (begin-sync! sync-manager lsn))]
-              (if-let [sync-res
-                       (perform-sync-round! state
-                                            ch
-                                            sync-manager
-                                            ;; Reuse the first sync begin from append path
-                                            ;; so strict mode avoids an immediate extra
-                                            ;; monitor-lock round-trip.
-                                            sync-begin*
-                                            hooks)]
-                (recur (:sync-done-ms sync-res)
-                       (:sync-reason sync-res)
-                       nil)
-                (do
-                  (await-durable-retry-window!
-                   sync-manager
-                   lsn
-                   (long (min 5 remaining)))
-                  (recur last-sync-ms last-sync-reason nil)))
-              (do
-                (await-durable-or-sync-available!
-                 sync-manager
-                 lsn
-                 remaining
-                 now)
-                (recur last-sync-ms last-sync-reason nil))))))))))
+         deadline (long (or (::wait-deadline-ns hooks)
+                            (lifetime/deadline timeout-ms)))]
+     (loop [last-sync-ms nil last-sync-reason nil sync-begin initial-sync-begin]
+       ;; Ownership is an obligation even if another process has already made
+       ;; our requested LSN durable. Settle a claimed round before any return,
+       ;; timeout or shared-watermark refresh can bypass it.
+       (if sync-begin
+         (let [sync-res (perform-sync-round! state ch sync-manager sync-begin hooks)]
+           (when-not sync-res
+             (await-durable-retry-window!
+              sync-manager lsn
+              (max 0 (min 5 (quot (- deadline (lifetime/nano-time)) 1000000)))))
+           (recur (or (:sync-done-ms sync-res) last-sync-ms)
+                  (or (:sync-reason sync-res) last-sync-reason) nil))
+         (do
+           (refresh-shared-watermarks! state false)
+           (if (<= lsn (long @(:last-durable-lsn sync-manager)))
+             {:sync-done-ms last-sync-ms
+              :sync-reason (or last-sync-reason @(:last-sync-reason sync-manager))}
+             (let [remaining-ns (- deadline (lifetime/nano-time))
+                   remaining (max 0 (quot (+ remaining-ns 999999) 1000000))]
+               (when-not (pos? remaining-ns)
+                 (raise "Timed out waiting for durable LSN"
+                        {:type :txlog/commit-timeout :lsn lsn :timeout-ms timeout-ms}))
+               (if-let [round (do (await-sync-collection!
+                                   sync-manager (more-work-predicate state))
+                                  (begin-sync! sync-manager lsn))]
+                 (recur last-sync-ms last-sync-reason round)
+                 (do
+                   (await-durable-or-sync-available!
+                    sync-manager lsn remaining deadline)
+                   (recur last-sync-ms last-sync-reason nil)))))))))))
+
+(defn- await-sync-collection!
+  "Wait for adjacent appended records while the engine still reports pending
+  work, then let the force claim sync ownership. The predicate is the engine's
+  collector activity, so this is adaptive: it batches exactly as long as more
+  records are coming and flushes the moment the pipeline is idle. The bounded
+  timer only guards a stuck predicate."
+  [manager more-work?]
+  (when (and more-work?
+             (not (boolean @(:sync-in-progress? manager)))
+             (> (long @(:last-appended-lsn manager))
+                (long @(:last-durable-lsn manager))))
+    (let [stall (max 1 (long @(:collect-stall-ns manager)))
+          deadline (+ (lifetime/nano-time)
+                      (max 1 (long @(:collect-window-ns manager))))]
+      (loop []
+        (when (and (more-work?)
+                   (not (boolean @(:sync-in-progress? manager)))
+                   (< (lifetime/nano-time) deadline))
+          ;; Park with a precise timeout; an appender unparks this thread after
+          ;; publishing a record, so a filling queue wakes us immediately.
+          (vreset! (:collect-waiter manager) (Thread/currentThread))
+          (try
+            (LockSupport/parkNanos (max 1 (min stall
+                                                (- deadline (lifetime/nano-time)))))
+            (finally (vreset! (:collect-waiter manager) nil)))
+          (recur))))))
+
+(defn- more-work-predicate
+  "Engine hook: true while the collector still has queued or in-flight work.
+  Nil when the engine has not opted into adaptive collection."
+  [state]
+  (:sync-more-work? (some-> (:application-hooks state) deref)))
+
+(defn- begin-append-sync!
+  [manager lsn force? more-work?]
+  (await-sync-collection! manager more-work?)
+  (locking (:monitor manager)
+    ;; An old receipt may outlive its segment. Do not claim a flush of newer
+    ;; records using that receipt's channel after its own LSN is durable.
+    (when (> (long lsn) (long @(:last-durable-lsn manager)))
+      (when force? (request-sync-now! manager))
+      (when (or force? @(:sync-requested? manager))
+        (begin-sync! manager lsn)))))
 
 (defn- append-durable-relaxed!
-  [state append hooks]
-  (let [{:keys [append-res append-start-ms ch lsn near-roll?
-                sid sync-manager]}
-        append
-        request-count (long (if (:wal-shared? state) 1 group/*request-count*))
-        sync-begin (if (= request-count 1)
-                     (append-sync-transition! sync-manager lsn append-start-ms)
-                     (append-sync-transition! sync-manager lsn append-start-ms
-                                              {:request-count request-count}))
+  [state batch lsn hooks]
+  (let [ch (append/channel batch)
+        sync-manager (append/sync-manager batch)
+        sync-begin (begin-append-sync! sync-manager lsn false nil)
         sync-res (when sync-begin
                    (perform-sync-round! state
                                         ch
@@ -1334,24 +1468,27 @@
                     (<= ^long lsn
                         ^long @(:last-durable-lsn sync-manager)))
         sync-done-ms (:sync-done-ms sync-res)]
-    (when near-roll?
+    (when (append/near-roll? batch)
       (record-append-near-roll-ms!
        state
        (- (long (or sync-done-ms
                     (System/currentTimeMillis)))
-          (long append-start-ms))))
-    (assoc append-res
-           :lsn lsn
-           :segment-id sid
-           :synced? synced?)))
+          (long (append/started-ms batch)))))
+    synced?))
 
 (defn- append-durable-strict!
-  [state append {:as hooks}]
-  (let [{:keys [append-res append-start-ms ch lsn near-roll?
-                sid sync-manager timeout-ms]}
-        append
-        sync-begin (append-sync-transition! sync-manager lsn append-start-ms
-                                            {:force? true :begin-lsn lsn})
+  [state batch lsn deadline-ns hooks]
+  (let [ch (append/channel batch)
+        sync-manager (append/sync-manager batch)
+        timeout-ms (long (append/timeout-ms batch))
+        append-start-ms (long (append/started-ms batch))
+        hooks (assoc hooks ::wait-deadline-ns deadline-ns)
+        _ (when (and (>= (lifetime/nano-time) (long deadline-ns))
+                     (> (long lsn) (long @(:last-durable-lsn sync-manager))))
+            (raise "Timed out waiting for durable LSN"
+                   {:type :txlog/commit-timeout :lsn lsn :timeout-ms timeout-ms}))
+        sync-begin (begin-append-sync! sync-manager lsn true
+                                       (more-work-predicate state))
         done-ms
         (if (and (:sync-on-write? state)
                  (not (:wal-shared? state))
@@ -1370,26 +1507,168 @@
                                   (- (long done-ms) (long append-start-ms))
                                   sync-reason false)
             done-ms))]
-    (when near-roll?
+    (when (append/near-roll? batch)
       (record-append-near-roll-ms! state (- (long done-ms)
                                             (long append-start-ms))))
-    (assoc append-res
-           :lsn lsn
-           :segment-id sid
-           :synced? true)))
+    true))
 
 (defn- per-tx-durable-profile-state?
   [state]
   (not= :relaxed (:durability-profile state)))
 
+(defn append-pending!
+  "Insert a transaction and return a singleton append batch without a sync wait.
+  Encoding is outside the insertion lock; LSN, file order, and appended progress
+  are published together inside it. Synchronous-write channels still perform
+  their configured I/O during append. Shared-WAL callers must retain the existing
+  external process-ownership protocol."
+  [state rows hooks]
+  (with-wal-use state
+    (refresh-shared-state! state false)
+    (maybe-roll-segment! state (System/currentTimeMillis))
+    (append-prepared-record! state rows hooks)))
+
+(defn complete-prefix!
+  "Complete an appended LSN under the WAL durability policy, using shared batch
+  context and the caller's deadline. Returns whether that LSN is durable. No
+  per-request receipt is constructed; call outside insertion/collector locks."
+  [state batch lsn deadline-ns hooks]
+  (when-not (identical? (:sync-manager state) (append/sync-manager batch))
+    (raise "Txn-log append batch belongs to another runtime"
+           {:type :txlog/foreign-receipt}))
+  (append/record-info batch lsn)
+  (with-wal-use state
+    (if (per-tx-durable-profile-state? state)
+      (append-durable-strict! state batch lsn deadline-ns hooks)
+      (append-durable-relaxed! state batch lsn hooks))))
+
+(defn complete-append!
+  "Complete through the batch's last LSN and return its commit metadata for
+  native/legacy callers. Engine waiters use complete-prefix! directly."
+  [state batch hooks]
+  (let [lsn (append/last-lsn batch)
+        synced? (complete-prefix! state batch lsn (append/deadline-ns batch) hooks)]
+    (assoc (append/commit-info batch lsn) :synced? synced?)))
+
+(defn append-identity
+  "Stable record coordinates from a successful append, for reconciliation."
+  ([batch]
+   (when batch (append-identity batch (append/last-lsn batch))))
+  ([batch lsn]
+   (when batch
+     (let [result (append/record-info batch lsn)]
+       {:lsn (long lsn) :segment-id (append/segment-id batch)
+        :offset (:offset result) :checksum (:checksum result)}))))
+
+(defn durable-append?
+  "Verify a failed request's own record, not just its tentative LSN. This
+  bounded read is only on the error/reconciliation path, never normal commit."
+  ([state batch]
+   (boolean (and batch (durable-append? state batch (append/last-lsn batch)))))
+  ([state batch lsn]
+   (boolean
+    (when (and batch
+               (identical? (:sync-manager state) (append/sync-manager batch))
+               (<= (long lsn)
+                   (long @(:last-durable-lsn (:sync-manager state)))))
+      (try
+        ;; Own a separate read handle: runtime I/O may already be fenced while
+        ;; an application owner is unwinding. No live append handle is used.
+        (let [identity (append-identity batch lsn)
+              offset (long (:offset identity))
+              size (long (:size (append/record-info batch lsn)))
+              path (segment-path (:dir state) (:segment-id identity))
+              record (first (:records
+                             (tseg/scan-segment path
+                                                {:start-offset offset
+                                                 :max-offset (+ offset size)})))]
+          (and record
+               (= identity (scanned-record-summary (:segment-id identity) path record))))
+        (catch Exception _ false))))))
+
+(defn ^:redef prepare-append-body
+  "Serialize canonical rows without assigning their ordered LSN or timestamp.
+  Returns independently owned bytes, safe to hand to another thread after the
+  encoder's thread-local scratch is reused. Input validation belongs to the
+  producer and must precede this call; preparation does not append anything."
+  ^bytes [rows hooks]
+  (tcodec/encode-commit-row-payload 0 0 rows {:ha-term (:ha-term hooks)}))
+
+(defn append-prepared-batch-pending!
+  "Append a collected group as one record/LSN. Exclusively owned bodies from
+  prepare-append-body contribute their encoded rows in request order. The
+  preparation owner fixes expected-lsn; row serialization precedes collection
+  for blind requests, and only the combined header is stamped at insertion.
+  Byte writes stay serialized; durability ownership is acquired later.
+  Return one shared append descriptor; register-appends! publishes it with all
+  roots/entries before advertising the prefix. Bodies must not be reused or
+  modified after handoff. No per-transaction durability receipts."
+  [state expected-lsn bodies {:keys [before-append! register-appends!] :as hooks}]
+  (when (empty? bodies)
+    (throw (IllegalArgumentException. "A prepared WAL batch cannot be empty")))
+  (when (:wal-shared? state)
+    (raise "Prepared batch insertion requires a private WAL"
+           {:type :txlog/shared-preparation}))
+  (with-wal-use state
+    (let [expected-lsn (long expected-lsn)
+          single? (= 1 (count bodies))
+          body (when single? (first bodies))
+          group (when-not single? (tcodec/prepare-commit-row-group bodies))
+          now (System/currentTimeMillis)]
+      (maybe-roll-segment! state now)
+      (locking (or (:append-lock state) state)
+        (when-let [check (:check-admission! (some-> (:application-hooks state) deref))]
+          (check))
+        (when-let [error (some-> (:fatal-error state) deref)]
+          (throw (ex-info "Txn-log runtime is in fatal state" {:type :txlog/fatal} error)))
+        (when-let [check (:throw-if-fatal! hooks)] (check state))
+        (when-not (= expected-lsn (long @(:next-lsn state)))
+          (raise "Prepared WAL prefix changed before insertion"
+                 {:type :txlog/stale-preparation :outcome :not-committed}))
+        (let [^FileChannel ch @(:segment-channel state)
+              sid (long @(:segment-id state))
+              offset (long @(:segment-offset state))
+              manager (:sync-manager state)]
+          (ensure-sync-manager-healthy! manager)
+          (when before-append! (before-append! state))
+          (try
+            (let [result (if single?
+                           (do (tcodec/patch-commit-row-payload-header! body expected-lsn now)
+                               (tseg/write-record-at! ch offset body))
+                           (tseg/write-prepared-record-at! ch offset group expected-lsn now))
+                  end (+ (long (:offset result)) (long (:size result)))
+                  deadline (lifetime/deadline (:commit-wait-ms state))
+                  batch (append/create expected-lsn sid ch manager now deadline
+                                       (:commit-wait-ms state) false [result])]
+              (vreset! (:segment-offset state) end)
+              (when-let [total (:retention-total-bytes state)]
+                (vreset! total (+ (long @total) (- end offset))))
+              (vreset! (:next-lsn state) (inc expected-lsn))
+              (mark-meta-dirty! state)
+              (when register-appends! (register-appends! state batch))
+              ;; One physical record still represents every logical request
+              ;; for the relaxed/adaptive group-commit threshold.
+              (append-sync-transition! manager expected-lsn now
+                                       {:force? (not= :relaxed (:durability-profile state))
+                                        :begin? false :request-count (count bodies)})
+              batch)
+            (catch Throwable e
+              (when-let [fatal (:fatal-error state)] (vreset! fatal e))
+              (notify-runtime-failure! state e)
+              (when-let [mark (:mark-fatal! hooks)] (mark state e))
+              (throw e))))))))
+
+(defn append-batch-pending!
+  "Serialize and append a sealed preparation group as one record and LSN.
+  Producers with state-independent input should prepare bodies before taking
+  preparation ownership and use append-prepared-batch-pending! directly."
+  [state expected-lsn rows hooks]
+  (append-prepared-batch-pending!
+   state expected-lsn (mapv #(prepare-append-body % hooks) rows) hooks))
+
 (defn append-durable!
   [state rows hooks]
-  (refresh-shared-state! state false)
-  (maybe-roll-segment! state (System/currentTimeMillis))
-  (let [append (append-prepared-record! state rows hooks)]
-    (if (per-tx-durable-profile-state? state)
-      (append-durable-strict! state append hooks)
-      (append-durable-relaxed! state append hooks))))
+  (complete-append! state (append-pending! state rows hooks) hooks))
 
 (defn append-replay-batch!
   "Append consecutive source records to a private WAL, sharing its durability
@@ -1442,17 +1721,19 @@
                   (vreset! total (+ (long @total) (- end offset))))
                 (vreset! (:next-lsn state) (inc lsn))
                 (mark-meta-dirty! state)
-                {:append-res last-result :append-start-ms now :ch ch :lsn lsn
-                 :near-roll? (near-roll-append? state offset) :sid sid
-                 :sync-manager manager
-                 :timeout-ms (long (:commit-wait-ms state))})))]
-      (if (per-tx-durable-profile-state? state)
-        (append-durable-strict! state append hooks)
-        (append-durable-relaxed! state append hooks)))))
+                (register-append!
+                 state
+                 (append/create first-lsn sid ch manager now
+                                (lifetime/deadline (:commit-wait-ms state))
+                                (:commit-wait-ms state)
+                                (near-roll-append? state offset) results)
+                 1))))]
+      (complete-append! state append hooks))))
 
 (defn force-sync!
   [state hooks]
-  (refresh-shared-state! state false)
+  (with-wal-use state
+   (refresh-shared-state! state false)
   (let [sync-manager (:sync-manager state)
         timeout-ms (long (:commit-wait-ms state))
         before (sync-manager-state sync-manager)
@@ -1463,11 +1744,9 @@
             _ (when-not ch
                 (raise "Txn-log segment channel is not available"
                        {:type :txlog/no-segment-channel}))
-            sync-begin (append-sync-transition! sync-manager
-                                                target-lsn
-                                                (System/currentTimeMillis)
-                                                {:force? true
-                                                 :begin-lsn target-lsn})]
+            _ (when-let [before-claim (:before-force-claim! hooks)]
+                (before-claim state target-lsn))
+            sync-begin (begin-append-sync! sync-manager target-lsn true nil)]
         (wait-strict-durable! state ch sync-manager target-lsn timeout-ms hooks
                               sync-begin)))
     (flush-meta! state true)
@@ -1476,7 +1755,7 @@
        :last-appended-lsn (long (:last-appended-lsn after))
        :last-durable-lsn (long (:last-durable-lsn after))
        :pending-count (long (:pending-count after))
-       :synced? (<= target-lsn (long (:last-durable-lsn after)))})))
+       :synced? (<= target-lsn (long (:last-durable-lsn after)))}))))
 
 (defn commit-finished!
   [state marker-entry]
@@ -1598,14 +1877,18 @@
            group-commit
            group-commit-ms
            sync-adaptive?
-           track-trailing?]
+           track-trailing?
+           collect-window-ns
+           collect-stall-ns]
     :or {last-durable-lsn 0
          last-appended-lsn 0
          last-sync-ms 0
          group-commit 100
          group-commit-ms 100
          sync-adaptive? true
-         track-trailing? true}}]
+         track-trailing? true
+         collect-window-ns 0
+         collect-stall-ns sync-collect-stall-ns}}]
   (let [last-durable-lsn* (long last-durable-lsn)
         last-appended-lsn* (long last-appended-lsn)
         pending0 (max 0 (- last-appended-lsn* last-durable-lsn*))]
@@ -1619,6 +1902,9 @@
    :last-commit-wait-at-ms (volatile! 0)
    :group-commit (volatile! (long group-commit))
    :group-commit-ms (volatile! (long group-commit-ms))
+   :collect-window-ns (volatile! (long collect-window-ns))
+   :collect-stall-ns (volatile! (long collect-stall-ns))
+   :collect-waiter (volatile! nil)
    :sync-adaptive? (boolean sync-adaptive?)
    :track-trailing? (boolean track-trailing?)
    :sync-count-by-reason (zero-sync-reason-array)
@@ -1840,6 +2126,10 @@
                (+ (long @(:pending-group-extra-count manager)) extra-count)))
     (vreset! (:last-appended-lsn manager) new-appended)
     (vreset! (:unsynced-count manager) unsynced-after)
+    ;; Wake a collection wait so it can cover this record before claiming.
+    (when-let [waiter @(:collect-waiter manager)]
+      (LockSupport/unpark ^Thread waiter))
+    (.notifyAll ^Object (:monitor manager))
     (when (and reason (not sync-requested?))
       (vreset! (:sync-requested? manager) true)
       (vreset! (:sync-request-reason manager) reason)
@@ -1901,7 +2191,8 @@
         track-trailing? (boolean (:track-trailing? manager))]
     (if sync-in-progress?
       nil
-      (if (> ^long last-appended-lsn ^long last-durable-lsn)
+      (if (and (> last-appended-lsn last-durable-lsn)
+               (or (nil? lsn) (> (long lsn) last-durable-lsn)))
         (let [target-lsn (long (if track-trailing?
                                  (or (pending-trailing-lsn manager)
                                      last-appended-lsn)
@@ -1918,7 +2209,7 @@
               (vreset! (:last-sync-reason manager) reason)
               {:target-lsn target-lsn
                :reason reason})))
-        (when sync-requested?
+        (when (and sync-requested? (<= last-appended-lsn last-durable-lsn))
           (vreset! (:sync-requested? manager) false)
           (vreset! (:sync-request-reason manager) nil)
           nil)))))
@@ -1933,12 +2224,13 @@
 (defn append-sync-transition!
   "Run append-side sync-manager transitions under one monitor lock.
    :request-count weights this record's logical requests for the sync threshold.
-   Returns the optional begin-sync payload for the caller to perform fsync."
+   Returns the optional begin-sync payload for the caller to perform fsync.
+   :begin? false publishes progress without reserving a sync owner."
   ([sync-manager lsn now]
    (append-sync-transition! sync-manager lsn now {}))
   ([{:keys [monitor] :as sync-manager} lsn now
-    {:keys [force? begin-lsn request-count]
-     :or {force? false begin-lsn nil request-count 1}}]
+    {:keys [force? begin-lsn request-count begin?]
+     :or {force? false begin-lsn nil request-count 1 begin? true}}]
    (locking monitor
      (let [requested? (boolean
                        (request-sync-on-append-under-monitor! sync-manager
@@ -1947,7 +2239,7 @@
                                                               request-count))
            _ (when force?
                (request-sync-now-under-monitor! sync-manager))
-           sync-begin (when (or force? requested?)
+           sync-begin (when (and begin? (or force? requested?))
                         (begin-sync-under-monitor! sync-manager begin-lsn))]
        sync-begin))))
 
@@ -2009,10 +2301,9 @@
 (defn- complete-sync-on-write!
   "Complete an owned private-WAL DSYNC append without a durability wait loop."
   [state manager sync-begin append-start-ms
-   {:keys [before-sync! mark-fatal!]}]
+   {:keys [before-sync! after-sync! mark-fatal!]}]
   (try
-    (when before-sync!
-      (before-sync! state sync-begin))
+    (before-sync-round! state sync-begin before-sync!)
     (let [done-ms (System/currentTimeMillis)
           reason (:reason sync-begin)]
       (mark-meta-dirty! state)
@@ -2023,13 +2314,15 @@
          manager (:target-lsn sync-begin) done-ms reason)
         (record-commit-wait-under-monitor!
          manager (- done-ms (long append-start-ms)) done-ms reason))
+      (after-sync-round! state sync-begin after-sync!)
       done-ms)
-    (catch Exception e
+    (catch Throwable e
       (try
         (when mark-fatal!
           (mark-fatal! state e))
         (finally
-          (complete-sync-failure! manager e false)))
+          (complete-sync-failure! manager e false)
+          (notify-runtime-failure! state e)))
       (throw e))))
 
 (defn complete-sync-failure!

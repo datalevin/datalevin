@@ -13,6 +13,17 @@
 
 (deftype WriteBatch [^List rows ^FastList encoded arena])
 
+(deftype StorageRows [rows])
+
+(defn storage-rows
+  "Wrap physical WAL rows only after their producer has validated the original
+  user types and native encoding constraints before append. Application and
+  recovery skip typed validation because :raw fields contain owned encoded
+  bytes; validate-storage-tx-data still checks their physical shape and size.
+  Never use this wrapper to admit unvalidated user or replica input."
+  [rows]
+  (StorageRows. rows))
+
 (deftype CommitMetadata [^longs fields ^ByteBuffer slot]
   ;; Reused only under the environment write lock. Fields are revision,
   ;; applied LSN, segment, offset, CRC, time, and the persisted payload floor.

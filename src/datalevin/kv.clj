@@ -55,7 +55,7 @@
    [datalevin.lmdb :as l]
    [datalevin.txlog :as txlog]
    [datalevin.txlog.transfer :as transfer]
-   [datalevin.tx-group :as group]
+   [datalevin.tx-group.compat :as group]
    [datalevin.util :refer [deftype+ raise]])
   (:import [java.util.concurrent.atomic AtomicReference]
            [java.util.concurrent ConcurrentHashMap]
@@ -499,7 +499,9 @@
     (try
       (i/close-kv db)
       (finally
-        (close-txlog-state! db))))
+        ;; A fenced native call can outlive a close deadline. Its WAL channels
+        ;; and runtime must stay registered until native teardown succeeds.
+        (when (i/closed-kv? db) (close-txlog-state! db)))))
   (close-transact-kv
     [_]
     (with-write-txn-lock-before-runtime-txlog-state

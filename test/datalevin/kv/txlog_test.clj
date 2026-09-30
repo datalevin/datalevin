@@ -3,7 +3,10 @@
    [clojure.java.io :as io]
    [clojure.test :refer [deftest is testing use-fixtures]]
    [datalevin.constants :as c]
+   [datalevin.interface :as i]
+   [datalevin.kv :as kv]
    [datalevin.kv.txlog :as sut]
+   [datalevin.lmdb :as l]
    [datalevin.txlog :as txlog]
    [datalevin.txlog.transfer :as transfer]
    [datalevin.util :as u])
@@ -18,6 +21,50 @@
     (binding [*dir* (u/tmp-dir (str "bounded-txlog-" (random-uuid)))]
       (u/create-dirs *dir*)
       (try (f) (finally (u/delete-files *dir*))))))
+
+(deftest record-replay-through-a-wal-handle-does-not-append-again
+  (doseq [wrapped? [true false]]
+    (let [db (l/open-kv (str *dir* "/" wrapped?)
+                        {:wal? true :wal-shared? false
+                         :wal-segment-prealloc? false :snapshot-scheduler? false})
+          raw (kv/raw-lmdb db)
+          wal (txlog/state db)]
+      (try
+        (i/open-dbi db "data" {:validate-data? true})
+        (i/transact-kv db [[:put "data" 1 "1" :long :string]])
+        (let [record (last (sut/txlog-records wal))
+              handle (if wrapped? db raw)
+              next-lsn @(:next-lsn wal)
+              segment @(:segment-id wal)
+              offset @(:segment-offset wal)
+              rollout #(select-keys @(i/kv-info raw)
+                                    [:wal-rollout-mode :wal-rollback?])
+              original-rollout (rollout)]
+          ;; Remove only the materialized value; retain its WAL record to replay.
+          (i/transact-kv raw [[:del "data" 1 :long]])
+          (is (nil? (i/get-value db "data" 1 :long :string)))
+          (is (identical? record (sut/txlog-replay-record! handle wal record)))
+          (is (= "1" (i/get-value db "data" 1 :long :string)))
+          (is (= next-lsn @(:next-lsn wal)))
+          (is (= segment @(:segment-id wal)))
+          (is (= offset @(:segment-offset wal)))
+          (is (= original-rollout (rollout)))
+          (is (:ok? (i/verify-commit-marker! db)))
+          ;; Physical validation must still reject malformed rows, and restore
+          ;; normal WAL routing even when applying a replay record throws.
+          (let [malformed (assoc record :rows
+                                 [[:put "data" (byte-array 0) (byte-array [1])
+                                   :raw :raw]])]
+            (is (thrown? Exception
+                         (sut/txlog-replay-record! handle wal malformed))))
+          (is (= original-rollout (rollout)))
+          (is (= next-lsn @(:next-lsn wal)))
+          (is (= offset @(:segment-offset wal)))
+          (is (= "1" (i/get-value db "data" 1 :long :string)))
+          (i/transact-kv db [[:put "data" 2 "2" :long :string]])
+          (is (= (inc (long next-lsn)) @(:next-lsn wal)))
+          (is (= "2" (i/get-value db "data" 2 :long :string))))
+        (finally (i/close-kv db))))))
 
 (defn- append! [id lsns]
   (let [path (txlog/segment-path *dir* id)]

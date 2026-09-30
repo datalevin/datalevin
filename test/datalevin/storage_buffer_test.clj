@@ -5,6 +5,7 @@
    [datalevin.constants :as c]
    [datalevin.core :as d]
    [datalevin.datom :as datom]
+   [datalevin.interface :as i]
    [datalevin.util :as u]
    [taoensso.nippy :as nippy])
   (:import
@@ -14,6 +15,37 @@
 
 (defn- buffer ^ByteBuffer [direct? size]
   (if direct? (ByteBuffer/allocateDirect size) (ByteBuffer/allocate size)))
+
+(deftest near-list-buffer-survives-cursor-reuse
+  (let [dir (u/tmp-dir (str "near-list-buffer-" (UUID/randomUUID)))
+        db (d/open-kv dir)]
+    (try
+      (doseq [prefix? [false true]]
+        (let [dbi (str "list-" prefix?)
+              flags ((if prefix? conj disj)
+                     c/default-dbi-flags :prefix-compression)]
+          (i/open-list-dbi db dbi {:flags flags})
+          (i/put-list-items db dbi 1 ["prefix/a" "prefix/b" "prefix/c"]
+                            :long :string)
+          (letfn [(check-buffers [kv]
+                    (let [^ByteBuffer first-value
+                          (i/near-list kv dbi 1 "prefix/b" :long :string)
+                          ^ByteBuffer next-value
+                          (i/near-list kv dbi 1 "prefix/c" :long :string)]
+                      (is (= "prefix/b"
+                             (b/read-buffer (.duplicate first-value) :string)))
+                      (is (= "prefix/c"
+                             (b/read-buffer (.duplicate next-value) :string)))
+                      (is (nil? (i/near-list kv dbi 1 "prefix/z" :long :string)))
+                      (is (nil? (i/near-list kv dbi 2 "prefix/a" :long :string)))))]
+            (testing (str "read cursor, prefix compression " prefix?)
+              (check-buffers db))
+            (testing (str "write cursor, prefix compression " prefix?)
+              (d/with-transaction-kv [tx db]
+                (check-buffers tx))))))
+      (finally
+        (d/close-kv db)
+        (u/delete-files dir)))))
 
 (deftest storage-buffer-byte-compatibility
   (let [cached (apply str (repeat 100 "cached"))

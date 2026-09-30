@@ -2,8 +2,11 @@
   (:require
    [clojure.edn :as edn]
    [clojure.test :as t :refer [is deftest testing]]
+   [datalevin.constants :as c]
    [datalevin.core :as d]
    [datalevin.db :as ddb]
+   [datalevin.interface :as i]
+   [datalevin.storage :as st]
    [datalevin.util :as u]
    [datalevin.test.core :as tdc])
   (:import [java.util UUID]))
@@ -252,14 +255,24 @@
   (let [dir  (u/tmp-dir (str "entity-stale-db-test-" (UUID/randomUUID)))
         conn (d/create-conn dir {:company/name {}
                                  :company/linkedin {}})
-        db   @conn]
+        db   @conn
+        before-modified (+ (max (long (i/last-modified (:store db)))
+                                (System/currentTimeMillis))
+                           3600000)]
+    ;; Put the metadata clock ahead of wall time so a schema publication's
+    ;; version cannot be hidden by a same-millisecond datom commit.
+    (i/transact-kv (d/datalog-kv conn)
+                   [[:put c/meta :last-modified before-modified :attr :long]])
+    (st/mark-state-current! (:store db) before-modified)
     (d/transact! conn [{:db/id 1
                         :company/name "8AM Golf"
                         :company/linkedin
                         "https://www.linkedin.com/company/8am-golf/"
                         :company/url "https://8amgolf.com/"}])
 
+    (is (< (long before-modified) (long (i/last-modified (:store db)))))
     (ddb/refresh-cache (:store db))
+    (is (contains? (i/schema (:store db)) :company/url))
 
     (is (= [[1 :company/name "8AM Golf"]
             [1 :company/linkedin

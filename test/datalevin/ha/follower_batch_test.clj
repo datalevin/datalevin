@@ -8,6 +8,7 @@
    [datalevin.ha.replication :as repl]
    [datalevin.interface :as i]
    [datalevin.kv :as kv]
+   [datalevin.kv.txlog :as kvtx]
    [datalevin.test.core :refer [db-fixture]]
    [datalevin.txlog :as wal]
    [datalevin.txlog.transfer :as transfer]
@@ -34,7 +35,7 @@
 
 (defn- source-records [source target values]
   (let [from @(:next-lsn (wal/state target))]
-    (binding [wal/*commit-payload-ha-term* 7]
+    (binding [kvtx/*commit-payload-ha-term* 7]
       (doseq [value values]
         (d/transact-kv source [[:put "data" :value value]])))
     (transfer/decode-batch (kv/open-tx-log-batch source from Long/MAX_VALUE))))

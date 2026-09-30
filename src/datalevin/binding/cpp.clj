@@ -25,6 +25,7 @@
    [datalevin.buffer :as bf]
    [datalevin.migrate :as m]
    [datalevin.scan :as scan]
+   [datalevin.tx-state.lifetime :as lifetime]
    [datalevin.interface :as i
     :refer [IList ILMDB IAdmin open-dbi close-kv env-dir close-vecs
             transact-kv stat key-compressor
@@ -42,7 +43,7 @@
    [java.util.concurrent.atomic AtomicBoolean]
    [java.lang AutoCloseable]
    [java.io File]
-   [java.util HashMap Arrays Collection List
+   [java.util HashMap Arrays Collection List ArrayList
     Map$Entry]
    [java.nio BufferOverflowException ByteBuffer]
    [org.bytedeco.javacpp LongPointer]
@@ -136,7 +137,8 @@
               ^:volatile-mutable ^ByteBuffer v-comp-bf
               aborted?
               ^AtomicBoolean closed?
-              ^boolean owns-buffers?]
+              ^boolean owns-buffers?
+              ^ArrayList native-leases]
 
   ICompress
   (key-bf [_] (.clear k-comp-bf))
@@ -354,7 +356,9 @@
           (buffer/close-bufval-quiet! start-vp*)
           (buffer/close-bufval-quiet! stop-vp*)
           (buffer/clean-buffer-quiet! k-comp-bf*)
-          (buffer/clean-buffer-quiet! v-comp-bf*))))
+          (buffer/clean-buffer-quiet! v-comp-bf*))
+        (doseq [^AutoCloseable lease native-leases] (.close lease))
+        (.clear native-leases)))
     nil))
 
 
@@ -380,7 +384,11 @@
                       :at-least k nil kt :at-least v nil vt value-compressor)
     (when (.get cur ^BufVal (.-start-kp rtx) ^BufVal (.-start-vp rtx)
                 DTLV/MDB_GET_BOTH_RANGE)
-      (iter/v-bf (.val cur) value-compressor rtx))))
+      ;; Prefix-decoded duplicate values can live in cursor-owned scratch
+      ;; memory. scan releases the cursor before the caller decodes this value;
+      ;; retain the bytes while both the cursor and transaction are still live.
+      (ByteBuffer/wrap
+        (b/get-bytes (iter/v-bf (.val cur) value-compressor rtx))))))
 
 (declare ->CppLMDB)
 
@@ -459,7 +467,7 @@
                   (bf/allocate-buffer max-val-size*)
                   (volatile! false)
                   (AtomicBoolean.)
-                  true)]
+                  true (ArrayList. 1))]
     (.set tl-reader rtx)
     (when-not (.isVirtual thread)
       (when-let [^Rtx old (.put reader-registry thread rtx)]
@@ -480,7 +488,112 @@
 
 (declare key-range-list-count-fast)
 
-(deftype CppLMDB [^Env env
+(defn- close-native-write!
+  [^Env env write-txn before-commit]
+    (if-let [^Rtx wtxn @write-txn]
+     (try
+      (when-let [^Txn txn (.-txn wtxn)]
+        (let [aborted? @(.-aborted? wtxn)]
+          (if aborted?
+            (.close txn)
+            (try
+              (when before-commit (before-commit {:operation :close-transact-kv}))
+              (.commit txn)
+              (catch Util$MapFullException _
+                (.close txn)
+                (up-db-size env)
+                (vreset! write-txn nil)
+                (raise "DB resized" {:resized true}))
+              (catch Exception e
+                (.close txn)
+                (vreset! write-txn nil)
+                (if (= :ha/write-rejected (:error (ex-data e)))
+                  (throw e)
+                  (raise "Fail to commit read/write transaction in LMDB: "
+                         e {})))))
+          (vreset! write-txn nil)
+          (.close txn)
+          (if aborted? :aborted :committed)))
+      (finally (close-rtx-quiet! wtxn)))
+      (raise "Calling `close-transact-kv` without opening" {})))
+
+
+(defprotocol IApplicationWriter
+  (apply-native-range! [this body before-commit]
+    "Apply immutable WAL rows directly. Retry only native map growth, with no
+    WAL append, collector, or dynamically scoped commit hook."))
+
+(defprotocol IPendingReader
+  (get-pending-rtx [this]
+    "Internal reader captured against an explicitly pinned pending root.")
+  (range-count-pending [this rtx dbi-name k-range k-type]
+    "Count keys or duplicate values in that reader without decoding rows.")
+  (key-present-pending? [this rtx dbi-name key]
+    "Probe an encoded key without reading or decoding its value.")
+  (list-value-pending? [this rtx dbi-name key value]
+    "Probe an encoded duplicate pair in that reader."))
+
+(defn- borrow-reader!
+  [this env info tl-reader reader-registry public?]
+  (loop []
+    (let [lease (when-let [guard (:native-lifetime @info)]
+                  (when-not (lifetime/teardown-owner? guard)
+                    (lifetime/borrow! guard)))
+          ^Rtx rtx
+          (try
+            (if (i/closed-kv? this)
+              (do (when lease (.close ^AutoCloseable lease)) nil)
+              (let [^Rtx rtx
+                    (or (reusable-reader-rtx this tl-reader reader-registry)
+                        (do
+                          (sweep-dead-reader-rtxs! reader-registry)
+                          (fresh-reader-rtx this env tl-reader reader-registry)))]
+                (when lease (.add ^ArrayList (.-native-leases rtx) lease))
+                rtx))
+            (catch Throwable e
+              (when lease (.close ^AutoCloseable lease))
+              (if (instance? Exception e)
+                (throw (read-transaction-acquisition-error (env-dir this) e))
+                (throw e))))
+          unpublished
+          (when rtx
+            (try
+              (when public?
+                (when-let [check (:unpublished-reader-lsn @info)] (check rtx)))
+              (catch Throwable e
+                (i/return-rtx this rtx)
+                (throw e))))]
+      (if unpublished
+        (do
+            ;; Release both the native snapshot and its lifetime lease before
+            ;; waiting. Recheck the replacement snapshot after publication.
+          (i/return-rtx this rtx)
+          ((:await-native-publication! @info) unpublished)
+          (recur))
+        rtx))))
+
+
+(defmacro ^:private native-call [info & body]
+  `(if-let [guard# (:native-lifetime @~info)]
+     (lifetime/with-use guard# ~@body)
+     (do ~@body)))
+
+(defmacro ^:private def-native-env [name fields & methods]
+  ;; Reads retain a lease at get-rtx/return-rtx (including lazy cursors), and
+  ;; explicit writers at reset-write/close. Do not lock again around every
+  ;; point/range/count adapter or its forwarding arities. Only these entry
+  ;; points touch native handles without an existing borrow boundary.
+  ;; Cleanup remains callable after fencing so existing borrows can drain.
+  (let [guarded '#{apply-native-range! open-dbi clear-dbi drop-dbi copy
+                  transact-kv set-env-flags get-env-flags sync}]
+    `(deftype ~name ~fields
+       ~@(map (fn [method]
+                (if (and (seq? method) (guarded (first method)))
+                  (let [[method args & body] method]
+                    `(~method ~args (native-call ~'info ~@body)))
+                  method)) methods))))
+
+(def-native-env CppLMDB [^Env env
                   info
                   ^ThreadLocal tl-reader
                   ^ConcurrentHashMap reader-registry
@@ -500,6 +613,81 @@
                   ^:volatile-mutable v-comp
                   ^:unsynchronized-mutable meta]
 
+  IApplicationWriter
+  (apply-native-range! [this body before-commit]
+    (locking write-txn
+      (when @write-txn
+        (throw (ex-info "Native writer is already owned"
+                        {:error :txlog/application-writer-in-use :applied? false})))
+      (u/repeat-try-catch c/+in-tx-overflow-times+ l/resized?
+        (try
+          (let [wdb (.open-transact-kv this)
+                result (body wdb)]
+            (close-native-write! env write-txn before-commit)
+            result)
+          (catch Throwable e
+            (when @write-txn
+              (.abort-transact-kv this)
+              (close-native-write! env write-txn nil))
+            (throw e))))))
+
+  IPendingReader
+  (get-pending-rtx [this]
+    (borrow-reader! this env info tl-reader reader-registry false))
+
+  (range-count-pending [this rtx dbi-name [range-type k1 k2] k-type]
+    (let [^DBI dbi (i/get-dbi this dbi-name false)
+          ^Rtx rtx rtx
+          ;; Match scan/scan: the cursor opens this DBI in the pinned reader
+          ;; before the count kernel inspects its range metadata.
+          ^Cursor cur (l/get-cursor dbi rtx)]
+      (try
+        (let [^RangeContext ctx (buffer/key-range-info*
+                                 (.-key-codec dbi) rtx range-type k1 k2 k-type)
+              forward? (.-forward? ctx)
+              lower (if forward? (.-start-bf ctx) (.-stop-bf ctx))
+              upper (if forward? (.-stop-bf ctx) (.-start-bf ctx))
+              include-lower? (if forward? (.-include-start? ctx) (.-include-stop? ctx))
+              include-upper? (if forward? (.-include-stop? ctx) (.-include-start? ctx))
+              flag (BitOps/intOr
+                    (if include-lower? (int DTLV/MDB_COUNT_LOWER_INCL) 0)
+                    (if include-upper? (int DTLV/MDB_COUNT_UPPER_INCL) 0))]
+          (with-open [total (LongPointer. 1)]
+            (if (.-dupsort? dbi)
+              (DTLV/mdb_range_count_values
+               (.get ^Txn (.-txn rtx)) (.get ^Dbi (.-db dbi))
+               (iter/dtlv-val lower) (iter/dtlv-val upper) flag total)
+              (DTLV/mdb_range_count_keys
+               (.get ^Txn (.-txn rtx)) (.get ^Dbi (.-db dbi))
+               (iter/dtlv-val lower) (iter/dtlv-val upper) flag total))
+            (.get ^LongPointer total)))
+        (finally
+          (if (l/read-only? rtx)
+            (l/return-cursor dbi cur)
+            (l/close-cursor dbi cur))))))
+
+  (key-present-pending? [this rtx dbi-name key]
+    (let [^DBI dbi (i/get-dbi this dbi-name false)
+          ^Rtx rtx rtx]
+      (l/put-read-key dbi rtx key :raw)
+      (let [rc (DTLV/mdb_get (.get ^Txn (.-txn rtx))
+                             (.get ^Dbi (.-db dbi))
+                             (.ptr ^BufVal (.-kp rtx))
+                             (.ptr ^BufVal (.-vp rtx)))]
+        (Util/checkRc ^int rc)
+        (not= rc DTLV/MDB_NOTFOUND))))
+
+  (list-value-pending? [this rtx dbi-name key value]
+    (let [^DBI dbi (i/get-dbi this dbi-name false)
+          ^Rtx rtx rtx
+          ^Cursor cur (l/get-cursor dbi rtx)]
+      (try
+        (boolean (in-list?* dbi rtx cur key :raw value :raw))
+        (finally
+          (if (l/read-only? rtx)
+            (l/return-cursor dbi cur)
+            (l/close-cursor dbi cur))))))
+
   IWriting
   (writing? [_] writing?)
 
@@ -513,29 +701,37 @@
 
   (reset-write
     [this]
-    (.clear kp-w)
-    (.clear vp-w)
-    (.clear start-kp-w)
-    (.clear stop-kp-w)
-    (.clear start-vp-w)
-    (.clear stop-vp-w)
-    (.clear k-comp-bf-w)
-    (when-some [^ByteBuffer bf v-comp-bf-w]
-      (.clear bf))
-    (vreset! write-txn (Rtx. this
-                             (Txn/create env)
-                             (volatile! 1)
-                             kp-w
-                             vp-w
-                             start-kp-w
-                             stop-kp-w
-                             start-vp-w
-                             stop-vp-w
-                             k-comp-bf-w
-                             v-comp-bf-w
-                             (volatile! false)
-                             (AtomicBoolean.)
-                             false)))
+    (when-let [old @write-txn] (close-rtx-quiet! old))
+    (let [lease (when-let [guard (:native-lifetime @info)] (lifetime/enter! guard))]
+      (try
+        (.clear kp-w)
+        (.clear vp-w)
+        (.clear start-kp-w)
+        (.clear stop-kp-w)
+        (.clear start-vp-w)
+        (.clear stop-vp-w)
+        (.clear k-comp-bf-w)
+        (when-some [^ByteBuffer bf v-comp-bf-w]
+          (.clear bf))
+        (vreset! write-txn (Rtx. this
+                                (Txn/create env)
+                                (volatile! 1)
+                                kp-w
+                                vp-w
+                                start-kp-w
+                                stop-kp-w
+                                start-vp-w
+                                stop-vp-w
+                                k-comp-bf-w
+                                v-comp-bf-w
+                                (volatile! false)
+                                (AtomicBoolean.)
+                                false (let [leases (ArrayList. 1)]
+                                        (when lease (.add leases lease))
+                                        leases)))
+        (catch Throwable e
+          (when lease (.close ^AutoCloseable lease))
+          (throw e)))))
 
   IObj
   (withMeta [this m] (set! meta m) this)
@@ -549,6 +745,12 @@
     (vswap! info assoc :max-val-size size :max-val-size-changed? true))
 
   (close-kv [this]
+    (let [guard (:native-lifetime @info)]
+     (if (and guard (not (lifetime/teardown-owner? guard)))
+       (if-let [close! (:close-independent! @info)]
+         (close!)
+         (lifetime/close! guard (or (:wal-close-timeout-ms @info) 30000)
+                          #(.close-kv this)))
     (let [dir         (env-dir this)
           dir-key     (lifecycle/local-kv-handle-key (u/file dir) (@info :flags))
           close-error (volatile! nil)]
@@ -612,7 +814,7 @@
           (l/shutdown-last-lmdb-executors!)))
       (when-let [e @close-error]
         (throw e))
-      nil))
+      nil))))
 
   (closed-kv? [_] (.isClosed env))
 
@@ -625,7 +827,8 @@
 
   (env-opts [_] (dissoc @info :compression :dbis :custom-dbis :types :custom-types-revision :custom-value-id
                        :custom-type-cache :custom-payload-dbi-open? :runtime-opts
-                       :write-groups))
+                       :write-groups :native-lifetime :close-independent!
+                       :unpublished-reader-lsn :await-native-publication!))
 
   (dbi-opts [_ dbi-name] (get-in @info [:dbis dbi-name]))
 
@@ -787,32 +990,36 @@
       (raise "Destination directory is not empty." {})))
 
   (get-rtx [this]
-    (when-not (.closed-kv? this)
-      (try
-        (or (reusable-reader-rtx this tl-reader reader-registry)
-            (do
-              (sweep-dead-reader-rtxs! reader-registry)
-              (fresh-reader-rtx this env tl-reader reader-registry)))
-        (catch Exception e
-          (throw (read-transaction-acquisition-error (env-dir this) e))))))
+    (borrow-reader! this env info tl-reader reader-registry true))
 
   (return-rtx [this rtx]
-    (when-not (.closed-kv? this)
-      (if (.isVirtual (Thread/currentThread))
-        (try
-          (close-rtx-quiet! rtx)
-          (finally
-            (.remove tl-reader)))
-        (.reset ^Rtx rtx))))
+    (let [^Rtx rtx rtx
+          ^ArrayList leases (.-native-leases rtx)
+          lease (when-not (.isEmpty leases) (.get leases (dec (.size leases))))]
+      (try
+        (when-not (.closed-kv? this)
+          (if (.isVirtual (Thread/currentThread))
+            (try
+              (close-rtx-quiet! rtx)
+              (finally (.remove tl-reader)))
+            (.reset rtx)))
+        (finally
+          ;; Virtual-thread close already released the whole borrow stack.
+          (when (and lease (not (.isEmpty leases))
+                     (identical? lease (.get leases (dec (.size leases)))))
+            (.remove leases (int (dec (.size leases))))
+            (.close ^AutoCloseable lease))))))
 
   (stat [_]
-    (try
-      (let [stat ^Stat (Stat/create env)
-            m    (buffer/stat-map stat)]
-        (.close stat)
-        m)
-      (catch Exception e
-        (raise "Fail to get statistics: " e {}))))
+    (native-call info
+      (try
+        (let [stat ^Stat (Stat/create env)
+              m    (buffer/stat-map stat)]
+          (.close stat)
+          m)
+        (catch Exception e
+          (raise "Fail to get statistics: " e {})))))
+
   (stat [this dbi-name]
     (if dbi-name
       (let [^Rtx rtx (.get-rtx this)]
@@ -856,30 +1063,7 @@
         (raise "Fail to open read/write transaction in LMDB: " e {}))))
 
   (close-transact-kv [_]
-    (if-let [^Rtx wtxn @write-txn]
-      (when-let [^Txn txn (.-txn wtxn)]
-        (let [aborted? @(.-aborted? wtxn)]
-          (if aborted?
-            (.close txn)
-            (try
-              (run-before-write-commit! {:operation :close-transact-kv})
-              (.commit txn)
-              (catch Util$MapFullException _
-                (.close txn)
-                (up-db-size env)
-                (vreset! write-txn nil)
-                (raise "DB resized" {:resized true}))
-              (catch Exception e
-                (.close txn)
-                (vreset! write-txn nil)
-                (if (= :ha/write-rejected (:error (ex-data e)))
-                  (throw e)
-                  (raise "Fail to commit read/write transaction in LMDB: "
-                         e {})))))
-          (vreset! write-txn nil)
-          (.close txn)
-          (if aborted? :aborted :committed)))
-      (raise "Calling `close-transact-kv` without opening" {})))
+    (close-native-write! env write-txn run-before-write-commit!))
 
   (abort-transact-kv [_]
     (when-let [^Rtx wtxn @write-txn]
@@ -895,7 +1079,7 @@
   (transact-kv [this dbi-name txs k-type v-type]
     (let [^objects prepared-one-shot
           (let [tx-open? (some? @write-txn)]
-            (when-not tx-open?
+            (when-not (or tx-open? (instance? datalevin.kv.encoding.StorageRows txs))
               (write/prepare-kvtx-ops txs dbis dbi-name k-type v-type)))]
       (letfn [(do-transact [prepared]
               (.check-ready this)
@@ -1261,9 +1445,10 @@
           ^ConcurrentHashMap reader-registry (.-reader-registry lmdb)
           thread (Thread/currentThread)]
       (when-let [^Rtx rtx (.get tl-reader)]
-        (.remove reader-registry thread rtx)
-        (close-rtx-quiet! rtx)
-        (.remove tl-reader))))
+        (native-call (.-info lmdb)
+          (.remove reader-registry thread rtx)
+          (close-rtx-quiet! rtx)
+          (.remove tl-reader)))))
   nil)
 
 (defn- key-range-list-count-fast
@@ -1407,7 +1592,7 @@
             (set-val-compressor lmdb value-codec)
             (lifecycle/register-shutdown-hook!
               dir (Thread. #(lifecycle/run-shutdown-close! dir lmdb)))
-            (lifecycle/start-scheduled-sync (.-scheduled-sync lmdb) dir env)))
+            (lifecycle/start-scheduled-sync (.-scheduled-sync lmdb) dir lmdb)))
         ;; Every environment needs the write transaction's value scratch buffer,
         ;; including in-memory and temporary stores that skip persisted metadata.
         (set-max-val-size lmdb (max-val-size lmdb))
@@ -1421,7 +1606,8 @@
       (catch Exception e
         (when-let [lmdb @opened]
           (try (close-kv lmdb) (catch Throwable _)))
-        (lifecycle/release-local-kv-handle! local-handle-key)
+        (when (or (nil? @opened) (i/closed-kv? @opened))
+          (lifecycle/release-local-kv-handle! local-handle-key))
         (raise "Fail to open database: " e {:dir dir})))))
 
 (defmethod open-kv :cpp

@@ -18,7 +18,6 @@
    [datalevin.util :as u :refer [raise]])
   (:import
    [datalevin.async IAsyncWork]
-   [datalevin.cpp Env]
    [java.io File]
    [java.util.concurrent ScheduledExecutorService ScheduledFuture TimeUnit]))
 
@@ -32,21 +31,21 @@
 
 (def sync-key (memoize sync-key*))
 
-(deftype AsyncSync [dir ^Env env]
+(deftype AsyncSync [dir lmdb]
   IAsyncWork
   (work-key [_] (sync-key dir))
-  (do-work [_] (.sync env 1))
+  (do-work [_] (i/sync lmdb 1))
   (combine [_] first)
   (callback [_] nil))
 
 (defn start-scheduled-sync
-  [scheduled-sync dir ^Env env]
+  [scheduled-sync dir lmdb]
   (let [scheduler ^ScheduledExecutorService (u/get-scheduler)
         fut (.scheduleWithFixedDelay
              scheduler
              ^Runnable #(let [exe (a/get-executor)]
                           (when (a/running? exe)
-                            (a/exec exe (AsyncSync. dir env))))
+                            (a/exec exe (AsyncSync. dir lmdb))))
              ^long (rand-int c/lmdb-sync-interval)
              ^long c/lmdb-sync-interval
              TimeUnit/SECONDS)]

@@ -30,8 +30,8 @@
   Clojure one. Clojure will still be the source of new feature development and
   serves JVM, while rust one serves the native embedded/client in the future.
   Auto-migration from 0.9.27 and above will be conducted on DB open.
-- [WAL] standalone transactions in `:strict` profile also uses group commit
-  similar to PostgreSQL, while keeping durability guarantees (i.e. only durable
+- [Write] native LMDB transactions and WAL transactions in `:strict` profile
+  both also use group commit while keeping durability guarantees (i.e. only durable
   commit is acknowledged). Such batching is disabled if synchronous secondary
   indexing (idoc, fulltext, vector, and embedding) is requested, asynchronous
   secondary indexing is unaffected.
@@ -40,7 +40,8 @@
 - [Datalog] planner range conversion for `like`.
 - [Datalog] false-negative giant AVE lookup.
 - [Datalog] simulated transaction range bounds.
-- [KV] prefix overflow page deletion.
+- [KV] a cursor-lifetime bug in near-list that causes concurrent databases regression.
+- [KV] prefix overflow page deletion [#390](https://github.com/datalevin/datalevin/issues/390).
 
 ### Improved
 - [Server] simplify, speedup and harden client/server lifecycle, by using

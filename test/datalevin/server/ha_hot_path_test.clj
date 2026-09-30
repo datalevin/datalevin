@@ -16,7 +16,7 @@
    [datalevin.server.ha :as ha]
    [datalevin.server.handlers :as handlers]
    [datalevin.test.core :refer [db-fixture]]
-   [datalevin.tx-group :as group]
+   [datalevin.tx-group.compat :as group]
    [datalevin.util :as u])
   (:import
    [datalevin.tx_group Group]
@@ -346,7 +346,7 @@
                              deps nil "db" false
                              #(if conn
                                 (d/with-transaction [tx conn]
-                                  (if group/*batched?*
+                                  (if (group/batched?)
                                     (:result (db/execute-write-group tx execute))
                                     (execute tx)))
                                 (l/with-transaction-kv [tx store] (execute tx)))))

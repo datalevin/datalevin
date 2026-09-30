@@ -214,6 +214,9 @@
   ([store target]
    (refresh-cache store target nil))
   ([store target remote-max-tx]
+   ;; An older DB can retain a Store wrapper from before a schema change.
+   ;; Refresh its attribute-ID map along with the cached query results.
+   (s/maybe-ensure-current! store)
    (let [target (long (or target 0))
          old    ^LRUCache (.get ^ConcurrentHashMap caches (dir store))
          cache  (LRUCache. (:cache-limit (opts store)) target cache-dependencies)]
@@ -1669,26 +1672,34 @@
              db)))
        (if (instance? Store store)
          (let [embedding-plan (s/prepare-embedding-plan ^Store store tx-data)
-               ;; Schema publication may have advanced beyond the wall clock.
-               ;; Keep its version visible to retained readers after this write.
+               ;; Preparation can create attributes and advance the schema
+               ;; version. This is a floor; storage chooses the final version
+               ;; after preparing all datoms.
                commit-ms      (max (long (s/observed-state-sync-ms store))
                                    (System/currentTimeMillis))
-               extra-kv-tx    (some-> report
-                                      (committed-client-op-response commit-ms))
-               commit-opts    (cond-> {:last-modified-ms commit-ms}
-                                extra-kv-tx
-                                (assoc :extra-kv-txs [extra-kv-tx]))]
-           (s/load-datoms-with-plan! ^Store store tx-data embedding-plan
-                                     commit-opts)
+               tx-meta        (:tx-meta report)
+               client-op?     (and (:client-op/id tx-meta)
+                                   (:client-op/request-type tx-meta)
+                                   (:client-op/hash tx-meta)
+                                   (:client-op/response-kind tx-meta))
+               commit-opts    (cond-> {:last-modified-ms commit-ms
+                                       :return-modified-ms? true}
+                                client-op?
+                                (assoc :extra-kv-txs-fn
+                                       (fn [modified-ms]
+                                         [(committed-client-op-response
+                                            report modified-ms)])))
+               modified-ms    (long (s/load-datoms-with-plan!
+                                      ^Store store tx-data embedding-plan
+                                      commit-opts))]
            (when ensures
              (run-report-ensures! (transfer (:db-after report) store)
                                   report))
-           (s/mark-state-current! ^Store store commit-ms)
+           (s/mark-state-current! ^Store store modified-ms)
            (if-let [^WriteGroup group
                     (s/current-write-group (.-lmdb ^Store store))]
              (doseq [datom tx-data] (.add ^FastList (.-datoms group) datom))
-             ;; Reuse the persisted timestamp without a post-commit read txn.
-             (invalidate-cache store tx-data commit-ms))
+             (invalidate-cache store tx-data modified-ms))
            db)
          (do
            (load-datoms store tx-data)

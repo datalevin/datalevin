@@ -2156,27 +2156,31 @@
 (defn load-datoms-with-plan!
   ([^Store store datoms embedding-plan]
    (load-datoms-with-plan! store datoms embedding-plan nil))
-  ([^Store store datoms embedding-plan {:keys [extra-kv-txs last-modified-ms]}]
-   (let [[res secondary-index-job-count]
+  ([^Store store datoms embedding-plan
+    {:keys [extra-kv-txs extra-kv-txs-fn last-modified-ms
+            return-modified-ms?]}]
+   (let [[res secondary-index-job-count modified-ms]
          (locking (.-write-txn store)
            ;; Transaction stores refresh when the write lock is acquired.
            ;; Direct writes acquire it here, before allocating any giant IDs.
            (when-not (lmdb/writing? (.-lmdb store))
              (sync-giant-id! store))
            (let [run (fn [tx-lmdb]
-                       (let [plan (prepare-datoms-kv-plan store datoms embedding-plan
-                                                          extra-kv-txs last-modified-ms)
+                       (let [plan (prepare-datoms-kv-plan
+                                    store datoms embedding-plan extra-kv-txs
+                                    extra-kv-txs-fn last-modified-ms)
                              res (commit-datoms-kv-plan!
                                   tx-lmdb (.-search-engines store)
                                   (.-vector-indices store) (.-embedding-indices store)
                                   (store-idoc-indices store) plan)]
-                         [res (:secondary-index-job-count plan)]))]
+                         [res (:secondary-index-job-count plan)
+                          (:modified-ms plan)]))]
              (if (cd/custom-schema? (schema store))
                (lmdb/with-transaction-kv [tx-lmdb (.-lmdb store)] (run tx-lmdb))
                (run (.-lmdb store)))))]
      (when (pos? (long (or secondary-index-job-count 0)))
        (enqueue-secondary-index-work! store))
-     res)))
+     (if return-modified-ms? modified-ms res))))
 
 (defn- write-attr-info
   [^Store store ^HashMap attr-infos attr value insert?]
@@ -2353,8 +2357,9 @@
   ([^Store store datoms]
    (prepare-datoms-kv-plan store datoms nil))
   ([^Store store datoms embedding-plan]
-   (prepare-datoms-kv-plan store datoms embedding-plan nil nil))
-  ([^Store store datoms embedding-plan extra-kv-txs last-modified-ms]
+   (prepare-datoms-kv-plan store datoms embedding-plan nil nil nil))
+  ([^Store store datoms embedding-plan extra-kv-txs extra-kv-txs-fn
+    last-modified-ms]
    ;; Another connection may have enabled AVE since this wrapper was created.
    ;; The caller holds the write lock, so index participation cannot change
    ;; between this refresh and the commit.
@@ -2404,11 +2409,12 @@
                                            changes)})
                            (group-by first ops)))
            tx-id (long (.advance-max-tx store))
-           modified-ms (long (or last-modified-ms
-                                 ;; Do not undo index-attr's schema publication
-                                 ;; timestamp when a write follows in the same ms.
-                                 (max (long (observed-state-sync-ms store))
-                                      (System/currentTimeMillis))))]
+           ;; Auto-created attributes can advance this store's schema version
+           ;; while the datom plan is built. Never overwrite that newer version
+           ;; with a timestamp chosen before preparation.
+           modified-ms (long (max (long (or last-modified-ms 0))
+                                  (long (observed-state-sync-ms store))
+                                  (System/currentTimeMillis)))]
        (when (or ft-jobs vi-jobs em-jobs id-jobs)
          (doseq [[ordinal job] (map-indexed vector
                                             (concat ft-jobs vi-jobs em-jobs id-jobs))]
@@ -2427,18 +2433,22 @@
            (.add txs (lmdb/kv-tx :put c/meta :max-tx tx-id :attr :long))
            (.add txs (lmdb/kv-tx :put c/meta :last-modified
                                   modified-ms
-                                  :attr :long)))))
-     (doseq [tx extra-kv-txs]
-       (.add txs tx))
-     {:txs txs
-      :ft-ds (aget work ft-ds-slot)
-      :vi-ds (aget work vi-ds-slot)
-      :em-ds (aget work em-ds-slot)
-      :id-ds (aget work id-ds-slot)
-      :secondary-index-job-count (+ (count (aget work ft-jobs-slot))
-                                    (count (aget work vi-jobs-slot))
-                                    (count (aget work em-jobs-slot))
-                                    (count (aget work id-jobs-slot)))})))
+                                  :attr :long))))
+       (doseq [tx extra-kv-txs]
+         (.add txs tx))
+       (when extra-kv-txs-fn
+         (doseq [tx (extra-kv-txs-fn modified-ms)]
+           (.add txs tx)))
+       {:txs txs
+        :modified-ms modified-ms
+        :ft-ds (aget work ft-ds-slot)
+        :vi-ds (aget work vi-ds-slot)
+        :em-ds (aget work em-ds-slot)
+        :id-ds (aget work id-ds-slot)
+        :secondary-index-job-count (+ (count (aget work ft-jobs-slot))
+                                      (count (aget work vi-jobs-slot))
+                                      (count (aget work em-jobs-slot))
+                                      (count (aget work id-jobs-slot)))}))))
 
 (defn- commit-datoms-kv-plan!
   "Commit a prepared datom KV plan."
