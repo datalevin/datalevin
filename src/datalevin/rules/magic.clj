@@ -162,35 +162,36 @@
 
 (defn magic-effective?
   "Check if magic set rewrite would be effective for the given rule and bound
-   pattern. Magic is ineffective when bound head vars don't appear in any
-   non-recursive body clause of a recursive branch - they can't filter
-   intermediate results, causing cross-product scans."
+   pattern. Stable bindings are already seeded in the ordinary evaluator;
+   rewriting only those bindings adds propagation joins without narrowing
+   recursion. Bound variables must also occur in non-recursive body clauses
+   to filter intermediate results."
   [rules rule-name bound-idxs stratum-set]
   (let [branches  (rules rule-name)
         head-vars (vec (rest (ffirst branches)))]
-    (every?
-      (fn [branch]
-        (let [body-clauses (rest branch)
-              ;; Check if this branch has any recursive calls
-              has-recursive? (some (fn [clause]
-                                     (and (sequential? clause)
-                                          (stratum-set (rule-head clause))))
-                                   body-clauses)]
-          (if has-recursive?
-            ;; For recursive branches, bound vars must appear in non-recursive
-            ;; clauses to effectively filter intermediate results
-            (let [non-rec-clauses (remove (fn [clause]
-                                            (and (sequential? clause)
-                                                 (stratum-set (rule-head clause))))
-                                          body-clauses)
-                  non-rec-vars    (into #{} (mapcat clause-free-vars)
-                                        non-rec-clauses)
-                  bound-vars      (into #{} (map head-vars) bound-idxs)]
-              ;; At least one bound var must appear in non-recursive clauses
-              (seq (set/intersection bound-vars non-rec-vars)))
-            ;; Non-recursive branches are always OK
-            true)))
-      branches)))
+    (and
+      (not (set/subset? (set bound-idxs)
+                       (stable-head-idxs branches stratum-set)))
+      (every?
+        (fn [branch]
+          (let [body-clauses (rest branch)
+                ;; Check if this branch has any recursive calls
+                has-recursive? (some (fn [clause]
+                                      (and (sequential? clause)
+                                           (stratum-set (rule-head clause))))
+                                    body-clauses)]
+            (if has-recursive?
+              ;; Bound vars must filter a non-recursive clause as well.
+              (let [non-rec-clauses (remove (fn [clause]
+                                              (and (sequential? clause)
+                                                   (stratum-set (rule-head clause))))
+                                            body-clauses)
+                    non-rec-vars    (into #{} (mapcat clause-free-vars)
+                                          non-rec-clauses)
+                    bound-vars      (into #{} (map head-vars) bound-idxs)]
+                (seq (set/intersection bound-vars non-rec-vars)))
+              true)))
+        branches))))
 
 (defn magic-rewrite-program
   [rules goal-name goal-pattern stratum-set]

@@ -48,6 +48,8 @@
 one thread per connection.
 - [Server] avoid decode then re-encode KV point reads and scalar pulls.
 - [Datalog] always refresh giant id floor in transaction.
+- [Datalog] skip magic set rewrite when retained bindings are unchanged through
+  recursion.
 - [WAL] simplify Datalog WAL record and use `:writemap` for DLMDB overlay.
 - [KV] cheaper prefix cache operations.
 - [KV] reduce reader table scans.
