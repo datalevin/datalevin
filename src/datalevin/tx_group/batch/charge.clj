@@ -182,8 +182,7 @@
                  wal-pending-max-bytes (:byte-budget default-limits)
                  write-batch-size (:batch-limit default-limits)
                  write-batch-max-bytes (:batch-max-bytes default-limits)
-                 wal-rmw-max-bytes (:rmw-allowance-bytes default-limits)}
-            :as opts}]
+                 wal-rmw-max-bytes (:rmw-allowance-bytes default-limits)}}]
   (let [max-requests (positive-int! :wal-pending-max-requests
                                    (long wal-pending-max-requests))
         byte-budget (positive-int! :wal-pending-max-bytes (long wal-pending-max-bytes))
