@@ -16,14 +16,14 @@
    [datalevin.util :as u :refer [raise]]
    [taoensso.timbre :as log])
   (:import
-   [com.alipay.sofa.jraft Closure Iterator Node RaftGroupService Status]
+   [com.alipay.sofa.jraft Closure Iterator Node NodeManager RaftGroupService Status]
    [com.alipay.sofa.jraft.closure ReadIndexClosure]
    [com.alipay.sofa.jraft.conf Configuration]
    [com.alipay.sofa.jraft.core StateMachineAdapter]
    [com.alipay.sofa.jraft.entity PeerId Task]
    [com.alipay.sofa.jraft.error RaftError]
    [com.alipay.sofa.jraft.option NodeOptions RpcOptions]
-   [com.alipay.sofa.jraft.rpc RpcContext RpcProcessor RpcClient
+   [com.alipay.sofa.jraft.rpc RpcContext RpcProcessor RpcClient RpcServer
     RpcRequests$ErrorResponse ProtobufMsgFactory]
    [com.alipay.sofa.jraft.storage.snapshot SnapshotReader SnapshotWriter]
    [com.alipay.sofa.jraft.util RpcFactoryHelper]
@@ -1558,6 +1558,36 @@
           (log/warn e "HA control JRaft configuration callback failed"
                     {:configuration (str conf)}))))))
 
+(defn- shutdown-raft-service!
+  [^RaftGroupService service]
+  (if (.isStarted service)
+    (try
+      (.shutdown service)
+      (catch Exception e
+        (log/warn e "Failed to shutdown HA control raft service")))
+    ;; JRaft initializes the node before binding its RPC listener. If binding
+    ;; throws, service.shutdown is a no-op because started is still false.
+    (do
+      (when-let [^RpcServer rpc-server (.getRpcServer service)]
+        ;; Bolt closes a listener whose startup failed; shutdown is not
+        ;; idempotent on that closed instance.
+        (when (.isStarted rpc-server)
+          (try
+            (.shutdown rpc-server)
+            (catch Exception e
+              (log/warn e "Failed to stop HA control rpc server")))))
+      (when-let [^Node node (.getRaftNode service)]
+        (try
+          (.shutdown node)
+          (catch Exception e
+            (log/warn e "Failed to stop partially started HA control node"))))
+      (.removeAddress (NodeManager/getInstance)
+                      (.getEndpoint (.getServerId service)))))
+  (try
+    (.join service)
+    (catch Exception e
+      (log/warn e "Failed to join HA control raft service"))))
+
 (defrecord SofaJraftLeaseAuthority [group-id local-peer-id voters
                                     rpc-timeout-ms election-timeout-ms
                                     operation-timeout-ms raft-dir
@@ -1613,9 +1643,11 @@
                                         (int default-snapshot-interval-secs)))
                   service            (RaftGroupService.
                                       group-id local-peer opts)
+                  _                  (vreset! group-service-box service)
                   node               (.start service)
                   client             (.createRpcClient
-                                      (RpcFactoryHelper/rpcFactory))]
+                                      (RpcFactoryHelper/rpcFactory))
+                  _                  (vreset! rpc-client-box client)]
               (when-not node
                 (raise "Failed to start HA control JRaft node"
                          {:error :ha/control-start-failed
@@ -1629,8 +1661,6 @@
                   (.registerProcessor
                    (.getRpcServer service)
                    (forward-request-processor this))
-                  (vreset! group-service-box service)
-                  (vreset! rpc-client-box client)
                   (vreset! group-service-v service)
                   (vreset! node-v node)
                   (vreset! rpc-client-v client)
@@ -1646,14 +1676,7 @@
                   (catch Exception shutdown-e
                     (log/warn shutdown-e "Failed to stop HA control rpc client"))))
               (when-let [^RaftGroupService service @group-service-box]
-                (try
-                  (.shutdown service)
-                  (catch Exception shutdown-e
-                    (log/warn shutdown-e "Failed to shutdown HA control raft service")))
-                (try
-                  (.join service)
-                  (catch Exception join-e
-                    (log/warn join-e "Failed to join HA control raft service"))))
+                (shutdown-raft-service! service))
               (vreset! group-service-v nil)
               (vreset! node-v nil)
               (vreset! rpc-client-v nil)
@@ -1671,14 +1694,7 @@
             (catch Exception e
               (log/warn e "Failed to stop HA control rpc client"))))
         (when-let [^RaftGroupService service @group-service-v]
-          (try
-            (.shutdown service)
-            (catch Exception e
-              (log/warn e "Failed to shutdown HA control raft service")))
-          (try
-            (.join service)
-            (catch Exception e
-              (log/warn e "Failed to join HA control raft service"))))
+          (shutdown-raft-service! service))
         (vreset! group-service-v nil)
         (vreset! node-v nil)
         (vreset! rpc-client-v nil)))

@@ -555,7 +555,7 @@
   *wal-sync-mode* :fdatasync)
 
 (def ^{:dynamic true
-       :doc     "WAL group-commit threshold by number of records (primarily affects `:relaxed` durability profile)."}
+       :doc     "WAL group-commit threshold by number of logical write requests, including requests batched into one WAL record (primarily affects `:relaxed` durability profile)."}
   *wal-group-commit* 128)
 
 (def ^{:dynamic true
