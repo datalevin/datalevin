@@ -6,7 +6,8 @@
   into the same environment."
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [datalevin.tx-group.batch :as batch]
-            [datalevin.tx-group.batch.env :as env])
+            [datalevin.tx-group.batch.env :as env]
+            [datalevin.tx-state.protocol :as protocol])
   (:import [java.io File]
            [java.nio.file Files]
            [java.nio.file.attribute FileAttribute]
@@ -77,6 +78,120 @@
     (is (zero? (env/handles second-handle)))
     (testing "the last release stops admission"
       (is (not (batch/serving? (env/collector second-handle)))))))
+
+(deftest runtime-opens-once-under-the-lease-and-closes-after-last-handle
+  (let [dir (fresh-dir!)
+        events (atom [])
+        opts {:dir dir :db-identity "private-db"
+              :open-runtime!
+              (fn []
+                (is (= :kv-independent-v1
+                       (:mode (protocol/read-write-protocol-marker dir))))
+                (is (thrown? clojure.lang.ExceptionInfo
+                             (protocol/acquire-write-protocol-lease!
+                              dir :legacy-writer-v1 "private-db")))
+                (swap! events conj :open)
+                {:executor echo-values :resources :native
+                 :close! #(do (swap! events conj :close) true)})}
+        first-handle (env/open-batch! opts)
+        alias (env/open-batch! (assoc opts :dir (str dir "/.")))]
+    (is (identical? first-handle alias))
+    (is (= :native (env/resources alias)))
+    (is (= [:open] @events))
+    (env/close! first-handle)
+    (is (= [:open] @events))
+    (is (= :ok (batch/submit! (env/collector alias) {:allowance 1024 :data :ok})))
+    (env/close! alias)
+    (is (= [:open :close] @events))))
+
+(deftest a-failed-runtime-open-releases-its-lease
+  (let [dir (fresh-dir!)
+        opts {:dir dir :db-identity "private-db"}]
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"open failed"
+         (env/open-batch! (assoc opts :open-runtime!
+                                #(throw (ex-info "open failed" {}))))))
+    (is (not (some #{dir} (env/active-environments))))
+    (let [environment (env/open-batch! (assoc opts :executor echo-values))]
+      (is (= 1 (env/handles environment)))
+      (env/close! environment))))
+
+(deftest last-close-drains-the-executor-after-collector-quiescence
+  (let [dir (fresh-dir!)
+        events (atom [])
+        env* (atom nil)
+        environment (env/open-batch!
+                     {:dir dir
+                      :db-identity "db-1"
+                      :executor (fn [batch]
+                                  (swap! events conj :batch)
+                                  (echo-values batch))
+                      :executor-close! (fn []
+                                         (swap! events conj
+                                                [:executor-close
+                                                 (batch/serving?
+                                                  (env/collector @env*))])
+                                         true)})]
+    (reset! env* environment)
+    (batch/submit! (env/collector environment) {:allowance 1024 :data :a})
+    (env/close! environment)
+    (is (some #(= :batch %) @events))
+    (is (= [:executor-close false] (last @events))
+        "the executor drains only after the collector stopped serving")))
+
+(deftest close-does-not-stop-the-executor-when-quiescence-times-out
+  ;; Regression: close stopped the executor even after await-quiescence! timed
+  ;; out, discarding WAL work a live batch was still waiting on.
+  (let [dir (fresh-dir!)
+        entered (CountDownLatch. 1)
+        release (CountDownLatch. 1)
+        executor-closed? (atom false)
+        environment (env/open-batch!
+                     {:dir dir
+                      :db-identity "db-1"
+                      :executor (fn [batch]
+                                  (.countDown entered)
+                                  (.await release 5 TimeUnit/SECONDS)
+                                  (echo-values batch))
+                      :executor-close! (fn []
+                                         (reset! executor-closed? true)
+                                         true)
+                      :write-close-timeout-ms 50})
+        submission (future (try (batch/submit! (env/collector environment)
+                                               {:allowance 1024 :data :a})
+                                (catch Throwable t t)))]
+    (try
+      (is (.await entered 5 TimeUnit/SECONDS))
+      (env/close! environment)
+      (testing "a timed-out quiescence leaves the live executor running"
+        (is (false? @executor-closed?))
+        (is (some #{(.getCanonicalPath (File. dir))}
+                  (env/active-environments))))
+      (finally
+        (.countDown release)
+        (deref submission 5000 nil)))))
+
+(deftest concurrent-close-and-open-cannot-attach-to-a-retired-runtime
+  ;; Regression: the closed flag was set after the registry lock was released,
+  ;; so an open could attach between the last-handle decrement and retirement.
+  (dotimes [_ 50]
+    (let [dir (fresh-dir!)
+          environment (env/open-batch! {:dir dir :db-identity "db-1"
+                                        :executor echo-values})
+          start (CountDownLatch. 1)
+          closer (future (.await start 5 TimeUnit/SECONDS)
+                         (env/close! environment))
+          opener (future (.await start 5 TimeUnit/SECONDS)
+                         (try (env/open-batch! {:dir dir :db-identity "db-1"
+                                                :executor echo-values})
+                              (catch Throwable t t)))]
+      (.countDown start)
+      (let [opened (deref opener 5000 nil)]
+        (deref closer 5000 nil)
+        (when (and (some? opened) (not (instance? Throwable opened)))
+          (is (batch/serving? (env/collector opened))
+              "a successful open must not attach to a retired runtime")
+          (env/close! opened))))))
 
 (deftest byte-measure-overrides-reach-the-runtime
   (let [dir (fresh-dir!)

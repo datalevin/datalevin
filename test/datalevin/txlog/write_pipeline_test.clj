@@ -313,7 +313,7 @@
             (is (:partial-tail? scan))))))))
 
 (deftest positioned-and-gathered-batches-retry-short-writes
-  (doseq [large? [false true]]
+  (doseq [large? [false true] array? [false true]]
     (with-runtime
       {}
       (fn [state]
@@ -346,12 +346,15 @@
                         :long :string]]
                       [[:del "data" 6 :long]]]
               prepared (mapv #(wal/prepare-append-body % {:ha-term 7}) inputs)
-              group (codec/prepare-commit-row-group prepared)
+              carrier (if array? (object-array prepared) prepared)
+              group (codec/prepare-commit-row-group carrier)
               next-offset (+ (:offset (last results)) (:size (last results)))
               grouped (segment/write-prepared-record-at! channel next-offset group 8 12345)
               expected (wal/encode-commit-row-payload 8 12345 (mapcat identity inputs)
                                                        {:ha-term 7})
               records (:records (segment/scan-segment (wal/segment-path (:dir state) 1)))]
+          (is (identical? carrier (:bodies group))
+              "retain the sealed array or compatibility vector without copying")
           (is (= 5 (count records)))
           (is (= (mapv :offset results) (mapv :offset (take 3 (rest records)))))
           (is (= [1 2 3] (mapv #(aget ^bytes (:body %) 0) (take 3 (rest records)))))

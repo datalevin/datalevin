@@ -10,7 +10,8 @@
             [datalevin.tx-group.batch.charge :as charge]
             [datalevin.tx-group.phase :as phase])
   (:import [java.util.concurrent ConcurrentLinkedQueue CountDownLatch TimeUnit]
-           [java.util.concurrent.atomic AtomicInteger]))
+           [java.util.concurrent.atomic AtomicBoolean AtomicInteger AtomicLong]
+           [java.util.concurrent.locks Condition LockSupport ReentrantLock]))
 
 (def ^:private default-overrides
   {:wal-pending-max-requests 64
@@ -43,6 +44,28 @@
 
 (defn- timeout [] ::timeout)
 
+(defn- progress-probe
+  "Observe actual condition waits/signals without changing production code."
+  [^datalevin.tx_group.batch.Collector c on-await]
+  (let [^ReentrantLock lock (.lock c)
+        ^Condition delegate (.newCondition lock)
+        signals (atom [])
+        progress (reify Condition
+                   (await [_] (on-await c) (.await delegate))
+                   (await [_ time unit] (on-await c) (.await delegate time unit))
+                   (awaitNanos [_ ns] (on-await c) (.awaitNanos delegate ns))
+                   (awaitUntil [_ date] (on-await c) (.awaitUntil delegate date))
+                   (awaitUninterruptibly [_]
+                     (on-await c) (.awaitUninterruptibly delegate))
+                   (signal [_] (swap! signals conj :one) (.signal delegate))
+                   (signalAll [_] (swap! signals conj :all) (.signalAll delegate)))]
+    {:signals signals
+     :collector (batch/->Collector
+                 lock progress (.ready c) (.queued c) (.active c) (.serving c)
+                 (.active-batch c) (.failure c) (.waiters c) (.budget c)
+                 (.max-requests c) (.batch-limit c) (.batch-max-bytes c)
+                 (.shared-reserved c) (.published c) (.next-id c) (.executor c))}))
+
 ;; ---------------------------------------------------------------------------
 ;; Lifecycle and limits
 
@@ -62,6 +85,60 @@
     (testing "each request holds exactly one reserve/release pair"
       (is (zero? (:requests (batch/usage c))))
       (is (zero? (:bytes (batch/usage c)))))))
+
+(deftest a-batch-releases-retained-charges-at-cleanup
+  ;; Cleanup must not depend on caller notification: the batch releases a sealed
+  ;; member's reservation before the leader's submit! returns and runs its
+  ;; fallback finally. :next-activation fires after the sealed batch's cleanup
+  ;; but before lead! returns to the caller.
+  (let [c (collector-with echo-values)
+        at-next-activation (promise)
+        remove-observer
+        (phase/observe!
+         (fn [event _]
+           (when (= :next-activation event)
+             (deliver at-next-activation (:requests (batch/usage c))))))]
+    (try
+      (is (= :a (batch/submit! c {:allowance 1024 :data :a})))
+      (is (= 0 (deref at-next-activation 5000 ::timeout))
+          "the batch released the charge before the caller's finally ran")
+      (is (zero? (:requests (batch/usage c))))
+      (is (zero? (:bytes (batch/usage c))))
+      (finally
+        (remove-observer)))))
+
+(deftest a-selected-descriptor-cannot-be-released-by-its-caller
+  ;; Regression: the caller fallback used to release a sealed member's
+  ;; reservation. A timed-out follower could then drop accounted bytes while its
+  ;; active batch still retained the storage. Once selected, only batch cleanup
+  ;; may release the reservation.
+  (let [entered (CountDownLatch. 1)
+        release (CountDownLatch. 1)
+        captured (promise)
+        executor (fn [batch]
+                   (deliver captured (batch/batch-at batch 0))
+                   (.countDown entered)
+                   (.await release 5 TimeUnit/SECONDS)
+                   (echo-values batch))
+        c (collector-with executor)
+        f (future (try (batch/submit! c {:allowance 2048 :data :a})
+                       (catch Throwable t t)))]
+    (try
+      (is (.await entered 5 TimeUnit/SECONDS))
+      (is (= 2048 (:bytes (batch/usage c))))
+      (let [descriptor (deref captured 1000 nil)]
+        (is (some? descriptor))
+        (testing "the caller fallback cannot release a sealed member"
+          (#'batch/release-descriptor! c descriptor)
+          (is (= 2048 (:bytes (batch/usage c)))
+              "the batch still owns the retained storage")
+          (is (= 1 (:requests (batch/usage c))))))
+      (finally
+        (.countDown release)))
+    (is (= :a (deref f 5000 ::timeout)))
+    (testing "batch cleanup releases it once both branches stop"
+      (is (zero? (:bytes (batch/usage c))))
+      (is (zero? (:requests (batch/usage c)))))))
 
 (deftest joined-prefix-advances-only-on-join
   (testing "each joined group advances the prefix to its assigned LSN"
@@ -136,6 +213,411 @@
                       (range 16))]
     (doseq [w writers] (is (not= (timeout) (deref w 10000 ::timeout))))
     (is (= 1 (.get peak)) "a second batch ran before the first joined")))
+
+(defn- admitted-descriptor
+  "A prepared request for deterministically scheduling election/handoff races."
+  ([c value] (admitted-descriptor c value 0))
+  ([c value deadline]
+   (admitted-descriptor c value deadline (Thread/currentThread)))
+  ([c value deadline ready]
+   (#'batch/admit! c 1024 deadline)
+   (batch/->Descriptor nil (volatile! value) nil 1024 deadline
+                       (AtomicLong. 1024) (AtomicBoolean. false)
+                       (volatile! nil) ready
+                       (AtomicBoolean. false) (AtomicBoolean. false))))
+
+(defn- parked-descriptor
+  "Start a real waiter before publishing its descriptor; observe result or handoff."
+  ([c value] (parked-descriptor c value (fn [d] (some? @(.result d)))))
+  ([c value progressed?]
+   (let [slot (volatile! nil)
+         done (promise)
+         thread (Thread.
+                 (fn []
+                   (let [d @slot]
+                     (loop []
+                       (cond
+                         (progressed? d) (deliver done true)
+                         (Thread/interrupted) (deliver done false)
+                         :else (do (LockSupport/park d) (recur)))))))
+         d (admitted-descriptor c value 0 thread)
+         deadline (+ (System/nanoTime) 2000000000)]
+     (vreset! slot d)
+     (.start thread)
+     (loop []
+       (when (and (not (identical? d (LockSupport/getBlocker thread)))
+                  (< (System/nanoTime) deadline))
+         (Thread/sleep 1)
+         (recur)))
+     (is (identical? d (LockSupport/getBlocker thread)))
+     {:descriptor d :thread thread :done done})))
+
+(defn- stop-waiter! [{:keys [^Thread thread]}]
+  (.interrupt thread)
+  (.join thread 2000))
+
+(deftest joined-callers-are-notified-after-publication
+  (let [c (collector-with echo-values)
+        leader (admitted-descriptor c :leader)
+        probe (parked-descriptor c :follower)
+        follower (:descriptor probe)]
+    (try
+      (is (true? (#'batch/publish-and-elect! c leader)))
+      (is (false? (#'batch/publish-and-elect! c follower)))
+      (#'batch/lead! c leader)
+      (is (true? (deref (:done probe) 2000 ::timeout)))
+      (is (= [true :leader] @(.result leader)))
+      (is (= [true :follower] @(.result follower)))
+      (is (zero? (:requests (batch/usage c))))
+      (finally (stop-waiter! probe)))))
+
+(deftest sealed-initialization-failure-rejects-every-member-and-retires
+  (let [c (collector-with echo-values)
+        leader (admitted-descriptor c :leader)
+        probe (parked-descriptor c :follower)
+        follower (:descriptor probe)
+        failure (ex-info "seal observer failed" {})
+        uninstall (phase/observe!
+                   (fn [event _]
+                     (when (= :batch-sealed event) (throw failure))))]
+    (try
+      (is (true? (#'batch/publish-and-elect! c leader)))
+      (is (false? (#'batch/publish-and-elect! c follower)))
+      (#'batch/lead! c leader)
+      (is (= [false failure] @(.result leader)))
+      (is (= [false failure] @(.result follower)))
+      (is (true? (deref (:done probe) 2000 ::timeout)))
+      (is (false? (batch/serving? c)))
+      (is (batch/await-quiescence! c 100))
+      (is (zero? (:requests (batch/usage c))))
+      (finally (stop-waiter! probe) (uninstall)))))
+
+(deftest partial-publication-does-not-strand-a-completed-follower
+  ;; Inject an undersized value array so publication fails after two slots.
+  (let [c (collector-with
+           (fn [b] (#'batch/join-or-reject! b (object-array [:leader :completed]))))
+        leader (admitted-descriptor c :leader)
+        completed-probe (parked-descriptor c :completed)
+        failed-probe (parked-descriptor c :failed)
+        completed (:descriptor completed-probe)
+        failed (:descriptor failed-probe)]
+    (try
+      (is (true? (#'batch/publish-and-elect! c leader)))
+      (is (false? (#'batch/publish-and-elect! c completed)))
+      (is (false? (#'batch/publish-and-elect! c failed)))
+      (#'batch/lead! c leader)
+      (is (= [true :completed] @(.result completed)))
+      (is (true? (deref (:done completed-probe) 2000 ::timeout)))
+      (is (false? (first @(.result failed))))
+      (is (instance? ArrayIndexOutOfBoundsException (second @(.result failed))))
+      (is (true? (deref (:done failed-probe) 2000 ::timeout)))
+      (is (false? (batch/serving? c)))
+      (is (batch/await-quiescence! c 100))
+      (is (zero? (:requests (batch/usage c))))
+      (finally (stop-waiter! completed-probe) (stop-waiter! failed-probe)))))
+
+(deftest returning-and-queued-callers-cannot-take-the-waking-heads-turn
+  ;; Freeze scheduling just after the previous leader releases the slot, before
+  ;; the notified head runs. Later callers must queue, making one wider batch.
+  (let [executed (atom [])
+        c (collector-with (fn [b]
+                            (swap! executed conj (vec (echo-values b)))
+                            (echo-values b)))
+        first (admitted-descriptor c :first)
+        head (admitted-descriptor c :head)
+        queued (admitted-descriptor c :queued)
+        returning (admitted-descriptor c :returning)]
+    (is (true? (#'batch/publish-and-elect! c first)))
+    (let [selected (#'batch/claim-next-batch! c first)]
+      (is (false? (#'batch/publish-and-elect! c head)))
+      (is (false? (#'batch/publish-and-elect! c queued)))
+      (#'batch/run-sealed-batch! c selected))
+    (is (nil? (#'batch/try-lead! c queued))
+        "an already queued follower cannot take the head's turn")
+    (is (false? (#'batch/publish-and-elect! c returning))
+        "a newly published request cannot take the head's turn")
+    (let [elected? (#'batch/try-lead! c head)]
+      (is (true? elected?))
+      (when elected? (#'batch/lead! c head)))
+    (is (= [[:first] [:head :queued :returning]] @executed))
+    (is (= [[true :first] [true :head] [true :queued] [true :returning]]
+           (mapv #(deref (.result ^datalevin.tx_group.batch.Descriptor %))
+                 [first head queued returning])))
+    (is (zero? (:requests (batch/usage c))))
+    (is (batch/await-quiescence! c 100))))
+
+(deftest an-expiring-head-relays-the-free-slot-to-the-next-caller
+  (let [executed (atom [])
+        c (collector-with (fn [b]
+                            (swap! executed conj (vec (echo-values b)))
+                            (echo-values b)))
+        first (admitted-descriptor c :first)
+        head (admitted-descriptor c :expired 1)]
+    (is (true? (#'batch/publish-and-elect! c first)))
+    (let [selected (#'batch/claim-next-batch! c first)
+          probe (parked-descriptor
+                 c :tail #(and (not (.get (.active c)))
+                               (identical? % (.peek (.ready c)))))
+          tail (:descriptor probe)]
+      (try
+        (is (false? (#'batch/publish-and-elect! c head)))
+        (is (false? (#'batch/publish-and-elect! c tail)))
+        (#'batch/run-sealed-batch! c selected)
+        ;; Expiry can race handoff before the head claims leadership.
+        (#'batch/await-progress! c head (.result head) (volatile! false) 1)
+        (#'batch/release-descriptor! c head)
+        (is (= :txlog/write-deadline-exceeded
+               (:error (ex-data (second @(.result head))))))
+        (is (true? (deref (:done probe) 2000 ::timeout))
+            "removing the head wakes its successor without another submission")
+        (let [elected? (#'batch/try-lead! c tail)]
+          (is (true? elected?))
+          (when elected? (#'batch/lead! c tail)))
+        (is (= [[:first] [:tail]] @executed))
+        (is (= [true :tail] @(.result tail)))
+        (is (zero? (:bytes (batch/usage c))))
+        (is (batch/await-quiescence! c 100))
+        (finally (stop-waiter! probe))))))
+
+(deftest retirement-failure-fences-without-revoking-published-results
+  (let [boom (ex-info "retirement failed" {})
+        c (collector-with (fn [b]
+                            (batch/set-lsn! b 1)
+                            (batch/record-wal-policy! b true)
+                            (echo-values b)))
+        uninstall (phase/observe!
+                   (fn [event _]
+                     (when (= :batch-retired event) (throw boom))))]
+    (try
+      (is (= :committed (batch/submit! c {:allowance 1024 :data :committed})))
+      (is (= 1 (batch/published-lsn c)))
+      (is (false? (batch/serving? c)))
+      (is (batch/await-quiescence! c 100))
+      (is (zero? (:requests (batch/usage c))))
+      (let [error (try (batch/submit! c {:allowance 1024 :data :later})
+                       (catch Throwable t t))]
+        (is (= :not-committed (:outcome (ex-data error))))
+        (is (= :txlog/runtime-fenced (:error (ex-data error))))
+        (is (nil? (:txlog-lsn (ex-data error))))
+        (is (identical? boom (ex-cause (ex-cause error)))))
+      (finally (uninstall)))))
+
+(deftest queued-and-future-requests-do-not-inherit-a-committed-batch-outcome
+  (let [entered (CountDownLatch. 1)
+        queued (CountDownLatch. 1)
+        release (CountDownLatch. 1)
+        boom (ex-info "native completion failed" {})
+        c (collector-with
+           (fn [b]
+             (batch/set-lsn! b 77)
+             (batch/record-wal-policy! b true)
+             (.countDown entered)
+             (.await release 5 TimeUnit/SECONDS)
+             (throw boom)))
+        uninstall (phase/observe!
+                   (fn [event d]
+                     (when (and (= :ready-published event)
+                                (= :queued (batch/data d)))
+                       (.countDown queued))))
+        submit (fn [value]
+                 (try (batch/submit! c {:allowance 1024 :data value})
+                      (catch Throwable t t)))
+        active (future (submit :active))]
+    (try
+      (is (.await entered 5 TimeUnit/SECONDS))
+      (let [unstarted (future (submit :queued))]
+        (is (.await queued 5 TimeUnit/SECONDS))
+        (.countDown release)
+        (let [error (deref active 5000 ::timeout)]
+          (is (= :committed (:outcome (ex-data error))))
+          (is (= 77 (:txlog-lsn (ex-data error))))
+          (is (identical? boom (ex-cause error))))
+        (doseq [error [(deref unstarted 5000 ::timeout) (submit :future)]]
+          (is (= :not-committed (:outcome (ex-data error))))
+          (is (= :txlog/runtime-fenced (:error (ex-data error))))
+          (is (nil? (:txlog-lsn (ex-data error))))
+          (is (identical? boom (ex-cause (ex-cause error)))))
+        (is (batch/await-quiescence! c 100))
+        (is (zero? (:requests (batch/usage c)))))
+      (finally (.countDown release) (uninstall)))))
+
+(deftest selection-failure-releases-the-elected-slot
+  (let [boom (ex-info "selection observer failed" {})
+        c (collector-with echo-values)
+        uninstall (phase/observe!
+                   (fn [event _]
+                     (when (= :selection-start event) (throw boom))))]
+    (try
+      (is (identical? boom (try (batch/submit! c {:allowance 1024 :data :first})
+                               (catch Throwable t t))))
+      (is (false? (batch/serving? c)))
+      (is (batch/await-quiescence! c 100))
+      (is (zero? (:requests (batch/usage c))))
+      (let [later (future (try (batch/submit! c {:allowance 1024 :data :later})
+                               (catch Throwable t t)))
+            error (deref later 1000 ::timeout)]
+        (is (= :txlog/runtime-fenced (:error (ex-data error))))
+        (is (= :not-committed (:outcome (ex-data error)))))
+      (finally (uninstall)))))
+
+(deftest admitted-observer-failure-refunds-fast-and-waiting-reservations
+  (doseq [waiting? [false true]]
+    (let [c (collector-with echo-values {:wal-pending-max-requests 1
+                                         :write-batch-size 1})
+          parked (CountDownLatch. 1)
+          boom (ex-info "admitted observer failed" {})]
+      (when waiting? (#'batch/admit! c 1024 0))
+      (let [uninstall (phase/observe!
+                       (fn [event _]
+                         (case event
+                           :admitted (throw boom)
+                           :admission-wait (.countDown parked)
+                           nil)))
+            submit (future (try (batch/submit! c {:allowance 1024 :data :value})
+                                (catch Throwable t t)))]
+        (try
+          (when waiting?
+            (is (.await parked 5 TimeUnit/SECONDS))
+            (#'batch/release-allowance! c 1024))
+          (is (identical? boom (deref submit 5000 ::timeout)))
+          (is (zero? (:requests (batch/usage c))))
+          (is (zero? (:bytes (batch/usage c))))
+          (is (= [0 0] (vec (.waiters c))))
+          (is (= :next (do (uninstall)
+                          (batch/submit! c {:allowance 1024 :data :next}))))
+          (finally (uninstall)))))))
+
+(deftest a-completed-leader-returns-while-the-successor-batch-is-blocked
+  (doseq [timeout-ms [nil 10000]]
+    (testing (str "successor timeout: " timeout-ms)
+      (let [first-entered (CountDownLatch. 1)
+            first-release (CountDownLatch. 1)
+            queued (CountDownLatch. 1)
+            second-entered (CountDownLatch. 1)
+            second-release (CountDownLatch. 1)
+            owners (ConcurrentLinkedQueue.)
+            remove-observer
+            (phase/observe!
+             (fn [event descriptor]
+               (when (and (= :ready-published event)
+                          (= :second (batch/data descriptor)))
+                 (.countDown queued))))
+            c (collector-with
+               (fn [b]
+                 (.add owners (Thread/currentThread))
+                 (if (= :first (batch/data (batch/batch-at b 0)))
+                   (do (.countDown first-entered)
+                       (.await first-release 5 TimeUnit/SECONDS))
+                   (do (.countDown second-entered)
+                       (.await second-release 5 TimeUnit/SECONDS)))
+                 (echo-values b)))
+            leader (future (batch/submit! c {:allowance 1024 :data :first}))]
+        (try
+          (is (.await first-entered 5 TimeUnit/SECONDS))
+          (let [follower (future (batch/submit!
+                                 c {:allowance 1024 :data :second
+                                    :timeout-ms timeout-ms}))]
+            (is (.await queued 5 TimeUnit/SECONDS))
+            (.countDown first-release)
+            (is (.await second-entered 5 TimeUnit/SECONDS)
+                "queued work starts without another submission")
+            (is (= :first (deref leader 1000 ::timeout))
+                "later I/O cannot delay the completed caller")
+            (is (not (realized? follower)))
+            (is (= 2 (count (set owners)))
+                "a successor owns the second batch")
+            (.countDown second-release)
+            (is (= :second (deref follower 5000 ::timeout)))
+            (is (batch/await-quiescence! c 1000)))
+          (finally
+            (.countDown first-release)
+            (.countDown second-release)
+            (remove-observer)))))))
+
+(deftest an-arrival-racing-idle-handoff-is-not-stranded
+  (let [idle (CountDownLatch. 1)
+        release-idle (CountDownLatch. 1)
+        prepared (CountDownLatch. 1)
+        second-entered (CountDownLatch. 1)
+        second-release (CountDownLatch. 1)
+        activations (AtomicInteger. 0)
+        remove-observer
+        (phase/observe!
+         (fn [event _]
+           (when (and (= :next-activation event)
+                      (zero? (.getAndIncrement activations)))
+             (.countDown idle)
+             (.await release-idle 5 TimeUnit/SECONDS))))
+        c (collector-with
+           (fn [b]
+             (when (= :second (batch/data (batch/batch-at b 0)))
+               (.countDown second-entered)
+               (.await second-release 5 TimeUnit/SECONDS))
+             (echo-values b)))
+        leader (future (batch/submit! c {:allowance 1024 :data :first}))]
+    (try
+      (is (.await idle 5 TimeUnit/SECONDS))
+      (let [follower (future (batch/submit!
+                             c {:allowance 1024 :data :second
+                                :prepare (fn [_] (.countDown prepared) :second)}))]
+        (is (.await prepared 5 TimeUnit/SECONDS))
+        (.countDown release-idle)
+        (is (.await second-entered 5 TimeUnit/SECONDS))
+        (is (= :first (deref leader 1000 ::timeout)))
+        (.countDown second-release)
+        (is (= :second (deref follower 5000 ::timeout)))
+        (is (batch/await-quiescence! c 1000)))
+      (finally
+        (.countDown release-idle)
+        (.countDown second-release)
+        (remove-observer)))))
+
+(deftest an-interrupted-waiter-can-take-over-without-cancelling-its-batch
+  (doseq [timeout-ms [nil 10000]]
+    (let [entered (CountDownLatch. 1)
+          release (CountDownLatch. 1)
+          queued (CountDownLatch. 1)
+          answer (promise)
+          body-interrupted? (promise)
+          remove-observer
+          (phase/observe!
+           (fn [event descriptor]
+             (when (and (= :ready-published event)
+                        (= :second (batch/data descriptor)))
+               ;; Interrupt as it publishes, before it waits or can take over.
+               (.interrupt (Thread/currentThread))
+               (.countDown queued))))
+          c (collector-with
+             (fn [b]
+               (if (= :first (batch/data (batch/batch-at b 0)))
+                 (do (.countDown entered)
+                     (.await release 5 TimeUnit/SECONDS))
+                 (deliver body-interrupted?
+                          (.isInterrupted (Thread/currentThread))))
+               (echo-values b)))
+          leader (future (batch/submit! c {:allowance 1024 :data :first}))]
+      (try
+        (is (.await entered 5 TimeUnit/SECONDS))
+        (let [follower (Thread.
+                        #(deliver answer
+                                  (try
+                                    (let [value (batch/submit!
+                                                 c {:allowance 1024 :data :second
+                                                    :timeout-ms timeout-ms})]
+                                      [value (.isInterrupted (Thread/currentThread))])
+                                    (catch Throwable t t))))]
+          (.start follower)
+          (is (.await queued 5 TimeUnit/SECONDS))
+          (.countDown release)
+          (is (= :first (deref leader 5000 ::timeout)))
+          (is (= [:second true] (deref answer 5000 ::timeout)))
+          (is (false? (deref body-interrupted? 1000 ::timeout))
+              "waiting interruption is deferred until caller return")
+          (.join follower 1000)
+          (is (not (.isAlive follower))))
+        (finally
+          (.countDown release)
+          (remove-observer))))))
 
 (deftest later-arrivals-accumulate-unsealed-through-join
   (let [sizes (ConcurrentLinkedQueue.)
@@ -217,6 +699,40 @@
       (testing "the oversized head keeps its place instead of being bypassed"
         (is (= [1 2 1] (vec sizes)))))))
 
+(deftest batch-selection-never-exceeds-the-byte-cap-with-heterogeneous-allowances
+  ;; A small head followed by a large follower exposed the old peek-loop, which
+  ;; accumulated the head's allowance repeatedly and sealed past the byte cap.
+  (let [batches (ConcurrentLinkedQueue.)
+        entered (CountDownLatch. 1)
+        release (CountDownLatch. 1)
+        first-batch (AtomicInteger. 0)
+        executor (fn [batch]
+                   (let [n (batch/batch-count batch)
+                         total (reduce + (map #(batch/allowance
+                                                (batch/batch-at batch %))
+                                              (range n)))]
+                     (.add batches [n total]))
+                   (when (zero? (.getAndIncrement first-batch))
+                     (.countDown entered)
+                     (.await release 5 TimeUnit/SECONDS))
+                   (echo-values batch))
+        c (collector-with executor {:write-batch-max-bytes 10000})
+        leader (future (batch/submit! c {:allowance 1024 :data :first}))]
+    (is (.await entered 5 TimeUnit/SECONDS))
+    (let [followers (mapv (fn [[i a]]
+                            (future (batch/submit! c {:allowance a :data i})))
+                          (map vector (range 5) [1024 9000 1024 1024 1024]))]
+      (.countDown release)
+      (is (= :first (await! leader)))
+      (doseq [f followers] (is (not= (timeout) (deref f 5000 ::timeout))))
+      (let [observed (vec batches)]
+        (testing "no sealed batch's full allowances exceed the byte cap"
+          (is (every? (fn [[_ total]] (<= (long total) 10000)) observed)))
+        (testing "the large follower is not absorbed behind a small head"
+          (is (some (fn [[_ total]] (> (long total) 1024)) observed)))
+        (testing "every admitted request is sealed exactly once"
+          (is (= 6 (reduce + (map first observed)))))))))
+
 (deftest an-allowance-above-the-batch-cap-is-rejected-before-admission
   (let [c (collector-with echo-values {:write-batch-max-bytes 2048
                                       :wal-rmw-max-bytes 1024})
@@ -261,7 +777,7 @@
 (deftest caller-preparation-failure-rejects-only-that-request
   (let [c (collector-with echo-values)
         thrown (try (batch/submit! c {:allowance 1024
-                                      :prepare (fn []
+                                      :prepare (fn [_]
                                                  (throw (ex-info "encode failed"
                                                                  {:row 2})))})
                     nil
@@ -296,14 +812,18 @@
       (doseq [f followers]
         (let [t (deref f 5000 ::timeout)]
           (is (some? t))
-          (is (= :txlog/write-indeterminate (:error (ex-data t))))))
+          (is (= :txlog/runtime-fenced (:error (ex-data t))))
+          (is (= :not-committed (:outcome (ex-data t))))
+          (is (identical? boom (ex-cause t)))))
       (testing "the terminal fence closes admission permanently"
         (is (not (batch/serving? c)))
         (let [late (try (batch/submit! c {:allowance 1024 :data :late})
                         nil
                         (catch Throwable t t))]
           (is (some? late))
-          (is (= :txlog/write-indeterminate (:error (ex-data late))))))
+          (is (= :txlog/runtime-fenced (:error (ex-data late))))
+          (is (= :not-committed (:outcome (ex-data late))))
+          (is (identical? boom (ex-cause late)))))
       (testing "no reservation is refunded while a request is still owned"
         (is (zero? (:requests (batch/usage c))))))))
 
@@ -442,7 +962,7 @@
                             (.await release 5 TimeUnit/SECONDS)
                             (echo-values batch)))
         leader (future (batch/submit! c {:allowance 1024
-                                         :prepare (fn [] nil)
+                                         :prepare (fn [_] :first)
                                          :data :first}))]
     (try
       (is (.await entered 5 TimeUnit/SECONDS))
@@ -507,6 +1027,79 @@
 
 ;; ---------------------------------------------------------------------------
 ;; Admission waiting, deadlines and charging
+
+(deftest batches-with-no-progress-waiters-do-not-signal
+  (let [{c :collector signals :signals}
+        (progress-probe (collector-with echo-values) (constantly nil))]
+    (is (= :plain (batch/submit! c {:allowance 1024 :data :plain})))
+    (is (= :bounded (batch/submit! c {:allowance 1024 :data :bounded
+                                     :timeout-ms 5000})))
+    (is (batch/await-quiescence! c 100))
+    (batch/close! c)
+    (batch/fence! c (ex-info "closed" {}))
+    (is (empty? @signals)
+        "publication, retirement and shutdown skip an empty condition")))
+
+(deftest retirement-notifies-capacity-and-quiescence-waiters
+  (doseq [[capacity quiescence :as expected] [[1 0] [0 1] [1 1]]]
+    (testing (str "registered waiters " expected)
+      (let [entered (CountDownLatch. 1)
+            waiting (CountDownLatch. 1)
+            release (CountDownLatch. 1)
+            first-batch (AtomicBoolean. true)
+            {c :collector signals :signals}
+            (progress-probe
+             (collector-with
+              (fn [b]
+                (when (.compareAndSet first-batch true false)
+                  (.countDown entered)
+                  (.await release 5 TimeUnit/SECONDS))
+                (echo-values b))
+              {:wal-pending-max-requests 1 :write-batch-size 1
+               :write-batch-max-bytes 1024 :wal-rmw-max-bytes 1024})
+             (fn [c]
+               (when (= expected (vec (.waiters c)))
+                 (.countDown waiting))))
+            leader (future (batch/submit! c {:allowance 1024 :data :leader}))]
+        (try
+          (is (.await entered 5 TimeUnit/SECONDS))
+          (let [closer (when (pos? quiescence)
+                         (future (batch/await-quiescence! c 5000)))
+                follower (when (pos? capacity)
+                           (future (batch/submit! c {:allowance 1024 :data :follower
+                                                    :timeout-ms 5000})))]
+            (is (.await waiting 5 TimeUnit/SECONDS))
+            (.countDown release)
+            (is (= :leader (deref leader 5000 ::timeout)))
+            (when follower (is (= :follower (deref follower 5000 ::timeout))))
+            (when closer (is (true? (deref closer 5000 false))))
+            (is (= (if (= expected [1 1]) :all :one) (first @signals)))
+            (is (= [0 0] (vec (.waiters c)))))
+          (finally (.countDown release)))))))
+
+(deftest progress-waiter-registration-is-unwound-on-failure
+  (let [c (collector-with echo-values {:wal-pending-max-requests 1
+                                      :write-batch-size 1})
+        boom (ex-info "admission observer failed" {})]
+    (#'batch/admit! c 1024 0)
+    (let [uninstall (phase/observe!
+                     (fn [event _] (when (= :admission-wait event) (throw boom))))]
+      (try
+        (is (identical? boom (try (#'batch/admit! c 1024 0)
+                                 (catch Throwable t t))))
+        (is (= [0 0] (vec (.waiters c))))
+        (finally (uninstall) (#'batch/release-allowance! c 1024))))
+    (.set ^AtomicBoolean (.active c) true)
+    (try
+      (is (false? (batch/await-quiescence! c 0)))
+      (is (= [0 0] (vec (.waiters c))))
+      (let [interrupted (future
+                          (.interrupt (Thread/currentThread))
+                          (try (batch/await-quiescence! c 5000)
+                               (catch InterruptedException _ :interrupted)))]
+        (is (= :interrupted (deref interrupted 5000 ::timeout)))
+        (is (= [0 0] (vec (.waiters c)))))
+      (finally (.set ^AtomicBoolean (.active c) false)))))
 
 (deftest capacity-waiters-are-admitted-after-a-release
   (let [entered (CountDownLatch. 1)
@@ -653,9 +1246,52 @@
                                 (catch Throwable t [:outer t]))))
                    (echo-values batch))
         c (collector-with executor)]
-    (is (= :a (batch/submit! c {:allowance 1024 :data :a})))
-    (is (= [:charged 100 300 :txlog/pending-budget-exceeded 300]
+    (is (= :a (batch/submit! c {:allowance 2048 :op identity :data :a})))
+    (is (= [:charged 1124 1324 :txlog/pending-budget-exceeded 1324]
            (deref observed 5000 ::timeout)))))
+
+(deftest blind-preparation-is-admitted-precharged-and-published-once
+  (let [c (collector-with echo-values)
+        calls (atom 0)
+        allowance (charge/blind-allowance {:declared-bytes 16})]
+    (is (= :prepared
+           (batch/submit!
+            c {:allowance allowance :data :borrowed
+               :prepare (fn [descriptor]
+                          (swap! calls inc)
+                          (is (= allowance (batch/charged descriptor)))
+                          (is (= allowance (:bytes (batch/usage c))))
+                          (is (not (batch/selected? descriptor)))
+                          :prepared)})))
+    (is (= 1 @calls))
+    (is (zero? (:bytes (batch/usage c))))))
+
+(deftest blind-growth-rejects-before-allocation-and-releases-admission
+  (let [executed (atom 0)
+        allocated (atom false)
+        c (collector-with (fn [b] (swap! executed inc) (echo-values b)))
+        allowance (charge/blind-allowance {:declared-bytes 16})
+        error (try
+                (batch/submit!
+                 c {:allowance allowance
+                    :prepare (fn [d]
+                               (batch/charge! d (charge/array-bytes 1 32))
+                               (reset! allocated true)
+                               (byte-array 32))})
+                nil
+                (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+    (is (= :txlog/pending-budget-exceeded (:error error)))
+    (is (= :not-committed (:outcome error)))
+    (is (= allowance (:charged error)))
+    (is (false? @allocated))
+    (is (zero? @executed))
+    (is (zero? (:bytes (batch/usage c))))
+    (is (zero? (:requests (batch/usage c))))
+    (is (= :after (batch/submit! c {:allowance 1024 :data :after})))))
+
+(deftest disabled-traces-do-not-evaluate-payloads
+  (is (not (phase/observed?)))
+  (phase/phase! :unused (throw (ex-info "disabled payload evaluated" {}))))
 
 (deftest a-request-allowance-below-the-minimum-is-rejected
   (let [c (collector-with echo-values)
@@ -693,7 +1329,9 @@
                                 (catch Throwable t t)))
             v (deref waiter 5000 ::timeout)]
         (is (instance? Throwable v))
-        (is (= :txlog/write-deadline-exceeded (:error (ex-data v)))))
+        (is (= :txlog/runtime-fenced (:error (ex-data v))))
+        (is (= :not-committed (:outcome (ex-data v))))
+        (is (= :txlog/write-deadline-exceeded (:error (ex-data (ex-cause v))))))
       (testing "the observer fences serving but retains the live owner's resources"
         (is (not (batch/serving? c)))
         (is (pos? (:requests (batch/usage c)))))
@@ -768,3 +1406,67 @@
       (finally
         (.countDown release)
         (remove-observer)))))
+
+(deftest a-withdrawn-preparation-cutoff-does-not-expire-a-capacity-waiter
+  (let [entered (CountDownLatch. 1)
+        parked (CountDownLatch. 1)
+        dispatch (CountDownLatch. 1)
+        dispatched (CountDownLatch. 1)
+        finish (CountDownLatch. 1)
+        c0 (collector-with
+            (fn [b]
+              (when (= :owner (batch/data (batch/batch-at b 0)))
+                (.countDown entered)
+                (.await dispatch 5 TimeUnit/SECONDS)
+                (batch/mark-dispatched! b)
+                (.countDown dispatched)
+                (.await finish 5 TimeUnit/SECONDS))
+              (echo-values b))
+            {:wal-pending-max-requests 1 :write-batch-size 1
+             :write-batch-max-bytes 1024 :wal-rmw-max-bytes 1024})
+        {:keys [collector]} (progress-probe c0 (fn [_] (.countDown parked)))
+        owner (future (batch/submit! collector
+                                    {:allowance 1024 :data :owner :timeout-ms 500}))]
+    (try
+      (is (.await entered 5 TimeUnit/SECONDS))
+      (let [follower (future
+                       (try (batch/submit! collector {:allowance 1024 :data :follower})
+                            (catch Throwable t t)))]
+        (is (.await parked 5 TimeUnit/SECONDS))
+        ;; The condition callback runs under the lock. Cross coordination here
+        ;; so dispatch cannot race ahead of the wait's sampled live cutoff.
+        (let [^ReentrantLock lock (.lock collector)]
+          (.lock lock)
+          (try (.countDown dispatch) (finally (.unlock lock))))
+        (is (.await dispatched 5 TimeUnit/SECONDS))
+        (is (= ::waiting (deref follower 650 ::waiting)))
+        (is (batch/serving? collector))
+        (.countDown finish)
+        (is (= :owner (deref owner 5000 ::timeout)))
+        (is (= :follower (deref follower 5000 ::timeout)))
+        (is (= [0 0] (vec (.waiters collector)))))
+      (finally (.countDown dispatch) (.countDown finish)))))
+
+(deftest a-dispatched-batch-is-not-fenced-by-its-preparation-cutoff
+  (let [entered (CountDownLatch. 1)
+        release (CountDownLatch. 1)
+        first-batch (AtomicInteger. 0)
+        c (collector-with
+           (fn [batch]
+             ;; The executor finishes ordered preparation and forks here.
+             (batch/mark-dispatched! batch)
+             (when (zero? (.getAndIncrement first-batch))
+               (.countDown entered)
+               (.await release 5 TimeUnit/SECONDS))
+             (echo-values batch)))
+        owner (future (batch/submit! c {:allowance 1024 :data :owner
+                                        :timeout-ms 60}))]
+    (try
+      (is (.await entered 5 TimeUnit/SECONDS))
+      (Thread/sleep 100)
+      (testing "branch execution is owned by WAL/native deadlines, not the cutoff"
+        (is (false? (batch/observe-cutoff! c)))
+        (is (batch/serving? c)))
+      (finally
+        (.countDown release)
+        (is (= :owner (deref owner 5000 ::timeout)))))))

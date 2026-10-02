@@ -33,7 +33,12 @@
 
 (deftype Environment [^String dir mode db-identity collector compat-collector
                       lease ^AtomicInteger handles closed? ^long close-timeout-ms
-                      limits])
+                      limits executor-close! resources])
+
+(defn resources
+  "Private opener resources shared by every handle; never a public KV handle."
+  [^Environment environment]
+  (.-resources environment))
 
 (defn mode-name
   "The one protocol selected for an environment."
@@ -127,12 +132,17 @@
   "Open (or attach to) one new-protocol environment and return its runtime.
 
   `opts` supplies `:dir`, the required `:db-identity` of the environment, the
-  `:executor` for its batches and optional byte-measure overrides. Selection
-  happens once per canonical environment under its write-protocol lease: a
-  second open of the same environment in compatibility mode, or with a
-  different database identity, is rejected rather than silently mixed. Different
-  environments may select different protocols concurrently."
-  [{:keys [dir db-identity executor] :as opts}]
+  `:executor` for its batches, an optional `:executor-close!` that drains the
+  executor's worker after collector quiescence, and optional byte-measure
+  overrides. Selection happens once per canonical environment under its
+  write-protocol lease: a second open of the same environment in compatibility
+  mode, or with a different database identity, is rejected rather than silently
+  mixed. Alternatively `:open-runtime!` builds {:executor :close! :resources}
+  under the acquired lease, once per environment. It must clean up on failure;
+  :close! drains the worker and closes native/WAL resources after quiescence.
+  An optional :bind! receives the collector before the runtime is published.
+  Different environments may select different protocols concurrently."
+  [{:keys [dir db-identity executor executor-close! open-runtime!] :as opts}]
   (let [path (canonical (File. ^String dir))
         limits (charge/resolve-limits
                 (select-keys opts [:wal-pending-max-requests :wal-pending-max-bytes
@@ -145,12 +155,24 @@
             (.incrementAndGet ^AtomicInteger (.-handles record))
             record)
         (let [lease (protocol/acquire-write-protocol-lease!
-                     path :kv-independent-v1 db-identity)
-              record (->Environment path :kv-independent-v1 db-identity
-                                    (build-collector executor {:limits limits})
-                                    nil lease (AtomicInteger. 1)
-                                    (AtomicBoolean. false) timeout-ms limits)]
-          (install! path record))))))
+                     path :kv-independent-v1 db-identity)]
+          (try
+            (let [runtime (if open-runtime! (open-runtime!)
+                              {:executor executor :close! executor-close!})]
+              (try
+                (let [c (build-collector (:executor runtime) {:limits limits})
+                      record (->Environment path :kv-independent-v1 db-identity
+                                            c nil lease (AtomicInteger. 1)
+                                            (AtomicBoolean. false) timeout-ms limits
+                                            (:close! runtime) (:resources runtime))]
+                  (when-let [bind! (:bind! runtime)] (bind! c))
+                  (install! path record))
+                (catch Throwable t
+                  (when-let [close! (:close! runtime)] (close!))
+                  (throw t))))
+            (catch Throwable t
+              (protocol/release! lease)
+              (throw t))))))))
 
 (defn open-compat!
   "Open (or attach to) one compatibility environment and return its runtime.
@@ -172,7 +194,8 @@
               record (->Environment path :legacy-writer-v1 db-identity
                                     nil (compat-group/create (long (or limit 256)))
                                     lease (AtomicInteger. 1)
-                                    (AtomicBoolean. false) timeout-ms nil)]
+                                    (AtomicBoolean. false) timeout-ms nil
+                                    nil nil)]
           (install! path record))))))
 
 (defn- release-runtime!
@@ -189,23 +212,40 @@
 
   The last handle marks the runtime closed under the registry monitor, fences
   the collector so no new work is admitted, then waits up to its close timeout
-  for the executing batch to drain. Only after quiescence are the registry entry
-  removed and the protocol lease released. If quiescence cannot be confirmed,
-  the closed record and lease are retained and later opens are rejected, so a
-  replacement requires confirmed process exit."
+  for the executing batch to drain. Only once quiescence is confirmed does it
+  drain the environment executor's worker, so WAL maintenance cannot outlive the
+  collector. If quiescence times out, the executor is left running — a live batch
+  may still be awaiting its WAL task — and the closed record and lease are
+  retained; later opens are rejected, so a replacement requires confirmed process
+  exit."
   [^Environment environment]
   (let [last? (locking environments
-                (zero? (.decrementAndGet ^AtomicInteger (.-handles environment))))]
-    (when (and last?
-               (.compareAndSet ^AtomicBoolean (.-closed? environment) false true))
+                (when (zero? (.decrementAndGet ^AtomicInteger (.-handles environment)))
+                  ;; Mark the runtime closed in the same critical section as the
+                  ;; last-handle decision. An open racing this close either
+                  ;; attaches before the decrement (and keeps a handle, so this
+                  ;; is not the last one) or acquires the registry lock afterward
+                  ;; and observes the closed flag. Setting it outside the lock
+                  ;; let an open attach between the decrement and retirement.
+                  (.set ^AtomicBoolean (.-closed? environment) true)
+                  true))]
+    (when last?
       (let [c (.-collector environment)
             quiescent? (if c
                          (do (batch/close! c)
                              (batch/await-quiescence! c
                                                       (.-close-timeout-ms environment)))
                          true)]
+        ;; Stop the executor's worker only after the collector is confirmed
+        ;; drained. If quiescence timed out, a live batch may be awaiting a WAL
+        ;; task on that worker; stopping it would discard accepted work and could
+        ;; strand the batch permanently. Retain the record and lease instead.
         (when quiescent?
-          (release-runtime! environment))))
+          (let [drained? (if-let [close-executor (.-executor-close! environment)]
+                           (boolean (close-executor))
+                           true)]
+            (when drained?
+              (release-runtime! environment))))))
     nil))
 
 (defn active-environments

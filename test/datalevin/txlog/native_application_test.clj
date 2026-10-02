@@ -1,5 +1,5 @@
 (ns datalevin.txlog.native-application-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.test :refer [deftest is use-fixtures]]
             [datalevin.constants :as c]
             [datalevin.interface :as i]
             [datalevin.kv :as kv]
@@ -7,6 +7,7 @@
             [datalevin.kv.txlog :as kvtx]
             [datalevin.lmdb :as l]
             [datalevin.tx-group :as group]
+            [datalevin.tx-group.phase :as phase]
             [datalevin.tx-state :as state]
             [datalevin.tx-state.kv :as pending]
             [datalevin.tx-state.lifetime :as lifetime]
@@ -20,6 +21,13 @@
 
 (defn- caught [f] (try (f) (catch Throwable e e)))
 (defn- join [job] (deref job 10000 ::timeout))
+
+;; The production native seam no longer loads the superseded pending engine.
+;; Forward it into this legacy harness's existing fault definitions only here.
+(use-fixtures :each
+  (fn [f]
+    (let [uninstall (phase/observe! #(state/phase! %1 %2))]
+      (try (f) (finally (uninstall))))))
 (defn- rows [n] [[:put "data" n (str n) :long :string]])
 
 (defn- with-native [hooks f]

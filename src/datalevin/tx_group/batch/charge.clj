@@ -51,36 +51,36 @@
 
 ;; Fixed charges. Each covers the whole owned representation it names,
 ;; including its synchronization wrappers; variable storage is additional.
-(def request-control-bundle
+(def ^:const request-control-bundle
   "Descriptor, queue link, admission/ownership fields, context control, result
   slot and notification."
   1024)
 
-(def encoded-row-descriptor 128)
-(def ordered-map-container 128)
-(def ordered-map-entry 128)
-(def per-key-staging-state 128)
-(def vector-wrapper 64)
-(def buffer-wrapper 256)
-(def scalar-box 64)
+(def ^:const encoded-row-descriptor 128)
+(def ^:const ordered-map-container 128)
+(def ^:const ordered-map-entry 128)
+(def ^:const per-key-staging-state 128)
+(def ^:const vector-wrapper 64)
+(def ^:const buffer-wrapper 256)
+(def ^:const scalar-box 64)
 
-(def ^:private min-request-allowance
+(def ^:private ^:const min-request-allowance
   "Every admitted request must at least cover its own control bundle."
   request-control-bundle)
 
-(def ^:private wal-control-bytes
+(def ^:private ^:const wal-control-bytes
   "96 KiB for WAL controls/scratch, including the at-most-64-KiB compact record
   buffer and record headers."
   (* 96 1024))
 
-(def ^:private branch-control-bytes
+(def ^:private ^:const branch-control-bytes
   "32 KiB for collector/native branch controls."
   (* 32 1024))
 
-(def ^:private shared-workspace-bytes
+(def ^:private ^:const shared-workspace-bytes
   (Math/addExact wal-control-bytes branch-control-bytes))
 
-(def ^:private waiter-control-bytes 256)
+(def ^:private ^:const waiter-control-bytes 256)
 
 (defn shared-reserved
   "`F = 128 KiB + 256*Q + 3*V(N + 2) + 256*(N + 2)`, checked.
@@ -116,7 +116,8 @@
   (when (neg? (long scratch-bytes)) (overflow! :negative-scratch-bytes scratch-bytes))
   (when (neg? (long result-capacity)) (overflow! :negative-result-capacity result-capacity))
   (when (neg? (long duplicate-values)) (overflow! :negative-duplicate-values duplicate-values))
-  (let [rows (Math/addExact 1 (long row-capacity))
+  (let [declared-bytes (long declared-bytes)
+        rows (Math/addExact 1 (long row-capacity))
         ;; One owned key array and one owned value array, plus one assembled
         ;; record buffer. Each wrapper is charged; growth charges old and new
         ;; capacity while the scratch is still owned.
@@ -127,13 +128,20 @@
      (Math/addExact
       (Math/multiplyExact encoded-row-descriptor rows)
       (Math/addExact
-       (Math/addExact (array-bytes 1 declared-bytes) (array-bytes 1 assembled))
+       ;; Each row can own separate key/value arrays. Summing payload bytes
+       ;; alone misses their headers and alignment, especially for empty rows.
        (Math/addExact
-        (Math/addExact (Math/multiplyExact buffer-wrapper 3)
-                       (Math/multiplyExact per-key-staging-state rows))
+        (Math/addExact declared-bytes
+                       (Math/multiplyExact 94 (long row-capacity)))
+        (array-bytes 1 assembled))
+       (Math/addExact
+        (Math/addExact
+         (Math/multiplyExact buffer-wrapper
+                            (Math/addExact 3 (Math/multiplyExact 2 (long row-capacity))))
+         (Math/multiplyExact per-key-staging-state rows))
+        (Math/addExact
+         (Math/addExact ordered-map-container (Math/multiplyExact ordered-map-entry rows))
          (Math/addExact
-          (Math/addExact ordered-map-container (Math/addExact ordered-map-entry rows))
-          (Math/addExact
           (vector-bytes (Math/addExact 1 (long result-capacity)))
           (Math/multiplyExact ordered-map-entry (long duplicate-values))))))))))
 

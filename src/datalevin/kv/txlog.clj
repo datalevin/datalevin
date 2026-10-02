@@ -17,7 +17,7 @@
                                   snapshot-slot-path update-snapshot-slot-meta!
                                   write-snapshot-meta!]]
    [datalevin.lmdb :as l]
-   [datalevin.tx-state :as tx-state]
+   [datalevin.tx-group.phase :as phase]
    [datalevin.txlog :as txlog]
    [datalevin.txlog.append :as append]
    [datalevin.txlog.codec :as tcodec]
@@ -2238,7 +2238,7 @@
                lmdb
                (fn [wdb]
                  (vreset! commit-attempted? false)
-                 (tx-state/phase! :native-writer-acquired token)
+                 (phase/phase! :native-writer-acquired token)
                  (let [^Txn txn (.-txn ^Rtx @(l/write-txn lmdb))
                        txn-id (.id txn)
                        before (long (refresh-commit-metadata! wdb state txn txn-id))]
@@ -2257,10 +2257,10 @@
                             (inc (long @(:marker-revision state)))) append-res)
                          marker-entry (when (:commit-marker? state) commit-metadata)]
                      (i/transact-kv wdb commit-metadata)
-                     (tx-state/phase! :before-native-commit token)
+                     (phase/phase! :before-native-commit token)
                      {:txn-id txn-id :marker-entry marker-entry
                       :payload-lsn payload-lsn :metadata-changed? metadata-changed?})))
-               (fn [_] (vreset! commit-attempted? true)))]
+               (fn [_wdb _context] (vreset! commit-attempted? true)))]
             ;; The native commit contains both data and the applied marker.
             ;; Metadata/cache publication can fail without undoing that commit.
           (vreset! committed? true)

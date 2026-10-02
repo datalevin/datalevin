@@ -15,16 +15,15 @@
   - the elected leader seals a bounded FIFO prefix, and only one batch executes
     per environment until it joins;
   - later ready arrivals accumulate unsealed through joint completion;
-  - the leader selects the next prefix itself after a join instead of electing a
-    successor, so activation is immediate;
+  - after its own result joins, the leader wakes a queued successor and returns;
   - request bodies and confirmations run on execution threads, never with
     submitting-caller binding affinity."
   (:require [datalevin.tx-group.phase :as phase]
             [datalevin.tx-group.batch.charge :as charge])
   (:import [datalevin.utl PendingBudget PendingBudget$Usage]
-           [java.util.concurrent ConcurrentLinkedQueue Semaphore TimeUnit]
+           [java.util.concurrent ConcurrentLinkedQueue TimeUnit]
            [java.util.concurrent.atomic AtomicBoolean AtomicInteger AtomicLong]
-           [java.util.concurrent.locks Condition ReentrantLock]
+           [java.util.concurrent.locks Condition LockSupport ReentrantLock]
            [java.util.function LongBinaryOperator]
            [org.eclipse.collections.impl.list.mutable FastList]))
 
@@ -42,18 +41,21 @@
 
 (deftype Descriptor
   ;; One admitted request. Its result slot is completed exactly once, by
-  ;; whichever thread gets there first.
-  [op data context prepare
+  ;; whichever thread gets there first, and its reservation is released exactly
+  ;; once, by the batch at cleanup or by the caller as an idempotent fallback.
+  [op data context
    ^long allowance
    ^long deadline-nanos
    ^AtomicLong charged
    ^AtomicBoolean selected?
    result
-   ^Semaphore ready
-   ^AtomicBoolean delivered?])
+   ^Thread waiter
+   ^AtomicBoolean delivered?
+   ^AtomicBoolean released?])
 
-(deftype Batch [^long id ^FastList descriptors ^long weight
-                ^long cutoff-nanos schedule ^AtomicLong lsn collector])
+(deftype Batch [^long id ^FastList descriptors ^objects wal-bodies ^long weight
+                ^long cutoff-nanos schedule ^AtomicLong lsn
+                ^AtomicBoolean dispatched? wal-status collector])
 
 (deftype Collector [^ReentrantLock lock
                     ^Condition progress
@@ -63,6 +65,7 @@
                     ^AtomicBoolean serving
                     active-batch
                     failure
+                    ;; Lock-protected counts: capacity at 0, quiescence at 1.
                     waiters
                     ^PendingBudget budget
                     ^long max-requests
@@ -82,11 +85,11 @@
 
 (defn- fenced-error
   ^Throwable [^Collector collector]
-  (let [failure @(.failure ^clojure.lang.IDeref collector)]
-    (if failure
-      failure
-      (not-committed "Environment write runtime is fenced"
-                     {:error :txlog/runtime-fenced :retryable? false}))))
+  (let [failure @(.failure collector)]
+    (ex-info "Environment write runtime is fenced"
+             {:error :txlog/runtime-fenced :outcome :not-committed
+              :retryable? false}
+             failure)))
 
 (defn- closed-error
   ^Throwable []
@@ -132,7 +135,7 @@
 (defn data
   "Caller-prepared payload owned by this descriptor."
   ^Object [^Descriptor descriptor]
-  (.data descriptor))
+  @(.data descriptor))
 
 (defn context
   "Explicit per-request context for identity, options and confirmations."
@@ -152,32 +155,78 @@
 (defn selected?
   "Whether this request has been sealed into a batch."
   [^Descriptor descriptor]
-  (.get (.selected? descriptor)))
+  (.get ^AtomicBoolean (.selected? descriptor)))
 
 (defn batch-count
   "Sealed member count."
   ^long [^Batch batch]
-  (.size (.descriptors batch)))
+  (.size ^FastList (.descriptors batch)))
 
 (defn batch-at
   "The sealed member at `idx`, in publication order."
   ^Descriptor [^Batch batch idx]
-  (.get (.descriptors batch) (int idx)))
+  (.get ^FastList (.descriptors batch) (int idx)))
+
+(defn wal-bodies
+  "Sealed WAL body references in request order; immutable after dispatch."
+  ^objects [^Batch batch]
+  (.wal-bodies batch))
+
+(defn refresh-wal-bodies!
+  "Fill the batch's preallocated body array before dispatch.
+
+  Sealing captures caller-prepared blind bodies. An ordered preparation hook
+  refreshes the same array after finalizing state-dependent bodies."
+  [^Batch batch]
+  (let [^FastList descriptors (.descriptors batch)
+        ^objects bodies (.wal-bodies batch)]
+    (dotimes [idx (.size descriptors)]
+      (aset bodies idx (:wal-body (data (.get descriptors idx))))))
+  batch)
 
 (defn batch-cutoff
   "The batch's preparation cutoff: the earliest selected member's deadline."
   ^long [^Batch batch]
   (.cutoff-nanos batch))
 
-(defn- deliver!
-  "Publish one result slot and wake its waiter. Exactly-once across every racing
+(defn batch-schedule
+  "The schedule fixed for this sealed batch: `:inline` or `:parallel`."
+  [^Batch batch]
+  (.schedule batch))
+
+(defn batch-collector
+  "The collector that sealed this batch."
+  [^Batch batch]
+  (.collector batch))
+
+(defn check-serving!
+  "Throw the collector's terminal failure when it is no longer serving.
+
+  Branch owners call this immediately before applying or committing native work
+  so a fence recorded during WAL/policy work aborts the commit instead of
+  publishing an overlay after runtime failure. Returns nil while healthy."
+  [^Collector collector]
+  (when-not (.get ^AtomicBoolean (.serving collector))
+    (throw (fenced-error collector))))
+
+(defn- publish-result!
+  "Publish one result slot. Exactly-once across every racing
   completion, cancellation and fence path."
   [^Descriptor descriptor value]
-  (when (.compareAndSet (.delivered? descriptor) false true)
+  (when (.compareAndSet ^AtomicBoolean (.delivered? descriptor) false true)
     (vreset! (.result descriptor) value)
-    ;; Readiness is published only after the producing owner released its
-    ;; coordination, so a woken caller never observes a half-published slot.
-    (.release (.ready descriptor))
+    true))
+
+(defn- notify-descriptor!
+  "Nudge the one submitting thread; result/election predicates carry progress."
+  [^Descriptor descriptor]
+  (LockSupport/unpark (.waiter descriptor)))
+
+(defn- deliver!
+  "Publish and notify immediately on cancellation and other unbatched paths."
+  [^Descriptor descriptor value]
+  (when (publish-result! descriptor value)
+    (notify-descriptor! descriptor)
     true))
 
 (defn- rejected-value
@@ -189,12 +238,24 @@
 ;; ---------------------------------------------------------------------------
 ;; Fence and shutdown
 
+(defn- signal-progress-under-lock!
+  "Notify registered progress waiters while holding collector coordination."
+  [^Collector collector]
+  (let [^longs waiters (.waiters collector)
+        n (+ (aget waiters 0) (aget waiters 1))]
+    (when (pos? n)
+      (if (= n 1)
+        (.signal ^Condition (.progress collector))
+        ;; Different allowances and predicates share this condition. Waking
+        ;; only one of several waiters could leave an eligible caller asleep.
+        (.signalAll ^Condition (.progress collector))))))
+
 (defn- reject-queued!
   [^Collector collector value]
   (let [^ConcurrentLinkedQueue queue (.ready collector)]
     (loop []
       (when-let [^Descriptor descriptor (.poll queue)]
-        (.decrementAndGet (.queued collector))
+        (.decrementAndGet ^AtomicInteger (.queued collector))
         (deliver! descriptor value)
         (recur)))))
 
@@ -203,11 +264,13 @@
   [^Collector collector error]
   ;; Written only under the lock, so the first writer publishes the one
   ;; terminal record and later callers observe it unchanged.
-  (when (nil? @(.failure ^clojure.lang.IDeref collector))
+  (when (nil? @(.failure collector))
     (vreset! ^clojure.lang.IDeref (.failure collector) error)
-    (.set (.serving ^AtomicBoolean collector) false)
-    (reject-queued! collector [false error])
-    (.signalAll (.progress ^Condition collector))
+    (.set ^AtomicBoolean (.serving collector) false)
+    ;; This failure belongs to the active batch. Unstarted requests have no
+    ;; WAL outcome or LSN and must not inherit that batch's committed result.
+    (reject-queued! collector [false (fenced-error collector)])
+    (signal-progress-under-lock! collector)
     (phase/phase! :fenced error)))
 
 (defn fence!
@@ -230,19 +293,19 @@
   batch keeps its established outcome; a replacement runtime may only open
   after confirmed quiescence."
   [^Collector collector]
-  (.set (.serving ^AtomicBoolean collector) false)
+  (.set ^AtomicBoolean (.serving collector) false)
   (let [^ReentrantLock lock (.lock collector)]
     (.lock lock)
     (try
       (reject-queued! collector [false (closed-error)])
-      (.signalAll (.progress ^Condition collector))
+      (signal-progress-under-lock! collector)
       (finally (.unlock lock))))
   nil)
 
 (defn serving?
   "Whether this runtime still accepts writes and activates new batches."
   [^Collector collector]
-  (.get (.serving ^AtomicBoolean collector)))
+  (.get ^AtomicBoolean (.serving collector)))
 
 (defn await-quiescence!
   "Wait until no batch is executing, up to `timeout-ms`. Returns true when the
@@ -251,30 +314,34 @@
   notification cannot hang close."
   [^Collector collector ^long timeout-ms]
   (let [deadline (+ (System/nanoTime) (* 1000000 timeout-ms))
-        ^ReentrantLock lock (.lock collector)]
+        ^ReentrantLock lock (.lock collector)
+        ^longs waiters (.waiters collector)]
     (.lock lock)
     (try
-      (loop []
-        (if-not (.get (.active ^AtomicBoolean collector))
-          true
-          (let [remaining (- deadline (System/nanoTime))]
-            (if (pos? remaining)
-              (do (.await ^Condition (.progress collector)
-                          (min remaining 50000000) TimeUnit/NANOSECONDS)
-                  (recur))
-              false))))
+      (aset waiters 1 (inc (aget waiters 1)))
+      (try
+        (loop []
+          (if-not (.get ^AtomicBoolean (.active collector))
+            true
+            (let [remaining (- deadline (System/nanoTime))]
+              (if (pos? remaining)
+                (do (.await ^Condition (.progress collector)
+                            (min remaining 50000000) TimeUnit/NANOSECONDS)
+                    (recur))
+                false))))
+        (finally (aset waiters 1 (dec (aget waiters 1)))))
       (finally (.unlock lock)))))
 
 (defn published-lsn
   "Joined, locally published LSN prefix: diagnostic progress and the snapshot
   replay floor source, never a per-reader visibility filter."
   [^Collector collector]
-  (.get (.published ^AtomicLong collector)))
+  (.get ^AtomicLong (.published collector)))
 
 (defn usage
   "Charged usage of admitted-but-unreleased requests and their allowances."
   [^Collector collector]
-  (let [^PendingBudget$Usage u (.snapshot (.budget collector))]
+  (let [^PendingBudget$Usage u (.snapshot ^PendingBudget (.budget collector))]
     {:requests (.requests u) :bytes (.bytes u)
      :shared-reserved (.shared-reserved collector)}))
 
@@ -291,7 +358,82 @@
   "Record the group LSN assigned before dispatch. Publication advances the
   joined prefix to this value; an unassigned group advances nothing."
   [^Batch batch ^long lsn]
-  (.set (.lsn ^AtomicLong batch) lsn))
+  (.set ^AtomicLong (.lsn batch) lsn))
+
+(defn record-wal-policy!
+  "Retain the established WAL policy result through join and caller delivery.
+
+  The WAL owner records this before publishing branch completion. Nil means no
+  policy result was established; :appended and :durable preserve the distinction
+  between relaxed acknowledgment and confirmed durability."
+  [^Batch batch durable?]
+  (vreset! (.wal-status batch) (if durable? :durable :appended)))
+
+(defn- wal-outcome-error
+  "Preserve this batch's established WAL outcome when local completion fails."
+  [^Batch batch cause]
+  (if-let [status @(.wal-status batch)]
+    (let [durable? (= :durable status)]
+      (ex-info (if durable?
+                 "WAL durability confirmed but local completion failed"
+                 "WAL append policy-complete but local completion failed; durability unconfirmed")
+               {:error (if durable? :txlog/write-committed
+                           :txlog/write-indeterminate)
+                :outcome (if durable? :committed :indeterminate)
+                :wal-status status
+                :txlog-lsn (.get ^AtomicLong (.lsn batch))
+                :retryable? false}
+               cause))
+    cause))
+
+(defn mark-dispatched!
+  "Transition the batch from ordered preparation to branch execution.
+
+  After this the collector stops fencing on the preparation cutoff: the
+  WAL/native branch deadlines own the batch. The environment executor calls this
+  between finishing ordered preparation and starting its branches. A batch that
+  never reaches this point is still preparation and remains subject to the
+  cutoff observer."
+  [^Batch batch]
+  (.set ^AtomicBoolean (.dispatched? batch) true))
+
+(declare expired-member?)
+
+(defn begin-dispatch!
+  "Finalize ordered preparation and dispatch, atomically under coordination.
+
+  Rechecks serving status and every selected member's deadline, then marks the
+  batch dispatched. Raises a clean pre-dispatch cancellation when the batch must
+  not start, so dispatch and cancellation are mutually exclusive and ordered
+  preparation that overran the batch deadline cannot commit. If this returns,
+  both branches may run. The environment executor calls this in place of
+  `mark-dispatched!`."
+  [^Batch batch]
+  (let [^Collector collector (.collector batch)
+        ^ReentrantLock lock (.lock collector)]
+    (.lock lock)
+    (try
+      (when-not (.get ^AtomicBoolean (.serving collector))
+        (throw (cancel-error (fenced-error collector))))
+      (when (expired-member? ^FastList (.descriptors batch))
+        (throw (cancel-error
+                (expired-error "ordered preparation" (.cutoff-nanos batch)))))
+      (.set ^AtomicBoolean (.dispatched? batch) true)
+      (finally (.unlock lock)))))
+
+(defn dispatched?
+  "Whether this batch has left ordered preparation for branch execution."
+  [^Batch batch]
+  (.get ^AtomicBoolean (.dispatched? batch)))
+
+(defn expired?
+  "Whether any selected member's deadline has passed.
+
+  Branch owners use this for the final pre-commit deadline check, so a WAL wait
+  that outlasts the batch deadline skips the native commit instead of committing
+  a policy-complete but overdue batch."
+  [^Batch batch]
+  (expired-member? ^FastList (.descriptors batch)))
 
 ;; ---------------------------------------------------------------------------
 ;; Charging
@@ -300,11 +442,11 @@
   "Advance a request's monotonic charge counter before unplanned owned
   allocation. Returns the new charged total. Throws `:not-committed` when the
   charge would exceed the request's allowance, leaving the counter unchanged.
-  Prepaid blind requests never re-enter this path; dynamic RMW storage and
-  unplanned growth do."
+  Planned prepaid allocations never re-enter this path; dynamic RMW storage
+  and unplanned growth do. A fully prepaid blind request rejects any growth."
   [^Descriptor descriptor ^long extra]
   (let [allowance (long (.allowance descriptor))
-        ^AtomicLong charged (.charged descriptor)]
+        ^AtomicLong charged ^AtomicLong (.charged descriptor)]
     (loop []
       (let [current (.get charged)]
         (when (or (neg? extra) (> extra (- allowance current)))
@@ -321,7 +463,7 @@
             (recur)))))))
 
 (defn charged
-  "Dynamic charges accumulated against this request's allowance."
+  "Cumulative charge, including the initial precharge."
   ^long [^Descriptor descriptor]
   (.get ^AtomicLong (.charged descriptor)))
 
@@ -339,11 +481,13 @@
   ([executor] (create executor nil))
   ([executor opts]
    (let [{:keys [limits]} (or opts {:limits (charge/resolve-limits nil)})
-         lock (ReentrantLock.)
+         ;; A selecting leader must not barge ahead of publishers already
+         ;; waiting to enqueue their prepared requests.
+         lock (ReentrantLock. true)
          progress (.newCondition lock)]
      (->Collector lock progress (ConcurrentLinkedQueue.) (AtomicInteger. 0)
                   (AtomicBoolean. false) (AtomicBoolean. true)
-                  (volatile! nil) (volatile! nil) (long-array 1)
+                  (volatile! nil) (volatile! nil) (long-array 2)
                   (PendingBudget. (long (:request-budget limits))
                                   (long (:max-requests limits)))
                   (long (:max-requests limits)) (long (:batch-limit limits))
@@ -355,28 +499,67 @@
 
 (declare await-capacity! release-allowance! observe-cutoff!)
 
-(defn- release-allowance!
-  "Release one request reservation and wake capacity waiters.
+(defn- signal-capacity!
+  "Wake capacity waiters once after one or more reservations are released.
 
-  The reservation belongs to the submitting thread, so it is held until that
-  caller has consumed the result and dropped its references. Releasing under
-  coordination is what lets a bounded capacity waiter make progress; a waiter
-  must never poll for capacity."
-  [^Collector collector ^long allowance]
-  (.release (.budget collector) allowance)
+  Releasing under coordination is what lets a bounded capacity waiter make
+  progress; a waiter must never poll for capacity."
+  [^Collector collector]
   (let [^ReentrantLock lock (.lock collector)]
     (.lock lock)
     (try
-      (.signalAll (.progress ^Condition collector))
+      (when (pos? (aget ^longs (.waiters collector) 0))
+        (signal-progress-under-lock! collector))
       (finally (.unlock lock)))))
+
+(defn- release-allowance!
+  "Release one request reservation and wake capacity waiters."
+  [^Collector collector ^long allowance]
+  (.release ^PendingBudget (.budget collector) allowance)
+  (signal-capacity! collector))
+
+(defn- admitted!
+  "Observe a new reservation before transferring it to a descriptor."
+  [^Collector collector ^long allowance]
+  (try
+    (phase/phase! :admitted allowance)
+    :admitted
+    (catch Throwable t
+      (release-allowance! collector allowance)
+      (throw t))))
+
+(defn- release-descriptor!
+  "Release one caller-owned request reservation exactly once.
+
+  A request becomes **batch-owned** the moment `take-prefix!` seals it: the batch
+  still retains its descriptor and live storage, so only
+  `release-batch-charges!` may release that reservation. This caller fallback
+  can return immediately once it observes selection, which never reverses.
+  Otherwise it takes collector coordination and rechecks before removing any
+  queued reference and releasing. The recheck closes the window where a caller
+  could release a reservation the batch is about to claim. The CAS still makes
+  a double release impossible."
+  [^Collector collector ^Descriptor descriptor]
+  (when-not (.get ^AtomicBoolean (.selected? descriptor))
+    (let [^ReentrantLock lock (.lock collector)]
+      (.lock lock)
+      (try
+        (when-not (.get ^AtomicBoolean (.selected? descriptor))
+          (when (.remove ^ConcurrentLinkedQueue (.ready collector) descriptor)
+            (.decrementAndGet ^AtomicInteger (.queued collector)))
+          (when (.compareAndSet ^AtomicBoolean (.released? descriptor) false true)
+            (release-allowance! collector (.allowance descriptor))))
+        (finally (.unlock lock))))))
 
 (defn- bound-deadline
   "The earlier of a caller's own deadline and the live active batch's
   preparation cutoff. Zero means unbounded; a cutoff is considered only while a
-  batch is actually executing."
+  batch is executing and has not yet been dispatched to its branches."
   ^long [^Collector collector ^long own-deadline]
-  (let [^Batch batch @(.active-batch ^clojure.lang.IDeref collector)
-        cutoff (if (and batch (.get (.active ^AtomicBoolean collector)))
+  (let [^Batch batch @(.active-batch collector)
+        cutoff (if (and batch
+                        (.get ^AtomicBoolean (.active collector))
+                        (not (.get ^AtomicBoolean (.dispatched? batch))))
                  (.cutoff-nanos batch)
                  0)]
     (cond
@@ -393,13 +576,13 @@
   under the condition lock. The wait ends at the caller's own deadline; it
   never cancels or steals anything from the active owner."
   [^Collector collector ^long allowance ^long deadline-nanos]
-  (when-not (.get (.serving ^AtomicBoolean collector))
+  (when-not (.get ^AtomicBoolean (.serving collector))
     (throw (fenced-error collector)))
   ;; Admission is one of the phase checks that observes a stalled active batch.
   (when (observe-cutoff! collector)
     (throw (fenced-error collector)))
-  (if (.tryReserve (.budget collector) allowance)
-    (do (phase/phase! :admitted allowance) :admitted)
+  (if (.tryReserve ^PendingBudget (.budget collector) allowance)
+    (admitted! collector allowance)
     (await-capacity! collector allowance deadline-nanos)))
 
 (defn- await-capacity!
@@ -422,37 +605,35 @@
                               {:error :txlog/pending-budget-exceeded
                                :retryable? false})))
       (aset waiters 0 (inc (aget waiters 0)))
-      (phase/phase! :admission-wait nil)
       (try
+        (phase/phase! :admission-wait nil)
         (loop []
           (cond
-            (not (.get (.serving ^AtomicBoolean collector)))
+            (not (.get ^AtomicBoolean (.serving collector)))
             (throw (fenced-error collector))
 
+            (observe-cutoff! collector)
+            (throw (fenced-error collector))
+
+            (and (pos? deadline-nanos) (<= deadline-nanos (System/nanoTime)))
+            (throw (expired-error "admission" deadline-nanos))
+
             ;; Claim a release that arrived before this waiter parked.
-            (.tryReserve (.budget collector) allowance)
-            (do (phase/phase! :admitted allowance) :admitted)
+            (.tryReserve ^PendingBudget (.budget collector) allowance)
+            (admitted! collector allowance)
 
             :else
             (let [bound (bound-deadline collector deadline-nanos)
                   remaining (if (zero? bound)
                               Long/MAX_VALUE
                               (- bound (System/nanoTime)))]
-              (when-not (pos? remaining)
-                (throw (if (observe-cutoff! collector)
-                         (fenced-error collector)
-                         (expired-error "admission" deadline-nanos))))
-              (if (zero? bound)
-                ;; Unbounded: slice only so a newly published cutoff is
-                ;; rechecked; a slice ending is not an expiry.
+              ;; A preparation cutoff can be withdrawn by dispatch while this
+              ;; wait is parked. A timed wake only rechecks the live predicates;
+              ;; it cannot turn the old cutoff into this caller's deadline.
+              (when (pos? remaining)
                 (.await ^Condition (.progress collector)
-                        50000000 TimeUnit/NANOSECONDS)
-                ;; Bounded: await returns false exactly when the bound elapses.
-                (when-not (.await ^Condition (.progress collector)
-                                  remaining TimeUnit/NANOSECONDS)
-                  (throw (if (observe-cutoff! collector)
-                           (fenced-error collector)
-                           (expired-error "admission" deadline-nanos)))))
+                        (if (zero? bound) 50000000 remaining)
+                        TimeUnit/NANOSECONDS))
               (recur))))
         (finally (aset waiters 0 (dec (aget waiters 0)))))
       (finally (.unlock lock)))))
@@ -463,54 +644,73 @@
 (defn- drop-expired!
   "Remove every queued request whose own deadline passed, not only a leading
   run, so an expired request behind a live head cannot be sealed. Called under
-  collector coordination, so the queue is stable; survivors are restored in
-  their original order. A queued expiry never affects the active owner."
+  collector coordination, so the queue is stable; live entries stay in their
+  original order. A queued expiry never affects the active owner."
   [^Collector collector]
   (let [now (System/nanoTime)
-        ^ConcurrentLinkedQueue queue (.ready collector)
-        survivors (FastList.)]
-    (loop []
-      (when-let [^Descriptor descriptor (.poll queue)]
-        (let [d (.deadline-nanos descriptor)]
-          (if (and (pos? d) (<= d now))
-            (do (.decrementAndGet (.queued collector))
-                (deliver! descriptor
-                          [false (expired-error "collection" d)])
-                (phase/phase! :queue-expired descriptor))
-            (.add survivors descriptor)))
-        (recur)))
-    (dotimes [idx (.size survivors)]
-      (.add queue (.get survivors idx)))))
+        ^java.util.Iterator it (.iterator ^ConcurrentLinkedQueue (.ready collector))]
+    (while (.hasNext it)
+      (let [^Descriptor descriptor (.next it)
+            d (.deadline-nanos descriptor)]
+        (when (and (pos? d) (<= d now))
+          (.remove it)
+          (.decrementAndGet ^AtomicInteger (.queued collector))
+          (deliver! descriptor [false (expired-error "collection" d)])
+          (phase/phase! :queue-expired descriptor))))))
+
+(declare preparation-cutoff! schedule-for release-batch-charges!)
 
 (defn- take-prefix!
   "Seal the longest ready FIFO prefix that fits both batch caps.
 
-  Counts every selected descriptor's full allowance and stops before the first
-  descriptor that would exceed either cap: it never backfills after bodies run
-  and never skips a queue head to fit smaller followers. The remainder stays
-  queued and unsealed until this batch joins."
-  ^FastList [^Collector collector]
+  Walks the queue once in publication order, counting every candidate's full
+  allowance until the first descriptor that would exceed either the request-count
+  or byte cap. That descriptor and its followers stay queued: the selector never
+  backfills after bodies run and never skips a queue head to fit smaller
+  followers. The remainder stays queued and unsealed until this batch joins.
+  Called under collector coordination, so the ready queue is stable."
+  ^Batch [^Collector collector]
   (let [^ConcurrentLinkedQueue queue (.ready collector)
-        limit (.batch-limit collector)
-        cap (.batch-max-bytes collector)
-        available (.get (.queued collector))
-        bound (min limit available)]
-    (loop [taken 0 bytes 0]
-      (let [head (when (< taken bound) (.peek queue))
-            next-bytes (when head (+ bytes (.allowance ^Descriptor head)))]
-        ;; Stop before the first descriptor that would exceed either cap.
-        ;; Later, smaller followers are not backfilled in, and a head that does
-        ;; not fit is never skipped.
-        (if (and head (<= next-bytes cap))
-          (recur (inc taken) next-bytes)
-          (when (pos? taken)
-          (let [batch (FastList. taken)]
-              (dotimes [_ taken]
-                (let [^Descriptor descriptor (.poll queue)]
-                  (.set (.selected? descriptor) true)
-                  (.add batch descriptor)
-                  (.decrementAndGet (.queued collector))))
-              batch)))))))
+        limit (long (.batch-limit collector))
+        cap (long (.batch-max-bytes collector))
+        taken (loop [^java.util.Iterator it (.iterator queue)
+                     taken 0
+                     bytes 0]
+                (if (and (.hasNext it) (< (long taken) limit))
+                  (let [^Descriptor descriptor (.next it)
+                        next-bytes (+ (long bytes) (long (.allowance descriptor)))]
+                    (if (<= next-bytes cap)
+                      (recur it (inc (long taken)) next-bytes)
+                      taken))
+                  taken))]
+    (when (pos? (long taken))
+      (let [descriptors (FastList. (int taken))
+            it (.iterator queue)]
+        ;; Allocate all sealed storage while the requests are still queued and
+        ;; caller-owned. A constructor failure cannot strand selected charges.
+        (dotimes [_ (long taken)] (.add descriptors (.next it)))
+        (let [batch (->Batch (.getAndIncrement ^AtomicLong (.next-id collector))
+                             descriptors (object-array taken) taken
+                             (preparation-cutoff! descriptors) (schedule-for taken)
+                             (AtomicLong. 0) (AtomicBoolean. false)
+                             (volatile! nil) collector)]
+          (try
+            (dotimes [_ (long taken)]
+              (let [^Descriptor descriptor (.peek queue)]
+                (.set ^AtomicBoolean (.selected? descriptor) true)
+                (.poll queue)
+                (.decrementAndGet ^AtomicInteger (.queued collector))))
+            batch
+            (catch Throwable t
+              ;; Also cover an exceptional partial ownership transfer.
+              (try
+                (fence-under-lock! collector t)
+                (finally
+                  (let [error (fenced-error collector)]
+                    (dotimes [idx (.size descriptors)]
+                      (deliver! (.get descriptors idx) [false error])))
+                  (release-batch-charges! collector batch)))
+              (throw t))))))))
 
 (defn- publish-active-batch!
   "Record the batch whose preparation cutoff observers should watch."
@@ -519,25 +719,32 @@
     (.lock lock)
     (try
       (vreset! ^clojure.lang.IDeref (.active-batch collector) batch)
-      ;; A newly earlier cutoff wakes waiters so they recompute their bound.
-      (.signalAll (.progress ^Condition collector))
-      (finally (.unlock lock)))))
-
-(defn- clear-active-batch!
-  "Clear the active batch slot when `batch` retires, if it is still current."
-  [^Collector collector ^Batch batch]
-  (let [^ReentrantLock lock (.lock collector)]
-    (.lock lock)
-    (try
-      (when (identical? batch @(.active-batch ^clojure.lang.IDeref collector))
-        (vreset! ^clojure.lang.IDeref (.active-batch collector) nil)
-        (.signalAll (.progress ^Condition collector)))
+      ;; Only capacity waiters need to recompute a newly published cutoff.
+      (when (and (pos? (.cutoff-nanos batch))
+                 (pos? (aget ^longs (.waiters collector) 0)))
+        (signal-progress-under-lock! collector))
       (finally (.unlock lock)))))
 
 (defn- reset-active-batch!
   "Unconditionally clear the active batch slot. Callers hold the collector lock."
   [^Collector collector]
   (vreset! ^clojure.lang.IDeref (.active-batch collector) nil))
+
+(defn- wake-successor!
+  "Wake the queue head to claim a free slot. Caller holds coordination."
+  [^Collector collector]
+  (when-let [^Descriptor descriptor (.peek ^ConcurrentLinkedQueue (.ready collector))]
+    (notify-descriptor! descriptor)))
+
+(defn- release-slot-under-lock!
+  "Retire execution ownership and notify a successor, or publish idle."
+  [^Collector collector]
+  (.set ^AtomicBoolean (.active collector) false)
+  (reset-active-batch! collector)
+  (signal-progress-under-lock! collector)
+  (if (.isEmpty ^ConcurrentLinkedQueue (.ready collector))
+    (phase/phase! :next-activation nil)
+    (wake-successor! collector)))
 
 (defn- claim-next-batch!
   "Under coordination: drop expired queued requests and seal the next bounded
@@ -546,40 +753,56 @@
   Deciding idle and releasing the slot happen under one lock, so a request
   published in the gap between an empty-queue check and slot release cannot
   strand itself behind a leader that already stopped."
-  ^FastList [^Collector collector]
+  ^Batch [^Collector collector ^Descriptor own]
   (let [^ReentrantLock lock (.lock collector)]
     (.lock lock)
     (try
-      (if (.get (.serving ^AtomicBoolean collector))
-        (let [batch (do (drop-expired! collector)
-                        (take-prefix! collector))]
+      (if (.get ^AtomicBoolean (.serving collector))
+        (let [_ (when (pos? (long (.get ^AtomicInteger (.queued collector))))
+                  (phase/phase! :selection-start nil))
+              batch (do (drop-expired! collector)
+                        ;; Expiring this caller must not make it execute a
+                        ;; later request before returning its own rejection.
+                        (when (nil? @(.result own))
+                          (take-prefix! collector)))]
           (when (nil? batch)
-            ;; Activation is available again: the next ready publication elects
-            ;; its own owner without waiting for a handoff signal. Wake close
-            ;; waiters once the executing batch has retired.
-            (.set (.active ^AtomicBoolean collector) false)
-            (reset-active-batch! collector)
-            (.signalAll (.progress ^Condition collector))
-            (phase/phase! :next-activation nil))
+            (release-slot-under-lock! collector))
           batch)
-        (do (.set (.active ^AtomicBoolean collector) false)
-            (reset-active-batch! collector)
-            (.signalAll (.progress ^Condition collector))
-            (phase/phase! :next-activation nil)
+        (do (release-slot-under-lock! collector)
             nil))
+      (catch Throwable t
+        ;; Election already owns the slot, including before any batch exists.
+        ;; Coordination prevents a successor from claiming it during cleanup.
+        (try (fence-under-lock! collector t)
+             (finally (release-slot-under-lock! collector)))
+        (throw t))
       (finally (.unlock lock)))))
 
-(defn- release-slot!
-  "Release the single active slot under coordination and wake capacity waiters.
-  Only the leader that owns the slot may do this."
-  [^Collector collector]
-  (let [^ReentrantLock lock (.lock collector)]
-    (.lock lock)
-    (try
-      (.set (.active ^AtomicBoolean collector) false)
-      (reset-active-batch! collector)
-      (.signalAll (.progress ^Condition collector))
-      (finally (.unlock lock)))))
+(defn- try-lead!
+  "Claim the free active slot only for the head of the ready queue.
+
+  Called by a waiting submitter after a leader handed the slot off, so the
+  remaining queued work is led by a successor rather than stranded or delayed
+  behind a caller that already has its own result. Returns true when this caller
+  became the leader; it must then run `lead!`. Later publishers cannot take the
+  slot while the head is waking, so their ready work can join its batch."
+  [^Collector collector ^Descriptor descriptor]
+  ;; An active owner or an earlier queue member will deliver our result or wake
+  ;; us as successor. The concurrent queue permits this fast check; election
+  ;; still rechecks under coordination. The park predicate is checked again after
+  ;; any lock wait, which could consume a thread-level unpark permit.
+  (when (and (not (.get ^AtomicBoolean (.active collector)))
+             (identical? descriptor (.peek ^ConcurrentLinkedQueue (.ready collector))))
+    (let [^ReentrantLock lock (.lock collector)]
+      (.lock lock)
+      (try
+        (when (and (nil? @(.result descriptor))
+                   (.get ^AtomicBoolean (.serving collector))
+                   (identical? descriptor
+                               (.peek ^ConcurrentLinkedQueue (.ready collector)))
+                   (.compareAndSet ^AtomicBoolean (.active collector) false true))
+          true)
+        (finally (.unlock lock))))))
 
 (defn- preparation-cutoff!
   "The batch's preparation cutoff is the earliest selected member's applicable
@@ -618,7 +841,7 @@
   "Reject every request without a delivered value. Used by cancellation and
   pre-dispatch failure; earlier accepted rows and results are provisional."
   [^Batch batch value]
-  (let [descriptors (.descriptors batch)]
+  (let [descriptors ^FastList (.descriptors batch)]
     (dotimes [idx (.size descriptors)]
       (deliver! ^Descriptor (.get descriptors idx) value)))
   nil)
@@ -626,24 +849,28 @@
 (defn observe-cutoff!
   "Observe the live active batch's preparation cutoff.
 
-  If the same batch is still executing and its cutoff has expired, reject its
-  members and fence the runtime with the established not-committed outcome.
-  This never runs a body, closes another thread's reader or reclaims the active
-  slot: a stuck owner keeps its resources until it actually exits, and its late
-  return cannot publish success. Returns true when it fenced."
+  Applies only while the same batch is still in ordered preparation and has not
+  been dispatched (see `mark-dispatched!`); once branches run, their own
+  deadlines own the batch. If the cutoff has expired, reject the batch's members
+  and fence the runtime with the established not-committed outcome. This never
+  runs a body, closes another thread's reader or reclaims the active slot: a
+  stuck owner keeps its resources until it actually exits, and its late return
+  cannot publish success. Returns true when it fenced."
   [^Collector collector]
-  (let [^Batch batch @(.active-batch ^clojure.lang.IDeref collector)
+  (let [^Batch batch @(.active-batch collector)
         now (System/nanoTime)]
     (if (and batch
+             (not (.get ^AtomicBoolean (.dispatched? batch)))
              (let [c (.cutoff-nanos batch)] (and (pos? c) (<= c now))))
       (let [^ReentrantLock lock (.lock collector)]
         (.lock lock)
         (try
-          (let [current @(.active-batch ^clojure.lang.IDeref collector)
+          (let [current @(.active-batch collector)
                 c (when (identical? current batch) (.cutoff-nanos batch))
                 now (System/nanoTime)]
             (if (and (identical? current batch)
-                     (.get (.active ^AtomicBoolean collector))
+                     (.get ^AtomicBoolean (.active collector))
+                     (not (.get ^AtomicBoolean (.dispatched? batch)))
                      (pos? (long (or c 0)))
                      (<= (long (or c 0)) now))
               (let [error (expired-error "preparation" (long c))]
@@ -657,28 +884,44 @@
       false)))
 
 (defn- join-batch!
-  "Coherent local publication, result recording and joined-prefix advance."
+  "Publish the prefix and results while holding collector coordination."
   [^Batch batch values]
   (let [^Collector collector (.collector batch)
-        descriptors (.descriptors batch)]
+        descriptors ^FastList (.descriptors batch)]
     ;; P is an absolute joined prefix, not a running sum of group lengths.
-    (.accumulateAndGet (.published ^AtomicLong collector)
-                       (.get (.lsn ^AtomicLong batch))
+    (.accumulateAndGet ^AtomicLong (.published collector)
+                       (.get ^AtomicLong (.lsn batch))
                        max-long)
-    (phase/phase! :joint-publication batch)
     (dotimes [idx (.size descriptors)]
-      (deliver! ^Descriptor (.get descriptors idx)
-                (rejected-value (aget ^objects values idx))))
+      (publish-result! ^Descriptor (.get descriptors idx)
+                       (rejected-value (aget ^objects values idx))))
     nil))
 
 (defn- join-or-reject!
   "Publish joined results, unless a terminal fence was recorded while the batch
-  executed; a late return must never publish normal success."
+  executed. The final decision and publication share coordination with fencing."
   [^Batch batch values]
-  (let [^Collector collector (.collector batch)]
-    (if-let [failure @(.failure ^clojure.lang.IDeref collector)]
-      (reject-pending! batch [false failure])
-      (join-batch! batch values))))
+  ;; The seam marks entry into publication, before its atomic decision. A fault
+  ;; here must preserve the WAL result just like an execution failure.
+  (phase/phase! :joint-publication batch)
+  (let [^Collector collector (.collector batch)
+        ^ReentrantLock lock (.lock collector)]
+    (.lock lock)
+    (try
+      (if-let [failure @(.failure collector)]
+        (reject-pending! batch [false (wal-outcome-error batch failure)])
+        (join-batch! batch values))
+      (finally
+        (.unlock lock)
+        ;; Publication is settled before notifications. Returning writers can
+        ;; now publish without immediately parking behind the publication lock.
+        ;; The queue head is the executing leader and never waits for its result.
+        ;; Also notify any published prefix if publication threw partway through;
+        ;; the failure path will complete the remaining slots.
+        (dotimes [idx (dec (batch-count batch))]
+          (let [descriptor (batch-at batch (inc idx))]
+            (when (some? @(.result descriptor))
+              (notify-descriptor! descriptor))))))))
 
 (defn- dispatch-batch!
   "Hand the sealed batch to the environment executor and join its results.
@@ -688,13 +931,13 @@
   recording belong to this collector."
   [^Batch batch]
   (let [^Collector collector (.collector batch)
-        descriptors (.descriptors batch)
+        descriptors ^FastList (.descriptors batch)
         weight (long (.size descriptors))]
     (phase/phase! :ordered-work batch)
     (when (expired-member? descriptors)
       (throw (cancel-error
               (expired-error "ordered preparation" (.cutoff-nanos batch)))))
-    (when-not (.get (.serving ^AtomicBoolean collector))
+    (when-not (.get ^AtomicBoolean (.serving collector))
       (throw (cancel-error (fenced-error collector))))
     (phase/phase! :schedule-selected {:schedule (.schedule batch) :weight weight})
     (let [values ((.executor collector) batch)]
@@ -704,6 +947,14 @@
                          :expected weight :actual (alength ^objects values)})))
       (join-or-reject! batch values))))
 
+(defn- fail-batch!
+  "Reject the active batch using its own WAL result and fence further work."
+  [^Batch batch cause]
+  (let [error (wal-outcome-error batch cause)]
+    (reject-pending! batch [false error])
+    (fence! (.collector batch) error)
+    :fenced))
+
 (defn- execute-batch!
   "Run one sealed batch to joint completion, applying the phase table's
   cancellation and pre-dispatch failure rows.
@@ -712,61 +963,82 @@
   `:interrupted` (the preparation owner must stop leading). An unexpected
   failure rejects the batch and fences, returning `:fenced`."
   [^Batch batch]
-  (let [^Collector collector (.collector batch)]
-    (try
-      (dispatch-batch! batch)
-      :joined
-      (catch InterruptedException _
-        ;; An observed preparation-owner interruption cancels the undispatched
-        ;; batch. The owner never evaluates the suffix or leads another batch.
-        (let [interrupted? (Thread/interrupted)]
-          (reject-pending! batch [false (interrupted-error)])
-          (when interrupted? (.interrupt (Thread/currentThread)))
-          :interrupted))
-      (catch Throwable t
-        (if (pre-dispatch-cancel? t)
-          ;; A clean pre-dispatch cancellation rejects the undispatched batch,
-          ;; preserves its not-committed outcome and lets the runtime continue.
-          (do (reject-pending! batch [false (ex-cause t)])
-              :cancelled)
-          (do (reject-pending! batch [false t])
-              (fence! collector t)
-              :fenced))))))
+  (try
+    (dispatch-batch! batch)
+    :joined
+    (catch InterruptedException t
+      ;; An interrupted join cannot turn a durable write into a pre-dispatch
+      ;; cancellation. The executor drains both branches before returning.
+      (try
+        (if (dispatched? batch)
+          (fail-batch! batch t)
+          (do (reject-pending! batch [false (interrupted-error)])
+              :interrupted))
+        (finally (.interrupt (Thread/currentThread)))))
+    (catch Throwable t
+      (if (and (not (dispatched? batch)) (pre-dispatch-cancel? t))
+        ;; A clean pre-dispatch cancellation rejects the undispatched batch,
+        ;; preserves its not-committed outcome and lets the runtime continue.
+        (do (reject-pending! batch [false (ex-cause t)])
+            :cancelled)
+        (fail-batch! batch t)))))
+
+(defn- release-batch-charges!
+  "Release every sealed member's retained reservation at batch cleanup.
+
+  One batch owns its WAL outcome, active slot and retained charges until both
+  branches stop, so cleanup is driven by branch completion rather than by caller
+  notification. Each reservation's CAS keeps the batch/caller paths idempotent;
+  retirement holds coordination and signals capacity waiters after releasing
+  the whole batch."
+  [^Collector collector ^Batch batch]
+  (let [descriptors ^FastList (.descriptors batch)]
+    (dotimes [idx (.size descriptors)]
+      (let [^Descriptor descriptor (.get descriptors idx)]
+        (when (.compareAndSet ^AtomicBoolean (.released? descriptor) false true)
+          (.release ^PendingBudget (.budget collector) (.allowance descriptor))))))
+  nil)
 
 (defn- run-sealed-batch!
-  "Execute one sealed batch on this leader. Returns true when the preparation
-  owner was interrupted and must therefore stop leading."
-  [^Collector collector ^FastList descriptors]
-  (let [selected (FastList. (.size descriptors))]
-    ;; Bounded by N, so this copy cannot exceed the membership carrier already
-    ;; charged in the shared workspace.
-    (dotimes [idx (.size descriptors)]
-      (.add selected (.get descriptors idx)))
-    (let [weight (long (.size selected))
-          batch (->Batch (.getAndIncrement (.next-id collector)) selected weight
-                         (preparation-cutoff! selected) (schedule-for weight)
-                         (AtomicLong. 0) collector)]
-      (phase/phase! :batch-sealed batch)
-      (publish-active-batch! collector batch)
-      (let [outcome (execute-batch! batch)]
-        (clear-active-batch! collector batch)
-        (if (= :interrupted outcome)
-          (do (release-slot! collector) true)
-          false)))))
+  "Execute one sealed batch, then retire its storage and ownership together."
+  [^Collector collector ^Batch batch]
+  (try
+    (refresh-wal-bodies! batch)
+    (phase/phase! :batch-sealed batch)
+    (publish-active-batch! collector batch)
+    (execute-batch! batch)
+    (catch Throwable t
+      ;; Sealed storage initialization/observation may fail before execution's
+      ;; own handler is entered. Complete all selected requests and fence.
+      (fail-batch! batch t))
+    (finally
+      ;; Both branches have stopped. One acquisition covers charge release,
+      ;; retirement and handoff, rather than rejoining the fair lock queue
+      ;; separately for each cleanup step.
+      (let [^ReentrantLock lock (.lock collector)]
+        (.lock lock)
+        (try
+          (try
+            (release-batch-charges! collector batch)
+            (phase/phase! :batch-retired batch)
+            (catch Throwable t
+              ;; Results already published by join cannot be revoked. Fence
+              ;; further work on a cleanup failure, then relinquish ownership
+              ;; now that both branches have stopped.
+              (fence-under-lock! collector (wal-outcome-error batch t)))
+            (finally (release-slot-under-lock! collector)))
+          (finally (.unlock lock)))))))
 
 (defn- lead!
-  "Own the single active slot, sealing and joining one batch at a time until the
-  ready queue is empty.
+  "Seal and execute this caller's one batch, then return.
 
-  The leader never hands off: after a join it selects the next prefix itself, so
-  activation is immediate and no elected successor needs waking."
-  [^Collector collector]
-  (loop []
-    (let [descriptors (claim-next-batch! collector)]
-      (cond
-        (nil? descriptors) :idle
-        (run-sealed-batch! collector descriptors) :interrupted
-        :else (recur)))))
+  Only the queue head can be elected, so every nonempty selected prefix includes
+  `own`. Selection releases the slot if this caller expires or is rejected;
+  otherwise batch retirement releases it. A leader never runs a later batch
+  after its own result completes."
+  [^Collector collector ^Descriptor own]
+  (when-let [batch (claim-next-batch! collector own)]
+    (run-sealed-batch! collector batch)))
 
 ;; ---------------------------------------------------------------------------
 ;; Submission
@@ -788,49 +1060,55 @@
   (let [^ReentrantLock lock (.lock collector)]
     (.lock lock)
     (try
-      (when (.remove (.ready collector) descriptor)
-        (.decrementAndGet (.queued collector))
+      (when (.remove ^ConcurrentLinkedQueue (.ready collector) descriptor)
+        (.decrementAndGet ^AtomicInteger (.queued collector))
+        ;; An expiring head may have consumed the handoff notification. Relay
+        ;; it if there is no execution owner to notify the next caller.
+        (when-not (.get ^AtomicBoolean (.active collector))
+          (wake-successor! collector))
         true)
       (finally (.unlock lock)))))
 
-(defn- wait-until-deadline!
-  "Wait for a result under the earlier of this request's own deadline and the
-  live active batch's preparation cutoff.
+(defn- park-for-progress!
+  "Recheck progress after every possible lock wait, immediately before parking.
 
-  A short bounded poll keeps an interruption and a post-deadline selection
-  visible without busy waiting. When the bound elapses, the waiter observes the
-  active batch's cutoff: an expired live batch is fenced so the waiter (and a
-  queued request) can fail now. Otherwise a selected request keeps waiting for
-  its elected owner, while an unselected one is definitively rejected and
-  unlinked from the ready queue."
-  [^Collector collector ^Descriptor descriptor ^Semaphore ready
+  A thread-level permit can be consumed by another synchronizer. Result and
+  queue-head predicates therefore retain progress even if an earlier unpark was
+  consumed. No blocking operation may be inserted between these checks and park.
+  Spurious or duplicate notifications simply return to result/election checks."
+  [^Collector collector ^Descriptor descriptor ^long nanos]
+  (when (and (nil? @(.result descriptor))
+             (or (.get ^AtomicBoolean (.active collector))
+                 (not (identical? descriptor
+                                  (.peek ^ConcurrentLinkedQueue (.ready collector))))))
+    (if (zero? nanos)
+      (LockSupport/park descriptor)
+      (LockSupport/parkNanos descriptor nanos))))
+
+(defn- await-progress!
+  "Wait once for a result or handoff, observing applicable deadlines."
+  [^Collector collector ^Descriptor descriptor
    ^clojure.lang.IDeref result ^clojure.lang.IDeref interrupted?
    deadline-nanos]
-  (loop []
-    (when (nil? @result)
-      (let [selected? (.get (.selected? descriptor))
-            bound (bound-deadline collector deadline-nanos)
+  (try
+    (if (zero? deadline-nanos)
+      (park-for-progress! collector descriptor 0)
+      (let [bound (bound-deadline collector deadline-nanos)
             remaining (- bound (System/nanoTime))]
-        (cond
-          (pos? remaining)
-          (try
-            (.tryAcquire ready (min remaining 100000) TimeUnit/NANOSECONDS)
-            (catch InterruptedException _
-              (vreset! interrupted? true)))
-
-          selected?
+        (if (pos? remaining)
+          (park-for-progress! collector descriptor (min remaining 100000))
           (do (observe-cutoff! collector)
-              ;; The observer may have rejected this member; otherwise the
-              ;; elected owner still owes the result.
-              (.acquireUninterruptibly ready))
-
-          :else
-          (do (observe-cutoff! collector)
-              (when (nil? @result)
-                (unlink! collector descriptor)
-                (deliver! descriptor [false (expired-error "execution" deadline-nanos)]))
-              (.acquireUninterruptibly ready))))
-      (recur))))
+              ;; Removal and selection share coordination. If selection won,
+              ;; only the batch may decide this request's outcome.
+              (when (and (nil? @result) (unlink! collector descriptor))
+                (deliver! descriptor
+                          [false (expired-error "execution" deadline-nanos)]))
+              (park-for-progress! collector descriptor 0)))))
+    (finally
+      ;; park returns on interruption without clearing it. Clear and remember
+      ;; it before this waiter can take leadership; restore it on submit return.
+      (when (Thread/interrupted)
+        (vreset! interrupted? true)))))
 
 (defn- await-result!
   "Wait for this request's own result slot.
@@ -841,14 +1119,22 @@
   still merely queued, it is definitively rejected; a selected request keeps its
   execution deadline with its elected owner."
   [^Collector collector ^Descriptor descriptor ^long deadline-nanos]
-  (let [ready (.ready descriptor)
-        result (.result descriptor)
+  (let [result (.result descriptor)
         interrupted? (volatile! false)]
     (try
-      (if (zero? deadline-nanos)
-        (.acquireUninterruptibly ready)
-        (wait-until-deadline! collector descriptor ready result interrupted?
-                              deadline-nanos))
+      (loop []
+        (when (nil? @result)
+          ;; A handoff may arrive before the caller's first wait. Remember an
+          ;; already pending waiter interruption before it becomes the owner.
+          (when (Thread/interrupted)
+            (vreset! interrupted? true))
+          ;; If a previous leader handed the slot off, take over and lead the
+          ;; remaining queued work instead of only waiting for its result.
+          (if (try-lead! collector descriptor)
+            (lead! collector descriptor)
+            (await-progress! collector descriptor result interrupted?
+                             deadline-nanos))
+          (recur)))
       (result! result)
       (finally
         ;; A waiting submitter never cancels its request or interrupts the
@@ -864,40 +1150,42 @@
   single active batch slot."
   [^Collector collector descriptor]
   (let [^ReentrantLock lock (.lock collector)]
-    (.lock lock)
+    ;; Ready publishers may take a free lock immediately. Selection uses fair
+    ;; acquisition, so it cannot cut ahead of publishers already waiting. This
+    ;; lets ready work accumulate without making every publisher pay a handoff.
+    (when-not (.tryLock lock) (.lock lock))
     (try
-      (when-not (.get (.serving ^AtomicBoolean collector))
+      (when-not (.get ^AtomicBoolean (.serving collector))
         (throw (fenced-error collector)))
-      (.add (.ready collector) descriptor)
-      (.incrementAndGet (.queued collector))
+      (.add ^ConcurrentLinkedQueue (.ready collector) descriptor)
+      (.incrementAndGet ^AtomicInteger (.queued collector))
       ;; Emit at the enqueue point, under the same coordination that fixes FIFO,
       ;; so a trace observer records the real publication order.
       (phase/phase! :ready-published descriptor)
-      ;; The first ready publication in an idle environment elects an owner;
-      ;; every other caller waits for its own result slot.
-      (.compareAndSet (.active ^AtomicBoolean collector) false true)
+      ;; The queue head owns the next election. A returning writer may publish
+      ;; before a woken head runs, but cannot seal a smaller batch ahead of it.
+      (and (identical? descriptor
+                       (.peek ^ConcurrentLinkedQueue (.ready collector)))
+           (.compareAndSet ^AtomicBoolean (.active collector) false true))
       (finally (.unlock lock)))))
 
 (defn submit!
   "Admit, prepare, publish and complete one write request.
 
   `request` is a map of `:allowance` (required bytes, declared before the caller
-  allocates anything), optional `:prepare` (state-independent caller work),
+  allocates anything), optional `:prepare` (fn [descriptor] returning owned
+  prepared data on the caller after admission),
   optional `:op`/`:data`/`:context` (ordered body inputs, run on the execution
   thread) and optional `:timeout-ms`. Returns this request's own value, or
   throws its own failure. Preparation alone grants no batch membership, LSN,
-  state visibility or permission to start I/O."
+  state visibility or permission to start I/O. Blind requests precharge their
+  full allowance; body-based requests start with the control-bundle charge."
   [^Collector collector {:keys [allowance prepare op data context timeout-ms]}]
   (let [allowance (long allowance)
         deadline (if timeout-ms
                          (+ (System/nanoTime) (long (* 1000000 (long timeout-ms))))
                          0)
-        batch-max-bytes (.batch-max-bytes collector)
-        descriptor (doto (Descriptor. op data context prepare
-                                      allowance deadline
-                                      (AtomicLong. 0) (AtomicBoolean. false)
-                                      (volatile! nil) (Semaphore. 0)
-                                      (AtomicBoolean. false)))]
+        batch-max-bytes (.batch-max-bytes collector)]
     ;; Every admitted request must cover at least its own control bundle; an
     ;; allowance above the batch byte cap could never be selected. Both are
     ;; rejected before admission, encoding or body evaluation.
@@ -914,17 +1202,26 @@
                              :allowance allowance
                              :write-batch-max-bytes batch-max-bytes})))
     (admit! collector allowance deadline)
-    (try
-      (when prepare
-        (phase/phase! :caller-preparation descriptor)
-        (prepare)
-        (phase/phase! :caller-prepared descriptor))
-      (when (publish-and-elect! collector descriptor)
-        (lead! collector))
-      (await-result! collector descriptor deadline)
-      (finally
-        ;; Exactly one reserve/release pair per request.
-        (release-allowance! collector allowance)))))
+    (let [^Descriptor descriptor
+          (try
+            (Descriptor. op (volatile! data) context allowance deadline
+                         (AtomicLong. (if op charge/request-control-bundle allowance))
+                         (AtomicBoolean. false) (volatile! nil) (Thread/currentThread)
+                         (AtomicBoolean. false) (AtomicBoolean. false))
+            (catch Throwable t
+              (release-allowance! collector allowance)
+              (throw t)))]
+      (try
+        (when prepare
+          (phase/phase! :caller-preparation descriptor)
+          (vreset! (.data descriptor) (prepare descriptor))
+          (phase/phase! :caller-prepared descriptor))
+        (when (publish-and-elect! collector descriptor)
+          (lead! collector descriptor))
+        (await-result! collector descriptor deadline)
+        (finally
+          ;; Sealed storage belongs to batch cleanup; unselected storage to caller.
+          (release-descriptor! collector descriptor))))))
 
 (defn admitted-usage
   "Diagnostic snapshot used by the accounting oracle."

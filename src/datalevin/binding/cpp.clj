@@ -489,7 +489,7 @@
 (declare key-range-list-count-fast)
 
 (defn- close-native-write!
-  [^Env env write-txn before-commit]
+  [^Env env write-txn wdb before-commit]
     (if-let [^Rtx wtxn @write-txn]
      (try
       (when-let [^Txn txn (.-txn wtxn)]
@@ -497,7 +497,8 @@
           (if aborted?
             (.close txn)
             (try
-              (when before-commit (before-commit {:operation :close-transact-kv}))
+              (when before-commit
+                (before-commit wdb {:operation :close-transact-kv}))
               (.commit txn)
               (catch Util$MapFullException _
                 (.close txn)
@@ -521,7 +522,9 @@
 (defprotocol IApplicationWriter
   (apply-native-range! [this body before-commit]
     "Apply immutable WAL rows directly. Retry only native map growth, with no
-    WAL append, collector, or dynamically scoped commit hook."))
+    WAL append, collector, or dynamically scoped commit hook. `body` receives the
+    writable view and returns its result; `before-commit` receives that same
+    writable view and an operation map, and may throw to abort the transaction."))
 
 (defprotocol IPendingReader
   (get-pending-rtx [this]
@@ -623,12 +626,12 @@
         (try
           (let [wdb (.open-transact-kv this)
                 result (body wdb)]
-            (close-native-write! env write-txn before-commit)
+            (close-native-write! env write-txn wdb before-commit)
             result)
           (catch Throwable e
             (when @write-txn
               (.abort-transact-kv this)
-              (close-native-write! env write-txn nil))
+              (close-native-write! env write-txn nil nil))
             (throw e))))))
 
   IPendingReader
@@ -1063,7 +1066,8 @@
         (raise "Fail to open read/write transaction in LMDB: " e {}))))
 
   (close-transact-kv [_]
-    (close-native-write! env write-txn run-before-write-commit!))
+    (close-native-write! env write-txn nil
+                         (fn [_wdb context] (run-before-write-commit! context))))
 
   (abort-transact-kv [_]
     (when-let [^Rtx wtxn @write-txn]

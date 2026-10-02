@@ -23,6 +23,18 @@
   (testing "overflow is rejected before allocation"
     (is (thrown? ArithmeticException (charge/array-bytes Long/MAX_VALUE 4)))))
 
+(deftest many-empty-rows-still-charge-their-separate-owned-representations
+  ;; Payload-only or one-header-per-request accounting misses these costs.
+  (let [n 256
+        minimum (+ charge/request-control-bundle
+                   (* n (+ charge/encoded-row-descriptor
+                           (* 2 (charge/array-bytes 1 0))
+                           (* 2 charge/buffer-wrapper)
+                           charge/per-key-staging-state
+                           charge/ordered-map-entry)))
+        allowance (charge/blind-allowance {:declared-bytes 0 :row-capacity n})]
+    (is (>= allowance minimum))))
+
 (deftest owned-representation-charges
   (testing "a flat vector is its wrapper plus a reference array"
     (is (= 64 charge/vector-wrapper))

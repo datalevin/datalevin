@@ -10,10 +10,12 @@
 
 (defonce ^:private observer (volatile! nil))
 
-(defn ^:redef phase!
-  "Record one execution phase. Disabled production calls allocate nothing."
+(defn current-observer [] @observer)
+
+(defmacro phase!
+  "Record one execution phase. A disabled seam does not evaluate its payload."
   [event context]
-  (when-let [f @observer] (f event context)))
+  `(when-let [f# (current-observer)] (f# ~event ~context)))
 
 (defn observe!
   "Install a trace/fault observer and return a zero-argument uninstaller.

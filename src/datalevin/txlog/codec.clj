@@ -1269,15 +1269,20 @@
 
 (defrecord CommitRowGroup [bodies header-size body-size row-count major])
 
+(def ^:private ^Class object-array-class (Class/forName "[Ljava.lang.Object;"))
+
 (defn prepare-commit-row-group
   "Validate prepared payload headers and describe their ordered row regions.
   Retain owned inputs without allocating or copying a combined payload. Equal
   HA terms imply equal header sizes, including for mixed format-1/format-2 rows."
   [bodies]
-  (when (empty? bodies)
+  (when (zero? (count bodies))
     (throw (IllegalArgumentException. "A WAL group cannot be empty")))
-  (let [bodies (vec bodies)
-        ^bytes first-body (first bodies)
+  (let [;; The new collector already owns a sealed reference array. Keep it
+        ;; instead of rebuilding a vector on the WAL worker. Other callers
+        ;; retain the existing normalization of sequential inputs.
+        bodies (if (.isInstance object-array-class bodies) bodies (vec bodies))
+        ^bytes first-body (nth bodies 0)
         bf (ByteBuffer/wrap first-body)
         first-header (decode-commit-row-payload-prefix bf)
         header-size (.position bf)]
@@ -1303,7 +1308,7 @@
   Input payloads stay unchanged; the insertion owner stamps this output only."
   [^ByteBuffer out group]
   (let [start (.position out) size (int (:header-size group))]
-    (.put out ^bytes (first (:bodies group)) 0 size)
+    (.put out ^bytes (nth (:bodies group) 0) 0 size)
     ;; Format 2 also accepts all ordinary format-1 KV opcodes.
     (.put out (+ start 4) (byte (:major group)))
     (.putInt out (+ start (- size 4)) (int (:row-count group))))
@@ -1314,9 +1319,11 @@
   output position without joining or copying input rows into an intermediate."
   [^ByteBuffer out group]
   (write-commit-row-group-header! out group)
-  (let [start (int (:header-size group))]
-    (doseq [^bytes body (:bodies group)]
-      (.put out body start (- (alength body) start))))
+  (let [start (int (:header-size group))
+        bodies (:bodies group)]
+    (dotimes [idx (count bodies)]
+      (let [^bytes body (nth bodies idx)]
+        (.put out body start (- (alength body) start)))))
   out)
 
 (defn combine-commit-row-payloads
