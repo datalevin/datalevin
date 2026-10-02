@@ -5,12 +5,25 @@
   (:import [java.lang AutoCloseable]
            [datalevin.utl NativeUsers]
            [java.util.concurrent.atomic AtomicBoolean]
-           [java.util.concurrent.locks Condition ReentrantLock]))
+           [java.util.concurrent.locks Condition ReentrantLock]
+           [clojure.lang Volatile]))
+
+;; A deftype, not a map: the borrow boundary reads `users` and `teardown-thread`
+;; on every eager read, and array-map lookups there are measurable. External
+;; callers only use the functions below. Field hints do not propagate to
+;; `.-field`, so each access binds an explicitly hinted local.
+(deftype Lifetime [^ReentrantLock lock
+                   ^Condition changed
+                   ^ThreadLocal call-owner
+                   ^Volatile teardown-thread
+                   ^NativeUsers users
+                   ^Volatile state])
 
 (defn ^:redef nano-time ^long [] (System/nanoTime))
 
-(defn teardown-owner? [lifetime]
-  (identical? (Thread/currentThread) @(:teardown-thread lifetime)))
+(defn teardown-owner? [^Lifetime lifetime]
+  (let [^Volatile tt (.-teardown-thread lifetime)]
+    (identical? (Thread/currentThread) @tt)))
 
 (defmacro with-lock [lock & body]
   `(let [^ReentrantLock lock# ~lock]
@@ -30,30 +43,44 @@
   []
   (let [lock (ReentrantLock.)
         changed (.newCondition lock)]
-    {:lock lock :changed changed
-     :call-owner (ThreadLocal.) :teardown-thread (volatile! nil)
-     :users (NativeUsers. lock changed) :state (volatile! :open)}))
+    (Lifetime. lock changed (ThreadLocal.) (volatile! nil)
+               (NativeUsers. lock changed) (volatile! :open))))
+
+(defn instrument
+  "Diagnostic seam: a lifetime over this runtime's state and teardown thread with
+  a supplied lock, condition and native-user accounting, so a test can observe
+  shared-lock acquisition on the borrow path."
+  ^Lifetime [^Lifetime lifetime
+             ^ReentrantLock lock
+             ^Condition changed
+             ^NativeUsers users]
+  (Lifetime. lock changed (.-call-owner lifetime) (.-teardown-thread lifetime)
+             users (.-state lifetime)))
 
 (defn borrow!
   "Register native use with a reusable thread-local counter. Exactly one close
   per successful borrow is required, possibly on another thread. Registration
   and close coordinate under the lifecycle lock; steady-state reads do not."
-  ^AutoCloseable [lifetime]
-  (try (.borrow ^NativeUsers (:users lifetime))
-       (catch IllegalStateException e
-         (throw (ex-info "Native environment is fenced"
-                         {:error :txlog/native-fenced :retryable? false} e)))))
+  ^AutoCloseable [^Lifetime lifetime]
+  (let [^NativeUsers users (.-users lifetime)]
+    (try (.borrow users)
+         (catch IllegalStateException e
+           (throw (ex-info "Native environment is fenced"
+                           {:error :txlog/native-fenced :retryable? false} e))))))
 
 (defn state
   "Return lifecycle diagnostics without acquiring any native resource."
-  [lifetime]
-  (with-lock (:lock lifetime)
-    {:phase @(:state lifetime) :native-users (.countActive ^NativeUsers (:users lifetime))}))
+  [^Lifetime lifetime]
+  (let [^ReentrantLock lock (.-lock lifetime)
+        ^NativeUsers users (.-users lifetime)
+        ^Volatile s (.-state lifetime)]
+    (with-lock lock
+      {:phase @s :native-users (.countActive users)})))
 
 (defn enter!
   "Register native use before touching the environment. Retain the returned
   lease through transaction/cursor cleanup, including blocked native calls."
-  ^AutoCloseable [lifetime]
+  ^AutoCloseable [^Lifetime lifetime]
   (let [lease (borrow! lifetime)
         released (AtomicBoolean. false)]
     (reify AutoCloseable
@@ -62,19 +89,23 @@
 
 (defn fence!
   "Prevent new native users, preserving resources held by existing users."
-  [lifetime]
-  (with-lock (:lock lifetime)
-    (when (= :open @(:state lifetime))
-      (.fence ^NativeUsers (:users lifetime))
-      (vreset! (:state lifetime) :fenced))
-    (.signalAll ^Condition (:changed lifetime))))
+  [^Lifetime lifetime]
+  (let [^ReentrantLock lock (.-lock lifetime)
+        ^Condition changed (.-changed lifetime)
+        ^NativeUsers users (.-users lifetime)
+        ^Volatile s (.-state lifetime)]
+    (with-lock lock
+      (when (= :open @s)
+        (.fence users)
+        (vreset! s :fenced))
+      (.signalAll changed))))
 
 (defmacro with-use
   "Retain one native/IO lease through a reentrant call chain. Ownership belongs
   to the guard and the current Java thread; it cannot propagate to futures."
   [guard & body]
-  `(let [guard# ~guard
-         ^ThreadLocal owner# (:call-owner guard#)]
+  `(let [^Lifetime guard# ~guard
+         ^ThreadLocal owner# (.-call-owner guard#)]
      (if (or (.get owner#) (teardown-owner? guard#))
        (do ~@body)
        (with-open [~(with-meta 'lease# {:tag 'java.lang.AutoCloseable}) (enter! guard#)]
@@ -86,15 +117,20 @@
   interruption leaves the runtime fenced without invoking teardown. The caller
   must retain its environment registry entry and protocol lease on failure.
   Teardown must free native resources before unregistering/releasing the lease."
-  [lifetime timeout-ms teardown]
-  (let [limit (deadline timeout-ms)
-        run? (with-lock (:lock lifetime)
-               (when (= :open @(:state lifetime))
-                 (.fence ^NativeUsers (:users lifetime))
-                 (vreset! (:state lifetime) :fenced))
+  [^Lifetime lifetime timeout-ms teardown]
+  (let [^ReentrantLock lock (.-lock lifetime)
+        ^Condition changed (.-changed lifetime)
+        ^NativeUsers users (.-users lifetime)
+        ^Volatile s (.-state lifetime)
+        ^Volatile tt (.-teardown-thread lifetime)
+        limit (deadline timeout-ms)
+        run? (with-lock lock
+               (when (= :open @s)
+                 (.fence users)
+                 (vreset! s :fenced))
                (loop []
-                 (let [phase @(:state lifetime)
-                       users (.countActive ^NativeUsers (:users lifetime))
+                 (let [phase @s
+                       active (.countActive users)
                        remaining (- limit (nano-time))]
                    (cond
                      (= :closed phase) false
@@ -102,34 +138,34 @@
                      (throw (ex-info "Native teardown failed; restart the process"
                                      {:error :txlog/native-teardown-failed
                                       :process-restart-required? true}))
-                     (and (zero? users) (= :fenced phase))
-                     (do (vreset! (:state lifetime) :closing) true)
+                     (and (zero? active) (= :fenced phase))
+                     (do (vreset! s :closing) true)
                      (not (pos? remaining))
                      (throw (ex-info "Native users have not quiesced; environment remains fenced"
                                      {:error :txlog/native-not-quiescent
-                                      :native-users users
+                                      :native-users active
                                       :process-restart-required? true}))
                      :else
                      (do
                        (try
-                         (.awaitNanos ^Condition (:changed lifetime) remaining)
+                         (.awaitNanos changed remaining)
                          (catch InterruptedException e
                            (.interrupt (Thread/currentThread))
                            (throw (ex-info "Interrupted while draining native users"
                                            {:error :txlog/native-not-quiescent
-                                            :native-users users
+                                            :native-users active
                                             :process-restart-required? true} e))))
                        (recur))))))]
     (when run?
       (try
-        (vreset! (:teardown-thread lifetime) (Thread/currentThread))
-        (try (teardown) (finally (vreset! (:teardown-thread lifetime) nil)))
-        (with-lock (:lock lifetime)
-          (vreset! (:state lifetime) :closed)
-          (.signalAll ^Condition (:changed lifetime)))
+        (vreset! tt (Thread/currentThread))
+        (try (teardown) (finally (vreset! tt nil)))
+        (with-lock lock
+          (vreset! s :closed)
+          (.signalAll changed))
         (catch Throwable e
-          (with-lock (:lock lifetime)
-            (vreset! (:state lifetime) :teardown-failed)
-            (.signalAll ^Condition (:changed lifetime)))
+          (with-lock lock
+            (vreset! s :teardown-failed)
+            (.signalAll changed))
           (throw e))))
     nil))

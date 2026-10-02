@@ -1644,6 +1644,39 @@
       (<= (long (append/last-lsn batch))
           (long @(:last-durable-lsn (:sync-manager state)))))))
 
+(defn- policy-outcome-error
+  "Classify a WAL policy-completion failure by the durability actually reached.
+
+  A failure before D reached this record's LSN leaves durability unknown
+  (`:indeterminate`). A failure after D advanced, such as an after-sync hook,
+  still means the record is durable (`:committed`). The original cause, its data
+  and the record's identity (segment, offset, checksum) are preserved."
+  [batch cause]
+  (let [lsn (long (append/last-lsn batch))
+        manager (append/sync-manager batch)
+        durable? (boolean
+                  (and manager
+                       (<= lsn (long @(:last-durable-lsn manager)))))
+        identity (merge {:lsn lsn}
+                        (try
+                          (let [info (append/record-info batch lsn)]
+                            {:segment-id (append/segment-id batch)
+                             :offset (:offset info)
+                             :checksum (:checksum info)})
+                          (catch Throwable _ nil)))]
+    (ex-info (if durable?
+               "WAL durability confirmed but policy completion failed"
+               "WAL policy completion failed; durability unconfirmed")
+             (merge (ex-data cause)
+                    identity
+                    {:error (if durable? :txlog/write-committed
+                                :txlog/write-indeterminate)
+                     :outcome (if durable? :committed :indeterminate)
+                     :wal-status (if durable? :durable :appended)
+                     :txlog-lsn lsn
+                     :retryable? false})
+             cause)))
+
 (defn complete-policy!
   "WAL-only completion for one appended group under its configured policy.
 
@@ -1672,6 +1705,8 @@
    (let [token (claim-wal-ownership! state deadline-ns)]
      (try
        (complete-policy-holding! state batch deadline-ns)
+       (catch Throwable t
+         (throw (policy-outcome-error batch t)))
        (finally
          (release-wal-ownership! state token))))))
 
@@ -1881,6 +1916,8 @@
   (append/record-info batch (append/last-lsn batch))
   (try
     (complete-policy-holding! state batch deadline-ns)
+    (catch Throwable t
+      (throw (policy-outcome-error batch t)))
     (finally
       (release-held-wal-ownership! state))))
 

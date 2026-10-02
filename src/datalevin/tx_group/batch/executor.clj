@@ -17,7 +17,9 @@
   success after the collector fences."
   (:require [datalevin.tx-group.batch :as batch]
             [datalevin.tx-group.phase :as phase])
-  (:import [java.util.concurrent Executor Semaphore]))
+  (:import [java.util.concurrent Executor]
+           [java.util.concurrent.atomic AtomicBoolean]
+           [java.util.concurrent.locks LockSupport]))
 
 (defprotocol IWalBranch
   (append-group!
@@ -74,31 +76,43 @@
   (clear-handoff! [handoff]))
 
 (deftype ParallelHandoff
-  [wal ^Semaphore done
+  [wal ^AtomicBoolean done
    ^:unsynchronized-mutable current-batch
    ^:unsynchronized-mutable ^long lsn
    ^:unsynchronized-mutable token
    ^:unsynchronized-mutable error
+   ^:unsynchronized-mutable waiter
    ^:unsynchronized-mutable drained?]
   IParallelHandoff
   (start-handoff! [_ batch next-lsn]
-    ;; Only one batch uses this environment executor at a time. The previous
-    ;; task's permit was consumed before its slot was cleared and can be reused.
+    ;; Only one batch uses this environment executor at a time. The completion
+    ;; flag is reset before dispatch and is consumed by the leader before the
+    ;; slot is cleared and reused.
     (set! current-batch batch)
     (set! lsn (long next-lsn))
-    (set! drained? false))
-  (drain-handoff! [_]
+    (set! waiter (Thread/currentThread))
+    (set! drained? false)
+    (.set done false))
+  (drain-handoff! [this]
     (when-not drained?
-      ;; Exactly one acquire per dispatch, even when the commit gate and final
-      ;; drain both run. This preserves interrupt status and establishes the
-      ;; visibility of token/error before the leader reads or clears them.
-      (.acquireUninterruptibly done)
-      (set! drained? true)))
+      ;; Uninterruptible wait for the WAL branch, preserving the caller's
+      ;; interrupt status. The flag is rechecked immediately before parking, so
+      ;; an unpark that raced the check is not lost. Exactly one wait per
+      ;; dispatch, even when the commit gate and final drain both run.
+      (let [interrupted? (volatile! false)]
+        (loop []
+          (when-not (.get done)
+            (when (Thread/interrupted) (vreset! interrupted? true))
+            (LockSupport/park this)
+            (recur)))
+        (set! drained? true)
+        (when @interrupted? (.interrupt (Thread/currentThread))))))
   (handoff-error [_] error)
   (clear-handoff! [_]
     (set! current-batch nil)
     (set! token nil)
-    (set! error nil))
+    (set! error nil)
+    (set! waiter nil))
   Runnable
   (run [_]
     (try
@@ -110,9 +124,12 @@
         (phase/phase! :wal-complete current-batch)
         (set! token value))
       (catch Throwable t (set! error t))
-      ;; Last access to shared handoff state by this invocation. Once acquired,
-      ;; the leader may clear/reuse the slot; no late completion touches it.
-      (finally (.release done))))
+      ;; Publish completion before waking the leader. The leader may clear or
+      ;; reuse the slot only after observing the flag; no late completion
+      ;; touches it.
+      (finally
+        (.set done true)
+        (LockSupport/unpark waiter))))
   clojure.lang.IFn
   (invoke [this]
     (check-commit-gate! current-batch)
@@ -201,9 +218,10 @@
                           :or {schedule-fn batch/batch-schedule
                                wake-maintenance! (constantly nil)}}]
    (let [^Executor wal-executor (or wal-executor clojure.lang.Agent/soloExecutor)
-         ;; One reusable task, completion permit, result slot and commit gate
-         ;; per environment executor. The collector serializes its batches.
-         handoff (ParallelHandoff. wal (Semaphore. 0) nil 0 nil nil false)]
+         ;; One reusable task, completion flag, result slot and commit gate per
+         ;; environment executor. The collector serializes its batches.
+         handoff (ParallelHandoff. wal (AtomicBoolean. false)
+                                   nil 0 nil nil nil false)]
      (fn [^datalevin.tx_group.batch.Batch batch]
        (let [lsn (long (next-lsn!))]
          (batch/set-lsn! batch lsn)

@@ -132,6 +132,77 @@
             (is (zero? (:last-durable-lsn (status state))))
             (finally (uninstall))))))))
 
+(deftest force-failure-before-durability-reports-indeterminate
+  (doseq [schedule [:inline :parallel]]
+    (with-runtime
+      {:wal-durability-profile :strict :wal-sync-mode :fsync
+       :wal-full-prefix? true :wal-group-commit 100 :wal-group-commit-ms 0}
+      (fn [state]
+        (wal/bind-runtime-control! state (control))
+        (let [fault (java.io.IOException. "injected force failure")
+              commits (atom 0)
+              c (batch/create
+                 (executor/create
+                  (wal-adapter/branch state)
+                  (reify executor/INativeBranch
+                    (apply-rows! [_ _ gate]
+                      (gate)
+                      (swap! commits inc)
+                      (object-array [:ok])))
+                  (constantly 1) {:schedule-fn (constantly schedule)}))]
+          (try
+            (with-redefs [segment/phase!
+                          (fn [event _]
+                            (when (= :force-started event) (throw fault)))]
+              (let [error (caught #(batch/submit!
+                                    c {:allowance 1024
+                                       :data {:wal-body (wal/prepare-append-body (rows 1) {})}}))]
+                (is (= :indeterminate (:outcome (ex-data error))))
+                (is (= :txlog/write-indeterminate (:error (ex-data error))))
+                (is (= :appended (:wal-status (ex-data error))))
+                (is (= 1 (:txlog-lsn (ex-data error))))
+                (is (= 1 (:lsn (ex-data error))) "record identity is retained")
+                (is (some? (:checksum (ex-data error))))
+                (is (identical? fault (ex-cause error)) "original cause is retained")
+                (is (zero? @commits))))
+            (finally
+              (is (batch/await-quiescence! c 1000))
+              (is (zero? (:requests (batch/usage c)))))))))))
+
+(deftest after-sync-failure-after-durability-reports-committed
+  (doseq [schedule [:inline :parallel]]
+    (with-runtime
+      {:wal-durability-profile :strict :wal-sync-mode :fsync
+       :wal-full-prefix? true :wal-group-commit 100 :wal-group-commit-ms 0}
+      (fn [state]
+        (let [fault (java.io.IOException. "injected after-sync failure")
+              c (batch/create
+                 (executor/create
+                  (wal-adapter/branch state)
+                  (reify executor/INativeBranch
+                    (apply-rows! [_ _ gate]
+                      (gate)
+                      (object-array [:ok])))
+                  (constantly 1) {:schedule-fn (constantly schedule)}))]
+          (wal/bind-runtime-control! state
+            (assoc (control) :after-sync! (fn [_ _] (throw fault))))
+          (try
+            (let [error (caught #(batch/submit!
+                                  c {:allowance 1024
+                                     :data {:wal-body (wal/prepare-append-body (rows 1) {})}}))]
+              (is (= :committed (:outcome (ex-data error))))
+              (is (= :txlog/write-committed (:error (ex-data error))))
+              (is (= :durable (:wal-status (ex-data error))))
+              (is (= 1 (:txlog-lsn (ex-data error))))
+              (is (= 1 (:lsn (ex-data error))) "record identity is retained")
+              (is (some? (:checksum (ex-data error))))
+              (is (identical? fault (ex-cause error)) "original cause is retained")
+              (is (= 1 (:last-durable-lsn (status state)))
+                  "durability had already advanced past the record's LSN"))
+            (finally
+              (is (batch/await-quiescence! c 1000))
+              (is (zero? (:requests (batch/usage c)))))))))))
+
 (deftest wal-only-insertion-requires-a-bound-runtime-control
   (with-runtime
     {}

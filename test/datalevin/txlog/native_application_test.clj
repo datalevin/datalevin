@@ -1176,8 +1176,9 @@
                        (proxy-super lock))))
             guard (:lifetime runtime)
             changed (.newCondition lock)
-            instrumented (assoc guard :lock lock :changed changed
-                                :users (datalevin.utl.NativeUsers. lock changed))]
+            instrumented (lifetime/instrument
+                          guard lock changed
+                          (datalevin.utl.NativeUsers. lock changed))]
         (vswap! (i/kv-info raw) assoc :native-lifetime instrumented)
         (try
           (i/get-value raw "data" 1 :long :string)

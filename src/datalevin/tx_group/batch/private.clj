@@ -12,6 +12,7 @@
             [datalevin.tx-group.batch :as batch]
             [datalevin.tx-group.batch.env :as env]
             [datalevin.tx-group.batch.factory :as factory]
+            [datalevin.tx-state.lifetime :as lifetime]
             [datalevin.txlog :as wal])
   (:import [java.io Closeable]))
 
@@ -35,7 +36,14 @@
                                 (assoc opts :wal? false :snapshot-scheduler? false
                                        :flags (conj (or (:flags opts) c/default-env-flags)
                                                     :writemap :nosync)))
-                  raw (kv/raw-lmdb db)]
+                  raw (kv/raw-lmdb db)
+                  ;; Bind the native lifetime guard before any handle can read.
+                  ;; Reader borrows then attach a lease to their native
+                  ;; transaction, and `close-kv` fences and drains those borrows
+                  ;; before freeing native resources instead of tearing the
+                  ;; environment down under an active reader.
+                  _ (vswap! (i/kv-info raw) assoc
+                            :native-lifetime (lifetime/create))]
               (try
                 (let [{:keys [state]} (wal/init-runtime-state
                                       (assoc opts :wal? true :wal-shared? false

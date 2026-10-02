@@ -307,6 +307,14 @@
   [^Collector collector]
   (.get ^AtomicBoolean (.serving collector)))
 
+(defn serving-flag
+  "The collector's terminal serving flag.
+
+  A read handle binds this once at open, so a point/range/count read performs
+  only its two required status reads and never re-resolves the environment."
+  ^AtomicBoolean [^Collector collector]
+  (.serving collector))
+
 (defn await-quiescence!
   "Wait until no batch is executing, up to `timeout-ms`. Returns true when the
   active slot is clear. A stuck executor keeps the slot owned; callers must not

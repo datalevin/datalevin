@@ -4,7 +4,7 @@ package datalevin.utl;
 
 import java.lang.ref.WeakReference;
 import java.util.ArrayList;
-import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicIntegerFieldUpdater;
 import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 
@@ -25,6 +25,20 @@ public final class NativeUsers {
         }
     }
 
+    /**
+     * A per-thread counter with its own cache line. Concurrent readers increment
+     * only their own slot, so a shared line would ping-pong between cores and
+     * inflate the eight-reader tail.
+     */
+    private static final class PaddedCounter {
+        private volatile int value;
+        private long p0, p1, p2, p3, p4, p5, p6, p7;
+        private long q0, q1, q2, q3, q4, q5, q6, q7;
+    }
+
+    private static final AtomicIntegerFieldUpdater<PaddedCounter> COUNT =
+        AtomicIntegerFieldUpdater.newUpdater(PaddedCounter.class, "value");
+
     public NativeUsers(ReentrantLock lock, Condition changed) {
         this.gate = new Gate(lock, changed);
     }
@@ -34,7 +48,7 @@ public final class NativeUsers {
         if (!gate.open) throw new IllegalStateException("Native environment is fenced");
         Slot slot = local.get();
         if (slot == null) slot = register();
-        slot.count.incrementAndGet();
+        COUNT.incrementAndGet(slot.counter);
         // Fence precedes the closing thread's scan. If that scan missed this
         // entrant, this second volatile read rejects it before native access.
         if (gate.open) return slot;
@@ -62,7 +76,7 @@ public final class NativeUsers {
     /** Caller holds the lifecycle lock; active slots are never removed. */
     public long countActive() {
         long count = 0;
-        for (Slot slot : slots) count += slot.count.get();
+        for (Slot slot : slots) count += COUNT.get(slot.counter);
         return count;
     }
 
@@ -70,7 +84,7 @@ public final class NativeUsers {
     // ThreadLocal key), otherwise closed environments leak on pooled threads.
     private static final class Slot implements AutoCloseable {
         private final Gate gate;
-        private final AtomicInteger count = new AtomicInteger();
+        private final PaddedCounter counter = new PaddedCounter();
         private final WeakReference<Thread> thread;
 
         Slot(Gate gate, Thread thread) {
@@ -80,12 +94,12 @@ public final class NativeUsers {
 
         boolean retired() {
             Thread owner = thread.get();
-            return count.get() == 0 && (owner == null || !owner.isAlive());
+            return COUNT.get(counter) == 0 && (owner == null || !owner.isAlive());
         }
 
         @Override
         public void close() {
-            count.decrementAndGet();
+            COUNT.decrementAndGet(counter);
             // No shared read-side mutex. Only a draining closer needs a wake.
             if (!gate.open) {
                 gate.lock.lock();

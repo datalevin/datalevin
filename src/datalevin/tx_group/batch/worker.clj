@@ -3,22 +3,28 @@
 (ns ^:no-doc datalevin.tx-group.batch.worker
   "Single reusable WAL worker for the new write protocol.
 
-  Owns one thread that runs WAL-branch tasks in FIFO order and, between tasks,
-  drives relaxed WAL maintenance: it services an armed force, then parks until
-  the next maintenance deadline. It implements `java.util.concurrent.Executor`
-  so it can be supplied as the executor's `:wal-executor`.
+  Owns one thread that runs WAL-branch tasks and, between tasks, drives relaxed
+  WAL maintenance: it services an armed force, then parks until the next
+  maintenance deadline. It implements `java.util.concurrent.Executor` so it can
+  be supplied as the executor's `:wal-executor`.
 
-  The worker never runs user callbacks or native application (`execute` only
-  carries WAL work), and a service failure is recorded rather than thrown, so a
-  task can still be delivered and observed. Close is cooperative: it stops
-  admission, wakes the thread and joins it with the caller's timeout."
+  One reusable slot replaces the general queue: the collector serializes
+  batches, so at most one WAL task is outstanding. A submit publishes the task
+  into the slot and unparks the worker; a second submit waits for pickup rather
+  than dropping or reordering it. Maintenance nudges are plain unparks, so any
+  number of them coalesce to one re-read of `:deadline!`. The worker never runs
+  user callbacks or native application (`execute` only carries WAL work), and a
+  service failure is recorded rather than thrown, so a task can still be
+  delivered and observed. Close is cooperative: it stops admission, unparks the
+  thread and joins it with the caller's timeout after draining any accepted task."
   (:require [datalevin.tx-group.batch.executor :as executor])
-  (:import [java.util.concurrent Executor LinkedBlockingQueue
-            RejectedExecutionException TimeUnit]
-           [java.util.concurrent.atomic AtomicBoolean AtomicReference]))
+  (:import [java.util.concurrent Executor RejectedExecutionException]
+           [java.util.concurrent.atomic AtomicBoolean AtomicReference]
+           [java.util.concurrent.locks LockSupport]))
 
 (def ^:private idle-poll-ns 100000000)      ; 100 ms fallback re-evaluation
 (def ^:private settled-poll-ns 1000000)     ; 1 ms guard against a stale deadline
+(def ^:private slot-wait-ns 1000000)        ; 1 ms retry when the task slot is full
 
 (defn create
   "Create one WAL worker.
@@ -39,22 +45,13 @@
            name "dtlv-wal-worker"
            daemon? true
            close-timeout-ms 5000}}]
-  (let [queue (LinkedBlockingQueue.)
-        ;; Admission and close coordinate here: a task is accepted (enqueued)
-        ;; only while running? is true, and close flips running? under this lock.
-        ;; Every accepted task therefore happens-before the close and is
-        ;; guaranteed to be in the queue for the final drain.
+  (let [;; One reusable task slot, nil when free. Admission and close share this
+        ;; lock so an accepted task is always visible to the final drain: either
+        ;; the submitter wins the lock and publishes before close flips running?,
+        ;; or close wins and the submitter observes the closed flag and rejects.
+        slot (AtomicReference.)
         admission-lock (Object.)
         running? (AtomicBoolean. true)
-        wake-pending? (AtomicBoolean. false)
-        wake-token (Object.)
-        ;; Inline batches may retire while maintenance remains blocked. Their
-        ;; notifications share one pending token, independent of request count.
-        wake! (fn []
-                (locking admission-lock
-                  (when (and (.get running?)
-                             (.compareAndSet wake-pending? false true))
-                    (.offer queue wake-token))))
         failure (AtomicReference.)
         record-failure! (fn [t] (when (some? t) (.compareAndSet failure nil t)))
         maintenance-deadline
@@ -75,23 +72,22 @@
                  nil)))
         run-task
         (fn [task]
-          ;; Clear before rereading the deadline, so an arriving trigger either
-          ;; appears in this check or queues the next single notification.
-          (when (identical? task wake-token) (.set wake-pending? false))
-          ;; A deadline may have changed while a timed poll was parked. Every
-          ;; task, including one returned by that poll, crosses this fresh check.
-          ;; A failed/stale maintenance attempt still lets the accepted task run
-          ;; and observe its own outcome; it must not be discarded on close.
+          ;; A deadline may have changed after the previous park. Every task
+          ;; crosses this fresh check; a failed/stale maintenance attempt still
+          ;; lets the accepted task run and observe its own outcome.
           (when (due? (maintenance-deadline))
             (service-now!))
-          (when-not (identical? task wake-token)
-            (try (.run ^Runnable task)
-                 (catch Throwable t (record-failure! t)))))
-        poll! (fn [timeout-ns]
-                (let [task (.poll queue (max 0 (long timeout-ns))
-                                  TimeUnit/NANOSECONDS)]
-                  (when task (run-task task))
-                  (some? task)))
+          (try (.run ^Runnable task)
+               (catch Throwable t (record-failure! t))))
+        ;; Timed park, re-evaluated at the next maintenance deadline with a
+        ;; bounded fallback so a deadline armed without a wake is still seen.
+        park-until
+        (fn [deadline]
+          (let [remaining (if (zero? (long deadline))
+                            (long idle-poll-ns)
+                            (max 0 (- (long deadline) (System/nanoTime))))]
+            (LockSupport/parkNanos (Thread/currentThread)
+                                   (min remaining (long idle-poll-ns)))))
         service-due!
         (fn [deadline]
           (if (due? deadline)
@@ -99,60 +95,58 @@
               (let [acted? (service-now!)]
                 ;; A deadline the service did not clear must not spin.
                 (when-not acted?
-                  (poll! settled-poll-ns)))
+                  (LockSupport/parkNanos (Thread/currentThread)
+                                         (long settled-poll-ns))))
               true)
             false))
         step
         (fn []
           (try
             (let [deadline (maintenance-deadline)]
-              ;; Already-due maintenance has priority over any queued batch
-              ;; task, so a later append cannot delay an overdue force past its
-              ;; deadline.
+              ;; Already-due maintenance has priority over an accepted batch
+              ;; task, so a later append cannot delay an overdue force.
               (if (service-due! deadline)
                 true
-                (if-let [task (.poll queue)]
+                (if-let [task (.getAndSet slot nil)]
                   (do (run-task task) true)
                   (if (.get running?)
-                    (do
-                      (if (zero? deadline)
-                        (poll! idle-poll-ns)
-                        (let [remaining (- (long deadline) (System/nanoTime))]
-                          (if (pos? remaining)
-                            (poll! remaining)
-                            ;; Became due while waiting; service it now.
-                            (service-due! deadline))))
-                      true)
-                    ;; Closed: admission is fenced, so every accepted task was
-                    ;; queued before this. Drain it instead of exiting with work
-                    ;; a batch is still waiting on.
-                    (if-let [task (.poll queue)]
+                    (do (park-until deadline) true)
+                    ;; Closed: admission is fenced, so any task accepted before
+                    ;; the flip is already published. Drain it before exiting.
+                    (if-let [task (.getAndSet slot nil)]
                       (do (run-task task) true)
                       false)))))
-            (catch InterruptedException _ true)
             (catch Throwable t (record-failure! t) true)))
         loop-fn (fn [] (while (step)))
         thread (doto (Thread. ^Runnable loop-fn ^String name)
                  (.setDaemon (boolean daemon?))
-                 (.start))
-        executor (reify Executor
-                   (execute [_ task]
-                     (locking admission-lock
-                       (if (.get running?)
-                         (.put queue task)
-                         (throw (RejectedExecutionException.
-                                 "WAL worker is closed"))))))]
-    {:executor executor
-     :wake! wake!
+                 (.start))]
+    {:executor
+     (reify Executor
+       (execute [_ task]
+         (loop []
+           (let [placed? (locking admission-lock
+                           (if (.get running?)
+                             (.compareAndSet slot nil task)
+                             (throw (RejectedExecutionException.
+                                     "WAL worker is closed"))))]
+             (if placed?
+               (LockSupport/unpark thread)
+               ;; The slot holds a task awaiting pickup. Production serializes
+               ;; batches so this waits only for pickup; park briefly and retry
+               ;; rather than dropping or reordering the later task.
+               (do (LockSupport/parkNanos (Thread/currentThread)
+                                          (long slot-wait-ns))
+                   (recur)))))))
+     :wake! (fn [] (LockSupport/unpark thread))
      :failure (fn [] (.get failure))
      ;; Graceful drain, not an interrupt: every accepted task and the current
      ;; force must finish so an interrupted FileChannel cannot close under the
      ;; WAL. Returns true when the thread has actually exited within the timeout.
      :close! (fn []
                (locking admission-lock
-                 (.set running? false)
-                 (when (.compareAndSet wake-pending? false true)
-                   (.offer queue wake-token)))
+                 (.set running? false))
+               (LockSupport/unpark thread)
                (.join thread (long close-timeout-ms))
                (not (.isAlive thread)))}))
 
