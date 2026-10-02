@@ -192,3 +192,30 @@
           (is (= [:force :append] @events))
           (is (identical? (when fail-service? failure) ((:failure w))))
           (finally ((:close! w))))))))
+
+(deftest failed-uncleared-maintenance-does-not-starve-tasks-or-close
+  ;; Regression: a due deadline whose service failed without clearing it was
+  ;; retried forever, so accepted tasks never ran and close timed out.
+  (doseq [advancing? [false true]]
+    (testing (str {:advancing? advancing?})
+      (let [events (atom [])
+            failure (ex-info "maintenance failed" {})
+            deadline (atom (System/nanoTime))
+            w (worker/create
+               :name "test-wal-settled-failure"
+               :close-timeout-ms 2000
+               :deadline! (fn [] (if advancing? (System/nanoTime) @deadline))
+               :service! (fn []
+                           (swap! events conj :service)
+                           (throw failure)))
+            ran (promise)]
+        (try
+          (submit! w (fn [] (deliver ran true)))
+          (is (true? (await! ran 5000))
+              "an accepted task runs after an uncleared failed service")
+          (is (identical? failure ((:failure w))))
+          (is (true? ((:close! w)))
+              "close drains instead of timing out")
+          (is (<= (count @events) 64)
+              "the failed service is not retried in a tight loop")
+          (finally ((:close! w))))))))

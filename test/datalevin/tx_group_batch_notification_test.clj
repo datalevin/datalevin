@@ -10,6 +10,7 @@
   (batch/->Descriptor nil (volatile! :value) nil 1024 0
                       (AtomicLong. 1024) (AtomicBoolean. false)
                       (volatile! nil) thread
+                      (AtomicBoolean. false) (AtomicBoolean. false)
                       (AtomicBoolean. false) (AtomicBoolean. false)))
 
 (deftest retained-predicates-survive-a-consumed-thread-permit

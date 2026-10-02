@@ -57,7 +57,11 @@
   "Build the collector over a factory runtime. Returns
   `{:collector :executor :worker :close!}`."
   ([wal-state native-writer] (collector wal-state native-writer nil))
-  ([wal-state native-writer {:keys [limits] :as opts}]
+  ([wal-state native-writer {:as opts}]
    (let [{:keys [executor] :as runtime} (executor wal-state native-writer opts)]
      (assoc runtime
-            :collector (batch/create executor (when limits {:limits limits}))))))
+            :collector (batch/create executor
+                                      (not-empty (select-keys
+                                                  opts
+                                                  [:limits
+                                                   :preparation-timeout-ms])))))))

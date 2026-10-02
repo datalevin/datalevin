@@ -148,6 +148,13 @@
                 (select-keys opts [:wal-pending-max-requests :wal-pending-max-bytes
                                    :write-batch-size :write-batch-max-bytes
                                    :wal-rmw-max-bytes]))
+        preparation-timeout-ms
+        (let [v (get opts :wal-preparation-timeout-ms
+                     batch/default-preparation-timeout-ms)]
+          (when-not (pos-int? v)
+            (throw (ex-info "Preparation timeout must be a positive integer"
+                            {:error :txlog/invalid-preparation-timeout :value v})))
+          (long v))
         timeout-ms (close-timeout-ms opts)]
     (locking environments
       (if-let [record (.get environments path)]
@@ -160,7 +167,9 @@
             (let [runtime (if open-runtime! (open-runtime!)
                               {:executor executor :close! executor-close!})]
               (try
-                (let [c (build-collector (:executor runtime) {:limits limits})
+                (let [c (build-collector (:executor runtime)
+                                         {:limits limits
+                                          :preparation-timeout-ms preparation-timeout-ms})
                       record (->Environment path :kv-independent-v1 db-identity
                                             c nil lease (AtomicInteger. 1)
                                             (AtomicBoolean. false) timeout-ms limits

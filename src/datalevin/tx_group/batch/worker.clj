@@ -15,7 +15,9 @@
   number of them coalesce to one re-read of `:deadline!`. The worker never runs
   user callbacks or native application (`execute` only carries WAL work), and a
   service failure is recorded rather than thrown, so a task can still be
-  delivered and observed. Close is cooperative: it stops admission, unparks the
+  delivered and observed. A due maintenance deadline the service fails to clear
+  is settled, so a failing service yields to accepted tasks and shutdown instead
+  of starving them. Close is cooperative: it stops admission, unparks the
   thread and joins it with the caller's timeout after draining any accepted task."
   (:require [datalevin.tx-group.batch.executor :as executor])
   (:import [java.util.concurrent Executor RejectedExecutionException]
@@ -54,6 +56,14 @@
         running? (AtomicBoolean. true)
         failure (AtomicReference.)
         record-failure! (fn [t] (when (some? t) (.compareAndSet failure nil t)))
+        ;; The last due deadline the service did not clear. A failed or stale
+        ;; maintenance attempt is settled here so the loop can run accepted tasks
+        ;; and observe the failure instead of retrying it forever; a changed
+        ;; deadline is serviced again.
+        settled-deadline (volatile! 0)
+        settled? (fn [deadline]
+                   (and (pos? (long deadline))
+                        (= (long deadline) (long @settled-deadline))))
         maintenance-deadline
         (fn []
           (long (or (try (deadline!)
@@ -80,24 +90,30 @@
           (try (.run ^Runnable task)
                (catch Throwable t (record-failure! t))))
         ;; Timed park, re-evaluated at the next maintenance deadline with a
-        ;; bounded fallback so a deadline armed without a wake is still seen.
+        ;; bounded fallback so a deadline armed without a wake is still seen. A
+        ;; settled due deadline falls back to the settled poll rather than
+        ;; spinning, so close and queued tasks still make progress.
         park-until
         (fn [deadline]
           (let [remaining (if (zero? (long deadline))
                             (long idle-poll-ns)
                             (max 0 (- (long deadline) (System/nanoTime))))]
             (LockSupport/parkNanos (Thread/currentThread)
-                                   (min remaining (long idle-poll-ns)))))
+                                   (min (max remaining (long settled-poll-ns))
+                                        (long idle-poll-ns)))))
         service-due!
         (fn [deadline]
-          (if (due? deadline)
-            (do
-              (let [acted? (service-now!)]
-                ;; A deadline the service did not clear must not spin.
-                (when-not acted?
-                  (LockSupport/parkNanos (Thread/currentThread)
-                                         (long settled-poll-ns))))
-              true)
+          (if (and (due? deadline) (not (settled? deadline)))
+            (let [acted? (service-now!)]
+              (if acted?
+                (do (vreset! settled-deadline 0) true)
+                ;; A deadline the service did not clear must not spin, and it must
+                ;; not starve the mailbox or shutdown either: settle it, then yield
+                ;; to accepted tasks and closure this iteration.
+                (do (vreset! settled-deadline (long deadline))
+                    (LockSupport/parkNanos (Thread/currentThread)
+                                           (long settled-poll-ns))
+                    false)))
             false))
         step
         (fn []

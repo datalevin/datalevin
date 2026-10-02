@@ -22,10 +22,14 @@
 
 (defn- collector-with
   ([executor] (collector-with executor nil))
-  ([executor overrides]
-   (batch/create executor
-                 {:limits (charge/resolve-limits
-                           (merge default-overrides overrides))})))
+  ([executor {:keys [preparation-timeout-ms] :as overrides}]
+   (batch/create
+    executor
+    (cond-> {:limits (charge/resolve-limits
+                      (merge default-overrides
+                             (dissoc overrides :preparation-timeout-ms)))}
+      preparation-timeout-ms
+      (assoc :preparation-timeout-ms preparation-timeout-ms)))))
 
 (defn- echo-values
   "Default executor: each request returns its own prepared data, in order."
@@ -64,7 +68,8 @@
                  lock progress (.ready c) (.queued c) (.active c) (.serving c)
                  (.active-batch c) (.failure c) (.waiters c) (.budget c)
                  (.max-requests c) (.batch-limit c) (.batch-max-bytes c)
-                 (.shared-reserved c) (.published c) (.next-id c) (.executor c))}))
+                 (.shared-reserved c) (.preparation-timeout-ms c)
+                 (.published c) (.next-id c) (.executor c))}))
 
 ;; ---------------------------------------------------------------------------
 ;; Lifecycle and limits
@@ -86,11 +91,12 @@
       (is (zero? (:requests (batch/usage c))))
       (is (zero? (:bytes (batch/usage c)))))))
 
-(deftest a-batch-releases-retained-charges-at-cleanup
-  ;; Cleanup must not depend on caller notification: the batch releases a sealed
-  ;; member's reservation before the leader's submit! returns and runs its
-  ;; fallback finally. :next-activation fires after the sealed batch's cleanup
-  ;; but before lead! returns to the caller.
+(deftest a-batch-retains-charges-until-caller-delivery
+  ;; The reservation covers storage the caller still retains until delivery.
+  ;; :next-activation fires after the sealed batch's cleanup but before lead!
+  ;; returns to the caller, so the charge must still be held there. Releasing at
+  ;; cleanup alone would let another write proceed while an undelivered result
+  ;; still held storage.
   (let [c (collector-with echo-values)
         at-next-activation (promise)
         remove-observer
@@ -100,8 +106,8 @@
              (deliver at-next-activation (:requests (batch/usage c))))))]
     (try
       (is (= :a (batch/submit! c {:allowance 1024 :data :a})))
-      (is (= 0 (deref at-next-activation 5000 ::timeout))
-          "the batch released the charge before the caller's finally ran")
+      (is (= 1 (deref at-next-activation 5000 ::timeout))
+          "the batch retains the charge until the caller finishes delivery")
       (is (zero? (:requests (batch/usage c))))
       (is (zero? (:bytes (batch/usage c))))
       (finally
@@ -224,6 +230,7 @@
    (batch/->Descriptor nil (volatile! value) nil 1024 deadline
                        (AtomicLong. 1024) (AtomicBoolean. false)
                        (volatile! nil) ready
+                       (AtomicBoolean. false) (AtomicBoolean. false)
                        (AtomicBoolean. false) (AtomicBoolean. false))))
 
 (defn- parked-descriptor
@@ -256,6 +263,29 @@
   (.interrupt thread)
   (.join thread 2000))
 
+(defn- release-callers!
+  "Simulate each synthetic caller's delivery finally, dropping the caller side of
+  its reservation; the batch side drops when its sealed batch retires."
+  [c & descriptors]
+  (doseq [descriptor descriptors]
+    (#'batch/release-descriptor! c descriptor)))
+
+(deftest a-retired-batch-retains-the-charge-until-caller-delivery
+  ;; Regression: batch cleanup refunded the whole reservation, so a caller paused
+  ;; before consuming its delivered result held storage for free and another
+  ;; write could pass the bound covering undelivered results.
+  (let [c (collector-with echo-values)
+        leader (admitted-descriptor c :leader)]
+    (is (true? (#'batch/publish-and-elect! c leader)))
+    (#'batch/lead! c leader)
+    (is (= [true :leader] @(.result leader)))
+    (testing "the batch has retired, but the caller has not delivered yet"
+      (is (pos? (:requests (batch/usage c))))
+      (is (pos? (:bytes (batch/usage c)))))
+    (release-callers! c leader)
+    (is (zero? (:requests (batch/usage c))))
+    (is (zero? (:bytes (batch/usage c))))))
+
 (deftest joined-callers-are-notified-after-publication
   (let [c (collector-with echo-values)
         leader (admitted-descriptor c :leader)
@@ -268,6 +298,7 @@
       (is (true? (deref (:done probe) 2000 ::timeout)))
       (is (= [true :leader] @(.result leader)))
       (is (= [true :follower] @(.result follower)))
+      (release-callers! c leader follower)
       (is (zero? (:requests (batch/usage c))))
       (finally (stop-waiter! probe)))))
 
@@ -289,6 +320,7 @@
       (is (true? (deref (:done probe) 2000 ::timeout)))
       (is (false? (batch/serving? c)))
       (is (batch/await-quiescence! c 100))
+      (release-callers! c leader follower)
       (is (zero? (:requests (batch/usage c))))
       (finally (stop-waiter! probe) (uninstall)))))
 
@@ -313,6 +345,7 @@
       (is (true? (deref (:done failed-probe) 2000 ::timeout)))
       (is (false? (batch/serving? c)))
       (is (batch/await-quiescence! c 100))
+      (release-callers! c leader completed failed)
       (is (zero? (:requests (batch/usage c))))
       (finally (stop-waiter! completed-probe) (stop-waiter! failed-probe)))))
 
@@ -343,6 +376,7 @@
     (is (= [[true :first] [true :head] [true :queued] [true :returning]]
            (mapv #(deref (.result ^datalevin.tx_group.batch.Descriptor %))
                  [first head queued returning])))
+    (release-callers! c first head queued returning)
     (is (zero? (:requests (batch/usage c))))
     (is (batch/await-quiescence! c 100))))
 
@@ -375,6 +409,7 @@
           (when elected? (#'batch/lead! c tail)))
         (is (= [[:first] [:tail]] @executed))
         (is (= [true :tail] @(.result tail)))
+        (release-callers! c first tail)
         (is (zero? (:bytes (batch/usage c))))
         (is (batch/await-quiescence! c 100))
         (finally (stop-waiter! probe))))))
@@ -788,6 +823,31 @@
       (is (zero? (:requests (batch/usage c))))
       (is (= :ok (batch/submit! c {:allowance 1024 :data :ok}))))))
 
+(deftest an-interrupt-after-preparation-rejects-only-its-request
+  ;; Regression: an interrupted preparer published and led, so the WAL channel's
+  ;; interruptible I/O threw ClosedByInterruptException and fenced the runtime
+  ;; instead of rejecting one request.
+  (let [executed (atom 0)
+        c (collector-with (fn [b] (swap! executed inc) (echo-values b)))
+        thrown (try
+                 (batch/submit! c {:allowance 1024 :data :a
+                                   :prepare (fn [_]
+                                              (.interrupt (Thread/currentThread))
+                                              :a)})
+                 nil
+                 (catch Throwable t t))]
+    (try
+      (is (instance? Throwable thrown))
+      (is (= :txlog/write-interrupted (:error (ex-data thrown))))
+      (is (= :not-committed (:outcome (ex-data thrown))))
+      (is (zero? @executed) "an interrupted preparer never dispatches a batch")
+      (is (batch/serving? c) "the interrupted request does not fence the runtime")
+      (is (zero? (:requests (batch/usage c))))
+      (is (zero? (:bytes (batch/usage c))))
+      (finally
+        ;; Clear the test thread's interrupt status for later tests.
+        (Thread/interrupted)))))
+
 (deftest executor-failure-fences-and-preserves-the-established-outcome
   (let [entered (CountDownLatch. 1)
         release (CountDownLatch. 1)
@@ -1163,6 +1223,59 @@
           (is (instance? Throwable v))
           (is (= :txlog/write-deadline-exceeded (:error (ex-data v)))))
         (testing "request-local expiry does not fence the runtime"
+          (is (batch/serving? c))
+          (is (= :after (batch/submit! c {:allowance 1024 :data :after})))))
+      (finally (.countDown release)))))
+
+(deftest preparation-timeout-default-is-wired
+  (is (= 30000 (.preparation-timeout-ms (collector-with echo-values)))))
+
+(deftest preparation-timeout-bounds-submission-and-an-explicit-timeout-tightens-it
+  (let [c (collector-with echo-values {:preparation-timeout-ms 1234})
+        captured (promise)
+        before (System/nanoTime)]
+    (is (= :a (batch/submit! c {:allowance 1024 :data :a
+                                :prepare (fn [d] (deliver captured d) :a)})))
+    (let [descriptor ^datalevin.tx_group.batch.Descriptor (deref captured 1000 nil)]
+      (is (some? descriptor))
+      (is (<= 1234.0 (/ (- (long (.deadline-nanos descriptor)) before) 1e6) 2000.0)
+          "a request with no :timeout-ms is bounded by the preparation timeout"))
+    (let [captured2 (promise)
+          before2 (System/nanoTime)]
+      (is (= :b (batch/submit! c {:allowance 1024 :data :b :timeout-ms 5
+                                  :prepare (fn [d] (deliver captured2 d) :b)})))
+      (let [descriptor ^datalevin.tx_group.batch.Descriptor (deref captured2 1000 nil)]
+        (is (some? descriptor))
+        (is (<= 5.0 (/ (- (long (.deadline-nanos descriptor)) before2) 1e6) 1000.0)
+            "a shorter explicit request timeout is honoured")))))
+
+(deftest a-queued-request-without-a-timeout-is-bounded-by-preparation
+  (let [entered (CountDownLatch. 1)
+        release (CountDownLatch. 1)
+        first-batch (AtomicInteger. 0)
+        c (collector-with
+           (fn [batch]
+             ;; The real environment executor marks dispatch before its branches;
+             ;; once dispatched, the preparation cutoff no longer fences.
+             (batch/mark-dispatched! batch)
+             (when (zero? (.getAndIncrement first-batch))
+               (.countDown entered)
+               (.await release 5 TimeUnit/SECONDS))
+             (echo-values batch))
+           {:preparation-timeout-ms 50})
+        leader (future (batch/submit! c {:allowance 1024 :data :leader}))]
+    (try
+      (is (.await entered 5 TimeUnit/SECONDS))
+      (let [late (future (try (batch/submit! c {:allowance 1024 :data :late})
+                              (catch Throwable t t)))]
+        (Thread/sleep 250)
+        (.countDown release)
+        (is (= :leader (deref leader 5000 ::timeout)))
+        (let [v (deref late 5000 ::timeout)]
+          (is (instance? Throwable v))
+          (is (= :txlog/write-deadline-exceeded (:error (ex-data v)))
+              "the preparation timeout bounds a request with no :timeout-ms"))
+        (testing "the bounded request does not fence the runtime"
           (is (batch/serving? c))
           (is (= :after (batch/submit! c {:allowance 1024 :data :after})))))
       (finally (.countDown release)))))

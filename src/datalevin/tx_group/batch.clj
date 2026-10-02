@@ -41,8 +41,10 @@
 
 (deftype Descriptor
   ;; One admitted request. Its result slot is completed exactly once, by
-  ;; whichever thread gets there first, and its reservation is released exactly
-  ;; once, by the batch at cleanup or by the caller as an idempotent fallback.
+  ;; whichever thread gets there first. Its reservation has two owners once the
+  ;; batch seals it: the batch, until both branches stop, and the caller, until
+  ;; the result is delivered. The last owner to drop the reservation physically
+  ;; releases it; an unsealed request has only the caller owner.
   [op data context
    ^long allowance
    ^long deadline-nanos
@@ -51,7 +53,9 @@
    result
    ^Thread waiter
    ^AtomicBoolean delivered?
-   ^AtomicBoolean released?])
+   ^AtomicBoolean released?
+   ^AtomicBoolean caller-done?
+   ^AtomicBoolean batch-done?])
 
 (deftype Batch [^long id ^FastList descriptors ^objects wal-bodies ^long weight
                 ^long cutoff-nanos schedule ^AtomicLong lsn
@@ -72,9 +76,15 @@
                     ^long batch-limit
                     ^long batch-max-bytes
                     ^long shared-reserved
+                    ^long preparation-timeout-ms
                     ^AtomicLong published
                     ^AtomicLong next-id
                     executor])
+
+(def default-preparation-timeout-ms
+  "Default bound on admission and caller preparation, measured from submission.
+  An explicit request `:timeout-ms` only tightens it."
+  30000)
 
 ;; ---------------------------------------------------------------------------
 ;; Errors
@@ -488,7 +498,8 @@
   delivery and cleanup."
   ([executor] (create executor nil))
   ([executor opts]
-   (let [{:keys [limits]} (or opts {:limits (charge/resolve-limits nil)})
+   (let [{:keys [limits preparation-timeout-ms]} opts
+         limits (or limits (charge/resolve-limits nil))
          ;; A selecting leader must not barge ahead of publishers already
          ;; waiting to enqueue their prepared requests.
          lock (ReentrantLock. true)
@@ -500,6 +511,7 @@
                                   (long (:max-requests limits)))
                   (long (:max-requests limits)) (long (:batch-limit limits))
                   (long (:batch-max-bytes limits)) (long (:shared-reserved limits))
+                  (long (or preparation-timeout-ms default-preparation-timeout-ms))
                   (AtomicLong. 0) (AtomicLong. 0) executor))))
 
 ;; ---------------------------------------------------------------------------
@@ -526,6 +538,15 @@
   (.release ^PendingBudget (.budget collector) allowance)
   (signal-capacity! collector))
 
+(defn- release-reservation!
+  "Physically release one request reservation exactly once.
+
+  Both the caller and the batch call the two-sided release paths, so the CAS on
+  `released?` is the single gate that charges the budget exactly once."
+  [^Collector collector ^Descriptor descriptor]
+  (when (.compareAndSet ^AtomicBoolean (.released? descriptor) false true)
+    (release-allowance! collector (.allowance descriptor))))
+
 (defn- admitted!
   "Observe a new reservation before transferring it to a descriptor."
   [^Collector collector ^long allowance]
@@ -537,27 +558,32 @@
       (throw t))))
 
 (defn- release-descriptor!
-  "Release one caller-owned request reservation exactly once.
+  "Drop this caller's ownership of its request reservation exactly once.
 
-  A request becomes **batch-owned** the moment `take-prefix!` seals it: the batch
-  still retains its descriptor and live storage, so only
-  `release-batch-charges!` may release that reservation. This caller fallback
-  can return immediately once it observes selection, which never reverses.
-  Otherwise it takes collector coordination and rechecks before removing any
-  queued reference and releasing. The recheck closes the window where a caller
-  could release a reservation the batch is about to claim. The CAS still makes
-  a double release impossible."
+  A reservation is released only after both owners drop it: the batch, once a
+  sealed request's branches stop, and the caller, once the result is delivered.
+  This caller fallback is idempotent through the `caller-done?` CAS. A request
+  the batch never seals has only the caller owner, so the caller releases it
+  directly; the recheck under collector coordination closes the window where the
+  batch is about to seal it."
   [^Collector collector ^Descriptor descriptor]
-  (when-not (.get ^AtomicBoolean (.selected? descriptor))
-    (let [^ReentrantLock lock (.lock collector)]
-      (.lock lock)
-      (try
-        (when-not (.get ^AtomicBoolean (.selected? descriptor))
-          (when (.remove ^ConcurrentLinkedQueue (.ready collector) descriptor)
-            (.decrementAndGet ^AtomicInteger (.queued collector)))
-          (when (.compareAndSet ^AtomicBoolean (.released? descriptor) false true)
-            (release-allowance! collector (.allowance descriptor))))
-        (finally (.unlock lock))))))
+  (when (.compareAndSet ^AtomicBoolean (.caller-done? descriptor) false true)
+    (if (.get ^AtomicBoolean (.selected? descriptor))
+      ;; The batch co-owns a sealed request; it releases if it already finished.
+      (when (.get ^AtomicBoolean (.batch-done? descriptor))
+        (release-reservation! collector descriptor))
+      (let [^ReentrantLock lock (.lock collector)]
+        (.lock lock)
+        (try
+          (if (.get ^AtomicBoolean (.selected? descriptor))
+            ;; Selection won the race; the batch now co-owns and finishes later.
+            (when (.get ^AtomicBoolean (.batch-done? descriptor))
+              (release-reservation! collector descriptor))
+            (do
+              (when (.remove ^ConcurrentLinkedQueue (.ready collector) descriptor)
+                (.decrementAndGet ^AtomicInteger (.queued collector)))
+              (release-reservation! collector descriptor)))
+          (finally (.unlock lock)))))))
 
 (defn- bound-deadline
   "The earlier of a caller's own deadline and the live active batch's
@@ -992,19 +1018,22 @@
         (fail-batch! batch t)))))
 
 (defn- release-batch-charges!
-  "Release every sealed member's retained reservation at batch cleanup.
+  "Drop the batch's ownership of every sealed member's retained reservation.
 
-  One batch owns its WAL outcome, active slot and retained charges until both
-  branches stop, so cleanup is driven by branch completion rather than by caller
-  notification. Each reservation's CAS keeps the batch/caller paths idempotent;
-  retirement holds coordination and signals capacity waiters after releasing
-  the whole batch."
+  The batch owns a sealed request's reservation until both branches stop, but the
+  reservation stays charged until the caller has also delivered the result, so a
+  paused caller cannot refund storage it still retains. Each descriptor's
+  `batch-done?` CAS keeps this path idempotent for the partial-selection failure
+  path, and `released?` gates the physical release."
   [^Collector collector ^Batch batch]
   (let [descriptors ^FastList (.descriptors batch)]
     (dotimes [idx (.size descriptors)]
       (let [^Descriptor descriptor (.get descriptors idx)]
-        (when (.compareAndSet ^AtomicBoolean (.released? descriptor) false true)
-          (.release ^PendingBudget (.budget collector) (.allowance descriptor))))))
+        ;; The batch owns only the descriptors `take-prefix!` actually sealed.
+        (when (.get ^AtomicBoolean (.selected? descriptor))
+          (when (.compareAndSet ^AtomicBoolean (.batch-done? descriptor) false true)
+            (when (.get ^AtomicBoolean (.caller-done? descriptor))
+              (release-reservation! collector descriptor)))))))
   nil)
 
 (defn- run-sealed-batch!
@@ -1190,9 +1219,14 @@
   full allowance; body-based requests start with the control-bundle charge."
   [^Collector collector {:keys [allowance prepare op data context timeout-ms]}]
   (let [allowance (long allowance)
-        deadline (if timeout-ms
-                         (+ (System/nanoTime) (long (* 1000000 (long timeout-ms))))
-                         0)
+        prep-timeout-ms (long (.preparation-timeout-ms collector))
+        ;; Admission and caller preparation are bounded from submission even
+        ;; when the caller supplies no `:timeout-ms`; an explicit request
+        ;; timeout only tightens that bound.
+        effective-timeout-ms (if timeout-ms
+                               (min (long timeout-ms) prep-timeout-ms)
+                               prep-timeout-ms)
+        deadline (+ (System/nanoTime) (long (* 1000000 effective-timeout-ms)))
         batch-max-bytes (.batch-max-bytes collector)]
     ;; Every admitted request must cover at least its own control bundle; an
     ;; allowance above the batch byte cap could never be selected. Both are
@@ -1215,6 +1249,7 @@
             (Descriptor. op (volatile! data) context allowance deadline
                          (AtomicLong. (if op charge/request-control-bundle allowance))
                          (AtomicBoolean. false) (volatile! nil) (Thread/currentThread)
+                         (AtomicBoolean. false) (AtomicBoolean. false)
                          (AtomicBoolean. false) (AtomicBoolean. false))
             (catch Throwable t
               (release-allowance! collector allowance)
@@ -1224,6 +1259,12 @@
           (phase/phase! :caller-preparation descriptor)
           (vreset! (.data descriptor) (prepare descriptor))
           (phase/phase! :caller-prepared descriptor))
+        ;; An interrupt observed after preparation rejects only this request. If
+        ;; this thread published or led while interrupted, the WAL channel's
+        ;; interruptible I/O would close the channel and fence the whole
+        ;; environment instead.
+        (when (.isInterrupted (Thread/currentThread))
+          (throw (interrupted-error)))
         (when (publish-and-elect! collector descriptor)
           (lead! collector descriptor))
         (await-result! collector descriptor deadline)

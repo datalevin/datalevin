@@ -203,6 +203,53 @@
               (is (batch/await-quiescence! c 1000))
               (is (zero? (:requests (batch/usage c)))))))))))
 
+(deftest an-interrupt-after-preparation-rejects-without-closing-the-wal
+  ;; A real probe: an interrupted preparer used to publish and lead, so the WAL
+  ;; channel's interruptible I/O threw ClosedByInterruptException and fenced the
+  ;; runtime. The interrupt must reject only this request.
+  (doseq [schedule [:inline :parallel]]
+    (with-runtime
+      {:wal-durability-profile :strict :wal-sync-mode :fsync
+       :wal-full-prefix? true :wal-group-commit 100 :wal-group-commit-ms 0}
+      (fn [state]
+        (wal/bind-runtime-control! state (control))
+        (let [body {:wal-body (wal/prepare-append-body (rows 1) {})}
+              commits (atom 0)
+              c (batch/create
+                 (executor/create
+                  (wal-adapter/branch state)
+                  (reify executor/INativeBranch
+                    (apply-rows! [_ _ gate]
+                      (gate)
+                      (swap! commits inc)
+                      (object-array [:ok])))
+                  (constantly 1) {:schedule-fn (constantly schedule)}))]
+          (try
+            (let [thrown (try
+                           (batch/submit!
+                            c {:allowance 1024 :data body
+                               :prepare (fn [_]
+                                          (.interrupt (Thread/currentThread))
+                                          body)})
+                           nil
+                           (catch Throwable t t))]
+              (is (instance? Throwable thrown))
+              (is (= :txlog/write-interrupted (:error (ex-data thrown))))
+              (is (= :not-committed (:outcome (ex-data thrown))))
+              (is (zero? @commits) "the interrupted request never runs a branch")
+              (is (.isOpen ^java.nio.channels.FileChannel
+                           @(:segment-channel state))
+                  "the WAL channel is not closed")
+              (is (= 1 @(:next-lsn state)) "nothing was appended")
+              (is (batch/serving? c) "the runtime is not fenced")
+              (is (batch/await-quiescence! c 1000))
+              (is (zero? (:requests (batch/usage c))))
+              (is (= :ok (batch/submit! c {:allowance 1024 :data body}))
+                  "the runtime remains usable"))
+            (finally
+              ;; Do not leak the interrupt into cleanup/later tests.
+              (Thread/interrupted))))))))
+
 (deftest wal-only-insertion-requires-a-bound-runtime-control
   (with-runtime
     {}
