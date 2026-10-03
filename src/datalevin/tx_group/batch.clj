@@ -615,12 +615,10 @@
 (defn request-rejection
   "Build one request-local rejection cause.
 
-  The `:outcome :not-committed` marker is the whole difference between an
-  ordinary request-local failure, which discards only that request's private
-  staging, and an infrastructure failure, which rejects the batch and fences the
-  runtime. Ordered preparation classifies on this marker rather than on the
-  exception class, so neither a broad `Throwable` nor an application's own
-  failure establishes a recoverable rejection."
+  The `:outcome :not-committed` marker distinguishes explicit rejection from
+  infrastructure failure at preparation's reader and encoding boundaries.
+  Ordinary application exceptions from the body also reject only its request;
+  engine cancellations and Errors always escape request-local classification."
   ^Throwable [what data]
   (not-committed what data))
 

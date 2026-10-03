@@ -20,7 +20,7 @@
   prepared."
   (:require [datalevin.tx-group.batch :as batch]
             [datalevin.tx-group.batch.stage :as stage])
-  (:import [datalevin.tx_group.batch Batch Descriptor]))
+  (:import [datalevin.tx_group.batch Batch]))
 
 ;; Failures the engine itself raises. They are never a request's own business,
 ;; even though they carry the same `:outcome :not-committed` marker, so they
@@ -34,16 +34,28 @@
 (defn- request-rejection?
   "Whether this body failure rejects only its own request.
 
-  Ordinary application failures, explicit aborts, validation failures and
-  allowance exhaustion all carry `:outcome :not-committed`. Classification uses
-  that marker and excludes the engine's own errors, so neither a broad
-  `Throwable` catch nor an application's own timeout exception can turn an
-  infrastructure failure into a recoverable rejection."
+  Application exceptions and explicit rejections are request-local. Errors,
+  interruption and engine cancellations must escape; infrastructure failures
+  are recorded at their call boundary and bypass this classification."
   [^Throwable t]
   (let [data (ex-data t)]
-    (and (= :not-committed (:outcome data))
+    (and (not (instance? Error t))
+         (not (instance? InterruptedException t))
          (not (contains? engine-errors (:error data)))
          (not (batch/pre-dispatch-cancellation? t)))))
+
+(defn- infrastructure-call
+  "Record infrastructure failures even when a body catches a reader exception.
+  Explicit request rejections, including reader allowance exhaustion, stay local."
+  [failure f]
+  (fn [& args]
+    (try
+      (apply f args)
+      (catch Throwable t
+        (when-not (and (= :not-committed (:outcome (ex-data t)))
+                       (request-rejection? t))
+          (compare-and-set! failure nil t))
+        (throw t)))))
 
 (defn- wal-body!
   "Encode one accepted member's frozen rows into its WAL body.
@@ -59,50 +71,57 @@
       body)))
 
 (defn- classify!
-  "Run one body, freeze its result and classify the member.
+  "Run one body, materialize and encode its result, and classify the member.
 
   Returns `{:kind :write ...}`, `{:kind :read-only ...}` or
   `{:kind :rejected ...}`. A request-local failure reaches this caller as a
-  rejection; anything else is rethrown so the batch fails and the runtime
-  fences."
-  [batch st descriptor view {:keys [row-fn body-cost encode-body]}]
+  rejection; anything else is rethrown so the collector cancels interruption
+  before dispatch or fences an infrastructure failure."
+  [batch st descriptor view {:keys [row-fn body-cost encode-body failure]}]
   (try
-    (let [result ((batch/op descriptor) view)]
-      ;; Expiry, fencing and interruption are re-read after every body, so a
-      ;; batch that ran out of time cancels instead of dispatching.
-      (batch/check-preparation! batch)
+    (let [result ((batch/op descriptor) view)
+          ;; Expiry, fencing and interruption are re-read after every body, so a
+          ;; batch that ran out of time cancels instead of dispatching.
+          _ (when-let [t @failure] (throw t))
+          _ (batch/check-preparation! batch)]
       (if (stage/rejected? view)
         ;; The body caught its own allowance failure, or aborted explicitly.
         ;; Either way its request is already ineligible and its staging is
-        ;; dropped below.
+        ;; dropped above.
         {:kind :rejected :error (stage/rejection view)}
-        (let [rows (stage/freeze! st descriptor row-fn)]
+        (let [rows (stage/materialize! st descriptor row-fn)]
           (if (.isEmpty ^java.util.List rows)
             {:kind :read-only :result result}
-            {:kind :write
-             :result result
-             :rows rows
-             :wal-body (wal-body! descriptor body-cost encode-body rows)}))))
+            (let [wal-body (wal-body! descriptor body-cost encode-body rows)]
+              ;; Accept only after the whole member is known to fit: rows built
+              ;; and the WAL body encoded and charged. A failure above still
+              ;; discards the private staging, so a rejected member never leaks
+              ;; into a successor's reads.
+              (stage/accept! st descriptor)
+              {:kind :write
+               :result result
+               :rows rows
+               :wal-body wal-body})))))
     (catch Throwable t
       (stage/invalidate! view)
-      (if (request-rejection? t)
+      (if (and (nil? @failure) (request-rejection? t))
         (do (batch/check-preparation! batch)
             {:kind :rejected :error t})
-        (throw t)))))
+        (throw (or @failure t))))))
 
-(defn- fold-blind!
-  "Make the sealed blind rows visible to every later body.
+(defn- publish-blind-member!
+  "Make one blind member's sealed rows visible to later bodies.
 
-  Walked in request order before any body runs, so a body sees the whole
-  accepted prefix its predecessors wrote, blind or not."
-  [st batch fold-row]
-  (dotimes [idx (batch/batch-count batch)]
-    (let [descriptor (batch/batch-at batch idx)]
-      (when (nil? (batch/op descriptor))
-        (doseq [row (:rows (batch/data descriptor))]
-          (let [[dbi op k v] (fold-row row)]
-            (stage/fold! st descriptor dbi op k v)))
-        (stage/accept! st descriptor)))))
+  Folded in member order at the point this member is reached, so a body sees
+  exactly the blind rows of its predecessors and never a later member's rows,
+  even though those rows are already encoded in the physical group. A blind
+  request is fully prepaid before admission, so this is pure visibility: it
+  charges nothing and does not go through that descriptor's staging."
+  [st fold-row descriptor]
+  (doseq [row (:rows (batch/data descriptor))]
+    (let [[dbi op k v] (fold-row row)]
+      (stage/fold-blind! st dbi op k v)))
+  nil)
 
 (defn- any-body?
   "Whether this batch owns at least one ordered body."
@@ -120,12 +139,21 @@
   Returns `:write` when this member ends with accepted physical writes, and
   `:other` for a read-only or rejected one. The descriptor's data and the
   batch's own value slot are both completed here, so the loop below only has to
-  count."
+  count.
+
+  The view is invalidated once the outcome is known, on every exit including a
+  failure, so a body that retained its view can neither stage after its request
+  was decided nor reach the stage from another thread."
   [batch st descriptor {:keys [base check row-fn body-cost encode-body]} values idx]
-  (let [view (stage/view st descriptor base check)
-        outcome (classify! batch st descriptor view
-                            {:row-fn row-fn :body-cost body-cost
-                             :encode-body encode-body})
+  (let [failure (atom nil)
+        guard #(infrastructure-call failure %)
+        view (stage/view st descriptor (guard base) check)
+        outcome (try
+                  (classify! batch st descriptor view
+                              {:row-fn (guard row-fn) :body-cost (guard body-cost)
+                               :encode-body (guard encode-body) :failure failure})
+                  (finally
+                    (stage/invalidate! view)))
         kind (:kind outcome)]
     (case kind
       :rejected
@@ -149,26 +177,58 @@
 (defn- count-members!
   "Classify every member in sealed FIFO order.
 
-  Returns the accepted write weight and the accepted member count, which is what
-  the schedule and the compacted WAL body carrier are derived from."
-  [batch st opts values]
+  Members are visited in publication order, and each accepted write becomes the
+  newest layer of the accepted prefix before the next member runs, so a body
+  reads its predecessors and nothing after it. Returns the accepted write weight
+  and the accepted member count, which is what the schedule and the compacted
+  WAL body carrier are derived from."
+  [batch st {:keys [fold-row] :as opts} values]
   (loop [idx 0 weight 0 accepted 0]
     (if (>= idx (batch/batch-count batch))
       [weight accepted]
       (let [descriptor (batch/batch-at batch idx)]
         (if (nil? (batch/op descriptor))
-          ;; Blind: its caller-prepared rows and WAL body are already final.
-          (recur (inc idx) (inc weight) (inc accepted))
+          ;; Blind: its caller-prepared rows and WAL body are already final, so
+          ;; only its visibility is published.
+          (do (publish-blind-member! st fold-row descriptor)
+              (recur (inc idx) (inc weight) (inc accepted)))
           (if (= :write (run-member! batch st descriptor opts values idx))
             (recur (inc idx) (inc weight) (inc accepted))
             (recur (inc idx) weight accepted)))))))
+
+(defn- prepare!
+  "Run one sealed batch's bodies against `base`, and return its frozen plan."
+  [batch st base {:keys [row-fn fold-row body-cost encode-body]}]
+  (let [n (batch/batch-count batch)
+        values (object-array n)
+        check (fn [] (batch/check-preparation! batch))]
+    (try
+      (let [[weight accepted] (count-members!
+                               batch st
+                               {:base base :check check :fold-row fold-row
+                                :row-fn row-fn :body-cost body-cost
+                                :encode-body encode-body}
+                               values)]
+        (batch/set-accepted-count! batch accepted)
+        (batch/freeze-schedule! batch weight)
+        {:weight weight
+         ;; A batch with no accepted write still owes every member its own
+         ;; value: its body result, or its own rejection.
+         :values (when (zero? weight) values)})
+      (finally
+        (stage/release! st)))))
 
 (defn prepare-batch!
   "Run this batch's ordered bodies and return its frozen dispatch plan.
 
   `opts`:
-  - `:base` is `(fn [dbi key])`, reading one key from the native snapshot pinned
-    for this preparation.
+  - `:with-base` is `(fn [f])`, calling `f` with the `(fn [descriptor dbi key])`
+    reader while holding one pinned native snapshot for the whole preparation; it
+    defaults to calling `f` with `:base` directly for a store that needs no
+    snapshot.
+  - `:base` is `(fn [descriptor dbi key])`, reading one key from the native
+    snapshot pinned for this preparation. The store charges the descriptor and
+    returns a detached copy before any such copy is made.
   - `:row-fn` is `(fn [dbi op key value])`, building one physical row from a
     staged write.
   - `:fold-row` is `(fn [row])`, splitting one caller-prepared blind row into
@@ -180,26 +240,10 @@
   Publishing the accepted member count and the final schedule is the last step,
   so the dispatch transition and both branches always read values that describe
   the writes that will actually run."
-  [batch {:keys [base row-fn fold-row body-cost encode-body]}]
+  [batch {:keys [with-base base] :as opts}]
   (if-not (any-body? batch)
     nil
-    (let [n (batch/batch-count batch)
-          st (stage/create)
-          values (object-array n)
-          check (fn [] (batch/check-preparation! batch))]
-      (try
-        (fold-blind! st batch fold-row)
-        (let [[weight accepted] (count-members!
-                                 batch st
-                                 {:base base :check check
-                                  :row-fn row-fn :body-cost body-cost
-                                  :encode-body encode-body}
-                                 values)]
-          (batch/set-accepted-count! batch accepted)
-          (batch/freeze-schedule! batch weight)
-          {:weight weight
-           ;; A batch with no accepted write still owes every member its own
-           ;; value: its body result, or its own rejection.
-           :values (when (zero? weight) values)})
-        (finally
-          (stage/release! st))))))
+    (let [run (fn [base-fn] (prepare! batch (stage/create) base-fn opts))]
+      (if with-base
+        (with-base run)
+        (run base)))))

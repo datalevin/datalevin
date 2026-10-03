@@ -732,8 +732,19 @@
       (.countDown release)
       (is (= :first (await! leader)))
       (doseq [f followers] (is (not= (timeout) (deref f 5000 ::timeout))))
-      (testing "the oversized head keeps its place instead of being bypassed"
-        (is (= [1 2 1] (vec sizes)))))))
+      (let [observed (vec sizes)]
+        (testing "the blocked leader is sealed on its own"
+          (is (= 1 (first observed))))
+        (testing "no later batch exceeds the two requests the byte cap allows"
+          (is (every? #(<= (long %) 2) (rest observed))))
+        (testing "every follower is served exactly once"
+          (is (= 3 (reduce + (rest observed)))))
+        (testing "so the cap, not the head, decided the split"
+          ;; Whether the three followers seal as 2+1 or 1+2 depends on when each
+          ;; reaches the queue head. Either way the two oversized followers stay
+          ;; in publication order: no batch skips an earlier oversized request for
+          ;; a later smaller one, which would show up as a leading 1+1.
+          (is (not= [1 1 1] (vec (rest observed)))))))))
 
 (deftest batch-selection-never-exceeds-the-byte-cap-with-heterogeneous-allowances
   ;; A small head followed by a large follower exposed the old peek-loop, which

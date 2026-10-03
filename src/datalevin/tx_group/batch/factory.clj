@@ -15,6 +15,7 @@
   (:require [datalevin.tx-group.batch :as batch]
             [datalevin.tx-group.batch.executor :as executor]
             [datalevin.tx-group.batch.native :as native]
+            [datalevin.tx-group.batch.rmw :as rmw]
             [datalevin.tx-group.batch.wal :as wal]
             [datalevin.tx-group.batch.worker :as worker]
             [datalevin.txlog :as txlog]))
@@ -27,6 +28,9 @@
     before anything is built; required for a private WAL runtime.
   - `:native-opts` is forwarded to `native/branch` (`:apply-fn`, `:transact!`,
     `:write-metadata!`).
+  - `:rmw-opts` is forwarded to `rmw/prepare-batch!`; supplying it is what turns
+    on ordered read-modify-write preparation for this runtime. Without it every
+    request is blind and no body runs.
   - `:worker-opts` is forwarded to `worker/for-wal` (`:name`, `:daemon?`,
     `:close-timeout-ms`).
   - `:schedule-fn` overrides the fixed schedule selector (tests/diagnostics).
@@ -36,7 +40,7 @@
   ([wal-state native-writer]
    (executor wal-state native-writer nil))
   ([wal-state native-writer
-    {:keys [runtime-control native-opts worker-opts schedule-fn]}]
+    {:keys [runtime-control native-opts rmw-opts worker-opts schedule-fn]}]
    (when runtime-control
      (txlog/bind-runtime-control! wal-state runtime-control))
    (let [wal-branch (wal/branch wal-state)
@@ -46,7 +50,9 @@
                                #(long @(:next-lsn wal-state))
                                (cond-> {:wal-executor (:executor w)
                                         :wake-maintenance! (:wake! w)}
-                                 schedule-fn (assoc :schedule-fn schedule-fn)))]
+                                 schedule-fn (assoc :schedule-fn schedule-fn)
+                                 rmw-opts (assoc :prepare-batch!
+                                                 #(rmw/prepare-batch! % rmw-opts))))]
      {:executor exec
       :worker w
       :wal-branch wal-branch

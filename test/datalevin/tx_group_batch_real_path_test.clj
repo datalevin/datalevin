@@ -15,11 +15,13 @@
             [datalevin.tx-group.batch.factory :as factory]
             [datalevin.tx-group.batch.env :as env]
             [datalevin.tx-group.batch.private :as private]
+            [datalevin.tx-group.batch.stage :as stage]
             [datalevin.tx-group.phase :as phase]
             [datalevin.txlog :as wal]
             [datalevin.util :as u])
   (:import [java.nio ByteBuffer]
-           [java.util.concurrent ConcurrentLinkedQueue CountDownLatch]))
+           [java.util.concurrent ConcurrentLinkedQueue CountDownLatch
+            TimeUnit]))
 
 (defn- put-long! [c k v]
   (batch/submit!
@@ -86,6 +88,183 @@
       (finally
         (uninstall)
         (env/close! alias)
+        (u/delete-files dir)))))
+
+(defn- encoded-long [v]
+  (let [buffer (ByteBuffer/allocate 9)]
+    (bits/put-buffer buffer v :long)
+    (.array buffer)))
+
+(defn- increment-key!
+  "One ordered read-modify-write request for `k`, declaring no allowance of its
+  own so the collector's configured RMW allowance applies."
+  [c k]
+  (batch/submit!
+   c {:op (fn [tx]
+            (let [key (encoded-long k)
+                  seen (bits/read-buffer
+                        (ByteBuffer/wrap
+                         (or (stage/tx-get tx "data" key) (encoded-long 0)))
+                        :long)]
+              (stage/tx-put! tx "data" key (encoded-long (inc seen)))
+              seen))}))
+
+(defn- increment!
+  "One ordered read-modify-write request: read one encoded long key, write it
+  plus one, and return the value the body saw (0 when the key was absent)."
+  [c]
+  (increment-key! c 1))
+
+(deftest an-ordered-body-reads-the-pinned-writer-and-commits-incrementally
+  (let [dir (u/tmp-dir (str "wal-private-rmw-" (random-uuid)))
+        opts {:dir dir :db-identity (str (random-uuid))
+              :wal-durability-profile :strict :wal-sync-mode :fsync
+              :wal-segment-prealloc? false}
+        environment (private/open! opts)
+        {:keys [raw wal-state]} (env/resources environment)
+        c (env/collector environment)]
+    (try
+      (i/open-dbi raw "data")
+      (testing "a body reads the pinned native snapshot and commits its write"
+        (is (= 0 (increment! c)))
+        (is (= 1 (i/get-value raw "data" 1 :long :long))))
+      (testing "the next body reads the previous body's committed write"
+        (is (= 1 (increment! c)))
+        (is (= 2 (i/get-value raw "data" 1 :long :long))))
+      (testing "each committed body produced exactly one durable WAL record"
+        (let [{:keys [last-appended-lsn last-durable-lsn]}
+              (wal/sync-manager-state (:sync-manager wal-state))]
+          (is (= 2 last-appended-lsn))
+          (is (= 2 last-durable-lsn))))
+      (testing "no charges or batches were retained afterwards"
+        (is (zero? (:requests (batch/usage c))))
+        (is (zero? (:bytes (batch/usage c))))
+        (is (batch/serving? c)))
+      (finally
+        (env/close! environment)
+        (u/delete-files dir)))))
+
+(deftest a-native-read-is-charged-before-it-detaches
+  ;; Regression: the pinned native base detached values without charging the
+  ;; reading descriptor, so a request could copy more than it owned.
+  (let [dir (u/tmp-dir (str "wal-private-read-charge-" (random-uuid)))
+        opts {:dir dir :db-identity (str (random-uuid))
+              :wal-durability-profile :strict :wal-sync-mode :fsync
+              :wal-segment-prealloc? false}
+        environment (private/open! opts)
+        {:keys [raw]} (env/resources environment)
+        c (env/collector environment)
+        big (byte-array 64)]
+    (try
+      (i/open-dbi raw "data")
+      (java.util.Arrays/fill big (byte 7))
+      ;; Seed one native value through the blind path.
+      (is (= :ok (batch/submit!
+                  c {:allowance (charge/blind-allowance {:declared-bytes 64
+                                                         :scratch-bytes 4096})
+                     :prepare (fn [_]
+                                (let [key (encoded-long 1)
+                                      rows (java.util.Collections/singletonList
+                                            (l/kv-tx :put "data" key big :raw :raw))]
+                                  {:rows rows
+                                   :wal-body (wal/prepare-append-body rows {})
+                                   :result :ok}))})))
+      (is (some? (i/get-value raw "data" 1 :long :raw)))
+      (testing "the base copy is charged before it is allocated"
+        (let [copy-charge (charge/array-bytes 1 (alength big))
+              ;; Exactly enough for the control bundle and one copy: the read
+              ;; only fits if the base's own copy is charged as well.
+              allowance (+ (long charge/request-control-bundle) copy-charge 1)
+              seen (atom ::unread)
+              thrown (try
+                       (batch/submit!
+                        c {:allowance allowance
+                           :op (fn [tx]
+                                 (reset! seen (stage/tx-get tx "data" (encoded-long 1))))})
+                       nil
+                       (catch Throwable t t))]
+          (is (some? thrown))
+          (is (= :txlog/pending-budget-exceeded (:error (ex-data thrown)))
+              "the read is rejected once the base copy is charged")
+          (is (= ::unread @seen) "the body never observed the value")))
+      (finally
+        (env/close! environment)
+        (u/delete-files dir)))))
+
+(deftest a-blind-and-an-ordered-request-commit-under-one-real-collector
+  ;; Regression for the prepaid blind request: a blind member reaching a batch
+  ;; with an ordered body is published for visibility only, and must not be
+  ;; charged again. Its charge already equals its allowance, so a second charge
+  ;; would reject it and take the whole batch down with it.
+  (let [dir (u/tmp-dir (str "wal-private-mixed-" (random-uuid)))
+        opts {:dir dir :db-identity (str (random-uuid))
+              :wal-durability-profile :strict :wal-sync-mode :fsync
+              :wal-segment-prealloc? false}
+        environment (private/open! opts)
+        {:keys [raw wal-state]} (env/resources environment)
+        c (env/collector environment)
+        base (long (:last-durable-lsn (wal/sync-manager-state
+                                       (:sync-manager wal-state))))
+        entered (CountDownLatch. 1)
+        release (CountDownLatch. 1)
+        ;; Two publications mean both queued requests are waiting in the queue.
+        queued (CountDownLatch. 2)
+        batches (atom [])
+        appended (atom 0)
+        ;; The phase seam holds one observer, so it counts publications and
+        ;; records each sealed batch's member kinds: `true` is a member with an
+        ;; ordered body.
+        observe (phase/observe!
+                 (fn [event context]
+                   (case event
+                     :ready-published (.countDown queued)
+                     :batch-sealed (swap! batches conj
+                                          (mapv #(some? (batch/op
+                                                         (batch/batch-at context %)))
+                                                (range (batch/batch-count context))))
+                     :wal-appended (swap! appended inc)
+                     nil)))]
+    (try
+      (i/open-dbi raw "data")
+      (let [blocker (future
+                     (batch/submit! c
+                                    {:op (fn [_tx]
+                                           (.countDown entered)
+                                           (.await release 5 TimeUnit/SECONDS)
+                                           :blocked)}))]
+        (is (.await entered 5 TimeUnit/SECONDS) "the blocking body never ran")
+        (let [blind (future (put-long! c 1 7))
+              body (future (increment-key! c 2))]
+          (is (.await queued 5 TimeUnit/SECONDS)
+              "both queued requests never published")
+          (.countDown release)
+          (is (= :blocked (deref blocker 30000 ::timeout)))
+          (is (= :ok (deref blind 30000 ::timeout)))
+          (is (= 0 (deref body 30000 ::timeout)))
+          (testing "both rows committed and the runtime stayed healthy"
+            (is (= 7 (i/get-value raw "data" 1 :long :long)))
+            (is (= 1 (i/get-value raw "data" 2 :long :long)))
+            (is (batch/serving? c))
+            (is (zero? (:requests (batch/usage c)))))
+          (testing "the blocker ran alone and wrote no record"
+            (is (some #{[true]} @batches) (str "sealed " (pr-str @batches))))
+          (testing "every batch that wrote rows appended exactly one record"
+            ;; Whether the queued pair is sealed as one prefix or as two batches
+            ;; depends on when each reaches the queue head, and a mixed batch
+            ;; carries both members' bodies in one group record. What is fixed is
+            ;; one record per writing batch, so the durable LSN tracks the
+            ;; appends. The mixed-batch contract itself is covered
+            ;; deterministically in `datalevin.tx-group-batch-rmw-test`.
+            (let [durable (long (:last-durable-lsn
+                                 (wal/sync-manager-state
+                                  (:sync-manager wal-state))))]
+              (is (pos? @appended))
+              (is (= @appended (- durable (long base)))
+                  (str "appended " @appended " sealed " (pr-str @batches)
+                       " durable " durable))))))
+      (finally
+        (observe)
+        (env/close! environment)
         (u/delete-files dir)))))
 
 (defn- control []
