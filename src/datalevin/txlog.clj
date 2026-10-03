@@ -1762,6 +1762,17 @@
   ^bytes [rows hooks]
   (tcodec/encode-commit-row-payload 0 0 rows {:ha-term (:ha-term hooks)}))
 
+(defn- append-write-error
+  "Preserve the attempted record's coordinates when writing may have started.
+  No append descriptor or complete-record/durability claim is available yet."
+  [lsn segment-id offset cause]
+  (ex-info "WAL append failed; record completion and durability are unconfirmed"
+           (merge (ex-data cause)
+                  {:error :txlog/write-indeterminate :outcome :indeterminate
+                   :lsn lsn :txlog-lsn lsn :segment-id segment-id :offset offset
+                   :retryable? false})
+           cause))
+
 (defn append-prepared-batch-pending!
   "Append a collected group as one record/LSN. Exclusively owned bodies from
   prepare-append-body contribute their encoded rows in request order. The
@@ -1799,10 +1810,11 @@
               manager (:sync-manager state)]
           (ensure-sync-manager-healthy! manager)
           (when before-append! (before-append! state))
+          (when single?
+            (tcodec/patch-commit-row-payload-header! body expected-lsn now))
           (try
             (let [result (if single?
-                           (do (tcodec/patch-commit-row-payload-header! body expected-lsn now)
-                               (tseg/write-record-at! ch offset body))
+                           (tseg/write-record-at! ch offset body)
                            (tseg/write-prepared-record-at! ch offset group expected-lsn now))
                   end (+ (long (:offset result)) (long (:size result)))
                   deadline (lifetime/deadline (:commit-wait-ms state))
@@ -1821,10 +1833,16 @@
                                         :begin? false :request-count (count bodies)})
               batch)
             (catch Throwable e
-              (when-let [fatal (:fatal-error state)] (vreset! fatal e))
-              (notify-runtime-failure! state e)
-              (when-let [mark (:mark-fatal! hooks)] (mark state e))
-              (throw e))))))))
+              (let [error (if (runtime-control state)
+                            (append-write-error expected-lsn sid offset e)
+                            e)]
+                (when-let [fatal (:fatal-error state)] (vreset! fatal e))
+                (try
+                  (notify-runtime-failure! state error)
+                  (when-let [mark (:mark-fatal! hooks)] (mark state e))
+                  ;; A notification failure cannot turn attempted WAL I/O into
+                  ;; a pre-append rejection or replace its original cause.
+                  (finally (throw error)))))))))))
 
 (defn append-batch-pending!
   "Serialize and append a sealed preparation group as one record and LSN.
@@ -1903,7 +1921,14 @@
          batch)
        (catch Throwable t
          (release-wal-ownership! state token)
-         (throw t))))))
+         ;; Record-writing failures already carry their indeterminate outcome.
+         ;; All other failures here precede this request's record write.
+         (throw (if (:outcome (ex-data t))
+                  t
+                  (ex-info "WAL append rejected before record writing"
+                           (assoc (ex-data t) :outcome :not-committed
+                                  :retryable? false)
+                           t))))))))
 
 (defn finish-prepared-group!
   "Complete policy for an append from `begin-prepared-group!` and release the

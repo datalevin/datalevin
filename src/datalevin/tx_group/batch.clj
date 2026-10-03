@@ -57,9 +57,36 @@
    ^AtomicBoolean caller-done?
    ^AtomicBoolean batch-done?])
 
-(deftype Batch [^long id ^FastList descriptors ^objects wal-bodies ^long weight
-                ^long cutoff-nanos schedule ^AtomicLong lsn
-                ^AtomicBoolean dispatched? wal-status collector])
+(definterface ^:private IBatchPreparation
+  (^"[Ljava.lang.Object;" walBodies [])
+  (^void setWalBodies [^"[Ljava.lang.Object;" bodies])
+  (executionSchedule [])
+  (^void setExecutionSchedule [value])
+  (^long acceptedCount [])
+  (^void setAcceptedCount [^long accepted]))
+
+(deftype Batch [^long id ^FastList descriptors
+                ;; Mutable before dispatch, on the elected leader only: ordered
+                ;; preparation compacts the body carrier when requests were
+                ;; rejected and re-selects the schedule from the final accepted
+                ;; write weight. Dispatch publishes both to the other branch.
+                ^objects ^:unsynchronized-mutable wal-bodies
+                ^long weight
+                ^long cutoff-nanos
+                ^:unsynchronized-mutable schedule
+                ^AtomicLong lsn
+                ^AtomicBoolean dispatched?
+                wal-status collector
+                ^long ^:unsynchronized-mutable accepted-count]
+  ;; Mutable deftype fields are private to its methods. Keep their access here
+  ;; so preparation uses direct calls rather than reflective field access.
+  IBatchPreparation
+  (walBodies [_] wal-bodies)
+  (setWalBodies [_ bodies] (set! wal-bodies bodies))
+  (executionSchedule [_] schedule)
+  (setExecutionSchedule [_ value] (set! schedule value))
+  (acceptedCount [_] accepted-count)
+  (setAcceptedCount [_ accepted] (set! accepted-count accepted)))
 
 (deftype Collector [^ReentrantLock lock
                     ^Condition progress
@@ -77,6 +104,9 @@
                     ^long batch-max-bytes
                     ^long shared-reserved
                     ^long preparation-timeout-ms
+                    ;; Configured `:wal-rmw-max-bytes`, the reserved allowance
+                    ;; `R_i` of every admitted body-based request.
+                    ^long rmw-allowance
                     ^AtomicLong published
                     ^AtomicLong next-id
                     executor])
@@ -130,8 +160,18 @@
   [t]
   (boolean (::pre-dispatch-cancel (ex-data t))))
 
+(defn pre-dispatch-cancellation?
+  "Whether this failure is a clean pre-dispatch cancellation of its whole batch.
+
+  Ordered preparation uses it to keep expiry, fencing and interruption
+  batch-level instead of turning an engine failure into one request's rejection."
+  [^Throwable t]
+  (pre-dispatch-cancel? t))
+
 ;; ---------------------------------------------------------------------------
 ;; Result delivery
+
+(declare schedule-for)
 
 ;; Descriptor accessors used by the environment executor. A request's own
 ;; identity, options and prepared data travel on its descriptor; nothing is read
@@ -146,6 +186,16 @@
   "Caller-prepared payload owned by this descriptor."
   ^Object [^Descriptor descriptor]
   @(.data descriptor))
+
+(defn set-data!
+  "Install this descriptor's prepared payload.
+
+  Ordered preparation owns the final per-request classification and rows: it
+  replaces the submitted payload with `{:rejection error}` for a rejected
+  request, or with `{:rows rows :result result :wal-body body}` for an accepted
+  one. Only the elected leader touches descriptors before dispatch."
+  [^Descriptor descriptor value]
+  (vreset! (.data descriptor) value))
 
 (defn context
   "Explicit per-request context for identity, options and confirmations."
@@ -178,21 +228,70 @@
   (.get ^FastList (.descriptors batch) (int idx)))
 
 (defn wal-bodies
-  "Sealed WAL body references in request order; immutable after dispatch."
+  "Sealed WAL body references in request order; immutable after dispatch.
+
+  Before dispatch this is the preallocated array shared by the scheduled tasks,
+  so the task that refreshes it stays a stable identity."
   ^objects [^Batch batch]
-  (.wal-bodies batch))
+  (.walBodies batch))
+
+(defn accepted-count
+  "Sealed member count; mutable before dispatch.
+
+  Ordered preparation lowers it to the number of accepted writes, so a batch
+  carrying rejected requests no longer reserves or refreshes WAL body slots for
+  them. The collector and both branches read it only after dispatch."
+  ^long [^Batch batch]
+  (.acceptedCount batch))
+
+(defn freeze-schedule!
+  "Pin the dispatch schedule from the final accepted write weight.
+
+  Ordered preparation calls this once every member is classified, so the chosen
+  schedule always matches the WAL groups that will actually run."
+  [^Batch batch ^long accepted-weight]
+  (.setExecutionSchedule batch (schedule-for accepted-weight))
+  (.executionSchedule batch))
+
+(defn- compact-bodies!
+  "Copy the accepted bodies into one compacted carrier, in request order.
+
+  A rejected request carries no body, so its WAL group disappears with it: the
+  physical group matches the members that will actually commit."
+  ^objects [^FastList descriptors ^long accepted]
+  (let [^objects compacted (object-array (int accepted))
+        total (.size descriptors)]
+    (loop [idx 0 out 0]
+      (if (< idx total)
+        (let [body (:wal-body (data (.get descriptors idx)))]
+          (if (nil? body)
+            (recur (inc idx) out)
+            (do (aset compacted out body)
+                (recur (inc idx) (inc out)))))
+        (do (when-not (== out accepted)
+              (throw (IllegalStateException.
+                       "Accepted WAL body count does not match the accepted members")))
+            ;; Published once, so the scheduled refresh task and the dispatching
+            ;; leader cannot observe different carriers.
+            compacted)))))
 
 (defn refresh-wal-bodies!
-  "Fill the batch's preallocated body array before dispatch.
+  "Fill the batch's WAL body array before dispatch.
 
   Sealing captures caller-prepared blind bodies. An ordered preparation hook
-  refreshes the same array after finalizing state-dependent bodies."
+  refreshes the same array after finalizing state-dependent bodies, compacting
+  it when rejected members leave accepted writes behind. With every member
+  accepted this writes the preallocated array in place, keeping the identity
+  that scheduled tasks and the WAL append already hold."
   [^Batch batch]
   (let [^FastList descriptors (.descriptors batch)
-        ^objects bodies (.wal-bodies batch)]
-    (dotimes [idx (.size descriptors)]
-      (aset bodies idx (:wal-body (data (.get descriptors idx))))))
-  batch)
+        accepted (.acceptedCount batch)
+        ^objects bodies (.walBodies batch)]
+    (if (== accepted (.size descriptors))
+      (dotimes [idx (.size descriptors)]
+        (aset bodies idx (:wal-body (data (.get descriptors idx)))))
+      (.setWalBodies batch (compact-bodies! descriptors accepted)))
+    batch))
 
 (defn batch-cutoff
   "The batch's preparation cutoff: the earliest selected member's deadline."
@@ -202,7 +301,7 @@
 (defn batch-schedule
   "The schedule fixed for this sealed batch: `:inline` or `:parallel`."
   [^Batch batch]
-  (.schedule batch))
+  (.executionSchedule batch))
 
 (defn batch-collector
   "The collector that sealed this batch."
@@ -444,6 +543,34 @@
   [^Batch batch]
   (.get ^AtomicBoolean (.dispatched? batch)))
 
+(defn set-accepted-count!
+  "Record how many sealed members carry accepted writes.
+
+  Ordered preparation publishes the final count after classifying every member,
+  before dispatch. It stays equal to the sealed count unless requests were
+  rejected, and it bounds the compacted WAL body array."
+  [^Batch batch ^long accepted]
+  (.setAcceptedCount batch accepted))
+
+(defn check-preparation!
+  "Ordered preparation's between-member check.
+
+  Deliberately cheap and lock-free: it reads serving status, the batch cutoff
+  and the preparation owner's interrupt flag. Each of those cancels the whole
+  undispatched batch instead of rejecting one request, because none of them can
+  be attributed to a single request's own work. Returns nil while the batch may
+  still prepare."
+  [^Batch batch]
+  (let [^Collector collector (.collector batch)
+        cutoff (long (.cutoff-nanos batch))]
+    (when-not (.get ^AtomicBoolean (.serving collector))
+      (throw (cancel-error (fenced-error collector))))
+    (when (and (pos? cutoff) (> (System/nanoTime) cutoff))
+      (throw (cancel-error (expired-error "ordered preparation" cutoff))))
+    (when (.isInterrupted (Thread/currentThread))
+      (throw (cancel-error (interrupted-error))))
+    nil))
+
 (defn expired?
   "Whether any selected member's deadline has passed.
 
@@ -485,6 +612,18 @@
   ^long [^Descriptor descriptor]
   (.get ^AtomicLong (.charged descriptor)))
 
+(defn request-rejection
+  "Build one request-local rejection cause.
+
+  The `:outcome :not-committed` marker is the whole difference between an
+  ordinary request-local failure, which discards only that request's private
+  staging, and an infrastructure failure, which rejects the batch and fences the
+  runtime. Ordered preparation classifies on this marker rather than on the
+  exception class, so neither a broad `Throwable` nor an application's own
+  failure establishes a recoverable rejection."
+  ^Throwable [what data]
+  (not-committed what data))
+
 ;; ---------------------------------------------------------------------------
 ;; Collector lifecycle
 
@@ -510,9 +649,10 @@
                   (PendingBudget. (long (:request-budget limits))
                                   (long (:max-requests limits)))
                   (long (:max-requests limits)) (long (:batch-limit limits))
-                  (long (:batch-max-bytes limits)) (long (:shared-reserved limits))
-                  (long (or preparation-timeout-ms default-preparation-timeout-ms))
-                  (AtomicLong. 0) (AtomicLong. 0) executor))))
+(long (:batch-max-bytes limits)) (long (:shared-reserved limits))
+                   (long (or preparation-timeout-ms default-preparation-timeout-ms))
+                   (long (:rmw-allowance-bytes limits))
+                   (AtomicLong. 0) (AtomicLong. 0) executor))))
 
 ;; ---------------------------------------------------------------------------
 ;; Admission
@@ -727,7 +867,7 @@
                              descriptors (object-array taken) taken
                              (preparation-cutoff! descriptors) (schedule-for taken)
                              (AtomicLong. 0) (AtomicBoolean. false)
-                             (volatile! nil) collector)]
+                             (volatile! nil) collector taken)]
           (try
             (dotimes [_ (long taken)]
               (let [^Descriptor descriptor (.peek queue)]
@@ -973,7 +1113,7 @@
               (expired-error "ordered preparation" (.cutoff-nanos batch)))))
     (when-not (.get ^AtomicBoolean (.serving collector))
       (throw (cancel-error (fenced-error collector))))
-    (phase/phase! :schedule-selected {:schedule (.schedule batch) :weight weight})
+    (phase/phase! :schedule-selected {:schedule (.executionSchedule batch) :weight weight})
     (let [values ((.executor collector) batch)]
       (when-not (= weight (alength ^objects values))
         (throw (ex-info "Batch executor returned the wrong number of values"
@@ -1216,9 +1356,16 @@
   thread) and optional `:timeout-ms`. Returns this request's own value, or
   throws its own failure. Preparation alone grants no batch membership, LSN,
   state visibility or permission to start I/O. Blind requests precharge their
-  full allowance; body-based requests start with the control-bundle charge."
+  full allowance; body-based requests reserve the configured
+  `:wal-rmw-max-bytes` allowance for their private staging when they declare no
+  allowance of their own, and start with the control-bundle charge."
   [^Collector collector {:keys [allowance prepare op data context timeout-ms]}]
-  (let [allowance (long allowance)
+  (let [;; A body-based request owns private staging whose encoding this engine
+        ;; cannot know before the body runs, so it reserves the configured
+        ;; allowance up front. An explicit allowance stays authoritative.
+        allowance (long (or allowance
+                           (when op (.rmw-allowance collector))
+                           charge/request-control-bundle))
         prep-timeout-ms (long (.preparation-timeout-ms collector))
         ;; Admission and caller preparation are bounded from submission even
         ;; when the caller supplies no `:timeout-ms`; an explicit request

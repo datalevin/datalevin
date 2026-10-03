@@ -111,7 +111,8 @@
             {:schedule-fn (constantly :parallel)
              :prepare-batch! (fn [b]
                                (let [d (batch/batch-at b 0)]
-                                 (vreset! (.data d) {:wal-body :after})))})
+                                 (batch/set-data! d {:wal-body :after}))
+                               nil)})
            {:limits (charge/resolve-limits limits)})]
     (try
       (is (= :ok (batch/submit! c {:allowance 1024 :data {:wal-body :before}})))

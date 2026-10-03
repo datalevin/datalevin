@@ -169,6 +169,143 @@
               (is (batch/await-quiescence! c 1000))
               (is (zero? (:requests (batch/usage c)))))))))))
 
+(deftest record-write-failure-reports-indeterminate-before-append-publication
+  (doseq [schedule [:inline :parallel]
+          profile [:strict :relaxed]]
+    (with-runtime
+      {:wal-durability-profile profile :wal-full-prefix? true
+       :wal-group-commit 100 :wal-group-commit-ms 0}
+      (fn [state]
+        (let [fault (java.io.IOException. "record written but append failed")
+              commits (atom 0)
+              c (batch/create
+                 (executor/create
+                  (wal-adapter/branch state)
+                  (reify executor/INativeBranch
+                    (apply-rows! [_ _ gate]
+                      (gate)
+                      (swap! commits inc)
+                      (object-array [:ok])))
+                  (constantly 1) {:schedule-fn (constantly schedule)}))]
+          (wal/bind-runtime-control!
+           state (assoc (control) :on-failure! #(batch/fence! c %)))
+          (with-redefs [segment/phase!
+                        (fn [event _]
+                          (when (= :record-bytes-completely-written event)
+                            (throw fault)))]
+            (let [error (caught #(batch/submit!
+                                  c {:allowance 1024
+                                     :data {:wal-body (wal/prepare-append-body (rows 1) {})}}))]
+              (is (= :txlog/write-indeterminate (:error (ex-data error))))
+              (is (= :indeterminate (:outcome (ex-data error))))
+              (is (= 1 (:txlog-lsn (ex-data error))))
+              (is (= {:lsn 1 :segment-id 1 :offset 0}
+                     (select-keys (ex-data error) [:lsn :segment-id :offset])))
+              (is (false? (:retryable? (ex-data error))))
+              (is (nil? (:wal-status (ex-data error)))
+                  "a failed writer has not established a complete append")
+              (is (identical? fault (ex-cause error)))
+              (is (identical? fault @(:fatal-error state)))))
+          (is (zero? @commits))
+          (is (false? (batch/serving? c)))
+          (is (batch/await-quiescence! c 1000))
+          (is (zero? (:requests (batch/usage c))))
+          (is (nil? @(:wal-owner (:sync-manager state))))
+          (is (zero? (:last-appended-lsn (status state))))
+          (is (zero? (:last-durable-lsn (status state))))
+          (is (= 1 (count (:records (segment/scan-segment
+                                     (wal/segment-path (:dir state) 1)))))
+              "a complete replayable record can exist before append publication"))))))
+
+(deftest grouped-record-write-failure-preserves-the-attempted-record
+  (doseq [append-fn [wal/append-prepared-group! wal/begin-prepared-group!]
+          value-size [1 100000]
+          notification-throws? [false true]]
+    (with-runtime
+      {:wal-full-prefix? true}
+      (fn [state]
+        (let [fault (java.io.IOException. "group write failed")
+              notified (atom nil)
+              inputs (mapv (fn [key]
+                             [[:put "data" key (apply str (repeat value-size "x"))
+                               :long :string]])
+                           [1 2])
+              bodies (mapv #(wal/prepare-append-body % {}) inputs)]
+          (wal/bind-runtime-control!
+           state (assoc (control) :on-failure!
+                        (fn [error]
+                          (reset! notified error)
+                          (when notification-throws?
+                            (throw (IllegalStateException. "notification failed"))))))
+          (with-redefs [segment/phase!
+                        (fn [event _]
+                          (when (= :record-bytes-completely-written event)
+                            (throw fault)))]
+            (let [error (caught #(append-fn state 1 bodies))]
+              (is (= :indeterminate (:outcome (ex-data error))))
+              (is (= :txlog/write-indeterminate (:error (ex-data error))))
+              (is (= 1 (:txlog-lsn (ex-data error))))
+              (is (identical? fault (ex-cause error)))
+              (is (identical? error @notified))))
+          (is (nil? @(:wal-owner (:sync-manager state))))
+          (let [records (:records (segment/scan-segment
+                                   (wal/segment-path (:dir state) 1)))]
+            (is (= 1 (count records)))
+            (is (= (vec (mapcat identity inputs))
+                   (:ops (wal/decode-commit-row-payload (:body (first records))))))))))))
+
+(deftest compatibility-prepared-write-failure-preserves-original-exception
+  (with-runtime
+    {}
+    (fn [state]
+      (let [fault (java.io.IOException. "compatibility record write failed")
+            marked (atom nil)]
+        (with-redefs [segment/phase!
+                      (fn [event _]
+                        (when (= :record-bytes-completely-written event)
+                          (throw fault)))]
+          (let [error (caught #(wal/append-prepared-batch-pending!
+                               state 1 [(wal/prepare-append-body (rows 1) {})]
+                               {:mark-fatal! (fn [_ error] (reset! marked error))}))]
+            (is (identical? fault error))
+            (is (identical? fault @marked))
+            (is (identical? fault @(:fatal-error state)))))
+        (is (= 1 (count (:records (segment/scan-segment
+                                   (wal/segment-path (:dir state) 1))))))))))
+
+(deftest pre-append-rejection-does-not-claim-an-uncertain-record
+  (doseq [schedule [:inline :parallel]]
+    (with-runtime
+      {:wal-full-prefix? true}
+      (fn [state]
+        (let [fault (ex-info "append admission rejected" {:reason :test-rejection})
+              commits (atom 0)
+              c (batch/create
+                 (executor/create
+                  (wal-adapter/branch state)
+                  (reify executor/INativeBranch
+                    (apply-rows! [_ _ gate]
+                      (gate)
+                      (swap! commits inc)
+                      (object-array [:ok])))
+                  (constantly 1) {:schedule-fn (constantly schedule)}))]
+          (wal/bind-runtime-control!
+           state (assoc (control) :before-append! (fn [_] (throw fault))))
+          (let [error (caught #(batch/submit!
+                                c {:allowance 1024
+                                   :data {:wal-body (wal/prepare-append-body (rows 1) {})}}))]
+            (is (= :not-committed (:outcome (ex-data error))))
+            (is (= :test-rejection (:reason (ex-data error))))
+            (is (nil? (:txlog-lsn (ex-data error))))
+            (is (identical? fault (ex-cause error))))
+          (is (zero? @commits))
+          (is (false? (batch/serving? c)))
+          (is (batch/await-quiescence! c 1000))
+          (is (zero? (:requests (batch/usage c))))
+          (is (nil? @(:wal-owner (:sync-manager state))))
+          (is (empty? (:records (segment/scan-segment
+                                 (wal/segment-path (:dir state) 1))))))))))
+
 (deftest after-sync-failure-after-durability-reports-committed
   (doseq [schedule [:inline :parallel]]
     (with-runtime

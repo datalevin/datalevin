@@ -303,7 +303,7 @@
         (deliver append-gate true)
         (.join worker 5000)))))
 
-(deftest prepare-batch-runs-after-lsn-and-before-dispatch
+(deftest prepare-batch-runs-before-lsn-and-dispatch
   (let [before (promise)
         after (promise)
         [wal _] (wal-branch {:events (ConcurrentLinkedQueue.)})
@@ -320,11 +320,12 @@
         executor (executor/create
                   wal native #(swap! lsn inc)
                   {:prepare-batch! (fn [batch]
-                                     (deliver before (batch/dispatched? batch)))})
+                                     (deliver before [(batch/dispatched? batch) @lsn])
+                                     nil)})
         c (batch/create executor {:limits (charge/resolve-limits default-overrides)})]
     (is (= :a (batch/submit! c {:allowance 1024 :data :a})))
-    (testing "ordered preparation runs before dispatch; branches see dispatched"
-      (is (false? (deref before 5000 ::timeout)))
+    (testing "ordered preparation precedes LSN assignment and dispatch"
+      (is (= [false 0] (deref before 5000 ::timeout)))
       (is (true? (deref after 5000 ::timeout))))))
 
 (deftest preparation-overrunning-the-deadline-cancels-before-dispatch

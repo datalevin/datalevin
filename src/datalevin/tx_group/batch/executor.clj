@@ -197,16 +197,17 @@
   `opts`:
   - `:wal-executor` runs the parallel WAL branch (one task per environment in
     production, the shared agent pool when absent). Inline batches never use it.
-  - `:prepare-batch!` runs on the leader after LSN assignment and before the
-    dispatch transition (`begin-dispatch!`); it finalizes ordered state-dependent
-    preparation. Blind batches omit it. The transition rechecks serving status
-    and the batch deadline, so preparation that overruns the deadline cancels
-    instead of committing.
+- `:prepare-batch!` runs on the leader before dispatch (`begin-dispatch!`); it
+  finalizes ordered state-dependent preparation and returns the frozen plan: nil
+  when every member stayed blind, `{:weight w}` when accepted writes exist, or
+  `{:weight 0 :values values}` when the batch owns no write at all. Blind batches
+  omit it. The transition rechecks serving status and the batch deadline, so
+  preparation that overruns the deadline cancels instead of committing.
   - `:schedule-fn` selects the schedule from the sealed batch; defaults to the
-    collector's fixed `batch-schedule`. Tests and diagnostics inject it to drive
-    both paths deterministically.
+  collector's fixed `batch-schedule`. Tests and diagnostics inject it to drive
+  both paths deterministically.
   - `:wake-maintenance!` nudges the maintenance worker after inline work arms a
-    relaxed threshold; defaults to a no-op.
+  relaxed threshold; defaults to a no-op.
 
   The fixed schedule is read from the sealed batch: weight-one batches run inline
   on the leader, larger batches run the two branches in parallel. Both schedules
@@ -223,19 +224,37 @@
          handoff (ParallelHandoff. wal (AtomicBoolean. false)
                                    nil 0 nil nil nil false)]
      (fn [^datalevin.tx_group.batch.Batch batch]
-       (let [lsn (long (next-lsn!))]
-         (batch/set-lsn! batch lsn)
-         (when prepare-batch!
-           (prepare-batch! batch)
+       ;; Ordered preparation runs first and returns the frozen plan, because a
+       ;; batch that owns no accepted write must not be given an LSN.
+       (let [plan (when prepare-batch! (prepare-batch! batch))
+             planned? (some? plan)
+             ;; Accepted write weight. A hook that classified nothing leaves
+             ;; every member blind, so the batch still owns an LSN and a group.
+             weight (if planned?
+                      (long (:weight plan))
+                      (long (batch/batch-count batch)))
+             lsn (when-not (zero? weight)
+                   (let [lsn (long (next-lsn!))]
+                     (batch/set-lsn! batch lsn)
+                     lsn))]
+         ;; Ordered preparation publishes the accepted member count, the final
+         ;; schedule and the WAL bodies of every accepted member.
+         (when-not (zero? weight)
            (batch/refresh-wal-bodies! batch))
-         ;; Ordered preparation is complete. Recheck serving/deadlines and mark
-         ;; the batch dispatched atomically: an overrun preparation phase must
-         ;; cancel here rather than commit.
+         ;; Preparation is complete. Recheck serving/deadlines and mark the batch
+         ;; dispatched atomically: an overrun preparation phase must cancel here
+         ;; rather than commit.
          (batch/begin-dispatch! batch)
-         (let [values (if (= :inline (schedule-fn batch))
-                        (run-inline! wal native batch lsn wake-maintenance!)
-                        (run-parallel! native batch lsn wal-executor handoff))]
-           ;; Both branches have stopped and the WAL outcome is settled; the
-           ;; collector's join/publication now follows.
-           (phase/phase! :execution-complete batch)
-           values))))))
+         (if (zero? weight)
+           ;; Nothing accepted, nothing to persist: no LSN, no WAL record and no
+           ;; native write transaction. Each member completes from the result its
+           ;; own preparation already produced.
+           (do (phase/phase! :zero-write-complete batch)
+               ^objects (:values plan))
+           (let [values (if (= :inline (schedule-fn batch))
+                          (run-inline! wal native batch lsn wake-maintenance!)
+                          (run-parallel! native batch lsn wal-executor handoff))]
+             ;; Both branches have stopped and the WAL outcome is settled; the
+             ;; collector's join/publication now follows.
+             (phase/phase! :execution-complete batch)
+             values)))))))

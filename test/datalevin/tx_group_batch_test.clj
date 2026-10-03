@@ -69,6 +69,7 @@
                  (.active-batch c) (.failure c) (.waiters c) (.budget c)
                  (.max-requests c) (.batch-limit c) (.batch-max-bytes c)
                  (.shared-reserved c) (.preparation-timeout-ms c)
+                 (.rmw-allowance c)
                  (.published c) (.next-id c) (.executor c))}))
 
 ;; ---------------------------------------------------------------------------
@@ -661,7 +662,7 @@
         release (CountDownLatch. 1)
         executor (fn [batch]
                    (.add sizes (.size (.descriptors batch)))
-                   (.add schedules (.schedule batch))
+                   (.add schedules (batch/batch-schedule batch))
                    (.countDown entered)
                    (.await release 5 TimeUnit/SECONDS)
                    (echo-values batch))
