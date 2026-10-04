@@ -8,13 +8,12 @@
   its own collector, and one environment selects exactly one of them (see
   `datalevin.tx-group.batch.env`).
 
-  The model is deliberately different from the compatibility collector:
-
   - callers do their own state-independent preparation, then publish one ready
-    descriptor; nothing is collected during body execution;
-  - the elected leader seals a bounded FIFO prefix, and only one batch executes
+    descriptor;
+  - the elected leader selects a bounded FIFO prefix, and only one batch executes
     per environment until it joins;
-  - later ready arrivals accumulate unsealed through joint completion;
+  - native application can collect more ready members within the same caps;
+    membership freezes before WAL dispatch, and later arrivals queue;
   - after its own result joins, the leader wakes a queued successor and returns;
   - request bodies and confirmations run on execution threads, never with
     submitting-caller binding affinity."
@@ -56,17 +55,19 @@
   (^void setWalBodies [^"[Ljava.lang.Object;" bodies])
   (executionSchedule [])
   (^void setExecutionSchedule [value])
+  (^long cutoffNanos [])
+  (^void setCutoffNanos [^long deadline])
   (^long acceptedCount [])
   (^void setAcceptedCount [^long accepted]))
 
 (deftype Batch [^long id ^FastList descriptors
                 ;; Mutable before dispatch, on the elected leader only: ordered
-                ;; preparation compacts the body carrier when requests were
-                ;; rejected and re-selects the schedule from the final accepted
+                ;; preparation compacts the body carrier for conditional no-ops
+                ;; and re-selects the schedule from the final accepted
                 ;; write weight. Dispatch publishes both to the other branch.
                 ^objects ^:unsynchronized-mutable wal-bodies
                 ^long weight
-                ^long cutoff-nanos
+                ^long ^:volatile-mutable cutoff-nanos
                 ^:unsynchronized-mutable schedule
                 ^AtomicLong lsn
                 ^AtomicBoolean dispatched?
@@ -79,6 +80,8 @@
   (setWalBodies [_ bodies] (set! wal-bodies bodies))
   (executionSchedule [_] schedule)
   (setExecutionSchedule [_ value] (set! schedule value))
+  (cutoffNanos [_] cutoff-nanos)
+  (setCutoffNanos [_ deadline] (set! cutoff-nanos deadline))
   (acceptedCount [_] accepted-count)
   (setAcceptedCount [_ accepted] (set! accepted-count accepted)))
 
@@ -214,7 +217,7 @@
   (.deadline-nanos descriptor))
 
 (defn selected?
-  "Whether this request has been sealed into a batch."
+  "Whether this request has been selected into a batch."
   [^Descriptor descriptor]
   (.get ^AtomicBoolean (.selected? descriptor)))
 
@@ -224,7 +227,7 @@
   (.size ^FastList (.descriptors batch)))
 
 (defn batch-at
-  "The sealed member at `idx`, in publication order."
+  "The selected member at `idx`, in publication order."
   ^Descriptor [^Batch batch idx]
   (.get ^FastList (.descriptors batch) (int idx)))
 
@@ -245,13 +248,11 @@
   (.acceptedCount batch))
 
 (defn freeze-schedule!
-  "Pin the dispatch schedule from the final accepted write weight.
-
-  Native body execution calls this after freezing the batch, so the chosen
-  schedule always matches the WAL groups that will actually run."
-  [^Batch batch ^long accepted-weight]
-  (.setExecutionSchedule batch (schedule-for accepted-weight))
-  (.executionSchedule batch))
+  "Fix the WAL schedule after collection. Overlap only when native work remains."
+  ([batch accepted-weight] (freeze-schedule! batch accepted-weight true))
+  ([^Batch batch ^long accepted-weight native-work?]
+   (.setExecutionSchedule batch (if native-work? (schedule-for accepted-weight) :inline))
+   (.executionSchedule batch)))
 
 (defn- compact-bodies!
   "Copy the accepted bodies into one compacted carrier, in request order.
@@ -287,7 +288,7 @@
   (let [^FastList descriptors (.descriptors batch)
         accepted (.acceptedCount batch)
         ^objects bodies (.walBodies batch)]
-    (if (== accepted (.size descriptors))
+    (if (and (== accepted (.size descriptors)) (== accepted (alength bodies)))
       (dotimes [idx (.size descriptors)]
         (aset bodies idx (:wal-body (data (.get descriptors idx)))))
       (.setWalBodies batch (compact-bodies! descriptors accepted)))
@@ -296,7 +297,14 @@
 (defn batch-cutoff
   "The batch's preparation cutoff: the earliest selected member's deadline."
   ^long [^Batch batch]
-  (.cutoff-nanos batch))
+  (.cutoffNanos batch))
+
+(defn expired?
+  "Whether the earliest selected member's deadline has passed.
+  Collection maintains this cutoff; dispatch and commit need no member scan."
+  [^Batch batch]
+  (let [cutoff (.cutoffNanos batch)]
+    (and (pos? cutoff) (<= cutoff (System/nanoTime)))))
 
 (defn batch-schedule
   "The schedule fixed for this sealed batch: `:inline` or `:parallel`."
@@ -304,7 +312,7 @@
   (.executionSchedule batch))
 
 (defn batch-collector
-  "The collector that sealed this batch."
+  "The collector that owns this batch."
   [^Batch batch]
   (.collector batch))
 
@@ -524,8 +532,6 @@
   [^Batch batch]
   (.set ^AtomicBoolean (.dispatched? batch) true))
 
-(declare expired-member?)
-
 (defn begin-dispatch!
   "Finalize ordered preparation and dispatch, atomically under coordination.
 
@@ -542,9 +548,9 @@
     (try
       (when-not (.get ^AtomicBoolean (.serving collector))
         (throw (cancel-error (fenced-error collector))))
-      (when (expired-member? ^FastList (.descriptors batch))
+      (when (expired? batch)
         (throw (cancel-error
-                (expired-error "ordered preparation" (.cutoff-nanos batch)))))
+                (expired-error "ordered preparation" (.cutoffNanos batch)))))
       (.set ^AtomicBoolean (.dispatched? batch) true)
       (finally (.unlock lock)))))
 
@@ -572,7 +578,7 @@
   still prepare."
   [^Batch batch]
   (let [^Collector collector (.collector batch)
-        cutoff (long (.cutoff-nanos batch))]
+        cutoff (long (.cutoffNanos batch))]
     (when-not (.get ^AtomicBoolean (.serving collector))
       (throw (cancel-error (fenced-error collector))))
     (when (and (pos? cutoff) (> (System/nanoTime) cutoff))
@@ -580,15 +586,6 @@
     (when (.isInterrupted (Thread/currentThread))
       (throw (cancel-error (interrupted-error))))
     nil))
-
-(defn expired?
-  "Whether any selected member's deadline has passed.
-
-  Branch owners use this for the final pre-commit deadline check, so a WAL wait
-  that outlasts the batch deadline skips the native commit instead of committing
-  a policy-complete but overdue batch."
-  [^Batch batch]
-  (expired-member? ^FastList (.descriptors batch)))
 
 ;; ---------------------------------------------------------------------------
 ;; Charging
@@ -633,8 +630,8 @@
 (defn create
   "Create one additive collector for a new-protocol environment.
 
-  `executor` receives the sealed batch and returns one value per request in
-  batch order, where a `rejected` element is that request's own failure. The
+  `executor` receives the selected batch and returns one value per final member in
+  batch order. Any preparation failure aborts the whole batch. The
   executor owns ordered state-dependent work, branch dispatch, join and local
   publication; this collector owns admission, sealing, activation, result
   delivery and cleanup."
@@ -741,7 +738,7 @@
         cutoff (if (and batch
                         (.get ^AtomicBoolean (.active collector))
                         (not (.get ^AtomicBoolean (.dispatched? batch))))
-                 (.cutoff-nanos batch)
+                 (.cutoffNanos batch)
                  0)]
     (cond
       (zero? own-deadline) cutoff
@@ -847,8 +844,8 @@
   Walks the queue once in publication order, counting every candidate's full
   allowance until the first descriptor that would exceed either the request-count
   or byte cap. That descriptor and its followers stay queued: the selector never
-  backfills after bodies run and never skips a queue head to fit smaller
-  followers. The remainder stays queued and unsealed until this batch joins.
+  skips a queue head to fit smaller followers. Native application may collect
+  more ready requests within the same caps before WAL dispatch.
   Called under collector coordination, so the ready queue is stable."
   ^Batch [^Collector collector]
   (let [^ConcurrentLinkedQueue queue (.ready collector)
@@ -865,7 +862,7 @@
                       taken))
                   taken))]
     (when (pos? (long taken))
-      (let [descriptors (FastList. (int taken))
+      (let [descriptors (FastList. (int limit))
             it (.iterator queue)]
         ;; Allocate all sealed storage while the requests are still queued and
         ;; caller-owned. A constructor failure cannot strand selected charges.
@@ -893,6 +890,47 @@
                   (release-batch-charges! collector batch)))
               (throw t))))))))
 
+(defn collect-ready!
+  "Add the next ready FIFO prefix while this owner applies native writes.
+  Collection ends before WAL dispatch. Count/byte caps and the earliest deadline
+  cover the whole growing batch, including every newly selected member."
+  [^Batch batch]
+  (let [^Collector collector (.collector batch)
+        ^ReentrantLock lock (.lock collector)
+        ^FastList descriptors (.descriptors batch)
+        ^ConcurrentLinkedQueue queue (.ready collector)]
+    (.lock lock)
+    (try
+      (when (dispatched? batch)
+        (throw (IllegalStateException. "Cannot collect after WAL dispatch")))
+      (check-preparation! batch)
+      (drop-expired! collector)
+      (let [before (.size descriptors)]
+        (when-not (.isEmpty queue)
+          (let [limit (.batch-limit collector)
+                cap (.batch-max-bytes collector)
+                initial-bytes (reduce (fn [^long total ^Descriptor d]
+                                        (+ total (.allowance d)))
+                                      0 descriptors)]
+            (loop [bytes (long initial-bytes)]
+              (when (< (.size descriptors) limit)
+                (when-let [^Descriptor d (.peek queue)]
+                  (let [next-bytes (+ bytes (.allowance d))]
+                    (when (<= next-bytes cap)
+                      ;; The carrier was allocated to the cap before selection.
+                      (.add descriptors d)
+                      (.set ^AtomicBoolean (.selected? d) true)
+                      (.poll queue)
+                      (.decrementAndGet ^AtomicInteger (.queued collector))
+                      (let [deadline (.deadline-nanos d) current (.cutoffNanos batch)]
+                        (when (and (pos? deadline) (or (zero? current) (< deadline current)))
+                          (.setCutoffNanos batch deadline)
+                          (when (pos? (.get ^AtomicLongArray (.waiters collector) 0))
+                            (signal-progress-under-lock! collector))))
+                      (recur next-bytes))))))))
+        (- (.size descriptors) before))
+      (finally (.unlock lock)))))
+
 (defn- publish-active-batch!
   "Record the batch whose preparation cutoff observers should watch."
   [^Collector collector ^Batch batch]
@@ -901,7 +939,7 @@
     (try
       (vreset! ^clojure.lang.IDeref (.active-batch collector) batch)
       ;; Only capacity waiters need to recompute a newly published cutoff.
-      (when (and (pos? (.cutoff-nanos batch))
+      (when (and (pos? (.cutoffNanos batch))
                  (pos? (.get ^AtomicLongArray (.waiters collector) 0)))
         (signal-progress-under-lock! collector))
       (finally (.unlock lock)))))
@@ -997,21 +1035,10 @@
                 :else (min acc d))))
           0 descriptors))
 
-(defn- expired-member?
-  "Final admission/deadline recheck before dispatch. Losing this race prevents
-  both branches from starting, so the batch is definitively not committed."
-  [^FastList descriptors]
-  (let [now (System/nanoTime)]
-    (reduce (fn [found ^Descriptor descriptor]
-              (or found
-                  (let [d (.deadline-nanos descriptor)]
-                    (and (pos? d) (<= d now)))))
-            false descriptors)))
-
 (defn- schedule-for
-  "Fixed initial selector, chosen once after freezing the accepted writes and
-  before any WAL/native execution: inline for one logical write, parallel for
-  two or more. Bodies producing no physical writes do not raise the weight."
+  "Schedule after freezing accepted writes: inline for one logical write,
+  parallel for two or more when native work remains. Bodies producing no
+  physical writes do not raise the weight."
   [^long weight]
   (if (<= weight 1) :inline :parallel))
 
@@ -1042,12 +1069,12 @@
         now (System/nanoTime)]
     (if (and batch
              (not (.get ^AtomicBoolean (.dispatched? batch)))
-             (let [c (.cutoff-nanos batch)] (and (pos? c) (<= c now))))
+             (let [c (.cutoffNanos batch)] (and (pos? c) (<= c now))))
       (let [^ReentrantLock lock (.lock collector)]
         (.lock lock)
         (try
           (let [current @(.active-batch collector)
-                c (when (identical? current batch) (.cutoff-nanos batch))
+                c (when (identical? current batch) (.cutoffNanos batch))
                 now (System/nanoTime)]
             (if (and (identical? current batch)
                      (.get ^AtomicBoolean (.active collector))
@@ -1120,11 +1147,10 @@
         (join-batch! batch values))
       (finally
         (.unlock lock)
-        ;; Publication is settled before notifications. Returning writers can
-        ;; now publish without immediately parking behind the publication lock.
-        ;; The queue head is the executing leader and never waits for its result.
-        ;; Also notify any published prefix if publication threw partway through;
-        ;; the failure path will complete the remaining slots.
+        ;; Returning writers can prepare and publish the next ready batch while
+        ;; this owner retires. Notify outside publication coordination.
+        ;; Include any published prefix when publication threw partway through.
+        ;; The first member is the owner and never parks for its own result.
         (dotimes [idx (dec (batch-count batch))]
           (let [descriptor (batch-at batch (inc idx))]
             (when (some? @(.result descriptor))
@@ -1141,17 +1167,17 @@
         descriptors ^FastList (.descriptors batch)
         weight (long (.size descriptors))]
     (phase/phase! :ordered-work batch)
-    (when (expired-member? descriptors)
+    (when (expired? batch)
       (throw (cancel-error
-              (expired-error "ordered preparation" (.cutoff-nanos batch)))))
+              (expired-error "ordered preparation" (.cutoffNanos batch)))))
     (when-not (.get ^AtomicBoolean (.serving collector))
       (throw (cancel-error (fenced-error collector))))
     (phase/phase! :schedule-selected {:schedule (.executionSchedule batch) :weight weight})
     (let [values ((.executor collector) batch)]
-      (when-not (= weight (alength ^objects values))
+      (when-not (= (batch-count batch) (alength ^objects values))
         (throw (ex-info "Batch executor returned the wrong number of values"
                         {:error :txlog/batch-executor-mismatch
-                         :expected weight :actual (alength ^objects values)})))
+                         :expected (batch-count batch) :actual (alength ^objects values)})))
       (join-or-reject! batch values))))
 
 (defn- fail-batch!
@@ -1202,7 +1228,7 @@
   (let [descriptors ^FastList (.descriptors batch)]
     (dotimes [idx (.size descriptors)]
       (let [^Descriptor descriptor (.get descriptors idx)]
-        ;; The batch owns only the descriptors `take-prefix!` actually sealed.
+        ;; The batch owns every descriptor selected before WAL dispatch.
         (when (.get ^AtomicBoolean (.selected? descriptor))
           (when (.compareAndSet ^AtomicBoolean (.batch-done? descriptor) false true)
             (when (.get ^AtomicBoolean (.caller-done? descriptor))
@@ -1307,7 +1333,10 @@
       (let [bound (bound-deadline collector deadline-nanos)
             remaining (- bound (System/nanoTime))]
         (if (pos? remaining)
-          (park-for-progress! collector descriptor (min remaining 100000))
+          ;; Completion and handoff unpark this caller. Poll only to discover a
+          ;; preparation cutoff published after it parked; waking every 100 us
+          ;; burned CPU throughout WAL I/O.
+          (park-for-progress! collector descriptor (min remaining 1000000))
           (do (observe-cutoff! collector)
               ;; Removal and selection share coordination. If selection won,
               ;; only the batch may decide this request's outcome.

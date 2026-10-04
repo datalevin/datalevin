@@ -8,14 +8,31 @@
             [datalevin.tx-group.batch.private :as private]
             [datalevin.tx-group.batch.stage :as tx]
             [datalevin.tx-group.phase :as phase]
+            [datalevin.txlog :as wal]
             [datalevin.util :as u])
-  (:import [java.io IOException]
+  (:import [datalevin.cpp Util$DTLVException]
+           [java.io IOException]
            [java.nio ByteBuffer]
            [java.util.concurrent CountDownLatch TimeUnit]
            [java.util.concurrent.atomic AtomicBoolean]))
 
 (defn- encoded ^bytes [n] (.array (.putLong (ByteBuffer/allocate 8) (long n))))
 (defn- decoded [^bytes bs] (when bs (.getLong (ByteBuffer/wrap bs))))
+
+(defn- native-reader-error! [db failure]
+  (let [native (i/get-dbi db "data" false)
+        broken (reify l/IDB
+                 (put-read-key [_ rtx key kt] (l/put-read-key native rtx key kt))
+                 (get-kv [_ _] (throw failure)))
+        reader (with-meta
+                 (reify i/ILMDB
+                   (check-ready [_] (i/check-ready db))
+                   (get-dbi [_ _ _] broken)
+                   l/IWriting
+                   (writing? [_] true)
+                   (write-txn [_] (l/write-txn db)))
+                 (meta db))]
+    (scan/get-value reader "data" (encoded 1) :raw :raw true)))
 
 (defn- with-runtime [f]
   (let [dir (u/tmp-dir (str "native-rmw-" (random-uuid)))
@@ -116,6 +133,29 @@
           (is (nil? (i/get-value raw "data" (encoded 1) :raw :raw)))
           (is (= :next (batch/submit! c {:op (fn [_] :next)}))))))))
 
+(deftest retained-native-reader-interruption-restores-the-owner-flag
+  (doseq [wrapped? [false true] caught? [false true]]
+    (with-runtime
+      (fn [environment _]
+        (let [c (env/collector environment) raw (:raw (env/resources environment))
+              ran? (atom false)
+              interruption (InterruptedException. "native reader interrupted")
+              failure (if wrapped? (ex-info "wrapped reader interruption" {} interruption)
+                          interruption)
+              results
+              (group! c [{:op (fn [db]
+                               (tx/tx-put! db "data" (encoded 1) (encoded 11))
+                               (try (native-reader-error! db failure)
+                                    (catch Throwable t (if caught? :caught (throw t)))))}
+                         {:op (fn [_] (reset! ran? true))}])]
+          (is (false? @ran?))
+          (is (:interrupted? (results 0)))
+          (is (every? #(= :txlog/write-interrupted (:error (ex-data (:error %)))) results))
+          (is (nil? (i/get-value raw "data" (encoded 1) :raw :raw)))
+          (is (batch/serving? c))
+          (is (zero? (:requests (batch/usage c))))
+          (is (= :next (batch/submit! c {:op (fn [_] :next)}))))))))
+
 (deftest caught-abort-or-allowance-exhaustion-still-aborts-the-whole-batch
   (doseq [kind [:abort :allowance :close]]
     (with-runtime
@@ -181,23 +221,10 @@
               (group! c
                       [{:op (fn [db]
                               (tx/tx-put! db "data" (encoded 1) (encoded 11))
-                              (let [native (i/get-dbi db "data" false)
-                                    broken (reify l/IDB
-                                             (put-read-key [_ rtx key kt]
-                                               (l/put-read-key native rtx key kt))
-                                             (get-kv [_ _] (throw failure)))
-                                    reader (with-meta (reify
-                                             i/ILMDB
-                                             (check-ready [_] (i/check-ready db))
-                                             (get-dbi [_ _ _] broken)
-                                             l/IWriting
-                                             (writing? [_] true)
-                                             (write-txn [_] (l/write-txn db)))
-                                             (meta db))]
-                                (if caught?
-                                  (try (scan/get-value reader "data" (encoded 1) :raw :raw true)
-                                       (catch Throwable _ :caught))
-                                  (scan/get-value reader "data" (encoded 1) :raw :raw true))))}
+                              (if caught?
+                                (try (native-reader-error! db failure)
+                                     (catch Throwable _ :caught))
+                                (native-reader-error! db failure)))}
                        {:op (fn [_] (reset! ran? true))}])]
           (is (false? @ran?))
           (is (not (batch/serving? c)))
@@ -207,16 +234,87 @@
           (is (thrown? Throwable (i/get-value raw "data" (encoded 1) :raw :raw))))))))
 
 (deftest wrapped-infrastructure-errors-still-fence-the-batch
-  (with-runtime
-    (fn [environment _]
-      (let [collector (env/collector environment)
-            successor? (atom false)
-            results (group! collector
-                            [{:op (fn [_]
-                                    (throw (ex-info "native reader failed" {}
-                                                    (IOException. "reader"))))}
-                             {:op (fn [_] (reset! successor? true))}])]
-        (is (false? @successor?))
-        (is (not (batch/serving? collector)))
-        (is (every? #(instance? IOException (ex-cause (:error %))) results))
-        (is (zero? (:requests (batch/usage collector))))))))
+  (doseq [failure [(IOException. "reader") (Util$DTLVException. "native reader")]
+          wrapped? [false true]]
+    (with-runtime
+      (fn [environment _]
+        (let [collector (env/collector environment)
+              successor? (atom false)
+              results (group! collector
+                              [{:op (fn [_]
+                                      (throw (if wrapped?
+                                               (ex-info "native reader failed" {} failure)
+                                               failure)))}
+                               {:op (fn [_] (reset! successor? true))}])]
+          (is (false? @successor?))
+          (is (not (batch/serving? collector)))
+          (is (every? #(identical? failure (if wrapped? (ex-cause (:error %)) (:error %))) results))
+          (is (zero? (:requests (batch/usage collector)))))))))
+
+(deftest requests-arriving-during-native-application-share-the-batch
+  (doseq [failure? [false true]]
+    (with-runtime
+      (fn [environment _]
+        (let [collector (env/collector environment)
+              {:keys [raw wal-state]} (env/resources environment)
+              applied (CountDownLatch. 1) release (CountDownLatch. 1)
+              ready (CountDownLatch. 1) once (AtomicBoolean. true)
+              counts (atom []) calls (atom [])
+              uninstall
+              (phase/observe!
+               (fn [event context]
+                 (case event
+                   :native-prefix-applied
+                   (when (.compareAndSet once true false)
+                     (.countDown applied) (.await release 10 TimeUnit/SECONDS))
+                   :ready-published
+                   (when (= :late (:which (batch/context context))) (.countDown ready))
+                   :joint-publication (swap! counts conj (batch/batch-count context))
+                   nil)))]
+          (try
+            (let [first-write
+                  (future
+                    (try (batch/submit! collector
+                                        {:op (fn [db]
+                                               (swap! calls conj :first)
+                                               (tx/tx-put! db "data" (encoded 1) (encoded 11))
+                                               :first)})
+                         (catch Throwable t t)))]
+              (is (.await applied 10 TimeUnit/SECONDS))
+              (let [late-write
+                    (future
+                      (try
+                        (batch/submit!
+                         collector
+                         (if failure?
+                           {:context {:which :late}
+                            :op (fn [db]
+                                  (swap! calls conj :late)
+                                  (is (= 11 (decoded (i/get-value db "data" (encoded 1) :raw :raw))))
+                                  (throw (ex-info "late rejection" {})))}
+                           {:context {:which :late}
+                            :allowance 65536
+                            :prepare (fn [_]
+                                       (let [rows [(l/kv-tx :put "data" (encoded 2) (encoded 22) :raw :raw)]]
+                                         {:rows rows :wal-body (wal/prepare-append-body rows {})
+                                          :result :late}))}))
+                        (catch Throwable t t)))]
+                (is (.await ready 10 TimeUnit/SECONDS))
+                (is (nil? (i/get-value raw "data" (encoded 1) :raw :raw)))
+                (.countDown release)
+                (let [first-result (deref first-write 10000 ::timeout)
+                      late-result (deref late-write 10000 ::timeout)]
+                  (if failure?
+                    (do (is (instance? Throwable first-result))
+                        (is (instance? Throwable late-result))
+                        (is (nil? (i/get-value raw "data" (encoded 1) :raw :raw)))
+                        (is (= [:first :late] @calls))
+                        (is (= 1 @(:next-lsn wal-state))))
+                    (do (is (= :first first-result))
+                        (is (= :late late-result))
+                        (is (= [2] @counts))
+                        (is (= 22 (decoded (i/get-value raw "data" (encoded 2) :raw :raw))))
+                        (is (= 2 @(:next-lsn wal-state))))))))
+            (is (batch/serving? collector))
+            (is (zero? (:requests (batch/usage collector))))
+            (finally (.countDown release) (uninstall))))))))

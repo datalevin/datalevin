@@ -12,17 +12,15 @@
             [datalevin.tx-group.batch.charge :as charge]
             [datalevin.tx-group.batch.executor :as executor]
             [datalevin.tx-group.phase :as phase])
-  (:import [datalevin.lmdb KVTxData]
+  (:import [datalevin.cpp Util$DTLVException]
+           [datalevin.lmdb KVTxData]
            [java.io IOException]
            [java.util ArrayList Arrays]))
-
-(defn any-body? [batch]
-  (boolean (some #(batch/op (batch/batch-at batch %))
-                 (range (batch/batch-count batch)))))
 
 (defn- clean-body-failure? [^Throwable t]
   (and (instance? Exception t)
        (not (instance? IOException t))
+       (not (instance? Util$DTLVException t))
        (not (instance? InterruptedException t))
        (not (batch/pre-dispatch-cancellation? t))
        (not (:resized (ex-data t)))
@@ -122,11 +120,11 @@
                      ((batch/op descriptor) wdb)
                      (catch Throwable t
                        (cond
-                         @failure (throw @failure)
+                         @failure (throw (or (owner-interruption @failure) @failure))
                          (owner-interruption t) (throw (owner-interruption t))
                          (clean-body-failure? t) (batch/cancel-before-dispatch! t)
                          :else (throw t))))]
-        (when-let [t @failure] (throw t))
+        (when-let [t @failure] (throw (or (owner-interruption t) t)))
         (batch/check-preparation! batch)
         (let [wal-body (when (and encode-body (pos? (.size rows)))
                          (let [estimate (long (body-cost rows))]
@@ -139,50 +137,80 @@
       (finally (vreset! valid? false)))))
 
 (defn execute!
-  "Run the sealed batch once in LMDB, freeze accepted rows, satisfy WAL policy,
-   then commit the same transaction. Never replay a state-dependent body."
+  "Collect while applying the native prefix, then freeze membership for WAL.
+  A final prepared suffix can overlap WAL work. Bodies run once before append;
+  every member shares the same native transaction and commit outcome."
   [raw wal next-lsn! wake! check-batch! opts batch]
-  (let [values (object-array (batch/batch-count batch))
-        failure (volatile! nil)]
+  (let [failure (volatile! nil)
+        token (volatile! nil)
+        apply-member! (fn [wdb idx]
+                        (batch/check-preparation! batch)
+                        (let [d (batch/batch-at batch idx)]
+                          (if (batch/op d)
+                            (run-member! raw wdb batch d failure opts)
+                            (do (i/transact-kv raw (encoding/storage-rows (:rows (batch/data d))))
+                                1))))]
     (phase/phase! :native-start batch)
     (cpp/apply-native-once!
      raw
      (fn [wdb]
-       (let [weight
-             (loop [idx 0 weight 0]
-               (if (= idx (batch/batch-count batch))
-                 weight
-                 (let [d (batch/batch-at batch idx)
-                       member-weight
-                       (if (batch/op d)
-                         (run-member! raw wdb batch d failure opts)
-                         (do (i/transact-kv raw (encoding/storage-rows (:rows (batch/data d))))
-                             1))
-                       data (batch/data d)]
-                   (aset values idx (:result data))
-                   (recur (inc idx) (+ weight member-weight)))))]
+       (let [[weight suffix-start]
+             (loop [start 0 end (min 1 (batch/batch-count batch)) weight 0]
+               (let [weight (loop [idx start weight weight]
+                              (if (< idx end)
+                                (recur (inc idx) (+ weight (apply-member! wdb idx)))
+                                weight))]
+                 (phase/phase! :native-prefix-applied batch)
+                 (when (:collect? opts) (batch/collect-ready! batch))
+                 (let [next-end (batch/batch-count batch)]
+                   (cond
+                     (= end next-end) [weight end]
+                     ;; These already-prepared writes need no body evaluation.
+                     ;; Freeze before append, then apply them alongside WAL I/O.
+                     (and wal (every? #(nil? (batch/op (batch/batch-at batch %)))
+                                      (range end next-end)))
+                     [(+ weight (- next-end end)) end]
+                     :else (recur end next-end weight)))))]
          (batch/set-accepted-count! batch weight)
-         (batch/freeze-schedule! batch weight)
+         (batch/freeze-schedule! batch weight (< suffix-start (batch/batch-count batch)))
          (when (and wal (pos? weight))
            (batch/set-lsn! batch (long (next-lsn!)))
            (batch/refresh-wal-bodies! batch))
          (when check-batch! (check-batch! batch))
          (batch/begin-dispatch! batch)
-         (phase/phase! :native-applied batch)
-         (when (and wal (pos? weight))
-           (let [token (executor/append-group! wal batch (batch/batch-lsn batch))
-                 durable? (boolean (executor/complete-policy!
-                                     wal token (batch/batch-cutoff batch)))]
-             (batch/record-wal-policy! batch durable?)
-             (when-not durable? (wake!))
-             (phase/phase! :wal-complete batch)))
+         (let [apply-suffix! (fn []
+                               (loop [idx (long suffix-start)]
+                                 (when (< idx (batch/batch-count batch))
+                                   (i/transact-kv
+                                    raw (encoding/storage-rows
+                                         (:rows (batch/data (batch/batch-at batch idx)))))
+                                   (recur (inc idx))))
+                               (phase/phase! :native-applied batch))]
+           (if (and wal (pos? weight))
+             (vreset! token
+                      (if-let [run-policy! (:run-policy! opts)]
+                        (run-policy! batch (batch/batch-lsn batch) apply-suffix!)
+                        (let [value (executor/append-group! wal batch (batch/batch-lsn batch))
+                              durable? (boolean (executor/complete-policy!
+                                                 wal value (batch/batch-cutoff batch)))]
+                          (batch/record-wal-policy! batch durable?)
+                          (when-not durable? (wake!))
+                          (phase/phase! :wal-complete batch)
+                          (apply-suffix!)
+                          value)))
+             (apply-suffix!)))
          (when (zero? weight) (i/abort-transact-kv raw))))
-     (fn [_ _]
+     (fn [wdb _]
        (batch/check-serving! (batch/batch-collector batch))
        (when (batch/expired? batch)
          (throw (ex-info "Write deadline expired before native commit"
                          {:error :txlog/write-deadline-exceeded
-                          :outcome :not-committed :retryable? false})))))
+                          :outcome :not-committed :retryable? false})))
+       (when-let [write-metadata! (:write-metadata! opts)]
+         (write-metadata! wdb @token))))
     (phase/phase! :native-committed batch)
     (phase/phase! :execution-complete batch)
-    values))
+    (let [values (object-array (batch/batch-count batch))]
+      (dotimes [idx (batch/batch-count batch)]
+        (aset values idx (:result (batch/data (batch/batch-at batch idx)))))
+      values)))

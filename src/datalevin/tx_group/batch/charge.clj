@@ -168,13 +168,13 @@
                  write-batch-size (:batch-limit default-limits)
                  write-batch-max-bytes (:batch-max-bytes default-limits)
                  wal-rmw-max-bytes (:rmw-allowance-bytes default-limits)}}]
-  (let [max-requests (positive-int! :wal-pending-max-requests
-                                   (long wal-pending-max-requests))
-        byte-budget (positive-int! :wal-pending-max-bytes (long wal-pending-max-bytes))
-        batch-limit (positive-int! :write-batch-size (long write-batch-size))
-        batch-max-bytes (positive-int! :write-batch-max-bytes (long write-batch-max-bytes))
-        waiter-limit max-requests
-        rmw-max (positive-int! :wal-rmw-max-bytes (long wal-rmw-max-bytes))]
+  (let [^long max-requests (positive-int! :wal-pending-max-requests
+                                          (long wal-pending-max-requests))
+        ^long byte-budget (positive-int! :wal-pending-max-bytes (long wal-pending-max-bytes))
+        ^long batch-limit (positive-int! :write-batch-size (long write-batch-size))
+        ^long batch-max-bytes (positive-int! :write-batch-max-bytes (long write-batch-max-bytes))
+        ^long waiter-limit max-requests
+        ^long rmw-max (positive-int! :wal-rmw-max-bytes (long wal-rmw-max-bytes))]
     (when (> batch-limit max-requests)
       (throw (ex-info "Batch request count cannot exceed the admitted request limit"
                       {:error :txlog/write-protocol-limits

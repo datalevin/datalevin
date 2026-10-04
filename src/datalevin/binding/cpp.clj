@@ -1040,7 +1040,7 @@
             (.remove leases (int (dec (.size leases))))
             (.close ^AutoCloseable lease))))))
 
-  (stat [_]
+  (stat [this]
     (native-call info
       (try
         (let [stat ^Stat (Stat/create env)
@@ -1048,6 +1048,7 @@
           (.close stat)
           m)
         (catch Exception e
+          (scan/record-native-read-failure! this e)
           (raise "Fail to get statistics: " e {})))))
 
   (stat [this dbi-name]
@@ -1062,6 +1063,7 @@
             (.close stat)
             m)
           (catch Exception e
+            (scan/record-native-read-failure! this e)
             (raise "Fail to get statistics: " e {:dbi dbi-name}))
           (finally (.return-rtx this rtx))))
       (stat this)))
@@ -1081,6 +1083,7 @@
             (.close stat)
             entries))
         (catch Exception e
+          (scan/record-native-read-failure! this e)
           (raise "Fail to get entries: " (ex-message e) {:dbi dbi-name}))
         (finally (.return-rtx this rtx)))))
 

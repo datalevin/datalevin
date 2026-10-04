@@ -138,6 +138,41 @@
     (check-commit-gate! current-batch)
     token))
 
+(defn policy-runner
+  "Start WAL work only after collection freezes. Apply a prepared native suffix
+  concurrently, then drain WAL before the native transaction may commit. One
+  reusable handoff serves the environment; bodies must finish before this call."
+  [wal ^Executor wal-executor wake!]
+  (let [handoff (ParallelHandoff. wal (AtomicBoolean. false) nil 0 nil nil nil false)]
+    (fn [batch lsn apply-suffix!]
+      (if (= :parallel (batch/batch-schedule batch))
+        (do
+          (start-handoff! handoff batch lsn)
+          (try
+            (phase/phase! :worker-dispatch batch)
+            (.execute wal-executor handoff)
+            (try
+              (apply-suffix!)
+              (finally
+                (drain-handoff! handoff)
+                (when-let [error (handoff-error handoff)] (throw ^Throwable error))))
+            (phase/phase! :before-commit-wait batch)
+            (let [token (handoff)]
+              (phase/phase! :before-commit-ready batch)
+              token)
+            (finally (clear-handoff! handoff))))
+        (let [_ (phase/phase! :inline-execution batch)
+              token (append-group! wal batch lsn)
+              durable? (boolean (complete-policy! wal token (batch/batch-cutoff batch)))]
+          (batch/record-wal-policy! batch durable?)
+          (when-not durable? (wake!))
+          (phase/phase! :wal-complete batch)
+          (apply-suffix!)
+          (phase/phase! :before-commit-wait batch)
+          (check-commit-gate! batch)
+          (phase/phase! :before-commit-ready batch)
+          token)))))
+
 (defn- run-inline!
   "Weight-one leader path: no worker task and no branch-completion wait.
 

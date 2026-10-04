@@ -1592,3 +1592,50 @@
       (finally
         (.countDown release)
         (is (= :owner (deref owner 5000 ::timeout)))))))
+
+(deftest collection-during-application-preserves-caps-fifo-and-deadlines
+  (doseq [[limits expected]
+          [[{:write-batch-size 2 :write-batch-max-bytes 4096 :wal-rmw-max-bytes 1024}
+            [[:first :big] [:small]]]
+           [{:write-batch-size 8 :write-batch-max-bytes 2500 :wal-rmw-max-bytes 1024}
+            [[:first] [:big] [:small]]]]]
+    (let [entered (CountDownLatch. 1) release (CountDownLatch. 1)
+          published [(CountDownLatch. 1) (CountDownLatch. 1)]
+          first? (AtomicBoolean. true) batches (atom [])
+          executor (fn [b]
+                     (let [initial-cutoff (batch/batch-cutoff b)]
+                       (when (.compareAndSet first? true false)
+                         (.countDown entered)
+                         (.await release 5 TimeUnit/SECONDS))
+                       (let [added (batch/collect-ready! b)]
+                         (when (pos? added)
+                           (is (< (batch/batch-cutoff b) initial-cutoff))))
+                       (swap! batches conj
+                              (mapv #(batch/data (batch/batch-at b %))
+                                    (range (batch/batch-count b))))
+                       (batch/begin-dispatch! b)
+                       (is (thrown? IllegalStateException (batch/collect-ready! b)))
+                       (echo-values b)))
+          c (collector-with executor limits)
+          uninstall (phase/observe!
+                     (fn [event d]
+                       (when (= event :ready-published)
+                         (when-let [idx (:idx (batch/context d))]
+                           (.countDown ^CountDownLatch (published idx))))))]
+      (try
+        (let [leader (future (batch/submit! c {:allowance 1024 :data :first}))]
+          (is (.await entered 5 TimeUnit/SECONDS))
+          (let [followers
+                (mapv (fn [idx value allowance]
+                        (let [f (future (batch/submit! c {:allowance allowance :data value
+                                                         :timeout-ms 10000 :context {:idx idx}}))]
+                          (is (.await ^CountDownLatch (published idx) 5 TimeUnit/SECONDS))
+                          f))
+                      [0 1] [:big :small] [2048 1024])]
+            (.countDown release)
+            (is (= :first (await! leader)))
+            (is (= [:big :small] (mapv await! followers)))
+            (is (= expected @batches))
+            (is (batch/serving? c))
+            (is (zero? (:requests (batch/usage c))))))
+        (finally (.countDown release) (uninstall))))))

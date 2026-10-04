@@ -46,18 +46,36 @@
         {:keys [raw wal-state]} (env/resources environment)
         c (env/collector alias)
         events (ConcurrentLinkedQueue.)
+        applying (CountDownLatch. 1)
+        ready (CountDownLatch. 8)
+        release (CountDownLatch. 1)
+        first-prefix? (atom true)
         uninstall (phase/observe! (fn [event _]
-                                    (.add events [(System/nanoTime) event])))
+                                    (.add events [(System/nanoTime) event])
+                                    (case event
+                                      :native-prefix-applied
+                                      (when (compare-and-set! first-prefix? true false)
+                                        (.countDown applying)
+                                        (.await release 10 TimeUnit/SECONDS))
+                                      :ready-published
+                                      (when (zero? (.getCount applying)) (.countDown ready))
+                                      nil)))
         go (CountDownLatch. 1)]
     (try
       (i/open-dbi raw "data")
       (is (identical? (env/collector environment) c))
       (env/close! environment)
-      (let [writers (mapv (fn [k] (future (.await go)
-                                         (dotimes [v 100] (put-long! c k v))))
-                          (range 8))]
-        (.countDown go)
-        (doseq [f writers] (is (not= ::timeout (deref f 30000 ::timeout)))))
+      (let [seed (future (put-long! c 8 0))]
+        (is (.await applying 10 TimeUnit/SECONDS))
+        (let [writers (mapv (fn [k] (future (.await go)
+                                           (dotimes [v 100] (put-long! c k v))))
+                            (range 8))]
+          (.countDown go)
+          (is (.await ready 10 TimeUnit/SECONDS))
+          (.countDown release)
+          (is (= :ok (deref seed 30000 ::timeout)))
+          (doseq [f writers] (is (not= ::timeout (deref f 30000 ::timeout))))))
+      (put-long! c 8 1)
       (uninstall)
       (doseq [k (range 8)] (is (= 99 (i/get-value raw "data" k :long :long))))
       (let [trace (map second (sort-by first (vec events)))
@@ -66,7 +84,7 @@
                               (case event
                                 :batch-sealed (do (is (not active)) (assoc state :active true))
                                 :batch-retired (assoc state :active false :executing false)
-                                (:inline-execution :worker-dispatch) (assoc state :executing true)
+                                :native-start (assoc state :executing true)
                                 :execution-complete (assoc state :executing false)
                                 :caller-prepared (if (:executing state)
                                                    (update state :overlap inc) state)
@@ -86,6 +104,7 @@
       (is (zero? (:requests (batch/usage c))))
       (is (zero? (:bytes (batch/usage c))))
       (finally
+        (.countDown release)
         (uninstall)
         (env/close! alias)
         (u/delete-files dir)))))

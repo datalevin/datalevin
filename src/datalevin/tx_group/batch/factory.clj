@@ -28,7 +28,7 @@
     before anything is built; required for a private WAL runtime.
   - `:native-opts` is forwarded to `native/branch` (`:apply-fn`, `:transact!`,
     `:write-metadata!`).
-  - `:rmw-opts` supplies write capture, inverse-copy charging and WAL encoding
+  - `:rmw-opts` supplies write capture, allocation charging and WAL encoding
     for bodies executed once in the ordinary native write transaction.
   - `:worker-opts` is forwarded to `worker/for-wal` (`:name`, `:daemon?`,
     `:close-timeout-ms`).
@@ -44,10 +44,11 @@
      (txlog/bind-runtime-control! wal-state runtime-control))
    (if-not wal-state
      (let [native-branch (native/branch native-writer native-opts)
-           native-rmw (when rmw-opts (dissoc rmw-opts :encode-body :body-cost))
+           native-rmw (when rmw-opts
+                        (assoc (dissoc rmw-opts :encode-body :body-cost) :collect? true))
            blind-exec (executor/create-native native-branch nil check-batch!)]
        {:executor (fn [batch]
-                    (if (and native-rmw (rmw/any-body? batch))
+                    (if native-rmw
                       (rmw/execute! native-writer nil nil (constantly nil)
                                     check-batch! native-rmw batch)
                       (blind-exec batch)))
@@ -56,6 +57,11 @@
      (let [wal-branch (wal/branch wal-state)
          native-branch (native/branch native-writer native-opts)
          w (apply worker/for-wal wal-branch (apply concat worker-opts))
+         policy! (executor/policy-runner wal-branch (:executor w) (:wake! w))
+         native-rmw (when rmw-opts
+                      (cond-> (assoc rmw-opts :collect? true :run-policy! policy!)
+                        (:write-metadata! native-opts)
+                        (assoc :write-metadata! (:write-metadata! native-opts))))
          exec (executor/create wal-branch native-branch
                                #(long @(:next-lsn wal-state))
                                (cond-> {:wal-executor (:executor w)
@@ -63,10 +69,10 @@
                                  schedule-fn (assoc :schedule-fn schedule-fn)
                                  check-batch! (assoc :check-batch! check-batch!)))]
      {:executor (fn [batch]
-                  (if (and rmw-opts (rmw/any-body? batch))
+                  (if native-rmw
                     (rmw/execute! native-writer wal-branch
                                   #(long @(:next-lsn wal-state)) (:wake! w)
-                                  check-batch! rmw-opts batch)
+                                  check-batch! native-rmw batch)
                     (exec batch)))
       :worker w
       :wal-branch wal-branch
