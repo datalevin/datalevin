@@ -191,6 +191,20 @@
           (throw ^Throwable error))))
     (finally (clear-handoff! handoff))))
 
+(defn create-native
+  "Native-only executor for internal new-mode writes. It shares ordered
+  preparation and the commit checks, and creates no WAL worker or LSN."
+  [native prepare-batch! check-batch!]
+  (fn [batch]
+    (let [plan (when prepare-batch! (prepare-batch! batch))]
+      (when check-batch! (check-batch! batch))
+      (batch/begin-dispatch! batch)
+      (if (and plan (zero? (long (:weight plan))))
+        (:values plan)
+        (let [values (apply-rows! native batch #(check-commit-gate! batch))]
+          (phase/phase! :execution-complete batch)
+          values)))))
+
 (defn create
   "Build a collector executor over WAL and native branches.
 
@@ -214,7 +228,7 @@
   share the same WAL policy and native-commit gate."
   ([wal native next-lsn!]
    (create wal native next-lsn! nil))
-  ([wal native next-lsn! {:keys [wal-executor prepare-batch! schedule-fn
+  ([wal native next-lsn! {:keys [wal-executor prepare-batch! check-batch! schedule-fn
                                  wake-maintenance!]
                           :or {schedule-fn batch/batch-schedule
                                wake-maintenance! (constantly nil)}}]
@@ -240,7 +254,8 @@
          ;; Ordered preparation publishes the accepted member count, the final
          ;; schedule and the WAL bodies of every accepted member.
          (when-not (zero? weight)
-           (batch/refresh-wal-bodies! batch))
+           (batch/refresh-wal-bodies! batch)
+           (when check-batch! (check-batch! batch)))
          ;; Preparation is complete. Recheck serving/deadlines and mark the batch
          ;; dispatched atomically: an overrun preparation phase must cancel here
          ;; rather than commit.

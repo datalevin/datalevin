@@ -29,9 +29,7 @@
         minimum (+ charge/request-control-bundle
                    (* n (+ charge/encoded-row-descriptor
                            (* 2 (charge/array-bytes 1 0))
-                           (* 2 charge/buffer-wrapper)
-                           charge/per-key-staging-state
-                           charge/ordered-map-entry)))
+                           (* 2 charge/buffer-wrapper))))
         allowance (charge/blind-allowance {:declared-bytes 0 :row-capacity n})]
     (is (>= allowance minimum))))
 
@@ -47,9 +45,6 @@
   (testing "buffer wrappers are fixed"
     (is (= 256 charge/buffer-wrapper))
     (is (= 128 charge/encoded-row-descriptor))
-    (is (= 128 charge/ordered-map-container))
-    (is (= 128 charge/ordered-map-entry))
-    (is (= 128 charge/per-key-staging-state))
     (is (= 1024 charge/request-control-bundle))))
 
 (deftest shared-workspace-matches-the-contract
@@ -132,8 +127,7 @@
 (deftest blind-allowance-covers-its-declared-layout
   (let [small (charge/blind-allowance {:declared-bytes 0 :row-capacity 1})
         large (charge/blind-allowance {:declared-bytes 65536 :row-capacity 64
-                                       :scratch-bytes 4096 :result-capacity 32
-                                       :duplicate-values 16})]
+                                       :scratch-bytes 4096 :result-capacity 32})]
     (testing "every allowance at least covers its own control bundle"
       (is (>= small charge/request-control-bundle))
       (is (>= large charge/request-control-bundle)))

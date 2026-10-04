@@ -48,6 +48,15 @@
                                     true)})
         entered (CountDownLatch. 1)
         release (CountDownLatch. 1)
+        b-ready (CountDownLatch. 1)
+        c-ready (CountDownLatch. 1)
+        uninstall (phase/observe!
+                   (fn [event descriptor]
+                     (when (= event :ready-published)
+                       (case (:result (batch/data descriptor))
+                         :b (.countDown b-ready)
+                         :c (.countDown c-ready)
+                         nil))))
         lsn (atom 0)
         c (batch/create
            (executor/create wal-branch (native-branch entered release)
@@ -60,13 +69,16 @@
       (is (.await entered 5 TimeUnit/SECONDS))
       (let [b (future (batch/submit! c {:allowance 1024
                                         :data {:wal-body :body-b :result :b}}))
+            _ (is (.await b-ready 5 TimeUnit/SECONDS))
             d (future (batch/submit! c {:allowance 1024
                                         :data {:wal-body :body-c :result :c}}))]
+        (is (.await c-ready 5 TimeUnit/SECONDS))
         (.countDown release)
         (is (= :a (deref leader 5000 ::timeout)))
         (is (= :b (deref b 5000 ::timeout)))
         (is (= :c (deref d 5000 ::timeout))))
       (finally
+        (uninstall)
         (.countDown release)))
     (testing "one group record per sealed batch, bodies in dispatch order"
       (is (= [[1 [:body-a]] [2 [:body-b :body-c]]] @appends)))

@@ -349,7 +349,8 @@
    start-offset
    allow-preallocated-tail?
    collect-records?
-   on-record]
+   on-record
+   max-record-bytes]
   (let [size             (long size)
         start-offset     (long (min size (max 0 (long start-offset))))
         ^ByteBuffer read-bf (codec/big-endian-buffer! (bf/get-array-buffer 8192))]
@@ -396,6 +397,12 @@
               (cond
                 (identical? header-map :txlog/preallocated-tail)
                 (partial-tail records offset size true)
+
+                (and max-record-bytes (> (long body-len) (long max-record-bytes)))
+                (throw (ex-info "WAL record exceeds the recovery workspace"
+                                {:type :txlog/recovery-record-too-large
+                                 :path path :offset offset :body-len body-len
+                                 :max-record-bytes max-record-bytes}))
 
                 (> ^long total-len ^long remaining)
                 (partial-tail records offset size)
@@ -459,7 +466,7 @@
   to stop after that record; :stopped? distinguishes this from reaching EOF."
   ([^String path] (scan-segment path {}))
   ([^String path {:keys [allow-preallocated-tail? collect-records?
-                         max-offset start-offset on-record]
+                         max-offset start-offset on-record max-record-bytes]
                   :or   {allow-preallocated-tail? false
                          collect-records?         true
                          start-offset             0}}]
@@ -478,7 +485,7 @@
                  (try
                    {:value (scan-segment-once
                             path ch size start-offset allow-preallocated-tail?
-                            collect-records? on-record)}
+                            collect-records? on-record max-record-bytes)}
                    (catch Exception e
                      (let [current-size (long (.length f))
                            size-limit   (long size)]

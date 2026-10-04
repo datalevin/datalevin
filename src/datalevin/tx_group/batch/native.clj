@@ -6,9 +6,7 @@
 
   Supports blind writes. Each accepted sealed descriptor's prepared data carries
   `:rows` (the frozen canonical rows to apply) and `:result` (this request's
-  return value). A request rejected during ordered preparation carries
-  `:rejection` instead: it owns no rows, so it is neither applied nor given a
-  slot in the native transaction. Rows are applied in one native transaction on
+  return value). Rows are applied in one native transaction on
   the calling leader thread; `before-commit` blocks on the executor's
   WAL-policy gate, so a WAL failure aborts the native transaction before it
   commits."
@@ -44,8 +42,6 @@
                      (fn [wdb]
                        ;; Iterate owned regions in FIFO order. A flattened row
                        ;; list would grow with row count outside shared capacity.
-                       ;; A rejected request carries no rows, so it is skipped
-                       ;; here and cannot reach the store through any other path.
                        (dotimes [i n]
                          (when-let [rows (:rows (batch/data (batch/batch-at batch i)))]
                            (transact! wdb rows)))
@@ -59,9 +55,5 @@
            (phase/phase! :native-committed batch)
            (let [values (object-array n)]
              (dotimes [i n]
-               (let [data (batch/data (batch/batch-at batch i))]
-                 (aset values i
-                       (if-let [error (:rejection data)]
-                         (batch/rejected error)
-                         (:result data)))))
+               (aset values i (:result (batch/data (batch/batch-at batch i)))))
              values)))))))

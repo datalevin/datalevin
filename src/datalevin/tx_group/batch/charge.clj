@@ -57,9 +57,6 @@
   1024)
 
 (def ^:const encoded-row-descriptor 128)
-(def ^:const ordered-map-container 128)
-(def ^:const ordered-map-entry 128)
-(def ^:const per-key-staging-state 128)
 (def ^:const vector-wrapper 64)
 (def ^:const buffer-wrapper 256)
 (def ^:const scalar-box 64)
@@ -98,52 +95,32 @@
        (Math/multiplyExact waiter-control-bytes slots))))))
 
 (defn blind-allowance
-  "Declared whole-request allowance for a blind write, charged once before the
-  caller allocates anything.
-
-  The declaration must cover every planned owned allocation for the request:
-  its control bundle, encoded row descriptors, owned key/value arrays, encode
-  scratch with old/new growth overlap, the assembled record buffers, result
-  storage and any deferred staging the descriptor might later materialize.
-  Because it is prepaid, creating objects inside this layout performs no
-  further `C_i` comparison; only unplanned growth re-enters the checked path."
-  ^long [{:keys [declared-bytes row-capacity scratch-bytes result-capacity
-                 duplicate-values]
-          :or {row-capacity 1 scratch-bytes 0 result-capacity 1
-               duplicate-values 0}}]
-  (when (neg? (long declared-bytes)) (overflow! :negative-declared-bytes declared-bytes))
-  (when (neg? (long row-capacity)) (overflow! :negative-row-capacity row-capacity))
-  (when (neg? (long scratch-bytes)) (overflow! :negative-scratch-bytes scratch-bytes))
-  (when (neg? (long result-capacity)) (overflow! :negative-result-capacity result-capacity))
-  (when (neg? (long duplicate-values)) (overflow! :negative-duplicate-values duplicate-values))
-  (let [declared-bytes (long declared-bytes)
-        rows (Math/addExact 1 (long row-capacity))
-        ;; One owned key array and one owned value array, plus one assembled
-        ;; record buffer. Each wrapper is charged; growth charges old and new
-        ;; capacity while the scratch is still owned.
-        assembled (Math/addExact (Math/addExact declared-bytes (long scratch-bytes))
-                                 (long scratch-bytes))]
-    (Math/addExact
-     request-control-bundle
-     (Math/addExact
-      (Math/multiplyExact encoded-row-descriptor rows)
-      (Math/addExact
-       ;; Each row can own separate key/value arrays. Summing payload bytes
-       ;; alone misses their headers and alignment, especially for empty rows.
-       (Math/addExact
-        (Math/addExact declared-bytes
-                       (Math/multiplyExact 94 (long row-capacity)))
-        (array-bytes 1 assembled))
-       (Math/addExact
-        (Math/addExact
-         (Math/multiplyExact buffer-wrapper
-                            (Math/addExact 3 (Math/multiplyExact 2 (long row-capacity))))
-         (Math/multiplyExact per-key-staging-state rows))
-        (Math/addExact
-         (Math/addExact ordered-map-container (Math/multiplyExact ordered-map-entry rows))
-         (Math/addExact
-          (vector-bytes (Math/addExact 1 (long result-capacity)))
-          (Math/multiplyExact ordered-map-entry (long duplicate-values))))))))))
+  "Reserve a blind request's rows, owned bytes, encoding scratch and results
+  before preparation. Scratch includes old/new growth overlap; unplanned
+  growth must still be charged before allocation."
+  ^long [{:keys [declared-bytes row-capacity scratch-bytes result-capacity]
+          :or {row-capacity 1 scratch-bytes 0 result-capacity 1}}]
+  (let [rows (long row-capacity)
+        payload (long declared-bytes)
+        scratch (long scratch-bytes)
+        results (long result-capacity)]
+    (when (neg? rows) (overflow! :row-capacity rows))
+    (when (neg? payload) (overflow! :declared-bytes payload))
+    (when (neg? scratch) (overflow! :scratch-bytes scratch))
+    (when (neg? results) (overflow! :result-capacity results))
+    (let [descriptors (Math/multiplyExact encoded-row-descriptor (Math/addExact rows 1))
+          ;; Separate key/value arrays need headers and alignment even when
+          ;; their payloads are empty.
+          arrays (Math/addExact payload (Math/multiplyExact 94 rows))
+          assembled (array-bytes 1 (Math/addExact payload (Math/multiplyExact 2 scratch)))
+          buffers (Math/multiplyExact buffer-wrapper
+                                     (Math/addExact 3 (Math/multiplyExact 2 rows)))
+          carriers (Math/addExact (carriers-bytes rows) (carriers-bytes results))]
+      (Math/addExact request-control-bundle
+                     (Math/addExact descriptors
+                                    (Math/addExact arrays
+                                                   (Math/addExact assembled
+                                                                  (Math/addExact buffers carriers))))))))
 
 (defn rmw-allowance
   "Configured maximum allowance for a body-based request whose output size is

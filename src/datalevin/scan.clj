@@ -23,6 +23,13 @@
    [java.util Iterator]
    [java.lang AutoCloseable Iterable]))
 
+(defn record-native-read-failure!
+  "Retain a native transaction's failure at the common read boundary. This runs
+   only on an exception, so catching a native failure cannot salvage its writer."
+  [lmdb error]
+  (when-let [failed! (:native-transaction-failed! (meta lmdb))]
+    (failed! error)))
+
 (defn get-value
   [lmdb dbi-name k k-type v-type ignore-key?]
   (i/check-ready lmdb)
@@ -37,6 +44,7 @@
           (b/read-buffer bb v-type)
           [(b/expected-return k k-type) (b/read-buffer bb v-type)]))
       (catch Throwable e
+        (record-native-read-failure! lmdb e)
         (raise "Fail to get-value: " e
                {:dbi dbi-name :k k :k-type k-type :v-type v-type}))
       (finally
@@ -94,6 +102,7 @@
       (l/put-read-key dbi rtx k k-type)
       (l/get-key-rank dbi rtx)
       (catch Throwable e
+        (record-native-read-failure! lmdb e)
         (raise "Fail to get-rank: " e
                {:dbi dbi-name :k k :k-type k-type}))
       (finally
@@ -121,6 +130,7 @@
                 v
                 [(b/read-buffer (l/k kv) k-type) v])))))
       (catch Throwable e
+        (record-native-read-failure! lmdb e)
         (raise "Fail to get-by-rank: " e
                {:dbi dbi-name :rank rank :k-type k-type :v-type v-type}))
       (finally
@@ -144,6 +154,7 @@
         (try
           ~call
           (catch Throwable ~'e
+            (record-native-read-failure! ~lmdb ~'e)
             (when ~keep-rtx?
               (if (l/read-only? ~'rtx)
                 (l/return-cursor ~'dbi ~'cur)

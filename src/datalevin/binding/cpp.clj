@@ -520,6 +520,9 @@
 
 
 (defprotocol IApplicationWriter
+  (apply-native-once! [this body before-commit]
+    "Run a state-dependent body once in a native transaction. Abort on any
+    escaping failure; unlike immutable row application, never replay the body.")
   (apply-native-range! [this body before-commit]
     "Apply immutable WAL rows directly. Retry only native map growth, with no
     WAL append, collector, or dynamically scoped commit hook. `body` receives the
@@ -587,7 +590,7 @@
   ;; point/range/count adapter or its forwarding arities. Only these entry
   ;; points touch native handles without an existing borrow boundary.
   ;; Cleanup remains callable after fencing so existing borrows can drain.
-  (let [guarded '#{apply-native-range! open-dbi clear-dbi drop-dbi copy
+  (let [guarded '#{apply-native-once! apply-native-range! open-dbi clear-dbi drop-dbi copy
                   transact-kv set-env-flags get-env-flags sync}]
     `(deftype ~name ~fields
        ~@(map (fn [method]
@@ -617,6 +620,22 @@
                   ^:unsynchronized-mutable meta]
 
   IApplicationWriter
+  (apply-native-once! [this body before-commit]
+    (locking write-txn
+      (when @write-txn
+        (throw (ex-info "Native writer is already owned"
+                        {:error :txlog/application-writer-in-use :applied? false})))
+      (try
+        (let [wdb (.open-transact-kv this)
+              result (body wdb)]
+          (close-native-write! env write-txn wdb before-commit)
+          result)
+        (catch Throwable e
+          (when @write-txn
+            (.abort-transact-kv this)
+            (close-native-write! env write-txn nil nil))
+          (throw e)))))
+
   (apply-native-range! [this body before-commit]
     (locking write-txn
       (when @write-txn
@@ -694,13 +713,21 @@
   IWriting
   (writing? [_] writing?)
 
-  (write-txn [_] write-txn)
+  (write-txn [_]
+    (when (and writing?
+               (or (not (identical? (:native-write-owner meta) (Thread/currentThread)))
+                   (not (identical? (:native-write-rtx meta) @write-txn))))
+      (throw (ex-info "Native transaction is no longer owned by this caller"
+                      {:error :txlog/transaction-view-invalidated :retryable? false})))
+    write-txn)
 
   (mark-write [_]
     (->CppLMDB
       env info tl-reader reader-registry dbis scheduled-sync kp-w vp-w start-kp-w
       stop-kp-w start-vp-w stop-vp-w k-comp-bf-w v-comp-bf-w
-      write-txn true k-comp v-comp meta))
+      write-txn true k-comp v-comp
+      (assoc meta :native-write-owner (Thread/currentThread)
+                  :native-write-rtx @write-txn)))
 
   (reset-write
     [this]
@@ -1058,6 +1085,7 @@
         (finally (.return-rtx this rtx)))))
 
   (open-transact-kv [this]
+    (when-let [abort! (:native-batch-abort! meta)] (abort!))
     (.check-ready this)
     (try
       (.reset-write this)
@@ -1066,10 +1094,12 @@
         (raise "Fail to open read/write transaction in LMDB: " e {}))))
 
   (close-transact-kv [_]
+    (when-let [abort! (:native-batch-abort! meta)] (abort!))
     (close-native-write! env write-txn nil
                          (fn [_wdb context] (run-before-write-commit! context))))
 
   (abort-transact-kv [_]
+    (when-let [abort! (:native-batch-abort! meta)] (abort!))
     (when-let [^Rtx wtxn @write-txn]
       (vreset! (.-aborted? wtxn) true)
       (vreset! write-txn wtxn)
@@ -1081,7 +1111,9 @@
   (transact-kv [this dbi-name txs k-type]
     (.transact-kv this dbi-name txs k-type :data))
   (transact-kv [this dbi-name txs k-type v-type]
-    (let [^objects prepared-one-shot
+    (if-let [capture (when writing? (:native-row-capture meta))]
+      (capture dbi-name txs k-type v-type)
+      (let [^objects prepared-one-shot
           (let [tx-open? (some? @write-txn)]
             (when-not (or tx-open? (instance? datalevin.kv.encoding.StorageRows txs))
               (write/prepare-kvtx-ops txs dbis dbi-name k-type v-type)))]
@@ -1126,7 +1158,7 @@
         (if (Thread/holdsLock write-txn)
           (do-transact prepared-one-shot)
           (locking write-txn
-            (do-transact prepared-one-shot))))))
+            (do-transact prepared-one-shot)))))))
 
   (set-env-flags [_ ks on-off] (.setFlags env (buffer/kv-flags ks) (if on-off 1 0)))
 

@@ -477,6 +477,19 @@
         (testing "a serviced runtime returns to no deadline"
           (is (zero? (wal/maintenance-deadline-ns state))))))))
 
+(deftest background-force-respects-the-configured-metadata-flush-policy
+  (with-runtime
+    {:wal-durability-profile :relaxed :wal-group-commit 1 :wal-group-commit-ms 0
+     :wal-meta-flush-max-txs 0 :wal-meta-flush-max-ms 0}
+    (fn [state]
+      (wal/bind-runtime-control! state (control))
+      (wal/append-prepared-group! state 1 [(wal/prepare-append-body (rows 1) {})])
+      (is (:synced? (wal/service-pending-sync! state 0)))
+      (is (= 1 (:last-durable-lsn (status state))))
+      (is @(:meta-dirty? state) "ordinary maintenance does not force metadata publication")
+      (is (:synced? (wal/force-through! state 1 0)))
+      (is (false? @(:meta-dirty? state)) "explicit sync/close still publishes metadata"))))
+
 (deftest wal-only-service-maintenance-drives-a-due-time-trigger
   (with-runtime
     {:wal-durability-profile :relaxed :wal-group-commit 100 :wal-group-commit-ms 1}

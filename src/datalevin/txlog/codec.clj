@@ -1337,6 +1337,47 @@
       (write-commit-row-group! (ByteBuffer/wrap out) group)
       out)))
 
+(defn decode-raw-commit-row-payload
+  "Bounded private-KV replay. Accept physical raw puts/deletes only, with no
+  object deserialization or body evaluation. Charge the source, detached bytes,
+  strings and row carriers before materializing any rows."
+  [^bytes body ^long workspace-bytes]
+  (let [bf (ByteBuffer/wrap body)
+        {:keys [lsn op-count]} (decode-commit-row-payload-prefix bf)
+        required (+ (* 4 (long (alength body))) (* 512 (long op-count)))]
+    (when (> required workspace-bytes)
+      (raise "Decoded WAL record exceeds the recovery workspace"
+             {:type :txlog/recovery-record-too-large
+              :required-bytes required :workspace-bytes workspace-bytes}))
+    (let [rows (loop [idx 0 out []]
+                 (if (= idx op-count)
+                   out
+                   (let [opcode (bb-get-u8 bf)
+                         _ (when-not (#{0x10 0x11} opcode)
+                             (raise "Unsupported private WAL operation"
+                                    {:type :txlog/corrupt :opcode opcode}))
+                         dbi (String. ^bytes (bb-get-bytes bf (bb-get-u16 bf) nil)
+                                      StandardCharsets/UTF_8)
+                         kt (bb-read-type bf)
+                         _ (when-not (= :raw kt)
+                             (raise "Private WAL keys must be raw"
+                                    {:type :txlog/corrupt :key-type kt}))
+                         key (bb-get-bytes bf (bb-get-u16 bf) nil)
+                         value (when (= opcode 0x10)
+                                 (let [vt (bb-read-type bf)]
+                                   (when-not (= :raw vt)
+                                     (raise "Private WAL values must be raw"
+                                            {:type :txlog/corrupt :value-type vt}))
+                                   (bb-get-bytes bf (bb-get-u32 bf) nil)))
+                         flags (bb-read-flags bf)
+                         row (if (= opcode 0x10)
+                               [:put dbi key value :raw :raw]
+                               [:del dbi key :raw])]
+                     (recur (inc idx) (conj out (cond-> row (seq flags) (conj flags)))))))]
+      (when (.hasRemaining bf)
+        (raise "Trailing bytes in private WAL payload" {:type :txlog/corrupt}))
+      {:lsn lsn :rows rows})))
+
 (defn decode-commit-row-payload
   "Decode raw binary txn-log payload bytes."
   [^bytes body]

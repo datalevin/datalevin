@@ -10,7 +10,8 @@
             [datalevin.tx-group.batch.charge :as charge]
             [datalevin.tx-group.phase :as phase])
   (:import [java.util.concurrent ConcurrentLinkedQueue CountDownLatch TimeUnit]
-           [java.util.concurrent.atomic AtomicBoolean AtomicInteger AtomicLong]
+           [java.util.concurrent.atomic AtomicBoolean AtomicInteger AtomicLong
+            AtomicLongArray]
            [java.util.concurrent.locks Condition LockSupport ReentrantLock]))
 
 (def ^:private default-overrides
@@ -48,6 +49,10 @@
 
 (defn- timeout [] ::timeout)
 
+(defn- waiter-counts [^datalevin.tx_group.batch.Collector c]
+  (let [^AtomicLongArray waiters (.waiters c)]
+    [(.get waiters 0) (.get waiters 1)]))
+
 (defn- progress-probe
   "Observe actual condition waits/signals without changing production code."
   [^datalevin.tx_group.batch.Collector c on-await]
@@ -70,7 +75,8 @@
                  (.max-requests c) (.batch-limit c) (.batch-max-bytes c)
                  (.shared-reserved c) (.preparation-timeout-ms c)
                  (.rmw-allowance c)
-                 (.published c) (.next-id c) (.executor c))}))
+                 (.published c) (.next-id c) (.executor c)
+                 (.check-prepared! c) (.on-failure! c))}))
 
 ;; ---------------------------------------------------------------------------
 ;; Lifecycle and limits
@@ -518,7 +524,7 @@
           (is (identical? boom (deref submit 5000 ::timeout)))
           (is (zero? (:requests (batch/usage c))))
           (is (zero? (:bytes (batch/usage c))))
-          (is (= [0 0] (vec (.waiters c))))
+          (is (= [0 0] (waiter-counts c)))
           (is (= :next (do (uninstall)
                           (batch/submit! c {:allowance 1024 :data :next}))))
           (finally (uninstall)))))))
@@ -795,31 +801,7 @@
       (is (zero? (:bytes (batch/usage c)))))))
 
 ;; ---------------------------------------------------------------------------
-;; Per-request rejection and failure
-
-(deftest a-request-local-rejection-does-not-fail-its-batch
-  (let [executor (fn [batch]
-                   (let [descriptors (.descriptors batch)
-                         n (.size descriptors)
-                         values (object-array n)]
-                     (dotimes [i n]
-                       (let [d (batch/batch-at batch i)]
-                         (aset values i
-                               (if (= :bad (batch/data d))
-                                 (batch/rejected (ex-info "row too wide" {:row 1}))
-                                 (batch/data d)))))
-                     values))
-        c (collector-with executor)
-        ok (batch/submit! c {:allowance 1024 :data :ok})
-        rejected (try (batch/submit! c {:allowance 1024 :data :bad})
-                      nil
-                      (catch clojure.lang.ExceptionInfo e e))]
-    (is (= :ok ok))
-    (is (= "row too wide" (ex-message rejected)))
-    (testing "the runtime stays serving and keeps admitting"
-      (is (batch/serving? c))
-      (is (= :after (batch/submit! c {:allowance 1024 :data :after}))))
-    (is (zero? (:requests (batch/usage c))))))
+;; Unbatched preparation failure
 
 (deftest caller-preparation-failure-rejects-only-that-request
   (let [c (collector-with echo-values)
@@ -1100,6 +1082,21 @@
 ;; ---------------------------------------------------------------------------
 ;; Admission waiting, deadlines and charging
 
+(deftest an-idle-refund-does-not-wait-for-collector-coordination
+  (let [c (collector-with echo-values)
+        ^ReentrantLock lock (.lock c)]
+    (#'batch/admit! c 1024 0)
+    (.lock lock)
+    (try
+      ;; A publisher/selector may hold coordination while another caller drops
+      ;; its final ownership. With no capacity waiter, that refund can complete
+      ;; immediately rather than join the publication lock queue.
+      (let [refund (future (#'batch/release-allowance! c 1024) :released)]
+        (is (= :released (deref refund 5000 ::timeout)))
+        (is (zero? (:requests (batch/usage c))))
+        (is (zero? (:bytes (batch/usage c)))))
+      (finally (.unlock lock)))))
+
 (deftest batches-with-no-progress-waiters-do-not-signal
   (let [{c :collector signals :signals}
         (progress-probe (collector-with echo-values) (constantly nil))]
@@ -1130,7 +1127,7 @@
               {:wal-pending-max-requests 1 :write-batch-size 1
                :write-batch-max-bytes 1024 :wal-rmw-max-bytes 1024})
              (fn [c]
-               (when (= expected (vec (.waiters c)))
+               (when (= expected (waiter-counts c))
                  (.countDown waiting))))
             leader (future (batch/submit! c {:allowance 1024 :data :leader}))]
         (try
@@ -1146,7 +1143,7 @@
             (when follower (is (= :follower (deref follower 5000 ::timeout))))
             (when closer (is (true? (deref closer 5000 false))))
             (is (= (if (= expected [1 1]) :all :one) (first @signals)))
-            (is (= [0 0] (vec (.waiters c)))))
+            (is (= [0 0] (waiter-counts c))))
           (finally (.countDown release)))))))
 
 (deftest progress-waiter-registration-is-unwound-on-failure
@@ -1159,18 +1156,18 @@
       (try
         (is (identical? boom (try (#'batch/admit! c 1024 0)
                                  (catch Throwable t t))))
-        (is (= [0 0] (vec (.waiters c))))
+        (is (= [0 0] (waiter-counts c)))
         (finally (uninstall) (#'batch/release-allowance! c 1024))))
     (.set ^AtomicBoolean (.active c) true)
     (try
       (is (false? (batch/await-quiescence! c 0)))
-      (is (= [0 0] (vec (.waiters c))))
+      (is (= [0 0] (waiter-counts c)))
       (let [interrupted (future
                           (.interrupt (Thread/currentThread))
                           (try (batch/await-quiescence! c 5000)
                                (catch InterruptedException _ :interrupted)))]
         (is (= :interrupted (deref interrupted 5000 ::timeout)))
-        (is (= [0 0] (vec (.waiters c)))))
+        (is (= [0 0] (waiter-counts c))))
       (finally (.set ^AtomicBoolean (.active c) false)))))
 
 (deftest capacity-waiters-are-admitted-after-a-release
@@ -1569,7 +1566,7 @@
         (.countDown finish)
         (is (= :owner (deref owner 5000 ::timeout)))
         (is (= :follower (deref follower 5000 ::timeout)))
-        (is (= [0 0] (vec (.waiters collector)))))
+        (is (= [0 0] (waiter-counts collector))))
       (finally (.countDown dispatch) (.countDown finish)))))
 
 (deftest a-dispatched-batch-is-not-fenced-by-its-preparation-cutoff

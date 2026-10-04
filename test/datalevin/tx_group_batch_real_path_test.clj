@@ -144,7 +144,7 @@
         (env/close! environment)
         (u/delete-files dir)))))
 
-(deftest a-native-read-is-charged-before-it-detaches
+(deftest native-body-reads-use-the-common-api-without-a-wal-budget-check
   ;; Regression: the pinned native base detached values without charging the
   ;; reading descriptor, so a request could copy more than it owned.
   (let [dir (u/tmp-dir (str "wal-private-read-charge-" (random-uuid)))
@@ -170,23 +170,12 @@
                                    :wal-body (wal/prepare-append-body rows {})
                                    :result :ok}))})))
       (is (some? (i/get-value raw "data" 1 :long :raw)))
-      (testing "the base copy is charged before it is allocated"
-        (let [copy-charge (charge/array-bytes 1 (alength big))
-              ;; Exactly enough for the control bundle and one copy: the read
-              ;; only fits if the base's own copy is charged as well.
-              allowance (+ (long charge/request-control-bundle) copy-charge 1)
-              seen (atom ::unread)
-              thrown (try
-                       (batch/submit!
-                        c {:allowance allowance
-                           :op (fn [tx]
-                                 (reset! seen (stage/tx-get tx "data" (encoded-long 1))))})
-                       nil
-                       (catch Throwable t t))]
-          (is (some? thrown))
-          (is (= :txlog/pending-budget-exceeded (:error (ex-data thrown)))
-              "the read is rejected once the base copy is charged")
-          (is (= ::unread @seen) "the body never observed the value")))
+      (testing "native read results remain application-owned in either write mode"
+        (let [seen (batch/submit!
+                    c {:allowance (+ charge/request-control-bundle 256)
+                       :op (fn [tx] (i/get-value tx "data" (encoded-long 1) :raw :raw))})]
+          (is (java.util.Arrays/equals ^bytes big ^bytes seen))
+          (is (batch/serving? c))))
       (finally
         (env/close! environment)
         (u/delete-files dir)))))

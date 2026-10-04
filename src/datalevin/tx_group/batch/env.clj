@@ -159,6 +159,11 @@
     (locking environments
       (if-let [record (.get environments path)]
         (do (check-openable! record path :kv-independent-v1 db-identity)
+            (when (and (contains? opts :wal?)
+                       (contains? (resources record) :wal?)
+                       (not= (:wal? opts) (:wal? (resources record))))
+              (throw (ex-info "Cannot mix WAL and native-only handles"
+                              {:error :txlog/write-protocol-mismatch :dir path})))
             (.incrementAndGet ^AtomicInteger (.-handles record))
             record)
         (let [lease (protocol/acquire-write-protocol-lease!
@@ -169,7 +174,9 @@
               (try
                 (let [c (build-collector (:executor runtime)
                                          {:limits limits
-                                          :preparation-timeout-ms preparation-timeout-ms})
+                                          :preparation-timeout-ms preparation-timeout-ms
+                                          :check-prepared! (:check-prepared! runtime)
+                                          :on-failure! (:on-failure! runtime)})
                       record (->Environment path :kv-independent-v1 db-identity
                                             c nil lease (AtomicInteger. 1)
                                             (AtomicBoolean. false) timeout-ms limits

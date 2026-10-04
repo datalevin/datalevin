@@ -386,9 +386,13 @@
         meta-committed-lsn (long (or (:last-committed-lsn meta-cur) 0))
         meta-durable-lsn   (long (or (:last-durable-lsn meta-cur) 0))
         meta-applied-lsn   (long (or (:last-applied-lsn meta-cur) 0))
-        last-committed    (long last-from-seg)
+        ;; Only the private snapshot/WAL opener supplies this already verified
+        ;; floor. It preserves LSNs when retention has removed covered segments.
+        last-committed    (long (max last-from-seg
+                                     (long (or (:wal-recovery-floor info) 0))))
         last-durable      (long (min last-committed
-                                     (max meta-durable-lsn last-from-seg)))
+                                     (max meta-durable-lsn last-from-seg
+                                          (long (or (:wal-recovery-floor info) 0)))))
         last-applied      (long (min last-committed
                                      (max 0 meta-applied-lsn)))
         startup-watermark-warning
@@ -1618,6 +1622,13 @@
         (vreset! (:wal-owner manager) nil)
         (.notifyAll monitor)))))
 
+(defn with-wal-owner!
+  "Run lifecycle maintenance under the same exclusive owner as append/force.
+  Used by private snapshot retention; no native ownership is acquired here."
+  [state deadline-ns f]
+  (let [token (claim-wal-ownership! state deadline-ns)]
+    (try (f) (finally (release-wal-ownership! state token)))))
+
 (defn- release-held-wal-ownership!
   "Release the ownership currently held by this runtime's append/policy span.
 
@@ -2044,7 +2055,9 @@
   appended work may finish; the returned map reports durable progress. The force
   is a no-op when `target-lsn` is already durable. `deadline-ns` is a monotonic
   absolute deadline, or zero for the runtime's configured commit-wait window."
-  [state target-lsn deadline-ns]
+  ([state target-lsn deadline-ns]
+   (force-through! state target-lsn deadline-ns true))
+  ([state target-lsn deadline-ns force-meta?]
   (when-not (some? @(:runtime-control state))
     (raise "WAL-only force requires a bound runtime control"
            {:type :txlog/no-runtime-control}))
@@ -2069,7 +2082,7 @@
               (wait-strict-durable! state ch sync-manager target-lsn timeout-ms
                                     {::wait-deadline-ns deadline}
                                     sync-begin)))
-          (flush-meta! state true)
+          (flush-meta! state force-meta?)
           (let [after (sync-manager-state sync-manager)]
             {:target-lsn target-lsn
              :last-appended-lsn (long (:last-appended-lsn after))
@@ -2077,7 +2090,7 @@
              :pending-count (long (:pending-count after))
              :synced? (<= target-lsn (long (:last-durable-lsn after)))})))
       (finally
-        (release-wal-ownership! state token)))))
+        (release-wal-ownership! state token))))))
 
 (defn pending-sync?
   "WAL-only diagnostic: whether appends left a force armed for maintenance.
@@ -2106,7 +2119,7 @@
               (vreset! (:sync-requested? manager) false)
               (vreset! (:sync-request-reason manager) nil))
             nil)
-        (force-through! state target deadline-ns)))))
+        (force-through! state target deadline-ns false)))))
 
 (declare request-sync-if-needed!)
 

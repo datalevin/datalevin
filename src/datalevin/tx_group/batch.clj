@@ -22,7 +22,8 @@
             [datalevin.tx-group.batch.charge :as charge])
   (:import [datalevin.utl PendingBudget PendingBudget$Usage]
            [java.util.concurrent ConcurrentLinkedQueue TimeUnit]
-           [java.util.concurrent.atomic AtomicBoolean AtomicInteger AtomicLong]
+           [java.util.concurrent.atomic AtomicBoolean AtomicInteger AtomicLong
+            AtomicLongArray]
            [java.util.concurrent.locks Condition LockSupport ReentrantLock]
            [java.util.function LongBinaryOperator]
            [org.eclipse.collections.impl.list.mutable FastList]))
@@ -31,13 +32,6 @@
   "Joined-prefix advance is monotonic and allocates nothing per batch."
   (reify LongBinaryOperator
     (applyAsLong [_ a b] (if (> a b) a b))))
-
-(deftype Rejected [error])
-
-(defn rejected
-  "Per-request failure that must not fail, retry or reopen its batch."
-  [error]
-  (Rejected. error))
 
 (deftype Descriptor
   ;; One admitted request. Its result slot is completed exactly once, by
@@ -96,8 +90,9 @@
                     ^AtomicBoolean serving
                     active-batch
                     failure
-                    ;; Lock-protected counts: capacity at 0, quiescence at 1.
-                    waiters
+                    ;; Registration is lock-protected; atomic visibility lets
+                    ;; refunds skip coordination when no capacity waiter exists.
+                    ^AtomicLongArray waiters
                     ^PendingBudget budget
                     ^long max-requests
                     ^long batch-limit
@@ -109,7 +104,9 @@
                     ^long rmw-allowance
                     ^AtomicLong published
                     ^AtomicLong next-id
-                    executor])
+                    executor
+                    check-prepared!
+                    on-failure!])
 
 (def default-preparation-timeout-ms
   "Default bound on admission and caller preparation, measured from submission.
@@ -152,9 +149,15 @@
   released without fencing the runtime. An unexpected executor or coordinator
   failure is not tagged and still fences."
   ^Throwable [cause]
-  (ex-info "Batch cancelled before dispatch"
-           (assoc (ex-data cause) ::pre-dispatch-cancel true)
-           cause))
+  (let [cause (if (= :not-committed (:outcome (ex-data cause)))
+                cause
+                (ex-info "Batch aborted before WAL append"
+                         (assoc (ex-data cause) :outcome :not-committed
+                                :retryable? false)
+                         cause))]
+    (ex-info "Batch cancelled before dispatch"
+             (assoc (ex-data cause) ::pre-dispatch-cancel true)
+             cause)))
 
 (defn- pre-dispatch-cancel?
   [t]
@@ -190,10 +193,8 @@
 (defn set-data!
   "Install this descriptor's prepared payload.
 
-  Ordered preparation owns the final per-request classification and rows: it
-  replaces the submitted payload with `{:rejection error}` for a rejected
-  request, or with `{:rows rows :result result :wal-body body}` for an accepted
-  one. Only the elected leader touches descriptors before dispatch."
+  Native body execution installs `{:rows rows :result result :wal-body body}`.
+  Only the elected leader touches descriptors before dispatch."
   [^Descriptor descriptor value]
   (vreset! (.data descriptor) value))
 
@@ -238,16 +239,15 @@
 (defn accepted-count
   "Sealed member count; mutable before dispatch.
 
-  Ordered preparation lowers it to the number of accepted writes, so a batch
-  carrying rejected requests no longer reserves or refreshes WAL body slots for
-  them. The collector and both branches read it only after dispatch."
+  Native body execution lowers it to the number of write-bearing members;
+  conditional no-ops need no WAL body. The collector and both branches read it only after dispatch."
   ^long [^Batch batch]
   (.acceptedCount batch))
 
 (defn freeze-schedule!
   "Pin the dispatch schedule from the final accepted write weight.
 
-  Ordered preparation calls this once every member is classified, so the chosen
+  Native body execution calls this after freezing the batch, so the chosen
   schedule always matches the WAL groups that will actually run."
   [^Batch batch ^long accepted-weight]
   (.setExecutionSchedule batch (schedule-for accepted-weight))
@@ -256,8 +256,8 @@
 (defn- compact-bodies!
   "Copy the accepted bodies into one compacted carrier, in request order.
 
-  A rejected request carries no body, so its WAL group disappears with it: the
-  physical group matches the members that will actually commit."
+  A conditional write producing no rows needs no WAL body. All members still
+  share the same batch outcome."
   ^objects [^FastList descriptors ^long accepted]
   (let [^objects compacted (object-array (int accepted))
         total (.size descriptors)]
@@ -280,8 +280,8 @@
 
   Sealing captures caller-prepared blind bodies. An ordered preparation hook
   refreshes the same array after finalizing state-dependent bodies, compacting
-  it when rejected members leave accepted writes behind. With every member
-  accepted this writes the preallocated array in place, keeping the identity
+  it when conditional bodies produce no rows. When every member writes,
+  this fills the preallocated array in place, keeping the identity
   that scheduled tasks and the WAL append already hold."
   [^Batch batch]
   (let [^FastList descriptors (.descriptors batch)
@@ -313,7 +313,7 @@
 
   Branch owners call this immediately before applying or committing native work
   so a fence recorded during WAL/policy work aborts the commit instead of
-  publishing an overlay after runtime failure. Returns nil while healthy."
+  committing after runtime failure. Returns nil while healthy."
   [^Collector collector]
   (when-not (.get ^AtomicBoolean (.serving collector))
     (throw (fenced-error collector))))
@@ -338,20 +338,14 @@
     (notify-descriptor! descriptor)
     true))
 
-(defn- rejected-value
-  [value]
-  (cond
-    (instance? Rejected value) [false (.-error ^Rejected value)]
-    :else [true value]))
-
 ;; ---------------------------------------------------------------------------
 ;; Fence and shutdown
 
 (defn- signal-progress-under-lock!
   "Notify registered progress waiters while holding collector coordination."
   [^Collector collector]
-  (let [^longs waiters (.waiters collector)
-        n (+ (aget waiters 0) (aget waiters 1))]
+  (let [^AtomicLongArray waiters (.waiters collector)
+        n (+ (.get waiters 0) (.get waiters 1))]
     (when (pos? n)
       (if (= n 1)
         (.signal ^Condition (.progress collector))
@@ -380,6 +374,10 @@
     ;; WAL outcome or LSN and must not inherit that batch's committed result.
     (reject-queued! collector [false (fenced-error collector)])
     (signal-progress-under-lock! collector)
+    ;; Keep native admission in step with the terminal collector fence. The
+    ;; callback only closes a lifetime gate; it never waits for native owners.
+    (when-let [on-failure! (.-on-failure! collector)]
+      (on-failure! error))
     (phase/phase! :fenced error)))
 
 (defn fence!
@@ -416,14 +414,6 @@
   [^Collector collector]
   (.get ^AtomicBoolean (.serving collector)))
 
-(defn serving-flag
-  "The collector's terminal serving flag.
-
-  A read handle binds this once at open, so a point/range/count read performs
-  only its two required status reads and never re-resolves the environment."
-  ^AtomicBoolean [^Collector collector]
-  (.serving collector))
-
 (defn await-quiescence!
   "Wait until no batch is executing, up to `timeout-ms`. Returns true when the
   active slot is clear. A stuck executor keeps the slot owned; callers must not
@@ -432,10 +422,10 @@
   [^Collector collector ^long timeout-ms]
   (let [deadline (+ (System/nanoTime) (* 1000000 timeout-ms))
         ^ReentrantLock lock (.lock collector)
-        ^longs waiters (.waiters collector)]
+        ^AtomicLongArray waiters (.waiters collector)]
     (.lock lock)
     (try
-      (aset waiters 1 (inc (aget waiters 1)))
+      (.incrementAndGet waiters 1)
       (try
         (loop []
           (if-not (.get ^AtomicBoolean (.active collector))
@@ -446,7 +436,7 @@
                             (min remaining 50000000) TimeUnit/NANOSECONDS)
                     (recur))
                 false))))
-        (finally (aset waiters 1 (dec (aget waiters 1)))))
+        (finally (.decrementAndGet waiters 1)))
       (finally (.unlock lock)))))
 
 (defn published-lsn
@@ -454,6 +444,21 @@
   replay floor source, never a per-reader visibility filter."
   [^Collector collector]
   (.get ^AtomicLong (.published collector)))
+
+(defn initialize-prefix!
+  "Install the verified recovered prefix before publishing a fresh collector.
+  Runtime writes advance it only at join."
+  [^Collector collector ^long lsn]
+  (when (or (.get ^AtomicBoolean (.active collector))
+            (pos? (.get ^AtomicInteger (.queued collector))))
+    (throw (IllegalStateException. "Cannot initialize a running collector")))
+  (.set ^AtomicLong (.published collector) lsn))
+
+(defn cancel-before-dispatch!
+  "Reject a sealed but undispatched batch without fencing, preserving the
+  original cause/outcome. Capacity pressure uses this before either I/O branch."
+  [cause]
+  (throw (cancel-error cause)))
 
 (defn usage
   "Charged usage of admitted-but-unreleased requests and their allowances."
@@ -476,6 +481,11 @@
   joined prefix to this value; an unassigned group advances nothing."
   [^Batch batch ^long lsn]
   (.set ^AtomicLong (.lsn batch) lsn))
+
+(defn batch-lsn
+  "The assigned WAL group LSN, or zero before assignment."
+  ^long [^Batch batch]
+  (.get ^AtomicLong (.lsn batch)))
 
 (defn record-wal-policy!
   "Retain the established WAL policy result through join and caller delivery.
@@ -547,8 +557,8 @@
   "Record how many sealed members carry accepted writes.
 
   Ordered preparation publishes the final count after classifying every member,
-  before dispatch. It stays equal to the sealed count unless requests were
-  rejected, and it bounds the compacted WAL body array."
+  before dispatch. Conditional no-ops reduce it below the sealed count; it
+  bounds the compacted WAL body array."
   [^Batch batch ^long accepted]
   (.setAcceptedCount batch accepted))
 
@@ -589,7 +599,7 @@
   charge would exceed the request's allowance, leaving the counter unchanged.
   Planned prepaid allocations never re-enter this path; dynamic RMW storage
   and unplanned growth do. A fully prepaid blind request rejects any growth."
-  [^Descriptor descriptor ^long extra]
+  ^long [^Descriptor descriptor ^long extra]
   (let [allowance (long (.allowance descriptor))
         ^AtomicLong charged ^AtomicLong (.charged descriptor)]
     (loop []
@@ -599,6 +609,11 @@
                                 {:error :txlog/pending-budget-exceeded
                                  :outcome :not-committed
                                  :retryable? false
+                                 :reason (if (.op descriptor) :rmw-allowance :blind-growth)
+                                 :phase :preparation
+                                 :limit-bytes allowance
+                                 :charged-bytes current
+                                 :next-charge-bytes extra
                                  :allowance allowance
                                  :charged current
                                  :requested extra})))
@@ -611,16 +626,6 @@
   "Cumulative charge, including the initial precharge."
   ^long [^Descriptor descriptor]
   (.get ^AtomicLong (.charged descriptor)))
-
-(defn request-rejection
-  "Build one request-local rejection cause.
-
-  The `:outcome :not-committed` marker distinguishes explicit rejection from
-  infrastructure failure at preparation's reader and encoding boundaries.
-  Ordinary application exceptions from the body also reject only its request;
-  engine cancellations and Errors always escape request-local classification."
-  ^Throwable [what data]
-  (not-committed what data))
 
 ;; ---------------------------------------------------------------------------
 ;; Collector lifecycle
@@ -635,7 +640,7 @@
   delivery and cleanup."
   ([executor] (create executor nil))
   ([executor opts]
-   (let [{:keys [limits preparation-timeout-ms]} opts
+   (let [{:keys [limits preparation-timeout-ms check-prepared! on-failure!]} opts
          limits (or limits (charge/resolve-limits nil))
          ;; A selecting leader must not barge ahead of publishers already
          ;; waiting to enqueue their prepared requests.
@@ -643,14 +648,15 @@
          progress (.newCondition lock)]
      (->Collector lock progress (ConcurrentLinkedQueue.) (AtomicInteger. 0)
                   (AtomicBoolean. false) (AtomicBoolean. true)
-                  (volatile! nil) (volatile! nil) (long-array 2)
+                  (volatile! nil) (volatile! nil) (AtomicLongArray. 2)
                   (PendingBudget. (long (:request-budget limits))
                                   (long (:max-requests limits)))
                   (long (:max-requests limits)) (long (:batch-limit limits))
 (long (:batch-max-bytes limits)) (long (:shared-reserved limits))
                    (long (or preparation-timeout-ms default-preparation-timeout-ms))
                    (long (:rmw-allowance-bytes limits))
-                   (AtomicLong. 0) (AtomicLong. 0) executor))))
+                   (AtomicLong. 0) (AtomicLong. 0) executor check-prepared!
+                   on-failure!))))
 
 ;; ---------------------------------------------------------------------------
 ;; Admission
@@ -660,15 +666,18 @@
 (defn- signal-capacity!
   "Wake capacity waiters once after one or more reservations are released.
 
-  Releasing under coordination is what lets a bounded capacity waiter make
-  progress; a waiter must never poll for capacity."
+  Refunds publish budget capacity before reading the registered waiter count.
+  Registration happens before the waiter's locked capacity recheck: either the
+  refund sees a waiter and signals under coordination, or a later registration
+  observes the refund in that recheck. Idle refunds need no collector lock."
   [^Collector collector]
-  (let [^ReentrantLock lock (.lock collector)]
-    (.lock lock)
-    (try
-      (when (pos? (aget ^longs (.waiters collector) 0))
-        (signal-progress-under-lock! collector))
-      (finally (.unlock lock)))))
+  (when (pos? (.get ^AtomicLongArray (.waiters collector) 0))
+    (let [^ReentrantLock lock (.lock collector)]
+      (.lock lock)
+      (try
+        (when (pos? (.get ^AtomicLongArray (.waiters collector) 0))
+          (signal-progress-under-lock! collector))
+        (finally (.unlock lock))))))
 
 (defn- release-allowance!
   "Release one request reservation and wake capacity waiters."
@@ -769,14 +778,14 @@
   the active owner."
   [^Collector collector ^long allowance ^long deadline-nanos]
   (let [^ReentrantLock lock (.lock collector)
-        ^longs waiters (.waiters collector)]
+        ^AtomicLongArray waiters (.waiters collector)]
     (.lock lock)
     (try
-      (when (>= (aget waiters 0) (.max-requests collector))
+      (when (>= (.get waiters 0) (.max-requests collector))
         (throw (not-committed "Too many capacity waiters"
                               {:error :txlog/pending-budget-exceeded
                                :retryable? false})))
-      (aset waiters 0 (inc (aget waiters 0)))
+      (.incrementAndGet waiters 0)
       (try
         (phase/phase! :admission-wait nil)
         (loop []
@@ -807,7 +816,7 @@
                         (if (zero? bound) 50000000 remaining)
                         TimeUnit/NANOSECONDS))
               (recur))))
-        (finally (aset waiters 0 (dec (aget waiters 0)))))
+        (finally (.decrementAndGet waiters 0)))
       (finally (.unlock lock)))))
 
 ;; ---------------------------------------------------------------------------
@@ -893,7 +902,7 @@
       (vreset! ^clojure.lang.IDeref (.active-batch collector) batch)
       ;; Only capacity waiters need to recompute a newly published cutoff.
       (when (and (pos? (.cutoff-nanos batch))
-                 (pos? (aget ^longs (.waiters collector) 0)))
+                 (pos? (.get ^AtomicLongArray (.waiters collector) 0)))
         (signal-progress-under-lock! collector))
       (finally (.unlock lock)))))
 
@@ -1002,7 +1011,7 @@
 (defn- schedule-for
   "Fixed initial selector, chosen once after freezing the accepted writes and
   before any WAL/native execution: inline for one logical write, parallel for
-  two or more. Rejected or read-only members do not raise the weight."
+  two or more. Bodies producing no physical writes do not raise the weight."
   [^long weight]
   (if (<= weight 1) :inline :parallel))
 
@@ -1065,9 +1074,35 @@
                        (.get ^AtomicLong (.lsn batch))
                        max-long)
     (dotimes [idx (.size descriptors)]
-      (publish-result! ^Descriptor (.get descriptors idx)
-                       (rejected-value (aget ^objects values idx))))
+      (let [^Descriptor descriptor (.get descriptors idx)
+            value [true (aget ^objects values idx)]]
+        (if (and (first value) (:confirm! (.context descriptor)))
+          ;; Both branches have finished using the prepared data. Reuse this
+          ;; already charged slot for a confirmation's result; leave the caller
+          ;; parked until confirmation finishes after execution handoff.
+          (vreset! (.data descriptor) value)
+          (publish-result! descriptor value))))
     nil))
+
+(defn- finish-confirmations!
+  "Run accepted requests' confirmations once on the completing leader, after
+  handoff. The caller retains its reservation until this final result arrives.
+  Callback failure preserves the established WAL outcome and never replays or
+  undoes the locally joined write."
+  [^Batch batch]
+  (dotimes [idx (batch-count batch)]
+    (let [^Descriptor descriptor (batch-at batch idx)]
+      (when (nil? @(.result descriptor))
+        (when-let [confirm! (:confirm! (.context descriptor))]
+          (let [value @(.data descriptor)
+                outcome (try
+                          (confirm! (.context descriptor) (second value))
+                          value
+                          (catch Throwable t
+                            (when (instance? InterruptedException t)
+                              (.interrupt (Thread/currentThread)))
+                            [false (wal-outcome-error batch t)]))]
+            (deliver! descriptor outcome)))))))
 
 (defn- join-or-reject!
   "Publish joined results, unless a terminal fence was recorded while the batch
@@ -1202,7 +1237,8 @@
               ;; now that both branches have stopped.
               (fence-under-lock! collector (wal-outcome-error batch t)))
             (finally (release-slot-under-lock! collector)))
-          (finally (.unlock lock)))))))
+          (finally (.unlock lock))))
+      (finish-confirmations! batch))))
 
 (defn- lead!
   "Seal and execute this caller's one batch, then return.
@@ -1355,10 +1391,10 @@
   throws its own failure. Preparation alone grants no batch membership, LSN,
   state visibility or permission to start I/O. Blind requests precharge their
   full allowance; body-based requests reserve the configured
-  `:wal-rmw-max-bytes` allowance for their private staging when they declare no
+  `:wal-rmw-max-bytes` allowance for captured writes when they declare no
   allowance of their own, and start with the control-bundle charge."
   [^Collector collector {:keys [allowance prepare op data context timeout-ms]}]
-  (let [;; A body-based request owns private staging whose encoding this engine
+  (let [;; A body-based request produces writes whose encoding this engine
         ;; cannot know before the body runs, so it reserves the configured
         ;; allowance up front. An explicit allowance stays authoritative.
         allowance (long (or allowance
@@ -1404,6 +1440,8 @@
           (phase/phase! :caller-preparation descriptor)
           (vreset! (.data descriptor) (prepare descriptor))
           (phase/phase! :caller-prepared descriptor))
+        (when-let [check! (.check-prepared! collector)]
+          (check! descriptor))
         ;; An interrupt observed after preparation rejects only this request. If
         ;; this thread published or led while interrupted, the WAL channel's
         ;; interruptible I/O would close the channel and fence the whole

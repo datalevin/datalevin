@@ -118,13 +118,14 @@
         step
         (fn []
           (try
-            (let [deadline (maintenance-deadline)]
-              ;; Already-due maintenance has priority over an accepted batch
-              ;; task, so a later append cannot delay an overdue force.
-              (if (service-due! deadline)
-                true
-                (if-let [task (.getAndSet slot nil)]
-                  (do (run-task task) true)
+            ;; Pickup precedes the fresh maintenance check in run-task. It
+            ;; services overdue maintenance before running the accepted task,
+            ;; without a redundant deadline lookup before mailbox pickup.
+            (if-let [task (.getAndSet slot nil)]
+              (do (run-task task) true)
+              (let [deadline (maintenance-deadline)]
+                (if (service-due! deadline)
+                  true
                   (if (.get running?)
                     (do (park-until deadline) true)
                     ;; Closed: admission is fenced, so any task accepted before
