@@ -11,6 +11,9 @@
   [^KVTxData tx ^ByteBuffer buffer
    ^long key-offset ^long key-length ^long value-offset ^long value-length])
 
+(deftype OwnedKVTxData
+  [op ^String dbi ^bytes key ^bytes value kt vt])
+
 (deftype WriteBatch [^List rows ^FastList encoded arena])
 
 (deftype StorageRows [rows])

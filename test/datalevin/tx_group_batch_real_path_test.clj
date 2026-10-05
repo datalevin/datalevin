@@ -281,6 +281,16 @@
    :before-append! (fn [_state])
    :mark-fatal! (fn [_state _error])})
 
+(defn- prepared-string-row
+  []
+  (let [key (ByteBuffer/allocate 9)
+        value (ByteBuffer/allocate 32)]
+    (bits/put-buffer key 1 :long)
+    (bits/put-buffer value "v" :string)
+    (.flip key)
+    (.flip value)
+    (l/kv-tx :put "data" (bits/get-bytes key) (bits/get-bytes value) :raw :raw)))
+
 (deftest real-blind-write-reaches-lmdb-and-one-durable-wal-record
   (let [dir (u/tmp-dir (str "wal-real-path-" (random-uuid)))
         opts {:wal? true :wal-shared? false :wal-sync-mode :fsync
@@ -298,7 +308,7 @@
                      {:runtime-control (control)
                       :limits (charge/resolve-limits nil)})
             c (:collector runtime)
-            rows [[:put "data" 1 "v" :long :string]]]
+            rows [(prepared-string-row)]]
         (try
           (testing "the collector accepts one blind write end to end"
             (is (= :ok (batch/submit!
@@ -339,7 +349,7 @@
                        (fn [event _]
                          (when (= :execution-complete event)
                            (batch/fence! c failure))))
-            rows [[:put "data" 1 "v" :long :string]]]
+            rows [(prepared-string-row)]]
         (try
           (let [thrown (try
                          (batch/submit! c {:allowance 1024

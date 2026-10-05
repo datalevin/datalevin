@@ -500,7 +500,9 @@
   (open-transact-kv
     [_]
     (when-let [control (independent-control db)]
-      ((:unsupported! control) :manual-transaction))
+      (when-let [check! (:check! control)] (check!))
+      (when-not (:embedded? control)
+        ((:unsupported! control) :manual-transaction)))
     (->KVLMDB (kvtx/open-transact-with-txlog! db) nil))
   (abort-transact-kv
     [_]
@@ -515,7 +517,13 @@
     [this dbi-name]
     (custom-kv/guard-internal! db dbi-name)
     (if-let [control (independent-control db)]
-      (do (i/check-ready this) ((:clear-dbi! control) dbi-name))
+      (do (i/check-ready this)
+          (when-let [check! (:check! control)] (check!))
+          (when (and (:embedded? control) (l/writing? db))
+            ((:unsupported! control) :admin-inside-transaction))
+          (if (and (:embedded? control) (custom-kv/custom-dbi? db dbi-name))
+            (custom-kv/clear! this db dbi-name)
+            ((:clear-dbi! control) dbi-name)))
       (if (custom-kv/custom-dbi? db dbi-name)
         (custom-kv/clear! this db dbi-name)
         (i/clear-dbi db dbi-name))))
@@ -524,6 +532,8 @@
     [_]
     (when (and (l/writing? db) (independent-control db))
       ((:unsupported! (independent-control db)) :close-inside-transaction))
+    (when-let [control (independent-control db)]
+      (when (:embedded? control) ((:close! control))))
     (if handle
       ((:close! handle))
       (try
@@ -553,7 +563,9 @@
   (drop-dbi
     [this dbi-name]
     (when-let [control (independent-control db)]
-      ((:unsupported! control) :drop-dbi))
+      (when-let [check! (:check! control)] (check!))
+      (when (or (not (:embedded? control)) (l/writing? db))
+        ((:unsupported! control) :drop-dbi)))
     (custom-kv/guard-internal! db dbi-name)
     (locking (l/write-txn db)
       (when (and (custom-kv/custom-dbi? db dbi-name) (some? @(l/write-txn db)))
@@ -581,8 +593,11 @@
   (open-dbi [this dbi-name] (.open-dbi this dbi-name nil))
   (open-dbi
     [this dbi-name opts]
-    (if-let [control (independent-control db)]
-      (do (.check-ready this) ((:open-dbi! control) dbi-name opts))
+    (when-let [check! (:check! (independent-control db))] (check!))
+    (when (and (:embedded? (independent-control db)) (l/writing? db))
+      ((:unsupported! (independent-control db)) :open-dbi))
+    (if-let [open! (:open-dbi! (independent-control db))]
+      (do (.check-ready this) (open! dbi-name opts))
       (let [before   (try
                      (i/dbi-opts db dbi-name)
                      (catch Exception _ nil))
@@ -595,7 +610,11 @@
   (open-list-dbi [this list-name] (.open-list-dbi this list-name nil))
   (open-list-dbi
     [this list-name opts]
-    (if-let [control (independent-control db)]
+    (when-let [check! (:check! (independent-control db))] (check!))
+    (when (and (:embedded? (independent-control db)) (l/writing? db))
+      ((:unsupported! (independent-control db)) :open-dbi))
+    (if-let [control (when-let [control (independent-control db)]
+                       (when (:open-dbi! control) control))]
       (do
         (i/check-ready this)
         (when-not (some #{:dupsort} (:flags (i/dbi-opts db list-name)))
@@ -634,9 +653,14 @@
     [this dbi-name txs k-type v-type]
     (if-let [control (independent-control db)]
       (do (.check-ready this)
-          (if (l/writing? db)
-            (i/transact-kv db dbi-name txs k-type v-type)
-            ((:transact! control) dbi-name txs k-type v-type)))
+          (cond
+            (and (:embedded? control) (custom-kv/custom-txs? db dbi-name txs))
+            (custom-kv/transact! this db dbi-name txs k-type v-type)
+            (l/writing? db)
+            (if (and (:embedded? control) (not (:native-row-capture (meta db))))
+              (transact-with-txlog! db (txlog/state db) dbi-name txs k-type v-type)
+              (i/transact-kv db dbi-name txs k-type v-type))
+            :else ((:transact! control) dbi-name txs k-type v-type)))
       (if-let [g (write-group db :kv)]
       (group/submit! g
                      (fn [execute]
@@ -792,10 +816,8 @@
   "Atomically replace the value at `k` with `(apply f old-value args)`.
   Missing keys pass nil to `f`. Returns :transacted. Only ordinary, single-value
   DBIs are supported. Remote functions must be serializable inter-fn functions.
-  Compatibility mode can retry the function after map resize or an aborted
-  commit group, so it must be free of side effects. Its concurrent standalone
-  writes preserve Clojure dynamic bindings. Independent mode evaluates the
-  function once on the batch owner and uses explicit request context."
+  Concurrent standalone writes preserve Clojure dynamic bindings. WAL bodies
+  run once in the native transaction; a resize may replay their frozen writes."
   ([db dbi-name k f] (update-kv db dbi-name k f :data :data))
   ([db dbi-name k f k-type] (update-kv db dbi-name k f k-type :data))
   ([db dbi-name k f k-type v-type & args]

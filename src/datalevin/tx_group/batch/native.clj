@@ -11,8 +11,6 @@
   WAL-policy gate, so a WAL failure aborts the native transaction before it
   commits."
   (:require [datalevin.binding.cpp :as cpp]
-            [datalevin.interface :as i]
-            [datalevin.kv.encoding :as encoding]
             [datalevin.tx-group.batch :as batch]
             [datalevin.tx-group.batch.executor :as executor]
             [datalevin.tx-group.phase :as phase]))
@@ -24,16 +22,13 @@
   - `:apply-fn` overrides the native application writer (default
     `cpp/apply-native-range!`); injected by tests.
   - `:transact!` applies each descriptor's rows to the writable view (default
-    `i/transact-kv` of `encoding/storage-rows`); injected by tests.
+    the owned native prepared-row helper); injected by tests.
   - `:write-metadata!`, when supplied, runs after the WAL gate with the writable
     view and the WAL append token, for retained append-dependent metadata that
     must be in the same native transaction."
   ([raw] (branch raw nil))
   ([raw {:keys [apply-fn write-metadata! transact!]}]
-   (let [apply-fn (or apply-fn cpp/apply-native-range!)
-         transact! (or transact!
-                       (fn [wdb rows]
-                         (i/transact-kv wdb (encoding/storage-rows rows))))]
+   (let [apply-fn (or apply-fn cpp/apply-native-range!)]
      (reify executor/INativeBranch
        (apply-rows! [_ batch gate]
          (let [n (batch/batch-count batch)]
@@ -42,9 +37,12 @@
                      (fn [wdb]
                        ;; Iterate owned regions in FIFO order. A flattened row
                        ;; list would grow with row count outside shared capacity.
-                       (dotimes [i n]
-                         (when-let [rows (:rows (batch/data (batch/batch-at batch i)))]
-                           (transact! wdb rows)))
+                       (let [apply-rows! (if transact!
+                                           #(transact! wdb %)
+                                           (cpp/prepared-row-applier wdb))]
+                         (dotimes [i n]
+                           (when-let [rows (:rows (batch/data (batch/batch-at batch i)))]
+                             (apply-rows! rows))))
                        (phase/phase! :native-applied batch))
                      (fn [wdb _context]
                        (phase/phase! :before-commit-wait batch)

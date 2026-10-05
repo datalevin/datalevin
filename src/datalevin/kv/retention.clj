@@ -115,26 +115,26 @@
                             :backup backup-state}
           :explicit-gc? explicit-gc?})))))
 
+(defn- log-admin-metadata! [wrapped raw-db txs kt]
+  ;; Catalog administration already owns its standalone native transaction.
+  ;; Do not enqueue a data batch while the admin caller holds the writer lock.
+  (if (:embedded? (:independent-control @(i/kv-info raw-db)))
+    (kvtx/transact-with-txlog! raw-db (txlog/state raw-db) c/kv-info txs kt :data)
+    (i/transact-kv wrapped c/kv-info txs kt :data)))
+
 (defn txlog-log-dbi-registration!
   [wrapped raw-db dbi-name before after]
   (when (and (not= dbi-name c/kv-info)
              (not= before after)
              (txlog-write-path-enabled? raw-db))
-    (i/transact-kv wrapped
-                   c/kv-info
-                   [[:put [:dbis dbi-name] after]]
-                   [:keyword :string]
-                   :data)))
+    (log-admin-metadata! wrapped raw-db [[:put [:dbis dbi-name] after]] [:keyword :string])))
 
 (defn txlog-log-dbi-drop!
   [wrapped raw-db dbi-name before]
   (when (and (not= dbi-name c/kv-info)
              (some? before)
              (txlog-write-path-enabled? raw-db))
-    (i/transact-kv wrapped
-                   c/kv-info
-                   [[:del [:dbis dbi-name]]]
-                   [:keyword :string])))
+    (log-admin-metadata! wrapped raw-db [[:del [:dbis dbi-name]]] [:keyword :string])))
 
 (defn txlog-retention-state-local
   [db]

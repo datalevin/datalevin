@@ -1237,9 +1237,10 @@
     (.notifyAll monitor)))
 
 (defn- before-sync-round! [state round hook]
-  (when-let [f (:before-sync! (control state))]
-    (f state round))
-  (when hook (hook state round)))
+  (let [f (:before-sync! (control state))]
+    (when f (f state round))
+    ;; Standalone admin writes share these hooks with the batch runtime.
+    (when (and hook (not (identical? f hook))) (hook state round))))
 
 (defn- after-sync-round! [state round hook]
   (when-let [f (:after-sync! (control state))]

@@ -27,7 +27,9 @@ optional idoc format and a domain name:
 * `:db.idoc/indexedPaths` -- optional collection of path prefix selectors to
   index for this attribute's domain. If absent, all paths are indexed. A
   selector can be a keyword, string, or vector path. For example, `:profile`
-  indexes leaf paths such as `[:profile :age]` and `[:profile :name]`.
+  indexes leaf paths such as `[:profile :age]` and `[:profile :name]`. Vector
+  paths may include non-negative integer positions, e.g. `[:tags 1]`. Selectors
+  that omit positions apply across vector elements.
 * `:db.idoc/excludedPaths` -- optional collection of path prefix selectors to
   omit from this attribute's domain. Excluded paths win over included paths.
 
@@ -103,14 +105,14 @@ synchronous indexing.
 
 ### Transact idoc values
 
-Idoc values must be maps whose keys are keywords or strings, i.e. top level of
-the document must be a map. Vectors are allowed as arrays. You can nest map and
+Idoc values must be maps or vectors. Map keys must be keywords or strings.
+Vectors are allowed as arrays, including at the root. You can nest maps and
 vectors arbitrarily. However, the maximal path when binary encoded cannot be
 over 511 bytes.
 
 lists are **not** allowed. `nil` values are normalized to `:json/null`. Literal
 `:json/null` is reserved and cannot be used in input. For `:edn` format, strings
-are parsed with `clojure.edn/read-string` and must yield a map.
+are parsed with `clojure.edn/read-string` and must yield a map or vector.
 
 ```clojure
 (d/transact! conn
@@ -162,8 +164,9 @@ Patch ops:
   `:conj` (vector), `:merge`/`:assoc`/`:dissoc` (map), `:inc`/`:dec` (number)
 
 Paths are vectors of keyword/string keys and integer indices. Wildcards (`:?`,
-`:*`) are not allowed. Integer segments address a specific vector element; idoc
-indexing still matches arrays by value (any element).
+`:*`) are not allowed in patches. Integer segments address a specific vector
+element. Idoc queries can likewise select a position, or omit positions to
+match any element.
 
 `patchIdoc` works on idoc attributes with cardinality one. For cardinality many,
 an old value must be provided (see example above).
@@ -175,12 +178,12 @@ keyword ident. Tempids are not supported for `patchIdoc`.
 
 Idoc enforces a few structural rules at ingest:
 
-* Top-level value must be a map (no top-level vector or scalar).
+* Top-level value must be a map or vector (no top-level scalar).
 * Keys must be keywords or strings.
 * Lists are not allowed anywhere; use vectors for arrays.
 * `nil` values are normalized to `:json/null`.
 * Literal `:json/null` is reserved and rejected on input.
-* EDN strings must parse to a map.
+* EDN and JSON strings must parse to a map or vector.
 * Markdown content must start under a header (text before any header is invalid).
 * Circular references are rejected.
 
@@ -245,6 +248,82 @@ if **any** array element matches.
 ;; => #{[1]}
 ```
 
+#### Root vectors
+
+An idoc attribute can store a vector directly, with no surrounding document map
+or additional schema option. The entire vector is stored as one datom value for
+a cardinality-one attribute, preserving order and duplicate elements:
+
+```clojure
+(def schema
+  {:attr1 {:db/valueType   :db.type/idoc
+           :db/cardinality :db.cardinality/one}})
+
+(d/transact! conn [{:db/id 1 :attr1 [1 2 5 3 5]}])
+(d/pull (d/db conn) [:attr1] 1)
+;; => {:attr1 [1 2 5 3 5]}
+
+;; A scalar query matches any element of the root vector.
+(d/q '[:find ?e ?v
+       :where [(idoc-match $ :attr1 5) [[?e _ ?v]]]]
+     (d/db conn))
+;; => #{[1 [1 2 5 3 5]]}
+```
+
+Repeated elements do not produce additional matching datoms. For cardinality
+many, each vector is a separate value; in an entity map, supply a collection of
+vectors, e.g. `{:attr1 [[1 5] [2 5]]}`.
+
+Logical combinators apply the same membership semantics at the root:
+
+| Query argument | Meaning |
+| --- | --- |
+| `5` | Contains `5` |
+| `[:and 1 5]` | Contains both `1` and `5`, possibly in different elements |
+| `[:or 2 4]` | Contains either `2` or `4` |
+| `[:not 5]` | Does not contain `5` |
+| `{1 3}` | The second element matches `3` (zero-based position `1`) |
+| `(> [] 3)` | Has an element greater than `3` |
+| `(> [1] 3)` | The second element matches a value greater than `3` |
+| `(< 2 [] 5)` | Has a single element strictly between `2` and `5` |
+| `(nil? [])` | Has a null element |
+
+Use `[]` as the root path in predicates. Predicate lists must be quoted when
+passed as query data, just like predicates on named paths:
+
+```clojure
+(d/q '[:find ?e
+       :in $ ?q
+       :where [(idoc-match $ :attr1 ?q) [[?e _ _]]]]
+     (d/db conn)
+     '(< 2 [] 5))
+```
+
+Vector positions use the same query model as map keys. Integer query-map keys
+select positions, and integer path segments select positions in predicates:
+
+```clojure
+;; The second element of the root vector is 3.
+[(idoc-match $ :attr1 {1 3}) [[?e _ ?v]]]
+
+;; The second tag in a nested vector is "b".
+[(idoc-match $ :doc/edn {:tags {1 "b"}}) [[?e _ ?v]]]
+
+;; The second tag is greater than 3.
+[(idoc-match $ :doc/edn (> [:tags 1] 3)) [[?e _ ?v]]]
+```
+
+Integer positions are distinct from string keys: `{1 3}` selects a vector
+element, while `{"1" 3}` matches a map field. When a selected element is itself
+a vector, matching follows the same membership semantics as a vector-valued
+map field.
+
+For whole-vector equality, use an ordinary datom clause:
+`[?e :attr1 [1 2 5 3 5]]`. Query vectors passed to `idoc-match` remain logical
+expressions, rather than literal vector values. `idoc-get` with path `[]`
+returns the entire vector. Patch paths such as `[0]` address individual root
+vector elements; empty patch paths remain invalid.
+
 #### Logical combinators
 
 Boolean expressions can be used to combine match conditions. Use `[:and ...]`,
@@ -293,7 +372,7 @@ support multiple arity, so you can express ranges without a dedicated
 
 Wildcard segments can be used in path expressions and map keys:
 
-* `:?` matches exactly one path segment.
+* `:?` matches one map key or vector position.
 * `:*` matches any depth (zero or more segments).
 
 ```clojure
@@ -361,8 +440,10 @@ when the path traverses arrays.
 * **Id ranges**: Idoc assigns a per-domain document id using 32-bit signed
   integers (about 2.1 billion docs per domain). Path ids are also 32-bit
   integers and are append-only.
-* **Paths**: Paths are encoded as strings with `/` separators and include
-  keyword vs string segment markers for lossless decode.
+* **Paths**: Paths are encoded as strings with `/` separators and distinct
+  markers for keyword keys, string keys, and integer vector positions. Vector
+  elements are indexed at their actual positions; membership queries combine
+  entries across positions without storing additional flattened entries.
 * **Markdown**: Markdown is parsed into a nested map. Headers are normalized
   (lowercase, punctuation removed, whitespace to `-`). Text content under a
   header is stored as a string. The normalized header keys are indexed and

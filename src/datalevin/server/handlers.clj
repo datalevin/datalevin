@@ -1605,12 +1605,17 @@
            (assoc report :db-before db0 :db-after @conn))))
      (catch Exception e
        (when (:resized (ex-data e))
-         (let [new-db (db/carry-runtime-opts
-                       (db/new-db ((:get-store deps) server db-name writing?))
+         (let [wlmdb (when writing?
+                       (l/mark-write ((:get-kv-store deps) server db-name)))
+               store ((:get-store deps) server db-name writing?)
+               store (if writing? (st/transfer store wlmdb) store)
+               new-db (db/carry-runtime-opts
+                       (db/new-db store)
                        db0)]
            ((:update-db deps) server db-name
             (fn [m]
-              (assoc m (if writing? :wdt-db :dt-db) new-db)))))
+              (cond-> (assoc m (if writing? :wdt-db :dt-db) new-db)
+                writing? (assoc :wlmdb wlmdb :wstore store))))))
        (throw e)))))
 
 (defn- build-tx-response

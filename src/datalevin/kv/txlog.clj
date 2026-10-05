@@ -2062,7 +2062,7 @@
        (.add rows* (payload-lsn-row lsn)))
      rows*)))
 
-(def ^:private txlog-append-hooks
+(def txlog-append-hooks
   {:throw-if-fatal! txlog-throw-if-fatal!
    :mark-fatal! txlog-mark-fatal!
    :before-append!
@@ -2211,6 +2211,34 @@
                (= (dec (long txn-id)) (aget cache 0)))
       (aset-long cache 0 (long txn-id))
       (aset-long cache 1 (max (aget cache 1) (long payload-lsn))))))
+
+(defn write-batch-commit-metadata!
+  "Write the existing commit metadata in an owned collector transaction after
+  WAL policy completion. Return the state published only after native commit."
+  [lmdb state token]
+  (when token
+    (let [^Txn txn (.-txn ^Rtx @(l/write-txn lmdb))
+          txn-id (.id txn)
+          append-res (append/commit-info token (append/last-lsn token))
+          metadata-changed? (.hasKvInfoChanges txn)
+          payload-lsn (max (long (:lsn append-res))
+                           (refresh-commit-metadata! lmdb state txn txn-id))
+          metadata (tcodec/prepare-commit-metadata!
+                    (:commit-metadata-write state) payload-lsn
+                    (when (:commit-marker? state)
+                      (inc (long @(:marker-revision state)))) append-res)]
+      (i/transact-kv lmdb metadata)
+      {:txn-id txn-id :marker-entry (when (:commit-marker? state) metadata)
+       :payload-lsn payload-lsn :metadata-changed? metadata-changed?
+       :append-res append-res})))
+
+(defn finish-batch-commit!
+  "Publish the existing metadata caches after the collector's native commit."
+  [state {:keys [txn-id marker-entry payload-lsn metadata-changed? append-res] :as metadata}]
+  (when metadata
+    (txlog/commit-finished! state marker-entry)
+    (cache-commit-metadata! state txn-id marker-entry payload-lsn metadata-changed?)
+    (txlog/note-commit-applied! state append-res)))
 
 (defn apply-appended-range!
   "Apply one sealed WAL prefix directly in one native transaction. All records

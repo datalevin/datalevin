@@ -1,11 +1,11 @@
 ;; Copyright (c) Huahai Yang. All rights reserved.
 ;; Distributed under the Eclipse Public License 2.0.
 (ns ^:no-doc datalevin.tx-group.batch.public
-  "Opt-in public KV routing over the independent collector. Reads retain KVLMDB's
-  ordinary native forwarders. This first migration supports a declared catalog
-  of ordinary and list DBIs, typed unconditional writes and once-only write bodies."
+  "Private prototype opener and preparation helpers used by embedded KV.
+  Production routing uses batch.embedded and the existing storage layout."
   (:require [clojure.java.io :as io]
             [datalevin.bits :as bits]
+            [datalevin.binding.cpp :as cpp]
             [datalevin.binding.cpp.lifecycle :as lifecycle]
             [datalevin.constants :as c]
             [datalevin.interface :as i]
@@ -21,6 +21,7 @@
             [datalevin.txlog.codec :as codec]
             [datalevin.validate :as validate])
   (:import [datalevin.lmdb KVTxData]
+           [datalevin.kv.encoding OwnedKVTxData]
            [java.nio ByteBuffer BufferOverflowException]
            [org.eclipse.collections.impl.list.mutable FastList]
            [java.util.concurrent.atomic AtomicBoolean]))
@@ -125,7 +126,7 @@
           (recur (Math/multiplyExact (long capacity) 2)))))))
 
 (defn- add-prepared-row!
-  [^FastList rows charge! name op ^bytes key ^bytes value wal?]
+  [^FastList rows charge! name op ^bytes key ^bytes value wal? flags]
   (charge! (+ charge/encoded-row-descriptor
               (charge/carriers-bytes (inc (.size rows)))))
   (when wal?
@@ -135,39 +136,53 @@
     (charge! (+ charge/encoded-row-descriptor (* 3 (count name))
                 (alength key) (if value (alength value) 0))))
   (when (= :del-list op) (charge! charge/vector-wrapper))
-  (.add rows (l/kv-tx op name key (if (= :del-list op) [value] value) :raw :raw)))
+  (.add rows (l/kv-tx op name key (if (= :del-list op) [value] value) :raw :raw flags)))
 
-(defn- prepare-rows
-  ^FastList [raw charge! dbi-name txs kt vt wal?]
-  (charge! charge/vector-wrapper)
-  (let [rows (FastList. 0)
-        named-options (when dbi-name (i/dbi-opts raw dbi-name))]
-    (doseq [input txs]
-      (let [^KVTxData tx (if dbi-name
-                           (if (instance? KVTxData input) input (l/->kv-tx-data input kt vt))
-                           (l/->kv-tx-data input))
-            name (or dbi-name (.-dbi-name tx))
-            options (if dbi-name named-options (i/dbi-opts raw name))
-            op (.-op tx)
-            list? (#{:put-list :del-list} op)
-            duplicates? (boolean (some #{:dupsort} (:flags options)))]
-        (when-not (and (some? options) (not= name c/kv-info)
-                       (#{:put :del :put-list :del-list} op)
-                       (empty? (.-flags tx))
-                       (or (not list?) duplicates?))
-          (unsupported! :transaction-row))
-        (validate/validate-kv-tx-data tx (:validate-data? options))
-        (let [key (encode charge! (.-k tx) (or (.-kt tx) :data) true)
-              value-type (or (.-vt tx) :data)]
-          (if list?
-            ;; Freeze individual physical duplicate effects for bounded replay.
-            (doseq [value (.-v tx)]
-              (add-prepared-row! rows charge! name (if (= :put-list op) :put op)
-                                 key (encode charge! value value-type duplicates?) wal?))
-            (add-prepared-row! rows charge! name op key
-                               (when-not (= :del op)
-                                 (encode charge! (.-v tx) value-type duplicates?)) wal?)))))
-    rows))
+(defn prepare-rows
+  "Freeze typed KV input for native application and WAL; existing stores allow
+  internal DBIs and native flags, whose successful effects are logged by RMW."
+  (^FastList [raw charge! dbi-name txs kt vt wal?]
+   (prepare-rows raw charge! dbi-name txs kt vt wal? false))
+  (^FastList [raw charge! dbi-name txs kt vt wal? existing?]
+   (prepare-rows raw charge! dbi-name txs kt vt wal? existing? nil))
+  (^FastList [raw charge! dbi-name txs kt vt wal? existing? ^java.util.List log-rows]
+   (charge! charge/vector-wrapper)
+   (let [rows (FastList. 0)
+         named-options (when dbi-name (i/dbi-opts raw dbi-name))]
+     (doseq [input txs]
+       (let [^KVTxData tx (if dbi-name
+                            (if (instance? KVTxData input) input (l/->kv-tx-data input kt vt))
+                            (l/->kv-tx-data input))
+             name (or dbi-name (.-dbi-name tx))
+             options (if (and existing? (= name c/kv-info)) {}
+                         (if dbi-name named-options (i/dbi-opts raw name)))
+             op (.-op tx)
+             list? (#{:put-list :del-list} op)
+             duplicates? (boolean (some #{:dupsort} (:flags options)))]
+         (when-not (and (some? options) (or existing? (not= name c/kv-info))
+                        (#{:put :del :put-list :del-list} op)
+                        (or existing? (empty? (.-flags tx)))
+                        (or (not list?) duplicates?))
+           (unsupported! :transaction-row))
+         (validate/validate-kv-tx-data tx (:validate-data? options))
+         (let [key-type (or (.-kt tx) :data)
+               key (encode charge! (.-k tx) key-type true)
+               value-type (or (.-vt tx) :data)]
+           (if list?
+             (do
+               (doseq [value (.-v tx)]
+                 (add-prepared-row! rows charge! name (if (= :put-list op) :put op)
+                                    key (encode charge! value value-type duplicates?) wal? nil))
+               (when log-rows
+                 (.add log-rows (OwnedKVTxData. op name key
+                                               (encode charge! (.-v tx) :data false)
+                                               key-type value-type))))
+             (let [value (when-not (= :del op)
+                           (encode charge! (.-v tx) value-type duplicates?))]
+               (add-prepared-row! rows charge! name op key value wal? (.-flags tx))
+               (when log-rows
+                 (.add log-rows (OwnedKVTxData. op name key value key-type value-type))))))))
+     rows)))
 
 (defn- prepare-blind [raw state allowance name txs kt vt]
   (let [charge! (local-charge allowance)
@@ -221,7 +236,7 @@
                                 :row-capacity rows :scratch-bytes (+ 1024 (* 4 payload))})))
     fallback))
 
-(defn- run-body [collector body opts]
+(defn run-body [collector body opts]
   (let [timeout (l/explicit-transaction-timeout-ms-from-option
                  (l/explicit-transaction-timeout-option opts))]
     (batch/submit!
@@ -237,7 +252,7 @@
                 (catch Throwable t (l/throw-explicit-transaction-failure! watchdog t))
                 (finally (l/cancel-explicit-transaction-watchdog! watchdog)))))})))
 
-(defn- clear-admin!
+(defn clear-admin!
   "Serialize with native writers, then use the existing standalone clear txn.
   Its WAL record preserves the admin effect on snapshot-based recovery; this
   operation is never submitted as a data request or run in a user transaction."
@@ -254,6 +269,7 @@
     (i/get-dbi raw name false)
     (let [lsn (when state (long @(:next-lsn state)))
           status (volatile! nil)
+          append-token (volatile! nil)
           native? (volatile! false)]
       (try
         (when state
@@ -262,17 +278,24 @@
                         (* 2 (long (:segment-prealloc-bytes state))) 0)
                 projected (+ (long @(:retention-total-bytes state)) slack
                              (alength ^bytes body) codec/record-header-size)]
-            (when (> projected (recovery/retention-limit options))
+            (when (and (not= false (:check-retention? options))
+                       (> projected (recovery/retention-limit options)))
               (throw (ex-info "Required WAL history fills the hard retention limit"
                               {:error :txlog/retention-backpressure
                                :outcome :not-committed :retryable? true})))
             (let [token (wal/begin-prepared-group! state lsn (object-array [body]))]
+              (vreset! append-token token)
               (vreset! status :appended)
               (if (wal/finish-prepared-group! state token 0)
                 (vreset! status :durable)
                 (when wake! (wake!))))))
         (vreset! native? true)
-        (i/clear-dbi raw name)
+        (cpp/apply-native-range!
+          raw
+          (fn [wdb] ((cpp/prepared-row-applier wdb) [(l/kv-tx :clear name nil nil :raw :raw)]))
+          (fn [wdb _]
+            (when-let [write! (:write-metadata! options)] (write! wdb @append-token))))
+        (when-let [committed! (:committed! options)] (committed! @append-token))
         (when state (batch/publish-admin-prefix! collector lsn))
         nil
         (catch Throwable t
@@ -294,9 +317,8 @@
             (throw error)))))))
 
 (defn open!
-  "Open public independent KV, or attach an alias to its single native runtime.
-  Open options are persisted in the protocol marker and frozen for aliases.
-  Existing compatibility databases require explicit migration outside this API."
+  "Private M0/M1 validation opener. Its protocol marker and fixed catalog are
+  test scaffolding; production opens the existing native store via conn/open-kv."
   [dir requested]
   (when-not (string? dir) (unsupported! :environment-path))
   (locking open-lock

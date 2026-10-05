@@ -1,13 +1,14 @@
 (ns datalevin.txlog.write-pipeline-test
   (:require [clojure.test :refer [deftest is]]
             [datalevin.tx-group :as group]
+            [datalevin.lmdb :as l]
             [datalevin.txlog :as wal]
             [datalevin.txlog.append :as append]
             [datalevin.txlog.codec :as codec]
             [datalevin.txlog.segment :as segment]
             [datalevin.tx-state.lifetime :as lifetime]
             [datalevin.util :as u])
-  (:import [datalevin.lmdb DatomKVTxData]
+  (:import [datalevin.lmdb DatomKVTxData KVTxData]
            [java.io Closeable IOException]
            [java.util.concurrent CountDownLatch]
            [java.nio ByteBuffer]
@@ -32,6 +33,63 @@
 (defn- status [state] (wal/sync-manager-state (:sync-manager state)))
 (defn- join [job] (deref job 10000 ::timeout))
 (defn- caught [f] (try (f) (catch Throwable e e)))
+
+(deftest owned-raw-fields-encode-without-bits-scratch
+  (let [scratch codec/tl-bits-buffer
+        previous (.get scratch)
+        sentinel (.asReadOnlyBuffer (ByteBuffer/allocate 8))
+        key (byte-array [1 2 3])
+        values [(byte-array 0) (byte-array [4]) (byte-array 511)
+                (byte-array 65536) (byte-array 131073)]
+        rows (vec (concat (map #(l/kv-tx :put "資料😀" key % :raw :raw) values)
+                          [(l/kv-tx :del "資料😀" key nil :raw)
+                           (l/kv-tx :del-list "列😀" key [(byte-array [5])] :raw :raw)
+                           (l/kv-tx :clear "列😀" nil nil :raw :raw)]))]
+    (.position sentinel 3)
+    (.set scratch sentinel)
+    (try
+      ;; Any attempt to encode through this scratch buffer would throw.
+      (let [body (codec/encode-commit-row-payload 7 11 rows)
+            decoded (codec/decode-raw-commit-row-payload body 10000000)]
+        (is (= 8 (count (:rows decoded))))
+        (is (= (mapv alength values)
+               (mapv #(alength ^bytes (nth % 3)) (take 5 (:rows decoded)))))
+        (is (= 3 (.position sentinel)))
+        (is (identical? sentinel (.get scratch))))
+      (finally (.set scratch previous)))))
+
+(deftest direct-raw-fields-match-generic-buffer-encoding
+  (let [key (byte-array [1 2 3])
+        value (byte-array [4 5 6])
+        rows [(l/kv-tx :put "資料😀" key value :raw :raw #{:nooverwrite})
+              (l/kv-tx :put "data" key (byte-array 131073) :raw :raw)
+              (l/kv-tx :put "data" key (byte-array 0) :raw :raw)
+              (l/kv-tx :del "data" key nil :raw)
+              (l/kv-tx :del-list "list" key [value] :raw :raw)
+              (l/kv-tx :put-list "list" key [value key] :raw :raw)
+              (l/kv-tx :del-list "list" key [value key] :raw :raw)
+              (l/kv-tx :put "data" 99 value :long :raw)
+              (l/kv-tx :put "data" key "typed value" :raw :string)
+              (l/kv-tx :put "data" [1 "tuple"] {:nested [1 2]} [:long :string] :data)]
+        buffered (fn [^KVTxData row]
+                   (let [k (.-k row) v (.-v row)
+                         raw-key? (= :raw (.-kt row))
+                         raw-value? (= :raw (.-vt row))]
+                     (l/kv-tx (.-op row) (.-dbi-name row)
+                              (if raw-key? (ByteBuffer/wrap ^bytes k) k)
+                              (cond
+                                (and (= :put (.-op row)) raw-value?)
+                                (ByteBuffer/wrap ^bytes v)
+                                (and (= :del-list (.-op row)) raw-value? (= 1 (count v)))
+                                [(ByteBuffer/wrap ^bytes (first v))]
+                                :else v)
+                              (.-kt row) (.-vt row) (.-flags row))))]
+    ;; Small groups use sequential encoding; the larger group crosses the
+    ;; parallel threshold. Buffers deliberately keep using the old encoder.
+    (doseq [inputs [rows (vec (take 1100 (cycle rows)))]]
+      (let [expected (codec/encode-commit-row-payload 9 123 (mapv buffered inputs) {:ha-term 7})
+            actual (codec/encode-commit-row-payload 9 123 inputs {:ha-term 7})]
+        (is (java.util.Arrays/equals ^bytes expected ^bytes actual))))))
 
 (deftest grouped-payload-preserves-compact-and-ordinary-row-encoding
   (doseq [inputs [[(rows 1) [(DatomKVTxData. 9 (byte-array [1 2 3]) true false)] (rows 2)]

@@ -38,6 +38,7 @@
 
 (def ^:private allowed-formats #{:edn :json :markdown})
 
+
 (def ^:private json-mapper
   (json/object-mapper {:decode-key-fn identity}))
 
@@ -293,12 +294,14 @@
                             :json     (parse-json v)
                             :markdown (parse-markdown v)
                             :edn      (parse-edn v))
-              (map? v)    v
+              (or (map? v) (vector? v)) v
 
               :else
-              (raise "Idoc root must be a map" {:attribute attr :value v}))]
-    (when-not (map? doc)
-      (raise "Idoc root must be a map" {:attribute attr :value doc}))
+              (raise "Idoc root must be a map or vector"
+                     {:attribute attr :value v}))]
+    (when-not (or (map? doc) (vector? doc))
+      (raise "Idoc root must be a map or vector"
+             {:attribute attr :value doc}))
     (normalize-doc doc opts)))
 
 ;; idoc patch
@@ -557,18 +560,27 @@
   (let [s (-> (str s)
               (str/replace "%" "%25")
               (str/replace "/" "%2F"))]
-    (if (str/starts-with? s ":")
-      (str "%3A" (subs s 1))
-      s)))
+    (cond
+      (str/starts-with? s ":") (str "%3A" (subs s 1))
+      (str/starts-with? s "#") (str "%23" (subs s 1))
+      :else s)))
+
+(defn- append-path-seg
+  [^String path seg]
+  (cond
+    (keyword? seg) (str path "/:" (subs (str seg) 1))
+    (string? seg)  (str path "/" (encode-string-seg seg))
+    (integer? seg)
+    (if (neg? ^long seg)
+      (raise "Idoc vector index must be non-negative" {:segment seg})
+      (str path "/#" seg))
+    :else
+    (raise "Idoc path segment must be a keyword, string, or integer"
+           {:segment seg})))
 
 (defn encode-path
   [segments]
-  (reduce
-    (fn [acc seg]
-      (if (keyword? seg)
-        (str acc "/:" (subs (str seg) 1))
-        (str acc "/" (encode-string-seg seg))))
-    "" segments))
+  (reduce append-path-seg "" segments))
 
 (defn- path-selector->segments
   [selector k]
@@ -580,8 +592,9 @@
                    (raise "Idoc path selector must be a keyword, string, or vector"
                           {:key k :selector selector}))]
     (doseq [seg segments]
-      (when-not (or (keyword? seg) (string? seg))
-        (raise "Idoc path selector segments must be keywords or strings"
+      (when-not (or (keyword? seg) (string? seg)
+                    (and (integer? seg) (not (neg? ^long seg))))
+        (raise "Idoc path selector segments must be keywords, strings, or non-negative integers"
                {:key k :selector selector :segment seg})))
     segments))
 
@@ -595,7 +608,7 @@
     (when-not (sequential? selectors)
       (raise "Idoc path selector option must be a sequential collection"
              {:key k :value selectors}))
-    (vec (distinct (map #(encode-path (normalize-selector format % k))
+    (vec (distinct (map #(normalize-selector format % k)
                         selectors)))))
 
 (defn compile-path-filter
@@ -608,24 +621,34 @@
 
 (defn- path-prefix-match?
   [prefix path]
-  (or (empty? prefix)
-      (= prefix path)
-      (str/starts-with? path (str prefix "/"))))
+  (loop [prefix (seq prefix)
+         path   (seq path)]
+    (cond
+      (nil? prefix) true
+      (nil? path)   false
+      (= (first prefix) (first path)) (recur (next prefix) (next path))
+      (and (integer? (first path)) (not (integer? (first prefix))))
+      (recur prefix (next path))
+      :else false)))
+
+(declare decode-path)
 
 (defn- indexed-path?
   [path-filter path]
   (if-not path-filter
     true
-    (let [{:keys [included excluded]} path-filter]
+    (let [{:keys [included excluded]} path-filter
+          path (decode-path path)]
       (and (or (nil? included)
                (some #(path-prefix-match? % path) included))
            (not-any? #(path-prefix-match? % path) excluded)))))
 
 (defn- decode-string-seg
   [s]
-  (let [s (if (str/starts-with? s "%3A")
-            (str ":" (subs s 3))
-            s)
+  (let [s (cond
+            (str/starts-with? s "%3A") (str ":" (subs s 3))
+            (str/starts-with? s "%23") (str "#" (subs s 3))
+            :else s)
         s (str/replace s "%2F" "/")
         s (str/replace s "%25" "%")]
     s))
@@ -654,7 +677,11 @@
                 (let [start idx1
                       next  (long (or (str/index-of path "/" start) len))
                       seg   (subs path (int start) (int next))]
-                  (recur next (conj out (decode-string-seg seg))))))))))))
+                  (recur next (conj out (if-let [position
+                                                (when (re-matches #"#(?:0|[1-9][0-9]*)" seg)
+                                                  (parse-long (subs seg 1)))]
+                                         position
+                                         (decode-string-seg seg)))))))))))))
 
 ;; value typing for index encoding
 
@@ -687,27 +714,19 @@
 (defn- doc->path-values
   ([doc] (doc->path-values doc []))
   ([doc path0]
-   (letfn [(append-seg [^String path seg]
-             (if (keyword? seg)
-               (str path "/:" (subs (str seg) 1))
-               (str path "/" (encode-string-seg seg))))
-           (add-leaf [acc ^String path v]
+   (letfn [(add-leaf [acc ^String path v]
              (assoc! acc path (conj (get acc path #{}) v)))
            (walk [acc node ^String path]
              (cond
                (nil? node)    acc
                (map? node)    (reduce-kv (fn [a k v]
-                                           (walk a v (append-seg path k)))
+                                           (walk a v (append-path-seg path k)))
                                          acc node)
-               (vector? node) (reduce (fn [a v] (walk a v path)) acc node)
+               (vector? node) (reduce-kv (fn [a k v]
+                                          (walk a v (append-path-seg path k)))
+                                        acc node)
                :else          (add-leaf acc path node)))]
      (persistent! (walk (transient {}) doc (encode-path path0))))))
-
-(defn- append-path-seg
-  [^String path seg]
-  (if (keyword? seg)
-    (str path "/:" (subs (str seg) 1))
-    (str path "/" (encode-string-seg seg))))
 
 (defn- collect-path-values!
   [^HashMap acc node ^String path path-filter]
@@ -721,9 +740,9 @@
                acc node)
 
     (vector? node)
-    (reduce (fn [a v]
-              (collect-path-values! a v path path-filter))
-            acc node)
+    (reduce-kv (fn [a k v]
+                 (collect-path-values! a v (append-path-seg path k) path-filter))
+               acc node)
 
     :else
     (do
@@ -745,11 +764,7 @@
   ([old new] (diff-path-values old new []))
   ([old new path0] (diff-path-values old new path0 nil))
   ([old new path0 path-filter]
-   (letfn [(append-seg [^String path seg]
-             (if (keyword? seg)
-               (str path "/:" (subs (str seg) 1))
-               (str path "/" (encode-string-seg seg))))
-           (add-leaf [^HashMap acc ^String path v]
+   (letfn [(add-leaf [^HashMap acc ^String path v]
              (when (indexed-path? path-filter path)
                (let [^HashSet s (or (.get acc path)
                                     (let [s (HashSet.)]
@@ -761,9 +776,11 @@
              (cond
                (nil? node)    acc
                (map? node)    (reduce-kv (fn [a k v]
-                                           (collect! a v (append-seg path k)))
+                                           (collect! a v (append-path-seg path k)))
                                          acc node)
-               (vector? node) (reduce (fn [a v] (collect! a v path)) acc node)
+               (vector? node) (reduce-kv (fn [a k v]
+                                          (collect! a v (append-path-seg path k)))
+                                        acc node)
                :else          (add-leaf acc path node)))
            (walk [old new ^String path ^HashMap acc-old ^HashMap acc-new]
              (cond
@@ -772,7 +789,7 @@
 
                (and (map? old) (map? new))
                (let [step (fn [[ao an] k ov nv]
-                            (walk ov nv (append-seg path k) ao an))
+                            (walk ov nv (append-path-seg path k) ao an))
                      acc  (reduce-kv (fn [acc k ov]
                                        (step acc k ov (get new k)))
                                      [acc-old acc-new] old)]
@@ -806,9 +823,14 @@
 
 (defn- init-paths
   [lmdb path-dict-dbi]
-  (if-let [[_ pid] (i/get-first lmdb path-dict-dbi [:all-back] :string :int)]
-    pid
-    0))
+  (let [max-id (volatile! 0)]
+    (visit lmdb path-dict-dbi
+           (fn [kv]
+             (let [pid (b/read-buffer (l/v kv) :int)]
+               (when (< ^long @max-id ^int pid)
+                 (vreset! max-id pid))))
+           [:all])
+    @max-id))
 
 (defn- init-doc-refs
   [lmdb doc-ref-dbi]
@@ -883,25 +905,25 @@
         range-cache                    (LRUCache. (int c/idoc-range-cache-size))
         index-version                  (AtomicLong. 0)]
     (->IdocIndex lmdb
-                 domain
-                 format
-                 path-filter
-                 doc-ref-dbi
-                 doc-index-dbi
-                 path-dict-dbi
-                 doc-refs
-                 all-doc-ids
-                 (ReentrantReadWriteLock.)
-                 (AtomicInteger. max-doc)
-                 (AtomicInteger. max-path)
-                 path-cache
-                 path-seg-cache
-                 pattern-cache
-                 path-trie
-                 paths-loaded
-                 paths-lock
-                 range-cache
-                 index-version)))
+                domain
+                format
+                path-filter
+                doc-ref-dbi
+                doc-index-dbi
+                path-dict-dbi
+                doc-refs
+                all-doc-ids
+                (ReentrantReadWriteLock.)
+                (AtomicInteger. max-doc)
+                (AtomicInteger. max-path)
+                path-cache
+                path-seg-cache
+                pattern-cache
+                path-trie
+                paths-loaded
+                paths-lock
+                range-cache
+                index-version)))
 
 (defn transfer
   [^IdocIndex old lmdb]
@@ -1040,7 +1062,11 @@
                                     (let [s (decode-path p)]
                                       (.put seg-cache pid s)
                                       s))]
-                       (cache-path! index p pid segs)))
+                       ;; Retained legacy string paths can decode to the same
+                       ;; segments as a new escaped path. Only canonical paths
+                       ;; may populate the trie used by positional queries.
+                       (when (= p (encode-path segs))
+                         (cache-path! index p pid segs))))
                    [:all-back]))
           (.set loaded true))))))
 
@@ -1567,13 +1593,7 @@
 
 (defn- normalize-path
   [format segments]
-  (if (identical? format :markdown)
-    (mapv #(normalize-seg format %) segments)
-    segments))
-
-(defn- path-wildcards?
-  [segments]
-  (some #(and (keyword? %) (#{:? :*} %)) segments))
+  (mapv #(if (integer? %) (long %) (normalize-seg format %)) segments))
 
 (defn- match-path?
   [pattern path]
@@ -1583,26 +1603,32 @@
         lt   (count t)
         memo (volatile! {})]
     (letfn [(step [^long i ^long j]
-              (if-let [res (get @memo [i j])]
+              (if-some [res (get @memo [i j])]
                 res
                 (let [res (cond
-                            (= i lp) (= j lt)
+                            (= i lp) (every? integer? (subvec t (int j)))
                             :else
                             (let [seg (nth p (int i))]
-                              (cond
-                                (= seg :*)
-                                (or (step (u/long-inc i) j)
-                                    (and (< j lt) (step i (u/long-inc j))))
+                              (or
+                                ;; Omitted vector positions retain membership
+                                ;; semantics; an explicit integer selects one.
+                                (and (< j lt) (integer? (nth t (int j)))
+                                     (not (integer? seg))
+                                     (step i (u/long-inc j)))
+                                (cond
+                                  (= seg :*)
+                                  (or (step (u/long-inc i) j)
+                                      (and (< j lt) (step i (u/long-inc j))))
 
-                                (= seg :?)
-                                (and (< j lt)
-                                     (step (u/long-inc i) (u/long-inc j)))
+                                  (= seg :?)
+                                  (and (< j lt)
+                                       (step (u/long-inc i) (u/long-inc j)))
 
-                                :else
-                                (and (< j lt)
-                                     (= seg (nth t (int j)))
-                                     (step (u/long-inc i)
-                                           (u/long-inc j))))))]
+                                  :else
+                                  (and (< j lt)
+                                       (= seg (nth t (int j)))
+                                       (step (u/long-inc i)
+                                             (u/long-inc j)))))))]
                   (vswap! memo assoc [i j] res)
                   res)))]
       (step 0 0))))
@@ -1663,57 +1689,67 @@
 
 (declare parse-predicate get-path values-for-path)
 
+(defn- child-entries
+  [doc]
+  (if (map? doc) doc (map-indexed vector doc)))
+
 (defn- doc-matches*
   [format doc expr ctx-path]
   (cond
     (map? expr)
-    (cond
-      (vector? doc)
-      (boolean (some #(doc-matches* format % expr ctx-path) doc))
+    (when (or (map? doc) (vector? doc))
+      (if (and (vector? doc) (seq expr)
+               (not-any? #(or (integer? %) (#{:? :*} %)) (keys expr)))
+        ;; A map pattern without positions must match a single array element.
+        (boolean (some #(doc-matches* format % expr ctx-path) doc))
+        (every?
+          (fn [[k v]]
+            (let [k' (normalize-seg format k)]
+              (cond
+                (= k' :?)
+                (or (boolean
+                      (some (fn [[ck cv]]
+                              (doc-matches* format cv v
+                                            (conj (or ctx-path [])
+                                                  (normalize-seg format ck))))
+                            (child-entries doc)))
+                    (and (vector? doc)
+                         (boolean (some #(doc-matches* format % {k v} ctx-path)
+                                        doc))))
 
-      (map? doc)
-      (every?
-        (fn [[k v]]
-          (let [k' (normalize-seg format k)]
-            (cond
-              (= k' :?)
-              (boolean
-                (some (fn [[ck cv]]
-                        (doc-matches* format cv v
-                                      (conj (or ctx-path [])
-                                            (normalize-seg format ck))))
-                      doc))
+                (= k' :*)
+                (letfn [(match-depth [node path]
+                          (or (doc-matches* format node v path)
+                              (cond
+                                (or (map? node) (vector? node))
+                                (boolean
+                                  (some (fn [[ck cv]]
+                                          (match-depth
+                                            cv
+                                            (conj path (normalize-seg format ck))))
+                                        (child-entries node)))
 
-              (= k' :*)
-              (letfn [(match-depth [node path]
-                        (or (doc-matches* format node v path)
-                            (cond
-                              (map? node)
-                              (boolean
-                                (some (fn [[ck cv]]
-                                        (match-depth
-                                          cv
-                                          (conj path (normalize-seg format ck))))
-                                      node))
+                                :else false)))]
+                  (match-depth doc (or ctx-path [])))
 
-                              (vector? node)
-                              (boolean (some #(match-depth % path) node))
+                (integer? k')
+                (and (vector? doc) (<= 0 ^long k') (< ^long k' (long (count doc)))
+                     (doc-matches* format (nth doc k') v
+                                   (conj (or ctx-path []) k')))
 
-                              :else false)))]
-                (match-depth doc (or ctx-path [])))
+                (vector? doc)
+                (boolean (some #(doc-matches* format % {k v} ctx-path) doc))
 
-              :else
-              (doc-matches* format (get doc k') v (conj (or ctx-path []) k')))))
-        expr)
-
-      :else false)
+                :else
+                (doc-matches* format (get doc k') v (conj (or ctx-path []) k')))))
+          expr)))
 
     (vector? expr)
     (let [[op & rest] expr]
       (case op
-        :and (every? #(doc-matches* format doc % nil) rest)
-        :or  (boolean (some #(doc-matches* format doc % nil) rest))
-        :not (not (doc-matches* format doc (first rest) nil))
+        :and (every? #(doc-matches* format doc % ctx-path) rest)
+        :or  (boolean (some #(doc-matches* format doc % ctx-path) rest))
+        :not (not (doc-matches* format doc (first rest) ctx-path))
         (raise "Unknown idoc logical operator" {:op op :expr expr})))
 
     (and (sequential? expr) (not (vector? expr)))
@@ -1724,18 +1760,15 @@
               vals                    (values-for-path format doc path)]
           (boolean (some #(pred-match? op % args pos) vals)))
         (cond
-          (and (= op :nil?) (vector? doc))
-          (boolean (some #(pred-match? :nil? % []) doc))
-
           (vector? doc)
-          (boolean (some #(pred-match? op % args) doc))
+          (boolean (some #(doc-matches* format % expr ctx-path) doc))
 
           :else
           (pred-match? op doc args))))
 
     :else
     (cond
-      (vector? doc) (boolean (some #(strict-eq? % expr) doc))
+      (vector? doc) (boolean (some #(doc-matches* format % expr ctx-path) doc))
       (nil? doc)    false
       :else         (strict-eq? doc expr))))
 
@@ -1753,17 +1786,18 @@
 (defn- values-for-path
   [format doc path]
   (let [path (normalize-path format path)]
-    (if (path-wildcards? path)
+    (if (some #{:? :*} path)
       (let [path-values (doc->path-values doc)]
         (into [] cat (for [[p vals] path-values
                            :let     [segs (decode-path p)]
                            :when    (match-path? path segs)]
                        vals)))
-      (let [v (get-path doc path)]
-        (cond
-          (nil? v)    nil
-          (vector? v) v
-          :else       [v])))))
+      (letfn [(collect [acc node]
+                (cond
+                  (or (nil? node) (map? node)) acc
+                  (vector? node) (reduce collect acc node)
+                  :else (conj! acc node)))]
+        (persistent! (collect (transient []) (get-path doc path)))))))
 
 (defn- indexable-key*
   [^long path-id vt v]
@@ -1803,6 +1837,13 @@
                                 (do (aset visited idx true) true))))
                           (step [^PathTrieNode node ^long idx]
                             (when (mark! node idx)
+                              (when (or (== idx plen)
+                                        (not (integer? (nth path idx))))
+                                (doseq [^Map$Entry entry
+                                        (.entrySet ^ConcurrentHashMap
+                                                   (.-children node))]
+                                  (when (integer? (.getKey entry))
+                                    (step (.getValue entry) idx))))
                               (if (== idx plen)
                                 (let [pid (.get ^AtomicInteger (.-pid node))]
                                   (when (pos? pid)
@@ -1844,14 +1885,10 @@
 
 (defn- ids-for-eq
   [^IdocIndex index path value]
-  (if (path-wildcards? path)
-    (or (b/bitmaps-or
-          (map+ #(ids-for-eq-path-id index % value)
-                (matching-path-ids index path)))
-        (RoaringBitmap.))
-    (if-let [pid (get-path-id index (encode-path path))]
-      (ids-for-eq-path-id index pid value)
-      (RoaringBitmap.))))
+  (or (b/bitmaps-or
+        (map+ #(ids-for-eq-path-id index % value)
+              (matching-path-ids index path)))
+      (RoaringBitmap.)))
 
 (defn- ids-for-range-path-id
   [^IdocIndex index ^long pid lo hi]
@@ -1890,14 +1927,10 @@
 
 (defn- ids-for-range
   [^IdocIndex index path lo hi]
-  (if (path-wildcards? path)
-    (or (b/bitmaps-or
-          (map+ #(ids-for-range-path-id index % lo hi)
-                (matching-path-ids index path)))
-        (RoaringBitmap.))
-    (if-let [pid (get-path-id index (encode-path path))]
-      (ids-for-range-path-id index pid lo hi)
-      (RoaringBitmap.))))
+  (or (b/bitmaps-or
+        (map+ #(ids-for-range-path-id index % lo hi)
+              (matching-path-ids index path)))
+      (RoaringBitmap.)))
 
 (defn- parse-predicate
   [expr ctx-path]
@@ -1970,7 +2003,9 @@
             lo-ids          (when (some? lo) (ids-for-eq index path lo))
             hi-ids          (when (some? hi) (ids-for-eq index path hi))]
         (cond
-          (and lo-ids hi-ids) (.or ^RoaringBitmap lo-ids ^RoaringBitmap hi-ids)
+          (and lo-ids hi-ids) (do
+                                (.or ^RoaringBitmap lo-ids ^RoaringBitmap hi-ids)
+                                lo-ids)
           lo-ids              lo-ids
           hi-ids              hi-ids
           :else               (RoaringBitmap.))))))
@@ -2023,12 +2058,11 @@
     (ids-for-predicate index format expr ctx-path)
 
     :else
-    (if (seq ctx-path)
-      (do
-        (when (nil? expr)
-          (raise "Use (nil? :field) to match null values" {:path ctx-path}))
-        (ids-for-eq index (normalize-path format ctx-path) expr))
-      (raise "Idoc scalar query must be inside a map" {:expr expr}))))
+    (do
+      (when (nil? expr)
+        (raise "Use (nil? :field) to match null values"
+               {:path (or ctx-path [])}))
+      (ids-for-eq index (normalize-path format (or ctx-path [])) expr))))
 
 (defn- index-exact-value?
   [v]

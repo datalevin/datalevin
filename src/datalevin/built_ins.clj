@@ -756,6 +756,10 @@
   When neither an attribute nor :domains is specified, a full DB search is
   performed across all idoc domains.
 
+  A scalar query matches an element of a root vector. Path predicates use
+  `[]` to address the root, e.g. `(> [] 3)`. Integer map keys and path segments
+  select zero-based vector positions, e.g. `{1 3}` or `(> [1] 3)`.
+
   * Full DB search: `[(idoc-match $ {:status \"active\"}) [[?e ?a ?v]]]`
   * Attribute specific search:
        `[(idoc-match $ :person/profile {:status \"active\"}) [[?e ?a ?v]]]`

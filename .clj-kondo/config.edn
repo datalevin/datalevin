@@ -17,6 +17,7 @@
    datalevin.core/with-transaction hooks.datalevin/with-binding
    datalevin.core/with-transaction-kv hooks.datalevin/with-binding
    datalevin.lmdb/with-transaction-kv hooks.datalevin/with-binding
+   datalevin.lmdb/with-compatibility-transaction-kv hooks.datalevin/with-binding
    datalevin.compression-test/with-kv hooks.datalevin/with-binding
    datalevin.compression-test/with-directory hooks.datalevin/with-binding
    pod.huahaiy.datalevin/defpodfn hooks.datalevin/defpodfn

@@ -132,7 +132,13 @@
                         {:error :txlog/unsupported-private-operation
                          :outcome :not-committed :dbi name :operation op
                          :retryable? false})))
-            (check-physical! declared name op k (if (= :del-list op) (first v) v)))))))
+            (check-physical! declared name op k (if (= :del-list op) (first v) v))))
+        ;; Legacy private probes supply vectors; canonicalize at preparation,
+        ;; so native application sees the same frozen records as public writes.
+        (when (and (not public?) (some vector? rows))
+          (batch/set-data! descriptor
+                           (assoc (batch/data descriptor)
+                                  :rows (mapv l/->kv-tx-data rows)))))))
 
 (defn- snapshot-due? [raw state collector manifest]
   (let [age (- (System/currentTimeMillis) (long (:created-ms manifest)))

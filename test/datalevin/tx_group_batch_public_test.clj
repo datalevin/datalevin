@@ -6,6 +6,7 @@
             [datalevin.interface :as i]
             [datalevin.lmdb :as l]
             [datalevin.tx-group.batch :as batch]
+            [datalevin.tx-group.batch.public :as prototype]
             [datalevin.tx-group.batch.env :as env]
             [datalevin.tx-group.batch.stage :as stage]
             [datalevin.tx-group.batch.recovery :as recovery]
@@ -16,6 +17,16 @@
             [datalevin.util :as u])
   (:import [java.util.concurrent CountDownLatch TimeUnit]))
 
+;; The M0 opener is private validation scaffolding, not a public write mode.
+(defn- open-prototype
+  ([dir] (open-prototype dir nil))
+  ([dir opts]
+   (if (or (= :independent (:write-mode opts))
+           (and (not (:write-mode opts))
+                (= :kv-independent-v1 (:mode (protocol/read-write-protocol-marker dir)))))
+     (prototype/open! dir opts)
+     (d/open-kv dir opts))))
+
 (defn- options [wal?]
   {:write-mode :independent :wal? wal? :dbis {"data" {:validate-data? true}}
    :wal-sync-mode :fsync :wal-segment-prealloc? false :snapshot-scheduler? false})
@@ -23,7 +34,7 @@
 (deftest public-typed-writes-and-native-transaction-reads
   (doseq [wal? [false true]]
     (let [dir (u/tmp-dir (str "public-batch-" (random-uuid)))
-          db (d/open-kv dir (options wal?))]
+          db (open-prototype dir (options wal?))]
       (try
         (d/open-dbi db "data")
         (is (= :transacted (d/transact-kv db "data" [[:put 1 {:n 2}]] :long :data)))
@@ -47,7 +58,7 @@
 
 (deftest public-body-failure-rolls-back-once-and-next-write-succeeds
   (let [dir (u/tmp-dir (str "public-batch-abort-" (random-uuid)))
-        db (d/open-kv dir (options true))
+        db (open-prototype dir (options true))
         calls (atom 0)]
     (try
       (is (thrown? clojure.lang.ExceptionInfo
@@ -72,18 +83,18 @@
 
 (deftest public-aliases-share-runtime-and-reopen-restores-wal
   (let [dir (u/tmp-dir (str "public-batch-alias-" (random-uuid)))
-        db (d/open-kv dir (options true))
-        alias (d/open-kv (str dir "/."))]
+        db (open-prototype dir (options true))
+        alias (open-prototype (str dir "/."))]
     (try
       (is (identical? (i/kv-info db) (i/kv-info alias)))
       (is (= :independent (:write-mode (i/env-opts alias))))
       (is (not-any? fn? (vals (i/env-opts alias))))
       (is (thrown? clojure.lang.ExceptionInfo
-                   (d/open-kv dir {:write-mode :compatibility})))
+                   (open-prototype dir {:write-mode :compatibility})))
       (is (thrown? clojure.lang.ExceptionInfo
                    (l/open-kv dir {})))
       (is (thrown? clojure.lang.ExceptionInfo
-                   (d/open-kv dir {:write-batch-size 1})))
+                   (open-prototype dir {:write-batch-size 1})))
       (d/close-kv db)
       (d/close-kv db)
       (is (d/closed-kv? db))
@@ -92,7 +103,7 @@
                    (d/transact-kv db "data" [[:put 5 500]] :long :long)))
       (is (= :transacted (d/transact-kv alias "data" [[:put 5 50]] :long :long)))
       (d/close-kv alias)
-      (let [reopened (d/open-kv dir)]
+      (let [reopened (open-prototype dir)]
         (try
           (is (= 50 (d/get-value reopened "data" 5 :long :long)))
           (is (= 1 (:applied-lsn (d/txlog-watermarks reopened))))
@@ -104,7 +115,7 @@
 (deftest public-mixed-updates-have-no-lost-writes
   (doseq [profile [:strict :relaxed :extra]]
     (let [dir (u/tmp-dir (str "public-batch-mixed-" (random-uuid)))
-          db (d/open-kv dir (assoc (options true) :wal-durability-profile profile
+          db (open-prototype dir (assoc (options true) :wal-durability-profile profile
                                   :wal-group-commit 8 :wal-group-commit-ms 5))]
       (try
         (let [writers (doall (for [_ (range 8)]
@@ -118,7 +129,7 @@
 
 (deftest public-unsupported-operations-cannot-bypass-the-collector
   (let [dir (u/tmp-dir (str "public-batch-boundary-" (random-uuid)))
-        db (d/open-kv dir (options true))]
+        db (open-prototype dir (options true))]
     (try
       (doseq [operation [#(d/open-dbi db "undeclared")
                          #(d/drop-dbi db "data")
@@ -138,7 +149,7 @@
     (let [dir (u/tmp-dir (str "public-batch-invalid-" (random-uuid)))]
       (try
         (is (thrown? clojure.lang.ExceptionInfo
-                     (d/open-kv dir (merge (options false) invalid-options))))
+                     (open-prototype dir (merge (options false) invalid-options))))
         (is (not (some #{dir} (env/active-environments))))
         (finally (when (.exists (io/file dir)) (u/delete-files dir)))))))
 
@@ -152,7 +163,7 @@
 
 (deftest public-option-validation-does-not-select-a-collector
   (let [dir (u/tmp-dir (str "public-compatible-options-" (random-uuid)))
-        db (d/open-kv dir {:wal-pending-max-requests 4096
+        db (open-prototype dir {:wal-pending-max-requests 4096
                           :wal-preparation-timeout-ms 1000})]
     (try
       (is (nil? (:independent-control @(i/kv-info db))))
@@ -167,7 +178,7 @@
 
 (deftest public-body-budget-and-timeout-do-not-replay-the-body
   (let [dir (u/tmp-dir (str "public-batch-limits-" (random-uuid)))
-        db (d/open-kv dir (assoc (options true) :wal-rmw-max-bytes 16384))
+        db (open-prototype dir (assoc (options true) :wal-rmw-max-bytes 16384))
         calls (atom 0)]
     (try
       (is (thrown? clojure.lang.ExceptionInfo
@@ -189,16 +200,16 @@
 
 (deftest public-shutdown-drains-all-aliases-and-forces-relaxed-wal
   (let [dir (u/tmp-dir (str "public-batch-shutdown-" (random-uuid)))
-        db (d/open-kv dir (assoc (options true) :wal-durability-profile :relaxed
+        db (open-prototype dir (assoc (options true) :wal-durability-profile :relaxed
                                 :wal-group-commit 1000000 :wal-group-commit-ms 60000))
-        alias (d/open-kv (str dir "/."))]
+        alias (open-prototype (str dir "/."))]
     (try
       (d/transact-kv db "data" [[:put 1 2]] :long :long)
       (lifecycle/run-shutdown-close! (i/env-dir db) db)
       (is (d/closed-kv? db))
       (is (d/closed-kv? alias))
       (is (= 1 (:durable-lsn (d/txlog-watermarks db))))
-      (let [reopened (d/open-kv dir)]
+      (let [reopened (open-prototype dir)]
         (try
           (is (= 2 (d/get-value reopened "data" 1 :long :long)))
           (finally (d/close-kv reopened))))
@@ -206,7 +217,7 @@
 
 (deftest public-scheduled-snapshots-during-mixed-writes-reopen-correctly
   (let [dir (u/tmp-dir (str "public-batch-snapshots-" (random-uuid)))
-        db (d/open-kv dir (assoc (options true) :snapshot-scheduler? true
+        db (open-prototype dir (assoc (options true) :snapshot-scheduler? true
                                 :snapshot-interval-ms 200 :snapshot-max-age-ms 200
                                 :snapshot-max-lsn-delta 1))]
     (try
@@ -228,7 +239,7 @@
         (is (nil? (:last-error snapshot)))
         (is (pos? (long (get-in snapshot [:latest :floor-lsn] 0)))))
       (d/close-kv db)
-      (let [reopened (d/open-kv dir)]
+      (let [reopened (open-prototype dir)]
         (try
           (is (= 100 (d/get-value reopened "data" 1 :long :long)))
           (finally (d/close-kv reopened))))
@@ -239,7 +250,7 @@
     (let [dir (u/tmp-dir (str "public-batch-list-" (random-uuid)))
           opts (assoc (options wal?) :dbis {"list" {:flags #{:create :dupsort}
                                                    :validate-data? true}})
-          db (d/open-kv dir opts)]
+          db (open-prototype dir opts)]
       (try
         (d/open-list-dbi db "list")
         (is (= :transacted
@@ -260,7 +271,7 @@
         (d/transact-kv db "list" [[:del-list 1 [30 99]]] :long :long)
         (is (= [10 40] (vec (d/get-list db "list" 1 :long :long))))
         (d/close-kv db)
-        (let [reopened (d/open-kv dir)]
+        (let [reopened (open-prototype dir)]
           (try
             (is (= [10 40] (vec (d/get-list reopened "list" 1 :long :long))))
             (d/transact-kv reopened "list" [[:del 1]] :long)
@@ -271,7 +282,7 @@
 (deftest public-clear-is-a-standalone-admin-transaction
   (doseq [wal? [false true]]
     (let [dir (u/tmp-dir (str "public-admin-clear-" (random-uuid)))
-          db (d/open-kv dir (options wal?))]
+          db (open-prototype dir (options wal?))]
       (try
         (d/transact-kv db "data" [[:put 1 10] [:put 2 20]] :long :long)
         (is (thrown? clojure.lang.ExceptionInfo
@@ -285,7 +296,7 @@
                      (d/transact-kv db [(l/kv-tx :clear "data" nil nil :raw :raw)])))
         (d/transact-kv db "data" [[:put 4 40]] :long :long)
         (d/close-kv db)
-        (let [reopened (d/open-kv dir)]
+        (let [reopened (open-prototype dir)]
           (try
             (is (= [[4 40]] (vec (d/get-range reopened "data" [:all] :long :long))))
             (finally (d/close-kv reopened))))
@@ -293,7 +304,7 @@
 
 (deftest public-list-budget-failure-and-empty-list-do-not-change-native-state
   (let [dir (u/tmp-dir (str "public-batch-list-budget-" (random-uuid)))
-        db (d/open-kv dir (assoc (options true) :wal-rmw-max-bytes 16384
+        db (open-prototype dir (assoc (options true) :wal-rmw-max-bytes 16384
                                 :dbis {"list" {:flags #{:create :dupsort}}}))]
     (try
       (is (= :transacted (d/put-list-items db "list" 1 [] :long :long)))
@@ -312,7 +323,7 @@
 
 (deftest public-admin-clear-waits-for-wal-policy-before-native-transaction
   (let [dir (u/tmp-dir (str "public-admin-clear-policy-" (random-uuid)))
-        db (d/open-kv dir (options true))
+        db (open-prototype dir (options true))
         started (CountDownLatch. 1) release (CountDownLatch. 1)]
     (try
       (d/transact-kv db "data" [[:put 1 10]] :long :long)
@@ -334,7 +345,7 @@
 
 (deftest public-admin-clear-follows-committed-data-before-result-publication
   (let [dir (u/tmp-dir (str "public-admin-clear-publication-" (random-uuid)))
-        db (d/open-kv dir (options true))
+        db (open-prototype dir (options true))
         paused (CountDownLatch. 1) release (CountDownLatch. 1)
         uninstall (phase/observe!
                    (fn [event _]
@@ -356,7 +367,7 @@
 
 (deftest public-clear-and-list-recover-through-an-older-snapshot
   (let [dir (u/tmp-dir (str "public-batch-list-fallback-" (random-uuid)))
-        db (d/open-kv dir (assoc (options true)
+        db (open-prototype dir (assoc (options true)
                                 :dbis {"list" {:flags #{:create :dupsort}}}))]
     (try
       (d/put-list-items db "list" 1 [10 20 30] :long :long)
@@ -367,7 +378,7 @@
       (d/del-list-items db "list" 1 [40] :long :long)
       (d/close-kv db)
       (spit (io/file (recovery/root {:dir dir}) "current" "snapshot.edn") "{:broken [")
-      (let [reopened (d/open-kv dir)]
+      (let [reopened (open-prototype dir)]
         (try
           (is (= [50] (vec (d/get-list reopened "list" 1 :long :long))))
           (finally (d/close-kv reopened))))
@@ -392,7 +403,7 @@
 (deftest public-fixed-encodings-and-raw-buffer-ownership
   (doseq [wal? [false true]]
     (let [dir (u/tmp-dir (str "public-fixed-encoding-" (random-uuid)))
-          db (d/open-kv dir (assoc-in (options wal?) [:dbis "raw"] {}))]
+          db (open-prototype dir (assoc-in (options wal?) [:dbis "raw"] {}))]
       (try
         (doseq [[idx [type value]]
                 (map-indexed vector [[:long -123] [:id 99]
@@ -415,7 +426,7 @@
     (let [dir (u/tmp-dir (str "public-mixed-preparation-" (random-uuid)))
           ordinary "資料😀"
           duplicates "列😀"
-          db (d/open-kv dir (assoc (options wal?) :dbis
+          db (open-prototype dir (assoc (options wal?) :dbis
                                   {ordinary {:validate-data? true}
                                    duplicates {:flags #{:create :dupsort}
                                                :validate-data? true}}))]
@@ -431,7 +442,7 @@
         (is (= ["乙"] (vec (d/get-list db duplicates "key" :string :string))))
         (is (empty? (d/get-list db duplicates "empty" :string :string)))
         (d/close-kv db)
-        (let [reopened (d/open-kv dir)]
+        (let [reopened (open-prototype dir)]
           (try
             (is (= "new" (d/get-value reopened ordinary 1 :long :string)))
             (is (= ["乙"] (vec (d/get-list reopened duplicates "key" :string :string))))

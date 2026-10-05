@@ -1322,22 +1322,6 @@ Only usable for debug output.
    `dir` also implies in-memory mode without needing to set this option.
   * `:wal?` is a boolean, enabling WAL mode for direct KV writes. Default is
    `false` for `open-kv`.
-  * `:write-mode` selects `:compatibility` (default) or the opt-in
-   `:independent` embedded KV collector. Independent mode currently supports a
-   catalog declared at open with `:dbis`, typed unconditional puts/deletes,
-   `update-kv`, and `with-transaction-kv` bodies that run once. Every read uses
-   ordinary LMDB. Catalog changes, list DBIs, conditional write flags, manual
-   transaction handles, custom types/compression, remote and HA are outside this
-   initial public migration and are rejected. The selected mode and options are
-   retained across reopen; aliases share one runtime. Existing compatibility
-   stores require separate migration before selecting independent mode.
-  * Independent mode bounds preparation with `:wal-pending-max-requests`
-   (4,096), `:wal-pending-max-bytes` (64 MiB), `:write-batch-size` (256),
-   `:write-batch-max-bytes` (8 MiB), `:wal-rmw-max-bytes` (1 MiB) and
-   `:wal-preparation-timeout-ms` (30,000). These limits include encoding and
-   pending result controls. Serialized blind writes whose size is unknown also reserve
-   the RMW allowance. WAL snapshots default on in independent mode; every WAL
-   reopen restores a verified snapshot plus contiguous log history.
   * `:wal-durability-profile` is one of `:strict`, `:relaxed`, or `:extra`.
    `:strict` waits for durable WAL acknowledgement per write transaction with
    fsync semantics; `:relaxed` batches durability for higher throughput with a

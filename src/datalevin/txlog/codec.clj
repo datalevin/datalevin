@@ -21,7 +21,7 @@
    [java.util Arrays HashMap List Collection]
    [java.util.zip CRC32C]
    [datalevin.lmdb DatomKVTxData]
-   [datalevin.kv.encoding CommitMetadata EncodedKVTxData]
+   [datalevin.kv.encoding CommitMetadata EncodedKVTxData OwnedKVTxData]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
 (def ^:const record-header-size 14)
@@ -811,6 +811,24 @@
            bs)))
      (dbi-name-bytes dbi-name))))
 
+(defn- bb-write-payload!
+  "Write a length-prefixed field. Owned raw bytes go straight into the body;
+  typed values and raw ByteBuffers retain the generic scratch encoder."
+  ^ByteBuffer [^ByteBuffer bf ^ThreadLocal tl value type key?]
+  (if (and (= :raw type) (bytes? value))
+    (let [^bytes bs value
+          length (alength bs)
+          ^ByteBuffer out (if key?
+                            (bb-put-u16! bf tl length)
+                            (bb-put-u32! bf tl length))]
+      (bb-put-bytes! out tl bs))
+    (let [^ByteBuffer encoded (encode-to-buf value type)
+          length (.remaining encoded)
+          ^ByteBuffer out (if key?
+                            (bb-put-u16! bf tl length)
+                            (bb-put-u32! bf tl length))]
+      (bb-put-buffer! out tl encoded))))
+
 (defn- write-kv-components!
   ^ByteBuffer [^ThreadLocal tl
                ^ByteBuffer bf
@@ -826,9 +844,7 @@
   (let [^String dbi-name (dbi-name->string dbi)
         ^bytes dbi-bs (dbi-name-bytes dbi-name dbi-cache)
         dbi-len (alength dbi-bs)
-        k-type (or kt :data)
-        ^ByteBuffer k-bf (when-not (= :clear op) (encode-to-buf k k-type))
-        k-len (if k-bf (.remaining k-bf) 0)]
+        k-type (or kt :data)]
     (case op
       :clear
       (-> bf
@@ -836,70 +852,51 @@
           (bb-put-u16! tl dbi-len)
           (bb-put-bytes! tl dbi-bs)
           (bb-write-flags! tl flags))
+
       :put
-      (let [^ByteBuffer bf1 (-> bf
-                                (bb-put-byte! tl (int op-kv-put))
-                                (bb-put-u16! tl dbi-len)
-                                (bb-put-bytes! tl dbi-bs)
-                                (bb-write-type! tl k-type)
-                                (bb-put-u16! tl k-len))
-            ^ByteBuffer bf2 (bb-put-buffer! bf1 tl k-bf)
-            v-type (or vt :data)
-            ^ByteBuffer v-bf (encode-to-buf v v-type)
-            v-len (.remaining v-bf)
-            ^ByteBuffer bf3 (-> bf2
-                                (bb-write-type! tl v-type)
-                                (bb-put-u32! tl v-len))]
-        (-> bf3
-            (bb-put-buffer! tl v-bf)
+      (let [v-type (or vt :data)]
+        (-> bf
+            (bb-put-byte! tl (int op-kv-put))
+            (bb-put-u16! tl dbi-len)
+            (bb-put-bytes! tl dbi-bs)
+            (bb-write-type! tl k-type)
+            (bb-write-payload! tl k k-type true)
+            (bb-write-type! tl v-type)
+            (bb-write-payload! tl v v-type false)
             (bb-write-flags! tl flags)))
 
       :del
-      (let [^ByteBuffer bf1 (-> bf
-                                (bb-put-byte! tl (int op-kv-del))
-                                (bb-put-u16! tl dbi-len)
-                                (bb-put-bytes! tl dbi-bs)
-                                (bb-write-type! tl k-type)
-                                (bb-put-u16! tl k-len))]
-        (-> bf1
-            (bb-put-buffer! tl k-bf)
-            (bb-write-flags! tl flags)))
+      (-> bf
+          (bb-put-byte! tl (int op-kv-del))
+          (bb-put-u16! tl dbi-len)
+          (bb-put-bytes! tl dbi-bs)
+          (bb-write-type! tl k-type)
+          (bb-write-payload! tl k k-type true)
+          (bb-write-flags! tl flags))
 
       :put-list
-      (let [^ByteBuffer bf1 (-> bf
-                                (bb-put-byte! tl (int op-kv-put-list))
-                                (bb-put-u16! tl dbi-len)
-                                (bb-put-bytes! tl dbi-bs)
-                                (bb-write-type! tl k-type)
-                                (bb-put-u16! tl k-len))
-            ^ByteBuffer bf2 (bb-put-buffer! bf1 tl k-bf)
-            v-type (or vt :data)
-            ^ByteBuffer v-bf (encode-to-buf v :data)
-            v-len (.remaining v-bf)]
-        (-> bf2
-            (bb-write-type! tl v-type)
-            (bb-put-u32! tl v-len)
-            (bb-put-buffer! tl v-bf)
-            (bb-write-flags! tl flags)))
+      (-> bf
+          (bb-put-byte! tl (int op-kv-put-list))
+          (bb-put-u16! tl dbi-len)
+          (bb-put-bytes! tl dbi-bs)
+          (bb-write-type! tl k-type)
+          (bb-write-payload! tl k k-type true)
+          (bb-write-type! tl (or vt :data))
+          (bb-write-payload! tl v :data false)
+          (bb-write-flags! tl flags))
 
       :del-list
-      (let [raw-pair? (and (= :raw kt) (= :raw vt) (= 1 (count v)))
-            ^ByteBuffer bf1 (-> bf
-                                (bb-put-byte! tl (int (if raw-pair?
-                                                       op-kv-del-raw-pair op-kv-del-list)))
-                                (bb-put-u16! tl dbi-len)
-                                (bb-put-bytes! tl dbi-bs)
-                                (bb-write-type! tl k-type)
-                                (bb-put-u16! tl k-len))
-            ^ByteBuffer bf2 (bb-put-buffer! bf1 tl k-bf)
-            v-type (or vt :data)
-            ^ByteBuffer v-bf (encode-to-buf (if raw-pair? (first v) v)
-                                          (if raw-pair? :raw :data))
-            v-len (.remaining v-bf)]
-        (-> bf2
-            (bb-write-type! tl v-type)
-            (bb-put-u32! tl v-len)
-            (bb-put-buffer! tl v-bf)
+      (let [raw-pair? (and (= :raw kt) (= :raw vt) (= 1 (count v)))]
+        (-> bf
+            (bb-put-byte! tl (int (if raw-pair?
+                                   op-kv-del-raw-pair op-kv-del-list)))
+            (bb-put-u16! tl dbi-len)
+            (bb-put-bytes! tl dbi-bs)
+            (bb-write-type! tl k-type)
+            (bb-write-payload! tl k k-type true)
+            (bb-write-type! tl (or vt :data))
+            (bb-write-payload! tl (if raw-pair? (first v) v)
+                               (if raw-pair? :raw :data) false)
             (bb-write-flags! tl flags)))
 
       (raise "Unsupported txn-log KV op"
@@ -944,6 +941,25 @@
    (write-kv-row! tl bf row nil))
   ([^ThreadLocal tl ^ByteBuffer bf row ^HashMap dbi-cache]
    (cond
+     (instance? OwnedKVTxData row)
+     (let [^OwnedKVTxData row row
+           op (.-op row)
+           ^bytes name (dbi-name-bytes (.-dbi row) dbi-cache)
+           ^bytes key (.-key row)
+           ^bytes value (.-value row)
+           ^ByteBuffer out (-> bf
+                               (bb-put-byte! tl (int (case op :put op-kv-put :del op-kv-del
+                                                           :put-list op-kv-put-list :del-list op-kv-del-list)))
+                               (bb-put-u16! tl (alength name))
+                               (bb-put-bytes! tl name)
+                               (bb-write-type! tl (.-kt row))
+                               (bb-put-u16! tl (alength key))
+                               (bb-put-bytes! tl key))
+           out (if (= op :del) out
+                   (-> out (bb-write-type! tl (.-vt row))
+                       (bb-put-u32! tl (alength value)) (bb-put-bytes! tl value)))]
+       (bb-write-flags! out tl nil))
+
      (instance? EncodedKVTxData row)
      (write-encoded-kv-row! tl bf row dbi-cache)
 

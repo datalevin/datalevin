@@ -21,6 +21,7 @@
 - [Datalog] added `transact-ack!` function to return `:transacted` on success,
   this improves write throughput, particularly on server, for cases when `listen!`
   is not used.
+- [Datalog] idoc allows vector as root and allows query by element directly.
 - [Benchmark] added YCSB benchmark.
 
 ### Changed

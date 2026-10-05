@@ -20,7 +20,6 @@
    [datalevin.interface :as i]
    [datalevin.kv :as kv]
    [datalevin.tx-group.compat :as group]
-   [datalevin.tx-state.protocol :as protocol]
    [datalevin.validate :as vld])
   (:import
    [datalevin.db DB TxReport]
@@ -1512,22 +1511,9 @@
    (open-kv dir nil))
   ([dir opts]
    (if (u/dtlv-uri? dir)
-     (do
-       (when (= :independent (:write-mode opts))
-         (raise "Independent write mode is embedded KV only"
-                {:error :txlog/write-protocol-mismatch}))
-       (r/open-kv dir opts))
-     (let [mode (or (:write-mode opts)
-                    (when (and dir
-                               (= :kv-independent-v1
-                                  (:mode (protocol/read-write-protocol-marker dir))))
-                      :independent)
-                    :compatibility)]
-       (case mode
-         :independent ((requiring-resolve 'datalevin.tx-group.batch.public/open!) dir opts)
-         :compatibility (l/open-kv dir opts)
-         (raise "Unknown KV write mode" {:error :txlog/write-protocol-mismatch
-                                         :write-mode mode}))))))
+     (r/open-kv dir opts)
+     ((requiring-resolve 'datalevin.tx-group.batch.embedded/attach!)
+      (l/open-kv dir opts)))))
 
 (defmacro with-kv
   "Evaluate body with an opened KV database, then close it.

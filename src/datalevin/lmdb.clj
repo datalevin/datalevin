@@ -720,9 +720,9 @@
                (throw t#))))))))
 
 (defmacro with-transaction-kv
-  "Evaluate one atomic KV write body. Independent mode runs the body once on
-  the elected batch owner; reads use that ordinary native write transaction.
-  :timeout-ms bounds the body and :context is explicitly conveyed to the owner."
+  "Evaluate one atomic KV write body. WAL bodies run once on the elected batch
+  owner with the caller's dynamic bindings. Reads use the native transaction.
+  :timeout-ms bounds the body."
   [[db orig-db opts] & body]
   `(let [orig-db# ~orig-db
          opts# ~opts]

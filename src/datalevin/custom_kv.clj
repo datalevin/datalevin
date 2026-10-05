@@ -211,7 +211,7 @@
   "Remove an owning DBI's references and payloads together, without user code."
   [kv raw dbi]
   (let [opts (i/dbi-opts raw dbi)]
-    (l/with-transaction-kv [tx kv]
+    (l/with-compatibility-transaction-kv [tx kv]
       (let [rows (i/get-range (l/mark-write raw) dbi [:all] :raw :raw)
             ids (into #{} (mapcat (fn [[k v]]
                                    (cond-> []

@@ -199,12 +199,6 @@
 
 (def ^:private positive-int-opts
   #{:write-batch-size
-    :write-batch-max-bytes
-    :wal-pending-max-requests
-    :wal-pending-max-bytes
-    :wal-rmw-max-bytes
-    :wal-preparation-timeout-ms
-    :write-close-timeout-ms
     :wal-commit-wait-ms
     :async-secondary-index-worker-max-jobs
     :async-secondary-index-worker-lease-ms
@@ -233,7 +227,6 @@
 
 (def ^:private keyword-enum-opts
   {:wal-durability-profile #{:strict :relaxed :extra}
-   :write-mode             #{:compatibility :independent}
    :wal-sync-mode          #{:fsync :fdatasync :extra :none}
    :wal-segment-prealloc-mode #{:native :none}
    :wal-rollout-mode       #{:active :rollback}})
@@ -1211,8 +1204,9 @@
                 :key k
                 :selector selector}))
     (doseq [seg segments]
-      (when-not (or (keyword? seg) (string? seg))
-        (raise "Idoc path selector segments must be keywords or strings"
+      (when-not (or (keyword? seg) (string? seg)
+                    (and (integer? seg) (not (neg? ^long seg))))
+        (raise "Idoc path selector segments must be keywords, strings, or non-negative integers"
                  {:error :store/validation
                   :where where
                   :key k

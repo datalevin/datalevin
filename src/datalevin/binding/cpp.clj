@@ -1522,6 +1522,39 @@
    (raise "Fail to count list in key range: " e {:dbi dbi-name})))
 
 
+(defn prepared-row-applier
+  "Capture the owned native writer once. The returned function applies only
+  preparation-validated physical rows; it must stay inside the native callback."
+  [^CppLMDB wdb]
+  (let [write-txn (l/write-txn wdb)
+        ^Rtx rtx @write-txn
+        ^Txn txn (when rtx (.-txn rtx))
+        ^Env env (.-env wdb)
+        ^HashMap dbis (.-dbis wdb)
+        info (.-info wdb)]
+    (when-not (and txn (Thread/holdsLock write-txn))
+      (raise "Prepared rows require an owned native transaction" {}))
+    (fn [rows]
+      (try
+        (write/apply-frozen-rows* rows dbis txn)
+        ;; Value buffers can grow while applying already-encoded bytes. Persist
+        ;; their new size in this same transaction, as transact-kv does.
+        (when (:max-val-size-changed? @info)
+          (write/transact* [[:put c/kv-info :max-val-size (:max-val-size @info)]]
+                           dbis txn)
+          (vswap! info assoc :max-val-size-changed? false))
+        :transacted
+        (catch Util$MapFullException _
+          (.close txn)
+          (up-db-size env)
+          (.reset-write wdb)
+          (raise "DB resized" {:resized true}))
+        (catch Exception e
+          (if (or (= :ha/write-rejected (:error (ex-data e)))
+                  (l/blind-unique-collision? e))
+            (throw e)
+            (raise "Fail to transact to LMDB: " e {})))))))
+
 (defn- open-kv*
   [dir dir-file db-file {:keys [mapsize max-readers flags max-dbs temp?
                                 key-compress val-compress]

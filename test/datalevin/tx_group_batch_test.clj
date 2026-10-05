@@ -74,7 +74,7 @@
                  (.active-batch c) (.failure c) (.waiters c) (.budget c)
                  (.max-requests c) (.batch-limit c) (.batch-max-bytes c)
                  (.shared-reserved c) (.preparation-timeout-ms c)
-                 (.rmw-allowance c)
+                 (.collection-delay-nanos c) (.rmw-allowance c)
                  (.published c) (.next-id c) (.executor c)
                  (.check-prepared! c) (.on-failure! c))}))
 
@@ -1639,3 +1639,81 @@
             (is (batch/serving? c))
             (is (zero? (:requests (batch/usage c))))))
         (finally (.countDown release) (uninstall))))))
+
+(deftest repeated-collection-keeps-the-byte-cap-and-expires-beyond-it
+  (let [c (collector-with echo-values {:write-batch-max-bytes 3072
+                                       :wal-rmw-max-bytes 1024})
+        owner (admitted-descriptor c :owner)
+        a (admitted-descriptor c :a)
+        b (admitted-descriptor c :b)
+        blocked (admitted-descriptor c :blocked)
+        expired (admitted-descriptor c :expired 1)]
+    (is (true? (#'batch/publish-and-elect! c owner)))
+    (let [selected (#'batch/claim-next-batch! c owner)]
+      (#'batch/publish-and-elect! c a)
+      (is (= 1 (batch/collect-ready! selected)))
+      (#'batch/publish-and-elect! c b)
+      (#'batch/publish-and-elect! c blocked)
+      (#'batch/publish-and-elect! c expired)
+      (is (= 1 (batch/collect-ready! selected)))
+      (is (= 0 (batch/collect-ready! selected)))
+      (is (= [:owner :a :b] (vec (echo-values selected))))
+      (is (false? (batch/selected? blocked)))
+      (is (= :txlog/write-deadline-exceeded
+             (:error (ex-data (second @(.result expired))))))
+      (#'batch/run-sealed-batch! c selected))
+    (is (true? (#'batch/try-lead! c blocked)))
+    (#'batch/lead! c blocked)
+    (is (= [true :blocked] @(.result blocked)))
+    (release-callers! c owner a b blocked expired)
+    (is (zero? (:requests (batch/usage c))))
+    (is (zero? (:bytes (batch/usage c))))))
+
+(deftest wal-carrier-is-built-after-collection-and-compacts-no-ops-in-order
+  (let [c (collector-with echo-values)
+        owner (admitted-descriptor c {:wal-body :first})
+        noop (admitted-descriptor c {:wal-body nil})
+        tail (admitted-descriptor c {:wal-body :last})]
+    (#'batch/publish-and-elect! c owner)
+    (let [^datalevin.tx_group.batch.Batch selected (#'batch/claim-next-batch! c owner)]
+      (is (nil? (.walBodies selected)))
+      (#'batch/publish-and-elect! c noop)
+      (#'batch/publish-and-elect! c tail)
+      (is (= 2 (batch/collect-ready! selected)))
+      (is (nil? (.walBodies selected)) "collection allocates no provisional body array")
+      (batch/set-accepted-count! selected 2)
+      (batch/refresh-wal-bodies! selected)
+      (let [bodies (batch/wal-bodies selected)]
+        (is (= [:first :last] (vec bodies)))
+        (batch/refresh-wal-bodies! selected)
+        (is (identical? bodies (batch/wal-bodies selected))))
+      (#'batch/run-sealed-batch! c selected))
+    (release-callers! c owner noop tail)
+    (is (zero? (:bytes (batch/usage c))))))
+
+(deftest collection-failure-releases-members-transferred-before-expiry-failed
+  (let [c (collector-with (fn [b] (batch/collect-ready! b) (echo-values b)))
+        owner (admitted-descriptor c :owner)
+        added (admitted-descriptor c :added)
+        expired (admitted-descriptor c :expired 1)
+        tail (admitted-descriptor c :tail)
+        failure (ex-info "expiry observer failed" {})]
+    (#'batch/publish-and-elect! c owner)
+    (let [selected (#'batch/claim-next-batch! c owner)
+          uninstall (phase/observe!
+                     (fn [event _]
+                       (when (= :queue-expired event) (throw failure))))]
+      (try
+        (doseq [d [added expired tail]] (#'batch/publish-and-elect! c d))
+        (#'batch/run-sealed-batch! c selected)
+        (is (= [false failure] @(.result owner)))
+        (is (= [false failure] @(.result added)))
+        (is (batch/selected? added))
+        (is (false? (batch/selected? tail)))
+        (is (every? #(some? @(.result ^datalevin.tx_group.batch.Descriptor %))
+                    [owner added expired tail]))
+        (release-callers! c owner added expired tail)
+        (is (zero? (:requests (batch/usage c))))
+        (is (zero? (:bytes (batch/usage c))))
+        (is (batch/await-quiescence! c 100))
+        (finally (uninstall))))))
