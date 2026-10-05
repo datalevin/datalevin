@@ -27,6 +27,26 @@
      (prototype/open! dir opts)
      (d/open-kv dir opts))))
 
+(deftest embedded-caught-encoding-failure-aborts-without-fencing
+  (let [dir (u/tmp-dir (str "embedded-encoding-rollback-" (random-uuid)))
+        db (d/open-kv dir {:wal? true :wal-durability-profile :strict})]
+    (try
+      (d/open-dbi db "data")
+      (d/transact-kv db "data" [[:put 1 2]] :long :long)
+      (let [before (vec (d/open-tx-log db 1))]
+        (is (thrown? Exception
+                     (d/with-transaction-kv [tx db]
+                       (d/transact-kv tx "data" [[:put 1 3]] :long :long)
+                       (try
+                         (d/transact-kv tx "data" [[:put 1 "wrong"]] :long :long)
+                         (catch Exception _ :caught)))))
+        (is (= 2 (d/get-value db "data" 1 :long :long)))
+        (is (= before (vec (d/open-tx-log db 1)))))
+      (d/open-dbi db "next")
+      (d/update-kv db "data" 1 inc :long :long)
+      (is (= 3 (d/get-value db "data" 1 :long :long)))
+      (finally (d/close-kv db) (u/delete-files dir)))))
+
 (defn- options [wal?]
   {:write-mode :independent :wal? wal? :dbis {"data" {:validate-data? true}}
    :wal-sync-mode :fsync :wal-segment-prealloc? false :snapshot-scheduler? false})

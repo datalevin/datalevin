@@ -511,7 +511,11 @@
              (not (rdonly-env? lmdb))
              (snapshot-source-ready? lmdb))
     (let [tx-v (l/write-txn lmdb)]
-      (when-not (and (some? tx-v) (some? @tx-v))
+      ;; Never start maintenance from inside this caller's own transaction.
+      ;; A foreign writer only defers when the existing option requests it.
+      (when-not (and (some? tx-v) (some? @tx-v)
+                     (or (Thread/holdsLock tx-v)
+                         (snapshot-defer-on-contention? lmdb)))
         (when-let [state (txlog/state lmdb)]
           (txlog/try-with-maintenance-lock
            state

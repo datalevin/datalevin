@@ -1,18 +1,139 @@
 (ns datalevin.tx-group-batch-embedded-test
   (:require [clojure.test :refer [deftest is]]
+            [datalevin.constants :as c]
             [datalevin.core :as d]
             [datalevin.interface :as i]
             [datalevin.kv :as kv]
+            [datalevin.kv.scheduler :as scheduler]
             [datalevin.kv.txlog :as kvtx]
             [datalevin.lmdb :as l]
             [datalevin.scan :as scan]
             [datalevin.tx-group.batch :as batch]
+            [datalevin.tx-group.phase :as phase]
+            [datalevin.txlog :as wal]
             [datalevin.util :as u])
   (:import [java.util.concurrent CountDownLatch TimeUnit]
-           [java.io IOException]))
+           [java.io IOException]
+           [java.util.concurrent.atomic AtomicBoolean]))
 
 (def opts {:wal? true :snapshot-scheduler? false :wal-segment-prealloc? false})
 (def ^:dynamic *caller* nil)
+
+(defn- grouped-updates! [db ops]
+  (let [collector (:collector (:independent-control @(i/kv-info db)))
+        paused (CountDownLatch. 1) release (CountDownLatch. 1)
+        ready (CountDownLatch. (count ops)) first? (AtomicBoolean. true)
+        jobs (atom [])
+        uninstall (phase/observe!
+                   (fn [event _]
+                     (case event
+                       :joint-publication
+                       (when (.compareAndSet first? true false)
+                         (.countDown paused) (.await release 10 TimeUnit/SECONDS))
+                       :ready-published
+                       (when-not (.get first?) (.countDown ready))
+                       nil)))]
+    (try
+      (let [seed (future (batch/submit! collector {:op (fn [_] :seed)}))]
+        (swap! jobs conj seed)
+        (is (.await paused 10 TimeUnit/SECONDS))
+        (let [requests (mapv (fn [idx op]
+                               (let [job (future (try (op) (catch Throwable t t)))
+                                     remaining (- (count ops) idx 1)
+                                     deadline (+ (System/nanoTime) 10000000000)]
+                                 ;; Publish in order so the failing middle body
+                                 ;; deterministically precedes its successor.
+                                 (is (loop []
+                                       (cond
+                                         (= remaining (.getCount ready)) true
+                                         (>= (System/nanoTime) deadline) false
+                                         :else (do (Thread/sleep 1) (recur)))))
+                                 job))
+                             (range) ops)]
+          (swap! jobs into requests)
+          (is (.await ready 10 TimeUnit/SECONDS))
+          (.countDown release)
+          (is (= :seed (deref seed 10000 ::timeout)))
+          (mapv #(deref % 10000 ::timeout) requests)))
+      (finally
+        (.countDown release)
+        (doseq [job @jobs] (deref job 10000 nil))
+        (uninstall)))))
+
+(deftest default-relaxed-groups-count-requests-and-abort-failed-batches
+  (let [dir (u/tmp-dir (str "m1-relaxed-count-" (random-uuid)))
+        db (d/open-kv dir (assoc opts :wal-durability-profile :relaxed
+                               :wal-group-commit 4 :wal-group-commit-ms 0
+                               :snapshot-bootstrap-force? false))
+        metrics #(wal/sync-manager-state (:sync-manager (wal/state db)))]
+    (try
+      (d/open-dbi db "data")
+      (d/transact-kv db "data" [[:put 1 0]] :long :long)
+      (kv/force-txlog-sync! db)
+      (let [before (metrics)
+            increment #(d/update-kv db "data" 1 inc :long :long)]
+        (is (= [:transacted :transacted] (grouped-updates! db [increment increment])))
+        (let [after (metrics)]
+          (is (= (inc (:last-appended-lsn before)) (:last-appended-lsn after)))
+          (is (= (:last-durable-lsn before) (:last-durable-lsn after)))
+          (is (= [1 2] ((juxt :pending-count :unsynced-count) after))))
+        (is (= [:transacted :transacted] (grouped-updates! db [increment increment])))
+        ;; Relaxed acknowledgements can precede the worker's requested sync.
+        (let [deadline (+ (System/nanoTime) 10000000000)]
+          (loop []
+            (when (and (< (:last-durable-lsn (metrics))
+                          (+ 2 (:last-appended-lsn before)))
+                       (< (System/nanoTime) deadline))
+              (Thread/sleep 1) (recur))))
+        (let [after (metrics)]
+          (is (= (+ 2 (:last-appended-lsn before))
+                 (:last-appended-lsn after) (:last-durable-lsn after)))
+          (is (= :batch-count (:last-sync-reason after)))
+          (is (zero? (:unsynced-count after))))
+        (let [failure (ex-info "bad request" {}) before (metrics)
+              successor? (atom false)
+              bad #(d/update-kv db "data" 1 (fn [_] (throw failure)) :long :long)
+              successor #(d/update-kv db "data" 1
+                                      (fn [value] (reset! successor? true) (inc value))
+                                      :long :long)
+              results (grouped-updates! db [increment bad successor])]
+          (is (every? #(identical? failure %) results))
+          (is (false? @successor?))
+          (is (= (:last-appended-lsn before) (:last-appended-lsn (metrics))))
+          (is (= 4 (d/get-value db "data" 1 :long :long)))
+          (is (= :transacted (increment)))
+          (is (= 5 (d/get-value db "data" 1 :long :long)))))
+      (finally (d/close-kv db)))
+    (try
+      (let [reopened (d/open-kv dir)]
+        (try (is (= 5 (d/get-value reopened "data" 1 :long :long)))
+             (finally (d/close-kv reopened))))
+      (finally (u/delete-files dir)))))
+
+(deftest default-startup-floor-failure-aborts-writer-without-closing-store
+  (let [dir (u/tmp-dir (str "m1-invalid-floor-" (random-uuid)))
+        db (d/open-kv dir opts)
+        raw (kv/raw-lmdb db)
+        called? (atom false)]
+    (try
+      (d/open-dbi db "data")
+      (d/with-transaction-kv [tx db]
+        (d/transact-kv tx "data" [[:put 0 0]] :long :long))
+      (i/transact-kv raw
+                     [[:put c/kv-info c/wal-snapshot-current-lsn
+                       :invalid-floor :keyword :data]])
+      (is (thrown? ClassCastException
+                   (d/with-transaction-kv [_ db] (reset! called? true))))
+      (is (false? @called?))
+      (is (nil? @(l/write-txn db)))
+      (is (false? (i/closed-kv? db)))
+      (is (= 0 (d/get-value db "data" 0 :long :long)))
+      (i/transact-kv raw
+                     [[:del c/kv-info c/wal-snapshot-current-lsn :keyword]])
+      (d/with-transaction-kv [tx db]
+        (d/transact-kv tx "data" [[:put 1 1]] :long :long))
+      (is (= 1 (d/get-value db "data" 1 :long :long)))
+      (finally (d/close-kv db) (u/delete-files dir)))))
 
 (deftest default-opener-dynamic-catalog-and-existing-store
   (let [dir (u/tmp-dir (str "m1-existing-" (random-uuid)))]
@@ -224,6 +345,41 @@
         (is (= (inc before) (:last-committed-lsn (d/txlog-watermarks db))))
         (doseq [key (range 4)] (is (= key (d/get-value db "data" key :long :long)))))
       (finally
+        (doseq [job @jobs] (deref job 10000 nil))
+        (d/close-kv db)
+        (u/delete-files dir)))))
+
+(deftest default-snapshot-does-not-defer-a-foreign-writer-when-disabled
+  (let [dir (u/tmp-dir (str "m1-snapshot-contention-" (random-uuid)))
+        db (d/open-kv dir (assoc opts :snapshot-defer-on-contention? false))
+        entered (promise) release (promise) jobs (atom [])]
+    (try
+      (d/open-dbi db "data")
+      (let [raw (kv/raw-lmdb db)
+            owner (future (d/with-transaction-kv [tx db]
+                            (d/transact-kv tx "data" [[:put 1 7]] :long :long)
+                            (deliver entered true)
+                            (deref release 10000 ::timeout))) ]
+        (swap! jobs conj owner)
+        (is (deref entered 10000 false))
+        ;; Enable the explicit scheduler probe without starting a poll thread.
+        (vswap! (i/kv-info raw) assoc :snapshot-scheduler? true)
+        (let [copy (future (#'scheduler/maybe-run-snapshot-scheduler! raw))
+              deadline (+ (System/nanoTime) 5000000000)]
+          (swap! jobs conj copy)
+          (loop []
+            (when (and (nil? (:snapshot-scheduler-last-run-start-ms @(i/kv-info raw)))
+                       (< (System/nanoTime) deadline))
+              (Thread/sleep 1)
+              (recur)))
+          (is (some? (:snapshot-scheduler-last-run-start-ms @(i/kv-info raw))))
+          (deliver release :done)
+          (is (= :done (deref owner 10000 ::timeout)))
+          (is (map? (deref copy 10000 ::timeout)))
+          (is (= 7 (d/get-value db "data" 1 :long :long)))
+          (is (seq (d/list-snapshots db)))))
+      (finally
+        (deliver release :done)
         (doseq [job @jobs] (deref job 10000 nil))
         (d/close-kv db)
         (u/delete-files dir)))))

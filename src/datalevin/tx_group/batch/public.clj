@@ -102,7 +102,7 @@
                                          (instance? ByteBuffer value)
                                          (.remaining ^ByteBuffer value))))]
                     (if known
-                      (max 1 (if key? (min c/+max-key-size+ known) known))
+                      (max 1 (if key? (min c/+max-key-size+ (long known)) (long known)))
                       (if key? c/+max-key-size+ 256)))]
     (charge! (+ charge/buffer-wrapper (charge/array-bytes 1 capacity)))
     (let [buffer (ByteBuffer/allocate (int capacity))
@@ -134,7 +134,7 @@
     ;; plus the UTF-8 name and payload. Reserve while those lengths are handy,
     ;; before the WAL encoder allocates its owned body; no second row walk.
     (charge! (+ charge/encoded-row-descriptor (* 3 (count name))
-                (alength key) (if value (alength value) 0))))
+                (alength key) (long (if value (alength value) 0)))))
   (when (= :del-list op) (charge! charge/vector-wrapper))
   (.add rows (l/kv-tx op name key (if (= :del-list op) [value] value) :raw :raw flags)))
 
@@ -245,7 +245,11 @@
       :op (fn [tx]
             (let [watchdog (l/start-explicit-transaction-watchdog! timeout)]
               (try
-                (let [result (body (kv/wrap-lmdb tx))]
+                ;; This writer belongs to an already-open environment. Opener
+                ;; cleanup would close that environment if floor validation
+                ;; fails; the native batch owner must abort only its writer.
+                (kv/ensure-txlog-ready! tx)
+                (let [result (body (kv/->KVLMDB tx nil))]
                   (l/cancel-explicit-transaction-watchdog! watchdog)
                   (l/assert-explicit-transaction-live! watchdog)
                   result)

@@ -124,13 +124,31 @@
 
 (def ensure-txlog-ready! kvtx/ensure-txlog-ready!)
 
-(def transact-kv-without-txlog! kvtx/transact-kv-without-txlog!)
+(defn transact-kv-without-txlog!
+  "Apply local rows directly, without entering the public WAL collector."
+  [db tx-data]
+  (i/check-ready db)
+  (kvtx/transact-kv-without-txlog! (raw-lmdb db) tx-data))
 
-(def mirror-replayed-txlog-record! kvtx/mirror-replayed-txlog-record!)
-(def mirror-replayed-txlog-records! kvtx/mirror-replayed-txlog-records!)
+(defn mirror-replayed-txlog-record!
+  ([db record]
+   (mirror-replayed-txlog-record! db record nil))
+  ([db record preapply-rows]
+   (mirror-replayed-txlog-record! db record preapply-rows nil))
+  ([db record preapply-rows opts]
+   (i/check-ready db)
+   (kvtx/mirror-replayed-txlog-record! (raw-lmdb db) record preapply-rows opts)))
+(defn mirror-replayed-txlog-records!
+  [db records preapply-fn]
+  (i/check-ready db)
+  (kvtx/mirror-replayed-txlog-records! (raw-lmdb db) records preapply-fn))
 (def batchable-replay-record? kvtx/batchable-replay-record?)
 
-(def replay-txlog-rows! kvtx/replay-txlog-rows!)
+(defn replay-txlog-rows!
+  "Materialize existing WAL rows directly without appending a new record."
+  [db rows lsn]
+  (i/check-ready db)
+  (kvtx/replay-txlog-rows! (raw-lmdb db) rows lsn))
 
 
 
@@ -249,21 +267,25 @@
 
 (defn txlog-update-replica-floor!
   [db replica-id applied-lsn]
-  (txlog-update-replica-floor-state! db replica-id applied-lsn))
+  (i/check-ready db)
+  (txlog-update-replica-floor-state! (raw-lmdb db) replica-id applied-lsn))
 
 (defn txlog-clear-replica-floor!
   [db replica-id]
-  (txlog-clear-replica-floor-state! db replica-id))
+  (i/check-ready db)
+  (txlog-clear-replica-floor-state! (raw-lmdb db) replica-id))
 
 (defn txlog-pin-backup-floor!
   ([db pin-id floor-lsn]
-   (txlog-pin-backup-floor-state! db pin-id floor-lsn nil))
+   (txlog-pin-backup-floor! db pin-id floor-lsn nil))
   ([db pin-id floor-lsn expires-ms]
-   (txlog-pin-backup-floor-state! db pin-id floor-lsn expires-ms)))
+   (i/check-ready db)
+   (txlog-pin-backup-floor-state! (raw-lmdb db) pin-id floor-lsn expires-ms)))
 
 (defn txlog-unpin-backup-floor!
   [db pin-id]
-  (txlog-unpin-backup-floor-state! db pin-id))
+  (i/check-ready db)
+  (txlog-unpin-backup-floor-state! (raw-lmdb db) pin-id))
 
 (declare wrap-lmdb)
 

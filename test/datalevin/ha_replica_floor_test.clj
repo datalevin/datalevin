@@ -11,6 +11,26 @@
 
 (use-fixtures :each db-fixture)
 
+(deftest local-retention-bookkeeping-preserves-wal-position
+  (let [dir (u/tmp-dir (str "retention-wal-bypass-" (random-uuid)))
+        db (d/open-kv dir {:wal? true :wal-shared? false
+                           :wal-durability-profile :strict})]
+    (try
+      (d/open-dbi db "data")
+      (d/transact-kv db [[:put "data" :key :value]])
+      (let [before (select-keys (kv/txlog-watermarks db)
+                                [:last-appended-lsn :last-durable-lsn :last-applied-lsn])
+            records (vec (kv/open-tx-log db 1))
+            floor (:last-applied-lsn before)]
+        (doseq [update! [#(kv/txlog-update-replica-floor! db :replica floor)
+                         #(kv/txlog-clear-replica-floor! db :replica)
+                         #(kv/txlog-pin-backup-floor! db :backup floor)
+                         #(kv/txlog-unpin-backup-floor! db :backup)]]
+          (update!)
+          (is (= before (select-keys (kv/txlog-watermarks db) (keys before))))
+          (is (= records (vec (kv/open-tx-log db 1))))))
+      (finally (d/close-kv db) (u/delete-files dir)))))
+
 (defn- with-reports [f]
   (let [now (atom 0)
         reports (atom [])

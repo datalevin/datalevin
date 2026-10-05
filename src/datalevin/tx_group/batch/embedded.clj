@@ -75,9 +75,9 @@
       (locking info
         (when-not (:independent-control @info)
           (let [limits (assoc (charge/resolve-limits
-                               {:write-batch-size (max 1 (min (:max-requests charge/default-limits)
-                                                              (or (:write-batch-size @info)
-                                                                  (wal/group-commit @info))))})
+                               {:write-batch-size (max 1 (min (long (:max-requests charge/default-limits))
+                                                              (long (or (:write-batch-size @info)
+                                                                        (wal/group-commit @info)))))})
                               ;; Existing public calls have no byte-size or
                               ;; preparation-timeout contract. Bound in-flight
                               ;; requests; retain the legacy caller's input size.

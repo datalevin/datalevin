@@ -2625,7 +2625,10 @@
                     (fn []
                       ;; Resize retries repeat materialization only. The WAL
                       ;; group already owns its LSNs and must not be appended twice.
-                      (l/with-transaction-kv [writing lmdb]
+                      ;; Replay already owns durable WAL positions. Use the
+                      ;; native transaction with resize retries, bypassing the
+                      ;; independent collector that appends local write bodies.
+                      (l/with-compatibility-transaction-kv [writing lmdb]
                         (doseq [record records]
                           (let [cleanup (when preapply-fn
                                           (preapply-fn writing record))

@@ -52,7 +52,8 @@
   "Freeze and apply writes in the batch transaction. Retain a failure even
    when the body catches it, so no failed batch can reach WAL or native commit."
   [raw wdb apply-rows! descriptor rows wal-rows valid? failure
-   {:keys [check-row! prepare-rows! allow-flags? prepared-owned? charge-fn prepared-request?]
+   {:keys [check-row! prepare-rows! allow-flags? prepared-owned? charge-fn prepared-request?
+           application-error!]
     :or {charge-fn charge!}} dbi-name txs kt vt]
   (try
     (l/write-txn wdb)
@@ -60,7 +61,17 @@
       (throw (ex-info "Write body has finished"
                       {:error :txlog/transaction-view-invalidated :retryable? false})))
     (when-let [t @failure] (throw t))
-    (let [prepared (if prepare-rows! (prepare-rows! raw descriptor dbi-name txs kt vt) txs)
+    (let [prepared (if prepare-rows!
+                     (try
+                       (prepare-rows! raw descriptor dbi-name txs kt vt)
+                       (catch Throwable t
+                         ;; Encoding/validation failed before native application.
+                         ;; Classify it just like a rejected user body, retaining
+                         ;; the cancellation even if that body catches the error.
+                         (if application-error!
+                           (application-error! t)
+                           (throw t))))
+                     txs)
           txs (if prepared-request? (:rows prepared) prepared)
           _ (when prepared-request? (.addAll ^ArrayList wal-rows ^java.util.Collection (:wal-rows prepared)))
           dbi-name (when-not prepare-rows! dbi-name)]
@@ -215,11 +226,12 @@
                                 (max 1 (dec (long (batch/batch-count batch))))
                                 (min 1 (long (batch/batch-count batch)))))
                     weight (long 0)]
-               (let [weight (loop [idx (long start) weight (long weight)]
-                              (if (< idx end)
-                                (recur (inc idx)
-                                       (+ weight (long (apply-member! idx))))
-                                weight))]
+               (let [weight (long
+                              (loop [idx (long start) weight (long weight)]
+                                (if (< idx end)
+                                  (recur (inc idx)
+                                         (+ weight (long (apply-member! idx))))
+                                  weight)))]
                  (phase/phase! :native-prefix-applied batch)
                  ;; Give already-admitted preparers one scheduling turn before
                  ;; freezing a microsecond native prefix. This is a bounded
@@ -259,10 +271,10 @@
                 ;; For tiny prepared suffixes the worker handoff costs more
                 ;; than applying the rows inline. Larger suffixes still overlap.
                 (or (not (:collect-prepared-prefix? opts))
-                    (> (reduce (fn [total idx]
-                                 (if-let [^bytes body (:wal-body (batch/data (batch/batch-at batch idx)))]
-                                   (+ (long total) (alength body)) total))
-                               0 (range suffix-start (batch/batch-count batch)))
+                    (> (long (reduce (fn [total idx]
+                                       (if-let [^bytes body (:wal-body (batch/data (batch/batch-at batch idx)))]
+                                         (+ (long total) (alength body)) total))
+                                     0 (range suffix-start (batch/batch-count batch))))
                        4096))))
          (when (and wal (pos? weight))
            (batch/set-lsn! batch (long (next-lsn!)))
