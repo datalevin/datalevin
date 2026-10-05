@@ -453,6 +453,13 @@
   [^Collector collector]
   (.get ^AtomicLong (.published collector)))
 
+(defn publish-admin-prefix!
+  "Publish a standalone admin commit while its caller holds the native writer
+  lock. Earlier data batches may still be delivering results; publication is
+  monotonic and every preceding native/WAL write has already completed."
+  [^Collector collector ^long lsn]
+  (.accumulateAndGet ^AtomicLong (.published collector) lsn max-long))
+
 (defn initialize-prefix!
   "Install the verified recovered prefix before publishing a fresh collector.
   Runtime writes advance it only at join."

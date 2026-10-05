@@ -40,15 +40,15 @@
                   op (if record? (.-op ^KVTxData row) (nth row 0))
                   name (if record? (.-dbi-name ^KVTxData row) (nth row 1))
                   key (if record? (.-k ^KVTxData row) (nth row 2))
-                  value (if record? (.-v ^KVTxData row) (nth row 3 nil))]
+                  value (if record? (.-v ^KVTxData row) (nth row 3 nil))
+                  ^bytes encoded-value (when-not (= :del op)
+                                         (if (= :del-list op) (first value) value))]
               (+ total (long charge/encoded-row-descriptor)
                ;; UTF-8 takes at most three bytes per UTF-16 code unit. Bound
                ;; it without allocating a temporary name encoding first.
                (* 3 (long (.length ^String name)))
                (if key (long (alength ^bytes key)) 0)
-               (if (#{:del :clear} op)
-                 (long 0)
-                 (long (alength ^bytes (if (= :del-list op) (first value) value)))))))
+               (if encoded-value (long (alength encoded-value)) 0))))
           charge/buffer-wrapper
           rows))
 
@@ -94,9 +94,8 @@
   [declared public?]
   {:check-row! (fn [name op key value]
                  (if public? (check-dbi! declared name) (check-single-value! declared name))
-                 (when-not (= :clear op)
-                   (check-physical! declared name op key
-                                    (if (= :del-list op) (first value) value))))
+                 (check-physical! declared name op key
+                                  (if (= :del-list op) (first value) value)))
    :body-cost rows-cost
    :encode-body (fn [rows hooks] (wal/prepare-append-body rows hooks))})
 
@@ -117,12 +116,11 @@
                     (if record? (.-v ^KVTxData row) (nth row 3)))
                 kt (if record? (.-kt ^KVTxData row)
                        (nth row (if (= :del op) 3 4) nil))
-                vt (when (#{:put :del-list :clear} op)
+                vt (when (#{:put :del-list} op)
                      (if record? (.-vt ^KVTxData row) (nth row 5 nil)))
                 flags (if record? (.-flags ^KVTxData row)
                           (nth row (if (= :del op) 4 6) nil))]
             (when-not (and (contains? declared name) (or (#{:put :del} op)
-                               (and public? (= :clear op))
                                (and public? (= :del-list op)
                                     (some #{:dupsort} (:flags (get declared name)))
                                     (= 1 (count v))))
@@ -134,8 +132,7 @@
                         {:error :txlog/unsupported-private-operation
                          :outcome :not-committed :dbi name :operation op
                          :retryable? false})))
-            (when-not (= :clear op)
-              (check-physical! declared name op k (if (= :del-list op) (first v) v))))))))
+            (check-physical! declared name op k (if (= :del-list op) (first v) v)))))))
 
 (defn- snapshot-due? [raw state collector manifest]
   (let [age (- (System/currentTimeMillis) (long (:created-ms manifest)))
@@ -273,6 +270,7 @@
                                   poll poll TimeUnit/MILLISECONDS))))
                            :on-failure! (fn [_] (lifetime/fence! native-lifetime))
                            :resources {:raw raw :wal-state state :wal? wal?
+                                       :wake-wal! (get-in runtime [:worker :wake!])
                                        :recovery restored :snapshot! (when state take-snapshot!)
                                        :snapshot-state latest :snapshot-error snapshot-error}
                            :close!

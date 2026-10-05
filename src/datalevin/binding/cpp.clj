@@ -987,8 +987,10 @@
     (try
       (let [^Dbi dbi (.-db ^DBI (.get-dbi this dbi-name))
             ^Txn txn (Txn/create env)]
-        (Util/checkRc (DTLV/mdb_drop (.get txn) (.get dbi) 0))
-        (.commit txn))
+        (try
+          (Util/checkRc (DTLV/mdb_drop (.get txn) (.get dbi) 0))
+          (.commit txn)
+          (finally (.close txn))))
       (catch Util$MapFullException _
         (let [^Info info (Info/create env)]
           (.setMapSize env (* ^long c/+buffer-grow-factor+

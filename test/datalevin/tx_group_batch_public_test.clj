@@ -5,11 +5,13 @@
             [datalevin.binding.cpp.lifecycle :as lifecycle]
             [datalevin.interface :as i]
             [datalevin.lmdb :as l]
+            [datalevin.tx-group.batch :as batch]
             [datalevin.tx-group.batch.env :as env]
             [datalevin.tx-group.batch.stage :as stage]
             [datalevin.tx-group.batch.recovery :as recovery]
             [datalevin.tx-group.phase :as phase]
             [datalevin.txlog.codec :as codec]
+            [datalevin.txlog.segment :as segment]
             [datalevin.tx-state.protocol :as protocol]
             [datalevin.util :as u])
   (:import [java.util.concurrent CountDownLatch TimeUnit]))
@@ -266,25 +268,22 @@
             (finally (d/close-kv reopened))))
         (finally (d/close-kv db) (u/delete-files dir))))))
 
-(deftest public-clear-participates-in-whole-batch-commit-and-recovery
+(deftest public-clear-is-a-standalone-admin-transaction
   (doseq [wal? [false true]]
-    (let [dir (u/tmp-dir (str "public-batch-clear-" (random-uuid)))
+    (let [dir (u/tmp-dir (str "public-admin-clear-" (random-uuid)))
           db (d/open-kv dir (options wal?))]
       (try
         (d/transact-kv db "data" [[:put 1 10] [:put 2 20]] :long :long)
         (is (thrown? clojure.lang.ExceptionInfo
-                     (d/with-transaction-kv [tx db]
-                       (d/clear-dbi tx "data")
-                       (is (empty? (d/get-range tx "data" [:all] :long :long)))
-                       (throw (ex-info "abort clear" {})))))
+                     (d/with-transaction-kv [tx db] (d/clear-dbi tx "data"))))
         (is (= [[1 10] [2 20]] (vec (d/get-range db "data" [:all] :long :long))))
-        (is (nil? (d/clear-dbi db "data")))
+        (with-redefs [batch/submit! (fn [& _] (throw (ex-info "admin entered data collector" {})))]
+          (is (nil? (d/clear-dbi db "data"))))
         (is (empty? (d/get-range db "data" [:all] :long :long)))
-        (d/transact-kv db "data" [[:put 3 30]] :long :long)
-        (d/with-transaction-kv [tx db]
-          (d/clear-dbi tx "data")
-          (d/transact-kv tx "data" [[:put 4 40]] :long :long)
-          (is (= [[4 40]] (vec (d/get-range tx "data" [:all] :long :long)))))
+        (is (= ["data"] (vec (d/list-dbis db))))
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (d/transact-kv db [(l/kv-tx :clear "data" nil nil :raw :raw)])))
+        (d/transact-kv db "data" [[:put 4 40]] :long :long)
         (d/close-kv db)
         (let [reopened (d/open-kv dir)]
           (try
@@ -302,7 +301,7 @@
       (d/put-list-items db "list" 1 [10 20] :long :long)
       (is (thrown? clojure.lang.ExceptionInfo
                    (d/with-transaction-kv [tx db]
-                     (d/clear-dbi tx "list")
+                     (d/del-list-items tx "list" 1 [10] :long :long)
                      (d/put-list-items tx "list" 1 (range 1000) :long :long))))
       (is (= [10 20] (vec (d/get-list db "list" 1 :long :long))))
       (is (thrown? clojure.lang.ExceptionInfo
@@ -311,32 +310,49 @@
       (is (= [20] (vec (d/get-list db "list" 1 :long :long))))
       (finally (d/close-kv db) (u/delete-files dir)))))
 
-(deftest public-clear-and-list-remain-invisible-before-wal-policy-completion
-  (let [dir (u/tmp-dir (str "public-batch-list-policy-" (random-uuid)))
-        db (d/open-kv dir (assoc (options true)
-                                :dbis {"list" {:flags #{:create :dupsort}}}))
+(deftest public-admin-clear-waits-for-wal-policy-before-native-transaction
+  (let [dir (u/tmp-dir (str "public-admin-clear-policy-" (random-uuid)))
+        db (d/open-kv dir (options true))
         started (CountDownLatch. 1) release (CountDownLatch. 1)]
     (try
-      (d/put-list-items db "list" 1 [10 20] :long :long)
-      (let [uninstall (phase/observe!
-                       (fn [event _]
-                         (when (#{:wal-start :inline-execution} event)
-                           (.countDown started)
-                           (.await release 10 TimeUnit/SECONDS))))]
-        (try
-          (let [write (future
-                        (d/with-transaction-kv [tx db]
-                          (d/clear-dbi tx "list")
-                          (d/put-list-items tx "list" 1 [30 40] :long :long)
-                          (is (= [30 40] (vec (d/get-list tx "list" 1 :long :long))))))]
+      (d/transact-kv db "data" [[:put 1 10]] :long :long)
+      (with-redefs [segment/phase!
+                    (fn [event _]
+                      (when (= :force-started event)
+                        (.countDown started)
+                        (.await release 10 TimeUnit/SECONDS)))]
+        (let [clear (future (d/clear-dbi db "data"))]
+          (try
             (is (.await started 10 TimeUnit/SECONDS))
-            (is (not (realized? write)))
-            (is (= [10 20] (vec (d/get-list db "list" 1 :long :long))))
+            (is (not (realized? clear)))
+            (is (= 10 (d/get-value db "data" 1 :long :long)))
             (.countDown release)
-            (is (not= ::timeout (deref write 10000 ::timeout)))
-            (is (= [30 40] (vec (d/get-list db "list" 1 :long :long)))))
-          (finally (.countDown release) (uninstall))))
+            (is (nil? (deref clear 10000 ::timeout)))
+            (is (nil? (d/get-value db "data" 1 :long :long)))
+            (finally (.countDown release) (deref clear 10000 ::timeout)))))
       (finally (d/close-kv db) (u/delete-files dir)))))
+
+(deftest public-admin-clear-follows-committed-data-before-result-publication
+  (let [dir (u/tmp-dir (str "public-admin-clear-publication-" (random-uuid)))
+        db (d/open-kv dir (options true))
+        paused (CountDownLatch. 1) release (CountDownLatch. 1)
+        uninstall (phase/observe!
+                   (fn [event _]
+                     (when (= event :joint-publication)
+                       (.countDown paused)
+                       (.await release 10 TimeUnit/SECONDS))))]
+    (try
+      (let [write (future (d/transact-kv db "data" [[:put 1 10]] :long :long))]
+        (try
+          (is (.await paused 10 TimeUnit/SECONDS))
+          (is (nil? (d/clear-dbi db "data")))
+          (is (= 2 (:applied-lsn (d/txlog-watermarks db))))
+          (.countDown release)
+          (is (= :transacted (deref write 10000 ::timeout)))
+          (is (= 2 (:applied-lsn (d/txlog-watermarks db))))
+          (is (nil? (d/get-value db "data" 1 :long :long)))
+          (finally (.countDown release) (deref write 10000 ::timeout))))
+      (finally (.countDown release) (uninstall) (d/close-kv db) (u/delete-files dir)))))
 
 (deftest public-clear-and-list-recover-through-an-older-snapshot
   (let [dir (u/tmp-dir (str "public-batch-list-fallback-" (random-uuid)))
@@ -372,3 +388,52 @@
       (is (= [:clear "list" nil nil :raw :raw] (second decoded))))
     (is (thrown? clojure.lang.ExceptionInfo
                  (codec/decode-raw-commit-row-payload body 1)))))
+
+(deftest public-fixed-encodings-and-raw-buffer-ownership
+  (doseq [wal? [false true]]
+    (let [dir (u/tmp-dir (str "public-fixed-encoding-" (random-uuid)))
+          db (d/open-kv dir (assoc-in (options wal?) [:dbis "raw"] {}))]
+      (try
+        (doseq [[idx [type value]]
+                (map-indexed vector [[:long -123] [:id 99]
+                                     [:float (float 1.25)] [:double 2.5]
+                                     [:boolean true]
+                                     [:instant (java.util.Date. 123456)]
+                                     [:uuid (java.util.UUID/randomUUID)]])]
+          (d/transact-kv db "data" [[:put idx value]] :long type)
+          (is (= value (d/get-value db "data" idx :long type))))
+        (let [input (java.nio.ByteBuffer/wrap (byte-array [0 1 2 3]))]
+          (.position input 1)
+          (d/transact-kv db "raw" [[:put 100 input]] :long :raw)
+          (is (= 1 (.position input)))
+          (.put input 1 (byte 99))
+          (is (= [1 2 3] (vec (d/get-value db "raw" 100 :long :raw)))))
+        (finally (d/close-kv db) (u/delete-files dir))))))
+
+(deftest public-mixed-physical-rows-preserve-order-and-recover-unicode-dbis
+  (doseq [wal? [false true]]
+    (let [dir (u/tmp-dir (str "public-mixed-preparation-" (random-uuid)))
+          ordinary "資料😀"
+          duplicates "列😀"
+          db (d/open-kv dir (assoc (options wal?) :dbis
+                                  {ordinary {:validate-data? true}
+                                   duplicates {:flags #{:create :dupsort}
+                                               :validate-data? true}}))]
+      (try
+        (is (= :transacted
+               (d/transact-kv db [[:put ordinary 1 "old" :long :string]
+                                  [:put-list duplicates "key" ["甲" "乙"] :string :string]
+                                  [:del ordinary 1 :long]
+                                  [:del-list duplicates "key" ["甲"] :string :string]
+                                  [:put ordinary 1 "new" :long :string]
+                                  [:put-list duplicates "empty" [] :string :string]])))
+        (is (= "new" (d/get-value db ordinary 1 :long :string)))
+        (is (= ["乙"] (vec (d/get-list db duplicates "key" :string :string))))
+        (is (empty? (d/get-list db duplicates "empty" :string :string)))
+        (d/close-kv db)
+        (let [reopened (d/open-kv dir)]
+          (try
+            (is (= "new" (d/get-value reopened ordinary 1 :long :string)))
+            (is (= ["乙"] (vec (d/get-list reopened duplicates "key" :string :string))))
+            (finally (d/close-kv reopened))))
+        (finally (d/close-kv db) (u/delete-files dir))))))

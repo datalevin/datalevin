@@ -1374,7 +1374,7 @@
     (let [rows (loop [idx 0 out []]
                  (if (= idx op-count)
                    out
-                   (let [opcode (bb-get-u8 bf)
+                   (let [opcode (int (bb-get-u8 bf))
                          _ (when-not (#{0x10 0x11 0x1a 0x1b} opcode)
                              (raise "Unsupported private WAL operation"
                                     {:type :txlog/corrupt :opcode opcode}))

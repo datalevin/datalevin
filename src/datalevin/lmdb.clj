@@ -726,7 +726,7 @@
   [[db orig-db opts] & body]
   `(let [orig-db# ~orig-db
          opts# ~opts]
-     (if-let [control# (:independent-control @(kv-info orig-db#))]
+     (if-let [control# (some-> (kv-info orig-db#) deref :independent-control)]
        (do (datalevin.interface/check-ready orig-db#)
            (if (writing? orig-db#)
              (do (write-txn orig-db#) (let [~db orig-db#] ~@body))

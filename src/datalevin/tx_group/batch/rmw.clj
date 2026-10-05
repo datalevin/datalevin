@@ -76,9 +76,7 @@
                       (nth row (if dbi-name (if (= op :put) 3 2)
                                    (if (= op :put) 6 4)) nil))]
         (when-not (and (or (#{:put :del} op)
-                           (and prepare-rows!
-                                (or (= :clear op)
-                                    (and (= :del-list op) (= 1 (count v)))))) (= key-type :raw)
+                           (and prepare-rows! (= :del-list op) (= 1 (count v)))) (= key-type :raw)
                        (or (= op :del) (= val-type :raw)) (empty? flags))
           (throw (ex-info "Operation is outside private native RMW scope"
                           {:error :txlog/unsupported-private-operation

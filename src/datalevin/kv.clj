@@ -515,13 +515,7 @@
     [this dbi-name]
     (custom-kv/guard-internal! db dbi-name)
     (if-let [control (independent-control db)]
-      (do
-        (i/check-ready this)
-        (if (l/writing? db)
-          (i/transact-kv db [(l/kv-tx :clear dbi-name nil nil :raw :raw)])
-          ((:body! control)
-           (fn [tx] (i/clear-dbi tx dbi-name)) {}))
-        nil)
+      (do (i/check-ready this) ((:clear-dbi! control) dbi-name))
       (if (custom-kv/custom-dbi? db dbi-name)
         (custom-kv/clear! this db dbi-name)
         (i/clear-dbi db dbi-name))))

@@ -18,10 +18,11 @@
             [datalevin.tx-group.batch.recovery :as recovery]
             [datalevin.tx-state.protocol :as protocol]
             [datalevin.txlog :as wal]
+            [datalevin.txlog.codec :as codec]
             [datalevin.validate :as validate])
   (:import [datalevin.lmdb KVTxData]
            [java.nio ByteBuffer BufferOverflowException]
-           [java.util ArrayList]
+           [org.eclipse.collections.impl.list.mutable FastList]
            [java.util.concurrent.atomic AtomicBoolean]))
 
 (def ^:private open-lock (Object.))
@@ -78,23 +79,30 @@
                            :outcome :not-committed :retryable? false})))
         (vreset! used next)))))
 
+(defn- charge-text! [charge! value type]
+  (cond
+    (#{:string :keyword :symbol :attr} type)
+    (charge! (charge/array-bytes 1 (* 3 (long (count (str value))))))
+    (vector? type)
+    (doseq [[element element-type]
+            (map vector value (if (= 1 (count type)) (repeat (first type)) type))]
+      (charge-text! charge! element element-type))))
+
 (defn- encode
   "Charge scratch, growth overlap and the detached byte array before allocation.
   Nippy writes into the bounded buffer; no unbounded serialized value is built."
   ^bytes [charge! value type key?]
   ;; String/symbol encoders create a UTF-8 array before copying into the buffer.
   ;; Reserve its worst-case size first, including tuple elements recursively.
-  (letfn [(charge-text! [value type]
-            (cond
-              (#{:string :keyword :symbol :attr} type)
-              (charge! (charge/array-bytes 1 (* 3 (long (count (str value))))))
-              (vector? type)
-              (doseq [[element element-type]
-                      (map vector value (if (= 1 (count type))
-                                          (repeat (first type)) type))]
-                (charge-text! element element-type))))]
-    (charge-text! value type))
-  (loop [capacity (if key? c/+max-key-size+ 256)]
+  (charge-text! charge! value type)
+  (loop [capacity (let [known (or (bits/type-size type)
+                                 (when (= :raw type)
+                                   (cond (bytes? value) (alength ^bytes value)
+                                         (instance? ByteBuffer value)
+                                         (.remaining ^ByteBuffer value))))]
+                    (if known
+                      (max 1 (if key? (min c/+max-key-size+ known) known))
+                      (if key? c/+max-key-size+ 256)))]
     (charge! (+ charge/buffer-wrapper (charge/array-bytes 1 capacity)))
     (let [buffer (ByteBuffer/allocate (int capacity))
           encoded? (try (bits/put-buffer buffer
@@ -104,101 +112,114 @@
                         (catch BufferOverflowException _ false))]
       (if encoded?
         (let [size (.position buffer)]
-          (charge! (charge/array-bytes 1 size))
-          (java.util.Arrays/copyOf (.array buffer) size))
+          (if (= size capacity)
+            ;; Exact-size buffers are already owned and charged. Their array
+            ;; needs no second allocation or copy after encoding finishes.
+            (.array buffer)
+            (do
+              (charge! (charge/array-bytes 1 size))
+              (java.util.Arrays/copyOf (.array buffer) size))))
         (if key?
           (throw (ex-info "Encoded key exceeds native key size"
                           {:error :kv/invalid-encoded-size :outcome :not-committed}))
           (recur (Math/multiplyExact (long capacity) 2)))))))
 
+(defn- add-prepared-row!
+  [^FastList rows charge! name op ^bytes key ^bytes value wal?]
+  (charge! (+ charge/encoded-row-descriptor
+              (charge/carriers-bytes (inc (.size rows)))))
+  (when wal?
+    ;; Raw, flag-free physical rows need at most 128 bytes of WAL overhead,
+    ;; plus the UTF-8 name and payload. Reserve while those lengths are handy,
+    ;; before the WAL encoder allocates its owned body; no second row walk.
+    (charge! (+ charge/encoded-row-descriptor (* 3 (count name))
+                (alength key) (if value (alength value) 0))))
+  (when (= :del-list op) (charge! charge/vector-wrapper))
+  (.add rows (l/kv-tx op name key (if (= :del-list op) [value] value) :raw :raw)))
+
 (defn- prepare-rows
-  [raw charge! dbi-name txs kt vt]
+  ^FastList [raw charge! dbi-name txs kt vt wal?]
   (charge! charge/vector-wrapper)
-  (let [rows (ArrayList.)]
+  (let [rows (FastList. 0)
+        named-options (when dbi-name (i/dbi-opts raw dbi-name))]
     (doseq [input txs]
       (let [^KVTxData tx (if dbi-name
                            (if (instance? KVTxData input) input (l/->kv-tx-data input kt vt))
                            (l/->kv-tx-data input))
             name (or dbi-name (.-dbi-name tx))
-            options (i/dbi-opts raw name)]
+            options (if dbi-name named-options (i/dbi-opts raw name))
+            op (.-op tx)
+            list? (#{:put-list :del-list} op)
+            duplicates? (boolean (some #{:dupsort} (:flags options)))]
         (when-not (and (some? options) (not= name c/kv-info)
-                       (#{:put :del :put-list :del-list :clear} (.-op tx))
+                       (#{:put :del :put-list :del-list} op)
                        (empty? (.-flags tx))
-                       (or (#{:put :del :clear} (.-op tx))
-                           (some #{:dupsort} (:flags options))))
+                       (or (not list?) duplicates?))
           (unsupported! :transaction-row))
-        (if (= :clear (.-op tx))
-          (do
-            (charge! (+ charge/encoded-row-descriptor
-                        (charge/carriers-bytes (inc (.size rows)))))
-            (.add rows (l/kv-tx :clear name nil nil :raw :raw)))
-          (do
-            (validate/validate-kv-tx-data tx (:validate-data? options))
-            (let [key (encode charge! (.-k tx) (or (.-kt tx) :data) true)
-                  list? (#{:put-list :del-list} (.-op tx))
-                  values (if list? (.-v tx) [(.-v tx)])]
-              ;; Freeze one physical effect per duplicate. Recovery never needs to
-              ;; deserialize a caller's collection or re-evaluate a write body.
-              (doseq [value values]
-                (charge! (+ charge/encoded-row-descriptor
-                            (charge/carriers-bytes (inc (.size rows)))))
-                (let [encoded (when-not (= :del (.-op tx))
-                                (encode charge! value (or (.-vt tx) :data)
-                                        (boolean (some #{:dupsort} (:flags options)))))
-                      op (if (= :put-list (.-op tx)) :put (.-op tx))]
-                  (when (= :del-list op) (charge! charge/vector-wrapper))
-                  (.add rows (l/kv-tx op name key
-                                     (if (= :del-list op) [encoded] encoded) :raw :raw)))))))))
+        (validate/validate-kv-tx-data tx (:validate-data? options))
+        (let [key (encode charge! (.-k tx) (or (.-kt tx) :data) true)
+              value-type (or (.-vt tx) :data)]
+          (if list?
+            ;; Freeze individual physical duplicate effects for bounded replay.
+            (doseq [value (.-v tx)]
+              (add-prepared-row! rows charge! name (if (= :put-list op) :put op)
+                                 key (encode charge! value value-type duplicates?) wal?))
+            (add-prepared-row! rows charge! name op key
+                               (when-not (= :del op)
+                                 (encode charge! (.-v tx) value-type duplicates?)) wal?)))))
     rows))
 
 (defn- prepare-blind [raw state allowance name txs kt vt]
   (let [charge! (local-charge allowance)
-        rows (prepare-rows raw charge! name txs kt vt)
-        body (when (and state (pos? (.size ^ArrayList rows)))
-               (let [estimate (reduce (fn [total ^KVTxData row]
-                                        (+ total charge/encoded-row-descriptor
-                                           (* 3 (count (.-dbi-name row)))
-                                           (if (.-k row) (alength ^bytes (.-k row)) 0)
-                                           (if (.-v row) (alength ^bytes (if (= :del-list (.-op row))
-                                                                        (first (.-v row)) (.-v row))) 0)))
-                                      charge/buffer-wrapper rows)]
-                 (charge! estimate)
-                 (let [encoded (wal/prepare-append-body rows {})]
-                   (charge! (max 0 (- (alength ^bytes encoded) estimate)))
-                   encoded)))]
+        wal? (some? state)
+        ;; Covers the body header/array overhead in addition to per-row bytes.
+        _ (when wal? (charge! charge/buffer-wrapper))
+        rows (prepare-rows raw charge! name txs kt vt wal?)
+        body (when (and wal? (not (.isEmpty rows)))
+               (wal/prepare-append-body rows {}))]
     {:rows rows :wal-body body :result :transacted}))
+
+(defn- payload-size [value type]
+  (or (bits/type-size type)
+      (case type
+        :string (inc (* 3 (long (count value))))
+        :bytes (inc (long (alength ^bytes value)))
+        :raw (if (bytes? value) (long (alength ^bytes value))
+                 (when (instance? ByteBuffer value) (.remaining ^ByteBuffer value)))
+        nil)))
 
 (defn- blind-allowance
   "Declare known primitive payloads without encoding them. Unknown serialized
   values reserve the configured allowance, then use the same bounded encoder."
   [txs name kt vt fallback]
-  (letfn [(size [value type]
-            (or (bits/type-size type)
-                (case type
-                  :string (inc (* 3 (long (count value))))
-                  :bytes (inc (long (alength ^bytes value)))
-                  :raw (if (bytes? value) (long (alength ^bytes value))
-                           (when (instance? ByteBuffer value) (.remaining ^ByteBuffer value)))
-                  nil)))]
-    (if (instance? java.util.Collection txs)
-      (loop [remaining (seq txs) payload 0 rows 0]
-        (if-let [input (first remaining)]
-          (let [^KVTxData tx (if name
+  (if (instance? java.util.Collection txs)
+    (loop [remaining (seq txs) payload 0 rows 0]
+      (if-let [input (first remaining)]
+        ;; The common named-DBI vector form can be inspected without allocating
+        ;; a second KVTxData before admission. Preparation canonicalizes it once.
+        (let [named-vector? (and name (vector? input))
+              ^KVTxData tx (when-not named-vector?
+                             (if name
                                (if (instance? KVTxData input) input (l/->kv-tx-data input kt vt))
-                               (l/->kv-tx-data input))
-                key-size (size (.-k tx) (or (.-kt tx) :data))
-                val-size (cond
-                           (= :del (.-op tx)) 0
-                           (#{:put-list :del-list} (.-op tx)) nil
-                           :else (size (.-v tx) (or (.-vt tx) :data)))]
-            (if (and key-size val-size)
-              (recur (next remaining)
-                     (Math/addExact (long payload) (+ (long key-size) (long val-size)))
-                     (inc rows))
-              fallback))
-          (charge/blind-allowance {:declared-bytes (* 4 payload)
-                                  :row-capacity rows :scratch-bytes (+ 1024 (* 4 payload))})))
-      fallback)))
+                               (l/->kv-tx-data input)))
+              op (if named-vector? (nth input 0) (.-op tx))
+              key (if named-vector? (nth input 1) (.-k tx))
+              value (if named-vector? (nth input 2 nil) (.-v tx))
+              key-type (or (if named-vector? kt (.-kt tx)) :data)
+              value-type (or (if named-vector? vt (.-vt tx)) :data)
+              key-size (payload-size key key-type)
+              val-size (cond
+                         (= :del op) 0
+                         (#{:put-list :del-list} op) nil
+                         :else (payload-size value value-type))]
+          (if (and key-size val-size)
+            (recur (next remaining)
+                   (Math/addExact (long payload) (+ (long key-size) (long val-size)))
+                   (inc rows))
+            fallback))
+        (charge/blind-allowance {:declared-bytes (* 4 payload)
+                                :row-capacity rows :scratch-bytes (+ 1024 (* 4 payload))})))
+    fallback))
 
 (defn- run-body [collector body opts]
   (let [timeout (l/explicit-transaction-timeout-ms-from-option
@@ -215,6 +236,62 @@
                   result)
                 (catch Throwable t (l/throw-explicit-transaction-failure! watchdog t))
                 (finally (l/cancel-explicit-transaction-watchdog! watchdog)))))})))
+
+(defn- clear-admin!
+  "Serialize with native writers, then use the existing standalone clear txn.
+  Its WAL record preserves the admin effect on snapshot-based recovery; this
+  operation is never submitted as a data request or run in a user transaction."
+  [raw state collector wake! options name]
+  (when (Thread/holdsLock (l/write-txn raw))
+    (unsupported! :admin-inside-transaction))
+  (locking (l/write-txn raw)
+    (batch/check-serving! collector)
+    (when-not (and (string? name) (not= name c/kv-info) (i/dbi-opts raw name))
+      (unsupported! :unknown-dbi))
+    ;; A native DBI name fits in a native key. One small admin record uses the
+    ;; existing serialized WAL workspace; no caller graph or batch is retained.
+    (when (> (count name) c/+max-key-size+) (unsupported! :dbi-name))
+    (i/get-dbi raw name false)
+    (let [lsn (when state (long @(:next-lsn state)))
+          status (volatile! nil)
+          native? (volatile! false)]
+      (try
+        (when state
+          (let [body (wal/prepare-append-body [(l/kv-tx :clear name nil nil :raw :raw)] {})
+                slack (if (:segment-prealloc? state)
+                        (* 2 (long (:segment-prealloc-bytes state))) 0)
+                projected (+ (long @(:retention-total-bytes state)) slack
+                             (alength ^bytes body) codec/record-header-size)]
+            (when (> projected (recovery/retention-limit options))
+              (throw (ex-info "Required WAL history fills the hard retention limit"
+                              {:error :txlog/retention-backpressure
+                               :outcome :not-committed :retryable? true})))
+            (let [token (wal/begin-prepared-group! state lsn (object-array [body]))]
+              (vreset! status :appended)
+              (if (wal/finish-prepared-group! state token 0)
+                (vreset! status :durable)
+                (when wake! (wake!))))))
+        (vreset! native? true)
+        (i/clear-dbi raw name)
+        (when state (batch/publish-admin-prefix! collector lsn))
+        nil
+        (catch Throwable t
+          (loop [cause t]
+            (when cause
+              (if (instance? InterruptedException cause)
+                (.interrupt (Thread/currentThread))
+                (recur (ex-cause cause)))))
+          (let [error (if (and @native? state)
+                        (ex-info "Standalone clear failed after WAL policy completion"
+                                 {:error (if (= :durable @status)
+                                           :txlog/write-committed :txlog/write-indeterminate)
+                                  :outcome (if (= :durable @status) :committed :indeterminate)
+                                  :wal-status @status :lsn lsn :retryable? false} t)
+                        t)]
+            (when (or @native? @status
+                      (not= :not-committed (:outcome (ex-data t))))
+              (batch/fence! collector error))
+            (throw error)))))))
 
 (defn open!
   "Open public independent KV, or attach an alias to its single native runtime.
@@ -251,8 +328,8 @@
                                                          (prepare-rows
                                                           raw
                                                           #(batch/charge! descriptor %)
-                                                          name txs kt vt))}))
-          {:keys [raw wal-state snapshot! snapshot-state snapshot-error]} (env/resources environment)
+                                                          name txs kt vt false))}))
+          {:keys [raw wal-state wake-wal! snapshot! snapshot-state snapshot-error]} (env/resources environment)
           collector (env/collector environment)
           close-actions (or (:close-actions (:independent-control @(i/kv-info raw))) (atom {}))
           closed (AtomicBoolean.)
@@ -265,6 +342,7 @@
           allowance (long (get options :wal-rmw-max-bytes (:rmw-allowance-bytes charge/default-limits)))
           control {:options (assoc options :db-identity identity)
                    :close-actions close-actions
+                   :clear-dbi! #(clear-admin! raw wal-state collector wake-wal! options %)
                    :body! #(run-body collector %1 %2)
                    :transact! (fn [name txs kt vt]
                                 (batch/check-serving! collector)
