@@ -199,6 +199,12 @@
 
 (def ^:private positive-int-opts
   #{:write-batch-size
+    :write-batch-max-bytes
+    :wal-pending-max-requests
+    :wal-pending-max-bytes
+    :wal-rmw-max-bytes
+    :wal-preparation-timeout-ms
+    :write-close-timeout-ms
     :wal-commit-wait-ms
     :async-secondary-index-worker-max-jobs
     :async-secondary-index-worker-lease-ms
@@ -227,6 +233,7 @@
 
 (def ^:private keyword-enum-opts
   {:wal-durability-profile #{:strict :relaxed :extra}
+   :write-mode             #{:compatibility :independent}
    :wal-sync-mode          #{:fsync :fdatasync :extra :none}
    :wal-segment-prealloc-mode #{:native :none}
    :wal-rollout-mode       #{:active :rollback}})
@@ -921,25 +928,30 @@
   data types. Typed metadata retains its ordinary validation."
   [^KVTxData tx validate-data?]
   (let [op (.-op tx) k (.-k tx) kt (.-kt tx) v (.-v tx) vt (.-vt tx)]
-    (validate-kv-op op)
-    (if (= kt :raw)
-      (validate-encoded-key k)
-      (do (validate-kv-key k kt validate-data?) (validate-key-size k kt)))
-    (let [validate-value (fn [v]
-                           (if (= vt :raw)
-                             (if (#{:put-list :del-list} op)
-                               (validate-encoded-key v)
-                               (when-not (bytes? v)
-                                 (raise "Physical WAL value must contain encoded bytes" {})))
-                             (validate-kv-value v vt validate-data?)))]
-      (case op
-        :put (validate-value v)
-        (:put-list :del-list)
-        (do
-          (when-not (or (sequential? v) (instance? java.util.List v))
-            (raise "Physical WAL list value must be a sequential collection" {}))
-          (doseq [value v] (validate-value value)))
-        :del nil))))
+    (if (= :clear op)
+      (when-not (and (nil? k) (nil? v) (= :raw kt) (= :raw vt)
+                     (empty? (.-flags tx)))
+        (raise "Invalid physical DBI clear" {:error :kv/invalid-encoded-size}))
+      (do
+        (validate-kv-op op)
+        (if (= kt :raw)
+          (validate-encoded-key k)
+          (do (validate-kv-key k kt validate-data?) (validate-key-size k kt)))
+        (let [validate-value (fn [v]
+                               (if (= vt :raw)
+                                 (if (#{:put-list :del-list} op)
+                                   (validate-encoded-key v)
+                                   (when-not (bytes? v)
+                                     (raise "Physical WAL value must contain encoded bytes" {})))
+                                 (validate-kv-value v vt validate-data?)))]
+          (case op
+            :put (validate-value v)
+            (:put-list :del-list)
+            (do
+              (when-not (or (sequential? v) (instance? java.util.List v))
+                (raise "Physical WAL list value must be a sequential collection" {}))
+              (doseq [value v] (validate-value value)))
+            :del nil))))))
 
 ;; ---- DB validators ----
 

@@ -1,8 +1,9 @@
 ;; Copyright (c) Huahai Yang. All rights reserved.
 ;; Distributed under the Eclipse Public License 2.0.
 (ns ^:no-doc datalevin.tx-group.batch.private
-  "Private M0 opener. The lease precedes recovery/native/WAL open and all private
-  handles share the collector. Public APIs remain on compatibility."
+  "Independent KV runtime opener. The lease precedes recovery/native/WAL open
+  and handles share the collector. M1 opt-in public routing reuses this runtime;
+  default public routing remains compatibility."
   (:require [clojure.java.io :as io]
             [datalevin.constants :as c]
             [datalevin.interface :as i]
@@ -15,6 +16,7 @@
             [datalevin.tx-group.batch.factory :as factory]
             [datalevin.tx-group.batch.recovery :as recovery]
             [datalevin.tx-state.lifetime :as lifetime]
+            [datalevin.tx-state.protocol :as protocol]
             [datalevin.txlog :as wal])
   (:import [datalevin.lmdb KVTxData]
            [java.io Closeable]
@@ -43,10 +45,10 @@
                ;; UTF-8 takes at most three bytes per UTF-16 code unit. Bound
                ;; it without allocating a temporary name encoding first.
                (* 3 (long (.length ^String name)))
-               (alength ^bytes key)
-               (if (= :del op)
-                 0
-                 (alength ^bytes value)))))
+               (if key (long (alength ^bytes key)) 0)
+               (if (#{:del :clear} op)
+                 (long 0)
+                 (long (alength ^bytes (if (= :del-list op) (first value) value)))))))
           charge/buffer-wrapper
           rows))
 
@@ -89,10 +91,12 @@
 
 (defn- rmw-adapters
   "Write capture and WAL encoding for the native batch transaction."
-  [declared]
+  [declared public?]
   {:check-row! (fn [name op key value]
-                 (check-single-value! declared name)
-                 (check-physical! declared name op key value))
+                 (if public? (check-dbi! declared name) (check-single-value! declared name))
+                 (when-not (= :clear op)
+                   (check-physical! declared name op key
+                                    (if (= :del-list op) (first value) value))))
    :body-cost rows-cost
    :encode-body (fn [rows hooks] (wal/prepare-append-body rows hooks))})
 
@@ -100,7 +104,7 @@
   "The private M0 catalog/operation boundary. Physical raw puts and key deletes
   are replayable from a conservative snapshot floor. Flags with position or
   conditional semantics and catalog changes remain compatibility-only."
-  [declared descriptor]
+  [declared public? descriptor]
     (let [rows ^java.util.List (:rows (batch/data descriptor))]
       (when rows
         (dotimes [row-idx (.size rows)]
@@ -109,15 +113,19 @@
                 op (if record? (.-op ^KVTxData row) (nth row 0))
                 name (if record? (.-dbi-name ^KVTxData row) (nth row 1))
                 k (if record? (.-k ^KVTxData row) (nth row 2))
-                v (when (= op :put)
+                v (when (#{:put :del-list} op)
                     (if record? (.-v ^KVTxData row) (nth row 3)))
                 kt (if record? (.-kt ^KVTxData row)
-                       (nth row (if (= :put op) 4 3) nil))
-                vt (when (= :put op)
+                       (nth row (if (= :del op) 3 4) nil))
+                vt (when (#{:put :del-list :clear} op)
                      (if record? (.-vt ^KVTxData row) (nth row 5 nil)))
                 flags (if record? (.-flags ^KVTxData row)
-                          (nth row (if (= :put op) 6 4) nil))]
-            (when-not (and (contains? declared name) (#{:put :del} op)
+                          (nth row (if (= :del op) 4 6) nil))]
+            (when-not (and (contains? declared name) (or (#{:put :del} op)
+                               (and public? (= :clear op))
+                               (and public? (= :del-list op)
+                                    (some #{:dupsort} (:flags (get declared name)))
+                                    (= 1 (count v))))
                            (or record? (= :put op))
                            (= :raw kt) (or (= :del op) (= :raw vt))
                            (empty? flags))
@@ -126,26 +134,32 @@
                         {:error :txlog/unsupported-private-operation
                          :outcome :not-committed :dbi name :operation op
                          :retryable? false})))
-            (check-physical! declared name op k v))))))
+            (when-not (= :clear op)
+              (check-physical! declared name op k (if (= :del-list op) (first v) v))))))))
 
 (defn- snapshot-due? [raw state collector manifest]
   (let [age (- (System/currentTimeMillis) (long (:created-ms manifest)))
+        max-age (long (snapshot/snapshot-max-age-ms raw))
+        interval (long (snapshot/snapshot-interval-ms raw))
+        lsn-delta (- (long (batch/published-lsn collector))
+                     (long (:floor-lsn manifest)))
+        max-lsn-delta (long (snapshot/snapshot-max-lsn-delta raw))
+        retained-delta (- (long @(:retention-total-bytes state))
+                          (long (or (:retained-byte-floor manifest) 0)))
+        max-log-delta (long (snapshot/snapshot-max-log-bytes-delta raw))
         urgent? (or @(:retention-backpressure-state state)
-                    (>= age (snapshot/snapshot-max-age-ms raw)))
+                    (>= age max-age))
         due? (or urgent?
-                 (>= age (snapshot/snapshot-interval-ms raw))
-                 (>= (- (batch/published-lsn collector) (long (:floor-lsn manifest)))
-                     (snapshot/snapshot-max-lsn-delta raw))
-                 (>= (- (long @(:retention-total-bytes state))
-                        (long (or (:retained-byte-floor manifest) 0)))
-                     (snapshot/snapshot-max-log-bytes-delta raw)))
+                 (>= age interval)
+                 (>= lsn-delta max-lsn-delta)
+                 (>= retained-delta max-log-delta))
         sync (when due? (wal/sync-manager-state (:sync-manager state)))
         thresholds (when due? (snapshot/snapshot-contention-thresholds raw))
         contended? (and due?
                         (or (> (long (or (:last-commit-wait-ms sync) 0))
-                               (:commit-wait-p99-ms thresholds))
+                               (long (:commit-wait-p99-ms thresholds)))
                             (> (long (or (:last-fsync-ms sync) 0))
-                               (:fsync-p99-ms thresholds))))]
+                               (long (:fsync-p99-ms thresholds)))))]
     (and due?
          (or urgent?
              (and (snapshot/in-offpeak-window? (snapshot/snapshot-offpeak-windows raw)
@@ -169,6 +183,7 @@
     (env/open-batch!
      (assoc opts :open-runtime!
             (fn []
+              (binding [protocol/*independent-native-open?* true]
               (when (and (not wal?)
                          (or (.exists (io/file (recovery/root opts)))
                              (.exists (io/file (recovery/wal-dir opts)))))
@@ -210,7 +225,8 @@
                                                        (batch/fence! @collector %))}
                                       :check-batch! (when state
                                                       #(recovery/check-capacity! opts state %))
-                                      :rmw-opts (rmw-adapters (recovery/dbis opts))})
+                                      :rmw-opts (merge (rmw-adapters (recovery/dbis opts) (boolean (:protocol-options opts)))
+                                                       (:rmw-opts opts))})
                             take-snapshot!
                             (fn []
                               (.lockInterruptibly snapshot-lock)
@@ -229,7 +245,7 @@
                         (try
                           (when (and state (nil? restored)) (take-snapshot!))
                           {:executor (:executor runtime)
-                           :check-prepared! #(check-prepared! (recovery/dbis opts) %)
+                           :check-prepared! #(check-prepared! (recovery/dbis opts) (boolean (:protocol-options opts)) %)
                            :bind!
                            (fn [c]
                              (batch/initialize-prefix! c (long (or (:last-lsn restored) 0)))
@@ -283,4 +299,4 @@
                             ((:close! runtime))
                             (throw t))))
                       (catch Throwable t (when state (close-wal! state)) (throw t))))
-                  (catch Throwable t (i/close-kv db) (throw t)))))))))
+                  (catch Throwable t (i/close-kv db) (throw t))))))))))

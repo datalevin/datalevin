@@ -57,13 +57,16 @@
    [datalevin.txlog.transfer :as transfer]
    [datalevin.tx-group.compat :as group]
    [datalevin.util :refer [deftype+ raise]])
-  (:import [java.util.concurrent.atomic AtomicReference]
+  (:import [java.util.concurrent.atomic AtomicReference AtomicBoolean]
            [java.util.concurrent ConcurrentHashMap]
            [java.util.function Function]))
 
 (declare ->KVLMDB)
 
 (declare raw-lmdb)
+
+(defn- independent-control [db]
+  (when-let [info (i/kv-info db)] (:independent-control @info)))
 
 (defn write-batch-delay-nanos
   "Optional idle collection window, shared by embedded KV and Datalog writes."
@@ -107,14 +110,17 @@
 (defn grouped-write!
   "Execute a standalone KV operation in a group under its durability policy."
   [db op]
-  (if-let [g (write-group db :kv)]
+  (if-let [control (independent-control db)]
+    (do (i/check-ready db)
+        (if (l/writing? db) (op db) ((:body! control) op nil)))
+    (if-let [g (write-group db :kv)]
     (group/submit! g
                    (fn [execute]
                      (l/with-transaction-kv [tx db]
                        (execute tx)))
                    op
                    (write-batch-delay-nanos db))
-    (l/with-transaction-kv [tx db] (op tx))))
+      (l/with-transaction-kv [tx db] (op tx)))))
 
 (def ensure-txlog-ready! kvtx/ensure-txlog-ready!)
 
@@ -173,7 +179,9 @@
 
 (defn txlog-watermarks
   [db]
-  (kvtx/txlog-watermarks db))
+  (if-let [control (independent-control db)]
+    ((:watermarks control))
+    (kvtx/txlog-watermarks db)))
 
 (defn force-lmdb-sync!
   [db]
@@ -275,7 +283,7 @@
                              args)))
              specs)))
 
-(deftype+ KVLMDB [db]
+(deftype+ KVLMDB [db handle]
   l/IWriting
   (writing? [_] (l/writing? db))
   (write-txn [_] (l/write-txn db))
@@ -330,11 +338,13 @@
   i/ITxLog
   (txlog-watermarks
     [_]
-    (if-let [state (txlog/state db)]
+    (if-let [control (independent-control db)]
+      ((:watermarks control))
+      (if-let [state (txlog/state db)]
       (txlog-watermarks-map db state)
       (if (txlog-config-enabled? db)
         (txlog-rollout-watermarks db (txlog-rollout-mode db))
-        {:wal? false})))
+        {:wal? false}))))
 
   (open-tx-log
     [this from-lsn]
@@ -359,7 +369,9 @@
 
   (force-txlog-sync!
     [_]
-    (with-runtime-txlog-state-guard
+    (if-let [control (independent-control db)]
+      ((:force! control))
+      (with-runtime-txlog-state-guard
       db
       (fn []
         (cond
@@ -376,7 +388,7 @@
           :else
           (let [state (txlog/enabled-state db)]
             (assoc (txlog-force-sync! state)
-                   :watermarks (txlog-watermarks-map db state)))))))
+                   :watermarks (txlog-watermarks-map db state))))))))
 
   (force-lmdb-sync!
     [_]
@@ -395,7 +407,9 @@
     ;; Snapshot creation updates backup-pin floor metadata before copying the
     ;; environment, so it participates in the same write-capable lock ordering
     ;; as replica-floor bookkeeping and transaction close.
-    (with-write-txn-lock-before-runtime-txlog-state
+    (if-let [control (independent-control db)]
+      ((:snapshot! control))
+      (with-write-txn-lock-before-runtime-txlog-state
       db
       (fn []
         (if (txlog-write-path-enabled? db)
@@ -406,14 +420,18 @@
                :skipped?   true
                :reason     :rollback
                :watermarks (txlog-rollout-watermarks db rollout-mode)})
-            (txlog/enabled-state db))))))
+            (txlog/enabled-state db)))))))
 
   (list-snapshots [_]
-                  (list-snapshot-entries db))
+    (if-let [control (independent-control db)]
+      ((:snapshots control))
+      (list-snapshot-entries db)))
 
   (snapshot-scheduler-state
     [_]
-    (scheduler/snapshot-scheduler-state-map db))
+    (if-let [control (independent-control db)]
+      ((:scheduler-state control))
+      (scheduler/snapshot-scheduler-state-map db)))
 
   (read-commit-marker
     [_]
@@ -481,27 +499,45 @@
   i/ILMDB
   (open-transact-kv
     [_]
-    (->KVLMDB (kvtx/open-transact-with-txlog! db)))
+    (when-let [control (independent-control db)]
+      ((:unsupported! control) :manual-transaction))
+    (->KVLMDB (kvtx/open-transact-with-txlog! db) nil))
   (abort-transact-kv
     [_]
     (when (txlog-config-enabled? db)
       (txlog-reset-pending! (i/kv-info db)))
     (i/abort-transact-kv db))
-  (check-ready [_] (i/check-ready db))
+  (check-ready [_]
+    (when (and handle (.get ^AtomicBoolean (:closed? handle)))
+      (raise "LMDB handle is closed." {:type :lmdb/closed}))
+    (i/check-ready db))
   (clear-dbi
     [this dbi-name]
     (custom-kv/guard-internal! db dbi-name)
-    (if (custom-kv/custom-dbi? db dbi-name)
-      (custom-kv/clear! this db dbi-name)
-      (i/clear-dbi db dbi-name)))
+    (if-let [control (independent-control db)]
+      (do
+        (i/check-ready this)
+        (if (l/writing? db)
+          (i/transact-kv db [(l/kv-tx :clear dbi-name nil nil :raw :raw)])
+          ((:body! control)
+           (fn [tx] (i/clear-dbi tx dbi-name)) {}))
+        nil)
+      (if (custom-kv/custom-dbi? db dbi-name)
+        (custom-kv/clear! this db dbi-name)
+        (i/clear-dbi db dbi-name))))
+
   (close-kv
     [_]
-    (try
+    (when (and (l/writing? db) (independent-control db))
+      ((:unsupported! (independent-control db)) :close-inside-transaction))
+    (if handle
+      ((:close! handle))
+      (try
       (i/close-kv db)
       (finally
         ;; A fenced native call can outlive a close deadline. Its WAL channels
         ;; and runtime must stay registered until native teardown succeeds.
-        (when (i/closed-kv? db) (close-txlog-state! db)))))
+        (when (i/closed-kv? db) (close-txlog-state! db))))))
   (close-transact-kv
     [_]
     (with-write-txn-lock-before-runtime-txlog-state
@@ -512,7 +548,8 @@
             (close-with-txlog! db state)
             (i/close-transact-kv db))
           (i/close-transact-kv db)))))
-  (closed-kv? [_] (i/closed-kv? db))
+  (closed-kv? [_] (or (and handle (.get ^AtomicBoolean (:closed? handle)))
+                      (i/closed-kv? db)))
   (copy [this dest] (.copy this dest false))
   (copy
     [this dest compact?]
@@ -521,6 +558,8 @@
   (dbi-opts [_ dbi-name] (i/dbi-opts db dbi-name))
   (drop-dbi
     [this dbi-name]
+    (when-let [control (independent-control db)]
+      ((:unsupported! control) :drop-dbi))
     (custom-kv/guard-internal! db dbi-name)
     (locking (l/write-txn db)
       (when (and (custom-kv/custom-dbi? db dbi-name) (some? @(l/write-txn db)))
@@ -537,7 +576,7 @@
   (entries [_ dbi-name] (i/entries db dbi-name))
   (env-dir [_] (i/env-dir db))
   (kv-info [_] (i/kv-info db))
-  (env-opts [_] (i/env-opts db))
+  (env-opts [_] (merge (i/env-opts db) (:options (independent-control db))))
   (get-dbi [_ dbi-name] (i/get-dbi db dbi-name))
   (get-dbi [_ dbi-name create?] (i/get-dbi db dbi-name create?))
   (get-env-flags [_] (i/get-env-flags db))
@@ -548,7 +587,9 @@
   (open-dbi [this dbi-name] (.open-dbi this dbi-name nil))
   (open-dbi
     [this dbi-name opts]
-    (let [before   (try
+    (if-let [control (independent-control db)]
+      (do (.check-ready this) ((:open-dbi! control) dbi-name opts))
+      (let [before   (try
                      (i/dbi-opts db dbi-name)
                      (catch Exception _ nil))
           prepared (if l/*raw-kv?* opts
@@ -556,23 +597,29 @@
           res      (i/open-dbi db dbi-name prepared)
           after    (i/dbi-opts db dbi-name)]
       (txlog-log-dbi-registration! this db dbi-name before after)
-      res))
+      res)))
   (open-list-dbi [this list-name] (.open-list-dbi this list-name nil))
   (open-list-dbi
     [this list-name opts]
-    (let [before   (try
-                     (i/dbi-opts db list-name)
-                     (catch Exception _ nil))
-          supplied (assoc opts :flags
-                          (conj (set (or (:flags opts) (:flags before)
-                                         c/default-dbi-flags))
-                                :dupsort))
-          prepared (if l/*raw-kv?* supplied
-                       (custom-kv/prepare-dbi! this db list-name supplied))
-          res      (i/open-list-dbi db list-name prepared)
-          after    (i/dbi-opts db list-name)]
-      (txlog-log-dbi-registration! this db list-name before after)
-      res))
+    (if-let [control (independent-control db)]
+      (do
+        (i/check-ready this)
+        (when-not (some #{:dupsort} (:flags (i/dbi-opts db list-name)))
+          ((:unsupported! control) :catalog-mutation))
+        ((:open-dbi! control) list-name opts))
+      (let [before   (try
+                       (i/dbi-opts db list-name)
+                       (catch Exception _ nil))
+            supplied (assoc opts :flags
+                            (conj (set (or (:flags opts) (:flags before)
+                                           c/default-dbi-flags))
+                                  :dupsort))
+            prepared (if l/*raw-kv?* supplied
+                         (custom-kv/prepare-dbi! this db list-name supplied))
+            res      (i/open-list-dbi db list-name prepared)
+            after    (i/dbi-opts db list-name)]
+        (txlog-log-dbi-registration! this db list-name before after)
+        res)))
   (return-rtx [_ rtx] (i/return-rtx db rtx))
   (set-env-flags [_ ks on-off] (i/set-env-flags db ks on-off))
   (set-key-compressor [_ c] (i/set-key-compressor db c))
@@ -591,7 +638,12 @@
     (.transact-kv this dbi-name txs k-type :data))
   (transact-kv
     [this dbi-name txs k-type v-type]
-    (if-let [g (write-group db :kv)]
+    (if-let [control (independent-control db)]
+      (do (.check-ready this)
+          (if (l/writing? db)
+            (i/transact-kv db dbi-name txs k-type v-type)
+            ((:transact! control) dbi-name txs k-type v-type)))
+      (if-let [g (write-group db :kv)]
       (group/submit! g
                      (fn [execute]
                        (l/with-transaction-kv [tx this]
@@ -607,7 +659,7 @@
               (if-let [state (txlog-runtime-state db)]
                 (transact-with-txlog! db state dbi-name txs k-type v-type)
                 (i/transact-kv db dbi-name txs k-type v-type))
-              (i/transact-kv db dbi-name txs k-type v-type)))))))
+              (i/transact-kv db dbi-name txs k-type v-type))))))))
   (val-compressor [_] (i/val-compressor db))
 
   (def-read-kv-forwarders this db
@@ -746,9 +798,10 @@
   "Atomically replace the value at `k` with `(apply f old-value args)`.
   Missing keys pass nil to `f`. Returns :transacted. Only ordinary, single-value
   DBIs are supported. Remote functions must be serializable inter-fn functions.
-  The function must be free of side effects: map resize or an aborted commit
-  group can retry it. Concurrent standalone strict writes may execute on another
-  submitting thread, with Clojure dynamic bindings preserved."
+  Compatibility mode can retry the function after map resize or an aborted
+  commit group, so it must be free of side effects. Its concurrent standalone
+  writes preserve Clojure dynamic bindings. Independent mode evaluates the
+  function once on the batch owner and uses explicit request context."
   ([db dbi-name k f] (update-kv db dbi-name k f :data :data))
   ([db dbi-name k f k-type] (update-kv db dbi-name k f k-type :data))
   ([db dbi-name k f k-type v-type & args]
@@ -789,7 +842,7 @@
                   (i/env-opts db)))]
       (try
         (ensure-txlog-ready! db)
-        (let [wrapped (->KVLMDB db)]
+        (let [wrapped (->KVLMDB db nil)]
           (when-not (l/writing? db) (custom-kv/initialize! wrapped db))
           wrapped)
         (catch Exception e

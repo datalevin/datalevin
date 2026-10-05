@@ -468,7 +468,7 @@
                             outer-db ^DB @outer-c
                             outer-s  (.-store outer-db)
                             write-s  (.-store ^DB @c)
-                            write-l  (.-lmdb ^Store write-s)
+                            write-l  (l/mark-write (.-lmdb ^Store write-s))
                             d        (db/transfer outer-db
                                                   (st/transfer outer-s write-l))]
                         (swap! wdl-dbs assoc conn d)
@@ -1613,12 +1613,16 @@
           [binding & body]
           `(let [db# ~(second binding)]
             (try
-              (let [res# (let [~(first binding) (open-transact-kv db#)]
+              (let [res# (let [tx# (open-transact-kv db#)]
                            (try
-                             ~@body
+                             (let [~(first binding) tx#] ~@body)
                              (catch Exception ~'e
                                (if (:resized (ex-data ~'e))
-                                 (do ~@body)
+                                 (do
+                                   (abort-transact-kv db#)
+                                   (let [tx2# (open-transact-kv db#)
+                                         ~(first binding) tx2#]
+                                     ~@body))
                                  (throw ~'e)))))]
                 (close-transact-kv db#)
                 res#)
@@ -1634,12 +1638,16 @@
           [binding & body]
           `(let [conn# ~(second binding)]
             (try
-              (let [res# (let [~(first binding) (open-transact conn#)]
+              (let [res# (let [tx# (open-transact conn#)]
                            (try
-                             ~@body
+                             (let [~(first binding) tx#] ~@body)
                              (catch Exception ~'e
                                (if (:resized (ex-data ~'e))
-                                 (do ~@body)
+                                 (do
+                                   (abort-transact conn#)
+                                   (let [tx2# (open-transact conn#)
+                                         ~(first binding) tx2#]
+                                     ~@body))
                                  (throw ~'e)))))]
                 (close-transact conn#)
                 res#)

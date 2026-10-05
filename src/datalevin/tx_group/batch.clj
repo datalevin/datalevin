@@ -1027,7 +1027,7 @@
   "The batch's preparation cutoff is the earliest selected member's applicable
   deadline. Rejecting a member never extends it."
   ^long [^FastList descriptors]
-  (reduce (fn [acc ^Descriptor descriptor]
+  (reduce (fn [^long acc ^Descriptor descriptor]
             (let [d (.deadline-nanos descriptor)]
               (cond
                 (zero? d) acc
@@ -1327,28 +1327,29 @@
   [^Collector collector ^Descriptor descriptor
    ^clojure.lang.IDeref result ^clojure.lang.IDeref interrupted?
    deadline-nanos]
-  (try
-    (if (zero? deadline-nanos)
-      (park-for-progress! collector descriptor 0)
-      (let [bound (bound-deadline collector deadline-nanos)
-            remaining (- bound (System/nanoTime))]
-        (if (pos? remaining)
-          ;; Completion and handoff unpark this caller. Poll only to discover a
-          ;; preparation cutoff published after it parked; waking every 100 us
-          ;; burned CPU throughout WAL I/O.
-          (park-for-progress! collector descriptor (min remaining 1000000))
-          (do (observe-cutoff! collector)
-              ;; Removal and selection share coordination. If selection won,
-              ;; only the batch may decide this request's outcome.
-              (when (and (nil? @result) (unlink! collector descriptor))
-                (deliver! descriptor
-                          [false (expired-error "execution" deadline-nanos)]))
-              (park-for-progress! collector descriptor 0)))))
-    (finally
-      ;; park returns on interruption without clearing it. Clear and remember
-      ;; it before this waiter can take leadership; restore it on submit return.
-      (when (Thread/interrupted)
-        (vreset! interrupted? true)))))
+  (let [^long deadline deadline-nanos]
+    (try
+      (if (zero? deadline)
+        (park-for-progress! collector descriptor 0)
+        (let [bound (bound-deadline collector deadline)
+              remaining (- bound (System/nanoTime))]
+          (if (pos? remaining)
+            ;; Completion and handoff unpark this caller. Poll only to discover a
+            ;; preparation cutoff published after it parked; waking every 100 us
+            ;; burned CPU throughout WAL I/O.
+            (park-for-progress! collector descriptor (min remaining 1000000))
+            (do (observe-cutoff! collector)
+                ;; Removal and selection share coordination. If selection won,
+                ;; only the batch may decide this request's outcome.
+                (when (and (nil? @result) (unlink! collector descriptor))
+                  (deliver! descriptor
+                            [false (expired-error "execution" deadline)]))
+                (park-for-progress! collector descriptor 0)))))
+      (finally
+        ;; park returns on interruption without clearing it. Clear and remember
+        ;; it before this waiter can take leadership; restore it on submit return.
+        (when (Thread/interrupted)
+          (vreset! interrupted? true))))))
 
 (defn- await-result!
   "Wait for this request's own result slot.

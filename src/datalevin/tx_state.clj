@@ -724,7 +724,7 @@
 (defn- ready-application-prefix
   "Combine sealed, durable ranges only at the native application turn. Sync
   boundaries stay fixed; no later append can join a range already being applied."
-  [state first-range now]
+  [state first-range ^long now]
   (let [^ConcurrentSkipListMap index (:entries state)
         next (some-> (.get index (Long/valueOf (inc (long (:hi first-range)))))
                      :range deref)]
@@ -733,10 +733,10 @@
             (>= (count (:entries first-range)) (long (:range-max-records state))))
       first-range
       (let [first-entries (:entries first-range)
-            first-count (count first-entries)
-            first-bytes (reduce (fn [n entry]
-                                  (+ n (long (:bytes (:reservation entry)))))
-                                0 first-entries)
+            first-count (long (count first-entries))
+            first-bytes (long (reduce (fn [^long n entry]
+                                        (+ n (long (:bytes (:reservation entry)))))
+                                      (long 0) first-entries))
             max-count (long (:range-max-records state))
             max-bytes (long (:range-max-bytes state))]
         (loop [hi (long (:hi first-range))
@@ -747,10 +747,10 @@
                joined? false]
           (let [next (some-> (.get index (Long/valueOf (inc hi))) :range deref)
                 next-entries (:entries next)
-                next-count (count next-entries)
-                next-bytes (reduce (fn [n entry]
-                                     (+ n (long (:bytes (:reservation entry)))))
-                                   0 next-entries)]
+                next-count (long (count next-entries))
+                next-bytes (long (reduce (fn [^long n entry]
+                                            (+ n (long (:bytes (:reservation entry)))))
+                                          (long 0) next-entries))]
             (if (and next (eligible? state next)
                      (<= (+ n next-count) max-count)
                      (<= (+ bytes next-bytes) max-bytes))

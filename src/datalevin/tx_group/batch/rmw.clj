@@ -18,7 +18,9 @@
            [java.util ArrayList Arrays]))
 
 (defn- clean-body-failure? [^Throwable t]
-  (and (instance? Exception t)
+  (or (and (l/explicit-transaction-timeout-error? t)
+           (instance? InterruptedException (ex-cause t)))
+      (and (instance? Exception t)
        (not (instance? IOException t))
        (not (instance? Util$DTLVException t))
        (not (instance? InterruptedException t))
@@ -27,13 +29,14 @@
        (not (#{:txlog/runtime-fenced :txlog/runtime-closed
                :txlog/write-deadline-exceeded :txlog/write-interrupted}
              (:error (ex-data t))))
-       (or (nil? (ex-cause t)) (clean-body-failure? (ex-cause t)))))
+       (or (nil? (ex-cause t)) (clean-body-failure? (ex-cause t))))))
 
 (defn- owner-interruption
   [^Throwable t]
-  (if (instance? InterruptedException t)
-    t
-    (when-let [cause (ex-cause t)] (owner-interruption cause))))
+  (when-not (l/explicit-transaction-timeout-error? t)
+    (if (instance? InterruptedException t)
+      t
+      (when-let [cause (ex-cause t)] (owner-interruption cause)))))
 
 (defn- charge! [descriptor n]
   (try (batch/charge! descriptor n)
@@ -49,19 +52,21 @@
 (defn- capture!
   "Freeze and apply writes in the batch transaction. Retain a failure even
    when the body catches it, so no failed batch can reach WAL or native commit."
-  [raw wdb descriptor rows valid? failure check-row! dbi-name txs kt vt]
+  [raw wdb descriptor rows valid? failure check-row! prepare-rows! dbi-name txs kt vt]
   (try
     (l/write-txn wdb)
     (when-not @valid?
       (throw (ex-info "Write body has finished"
                       {:error :txlog/transaction-view-invalidated :retryable? false})))
     (when-let [t @failure] (throw t))
+    (let [txs (if prepare-rows! (prepare-rows! raw descriptor dbi-name txs kt vt) txs)
+          dbi-name (when-not prepare-rows! dbi-name)]
     (doseq [row txs]
       (let [record? (instance? KVTxData row)
             op (if record? (.-op ^KVTxData row) (nth row 0))
             name (or dbi-name (if record? (.-dbi-name ^KVTxData row) (nth row 1)))
             k (if record? (.-k ^KVTxData row) (nth row (if dbi-name 1 2)))
-            v (when (= op :put)
+            v (when (#{:put :del-list} op)
                 (if record? (.-v ^KVTxData row) (nth row (if dbi-name 2 3))))
             key-type (if record? (.-kt ^KVTxData row)
                          (if dbi-name kt (nth row (if (= op :put) 4 3) :data)))
@@ -70,18 +75,25 @@
             flags (if record? (.-flags ^KVTxData row)
                       (nth row (if dbi-name (if (= op :put) 3 2)
                                    (if (= op :put) 6 4)) nil))]
-        (when-not (and (#{:put :del} op) (= key-type :raw)
+        (when-not (and (or (#{:put :del} op)
+                           (and prepare-rows!
+                                (or (= :clear op)
+                                    (and (= :del-list op) (= 1 (count v)))))) (= key-type :raw)
                        (or (= op :del) (= val-type :raw)) (empty? flags))
           (throw (ex-info "Operation is outside private native RMW scope"
                           {:error :txlog/unsupported-private-operation
                            :outcome :not-committed :retryable? false})))
         (check-row! name op k v)
         (charge! descriptor (+ charge/encoded-row-descriptor charge/vector-wrapper))
-        (let [key (owned descriptor k)
-              value (when (= op :put) (owned descriptor v))
+        (let [key (when k (owned descriptor k))
+              value (case op
+                      :put (owned descriptor v)
+                      :del-list (do (charge! descriptor charge/vector-wrapper)
+                                    [(owned descriptor (first v))])
+                      nil)
               forward (l/kv-tx op name key value :raw :raw)]
           (.add ^ArrayList rows forward)
-          (i/transact-kv raw (encoding/storage-rows [forward])))))
+          (i/transact-kv raw (encoding/storage-rows [forward]))))))
     :transacted
     (catch Throwable t
       (let [failure-error
@@ -93,12 +105,12 @@
         (throw failure-error)))))
 
 (defn- run-member!
-  [raw native-db batch descriptor failure {:keys [check-row! body-cost encode-body]}]
+  [raw native-db batch descriptor failure {:keys [check-row! body-cost encode-body prepare-rows!]}]
   (charge! descriptor charge/vector-wrapper)
   (let [rows (ArrayList.) valid? (volatile! true)
         wdb (l/mark-write native-db)
         capture (fn [name txs kt vt]
-                  (capture! raw wdb descriptor rows valid? failure check-row! name txs kt vt))
+                  (capture! raw wdb descriptor rows valid? failure check-row! prepare-rows! name txs kt vt))
         abort! (fn []
                  (let [t (try
                            (batch/cancel-before-dispatch!
@@ -148,29 +160,36 @@
                         (let [d (batch/batch-at batch idx)]
                           (if (batch/op d)
                             (run-member! raw wdb batch d failure opts)
-                            (do (i/transact-kv raw (encoding/storage-rows (:rows (batch/data d))))
-                                1))))]
+                            (let [rows (:rows (batch/data d))]
+                              (i/transact-kv raw (encoding/storage-rows rows))
+                              (if (seq rows) 1 0)))))]
     (phase/phase! :native-start batch)
     (cpp/apply-native-once!
      raw
      (fn [wdb]
-       (let [[weight suffix-start]
-             (loop [start 0 end (min 1 (batch/batch-count batch)) weight 0]
-               (let [weight (loop [idx start weight weight]
+       (let [[^long weight ^long suffix-start]
+             (loop [start (long 0)
+                    end (long (min 1 (long (batch/batch-count batch))))
+                    weight (long 0)]
+               (let [weight (loop [idx (long start) weight (long weight)]
                               (if (< idx end)
-                                (recur (inc idx) (+ weight (apply-member! wdb idx)))
+                                (recur (inc idx)
+                                       (+ weight (long (apply-member! wdb idx))))
                                 weight))]
                  (phase/phase! :native-prefix-applied batch)
                  (when (:collect? opts) (batch/collect-ready! batch))
-                 (let [next-end (batch/batch-count batch)]
+                 (let [next-end (long (batch/batch-count batch))]
                    (cond
                      (= end next-end) [weight end]
                      ;; These already-prepared writes need no body evaluation.
                      ;; Freeze before append, then apply them alongside WAL I/O.
                      (and wal (every? #(nil? (batch/op (batch/batch-at batch %)))
                                       (range end next-end)))
-                     [(+ weight (- next-end end)) end]
-                     :else (recur end next-end weight)))))]
+                     [(reduce (fn [total idx]
+                                (+ (long total)
+                                   (if (seq (:rows (batch/data (batch/batch-at batch idx)))) 1 0)))
+                              weight (range end next-end)) end]
+                     :else (recur end next-end (long weight))))))]
          (batch/set-accepted-count! batch weight)
          (batch/freeze-schedule! batch weight (< suffix-start (batch/batch-count batch)))
          (when (and wal (pos? weight))

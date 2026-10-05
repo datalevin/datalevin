@@ -51,6 +51,8 @@
 (def ^:const op-kv-del-list (byte 0x17))
 (def ^:const op-datom-add (byte 0x18))
 (def ^:const op-datom-retract (byte 0x19))
+(def ^:const op-kv-del-raw-pair (byte 0x1a))
+(def ^:const op-kv-clear (byte 0x1b))
 
 (def ^:const txlog-type-tuple-tag (byte 0x00))
 
@@ -825,9 +827,15 @@
         ^bytes dbi-bs (dbi-name-bytes dbi-name dbi-cache)
         dbi-len (alength dbi-bs)
         k-type (or kt :data)
-        ^ByteBuffer k-bf (encode-to-buf k k-type)
-        k-len (.remaining k-bf)]
+        ^ByteBuffer k-bf (when-not (= :clear op) (encode-to-buf k k-type))
+        k-len (if k-bf (.remaining k-bf) 0)]
     (case op
+      :clear
+      (-> bf
+          (bb-put-byte! tl (int op-kv-clear))
+          (bb-put-u16! tl dbi-len)
+          (bb-put-bytes! tl dbi-bs)
+          (bb-write-flags! tl flags))
       :put
       (let [^ByteBuffer bf1 (-> bf
                                 (bb-put-byte! tl (int op-kv-put))
@@ -875,15 +883,18 @@
             (bb-write-flags! tl flags)))
 
       :del-list
-      (let [^ByteBuffer bf1 (-> bf
-                                (bb-put-byte! tl (int op-kv-del-list))
+      (let [raw-pair? (and (= :raw kt) (= :raw vt) (= 1 (count v)))
+            ^ByteBuffer bf1 (-> bf
+                                (bb-put-byte! tl (int (if raw-pair?
+                                                       op-kv-del-raw-pair op-kv-del-list)))
                                 (bb-put-u16! tl dbi-len)
                                 (bb-put-bytes! tl dbi-bs)
                                 (bb-write-type! tl k-type)
                                 (bb-put-u16! tl k-len))
             ^ByteBuffer bf2 (bb-put-buffer! bf1 tl k-bf)
             v-type (or vt :data)
-            ^ByteBuffer v-bf (encode-to-buf v :data)
+            ^ByteBuffer v-bf (encode-to-buf (if raw-pair? (first v) v)
+                                          (if raw-pair? :raw :data))
             v-len (.remaining v-bf)]
         (-> bf2
             (bb-write-type! tl v-type)
@@ -1063,11 +1074,14 @@
   (let [dbi-len (bb-get-u16 bf {:field :dbi-len})
         dbi-bs (bb-get-bytes bf dbi-len {:field :dbi-bytes})
         dbi (String. ^bytes dbi-bs StandardCharsets/UTF_8)
-        k-type (bb-read-type bf)
-        k-len (bb-get-u16 bf {:field :key-len})
+        k-type (when-not (= opcode 0x1b) (bb-read-type bf))
+        k-len (if (= opcode 0x1b) 0 (bb-get-u16 bf {:field :key-len}))
         k-bs (bb-get-bytes bf k-len {:field :key-bytes})
-        k (decode-bits k-bs k-type)]
+        k (when-not (= opcode 0x1b) (decode-bits k-bs k-type))]
     (case opcode
+      0x1b (let [flags (bb-read-flags bf)]
+             (cond-> [:clear dbi nil nil :raw :raw]
+               (seq flags) (conj flags)))
       0x10 (let [v-type (bb-read-type bf)
                  v-len (bb-get-u32 bf {:field :val-len})
                  v-bs (bb-get-bytes bf v-len {:field :val-bytes})
@@ -1091,6 +1105,14 @@
                  flags (bb-read-flags bf)
                  v (decode-bits v-bs :data)]
              (cond-> [:del-list dbi k v k-type v-type]
+               (seq flags) (conj flags)))
+      0x1a (let [v-type (bb-read-type bf)
+                 v-len (bb-get-u32 bf {:field :val-len})
+                 v-bs (bb-get-bytes bf v-len {:field :val-bytes})
+                 flags (bb-read-flags bf)]
+             (when-not (and (= :raw k-type) (= :raw v-type))
+               (raise "Raw pair deletion must contain raw bytes" {:type :txlog/corrupt}))
+             (cond-> [:del-list dbi k [v-bs] :raw :raw]
                (seq flags) (conj flags)))
       (raise "Unknown txn-log opcode"
              {:type :txlog/corrupt
@@ -1338,7 +1360,7 @@
       out)))
 
 (defn decode-raw-commit-row-payload
-  "Bounded private-KV replay. Accept physical raw puts/deletes only, with no
+  "Bounded private-KV replay. Accept physical raw puts, key deletes and duplicate deletes only, with no
   object deserialization or body evaluation. Charge the source, detached bytes,
   strings and row carriers before materializing any rows."
   [^bytes body ^long workspace-bytes]
@@ -1353,25 +1375,28 @@
                  (if (= idx op-count)
                    out
                    (let [opcode (bb-get-u8 bf)
-                         _ (when-not (#{0x10 0x11} opcode)
+                         _ (when-not (#{0x10 0x11 0x1a 0x1b} opcode)
                              (raise "Unsupported private WAL operation"
                                     {:type :txlog/corrupt :opcode opcode}))
                          dbi (String. ^bytes (bb-get-bytes bf (bb-get-u16 bf) nil)
                                       StandardCharsets/UTF_8)
-                         kt (bb-read-type bf)
+                         kt (if (= opcode 0x1b) :raw (bb-read-type bf))
                          _ (when-not (= :raw kt)
                              (raise "Private WAL keys must be raw"
                                     {:type :txlog/corrupt :key-type kt}))
-                         key (bb-get-bytes bf (bb-get-u16 bf) nil)
-                         value (when (= opcode 0x10)
+                         key (when-not (= opcode 0x1b)
+                               (bb-get-bytes bf (bb-get-u16 bf) nil))
+                         value (when (#{0x10 0x1a} opcode)
                                  (let [vt (bb-read-type bf)]
                                    (when-not (= :raw vt)
                                      (raise "Private WAL values must be raw"
                                             {:type :txlog/corrupt :value-type vt}))
                                    (bb-get-bytes bf (bb-get-u32 bf) nil)))
                          flags (bb-read-flags bf)
-                         row (if (= opcode 0x10)
-                               [:put dbi key value :raw :raw]
+                         row (case opcode
+                               0x1b [:clear dbi nil nil :raw :raw]
+                               0x10 [:put dbi key value :raw :raw]
+                               0x1a [:del-list dbi key [value] :raw :raw]
                                [:del dbi key :raw])]
                      (recur (inc idx) (conj out (cond-> row (seq flags) (conj flags)))))))]
       (when (.hasRemaining bf)

@@ -90,9 +90,10 @@
                            (fn []
                              (i/close-kv raw)
                              (kvtx/close-txlog-state! raw))))
-    (let [collector (group/create (or (:write-batch-size opts) 256))
+    (let [^datalevin.tx_group.Group collector
+          (group/create (or (:write-batch-size opts) 256))
           appending (volatile! false)
-          sealed-pending (volatile! 0)]
+          sealed-pending (volatile! (long 0))]
       ;; A decoupled sync owner waits for an adjacent record while a group is in
       ;; its append step, while a sealed group is still waiting for its ordered
       ;; preparation turn, or while ready requests are queued. A slow body still
@@ -441,14 +442,16 @@
                 (let [late (group/collect-submissions execute extract (count initial))
                       submissions (into initial late)]
                   (group/seal! execute)
-                  (vswap! (:sealed-pending pipeline) inc)
+                  (vreset! (:sealed-pending pipeline)
+                           (inc (long @(:sealed-pending pipeline))))
                   ;; Preparation and append run without the collector lock; the
                   ;; runner still leads, so no other group forms meanwhile.
                   (group/release-collection! execute)
                   (try
                     (prepare-group! pipeline execute submissions token)
                     (finally
-                      (vswap! (:sealed-pending pipeline) dec)
+                      (vreset! (:sealed-pending pipeline)
+                               (dec (long @(:sealed-pending pipeline))))
                       (group/acquire-collection! execute))))
                 (finally
                   (state/release-preparation! token))))))

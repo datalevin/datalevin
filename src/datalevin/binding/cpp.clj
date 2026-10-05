@@ -26,6 +26,8 @@
    [datalevin.migrate :as m]
    [datalevin.scan :as scan]
    [datalevin.tx-state.lifetime :as lifetime]
+   [datalevin.tx-state.protocol :as protocol]
+   [datalevin.tx-group.batch.charge :as charge]
    [datalevin.interface :as i
     :refer [IList ILMDB IAdmin open-dbi close-kv env-dir close-vecs
             transact-kv stat key-compressor
@@ -838,6 +840,7 @@
                 (vreset! close-error e))))
           (when (@info :temp?) (u/delete-files (@info :dir)))))
       (when (.isClosed env)
+        (protocol/release-compat-open-lease! (:compat-open-lease @info))
         (lifecycle/release-local-kv-handle! dir-key)
         (swap! l/lmdb-dirs disj dir)
         (when (and (not (@info :spill?)) (zero? (count @l/lmdb-dirs)))
@@ -858,6 +861,8 @@
   (env-opts [_] (dissoc @info :compression :dbis :custom-dbis :types :custom-types-revision :custom-value-id
                        :custom-type-cache :custom-payload-dbi-open? :runtime-opts
                        :write-groups :native-lifetime :close-independent!
+                       :independent-control
+                       :compat-open-lease
                        :unpublished-reader-lsn :await-native-publication!))
 
   (dbi-opts [_ dbi-name] (get-in @info [:dbis dbi-name]))
@@ -1524,9 +1529,14 @@
                               flags c/default-env-flags
                               temp? false}
                          :as opts}]
-  (doseq [k [:write-batch-size :write-batch-delay-us]
+  (doseq [k [:write-batch-size :write-batch-delay-us :write-batch-max-bytes
+            :wal-pending-max-requests :wal-pending-max-bytes :wal-rmw-max-bytes
+            :wal-preparation-timeout-ms :write-close-timeout-ms :write-mode]
           :when (contains? opts k)]
     (vld/validate-option-mutation k (get opts k)))
+  (when (some #(contains? opts %) [:wal-pending-max-requests :wal-pending-max-bytes
+                                  :write-batch-max-bytes :wal-rmw-max-bytes])
+    (charge/resolve-limits opts))
   (let [runtime-opts      (:runtime-opts opts)
         opts             (dissoc opts :runtime-opts :compression)
         opened           (volatile! nil)
@@ -1541,7 +1551,13 @@
         prepared (when (and (not temp?) (not (some #{:inmemory} flags))
                             (not (.exists ^File db-file)))
                    (cp/open-compression dir opts {}))
-        local-handle-key (lifecycle/reserve-local-kv-handle! dir-file flags)]
+        local-handle-key (lifecycle/reserve-local-kv-handle! dir-file flags)
+        compat-open-lease (try
+                            (when (and (not temp?) (not (some #{:inmemory} flags)))
+                              (protocol/acquire-compat-open-lease! dir))
+                            (catch Throwable t
+                              (lifecycle/release-local-kv-handle! local-handle-key)
+                              (throw t)))]
     (try
       (let [inmemory? (some #{:inmemory} flags)
           ;; MDB_INMEMORY on Windows expects a simple env identifier instead of
@@ -1599,6 +1615,7 @@
                                    nil
                                    nil)]
         (vreset! opened lmdb)
+        (vswap! (.-info lmdb) assoc :compat-open-lease compat-open-lease)
         ;; Spill collections may outlive the application database until GC.
         ;; Their synchronous temporary stores must not keep global executors
         ;; alive after the last application database closes.
@@ -1622,9 +1639,10 @@
                 merged-info (open/retain-wal-durability-profile!
                               lmdb loaded-info merged-info)]
             (if (empty? loaded-info)
-              (vreset! (.-info lmdb) (open/init-info lmdb merged-info))
+              (vreset! (.-info lmdb) (assoc (open/init-info lmdb merged-info)
+                                          :compat-open-lease compat-open-lease))
               (do
-                (vreset! (.-info lmdb) merged-info)
+                (vreset! (.-info lmdb) (assoc merged-info :compat-open-lease compat-open-lease))
                 (when-not (:compression loaded-info)
                   (transact-kv lmdb [[:put c/kv-info :compression manifest]]))))
             (set-key-compressor lmdb key-codec)
@@ -1646,7 +1664,8 @@
         (when-let [lmdb @opened]
           (try (close-kv lmdb) (catch Throwable _)))
         (when (or (nil? @opened) (i/closed-kv? @opened))
-          (lifecycle/release-local-kv-handle! local-handle-key))
+          (lifecycle/release-local-kv-handle! local-handle-key)
+          (protocol/release-compat-open-lease! compat-open-lease))
         (raise "Fail to open database: " e {:dir dir})))))
 
 (defmethod open-kv :cpp
@@ -1654,6 +1673,10 @@
   ([dir opts]
    (let [migration-kv-types (:migration-kv-types opts)
          opts (c/canonicalize-wal-opts (dissoc opts :migration-kv-types))
+         _ (when (and (= :independent (:write-mode opts))
+                      (not protocol/*independent-native-open?*))
+             (raise "Use the public embedded KV opener for independent write mode"
+                    {:error :txlog/write-protocol-mismatch}))
          inmemory? (or (nil? dir)
                        (:inmemory? opts)
                        (some #{:inmemory} (:flags opts)))
@@ -1664,6 +1687,7 @@
          opts (if inmemory?
                 (update opts :flags (fnil conj c/default-env-flags) :inmemory)
                 opts)]
+     (when-not inmemory? (protocol/assert-native-open! dir))
      (if inmemory?
        (open-kv* dir dir-file db-file opts)
        (let [exist-db? (.exists db-file)

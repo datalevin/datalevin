@@ -680,7 +680,7 @@
                             (swap! computes inc)
 
                             (= event :application-claimed)
-                            (case (swap! claims inc)
+                            (case (int (swap! claims inc))
                               1 (do (deliver claimed-a true) (.await release))
                               2 (do (deliver claimed-b true) (.await release))
                               nil)))]

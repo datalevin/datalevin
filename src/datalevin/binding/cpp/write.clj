@@ -20,7 +20,7 @@
    [datalevin.validate :as vld])
   (:import
    [datalevin.dtlvnative DTLV]
-   [datalevin.cpp BufVal Cursor]
+   [datalevin.cpp BufVal Cursor Dbi Txn Util]
    [datalevin.binding.cpp.buffer DBI IEncodedInput IMultipleBuffer IWriteCursor]
    [datalevin.kv.encoding CommitMetadata WriteBatch StorageRows]
    [datalevin.lmdb DatomKVTxData KVTxData]
@@ -55,6 +55,8 @@
 (defn- put-tx
   [^DBI dbi txn ^KVTxData tx]
   (case (.-op tx)
+    :clear    (Util/checkRc (DTLV/mdb_drop (.get ^Txn txn)
+                                        (.get ^Dbi (.-db dbi)) 0))
     :put      (do (.put-key dbi (.-k tx) (.-kt tx))
                   (.put-val dbi (.-v tx) (.-vt tx))
                   (if-let [f (.-flags tx)]

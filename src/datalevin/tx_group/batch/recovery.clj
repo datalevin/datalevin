@@ -8,6 +8,7 @@
             [datalevin.constants :as c]
             [datalevin.interface :as i]
             [datalevin.kv :as kv]
+            [datalevin.kv.encoding :as encoding]
             [datalevin.lmdb :as l]
             [datalevin.tx-group.batch :as batch]
             [datalevin.tx-group.batch.charge :as charge]
@@ -42,7 +43,7 @@
   "Use writemap/nosync by default, respecting an explicit native flag override.
   Recovery itself never recursively opens a WAL runtime or snapshot scheduler."
   [opts]
-  (assoc opts :wal? false :snapshot-scheduler? false
+  (assoc (dissoc opts :rmw-opts :protocol-options) :wal? false :snapshot-scheduler? false
          :flags (if (contains? opts :flags)
                   (:flags opts)
                   (if (:wal? opts)
@@ -68,7 +69,8 @@
   including configured limits. Reject an unrecoverable configuration before open."
   [opts]
   (let [limits (charge/resolve-limits opts)
-        required (+ fixed-workspace (* 5 (long (:batch-max-bytes limits))))
+        required (+ (long fixed-workspace)
+                    (* 5 (long (:batch-max-bytes limits))))
         retained (retention-limit opts)
         segment-size (long (wal/segment-max-bytes opts))]
     ;; Two snapshot anchors can pin two full segments. A lower hard limit can
@@ -101,11 +103,12 @@
     ;; upper bound. Traverse bodies only when that bound could cross the cap.
     (when (> (+ retained max-growth) limit)
       (let [bodies (batch/wal-bodies sealed)
-            bytes (loop [idx 0 total (long codec/record-header-size)]
-                (if (= idx (batch/accepted-count sealed))
-                  total
-                  (recur (inc idx)
-                         (+ total (alength ^bytes (aget bodies idx))))))
+            bytes (long
+                   (loop [idx (long 0) total (long codec/record-header-size)]
+                     (if (= idx (long (batch/accepted-count sealed)))
+                       total
+                       (recur (inc idx)
+                              (+ total (long (alength ^bytes (aget bodies idx))))))))
             projected (+ retained bytes)]
         (when (> projected limit)
           (vreset! (:retention-backpressure-state state) bytes)
@@ -177,7 +180,8 @@
                        (= (dbis opts) (:dbis manifest))
                        (nat-int? (:floor-lsn manifest))
                        (nat-int? (:durable-lsn manifest))
-                       (<= (:floor-lsn manifest) (:durable-lsn manifest))
+                       (<= (long (:floor-lsn manifest))
+                           (long (:durable-lsn manifest)))
                        (pos-int? (:start-segment manifest))
                        (vector? (:files manifest))
                        (some #(= "data.mdb" (:name %)) (:files manifest))
@@ -249,6 +253,17 @@
       (finally
         (when (.exists incoming) (u/delete-files (.getPath incoming)))))))
 
+(defn available-snapshots
+  "List independent snapshot metadata without opening a native environment."
+  [opts]
+  (into []
+        (keep (fn [slot]
+                (let [directory (io/file (root opts) (name slot))]
+                  (when (.isDirectory directory)
+                    (assoc (read-manifest directory opts)
+                           :slot slot :path (.getPath directory) :exists? true)))))
+        [:current :previous]))
+
 (defn collect-covered-segments!
   "Retain the complete tails required by both snapshot slots. Private M0 has
   no replica/backup/secondary-index pins; those environments remain compatibility.
@@ -259,7 +274,7 @@
                               [(io/file (root opts) "current")
                                (io/file (root opts) "previous")]))
         start (when (seq anchors) (reduce min (map :start-segment anchors)))
-        removed (volatile! 0)]
+        removed (volatile! (long 0))]
     (when start
       (wal/with-wal-owner!
        state 0
@@ -269,12 +284,14 @@
                             (< (long id) (long @(:segment-id state))))]
            (let [length (.length ^File file)]
              (Files/delete (.toPath ^File file))
-             (vswap! removed + length)
-             (vswap! (:retention-total-bytes state) - length)))
+             (vreset! removed (+ (long @removed) length))
+             (vreset! (:retention-total-bytes state)
+                      (- (long @(:retention-total-bytes state)) length))))
          (when-let [growth @(:retention-backpressure-state state)]
            (let [slack (if (:segment-prealloc? state)
-                         (* 2 (long (:segment-prealloc-bytes state))) 0)]
-             (when (<= (+ (long @(:retention-total-bytes state)) slack (long growth))
+                         (* 2 (long (:segment-prealloc-bytes state))) 0)
+                 growth (long growth)]
+             (when (<= (+ (long @(:retention-total-bytes state)) slack growth)
                        (retention-limit opts))
                (vreset! (:retention-backpressure-state state) nil))))
          (segment/force-parent-directory! (str (wal-dir opts) "/gc")))))
@@ -282,9 +299,12 @@
 
 (defn- copy-snapshot! [opts ^File slot manifest ^File candidate]
   (let [buffer (byte-array (* 1024 1024))
-        snapshot-bytes (reduce + (map :bytes (:files manifest)))
-        tail-bytes (reduce + (map #(.length ^File (:file %))
-                                 (segment/segment-files (wal-dir opts))))
+        ^long snapshot-bytes (reduce (fn [^long total file]
+                                       (+ total (long (:bytes file))))
+                                     (long 0) (:files manifest))
+        ^long tail-bytes (reduce (fn [^long total segment]
+                                   (+ total (.length ^File (:file segment))))
+                                 (long 0) (segment/segment-files (wal-dir opts)))
         ;; Reserve room for the independent copy and native replay growth.
         required (+ snapshot-bytes (* 4 tail-bytes) (* 64 1024 1024))
         available (.getUsableSpace (Files/getFileStore (.toPath (io/file (:dir opts)))))]
@@ -301,38 +321,43 @@
     (phase! :snapshot-restored {:snapshot (.getPath slot) :bytes snapshot-bytes})))
 
 (defn- valid-replay-row?
-  "Only the unconditional physical operations admitted by the private writer.
-  Position/conditional flags cannot be replayed from a conservative floor."
+  "Unconditional physical effects can be replayed from a conservative floor."
   [catalog row]
   (let [op (nth row 0) name (nth row 1) key (nth row 2)
-        options (get catalog name) value (when (= op :put) (nth row 3))]
+        options (get catalog name)
+        duplicates? (some #{:dupsort} (:flags options))
+        value (case op :put (nth row 3)
+                       :del-list (first (nth row 3)) nil)]
     (and (some? options)
-         (= (count row) (if (= op :put) 6 4))
-         (bytes? key) (<= 1 (alength ^bytes key)
-                           (long (get options :key-size c/+max-key-size+)))
-         (or (= op :del)
-             (and (= op :put) (bytes? value)
-                  (or (not (some #{:dupsort} (:flags options)))
+         (= (count row) (if (= op :del) 4 6))
+         (or (and (= op :clear) (nil? key) (nil? (nth row 3)))
+             (and (bytes? key) (<= 1 (alength ^bytes key)
+                           (long (get options :key-size c/+max-key-size+)))))
+         (or (#{:del :clear} op)
+             (and (or (= op :put)
+                      (and (= op :del-list) duplicates? (= 1 (count (nth row 3)))))
+                  (bytes? value)
+                  (or (not duplicates?)
                       (<= 1 (alength ^bytes value) c/+max-key-size+)))))))
 
 (defn- replay! [opts raw manifest]
   (let [limits (charge/resolve-limits opts)
-        workspace (- (long (:byte-budget limits)) fixed-workspace)
+        workspace (- (long (:byte-budget limits)) (long fixed-workspace))
         _ (when-not (pos? workspace)
             (invalid! :workspace-too-small {:byte-budget (:byte-budget limits)} nil))
         segments (filterv #(>= (long (:id %)) (long (:start-segment manifest)))
                           (segment/segment-files (wal-dir opts)))
         floor (long (:floor-lsn manifest))
-        expected (volatile! (inc floor))
-        replayed (volatile! 0)
-        tail-bytes (volatile! 0)
+        expected (volatile! (long (inc floor)))
+        replayed (volatile! (long 0))
+        tail-bytes (volatile! (long 0))
         repairs (volatile! [])]
     (doseq [[idx {:keys [id file]}] (map-indexed vector segments)]
       (let [final? (= idx (dec (count segments)))
             scan (segment/scan-segment
                   (.getPath ^File file)
                   {:collect-records? false :allow-preallocated-tail? true
-                   :max-record-bytes (:batch-max-bytes limits)
+                   :max-record-bytes (long (:batch-max-bytes limits))
                    :on-record
                    (fn [record]
                      (let [^bytes body (:body record)
@@ -340,7 +365,7 @@
                        (when-not (pos? lsn)
                          (invalid! :corrupt-record {:segment-id id :observed-lsn lsn} nil))
                        (when (> lsn floor)
-                         (when-not (= lsn @expected)
+                         (when-not (= lsn (long @expected))
                            (invalid! :gap {:snapshot-floor floor :segment-id id
                                            :expected-lsn @expected :observed-lsn lsn} nil))
                          (when (:compressed? record)
@@ -349,11 +374,13 @@
                            (doseq [row rows]
                              (when-not (valid-replay-row? (dbis opts) row)
                                (invalid! :corrupt-record {:dbi (nth row 1)} nil)))
-                           (i/transact-kv raw rows))
-                         (vswap! expected inc)
-                         (vswap! replayed inc)
-                         (vswap! tail-bytes + (long codec/record-header-size)
-                                 (long (:body-len record)))
+                           (i/transact-kv raw (encoding/storage-rows rows)))
+                         (vreset! expected (inc (long @expected)))
+                         (vreset! replayed (inc (long @replayed)))
+                         (vreset! tail-bytes
+                                  (+ (long @tail-bytes)
+                                     (long codec/record-header-size)
+                                     (long (:body-len record))))
                          (phase! :record-replayed {:lsn lsn :segment-id id}))))})]
         (when (:checksum-mismatch-tail? scan)
           ;; A complete checksum-invalid final frame is corruption, not an

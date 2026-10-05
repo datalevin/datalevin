@@ -14,7 +14,7 @@
   (i/get-value db name key :raw :raw))
 
 (defn tx-exists? [db name key]
-  (pos? (i/range-count db name [:closed key key] :raw)))
+  (pos? (long (i/range-count db name [:closed key key] :raw))))
 
 (defn tx-range [db name lower upper limit]
   (with-open [^java.lang.AutoCloseable rows

@@ -21,6 +21,10 @@
                           StandardOpenOption/WRITE]))
 (def ^:private read-options (into-array OpenOption [StandardOpenOption/READ]))
 
+(def ^:dynamic *independent-native-open?*
+  "Bound only by the independent runtime while opening recovery/native files."
+  false)
+
 (defn ^:redef phase!
   "Open/marker fault seam; disabled production calls allocate no event payload."
   [_event _context]
@@ -79,7 +83,8 @@
 (defn ^:redef acquire-write-protocol-lease!
   "Acquire an exclusive independent-mode or shared compatibility-mode lease.
   Same-JVM handles share a canonical-path holder; mode/identity must match."
-  [dir mode identity]
+  ([dir mode identity] (acquire-write-protocol-lease! dir mode identity nil))
+  ([dir mode identity options]
   (when-not (and (modes mode) (some? identity))
     (throw (ex-info "Write protocol requires a supported mode and database identity"
                     {:mode mode :db-identity identity})))
@@ -108,8 +113,9 @@
                           initial (lock! channel dir (and shared? (not initialize?)))
                           marker (or (read-write-protocol-marker dir)
                                      (publish-write-protocol-marker!
-                                      dir {:version 1 :mode mode :db-identity identity
-                                           :generation (str (random-uuid))}))
+                                      dir (cond-> {:version 1 :mode mode :db-identity identity
+                                                   :generation (str (random-uuid))}
+                                            options (assoc :public-options options))))
                           _ (validate-marker! dir mode identity marker)
                           lock (if (and initialize? shared?)
                                  (do (.release initial) (lock! channel dir true))
@@ -123,7 +129,37 @@
                       (.put holders dir holder)
                       holder)
                     (catch Throwable e (.close channel) (throw e))))))]
-        {:holder holder :released? (AtomicBoolean. false)}))))
+        {:holder holder :released? (AtomicBoolean. false)})))))
+
+(defn assert-native-open!
+  "Reject compatibility native opens of an independent environment before any
+  native handle, migration or WAL runtime can be created."
+  [dir]
+  (when-not *independent-native-open?*
+    (when (= :kv-independent-v1 (:mode (read-write-protocol-marker dir)))
+      (mismatch! dir :legacy-writer-v1 :kv-independent-v1))))
+
+(defn acquire-compat-open-lease!
+  "Hold a shared protocol lock for a compatibility native environment. Do not
+  publish a mode marker or change compatibility metadata. Check the marker
+  under the lock, closing the race with independent runtime creation."
+  [dir]
+  (when-not *independent-native-open?*
+    (let [directory (.toPath (io/file dir))
+          _ (Files/createDirectories directory (make-array java.nio.file.attribute.FileAttribute 0))
+          channel (FileChannel/open (.toPath (io/file dir "write-protocol.lock")) open-options)]
+      (try
+        (let [lock (lock! channel dir true)]
+          (assert-native-open! dir)
+          {:channel channel :lock lock :released? (AtomicBoolean. false)})
+        (catch Throwable t (.close channel) (throw t))))))
+
+(defn release-compat-open-lease!
+  "Release only after native teardown, or when native creation never started."
+  [lease]
+  (when (and lease (.compareAndSet ^AtomicBoolean (:released? lease) false true))
+    (try (.release ^FileLock (:lock lease))
+         (finally (.close ^FileChannel (:channel lease))))))
 
 (defn bind-lifetime!
   "Tie protocol ownership to native lifetime before publishing the environment."

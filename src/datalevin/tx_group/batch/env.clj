@@ -1,14 +1,13 @@
 ;; Copyright (c) Huahai Yang. All rights reserved.
 ;; Distributed under the Eclipse Public License 2.0.
 (ns ^:no-doc datalevin.tx-group.batch.env
-  "Private environment open and routing for the new write protocol.
+  "Environment ownership and routing for the independent write protocol.
 
-  M0 wiring only. One canonical environment selects one collector protocol when
+  One canonical environment selects one collector protocol when
   it is first opened, and every handle into that environment shares that
   selection: there is no per-call switch and no fallback to compatibility after
-  admission or body evaluation. Public KV, Datalog, remote/HA and shared-WAL
-  entry points stay on `datalevin.tx-group.compat` until their own migration
-  gates pass; nothing here routes them.
+  admission or body evaluation. M1 public KV can opt in through its public opener;
+  default KV, Datalog, remote/HA and shared-WAL remain on compatibility.
 
   Registry membership, handle counts and the closed flag are all mutated under
   the `environments` monitor, so an open can never attach to a runtime that a
@@ -27,7 +26,7 @@
 
 (def ^:private default-close-timeout-ms 30000)
 
-(def ^:private environments
+(def ^:private ^ConcurrentHashMap environments
   "Canonical environment path -> its single runtime record."
   (ConcurrentHashMap.))
 
@@ -118,7 +117,7 @@
   (batch/create executor opts))
 
 (defn- install!
-  [dir record]
+  [^String dir ^Environment record]
   (.put environments dir record)
   record)
 
@@ -157,8 +156,11 @@
           (long v))
         timeout-ms (close-timeout-ms opts)]
     (locking environments
-      (if-let [record (.get environments path)]
+      (if-let [^Environment record (.get environments path)]
         (do (check-openable! record path :kv-independent-v1 db-identity)
+            (when-not (= limits (.-limits ^Environment record))
+              (throw (ex-info "Environment write limits are already fixed"
+                              {:error :txlog/write-protocol-limits :dir path})))
             (when (and (contains? opts :wal?)
                        (contains? (resources record) :wal?)
                        (not= (:wal? opts) (:wal? (resources record))))
@@ -166,8 +168,11 @@
                               {:error :txlog/write-protocol-mismatch :dir path})))
             (.incrementAndGet ^AtomicInteger (.-handles record))
             record)
-        (let [lease (protocol/acquire-write-protocol-lease!
-                     path :kv-independent-v1 db-identity)]
+        (let [lease (if-let [options (:protocol-options opts)]
+                      (protocol/acquire-write-protocol-lease!
+                       path :kv-independent-v1 db-identity options)
+                      (protocol/acquire-write-protocol-lease!
+                       path :kv-independent-v1 db-identity))]
           (try
             (let [runtime (if open-runtime! (open-runtime!)
                               {:executor executor :close! executor-close!})]
@@ -201,7 +206,7 @@
   (let [path (canonical (File. ^String dir))
         timeout-ms (close-timeout-ms opts)]
     (locking environments
-      (if-let [record (.get environments path)]
+      (if-let [^Environment record (.get environments path)]
         (do (check-openable! record path :legacy-writer-v1 db-identity)
             (.incrementAndGet ^AtomicInteger (.-handles record))
             record)

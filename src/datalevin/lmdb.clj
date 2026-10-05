@@ -653,7 +653,7 @@
                               ^long (:overflow-pages m)))))
              0 (list-dbis db))))
 
-(defmacro with-transaction-kv
+(defmacro ^:no-doc with-compatibility-transaction-kv
   "Evaluate body within the context of a single new read/write transaction,
   ensuring atomicity of key-value operations. Works with synchronous `transact-kv`.
 
@@ -699,10 +699,7 @@
                                                                    orig-db#)]
                                                           (vreset! opened?# true)
                                                           db#))]
-                                              (u/repeat-try-catch
-                                                  ~c/+in-tx-overflow-times+
-                                                  condition#
-                                                ~@body))]
+                                              ~@body)]
                                    (cancel-explicit-transaction-watchdog!
                                     @watchdog#)
                                    (assert-explicit-transaction-live!
@@ -721,6 +718,20 @@
                (when (and (not writing#) @opened?#)
                  (abort-open-transaction-kv! orig-db# t#))
                (throw t#))))))))
+
+(defmacro with-transaction-kv
+  "Evaluate one atomic KV write body. Independent mode runs the body once on
+  the elected batch owner; reads use that ordinary native write transaction.
+  :timeout-ms bounds the body and :context is explicitly conveyed to the owner."
+  [[db orig-db opts] & body]
+  `(let [orig-db# ~orig-db
+         opts# ~opts]
+     (if-let [control# (:independent-control @(kv-info orig-db#))]
+       (do (datalevin.interface/check-ready orig-db#)
+           (if (writing? orig-db#)
+             (do (write-txn orig-db#) (let [~db orig-db#] ~@body))
+             ((:body! control#) (fn [~db] ~@body) opts#)))
+       (with-compatibility-transaction-kv [~db orig-db# opts#] ~@body))))
 
 ;; for shutting down various executors when the last LMDB exits
 (defonce lmdb-dirs (atom #{}))
