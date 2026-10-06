@@ -721,6 +721,9 @@
                    (not (identical? (:native-write-rtx meta) @write-txn))))
       (throw (ex-info "Native transaction is no longer owned by this caller"
                       {:error :txlog/transaction-view-invalidated :retryable? false})))
+    ;; A frozen write tail must be visible before a body borrows its writer
+    ;; for a read (or another dependent write).
+    (when-let [flush! (when writing? (:native-before-read! meta))] (flush!))
     write-txn)
 
   (mark-write [_]

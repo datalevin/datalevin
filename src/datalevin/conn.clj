@@ -12,6 +12,7 @@
   (:require
    [datalevin.constants :as c]
    [datalevin.db :as db]
+   [datalevin.db.tx.common :as txcommon]
    [datalevin.lmdb :as l]
    [datalevin.storage :as s]
    [datalevin.async :as a]
@@ -19,6 +20,7 @@
    [datalevin.util :as u :refer [raise]]
    [datalevin.interface :as i]
    [datalevin.kv :as kv]
+   [datalevin.tx-group.batch.datalog :as datalog]
    [datalevin.tx-group.compat :as group]
    [datalevin.validate :as vld])
   (:import
@@ -117,6 +119,7 @@
 (defn conn-from-db
   [db]
   {:pre [(db/db? db)]}
+  (datalog/attach! db)
   (wrap-conn
    (atom db :meta {:listeners (atom {})
                    :db-listeners (atom {})
@@ -255,32 +258,8 @@
     (catch Throwable abort-error
       (.addSuppressed ^Throwable primary abort-error))))
 
-(defmacro with-transaction
-  "Evaluate body within the context of a single new read/write transaction,
-  ensuring atomicity of Datalog database operations. Works with synchronous
-  `transact!`.
-
-  `conn` is a new identifier of the Datalog database connection with a new
-  read/write transaction attached, and `orig-conn` is the original database
-  connection.
-
-  `body` should refer to `conn`.
-
-  The binding vector can include an optional opts map. `:timeout-ms` sets a
-  timeout for the user body in milliseconds. Nil disables the timeout. A timeout
-  interrupts the transaction thread and aborts the transaction when control
-  returns to the macro; non-interruptible user code can still run until it
-  returns.
-
-  Example:
-
-          (with-transaction [cn conn]
-            (let [query  '[:find ?c .
-                           :in $ ?e
-                           :where [?e :counter ?c]]
-                  ^long now (q query @cn 1)]
-              (transact! cn [{:db/id 1 :counter (inc now)}])
-              (q query @cn 1))) "
+(defmacro ^:no-doc with-compatibility-transaction
+  "Retain the existing transaction implementation for unmigrated callers."
   [[conn orig-conn opts] & body]
   `(let [orig-conn#        ~orig-conn
          tx-timeout-opt#   (l/explicit-transaction-timeout-option ~opts)
@@ -365,6 +344,39 @@
            (finally
              (when-not old#
                (db/enable-cache (.-store ^DB (deref orig-conn#))))))))))
+
+(defmacro with-transaction
+  "Evaluate body within the context of a single new read/write transaction,
+  ensuring atomicity of Datalog database operations. Works with synchronous
+  `transact!`.
+
+  `conn` is a new identifier of the Datalog database connection with a new
+  read/write transaction attached, and `orig-conn` is the original database
+  connection.
+
+  `body` should refer to `conn`.
+
+  The binding vector can include an optional opts map. `:timeout-ms` sets a
+  timeout for the user body in milliseconds. Nil disables the timeout. A timeout
+  interrupts the transaction thread and aborts the transaction when control
+  returns to the macro; non-interruptible user code can still run until it
+  returns.
+
+  Example:
+
+          (with-transaction [cn conn]
+            (let [query  '[:find ?c .
+                           :in $ ?e
+                           :where [?e :counter ?c]]
+                  ^long now (q query @cn 1)]
+              (transact! cn [{:db/id 1 :counter (inc now)}])
+              (q query @cn 1))) "
+  [[conn orig-conn opts] & body]
+  `(let [orig-conn# ~orig-conn
+         opts# ~opts]
+     (if-let [control# (datalog/control orig-conn#)]
+       (datalog/with-transaction! control# orig-conn# (fn [~conn] ~@body) opts#)
+       (with-compatibility-transaction [~conn orig-conn# opts#] ~@body))))
 
 (defn with
   ([db tx-data] (with db tx-data {} false))
@@ -706,11 +718,18 @@
 
 (defn- commit-writing-report!
   [db report ordered? path]
+  (when txcommon/*batch-prepare*
+    (doseq [datom (:tx-data report)]
+      (txcommon/stage-batch-datom! (:db-after report) datom)))
   ;; The enclosing transaction owns commit/abort. Probe uniqueness before
   ;; staging blind inserts: a late fused collision could poison that writer.
-  (binding [s/*enforce-blind-unique-inserts?* false
-            c/*ordered-datom-writes?* ordered?]
-    (db/commit-prepared-tx-data! (:db-after report) (:tx-data report) report))
+  (if (and txcommon/*batch-prepare*
+           (not s/*enforce-blind-unique-inserts?*)
+           (= c/*ordered-datom-writes?* ordered?))
+    (db/commit-prepared-tx-data! (:db-after report) (:tx-data report) report)
+    (binding [s/*enforce-blind-unique-inserts?* false
+              c/*ordered-datom-writes?* ordered?]
+      (db/commit-prepared-tx-data! (:db-after report) (:tx-data report) report)))
   (observe-local-wal-tx-path! path)
   (assoc report :db-before db))
 
@@ -718,9 +737,10 @@
   "Apply one request to an already owned local writer. Prepare and resolve
   against preceding writes, retaining the general interpreter for other shapes."
   [^DB db tx-data tx-meta]
-  ;; General preparation leaves mutable overlays on its report. Always give
-  ;; the next request fresh overlays, including when it uses a stamper.
-  (let [db1 (db/transfer db (.-store db))]
+  ;; The collector retains resolver indexes until frozen writes are applied.
+  ;; Other native transactions continue to isolate each request's indexes.
+  (let [db1 (if txcommon/*batch-prepare*
+              db (db/transfer db (.-store db)))]
     (or
       (when-let [prepared (db/prepare-scalar-update-tx db1 tx-data)]
         (when-let [report (db/stamp-scalar-update-tx db1 prepared tx-meta)]
@@ -780,8 +800,9 @@
 
 (defn- notify-listeners!
   [conn report]
-  (doseq [[_ callback] (some-> (:listeners (meta conn)) (deref))]
-    (callback report)))
+  (when-not (datalog/defer-listeners! conn report)
+    (doseq [[_ callback] (some-> (:listeners (meta conn)) (deref))]
+      (callback report))))
 
 (defn- run-transact-now!
   [conn tx-data tx-meta]
@@ -894,6 +915,15 @@
     (notify-listeners! conn report)
     report))
 
+(defn- stamp-collected-scalar!
+  [control ^DB before prepared tx-meta]
+  (when *txlog-sync-path-observer*
+    (let [opts (l/read-env-opts (.-lmdb ^Store (.-store before)))]
+      (observe-embedded-path! (:wal-durability-profile opts)
+                              (datalog/batched? control))))
+  (when-let [report (db/stamp-scalar-update-tx before prepared tx-meta)]
+    (commit-writing-report! before report false :scalar-update)))
+
 (defn transact!
   ([conn tx-data] (transact! conn tx-data nil))
   ([conn tx-data tx-meta]
@@ -905,6 +935,32 @@
        (observe-txlog-sync-path! :direct-remote)
        (notify-listeners! conn report)
        report)
+     (if-let [control (datalog/control conn)]
+       (let [opts (l/read-env-opts (.-lmdb ^Store (:store @conn)))
+             ;; Type correction and read-layout construction do not depend on
+             ;; the eventual native snapshot. Keep that work on the caller;
+             ;; resolve lookup refs and read old values on the native owner.
+             prepared (db/prepare-scalar-update-tx
+                        @conn tx-data {:defer-entity-resolution? true})
+             report (if (and prepared (nil? (l/explicit-transaction-timeout)))
+                      (datalog/run-scalar! control conn prepared tx-data tx-meta
+                                           stamp-collected-scalar! -transact!)
+                      (datalog/with-transaction!
+                        control conn
+                        (fn [tx]
+                          (observe-embedded-path! (:wal-durability-profile opts)
+                                                  (datalog/batched? control))
+                          (or (when prepared
+                                (when-let [report (db/stamp-scalar-update-tx
+                                                    @tx prepared tx-meta)]
+                                  (let [report (commit-writing-report!
+                                                 @tx report false :scalar-update)]
+                                    (reset! tx (:db-after report))
+                                    report)))
+                              (-transact! tx tx-data tx-meta)))
+                        {:context {:datalog-prepare? true}}))]
+         (notify-listeners! conn report)
+         report)
      (if-let [g (embedded-write-group conn)]
        (transact-embedded-group! g conn tx-data tx-meta)
        (do
@@ -915,7 +971,7 @@
                       (l/read-env-opts (.-lmdb ^Store store)))]
            (observe-embedded-path!
             (when (:wal? opts) (:wal-durability-profile opts)) false))
-         (run-transact-now! conn tx-data tx-meta))))))
+         (run-transact-now! conn tx-data tx-meta)))))))
 
 (defn transact-ack!
   ([conn tx-data] (transact-ack! conn tx-data nil))

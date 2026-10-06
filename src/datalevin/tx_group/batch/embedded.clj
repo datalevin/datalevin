@@ -19,9 +19,11 @@
             [datalevin.tx-group.batch.rmw :as rmw]
             [datalevin.txlog :as wal])
   (:import [datalevin.cpp Util$DTLVException]
-           [datalevin.lmdb KVTxData]
+           [datalevin.lmdb DatomKVTxData KVTxData]
+           [datalevin.utl RowRegions]
+           [org.eclipse.collections.impl.list.mutable FastList]
            [java.util.concurrent.atomic AtomicBoolean]
-           [java.util ArrayList]))
+           [java.util ArrayList Arrays]))
 
 (defn- expected-native-rejection? [^Throwable t]
   (or (and (instance? Util$DTLVException t)
@@ -57,21 +59,54 @@
                                    (after {:operation :close-transact-kv
                                            :txlog-lsn (:lsn info) :append-res info}))))))))
 
-(defn- prepare [raw name txs kt vt]
-  (let [log-rows (ArrayList.)
-        rows (public/prepare-rows raw (fn [_]) name txs kt vt false true log-rows)]
-    {:rows rows :wal-rows log-rows}))
+(defn- prepare
+  ([raw name txs kt vt] (prepare raw name txs kt vt false))
+  ([raw name txs kt vt owned-datoms?]
+  (let [log-rows (ArrayList.) datom? (l/datom-kv-txs? txs)
+        datom-bytes (when datom? (long-array 1))
+        rows (if datom?
+               (let [datoms (FastList.) other (FastList.)]
+                 (doseq [tx txs]
+                   (if (instance? DatomKVTxData tx)
+                     (let [^DatomKVTxData tx tx
+                           ^bytes avg (.-avg tx)
+                           ;; Storage's indexable-bytes already detaches AVG
+                           ;; from its scratch buffer. Other inputs still copy.
+                           frozen (if owned-datoms? tx
+                                      (l/->DatomKVTxData
+                                        (.-e tx) (Arrays/copyOf avg (alength avg))
+                                        (.-added? tx) (.-no-overwrite? tx)))]
+                       (.add datoms frozen)
+                       (aset datom-bytes 0 (+ (aget datom-bytes 0) 8 (alength avg)))
+                       (.add log-rows frozen))
+                     (.add other tx)))
+                 ;; Storage emits fused datoms before giant/schema/job rows.
+                 (let [rows (RowRegions.)]
+                   (.append rows datoms)
+                   (.append rows (public/prepare-rows raw (fn [_]) name other
+                                                     kt vt false true log-rows))
+                   rows))
+               (public/prepare-rows raw (fn [_]) name txs
+                                    kt vt false true log-rows))]
+    ;; Only a substantial unconditional datom region can repay the worker
+    ;; handoff. Native rejection flags must resolve before WAL dispatch.
+    (cond-> {:rows rows :wal-rows log-rows}
+      (and datom-bytes (> (aget ^longs datom-bytes 0) 4096)
+              (not-any? #(if (instance? KVTxData %)
+                           (seq (.-flags ^KVTxData %))
+                           (.-no-overwrite? ^DatomKVTxData %)) rows))
+      (assoc :native-tail-bytes (aget ^longs datom-bytes 0))))))
 
 (defn attach!
-  "Install the data collector once on an ordinary embedded WAL handle. Shared
-  WAL, HA and Datalog integration keep their existing caller paths until M2/M3."
-  [db]
+  "Install the data collector once on an existing embedded WAL handle."
+  ([db] (attach! db nil))
+  ([db hooks]
   (let [raw (kv/raw-lmdb db)
         info (i/kv-info raw)
         state (wal/state raw)]
     (when (and *enabled?* state (not (:wal-shared? state))
                (not (:ha-mode @info))
-               (not (i/dbi-opts raw c/eav)))
+               (or (:datalog? hooks) (not (i/dbi-opts raw c/eav))))
       (locking info
         (when-not (:independent-control @info)
           (let [limits (assoc (charge/resolve-limits
@@ -103,6 +138,14 @@
                             :prepared-owned? true :allow-flags? true
                             :prepared-request? true :retry-frozen? true :abort-returns? true
                             :collect-prepared-prefix? true
+                            :encode-batch? (:datalog? hooks)
+                            :shared-datalog-writer? (:datalog? hooks)
+                            :finish-preparation! (:finish-preparation! hooks)
+                            :before-body! (:before-body! hooks)
+                            :ensure-body-ready! (fn [wdb]
+                                                  (kv/ensure-txlog-ready! wdb false)
+                                                  (kvtx/align-runtime-txlog-payload-floor!
+                                                    wdb true))
                             :application-error! application-error!
                             :before-append! (fn [b]
                                               (dotimes [idx (batch/batch-count b)]
@@ -110,20 +153,26 @@
                                                   (when (seq (:rows (batch/data d)))
                                                     (when-let [before (:before-append! (batch/context d))]
                                                       (try (before) (catch Throwable t (application-error! t))))))))
-                            :prepare-rows! (fn [raw _ name txs kt vt]
-                                             (prepare raw name txs kt vt))
+                            :prepare-rows! (fn [raw descriptor name txs kt vt]
+                                             (prepare raw name txs kt vt
+                                                      (:datalog-prepare? (batch/context descriptor))))
                             :encode-body #(wal/prepare-append-body %1 %2)
                             :committed! (fn [b _]
                                           (kvtx/finish-batch-commit! state @metadata)
                                           (dotimes [idx (batch/batch-count b)]
                                             (when-let [info (:append-info (batch/context (batch/batch-at b idx)))]
                                               (vreset! info (:append-res @metadata))))
-                                          (vreset! metadata nil))}})
+                                          (vreset! metadata nil)
+                                          (when-let [committed! (:committed! hooks)]
+                                            (committed! b)))}})
                 c (batch/create (fn [b]
                                   ;; Native commit and existing metadata cache
                                   ;; publication share the same writer lock as
                                   ;; standalone admin/manual transactions.
-                                  (locking (l/write-txn raw) ((:executor runtime) b)))
+                                  (locking (l/write-txn raw)
+                                    (if-let [wrap (:wrap-execution hooks)]
+                                      (wrap #((:executor runtime) b) b)
+                                      ((:executor runtime) b))))
                                 {:limits limits :preparation-timeout-ms 0
                                  :collection-delay-nanos (kv/write-batch-delay-nanos raw)})
                 _ (vreset! collector c)
@@ -133,14 +182,20 @@
                            (throw (ex-info "LMDB handle is closed" {:type :lmdb/closed})))
                          (batch/check-serving! c))
                 close! (fn []
-                         (when (Thread/holdsLock (l/write-txn raw))
+                         (when (and (Thread/holdsLock (l/write-txn raw))
+                                    (some? @(l/write-txn raw)))
                            (throw (ex-info "Close KV outside its transaction" {})))
                          (.set closing true)
                          ;; Let the current native transaction establish its
                          ;; outcome before rejecting queued requests, as close
                          ;; did before collector integration.
                          (locking (l/write-txn raw) (batch/close! c))
-                         (when-not (batch/await-quiescence! c 30000)
+                         ;; An idle writer monitor may be held by store close
+                         ;; or administration. Do not wait under that monitor
+                         ;; for a collector owner that still needs to acquire it.
+                         (when-not (batch/await-quiescence!
+                                     c (if (Thread/holdsLock (l/write-txn raw))
+                                         0 30000))
                            (throw (ex-info "Native writer did not stop before close"
                                            {:error :txlog/native-close-timeout})))
                          (when-not ((:close! runtime))
@@ -151,17 +206,29 @@
                          (i/close-kv raw))
                 body! (fn [body opts]
                         (check!)
-                        (let [result (volatile! nil) completed? (volatile! false)]
-                          (try (public/run-body c (bound-fn [tx]
-                                                   (vreset! result (body tx))
-                                                   (vreset! completed? true)
-                                                   @result)
-                                                (assoc opts :context (merge (:context opts) (caller-context))))
+                        (let [result (volatile! nil) completed? (volatile! false)
+                              submitter (Thread/currentThread)
+                              bindings (get-thread-bindings)
+                              run (fn [tx]
+                                    (vreset! result (body tx))
+                                    (vreset! completed? true)
+                                    @result)]
+                          (try (public/run-body c (fn [tx]
+                                                   (if (identical? submitter (Thread/currentThread))
+                                                     (run tx)
+                                                     (with-bindings bindings (run tx))))
+                                                (assoc opts :ready? true
+                                                       :context (merge (:context opts) (caller-context))))
                                (catch Throwable t
                                  (if (and @completed? (= :txlog/request-aborted (:error (ex-data t))))
                                    @result (throw (public-error t)))))))
                 control
-                {:embedded? true :collector c :body! body! :close! close! :check! check!
+                {:embedded? true :datalog-context (:context hooks)
+                 :collector c :body! body! :close! close! :check! check!
+                 :internal-body!
+                 (fn [op context]
+                   (check!)
+                   (submit! c {:op op :context (merge context (caller-context))}))
                  :transact!
                  (fn [name txs kt vt]
                    (check!)
@@ -172,7 +239,10 @@
                           :prepare
                           (fn [_]
                             (let [{:keys [rows wal-rows]} (prepare raw name txs kt vt)
-                                  conditional? (boolean (some #(seq (.-flags ^KVTxData %)) rows))]
+                                  conditional? (boolean
+                                                 (some #(if (instance? KVTxData %)
+                                                          (seq (.-flags ^KVTxData %))
+                                                          (.-no-overwrite? ^DatomKVTxData %)) rows))]
                               {:rows rows :state-dependent? conditional?
                                :wal-body (when (seq rows) (wal/prepare-append-body wal-rows {}))
                                :result :transacted}))})
@@ -199,4 +269,4 @@
             (vswap! info assoc :independent-control control
                     :close-independent! close!)
             (lifecycle/register-shutdown-close! raw #(i/close-kv db))))))
-    db))
+    db)))

@@ -19,6 +19,22 @@
 (def opts {:wal? true :snapshot-scheduler? false :wal-segment-prealloc? false})
 (def ^:dynamic *caller* nil)
 
+(deftest close-distinguishes-idle-writer-monitor-from-transaction
+  (let [dir (u/tmp-dir (str "close-idle-monitor-" (random-uuid)))
+        db (d/open-kv dir opts)]
+    (try
+      (d/open-dbi db "data")
+      (l/with-transaction-kv [tx db]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                             #"Close KV outside its transaction"
+                             (d/close-kv tx)))
+        (d/transact-kv tx [[:put "data" 1 2 :long :long]]))
+      (is (= 2 (d/get-value db "data" 1 :long :long)))
+      (locking (l/write-txn db)
+        (d/close-kv db))
+      (is (d/closed-kv? db))
+      (finally (d/close-kv db) (u/delete-files dir)))))
+
 (defn- grouped-updates! [db ops]
   (let [collector (:collector (:independent-control @(i/kv-info db)))
         paused (CountDownLatch. 1) release (CountDownLatch. 1)

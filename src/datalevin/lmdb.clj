@@ -229,7 +229,8 @@
         avg     (.-avg tx)]
     (if (.-added? tx)
       (do
-        (.add out (kv-tx :put c/ave avg e :raw :id))
+        (.add out (kv-tx :put c/ave avg e :raw :id
+                        (when (.-no-overwrite? tx) [:nooverwrite])))
         (.add out (kv-tx :put c/eav e avg :id :raw)))
       (do
         (.add out (kv-tx :del-list c/ave avg [e] :raw :id))
@@ -728,9 +729,15 @@
          opts# ~opts]
      (if-let [control# (some-> (kv-info orig-db#) deref :independent-control)]
        (do (datalevin.interface/check-ready orig-db#)
-           (if (writing? orig-db#)
+           (cond
+             (writing? orig-db#)
              (do (write-txn orig-db#) (let [~db orig-db#] ~@body))
-             ((:body! control#) (fn [~db] ~@body) opts#)))
+             ;; Schema administration and secondary workers already own the
+             ;; native writer. Keep their existing standalone transaction;
+             ;; waiting on a queued owner here would invert writer ownership.
+             (Thread/holdsLock (write-txn orig-db#))
+             (with-compatibility-transaction-kv [~db orig-db# opts#] ~@body)
+             :else ((:body! control#) (fn [~db] ~@body) opts#)))
        (with-compatibility-transaction-kv [~db orig-db# opts#] ~@body))))
 
 ;; for shutting down various executors when the last LMDB exits

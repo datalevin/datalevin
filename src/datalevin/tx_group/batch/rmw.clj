@@ -10,11 +10,13 @@
             [datalevin.tx-group.batch :as batch]
             [datalevin.tx-group.batch.charge :as charge]
             [datalevin.tx-group.batch.executor :as executor]
+            [datalevin.txlog.codec :as codec]
             [datalevin.tx-group.phase :as phase])
   (:import [datalevin.cpp Util$DTLVException]
-           [datalevin.lmdb KVTxData]
+           [datalevin.lmdb DatomKVTxData KVTxData]
+           [datalevin.utl RowRegions]
            [java.io IOException]
-           [java.util ArrayList Arrays]))
+           [java.util ArrayList Arrays List]))
 
 (defn clean-body-failure? [^Throwable t]
   (or (and (l/explicit-transaction-timeout-error? t)
@@ -49,11 +51,12 @@
   (Arrays/copyOf value (alength value)))
 
 (defn- capture!
-  "Freeze and apply writes in the batch transaction. Retain a failure even
+  "Freeze writes in the batch transaction, deferring eligible native tails.
+   Retain a failure even
    when the body catches it, so no failed batch can reach WAL or native commit."
   [raw wdb apply-rows! descriptor rows wal-rows valid? failure
    {:keys [check-row! prepare-rows! allow-flags? prepared-owned? charge-fn prepared-request?
-           application-error!]
+           application-error! defer-rows!]
     :or {charge-fn charge!}} dbi-name txs kt vt]
   (try
     (l/write-txn wdb)
@@ -73,14 +76,15 @@
                            (throw t))))
                      txs)
           txs (if prepared-request? (:rows prepared) prepared)
-          _ (when prepared-request? (.addAll ^ArrayList wal-rows ^java.util.Collection (:wal-rows prepared)))
+          _ (when prepared-request? (.append ^RowRegions wal-rows (:wal-rows prepared)))
           dbi-name (when-not prepare-rows! dbi-name)]
     (if (and prepared-request? prepared-owned?)
       ;; Public preparation already validates and owns these native rows.
       ;; Apply the frozen region directly; only the private validation opener
       ;; needs the copy/charge path below.
-      (do (.addAll ^ArrayList rows ^java.util.Collection txs)
-          (apply-rows! txs))
+      (do (.append ^RowRegions rows txs)
+          (when-not (and defer-rows! (defer-rows! wdb prepared))
+            (apply-rows! txs)))
     (doseq [row txs]
       (let [record? (instance? KVTxData row)
             op (if record? (.-op ^KVTxData row) (nth row 0))
@@ -127,9 +131,15 @@
   [raw native-db apply-rows! batch descriptor failure
    {:keys [body-cost encode-body charge-fn] :or {charge-fn charge!} :as opts}]
   (charge-fn descriptor charge/vector-wrapper)
-  (let [rows (ArrayList.) wal-rows (ArrayList.) valid? (volatile! true)
+  (let [^List rows (if (and (:prepared-request? opts) (:prepared-owned? opts))
+               (RowRegions.) (ArrayList.))
+        wal-rows (RowRegions.) valid? (volatile! true)
         aborted? (volatile! false)
-        wdb (l/mark-write native-db)
+        shared-view (when (or (:datalog-publication (batch/context descriptor))
+                             (:datalog-conn (batch/context descriptor)))
+                      (:datalog-view opts))
+        wdb (or (when shared-view @shared-view) (l/mark-write native-db))
+        _ (when shared-view (vreset! shared-view wdb))
         capture (fn [name txs kt vt]
                   (capture! raw wdb apply-rows! descriptor rows wal-rows valid? failure opts name txs kt vt))
         abort! (fn []
@@ -142,8 +152,13 @@
                            (catch Throwable e e))]
                    (when-not @failure (vreset! failure t))
                    (when-not (:abort-returns? opts) (throw t))))
-        _ (with-meta wdb (assoc (meta wdb)
+        _ (with-meta wdb (assoc (if shared-view
+                                 (assoc (meta wdb)
+                                        :native-write-owner (:native-write-owner (meta native-db))
+                                        :native-write-rtx (:native-write-rtx (meta native-db)))
+                                 (meta wdb))
                                :native-row-capture capture
+                               :native-prepare-flush! (:preparation-flush! opts)
                                :native-batch-abort! abort!
                                :native-transaction-failed! (fn [t]
                                                              (when-not @failure
@@ -167,21 +182,48 @@
                                         :outcome :not-committed :retryable? false} t))
             (throw (or (owner-interruption t) t))))
         (batch/check-preparation! batch)
-        (let [wal-body (when (and encode-body (pos? (.size rows)))
+        (let [wal-body (when (and encode-body (not (:encode-batch? opts))
+                                 (pos? (.size rows)))
                          (let [estimate (long (if body-cost (body-cost rows) 0))]
                            (charge-fn descriptor estimate)
                            (let [^bytes body (encode-body (if (:prepared-request? opts) wal-rows rows) {})]
                              (charge-fn descriptor (max 0 (- (alength body) estimate)))
                              body)))]
-          (batch/set-data! descriptor {:rows rows :wal-body wal-body :result result})
+          (batch/set-data! descriptor
+                           (if (:encode-batch? opts)
+                             {:rows rows :wal-body wal-body :result result
+                              :wal-rows wal-rows}
+                             {:rows rows :wal-body wal-body :result result}))
           (if (.isEmpty rows) 0 1)))
       (finally (vreset! valid? false)
                (when-let [view (:active-view opts)] (vreset! view nil))))))
 
+(defn- encode-members!
+  "Serialize consecutive body writes together, preserving prepared KV regions
+  and the final Datalog metadata trailer in exactly their native order."
+  [b encode-body]
+  (let [parts (ArrayList.) rows (volatile! (RowRegions.))
+        flush! (fn []
+                 (when-not (.isEmpty ^RowRegions @rows)
+                   (.add parts (encode-body @rows {}))
+                   (vreset! rows (RowRegions.))))]
+    (dotimes [idx (batch/batch-count b)]
+      (let [d (batch/batch-at b idx)
+            data (batch/data d)]
+        (when-let [body (:wal-body data)]
+          (flush!)
+          (.add parts body)
+          (batch/set-data! d (assoc data :wal-body nil)))
+        (when-let [wal-rows (:wal-rows data)]
+          (.append ^RowRegions @rows wal-rows))))
+    (flush!)
+    (when-not (.isEmpty parts) (codec/combine-commit-row-payloads parts))))
+
 (defn execute!
-  "Collect while applying the native prefix, then freeze membership for WAL.
-  A final prepared suffix can overlap WAL work. Bodies run once before append;
-  every member shares the same native transaction and commit outcome."
+  "Collect while preparing Datalog writes or applying the native prefix, then
+  freeze membership for WAL. Resolved Datalog writes can overlap as a batch;
+  other bodies first drain deferred writes. Bodies run once before
+  append; every member shares the native transaction and commit outcome."
   [raw wal next-lsn! wake! check-batch! opts batch]
   (let [failure (volatile! nil)
         token (volatile! nil)]
@@ -190,7 +232,9 @@
      raw
      (fn [wdb]
        (let [active-view (volatile! nil)
-             opts (assoc opts :active-view active-view)
+             ready? (volatile! false)
+             opts (cond-> (assoc opts :active-view active-view)
+                    (:shared-datalog-writer? opts) (assoc :datalog-view (volatile! nil)))
              history (when (:retry-frozen? opts) (ArrayList.))
              native-apply! (volatile! (cpp/prepared-row-applier wdb))
              refresh! (fn []
@@ -209,14 +253,85 @@
                                              (catch Throwable t t))]
                                (when failure
                                  (if (and history (:resized (ex-data failure)))
-                                   (do (refresh!) (recur true))
+                                   (do (phase/phase! :native-resized batch)
+                                       (refresh!) (recur true))
                                    (if-let [on-error! (:application-error! opts)]
                                      (on-error! failure) (throw failure)))))))
+             tail (volatile! nil)
+             flush-tail! (fn []
+                           (when-let [{:keys [rows view]} @tail]
+                             ;; Detach before applying: a map resize rebuilds
+                             ;; the writer and must not recursively flush.
+                             (vreset! tail nil)
+                             (let [_ (with-meta view (dissoc (meta view) :native-before-read!))] nil)
+                             (try (phase/phase! :native-tail-start batch)
+                                  (apply-rows! rows)
+                                  (phase/phase! :native-tail-applied batch)
+                                  (catch Throwable t
+                                    (when-not @failure (vreset! failure t))
+                                    (throw t)))))
+             opts (cond-> opts
+                    (and wal (:shared-datalog-writer? opts))
+                    (assoc :defer-rows!
+                           (fn [view prepared]
+                             (let [preparing? (:datalog-prepare? (:request-context (meta view)))
+                                   ;; Custom payload/index operations allocate IDs
+                                   ;; and resolve values through native reads.
+                                   ;; Their raw write scope must stay eager.
+                                   eligible? (and preparing? (not l/*raw-kv?*)
+                                                  (not-any? #(if (instance? KVTxData %)
+                                                               (seq (.-flags ^KVTxData %))
+                                                               (.-no-overwrite? ^DatomKVTxData %))
+                                                            (:rows prepared)))]
+                               (cond
+                                 eligible?
+                                 (let [rows (or (:rows @tail) (RowRegions.))]
+                                   (.append ^RowRegions rows (:rows prepared))
+                                   (vreset! tail {:rows rows :view view :prepared? true
+                                                  :large? (or (:large? @tail)
+                                                              (> (long (:native-tail-bytes prepared 0)) 4096))})
+                                   true)
+                                 :else
+                                 (do (flush-tail!)
+                                     (when (and (not l/*raw-kv?*)
+                                                (> (long (:native-tail-bytes prepared 0)) 4096))
+                                       (vreset! tail {:rows (:rows prepared) :view view})
+                                       (let [_ (with-meta view (assoc (meta view) :native-before-read! flush-tail!))] nil)
+                                       true))))))
+                    (:shared-datalog-writer? opts)
+                    (assoc :preparation-flush!
+                           (fn []
+                             (flush-tail!)
+                             ;; User code can also issue KV writes followed by
+                             ;; ordinary native reads. Resume direct application
+                             ;; for this body; the next resolver gets a fresh scope.
+                             (when-let [view @active-view]
+                               (let [_ (with-meta view
+                                         (update (meta view) :request-context
+                                                 dissoc :datalog-prepare?))] nil)))))
              apply-member! (fn [idx]
                              (batch/check-preparation! batch)
                              (let [d (batch/batch-at batch idx)]
+                               ;; The Datalog resolver carries its own existing
+                               ;; transaction indexes across prepared requests.
+                               ;; Arbitrary bodies and KV writes need native state.
+                               (when-not (and (:datalog-prepare? (batch/context d))
+                                              (:prepared? @tail))
+                                 (flush-tail!))
+                               (when-let [before! (:before-body! opts)] (before! d))
                                (if (batch/op d)
-                                 (run-member! raw wdb apply-rows! batch d failure opts)
+                                 (do
+                                   ;; Recovery/floor readiness belongs to this
+                                   ;; owned transaction, rather than each body.
+                                   (when-not @ready?
+                                     (when-let [ensure! (:ensure-body-ready! opts)]
+                                       (try (ensure! wdb)
+                                            (catch Throwable t
+                                              (if (clean-body-failure? t)
+                                                (batch/cancel-before-dispatch! t)
+                                                (throw t)))))
+                                     (vreset! ready? true))
+                                   (run-member! raw wdb apply-rows! batch d failure opts))
                                  (let [rows (:rows (batch/data d))]
                                    (apply-rows! rows)
                                    (if (seq rows) 1 0)))))
@@ -263,19 +378,78 @@
                                 (+ (long total)
                                    (if (seq (:rows (batch/data (batch/batch-at batch idx)))) 1 0)))
                               weight (range end next-end)) end]
-                     :else (recur end next-end (long weight))))))]
-         (batch/set-accepted-count! batch weight)
+                     :else (recur end next-end (long weight))))))
+             extra (when-let [finish! (:finish-preparation! opts)]
+                       (finish! wdb batch))
+               last-member (when (seq extra)
+                             (batch/batch-at batch (dec (batch/batch-count batch))))
+               previous (when last-member (batch/data last-member))
+               extra (when (seq extra)
+                       ((:prepare-rows! opts) raw last-member nil extra :data :data))
+               suffix-start (if extra
+                              (do
+                                ;; The trailer follows every request, including
+                                ;; prepared KV callers sharing this environment.
+                                (when (< suffix-start (batch/batch-count batch)) (flush-tail!))
+                                (doseq [idx (range suffix-start (batch/batch-count batch))]
+                                  (apply-rows! (:rows (batch/data (batch/batch-at batch idx)))))
+                                (long (batch/batch-count batch)))
+                              suffix-start)
+               weight (if (and extra (empty? (:rows previous))) (inc weight) weight)]
+           (when extra
+             (if-let [pending @tail]
+               (let [rows (RowRegions.)]
+                 (.append rows (:rows pending))
+                 (.append rows (:rows extra))
+                 (vreset! tail (assoc pending :rows rows)))
+               (apply-rows! (:rows extra)))
+             (let [rows (RowRegions.)
+                   bodies (ArrayList.)]
+               (.append rows (:rows previous))
+               (.append rows (:rows extra))
+               ;; A metadata trailer is a WAL body after the request's frozen
+               ;; writes, and belongs to that same logical WAL record.
+               (when-let [body (:wal-body previous)] (.add bodies body))
+               (when-not (:encode-batch? opts)
+                 (.add bodies ((:encode-body opts) (:wal-rows extra) {})))
+               (batch/set-data! last-member
+                                (if (:encode-batch? opts)
+                                  (let [wal-rows (RowRegions.)]
+                                    (when-let [before (:wal-rows previous)]
+                                      (.append wal-rows before))
+                                    (.append wal-rows (:wal-rows extra))
+                                    (assoc previous :rows rows :wal-rows wal-rows))
+                                  (assoc previous :rows rows
+                                         :wal-body (codec/combine-commit-row-payloads bodies))))))
+         (batch/set-accepted-count!
+           batch
+           (if (:encode-batch? opts)
+             (if-let [body (encode-members! batch (:encode-body opts))]
+               (let [d (batch/batch-at batch (dec (batch/batch-count batch)))]
+                 (batch/set-data! d (assoc (batch/data d) :wal-body body))
+                 1)
+               0)
+             weight))
          (batch/freeze-schedule!
            batch weight
-           (and (< suffix-start (batch/batch-count batch))
-                ;; For tiny prepared suffixes the worker handoff costs more
-                ;; than applying the rows inline. Larger suffixes still overlap.
-                (or (not (:collect-prepared-prefix? opts))
-                    (> (long (reduce (fn [total idx]
-                                       (if-let [^bytes body (:wal-body (batch/data (batch/batch-at batch idx)))]
-                                         (+ (long total) (alength body)) total))
-                                     0 (range suffix-start (batch/batch-count batch))))
-                       4096))))
+           (or (and (some? @tail)
+                    (or (not (:prepared? @tail))
+                        (> (batch/batch-count batch) 1)
+                        (:large? @tail)
+                        (> (.size ^java.util.List (:rows @tail)) 256)))
+               (and (< suffix-start (batch/batch-count batch))
+                    ;; For tiny prepared suffixes the worker handoff costs more
+                    ;; than applying the rows inline. Larger suffixes still overlap.
+                    (or (not (:collect-prepared-prefix? opts))
+                        (> (long (reduce (fn [total idx]
+                                           (if-let [^bytes body (:wal-body (batch/data (batch/batch-at batch idx)))]
+                                             (+ (long total) (alength body)) total))
+                                         0 (range suffix-start (batch/batch-count batch))))
+                           4096))))
+           ;; A single large frozen tail also repays a worker handoff.
+           (and (some? @tail)
+                (or (not (:prepared? @tail)) (:large? @tail)
+                    (> (.size ^java.util.List (:rows @tail)) 256))))
          (when (and wal (pos? weight))
            (batch/set-lsn! batch (long (next-lsn!)))
            (batch/refresh-wal-bodies! batch))
@@ -283,6 +457,7 @@
          (when-let [before! (:before-append! opts)] (before! batch))
          (batch/begin-dispatch! batch)
          (let [apply-suffix! (fn []
+                               (flush-tail!)
                                (loop [idx (long suffix-start)]
                                  (when (< idx (batch/batch-count batch))
                                    (apply-rows! (:rows (batch/data (batch/batch-at batch idx))))

@@ -10,15 +10,134 @@
 (ns ^:no-doc datalevin.db.tx.common
   "Shared transaction helpers."
   (:require
-   [datalevin.constants :refer [e0 tx0 emax txmax]]
-   [datalevin.datom :refer [datom]]
-   [datalevin.interface :refer [av-first-e rschema]]
+   [datalevin.constants :refer [e0 tx0 emax txmax v0 vmax]]
+   [datalevin.datom :as d :refer [datom]]
+   [datalevin.interface :as i :refer [rschema]]
    [datalevin.validate :as vld])
   (:import
+   [datalevin.datom Datom]
    [java.util HashMap SortedSet]
    [org.eclipse.collections.impl.set.sorted.mutable TreeSortedSet]))
 
-(defn- sf [^SortedSet s] (when-not (.isEmpty s) (.first s)))
+(def ^:dynamic *batch-prepare* nil)
+
+(declare ref?)
+
+(defn flush-batch-prepare!
+  "Make previously frozen writes visible to ordinary native reads in user code."
+  []
+  (when-let [flush! (:flush! *batch-prepare*)] (flush!)))
+
+(defn stage-batch-datom!
+  "Update the resolver's existing indexes with the latest pending E/A/V state."
+  [db ^Datom datom]
+  (let [^TreeSortedSet eavt (:eavt db)
+        ^TreeSortedSet avet (:avet db)
+        ^SortedSet cached (.subSet eavt
+                                  (d/datom (.-e datom) (.-a datom) (.-v datom) tx0)
+                                  (d/datom (.-e datom) (.-a datom) (.-v datom) txmax))]
+    (while (not (.isEmpty cached))
+      (let [old (.first cached)] (.remove eavt old) (.remove avet old)))
+    ;; Keep the retraction bit: it masks an older native value until the
+    ;; frozen writes have been applied. One latest datom per E/A/V is enough.
+    (.add eavt datom)
+    (when-not (contains? (:db/noindex (rschema (:store db))) (.-a datom))
+      (.add avet datom))))
+
+(defn- first-added-datom
+  [^SortedSet datoms]
+  (let [iterator (.iterator datoms)]
+    (loop []
+      (when (.hasNext iterator)
+        (let [^Datom datom (.next iterator)]
+          (if (d/datom-added datom) datom (recur)))))))
+
+(defn visible-stored
+  "Let the resolver overlay's latest datom replace an older native value."
+  [db datoms]
+  (if *batch-prepare*
+    (remove (fn [^Datom d]
+              (not (.isEmpty (.subSet ^TreeSortedSet (:eavt db)
+                                     (datom (.-e d) (.-a d) (.-v d) tx0)
+                                     (datom (.-e d) (.-a d) (.-v d) txmax))))) datoms)
+    datoms))
+
+(defn cached-av-first-e
+  "Resolve an identity in the transaction index, skipping retracted values."
+  [db a v]
+  (let [^SortedSet cached (.subSet ^TreeSortedSet (:avet db)
+                                  (datom e0 a v tx0) (datom emax a v txmax))]
+    (if *batch-prepare*
+      (:e (first-added-datom cached))
+      (when-not (.isEmpty cached) (:e (.first cached))))))
+
+(defn ea-first-datom
+  "Resolve the first current entity/attribute datom during write preparation."
+  [db e a]
+  (if *batch-prepare*
+    (let [^SortedSet cached (.subSet ^TreeSortedSet (:eavt db)
+                                    (datom e a nil tx0) (datom e a nil txmax))]
+      (if (.isEmpty cached)
+        (i/ea-first-datom (:store db) e a)
+        (or (first-added-datom cached)
+            (first (visible-stored
+                     db (i/slice (:store db) :eav
+                                 (datom e a v0) (datom e a vmax)))))))
+    (i/ea-first-datom (:store db) e a)))
+
+(defn ea-first-v
+  "Resolve the current entity/attribute value during write preparation."
+  [db e a]
+  (if *batch-prepare*
+    (let [^SortedSet cached (.subSet ^TreeSortedSet (:eavt db)
+                                    (datom e a nil tx0) (datom e a nil txmax))]
+      (if (.isEmpty cached)
+        (i/ea-first-v (:store db) e a)
+        (or (some-> (first-added-datom cached) :v)
+            (:v (first (visible-stored
+                         db (i/slice (:store db) :eav
+                                     (datom e a v0) (datom e a vmax))))))))
+    (i/ea-first-v (:store db) e a)))
+
+(defn av-first-e
+  "Resolve the current owner of an indexed value during write preparation."
+  [db a v]
+  (if *batch-prepare*
+    (or (cached-av-first-e db a v)
+        (:e (first (visible-stored db (i/av-datoms (:store db) a v)))))
+    (i/av-first-e (:store db) a v)))
+
+(defn ea-datoms
+  "Resolve current attribute datoms for CAS and retraction preparation."
+  [db e a]
+  (let [stored (i/slice (:store db) :eav (datom e a v0) (datom e a vmax))]
+    (if *batch-prepare*
+      (vec (concat (filter d/datom-added
+                           (.subSet ^TreeSortedSet (:eavt db)
+                                    (datom e a nil tx0) (datom e a nil txmax)))
+                   (visible-stored db stored)))
+      stored)))
+
+(defn e-datoms
+  "Resolve current entity datoms for retraction preparation."
+  [db e]
+  (let [stored (i/e-datoms (:store db) e)]
+    (if *batch-prepare*
+      (vec (concat (filter d/datom-added
+                           (.subSet ^TreeSortedSet (:eavt db)
+                                    (datom e nil nil tx0) (datom e nil nil txmax)))
+                   (visible-stored db stored)))
+      stored)))
+
+(defn v-datoms
+  "Resolve current incoming references for entity retraction preparation."
+  [db e]
+  (let [stored (i/v-datoms (:store db) e)]
+    (if *batch-prepare*
+      (vec (concat (filter #(and (d/datom-added %)
+                                (ref? db (:a %)) (= e (:v %))) (:eavt db))
+                   (visible-stored db stored)))
+      stored)))
 
 (defn attrs-by
   [db property]
@@ -89,7 +208,7 @@
   [db attr value]
   (let [store (:store db)
         ^LookupRefCache cache *lookup-ref-cache*]
-    (if (and cache (identical? store (.-store cache))
+    (if (and (nil? *batch-prepare*) cache (identical? store (.-store cache))
              (identical? (Thread/currentThread) (.-owner cache))
              ;; Dates, byte arrays and custom values may change in user code.
              (immutable-lookup-value? value))
@@ -98,10 +217,10 @@
             cached (.getOrDefault entries key ::uncached)]
         (if-not (identical? cached ::uncached)
           cached
-          (let [eid (av-first-e store attr value)]
+          (let [eid (av-first-e db attr value)]
             (.put entries key eid)
             eid)))
-      (av-first-e store attr value))))
+      (av-first-e db attr value))))
 
 (defn entid
   [db eid]
@@ -122,15 +241,11 @@
         nil
 
         :else
-        (or (:e (sf (.subSet ^TreeSortedSet (:avet db)
-                             (datom e0 attr value tx0)
-                             (datom emax attr value txmax))))
+        (or (cached-av-first-e db attr value)
             (stored-entid db attr value))))
 
     (keyword? eid)
-    (or (:e (sf (.subSet ^TreeSortedSet (:avet db)
-                         (datom e0 :db/ident eid tx0)
-                         (datom emax :db/ident eid txmax))))
+    (or (cached-av-first-e db :db/ident eid)
         (stored-entid db :db/ident eid))
 
     :else

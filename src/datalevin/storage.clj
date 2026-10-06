@@ -278,7 +278,9 @@
   "Return bookkeeping for this thread's private writing handle, if grouped."
   [lmdb]
   (when-let [^WriteGroup group *write-group*]
-    (when (and (identical? lmdb (.-lmdb group))
+    (when (and (lmdb/writing? lmdb)
+               (identical? (datalevin.interface/kv-info lmdb)
+                           (datalevin.interface/kv-info (.-lmdb group)))
                (identical? (Thread/currentThread) (.-owner group)))
       group)))
 
@@ -288,16 +290,21 @@
   {:pre [(lmdb/writing? lmdb)]}
   (WriteGroup. lmdb (Thread/currentThread) (long-array [-1 0]) (FastList.)))
 
-(defn ^:no-doc flush-write-group!
-  "Stage the final metadata pair in the group's existing native transaction."
+(defn ^:no-doc write-group-metadata
+  "Return the final metadata pair for a native writing group."
   [^WriteGroup group]
   (let [^longs metadata (.-metadata group)
         tx-id (aget metadata 0)]
     (when-not (neg? tx-id)
-      (transact-kv (.-lmdb group)
-                   [(lmdb/kv-tx :put c/meta :max-tx tx-id :attr :long)
-                    (lmdb/kv-tx :put c/meta :last-modified
-                                (aget metadata 1) :attr :long)]))))
+      [(lmdb/kv-tx :put c/meta :max-tx tx-id :attr :long)
+       (lmdb/kv-tx :put c/meta :last-modified
+                   (aget metadata 1) :attr :long)])))
+
+(defn ^:no-doc flush-write-group!
+  "Stage the final metadata pair in the group's existing native transaction."
+  [^WriteGroup group]
+  (when-let [rows (write-group-metadata group)]
+    (transact-kv (.-lmdb group) rows)))
 
 (defn- merge-missing-idoc-indices
   [lmdb idoc-indices schema opts]
@@ -1482,9 +1489,12 @@
         aid    (props :db/aid)
         noindex? (:db/noindex props)
         datoms (if noindex?
-                 (.slice-filter store :eav #(when (= attr (:a %)) %)
-                                (d/datom c/e0 nil nil)
-                                (d/datom c/emax nil nil))
+                 ;; Restrict duplicate values to this attribute before decoding.
+                 ;; Unrelated custom payload references must not be resolved
+                 ;; as a side effect of migrating this attribute.
+                 (.slice store :eav
+                         (d/datom c/e0 attr c/v0)
+                         (d/datom c/emax attr c/vmax))
                  (.slice store :ave
                          (d/datom c/e0 attr c/v0)
                          (d/datom c/emax attr c/vmax)))]
@@ -2462,7 +2472,12 @@
     (embedding-index embedding-indices em-ds))
   (let [idoc-state-actions (when id-ds
                             (idoc-index idoc-indices id-ds txs))]
-    (transact-kv lmdb txs)
+    ;; The collector already owns this writer. Its capture validates and
+    ;; freezes the storage rows without repeating public KV routing.
+    (if-let [capture (when *write-group*
+                      (:native-row-capture (meta (kv/raw-lmdb lmdb))))]
+      (capture nil txs :data :data)
+      (transact-kv lmdb txs))
     (idoc/apply-state-actions! idoc-state-actions)))
 
 (defn ea-tuples
@@ -2802,7 +2817,9 @@
                   (max-aid old)
                   (init-max-aid schema*))
        :max-gt max-gt*
-       :max-tx (max-tx old)
+       :max-tx (if (and writing? (not (lmdb/writing? (.-lmdb old))))
+                 (max (long (max-tx old)) (long (init-max-tx lmdb)))
+                 (max-tx old))
        :state-sync-ms (if reuse-derived-schema-state?
                         (observed-state-sync-ms old)
                         (init-state-sync-ms lmdb))

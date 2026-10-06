@@ -79,16 +79,22 @@
                   ;; mdb_del may mutate the native key if value is missing
                   (.reset kp)))))
 
+(declare transact-datom-list*)
+
 (defn apply-frozen-rows*
-  "Apply preparation-validated physical KVTxData rows in an owned transaction.
+  "Apply preparation-validated KVTxData or DatomKVTxData rows in an owned transaction.
   Reuse native operation semantics without generic row conversion or validation."
   [^List rows ^HashMap dbis ^Txn txn]
+  (if (l/datom-kv-txs? rows)
+    ;; Keep the existing fused datom/index passes after freezing. Expanding
+    ;; those rows into generic physical puts loses the native write fast path.
+    (transact-datom-list* rows dbis txn)
   (when rows
     (dotimes [index (.size rows)]
       (let [^KVTxData tx (.get rows index)
             name (.-dbi-name tx)
             ^DBI dbi (or (.get dbis name) (raise name " is not open" {}))]
-        (put-tx dbi txn tx)))))
+        (put-tx dbi txn tx))))))
 
 (defn- put-captured-tx
   [^DBI dbi txn ^KVTxData tx ^WriteBatch batch]

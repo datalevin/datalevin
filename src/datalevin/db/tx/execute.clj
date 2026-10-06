@@ -10,15 +10,13 @@
 (ns ^:no-doc datalevin.db.tx.execute
   "Transaction execution loop."
   (:require
-   [datalevin.constants :as c :refer [e0 tx0 emax txmax]]
+   [datalevin.constants :as c :refer [tx0 txmax]]
    [datalevin.datom :as d :refer [datom datom-added datom?]]
    [datalevin.db.tx.common :as txcommon]
    [datalevin.db.tx.prepare :as txprep]
    [datalevin.idoc :as idoc]
    [datalevin.index :as idx]
-   [datalevin.interface :refer [av-first-e ea-first-v ea-first-datom
-                                fetch slice e-datoms init-max-eid
-                                v-datoms opts schema]]
+   [datalevin.interface :refer [fetch init-max-eid opts schema]]
    [datalevin.prepare :as coreprep]
    [datalevin.storage :as s]
    [datalevin.udf :as udf]
@@ -32,33 +30,39 @@
 
 (deftype ^:private TxStep [report entities])
 
-(defn- sf [^SortedSet s] (when-not (.isEmpty s) (.first s)))
-
 (defn- cached-ea-first-datom
   [db ^long e a]
-  (let [^SortedSet tail (.tailSet ^TreeSortedSet (:eavt db)
-                                  (datom e a nil tx0))]
-    (when-not (.isEmpty tail)
-      (let [^Datom d (.first tail)]
-        (when (and (== e (.-e d)) (= a (.-a d))) d)))))
+  (if txcommon/*batch-prepare*
+    (first (filter datom-added
+                   (.subSet ^TreeSortedSet (:eavt db)
+                            (datom e a nil tx0) (datom e a nil txmax))))
+    (let [^SortedSet tail (.tailSet ^TreeSortedSet (:eavt db)
+                                    (datom e a nil tx0))]
+      (when-not (.isEmpty tail)
+        (let [^Datom d (.first tail)]
+          (when (and (== e (.-e d)) (= a (.-a d))) d))))))
 
 (defn- cached-eav-first-datom
   [db ^long e a v]
-  (let [^SortedSet tail (.tailSet ^TreeSortedSet (:eavt db)
-                                  (datom e a v tx0))]
-    (when-not (.isEmpty tail)
-      (let [^Datom d (.first tail)]
-        (when (and (== e (.-e d))
-                   (= a (.-a d))
-                   (= v (.-v d)))
-          d)))))
+  (if txcommon/*batch-prepare*
+    (first (filter datom-added
+                   (.subSet ^TreeSortedSet (:eavt db)
+                            (datom e a v tx0) (datom e a v txmax))))
+    (let [^SortedSet tail (.tailSet ^TreeSortedSet (:eavt db)
+                                    (datom e a v tx0))]
+      (when-not (.isEmpty tail)
+        (let [^Datom d (.first tail)]
+          (when (and (== e (.-e d))
+                     (= a (.-a d))
+                     (= v (.-v d)))
+            d))))))
 
 (defn- clear-tx-cache
   [db]
-  (let [clear #(.clear ^TreeSortedSet %)]
-    (clear (:eavt db))
-    (clear (:avet db))
-    db))
+  (when-not txcommon/*batch-prepare*
+    (.clear ^TreeSortedSet (:eavt db))
+    (.clear ^TreeSortedSet (:avet db)))
+  db)
 
 (defn- validate-datom
   [db ^Datom datom]
@@ -70,11 +74,8 @@
         true
         datom
         (fn []
-          (or (not (.isEmpty
-                     (.subSet ^TreeSortedSet (:avet db)
-                              (d/datom e0 a v tx0)
-                              (d/datom emax a v txmax))))
-              (av-first-e (:store db) a v)))))))
+          (or (when (txcommon/cached-av-first-e db a v) true)
+              (txcommon/av-first-e db a v)))))))
 
 (defn- current-tx
   {:inline (fn [report] `(-> ~report :db-before :max-tx long inc))}
@@ -125,22 +126,25 @@
 (defn- with-datom
   [db ^Datom datom]
   (validate-datom db datom)
-  (if (datom-added datom)
-    (do
-      (.add ^TreeSortedSet (:eavt db) datom)
-      (when-not (txcommon/is-attr? db (.-a datom) :db/noindex)
-        (.add ^TreeSortedSet (:avet db) datom))
-      (advance-max-eid db (.-e datom)))
-    (if (.isEmpty
-          (.subSet ^TreeSortedSet (:eavt db)
-                   (d/datom (.-e datom) (.-a datom) (.-v datom) tx0)
-                   (d/datom (.-e datom) (.-a datom) (.-v datom) txmax)))
-      db
+  (if txcommon/*batch-prepare*
+    (do (txcommon/stage-batch-datom! db datom)
+        (if (datom-added datom) (advance-max-eid db (.-e datom)) db))
+    (if (datom-added datom)
       (do
-        (.remove ^TreeSortedSet (:eavt db) datom)
+        (.add ^TreeSortedSet (:eavt db) datom)
         (when-not (txcommon/is-attr? db (.-a datom) :db/noindex)
-          (.remove ^TreeSortedSet (:avet db) datom))
-        db))))
+          (.add ^TreeSortedSet (:avet db) datom))
+        (advance-max-eid db (.-e datom)))
+      (if (.isEmpty
+            (.subSet ^TreeSortedSet (:eavt db)
+                     (d/datom (.-e datom) (.-a datom) (.-v datom) tx0)
+                     (d/datom (.-e datom) (.-a datom) (.-v datom) txmax)))
+        db
+        (do
+          (.remove ^TreeSortedSet (:eavt db) datom)
+          (when-not (txcommon/is-attr? db (.-a datom) :db/noindex)
+            (.remove ^TreeSortedSet (:avet db) datom))
+          db)))))
 
 (declare effective-attr-value)
 
@@ -218,7 +222,7 @@
   (let [pending (pending-attr-state report e a)]
     (cond
       (identical? pending ::missing-attr-state)
-      (ea-first-v (:store db) e a)
+      (txcommon/ea-first-v db e a)
 
       (identical? pending ::retracted-attr-state)
       nil
@@ -275,6 +279,7 @@
          v'        (coreprep/correct-value-with-props
                      store-opts props a v)
          _         (when (:db.attr/preds props)
+                     (txcommon/flush-batch-prepare!)
                      (vld/validate-attr-preds
                        e a v' props #(txprep/resolve-attr-pred-udf db %)))
          meta*     (meta ent)
@@ -286,12 +291,12 @@
          (if multival?
            (or (cached-eav-first-datom db e a v')
                (when (<= e ^long (::max-eid-before report))
-                 (first (fetch store (datom e a v')))))
+                 (first (txcommon/visible-stored db (fetch store (datom e a v'))))))
            (or (cached-ea-first-datom db e a)
                ;; Use the store boundary captured before allocation: another
                ;; connection may have advanced past db-before's cached max-eid.
                (when (<= e ^long (::max-eid-before report))
-                 (ea-first-datom store e a))))]
+                 (txcommon/ea-first-datom db e a))))]
      (cond
        (nil? old-datom)
        (transact-report report new-datom)
@@ -316,6 +321,7 @@
         nv'       (coreprep/correct-value-with-props
                     (opts store) props a nv)
         _         (when (:db.attr/preds props)
+                    (txcommon/flush-batch-prepare!)
                     (vld/validate-attr-preds
                       e a nv' props #(txprep/resolve-attr-pred-udf db %)))
         meta*     (meta entity)
@@ -399,21 +405,19 @@
                              (assoc :tempids tempids')
                              (update ::upserted-tempids assoc
                                      tempid upserted-eid))]
+      (when-let [restore! (:restore! txcommon/*batch-prepare*)] (restore!))
       (local-transact-tx-data report' es tx-time))))
 
 (defn- flush-tuples [report]
-  (let [db    (:db-after report)
-        store (:store db)]
+  (let [db (:db-after report)]
     (reduce-kv
       (fn [entities eid tuples+values]
         (persistent!
           (reduce-kv
             (fn [entities tuple value]
               (let [value   (if (every? nil? value) nil value)
-                    current (or (:v (sf (.subSet ^TreeSortedSet (:eavt db)
-                                                 (d/datom eid tuple nil tx0)
-                                                 (d/datom eid tuple nil txmax))))
-                                (ea-first-v store eid tuple))]
+                    current (or (:v (cached-ea-first-datom db eid tuple))
+                                (txcommon/ea-first-v db eid tuple))]
                 (cond
                   (= value current) entities
                   (nil? value)
@@ -461,13 +465,12 @@
                         nv)
         _             (vld/validate-val nv entity)
         multival?     (txcommon/multival? db a)
-        datoms        (concatv
-                        (.subSet ^TreeSortedSet (:eavt db)
-                                 (datom e a nil tx0)
-                                 (datom e a nil txmax))
-                        (slice (:store db) :eav
-                               (datom e a c/v0)
-                               (datom e a c/vmax)))]
+        datoms        (if txcommon/*batch-prepare*
+                        (txcommon/ea-datoms db e a)
+                        (concatv
+                          (.subSet ^TreeSortedSet (:eavt db)
+                                   (datom e a nil tx0) (datom e a nil txmax))
+                          (txcommon/ea-datoms db e a)))]
     (vld/validate-cas-value multival? e a ov nv datoms)
     [(if multival?
        (transact-add report [:db/add e a nv])
@@ -495,10 +498,9 @@
         (if many?
           (let [old-v'    (coreprep/correct-value-with-props
                             (opts store) props a old-v)
-                old-datom (or (sf (.subSet ^TreeSortedSet (:eavt db)
-                                           (datom e a old-v' tx0)
-                                           (datom e a old-v' txmax)))
-                              (first (fetch (:store db) (datom e a old-v'))))]
+                old-datom (or (cached-eav-first-datom db e a old-v')
+                              (first (txcommon/visible-stored
+                                       db (fetch (:store db) (datom e a old-v')))))]
             (vld/validate-patch-idoc-old-value old-datom old-v a)
             (let [old-doc             (.-v ^Datom old-datom)
                   {:keys [doc paths]} (idoc/apply-patch old-doc ops)]
@@ -508,10 +510,8 @@
                             {:idoc/patch {:paths paths}})]
                   [(transact-add report ent)
                    (cons [:db/retract e a old-doc] entities)]))))
-          (let [old-datom           (or (sf (.subSet ^TreeSortedSet (:eavt db)
-                                                      (datom e a nil tx0)
-                                                      (datom e a nil txmax)))
-                                        (ea-first-datom store e a))
+          (let [old-datom           (or (cached-ea-first-datom db e a)
+                                        (txcommon/ea-first-datom db e a))
                 old-doc             (when old-datom (.-v ^Datom old-datom))
                 {:keys [doc paths]} (idoc/apply-patch (or old-doc {}) ops)
                 ent                 (with-meta [:db/add e a doc]
@@ -537,15 +537,12 @@
          es]))))
 
 (defn- handle-tempid-entity
-  [initial-report report db store tempids unique-identity? entity entities
+  [initial-report report db _store tempids unique-identity? entity entities
    initial-es tx-time]
   (let [[op e a v] entity
         upserted-eid  (when unique-identity?
-                        (or (:e (sf (.subSet
-                                      ^TreeSortedSet (:avet db)
-                                      (d/datom e0 a v tx0)
-                                      (d/datom emax a v txmax))))
-                            (av-first-e store a v)))
+                        (or (txcommon/cached-av-first-e db a v)
+                            (txcommon/av-first-e db a v)))
         allocated-eid (get tempids e)]
     (if (and upserted-eid allocated-eid (not= upserted-eid allocated-eid))
       (retry-with-tempid initial-report report initial-es e upserted-eid
@@ -567,7 +564,7 @@
                        upserted-eid tx-time)))
 
 (defn- handle-tuple-attr
-  [db store schema entity report entities]
+  [db _store schema entity report entities]
   (let [[_ e a v] entity
         tuple-attrs (get-in schema [a :db/tupleAttrs])]
     (vld/validate-tuple-direct-write
@@ -577,12 +574,8 @@
         (every?
           (fn [[tuple-attr tuple-value]]
             (let [db-value
-                  (or (:v (sf
-                            (.subSet
-                              ^TreeSortedSet (:eavt db)
-                              (d/datom e tuple-attr nil tx0)
-                              (d/datom e tuple-attr nil txmax))))
-                      (ea-first-v store e tuple-attr))]
+                  (or (:v (cached-ea-first-datom db e tuple-attr))
+                      (txcommon/ea-first-v db e tuple-attr))]
               (= tuple-value db-value)))
           (mapv vector tuple-attrs v)))
       entity)
@@ -628,26 +621,21 @@
                 v)]
         (vld/validate-attr a entity)
         (vld/validate-val v entity)
-        (if-some [old-datom (or (sf (.subSet
-                                      ^TreeSortedSet (:eavt db)
-                                      (datom e a v tx0)
-                                      (datom e a v txmax)))
-                                (first (fetch store (datom e a v))))]
+        (if-some [old-datom (or (cached-eav-first-datom db e a v)
+                                (first (txcommon/visible-stored db (fetch store (datom e a v)))))]
           [(transact-retract-datom report old-datom) entities]
           [report entities]))
       [report entities])))
 
 (defn- handle-retract-attribute
-  [report db store entity entities]
+  [report db _store entity entities]
   (let [[_ e a _] entity]
     (if-some [e (txcommon/entid db e)]
       (let [_       (vld/validate-attr a entity)
-            stored  (slice store :eav
-                           (datom e a c/v0)
-                           (datom e a c/vmax))
-            cached  (vec (.subSet ^TreeSortedSet (:eavt db)
-                                  (datom e a nil tx0)
-                                  (datom e a nil txmax)))
+            stored  (txcommon/ea-datoms db e a)
+            cached  (when-not txcommon/*batch-prepare*
+                      (vec (.subSet ^TreeSortedSet (:eavt db)
+                                    (datom e a nil tx0) (datom e a nil txmax))))
             report' (reduce transact-retract-datom report stored)
             report' (reduce transact-retract-datom report' cached)
             components (retract-components db stored)
@@ -658,14 +646,14 @@
       [report entities])))
 
 (defn- handle-retract-entity
-  [report db store entity entities]
+  [report db _store entity entities]
   (let [[_ e _ _] entity]
     (if-some [e (txcommon/entid db e)]
-      (let [stored-e-datoms (e-datoms store e)
-            cached-e-datoms (vec (.subSet ^TreeSortedSet (:eavt db)
-                                          (datom e nil nil tx0)
-                                          (datom e nil nil txmax)))
-            v-datoms        (v-datoms store e)
+      (let [stored-e-datoms (vec (txcommon/e-datoms db e))
+            cached-e-datoms (when-not txcommon/*batch-prepare*
+                              (vec (.subSet ^TreeSortedSet (:eavt db)
+                                            (datom e nil nil tx0) (datom e nil nil txmax))))
+            v-datoms        (vec (txcommon/v-datoms db e))
             report'         (reduce transact-retract-datom
                                     report stored-e-datoms)
             report'         (reduce transact-retract-datom
@@ -795,11 +783,8 @@
       :let [upserted-eid (when (and unique-identity?
                                     (contains? (::reverse-tempids report) e)
                                     e)
-                           (or (:e (sf (.subSet
-                                        ^TreeSortedSet (:avet db)
-                                        (d/datom e0 a v tx0)
-                                        (d/datom emax a v txmax))))
-                               (av-first-e store a v)))]
+                           (or (txcommon/cached-av-first-e db a v)
+                               (txcommon/av-first-e db a v)))]
 
       (and upserted-eid (not= e upserted-eid))
       (handle-reverse-tempid-upsert initial-report report entity entities

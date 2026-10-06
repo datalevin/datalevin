@@ -497,14 +497,22 @@
               jobs (atom [job-a])]
           (try
             (is (deref entered 5000 false))
-            (let [b (join (future (append! engine 2)))]
+            (let [first-range @(:range a)
+                  b (join (future (append! engine 2)))]
               (is (= 2 @(:lsn b)))
+              (is (= [1] (lsns (:entries first-range))))
+              (is (identical? first-range @(:range a)))
               (swap! jobs conj (future (caught #(state/await! engine b))))
               (is (empty? @applied))
               (is (zero? @(:last-durable-lsn (:sync-manager wal-state))))
               (.countDown release)
               (is (= [1 2] (mapv join @jobs)))
-              (is (= [[1] [2]] @applied)))
+              ;; Native application may combine adjacent durable ranges; their
+              ;; sealed membership remains fixed across the stopped force.
+              (is (= [1 2] (vec (mapcat identity @applied))))
+              (is (identical? first-range @(:range a)))
+              (is (= [[1] [2]]
+                     (mapv #(lsns (:entries @(:range %))) [a b]))))
             (finally (.countDown release) (doseq [job @jobs] (join job)))))))))
 
 (deftest application-failure-completes-two-durable-batches-without-reappend

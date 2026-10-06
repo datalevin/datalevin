@@ -1,11 +1,14 @@
 (ns datalevin.tx-group-batch-public-test
   (:require [clojure.java.io :as io]
+            [clojure.walk :as walk]
             [clojure.test :refer [deftest is]]
             [datalevin.core :as d]
+            [datalevin.constants :as c]
             [datalevin.binding.cpp.lifecycle :as lifecycle]
             [datalevin.interface :as i]
             [datalevin.lmdb :as l]
             [datalevin.tx-group.batch :as batch]
+            [datalevin.tx-group.batch.embedded :as embedded]
             [datalevin.tx-group.batch.public :as prototype]
             [datalevin.tx-group.batch.env :as env]
             [datalevin.tx-group.batch.stage :as stage]
@@ -15,7 +18,34 @@
             [datalevin.txlog.segment :as segment]
             [datalevin.tx-state.protocol :as protocol]
             [datalevin.util :as u])
-  (:import [java.util.concurrent CountDownLatch TimeUnit]))
+  (:import [datalevin.lmdb DatomKVTxData]
+           [java.util.concurrent CountDownLatch TimeUnit]))
+
+(deftest embedded-wal-preparation-keeps-owned-compact-datoms
+  (let [avg (byte-array [1 2 3])
+        inputs [(l/datom-kv-tx 7 avg true true false)
+                (l/datom-kv-tx 8 avg false false false)
+                [:put c/kv-info :probe 42 :keyword :long]]
+        {:keys [rows wal-rows]} (#'embedded/prepare nil nil inputs :data :data)]
+    ;; Caller buffers can change after preparation; native and WAL rows share
+    ;; the same detached compact datoms rather than allocating physical pairs.
+    (aset-byte avg 0 (byte 9))
+    (is (= 3 (count rows) (count wal-rows)))
+    (doseq [idx [0 1]]
+      (let [^DatomKVTxData row (nth wal-rows idx)]
+        (is (instance? DatomKVTxData row))
+        (is (identical? row (nth rows idx)))
+        (is (= [1 2 3] (vec (.-avg row))))))
+    (is (.-no-overwrite? ^DatomKVTxData (first rows)))
+    (let [body (codec/encode-commit-row-payload 7 11 wal-rows)]
+      (is (= 3 (:op-count (codec/decode-commit-row-payload-header body))))
+      (is (= [[:put c/ave (vec (byte-array [1 2 3])) 7 :raw :id]
+              [:put c/eav 7 (vec (byte-array [1 2 3])) :id :raw]
+              [:del-list c/ave (vec (byte-array [1 2 3])) [8] :raw :id]
+              [:del-list c/eav 8 [(vec (byte-array [1 2 3]))] :id :raw]
+              [:put c/kv-info :probe 42 :keyword :long]]
+             (walk/postwalk #(if (bytes? %) (vec %) %)
+                                   (:ops (codec/decode-commit-row-payload body))))))))
 
 ;; The M0 opener is private validation scaffolding, not a public write mode.
 (defn- open-prototype

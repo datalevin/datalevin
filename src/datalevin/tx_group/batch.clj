@@ -255,8 +255,13 @@
 (defn freeze-schedule!
   "Fix the WAL schedule after collection. Overlap only when native work remains."
   ([batch accepted-weight] (freeze-schedule! batch accepted-weight true))
-  ([^Batch batch ^long accepted-weight native-work?]
-   (.setExecutionSchedule batch (if native-work? (schedule-for accepted-weight) :inline))
+  ([batch accepted-weight native-work?]
+   (freeze-schedule! batch accepted-weight native-work? false))
+  ([^Batch batch ^long accepted-weight native-work? large-tail?]
+   (.setExecutionSchedule batch (cond
+                                  (not native-work?) :inline
+                                  large-tail? :parallel
+                                  :else (schedule-for accepted-weight)))
    (.executionSchedule batch)))
 
 (defn refresh-wal-bodies!
@@ -860,6 +865,7 @@
                 (recur bytes cutoff blocked?))
 
             (or blocked? (>= (.size descriptors) limit)
+                (and (pos? (.size descriptors)) (:isolated? (.context descriptor)))
                 (> (+ bytes (.allowance descriptor)) cap))
             (recur bytes cutoff true)
 
@@ -868,7 +874,7 @@
                 (recur (+ bytes (.allowance descriptor))
                        (if (and (pos? deadline) (or (zero? cutoff) (< deadline cutoff)))
                          deadline cutoff)
-                       false))))
+                       (boolean (:isolated? (.context descriptor)))))))
         (let [taken (.size descriptors)]
           (when (and (pos? taken) (nil? @(.result own)))
             (let [batch (->Batch (.getAndIncrement ^AtomicLong (.next-id collector))
@@ -912,7 +918,7 @@
             cap (.batch-max-bytes collector)
             now (System/nanoTime)
             ^java.util.Iterator it (.iterator queue)]
-        (loop [blocked? false]
+        (loop [blocked? (:isolated? (.context ^Descriptor (.get descriptors 0)))]
           (when (.hasNext it)
             (let [^Descriptor d (.next it)
                   deadline (.deadline-nanos d)
@@ -922,7 +928,8 @@
                 (do (expire-queued! collector it d deadline)
                     (recur blocked?))
 
-                (or blocked? (>= (.size descriptors) limit) (> next-bytes cap))
+                (or blocked? (:isolated? (.context d))
+                    (>= (.size descriptors) limit) (> next-bytes cap))
                 (recur true)
 
                 :else

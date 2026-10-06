@@ -21,6 +21,7 @@
    [java.util Arrays HashMap List Collection]
    [java.util.zip CRC32C]
    [datalevin.lmdb DatomKVTxData]
+   [datalevin.utl RowRegions]
    [datalevin.kv.encoding CommitMetadata EncodedKVTxData OwnedKVTxData]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
@@ -965,14 +966,19 @@
 
      (instance? DatomKVTxData row)
      (let [^DatomKVTxData tx row
-           ^bytes avg (.-avg tx)]
+           ^bytes avg (.-avg tx)
+           length (alength avg)
+           _ (when (> length 65535)
+               (raise "Txn-log u16 field out of range"
+                      {:value length :type :txlog/corrupt}))
+           ^ByteBuffer out (ensure-room! bf tl (+ 11 length))]
        ;; AVG already contains the encoded attribute, value and giant pointer.
        ;; Blind-insert flags are deliberately omitted: replay is idempotent.
-       (-> bf
-           (bb-put-byte! tl (if (.-added? tx) op-datom-add op-datom-retract))
-           (bb-put-long! tl (.-e tx))
-           (bb-put-u16! tl (alength avg))
-           (bb-put-bytes! tl avg)))
+       (.put out (byte (if (.-added? tx) op-datom-add op-datom-retract)))
+       (.putLong out (.-e tx))
+       (.putShort out (unchecked-short length))
+       (.put out avg)
+       out)
 
      (instance? datalevin.lmdb.KVTxData row)
      (let [^datalevin.lmdb.KVTxData tx row]
@@ -1037,7 +1043,7 @@
     (long (max (long parallel-row-encode-min-chunk-size) ceil-size))))
 
 (defn- encode-kv-row-chunk-bytes
-  ^bytes [^FastList rowsv ^long start ^long end]
+  ^bytes [^List rowsv ^long start ^long end]
   (let [^ThreadLocal tl tl-row-encode-buffer
         ^HashMap dbi-cache (.get tl-dbi-name-cache)
         _ (.clear dbi-cache)
@@ -1070,7 +1076,7 @@
           rows))
 
 (defn- append-parallel-kv-row-bytes!
-  ^ByteBuffer [^ByteBuffer bf ^ThreadLocal tl ^FastList rowsv ^long row-count]
+  ^ByteBuffer [^ByteBuffer bf ^ThreadLocal tl ^List rowsv ^long row-count]
   (let [chunk-size (parallel-row-encode-chunk-size row-count)
         ranges (loop [start (long 0)
                       acc []]
@@ -1168,9 +1174,15 @@
 
 (defn- encode-commit-row-payload-into
   ^ByteBuffer [^ByteBuffer bf0 lsn tx-time rows {:keys [ha-term]}]
-  (let [^FastList rowsv (ensure-fast-list rows)
+  (let [^List rowsv (if (instance? List rows) rows (ensure-fast-list rows))
         row-count (long (.size rowsv))
-        major (if (l/datom-kv-txs? rowsv)
+        major (if (if (instance? RowRegions rowsv)
+                    (let [iterator (.iterator rowsv)]
+                      (loop []
+                        (when (.hasNext iterator)
+                          (if (instance? DatomKVTxData (.next iterator))
+                            true (recur)))))
+                    (l/datom-kv-txs? rowsv))
                 commit-payload-format-major
                 legacy-commit-payload-format-major)
         parallel-rows? (use-parallel-row-encoding? row-count)
@@ -1193,11 +1205,22 @@
                             (cond-> (some? ha-term)
                               (bb-put-long! tl ha-term))
                             (bb-put-u32! tl row-count))
-        ^ByteBuffer bfN (if parallel-rows?
+        ^ByteBuffer bfN (cond
+                          parallel-rows?
                           (append-parallel-kv-row-bytes! bf1
                                                          tl
                                                          rowsv
                                                          row-count)
+
+                          (instance? RowRegions rowsv)
+                          (let [iterator (.iterator rowsv)]
+                            (loop [^ByteBuffer bf bf1]
+                              (if (.hasNext iterator)
+                                (recur (write-kv-row! tl bf (.next iterator)
+                                                     dbi-cache))
+                                bf)))
+
+                          :else
                           (loop [i 0
                                  ^ByteBuffer bf bf1]
                             (if (< i row-count)

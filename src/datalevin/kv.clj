@@ -553,7 +553,10 @@
   (close-kv
     [_]
     (when (and (l/writing? db) (independent-control db))
-      ((:unsupported! (independent-control db)) :close-inside-transaction))
+      (let [control (independent-control db)]
+        (if (:embedded? control)
+          (throw (ex-info "Close KV outside its transaction" {}))
+          ((:unsupported! control) :close-inside-transaction))))
     (when-let [control (independent-control db)]
       (when (:embedded? control) ((:close! control))))
     (if handle
@@ -682,6 +685,8 @@
             (if (and (:embedded? control) (not (:native-row-capture (meta db))))
               (transact-with-txlog! db (txlog/state db) dbi-name txs k-type v-type)
               (i/transact-kv db dbi-name txs k-type v-type))
+            (and (:embedded? control) (Thread/holdsLock (l/write-txn db)))
+            (transact-with-txlog! db (txlog/state db) dbi-name txs k-type v-type)
             :else ((:transact! control) dbi-name txs k-type v-type)))
       (if-let [g (write-group db :kv)]
       (group/submit! g

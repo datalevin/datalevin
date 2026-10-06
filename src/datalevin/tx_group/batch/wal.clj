@@ -26,15 +26,29 @@
   ([state] (branch state nil))
   ([state {:keys [append-fn complete-fn
                   maintenance-deadline-fn service-maintenance-fn]}]
-   (let [append-fn (or append-fn wal/begin-prepared-group!)
+   (let [custom-append? (some? append-fn)
+         append-fn (or append-fn wal/begin-prepared-group!)
          complete-fn (or complete-fn wal/finish-prepared-group!)
          deadline-fn (or maintenance-deadline-fn wal/maintenance-deadline-ns)
          service-fn (or service-maintenance-fn wal/service-maintenance!)]
      (reify
        executor/IWalBranch
        (append-group! [_ batch lsn]
-         (append-fn state lsn (batch/wal-bodies batch)
-                    (batch/batch-cutoff batch) batch))
+         (if custom-append?
+           (append-fn state lsn (batch/wal-bodies batch)
+                      (batch/batch-cutoff batch) batch)
+           (let [write-count
+                 (loop [idx 0 total 0]
+                   (if (< idx (batch/batch-count batch))
+                     (let [data (batch/data (batch/batch-at batch idx))]
+                       (recur (inc idx)
+                              (if (if (contains? data :rows)
+                                    (seq (:rows data)) (:wal-body data))
+                                (inc total) total)))
+                     total))]
+             (wal/begin-prepared-group! state lsn (batch/wal-bodies batch)
+                                        (batch/batch-cutoff batch) batch
+                                        write-count))))
        (complete-policy! [_ token deadline-ns]
          (complete-fn state token deadline-ns))
        executor/IWalMaintenance

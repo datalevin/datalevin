@@ -12,7 +12,7 @@
   (:require
    [datalevin.constants :refer [e0 tx0 emax txmax]]
    [datalevin.db.tx.common :as txcommon]
-   [datalevin.interface :refer [av-first-e ea-first-v opts schema]]
+   [datalevin.interface :refer [ea-first-v opts schema]]
    [datalevin.prepare :as coreprep]
    [datalevin.datom :as d :refer [datom?]]
    [datalevin.udf :as udf]
@@ -113,16 +113,14 @@
               (coreprep/correct-value-with-props options (schema a) a v)))
           validate-upsert-preds
           (fn [a v]
+            (when (:db.attr/preds (schema a)) (txcommon/flush-batch-prepare!))
             (vld/validate-attr-preds
               (:db/id entity) a v (schema a)
               #(resolve-attr-pred-udf db %)))
           resolve (fn [a v]
                     (when-some [v' (upsert-value a v)]
-                      (when-some [e (or (:e (sf (.subSet
-                                                 ^TreeSortedSet (:avet db)
-                                                 (d/datom e0 a v' tx0)
-                                                 (d/datom emax a v' txmax))))
-                                       (av-first-e store a v'))]
+                      (when-some [e (or (txcommon/cached-av-first-e db a v')
+                                       (txcommon/av-first-e db a v'))]
                         [e v'])))
           split   (fn [a vs]
                     (reduce
@@ -279,12 +277,14 @@
 
 (defn handle-fn-call
   [db entity]
+  (txcommon/flush-batch-prepare!)
   (let [[_ target & args] entity
         f                 (resolve-tx-callable db target)]
     (apply f db args)))
 
 (defn handle-custom-tx-fn
   ([db store entity]
+   (txcommon/flush-batch-prepare!)
    (let [op    (first entity)
          ident (or (:e (sf (.subSet
                              ^TreeSortedSet (:avet db)

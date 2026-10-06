@@ -248,7 +248,7 @@
                 ;; This writer belongs to an already-open environment. Opener
                 ;; cleanup would close that environment if floor validation
                 ;; fails; the native batch owner must abort only its writer.
-                (kv/ensure-txlog-ready! tx)
+                (when-not (:ready? opts) (kv/ensure-txlog-ready! tx))
                 (let [result (body (kv/->KVLMDB tx nil))]
                   (l/cancel-explicit-transaction-watchdog! watchdog)
                   (l/assert-explicit-transaction-live! watchdog)

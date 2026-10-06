@@ -6,13 +6,16 @@
    [datalevin.binding.cpp :as cpp]
    [datalevin.conn :as conn]
    [datalevin.core :as d]
+   [datalevin.db :as db]
    [datalevin.datom :as datom]
+   [datalevin.interface :as i]
    [datalevin.lmdb :as l]
    [datalevin.test.core :refer [db-fixture]]
+   [datalevin.tx-group.batch :as batch]
+   [datalevin.tx-group.phase :as phase]
    [datalevin.util :as u])
-  (:import [datalevin.tx_group Group]
-           [java.util.concurrent ConcurrentLinkedQueue]
-           [java.util.concurrent.locks ReentrantLock]))
+  (:import [datalevin.tx_group.batch Collector]
+           [java.util.concurrent ConcurrentLinkedQueue]))
 
 (use-fixtures :each db-fixture)
 
@@ -163,29 +166,37 @@
                             @conn {:counter 2})))))))
 
 (defn- queued-batch! [conn txs]
-  (let [^Group group (#'conn/embedded-write-group conn)
-        ^ReentrantLock lock (.-lock group)
-        ^ConcurrentLinkedQueue queue (.-queue group)
-        jobs (atom [])]
-    ;; Collect an ordered group before any request can acquire the writer.
-    (.lock lock)
+  (let [^Collector collector (get-in @(i/kv-info (d/datalog-kv conn))
+                                    [:independent-control :collector])
+        ^ConcurrentLinkedQueue queue (.-ready collector)
+        entered (promise) release (promise)
+        jobs (atom [])
+        unobserve (phase/observe!
+                    (fn [event context]
+                      (when (and (= :batch-sealed event)
+                                 (identical? collector (batch/batch-collector context))
+                                 (not (realized? entered)))
+                        (deliver entered true)
+                        (assert (deref release 10000 false)))))]
     (try
       (doseq [[idx tx] (map-indexed vector txs)]
         (swap! jobs conj (future (try (d/transact! conn tx {:request idx})
                                      (catch Throwable t t))))
+        (when (zero? (long idx)) (is (deref entered 10000 false)))
         (is (loop [attempt 0]
               (cond
-                (= (count @jobs) (.size queue)) true
+                (= (dec (count @jobs)) (.size queue)) true
                 (= 1000 attempt) false
                 :else (do (Thread/sleep 5) (recur (inc attempt)))))))
-      (finally (.unlock lock)))
-    (mapv (fn [job]
-            (let [result (deref job 10000 ::timeout)]
-              (is (not= ::timeout result))
-              (if (instance? Throwable result)
-                {:report nil :error result}
-                {:report result :error nil})))
-          @jobs)))
+      (deliver release true)
+      (mapv (fn [job]
+              (let [result (deref job 10000 ::timeout)]
+                (is (not= ::timeout result))
+                (if (instance? Throwable result)
+                  {:report nil :error result}
+                  {:report result :error nil})))
+            @jobs)
+      (finally (deliver release true) (unobserve)))))
 
 (deftest general-queued-batches-use-stampers-in-request-order
   (with-conn [conn [schema {:wal? true :wal-durability-profile :strict}]]
@@ -214,15 +225,39 @@
       (doseq [{:keys [report]} results]
         (is (= 4 (get (d/entity (:db-after report) [:item/key "new"]) (fields 0))))
         (is (not (l/writing? (d/datalog-kv (:db-before report)))))))
-    (testing "a failed group rolls back before retrying requests individually"
+    (testing "a failed group rolls back without retrying bodies"
       (let [before (:last-committed-lsn (d/txlog-watermarks (d/datalog-kv conn)))
             results (queued-batch! conn
                                    [[[:db/add [:item/key "new"] (fields 0) 5]]
                                     [{:item/key "new" (fields 0) 6}]
                                     [[:db.fn/call (fn [_] (throw (ex-info "rollback" {})))]]])]
-        (is (every? :report (take 2 results)))
-        (is (some? (:error (last results))))
-        (is (= [4 5] (mapv #(-> % :report :tx-data first :v) (take 2 results))))
-        (is (= 6 (get (d/entity @conn [:item/key "new"]) (fields 0))))
-        (is (= (+ (long before) 2)
+        (is (every? :error results))
+        (is (apply identical? (map :error (take 2 results))))
+        (is (= 4 (get (d/entity @conn [:item/key "new"]) (fields 0))))
+        (is (= (long before)
                (:last-committed-lsn (d/txlog-watermarks (d/datalog-kv conn)))))))))
+
+(deftest collected-scalars-fall-back-after-preceding-schema-change
+  (with-conn [conn [schema {:wal? true :wal-durability-profile :strict}]]
+    (d/transact! conn [{:db/id 1 :item/key "one" (fields 0) 0}])
+    (let [prepared (db/prepare-scalar-update-tx
+                     @conn [[:db/add 1 (fields 0) 1]]
+                     {:defer-entity-resolution? true})
+          paths (atom [])
+          results (binding [conn/*local-wal-tx-path-observer* #(swap! paths conj %)]
+                    (queued-batch! conn
+                                   [[{:db/id 1 :item/new-field 10}]
+                                    [[:db/add 1 (fields 0) 1]]
+                                    [[:db/add [:item/key "one"] (fields 0) 2]]]))]
+      (is (some? prepared))
+      (is (not (db/scalar-update-tx-valid? @conn prepared)))
+      (is (every? nil? (map :error results)))
+      (is (= [:general :scalar-update :scalar-update] @paths))
+      (is (= [0 1]
+             (mapv (fn [{:keys [report]}]
+                     (some #(when-not (datom/datom-added %) (:v %)) (:tx-data report)))
+                   (rest results))))
+      (is (= 2 (get (d/entity @conn 1) (fields 0))))
+      (doseq [{:keys [report]} results]
+        (is (= 2 (get (d/entity (:db-after report) 1) (fields 0))))
+        (is (not (l/writing? (d/datalog-kv (:db-after report)))))))))

@@ -658,6 +658,13 @@
        (mark-remote-cache-max-tx! store remote-max-tx))
      (refresh-cache store target remote-max-tx))))
 
+(defn ^:no-doc invalidate-write-group!
+  "Invalidate committed Datalog writes using their consolidated metadata."
+  [store ^WriteGroup group]
+  (let [^longs metadata (.-metadata group)]
+    (when-not (neg? (aget metadata 0))
+      (invalidate-cache store (.-datoms group) (aget metadata 1)))))
+
 (defn ^:no-doc execute-write-group
   "Execute logical writes on a private writing connection with caching disabled.
   Flush final metadata and invalidate combined dependencies before native commit."
@@ -1284,6 +1291,20 @@
          (.-pull-readers old))
     old))
 
+(defn ^:no-doc transfer-report-db
+  "Publish a report view using the committed store's index comparators.
+  Each view still owns fresh mutable indexes, while comparator setup is shared."
+  [^DB old ^DB committed]
+  (carry-runtime-opts
+    (DB. (.-store committed)
+         (.-max-eid old)
+         (.-max-tx old)
+         (TreeSortedSet. (.comparator ^TreeSortedSet (.-eavt committed)))
+         (TreeSortedSet. (.comparator ^TreeSortedSet (.-avet committed)))
+         (.-pull-patterns old)
+         (.-pull-readers old))
+    old))
+
 (defn ^:no-doc adopt-current-db!
   "Register an already constructed current DB value without repeating the
   store-open lifecycle work performed by `new-db`."
@@ -1693,6 +1714,7 @@
                                       ^Store store tx-data embedding-plan
                                       commit-opts))]
            (when ensures
+             (txcommon/flush-batch-prepare!)
              (run-report-ensures! (transfer (:db-after report) store)
                                   report))
            (s/mark-state-current! ^Store store modified-ms)
@@ -2014,12 +2036,11 @@
    The caller invokes this after opening its LMDB write transaction, so all
    probes share that transaction and no concurrent insert can race the check."
   [^DB db ^PreparedBlindTx prepared]
-  (let [^FastList avs (:unique-avs prepared)
-        store         (.-store db)]
+  (let [^FastList avs (:unique-avs prepared)]
     (loop [i 0]
       (or (>= i (.size avs))
           (let [[a v] (.get avs i)]
-            (and (nil? (i/av-first-e store a v))
+            (and (nil? (txcommon/av-first-e db a v))
                  (recur (unchecked-inc i))))))))
 
 (defn ^:no-doc blind-local-tx-valid?
@@ -2062,7 +2083,7 @@
         ^PreparedBlindEntity entity (.get entities 0)
         tx-id           (inc (long (:max-tx db)))
         ^FastList attrs (.-attrs entity)
-        layout          (:identity-upsert-read prepared)
+        layout          (when-not txcommon/*batch-prepare* (:identity-upsert-read prepared))
         old-values      (when layout (read-scalar-entity (.-store db) eid layout))
         tx-data
         (loop [i       0
@@ -2074,7 +2095,7 @@
                 (recur (+ i 2) tx-data)
                 (let [old-value (if layout
                                   (get old-values attr)
-                                  (i/ea-first-v (.-store db) eid attr))]
+                                  (txcommon/ea-first-v db eid attr))]
                   (cond
                     (nil? old-value)
                     (recur (+ i 2)
@@ -2156,8 +2177,7 @@
   [^DB db ^PreparedBlindTx prepared tx-meta]
   (when-let [[identity-attr identity-value]
              (:identity-upsert-av prepared)]
-    (if-some [eid (i/av-first-e (.-store db)
-                                identity-attr identity-value)]
+    (if-some [eid (txcommon/av-first-e db identity-attr identity-value)]
       [(stamp-existing-blind-local-identity-upsert
          db prepared tx-meta identity-attr eid)
        true]
@@ -2240,7 +2260,7 @@
   ([^DB db ^PreparedLocalPatchIdocTx prepared tx-meta]
    (when (local-patch-idoc-tx-valid? db prepared)
      (let [e         (entid-strict db (:e prepared))
-           old-datom (ea-first-datom (.-store db) e (:attr prepared))
+           old-datom (txcommon/ea-first-datom db e (:attr prepared))
            old-doc   (when old-datom (.-v ^Datom old-datom))]
        (stamp-local-patch-idoc-doc db prepared tx-meta old-doc))))
   ([^DB db ^PreparedLocalPatchIdocTx prepared tx-meta old-doc]
@@ -2332,7 +2352,7 @@
                                  (some #(not (integer? (first %))) entries))]
               (cond-> (->PreparedScalarUpdate
                         store-schema store-opts entries
-                        (when-not deferred?
+                        (when-not (or deferred? defer-entity-resolution?)
                           (scalar-update-entity-reads store-schema entries)))
                 deferred? (assoc :deferred-entity-resolution? true)))))))))
 
@@ -2346,8 +2366,12 @@
   ([db initial-es]
    (prepare-scalar-update-tx db initial-es nil))
   ([db initial-es {:keys [defer-entity-resolution?]}]
-   (txcommon/with-lookup-ref-cache db
-     (prepare-scalar-update-tx* db initial-es defer-entity-resolution?))))
+   (if defer-entity-resolution?
+     ;; Collector preparation reads no persisted identities. The owner resolves
+     ;; them and consults the pending transaction indexes when stamping.
+     (prepare-scalar-update-tx* db initial-es true)
+     (txcommon/with-lookup-ref-cache db
+       (prepare-scalar-update-tx* db initial-es false)))))
 
 (defn ^:no-doc scalar-update-tx-valid?
   [^DB db ^PreparedScalarUpdate prepared]
@@ -2387,7 +2411,7 @@
           tx-id   (inc (long (:max-tx db)))
           entries (:entries prepared)
           n       (count entries)
-          layouts (:entity-reads prepared)
+          layouts (when-not txcommon/*batch-prepare* (:entity-reads prepared))
           old-values (reduce-kv
                        (fn [values eid layout]
                          (assoc values eid (read-scalar-entity store eid layout)))
@@ -2398,7 +2422,7 @@
               (let [[e attr value] (nth entries i)
                     old-value (if (contains? layouts e)
                                 (get (get old-values e) attr)
-                                (i/ea-first-v store e attr))]
+                                (txcommon/ea-first-v db e attr))]
                 (cond
                   (nil? old-value)
                   (recur (unchecked-inc i)

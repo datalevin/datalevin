@@ -1842,7 +1842,9 @@
               ;; for the relaxed/adaptive group-commit threshold.
               (append-sync-transition! manager expected-lsn now
                                        {:force? (not= :relaxed (:durability-profile state))
-                                        :begin? false :request-count (count bodies)})
+                                        :begin? false
+                                        :request-count (or (:request-count hooks)
+                                                           (count bodies))})
               batch)
             (catch Throwable e
               (let [error (if (runtime-control state)
@@ -1898,12 +1900,17 @@
 
   `deadline-ns` bounds the ownership wait with the batch's original deadline.
   When supplied, `phase-context` observes :wal-appended inside the ownership
-  guard, so even an after-append observer failure releases the claim."
+  guard, so even an after-append observer failure releases the claim.
+  `request-count` preserves logical sync-threshold weight when encoding has
+  combined several requests into fewer bodies; it defaults to the body count."
   ([state expected-lsn bodies]
    (begin-prepared-group! state expected-lsn bodies 0 nil))
   ([state expected-lsn bodies deadline-ns]
    (begin-prepared-group! state expected-lsn bodies deadline-ns nil))
   ([state expected-lsn bodies deadline-ns phase-context]
+   (begin-prepared-group! state expected-lsn bodies deadline-ns phase-context
+                          (count bodies)))
+  ([state expected-lsn bodies deadline-ns phase-context request-count]
    (when-not (some? @(:runtime-control state))
      (raise "WAL-only insertion requires a bound runtime control"
             {:type :txlog/no-runtime-control}))
@@ -1919,7 +1926,8 @@
      (try
        (let [batch (append-prepared-batch-pending!
                     state expected-lsn bodies
-                    {:throw-if-fatal! (:throw-if-fatal! ctl)
+                    {:request-count request-count
+                     :throw-if-fatal! (:throw-if-fatal! ctl)
                      :before-append! (:before-append! ctl)
                      :mark-fatal! (:mark-fatal! ctl)})]
          (when phase-context
