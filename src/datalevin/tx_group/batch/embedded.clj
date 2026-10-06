@@ -141,6 +141,7 @@
                             :encode-batch? (:datalog? hooks)
                             :shared-datalog-writer? (:datalog? hooks)
                             :finish-preparation! (:finish-preparation! hooks)
+                            :storage-rows! (:storage-rows! hooks)
                             :before-body! (:before-body! hooks)
                             :ensure-body-ready! (fn [wdb]
                                                   (kv/ensure-txlog-ready! wdb false)
@@ -150,7 +151,8 @@
                             :before-append! (fn [b]
                                               (dotimes [idx (batch/batch-count b)]
                                                 (let [d (batch/batch-at b idx)]
-                                                  (when (seq (:rows (batch/data d)))
+                                                  (when (or (:storage-staged? (batch/data d))
+                                                            (seq (:rows (batch/data d))))
                                                     (when-let [before (:before-append! (batch/context d))]
                                                       (try (before) (catch Throwable t (application-error! t))))))))
                             :prepare-rows! (fn [raw descriptor name txs kt vt]

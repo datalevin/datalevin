@@ -1231,18 +1231,23 @@
 (defn- tx-datom-comparator [store index]
   (let [kv (when (instance? Store store) (.-lmdb ^Store store))
         value-cmp (cd/value-comparator kv #(schema store))]
-    (fn [^Datom x ^Datom y]
-      (if (= index :eav)
-        (u/combine-cmp
-         (Long/compare (.-e x) (.-e y))
-         (d/nil-cmp (.-a x) (.-a y))
-         (value-cmp (.-a x) (.-v x) (.-v y))
-         (Long/compare (d/datom-tx x) (d/datom-tx y)))
-        (u/combine-cmp
-         (d/nil-cmp (.-a x) (.-a y))
-         (value-cmp (.-a x) (.-v x) (.-v y))
-         (Long/compare (.-e x) (.-e y))
-         (Long/compare (d/datom-tx x) (d/datom-tx y)))))))
+    (if (= index :eav)
+      (reify Comparator
+        (compare [_ x y]
+          (let [^Datom x x ^Datom y y]
+            (int (u/combine-cmp
+                   (Long/compare (.-e x) (.-e y))
+                   (d/nil-cmp (.-a x) (.-a y))
+                   (value-cmp (.-a x) (.-v x) (.-v y))
+                   (Long/compare (d/datom-tx x) (d/datom-tx y)))))))
+      (reify Comparator
+        (compare [_ x y]
+          (let [^Datom x x ^Datom y y]
+            (int (u/combine-cmp
+                   (d/nil-cmp (.-a x) (.-a y))
+                   (value-cmp (.-a x) (.-v x) (.-v y))
+                   (Long/compare (.-e x) (.-e y))
+                   (Long/compare (d/datom-tx x) (d/datom-tx y))))))))))
 
 (defn new-db
   "Construct a current DB view. Rebuilds of the same database can supply
@@ -1692,27 +1697,32 @@
              (transfer ^DB @prepared-db new-store)
              db)))
        (if (instance? Store store)
-         (let [embedding-plan (s/prepare-embedding-plan ^Store store tx-data)
-               ;; Preparation can create attributes and advance the schema
-               ;; version. This is a floor; storage chooses the final version
-               ;; after preparing all datoms.
-               commit-ms      (max (long (s/observed-state-sync-ms store))
-                                   (System/currentTimeMillis))
-               tx-meta        (:tx-meta report)
-               client-op?     (and (:client-op/id tx-meta)
-                                   (:client-op/request-type tx-meta)
-                                   (:client-op/hash tx-meta)
-                                   (:client-op/response-kind tx-meta))
-               commit-opts    (cond-> {:last-modified-ms commit-ms
-                                       :return-modified-ms? true}
-                                client-op?
-                                (assoc :extra-kv-txs-fn
-                                       (fn [modified-ms]
-                                         [(committed-client-op-response
-                                            report modified-ms)])))
-               modified-ms    (long (s/load-datoms-with-plan!
-                                      ^Store store tx-data embedding-plan
-                                      commit-opts))]
+         (let [tx-meta (:tx-meta report)
+               staged-ms (when (and txcommon/*batch-prepare* (not ensures)
+                                    (not (:client-op/id tx-meta)))
+                           (s/stage-group-datoms! store tx-data))
+               modified-ms
+               (long
+                 (or staged-ms
+                     (let [embedding-plan (s/prepare-embedding-plan store tx-data)
+                           ;; Preparation may create attributes and advance the
+                           ;; schema version. Storage chooses the final floor.
+                           commit-ms (max (long (s/observed-state-sync-ms store))
+                                          (System/currentTimeMillis))
+                           client-op? (and (:client-op/id tx-meta)
+                                           (:client-op/request-type tx-meta)
+                                           (:client-op/hash tx-meta)
+                                           (:client-op/response-kind tx-meta))
+                           commit-opts
+                           (cond-> {:last-modified-ms commit-ms
+                                    :return-modified-ms? true}
+                             client-op?
+                             (assoc :extra-kv-txs-fn
+                                    (fn [modified-ms]
+                                      [(committed-client-op-response
+                                         report modified-ms)])))]
+                       (s/load-datoms-with-plan! store tx-data embedding-plan
+                                                commit-opts))))]
            (when ensures
              (txcommon/flush-batch-prepare!)
              (run-report-ensures! (transfer (:db-after report) store)

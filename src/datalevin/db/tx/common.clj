@@ -93,10 +93,11 @@
                                     (datom e a nil tx0) (datom e a nil txmax))]
       (if (.isEmpty cached)
         (i/ea-first-v (:store db) e a)
-        (or (some-> (first-added-datom cached) :v)
-            (:v (first (visible-stored
-                         db (i/slice (:store db) :eav
-                                     (datom e a v0) (datom e a vmax))))))))
+        (if-let [^Datom pending (first-added-datom cached)]
+          (.-v pending)
+          (:v (first (visible-stored
+                       db (i/slice (:store db) :eav
+                                   (datom e a v0) (datom e a vmax))))))))
     (i/ea-first-v (:store db) e a)))
 
 (defn av-first-e

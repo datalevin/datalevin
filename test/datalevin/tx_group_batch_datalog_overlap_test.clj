@@ -4,15 +4,18 @@
             [datalevin.constants :as c]
             [datalevin.interface :as i]
             [datalevin.lmdb :as l]
+            [datalevin.storage :as s]
             [datalevin.tx-group.batch :as batch]
             [datalevin.tx-group.batch.embedded :as embedded]
             [datalevin.tx-group.phase :as phase]
+            [datalevin.txlog :as wal]
             [datalevin.util :as u])
-  (:import [java.util.concurrent CountDownLatch TimeUnit]))
+  (:import [java.io IOException]
+           [java.util.concurrent CountDownLatch TimeUnit]))
 
 (def ^:private opts
   {:wal? true :wal-durability-profile :strict :wal-segment-prealloc? false
-   :snapshot-scheduler? false})
+   :snapshot-scheduler? false :background-sampling? false})
 
 (defn- with-conn [opts f]
   (let [dir (u/tmp-dir (str "datalog-native-overlap-" (random-uuid)))
@@ -114,6 +117,195 @@
         (is (every? map? reports) (pr-str reports))
         (is (= 1 @calls))
         (is (= 3 (:value (d/entity @conn 1))))))))
+
+(deftest batch-encoding-refreshes-after-schema-changes
+  (with-conn opts
+    (fn [conn dir]
+      (d/transact! conn [{:db/id 1 :value 0}])
+      (let [reports (collected! conn
+                               [#(d/transact! conn [[:db/retract 1 :value 0]])
+                                #(d/with-transaction [tx conn]
+                                   (d/update-schema tx {:value {:db/noindex true}})
+                                   (d/transact! tx [[:db/add 1 :value 2]]))])]
+        (is (every? map? reports) (pr-str reports))
+        (is (= 2 (:value (d/entity @conn 1))))
+        (is (zero? (i/entries (d/datalog-kv conn) c/ave))))
+      (d/close conn)
+      (let [reopened (d/create-conn dir)]
+        (try (is (= 2 (:value (d/entity @reopened 1))))
+             (is (zero? (i/entries (d/datalog-kv reopened) c/ave)))
+             (finally (d/close reopened)))))))
+
+(deftest resolved-batch-retains-false-scalar-values
+  (with-conn opts
+    (fn [conn _]
+      (d/update-schema conn {:flag {:db/valueType :db.type/boolean}})
+      (d/transact! conn [{:db/id 1 :flag true}])
+      (let [reports (collected! conn
+                               [#(d/transact! conn [[:db/add 1 :flag false]])
+                                #(d/transact! conn [[:db/add 1 :flag true]])
+                                #(d/transact! conn [[:db/add 1 :flag false]])])]
+        (is (every? map? reports) (pr-str reports))
+        (is (some #(and (= false (:v %)) (not (:added %)))
+                  (:tx-data (second reports))))
+        (is (= false (:flag (d/entity @conn 1))))
+        (is (= #{[false]} (d/q '[:find ?v :where [1 :flag ?v]] @conn)))
+        (is (= 1 (i/entries (d/datalog-kv conn) c/ave)))))))
+
+(deftest collected-scalars-share-one-storage-preparation
+  (with-conn opts
+    (fn [conn _]
+      (d/transact! conn [{:db/id 1 :value 0}])
+      (let [before-tx (:max-tx @conn)
+            prepared-counts (atom [])
+            prepare @#'s/prepare-datoms-kv-plan
+            reports (with-redefs-fn
+                      {#'s/prepare-datoms-kv-plan
+                       (fn [store datoms & args]
+                         (when (= 5 (count args))
+                           (swap! prepared-counts conj (count datoms)))
+                         (apply prepare store datoms args))}
+                      #(collected! conn
+                                   (mapv (fn [value]
+                                           (fn []
+                                             (d/transact! conn [[:db/add 1 :value value]]
+                                                          {:request value})))
+                                         (range 1 9))))
+            tx-ids (mapv #(get-in % [:tempids :db/current-tx]) reports)
+            lmdb (d/datalog-kv conn)]
+        (is (every? map? reports) (pr-str reports))
+        (is (= [16] @prepared-counts))
+        (is (= (vec (range (inc (long before-tx)) (+ (long before-tx) 9))) tx-ids))
+        (is (= (mapv #(hash-map :request %) (range 1 9)) (mapv :tx-meta reports)))
+        (doseq [[value report] (map vector (range 1 9) reports)]
+          (is (= #{[(dec value) false] [value true]}
+                 (set (map (juxt :v :added) (:tx-data report)))))
+          (is (every? #(= (get-in report [:tempids :db/current-tx]) (:tx %))
+                      (:tx-data report))))
+        (is (= 8 (:value (d/entity @conn 1))))
+        (is (= (last tx-ids) (:max-tx @conn)
+               (i/get-value lmdb c/meta :max-tx :attr :long)))
+        (is (= (i/last-modified (:store @conn))
+               (i/get-value lmdb c/meta :last-modified :attr :long)))))))
+
+(deftest collected-giant-datoms-retain-cross-request-order
+  (let [dir (u/tmp-dir (str "datalog-batched-giants-" (random-uuid)))
+        conn (d/create-conn dir {:text {:db/valueType :db.type/string}} opts)
+        prefix (.repeat "shared" 300)
+        old (str prefix "old")
+        final (str prefix "final")
+        check! (fn [conn]
+                 (let [lmdb (d/datalog-kv conn)]
+                   (is (= final (:text (d/entity @conn 1))))
+                   (is (= [[1 final]] (mapv (juxt :e :v) (d/datoms @conn :eav 1 :text))))
+                   (is (= [[1 final]] (mapv (juxt :e :v) (d/datoms @conn :ave :text))))
+                   (is (empty? (d/q '[:find ?e :in $ ?v :where [?e :text ?v]]
+                                    @conn old)))
+                   (is (= #{[1]} (d/q '[:find ?e :in $ ?v :where [?e :text ?v]]
+                                      @conn final)))
+                   (is (= 1 (i/entries lmdb c/eav)))
+                   (is (= 1 (i/entries lmdb c/ave)))
+                   (is (pos? (i/entries lmdb c/giants)))))]
+    (try
+      (let [reports (collected! conn
+                               [#(d/transact! conn [[:db/add 1 :text old]])
+                                #(d/transact! conn [[:db/retract 1 :text old]])
+                                #(d/transact! conn [[:db/add 1 :text final]])])]
+        (is (every? map? reports) (pr-str reports))
+        (is (= [[old true] [old false] [final true]]
+               (mapv (fn [report]
+                       (let [datom (first (:tx-data report))]
+                         [(:v datom) (:added datom)]))
+                     reports))))
+      (check! conn)
+      (d/close conn)
+      (let [reopened (d/create-conn dir)]
+        (try (check! reopened) (finally (d/close reopened))))
+      (finally (d/close conn) (u/delete-files dir)))))
+
+(deftest caught-storage-drain-failures-still-abort-the-whole-batch
+  (doseq [infrastructure? [false true]]
+    (with-conn opts
+      (fn [conn _]
+        (d/transact! conn [{:db/id 1 :value 0}])
+        (let [lmdb (d/datalog-kv conn)
+              control (:independent-control @(i/kv-info lmdb))
+              collector (:collector control)
+              state (wal/state lmdb)
+              before @conn
+              before-lsn @(:next-lsn state)
+              injected? (atom false)
+              caught (atom [])
+              successors (atom 0)
+              failure (if infrastructure?
+                        (IOException. "Forced late storage failure")
+                        (ex-info "Forced late storage rejection" {}))
+              prepare @#'s/prepare-datoms-kv-plan
+              results
+              (with-redefs-fn
+                {#'s/prepare-datoms-kv-plan
+                 (fn [store datoms & args]
+                   (if (and (= 5 (count args)) (last args)
+                            (compare-and-set! injected? false true))
+                     (throw failure)
+                     (apply prepare store datoms args)))}
+                (fn []
+                  (collected! conn
+                              [#(d/transact! conn [[:db/add 1 :value 1]])
+                               (fn []
+                                 ((:internal-body! control)
+                                  (fn [native]
+                                    (try
+                                      ((:native-prepare-flush! (meta native)))
+                                      (catch Throwable t (swap! caught conj t)))
+                                    [])
+                                  {:datalog-conn conn :datalog-prepare? true}))
+                               #(d/transact! conn
+                                             [[:db.fn/call
+                                               (fn [_]
+                                                 (swap! successors inc)
+                                                 [[:db/add 1 :value 2]])]])])))]
+          (is @injected?)
+          (is (= 1 (count @caught)))
+          (is (every? #(instance? Throwable %) results) (pr-str results))
+          (is (zero? @successors))
+          (is (identical? before @conn))
+          (is (= 0 (:value (d/entity @conn 1))))
+          (is (= before-lsn @(:next-lsn state)) "no WAL append after the failed drain")
+          (is (zero? (:requests (batch/usage collector))))
+          (if infrastructure?
+            (do
+              (is (not (batch/serving? collector)))
+              (is (thrown? Throwable (d/transact! conn [[:db/add 1 :value 3]]))))
+            (do
+              (is (batch/serving? collector))
+              (is (map? (d/transact! conn [[:db/add 1 :value 3]])))
+              (is (= 3 (:value (d/entity @conn 1)))))))))))
+
+(deftest no-op-native-read-does-not-inherit-preceding-storage-write-count
+  (with-conn (assoc opts :wal-durability-profile :relaxed :wal-shared? false
+                        :wal-group-commit 64 :wal-group-commit-ms 0)
+    (fn [conn _]
+      (d/transact! conn [{:db/id 1 :value 0}])
+      (let [lmdb (d/datalog-kv conn)
+            state (wal/state lmdb)]
+        (i/force-txlog-sync! lmdb)
+        (let [before-lsn @(:next-lsn state)
+              reports (collected! conn
+                                  [#(d/transact! conn [[:db/add 1 :value 1]])
+                                   #(d/transact! conn
+                                                 [[:db.fn/call
+                                                   (fn [tx-db]
+                                                     (is (= 1 (:value (d/entity tx-db 1))))
+                                                     [])]])
+                                   #(d/transact! conn [[:db/add 1 :value 2]])])
+              metrics (wal/sync-manager-state (:sync-manager state))]
+          (is (every? map? reports) (pr-str reports))
+          (is (empty? (:tx-data (second reports))))
+          (is (= 2 (:value (d/entity @conn 1))))
+          (is (= (inc (long before-lsn)) @(:next-lsn state)))
+          (is (= 1 (:pending-count metrics)))
+          (is (= 2 (:unsynced-count metrics))))))))
 
 (deftest transaction-functions-can-read-their-own-native-kv-writes
   (with-conn opts

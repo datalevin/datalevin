@@ -50,20 +50,29 @@
   (charge-fn descriptor (charge/array-bytes 1 (alength value)))
   (Arrays/copyOf value (alength value)))
 
+(defn- capture-prepared!
+  "Append storage owned by this native batch, including a late storage drain."
+  [wdb apply-rows! rows wal-rows {:keys [defer-rows!]} prepared]
+  (.append ^RowRegions rows (:rows prepared))
+  (.append ^RowRegions wal-rows (:wal-rows prepared))
+  (when-not (and defer-rows! (defer-rows! wdb prepared))
+    (apply-rows! (:rows prepared))))
+
 (defn- capture!
   "Freeze writes in the batch transaction, deferring eligible native tails.
    Retain a failure even
    when the body catches it, so no failed batch can reach WAL or native commit."
   [raw wdb apply-rows! descriptor rows wal-rows valid? failure
    {:keys [check-row! prepare-rows! allow-flags? prepared-owned? charge-fn prepared-request?
-           application-error! defer-rows!]
-    :or {charge-fn charge!}} dbi-name txs kt vt]
+           application-error!]
+    :or {charge-fn charge!} :as opts} dbi-name txs kt vt]
   (try
     (l/write-txn wdb)
     (when-not @valid?
       (throw (ex-info "Write body has finished"
                       {:error :txlog/transaction-view-invalidated :retryable? false})))
     (when-let [t @failure] (throw t))
+    (when-let [flush! (:storage-flush! opts)] (flush!))
     (let [prepared (if prepare-rows!
                      (try
                        (prepare-rows! raw descriptor dbi-name txs kt vt)
@@ -76,15 +85,14 @@
                            (throw t))))
                      txs)
           txs (if prepared-request? (:rows prepared) prepared)
-          _ (when prepared-request? (.append ^RowRegions wal-rows (:wal-rows prepared)))
+          _ (when (and prepared-request? (not prepared-owned?))
+              (.append ^RowRegions wal-rows (:wal-rows prepared)))
           dbi-name (when-not prepare-rows! dbi-name)]
     (if (and prepared-request? prepared-owned?)
       ;; Public preparation already validates and owns these native rows.
       ;; Apply the frozen region directly; only the private validation opener
       ;; needs the copy/charge path below.
-      (do (.append ^RowRegions rows txs)
-          (when-not (and defer-rows! (defer-rows! wdb prepared))
-            (apply-rows! txs)))
+      (capture-prepared! wdb apply-rows! rows wal-rows opts prepared)
     (doseq [row txs]
       (let [record? (instance? KVTxData row)
             op (if record? (.-op ^KVTxData row) (nth row 0))
@@ -158,6 +166,12 @@
                                         :native-write-rtx (:native-write-rtx (meta native-db)))
                                  (meta wdb))
                                :native-row-capture capture
+                               :native-storage-staged!
+                               (when-let [staged? (:storage-staged? opts)]
+                                 (fn []
+                                   (vreset! staged? true)
+                                   (vreset! (:storage-target opts)
+                                            [wdb descriptor rows wal-rows])))
                                :native-prepare-flush! (:preparation-flush! opts)
                                :native-batch-abort! abort!
                                :native-transaction-failed! (fn [t]
@@ -165,6 +179,7 @@
                                                                (vreset! failure t)))
                                :request-context (batch/context descriptor)))
         _ (when-let [view (:active-view opts)] (vreset! view wdb))]
+    (when-let [staged? (:storage-staged? opts)] (vreset! staged? false))
     (try
       (let [result (try
                      ((batch/op descriptor) wdb)
@@ -192,9 +207,10 @@
           (batch/set-data! descriptor
                            (if (:encode-batch? opts)
                              {:rows rows :wal-body wal-body :result result
-                              :wal-rows wal-rows}
+                              :wal-rows wal-rows
+                              :storage-staged? (boolean (some-> (:storage-staged? opts) deref))}
                              {:rows rows :wal-body wal-body :result result}))
-          (if (.isEmpty rows) 0 1)))
+          (if (and (.isEmpty rows) (not (some-> (:storage-staged? opts) deref))) 0 1)))
       (finally (vreset! valid? false)
                (when-let [view (:active-view opts)] (vreset! view nil))))))
 
@@ -258,6 +274,30 @@
                                    (if-let [on-error! (:application-error! opts)]
                                      (on-error! failure) (throw failure)))))))
              tail (volatile! nil)
+             storage-target (volatile! nil)
+             storage-staged? (volatile! false)
+             storage-opts (volatile! nil)
+             flush-storage!
+             (fn []
+               (try
+                 (when-let [take-rows! (:storage-rows! opts)]
+                   (when-let [txs (take-rows!)]
+                     (let [[view descriptor rows wal-rows] @storage-target]
+                       ;; The batch owns these carriers after the request view
+                       ;; expires. Never re-enter that request's capture.
+                       (l/write-txn view)
+                       (let [prepared ((:prepare-rows! opts) raw descriptor nil txs
+                                       :data :data)]
+                         (capture-prepared! view apply-rows! rows wal-rows
+                                            @storage-opts prepared)))))
+                 (catch Throwable t
+                   (let [failure-error
+                         (try
+                           (if-let [on-error! (:application-error! opts)]
+                             (on-error! t) (throw t))
+                           (catch Throwable e e))]
+                     (when-not @failure (vreset! failure failure-error))
+                     (throw failure-error)))))
              flush-tail! (fn []
                            (when-let [{:keys [rows view]} @tail]
                              ;; Detach before applying: a map resize rebuilds
@@ -301,6 +341,7 @@
                     (:shared-datalog-writer? opts)
                     (assoc :preparation-flush!
                            (fn []
+                             (flush-storage!)
                              (flush-tail!)
                              ;; User code can also issue KV writes followed by
                              ;; ordinary native reads. Resume direct application
@@ -309,6 +350,11 @@
                                (let [_ (with-meta view
                                          (update (meta view) :request-context
                                                  dissoc :datalog-prepare?))] nil)))))
+             opts (if (:storage-rows! opts)
+                    (assoc opts :storage-target storage-target
+                           :storage-staged? storage-staged?
+                           :storage-flush! flush-storage!) opts)
+             _ (vreset! storage-opts opts)
              apply-member! (fn [idx]
                              (batch/check-preparation! batch)
                              (let [d (batch/batch-at batch idx)]
@@ -316,7 +362,8 @@
                                ;; transaction indexes across prepared requests.
                                ;; Arbitrary bodies and KV writes need native state.
                                (when-not (and (:datalog-prepare? (batch/context d))
-                                              (:prepared? @tail))
+                                              (or (nil? @tail) (:prepared? @tail)))
+                                 (flush-storage!)
                                  (flush-tail!))
                                (when-let [before! (:before-body! opts)] (before! d))
                                (if (batch/op d)
@@ -379,6 +426,7 @@
                                    (if (seq (:rows (batch/data (batch/batch-at batch idx)))) 1 0)))
                               weight (range end next-end)) end]
                      :else (recur end next-end (long weight))))))
+             _ (flush-storage!)
              extra (when-let [finish! (:finish-preparation! opts)]
                        (finish! wdb batch))
                last-member (when (seq extra)

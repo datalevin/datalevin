@@ -270,7 +270,9 @@
     (ensure-current! this)
     this))
 
-(deftype ^:no-doc WriteGroup [lmdb owner ^longs metadata ^FastList datoms])
+(deftype ^:no-doc WriteGroup
+  [lmdb owner ^longs metadata ^FastList datoms ^objects attr-cache
+   ^FastList storage-datoms ^objects storage-context])
 
 (def ^:dynamic *write-group* nil)
 
@@ -288,7 +290,8 @@
   "Create bookkeeping scoped to one native writing transaction."
   [lmdb]
   {:pre [(lmdb/writing? lmdb)]}
-  (WriteGroup. lmdb (Thread/currentThread) (long-array [-1 0]) (FastList.)))
+  (WriteGroup. lmdb (Thread/currentThread) (long-array [-1 0]) (FastList.)
+               (object-array 2) (FastList.) (object-array 1)))
 
 (defn ^:no-doc write-group-metadata
   "Return the final metadata pair for a native writing group."
@@ -2163,6 +2166,62 @@
                       (ensure-embedding-vector! domain dimensions vec-data)))))
           plan)))))
 
+(defn- buffered-datom-value?
+  [value]
+  ;; Mutable values and giants retain their eager encoding/native lookup scope.
+  ;; A bounded string also bounds its UTF-8 encoding below the native key limit.
+  (or (instance? Long value) (instance? Integer value)
+      (instance? Double value) (instance? Float value)
+      (instance? Boolean value) (instance? java.util.UUID value)
+      (and (string? value) (<= (count value) 100))
+      (and (keyword? value) (<= (count (str value)) 100))))
+
+(defn ^:no-doc stage-group-datoms!
+  "Retain ordinary resolved datoms for one storage preparation per group.
+   Reserve logical metadata now; encoding is drained before native-read scopes."
+  [^Store store datoms]
+  (when-let [^WriteGroup group (current-write-group (.-lmdb store))]
+    (let [native (kv/raw-lmdb (.-lmdb store))
+          store-schema (schema store)
+          ^FastList pending (.-storage-datoms group)
+          ^objects context (.-storage-context group)]
+      (when (and (:datalog-prepare? (:request-context (meta native)))
+                 (not lmdb/*raw-kv?*)
+                 (not *enforce-blind-unique-inserts?*)
+                 (not c/*ordered-datom-writes?*)
+                 (not (cd/custom-schema? store-schema))
+                 (every? (fn [^Datom datom]
+                           (let [props (store-schema (.-a datom))
+                                 vt (:db/valueType props)]
+                             (and props (not (:db/fulltext props))
+                                  (not (:db/embedding props))
+                                  (not (#{:db.type/vec :db.type/idoc} vt))
+                                  (buffered-datom-value? (.-v datom)))))
+                         datoms))
+        (let [^longs metadata (.-metadata group)
+              modified-ms (long (max (long (observed-state-sync-ms store))
+                                     (System/currentTimeMillis)))]
+          (aset metadata 0 (long (.advance-max-tx store)))
+          (aset metadata 1 modified-ms)
+          (aset context 0 store)
+          (doseq [datom datoms] (.add pending datom))
+          (when (seq datoms)
+            ((:native-storage-staged! (meta native))))
+          modified-ms)))))
+
+(defn ^:no-doc take-group-storage-rows!
+  "Encode and detach the group's pending datoms without advancing metadata again."
+  [^WriteGroup group]
+  (let [^FastList datoms (.-storage-datoms group)
+        ^objects context (.-storage-context group)]
+    (when-not (.isEmpty datoms)
+      (let [store (aget context 0)
+            plan (prepare-datoms-kv-plan store datoms nil nil nil nil
+                                        (.-metadata group))]
+        (.clear datoms)
+        (aset context 0 nil)
+        (:txs plan)))))
+
 (defn load-datoms-with-plan!
   ([^Store store datoms embedding-plan]
    (load-datoms-with-plan! store datoms embedding-plan nil))
@@ -2171,6 +2230,9 @@
             return-modified-ms?]}]
    (let [[res secondary-index-job-count modified-ms]
          (locking (.-write-txn store)
+           ;; Eager/custom/giant plans can read native state during encoding.
+           (when-let [flush! (:native-prepare-flush! (meta (kv/raw-lmdb (.-lmdb store))))]
+             (flush!))
            ;; Transaction stores refresh when the write lock is acquired.
            ;; Direct writes acquire it here, before allocating any giant IDs.
            (when-not (lmdb/writing? (.-lmdb store))
@@ -2361,7 +2423,7 @@
                                                 :value v})
               (add-index-work! work vi-ds-slot [[domain] op]))))))))
 
-(defn- prepare-datoms-kv-plan
+(defn- ^:redef prepare-datoms-kv-plan
   "Prepare KV write plan for a datom batch.
    This is an extraction step toward sharing DL/KV commit flow."
   ([^Store store datoms]
@@ -2370,6 +2432,10 @@
    (prepare-datoms-kv-plan store datoms embedding-plan nil nil nil))
   ([^Store store datoms embedding-plan extra-kv-txs extra-kv-txs-fn
     last-modified-ms]
+   (prepare-datoms-kv-plan store datoms embedding-plan extra-kv-txs extra-kv-txs-fn
+                          last-modified-ms nil))
+  ([^Store store datoms embedding-plan extra-kv-txs extra-kv-txs-fn
+    last-modified-ms ^longs reserved-metadata]
    ;; Another connection may have enabled AVE since this wrapper was created.
    ;; The caller holds the write lock, so index participation cannot change
    ;; between this refresh and the commit.
@@ -2377,12 +2443,28 @@
      (ensure-current! store))
    ;; Datom operations lead the batch so LMDB can select the primitive-EID
    ;; executor once; generic giant, job, and metadata operations follow.
-   (let [txs    (FastList. (+ 2 (count datoms) (count extra-kv-txs)))
+   (let [^WriteGroup group (current-write-group (.-lmdb store))
+         store-schema (schema store)
+         ;; Custom descriptors also depend on the current UDF registry and
+         ;; native transaction. Keep their existing per-request cache scope.
+         ^objects attr-cache (when (and group (not (cd/custom-schema? store-schema)))
+                               (.-attr-cache group))
+         ;; Encoding metadata is stable until preparation changes the schema.
+         ;; Reuse it across the owned group instead of resolving each attribute
+         ;; and allocating its cache again for every request.
+         ^HashMap attr-infos
+         (if (and attr-cache (identical? (aget attr-cache 0) store-schema))
+           (aget attr-cache 1)
+           (let [infos (HashMap.)]
+             (when attr-cache
+               (aset attr-cache 0 store-schema)
+               (aset attr-cache 1 infos))
+             infos))
+         txs    (FastList. (+ 2 (count datoms) (count extra-kv-txs)))
          unindexed-txs (when (seq (:db/noindex (rschema store))) (FastList.))
          ;; Nil slots mean no work; each list is allocated on its first item.
          work   (object-array 8)
          giants (HashMap.)
-         attr-infos (HashMap.)
          avg-bf     (bf/get-array-buffer)]
      (try
        (doseq [^Datom datom datoms]
@@ -2418,13 +2500,15 @@
                                               (:idoc/patch (meta op))])
                                            changes)})
                            (group-by first ops)))
-           tx-id (long (.advance-max-tx store))
+           tx-id (long (if reserved-metadata (aget reserved-metadata 0)
+                           (.advance-max-tx store)))
            ;; Auto-created attributes can advance this store's schema version
            ;; while the datom plan is built. Never overwrite that newer version
            ;; with a timestamp chosen before preparation.
-           modified-ms (long (max (long (or last-modified-ms 0))
-                                  (long (observed-state-sync-ms store))
-                                  (System/currentTimeMillis)))]
+           modified-ms (long (if reserved-metadata (aget reserved-metadata 1)
+                                (max (long (or last-modified-ms 0))
+                                     (long (observed-state-sync-ms store))
+                                     (System/currentTimeMillis))))]
        (when (or ft-jobs vi-jobs em-jobs id-jobs)
          (doseq [[ordinal job] (map-indexed vector
                                             (concat ft-jobs vi-jobs em-jobs id-jobs))]
@@ -2435,7 +2519,7 @@
                                        :updated-ms modified-ms)))))
        ;; Only used to decide whether to wake the worker after staging writes.
        (when id-jobs (aset work id-jobs-slot id-jobs))
-       (if-let [^WriteGroup group (current-write-group (.-lmdb store))]
+       (if group
          (let [^longs metadata (.-metadata group)]
            (aset metadata 0 tx-id)
            (aset metadata 1 modified-ms))

@@ -4,6 +4,7 @@
   "Datalog bookkeeping around the shared native/WAL collector. Transaction
   reads use LMDB; connection values and caches are published after commit."
   (:require [datalevin.db :as db]
+            [datalevin.constants :as c]
             [datalevin.interface :as i]
             [datalevin.db.tx.common :as txcommon]
             [datalevin.kv :as kv]
@@ -108,6 +109,12 @@
          :finish-preparation! (fn [_ _]
                                 (when-let [group @(:group @context)]
                                   (s/write-group-metadata group)))
+         :storage-rows! (fn []
+                          (when-let [group @(:group @context)]
+                            (binding [s/*write-group* group
+                                      s/*enforce-blind-unique-inserts?* false
+                                      c/*ordered-datom-writes?* false]
+                              (s/take-group-storage-rows! group))))
          :before-body! (fn [descriptor]
                          (when-not (:datalog-prepare? (batch/context descriptor))
                            (when-let [current @(:current @context)]
@@ -127,15 +134,16 @@
         tx-store (if (identical? (kv/raw-lmdb (.-lmdb store))
                                 (kv/raw-lmdb lmdb))
                    store (s/transfer store lmdb))
-        tx-db (db/carry-runtime-opts
-                (cond-> (if (and (identical? tx-store store)
-                                 (or (:datalog-prepare? (:request-context (meta (kv/raw-lmdb lmdb))))
-                                     (and (empty? (:eavt previous))
-                                          (empty? (:avet previous)))))
-                          previous (db/transfer previous tx-store))
-                  (nil? @(:current context))
-                  (assoc :max-eid (i/init-max-eid tx-store)
-                         :max-tx (i/max-tx tx-store))) before)]
+        tx-db (cond-> (if (and (identical? tx-store store)
+                              (or (:datalog-prepare? (:request-context (meta (kv/raw-lmdb lmdb))))
+                                  (and (empty? (:eavt previous))
+                                       (empty? (:avet previous)))))
+                       previous (db/transfer previous tx-store))
+                (nil? @(:current context))
+                (assoc :max-eid (i/init-max-eid tx-store)
+                       :max-tx (i/max-tx tx-store)))
+        tx-db (if (identical? (db/runtime-opts tx-db) (db/runtime-opts before))
+                tx-db (db/carry-runtime-opts tx-db before))]
     (when-not @(:cache context)
       (vreset! (:cache context) [store (db/cache-disabled? store)])
       (db/disable-cache store))

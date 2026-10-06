@@ -42,8 +42,9 @@
                    (if (< idx (batch/batch-count batch))
                      (let [data (batch/data (batch/batch-at batch idx))]
                        (recur (inc idx)
-                              (if (if (contains? data :rows)
-                                    (seq (:rows data)) (:wal-body data))
+                              (if (or (:storage-staged? data)
+                                      (if (contains? data :rows)
+                                        (seq (:rows data)) (:wal-body data)))
                                 (inc total) total)))
                      total))]
              (wal/begin-prepared-group! state lsn (batch/wal-bodies batch)
