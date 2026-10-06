@@ -13,12 +13,14 @@
    [taoensso.nippy :as nippy])
   (:import
    [com.alipay.sofa.jraft Iterator StateMachine]
+   [com.github.luben.zstd Zstd]
    [datalevin NativeValue]
    [java.io DataOutput]
    [java.nio ByteBuffer]
    [java.security MessageDigest]
-   [java.util Random]
-   [java.util.concurrent ConcurrentLinkedDeque]
+   [java.util Arrays Random]
+   [java.util.concurrent ArrayBlockingQueue ConcurrentLinkedDeque
+    CountDownLatch]
    [java.util.concurrent.atomic AtomicInteger]
    [java.util.function BiPredicate]))
 
@@ -100,6 +102,71 @@
           (index/encode-giant-datom (d/datom 1 :value (CountedValue. calls))))]
     (b/put-buffer (ByteBuffer/allocate 4096) value vtype)
     (is (= 1 @calls))))
+
+(deftest pooled-giant-zstd-matches-the-static-helpers
+  ;; Reusing contexts must not change stored bytes. Two levels in one JVM: the
+  ;; level is set on every call, not left over from a pooled context.
+  (let [rnd (Random. 7)]
+    (doseq [size  [1023 1024 1025 65536]
+            level [3 9 3]]
+      (let [^bytes raw        (byte-array size)
+            _                 (dotimes [i size]
+                                (aset raw i (byte (+ 97 (.nextInt rnd 4)))))
+            ^bytes compressed (#'index/giant-zstd-compress raw level)
+            envelope          (byte-array (+ 9 (alength compressed)))]
+        (is (= (seq (Zstd/compress raw (int level))) (seq compressed)))
+        (System/arraycopy compressed 0 envelope 9 (alength compressed))
+        (is (= (seq raw)
+               (seq (#'index/giant-zstd-decompress
+                     envelope 9 (alength compressed) size))))))))
+
+(defn- compressed-giant
+  [datom]
+  (let [{:keys [value]} (binding [c/*giants-zstd-threshold* 0]
+                          (index/encode-giant-datom datom))]
+    value))
+
+(deftest giant-zstd-contexts-are-reused-and-bounded
+  (let [compressors   (ArrayBlockingQueue. 2)
+        decompressors (ArrayBlockingQueue. 16)]
+    (with-redefs-fn {#'index/giant-zstd-compressors   compressors
+                     #'index/giant-zstd-decompressors decompressors}
+      (fn []
+        (let [datom (d/datom 1 :config/doc (apply str (repeat 2000 "config")))
+              value (compressed-giant datom)]
+          (is (= 1 (.size compressors)))
+          ;; more readers than the pool holds: the overflow is closed, not kept
+          (let [start   (CountDownLatch. 1)
+                readers (mapv (fn [_]
+                                (future
+                                  (.await start)
+                                  (dotimes [_ 50] (index/decode-giant-datom value))
+                                  (index/decode-giant-datom value)))
+                              (range 64))]
+            (.countDown start)
+            (is (every? #(= datom (deref %)) readers)))
+          (is (<= 1 (.size decompressors) 16))
+          ;; one reader at a time keeps cycling through the same contexts
+          (let [before (vec decompressors)]
+            (dotimes [_ 100] (index/decode-giant-datom value))
+            (is (= (count before) (.size decompressors)))
+            (is (every? (fn [ctx] (some #(identical? ctx %) decompressors))
+                        before))))))))
+
+(deftest corrupt-giant-envelope-does-not-poison-the-pool
+  (let [decompressors (ArrayBlockingQueue. 16)]
+    (with-redefs-fn {#'index/giant-zstd-decompressors decompressors}
+      (fn []
+        (let [datom          (d/datom 1 :config/doc (apply str (repeat 2000 "config")))
+              ^bytes value   (compressed-giant datom)
+              ^bytes corrupt (aclone value)]
+          (Arrays/fill corrupt 9 (alength corrupt) (byte 0x7f))
+          (is (= datom (index/decode-giant-datom value)))
+          (is (= 1 (.size decompressors)))
+          (is (thrown? Exception (index/decode-giant-datom corrupt)))
+          (is (zero? (.size decompressors)) "the failed context is closed")
+          (is (= datom (index/decode-giant-datom value)))
+          (is (= 1 (.size decompressors))))))))
 
 (deftest ha-decodes-borrowed-buffers-without-changing-the-iterator
   (doseq [direct? [false true]
