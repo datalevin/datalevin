@@ -17,9 +17,10 @@
    [datalevin.constants :as c]
    [datalevin.util :refer [raise]])
   (:import
-   [com.github.luben.zstd Zstd]
+   [com.github.luben.zstd ZstdCompressCtx ZstdDecompressCtx]
    [java.nio ByteBuffer]
    [java.util Arrays]
+   [java.util.concurrent ArrayBlockingQueue]
    [datalevin.bits Indexable Retrieved CustomReference]
    [datalevin.datom Datom]))
 
@@ -115,11 +116,52 @@
        (= (aget bs 3) (aget giant-zstd-magic 3))
        (= (aget bs 4) giant-zstd-version)))
 
+;; Zstd/compress and Zstd/decompress create and free a native context on every
+;; call. Giant datoms reuse contexts from small bounded pools instead: writes are
+;; serialized per store, reads are concurrent. A context has no finalizer, so one
+;; that does not go back to its pool is closed.
+(def ^:private ^:const giant-zstd-compressors-max 2)
+
+(def ^:private ^:const giant-zstd-decompressors-max 16)
+
+;; Filled on first use, so no native context is created at load time.
+(defonce ^:private ^ArrayBlockingQueue giant-zstd-compressors
+  (ArrayBlockingQueue. giant-zstd-compressors-max))
+
+(defonce ^:private ^ArrayBlockingQueue giant-zstd-decompressors
+  (ArrayBlockingQueue. giant-zstd-decompressors-max))
+
+(defn- giant-zstd-compress
+  ^bytes [^bytes raw ^long level]
+  (let [^ZstdCompressCtx ctx (or (.poll giant-zstd-compressors)
+                                 (ZstdCompressCtx.))
+        compressed           (try
+                               (.compress (.setLevel ctx (int level)) raw)
+                               (catch Throwable e
+                                 (.close ctx)
+                                 (throw e)))]
+    (when-not (.offer giant-zstd-compressors ctx) (.close ctx))
+    compressed))
+
+(defn- giant-zstd-decompress
+  "Decompress `len` bytes of `bs` from `off` into a new array of `raw-len`."
+  ^bytes [^bytes bs ^long off ^long len ^long raw-len]
+  (let [^ZstdDecompressCtx ctx (or (.poll giant-zstd-decompressors)
+                                   (ZstdDecompressCtx.))
+        raw                    (try
+                                 (.decompress ctx bs (int off) (int len)
+                                              (int raw-len))
+                                 (catch Throwable e
+                                   (.close ctx)
+                                   (throw e)))]
+    (when-not (.offer giant-zstd-decompressors ctx) (.close ctx))
+    raw))
+
 (defn- maybe-compress-giant-datom-bytes
   ^bytes [^bytes raw]
   (let [threshold (long c/*giants-zstd-threshold*)]
     (when (<= threshold (long (alength raw)))
-      (let [compressed (Zstd/compress raw (int c/*giants-zstd-level*))]
+      (let [compressed (giant-zstd-compress raw (long c/*giants-zstd-level*))]
         (when (< (alength compressed) (alength raw))
           (let [compressed-len (alength compressed)
                 out            (byte-array
@@ -147,12 +189,12 @@
   and zstd-compressed raw envelope)."
   [^bytes bs]
   (if (giant-zstd-envelope? bs)
-    (let [bb         (ByteBuffer/wrap bs)
-          _          (.position bb 5)
-          raw-len    (.getInt bb)
-          compressed (byte-array (.remaining bb))]
-      (.get bb compressed)
-      (b/deserialize (Zstd/decompress compressed (long raw-len))))
+    (let [raw-len (.getInt (ByteBuffer/wrap bs) 5)]
+      ;; decompress straight from the envelope, no copy of the payload
+      (b/deserialize
+        (giant-zstd-decompress bs giant-zstd-header-size
+                               (- (alength bs) giant-zstd-header-size)
+                               raw-len)))
     (b/deserialize bs)))
 
 (defn index->k
