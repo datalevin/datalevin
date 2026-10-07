@@ -731,7 +731,9 @@
               c/*ordered-datom-writes?* ordered?]
       (db/commit-prepared-tx-data! (:db-after report) (:tx-data report) report)))
   (observe-local-wal-tx-path! path)
-  (assoc report :db-before db))
+  (if (identical? (:db-before report) db)
+    report
+    (assoc report :db-before db)))
 
 (defn- ^:redef transact-local-in-write-txn!
   "Apply one request to an already owned local writer. Prepare and resolve

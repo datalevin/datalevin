@@ -25,6 +25,36 @@
          :where [(idoc-match $ ?attr ?query) [[?e _ _]]]]
        db attr query))
 
+(deftest ignored-idoc-attribute-preserves-document-binding-test
+  (let [dir (u/tmp-dir (str "idoc-ignored-attribute-" (random-uuid)))
+        conn (d/create-conn dir {:doc {:db/valueType :db.type/idoc}})
+        doc {:status "active" :age 30}]
+    (try
+      (d/transact! conn [{:db/id 1 :doc doc}
+                         {:db/id 2 :doc {:status "inactive" :age 10}}])
+      (doseq [query [{:status "active"}
+                     {:age '(>= 20)}
+                     [:and {:status "active"} {:age '(>= 20)}]]]
+        (testing (pr-str query)
+          (doseq [form '[[:find ?e ?doc :in $ ?query ?opts
+                         :where [(idoc-match $ :doc ?query) [[?e _ ?doc]]]]
+                        [:find ?e ?doc :in $ ?query ?opts
+                         :where [(idoc-match $ :doc ?query ?opts) [[?e _ ?doc]]]]
+                        [:find ?e ?doc :in $ ?query ?opts
+                         :where [(idoc-match $ :doc (identity ?query)) [[?e _ ?doc]]]]]]
+            (is (= #{[1 doc]} (d/q form @conn query {})))
+            (is (= #{[1 doc]}
+                   (d/execute-prepared (d/prepare-q @conn form) [query {}]))))
+          (is (= #{[doc]}
+                 (d/q '[:find ?doc :in $ ?query
+                        :where [(idoc-match $ :doc ?query) [[_ _ ?doc]]]]
+                      @conn query)))
+          (is (= #{[1 :doc doc]}
+                 (d/q '[:find ?e ?a ?doc :in $ ?query
+                        :where [(idoc-match $ :doc ?query) [[?e ?a ?doc]]]]
+                      @conn query)))))
+      (finally (d/close conn) (u/delete-files dir)))))
+
 (deftest legacy-path-does-not-shadow-vector-position-test
   (let [dir (u/tmp-dir (str "idoc-legacy-path-" (random-uuid)))
         schema {:doc {:db/valueType :db.type/idoc}}

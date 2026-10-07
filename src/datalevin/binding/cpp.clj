@@ -126,6 +126,12 @@
     adjacent keys reuse their encoding and equal adjacent pairs are probed
     once."))
 
+(defprotocol IResolutionCursor
+  (resolution-cursor! [rtx dbi]
+    "Borrow this writer's EAV cursor, opening it lazily for resolution.")
+  (close-resolution-cursor! [rtx]
+    "Release the EAV cursor before its native transaction is committed or aborted."))
+
 (deftype Rtx [^:unsynchronized-mutable lmdb
               ^Txn txn
               depth
@@ -140,7 +146,20 @@
               aborted?
               ^AtomicBoolean closed?
               ^boolean owns-buffers?
-              ^ArrayList native-leases]
+              ^ArrayList native-leases
+              ^:unsynchronized-mutable ^Cursor resolution-cursor]
+
+  IResolutionCursor
+  (resolution-cursor! [this dbi]
+    (or resolution-cursor
+        (let [cur (l/get-cursor dbi this)]
+          (set! resolution-cursor cur)
+          cur)))
+  (close-resolution-cursor! [_]
+    (when resolution-cursor
+      (let [cur resolution-cursor]
+        (set! resolution-cursor nil)
+        (.close cur))))
 
   ICompress
   (key-bf [_] (.clear k-comp-bf))
@@ -337,6 +356,7 @@
   AutoCloseable
   (close [_]
     (when (.compareAndSet closed? false true)
+      (close-resolution-cursor! _)
       (let [txn*       txn
             kp*        kp
             vp*        vp
@@ -379,18 +399,21 @@
   (.get cur ^BufVal (.-start-kp rtx) ^BufVal (.-start-vp rtx)
         DTLV/MDB_GET_BOTH))
 
-(defn- near-list*
+(defn- near-list-buffer*
   [^DBI dbi ^Rtx rtx ^Cursor cur k kt v vt]
   (let [value-compressor (buffer/dbi-val-compressor dbi)]
-    (buffer/list-range-info* (.-key-codec dbi) rtx
-                      :at-least k nil kt :at-least v nil vt value-compressor)
+    ;; GET_BOTH_RANGE needs only the lower pair, not range contexts or upper bounds.
+    (buffer/put-bufval (.-start-kp rtx) k kt (.-key-codec dbi) (l/key-bf rtx))
+    (buffer/put-bufval (.-start-vp rtx) v vt value-compressor (l/val-bf rtx))
     (when (.get cur ^BufVal (.-start-kp rtx) ^BufVal (.-start-vp rtx)
                 DTLV/MDB_GET_BOTH_RANGE)
-      ;; Prefix-decoded duplicate values can live in cursor-owned scratch
-      ;; memory. scan releases the cursor before the caller decodes this value;
-      ;; retain the bytes while both the cursor and transaction are still live.
-      (ByteBuffer/wrap
-        (b/get-bytes (iter/v-bf (.val cur) value-compressor rtx))))))
+      (iter/v-bf (.val cur) value-compressor rtx))))
+
+(defn- near-list*
+  [dbi rtx cur k kt v vt]
+  (when-let [bf (near-list-buffer* dbi rtx cur k kt v vt)]
+    ;; Generic callers decode after releasing cursor-owned prefix scratch.
+    (ByteBuffer/wrap (b/get-bytes bf))))
 
 (declare ->CppLMDB)
 
@@ -469,7 +492,7 @@
                   (bf/allocate-buffer max-val-size*)
                   (volatile! false)
                   (AtomicBoolean.)
-                  true (ArrayList. 1))]
+                  true (ArrayList. 1) nil)]
     (.set tl-reader rtx)
     (when-not (.isVirtual thread)
       (when-let [^Rtx old (.put reader-registry thread rtx)]
@@ -495,19 +518,23 @@
     (if-let [^Rtx wtxn @write-txn]
      (try
       (when-let [^Txn txn (.-txn wtxn)]
+        (close-resolution-cursor! wtxn)
         (let [aborted? @(.-aborted? wtxn)]
           (if aborted?
             (.close txn)
             (try
               (when before-commit
                 (before-commit wdb {:operation :close-transact-kv}))
+              (close-resolution-cursor! wtxn)
               (.commit txn)
               (catch Util$MapFullException _
+                (close-resolution-cursor! wtxn)
                 (.close txn)
                 (up-db-size env)
                 (vreset! write-txn nil)
                 (raise "DB resized" {:resized true}))
               (catch Exception e
+                (close-resolution-cursor! wtxn)
                 (.close txn)
                 (vreset! write-txn nil)
                 (if (= :ha/write-rejected (:error (ex-data e)))
@@ -763,7 +790,7 @@
                                 (AtomicBoolean.)
                                 false (let [leases (ArrayList. 1)]
                                         (when lease (.add leases lease))
-                                        leases)))
+                                        leases) nil))
         (catch Throwable e
           (when lease (.close ^AutoCloseable lease))
           (throw e)))))
@@ -1156,6 +1183,7 @@
                     (.commit txn))
                   :transacted
                   (catch Util$MapFullException _
+                    (when rtx (close-resolution-cursor! rtx))
                     (.close txn)
                     (up-db-size env)
                     (if one-shot?
@@ -1525,6 +1553,22 @@
    (raise "Fail to count list in key range: " e {:dbi dbi-name})))
 
 
+(defn read-resolution-value
+  "Decode an EAV point lookup while its transaction-owned cursor is live.
+  Only native Datalog preparation calls this; pending datoms stay in the resolver."
+  [^CppLMDB native lmdb e aid decode]
+  (i/check-ready native)
+  (let [^Rtx rtx @(l/write-txn native)
+        dbi (i/get-dbi native c/eav false)
+        cur (resolution-cursor! rtx dbi)]
+    (try
+      (when-let [^ByteBuffer bf (near-list-buffer* dbi rtx cur e :id aid :int)]
+        (when (= (int aid) (.getInt bf 0))
+          (decode lmdb bf)))
+      (catch Throwable e
+        (scan/record-native-read-failure! native e)
+        (throw e)))))
+
 (defn prepared-row-applier
   "Capture the owned native writer once. The returned function applies only
   preparation-validated physical rows; it must stay inside the native callback."
@@ -1548,6 +1592,7 @@
           (vswap! info assoc :max-val-size-changed? false))
         :transacted
         (catch Util$MapFullException _
+          (close-resolution-cursor! rtx)
           (.close txn)
           (up-db-size env)
           (.reset-write wdb)

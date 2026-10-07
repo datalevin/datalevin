@@ -47,6 +47,7 @@
             max-tx get-env-flags set-env-flags sync abort-transact-kv
             kv-info]])
   (:import
+   [clojure.lang LazilyPersistentVector]
    [datalevin.datom Datom]
    [datalevin.interface IRemoteDB IRemotePrepared IStore]
    [datalevin.storage Store WriteGroup]
@@ -1963,8 +1964,8 @@
                      (datom eid nil nil c/tx0) (datom eid nil nil c/txmax))]
         (if (.isEmpty pending)
           (read-scalar-entity store eid layout)
-          (let [names (.-names layout)
-                aids (.-aids layout)
+          (let [^objects names (.-names layout)
+                ^longs aids (.-aids layout)
                 n (alength names)]
             (loop [idx 0 values {} remaining []]
               (if (< idx n)
@@ -2358,8 +2359,9 @@
         tuple-source-attrs (:db/attrTuples (rschema store))]
     (when-not (:auto-entity-time? store-opts)
       (loop [es      (seq initial-es)
-             seen    (java.util.HashSet.)
-             entries (transient [])]
+             seen    nil
+             ^FastList entries (FastList. (if (vector? initial-es)
+                                           (count initial-es) 1))]
         (if es
           (let [entity (first es)]
             (if (and (sequential? entity)
@@ -2387,15 +2389,23 @@
                                          (and (sequential? e) (= 2 (count e)))))
                               e
                               (scalar-update-entity-id db e))]
-                    (when (and eid (.add seen [eid attr]))
+                    (when (and eid (or (nil? seen) (.add ^java.util.HashSet seen [eid attr])))
                       (vld/validate-attr attr entity)
                       (vld/validate-val value entity)
                       (let [v (prepare/correct-value-with-props
-                                store-opts props attr value)]
-                        (recur (next es) seen (conj! entries [eid attr v])))))))
+                                store-opts props attr value)
+                            remaining (next es)]
+                        (.add entries [eid attr v])
+                        (recur remaining
+                               (or seen
+                                   (when remaining
+                                     (doto (java.util.HashSet.) (.add [eid attr]))))
+                               entries))))))
               nil))
-          (when (pos? (count entries))
-            (let [entries (persistent! entries)
+          (when-not (.isEmpty entries)
+            ;; The detached array is owned by the immutable prepared vector.
+            ;; Small requests need no transient root/tail or duplicate set.
+            (let [entries (LazilyPersistentVector/createOwning (.toArray entries))
                   deferred? (and defer-entity-resolution?
                                  (some #(not (integer? (first %))) entries))]
               (cond-> (->PreparedScalarUpdate
@@ -2464,7 +2474,7 @@
                          (assoc values eid (read-scalar-update-entity db eid layout)))
                        {} layouts)
           tx-data
-          (loop [i 0, out (transient [])]
+          (loop [i 0, ^FastList out (FastList. (* 2 n))]
             (if (< i n)
               (let [[e attr value] (nth entries i)
                     old-value (if (contains? layouts e)
@@ -2472,18 +2482,17 @@
                                 (txcommon/ea-first-v db e attr))]
                 (cond
                   (nil? old-value)
-                  (recur (unchecked-inc i)
-                         (conj! out (datom e attr value tx-id)))
+                  (do (.add out (datom e attr value tx-id))
+                      (recur (unchecked-inc i) out))
 
                   (= old-value value)
                   (recur (unchecked-inc i) out)
 
                   :else
-                  (recur (unchecked-inc i)
-                         (-> out
-                             (conj! (datom e attr old-value tx-id false))
-                             (conj! (datom e attr value tx-id))))))
-              (persistent! out)))
+                  (do (.add out (datom e attr old-value tx-id false))
+                      (.add out (datom e attr value tx-id))
+                      (recur (unchecked-inc i) out))))
+              (LazilyPersistentVector/createOwning (.toArray out))))
           db-after (assoc db :max-tx tx-id)]
       (->TxReport db db-after tx-data {:db/current-tx tx-id} tx-meta))))
 

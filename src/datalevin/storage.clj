@@ -885,9 +885,13 @@
         (d/datom e a (idx/avg-buffer->v lmdb bf)))))
 
   (ea-first-v [_ e a]
-    (cd/with-snapshot lmdb
-      (when-let [bf (ea->avg-buffer schema lmdb e a)]
-        (idx/avg-buffer->v lmdb bf))))
+    (let [native (kv/raw-lmdb lmdb)]
+      (if (:datalog-prepare? (lmdb/request-context native))
+        (when-let [aid (:db/aid (schema a))]
+          (cpp/read-resolution-value native lmdb e aid idx/avg-buffer->v))
+        (cd/with-snapshot lmdb
+          (when-let [bf (ea->avg-buffer schema lmdb e a)]
+            (idx/avg-buffer->v lmdb bf))))))
 
   (v-datoms [_ v]
     (mapcat

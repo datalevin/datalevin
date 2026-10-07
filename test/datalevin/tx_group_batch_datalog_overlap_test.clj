@@ -1,8 +1,11 @@
 (ns datalevin.tx-group-batch-datalog-overlap-test
   (:require [clojure.test :refer [deftest is]]
+            [datalevin.binding.cpp :as cpp]
             [datalevin.core :as d]
             [datalevin.constants :as c]
             [datalevin.interface :as i]
+            [datalevin.index :as idx]
+            [datalevin.kv :as kv]
             [datalevin.db.tx.common :as txcommon]
             [datalevin.lmdb :as l]
             [datalevin.storage :as s]
@@ -51,6 +54,47 @@
       (finally (deliver release true)
                (doseq [job @jobs] (deref job 10000 nil))
                (unobserve)))))
+
+(deftest resolution-cursor-decodes-before-release-and-closes-on-commit-or-abort
+  (with-conn opts
+    (fn [conn _]
+      (d/update-schema conn {:text {:db/valueType :db.type/string}
+                             :absent {:db/valueType :db.type/string}})
+      (let [giant (apply str (repeat 2000 "shared-prefix-"))]
+        (d/transact! conn [{:db/id 1 :value 10 :text "shared-prefix-small"}
+                          {:db/id 2 :value 20 :text giant}])
+        (let [raw (kv/raw-lmdb (d/datalog-kv conn))
+              schema (d/schema conn)
+              aid #(get-in schema [% :db/aid])]
+          (doseq [abort? [false true]]
+            (let [cursor (atom nil)
+                  owner (atom nil)
+                  run! #(cpp/apply-native-once!
+                          raw
+                          (fn [view]
+                            (let [rtx @(l/write-txn view)
+                                  dbi (i/get-dbi view c/eav false)
+                                  read! (fn [e a]
+                                          (cpp/read-resolution-value
+                                            view view e (aid a) idx/avg-buffer->v))]
+                              (reset! owner rtx)
+                              (is (= "shared-prefix-small" (read! 1 :text)))
+                              (reset! cursor (cpp/resolution-cursor! rtx dbi))
+                              (is (= giant (read! 2 :text)))
+                              (is (= 10 (read! 1 :value)))
+                              (is (nil? (read! 1 :absent)))
+                              (is (nil? (read! 999 :value)))
+                              (is (= "shared-prefix-small" (read! 1 :text)))
+                              (is (identical? @cursor (cpp/resolution-cursor! rtx dbi)))
+                              (when abort? (throw (ex-info "abort lookup" {})))))
+                          nil)]
+              (if abort?
+                (is (thrown-with-msg? Exception #"abort lookup" (run!)))
+                (run!))
+              (let [field (.getDeclaredField datalevin.binding.cpp.Rtx
+                                              "resolution_cursor")]
+                (.setAccessible field true)
+                (is (nil? (.get field @owner)))))))))))
 
 (deftest resolved-members-reuse-callbacks-across-a-generic-body
   (with-conn

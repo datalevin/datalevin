@@ -339,62 +339,70 @@
       fun)))
 
 (defn -call-fn
-  [context rel f args]
-  (validate-server-safe-apply! f args)
-  (let [sources              (:sources context)
-        attrs                (:attrs rel)
-        len                  (count args)
-        ^objects static-args (make-array Object len)
-        ^objects tuples-args (make-array Object len)
-        call                 (make-call (resolve-pred f context))]
-    (dotimes [i len]
-      (let [arg (nth args i)]
-        (cond
-          (symbol? arg)
-          (if-some [source (get sources arg)]
-            (aset static-args i source)
-            (if-some [fn-val (or (resolve-built-in-query-fn arg)
-                                 (when-not (server-safe-resolver?)
-                                   (resolve-sym arg)))]
-              (aset static-args i fn-val)
-              (if (contains? attrs arg)
-                (aset tuples-args i (get attrs arg))
-                (when (server-safe-resolver?)
-                  (disallowed-server-query-function! arg)))))
+  ([context rel f args]
+   (-call-fn context rel f args nil))
+  ([context rel f args needed]
+   (validate-server-safe-apply! f args)
+   (let [sources              (:sources context)
+         attrs                (:attrs rel)
+         len                  (count args)
+         ^objects static-args (make-array Object len)
+         ^objects tuples-args (make-array Object len)
+         invoke               (make-call (resolve-pred f context))
+         ;; Projection metadata belongs on resolved values, not query symbols
+         ;; or nested expressions whose evaluation would discard it.
+         call                 (if needed
+                                #(invoke (object-array
+                                           (attach-needed-meta % needed)))
+                                invoke)]
+     (dotimes [i len]
+       (let [arg (nth args i)]
+         (cond
+           (symbol? arg)
+           (if-some [source (get sources arg)]
+             (aset static-args i source)
+             (if-some [fn-val (or (resolve-built-in-query-fn arg)
+                                  (when-not (server-safe-resolver?)
+                                    (resolve-sym arg)))]
+               (aset static-args i fn-val)
+               (if (contains? attrs arg)
+                 (aset tuples-args i (get attrs arg))
+                 (when (server-safe-resolver?)
+                   (disallowed-server-query-function! arg)))))
 
-          (list? arg)
-          (aset tuples-args i (-call-fn context rel (first arg) (rest arg)))
+           (list? arg)
+           (aset tuples-args i (-call-fn context rel (first arg) (rest arg)))
 
-          :else
-          (aset static-args i arg))))
-    (let [tuple-bindings
-          (into []
-                (keep-indexed
-                  (fn [i tuple-arg]
-                    (when (and (some? tuple-arg) (not (fn? tuple-arg)))
-                      [i tuple-arg])))
-                tuples-args)
-          nested-bindings
-          (into []
-                (keep-indexed
-                  (fn [i tuple-arg]
-                    (when (fn? tuple-arg) [i tuple-arg])))
-                tuples-args)
-          ^ints tuple-positions (int-array (map first tuple-bindings))
-          ^ints tuple-indexes   (int-array (map (comp int second)
-                                                tuple-bindings))
-          ^ints nested-positions (int-array (map first nested-bindings))
-          ^objects nested-fns    (object-array (map second nested-bindings))
-          tuple-count            (alength tuple-positions)
-          nested-count           (alength nested-positions)]
-      (fn [^objects tuple]
-        (dotimes [i tuple-count]
-          (aset static-args (aget tuple-positions i)
-                (aget tuple (aget tuple-indexes i))))
-        (dotimes [i nested-count]
-          (aset static-args (aget nested-positions i)
-                ((aget nested-fns i) tuple)))
-        (call static-args)))))
+           :else
+           (aset static-args i arg))))
+     (let [tuple-bindings
+           (into []
+                 (keep-indexed
+                   (fn [i tuple-arg]
+                     (when (and (some? tuple-arg) (not (fn? tuple-arg)))
+                       [i tuple-arg])))
+                 tuples-args)
+           nested-bindings
+           (into []
+                 (keep-indexed
+                   (fn [i tuple-arg]
+                     (when (fn? tuple-arg) [i tuple-arg])))
+                 tuples-args)
+           ^ints tuple-positions (int-array (map first tuple-bindings))
+           ^ints tuple-indexes   (int-array (map (comp int second)
+                                                 tuple-bindings))
+           ^ints nested-positions (int-array (map first nested-bindings))
+           ^objects nested-fns    (object-array (map second nested-bindings))
+           tuple-count            (alength tuple-positions)
+           nested-count           (alength nested-positions)]
+       (fn [^objects tuple]
+         (dotimes [i tuple-count]
+           (aset static-args (aget tuple-positions i)
+                 (aget tuple (aget tuple-indexes i))))
+         (dotimes [i nested-count]
+           (aset static-args (aget nested-positions i)
+                 ((aget nested-fns i) tuple)))
+         (call static-args))))))
 
 (defn filter-by-pred
   [context clause]
@@ -463,9 +471,6 @@
         needed               (when (and projection
                                         (contains? tuple-producing-fns f))
                                (:needed projection))
-        args'                (if needed
-                               (attach-needed-meta args needed)
-                               args)
         attrs                (qu/collect-fn-arg-vars args)
         [context production] (rel-prod-by-attrs context attrs)
         out-var              (when (instance? BindScalar binding)
@@ -473,7 +478,7 @@
         out-idx              (when out-var (get (:attrs production) out-var))
         new-rel
         (if out-idx
-          (let [tuple-fn (-call-fn context production f args')]
+          (let [tuple-fn (-call-fn context production f args needed)]
             (clojure.core/update
               production :tuples
               #(r/select-tuples
@@ -482,7 +487,7 @@
                      (and (not (nil? val))
                           (= (aget tuple (int out-idx)) val))))
                  %)))
-          (let [tuple-fn (-call-fn context production f args')]
+          (let [tuple-fn (-call-fn context production f args needed)]
             (if (instance? BindScalar binding)
               (bind-scalar-tuples production out-var tuple-fn)
               (if flat-tuple-projection

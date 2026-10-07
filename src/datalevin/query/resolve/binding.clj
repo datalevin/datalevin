@@ -69,7 +69,7 @@
             (r/relation! attrs res)))))))
 
 (defn attach-needed-meta
-  "Attach :tuple-needed metadata to the last argument or append a metadata map.
+  "Attach :tuple-needed metadata to resolved arguments, or append a metadata map.
    Returns the modified args vector."
   [args ^ints needed]
   (let [v        (vec args)
@@ -84,7 +84,8 @@
       (assoc v (dec n) meta-map)
 
       (instance? clojure.lang.IObj last-arg)
-      (assoc v (dec n) (with-meta last-arg {:tuple-needed needed}))
+      (assoc v (dec n) (with-meta last-arg
+                        (assoc (meta last-arg) :tuple-needed needed)))
 
       :else
       (conj v meta-map))))
