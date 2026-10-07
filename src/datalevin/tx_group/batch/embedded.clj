@@ -142,6 +142,7 @@
                             :shared-datalog-writer? (:datalog? hooks)
                             :finish-preparation! (:finish-preparation! hooks)
                             :storage-rows! (:storage-rows! hooks)
+                            :storage-tail! (:storage-tail! hooks)
                             :before-body! (:before-body! hooks)
                             :ensure-body-ready! (fn [wdb]
                                                   (kv/ensure-txlog-ready! wdb false)

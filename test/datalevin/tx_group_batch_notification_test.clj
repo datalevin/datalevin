@@ -3,15 +3,13 @@
             [datalevin.tx-group.batch :as batch]
             [datalevin.tx-group.phase :as phase])
   (:import [java.util.concurrent CountDownLatch TimeUnit]
-           [java.util.concurrent.atomic AtomicBoolean AtomicLong]
+           [java.util.concurrent.atomic AtomicInteger]
            [java.util.concurrent.locks LockSupport]))
 
 (defn descriptor [thread]
   (batch/->Descriptor nil (volatile! :value) nil 1024 0
-                      (AtomicLong. 1024) (AtomicBoolean. false)
-                      (volatile! nil) thread
-                      (AtomicBoolean. false) (AtomicBoolean. false)
-                      (AtomicBoolean. false) (AtomicBoolean. false)))
+                      1024 (AtomicInteger. 0)
+                      (volatile! nil) thread))
 
 (deftest retained-predicates-survive-a-consumed-thread-permit
   (doseq [outcome [:result :leadership]]

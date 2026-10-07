@@ -15,9 +15,10 @@
             [datalevin.tx-group.phase :as phase])
   (:import [datalevin.cpp Util$DTLVException]
            [datalevin.lmdb DatomKVTxData KVTxData]
-           [datalevin.utl RowRegions]
+           [datalevin.utl DeferredRows RowRegions]
            [java.io IOException]
-           [java.util ArrayList Arrays List]))
+           [java.util ArrayList Arrays List]
+           [java.util.function Supplier]))
 
 (defn clean-body-failure? [^Throwable t]
   (or (and (l/explicit-transaction-timeout-error? t)
@@ -53,11 +54,18 @@
 
 (defn- capture-prepared!
   "Append storage owned by this native batch, including a late storage drain."
-  [wdb apply-rows! rows wal-rows {:keys [defer-rows!]} prepared]
+  [wdb apply-rows! rows wal-rows
+   {:keys [defer-rows! capture-context capture-batch]} prepared]
   (.append ^RowRegions rows (:rows prepared))
   (.append ^RowRegions wal-rows (:wal-rows prepared))
-  (when-not (and defer-rows! (defer-rows! wdb prepared))
-    (apply-rows! (:rows prepared))))
+  (let [context (or capture-context (l/request-context wdb))
+        deferred? (boolean (and defer-rows! (defer-rows! wdb prepared context)))]
+    (phase/phase! (if deferred? :native-capture-deferred :native-capture-eager)
+                  {:batch capture-batch :rows (count (:rows prepared))
+                   :storage-tail? (boolean (:storage-tail? prepared))
+                   :preparing? (boolean (:datalog-prepare? context))
+                   :raw? (boolean l/*raw-kv?*)})
+    (when-not deferred? (apply-rows! (:rows prepared)))))
 
 (defn- capture!
   "Freeze writes in the batch transaction, deferring eligible native tails.
@@ -162,6 +170,10 @@
   "Internal comparison switch for member-setup allocation measurements."
   true)
 
+(def ^:dynamic *defer-storage-encoding?*
+  "Internal comparison switch for the final storage drain."
+  true)
+
 (defn- member-carriers!
   "Allocate owned row regions only when this member captures physical rows."
   [^objects state]
@@ -208,7 +220,7 @@
              ;; A later drain can attach rows to an expired member. Carry its
              ;; identity, rather than allocating two empty row lists now.
              (vreset! (:storage-target opts)
-                      [wdb (aget state 0) nil nil state])))
+                      [wdb (aget state 0) nil nil state (l/request-context wdb)])))
          :native-prepare-flush!
          (when-let [flush! (:preparation-flush! opts)]
            (fn []
@@ -257,7 +269,7 @@
     ;; rather than allocating another native-view metadata map.
     (let [updated (if (identical? (:native-row-capture metadata)
                                  (:native-row-capture callbacks))
-                    metadata (merge metadata callbacks))]
+                    metadata (merge (dissoc metadata :request-context) callbacks))]
       (when-not (identical? updated (meta view))
         (let [_ (with-meta view updated)] nil)))
     (when-let [active (:active-view opts)] (vreset! active view))
@@ -267,8 +279,7 @@
             wal-rows (or (aget state 2) [])
             staged? (boolean (some-> (:storage-staged? opts) deref))]
         (batch/set-data! descriptor
-                         {:rows rows :wal-rows wal-rows :wal-body nil
-                          :result result :storage-staged? staged?})
+                         (batch/datalog-member-data rows wal-rows result staged?))
         (if (or (seq rows) staged?) 1 0))
       (finally
         (vreset! valid? false)
@@ -277,8 +288,7 @@
         (aset state 1 nil)
         (aset state 2 nil)
         (aset state 3 nil)
-        ;; Storage drain retains the last resolver's preparation mode after its
-        ;; capture expires, just as native metadata did before scope reuse.
+        (aset state 4 nil)
         (when-let [active (:active-view opts)] (vreset! active nil))))))
 
 (defn- run-member!
@@ -317,7 +327,8 @@
                                  (fn []
                                    (vreset! staged? true)
                                    (vreset! (:storage-target opts)
-                                            [wdb descriptor rows wal-rows])))
+                                            [wdb descriptor rows wal-rows nil
+                                             (l/request-context wdb)])))
                                :native-prepare-flush! (:preparation-flush! opts)
                                :native-batch-abort! abort!
                                :native-transaction-failed! (fn [t]
@@ -344,6 +355,7 @@
                              {:rows rows :wal-body wal-body :result result}))
           (if (and (.isEmpty rows) (not (some-> (:storage-staged? opts) deref))) 0 1))
       (finally (vreset! valid? false)
+               (let [_ (with-meta wdb (dissoc (meta wdb) :request-context))] nil)
                (when-let [view (:active-view opts)] (vreset! view nil))))))
 
 (defn- encode-members!
@@ -361,10 +373,12 @@
         (when-let [body (:wal-body data)]
           (flush!)
           (.add parts body)
-          (batch/set-data! d (assoc data :wal-body nil)))
+          (batch/set-data! d (batch/with-data-wal-body! data nil)))
         (when-let [wal-rows (:wal-rows data)]
           (.append ^RowRegions @rows wal-rows))))
-    (flush!)
+    ;; The final region needs no replacement accumulator.
+    (when-not (.isEmpty ^RowRegions @rows)
+      (.add parts @rows))
     (when-not (.isEmpty parts) (wal/prepare-body parts encode-body defer?))))
 
 (defn execute!
@@ -380,8 +394,9 @@
      raw
      (fn [wdb]
        (let [active-view (volatile! nil)
+             dispatched? (volatile! false)
              ready? (volatile! false)
-             opts (cond-> (assoc opts :active-view active-view)
+             opts (cond-> (assoc opts :active-view active-view :capture-batch batch)
                     (:shared-datalog-writer? opts) (assoc :datalog-view (volatile! nil)))
              history (when (:retry-frozen? opts) (ArrayList.))
              native-apply! (volatile! (cpp/prepared-row-applier wdb))
@@ -404,7 +419,10 @@
                                    (do (phase/phase! :native-resized batch)
                                        (refresh!) (recur true))
                                    (if-let [on-error! (:application-error! opts)]
-                                     (on-error! failure) (throw failure)))))))
+                                     (on-error! failure) (throw failure))))))
+                           (phase/phase! (if @dispatched?
+                                           :native-rows-tail :native-rows-prefix)
+                                         {:batch batch :rows (count rows)}))
              tail (volatile! nil)
              storage-target (volatile! nil)
              storage-staged? (volatile! false)
@@ -415,7 +433,7 @@
                  (when-let [take-rows! (:storage-rows! opts)]
                    (phase/phase! :storage-encode-start batch)
                    (when-let [txs (take-rows!)]
-                     (let [[view descriptor rows wal-rows state] @storage-target
+                     (let [[view descriptor rows wal-rows state context] @storage-target
                            ;; A trusted resolver can stage storage without
                            ;; allocating carriers. Materialize them at the drain,
                            ;; either in its active scope or its retained data.
@@ -429,15 +447,16 @@
                            wal-rows (if (instance? RowRegions wal-rows) wal-rows (RowRegions.))]
                        (when (and state (not active?))
                          (batch/set-data! descriptor
-                                          (assoc (batch/data descriptor)
-                                                 :rows rows :wal-rows wal-rows)))
+                                          (batch/with-data-rows! (batch/data descriptor)
+                                                             rows wal-rows)))
                        ;; The batch owns these carriers after the request view
                        ;; expires. Never re-enter that request's capture.
                        (l/write-txn view)
                        (let [prepared ((:prepare-rows! opts) raw descriptor nil txs
                                        :data :data)]
                          (capture-prepared! view apply-rows! rows wal-rows
-                                            @storage-opts prepared))))
+                                            (assoc @storage-opts :capture-context context)
+                                            prepared))))
                    (phase/phase! :storage-encode-complete batch))
                  (catch Throwable t
                    (let [failure-error
@@ -459,24 +478,57 @@
                                   (catch Throwable t
                                     (when-not @failure (vreset! failure t))
                                     (throw t)))))
+             freeze-storage!
+             (fn []
+               (let [[view descriptor rows wal-rows _ context] @storage-target]
+                 (if (and *defer-storage-encoding?* wal (:shared-datalog-writer? opts)
+                          (:storage-tail! opts) (:datalog-prepare? context))
+                   (when-let [plan ((:storage-tail! opts))]
+                     (let [region (DeferredRows.
+                                    (int (:row-count plan))
+                                    (reify Supplier
+                                      (get [_]
+                                        (phase/phase! :storage-encode-start batch)
+                                        (let [rows ((:encode plan))]
+                                          (phase/phase! :storage-encode-complete batch)
+                                          rows))))
+                           rows (or rows (:rows (batch/data descriptor)))
+                           wal-rows (or wal-rows (:wal-rows (batch/data descriptor)))
+                           rows (if (instance? RowRegions rows) rows (RowRegions.))
+                           wal-rows (if (instance? RowRegions wal-rows) wal-rows (RowRegions.))]
+                       (batch/set-data! descriptor
+                                        (batch/with-data-rows!
+                                          (batch/data descriptor) rows wal-rows))
+                       (capture-prepared!
+                         view apply-rows! rows wal-rows
+                         (assoc @storage-opts :capture-context context)
+                         {:rows region :wal-rows region :storage-tail? true
+                          :unconditional-datoms? true
+                          :native-tail-bytes (:native-tail-bytes plan)})
+                       (phase/phase! :storage-tail-frozen batch)))
+                   (flush-storage!))))
              opts (cond-> opts
                     (and wal (:shared-datalog-writer? opts))
                     (assoc :defer-rows!
-                           (fn [view prepared]
-                             (let [preparing? (:datalog-prepare? (l/request-context view))
+                           (fn [view prepared context]
+                             (let [preparing? (:datalog-prepare? context)
                                    ;; Custom payload/index operations allocate IDs
                                    ;; and resolve values through native reads.
                                    ;; Their raw write scope must stay eager.
                                    eligible? (and preparing? (not l/*raw-kv?*)
-                                                  (not-any? #(if (instance? KVTxData %)
-                                                               (seq (.-flags ^KVTxData %))
-                                                               (.-no-overwrite? ^DatomKVTxData %))
-                                                            (:rows prepared)))]
+                                                  (or (:unconditional-datoms? prepared)
+                                                      (not-any?
+                                                        #(if (instance? KVTxData %)
+                                                           (seq (.-flags ^KVTxData %))
+                                                           (.-no-overwrite? ^DatomKVTxData %))
+                                                        (:rows prepared))))]
                                (cond
                                  eligible?
                                  (let [rows (or (:rows @tail) (RowRegions.))]
                                    (.append ^RowRegions rows (:rows prepared))
                                    (vreset! tail {:rows rows :view view :prepared? true
+                                                  :storage-tail? (or (:storage-tail? @tail)
+                                                                     (:storage-tail? prepared))
                                                   :large? (or (:large? @tail)
                                                               (> (long (:native-tail-bytes prepared 0)) 4096))})
                                    true)
@@ -599,7 +651,7 @@
                                    (if (seq (:rows (batch/data (batch/batch-at batch idx)))) 1 0)))
                               weight (range end next-end)) end]
                      :else (recur end next-end (long weight))))))
-             _ (flush-storage!)
+             _ (freeze-storage!)
              extra (when-let [finish! (:finish-preparation! opts)]
                        (finish! wdb batch))
                last-member (when (seq extra)
@@ -608,15 +660,22 @@
                extra (when (seq extra)
                        ((:prepare-rows! opts) raw last-member nil extra :data :data))
                suffix-start (if extra
-                              (do
+                              (let [pending @tail]
                                 ;; The trailer follows every request, including
                                 ;; prepared KV callers sharing this environment.
-                                (when (< suffix-start (batch/batch-count batch)) (flush-tail!))
-                                (doseq [idx (range suffix-start (batch/batch-count batch))]
-                                  (apply-rows! (:rows (batch/data (batch/batch-at batch idx)))))
+                                ;; A frozen suffix has no resolver reads. Attach
+                                ;; it in order instead of draining the tail just
+                                ;; to place the metadata after it.
+                                (when (< suffix-start (batch/batch-count batch))
+                                  (let [rows (RowRegions.)]
+                                    (when pending (.append rows (:rows pending)))
+                                    (doseq [idx (range suffix-start (batch/batch-count batch))]
+                                      (.append rows (:rows (batch/data (batch/batch-at batch idx)))))
+                                    (vreset! tail (assoc (or pending {:view wdb :prepared? true})
+                                                       :rows rows))))
                                 (long (batch/batch-count batch)))
                               suffix-start)
-               weight (if (and extra (empty? (:rows previous))) (inc weight) weight)]
+               weight (if (and extra (zero? (count (:rows previous)))) (inc weight) weight)]
            (when extra
              (if-let [pending @tail]
                (let [rows (RowRegions.)]
@@ -639,7 +698,7 @@
                                     (when-let [before (:wal-rows previous)]
                                       (.append wal-rows before))
                                     (.append wal-rows (:wal-rows extra))
-                                    (assoc previous :rows rows :wal-rows wal-rows))
+                                    (batch/with-data-rows! previous rows wal-rows))
                                   (assoc previous :rows rows
                                          :wal-body (codec/combine-commit-row-payloads bodies))))))
          (batch/set-accepted-count!
@@ -647,10 +706,10 @@
            (if (:encode-batch? opts)
              (if-let [body (encode-members!
                             batch (:encode-body opts)
-                            (or (> weight 1) (:large? @tail)
+                            (or (:storage-tail? @tail) (> weight 1) (:large? @tail)
                                 (and @tail (> (.size ^List (:rows @tail)) 256))))]
                (let [d (batch/batch-at batch (dec (batch/batch-count batch)))]
-                 (batch/set-data! d (assoc (batch/data d) :wal-body body))
+                 (batch/set-data! d (batch/with-data-wal-body! (batch/data d) body))
                  1)
                0)
              weight))
@@ -681,6 +740,8 @@
          (when check-batch! (check-batch! batch))
          (when-let [before! (:before-append! opts)] (before! batch))
          (batch/begin-dispatch! batch)
+         (vreset! dispatched? true)
+         (phase/phase! :native-dispatch-start batch)
          (let [apply-suffix! (fn []
                                (flush-tail!)
                                (loop [idx (long suffix-start)]

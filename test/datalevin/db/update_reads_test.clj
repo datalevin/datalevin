@@ -39,6 +39,72 @@
   (assoc (zipmap fields (repeat "new")) :item/key key
          (fields 0) "old" (fields 1) true))
 
+(deftest scalar-stamping-reuses-only-scratch-storage
+  (doseq [wal? [false true]]
+    (with-conn [conn wal?]
+      (d/transact! conn [(initial-entity "existing") (initial-entity "other")])
+      (let [eid (d/entid @conn [:item/key "existing"])
+            other (d/entid @conn [:item/key "other"])
+            buffer (object-array 32)
+            busy? (volatile! false)
+            context (reify txcommon/ScalarDatomBuffer
+                      (acquire-scalar-datom-buffer! [_ _]
+                        (when-not @busy? (vreset! busy? true) buffer))
+                      (release-scalar-datom-buffer! [_ _]
+                        (vreset! busy? false)))
+            stamp (fn [operations specialized?]
+                    (binding [db/*specialize-scalar-stamping?* specialized?
+                              txcommon/*batch-prepare* context]
+                      (db/stamp-scalar-update-tx
+                        @conn (assoc (db/prepare-scalar-update-tx @conn operations)
+                                     :entity-reads nil)
+                        {:test true})))
+            operations (into (mapv #(vector :db/add eid % ((update-entity "existing") %))
+                                  fields)
+                             (map #(vector :db/add other % ((update-entity "other") %))
+                                  (take 7 fields)))
+            first-report (stamp (subvec operations 0 10) true)
+            first-rows (datoms first-report)]
+        (doseq [width [1 2 4 7 10 16 17]]
+          (let [tx (subvec operations 0 width)
+                optimized (stamp tx true)
+                baseline (stamp tx false)]
+            (is (= (datoms baseline) (datoms optimized)))
+            (is (= (:tempids baseline) (:tempids optimized)))
+            (is (= (:db-after baseline) (:db-after optimized)))
+            (is (= {:test true} (:tx-meta optimized)))
+            (is (identical? @conn (:db-before optimized)))
+            (is (= first-rows (datoms first-report)))
+            (is (every? nil? buffer))
+            (is (false? @busy?))))
+        (testing "no-op rows and nested stamps cannot share a leased buffer"
+          (is (empty? (:tx-data (stamp [[:db/add eid (fields 1) false]] true))))
+          (vreset! busy? true)
+          (is (= first-rows (datoms (stamp (subvec operations 0 10) true))))
+          (is @busy?)
+          (vreset! busy? false))
+        (testing "read failure clears references and releases the lease"
+          (let [store (:store @conn)
+                calls (atom 0)
+                failed-store (reify i/IStore
+                               (schema [_] (i/schema store))
+                               (opts [_] (i/opts store))
+                               (ea-first-v [_ e attr]
+                                 (if (= 2 (swap! calls inc))
+                                   (throw (ex-info "injected" {}))
+                                   (i/ea-first-v store e attr))))]
+            (is (thrown-with-msg?
+                  clojure.lang.ExceptionInfo #"injected"
+                  (binding [txcommon/*batch-prepare* context]
+                    (db/stamp-scalar-update-tx
+                      (assoc @conn :store failed-store)
+                      (assoc (db/prepare-scalar-update-tx @conn (subvec operations 0 10))
+                             :entity-reads nil)
+                      nil))))
+            (is (every? nil? buffer))
+            (is (false? @busy?))
+            (is (= first-rows (datoms (stamp (subvec operations 0 10) true))))))))))
+
 (deftest selective-upsert-reads-preserve-point-read-results
   (doseq [wal? [false true]]
     (with-conn [conn wal?]

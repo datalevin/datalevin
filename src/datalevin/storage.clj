@@ -272,7 +272,7 @@
 
 (deftype ^:no-doc WriteGroup
   [lmdb owner ^longs metadata ^FastList datoms ^objects attr-cache
-   ^FastList storage-datoms ^objects storage-context])
+   ^FastList storage-datoms ^objects storage-context ^LongObjectHashMap scalar-pending])
 
 (def ^:dynamic *write-group* nil)
 
@@ -291,7 +291,7 @@
   [lmdb]
   {:pre [(lmdb/writing? lmdb)]}
   (WriteGroup. lmdb (Thread/currentThread) (long-array [-1 0]) (FastList.)
-               (object-array 2) (FastList.) (object-array 1)))
+               (object-array 2) (FastList.) (object-array 2) (LongObjectHashMap. 8)))
 
 (defn ^:no-doc write-group-metadata
   "Return the final metadata pair for a native writing group."
@@ -2187,8 +2187,8 @@
   (when-let [^WriteGroup group (current-write-group (.-lmdb store))]
     (let [native (kv/raw-lmdb (.-lmdb store))
           store-schema (schema store)
-          ^FastList pending (.-storage-datoms group)
-          ^objects context (.-storage-context group)]
+          ^objects context (.-storage-context group)
+          ^FastList pending (or (aget context 1) (.-storage-datoms group))]
       (when (and (:datalog-prepare? (lmdb/request-context native))
                  (not lmdb/*raw-kv?*)
                  (not *enforce-blind-unique-inserts?*)
@@ -2235,8 +2235,8 @@
 (defn ^:no-doc take-group-storage-rows!
   "Encode and detach the group's pending datoms without advancing metadata again."
   [^WriteGroup group]
-  (let [^FastList datoms (.-storage-datoms group)
-        ^objects context (.-storage-context group)]
+  (let [^objects context (.-storage-context group)
+        ^FastList datoms (or (aget context 1) (.-storage-datoms group))]
     (when-not (.isEmpty datoms)
       (let [store (aget context 0)
             _ (when (seq (:db/noindex (rschema store))) (ensure-current! store))
@@ -2244,6 +2244,29 @@
         (.clear datoms)
         (aset context 0 nil)
         rows))))
+
+(defn ^:no-doc freeze-group-storage-datoms!
+  "Detach bounded ordinary datoms for encoding after dispatch. Schema refresh
+  stays on the native owner; the returned encoder uses immutable metadata only."
+  [^WriteGroup group]
+  (let [^objects context (.-storage-context group)
+        ^FastList datoms (or (aget context 1) (.-storage-datoms group))]
+    (when-not (.isEmpty datoms)
+      (let [store (aget context 0)
+            _ (when (seq (:db/noindex (rschema store))) (ensure-current! store))
+            store-schema (schema store)
+            ;; This is a scheduling bound, not a charge or serialized length.
+            bytes (reduce (fn [total ^Datom datom]
+                            (let [v (.-v datom)]
+                              (+ (long total) 32
+                                 (if (string? v) (* 4 (count v)) 0))))
+                          0 datoms)]
+        ;; The old region belongs exclusively to the frozen plan. Any later
+        ;; staging gets a fresh region, including an unexpected read boundary.
+        (aset context 1 (FastList. 0))
+        (aset context 0 nil)
+        {:row-count (.size datoms) :native-tail-bytes bytes
+         :encode (fn [] (encode-group-storage-datoms store-schema datoms))}))))
 
 (defn load-datoms-with-plan!
   ([^Store store datoms embedding-plan]

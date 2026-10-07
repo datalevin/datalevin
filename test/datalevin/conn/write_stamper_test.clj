@@ -10,6 +10,7 @@
    [datalevin.datom :as datom]
    [datalevin.interface :as i]
    [datalevin.lmdb :as l]
+   [datalevin.prepare :as prepare]
    [datalevin.test.core :refer [db-fixture]]
    [datalevin.tx-group.batch :as batch]
    [datalevin.tx-group.phase :as phase]
@@ -33,6 +34,51 @@
 (defn- report-data [report]
   {:datoms (mapv (juxt :e :a :v :tx datom/datom-added) (:tx-data report))
    :tempids (:tempids report) :tx-meta (:tx-meta report)})
+
+(defn- correction-outcome [f]
+  (try
+    (let [v (f)] [:value (if (bytes? v) (vec v) v)])
+    (catch Exception e [:error (class e) (ex-message e) (ex-data e)])))
+
+(deftest scalar-preparation-preserves-built-in-validation-and-coercion
+  (let [cases {:db.type/long [1 (int 2) 3.5 "bad"]
+               :db.type/string ["text" :text 42]
+               :db.type/keyword [:text "text" 42]
+               :db.type/symbol ['text "text" 42]
+               :db.type/float [(float 1) 2.5 "bad"]
+               :db.type/double [1.0 (float 2) "bad"]
+               :db.type/boolean [false true 0 :text]
+               :db.type/instant [(java.util.Date. 123) (java.time.Instant/ofEpochMilli 456)
+                                 789 "bad"]
+               :db.type/uuid [(random-uuid) "123e4567-e89b-12d3-a456-426614174000" "bad"]
+               :db.type/bytes [(byte-array [1 2]) [3 4] "bad"]
+               :db.type/bigint [1N (biginteger 2) "123" "bad"]
+               :db.type/bigdec [1M 2 "123.5" "bad"]
+               nil [false [] {:key "value"}]}
+        schema (into {:seed {:db/valueType :db.type/long}}
+                     (map (fn [[vt _]] [(keyword "scalar" (if vt (name vt) "untyped"))
+                                       (if vt {:db/valueType vt} {})])) cases)]
+    (doseq [validate? [false true]]
+      (with-conn [conn [schema {:wal? true :validate-data? validate?}]]
+        (d/transact! conn [{:db/id 1 :seed 0}])
+        (doseq [[vt values] cases
+                :let [attr (keyword "scalar" (if vt (name vt) "untyped"))
+                      props ((d/schema conn) attr)]
+                value values]
+          (is (= (correction-outcome #(prepare/correct-value-with-props
+                                       {:validate-data? validate?} props attr value))
+                 (correction-outcome #(let [prepared (db/prepare-scalar-update-tx
+                                                      @conn [[:db/add 1 attr value]])]
+                                        (assert (some? prepared))
+                                        (nth (first (:entries prepared)) 2))))
+              (str "type=" vt " validation=" validate? " value=" (pr-str value))))
+        (is (nil? (db/prepare-scalar-update-tx @conn [[:db/add 1 :seed nil]])))
+        (is (nil? (db/prepare-scalar-update-tx @conn [[:db/add 1 "seed" 1]])))
+        (is (thrown-with-msg? Exception #"Cannot store nil"
+                             (d/transact! conn [[:db/add 1 :seed nil]])))
+        (is (thrown-with-msg? Exception #"Bad entity attribute"
+                             (d/transact! conn [[:db/add 1 "seed" 1]])))
+        (is (= 0 (:seed (d/entity @conn 1))))))))
 
 (defn- general-transact [db tx-data tx-meta]
   (#'conn/with-isolated-tx-cache db tx-data tx-meta false))

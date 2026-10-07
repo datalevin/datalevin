@@ -22,7 +22,7 @@
   (:import [datalevin.utl PendingBudget PendingBudget$Usage]
            [java.util.concurrent ConcurrentLinkedQueue TimeUnit]
            [java.util.concurrent.atomic AtomicBoolean AtomicInteger AtomicLong
-            AtomicLongArray]
+            AtomicLongArray AtomicLongFieldUpdater]
            [java.util.concurrent.locks Condition LockSupport ReentrantLock]
            [java.util.function LongBinaryOperator]
            [org.eclipse.collections.impl.list.mutable FastList]))
@@ -31,6 +31,10 @@
   "Joined-prefix advance is monotonic and allocates nothing per batch."
   (reify LongBinaryOperator
     (applyAsLong [_ a b] (if (> a b) a b))))
+
+(definterface ^:private IDescriptorCharge
+  (^long chargedBytes [])
+  (^java.util.concurrent.atomic.AtomicLongFieldUpdater chargeUpdater []))
 
 (deftype Descriptor
   ;; One admitted request. Its result slot is completed exactly once, by
@@ -41,14 +45,38 @@
   [op data context
    ^long allowance
    ^long deadline-nanos
-   ^AtomicLong charged
-   ^AtomicBoolean selected?
+   ^:volatile-mutable ^long charged
+   ^AtomicInteger flags
    result
-   ^Thread waiter
-   ^AtomicBoolean delivered?
-   ^AtomicBoolean released?
-   ^AtomicBoolean caller-done?
-   ^AtomicBoolean batch-done?])
+   ^Thread waiter]
+  IDescriptorCharge
+  (chargedBytes [_] charged)
+  (chargeUpdater [this]
+    (AtomicLongFieldUpdater/newUpdater (class this) "charged")))
+
+(def ^:private ^AtomicLongFieldUpdater descriptor-charge-updater
+  ;; Construct inside Descriptor so the updater can access its mutable field.
+  (.chargeUpdater (Descriptor. nil nil nil 0 0 0 nil nil nil)))
+
+(def ^:private selected-bit 1)
+(def ^:private delivered-bit 2)
+(def ^:private released-bit 4)
+(def ^:private caller-done-bit 8)
+(def ^:private batch-done-bit 16)
+
+(defn- flag? [^Descriptor descriptor ^long bit]
+  (not (zero? (bit-and (.get ^AtomicInteger (.flags descriptor)) bit))))
+
+(defn- claim-flag!
+  "Set one monotonic lifecycle bit, preserving concurrent updates to other bits."
+  [^Descriptor descriptor ^long bit]
+  (let [^AtomicInteger flags (.flags descriptor)]
+    (loop []
+      (let [old (.get flags)]
+        (cond
+          (not (zero? (bit-and old bit))) false
+          (.compareAndSet flags old (int (bit-or old bit))) true
+          :else (recur))))))
 
 (definterface ^:private IBatchPreparation
   (^"[Ljava.lang.Object;" walBodies [])
@@ -198,6 +226,58 @@
   ^clojure.lang.IFn [^Descriptor descriptor]
   (.op descriptor))
 
+(definterface ^:private IDatalogMemberData
+  (^void setRows [rows walRows])
+  (^void setWalBody [body])
+  (^void setResult [value]))
+
+(deftype DatalogMemberData
+  [^:unsynchronized-mutable rows ^:unsynchronized-mutable wal-rows
+   ^:unsynchronized-mutable wal-body ^:unsynchronized-mutable result
+   ^boolean storage-staged?]
+  IDatalogMemberData
+  (setRows [_ native-rows encoded-rows]
+    (set! rows native-rows)
+    (set! wal-rows encoded-rows))
+  (setWalBody [_ body] (set! wal-body body))
+  (setResult [_ value] (set! result value))
+  clojure.lang.ILookup
+  (valAt [this key] (.valAt this key nil))
+  (valAt [_ key missing]
+    (case key
+      :rows rows
+      :wal-rows wal-rows
+      :wal-body wal-body
+      :result result
+      :storage-staged? storage-staged?
+      missing)))
+
+(defn datalog-member-data
+  "Compact retained resolver data. Each member owns its rows and result."
+  [rows wal-rows result staged?]
+  (DatalogMemberData. rows wal-rows nil result (boolean staged?)))
+
+(defn with-data-rows!
+  "Attach deferred rows before dispatch; preserve ordinary prepared maps."
+  [data rows wal-rows]
+  (if (instance? DatalogMemberData data)
+    (do (.setRows ^IDatalogMemberData data rows wal-rows) data)
+    (assoc data :rows rows :wal-rows wal-rows)))
+
+(defn with-data-wal-body!
+  "Install the frozen WAL body before dispatch."
+  [data body]
+  (if (instance? DatalogMemberData data)
+    (do (.setWalBody ^IDatalogMemberData data body) data)
+    (assoc data :wal-body body)))
+
+(defn with-data-result!
+  "Publish the readable result after both write branches finish."
+  [data value]
+  (if (instance? DatalogMemberData data)
+    (do (.setResult ^IDatalogMemberData data value) data)
+    (assoc data :result value)))
+
 (defn data
   "Caller-prepared payload owned by this descriptor."
   ^Object [^Descriptor descriptor]
@@ -206,7 +286,7 @@
 (defn set-data!
   "Install this descriptor's prepared payload.
 
-  Native body execution installs `{:rows rows :result result :wal-body body}`.
+  Native body execution installs prepared maps or compact Datalog member data.
   Only the elected leader touches descriptors before dispatch."
   [^Descriptor descriptor value]
   (vreset! (.data descriptor) value))
@@ -229,7 +309,7 @@
 (defn selected?
   "Whether this request has been selected into a batch."
   [^Descriptor descriptor]
-  (.get ^AtomicBoolean (.selected? descriptor)))
+  (flag? descriptor selected-bit))
 
 (defn batch-count
   "Sealed member count."
@@ -332,7 +412,7 @@
   "Publish one result slot. Exactly-once across every racing
   completion, cancellation and fence path."
   [^Descriptor descriptor value]
-  (when (.compareAndSet ^AtomicBoolean (.delivered? descriptor) false true)
+  (when (claim-flag! descriptor delivered-bit)
     (vreset! (.result descriptor) value)
     true))
 
@@ -617,9 +697,9 @@
   and unplanned growth do. A fully prepaid blind request rejects any growth."
   ^long [^Descriptor descriptor ^long extra]
   (let [allowance (long (.allowance descriptor))
-        ^AtomicLong charged ^AtomicLong (.charged descriptor)]
+        ^AtomicLongFieldUpdater charged descriptor-charge-updater]
     (loop []
-      (let [current (.get charged)]
+      (let [current (.get charged descriptor)]
         (when (or (neg? extra) (> extra (- allowance current)))
           (throw (not-committed "Request charge exceeds its allowance"
                                 {:error :txlog/pending-budget-exceeded
@@ -634,14 +714,14 @@
                                  :charged current
                                  :requested extra})))
         (let [next (+ current extra)]
-          (if (.compareAndSet charged current next)
+          (if (.compareAndSet charged descriptor current next)
             next
             (recur)))))))
 
 (defn charged
   "Cumulative charge, including the initial precharge."
   ^long [^Descriptor descriptor]
-  (.get ^AtomicLong (.charged descriptor)))
+  (.chargedBytes descriptor))
 
 ;; ---------------------------------------------------------------------------
 ;; Collector lifecycle
@@ -708,7 +788,7 @@
   Both the caller and the batch call the two-sided release paths, so the CAS on
   `released?` is the single gate that charges the budget exactly once."
   [^Collector collector ^Descriptor descriptor]
-  (when (.compareAndSet ^AtomicBoolean (.released? descriptor) false true)
+  (when (claim-flag! descriptor released-bit)
     (release-allowance! collector (.allowance descriptor))))
 
 (defn- admitted!
@@ -731,17 +811,17 @@
   directly; the recheck under collector coordination closes the window where the
   batch is about to seal it."
   [^Collector collector ^Descriptor descriptor]
-  (when (.compareAndSet ^AtomicBoolean (.caller-done? descriptor) false true)
-    (if (.get ^AtomicBoolean (.selected? descriptor))
+  (when (claim-flag! descriptor caller-done-bit)
+    (if (flag? descriptor selected-bit)
       ;; The batch co-owns a sealed request; it releases if it already finished.
-      (when (.get ^AtomicBoolean (.batch-done? descriptor))
+      (when (flag? descriptor batch-done-bit)
         (release-reservation! collector descriptor))
       (let [^ReentrantLock lock (.lock collector)]
         (.lock lock)
         (try
-          (if (.get ^AtomicBoolean (.selected? descriptor))
+          (if (flag? descriptor selected-bit)
             ;; Selection won the race; the batch now co-owns and finishes later.
-            (when (.get ^AtomicBoolean (.batch-done? descriptor))
+            (when (flag? descriptor batch-done-bit)
               (release-reservation! collector descriptor))
             (do
               (when (.remove ^ConcurrentLinkedQueue (.ready collector) descriptor)
@@ -889,7 +969,7 @@
               (try
                 (dotimes [_ taken]
                   (let [^Descriptor descriptor (.peek queue)]
-                    (.set ^AtomicBoolean (.selected? descriptor) true)
+                    (claim-flag! descriptor selected-bit)
                     (.poll queue)
                     (.decrementAndGet ^AtomicInteger (.queued collector))))
                 batch
@@ -941,7 +1021,7 @@
                 (do
                   ;; Descriptor capacity was allocated before any transfer.
                   (.add descriptors d)
-                  (.set ^AtomicBoolean (.selected? d) true)
+                  (claim-flag! d selected-bit)
                   (.remove it)
                   (.decrementAndGet ^AtomicInteger (.queued collector))
                   (.setReservedBytes batch next-bytes)
@@ -1254,9 +1334,9 @@
     (dotimes [idx (.size descriptors)]
       (let [^Descriptor descriptor (.get descriptors idx)]
         ;; The batch owns every descriptor selected before WAL dispatch.
-        (when (.get ^AtomicBoolean (.selected? descriptor))
-          (when (.compareAndSet ^AtomicBoolean (.batch-done? descriptor) false true)
-            (when (.get ^AtomicBoolean (.caller-done? descriptor))
+        (when (flag? descriptor selected-bit)
+          (when (claim-flag! descriptor batch-done-bit)
+            (when (flag? descriptor caller-done-bit)
               (release-reservation! collector descriptor)))))))
   nil)
 
@@ -1493,10 +1573,8 @@
     (let [^Descriptor descriptor
           (try
             (Descriptor. op (volatile! data) context allowance deadline
-                         (AtomicLong. (if op charge/request-control-bundle allowance))
-                         (AtomicBoolean. false) (volatile! nil) (Thread/currentThread)
-                         (AtomicBoolean. false) (AtomicBoolean. false)
-                         (AtomicBoolean. false) (AtomicBoolean. false))
+                         (if op charge/request-control-bundle allowance)
+                         (AtomicInteger. 0) (volatile! nil) (Thread/currentThread))
             (catch Throwable t
               (release-allowance! collector allowance)
               (throw t)))]

@@ -17,6 +17,7 @@
   (:import
    [datalevin.datom Datom]
    [java.util HashMap SortedSet]
+   [org.eclipse.collections.impl.map.mutable.primitive LongObjectHashMap]
    [org.eclipse.collections.impl.set.sorted.mutable TreeSortedSet]))
 
 (def ^:dynamic *batch-prepare* nil)
@@ -24,6 +25,24 @@
 (defprotocol BatchPreparation
   (flush-preparation! [context])
   (restore-preparation! [context db]))
+
+(defprotocol ScalarDatomBuffer
+  "Thread-confined batch scratch space. A failed lease uses request-local storage;
+  callers must clear the array and release it without publishing it."
+  (acquire-scalar-datom-buffer! [context capacity])
+  (release-scalar-datom-buffer! [context buffer]))
+
+(defprotocol ScalarPendingIndex
+  (pending-scalar-index [context])
+  (materialize-scalar-pending! [context db])
+  (discard-scalar-pending! [context]))
+
+(defn scalar-pending-index
+  "Return the owner's E/A index while preparation contains only scalar writes."
+  []
+  (let [context *batch-prepare*]
+    (when (instance? datalevin.db.tx.common.ScalarPendingIndex context)
+      (pending-scalar-index context))))
 
 (declare ref?)
 
@@ -38,18 +57,27 @@
 (defn stage-batch-datom!
   "Update the resolver's existing indexes with the latest pending E/A/V state."
   [db ^Datom datom]
-  (let [^TreeSortedSet eavt (:eavt db)
-        ^TreeSortedSet avet (:avet db)
-        ^SortedSet cached (.subSet eavt
-                                  (d/datom (.-e datom) (.-a datom) (.-v datom) tx0)
-                                  (d/datom (.-e datom) (.-a datom) (.-v datom) txmax))]
-    (while (not (.isEmpty cached))
-      (let [old (.first cached)] (.remove eavt old) (.remove avet old)))
-    ;; Keep the retraction bit: it masks an older native value until the
-    ;; frozen writes have been applied. One latest datom per E/A/V is enough.
-    (.add eavt datom)
-    (when-not (contains? (:db/noindex (rschema (:store db))) (.-a datom))
-      (.add avet datom))))
+  (if-let [^LongObjectHashMap pending (scalar-pending-index)]
+    ;; Scalar preparation has cardinality-one E/A keys. The latest datom,
+    ;; including a retraction, replaces its entire pending attribute state.
+    (let [e (.-e datom)
+          ^HashMap attrs (or (.get pending e)
+                             (let [attrs (HashMap. 4)]
+                               (.put pending e attrs)
+                               attrs))]
+      (.put attrs (.-a datom) datom))
+    (let [^TreeSortedSet eavt (:eavt db)
+          ^TreeSortedSet avet (:avet db)
+          ^SortedSet cached (.subSet eavt
+                                    (d/datom (.-e datom) (.-a datom) (.-v datom) tx0)
+                                    (d/datom (.-e datom) (.-a datom) (.-v datom) txmax))]
+      (while (not (.isEmpty cached))
+        (let [old (.first cached)] (.remove eavt old) (.remove avet old)))
+      ;; Keep the retraction bit: it masks an older native value until the
+      ;; frozen writes have been applied. One latest datom per E/A/V is enough.
+      (.add eavt datom)
+      (when-not (contains? (:db/noindex (rschema (:store db))) (.-a datom))
+        (.add avet datom)))))
 
 (defn- first-added-datom
   [^SortedSet datoms]
@@ -95,17 +123,21 @@
 (defn ea-first-v
   "Resolve the current entity/attribute value during write preparation."
   [db e a]
-  (if *batch-prepare*
-    (let [^SortedSet cached (.subSet ^TreeSortedSet (:eavt db)
-                                    (datom e a nil tx0) (datom e a nil txmax))]
-      (if (.isEmpty cached)
-        (i/ea-first-v (:store db) e a)
-        (if-let [^Datom pending (first-added-datom cached)]
-          (.-v pending)
-          (:v (first (visible-stored
-                       db (i/slice (:store db) :eav
-                                   (datom e a v0) (datom e a vmax))))))))
-    (i/ea-first-v (:store db) e a)))
+  (if-let [^LongObjectHashMap pending (scalar-pending-index)]
+    (if-let [^Datom datom (some-> ^HashMap (.get pending (long e)) (.get a))]
+      (when (d/datom-added datom) (.-v datom))
+      (i/ea-first-v (:store db) e a))
+    (if *batch-prepare*
+      (let [^SortedSet cached (.subSet ^TreeSortedSet (:eavt db)
+                                      (datom e a nil tx0) (datom e a nil txmax))]
+        (if (.isEmpty cached)
+          (i/ea-first-v (:store db) e a)
+          (if-let [^Datom pending (first-added-datom cached)]
+            (.-v pending)
+            (:v (first (visible-stored
+                         db (i/slice (:store db) :eav
+                                     (datom e a v0) (datom e a vmax))))))))
+      (i/ea-first-v (:store db) e a))))
 
 (defn av-first-e
   "Resolve the current owner of an indexed value during write preparation."

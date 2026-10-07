@@ -43,7 +43,7 @@
         first-data {:wal-rows [(row 1)] :result :first}
         descriptor (fn [data]
                      (batch/->Descriptor nil (volatile! data) nil 0 0
-                                         nil nil nil nil nil nil nil nil))
+                                         0 nil nil nil))
         members [(descriptor first-data)
                  (descriptor {:wal-body (encode [(row 2)] {}) :wal-rows [(row 3)]})
                  (descriptor {:wal-rows [(row 4) (row 5)]})]

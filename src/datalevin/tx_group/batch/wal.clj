@@ -88,7 +88,8 @@
                        (let [data (batch/data (batch/batch-at batch idx))]
                          (recur (inc idx)
                                 (if (or (:storage-staged? data)
-                                        (if (contains? data :rows)
+                                        (if (or (instance? datalevin.tx_group.batch.DatalogMemberData data)
+                                                (contains? data :rows))
                                           (seq (:rows data)) (:wal-body data)))
                                   (inc total) total)))
                        total))]

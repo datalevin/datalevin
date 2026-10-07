@@ -16,14 +16,48 @@
            [datalevin.storage Store WriteGroup]
            [clojure.lang Var]
            [java.util IdentityHashMap]
+           [org.eclipse.collections.impl.map.mutable.primitive LongObjectHashMap]
            [org.eclipse.collections.impl.list.mutable FastList]))
 
-(deftype ^:private PreparationContext [flush! group]
+(deftype ^:private PreparationContext
+  [flush! group ^:unsynchronized-mutable ^objects scalar-rows
+   ^:unsynchronized-mutable ^boolean scalar-rows-in-use?
+   ^LongObjectHashMap scalar-pending
+   ^:unsynchronized-mutable ^boolean scalar-pending?
+   ^:unsynchronized-mutable ^long pending-start]
+  txcommon/ScalarPendingIndex
+  (pending-scalar-index [_] (when scalar-pending? scalar-pending))
+  (materialize-scalar-pending! [_ tx-db]
+    (when scalar-pending?
+      ;; General resolution needs E/A/V tombstones and sorted indexes. Replay
+      ;; the group's existing ordered datoms only at that boundary.
+      (set! scalar-pending? (boolean false))
+      (let [^FastList datoms (.-datoms ^WriteGroup @group)]
+        (loop [idx pending-start]
+          (when (< idx (.size datoms))
+            (txcommon/stage-batch-datom! tx-db (.get datoms (int idx)))
+            (recur (unchecked-inc idx)))))
+      (.clear scalar-pending)))
+  (discard-scalar-pending! [_]
+    (.clear scalar-pending)
+    (set! pending-start (long (.size ^FastList (.-datoms ^WriteGroup @group)))))
+  txcommon/ScalarDatomBuffer
+  (acquire-scalar-datom-buffer! [_ capacity]
+    (when-not scalar-rows-in-use?
+      (when (or (nil? scalar-rows) (< (alength scalar-rows) (long capacity)))
+        (set! scalar-rows (object-array (int capacity))))
+      (set! scalar-rows-in-use? (boolean true))
+      scalar-rows))
+  (release-scalar-datom-buffer! [_ buffer]
+    (when (identical? buffer scalar-rows)
+      (set! scalar-rows-in-use? (boolean false))))
   txcommon/BatchPreparation
   (flush-preparation! [_] (when flush! (flush!)))
   (restore-preparation! [_ tx-db]
     ;; Retry alone rebuilds this request's resolver indexes. The normal path
     ;; needs neither a restore closure nor a request-specific context map.
+    (set! scalar-pending? (boolean false))
+    (.clear scalar-pending)
     (db/-clear-tx-cache tx-db)
     (doseq [datom (.-datoms ^WriteGroup @group)]
       (txcommon/stage-batch-datom! tx-db datom))))
@@ -94,7 +128,8 @@
               conn (:datalog-conn (batch/context d))
               after (or (when conn @conn)
                         (when publication @publication) committed)]
-          (batch/set-data! d (update data :result readable-result after)))))))
+          (batch/set-data! d (batch/with-data-result!
+                              data (readable-result (:result data) after))))))))
 
 (defn attach!
   "Attach the existing Datalog store to the environment's data collector."
@@ -127,10 +162,17 @@
                                       s/*enforce-blind-unique-inserts?* false
                                       c/*ordered-datom-writes?* false]
                               (s/take-group-storage-rows! group))))
+         :storage-tail! (fn []
+                          (when-let [group @(:group @context)]
+                            (s/freeze-group-storage-datoms! group)))
          :before-body! (fn [descriptor]
                          (when-not (:datalog-prepare? (batch/context descriptor))
                            (when-let [current @(:current @context)]
-                             (db/-clear-tx-cache current))))
+                             (db/-clear-tx-cache current))
+                           (when-let [preparation
+                                      (get @(:resolver-bindings @context)
+                                           #'txcommon/*batch-prepare*)]
+                             (txcommon/discard-scalar-pending! preparation))))
          :committed! #(publish! raw @context %)})))
   db)
 
@@ -178,7 +220,12 @@
           (let [bindings {#'s/*write-group* @(:group context)
                           #'txcommon/*batch-prepare*
                           (PreparationContext. (:native-prepare-flush! (meta native))
-                                               (:group context))}]
+                                               (:group context) nil false
+                                               (.-scalar-pending ^WriteGroup @(:group context))
+                                               true
+                                               (long (.size ^FastList
+                                                            (.-datoms ^WriteGroup
+                                                                      @(:group context)))))}]
             (vreset! (:resolver-bindings context) bindings)
             bindings))
       {#'s/*write-group* @(:group context) #'txcommon/*batch-prepare* nil})))
@@ -192,6 +239,8 @@
 
 (defn- execute-bound-body!
   [context conn tx-db body publication notifications]
+  (when-let [preparation (get @(:resolver-bindings context) #'txcommon/*batch-prepare*)]
+    (txcommon/materialize-scalar-pending! preparation tx-db))
   (let [tx (atom tx-db :meta (cond-> (meta conn)
                               notifications (assoc ::notifications notifications)))
         result (body tx)]
@@ -226,9 +275,10 @@
   Avoid transaction-local connection/publication/listener wrappers on success."
   [control conn prepared tx-data tx-meta stamp! fallback!]
   (let [submitter (Thread/currentThread)
-        ;; Convey the existing binding frame without materializing a bindings
-        ;; map. Restore the elected owner's frame even when stamping fails.
-        frame (Var/cloneThreadBindingFrame)]
+        ;; Submission blocks until execution completes, so the caller's frame
+        ;; remains live. Push/pop creates new frames; retain this one without
+        ;; cloning and restore the owner after cross-thread execution.
+        frame (Var/getThreadBindingFrame)]
     ((:internal-body! control)
      (fn [native]
        (if (identical? submitter (Thread/currentThread))

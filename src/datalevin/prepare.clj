@@ -171,6 +171,17 @@
             (raise "Invalid data, expecting" vt " got " v {:input v}))
         (type-coercion vt v)))))
 
+(defn ^:no-doc correct-scalar-value
+  "Validate and coerce a non-nil value after the scalar update gate has excluded
+  tuples, references, idoc and custom types. `vt` is the resolved built-in type
+  or nil for untyped attributes; value-dependent validation is never cached."
+  [validate? vt v]
+  (let [vt (or vt :data)]
+    (or (not validate?)
+        (b/valid-data? v vt)
+        (raise "Invalid data, expecting" vt " got " v {:input v}))
+    (type-coercion vt v)))
+
 (defn correct-value
   "Validate type and coerce value for an attribute."
   [store a v]

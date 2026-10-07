@@ -10,7 +10,7 @@
             [datalevin.tx-group.batch.charge :as charge]
             [datalevin.tx-group.phase :as phase])
   (:import [java.util.concurrent ConcurrentLinkedQueue CountDownLatch TimeUnit]
-           [java.util.concurrent.atomic AtomicBoolean AtomicInteger AtomicLong
+           [java.util.concurrent.atomic AtomicBoolean AtomicInteger
             AtomicLongArray]
            [java.util.concurrent.locks Condition LockSupport ReentrantLock]))
 
@@ -235,10 +235,8 @@
   ([c value deadline ready]
    (#'batch/admit! c 1024 deadline)
    (batch/->Descriptor nil (volatile! value) nil 1024 deadline
-                       (AtomicLong. 1024) (AtomicBoolean. false)
-                       (volatile! nil) ready
-                       (AtomicBoolean. false) (AtomicBoolean. false)
-                       (AtomicBoolean. false) (AtomicBoolean. false))))
+                       1024 (AtomicInteger. 0)
+                       (volatile! nil) ready)))
 
 (defn- parked-descriptor
   "Start a real waiter before publishing its descriptor; observe result or handoff."
@@ -1750,3 +1748,34 @@
         (is (zero? (:bytes (batch/usage c))))
         (is (batch/await-quiescence! c 100))
         (finally (uninstall))))))
+
+(deftest descriptor-lifecycle-bits-preserve-concurrent-claims
+  (dotimes [_ 100]
+    (let [d (batch/->Descriptor nil nil nil 1024 0 0
+                               (AtomicInteger. 0) nil nil)
+          start (CountDownLatch. 1)
+          jobs (mapv (fn [bit]
+                       (future
+                         (.await start)
+                         [bit (#'batch/claim-flag! d bit)]))
+                     [1 2 4 8 16 1 2 4 8 16])]
+      (.countDown start)
+      (let [results (mapv deref jobs)]
+        (is (= 31 (.get ^AtomicInteger (.flags d))))
+        (is (= {1 1 2 1 4 1 8 1 16 1}
+               (frequencies (map first (filter second results)))))))))
+
+(deftest descriptor-inline-charge-preserves-concurrent-limit
+  (let [d (batch/->Descriptor identity nil nil 1024 0 0
+                             (AtomicInteger. 0) nil nil)
+        start (CountDownLatch. 1)
+        jobs (mapv (fn [_]
+                     (future
+                       (.await start)
+                       (dotimes [_ 128] (batch/charge! d 1))))
+                   (range 8))]
+    (.countDown start)
+    (doseq [job jobs] @job)
+    (is (= 1024 (batch/charged d)))
+    (is (thrown? clojure.lang.ExceptionInfo (batch/charge! d 1)))
+    (is (= 1024 (batch/charged d)))))
