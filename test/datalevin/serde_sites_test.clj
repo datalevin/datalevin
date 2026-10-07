@@ -126,47 +126,66 @@
                           (index/encode-giant-datom datom))]
     value))
 
+(defn- close-zstd-pool!
+  [^ArrayBlockingQueue pool]
+  (loop []
+    (when-let [^java.lang.AutoCloseable ctx (.poll pool)]
+      (.close ctx)
+      (recur))))
+
 (deftest giant-zstd-contexts-are-reused-and-bounded
   (let [compressors   (ArrayBlockingQueue. 2)
         decompressors (ArrayBlockingQueue. 16)]
-    (with-redefs-fn {#'index/giant-zstd-compressors   compressors
-                     #'index/giant-zstd-decompressors decompressors}
-      (fn []
-        (let [datom (d/datom 1 :config/doc (apply str (repeat 2000 "config")))
-              value (compressed-giant datom)]
-          (is (= 1 (.size compressors)))
-          ;; more readers than the pool holds: the overflow is closed, not kept
-          (let [start   (CountDownLatch. 1)
-                readers (mapv (fn [_]
-                                (future
-                                  (.await start)
-                                  (dotimes [_ 50] (index/decode-giant-datom value))
-                                  (index/decode-giant-datom value)))
-                              (range 64))]
-            (.countDown start)
-            (is (every? #(= datom (deref %)) readers)))
-          (is (<= 1 (.size decompressors) 16))
-          ;; one reader at a time keeps cycling through the same contexts
-          (let [before (vec decompressors)]
-            (dotimes [_ 100] (index/decode-giant-datom value))
-            (is (= (count before) (.size decompressors)))
-            (is (every? (fn [ctx] (some #(identical? ctx %) decompressors))
-                        before))))))))
+    (try
+      (with-redefs-fn {#'index/giant-zstd-compressors   compressors
+                       #'index/giant-zstd-decompressors decompressors}
+        (fn []
+          (let [datom (d/datom 1 :config/doc (apply str (repeat 2000 "config")))
+                value (compressed-giant datom)]
+            (is (= 1 (.size compressors)))
+            ;; more readers than the pool holds: the overflow is closed, not kept
+            (let [start   (CountDownLatch. 1)
+                  readers (mapv (fn [_]
+                                  (future
+                                    (.await start)
+                                    (dotimes [_ 50] (index/decode-giant-datom value))
+                                    (index/decode-giant-datom value)))
+                                (range 64))]
+              (.countDown start)
+              (try
+                (is (every? #(= datom (deref %)) readers))
+                (finally
+                  ;; A mismatch or failed future must not leave other readers
+                  ;; using these temporary pools when redefs restores the globals.
+                  (doseq [reader readers]
+                    (try @reader (catch Throwable _ nil))))))
+            (is (<= 1 (.size decompressors) 16))
+            ;; one reader at a time keeps cycling through the same contexts
+            (let [before (vec decompressors)]
+              (dotimes [_ 100] (index/decode-giant-datom value))
+              (is (= (count before) (.size decompressors)))
+              (is (every? (fn [ctx] (some #(identical? ctx %) decompressors))
+                          before))))))
+      (finally
+        (close-zstd-pool! compressors)
+        (close-zstd-pool! decompressors)))))
 
 (deftest corrupt-giant-envelope-does-not-poison-the-pool
   (let [decompressors (ArrayBlockingQueue. 16)]
-    (with-redefs-fn {#'index/giant-zstd-decompressors decompressors}
-      (fn []
-        (let [datom          (d/datom 1 :config/doc (apply str (repeat 2000 "config")))
-              ^bytes value   (compressed-giant datom)
-              ^bytes corrupt (aclone value)]
-          (Arrays/fill corrupt 9 (alength corrupt) (byte 0x7f))
-          (is (= datom (index/decode-giant-datom value)))
-          (is (= 1 (.size decompressors)))
-          (is (thrown? Exception (index/decode-giant-datom corrupt)))
-          (is (zero? (.size decompressors)) "the failed context is closed")
-          (is (= datom (index/decode-giant-datom value)))
-          (is (= 1 (.size decompressors))))))))
+    (try
+      (with-redefs-fn {#'index/giant-zstd-decompressors decompressors}
+        (fn []
+          (let [datom          (d/datom 1 :config/doc (apply str (repeat 2000 "config")))
+                ^bytes value   (compressed-giant datom)
+                ^bytes corrupt (aclone value)]
+            (Arrays/fill corrupt 9 (alength corrupt) (byte 0x7f))
+            (is (= datom (index/decode-giant-datom value)))
+            (is (= 1 (.size decompressors)))
+            (is (thrown? Exception (index/decode-giant-datom corrupt)))
+            (is (zero? (.size decompressors)) "the failed context is closed")
+            (is (= datom (index/decode-giant-datom value)))
+            (is (= 1 (.size decompressors))))))
+      (finally (close-zstd-pool! decompressors)))))
 
 (deftest ha-decodes-borrowed-buffers-without-changing-the-iterator
   (doseq [direct? [false true]
