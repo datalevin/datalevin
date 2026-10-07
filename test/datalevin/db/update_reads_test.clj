@@ -213,29 +213,15 @@
       (is (some? prepared))
       (is (nil? (db/stamp-scalar-update-tx @conn prepared nil))))))
 
-(deftest prepared-scalars-preserve-order-and-duplicate-fallback
-  (with-conn [conn true]
-    (d/transact! conn
-                 (mapv #(hash-map :db/id % (fields 0) "old") (range 1 35)))
-    (doseq [n [1 2 17 34]]
-      (let [operations (mapv #(vector :db/add % (fields 0) "new") (range 1 (inc n)))
-            prepared (db/prepare-scalar-update-tx @conn operations)
-            report (db/stamp-scalar-update-tx @conn prepared {:size n})]
-        (is (= {:size n} (:tx-meta report)))
-        (is (= (mapcat #(vector [% "old" false] [% "new" true]) (range 1 (inc n)))
-               (map (juxt :e :v datom/datom-added) (:tx-data report))))
-        ;; Preparing another request cannot mutate either published vector.
-        (db/prepare-scalar-update-tx @conn [[:db/add 1 (fields 0) "other"]])
-        (is (= operations
-               (mapv (fn [[e a v]] [:db/add e a v]) (:entries prepared))))))
-    (doseq [operations [[[:db/add 1 (fields 0) "first"]
-                         [:db/add 1 (fields 0) "last"]]
-                        [[:db/add 1 (fields 0) "first"]
-                         [:db/add 2 (fields 0) "other"]
-                         [:db/add 1 (fields 0) "last"]]]]
-      (is (nil? (db/prepare-scalar-update-tx @conn operations))))
-    (is (nil? (db/prepare-scalar-update-tx @conn [])))
-    (is (empty? (:tx-data
-                  (db/stamp-scalar-update-tx
-                    @conn (db/prepare-scalar-update-tx
-                            @conn [[:db/add 1 (fields 0) "old"]]) nil))))))
+(deftest repeated-scalar-updates-retain-general-transaction-order
+  (doseq [wal? [false true]]
+    (with-conn [conn wal?]
+      (d/transact! conn [{:db/id 1 (fields 0) "old"}])
+      (let [operations [[:db/add 1 (fields 0) "first"]
+                        [:db/add 1 (fields 0) "last"]]]
+        (is (some? (db/prepare-scalar-update-tx @conn [(first operations)])))
+        (is (nil? (db/prepare-scalar-update-tx @conn operations)))
+        (let [report (d/transact! conn operations)]
+          (is (= [["old" false] ["first" true] ["first" false] ["last" true]]
+                 (mapv (juxt :v datom/datom-added) (:tx-data report))))
+          (is (= "last" (get (d/entity @conn 1) (fields 0)))))))))

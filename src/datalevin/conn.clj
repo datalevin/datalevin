@@ -718,18 +718,19 @@
 
 (defn- commit-writing-report!
   [db report ordered? path]
-  (when txcommon/*batch-prepare*
-    (doseq [datom (:tx-data report)]
-      (txcommon/stage-batch-datom! (:db-after report) datom)))
-  ;; The enclosing transaction owns commit/abort. Probe uniqueness before
-  ;; staging blind inserts: a late fused collision could poison that writer.
-  (if (and txcommon/*batch-prepare*
-           (not s/*enforce-blind-unique-inserts?*)
-           (= c/*ordered-datom-writes?* ordered?))
-    (db/commit-prepared-tx-data! (:db-after report) (:tx-data report) report)
-    (binding [s/*enforce-blind-unique-inserts?* false
-              c/*ordered-datom-writes?* ordered?]
-      (db/commit-prepared-tx-data! (:db-after report) (:tx-data report) report)))
+  (let [preparation txcommon/*batch-prepare*]
+    (when preparation
+      (doseq [datom (:tx-data report)]
+        (txcommon/stage-batch-datom! (:db-after report) datom)))
+    ;; The enclosing transaction owns commit/abort. Probe uniqueness before
+    ;; staging blind inserts: a late fused collision could poison that writer.
+    (if (and preparation
+             (not s/*enforce-blind-unique-inserts?*)
+             (= c/*ordered-datom-writes?* ordered?))
+      (db/commit-prepared-tx-data! (:db-after report) (:tx-data report) report)
+      (binding [s/*enforce-blind-unique-inserts?* false
+                c/*ordered-datom-writes?* ordered?]
+        (db/commit-prepared-tx-data! (:db-after report) (:tx-data report) report))))
   (observe-local-wal-tx-path! path)
   (if (identical? (:db-before report) db)
     report

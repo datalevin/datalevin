@@ -47,7 +47,6 @@
             max-tx get-env-flags set-env-flags sync abort-transact-kv
             kv-info]])
   (:import
-   [clojure.lang LazilyPersistentVector]
    [datalevin.datom Datom]
    [datalevin.interface IRemoteDB IRemotePrepared IStore]
    [datalevin.storage Store WriteGroup]
@@ -2360,8 +2359,7 @@
     (when-not (:auto-entity-time? store-opts)
       (loop [es      (seq initial-es)
              seen    nil
-             ^FastList entries (FastList. (if (vector? initial-es)
-                                           (count initial-es) 1))]
+             entries (transient [])]
         (if es
           (let [entity (first es)]
             (if (and (sequential? entity)
@@ -2395,17 +2393,14 @@
                       (let [v (prepare/correct-value-with-props
                                 store-opts props attr value)
                             remaining (next es)]
-                        (.add entries [eid attr v])
                         (recur remaining
                                (or seen
                                    (when remaining
                                      (doto (java.util.HashSet.) (.add [eid attr]))))
-                               entries))))))
+                               (conj! entries [eid attr v])))))))
               nil))
-          (when-not (.isEmpty entries)
-            ;; The detached array is owned by the immutable prepared vector.
-            ;; Small requests need no transient root/tail or duplicate set.
-            (let [entries (LazilyPersistentVector/createOwning (.toArray entries))
+          (when (pos? (count entries))
+            (let [entries (persistent! entries)
                   deferred? (and defer-entity-resolution?
                                  (some #(not (integer? (first %))) entries))]
               (cond-> (->PreparedScalarUpdate
@@ -2474,7 +2469,7 @@
                          (assoc values eid (read-scalar-update-entity db eid layout)))
                        {} layouts)
           tx-data
-          (loop [i 0, ^FastList out (FastList. (* 2 n))]
+          (loop [i 0, out (transient [])]
             (if (< i n)
               (let [[e attr value] (nth entries i)
                     old-value (if (contains? layouts e)
@@ -2482,17 +2477,18 @@
                                 (txcommon/ea-first-v db e attr))]
                 (cond
                   (nil? old-value)
-                  (do (.add out (datom e attr value tx-id))
-                      (recur (unchecked-inc i) out))
+                  (recur (unchecked-inc i)
+                         (conj! out (datom e attr value tx-id)))
 
                   (= old-value value)
                   (recur (unchecked-inc i) out)
 
                   :else
-                  (do (.add out (datom e attr old-value tx-id false))
-                      (.add out (datom e attr value tx-id))
-                      (recur (unchecked-inc i) out))))
-              (LazilyPersistentVector/createOwning (.toArray out))))
+                  (recur (unchecked-inc i)
+                         (-> out
+                             (conj! (datom e attr old-value tx-id false))
+                             (conj! (datom e attr value tx-id))))))
+              (persistent! out)))
           db-after (assoc db :max-tx tx-id)]
       (->TxReport db db-after tx-data {:db/current-tx tx-id} tx-meta))))
 
