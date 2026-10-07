@@ -421,6 +421,39 @@
         (is (batch/await-quiescence! c 100))
         (finally (stop-waiter! probe))))))
 
+(deftest publication-and-retirement-share-one-coordination-pass
+  (let [record? (volatile! false)
+        unlocks (atom 0)
+        lock (proxy [ReentrantLock] [true]
+               (unlock []
+                 (when @record? (swap! unlocks inc))
+                 (proxy-super unlock)))
+        original (collector-with echo-values)
+        c (batch/->Collector
+            lock (.newCondition ^ReentrantLock lock)
+            (.ready original) (.queued original) (.active original) (.serving original)
+            (.active-batch original) (.failure original) (.waiters original) (.budget original)
+            (.max-requests original) (.batch-limit original) (.batch-max-bytes original)
+            (.shared-reserved original) (.preparation-timeout-ms original)
+            (.collection-delay-nanos original) (.rmw-allowance original)
+            (.published original) (.next-id original) (.executor original)
+            (.check-prepared! original) (.on-failure! original))
+        retired (atom 0)
+        off (phase/observe!
+              (fn [event _]
+                (case event
+                  :joint-publication (vreset! record? true)
+                  :batch-retired (do (is (zero? @unlocks)
+                                        "publication must retain coordination until retirement")
+                                     (swap! retired inc))
+                  nil)))]
+    (try
+      (is (= :completed (batch/submit! c {:allowance 1024 :data :completed})))
+      (is (= 1 @retired))
+      (is (= 1 @unlocks))
+      (is (zero? (:requests (batch/usage c))))
+      (finally (off)))))
+
 (deftest retirement-failure-fences-without-revoking-published-results
   (let [boom (ex-info "retirement failed" {})
         c (collector-with (fn [b]

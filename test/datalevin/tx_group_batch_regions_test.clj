@@ -48,8 +48,8 @@
                  (descriptor {:wal-body (encode [(row 2)] {}) :wal-rows [(row 3)]})
                  (descriptor {:wal-rows [(row 4) (row 5)]})]
         b (batch/->Batch 0 (FastList. ^java.util.Collection members)
-                         nil 0 0 nil nil nil nil nil 0)
-        body (#'rmw/encode-members! b encode)]
+                         nil 0 0 nil nil nil nil nil 0 false)
+        body (#'rmw/encode-members! b encode false)]
     (is (= (mapv row (range 1 6))
            (:ops (codec/decode-commit-row-payload body))))
     (is (identical? first-data (batch/data (first members))))

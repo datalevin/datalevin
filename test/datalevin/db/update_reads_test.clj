@@ -6,6 +6,7 @@
    [datalevin.core :as d]
    [datalevin.datom :as datom]
    [datalevin.db :as db]
+   [datalevin.db.tx.common :as txcommon]
    [datalevin.interface :as i]
    [datalevin.test.core :refer [db-fixture]]
    [datalevin.util :as u]))
@@ -110,6 +111,74 @@
         (is (some #(and (= (fields 3) (:a %)) (= "intervening" (:v %))
                         (not (datom/datom-added %)))
                   (:tx-data report)))))))
+
+(deftest scalar-projection-cutoff-preserves-update-results
+  (doseq [wal? [false true]]
+    (with-conn [conn wal?]
+      (d/transact! conn [(initial-entity "existing")])
+      (let [eid (d/entid @conn [:item/key "existing"])]
+        (doseq [width [4 7 8 10]]
+          (let [attrs (take width fields)
+                entity (select-keys (update-entity "existing") attrs)
+                upsert (db/prepare-blind-local-tx
+                         @conn [(assoc entity :item/key "existing")] true false)
+                scalar (db/prepare-scalar-update-tx
+                         @conn (mapv #(vector :db/add eid % (entity %)) attrs))
+                projected? (>= width 8)]
+            (is (= projected? (some? (:identity-upsert-read upsert))))
+            (is (= projected? (contains? (:entity-reads scalar) eid)))
+            (is (= (datoms (first (db/stamp-blind-local-identity-tx
+                                   @conn (assoc upsert :identity-upsert-read nil) nil)))
+                   (datoms (first (db/stamp-blind-local-identity-tx @conn upsert nil)))))
+            (is (= (datoms (db/stamp-scalar-update-tx
+                            @conn (assoc scalar :entity-reads nil) nil))
+                   (datoms (db/stamp-scalar-update-tx @conn scalar nil))))))))))
+
+(deftest collected-scalar-projections-preserve-pending-values-and-retractions
+  (with-conn [conn true]
+    (d/transact! conn [(initial-entity "wide")])
+    (let [eid (d/entid @conn [:item/key "wide"])
+          pending-db (db/transfer @conn (:store @conn))
+          tx (inc (:max-tx pending-db))
+          changes (assoc (zipmap fields (repeat "new"))
+                         (fields 1) false (fields 3) "old")
+          prepared (db/prepare-scalar-update-tx
+                     pending-db (mapv #(vector :db/add eid % (changes %)) fields)
+                     {:defer-entity-resolution? true})]
+      (is (= #{eid} (set (keys (:entity-reads prepared)))))
+      (doseq [d [(datom/datom eid (fields 0) "old" tx false)
+                 (datom/datom eid (fields 0) "aaa" tx)
+                 (datom/datom eid (fields 1) false tx false)
+                 (datom/datom eid (fields 1) true tx)
+                 (datom/datom eid (fields 2) (get (initial-entity "wide") (fields 2)) tx false)
+                 (datom/datom eid :item/untouched "leave" tx false)]]
+        (txcommon/stage-batch-datom! pending-db d))
+      (binding [txcommon/*batch-prepare* {}]
+        (let [selected (db/stamp-scalar-update-tx pending-db prepared nil)
+              points (db/stamp-scalar-update-tx
+                       pending-db (assoc prepared :entity-reads nil) nil)]
+          (is (= (datoms points) (datoms selected)))
+          (is (= 16 (count (:tx-data selected))))
+          (is (some #(and (= "aaa" (:v %)) (not (datom/datom-added %)))
+                    (:tx-data selected)))
+          (is (some #(and (= true (:v %)) (not (datom/datom-added %)))
+                    (:tx-data selected)))))
+      (testing "a fully pending projection sees the current values without native state"
+        (binding [txcommon/*batch-prepare* {}]
+          (doseq [d (:tx-data (db/stamp-scalar-update-tx pending-db prepared nil))]
+            (txcommon/stage-batch-datom! pending-db d)))
+        (doseq [attr fields]
+          (txcommon/stage-batch-datom!
+            pending-db (datom/datom eid attr (changes attr) (inc tx))))
+        (let [store (:store pending-db)
+              schema-only (reify i/IStore
+                            (schema [_] (i/schema store))
+                            (opts [_] (i/opts store)))]
+          (binding [txcommon/*batch-prepare* {}]
+            (is (empty? (:tx-data (db/stamp-scalar-update-tx
+                                   (assoc pending-db :store schema-only) prepared nil)))))))
+      (is (= "old" (get (d/entity @conn eid) (fields 0))))
+      (is (= false (get (d/entity @conn eid) (fields 1)))))))
 
 (deftest deferred-scalar-preparation-resolves-identities-only-when-stamping
   (with-conn [conn true]

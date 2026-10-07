@@ -405,7 +405,10 @@
                              (assoc :tempids tempids')
                              (update ::upserted-tempids assoc
                                      tempid upserted-eid))]
-      (when-let [restore! (:restore! txcommon/*batch-prepare*)] (restore!))
+      (when-let [context txcommon/*batch-prepare*]
+        (if (satisfies? txcommon/BatchPreparation context)
+          (txcommon/restore-preparation! context (:db-after initial-report))
+          (when-let [restore! (:restore! context)] (restore!))))
       (local-transact-tx-data report' es tx-time))))
 
 (defn- flush-tuples [report]

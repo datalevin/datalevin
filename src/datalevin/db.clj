@@ -1937,13 +1937,13 @@
 
 (declare blind-identity-upsert-av)
 
-(def ^:private ^:const scalar-entity-read-min-attrs 4)
+(def ^:private ^:const scalar-entity-read-min-attrs 8)
 
 (defn- prepare-scalar-entity-read
   [store-schema attributes]
-  ;; Point seeks avoid walking unrelated attributes on narrow updates. Retain
-  ;; the projection layout so wider updates pay for just one selective scan
-  ;; inside the write transaction.
+  ;; Four-attribute projections cost more CPU on Linux. Use point seeks for
+  ;; narrow updates; retain a layout for wider updates so stamping can read
+  ;; their attributes with one shared cursor inside the write transaction.
   (when (>= (count attributes) scalar-entity-read-min-attrs)
     (let [names (sort-by #(:db/aid (store-schema %)) attributes)]
       (ScalarEntityRead. (object-array names)
@@ -1952,6 +1952,44 @@
 (defn- read-scalar-entity
   [store eid ^ScalarEntityRead layout]
   (first (s/select-entities store [eid] (.-names layout) (.-aids layout) false)))
+
+(defn- read-scalar-update-entity
+  [db eid ^ScalarEntityRead layout]
+  (let [store (:store db)]
+    (if txcommon/*batch-prepare*
+      (let [^TreeSortedSet eavt (:eavt db)
+            ^java.util.SortedSet pending
+            (.subSet eavt
+                     (datom eid nil nil c/tx0) (datom eid nil nil c/txmax))]
+        (if (.isEmpty pending)
+          (read-scalar-entity store eid layout)
+          (let [names (.-names layout)
+                aids (.-aids layout)
+                n (alength names)]
+            (loop [idx 0 values {} remaining []]
+              (if (< idx n)
+                (let [attr (aget names idx)
+                      ^java.util.SortedSet pending
+                      (.subSet eavt (datom eid attr nil c/tx0)
+                               (datom eid attr nil c/txmax))]
+                  (if (.isEmpty pending)
+                    (recur (unchecked-inc idx) values (conj remaining idx))
+                    ;; Scalar attributes have at most one current addition.
+                    ;; Retractions alone mean absent, and never override an
+                    ;; addition regardless of index sort order. Seek only the
+                    ;; requested attributes, avoiding unrelated pending datoms.
+                    (recur (unchecked-inc idx)
+                           (assoc values attr (:v (first (filter d/datom-added pending))))
+                           remaining)))
+                (if (empty? values)
+                  (read-scalar-entity store eid layout)
+                  (merge (when (seq remaining)
+                           (first (s/select-entities
+                                    store [eid]
+                                    (object-array (map #(aget names %) remaining))
+                                    (long-array (map #(aget aids %) remaining)) false)))
+                         values)))))))
+      (read-scalar-entity store eid layout))))
 
 (defn ^:no-doc prepare-blind-local-tx
   ([^DB db initial-es]
@@ -2362,7 +2400,7 @@
                                  (some #(not (integer? (first %))) entries))]
               (cond-> (->PreparedScalarUpdate
                         store-schema store-opts entries
-                        (when-not (or deferred? defer-entity-resolution?)
+                        (when-not deferred?
                           (scalar-update-entity-reads store-schema entries)))
                 deferred? (assoc :deferred-entity-resolution? true)))))))))
 
@@ -2417,14 +2455,13 @@
   [^DB db ^PreparedScalarUpdate prepared tx-meta]
   (when-let [prepared (when (scalar-update-tx-valid? db prepared)
                         (resolve-scalar-update-entities db prepared))]
-    (let [store   (.-store db)
-          tx-id   (inc (long (:max-tx db)))
+    (let [tx-id   (inc (long (:max-tx db)))
           entries (:entries prepared)
           n       (count entries)
-          layouts (when-not txcommon/*batch-prepare* (:entity-reads prepared))
+          layouts (:entity-reads prepared)
           old-values (reduce-kv
                        (fn [values eid layout]
-                         (assoc values eid (read-scalar-entity store eid layout)))
+                         (assoc values eid (read-scalar-update-entity db eid layout)))
                        {} layouts)
           tx-data
           (loop [i 0, out (transient [])]

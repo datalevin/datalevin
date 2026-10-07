@@ -60,7 +60,9 @@
   (^long reservedBytes [])
   (^void setReservedBytes [^long bytes])
   (^long acceptedCount [])
-  (^void setAcceptedCount [^long accepted]))
+  (^void setAcceptedCount [^long accepted])
+  (^boolean retired [])
+  (^void setRetired []))
 
 (deftype Batch [^long id ^FastList descriptors
                 ;; Mutable before dispatch, on the elected leader only: ordered
@@ -74,7 +76,8 @@
                 ^AtomicLong lsn
                 ^AtomicBoolean dispatched?
                 wal-status collector
-                ^long ^:unsynchronized-mutable accepted-count]
+                ^long ^:unsynchronized-mutable accepted-count
+                ^boolean ^:unsynchronized-mutable retired?]
   ;; Mutable deftype fields are private to its methods. Keep their access here
   ;; so preparation uses direct calls rather than reflective field access.
   IBatchPreparation
@@ -87,7 +90,9 @@
   (reservedBytes [_] reserved-bytes)
   (setReservedBytes [_ bytes] (set! reserved-bytes bytes))
   (acceptedCount [_] accepted-count)
-  (setAcceptedCount [_ accepted] (set! accepted-count accepted)))
+  (setAcceptedCount [_ accepted] (set! accepted-count accepted))
+  (retired [_] retired?)
+  (setRetired [_] (set! retired? (boolean true))))
 
 (deftype Collector [^ReentrantLock lock
                     ^Condition progress
@@ -880,7 +885,7 @@
             (let [batch (->Batch (.getAndIncrement ^AtomicLong (.next-id collector))
                                 descriptors nil bytes cutoff (schedule-for taken)
                                 (AtomicLong. 0) (AtomicBoolean. false)
-                                (volatile! nil) collector taken)]
+                                (volatile! nil) collector taken false)]
               (try
                 (dotimes [_ taken]
                   (let [^Descriptor descriptor (.peek queue)]
@@ -1133,6 +1138,23 @@
                             [false (wal-outcome-error batch t)]))]
             (deliver! descriptor outcome)))))))
 
+(declare release-batch-charges!)
+
+(defn- retire-batch-under-lock!
+  "Retire storage and execution ownership. Caller holds collector coordination."
+  [^Collector collector ^Batch batch]
+  (try
+    (release-batch-charges! collector batch)
+    (phase/phase! :batch-retired batch)
+    (catch Throwable t
+      ;; Published results cannot be revoked by a cleanup failure.
+      (fence-under-lock! collector (wal-outcome-error batch t)))
+    (finally
+      ;; Only the completing leader reads this bit. Mark before handoff so its
+      ;; fallback cleanup cannot release a successor's newly claimed slot.
+      (.setRetired batch)
+      (release-slot-under-lock! collector))))
+
 (defn- join-or-reject!
   "Publish joined results, unless a terminal fence was recorded while the batch
   executed. The final decision and publication share coordination with fencing."
@@ -1147,10 +1169,11 @@
       (if-let [failure @(.failure collector)]
         (reject-pending! batch [false (wal-outcome-error batch failure)])
         (join-batch! batch values))
+      (retire-batch-under-lock! collector batch)
       (finally
         (.unlock lock)
-        ;; Returning writers can prepare and publish the next ready batch while
-        ;; this owner retires. Notify outside publication coordination.
+        ;; Publication and retirement share one acquisition. Wake completed
+        ;; callers outside coordination, after relinquishing execution.
         ;; Include any published prefix when publication threw partway through.
         ;; The first member is the owner and never parks for its own result.
         (dotimes [idx (dec (batch-count batch))]
@@ -1249,22 +1272,13 @@
       ;; own handler is entered. Complete all selected requests and fence.
       (fail-batch! batch t))
     (finally
-      ;; Both branches have stopped. One acquisition covers charge release,
-      ;; retirement and handoff, rather than rejoining the fair lock queue
-      ;; separately for each cleanup step.
-      (let [^ReentrantLock lock (.lock collector)]
-        (.lock lock)
-        (try
-          (try
-            (release-batch-charges! collector batch)
-            (phase/phase! :batch-retired batch)
-            (catch Throwable t
-              ;; Results already published by join cannot be revoked. Fence
-              ;; further work on a cleanup failure, then relinquish ownership
-              ;; now that both branches have stopped.
-              (fence-under-lock! collector (wal-outcome-error batch t)))
-            (finally (release-slot-under-lock! collector)))
-          (finally (.unlock lock))))
+      ;; Successful publication already retired under the same lock. Failures
+      ;; before or during publication still need cleanup after both branches stop.
+      (when-not (.retired batch)
+        (let [^ReentrantLock lock (.lock collector)]
+          (.lock lock)
+          (try (retire-batch-under-lock! collector batch)
+               (finally (.unlock lock)))))
       (finish-confirmations! batch))))
 
 (defn- lead!
@@ -1502,7 +1516,10 @@
         (when (publish-and-elect! collector descriptor)
           (collect-idle-burst! collector deadline)
           (lead! collector descriptor))
-        (await-result! collector descriptor deadline)
+        ;; Completed callers need no waiter state or interrupt loop.
+        (if (some? @(.result descriptor))
+          (result! (.result descriptor))
+          (await-result! collector descriptor deadline))
         (finally
           ;; Sealed storage belongs to batch cleanup; unselected storage to caller.
           (release-descriptor! collector descriptor))))))

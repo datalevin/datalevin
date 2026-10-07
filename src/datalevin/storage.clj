@@ -2185,7 +2185,7 @@
           store-schema (schema store)
           ^FastList pending (.-storage-datoms group)
           ^objects context (.-storage-context group)]
-      (when (and (:datalog-prepare? (:request-context (meta native)))
+      (when (and (:datalog-prepare? (lmdb/request-context native))
                  (not lmdb/*raw-kv?*)
                  (not *enforce-blind-unique-inserts?*)
                  (not c/*ordered-datom-writes?*)
@@ -2209,6 +2209,25 @@
             ((:native-storage-staged! (meta native))))
           modified-ms)))))
 
+(defn ^:no-doc ^:redef encode-group-storage-datoms
+  "Encode ordinary frozen datoms using immutable schema metadata only.
+   The caller has checked grouping eligibility; no native transaction is used."
+  [store-schema datoms]
+  (let [txs (FastList. (count datoms))
+        unindexed (FastList.)
+        ^ByteBuffer buffer (bf/get-array-buffer)]
+    (try
+      (doseq [^Datom datom datoms]
+        (let [props (store-schema (.-a datom))
+              indexable (b/indexable nil (:db/aid props) (.-v datom)
+                                     (idx/value-type props) c/g0)
+              row (lmdb/datom-kv-tx (.-e datom) (b/indexable-bytes indexable buffer)
+                                    (d/datom-added datom) false (:db/noindex props))]
+          (.add ^FastList (if (:db/noindex props) unindexed txs) row)))
+      (.addAll txs ^FastList unindexed)
+      txs
+      (finally (bf/return-array-buffer buffer)))))
+
 (defn ^:no-doc take-group-storage-rows!
   "Encode and detach the group's pending datoms without advancing metadata again."
   [^WriteGroup group]
@@ -2216,11 +2235,11 @@
         ^objects context (.-storage-context group)]
     (when-not (.isEmpty datoms)
       (let [store (aget context 0)
-            plan (prepare-datoms-kv-plan store datoms nil nil nil nil
-                                        (.-metadata group))]
+            _ (when (seq (:db/noindex (rschema store))) (ensure-current! store))
+            rows (encode-group-storage-datoms (schema store) datoms)]
         (.clear datoms)
         (aset context 0 nil)
-        (:txs plan)))))
+        rows))))
 
 (defn load-datoms-with-plan!
   ([^Store store datoms embedding-plan]

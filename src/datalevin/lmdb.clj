@@ -35,6 +35,14 @@
    [java.util.concurrent ScheduledExecutorService ScheduledFuture TimeUnit]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
+(defn ^:no-doc request-context
+  "Read the current request from a batch-owned native callback scope."
+  [view]
+  (let [metadata (meta view)]
+    (if-let [^objects scope (:native-request-context metadata)]
+      (aget scope 4)
+      (:request-context metadata))))
+
 (defn read-env-opts
   "Read the current environment options for internal lookups without copying
   the local KV info map. The returned map can also contain runtime state;

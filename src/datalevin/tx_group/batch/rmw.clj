@@ -10,6 +10,7 @@
             [datalevin.tx-group.batch :as batch]
             [datalevin.tx-group.batch.charge :as charge]
             [datalevin.tx-group.batch.executor :as executor]
+            [datalevin.tx-group.batch.wal :as wal]
             [datalevin.txlog.codec :as codec]
             [datalevin.tx-group.phase :as phase])
   (:import [datalevin.cpp Util$DTLVException]
@@ -135,6 +136,151 @@
         (when-not @failure (vreset! failure failure-error))
         (throw failure-error)))))
 
+(defn- resolve-member!
+  [b descriptor view failure aborted? opts]
+  (phase/phase! :resolution-start b)
+  (let [result (try
+                 ((batch/op descriptor) view)
+                 (catch Throwable t
+                   (cond
+                     @failure (throw (or (owner-interruption @failure) @failure))
+                     (owner-interruption t) (throw (owner-interruption t))
+                     (clean-body-failure? t) (batch/cancel-before-dispatch! t)
+                     :else (throw t))))]
+    (phase/phase! :resolution-complete b)
+    (when-let [t @failure]
+      (if (and @aborted? (:abort-returns? opts)
+               (or (batch/pre-dispatch-cancellation? t) (clean-body-failure? t)))
+        (batch/cancel-before-dispatch!
+          (ex-info "Batch aborted" {:error :txlog/request-aborted
+                                    :outcome :not-committed :retryable? false} t))
+        (throw (or (owner-interruption t) t))))
+    (batch/check-preparation! b)
+    result))
+
+(def ^:dynamic *reuse-datalog-member-setup?*
+  "Internal comparison switch for member-setup allocation measurements."
+  true)
+
+(defn- member-carriers!
+  "Allocate owned row regions only when this member captures physical rows."
+  [^objects state]
+  (when-not (aget state 1)
+    (aset state 1 (RowRegions.))
+    (aset state 2 (RowRegions.)))
+  state)
+
+(defn- datalog-member-setup
+  "One callback scope for trusted resolvers in a native batch. Descriptor and
+  carrier slots belong to the currently executing member; retained row regions
+  themselves are never reset or reused."
+  [raw native-db apply-rows! failure opts]
+  (let [;; Active descriptor, native rows, WAL rows, optional user-code capture
+        ;; validity, and request context. All slots belong to the native owner.
+        state (object-array 5)
+        valid? (volatile! false)
+        aborted? (volatile! false)
+        shared-view (:datalog-view opts)
+        wdb (or @shared-view (l/mark-write native-db))
+        _ (vreset! shared-view wdb)
+        capture (fn [name txs kt vt]
+                  (member-carriers! state)
+                  (capture! raw wdb apply-rows! (aget state 0)
+                            (aget state 1) (aget state 2) valid? failure
+                            opts name txs kt vt))
+        abort! (fn []
+                 (vreset! aborted? true)
+                 (let [t (try
+                           (batch/cancel-before-dispatch!
+                             (ex-info "Batch aborted"
+                                      {:error :txlog/request-aborted
+                                       :outcome :not-committed :retryable? false}))
+                           (catch Throwable e e))]
+                   (when-not @failure (vreset! failure t))
+                   (when-not (:abort-returns? opts) (throw t))))
+        callbacks
+        {:native-request-context state
+         :native-row-capture capture
+         :native-storage-staged!
+         (when-let [staged? (:storage-staged? opts)]
+           (fn []
+             (vreset! staged? true)
+             ;; A later drain can attach rows to an expired member. Carry its
+             ;; identity, rather than allocating two empty row lists now.
+             (vreset! (:storage-target opts)
+                      [wdb (aget state 0) nil nil state])))
+         :native-prepare-flush!
+         (when-let [flush! (:preparation-flush! opts)]
+           (fn []
+             (flush!)
+             ;; Resolution can enter arbitrary user code. Give that code a
+             ;; capture with a permanently expiring request scope, so an escaped
+             ;; callback cannot revive when the batch starts its next resolver.
+             (when (and @valid? (nil? (aget state 3)))
+               (member-carriers! state)
+               (let [member-valid? (volatile! true)
+                     descriptor (aget state 0)
+                     rows (aget state 1)
+                     wal-rows (aget state 2)
+                     capture (fn [name txs kt vt]
+                               (capture! raw wdb apply-rows! descriptor rows wal-rows
+                                         member-valid? failure opts name txs kt vt))]
+                 (aset state 3 member-valid?)
+                 (let [_ (with-meta wdb (assoc (meta wdb) :native-row-capture capture))]
+                   nil)))))
+         :native-batch-abort! abort!
+         :native-transaction-failed! (fn [t] (when-not @failure (vreset! failure t)))}]
+    {:state state :valid? valid? :aborted? aborted? :view wdb :native-db native-db
+     :callbacks callbacks}))
+
+(defn- run-datalog-member!
+  [b descriptor failure opts setup]
+  ((:charge-fn opts charge!) descriptor charge/vector-wrapper)
+  (let [{:keys [state valid? aborted? view callbacks native-db]} setup
+        ^objects state state
+        context (batch/context descriptor)
+        metadata (meta view)
+        current-rtx (:native-write-rtx (meta native-db))
+        metadata (if (identical? (:native-write-rtx metadata) current-rtx)
+                   metadata (assoc metadata :native-write-rtx current-rtx))]
+    (aset state 0 descriptor)
+    (aset state 1 nil)
+    (aset state 2 nil)
+    (aset state 3 nil)
+    (aset state 4 context)
+    (vreset! valid? true)
+    (vreset! aborted? false)
+    (when-let [staged? (:storage-staged? opts)] (vreset! staged? false))
+    ;; Ordinary RMW members may have temporarily installed their own callbacks
+    ;; on the shared view. Restore only on that transition, preserving a writer
+    ;; refreshed after map growth. Consecutive resolvers update the owned scope
+    ;; rather than allocating another native-view metadata map.
+    (let [updated (if (identical? (:native-row-capture metadata)
+                                 (:native-row-capture callbacks))
+                    metadata (merge metadata callbacks))]
+      (when-not (identical? updated (meta view))
+        (let [_ (with-meta view updated)] nil)))
+    (when-let [active (:active-view opts)] (vreset! active view))
+    (try
+      (let [result (resolve-member! b descriptor view failure aborted? opts)
+            rows (or (aget state 1) [])
+            wal-rows (or (aget state 2) [])
+            staged? (boolean (some-> (:storage-staged? opts) deref))]
+        (batch/set-data! descriptor
+                         {:rows rows :wal-rows wal-rows :wal-body nil
+                          :result result :storage-staged? staged?})
+        (if (or (seq rows) staged?) 1 0))
+      (finally
+        (vreset! valid? false)
+        (when-let [member-valid? (aget state 3)] (vreset! member-valid? false))
+        (aset state 0 nil)
+        (aset state 1 nil)
+        (aset state 2 nil)
+        (aset state 3 nil)
+        ;; Storage drain retains the last resolver's preparation mode after its
+        ;; capture expires, just as native metadata did before scope reuse.
+        (when-let [active (:active-view opts)] (vreset! active nil))))))
+
 (defn- run-member!
   [raw native-db apply-rows! batch descriptor failure
    {:keys [body-cost encode-body charge-fn] :or {charge-fn charge!} :as opts}]
@@ -177,27 +323,13 @@
                                :native-transaction-failed! (fn [t]
                                                              (when-not @failure
                                                                (vreset! failure t)))
+                               :native-request-context nil
                                :request-context (batch/context descriptor)))
         _ (when-let [view (:active-view opts)] (vreset! view wdb))]
     (when-let [staged? (:storage-staged? opts)] (vreset! staged? false))
     (try
-      (let [result (try
-                     ((batch/op descriptor) wdb)
-                     (catch Throwable t
-                       (cond
-                         @failure (throw (or (owner-interruption @failure) @failure))
-                         (owner-interruption t) (throw (owner-interruption t))
-                         (clean-body-failure? t) (batch/cancel-before-dispatch! t)
-                         :else (throw t))))]
-        (when-let [t @failure]
-          (if (and @aborted? (:abort-returns? opts)
-                   (or (batch/pre-dispatch-cancellation? t) (clean-body-failure? t)))
-            (batch/cancel-before-dispatch!
-              (ex-info "Batch aborted" {:error :txlog/request-aborted
-                                        :outcome :not-committed :retryable? false} t))
-            (throw (or (owner-interruption t) t))))
-        (batch/check-preparation! batch)
-        (let [wal-body (when (and encode-body (not (:encode-batch? opts))
+      (let [result (resolve-member! batch descriptor wdb failure aborted? opts)
+            wal-body (when (and encode-body (not (:encode-batch? opts))
                                  (pos? (.size rows)))
                          (let [estimate (long (if body-cost (body-cost rows) 0))]
                            (charge-fn descriptor estimate)
@@ -210,18 +342,18 @@
                               :wal-rows wal-rows
                               :storage-staged? (boolean (some-> (:storage-staged? opts) deref))}
                              {:rows rows :wal-body wal-body :result result}))
-          (if (and (.isEmpty rows) (not (some-> (:storage-staged? opts) deref))) 0 1)))
+          (if (and (.isEmpty rows) (not (some-> (:storage-staged? opts) deref))) 0 1))
       (finally (vreset! valid? false)
                (when-let [view (:active-view opts)] (vreset! view nil))))))
 
 (defn- encode-members!
-  "Serialize consecutive body writes together, preserving prepared KV regions
+  "Freeze consecutive body writes together, preserving prepared KV regions
   and the final Datalog metadata trailer in exactly their native order."
-  [b encode-body]
+  [b encode-body defer?]
   (let [parts (ArrayList.) rows (volatile! (RowRegions.))
         flush! (fn []
                  (when-not (.isEmpty ^RowRegions @rows)
-                   (.add parts (encode-body @rows {}))
+                   (.add parts @rows)
                    (vreset! rows (RowRegions.))))]
     (dotimes [idx (batch/batch-count b)]
       (let [d (batch/batch-at b idx)
@@ -233,7 +365,7 @@
         (when-let [wal-rows (:wal-rows data)]
           (.append ^RowRegions @rows wal-rows))))
     (flush!)
-    (when-not (.isEmpty parts) (codec/combine-commit-row-payloads parts))))
+    (when-not (.isEmpty parts) (wal/prepare-body parts encode-body defer?))))
 
 (defn execute!
   "Collect while preparing Datalog writes or applying the native prefix, then
@@ -281,15 +413,32 @@
              (fn []
                (try
                  (when-let [take-rows! (:storage-rows! opts)]
+                   (phase/phase! :storage-encode-start batch)
                    (when-let [txs (take-rows!)]
-                     (let [[view descriptor rows wal-rows] @storage-target]
+                     (let [[view descriptor rows wal-rows state] @storage-target
+                           ;; A trusted resolver can stage storage without
+                           ;; allocating carriers. Materialize them at the drain,
+                           ;; either in its active scope or its retained data.
+                           active? (and state (identical? descriptor (aget ^objects state 0)))
+                           _ (when active? (member-carriers! state))
+                           rows (or rows (when active? (aget ^objects state 1))
+                                    (:rows (batch/data descriptor)))
+                           wal-rows (or wal-rows (when active? (aget ^objects state 2))
+                                        (:wal-rows (batch/data descriptor)))
+                           rows (if (instance? RowRegions rows) rows (RowRegions.))
+                           wal-rows (if (instance? RowRegions wal-rows) wal-rows (RowRegions.))]
+                       (when (and state (not active?))
+                         (batch/set-data! descriptor
+                                          (assoc (batch/data descriptor)
+                                                 :rows rows :wal-rows wal-rows)))
                        ;; The batch owns these carriers after the request view
                        ;; expires. Never re-enter that request's capture.
                        (l/write-txn view)
                        (let [prepared ((:prepare-rows! opts) raw descriptor nil txs
                                        :data :data)]
                          (capture-prepared! view apply-rows! rows wal-rows
-                                            @storage-opts prepared)))))
+                                            @storage-opts prepared))))
+                   (phase/phase! :storage-encode-complete batch))
                  (catch Throwable t
                    (let [failure-error
                          (try
@@ -314,7 +463,7 @@
                     (and wal (:shared-datalog-writer? opts))
                     (assoc :defer-rows!
                            (fn [view prepared]
-                             (let [preparing? (:datalog-prepare? (:request-context (meta view)))
+                             (let [preparing? (:datalog-prepare? (l/request-context view))
                                    ;; Custom payload/index operations allocate IDs
                                    ;; and resolve values through native reads.
                                    ;; Their raw write scope must stay eager.
@@ -347,14 +496,17 @@
                              ;; ordinary native reads. Resume direct application
                              ;; for this body; the next resolver gets a fresh scope.
                              (when-let [view @active-view]
-                               (let [_ (with-meta view
-                                         (update (meta view) :request-context
-                                                 dissoc :datalog-prepare?))] nil)))))
+                               (if-let [^objects scope (:native-request-context (meta view))]
+                                 (aset scope 4 (dissoc (aget scope 4) :datalog-prepare?))
+                                 (let [_ (with-meta view
+                                           (update (meta view) :request-context
+                                                   dissoc :datalog-prepare?))] nil))))))
              opts (if (:storage-rows! opts)
                     (assoc opts :storage-target storage-target
                            :storage-staged? storage-staged?
                            :storage-flush! flush-storage!) opts)
              _ (vreset! storage-opts opts)
+             member-setup (volatile! nil)
              apply-member! (fn [idx]
                              (batch/check-preparation! batch)
                              (let [d (batch/batch-at batch idx)]
@@ -378,7 +530,28 @@
                                                 (batch/cancel-before-dispatch! t)
                                                 (throw t)))))
                                      (vreset! ready? true))
-                                   (run-member! raw wdb apply-rows! batch d failure opts))
+                                   (if (and *reuse-datalog-member-setup?*
+                                            (:shared-datalog-writer? opts)
+                                            (:prepared-request? opts)
+                                            (:prepared-owned? opts)
+                                            (:encode-batch? opts)
+                                            (:datalog-prepare? (batch/context d))
+                                            ;; A lone resolver cannot amortize
+                                            ;; a shared scope. Queue observation
+                                            ;; is only a setup hint, never member
+                                            ;; selection or a wait for a caller.
+                                            (or @member-setup
+                                                (> (batch/batch-count batch) 1)
+                                                (some? (.peek ^java.util.Queue
+                                                          (.ready ^datalevin.tx_group.batch.Collector
+                                                            (batch/batch-collector batch))))))
+                                     (let [setup (or @member-setup
+                                                     (let [setup (datalog-member-setup
+                                                                   raw wdb apply-rows! failure opts)]
+                                                       (vreset! member-setup setup)
+                                                       setup))]
+                                       (run-datalog-member! batch d failure opts setup))
+                                     (run-member! raw wdb apply-rows! batch d failure opts)))
                                  (let [rows (:rows (batch/data d))]
                                    (apply-rows! rows)
                                    (if (seq rows) 1 0)))))
@@ -472,7 +645,10 @@
          (batch/set-accepted-count!
            batch
            (if (:encode-batch? opts)
-             (if-let [body (encode-members! batch (:encode-body opts))]
+             (if-let [body (encode-members!
+                            batch (:encode-body opts)
+                            (or (> weight 1) (:large? @tail)
+                                (and @tail (> (.size ^List (:rows @tail)) 256))))]
                (let [d (batch/batch-at batch (dec (batch/batch-count batch)))]
                  (batch/set-data! d (assoc (batch/data d) :wal-body body))
                  1)
@@ -488,7 +664,8 @@
                (and (< suffix-start (batch/batch-count batch))
                     ;; For tiny prepared suffixes the worker handoff costs more
                     ;; than applying the rows inline. Larger suffixes still overlap.
-                    (or (not (:collect-prepared-prefix? opts))
+                    (or (:encode-batch? opts)
+                        (not (:collect-prepared-prefix? opts))
                         (> (long (reduce (fn [total idx]
                                            (if-let [^bytes body (:wal-body (batch/data (batch/batch-at batch idx)))]
                                              (+ (long total) (alength body)) total))

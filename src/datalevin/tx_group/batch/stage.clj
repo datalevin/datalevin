@@ -8,7 +8,7 @@
 
 (defn tx-context [db]
   (l/write-txn db)
-  (:request-context (meta db)))
+  (l/request-context db))
 
 (defn tx-get [db name key]
   (i/get-value db name key :raw :raw))

@@ -18,6 +18,16 @@
            [java.util IdentityHashMap]
            [org.eclipse.collections.impl.list.mutable FastList]))
 
+(deftype ^:private PreparationContext [flush! group]
+  txcommon/BatchPreparation
+  (flush-preparation! [_] (when flush! (flush!)))
+  (restore-preparation! [_ tx-db]
+    ;; Retry alone rebuilds this request's resolver indexes. The normal path
+    ;; needs neither a restore closure nor a request-specific context map.
+    (db/-clear-tx-cache tx-db)
+    (doseq [datom (.-datoms ^WriteGroup @group)]
+      (txcommon/stage-batch-datom! tx-db datom))))
+
 (defn control
   "Return the collector for a standalone local Datalog connection."
   [conn]
@@ -99,6 +109,8 @@
          (fn [execute b]
            (let [ctx {:current (volatile! nil) :group (volatile! nil)
                       :cache (volatile! nil) :connections (IdentityHashMap.)
+                      :native-view (object-array 2)
+                      :resolver-bindings (volatile! nil)
                       :batch b}]
              (vreset! context ctx)
              (try (execute)
@@ -135,7 +147,7 @@
                                 (kv/raw-lmdb lmdb))
                    store (s/transfer store lmdb))
         tx-db (cond-> (if (and (identical? tx-store store)
-                              (or (:datalog-prepare? (:request-context (meta (kv/raw-lmdb lmdb))))
+                              (or (:datalog-prepare? (l/request-context (kv/raw-lmdb lmdb)))
                                   (and (empty? (:eavt previous))
                                        (empty? (:avet previous)))))
                        previous (db/transfer previous tx-store))
@@ -159,42 +171,55 @@
                              (update entry :publications (fnil conj []) publication)
                              entry))))
 
-(defn- preparation-context [context tx-db]
+(defn- resolver-bindings! [context tx-db]
   (let [native (kv/raw-lmdb (.-lmdb ^Store (:store tx-db)))]
-    (when (:datalog-prepare? (:request-context (meta native)))
-      {:flush! (:native-prepare-flush! (meta native))
-       ;; A rare tempid/upsert retry discards only this request's resolution.
-       ;; Rebuild its indexes from prior resolved datoms; no body is rerun.
-       :restore! (fn []
-                   (db/-clear-tx-cache tx-db)
-                   (doseq [datom (.-datoms ^WriteGroup @(:group context))]
-                     (txcommon/stage-batch-datom! tx-db datom)))})))
+    (if (:datalog-prepare? (l/request-context native))
+      (or @(:resolver-bindings context)
+          (let [bindings {#'s/*write-group* @(:group context)
+                          #'txcommon/*batch-prepare*
+                          (PreparationContext. (:native-prepare-flush! (meta native))
+                                               (:group context))}]
+            (vreset! (:resolver-bindings context) bindings)
+            bindings))
+      {#'s/*write-group* @(:group context) #'txcommon/*batch-prepare* nil})))
+
+(defn- native-kv-view! [context native]
+  (let [^objects scope (:native-view context)]
+    (when-not (identical? native (aget scope 0))
+      (aset scope 0 native)
+      (aset scope 1 (kv/->KVLMDB native nil)))
+    (aget scope 1)))
+
+(defn- execute-bound-body!
+  [context conn tx-db body publication notifications]
+  (let [tx (atom tx-db :meta (cond-> (meta conn)
+                              notifications (assoc ::notifications notifications)))
+        result (body tx)]
+    (record-connection! context conn publication)
+    (vreset! (:current context) @tx)
+    result))
 
 (defn- execute-body!
   [context conn tx-db body publication notifications]
-  (let [tx (atom tx-db :meta (cond-> (meta conn)
-                              notifications (assoc ::notifications notifications)))]
-    (binding [s/*write-group* @(:group context)
-              txcommon/*batch-prepare* (preparation-context context tx-db)]
-      (let [result (body tx)]
-        (record-connection! context conn publication)
-        (vreset! (:current context) @tx)
-        result))))
+  (Var/pushThreadBindings (resolver-bindings! context tx-db))
+  (try (execute-bound-body! context conn tx-db body publication notifications)
+       (finally (Var/popThreadBindings))))
 
 (defn- execute-scalar!
   [control conn prepared tx-data tx-meta stamp! fallback! native]
   (let [context @(:datalog-context control)
-        tx-db (writing-db! context conn (kv/->KVLMDB native nil))]
-    (binding [s/*write-group* @(:group context)
-              txcommon/*batch-prepare* (preparation-context context tx-db)]
+        tx-db (writing-db! context conn (native-kv-view! context native))]
+    (Var/pushThreadBindings (resolver-bindings! context tx-db))
+    (try
       (if-let [report (stamp! control tx-db prepared tx-meta)]
         (do (record-connection! context conn nil)
             (vreset! (:current context) (:db-after report))
             report)
         ;; Stale preparation uses the general runner in this same transaction.
         ;; No caller body is resubmitted or evaluated twice.
-        (execute-body! context conn tx-db
-                       #(fallback! % tx-data tx-meta) nil nil)))))
+        (execute-bound-body! context conn tx-db
+                             #(fallback! % tx-data tx-meta) nil nil))
+      (finally (Var/popThreadBindings)))))
 
 (defn run-scalar!
   "Stamp a prepared scalar request against the current native batch DB.

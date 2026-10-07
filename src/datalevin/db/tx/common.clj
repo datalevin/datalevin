@@ -21,12 +21,19 @@
 
 (def ^:dynamic *batch-prepare* nil)
 
+(defprotocol BatchPreparation
+  (flush-preparation! [context])
+  (restore-preparation! [context db]))
+
 (declare ref?)
 
 (defn flush-batch-prepare!
   "Make previously frozen writes visible to ordinary native reads in user code."
   []
-  (when-let [flush! (:flush! *batch-prepare*)] (flush!)))
+  (when-let [context *batch-prepare*]
+    (if (satisfies? BatchPreparation context)
+      (flush-preparation! context)
+      (when-let [flush! (:flush! context)] (flush!)))))
 
 (defn stage-batch-datom!
   "Update the resolver's existing indexes with the latest pending E/A/V state."
