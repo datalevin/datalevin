@@ -485,7 +485,7 @@
   (let [^Semaphore lock ((:get-lock deps) server db-name)]
     (if (.tryAcquire lock)
       (try
-        (f)
+        (binding [kv/*server-write-slot-held?* true] (f))
         (finally
           (.release lock)))
       {:ok? false
@@ -581,15 +581,18 @@
     (replace {frozen (b/deserialize frozen)} args)))
 
 (defn- normal-dt-handler
-  [op]
-  (fn [deps server skey {:keys [args writing?] :as message}]
-    (let [db-name (nth args 0)
-          store   (dt-store deps server skey db-name writing?)]
-      (ensure-ha-read-floor! deps server db-name writing? message store)
-      (write-result!
-       deps
-       skey
-       (apply op store (rest args))))))
+  ([op] (normal-dt-handler op false))
+  ([op direct-write?]
+   (fn [deps server skey {:keys [args writing?] :as message}]
+     (let [db-name (nth args 0)
+           store   (dt-store deps server skey db-name writing?)]
+       (ensure-ha-read-floor! deps server db-name writing? message store)
+       (write-result!
+         deps skey
+         (if direct-write?
+           (with-direct-db-transaction-slot
+             deps server db-name writing? #(apply op store (rest args)))
+           (apply op store (rest args))))))))
 
 (defn- sampling-dt-handler
   [op]
@@ -606,14 +609,16 @@
            (apply op store (rest args))))))))
 
 (defn- normal-kv-handler
-  [op]
-  (fn [deps server skey {:keys [args writing?]}]
-    (write-result!
-     deps
-     skey
-     (apply op
-            (kv-store deps server skey (nth args 0) writing?)
-            (rest args)))))
+  ([op] (normal-kv-handler op false))
+  ([op direct-write?]
+   (fn [deps server skey {:keys [args writing?]}]
+     (let [db-name (nth args 0)
+           run #(apply op (kv-store deps server skey db-name writing?) (rest args))]
+       (write-result!
+         deps skey
+         (if direct-write?
+           (with-direct-db-transaction-slot deps server db-name writing? run)
+           (run)))))))
 
 (defn- copying-dt-handler
   [op]
@@ -1489,7 +1494,8 @@
                       cpp/*before-write-commit-fn*
                       kvtx/*after-txlog-append-fn*
                       kvtx/*commit-payload-ha-term*)]
-    (when (and embedded/*enabled?* (not (l/writing? raw))
+    (when (and embedded/*enabled?* (not kv/*server-write-slot-held?*)
+               (not (l/writing? raw))
                (not (Thread/holdsLock (l/write-txn raw)))
                (or (not (ha-runtime-read-state? state)) guarded?)
                (or (not ha?) guarded?))
@@ -2582,7 +2588,7 @@
 
 (defn update-kv
   [deps server skey {:keys [args writing?] :as message}]
-  (let [[db-name dbi-name k serialized-f k-type v-type f-args] args]
+  (let [[db-name dbi-name k _serialized-f k-type v-type f-args] args]
     (db-alter-permission!
       deps server skey db-name
       "Don't have permission to alter the database"
@@ -2593,7 +2599,7 @@
                   deps server skey db-name writing? message
                   (fn [client-op]
                     (let [store (kv-store deps server skey db-name writing?)
-                          f     (b/deserialize serialized-f)
+                          f     (prepared/update-function! skey message)
                           op    (fn [tx]
                                   (apply kv/update-kv tx dbi-name k f k-type v-type f-args)
                                   (when client-op
@@ -2608,7 +2614,20 @@
                                   :transacted)]
                       (if-let [control (when-not writing?
                                          (server-write-control deps server db-name store))]
-                        ((:body! control) op nil)
+                        (if-let [update-op
+                                 (when (:update! control)
+                                   (kv/update-request
+                                     store dbi-name k f k-type v-type f-args
+                                     (when client-op
+                                       [(cop/committed-record-tx
+                                          (:client-op-id client-op)
+                                          (cop/committed-record
+                                            (:request-type client-op)
+                                            (:request-hash client-op)
+                                            (:response-kind client-op)
+                                            :transacted))])))]
+                          ((:update! control) update-op)
+                          ((:body! control) op nil))
                       (if-let [g (when-not writing?
                                    (server-write-group deps server db-name
                                                               store :server-kv))]

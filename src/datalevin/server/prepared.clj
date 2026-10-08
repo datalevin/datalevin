@@ -1,9 +1,10 @@
 ;; Copyright (c) Huahai Yang. All rights reserved.
 ;; Distributed under the Eclipse Public License 2.0.
 (ns ^:no-doc datalevin.server.prepared
-  "Connection-local prepared reads. Expansion precedes normal authorization,
-  admission and transaction routing; readers are installed after those checks."
-  (:require [datalevin.kv :as kv]
+  "Connection-local prepared operations. Expansion precedes authorization,
+  admission and transaction routing; functions are installed after those checks."
+  (:require [datalevin.bits :as b]
+            [datalevin.kv :as kv]
             [datalevin.prepared :as prepared]
             [datalevin.pull-api :as pull]
             [datalevin.pull-wire :as wire]
@@ -19,7 +20,7 @@
 
 (defn- check-id! [id]
   (when-not (and (integer? id) (<= 1 id Long/MAX_VALUE))
-    (raise "Invalid prepared read handle" {:error :prepared/invalid-handle})))
+    (raise "Invalid prepared handle" {:error :prepared/invalid-handle})))
 
 (defn expand-message
   "Restore routing fields from this connection's handle. Ignore caller-supplied
@@ -33,14 +34,20 @@
       (let [id (:handle message)
             _ (check-id! id)
             ^LinkedHashMap cache (:prepared-handles @(.attachment skey))
-            ^Entry entry (when (and (enabled? skey) cache) (.get cache id))]
+            ^Entry entry (when (and (or (enabled? skey)
+                                     (true? (get-in @(.attachment skey)
+                                                    [:wire-opts :prepared-update?])))
+                                 cache) (.get cache id))]
         (when-not entry
-          (raise "Prepared read handle is not registered on this connection"
+          (raise "Prepared handle is not registered on this connection"
                  {:error :prepared/missing :handle id}))
         (with-meta
           (cond-> {:type (.-type entry)
                    :args (assoc (.-args entry) 2 (:value message))
                    :writing? (:writing? message)}
+            (= :update-kv (.-type entry))
+            (merge (select-keys message [:client-op-id :client-op-hash
+                                         :client-op-response-kind]))
             (:ha-read-min-tx message)
             (assoc :ha-read-min-tx (:ha-read-min-tx message)))
           (assoc (meta message) ::entry entry)))
@@ -79,6 +86,24 @@
         (prepared/remember! cache prepare-id
                             (Entry. type (assoc args 2 nil) reader response-writer))
         reader))))
+
+(defn update-function!
+  "Resolve an update function only inside the authorized update handler."
+  [^SelectionKey skey {:keys [args prepare-id] :as message}]
+  (if-let [^Entry entry (::entry (meta message))]
+    (.-reader entry)
+    (let [f (b/deserialize (nth args 3))]
+      (when (and prepare-id
+                 (true? (get-in @(.attachment skey) [:wire-opts :prepared-update?])))
+        (check-id! prepare-id)
+        (let [attachment (.attachment skey)
+              ^LinkedHashMap cache (or (:prepared-handles @attachment)
+                                      (let [cache (prepared/handle-cache)]
+                                        (vswap! attachment assoc :prepared-handles cache)
+                                        cache))]
+          (prepared/remember! cache prepare-id
+                             (Entry. :update-kv (assoc args 2 nil) f nil))))
+      f)))
 
 (defn response-written!
   "Acknowledge a layout only after writing the complete response frame."

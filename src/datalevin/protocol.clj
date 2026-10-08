@@ -71,6 +71,7 @@
     :compression-settings? true
     :storage-read? true
     :prepared-read? true
+    :prepared-update? true
     :prepared-query? true
     :prepared-pull? true
     :compression-threshold (:compression-threshold opts)
@@ -108,6 +109,7 @@
                     (when (and (= (:compression local-opts) :zstd) peer-zstd?) :zstd))
        (true? (:storage-read? peer-capabilities)) (assoc :storage-read? true)
        (true? (:prepared-read? peer-capabilities)) (assoc :prepared-read? true)
+       (true? (:prepared-update? peer-capabilities)) (assoc :prepared-update? true)
        (true? (:prepared-query? peer-capabilities)) (assoc :prepared-query? true)
        (and (true? (:prepared-pull? peer-capabilities))
             (true? (:prepared-read? peer-capabilities))

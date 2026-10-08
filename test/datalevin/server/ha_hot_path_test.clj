@@ -675,6 +675,9 @@
               :transaction-lock-timeout-ms (constantly 10)}]
     (try
       (d/open-dbi store "data")
+      (#'handlers/with-direct-db-transaction-slot deps nil "db" false
+        #(is (nil? (#'handlers/server-write-control deps nil "db" store))))
+      (is (nil? (:independent-control @(i/kv-info store))))
       (let [control (#'handlers/server-write-control deps nil "db" store)]
         (.acquire slot)
         (try
@@ -688,7 +691,9 @@
         ;; Standalone administration owns the same semaphore and must not
         ;; enqueue recursively into a batch waiting to acquire it.
         (#'handlers/with-direct-db-transaction-slot deps nil "db" false
-          #(d/transact-kv store c/kv-info [[:put :server/probe true]] :keyword :data))
+          #(do
+             (is (nil? (#'handlers/server-write-control deps nil "db" store)))
+             (d/transact-kv store c/kv-info [[:put :server/probe true]] :keyword :data)))
         (is (= 1 (.availablePermits slot))))
       (finally (d/close-kv store) (u/delete-files path)))))
 

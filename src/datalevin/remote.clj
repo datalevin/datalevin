@@ -26,7 +26,7 @@
   (:import
    [datalevin.client Client]
    [datalevin.interface ICustomTypes ILMDB ITxLog IList IAdmin IStore
-    ISearchEngine IVectorIndex IRemoteDB IRemoteKV IRemotePrepared]
+    ISearchEngine IVectorIndex IRemoteDB IRemoteKV IRemotePrepared IRemotePreparedUpdate]
    [clojure.lang Seqable IReduceInit]
    [java.lang AutoCloseable]
    [java.util Collections WeakHashMap Map]
@@ -897,6 +897,31 @@
       Object
       (toString [this] (str (apply list this))))))
 
+(defn- update-kv-request
+  [client open-db-opts writing? args metadata]
+  (let [req        (with-meta
+                     {:type :update-kv
+                      :writing? writing?
+                      :args args
+                      :client-op-id (cop/new-client-op-id)
+                      :client-op-hash (cop/request-hash [:update-kv args])
+                      :client-op-response-kind cop/kv-result-response-kind}
+                     metadata)
+        request-fn (fn [client req] (cl/request client req))
+        {:keys [type message result err-data]}
+        (try
+          (request-fn client req)
+          (catch Exception e
+            (or (retry-ha-transport-failure
+                  client req request-fn
+                  (cached-ha-member-endpoints open-db-opts) e)
+                (throw e))))]
+    (if (= type :error-response)
+      (if (:resized err-data)
+        (raise message err-data)
+        (cl/retry-ha-write-request client req message err-data request-fn))
+      result)))
+
 (deftype+ KVStore [^String uri
                   ^String db-name
                   ^Client client
@@ -916,30 +941,23 @@
           (when (.get closed?) (raise "Database is closed" {:type :lmdb/closed}))
           (cl/normal-prepared-request client operation request key writing?)))))
 
+  IRemotePreparedUpdate
+  (prepare-remote-update [_ dbi-name f k-type v-type args]
+    (let [request (prepared/request
+                    [db-name dbi-name nil (b/serialize f) k-type v-type (vec args)])]
+      (prepared/prepared-read
+        (fn [key]
+          (when (.get closed?) (raise "Database is closed" {:type :lmdb/closed}))
+          (update-kv-request client open-db-opts writing?
+                             (assoc (.-args ^datalevin.prepared.Request request) 2 key)
+                             (.-metadata ^datalevin.prepared.Request request))))))
+
   IRemoteKV
   (remote-kv? [_] true)
   (remote-update-kv [_ dbi-name k f k-type v-type args]
-    (let [args       [db-name dbi-name k (b/serialize f) k-type v-type (vec args)]
-          req        {:type :update-kv
-                      :writing? writing?
-                      :args args
-                      :client-op-id (cop/new-client-op-id)
-                      :client-op-hash (cop/request-hash [:update-kv args])
-                      :client-op-response-kind cop/kv-result-response-kind}
-          request-fn (fn [client req] (cl/request client req))
-          {:keys [type message result err-data]}
-          (try
-            (request-fn client req)
-            (catch Exception e
-              (or (retry-ha-transport-failure
-                    client req request-fn
-                    (cached-ha-member-endpoints open-db-opts) e)
-                  (throw e))))]
-      (if (= type :error-response)
-        (if (:resized err-data)
-          (raise message err-data)
-          (cl/retry-ha-write-request client req message err-data request-fn))
-        result)))
+    (update-kv-request client open-db-opts writing?
+                       [db-name dbi-name k (b/serialize f) k-type v-type (vec args)]
+                       nil))
   (remote-new-search-engine [this opts] (new-search-engine this opts))
   (remote-batch-get-values [this dbi-name ks k-type v-type ignore-key?]
     (get-values this dbi-name ks k-type v-type ignore-key?))

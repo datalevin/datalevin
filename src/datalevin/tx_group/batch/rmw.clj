@@ -291,6 +291,39 @@
         (aset state 4 nil)
         (when-let [active (:active-view opts)] (vreset! active nil))))))
 
+(defn- run-update-member!
+  "Updates expose only a value to user code, so need no escaping view scope."
+  [raw native-db apply-rows! b descriptor failure opts]
+  ((:charge-fn opts charge!) descriptor charge/vector-wrapper)
+  (let [rows (RowRegions.)
+        wal-rows (RowRegions.)
+        defer? (boolean (:update-tail! opts))
+        valid? (volatile! true)
+        [name txs kt vt] (resolve-member! b descriptor native-db failure
+                                        (volatile! false) opts)]
+    (try
+      (capture! raw native-db (if defer? identity apply-rows!)
+                descriptor rows wal-rows valid? failure
+                opts name txs kt vt)
+      (let [wal-body (when (and (:encode-body opts) (not (:encode-batch? opts)))
+                       (let [estimate (long (if-let [cost (:body-cost opts)]
+                                              (cost rows) 0))
+                             charge-fn (:charge-fn opts charge!)]
+                         (charge-fn descriptor estimate)
+                         (let [^bytes body ((:encode-body opts) wal-rows
+                                           (batch/context descriptor))]
+                           (charge-fn descriptor (max 0 (- (alength body) estimate)))
+                           body)))]
+        (when defer?
+          (if (and wal-body (> (alength ^bytes wal-body) 4096))
+            ((:update-tail! opts) rows native-db)
+            (apply-rows! rows)))
+        (batch/set-data! descriptor
+                         {:rows rows :wal-rows wal-rows :wal-body wal-body
+                          :result :transacted}))
+      1
+      (finally (vreset! valid? false)))))
+
 (defn- run-member!
   [raw native-db apply-rows! batch descriptor failure
    {:keys [body-cost encode-body charge-fn] :or {charge-fn charge!} :as opts}]
@@ -565,6 +598,18 @@
                     (assoc opts :storage-target storage-target
                            :storage-staged? storage-staged?
                            :storage-flush! flush-storage!) opts)
+             ;; Each following member drains this tail before invoking user
+             ;; code. Only the final large KV update can survive to dispatch;
+             ;; mixed Datalog execution retains its existing visibility rules.
+             opts (cond-> opts
+                    (and wal (not (:shared-datalog-writer? opts))
+                         (not (:finish-preparation! opts))
+                         (:prepared-request? opts) (:prepared-owned? opts)
+                         (not (:encode-batch? opts)))
+                    (assoc :update-tail!
+                           (fn [rows view]
+                             (vreset! tail {:rows rows :view view
+                                            :prepared? true :large? true}))))
              _ (vreset! storage-opts opts)
              member-setup (volatile! nil)
              apply-member! (fn [idx]
@@ -611,7 +656,9 @@
                                                        (vreset! member-setup setup)
                                                        setup))]
                                        (run-datalog-member! batch d failure opts setup))
-                                     (run-member! raw wdb apply-rows! batch d failure opts)))
+                                     (if (:kv-update? (batch/context d))
+                                       (run-update-member! raw wdb apply-rows! batch d failure opts)
+                                       (run-member! raw wdb apply-rows! batch d failure opts))))
                                  (let [rows (:rows (batch/data d))]
                                    (apply-rows! rows)
                                    (if (seq rows) 1 0)))))

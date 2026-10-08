@@ -258,6 +258,12 @@
                 {:embedded? true :server? (:server? hooks) :datalog-context (:context hooks)
                  :direct-write? (fn [] (and (:server? hooks) kv/*server-write-slot-held?*))
                  :collector c :body! body! :close! close! :check! check!
+                 :update!
+                 (fn [op]
+                   (check!)
+                   (when-let [check-submission! (:check-submission! hooks)]
+                     (check-submission!))
+                   (submit! c {:op op :context (assoc (caller-context) :kv-update? true)}))
                  :internal-body!
                  (fn [op context]
                    (check!)

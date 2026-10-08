@@ -41,8 +41,11 @@
 - [Datalog] planner range conversion for `like`.
 - [Datalog] false-negative giant AVE lookup.
 - [Datalog] simulated transaction range bounds.
-- [KV] a cursor-lifetime bug in near-list that causes concurrent databases regression.
-- [KV] prefix overflow page deletion [#390](https://github.com/datalevin/datalevin/issues/390).
+- [Datalog] transacting recursive tempid restarts resulting in stack overflow.
+- [KV] a cursor-lifetime bug in near-list that causes concurrent databases
+  regression.
+- [KV] prefix overflow page deletion
+  [#390](https://github.com/datalevin/datalevin/issues/390).
 
 ### Improved
 - [Server] simplify, speedup and harden client/server lifecycle, by using
@@ -51,6 +54,9 @@ one thread per connection.
 - [Datalog] always refresh giant id floor in transaction.
 - [Datalog] skip magic set rewrite when retained bindings are unchanged through
   recursion.
+- [Datalog] reuse zstd context for giant datoms
+  [#392](https://github.com/datalevin/datalevin/issues/392). [Thx @reedho]
+- [WAL] write LMDB and WAL records in parallel.
 - [WAL] simplify Datalog WAL record and use `:writemap` for DLMDB overlay.
 - [KV] cheaper prefix cache operations.
 - [KV] reduce reader table scans.

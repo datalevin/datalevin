@@ -215,12 +215,12 @@ Only usable for debug output.
   prepare-get-value kv/prepare-get-value)
 
 (def ^{:arglists '([prepared input] [prepared view input])
-       :doc "Execute a prepared KV read with a key, a prepared pull with an
+       :doc "Execute a prepared KV read or update with a key, a prepared pull with an
   entity ID or lookup reference, or a prepared query with an input vector.
   Equivalent to invoking the prepared object.
   The three-argument arity executes a local preparation against an explicit
   view: pass the current transaction's DB view (`@tx`) for a prepared pull or
-  the transaction KV handle (`tx`) for a prepared KV read. A preparation made
+  the transaction KV handle (`tx`) for a prepared KV read or update. A preparation made
   outside a transaction can therefore be reused inside it without re-parsing.
   Remote preparations do not accept an explicit view.
   Prepared reads can be shared across threads; transaction-bound reads retain
@@ -1586,6 +1586,16 @@ See also: [[open-kv]], [[sync]]"}
 
       (update-kv kv \"counters\" :visits (fnil inc 0))"}
   update-kv kv/update-kv)
+
+(def ^{:arglists '([db dbi-name f]
+                  [db dbi-name f k-type]
+                  [db dbi-name f k-type v-type & args])
+       :doc "Prepare a reusable atomic update. The function, DBI, types and extra
+  arguments are fixed; invoke the result with a key or use [[execute-prepared]].
+  Remote functions must be defined with [[datalevin.interpret/inter-fn]].
+  Remote execution reuses the serialized and validated function per connection,
+  registering again after reconnect or handle eviction. See [[update-kv]]."}
+  prepare-update-kv kv/prepare-update-kv)
 
 (def ^{:arglists '([db])
        :doc      "Rollback writes of the transaction from inside

@@ -849,6 +849,25 @@
             (scan/read-prepared-value raw (.-dbi current) k k-type
                                      decode encode ignore-key? nil)))))))
 
+(defn ^:no-doc update-request
+  "Build an ordinary update resolver with optional atomic bookkeeping rows.
+  Custom DBIs retain the public transaction path."
+  [db dbi-name k f k-type v-type args extra-rows]
+  (when-not (custom-kv/custom-dbi? (raw-lmdb db) dbi-name)
+    (let [submitter (Thread/currentThread)
+          bindings (get-thread-bindings)]
+      (fn [tx]
+        (when (i/list-dbi? tx dbi-name)
+          (raise "update-kv requires a single-value DBI" {:dbi-name dbi-name}))
+        (let [old (i/get-value tx dbi-name k k-type v-type)
+              value (if (identical? submitter (Thread/currentThread))
+                      (apply f old args)
+                      (with-bindings bindings (apply f old args)))]
+          (if (seq extra-rows)
+            [nil (into [(l/kv-tx :put dbi-name k value k-type v-type)] extra-rows)
+             :data :data]
+            [dbi-name [[:put k value]] k-type v-type]))))))
+
 (defn update-kv
   "Atomically replace the value at `k` with `(apply f old-value args)`.
   Missing keys pass nil to `f`. Returns :transacted. Only ordinary, single-value
@@ -860,14 +879,33 @@
   ([db dbi-name k f k-type v-type & args]
    (if (satisfies? i/IRemoteKV db)
      (i/remote-update-kv db dbi-name k f k-type v-type args)
-     (grouped-write!
+     (if-let [update! (when-not (or (l/writing? db)
+                                  (custom-kv/custom-dbi? (raw-lmdb db) dbi-name))
+                       (:update! (write-control db)))]
+       (let [op (update-request db dbi-name k f k-type v-type args nil)]
+         (i/check-ready db)
+         (update! op))
+       (grouped-write!
        db
        (fn [tx]
          (when (i/list-dbi? tx dbi-name)
            (raise "update-kv requires a single-value DBI" {:dbi-name dbi-name}))
          (let [value (apply f (i/get-value tx dbi-name k k-type v-type) args)]
            (i/transact-kv tx dbi-name [[:put k value]] k-type v-type)
-           :transacted))))))
+           :transacted)))))))
+
+(defn prepare-update-kv
+  "Prepare an atomic update with a fixed function, types and extra arguments.
+  Invoke the result with a key, or use execute-prepared. Remote functions must
+  be inter-fn functions. Remote handles are registered lazily per connection."
+  ([db dbi-name f] (prepare-update-kv db dbi-name f :data :data))
+  ([db dbi-name f k-type] (prepare-update-kv db dbi-name f k-type :data))
+  ([db dbi-name f k-type v-type & args]
+   (if (satisfies? i/IRemotePreparedUpdate db)
+     (i/prepare-remote-update db dbi-name f k-type v-type args)
+     (prepared/prepared-read
+       #(apply update-kv db dbi-name % f k-type v-type args)
+       #(apply update-kv %1 dbi-name %2 f k-type v-type args)))))
 
 (defn prepare-get-value
   "Prepare a reusable KV point read. Execute it with a key using

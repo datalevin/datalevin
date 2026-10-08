@@ -29,6 +29,7 @@
    [org.eclipse.collections.impl.set.sorted.mutable TreeSortedSet]))
 
 (deftype ^:private TxStep [report entities])
+(deftype ^:private TxRetry [report])
 
 (defn- cached-ea-first-datom
   [db ^long e a]
@@ -389,10 +390,8 @@
           (dissoc-present ::value-tempids)
           (dissoc-present ::tx-redundant)))))
 
-(declare local-transact-tx-data)
-
 (defn- retry-with-tempid
-  [initial-report report es tempid upserted-eid tx-time]
+  [initial-report report _es tempid upserted-eid _tx-time]
   (let [eid (get (::upserted-tempids initial-report) tempid)]
     (vld/validate-upsert-retry-conflict eid tempid upserted-eid)
     ;; Retain stable mappings and tempids that own this in-flight target.
@@ -409,7 +408,7 @@
         (if (satisfies? txcommon/BatchPreparation context)
           (txcommon/restore-preparation! context (:db-after initial-report))
           (when-let [restore! (:restore! context)] (restore!))))
-      (local-transact-tx-data report' es tx-time))))
+      (TxRetry. report'))))
 
 (defn- flush-tuples [report]
   (let [db (:db-after report)]
@@ -865,7 +864,7 @@
         (map? entity)
         (let [result (handle-map-entity initial-report report db entity
                                         entities initial-es tx-time)]
-          (if (map? result)
+          (if (or (instance? TxRetry result) (map? result))
             result
             (let [[r' es'] result]
               (recur r' es'))))
@@ -875,6 +874,9 @@
                        initial-report report db store schema store-opts
                        tempids entity entities initial-es tx-time)]
           (cond
+            (instance? TxRetry result)
+            result
+
             (instance? TxStep result)
             (recur (.-report ^TxStep result) (.-entities ^TxStep result))
 
@@ -897,10 +899,65 @@
         :else
         (vld/validate-tx-entity-type entity)))))
 
+(defn- flat-upsert-tempids
+  "Resolve independent flat identity maps before allocating forward refs.
+  Restrict this to distinct explicit tempids and immutable scalar identities;
+  ordered mutations, nested entities and user predicates use ordinary retries."
+  [db entities]
+  (let [store (:store db)
+        schema (schema store)
+        identity? #(identical? :db.unique/identity (:db/unique (schema %)))
+        scalar-types #{nil :db.type/string :db.type/long :db.type/keyword
+                       :db.type/symbol :db.type/uuid :db.type/instant
+                       :db.type/boolean :db.type/float :db.type/double
+                       :db.type/bigint :db.type/bigdec :db.type/bytes}]
+    (when (and (next entities)
+               (not (:auto-entity-time? (opts store)))
+               (empty? (txcommon/attrs-by db :db.type/tuple))
+               (every? (fn [entity]
+                         (and (map? entity)
+                              (txprep/tempid? (:db/id entity))
+                              (not-any? coll? (vals entity))
+                              (every? #(and (keyword? %)
+                                            (or (= :db/id %)
+                                                (not= "db" (namespace %))))
+                                      (keys entity))
+                              (every? #(nil? (:db.attr/preds (schema %))) (keys entity))
+                              (<= (count (filter identity? (keys entity))) 1)
+                              (every? (fn [[a v]]
+                                        (or (not (identity? a))
+                                            (let [props (schema a)]
+                                              (and (some? v) (not (coll? v))
+                                                   (contains? scalar-types (:db/valueType props))
+                                                   (not= :db.cardinality/many (:db/cardinality props))
+                                                   (nil? (:db.attr/preds props))))))
+                                      entity)))
+                       entities)
+               (= (count entities) (count (set (map :db/id entities)))))
+      (reduce (fn [tempids entity]
+                (if-let [a (first (filter identity? (keys entity)))]
+                  (let [v (coreprep/correct-value-with-props
+                            (opts store) (schema a) a (get entity a))]
+                    (if-some [eid (txcommon/av-first-e db a v)]
+                      (assoc tempids (:db/id entity) eid)
+                      tempids))
+                  tempids))
+              {} entities))))
+
 (defn execute-tx-loop
   [initial-report initial-es tx-time]
-  (txcommon/with-lookup-ref-cache (:db-before initial-report)
-    (execute-tx-loop* initial-report initial-es tx-time)))
+  (let [upserts (flat-upsert-tempids (:db-before initial-report) initial-es)
+        initial-report (if (seq upserts)
+                         (-> initial-report
+                             (update :tempids merge upserts)
+                             (update ::upserted-tempids merge upserts))
+                         initial-report)]
+    (loop [initial-report initial-report]
+      (let [result (txcommon/with-lookup-ref-cache (:db-before initial-report)
+                     (execute-tx-loop* initial-report initial-es tx-time))]
+        (if (instance? TxRetry result)
+          (recur (.-report ^TxRetry result))
+          result)))))
 
 (defn local-transact-tx-data
   [initial-report initial-es tx-time]

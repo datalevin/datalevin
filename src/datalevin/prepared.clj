@@ -1,7 +1,7 @@
 ;; Copyright (c) Huahai Yang. All rights reserved.
 ;; Distributed under the Eclipse Public License 2.0.
 (ns ^:no-doc datalevin.prepared
-  "Reusable read operations. A prepared read owns metadata, never a transaction
+  "Reusable operations. A preparation owns metadata, never a transaction
   or a borrowed buffer."
   (:import [clojure.lang IFn]
            [java.util LinkedHashMap]
@@ -17,7 +17,7 @@
   ([run view-run] (PreparedRead. run view-run)))
 
 (defn execute
-  "Execute a prepared read with its key, entity identifier or query inputs.
+  "Execute a prepared operation with its key, entity identifier or query inputs.
   The three-argument arity executes a local preparation against an explicit
   view, such as a transaction's DB view or KV handle, so one preparation can
   be reused across transactions."

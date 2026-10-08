@@ -206,7 +206,10 @@
         (let [wire-opts (.get wire-options)
               prepared-id (::prepared/id (meta msg))
               enabled? (and prepared-id (:prepared-read? wire-opts)
-                            (or (not= :q (:type msg)) (:prepared-query? wire-opts)))
+                            (case (:type msg)
+                              :update-kv (:prepared-update? wire-opts)
+                              :q (:prepared-query? wire-opts)
+                              true))
               id (when enabled? prepared-id)]
           (loop [register? (and enabled? (nil? (.get prepared-handles id)))]
             (let [wire-msg
@@ -216,6 +219,9 @@
                       (cond-> {:type :execute-prepared :handle id
                                :value (nth (:args msg) 2)
                                :writing? (:writing? msg)}
+                        (= :update-kv (:type msg))
+                        (merge (select-keys msg [:client-op-id :client-op-hash
+                                                 :client-op-response-kind]))
                         (:ha-read-min-tx msg)
                         (assoc :ha-read-min-tx (:ha-read-min-tx msg))))
                     (if prepared-id (with-meta msg nil) msg))
