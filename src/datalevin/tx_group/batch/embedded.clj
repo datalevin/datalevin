@@ -40,8 +40,14 @@
 (def ^:dynamic *enabled?* true)
 
 (defn- public-error [t]
-  (if (and (ex-cause t) (= "Batch aborted before WAL append" (ex-message t)))
-    (ex-cause t) t))
+  (let [cause (ex-cause t)]
+    (cond
+      (and cause (= "Batch aborted before WAL append" (ex-message t))) cause
+      ;; Keep the established HA wire error visible to idempotent callers,
+      ;; together with the collector's already committed local WAL outcome.
+      (and cause (= :ha/write-indeterminate (:error (ex-data cause))))
+      (ex-info (ex-message cause) (merge (ex-data t) (ex-data cause)) cause)
+      :else t)))
 
 (defn- submit! [collector request]
   (try (batch/submit! collector request)
@@ -49,9 +55,11 @@
 
 (defn- caller-context []
   (let [before cpp/*before-write-commit-fn*
-        after kvtx/*after-txlog-append-fn*]
-    (when (or before after)
+        after kvtx/*after-txlog-append-fn*
+        term kvtx/*commit-payload-ha-term*]
+    (when (or before after term)
       (cond-> {}
+        term (assoc :ha-term term)
         before (assoc :before-append! (bound-fn [] (before {:operation :close-transact-kv})))
         after (assoc :append-info (volatile! nil)
                      :confirm! (bound-fn [context _]
@@ -61,7 +69,8 @@
 
 (defn- prepare
   ([raw name txs kt vt] (prepare raw name txs kt vt false))
-  ([raw name txs kt vt owned-datoms?]
+  ([raw name txs kt vt owned-datoms?] (prepare raw name txs kt vt owned-datoms? nil))
+  ([raw name txs kt vt owned-datoms? scratch]
   (let [log-rows (ArrayList.) datom? (l/datom-kv-txs? txs)
         datom-bytes (when datom? (long-array 1))
         rows (if datom?
@@ -84,10 +93,10 @@
                  (let [rows (RowRegions.)]
                    (.append rows datoms)
                    (.append rows (public/prepare-rows raw (fn [_]) name other
-                                                     kt vt false true log-rows))
+                                                     kt vt false true log-rows scratch))
                    rows))
                (public/prepare-rows raw (fn [_]) name txs
-                                    kt vt false true log-rows))]
+                                    kt vt false true log-rows scratch))]
     ;; Only a substantial unconditional datom region can repay the worker
     ;; handoff. Native rejection flags must resolve before WAL dispatch.
     (cond-> {:rows rows :wal-rows log-rows}
@@ -105,7 +114,7 @@
         info (i/kv-info raw)
         state (wal/state raw)]
     (when (and *enabled?* state (not (:wal-shared? state))
-               (not (:ha-mode @info))
+               (or (not (:ha-mode @info)) (:server? hooks))
                (or (:datalog? hooks) (not (i/dbi-opts raw c/eav))))
       (locking info
         (when-not (:independent-control @info)
@@ -117,6 +126,9 @@
                               ;; preparation-timeout contract. Bound in-flight
                               ;; requests; retain the legacy caller's input size.
                               :rmw-allowance-bytes charge/request-control-bundle)
+                ;; Collector execution serializes native owners. Caller-side
+                ;; preparation never touches this reusable value buffer.
+                scratch (object-array 1)
                 collector (volatile! nil)
                 closing (AtomicBoolean.)
                 metadata (volatile! nil)
@@ -150,15 +162,22 @@
                                                     wdb true))
                             :application-error! application-error!
                             :before-append! (fn [b]
-                                              (dotimes [idx (batch/batch-count b)]
-                                                (let [d (batch/batch-at b idx)]
-                                                  (when (or (:storage-staged? (batch/data d))
-                                                            (seq (:rows (batch/data d))))
-                                                    (when-let [before (:before-append! (batch/context d))]
-                                                      (try (before) (catch Throwable t (application-error! t))))))))
+                                              (let [term (:ha-term (batch/context (batch/batch-at b 0)))]
+                                                (dotimes [idx (batch/batch-count b)]
+                                                  (let [d (batch/batch-at b idx)]
+                                                    (when-not (= term (:ha-term (batch/context d)))
+                                                      (application-error!
+                                                        (ex-info "Cannot combine writes from different HA terms"
+                                                                 {:error :ha/write-rejected
+                                                                  :reason :leadership-changed
+                                                                  :retryable? true})))
+                                                    (when (or (:storage-staged? (batch/data d))
+                                                              (seq (:rows (batch/data d))))
+                                                      (when-let [before (:before-append! (batch/context d))]
+                                                        (try (before) (catch Throwable t (application-error! t)))))))))
                             :prepare-rows! (fn [raw descriptor name txs kt vt]
                                              (prepare raw name txs kt vt
-                                                      (:datalog-prepare? (batch/context descriptor))))
+                                                      (:datalog-prepare? (batch/context descriptor)) scratch))
                             :encode-body #(wal/prepare-append-body %1 %2)
                             :committed! (fn [b _]
                                           (kvtx/finish-batch-commit! state @metadata)
@@ -172,10 +191,17 @@
                                   ;; Native commit and existing metadata cache
                                   ;; publication share the same writer lock as
                                   ;; standalone admin/manual transactions.
-                                  (locking (l/write-txn raw)
-                                    (if-let [wrap (:wrap-execution hooks)]
-                                      (wrap #((:executor runtime) b) b)
-                                      ((:executor runtime) b))))
+                                  (let [execute (fn []
+                                                  (locking (l/write-txn raw)
+                                                    (if-let [wrap (:wrap-execution hooks)]
+                                                      (wrap #((:executor runtime) b) b)
+                                                      ((:executor runtime) b))))]
+                                    ;; Server admission precedes the native
+                                    ;; monitor; explicit remote transactions
+                                    ;; acquire their semaphore in that order.
+                                    (if-let [wrap (:wrap-batch! hooks)]
+                                      (wrap execute b)
+                                      (execute))))
                                 {:limits limits :preparation-timeout-ms 0
                                  :collection-delay-nanos (kv/write-batch-delay-nanos raw)})
                 _ (vreset! collector c)
@@ -206,9 +232,12 @@
                                            {:error :txlog/wal-close-timeout})))
                          (when @(:healthy? (:sync-manager state))
                            (wal/force-through! state (dec (long @(:next-lsn state))) 0))
+                         (aset scratch 0 nil)
                          (i/close-kv raw))
                 body! (fn [body opts]
                         (check!)
+                        (when-let [check-submission! (:check-submission! hooks)]
+                          (check-submission!))
                         (let [result (volatile! nil) completed? (volatile! false)
                               submitter (Thread/currentThread)
                               bindings (get-thread-bindings)
@@ -226,29 +255,35 @@
                                  (if (and @completed? (= :txlog/request-aborted (:error (ex-data t))))
                                    @result (throw (public-error t)))))))
                 control
-                {:embedded? true :datalog-context (:context hooks)
+                {:embedded? true :server? (:server? hooks) :datalog-context (:context hooks)
+                 :direct-write? (fn [] (and (:server? hooks) kv/*server-write-slot-held?*))
                  :collector c :body! body! :close! close! :check! check!
                  :internal-body!
                  (fn [op context]
                    (check!)
+                   (when-let [check-submission! (:check-submission! hooks)]
+                     (check-submission!))
                    (submit! c {:op op :context (merge context (caller-context))}))
                  :transact!
                  (fn [name txs kt vt]
                    (check!)
+                   (when-let [check-submission! (:check-submission! hooks)]
+                     (check-submission!))
                    (if (seq txs)
-                     (submit!
-                       c {:allowance charge/request-control-bundle
-                          :context (caller-context)
-                          :prepare
-                          (fn [_]
-                            (let [{:keys [rows wal-rows]} (prepare raw name txs kt vt)
-                                  conditional? (boolean
-                                                 (some #(if (instance? KVTxData %)
-                                                          (seq (.-flags ^KVTxData %))
-                                                          (.-no-overwrite? ^DatomKVTxData %)) rows))]
-                              {:rows rows :state-dependent? conditional?
-                               :wal-body (when (seq rows) (wal/prepare-append-body wal-rows {}))
-                               :result :transacted}))})
+                     (let [context (caller-context)]
+                       (submit!
+                         c {:allowance charge/request-control-bundle
+                            :context context
+                            :prepare
+                            (fn [_]
+                              (let [{:keys [rows wal-rows]} (prepare raw name txs kt vt)
+                                    conditional? (boolean
+                                                   (some #(if (instance? KVTxData %)
+                                                            (seq (.-flags ^KVTxData %))
+                                                            (.-no-overwrite? ^DatomKVTxData %)) rows))]
+                                {:rows rows :state-dependent? conditional?
+                                 :wal-body (when (seq rows) (wal/prepare-append-body wal-rows context))
+                                 :result :transacted}))}))
                      :transacted))
                  :clear-dbi! #(public/clear-admin! raw state c
                                                  (get-in runtime [:worker :wake!])

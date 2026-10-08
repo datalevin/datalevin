@@ -3,6 +3,7 @@
             [clojure.walk :as walk]
             [clojure.test :refer [deftest is]]
             [datalevin.core :as d]
+            [datalevin.bits :as bits]
             [datalevin.constants :as c]
             [datalevin.binding.cpp.lifecycle :as lifecycle]
             [datalevin.interface :as i]
@@ -19,7 +20,32 @@
             [datalevin.tx-state.protocol :as protocol]
             [datalevin.util :as u])
   (:import [datalevin.lmdb DatomKVTxData]
+           [java.nio ByteBuffer]
            [java.util.concurrent CountDownLatch TimeUnit]))
+
+(deftest native-preparation-scratch-keeps-earlier-values-owned
+  (let [scratch (object-array 1)
+        encode #(#'prototype/encode (fn [_]) % :data false scratch)
+        first-value {:response (apply str (repeat 400 "a"))}
+        first-bytes (encode first-value)
+        exact-capacity (.capacity ^ByteBuffer (aget scratch 0))
+        exact-value (apply str (repeat (dec exact-capacity) "x"))
+        exact-bytes (#'prototype/encode (fn [_]) exact-value :string false scratch)
+        second-value {:response (apply str (repeat 3000 "b"))}
+        second-bytes (encode second-value)
+        decode #(bits/read-buffer (ByteBuffer/wrap %) :data)]
+    (is (= first-value (decode first-bytes)))
+    (is (= exact-capacity (alength exact-bytes)))
+    (is (= exact-value (bits/read-buffer (ByteBuffer/wrap exact-bytes) :string)))
+    (is (= second-value (decode second-bytes)))
+    (is (thrown? Exception (encode java.lang.String)))
+    (let [large {:response (apply str (repeat 100000 "c"))}]
+      (is (= large (decode (encode large))))
+      (is (<= (.capacity ^ByteBuffer (aget scratch 0)) 65536)))
+    (is (= {:after :failure} (decode (encode {:after :failure}))))
+    (is (= first-value (decode first-bytes)))
+    (is (= exact-value (bits/read-buffer (ByteBuffer/wrap exact-bytes) :string)))
+    (is (= second-value (decode second-bytes)))))
 
 (deftest embedded-wal-preparation-keeps-owned-compact-datoms
   (let [avg (byte-array [1 2 3])

@@ -36,6 +36,9 @@
    [datalevin.server.notifications :as notifications]
    [datalevin.storage :as st]
    [datalevin.tx-group.compat :as group]
+   [datalevin.tx-group.batch :as batch]
+   [datalevin.tx-group.batch.datalog :as datalog]
+   [datalevin.tx-group.batch.embedded :as embedded]
    [datalevin.util :as u :refer [raise]]
    [datalevin.validate :as vld]
    [taoensso.timbre :as log])
@@ -507,7 +510,7 @@
         (let [^Semaphore lock (db-lock deps server db-name)]
           (acquire-db-transaction-slot! deps server db-name lock)
           (try
-            (f)
+            (binding [kv/*server-write-slot-held?* true] (f))
             (finally
               (.release lock))))))))
 
@@ -1471,6 +1474,53 @@
             (write-result! deps skey result)))))))
 
 (def ^:dynamic ^:private *datalog-write-group* nil)
+(def ^:dynamic ^:private *datalog-write-control* nil)
+
+(defn- server-write-control
+  "Attach one server-owned collector, admitting the physical batch through
+  the existing transaction semaphore before taking the native writer lock."
+  [deps server db-name store]
+  (let [raw (kv/raw-lmdb store)
+        info (i/kv-info raw)
+        state (db-state deps server db-name)
+        ha? (some? (:ha-mode @info))
+        guarded? (and (= :leader (:ha-role state))
+                      (satisfies? ctrl/ILeaseAuthority (:ha-authority state))
+                      cpp/*before-write-commit-fn*
+                      kvtx/*after-txlog-append-fn*
+                      kvtx/*commit-payload-ha-term*)]
+    (when (and embedded/*enabled?* (not (l/writing? raw))
+               (not (Thread/holdsLock (l/write-txn raw)))
+               (or (not (ha-runtime-read-state? state)) guarded?)
+               (or (not ha?) guarded?))
+      (locking info
+        (when-not (:independent-control @info)
+          (let [hooks
+                {:server? true
+                 :check-submission!
+                 (fn []
+                   (when (and (:ha-mode @info)
+                              (not (and cpp/*before-write-commit-fn*
+                                        kvtx/*after-txlog-append-fn*
+                                        kvtx/*commit-payload-ha-term*)))
+                     (raise "HA collector requires guarded server admission"
+                            {:error :ha/write-rejected :reason :missing-write-guards
+                             :retryable? false})))
+                 :wrap-batch!
+                 (fn [execute _]
+                   (let [^Semaphore lock (db-lock deps server db-name)]
+                     (try (acquire-db-transaction-slot! deps server db-name lock)
+                          (catch Exception e (batch/cancel-before-dispatch! e)))
+                     (try (execute) (finally (.release lock)))))
+                 :publish-db!
+                 (fn [committed]
+                   ((:update-db deps) server db-name
+                    #(assoc % :dt-db committed :store (:store committed))))}]
+            (if-let [dt-db (:dt-db state)]
+              (datalog/attach! dt-db hooks)
+              (embedded/attach! store hooks))))
+        (let [control (:independent-control @info)]
+          (when (:server? control) control))))))
 
 (defn- server-write-group
   [deps server db-name store kind]
@@ -1489,13 +1539,18 @@
 
 (defn- with-datalog-transaction-slot
   [deps server skey db-name writing? simulated? f]
+  (if-let [control (when (and (not writing?) (not simulated?))
+                    (let [store (dt-store deps server skey db-name false)]
+                      (when (instance? Store store)
+                        (server-write-control deps server db-name (.-lmdb ^Store store)))))]
+    (binding [*datalog-write-control* control] (f))
   (if-let [g (when (and (not writing?) (not simulated?))
                (let [store (dt-store deps server skey db-name false)]
                  (when (instance? Store store)
                    (server-write-group deps server db-name
                                               (.-lmdb ^Store store) :server-datalog))))]
     (binding [*datalog-write-group* g] (f))
-    (with-direct-db-transaction-slot deps server db-name writing? f)))
+    (with-direct-db-transaction-slot deps server db-name writing? f))))
 
 (defn- commit-stamped-report
   [report ordered?]
@@ -1560,6 +1615,35 @@
                                            [] {} (or tx-meta {}))
                             txs s?)))]
        (cond
+         *datalog-write-control*
+         (let [conn (atom db0)
+               stamp-report (fn [report]
+                              (assoc report ::group-committed? true
+                                            ::group-last-modified
+                                            (i/last-modified (:store (:db-after report)))))
+               body (fn [tx]
+                      (let [report (transact @tx)]
+                        (reset! tx (:db-after report))
+                        (stamp-report report)))
+               report (if (= :scalar-update (first prepared))
+                        ;; Retain pending scalar datoms across requests and
+                        ;; freeze the native suffix after resolution, as the
+                        ;; embedded collector does. The general body wrapper
+                        ;; materializes pending datoms before each request.
+                        (datalog/run-scalar!
+                          *datalog-write-control* conn prepared txs tx-meta
+                          (fn [_ db prepared tx-meta]
+                            (when-let [report (transact-prepared db prepared tx-meta)]
+                              (stamp-report report)))
+                          (fn [tx _ _] (body tx)))
+                        (datalog/with-transaction!
+                          *datalog-write-control* conn body
+                          {:context {:datalog-prepare? true
+                                     :isolated? (st/synchronous-secondary-indexing? (:store db0))}}))]
+           (when (seq (:tx-data report))
+             (database-changed! deps server db-name false))
+           report)
+
          *datalog-write-group*
          (group/submit!
            *datalog-write-group*
@@ -2471,6 +2555,11 @@
                                (if client-op
                                  (i/transact-kv tx txs)
                                  (i/transact-kv tx dbi-name txs k-type v-type)))]
+                      (if (when (and (not writing?) (= :request mode))
+                            (server-write-control deps server db-name kv-store))
+                        ;; Attach server admission, then use the public local
+                        ;; write entry point, including its custom-type fallback.
+                        (op kv-store)
                       (if-let [g (when (and (not writing?) (= :request mode))
                                    (server-write-group deps server db-name
                                                               kv-store :server-kv))]
@@ -2483,7 +2572,7 @@
                                  (execute tx))))
                           op)
                         (with-direct-db-transaction-slot
-                          deps server db-name writing? #(op kv-store))))
+                          deps server db-name writing? #(op kv-store)))))
                     (when (seq txs0)
                       (database-changed! deps server db-name writing?))
                     response)))]
@@ -2517,6 +2606,9 @@
                                               (:response-kind client-op)
                                               :transacted))]))
                                   :transacted)]
+                      (if-let [control (when-not writing?
+                                         (server-write-control deps server db-name store))]
+                        ((:body! control) op nil)
                       (if-let [g (when-not writing?
                                    (server-write-group deps server db-name
                                                               store :server-kv))]
@@ -2530,7 +2622,7 @@
                           op)
                         (with-direct-db-transaction-slot
                           deps server db-name writing?
-                          #(l/with-transaction-kv [tx store] (op tx))))
+                          #(l/with-transaction-kv [tx store] (op tx)))))
                       (database-changed! deps server db-name writing?)
                       :transacted))))]
           (write-result! deps skey response))))))

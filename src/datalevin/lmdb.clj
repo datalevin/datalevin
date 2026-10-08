@@ -743,7 +743,8 @@
              ;; Schema administration and secondary workers already own the
              ;; native writer. Keep their existing standalone transaction;
              ;; waiting on a queued owner here would invert writer ownership.
-             (Thread/holdsLock (write-txn orig-db#))
+             (or (Thread/holdsLock (write-txn orig-db#))
+                 (when-let [direct?# (:direct-write? control#)] (direct?#)))
              (with-compatibility-transaction-kv [~db orig-db# opts#] ~@body)
              :else ((:body! control#) (fn [~db] ~@body) opts#)))
        (with-compatibility-transaction-kv [~db orig-db# opts#] ~@body))))

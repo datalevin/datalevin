@@ -71,7 +71,9 @@
         (when-not (or (l/writing? lmdb)
                       (Thread/holdsLock (l/write-txn lmdb)))
           (let [control (:independent-control @(i/kv-info lmdb))]
-            (when (:datalog-context control) control)))))))
+            (when (and (:datalog-context control)
+                       (not (and (:server? control) kv/*server-write-slot-held?*)))
+              control)))))))
 
 (defn- local-writing-view?
   [view after]
@@ -129,53 +131,58 @@
               after (or (when conn @conn)
                         (when publication @publication) committed)]
           (batch/set-data! d (batch/with-data-result!
-                              data (readable-result (:result data) after))))))))
+                              data (readable-result (:result data) after)))))
+      committed)))
 
 (defn attach!
   "Attach the existing Datalog store to the environment's data collector."
-  [^DB db]
-  (when (instance? Store (.-store db))
-    (let [raw (.-lmdb ^Store (.-store db))
-          context (volatile! nil)]
-      (embedded/attach!
-        raw
-        {:datalog? true :context context
-         :wrap-execution
-         (fn [execute b]
-           (let [ctx {:current (volatile! nil) :group (volatile! nil)
-                      :cache (volatile! nil) :connections (IdentityHashMap.)
-                      :native-view (object-array 2)
-                      :resolver-bindings (volatile! nil)
-                      :batch b}]
-             (vreset! context ctx)
-             (try (execute)
-                  (finally
-                    (when-let [[store disabled?] @(:cache ctx)]
-                      (when-not disabled? (db/enable-cache store)))
-                    (vreset! context nil)))))
-         :finish-preparation! (fn [_ _]
-                                (when-let [group @(:group @context)]
-                                  (s/write-group-metadata group)))
-         :storage-rows! (fn []
-                          (when-let [group @(:group @context)]
-                            (binding [s/*write-group* group
-                                      s/*enforce-blind-unique-inserts?* false
-                                      c/*ordered-datom-writes?* false]
-                              (s/take-group-storage-rows! group))))
-         :storage-tail! (fn []
-                          (when-let [group @(:group @context)]
-                            (s/freeze-group-storage-datoms! group)))
-         :before-body! (fn [descriptor]
-                         (when-not (:datalog-prepare? (batch/context descriptor))
-                           (when-let [current @(:current @context)]
-                             (db/-clear-tx-cache current))
-                           (when-let [preparation
-                                      (get @(:resolver-bindings @context)
-                                           #'txcommon/*batch-prepare*)]
-                             (txcommon/discard-scalar-pending! preparation))))
-         :committed! #(publish! raw @context %)})))
-  db)
-
+  ([db] (attach! db nil))
+  ([^DB db hooks]
+    (when (instance? Store (.-store db))
+      (let [raw (.-lmdb ^Store (.-store db))
+            context (volatile! nil)]
+        (embedded/attach!
+          raw
+          (merge hooks
+            {:datalog? true :context context
+             :wrap-execution
+             (fn [execute b]
+               (let [ctx {:current (volatile! nil) :group (volatile! nil)
+                          :cache (volatile! nil) :connections (IdentityHashMap.)
+                          :native-view (object-array 2)
+                          :resolver-bindings (volatile! nil)
+                          :batch b}]
+                 (vreset! context ctx)
+                 (try (execute)
+                      (finally
+                        (when-let [[store disabled?] @(:cache ctx)]
+                          (when-not disabled? (db/enable-cache store)))
+                        (vreset! context nil)))))
+             :finish-preparation! (fn [_ _]
+                                    (when-let [group @(:group @context)]
+                                      (s/write-group-metadata group)))
+             :storage-rows! (fn []
+                              (when-let [group @(:group @context)]
+                                (binding [s/*write-group* group
+                                          s/*enforce-blind-unique-inserts?* false
+                                          c/*ordered-datom-writes?* false]
+                                  (s/take-group-storage-rows! group))))
+             :storage-tail! (fn []
+                              (when-let [group @(:group @context)]
+                                (s/freeze-group-storage-datoms! group)))
+             :before-body! (fn [descriptor]
+                             (when-not (:datalog-prepare? (batch/context descriptor))
+                               (when-let [current @(:current @context)]
+                                 (db/-clear-tx-cache current))
+                               (when-let [preparation
+                                          (get @(:resolver-bindings @context)
+                                               #'txcommon/*batch-prepare*)]
+                                 (txcommon/discard-scalar-pending! preparation))))
+             :committed! (fn [b]
+                           (when-let [committed (publish! raw @context b)]
+                             (when-let [publish-db! (:publish-db! hooks)]
+                               (publish-db! committed))))}))))
+    db))
 (defn batched? [control]
   (> (batch/batch-count (:batch @(:datalog-context control))) 1))
 

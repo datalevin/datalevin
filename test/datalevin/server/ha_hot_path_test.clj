@@ -17,6 +17,7 @@
    [datalevin.server.handlers :as handlers]
    [datalevin.test.core :refer [db-fixture]]
    [datalevin.tx-group.compat :as group]
+   [datalevin.tx-group.batch :as batch]
    [datalevin.util :as u])
   (:import
    [datalevin.tx_group Group]
@@ -599,3 +600,129 @@
           (is (= (:ha-lease-local-deadline-nanos newer)
                  (:ha-lease-local-deadline-nanos current)))
           (is (true? (:ha-clock-skew-paused? current))))))))
+
+(deftest server-collector-confirms-after-releasing-native-and-server-ownership
+  (doseq [outcome [:ok :indeterminate]]
+    (let [path (u/tmp-dir (str "ha-collector-" (random-uuid)))
+          store (l/open-kv path {:wal? true :snapshot-scheduler? false
+                                :wal-segment-prealloc? false})
+          slot (Semaphore. 1)
+          ownership (atom [])
+          {:keys [deps entered release confirmed]}
+          (authority-probe outcome
+            #(swap! ownership conj [(Thread/holdsLock (l/write-txn store))
+                                    (Thread/holdsLock (i/kv-info store))
+                                    (.availablePermits slot)]))
+          deps (assoc deps :get-lock (fn [_ _] slot)
+                           :transaction-lock-timeout-ms (constantly 1000))
+          message {:type :update-kv :args ["db"]}
+          jobs (atom [])
+          second-applied (promise)]
+      (try
+        (d/open-dbi store "counter")
+        (d/transact-kv store "counter" [[:put 1 0]] :id :long)
+        (vswap! (i/kv-info store) assoc :ha-mode :consensus-lease)
+        (binding [kvtx/*commit-payload-ha-term* 1
+                  cpp/*before-write-commit-fn* (ha/ha-write-commit-check-fn deps nil message)
+                  kvtx/*after-txlog-append-fn*
+                  (let [publish (ha/ha-write-commit-publish-fn deps nil message)]
+                    (fn [context]
+                      (when (= 2 (d/get-value store "counter" 1 :id :long))
+                        (deliver second-applied true))
+                      (publish context)))]
+          (let [control (#'handlers/server-write-control deps nil "db" store)
+                before (:last-committed-lsn (d/txlog-watermarks store))
+                submit #(future (try ((:body! control)
+                                       (fn [tx] (d/update-kv tx "counter" 1 inc :id :long)) nil)
+                                     :ok (catch Throwable t t)))]
+            (is (:server? control))
+            (swap! jobs conj (submit))
+            (is (deref entered 10000 false))
+            (is (not (realized? (first @jobs))))
+            (is (= 1 (.availablePermits slot)))
+            (swap! jobs conj (submit))
+            (is (deref second-applied 10000 false))
+            (is (= 2 (d/get-value store "counter" 1 :id :long)))
+            (let [records (vec (kv/open-tx-log store (inc (long before))))]
+              (is (= 2 (count records)))
+              (is (= [1 1] (mapv :ha-term records))))
+            (is (every? #(= [false false 1] %) @ownership))
+            (deliver release true)
+            (deliver confirmed true)
+            (let [results (mapv #(deref % 10000 ::timeout) @jobs)]
+              (is (not-any? #{::timeout} results))
+              (if (= outcome :ok)
+                (is (= [:ok :ok] results))
+                (let [failures (filter #(instance? Throwable %) results)]
+                  (is (seq failures))
+                  (doseq [failure failures]
+                    (is (= :ha/write-indeterminate (:error (ex-data failure))))
+                    (is (= :committed (:outcome (ex-data failure))))))))
+            (is (batch/serving? (:collector control)))))
+        (finally
+          (deliver release true)
+          (deliver confirmed true)
+          (doseq [job @jobs] (deref job 10000 nil))
+          (d/close-kv store)
+          (u/delete-files path))))))
+
+(deftest server-collector-semaphore-timeout-does-not-fence-runtime
+  (let [path (u/tmp-dir (str "server-collector-slot-" (random-uuid)))
+        store (l/open-kv path {:wal? true :snapshot-scheduler? false
+                              :wal-segment-prealloc? false})
+        slot (Semaphore. 1)
+        deps {:db-state (fn [_ _] {}) :get-lock (fn [_ _] slot)
+              :transaction-lock-timeout-ms (constantly 10)}]
+    (try
+      (d/open-dbi store "data")
+      (let [control (#'handlers/server-write-control deps nil "db" store)]
+        (.acquire slot)
+        (try
+          (is (thrown? Exception ((:body! control)
+                                  #(d/transact-kv % "data" [[:put 1 :blocked]]) nil)))
+          (finally (.release slot)))
+        (is (batch/serving? (:collector control)))
+        (is (nil? (d/get-value store "data" 1)))
+        ((:body! control) #(d/transact-kv % "data" [[:put 1 :accepted]]) nil)
+        (is (= :accepted (d/get-value store "data" 1)))
+        ;; Standalone administration owns the same semaphore and must not
+        ;; enqueue recursively into a batch waiting to acquire it.
+        (#'handlers/with-direct-db-transaction-slot deps nil "db" false
+          #(d/transact-kv store c/kv-info [[:put :server/probe true]] :keyword :data))
+        (is (= 1 (.availablePermits slot))))
+      (finally (d/close-kv store) (u/delete-files path)))))
+
+(deftest server-collector-rechecks-leadership-before-wal-append
+  (let [path (u/tmp-dir (str "ha-collector-admission-" (random-uuid)))
+        store (l/open-kv path {:wal? true :snapshot-scheduler? false
+                              :wal-segment-prealloc? false})
+        {:keys [deps dbs release confirmed]} (authority-probe :ok)
+        slot (Semaphore. 1)
+        deps (assoc deps :get-lock (fn [_ _] slot)
+                         :transaction-lock-timeout-ms (constantly 1000))
+        message {:type :transact-kv :args ["db"]}]
+    (try
+      (d/open-dbi store "data")
+      (vswap! (i/kv-info store) assoc :ha-mode :consensus-lease)
+      (binding [kvtx/*commit-payload-ha-term* 1
+                cpp/*before-write-commit-fn* (ha/ha-write-commit-check-fn deps nil message)
+                kvtx/*after-txlog-append-fn* (ha/ha-write-commit-publish-fn deps nil message)]
+        (let [control (#'handlers/server-write-control deps nil "db" store)
+              before (.get ^ConcurrentHashMap dbs "db")
+              lsn (:last-committed-lsn (d/txlog-watermarks store))
+              failure (try
+                        ((:body! control)
+                         (fn [tx]
+                           (d/transact-kv tx "data" [[:put 1 :rejected]])
+                           (.put ^ConcurrentHashMap dbs "db"
+                                 (assoc before :ha-leader-term 2 :ha-authority-term 2))) nil)
+                        nil (catch Throwable t t))]
+          (is (some? failure))
+          (is (some #(= :leadership-changed (:reason (ex-data %)))
+                    (take-while some? (iterate ex-cause failure))))
+          (is (= lsn (:last-committed-lsn (d/txlog-watermarks store))))
+          (is (nil? (d/get-value store "data" 1)))
+          (is (batch/serving? (:collector control)))
+          (is (= 1 (.availablePermits slot)))))
+      (finally (deliver release true) (deliver confirmed true)
+               (d/close-kv store) (u/delete-files path)))))

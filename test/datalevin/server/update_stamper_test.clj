@@ -2,7 +2,8 @@
   (:require [clojure.test :refer [deftest is use-fixtures]]
             [datalevin.core :as d]
             [datalevin.datom :as datom]
-            [datalevin.kv :as kv]
+            [datalevin.interface :as i]
+            [datalevin.interpret :as inter]
             [datalevin.kv.txlog :as kvtx]
             [datalevin.lmdb :as l]
             [datalevin.server :as server]
@@ -10,7 +11,7 @@
             [datalevin.test.core :refer [allocate-port db-fixture]]
             [datalevin.util :as u])
   (:import [datalevin.storage Store]
-           [datalevin.tx_group Group]
+           [datalevin.tx_group.batch Collector]
            [java.util.concurrent ConcurrentLinkedQueue]))
 
 (def ^:dynamic *uri* nil)
@@ -43,6 +44,52 @@
 (defn- report-data [report]
   {:datoms (mapv (juxt :e :a :v :tx datom/datom-added) (:tx-data report))
    :tempids (:tempids report) :tx-meta (:tx-meta report)})
+
+(deftest remote-kv-uses-local-write-entry-point
+  (doseq [profile [:strict :relaxed]]
+    (let [name (str (random-uuid))
+          remote (d/open-kv (str *uri* name) {:wal? true :wal-durability-profile profile})]
+      (try
+        (d/open-dbi remote "data")
+        (d/transact-kv remote "data" [[:put 1 "initial"]] :long :string)
+        (let [local (#'server/get-kv-store *server* name)
+              info (i/kv-info local)
+              control (:independent-control @info)
+              calls (atom 0)
+              transact! (:transact! control)]
+          (is (:server? control))
+          (vswap! info assoc :independent-control
+                  (assoc control
+                         :transact! (fn [& args]
+                                      (swap! calls inc)
+                                      (apply transact! args))
+                         :body! (fn [& _]
+                                  (throw (ex-info "Unexpected transaction body" {})))))
+          (try
+            (d/transact-kv remote "data" [[:put 1 "named"]] :long :string)
+            (d/transact-kv remote [[:put "data" 2 "mixed" :long :string]])
+            (is (= 2 @calls))
+            (is (= "named" (d/get-value remote "data" 1 :long :string)))
+            (is (= "mixed" (d/get-value remote "data" 2 :long :string)))
+            (finally (vswap! info assoc :independent-control control))))
+        (finally (d/close-kv remote))))))
+
+(deftest remote-wal-kv-retains-local-custom-type-fallback
+  (let [remote (d/open-kv (str *uri* (random-uuid)) {:wal? true})
+        a {:rank 1 :name "a"}
+        b {:rank 2 :name "b"}]
+    (try
+      (d/register-type remote :app/task
+                       {:index {:type :long
+                                :order-fn (inter/inter-fn [v] (:rank v))}})
+      (d/open-dbi remote "tasks" {:key-type :app/task})
+      (d/transact-kv remote "tasks" [[:put a :a] [:put b :b]])
+      (is (= :a (d/get-value remote "tasks" a)))
+      (is (= :b (d/get-value remote "tasks" b)))
+      (d/transact-kv remote [[:del "tasks" a]])
+      (is (nil? (d/get-value remote "tasks" a)))
+      (is (= :b (d/get-value remote "tasks" b)))
+      (finally (d/close-kv remote)))))
 
 (defn- trace-stamping [f]
   (let [prepare @#'handlers/prepare-server-tx
@@ -212,11 +259,11 @@
         (is (not-any? :used? events)))
       (finally (d/close conn)))))
 
-(defn- await-queued! [^Group group n]
+(defn- await-queued! [^Collector collector n]
   (let [deadline (+ (System/nanoTime) 10000000000)]
     (loop []
       (cond
-        (= n (.size ^ConcurrentLinkedQueue (.-queue group))) true
+        (= n (.size ^ConcurrentLinkedQueue (.-ready collector))) true
         (> (System/nanoTime) deadline) false
         :else (do (Thread/sleep 1) (recur))))))
 
@@ -231,13 +278,15 @@
       (d/transact! (first connections) [{:db/id 1 :item/key "one" :item/n 0}])
       (let [store ^Store (#'server/get-store *server* name false)
             lmdb (.-lmdb store)
-            group (kv/write-group lmdb :server-datalog)
+            control (:independent-control @(i/kv-info lmdb))
+            collector (:collector control)
             before (:last-committed-lsn (d/txlog-watermarks lmdb))
             txs [[[:db/add 1 :item/n 1]]
                  [{:item/key "new" :item/n 2}]
                  [[:db/add [:item/key "new"] :item/n 3]]
                  [{:item/key "new" :item/n 4}]]]
-        (is (some? group))
+        (is (:server? control))
+        (is (some? collector))
         (kvtx/set-storage-fault-hook!
          (fn [{:keys [stage]}]
            (when (and (= stage :txlog-sync) (compare-and-set! first? true false))
@@ -250,7 +299,7 @@
                   (is (deref entered 10000 false))
                   (doseq [idx (range 1 4)]
                     (swap! jobs conj (future (d/transact! (connections idx) (txs idx))))
-                    (is (await-queued! group idx)))
+                    (is (await-queued! collector idx)))
                   (deliver release true)
                   (let [reports (mapv (fn [job] (deref job 10000 ::timeout)) @jobs)]
                     (is (every? map? reports))

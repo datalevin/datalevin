@@ -90,40 +90,55 @@
       (charge-text! charge! element element-type))))
 
 (defn- encode
-  "Charge scratch, growth overlap and the detached byte array before allocation.
-  Nippy writes into the bounded buffer; no unbounded serialized value is built."
-  ^bytes [charge! value type key?]
-  ;; String/symbol encoders create a UTF-8 array before copying into the buffer.
-  ;; Reserve its worst-case size first, including tuple elements recursively.
-  (charge-text! charge! value type)
-  (loop [capacity (let [known (or (bits/type-size type)
-                                 (when (= :raw type)
-                                   (cond (bytes? value) (alength ^bytes value)
-                                         (instance? ByteBuffer value)
-                                         (.remaining ^ByteBuffer value))))]
-                    (if known
-                      (max 1 (if key? (min c/+max-key-size+ (long known)) (long known)))
-                      (if key? c/+max-key-size+ 256)))]
-    (charge! (+ charge/buffer-wrapper (charge/array-bytes 1 capacity)))
-    (let [buffer (ByteBuffer/allocate (int capacity))
-          encoded? (try (bits/put-buffer buffer
-                                        (if (instance? ByteBuffer value)
-                                          (.duplicate ^ByteBuffer value) value)
-                                        type) true
+  "Charge scratch, growth overlap and detached bytes before allocation.
+  Internal native owners can retain bounded value scratch across requests."
+  (^bytes [charge! value type key?]
+   (encode charge! value type key? nil))
+  (^bytes [charge! value type key? ^objects scratch]
+   ;; Text encoders allocate UTF-8 bytes, including tuple elements.
+   (charge-text! charge! value type)
+   (let [known (or (bits/type-size type)
+                   (when (= :raw type)
+                     (cond (bytes? value) (alength ^bytes value)
+                           (instance? ByteBuffer value)
+                           (.remaining ^ByteBuffer value))))
+         reusable? (and scratch (not key?) (nil? known))]
+     (loop [capacity (long (if known
+                            (max 1 (if key?
+                                     (min c/+max-key-size+ (long known))
+                                     (long known)))
+                            (if key? c/+max-key-size+
+                              (if-let [^ByteBuffer buffer
+                                       (when reusable? (aget scratch 0))]
+                                (.capacity buffer) 256))))]
+       (charge! (+ charge/buffer-wrapper (charge/array-bytes 1 capacity)))
+       (let [^ByteBuffer previous (when reusable? (aget scratch 0))
+             buffer (if (and previous (= capacity (.capacity previous)))
+                      (.clear previous) (ByteBuffer/allocate (int capacity)))
+             ;; Only the serialized native owner supplies scratch. Large
+             ;; outliers do not leave arbitrarily large retained buffers.
+             _ (when (and reusable? (<= capacity 65536))
+                 (aset scratch 0 buffer))
+             encoded? (try
+                        (bits/put-buffer buffer
+                                         (if (instance? ByteBuffer value)
+                                           (.duplicate ^ByteBuffer value) value)
+                                         type)
+                        true
                         (catch BufferOverflowException _ false))]
-      (if encoded?
-        (let [size (.position buffer)]
-          (if (= size capacity)
-            ;; Exact-size buffers are already owned and charged. Their array
-            ;; needs no second allocation or copy after encoding finishes.
-            (.array buffer)
-            (do
-              (charge! (charge/array-bytes 1 size))
-              (java.util.Arrays/copyOf (.array buffer) size))))
-        (if key?
-          (throw (ex-info "Encoded key exceeds native key size"
-                          {:error :kv/invalid-encoded-size :outcome :not-committed}))
-          (recur (Math/multiplyExact (long capacity) 2)))))))
+         (if encoded?
+           (let [size (.position buffer)]
+             (if (and (not reusable?) (= size capacity))
+               ;; Exact-size private buffers already own their bytes. Reused
+               ;; scratch must always detach, even when the value fills it.
+               (.array buffer)
+               (do (charge! (charge/array-bytes 1 size))
+                   (java.util.Arrays/copyOf (.array buffer) size))))
+           (if key?
+             (throw (ex-info "Encoded key exceeds native key size"
+                             {:error :kv/invalid-encoded-size
+                              :outcome :not-committed}))
+             (recur (Math/multiplyExact (long capacity) 2)))))))))
 
 (defn- add-prepared-row!
   [^FastList rows charge! name op ^bytes key ^bytes value wal? flags]
@@ -146,6 +161,8 @@
   (^FastList [raw charge! dbi-name txs kt vt wal? existing?]
    (prepare-rows raw charge! dbi-name txs kt vt wal? existing? nil))
   (^FastList [raw charge! dbi-name txs kt vt wal? existing? ^java.util.List log-rows]
+   (prepare-rows raw charge! dbi-name txs kt vt wal? existing? log-rows nil))
+  (^FastList [raw charge! dbi-name txs kt vt wal? existing? ^java.util.List log-rows scratch]
    (charge! charge/vector-wrapper)
    (let [rows (FastList. 0)
          named-options (when dbi-name (i/dbi-opts raw dbi-name))]
@@ -172,13 +189,13 @@
              (do
                (doseq [value (.-v tx)]
                  (add-prepared-row! rows charge! name (if (= :put-list op) :put op)
-                                    key (encode charge! value value-type duplicates?) wal? nil))
+                                    key (encode charge! value value-type duplicates? scratch) wal? nil))
                (when log-rows
                  (.add log-rows (OwnedKVTxData. op name key
-                                               (encode charge! (.-v tx) :data false)
+                                               (encode charge! (.-v tx) :data false scratch)
                                                key-type value-type))))
              (let [value (when-not (= :del op)
-                           (encode charge! (.-v tx) value-type duplicates?))]
+                           (encode charge! (.-v tx) value-type duplicates? scratch))]
                (add-prepared-row! rows charge! name op key value wal? (.-flags tx))
                (when log-rows
                  (.add log-rows (OwnedKVTxData. op name key value key-type value-type))))))))

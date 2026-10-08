@@ -68,6 +68,14 @@
 (defn- independent-control [db]
   (when-let [info (i/kv-info db)] (:independent-control @info)))
 
+(def ^:dynamic ^:no-doc *server-write-slot-held?*
+  "Standalone server administration already owns its transaction semaphore."
+  false)
+
+(defn- write-control [db]
+  (let [control (independent-control db)]
+    (when-not (and (:server? control) *server-write-slot-held?*) control)))
+
 (defn write-batch-delay-nanos
   "Optional idle collection window, shared by embedded KV and Datalog writes."
   ^long [db]
@@ -80,6 +88,7 @@
   ([db kind] (write-group db kind false))
   ([db kind ha-guarded?]
    (when (and group/*enabled?*
+              (not *server-write-slot-held?*)
               (nil? cpp/*before-write-commit-fn*)
               (nil? kvtx/*after-txlog-append-fn*)
               (not (l/writing? db))
@@ -110,7 +119,7 @@
 (defn grouped-write!
   "Execute a standalone KV operation in a group under its durability policy."
   [db op]
-  (if-let [control (independent-control db)]
+  (if-let [control (write-control db)]
     (do (i/check-ready db)
         (if (l/writing? db) (op db) ((:body! control) op nil)))
     (if-let [g (write-group db :kv)]
@@ -538,7 +547,8 @@
   (clear-dbi
     [this dbi-name]
     (custom-kv/guard-internal! db dbi-name)
-    (if-let [control (independent-control db)]
+    (if-let [control (let [control (independent-control db)]
+                      (when-not (:server? control) control))]
       (do (i/check-ready this)
           (when-let [check! (:check! control)] (check!))
           (when (and (:embedded? control) (l/writing? db))
@@ -676,7 +686,7 @@
     (.transact-kv this dbi-name txs k-type :data))
   (transact-kv
     [this dbi-name txs k-type v-type]
-    (if-let [control (independent-control db)]
+    (if-let [control (write-control db)]
       (do (.check-ready this)
           (cond
             (and (:embedded? control) (custom-kv/custom-txs? db dbi-name txs))

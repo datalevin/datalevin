@@ -344,7 +344,8 @@
                                  (pos? (.size rows)))
                          (let [estimate (long (if body-cost (body-cost rows) 0))]
                            (charge-fn descriptor estimate)
-                           (let [^bytes body (encode-body (if (:prepared-request? opts) wal-rows rows) {})]
+                           (let [^bytes body (encode-body (if (:prepared-request? opts) wal-rows rows)
+                                                         (batch/context descriptor))]
                              (charge-fn descriptor (max 0 (- (alength body) estimate)))
                              body)))]
           (batch/set-data! descriptor
@@ -362,7 +363,9 @@
   "Freeze consecutive body writes together, preserving prepared KV regions
   and the final Datalog metadata trailer in exactly their native order."
   [b encode-body defer?]
-  (let [parts (ArrayList.) rows (volatile! (RowRegions.))
+  (let [term (:ha-term (batch/context (batch/batch-at b 0)))
+        encode-body (fn [rows opts] (encode-body rows (assoc opts :ha-term term)))
+        parts (ArrayList.) rows (volatile! (RowRegions.))
         flush! (fn []
                  (when-not (.isEmpty ^RowRegions @rows)
                    (.add parts @rows)
@@ -370,6 +373,11 @@
     (dotimes [idx (batch/batch-count b)]
       (let [d (batch/batch-at b idx)
             data (batch/data d)]
+        (when-not (= term (:ha-term (batch/context d)))
+          (batch/cancel-before-dispatch!
+            (ex-info "Cannot combine writes from different HA terms"
+                     {:error :ha/write-rejected :reason :leadership-changed
+                      :retryable? true})))
         (when-let [body (:wal-body data)]
           (flush!)
           (.add parts body)
@@ -691,7 +699,8 @@
                ;; writes, and belongs to that same logical WAL record.
                (when-let [body (:wal-body previous)] (.add bodies body))
                (when-not (:encode-batch? opts)
-                 (.add bodies ((:encode-body opts) (:wal-rows extra) {})))
+                 (.add bodies ((:encode-body opts) (:wal-rows extra)
+                               (batch/context last-member))))
                (batch/set-data! last-member
                                 (if (:encode-batch? opts)
                                   (let [wal-rows (RowRegions.)]
