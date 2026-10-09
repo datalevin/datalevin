@@ -24,12 +24,11 @@
    [datalevin.tx-group.compat :as group]
    [datalevin.validate :as vld])
   (:import
-   [datalevin.db DB TxReport]
+   [datalevin.db DB]
    [datalevin.storage Store]
    [datalevin.remote DatalogStore]
    [datalevin.async IAsyncWork IBoundedAsyncWork AsyncExecutor]
    [org.eclipse.collections.impl.list.mutable FastList]
-   [java.util HashSet]
    [java.util.concurrent Executors LinkedBlockingQueue ConcurrentHashMap
     ThreadPoolExecutor ArrayBlockingQueue ThreadPoolExecutor$CallerRunsPolicy
     TimeUnit]
@@ -858,26 +857,11 @@
     (throw (ex-info "Secondary indexing requires individual commits"
                     {:datalevin.tx-group/body-failure true}))))
 
-(deftype ^:no-doc GroupedTx [tx-data tx-meta])
-
-(declare try-commit-prepared-group!)
-
-(defn- prepared-group-candidate?
-  [tx-data]
-  ;; Transaction functions and ordinary operation vectors use the bound general
-  ;; runner. Only inserts and patches need metadata for whole-batch preparation.
-  (when (or (sequential? tx-data) (instance? java.util.List tx-data))
-    (let [form (first tx-data)]
-      (or (map? form)
-          (and (sequential? form) (= :db.fn/patchIdoc (first form)))))))
-
 (defn- transact-embedded-group!
   [g conn tx-data tx-meta]
   (let [lmdb (.-lmdb ^Store (.-store ^DB @conn))
-        opts (l/read-env-opts lmdb)
-        profile (when (:wal? opts) (:wal-durability-profile opts))
         op (fn [[tx batched?]]
-             (observe-embedded-path! profile batched?)
+             (observe-embedded-path! nil batched?)
              (-transact! tx tx-data tx-meta))
         report
         (group/submit!
@@ -889,15 +873,13 @@
                (let [before @conn
                      ^objects reports
                      (locking (l/write-txn lmdb)
-                       (or (when (:wal? opts)
-                             (try-commit-prepared-group! conn execute profile))
-                           (with-transaction [tx conn]
-                             (group/collect! execute)
-                             (when (s/synchronous-secondary-indexing? (.-store ^DB @tx))
-                               (group/collect! execute true))
-                             (ensure-group-secondary-safe! (.-store ^DB @tx))
-                             (:result (db/execute-write-group
-                                       tx #(execute [% (> (group/request-count) 1)]))))))
+                       (with-transaction [tx conn]
+                         (group/collect! execute)
+                         (when (s/synchronous-secondary-indexing? (.-store ^DB @tx))
+                           (group/collect! execute true))
+                         (ensure-group-secondary-safe! (.-store ^DB @tx))
+                         (:result (db/execute-write-group
+                                   tx #(execute [% (> (group/request-count) 1)])))))
                      after @conn
                      store (.-store ^DB after)]
                  ;; The native writer is closed. Return readable Store views,
@@ -911,9 +893,7 @@
                                                               store))
                                   :db-after after))))
                  reports))))
-         (if (and profile (prepared-group-candidate? tx-data))
-           (with-meta op {::group/data (->GroupedTx tx-data tx-meta)})
-           op)
+         op
          (kv/write-batch-delay-nanos lmdb))]
     (notify-listeners! conn report)
     report))
@@ -1281,273 +1261,6 @@
                      out
                      (.-tx-meta fw)
                      (.-cb fw))))))
-
-(defn- prepare-grouped-patch-idoc-batch
-  [conn ^FastList requests]
-  (let [db    ^DB @conn
-        store (.-store db)]
-    (when (and (instance? Store store)
-               (true? (:wal? (l/read-env-opts (.-lmdb ^Store store)))))
-      (let [n                 (int (.size requests))
-            ^objects prepared (object-array n)]
-        (loop [i 0]
-          (if (< i n)
-            (let [^GroupedTx req (.get requests i)
-                  tx (db/prepare-local-patch-idoc-tx db (.-tx-data req))]
-              (if tx
-                (do
-                  (aset prepared i tx)
-                  (recur (unchecked-inc i)))
-                nil))
-            prepared))))))
-
-(defn- prepared-patch-idoc-batch-valid?
-  [^DB db ^objects prepared]
-  (let [n (alength prepared)]
-    (loop [i 0]
-      (or (>= i n)
-          (and (db/local-patch-idoc-tx-valid? db (aget prepared i))
-               (recur (unchecked-inc i)))))))
-
-(defn- prepare-grouped-patch-idoc-reports!
-  [^DB db ^FastList requests ^objects prepared ^objects reports]
-  (let [n (alength prepared)]
-    (loop [i       0
-           current db
-           docs    {}]
-      (if (< i n)
-        (let [^GroupedTx req (.get requests i)
-              patch             (aget prepared i)
-              doc-key           [(:e patch) (:attr patch)]
-              stamped           (if (contains? docs doc-key)
-                                  (db/stamp-local-patch-idoc-tx
-                                    current patch (.-tx-meta req)
-                                    (get docs doc-key))
-                                  (db/stamp-local-patch-idoc-tx
-                                    current patch (.-tx-meta req)))
-              _                 (when-not stamped
-                                  (raise
-                                    "Prepared patchIdoc batch became stale"
-                                    {:type ::stale-patch-idoc-batch}))
-              ^TxReport report  (:report stamped)]
-          (aset reports i report)
-          (recur (unchecked-inc i)
-                 (:db-after report)
-                 (assoc docs doc-key (:doc stamped))))
-        current))))
-
-(defn- try-commit-grouped-patch-idoc-batch!
-  [conn ^FastList requests ^objects prepared ^objects reports]
-  (locking conn
-    (let [db    ^DB @conn
-          store (.-store db)
-          n     (alength prepared)]
-      (when (and (instance? Store store)
-                 (= n (alength reports))
-                 (= n (.size requests))
-                 (not (l/writing? (.-lmdb ^Store store)))
-                 (prepared-patch-idoc-batch-valid? db prepared))
-        (let [old (db/cache-disabled? store)]
-          (db/disable-cache store)
-          (try
-            (let [kv       (.-lmdb ^Store store)
-                  final-db (volatile! nil)]
-              (l/with-transaction-kv [kv1 kv]
-                (let [store1 ^Store (s/transfer ^Store store kv1)
-                      db1    ^DB    (db/transfer db store1)
-                      _             (ensure-group-secondary-safe! store1)
-                      dbn    ^DB    (prepare-grouped-patch-idoc-reports!
-                                      db1 requests prepared reports)]
-                  (db/execute-write-group
-                    (atom db1)
-                    (fn [tx]
-                      (dotimes [i n]
-                        (let [^TxReport report (aget reports i)]
-                          (db/commit-prepared-tx-data!
-                            @tx (:tx-data report) report)
-                          (reset! tx (:db-after report))))))
-                  (vreset! final-db dbn)))
-              (let [final-db ^DB @final-db
-                    new-store ^Store
-                    (s/transfer ^Store (.-store final-db) kv)
-                    new-db (-> final-db
-                               (db/transfer new-store)
-                               (db/carry-runtime-opts db)
-                               (db/adopt-current-db!))]
-                (reset! conn new-db)
-                (dotimes [_ n]
-                  (observe-local-wal-tx-path! :patch-idoc))
-                true))
-            (finally
-              (when-not old
-                (db/enable-cache (.-store ^DB @conn))))))))))
-
-(defn- add-distinct-blind-unique-values!
-  [^HashSet seen prepared]
-  (let [^FastList avs (:unique-avs prepared)]
-    (loop [i 0]
-      (if (< i (.size avs))
-        (if (.add seen (.get avs i))
-          (recur (unchecked-inc i))
-          false)
-        true))))
-
-(defn- prepare-grouped-blind-batch
-  [conn ^FastList requests]
-  (let [db    ^DB @conn
-        store (.-store db)]
-    (when (and (instance? Store store)
-               (true? (:wal? (l/read-env-opts (.-lmdb ^Store store)))))
-      (let [n                 (int (.size requests))
-            ^objects prepared (object-array n)
-            seen              (HashSet.)]
-        (loop [i 0]
-          (if (< i n)
-            (let [^GroupedTx req (.get requests i)
-                  tx (db/prepare-blind-local-tx
-                       db (.-tx-data req) true)]
-              (if (and tx (add-distinct-blind-unique-values! seen tx))
-                (do
-                  (aset prepared i tx)
-                  (recur (unchecked-inc i)))
-                nil))
-            prepared))))))
-
-(def ^:private grouped-blind-fallback-type
-  ::grouped-blind-fallback)
-
-(defn- grouped-blind-fallback!
-  []
-  (raise "Queued blind transaction requires full resolution"
-                  {:type grouped-blind-fallback-type}))
-
-(defn- identity-upsert-prepared?
-  "Whether a prepared queued request may use the identity-upsert stamper. The
-   batch already required distinct unique values, so each eligible request is
-   independent and can resolve insert versus upsert in request order."
-  [prepared]
-  (and *local-wal-identity-upsert?*
-       (some? (:identity-upsert-av prepared))))
-
-(defn- prepared-blind-batch-valid?
-  [^DB db ^objects prepared]
-  (let [n (alength prepared)]
-    (loop [i 0]
-      (or (>= i n)
-          (and (db/blind-local-tx-valid? db (aget prepared i))
-               (recur (unchecked-inc i)))))))
-
-(defn- try-commit-grouped-blind-batch!
-  [conn ^FastList requests ^objects prepared ^objects reports]
-  (locking conn
-    (let [db    ^DB @conn
-          store (.-store db)
-          n     (alength prepared)]
-      (when (and (instance? Store store)
-                 (= n (alength reports))
-                 (= n (.size requests))
-                 (not (l/writing? (.-lmdb ^Store store)))
-                 (prepared-blind-batch-valid? db prepared))
-        (let [old (db/cache-disabled? store)]
-          (db/disable-cache store)
-          (try
-            (let [kv       (.-lmdb ^Store store)
-                  final-db (volatile! nil)]
-              (try
-                (l/with-transaction-kv [kv1 kv]
-                  (let [store1 ^Store (s/transfer ^Store store kv1)
-                        db1    ^DB    (db/transfer db store1)]
-                    (ensure-group-secondary-safe! store1)
-                    ;; Side-effect-free prepared requests enforce attribute
-                    ;; uniqueness in the eventual AVE put. Identity-upsert
-                    ;; requests may match an existing row and are stamped in
-                    ;; order instead. Other requests keep the preflight probe
-                    ;; because a late collision must not occur after updating a
-                    ;; secondary engine.
-                    (dotimes [i n]
-                      (let [tx (aget prepared i)]
-                        (when (and (not (identity-upsert-prepared? tx))
-                                   (not (:fuse-unique-inserts? tx))
-                                   (not
-                                     (db/blind-local-tx-unique-values-absent?
-                                       db1 tx)))
-                          (grouped-blind-fallback!))))
-                    (db/execute-write-group
-                      (atom db1)
-                      (fn [tx]
-                        (dotimes [i n]
-                          (let [^GroupedTx req (.get requests i)
-                                prepared-tx (aget prepared i)
-                                identity?   (identity-upsert-prepared?
-                                              prepared-tx)
-                                [^TxReport report upsert?]
-                                (if identity?
-                                  (db/stamp-blind-local-identity-tx
-                                    @tx prepared-tx (.-tx-meta req))
-                                  [(db/stamp-blind-local-tx
-                                     @tx prepared-tx (.-tx-meta req))
-                                   false])]
-                            (when-not report
-                              (grouped-blind-fallback!))
-                            (binding [s/*enforce-blind-unique-inserts?*
-                                      (and (not identity?)
-                                           (boolean
-                                             (:fuse-unique-inserts?
-                                               prepared-tx)))
-                                      c/*ordered-datom-writes?* (not upsert?)]
-                              (db/commit-prepared-tx-data!
-                                @tx (:tx-data report) report))
-                            (when identity?
-                              (observe-local-wal-tx-path!
-                                (if upsert?
-                                  :identity-upsert
-                                  :blind-insert)))
-                            (aset reports i report)
-                            (reset! tx (:db-after report))))
-                        (vreset! final-db @tx)))))
-                (let [final-db ^DB @final-db
-                      new-store ^Store
-                      (s/transfer ^Store (.-store final-db) kv)
-                      new-db   (-> final-db
-                                   (db/transfer new-store)
-                                   (db/carry-runtime-opts db)
-                                   (db/adopt-current-db!))]
-                  (reset! conn new-db)
-                  ;; Returned reports must not retain a Store bound to the
-                  ;; closed transaction-local writer.
-                  (dotimes [i n]
-                    (let [^TxReport report (aget reports i)]
-                      (aset reports i
-                            (assoc report :db-before
-                                   (if (zero? i)
-                                     db
-                                     (db/transfer (:db-before report)
-                                                  new-store))))))
-                  true)
-                (catch clojure.lang.ExceptionInfo e
-                  (if (or (= grouped-blind-fallback-type
-                             (:type (ex-data e)))
-                          (l/blind-unique-collision? e))
-                    false
-                    (throw e)))))
-            (finally
-              (when-not old
-                (db/enable-cache (.-store ^DB @conn))))))))))
-
-(defn- try-commit-prepared-group!
-  [conn execute profile]
-  (when-let [^FastList requests (group/batch-data execute)]
-    (let [n (.size requests)
-          reports (object-array n)
-          patches (when *local-wal-patch-idoc?*
-                    (prepare-grouped-patch-idoc-batch conn requests))]
-      (when (or (and patches
-                     (try-commit-grouped-patch-idoc-batch!
-                      conn requests patches reports))
-                (when-let [prepared (prepare-grouped-blind-batch conn requests)]
-                  (try-commit-grouped-blind-batch! conn requests prepared reports)))
-        (dotimes [_ n] (observe-embedded-path! profile (> n 1)))
-        reports))))
 
 (defn transact-async
   ([conn tx-data] (transact-async conn tx-data nil))

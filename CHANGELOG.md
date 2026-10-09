@@ -1,10 +1,11 @@
 # Change Log
 
 ## WIP
+
 ### Added
 - [storage] added `register-type` function to allow indexing of custom data
   types, and this also works on Datalog. Details are in the [custom data
-  documentation](/doc/custom-data.md).
+  documentation](doc/custom-data.md).
   [#234](https://github.com/datalevin/datalevin/issues/234)
 - [Server] `listen-db!` that provide `db-name` based change notifications across
   connections.
@@ -36,6 +37,8 @@
   commit is acknowledged). Such batching is disabled if synchronous secondary
   indexing (idoc, fulltext, vector, and embedding) is requested, asynchronous
   secondary indexing is unaffected.
+- [WAL] remove `:wal-shared?` option, no longer support multi-processes sharing
+  a WAL directory.
 
 ### Fixed
 - [Datalog] planner range conversion for `like`.

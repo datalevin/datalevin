@@ -1,11 +1,11 @@
 ;; Copyright (c) Huahai Yang. All rights reserved.
 ;; Distributed under the Eclipse Public License 2.0.
 (ns ^:no-doc datalevin.tx-group.batch
-  "Additive collector for the new write protocol.
+  "Collector for WAL writes.
 
   This namespace implements Invariants 1-6 of the design contract. It is not a
-  replacement for `datalevin.tx-group` and never calls it: compatibility keeps
-  its own collector. Production environment routing is installed by
+  replacement for the native-only `datalevin.tx-group` collector. Production
+  environment routing is installed by
   `datalevin.tx-group.batch.embedded`.
 
   - callers do their own state-independent preparation, then publish one ready

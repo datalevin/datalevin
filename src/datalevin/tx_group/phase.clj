@@ -3,9 +3,7 @@
 (ns ^:no-doc datalevin.tx-group.phase
   "Shared deterministic fault/trace seam for the new write protocol.
 
-  Deliberately independent of `datalevin.tx-state`, so tracing the additive
-  collector never loads the replaced pending engine. A disabled seam allocates
-  no event payload: the default body is one root volatile dereference, and the
+  A disabled seam allocates no event payload: the default body is one root volatile dereference, and the
   observer is only invoked when a trace is installed.")
 
 (defonce ^:private observer (volatile! nil))

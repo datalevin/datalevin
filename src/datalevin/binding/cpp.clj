@@ -558,15 +558,7 @@
     writable view and returns its result; `before-commit` receives that same
     writable view and an operation map, and may throw to abort the transaction."))
 
-(defprotocol IPendingReader
-  (get-pending-rtx [this]
-    "Internal reader captured against an explicitly pinned pending root.")
-  (range-count-pending [this rtx dbi-name k-range k-type]
-    "Count keys or duplicate values in that reader without decoding rows.")
-  (key-present-pending? [this rtx dbi-name key]
-    "Probe an encoded key without reading or decoding its value.")
-  (list-value-pending? [this rtx dbi-name key value]
-    "Probe an encoded duplicate pair in that reader."))
+
 
 (defn- borrow-reader!
   [this env info tl-reader reader-registry public?]
@@ -681,63 +673,6 @@
               (.abort-transact-kv this)
               (close-native-write! env write-txn nil nil))
             (throw e))))))
-
-  IPendingReader
-  (get-pending-rtx [this]
-    (borrow-reader! this env info tl-reader reader-registry false))
-
-  (range-count-pending [this rtx dbi-name [range-type k1 k2] k-type]
-    (let [^DBI dbi (i/get-dbi this dbi-name false)
-          ^Rtx rtx rtx
-          ;; Match scan/scan: the cursor opens this DBI in the pinned reader
-          ;; before the count kernel inspects its range metadata.
-          ^Cursor cur (l/get-cursor dbi rtx)]
-      (try
-        (let [^RangeContext ctx (buffer/key-range-info*
-                                 (.-key-codec dbi) rtx range-type k1 k2 k-type)
-              forward? (.-forward? ctx)
-              lower (if forward? (.-start-bf ctx) (.-stop-bf ctx))
-              upper (if forward? (.-stop-bf ctx) (.-start-bf ctx))
-              include-lower? (if forward? (.-include-start? ctx) (.-include-stop? ctx))
-              include-upper? (if forward? (.-include-stop? ctx) (.-include-start? ctx))
-              flag (BitOps/intOr
-                    (if include-lower? (int DTLV/MDB_COUNT_LOWER_INCL) 0)
-                    (if include-upper? (int DTLV/MDB_COUNT_UPPER_INCL) 0))]
-          (with-open [total (LongPointer. 1)]
-            (if (.-dupsort? dbi)
-              (DTLV/mdb_range_count_values
-               (.get ^Txn (.-txn rtx)) (.get ^Dbi (.-db dbi))
-               (iter/dtlv-val lower) (iter/dtlv-val upper) flag total)
-              (DTLV/mdb_range_count_keys
-               (.get ^Txn (.-txn rtx)) (.get ^Dbi (.-db dbi))
-               (iter/dtlv-val lower) (iter/dtlv-val upper) flag total))
-            (.get ^LongPointer total)))
-        (finally
-          (if (l/read-only? rtx)
-            (l/return-cursor dbi cur)
-            (l/close-cursor dbi cur))))))
-
-  (key-present-pending? [this rtx dbi-name key]
-    (let [^DBI dbi (i/get-dbi this dbi-name false)
-          ^Rtx rtx rtx]
-      (l/put-read-key dbi rtx key :raw)
-      (let [rc (DTLV/mdb_get (.get ^Txn (.-txn rtx))
-                             (.get ^Dbi (.-db dbi))
-                             (.ptr ^BufVal (.-kp rtx))
-                             (.ptr ^BufVal (.-vp rtx)))]
-        (Util/checkRc ^int rc)
-        (not= rc DTLV/MDB_NOTFOUND))))
-
-  (list-value-pending? [this rtx dbi-name key value]
-    (let [^DBI dbi (i/get-dbi this dbi-name false)
-          ^Rtx rtx rtx
-          ^Cursor cur (l/get-cursor dbi rtx)]
-      (try
-        (boolean (in-list?* dbi rtx cur key :raw value :raw))
-        (finally
-          (if (l/read-only? rtx)
-            (l/return-cursor dbi cur)
-            (l/close-cursor dbi cur))))))
 
   IWriting
   (writing? [_] writing?)

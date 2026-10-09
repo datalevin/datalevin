@@ -32,12 +32,14 @@
                  (.startsWith message "MDB_BAD_VALSIZE"))))
       (when-let [cause (ex-cause t)] (expected-native-rejection? cause))))
 
+(def ^:dynamic *defer-attachment?*
+  "Defer attachment while a server re-index replaces its environment."
+  false)
+
 (defn- application-error! [t]
   (if (or (rmw/clean-body-failure? t) (expected-native-rejection? t))
     (batch/cancel-before-dispatch! t)
     (throw t)))
-
-(def ^:dynamic *enabled?* true)
 
 (defn- public-error [t]
   (let [cause (ex-cause t)]
@@ -113,7 +115,7 @@
   (let [raw (kv/raw-lmdb db)
         info (i/kv-info raw)
         state (wal/state raw)]
-    (when (and *enabled?* state (not (:wal-shared? state))
+    (when (and (not *defer-attachment?*) state
                (or (not (:ha-mode @info)) (:server? hooks))
                (or (:datalog? hooks) (not (i/dbi-opts raw c/eav))))
       (locking info
@@ -124,7 +126,7 @@
                                                                         (wal/group-commit @info)))))})
                               ;; Existing public calls have no byte-size or
                               ;; preparation-timeout contract. Bound in-flight
-                              ;; requests; retain the legacy caller's input size.
+                              ;; requests; retain the caller's input size.
                               :rmw-allowance-bytes charge/request-control-bundle)
                 ;; Collector execution serializes native owners. Caller-side
                 ;; preparation never touches this reusable value buffer.

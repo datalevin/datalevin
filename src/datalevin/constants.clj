@@ -579,10 +579,6 @@
   *wal-sync-adaptive?* true)
 
 (def ^{:dynamic true
-       :doc     "Enable multi-process WAL directory reconciliation. Keep false for normal single-process stores to avoid per-commit directory/meta probes."}
-  *wal-shared?* false)
-
-(def ^{:dynamic true
        :doc     "WAL segment size cap in bytes before roll."}
   *wal-segment-max-bytes* (* 256 1024 1024))
 
@@ -703,7 +699,12 @@
   [opts]
   (reduce-kv
    (fn [m k v]
-     (assoc m (canonical-wal-option-key k) v))
+     (if (= k :wal-shared?)
+       (if (false? v)
+         m
+         (raise "Shared-WAL mode is no longer supported"
+                {:option k :value v}))
+       (assoc m (canonical-wal-option-key k) v)))
    {}
    (or opts {})))
 

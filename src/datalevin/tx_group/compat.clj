@@ -1,7 +1,7 @@
 ;; Copyright (c) Huahai Yang. All rights reserved.
 ;; Distributed under the Eclipse Public License 2.0.
 (ns ^:no-doc datalevin.tx-group.compat
-  "API adapter for unmigrated Datalog/server/native writers. Adapter state
+  "Adapter for native-only Datalog and server writers. Adapter state
   (batched?, request count, confirmations) is thread-local instead of a dynamic
   var; arbitrary caller bindings are still captured here, lazily, only when a
   queued request may run on a foreign collector leader."
@@ -19,7 +19,6 @@
   (ThreadLocal.))
 
 (def create group/create)
-(def batch-data group/batch-data)
 (def collect! group/collect!)
 
 (defn batched?

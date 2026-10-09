@@ -84,7 +84,7 @@
 (defn write-group
   "Return the admission queue for eligible standalone writes.
   The server may opt HA stores in when it retains both HA guards around the
-  physical commit. Embedded HA, explicit transactions and shared WAL stay out."
+  physical commit. Embedded HA and explicit transactions stay out."
   ([db kind] (write-group db kind false))
   ([db kind ha-guarded?]
    (when (and group/*enabled?*
@@ -93,22 +93,14 @@
               (nil? kvtx/*after-txlog-append-fn*)
               (not (l/writing? db))
               (not (Thread/holdsLock (l/write-txn db))))
-     (let [info @(i/kv-info db)
-           state (:txlog-state info)]
+     (let [info @(i/kv-info db)]
        (when (and (or (nil? (:ha-mode info)) ha-guarded?)
-                  (or (and state
-                           (or (#{:strict :relaxed} (:durability-profile state))
-                               (and (vector? kind) (= :datalog (first kind))
-                                    (= :extra (:durability-profile state))))
-                           (not (:wal-shared? state))
-                           (kvtx/txlog-write-path-enabled? db))
-                      (and (#{:kv :datalog} (if (vector? kind) (first kind) kind))
-                           (not (:wal? info))
-                           (not (:temp? info))
-                           (not-any? #{:nosync :nometasync :mapasync :inmemory}
-                                     (:flags info)))))
-         (let [^ConcurrentHashMap groups (if state (:write-groups state)
-                                            (:write-groups info))]
+                  (and (#{:kv :datalog} (if (vector? kind) (first kind) kind))
+                       (not (:wal? info))
+                       (not (:temp? info))
+                       (not-any? #{:nosync :nometasync :mapasync :inmemory}
+                                 (:flags info))))
+         (let [^ConcurrentHashMap groups (:write-groups info)]
            (.computeIfAbsent groups kind
                              (reify Function
                                (apply [_ _]
@@ -174,12 +166,10 @@
    (if-let [state (or (txlog/state db)
                       (when (txlog-write-path-enabled? db)
                         (ensure-txlog-ready! db)))]
-     (do
-       (txlog/refresh-shared-state! state)
-       (txlog/select-open-record-rows
-        (txlog-records state from-lsn upto-lsn)
-        from-lsn
-        upto-lsn))
+     (txlog/select-open-record-rows
+      (txlog-records state from-lsn upto-lsn)
+      from-lsn
+      upto-lsn)
      (if (txlog-config-enabled? db)
        []
        (txlog/select-open-record-rows
@@ -193,9 +183,7 @@
   (if-let [state (or (txlog/state db)
                      (when (txlog-write-path-enabled? db)
                        (ensure-txlog-ready! db)))]
-    (do
-      (txlog/refresh-shared-state! state)
-      (kvtx/txlog-record-batch state from-lsn upto-lsn))
+    (kvtx/txlog-record-batch state from-lsn upto-lsn)
     (if (txlog-config-enabled? db)
       (transfer/encode-batch [])
       (kvtx/txlog-record-batch (txlog/enabled-state db) from-lsn upto-lsn))))
@@ -385,12 +373,10 @@
     (if-let [state (or (txlog/state db)
                        (when (txlog-write-path-enabled? db)
                          (ensure-txlog-ready! db)))]
-      (do
-        (txlog/refresh-shared-state! state)
-        (txlog/select-open-records
-          (txlog-records state from-lsn upto-lsn)
-          from-lsn
-          upto-lsn))
+      (txlog/select-open-records
+        (txlog-records state from-lsn upto-lsn)
+        from-lsn
+        upto-lsn)
       (if (txlog-config-enabled? db)
         []
         (txlog/select-open-records

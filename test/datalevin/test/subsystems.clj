@@ -7,6 +7,15 @@
 
 (use-fixtures :each db-fixture)
 
+(deftest shared-wal-is-rejected
+  (let [dir (u/tmp-dir (str "shared-wal-rejected-" (random-uuid)))]
+    (try
+      (is (thrown-with-msg? Exception #"Shared-WAL mode is no longer supported"
+            (d/open-kv dir {:wal? true :wal-shared? true})))
+      (is (thrown-with-msg? Exception #"Shared-WAL mode is no longer supported"
+            (d/get-conn dir {} {:wal? true :wal-shared? true})))
+      (finally (u/delete-files dir)))))
+
 (deftest kv-transactions-lists-prepared-operations-and-reopen
   (doseq [wal? [false true]]
     (testing (str "WAL=" wal?)

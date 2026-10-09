@@ -101,13 +101,10 @@
          durability-profile)
 
 (defn- control
-  "Active WAL runtime-control reference. The new WAL-only protocol binds one
-  through `bind-runtime-control!`; the legacy pending engine exposes its hooks
-  through `:application-hooks`. The reference can supply only WAL I/O lifetime,
-  append-admission checking and terminal failure notification."
+  "Active WAL runtime control supplies I/O lifetime, append-admission checks
+  and terminal failure notification."
   [state]
-  (or (some-> (:runtime-control state) deref)
-      (some-> (:application-hooks state) deref)))
+  (some-> (:runtime-control state) deref))
 
 (defn enabled? [info] (true? (:wal? info)))
 
@@ -177,12 +174,6 @@
 (def sync-collect-stall-ns
   "Park slice between re-checks of the engine's pending-work predicate."
   20000)
-
-(defn wal-shared?
-  [info]
-  (if (contains? info :wal-shared?)
-    (boolean (:wal-shared? info))
-    c/*wal-shared?*))
 
 (defn segment-max-bytes
   [info]
@@ -316,6 +307,8 @@
 
 (defn init-runtime-state
   [info marker-state]
+  (when (:wal-shared? info)
+    (raise "Shared-WAL mode is no longer supported" {:option :wal-shared? :value true}))
   (validate-runtime-config! info)
   (let [dir               (or (:wal-dir info)
                               (str (:dir info) u/+separator+ "txlog"))
@@ -435,7 +428,6 @@
          :segment-channel        (volatile! ch)
          :segment-offset         (volatile! active-offset)
          :append-lock            (Object.)
-         :application-hooks      (volatile! nil)
          :runtime-control        (volatile! nil)
          :segment-roll-lock      (ReentrantLock.)
          :next-lsn               (volatile! (inc last-committed))
@@ -445,7 +437,6 @@
          :segment-prealloc-mode  prealloc-mode
          :segment-prealloc-bytes (long (segment-prealloc-bytes info))
          :durability-profile     profile
-         :wal-shared?            (wal-shared? info)
          :sync-mode              sync-mode*
          :sync-on-write?         sync-on-write?
          :commit-marker?         (commit-marker? info)
@@ -467,7 +458,6 @@
          ;; snapshot metadata. Also guarded by the environment write lock.
          :lmdb-runtime-floor    (long-array [-1 0])
          :kv-encode-buffer      (volatile! nil)
-         :write-groups          (java.util.concurrent.ConcurrentHashMap.)
          :commit-wait-ms         (long (commit-wait-ms info))
 
          :sync-manager (new-sync-manager
@@ -479,14 +469,11 @@
                           :sync-adaptive?    (sync-adaptive? info)
                           ;; Buffered private fsync can combine adjacent
                           ;; records in one force. DSYNC already pays the
-                          ;; durability cost at append, and shared WAL defers
-                          ;; ownership, so neither collects here.
-                          :collect-window-ns (if (or sync-on-write?
-                                                     (wal-shared? info))
+                          ;; durability cost at append, so it does not collect here.
+                          :collect-window-ns (if sync-on-write?
                                                0 sync-collect-window-ns)
                           :track-trailing?   (not= :relaxed profile)
-                           ;; New-protocol private WALs opt into full-prefix
-                           ;; accounting; compatibility leaves it off.
+                           ;; Prepared WAL batches use full-prefix accounting.
                            :full-prefix?      (boolean (:wal-full-prefix? info))})
 
          :segment-roll-count                      (volatile! 0)
@@ -984,10 +971,6 @@
 
 (def write-meta-file! tmeta/write-meta-file!)
 
-(def refresh-shared-state! tmeta/refresh-shared-state!)
-
-(def ^:private refresh-shared-watermarks! tmeta/refresh-shared-watermarks!)
-
 (def publish-meta-append! tmeta/publish-meta-append!)
 
 (def publish-meta-commit! tmeta/publish-meta-commit!)
@@ -1204,8 +1187,7 @@
    (append/sync-manager batch) (append/last-lsn batch) (append/started-ms batch)
    {:force? (not= :relaxed (:durability-profile state))
     :begin? false
-    :request-count (long (if (or (:wal-shared? state)
-                                (not= :relaxed (:durability-profile state)))
+    :request-count (long (if (not= :relaxed (:durability-profile state))
                            1 request-count))})
   batch)
 
@@ -1294,7 +1276,6 @@
           (throw e)))
       (if-let [lock-state (try-acquire-sync-lock! state)]
         (try
-          (refresh-shared-watermarks! state false)
           (let [sync-begin (capture-sync-round-prefix state ch sync-begin)
                 target-lsn (:target-lsn sync-begin)
                 reason (:reason sync-begin)
@@ -1339,7 +1320,6 @@
           (finally
             (release-sync-lock! lock-state)))
         (do
-          (refresh-shared-watermarks! state false)
           (defer-sync-attempt! sync-manager)
           nil)))))
 
@@ -1414,9 +1394,7 @@
          deadline (long (or (::wait-deadline-ns hooks)
                             (lifetime/deadline timeout-ms)))]
      (loop [last-sync-ms nil last-sync-reason nil sync-begin initial-sync-begin]
-       ;; Ownership is an obligation even if another process has already made
-       ;; our requested LSN durable. Settle a claimed round before any return,
-       ;; timeout or shared-watermark refresh can bypass it.
+       ;; Settle a claimed sync round before returning or timing out.
        (if sync-begin
          (let [sync-res (perform-sync-round! state ch sync-manager sync-begin hooks)]
            (when-not sync-res
@@ -1425,24 +1403,22 @@
               (max 0 (min 5 (quot (- deadline (lifetime/nano-time)) 1000000)))))
            (recur (or (:sync-done-ms sync-res) last-sync-ms)
                   (or (:sync-reason sync-res) last-sync-reason) nil))
-         (do
-           (refresh-shared-watermarks! state false)
-           (if (<= lsn (long @(:last-durable-lsn sync-manager)))
-             {:sync-done-ms last-sync-ms
-              :sync-reason (or last-sync-reason @(:last-sync-reason sync-manager))}
-             (let [remaining-ns (- deadline (lifetime/nano-time))
-                   remaining (max 0 (quot (+ remaining-ns 999999) 1000000))]
-               (when-not (pos? remaining-ns)
-                 (raise "Timed out waiting for durable LSN"
-                        {:type :txlog/commit-timeout :lsn lsn :timeout-ms timeout-ms}))
-               (if-let [round (do (await-sync-collection!
-                                   sync-manager (more-work-predicate state))
-                                  (begin-sync! sync-manager lsn))]
-                 (recur last-sync-ms last-sync-reason round)
-                 (do
-                   (await-durable-or-sync-available!
-                    sync-manager lsn remaining deadline)
-                   (recur last-sync-ms last-sync-reason nil)))))))))))
+         (if (<= lsn (long @(:last-durable-lsn sync-manager)))
+           {:sync-done-ms last-sync-ms
+            :sync-reason (or last-sync-reason @(:last-sync-reason sync-manager))}
+           (let [remaining-ns (- deadline (lifetime/nano-time))
+                 remaining (max 0 (quot (+ remaining-ns 999999) 1000000))]
+             (when-not (pos? remaining-ns)
+               (raise "Timed out waiting for durable LSN"
+                      {:type :txlog/commit-timeout :lsn lsn :timeout-ms timeout-ms}))
+             (if-let [round (do (await-sync-collection!
+                                 sync-manager (more-work-predicate state))
+                                (begin-sync! sync-manager lsn))]
+               (recur last-sync-ms last-sync-reason round)
+               (do
+                 (await-durable-or-sync-available!
+                  sync-manager lsn remaining deadline)
+                 (recur last-sync-ms last-sync-reason nil))))))))))
 
 (defn- await-sync-collection!
   "Wait for adjacent appended records while the engine still reports pending
@@ -1499,8 +1475,6 @@
                                         sync-manager
                                         sync-begin
                                         hooks))
-        _ (when-not sync-res
-            (refresh-shared-watermarks! state false))
         synced? (or (some? sync-res)
                     (<= ^long lsn
                         ^long @(:last-durable-lsn sync-manager)))
@@ -1528,12 +1502,11 @@
                                        (more-work-predicate state))
         done-ms
         (if (and (:sync-on-write? state)
-                 (not (:wal-shared? state))
                  (pos? (long timeout-ms))
                  sync-begin)
           ;; This caller owns sync completion and its DSYNC append has already
-          ;; returned. Shared WAL and another sync owner still use reconciliation
-          ;; and waiting below. Hooks remain outside both WAL/manager locks.
+          ;; returned. Another sync owner still uses waiting below. Hooks remain
+          ;; outside both WAL/manager locks.
           (complete-sync-on-write! state sync-manager sync-begin
                                    append-start-ms hooks)
           (let [{:keys [sync-done-ms sync-reason]}
@@ -1561,7 +1534,6 @@
   external process-ownership protocol."
   [state rows hooks]
   (with-wal-use state
-    (refresh-shared-state! state false)
     (maybe-roll-segment! state (System/currentTimeMillis))
     (append-prepared-record! state rows hooks)))
 
@@ -1652,7 +1624,6 @@
                      (lifetime/deadline (:commit-wait-ms state)))]
       (complete-prefix! state batch (append/last-lsn batch) deadline nil))
     (with-wal-use state
-      (refresh-shared-watermarks! state false)
       (<= (long (append/last-lsn batch))
           (long @(:last-durable-lsn (:sync-manager state)))))))
 
@@ -1797,9 +1768,6 @@
   [state expected-lsn bodies {:keys [before-append! register-appends!] :as hooks}]
   (when (zero? (count bodies))
     (throw (IllegalArgumentException. "A prepared WAL batch cannot be empty")))
-  (when (:wal-shared? state)
-    (raise "Prepared batch insertion requires a private WAL"
-           {:type :txlog/shared-preparation}))
   (with-wal-use state
     (let [expected-lsn (long expected-lsn)
           single? (= 1 (count bodies))
@@ -1976,8 +1944,6 @@
   info. The caller holds the store writer lock through materialization. Segment
   size is a soft limit: a fetched batch, like a single record, can cross it."
   [state records {:keys [throw-if-fatal! before-append! mark-fatal!] :as hooks}]
-  (when (:wal-shared? state)
-    (raise "Batched replay requires a private WAL" {:type :txlog/shared-replay-batch}))
   (when (seq records)
     (maybe-roll-segment! state (System/currentTimeMillis))
     (let [append
@@ -2033,7 +1999,6 @@
 (defn force-sync!
   [state hooks]
   (with-wal-use state
-   (refresh-shared-state! state false)
   (let [sync-manager (:sync-manager state)
         timeout-ms (long (:commit-wait-ms state))
         before (sync-manager-state sync-manager)
@@ -2073,7 +2038,6 @@
   (let [token (claim-wal-ownership! state deadline-ns)]
     (try
       (with-wal-use state
-        (refresh-shared-state! state false)
         (let [sync-manager (:sync-manager state)
               timeout-ms (long (:commit-wait-ms state))
               target-lsn (long target-lsn)

@@ -180,9 +180,6 @@
         wal? (:wal? opts)]
     (check-catalog! (recovery/dbis opts))
     (when wal? (recovery/validate-limits! opts))
-    (when (and wal? (:wal-shared? opts))
-      (throw (ex-info "Private M0 does not support shared WAL"
-                      {:error :txlog/write-protocol-mismatch})))
     (env/open-batch!
      (assoc opts :open-runtime!
             (fn []
@@ -202,7 +199,7 @@
                     (i/open-dbi raw name dbi-opts))
                   (let [state (when wal?
                                 (:state (wal/init-runtime-state
-                                         (assoc opts :wal-shared? false
+                                         (assoc opts
                                                 :wal-full-prefix? true
                                                 :wal-recovery-floor (long (or (:last-lsn restored) 0)))
                                          nil)))]

@@ -17,7 +17,6 @@
                                   snapshot-slot-path update-snapshot-slot-meta!
                                   write-snapshot-meta!]]
    [datalevin.lmdb :as l]
-   [datalevin.tx-group.phase :as phase]
    [datalevin.txlog :as txlog]
    [datalevin.txlog.append :as append]
    [datalevin.txlog.codec :as tcodec]
@@ -1146,7 +1145,6 @@
 
 (defn txlog-watermarks-map
   [lmdb state]
-  (txlog/refresh-shared-state! state false)
   (let [sync-state (txlog/sync-manager-state (:sync-manager state))
         vec-summary (txlog-vector-checkpoint-summary lmdb)
         rollout-mode (txlog-rollout-mode lmdb)
@@ -1177,7 +1175,6 @@
      :write-path-enabled? write-path-enabled?
      :rollback? (not write-path-enabled?)
      :durability-profile (:durability-profile state)
-     :wal-shared? (true? (:wal-shared? state))
      :dir (:dir state)
      :segment-id (long @(:segment-id state))
      :next-lsn next-lsn
@@ -1250,7 +1247,6 @@
 
 (defn txlog-recovery-context
   [lmdb state]
-  (txlog/refresh-shared-state! state false)
   (let [marker-state (read-commit-marker-state lmdb)
         marker-applied-lsn
         (long (or (some-> marker-state :current :applied-lsn) 0))
@@ -1927,7 +1923,6 @@
   (txlog/with-recovery-lock
     state
     (fn []
-      (txlog/refresh-shared-state! state false)
       (let [{:keys [last-record] :as recovery} (txlog-recover-on-open! lmdb)]
         (when last-record
           (txlog/publish-meta-commit! state
@@ -1980,7 +1975,6 @@
            (align-runtime-txlog-payload-floor! lmdb)
            (ensure-snapshot-bootstrap! lmdb state)
            (vswap! info-v assoc :txlog-recovered? true))
-         (txlog/refresh-shared-state! state false)
          ;; Explicit transactions defer the routine floor check until their
          ;; native writer is acquired. Initial recovery still aligns above.
          (when align-floor?
@@ -2240,73 +2234,6 @@
     (cache-commit-metadata! state txn-id marker-entry payload-lsn metadata-changed?)
     (txlog/note-commit-applied! state append-res)))
 
-(defn apply-appended-range!
-  "Apply one sealed WAL prefix directly in one native transaction. All records
-  already own LSNs; resize retries repeat only these immutable rows. This seam
-  does not enter a collector, append WAL, or wait for WAL durability."
-  [lmdb runtime entries token]
-  (let [state (:wal runtime)
-        first-lsn (long @(:lsn (first entries)))
-        last-entry (peek entries)
-        last-lsn (long @(:lsn last-entry))
-        range-rows (let [rows (FastList.)]
-                     (doseq [entry entries row @(:rows entry)] (.add rows row))
-                     rows)
-        append-res (append/commit-info @(:append-batch last-entry) last-lsn)
-        committed? (volatile! false)
-        commit-attempted? (volatile! false)]
-    (when (or (Thread/holdsLock (:append-lock state))
-              (not (instance? datalevin.binding.cpp.CppLMDB lmdb)))
-      (throw (ex-info "WAL application requires the raw native adapter outside insertion"
-                      {:error :txlog/invalid-application-context :applied? false})))
-    (try
-      (locking (l/write-txn lmdb)
-        (let [metadata
-              (cpp/apply-native-range!
-               lmdb
-               (fn [wdb]
-                 (vreset! commit-attempted? false)
-                 (phase/phase! :native-writer-acquired token)
-                 (let [^Txn txn (.-txn ^Rtx @(l/write-txn lmdb))
-                       txn-id (.id txn)
-                       before (long (refresh-commit-metadata! wdb state txn txn-id))]
-                   (when-not (= before (dec first-lsn))
-                     (throw (ex-info "Native application prefix does not match the WAL range"
-                                     {:error :txlog/application-prefix-mismatch
-                                      :expected (dec first-lsn) :applied-lsn before
-                                      :applied? false})))
-                   (i/transact-kv wdb (encoding/storage-rows range-rows))
-                   (let [metadata-changed? (.hasKvInfoChanges txn)
-                         payload-lsn last-lsn
-                         commit-metadata
-                         (tcodec/prepare-commit-metadata!
-                          (:commit-metadata-write state) payload-lsn
-                          (when (:commit-marker? state)
-                            (inc (long @(:marker-revision state)))) append-res)
-                         marker-entry (when (:commit-marker? state) commit-metadata)]
-                     (i/transact-kv wdb commit-metadata)
-                     (phase/phase! :before-native-commit token)
-                     {:txn-id txn-id :marker-entry marker-entry
-                      :payload-lsn payload-lsn :metadata-changed? metadata-changed?})))
-               (fn [_wdb _context] (vreset! commit-attempted? true)))]
-            ;; The native commit contains both data and the applied marker.
-            ;; Metadata/cache publication can fail without undoing that commit.
-          (vreset! committed? true)
-          (txlog/commit-finished! state (:marker-entry metadata))
-          (cache-commit-metadata! state (:txn-id metadata) (:marker-entry metadata)
-                                  (:payload-lsn metadata) (:metadata-changed? metadata))))
-        ;; The external hint may flush a metadata file. Native ownership has
-        ;; ended; only the application turn remains reserved for this prefix.
-      (txlog/note-commit-applied! state append-res)
-      :applied
-      (catch Throwable e
-        (throw (ex-info "Failed to apply an already appended WAL range"
-                        (assoc (ex-data e) :applied?
-                               (cond @committed? true
-                                     (l/resized? e) false
-                                     @commit-attempted? :unknown
-                                     :else false)) e))))))
-
 (defn- persisted-runtime-floor-lsn
   [lmdb]
   (long
@@ -2496,8 +2423,7 @@
                   {:type :txlog/ha-replay-missing-rows
                    :record (select-keys record [:lsn :segment-id :offset])}))
          (if-let [state (txlog-runtime-state lmdb)]
-           (let [_ (txlog/refresh-shared-state! state false)
-                 record-lsn (long (:lsn record))
+           (let [record-lsn (long (:lsn record))
                  local-payload-lsn (long (persisted-local-payload-lsn lmdb))
                  expected-lsn0 (long @(:next-lsn state))
                  expected-lsn (if (> record-lsn expected-lsn0)
@@ -2588,7 +2514,7 @@
 (defn ^:no-doc mirror-replayed-txlog-records!
   "Mirror new data records with one WAL append group and one LMDB transaction.
   `preapply-fn` receives the writing KV handle and each record, so cleanup reads
-  see preceding records in this transaction. Existing LSNs, shared WALs and
+  see preceding records in this transaction. Existing LSNs and
   catalog changes retain single-record replay and its divergence checks."
   [lmdb records preapply-fn]
   (with-write-txn-lock-before-runtime-txlog-state
@@ -2597,13 +2523,11 @@
       (let [records (mapv #(assoc % :rows (or (:rows %) (:ops %))) records)
             state (txlog-runtime-state lmdb)]
         (when state
-          (txlog/refresh-shared-state! state false)
           (when (and (seq records)
                      (> (long (:lsn (first records)))
                         (long @(:next-lsn state))))
             (align-runtime-txlog-payload-floor! lmdb)))
         (if (and state (> (count records) 1)
-                 (not (:wal-shared? state))
                  (not (write-txn-open? lmdb))
                  (every? batchable-replay-record? records)
                  (= (long (:lsn (first records))) (long @(:next-lsn state))))

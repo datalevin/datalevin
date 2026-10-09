@@ -8,7 +8,7 @@
 ;; You must not remove this notice, or any other, from this software.
 ;;
 (ns ^:no-doc datalevin.txlog.meta
-  "Txn-log meta file and shared-watermark helpers."
+  "Txn-log metadata publication helpers."
   (:require
    [clojure.java.io :as io]
    [datalevin.buffer :as bf]
@@ -132,272 +132,26 @@
      :segment-offset (long (or (some-> segment-offset-v deref) 0))
      :updated-ms (long (or (some-> sync-manager :last-sync-ms deref) 0))}))
 
-(defn- meta-long
-  ^long
-  [m k]
-  (long (or (get m k) 0)))
-
-(defn- newer-position
-  [base file]
-  (let [base-committed (long (meta-long base :last-committed-lsn))
-        file-committed (long (meta-long file :last-committed-lsn))
-        base-segment (long (meta-long base :segment-id))
-        file-segment (long (meta-long file :segment-id))
-        base-offset (long (meta-long base :segment-offset))
-        file-offset (long (meta-long file :segment-offset))]
-    (if (or (pos? (Long/compare file-committed base-committed))
-            (and (zero? (Long/compare file-committed base-committed))
-                 (or (pos? (Long/compare file-segment base-segment))
-                     (and (zero? (Long/compare file-segment base-segment))
-                          (pos? (Long/compare file-offset base-offset))))))
-      {:segment-id file-segment
-       :segment-offset file-offset}
-      {:segment-id base-segment
-       :segment-offset base-offset})))
-
-(defn- merge-meta-state
-  [base file]
-  (let [file (or file {})
-        base-committed (long (meta-long base :last-committed-lsn))
-        file-committed (long (meta-long file :last-committed-lsn))
-        committed (long (if (neg? (Long/compare base-committed file-committed))
-                          file-committed
-                          base-committed))
-        base-durable (long (meta-long base :last-durable-lsn))
-        file-durable (long (meta-long file :last-durable-lsn))
-        max-durable (long (if (neg? (Long/compare base-durable file-durable))
-                            file-durable
-                            base-durable))
-        durable (long (if (pos? (Long/compare max-durable committed))
-                        committed
-                        max-durable))
-        base-applied (long (meta-long base :last-applied-lsn))
-        file-applied (long (meta-long file :last-applied-lsn))
-        max-applied (long (if (neg? (Long/compare base-applied file-applied))
-                            file-applied
-                            base-applied))
-        applied (long (if (pos? (Long/compare max-applied committed))
-                        committed
-                        max-applied))
-        position (newer-position base file)]
-    (assoc (merge base file position)
-           :revision
-           (let [base-revision (long (or (:revision base) -1))
-                 file-revision (long (or (:revision file) -1))]
-             (if (neg? (Long/compare base-revision file-revision))
-               file-revision
-               base-revision))
-           :last-committed-lsn committed
-           :last-durable-lsn durable
-           :last-applied-lsn applied
-           :updated-ms
-           (let [base-updated (long (meta-long base :updated-ms))
-                 file-updated (long (meta-long file :updated-ms))]
-             (if (neg? (Long/compare base-updated file-updated))
-               file-updated
-               base-updated)))))
-
-(defn- current-meta-state
-  [state]
-  (merge-meta-state
-   (base-meta-state state)
-   (:current (read-meta-file (:meta-path state)))))
-
 (defn- next-meta-state
   [current f]
   (-> (f current)
       (assoc :revision (inc (long (or (:revision current) -1)))
              :updated-ms (System/currentTimeMillis))))
 
-(defn- segment-created-ms-from-file
-  [^String path now-ms]
-  (let [modified (.lastModified (io/file path))]
-    (if (pos? modified)
-      (long modified)
-      (long now-ms))))
-
-(defn- ensure-runtime-segment-channel!
-  [state ^long target-id ^String target-path]
-  (let [append-lock (or (:append-lock state) state)
-        segment-id-v (:segment-id state)
-        segment-channel-v (:segment-channel state)]
-    (locking append-lock
-      (let [current-id (long (or (some-> segment-id-v deref) 0))
-            current-ch (some-> segment-channel-v deref)]
-        (if (and current-ch (= current-id target-id))
-          current-ch
-          (let [next-ch (seg/open-segment-channel
-                         target-path
-                         (boolean (:sync-on-write? state)))]
-            (try
-              (when-let [old-ch @segment-channel-v]
-                (when-not (identical? old-ch next-ch)
-                  (try
-                    (.close ^FileChannel old-ch)
-                    (catch Exception _))))
-              (vreset! segment-id-v target-id)
-              (vreset! segment-channel-v next-ch)
-              next-ch
-              (catch Exception e
-                (try
-                  (.close ^FileChannel next-ch)
-                  (catch Exception _))
-                (throw e)))))))))
-
-(defn- apply-shared-watermarks!
-  [sync-manager committed-lsn durable-lsn updated-ms]
-  (when sync-manager
-    (let [committed* (max 0 (long (or committed-lsn 0)))
-          durable* (max 0 (min committed* (long (or durable-lsn 0))))
-          updated-ms* (long (or updated-ms 0))]
-      (locking (:monitor sync-manager)
-        (vreset! (:last-appended-lsn sync-manager) committed*)
-        (vreset! (:last-durable-lsn sync-manager) durable*)
-        (when (pos? updated-ms*)
-          (vreset! (:last-sync-ms sync-manager)
-                   (max updated-ms*
-                        (long @(:last-sync-ms sync-manager)))))
-        (vreset! (:unsynced-count sync-manager)
-                 (max 0 (- committed* durable*)))
-        (when (<= committed* durable*)
-          (vreset! (:sync-requested? sync-manager) false)
-          (vreset! (:sync-request-reason sync-manager) nil))
-        ;; Watermark refresh is an observer/reconciler. Sync round ownership and
-        ;; health are updated only by begin/complete/defer/reset transitions.
-        (.notifyAll ^Object (:monitor sync-manager))))))
-
-(defn- shared-wal-state?
-  [state]
-  (true? (:wal-shared? state)))
-
-(defn refresh-shared-state!
-  "Refresh runtime state; pass false when the metadata snapshot is unused."
-  ([state] (refresh-shared-state! state true))
-  ([state snapshot?]
-   ;; Runtime reconciliation can truncate/replace the active segment and reset
-   ;; append cursors, so serialize it with in-process record appends.
-   (if-not (shared-wal-state? state)
-     (when snapshot? (base-meta-state state))
-     (let [append-lock (or (:append-lock state) state)]
-       (locking append-lock
-         (let [base-state (base-meta-state state)
-               meta-file-state (or (:current (read-meta-file (:meta-path state))) {})
-               meta-state (merge-meta-state base-state meta-file-state)
-               dir (:dir state)
-               newest-segment-id (long (or (:id (peek (seg/segment-files dir))) 1))
-               current-segment-id (long (or (:segment-id base-state) 1))
-               current-offset (long (or (:segment-offset base-state) 0))
-               current-revision (long (or (:revision base-state) -1))
-               meta-revision (long (or (:revision meta-file-state) -1))
-               ^FileChannel current-ch (some-> (:segment-channel state) deref)
-               synced-runtime?
-               (and current-ch
-                    (= newest-segment-id current-segment-id)
-                    (<= meta-revision current-revision)
-                    (try
-                      (= (long (.size current-ch)) current-offset)
-                      (catch Exception _
-                        false)))]
-           (if synced-runtime?
-             (when snapshot? base-state)
-             (let [meta-segment-id (long (or (:segment-id meta-state) 1))
-                   target-segment-id (long (max 1 meta-segment-id newest-segment-id))
-                   target-path (seg/activate-next-segment! dir target-segment-id)
-                   target-scan (seg/truncate-partial-tail!
-                                target-path {:allow-preallocated-tail? true})
-                   scan-end-offset (long (seg/segment-end-offset target-scan))
-                   ;; Meta can be ahead of the actual segment bytes after snapshot
-                   ;; restore or other recovery fallback paths. Never resume appends at
-                   ;; the higher meta offset or the next write will create a zero-filled
-                   ;; hole that later segment scans report as corruption.
-                   target-offset (long scan-end-offset)
-                   target-last-lsn (long (or (some-> (:records target-scan) peek :lsn) 0))
-                   committed-lsn (max (long (or (:last-committed-lsn meta-state) 0))
-                                      target-last-lsn)
-                   durable-lsn (min committed-lsn
-                                    (max 0 (long (or (:last-durable-lsn meta-state) 0))))
-                   applied-lsn (min committed-lsn
-                                    (max 0 (long (or (:last-applied-lsn meta-state) 0))))
-                   updated-ms (long (or (:updated-ms meta-state) 0))
-                   revision (long (or (:revision meta-state) -1))
-                   now-ms (System/currentTimeMillis)]
-               (ensure-runtime-segment-channel! state target-segment-id target-path)
-               (when-let [segment-offset-v (:segment-offset state)]
-                 (vreset! segment-offset-v target-offset))
-               (when-let [segment-created-ms-v (:segment-created-ms state)]
-                 (vreset! segment-created-ms-v
-                          (segment-created-ms-from-file target-path now-ms)))
-               (when-let [next-lsn-v (:next-lsn state)]
-                 (vreset! next-lsn-v (inc committed-lsn)))
-               (when-let [meta-revision-v (:meta-revision state)]
-                 (vreset! meta-revision-v revision))
-               (when-let [last-applied-v (:meta-last-applied-lsn state)]
-                 (vreset! last-applied-v applied-lsn))
-               (apply-shared-watermarks! (:sync-manager state)
-                                         committed-lsn
-                                         durable-lsn
-                                         updated-ms)
-               (when snapshot?
-                 {:revision revision
-                  :last-committed-lsn committed-lsn
-                  :last-durable-lsn durable-lsn
-                  :last-applied-lsn applied-lsn
-                  :segment-id target-segment-id
-                  :segment-offset target-offset
-                  :updated-ms updated-ms})))))))))
-
-(defn refresh-shared-watermarks!
-  "Refresh runtime state; pass false when the metadata snapshot is unused."
-  ([state] (refresh-shared-watermarks! state true))
-  ([state snapshot?]
-   (if-not (shared-wal-state? state)
-     (when snapshot? (base-meta-state state))
-     (let [meta-state (current-meta-state state)
-           committed-lsn (max 0 (long (or (:last-committed-lsn meta-state) 0)))
-           durable-lsn (min committed-lsn
-                            (max 0 (long (or (:last-durable-lsn meta-state) 0))))
-           applied-lsn (min committed-lsn
-                            (max 0 (long (or (:last-applied-lsn meta-state) 0))))
-           updated-ms (long (or (:updated-ms meta-state) 0))
-           revision (long (or (:revision meta-state) -1))]
-       (when-let [meta-revision-v (:meta-revision state)]
-         (vreset! meta-revision-v revision))
-       (when-let [last-applied-v (:meta-last-applied-lsn state)]
-         (vreset! last-applied-v applied-lsn))
-       (apply-shared-watermarks! (:sync-manager state)
-                                 committed-lsn
-                                 durable-lsn
-                                 updated-ms)
-       (when snapshot?
-         {:revision revision
-          :last-committed-lsn committed-lsn
-          :last-durable-lsn durable-lsn
-          :last-applied-lsn applied-lsn
-          :updated-ms updated-ms})))))
-
-(defn- update-shared-meta!
+(defn- update-meta!
   [state f]
-  (seg/with-file-lock
-    (:meta-lock-path state)
-    (fn []
-      (let [current (current-meta-state state)
-            next-state (next-meta-state current f)
-            written (write-meta-file! (:meta-path state)
-                                      next-state
-                                      {:sync-mode :none})]
-        (when-let [meta-revision-v (:meta-revision state)]
-          (vreset! meta-revision-v (long (:revision written))))
-        (when-let [last-applied-v (:meta-last-applied-lsn state)]
-          (vreset! last-applied-v (long (:last-applied-lsn written))))
-        (apply-shared-watermarks! (:sync-manager state)
-                                  (:last-committed-lsn written)
-                                  (:last-durable-lsn written)
-                                  (:updated-ms written))
-        written))))
+  (locking (or (:append-lock state) state)
+    (let [next-state (next-meta-state (base-meta-state state) f)
+          written (write-meta-file! (:meta-path state) next-state {:sync-mode :none})]
+      (when-let [revision (:meta-revision state)]
+        (vreset! revision (long (:revision written))))
+      (when-let [applied (:meta-last-applied-lsn state)]
+        (vreset! applied (long (:last-applied-lsn written))))
+      written)))
 
 (defn publish-meta-append!
   [state {:keys [lsn segment-id offset]}]
-  (update-shared-meta!
+  (update-meta!
    state
    (fn [current]
      (let [committed-lsn (max (long (or (:last-committed-lsn current) 0))
@@ -429,7 +183,7 @@
 
 (defn publish-meta-commit!
   [state {:keys [lsn segment-id synced?] :as record}]
-  (update-shared-meta!
+  (update-meta!
    state
    (fn [current]
      (let [segment-id (long segment-id)
@@ -457,7 +211,7 @@
 
 (defn publish-meta-durable!
   [state target-lsn]
-  (update-shared-meta!
+  (update-meta!
    state
    (fn [current]
      (assoc current
@@ -467,28 +221,7 @@
 
 (defn publish-meta-current!
   [state]
-  (if (false? (:wal-shared? state))
-    ;; A private WAL owns its metadata revision and append position. Serialize
-    ;; publishers with appends, but do not reread/reconcile shared state or
-    ;; write captured watermarks back into a concurrently progressing syncer.
-    (locking (or (:append-lock state) state)
-      (let [next-state (next-meta-state (base-meta-state state) identity)
-            written (write-meta-file! (:meta-path state) next-state
-                                      {:sync-mode :none})]
-        (vreset! (:meta-revision state) (long (:revision written)))
-        written))
-    (update-shared-meta!
-     state
-     (fn [current]
-       (let [base (base-meta-state state)]
-         (merge current
-                (select-keys
-                 base
-                 [:last-committed-lsn
-                  :last-durable-lsn
-                  :last-applied-lsn
-                  :segment-id
-                  :segment-offset])))))))
+  (update-meta! state identity))
 
 (defn try-with-maintenance-lock
   [state f]

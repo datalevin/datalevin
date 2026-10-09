@@ -1500,7 +1500,7 @@
                       cpp/*before-write-commit-fn*
                       kvtx/*after-txlog-append-fn*
                       kvtx/*commit-payload-ha-term*)]
-    (when (and embedded/*enabled?* (not kv/*server-write-slot-held?*)
+    (when (and (not kv/*server-write-slot-held?*)
                (not (l/writing? raw))
                (not (Thread/holdsLock (l/write-txn raw)))
                (or (not (ha-runtime-read-state? state)) guarded?)
@@ -1530,7 +1530,8 @@
                    ;; raw environment and its collector (including on resize
                    ;; and schema changes).
                    ((:update-db deps) server db-name
-                    #(assoc % :dt-db committed :store (:store committed))))}]
+                    #(assoc % :dt-db committed :store (:store committed)))
+                   (database-changed! deps server db-name false))}]
             (if-let [dt-db (:dt-db state)]
               (datalog/attach! dt-db hooks)
               (embedded/attach! store hooks))))
@@ -1634,6 +1635,11 @@
          (let [conn (atom db0)
                stamp-report (fn [report]
                               (assoc report ::group-committed? true
+                                            ::group-db-info
+                                            {:max-eid (:max-eid (:db-after report))
+                                             :max-tx (:max-tx (:db-after report))
+                                             :last-modified
+                                             (i/last-modified (:store (:db-after report)))}
                                             ::group-last-modified
                                             (i/last-modified (:store (:db-after report)))))
                body (fn [tx]
@@ -1655,8 +1661,6 @@
                           *datalog-write-control* conn body
                           {:context {:datalog-prepare? true
                                      :isolated? (st/synchronous-secondary-indexing? (:store db0))}}))]
-           (when (seq (:tx-data report))
-             (database-changed! deps server db-name false))
            report)
 
          *datalog-write-group*
@@ -1732,7 +1736,8 @@
                    (and (not writing?) (not s?))
                    (assoc :store (:store db1))))))
         ack? (= response-kind cop/tx-data-ack-response-kind)
-        rp  (if ack? rp (assoc-in rp [:tempids :max-eid] (:max-eid db1)))]
+        rp  (if ack? rp (assoc-in rp [:tempids :max-eid]
+                                 (or (:max-eid (::group-db-info rp)) (:max-eid db1))))]
     (when (and (not s?) (not (::group-committed? rp)) (seq (:tx-data rp)))
       (database-changed! deps server db-name writing?))
     (cond-> (cond-> (if ack? {:result :transacted}
@@ -1742,9 +1747,10 @@
       (not= response-kind cop/tx-data-response-kind)
       (assoc :db-info
              (if (::group-committed? rp)
-               {:max-eid (:max-eid db1)
-                :max-tx (:max-tx db1)
-                :last-modified (::group-last-modified rp)}
+               (or (::group-db-info rp)
+                   {:max-eid (:max-eid db1)
+                    :max-tx (:max-tx db1)
+                    :last-modified (::group-last-modified rp)})
                {:max-eid       (:max-eid db1)
                 :max-tx        (i/max-tx
                                 (dt-store deps server skey db-name writing?))
@@ -2848,7 +2854,7 @@
         ;; one. Its temporary local connection must not install an embedded
         ;; collector: server-write-control attaches the replacement with the
         ;; server semaphore and publication hooks on its first write.
-        (binding [embedded/*enabled?* false]
+        (binding [embedded/*defer-attachment?* true]
           (sapi/datalog-re-index deps server skey {:args args}))))))
 
 (defn replica-status

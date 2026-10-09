@@ -434,9 +434,17 @@
     (cpp/apply-native-once!
      raw
      (fn [wdb]
+       ;; Refresh metadata once for every writer, including frozen blind rows.
+       ;; A raw commit can advance the payload floor between collected batches.
+       (when-let [ensure! (:ensure-body-ready! opts)]
+         (try (ensure! wdb)
+              (catch Throwable t
+                ;; No rows or WAL have been written. Preserve startup failure
+                ;; as a clean cancellation so a repaired store can be retried.
+                (batch/cancel-before-dispatch! t))))
        (let [active-view (volatile! nil)
              dispatched? (volatile! false)
-             ready? (volatile! false)
+             ready? (volatile! (boolean (:ensure-body-ready! opts)))
              opts (cond-> (assoc opts :active-view active-view :capture-batch batch)
                     (:shared-datalog-writer? opts) (assoc :datalog-view (volatile! nil)))
              history (when (:retry-frozen? opts) (ArrayList.))

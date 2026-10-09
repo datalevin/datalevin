@@ -45,7 +45,7 @@
 
 (defn- validate-options! [opts]
   (doseq [[key value] opts] (validate/validate-option-mutation key value))
-  (when (or (:temp? opts) (:inmemory? opts) (:ha-mode opts) (:wal-shared? opts)
+  (when (or (:temp? opts) (:inmemory? opts) (:ha-mode opts)
             (:key-compress opts) (:val-compress opts)
             (some #{:inmemory :rdonly-env :nosubdir} (:flags opts)))
     (unsupported! :environment-options))

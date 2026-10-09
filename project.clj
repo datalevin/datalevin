@@ -90,7 +90,12 @@
              "--add-opens=java.base/java.nio=ALL-UNNAMED"
              "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]
   :javac-options ["--release" "21"]
-  :jar-exclusions [#"datalevin/tx_group/test_support"
+  :jar-exclusions [#"datalevin/tx_state([$_.]|$)"
+                       #"datalevin/tx_state/(kv|view)([/$_.]|$)"
+                       #"datalevin/tx_state/[A-Z][^/]*\.class$"
+                       #"datalevin/tx_group/(Receipt|Deferred)\.class$"
+                       #"datalevin/binding/cpp/IPendingReader\.class$"
+                       #"datalevin/tx_group/test_support"
                        #"datalevin/tx_group/batch/(env|private|recovery)([/$_.]|$)"
                        #"_test" #"\/test\/" #"test\d" #"\/data\.json" #"all\.json"
                    #"\.csv" #"\.edn" #"\.java"
@@ -101,7 +106,12 @@
                    #"rust/fuzz/target/"
                    #"rust/test-adapter/target/"
                    #"client_quickstart_check\.clj"]
-  :uberjar-exclusions [#"datalevin/tx_group/test_support"
+  :uberjar-exclusions [#"datalevin/tx_state([$_.]|$)"
+                       #"datalevin/tx_state/(kv|view)([/$_.]|$)"
+                       #"datalevin/tx_state/[A-Z][^/]*\.class$"
+                       #"datalevin/tx_group/(Receipt|Deferred)\.class$"
+                       #"datalevin/binding/cpp/IPendingReader\.class$"
+                       #"datalevin/tx_group/test_support"
                        #"datalevin/tx_group/batch/(env|private|recovery)([/$_.]|$)"
                        #"pod.huahaiy.datalevin-test"
                        #"datalevin/test_adapter"

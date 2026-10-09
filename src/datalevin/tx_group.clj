@@ -2,8 +2,8 @@
 ;; Distributed under the Eclipse Public License 2.0.
 (ns ^:no-doc datalevin.tx-group
   "Collect synchronous writes with backend-owned execution and completion.
-  Native runners collect under their writer. WAL runners can hand off collection
-  after append and complete durability and application outside admission."
+  Native runners collect under their writer and publish after physical commit.
+  WAL writes use `datalevin.tx-group.batch`."
   (:refer-clojure :exclude [run!])
   (:import [java.util.concurrent ConcurrentLinkedQueue Semaphore TimeUnit]
            [java.util.concurrent.atomic AtomicBoolean]
@@ -14,8 +14,8 @@
 (deftype Group [^ReentrantLock lock ^ConcurrentLinkedQueue queue ^long limit
                 ^AtomicBoolean active])
 (deftype Committed [value confirmation])
-(deftype Deferred [completion])
-(deftype Receipt [value complete])
+
+
 (deftype Rejected [error])
 
 (defprotocol IExecution
@@ -125,7 +125,7 @@
 
 (defn committed
   "Attach an explicit, once-only confirmation after physical commit. Native
-  groups may share this result; WAL callers attach confirmations per receipt."
+  groups share this result."
   [value confirm]
   (Committed. value (delay (confirm))))
 
@@ -133,39 +133,17 @@
   [value]
   (cond
     (instance? Committed value)
-    ;; A WAL request confirms only after its own durability/application wait.
     (let [^Committed committed value
           value (await-commit (.-value committed))]
       @(.-confirmation committed)
       value)
-    (instance? Receipt value)
-    (let [^Receipt receipt value]
-      (await-commit ((.-complete receipt)))
-      (.-value receipt))
     (instance? Rejected value) (throw ^Throwable (.-error ^Rejected value))
     :else value))
-
-(defn receipt
-  "Deliver one appended request's value after complete has established its
-  durability, application and confirmation. Each submitting caller invokes its
-  own completion outside collector leadership; there is no shared batch delay.
-  Readiness is signalled after collector release, so no release barrier is needed.
-  All completion context must be passed explicitly or closed over by complete."
-  [_execute value complete]
-  (Receipt. value complete))
 
 (defn rejected
   "Return a request-specific failure without failing or retrying its group."
   [error]
   (Rejected. error))
-
-(defn defer-completion
-  "Return a runner result completed after releasing collector leadership.
-  f returns the ordered result array for the already fixed batch. It runs once,
-  on a waiting caller, using explicit context, and owns durability/application.
-  Failures here are final: request bodies must never be replayed after append."
-  [_execute f]
-  (Deferred. (delay (await-commit (f)))))
 
 (defn create
   "Create one bounded-batch admission queue for a store and execution path."
@@ -193,110 +171,16 @@
            (recur (inc idx)))
          (.toArray results))))))
 
-(defn batch-data
-  "Return operation metadata (::data) for a specialized batch runner, only when
-  every request has the runner's specialization context. Otherwise execute
-  its operation normally. A specialized batch is sealed before execution."
-  [execute]
-  (collect! execute)
-  ;; A lone request uses the general writer so arrivals during its execution
-  ;; can join it. Do not materialize its request list just to reject the
-  ;; specialized batch path.
-  (when (> (long (request-count execute)) 1)
-    (let [^FastList requests (requests execute)
-          context (specialization-context execute)
-          data (FastList. (.size requests))]
-      (loop [idx 0]
-        (if (= idx (.size requests))
-          (do (collect! execute true) data)
-          (let [^Request request (.get requests idx)]
-            (when (and (some? (.-data request))
-                       (= context (.-context request)))
-              (.add data (.-data request))
-              (recur (inc idx)))))))))
-
-(defn ^:redef preparation-nano-time
-  "Monotonic clock seam for the bounded WAL preparation window."
-  ^long []
-  (System/nanoTime))
-
-(defn prepare-requests
-  "Prepare bounded WAL requests independently, collecting arrivals until the
-  current preparation ends. Seal before returning to the insertion runner.
-  f receives an operation and its optional specialization data, and returns
-  a per-request receipt (or rejection). Bodies after append are never retried.
-  A positive max-nanos bounds collection between bodies; it never preempts a
-  body or waits to fill a batch. Poll one request at a time so an expired window
-  leaves the suffix in the existing queue for the next leader. Native runners
-  retain execute's collect-during-execution behavior. Zero uses the count limit."
-  ([execute f] (prepare-requests execute f 0))
-  ([execute f max-nanos]
-   (let [max-nanos (long max-nanos)
-         bounded? (pos? max-nanos)
-         started (if bounded? (preparation-nano-time) 0)]
-     (when-not bounded? (collect! execute))
-     (let [^FastList requests (requests execute)
-           results (FastList. (.size requests))]
-       (try
-         (loop [idx 0]
-           (when (< idx (.size requests))
-             (let [^Request request (.get requests idx)]
-               (.add results
-                     (try (f (.-op request) (.-data request))
-                          (catch Throwable t (rejected t)))))
-             (when (= (inc idx) (.size requests))
-               (if bounded?
-                 (when (< (- (preparation-nano-time) started) max-nanos)
-                   (collect-next! execute))
-                 (collect! execute)))
-             (recur (inc idx))))
-         (.toArray results)
-         (finally (collect! execute true)))))))
-
-(defn collect-submissions
-  "Collect queued requests under the caller's collector leadership and return a
-  vector of (f op data) descriptors for requests added at or after from-index.
-  Membership is not sealed; the caller seals once it stops accepting arrivals."
-  ([execute f] (collect-submissions execute f 0))
-  ([execute f from]
-   (collect! execute)
-   (let [^FastList requests (requests execute)
-         start (long from)
-         results (java.util.ArrayList.)]
-     (loop [idx start]
-       (when (< idx (.size requests))
-         (let [^Request request (.get requests idx)]
-           (.add results
-                 (try (f (.-op request) (.-data request))
-                      (catch Throwable t (rejected t)))))
-         (recur (inc idx))))
-     (vec results))))
-
-(defn seal!
-  "Fix the current group's membership. No later collect can extend it."
-  [execute]
-  (collect! execute true))
-
 (defn- complete!
   [^FastList requests results error]
   (let [confirmation (when (instance? Committed results)
                        (.-confirmation ^Committed results))
-        results (if confirmation (.-value ^Committed results) results)
-        deferred? (instance? Deferred results)
-        completion (if deferred?
-                     (let [completion (.-completion ^Deferred results)]
-                       (if confirmation
-                         (delay (let [values @completion]
-                                  @confirmation
-                                  values))
-                         completion))
-                     confirmation)]
+        results (if confirmation (.-value ^Committed results) results)]
     (dotimes [idx (.size requests)]
       (let [^Request request (.get requests idx)]
         (vreset! (.-result request)
-                 (cond error [false error]
-                       deferred? [true idx completion true]
-                       :else [true (aget ^objects results idx) completion]))))))
+                 (if error [false error]
+                     [true (aget ^objects results idx) confirmation]))))))
 
 (defn- notify-ready!
   "Publish readiness only after the producing collector has released its lock."
@@ -362,22 +246,6 @@
   (let [successor (try (handoff! group)
                        (finally (.unlock ^ReentrantLock (.-lock group))))]
     (when successor (.release ^Semaphore (.-ready ^Request successor)))))
-
-(defn release-collection!
-  "Unlock a collector the caller leads without handing off, so requests arriving
-  while the caller prepares outside the lock queue for this same group. Must be
-  paired with acquire-collection! on the same thread before the runner returns.
-  The group's active flag stays set, so no successor forms in the meantime."
-  [execute]
-  (when-let [^Group group (collection-group execute)]
-    (.unlock ^ReentrantLock (.-lock group))))
-
-(defn acquire-collection!
-  "Re-acquire collector leadership released by release-collection! on the same
-  thread."
-  [execute]
-  (when-let [^Group group (collection-group execute)]
-    (.lock ^ReentrantLock (.-lock group))))
 
 (defn drain!
   "Help one bounded queued collector group before a caller's operation.
@@ -454,21 +322,16 @@
 
 (defn- result!
   [result]
-  (let [[ok? value completion deferred?] @result]
+  (let [[ok? value completion] @result]
     (if ok?
-      (let [completed (when completion @completion)]
-        (await-commit
-         (if deferred? (aget ^objects completed (int value)) value)))
+      (do (when completion @completion) (await-commit value))
       (throw ^Throwable value))))
 
 (defn- single-result!
   [result]
   (let [confirmation (when (instance? Committed result)
                        (.-confirmation ^Committed result))
-        result (if confirmation (.-value ^Committed result) result)
-        values (if (instance? Deferred result)
-                 @(.-completion ^Deferred result)
-                 result)]
+        values (if confirmation (.-value ^Committed result) result)]
     (when confirmation @confirmation)
     (await-commit (aget ^objects values 0))))
 
@@ -541,8 +404,7 @@
 (defn submit!
   "Run op in a transaction under its durability policy, batching waiting callers.
   run-transaction receives a function of the private writing context, returns
-  its result, and owns commit and state publication. It may return
-  defer-completion to finish a fixed batch outside collector leadership.
+  its result, and owns commit and state publication.
   Every caller enters once; an idle caller skips the queue and ready semaphore.
   The backend chooses its collection point. Contending callers
   wait for completion or leadership handoff. The optional delay-nanos adds a

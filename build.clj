@@ -83,6 +83,12 @@
   ["datalevin/ha"
    "datalevin/server"
    "datalevin/test_adapter"
+   "datalevin/tx_state.class"
+   "datalevin/tx_group/Receipt.class"
+   "datalevin/tx_group/Deferred.class"
+   "datalevin/binding/cpp/IPendingReader.class"
+   "datalevin/tx_state/kv"
+   "datalevin/tx_state/view"
    "datalevin/tx_group/test_support"
    "datalevin/tx_group/batch/env"
    "datalevin/tx_group/batch/private"
@@ -192,7 +198,14 @@
 (defn- delete-under-root!
   [root paths]
   (doseq [path paths]
-    (b/delete {:path (str root "/" path)})))
+    (b/delete {:path (str root "/" path)}))
+  ;; A previous AOT build may leave classes for the deleted pending engine.
+  ;; Keep lifetime/protocol classes, which the current WAL runtime still uses.
+  (doseq [[dir pattern] [["datalevin" #"tx_state(?:[$_].*|\.class)"]
+                        ["datalevin/tx_state" #"(?:(?:kv|view)(?:[$_].*|\.class)|[A-Z][^/]*\.class)"]]
+          ^File file (.listFiles (File. (str root "/" dir)))
+          :when (re-matches pattern (.getName file))]
+    (b/delete {:path (.getPath file)})))
 
 (defn- copy-path-under-root!
   [src-root target-root path]

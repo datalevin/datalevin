@@ -186,7 +186,7 @@
   #{:validate-data? :auto-entity-time? :closed-schema? :background-sampling?
     :wal? :wal-sync-adaptive?
     :wal-segment-prealloc? :wal-commit-marker?
-    :wal-rollback? :wal-shared?})
+    :wal-rollback?})
 
 (def ^:private non-negative-int-opts
   #{:cache-limit
@@ -771,6 +771,10 @@
   [k v]
   (let [k (c/canonical-wal-option-key k)]
     (cond
+      (= k :wal-shared?)
+      (when-not (false? v)
+        (raise "Shared-WAL mode is no longer supported" {:option k :value v}))
+
       (contains? non-persistable-ha-option-keys k)
       (raise (str "Option " k " is node-local HA runtime config and cannot "
                     "be persisted via assoc-opt")

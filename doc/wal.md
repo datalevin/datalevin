@@ -59,11 +59,8 @@ For direct KV usage (`open-kv`), WAL is also off by default and must be enabled:
     {:wal? true}))
 ```
 
-By default, WAL assumes a single Datalevin process owns the WAL directory. This
-keeps the commit path from polling the WAL directory and metadata file before
-every append. If multiple Datalevin processes intentionally share one WAL
-directory, open the store with `:wal-shared? true` so each process reconciles
-against the shared files before appending or reporting watermarks.
+One Datalevin process owns each WAL directory. Multi-process sharing of a WAL
+directory is unsupported. HA nodes use separate local WAL directories.
 
 ### LMDB flags
 
