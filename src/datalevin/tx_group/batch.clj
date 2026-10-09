@@ -5,8 +5,8 @@
 
   This namespace implements Invariants 1-6 of the design contract. It is not a
   replacement for `datalevin.tx-group` and never calls it: compatibility keeps
-  its own collector, and one environment selects exactly one of them (see
-  `datalevin.tx-group.batch.env`).
+  its own collector. Production environment routing is installed by
+  `datalevin.tx-group.batch.embedded`.
 
   - callers do their own state-independent preparation, then publish one ready
     descriptor;

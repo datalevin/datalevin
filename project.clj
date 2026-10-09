@@ -52,8 +52,8 @@
    [com.cognitect/transit-clj]
    [com.github.luben/zstd-jni]
    ]
-  ;; `test-src` holds test-only infrastructure (the cross-language test
-  ;; adapter). It stays a source path so the sibling dtlvtest harness can
+  ;; `test-src` holds the cross-language adapter and WAL validation harness.
+  ;; It stays a source path so the sibling dtlvtest harness can
   ;; resolve it through `checkouts/datalevin`, but it is excluded from the
   ;; published jars below.
   :source-paths ["src" "test" "test-src"]
@@ -90,7 +90,9 @@
              "--add-opens=java.base/java.nio=ALL-UNNAMED"
              "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]
   :javac-options ["--release" "21"]
-  :jar-exclusions [#"_test" #"\/test\/" #"test\d" #"\/data\.json" #"all\.json"
+  :jar-exclusions [#"datalevin/tx_group/test_support"
+                       #"datalevin/tx_group/batch/(env|private|recovery)([/$_.]|$)"
+                       #"_test" #"\/test\/" #"test\d" #"\/data\.json" #"all\.json"
                    #"\.csv" #"\.edn" #"\.java"
                    #"\.md" #"\.txt"
                    #"^java/"
@@ -99,7 +101,9 @@
                    #"rust/fuzz/target/"
                    #"rust/test-adapter/target/"
                    #"client_quickstart_check\.clj"]
-  :uberjar-exclusions [#"pod.huahaiy.datalevin-test"
+  :uberjar-exclusions [#"datalevin/tx_group/test_support"
+                       #"datalevin/tx_group/batch/(env|private|recovery)([/$_.]|$)"
+                       #"pod.huahaiy.datalevin-test"
                        #"datalevin/test_adapter"
                        #"rust/target/"
                        #"rust/fuzz/target/"

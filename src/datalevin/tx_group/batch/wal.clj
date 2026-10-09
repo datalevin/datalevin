@@ -9,12 +9,22 @@
   WAL ownership span, so a force cannot claim ownership between the append and
   its policy completion. The WAL runtime must have a bound runtime control
   (`txlog/bind-runtime-control!`)."
-  (:require [datalevin.tx-group.batch :as batch]
+  (:require [datalevin.constants :as c]
+            [datalevin.tx-group.batch :as batch]
             [datalevin.tx-group.batch.executor :as executor]
             [datalevin.tx-group.phase :as phase]
             [datalevin.txlog :as wal]
             [datalevin.txlog.codec :as codec])
   (:import [java.util ArrayList List]))
+
+(defn retention-limit ^long [opts]
+  (let [value (get opts :wal-retained-max-bytes
+                   (* 2 (long (get opts :wal-retention-bytes c/*wal-retention-bytes*))))]
+    (when-not (pos-int? value)
+      (throw (ex-info "WAL hard retention limit must be positive"
+                      {:error :txlog/write-protocol-limits
+                       :wal-retained-max-bytes value})))
+    (long value)))
 
 (definterface ^:private IBodyPlan
   (^bytes encodeBody []))

@@ -7,8 +7,8 @@
   and the join for one sealed batch. The WAL branch writes and completes exactly
   one record; the native branch applies the same frozen rows and must call
   `before-commit` before committing, which blocks on the WAL policy outcome.
-  This is the M0 skeleton: the real `txlog` and `cpp` adapters implement the
-  protocols, while tests drive deterministic fakes.
+  The `txlog` and `cpp` adapters implement the production branches; tests also
+  drive deterministic fakes.
 
   The native branch runs on the calling leader thread so native transactions stay
   on their owning thread; the WAL branch runs on the supplied executor (one task

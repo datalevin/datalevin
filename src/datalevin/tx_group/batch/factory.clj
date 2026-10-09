@@ -4,14 +4,13 @@
   "Assemble the new-protocol environment runtime from a private WAL state and a
   raw native application writer.
 
-  This is the wiring seam a private environment opener uses. It owns neither the
+  Embedded KV and server admission use this wiring seam. It owns neither the
   WAL runtime nor the LMDB writer: the opener opens them, then this namespace
   binds the WAL-only runtime control, builds the two branch adapters and the one
   reusable WAL worker, and returns the collector with a close path that stops
   the worker only after the collector has drained.
 
-  The returned map is consumed by `datalevin.tx-group.batch.env/open-batch!` as
-  its `:executor` and `:executor-close!`."
+  The returned map supplies the collector executor and its close action."
   (:require [datalevin.tx-group.batch :as batch]
             [datalevin.tx-group.batch.executor :as executor]
             [datalevin.tx-group.batch.native :as native]

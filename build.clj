@@ -83,6 +83,10 @@
   ["datalevin/ha"
    "datalevin/server"
    "datalevin/test_adapter"
+   "datalevin/tx_group/test_support"
+   "datalevin/tx_group/batch/env"
+   "datalevin/tx_group/batch/private"
+   "datalevin/tx_group/batch/recovery"
    "datalevin/DatalevinServer.class"])
 (def runtime-source-includes
   "Source paths copied from `src` into release artifacts. The Rust tree is
