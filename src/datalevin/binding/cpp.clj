@@ -536,8 +536,14 @@
               (catch Exception e
                 (close-resolution-cursor! wtxn)
                 (.close txn)
+                ;; A metadata write can resize and replace the writer before
+                ;; throwing. Release that replacement before clearing ownership.
+                (when-let [replacement @write-txn]
+                  (when-not (identical? replacement wtxn)
+                    (close-rtx-quiet! replacement)))
                 (vreset! write-txn nil)
-                (if (= :ha/write-rejected (:error (ex-data e)))
+                (if (or (l/resized? e)
+                        (= :ha/write-rejected (:error (ex-data e))))
                   (throw e)
                   (raise "Fail to commit read/write transaction in LMDB: "
                          e {})))))

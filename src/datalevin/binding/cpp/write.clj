@@ -527,7 +527,7 @@
                   (put-tx dbi txn tx)
                   (recur (unchecked-inc i) ave eav))))))))))
 
-(defn transact*
+(defn ^:redef transact*
   [txs ^HashMap dbis txn]
   (let [storage? (instance? StorageRows txs)
         txs (if storage? (.-rows ^StorageRows txs) txs)]

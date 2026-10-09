@@ -2206,7 +2206,7 @@
       (aset-long cache 0 (long txn-id))
       (aset-long cache 1 (max (aget cache 1) (long payload-lsn))))))
 
-(defn write-batch-commit-metadata!
+(defn ^:redef write-batch-commit-metadata!
   "Write the existing commit metadata in an owned collector transaction after
   WAL policy completion. Return the state published only after native commit."
   [lmdb state token]

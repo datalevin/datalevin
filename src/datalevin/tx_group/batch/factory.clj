@@ -54,6 +54,7 @@
         :native-branch native-branch
         :close! (constantly true)})
      (let [wal-branch (wal/branch wal-state)
+         next-lsn! #(long @(:next-lsn wal-state))
          native-branch (native/branch native-writer native-opts)
          w (apply worker/for-wal wal-branch (apply concat worker-opts))
          policy! (executor/policy-runner wal-branch (:executor w) (:wake! w))
@@ -62,7 +63,7 @@
                         (:write-metadata! native-opts)
                         (assoc :write-metadata! (:write-metadata! native-opts))))
          exec (executor/create wal-branch native-branch
-                               #(long @(:next-lsn wal-state))
+                               next-lsn!
                                (cond-> {:wal-executor (:executor w)
                                         :wake-maintenance! (:wake! w)}
                                  schedule-fn (assoc :schedule-fn schedule-fn)
@@ -70,7 +71,7 @@
      {:executor (fn [batch]
                   (if native-rmw
                     (rmw/execute! native-writer wal-branch
-                                  #(long @(:next-lsn wal-state)) (:wake! w)
+                                  next-lsn! (:wake! w)
                                   check-batch! native-rmw batch)
                     (exec batch)))
       :worker w

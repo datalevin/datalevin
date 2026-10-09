@@ -2637,6 +2637,18 @@
             (write-result! deps skey response)
             (write-complete! deps skey)))))))
 
+(defn clear-dbi
+  [deps server skey {:keys [args writing?]}]
+  (let [[db-name dbi-name] args
+        store (kv-store deps server skey db-name writing?)]
+    ;; Attach before taking the server slot; the admin path uses that slot
+    ;; directly and serializes with the collector through the native lock.
+    (when-not writing? (server-write-control deps server db-name store))
+    (write-result! deps skey
+                   (with-direct-db-transaction-slot
+                     deps server db-name writing?
+                     #(i/clear-dbi store dbi-name)))))
+
 (defn update-kv
   [deps server skey {:keys [args writing?] :as message}]
   (let [[db-name dbi-name k _serialized-f k-type v-type f-args] args]
@@ -3000,7 +3012,7 @@
    :closed-kv? (normal-kv-handler i/closed-kv?)
    :open-dbi open-dbi
    :register-type register-type
-   :clear-dbi (normal-kv-handler i/clear-dbi true)
+   :clear-dbi clear-dbi
    :drop-dbi drop-dbi
    :list-dbis list-dbis
    :copy copy

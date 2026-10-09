@@ -7,6 +7,7 @@
             [datalevin.constants :as c]
             [datalevin.interface :as i]
             [datalevin.kv :as kv]
+            [datalevin.kv.txlog :as kvtx]
             [datalevin.lmdb :as l]
             [datalevin.tx-group.batch :as batch]
             [datalevin.tx-group.batch.charge :as charge]
@@ -180,13 +181,19 @@
     ;; existing serialized WAL workspace; no caller graph or batch is retained.
     (when (> (count name) c/+max-key-size+) (unsupported! :dbi-name))
     (i/get-dbi raw name false)
+    ;; Replay or snapshot installation can advance persisted payload metadata
+    ;; beyond this collector's cached cursor. Refresh before reserving the
+    ;; standalone admin record's LSN, just as ordinary writes do.
+    (when state (kvtx/align-runtime-txlog-payload-floor! raw))
     (let [lsn (when state (long @(:next-lsn state)))
           status (volatile! nil)
           append-token (volatile! nil)
           native? (volatile! false)]
       (try
+        (when-let [before! (:before-append! options)] (before!))
         (when state
-          (let [body (wal/prepare-append-body [(l/kv-tx :clear name nil nil :raw :raw)] {})
+          (let [body (wal/prepare-append-body [(l/kv-tx :clear name nil nil :raw :raw)]
+                                              (:wal-context options {}))
                 slack (if (:segment-prealloc? state)
                         (* 2 (long (:segment-prealloc-bytes state))) 0)
                 projected (+ (long @(:retention-total-bytes state)) slack

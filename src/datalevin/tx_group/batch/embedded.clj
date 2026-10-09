@@ -159,7 +159,11 @@
                             :storage-tail! (:storage-tail! hooks)
                             :before-body! (:before-body! hooks)
                             :ensure-body-ready! (fn [wdb]
-                                                  (kv/ensure-txlog-ready! wdb false)
+                                                  ;; The opener owns flags and scheduler startup.
+                                                  ;; Keep recovery as a fallback, but validate the
+                                                  ;; payload floor in every acquired writer.
+                                                  (when-not (:txlog-recovered? @(i/kv-info wdb))
+                                                    (kv/ensure-txlog-ready! wdb false))
                                                   (kvtx/align-runtime-txlog-payload-floor!
                                                     wdb true))
                             :application-error! application-error!
@@ -297,11 +301,18 @@
                                                  (get-in runtime [:worker :wake!])
                                                  (assoc (i/env-opts raw)
                                                         :check-retention? false
+                                                        :wal-context {:ha-term kvtx/*commit-payload-ha-term*}
+                                                        :before-append! (fn []
+                                                                          (when-let [f cpp/*before-write-commit-fn*]
+                                                                            (f {:operation :clear-dbi})))
                                                         :write-metadata! (fn [wdb token]
                                                                            (vreset! metadata (kvtx/write-batch-commit-metadata! wdb state token)))
-                                                        :committed! (fn [_]
+                                                        :committed! (fn [token]
                                                                       (kvtx/finish-batch-commit! state @metadata)
-                                                                      (vreset! metadata nil))) %)
+                                                                      (vreset! metadata nil)
+                                                                      (when-let [f kvtx/*after-txlog-append-fn*]
+                                                                        (f {:operation :clear-dbi
+                                                                            :txlog-lsn (:lsn token)})))) %)
                  :watermarks #(kvtx/txlog-watermarks raw)
                  :force! #(kvtx/with-runtime-txlog-state-guard
                             raw (fn [] (assoc (kvtx/txlog-force-sync! state)

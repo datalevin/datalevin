@@ -5,6 +5,7 @@
    Only writes are captured for WAL. The whole batch commits or aborts;
    reads use the ordinary native transaction."
   (:require [datalevin.binding.cpp :as cpp]
+            [datalevin.constants :as c]
             [datalevin.interface :as i]
             [datalevin.lmdb :as l]
             [datalevin.tx-group.batch :as batch]
@@ -12,7 +13,8 @@
             [datalevin.tx-group.batch.executor :as executor]
             [datalevin.tx-group.batch.wal :as wal]
             [datalevin.txlog.codec :as codec]
-            [datalevin.tx-group.phase :as phase])
+            [datalevin.tx-group.phase :as phase]
+            [datalevin.util :as u])
   (:import [datalevin.cpp Util$DTLVException]
            [datalevin.lmdb DatomKVTxData KVTxData]
            [datalevin.utl DeferredRows RowRegions]
@@ -422,6 +424,25 @@
       (.add parts @rows))
     (when-not (.isEmpty parts) (wal/prepare-body parts encode-body defer?))))
 
+(defn- apply-with-frozen-commit-retry!
+  [raw b history prepare! before-commit!]
+  (let [prepared? (volatile! false)]
+    (u/repeat-try-catch c/+in-tx-overflow-times+
+      #(and history @prepared? (l/resized? %))
+      (cpp/apply-native-once!
+        raw
+        (fn [wdb]
+          (if @prepared?
+            ;; Commit-stage growth discarded the transaction after WAL append.
+            ;; Rebuild only frozen writes, retaining the existing append token.
+            (let [apply! (cpp/prepared-row-applier wdb)]
+              (phase/phase! :native-resized b)
+              (doseq [rows history] (apply! rows)))
+            (let [result (prepare! wdb)]
+              (vreset! prepared? true)
+              result)))
+        before-commit!))))
+
 (defn execute!
   "Collect while preparing Datalog writes or applying the native prefix, then
   freeze membership for WAL. Resolved Datalog writes can overlap as a batch;
@@ -429,10 +450,11 @@
   append; every member shares the native transaction and commit outcome."
   [raw wal next-lsn! wake! check-batch! opts batch]
   (let [failure (volatile! nil)
-        token (volatile! nil)]
+        token (volatile! nil)
+        history (when (:retry-frozen? opts) (ArrayList.))]
     (phase/phase! :native-start batch)
-    (cpp/apply-native-once!
-     raw
+    (apply-with-frozen-commit-retry!
+     raw batch history
      (fn [wdb]
        ;; Refresh metadata once for every writer, including frozen blind rows.
        ;; A raw commit can advance the payload floor between collected batches.
@@ -447,7 +469,6 @@
              ready? (volatile! (boolean (:ensure-body-ready! opts)))
              opts (cond-> (assoc opts :active-view active-view :capture-batch batch)
                     (:shared-datalog-writer? opts) (assoc :datalog-view (volatile! nil)))
-             history (when (:retry-frozen? opts) (ArrayList.))
              native-apply! (volatile! (cpp/prepared-row-applier wdb))
              refresh! (fn []
                         (doseq [view [wdb @active-view] :when view]

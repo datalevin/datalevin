@@ -533,8 +533,7 @@
   (clear-dbi
     [this dbi-name]
     (custom-kv/guard-internal! db dbi-name)
-    (if-let [control (let [control (independent-control db)]
-                      (when-not (:server? control) control))]
+    (if-let [control (independent-control db)]
       (do (i/check-ready this)
           (when-let [check! (:check! control)] (check!))
           (when (and (:embedded? control) (l/writing? db))
