@@ -642,17 +642,11 @@
             (rest args)))))
 
 (defn- deserialized-normal-dt-handler
-  [idx op]
-  (fn [deps server skey {:keys [args writing?] :as message}]
-    (let [args    (deserialize-arg args idx)
-          db-name (nth args 0)
-          store   (dt-store deps server skey db-name writing?)]
-      (ensure-ha-read-floor! deps server db-name writing?
-                             message store)
-      (write-result!
-       deps
-       skey
-       (apply op store (rest args))))))
+  ([idx op] (deserialized-normal-dt-handler idx op false))
+  ([idx op direct-write?]
+   (let [handler (normal-dt-handler op direct-write?)]
+     (fn [deps server skey {:keys [args] :as message}]
+       (handler deps server skey (assoc message :args (deserialize-arg args idx)))))))
 
 (defn- deserialized-normal-kv-handler
   [idx op]
@@ -1198,8 +1192,11 @@
            (write-result!
             deps
             skey
-            ((:apply-assoc-opt! deps)
-             server db-name store writing? k v))))))))
+            (with-direct-db-transaction-slot
+              deps server db-name writing?
+              (fn []
+                ((:apply-assoc-opt! deps)
+                 server db-name store writing? k v))))))))))
 
 (defn assoc-opts
   [deps server skey {:keys [args writing?]}]
@@ -1221,8 +1218,11 @@
            (write-result!
             deps
             skey
-            ((:apply-assoc-opts! deps)
-             server db-name store writing? kvs))))))))
+            (with-direct-db-transaction-slot
+              deps server db-name writing?
+              (fn []
+                ((:apply-assoc-opts! deps)
+                 server db-name store writing? kvs))))))))))
 
 (def ^:private ha-membership-update-spec-keys
   #{:ha-members
@@ -1351,87 +1351,89 @@
          deps server skey control-act server-obj nil
          "Server control permission is required to update HA membership"
          (fn []
-           (let [store     (dt-store deps server skey db-name false)
-                 db-state  (db-state deps server db-name)
-                 authority (:ha-authority db-state)]
-             (when-not authority
-               (raise "Database is not running consensus HA"
-                        {:error :ha/not-enabled
-                         :db-name db-name}))
-             (let [{:keys [old-kvs persist-kvs runtime-opts
-                           membership-hash voter-peer-ids]}
-                   (ha-membership-update-plan deps store db-state spec)
-                   current-hash (ctrl/read-membership-hash authority)
-                   expected-hash (or (:expected-membership-hash spec)
-                                     current-hash)]
-               (when-not (= current-hash expected-hash)
-                 (raise "HA membership update expected hash does not match authority"
-                          {:error :ha/membership-hash-mismatch
-                           :db-name db-name
-                           :expected expected-hash
-                           :membership-hash current-hash
-                           :requested-membership-hash membership-hash}))
-               (let [replace-voters? (not (false? (:replace-voters? spec)))
-                     current-voters  (ctrl/read-voters authority)
-                     voters-changed? (not (same-peer-ids?
-                                           current-voters
-                                           voter-peer-ids))]
-                 (i/assoc-opts store persist-kvs)
-                 (let [voters-result
-                       (try
-                         (when (and replace-voters?
-                                    voters-changed?)
-                           (ctrl/replace-voters!
-                            authority
-                            (vec voter-peer-ids)))
-                         (catch Throwable t
-                           (rollback-ha-membership-local-opts!
-                            store old-kvs)
-                           (throw t)))
-                       update-result
-                       (try
-                         (ctrl/update-membership-hash!
-                          authority
-                          {:expected-membership-hash expected-hash
-                           :membership-hash membership-hash
-                           :clear-leases? (not (false?
-                                                (:clear-leases? spec)))
-                           :timeout-ms (:timeout-ms spec)})
-                         (catch Throwable t
-                           (rollback-ha-membership-local-opts!
-                            store old-kvs)
-                           (throw t)))]
-                   (when-not (:ok? update-result)
-                     (rollback-ha-membership-local-opts! store old-kvs)
-                     (raise "HA membership update was rejected by the control plane"
-                              {:error :ha/membership-update-rejected
+           (with-direct-db-transaction-slot
+             deps server db-name false
+             (fn []
+               (let [store     (dt-store deps server skey db-name false)
+                     db-state  (db-state deps server db-name)
+                     authority (:ha-authority db-state)]
+                 (when-not authority
+                   (raise "Database is not running consensus HA"
+                            {:error :ha/not-enabled
+                             :db-name db-name}))
+                 (let [{:keys [old-kvs persist-kvs runtime-opts
+                               membership-hash voter-peer-ids]}
+                       (ha-membership-update-plan deps store db-state spec)
+                       current-hash (ctrl/read-membership-hash authority)
+                       expected-hash (or (:expected-membership-hash spec)
+                                         current-hash)]
+                   (when-not (= current-hash expected-hash)
+                     (raise "HA membership update expected hash does not match authority"
+                              {:error :ha/membership-hash-mismatch
                                :db-name db-name
-                               :result update-result}))
-                   ((:add-store deps) server db-name store true runtime-opts)
-                   (write-result!
-                    deps
-                    skey
-                    (wire-safe-diagnostic
-                     (cond-> {:ok? true
-                              :db-name db-name
-                              :membership-hash membership-hash
-                              :previous-membership-hash
-                              (:previous-membership-hash update-result)
-                              :cleared-leases
-                              (:cleared-leases update-result)
-                              :voters voter-peer-ids
-                              :voters-changed? voters-changed?
-                              :membership-updated?
-                              (:updated? update-result)}
-                       voters-result
-                       (assoc :voter-update voters-result))))))))))))))
+                               :expected expected-hash
+                               :membership-hash current-hash
+                               :requested-membership-hash membership-hash}))
+                   (let [replace-voters? (not (false? (:replace-voters? spec)))
+                         current-voters  (ctrl/read-voters authority)
+                         voters-changed? (not (same-peer-ids?
+                                               current-voters
+                                               voter-peer-ids))]
+                     (i/assoc-opts store persist-kvs)
+                     (let [voters-result
+                           (try
+                             (when (and replace-voters?
+                                        voters-changed?)
+                               (ctrl/replace-voters!
+                                authority
+                                (vec voter-peer-ids)))
+                             (catch Throwable t
+                               (rollback-ha-membership-local-opts!
+                                store old-kvs)
+                               (throw t)))
+                           update-result
+                           (try
+                             (ctrl/update-membership-hash!
+                              authority
+                              {:expected-membership-hash expected-hash
+                               :membership-hash membership-hash
+                               :clear-leases? (not (false?
+                                                    (:clear-leases? spec)))
+                               :timeout-ms (:timeout-ms spec)})
+                             (catch Throwable t
+                               (rollback-ha-membership-local-opts!
+                                store old-kvs)
+                               (throw t)))]
+                       (when-not (:ok? update-result)
+                         (rollback-ha-membership-local-opts! store old-kvs)
+                         (raise "HA membership update was rejected by the control plane"
+                                  {:error :ha/membership-update-rejected
+                                   :db-name db-name
+                                   :result update-result}))
+                       ((:add-store deps) server db-name store true runtime-opts)
+                       (write-result!
+                        deps
+                        skey
+                        (wire-safe-diagnostic
+                         (cond-> {:ok? true
+                                  :db-name db-name
+                                  :membership-hash membership-hash
+                                  :previous-membership-hash
+                                  (:previous-membership-hash update-result)
+                                  :cleared-leases
+                                  (:cleared-leases update-result)
+                                  :voters voter-peer-ids
+                                  :voters-changed? voters-changed?
+                                  :membership-updated?
+                                  (:updated? update-result)}
+                           voters-result
+                           (assoc :voter-update voters-result))))))))))))))))
 
 (defn set-schema
   [deps server skey {:keys [args writing?]}]
   (let [db-name (nth args 0)
-        db-name ((:store->db-name deps)
-                 server
-                 ((:db-store deps) server skey db-name))]
+        store (dt-store deps server skey db-name writing?)
+        db-name ((:store->db-name deps) server store)]
     (db-alter-permission!
       deps server skey db-name
       "Don't have permission to alter the database"
@@ -1439,9 +1441,10 @@
         (write-result!
           deps
           skey
-          (apply i/set-schema
-                 (dt-store deps server skey (nth args 0) writing?)
-                 (rest args)))))))
+          (with-direct-db-transaction-slot
+            deps server db-name writing?
+            (fn []
+              (apply i/set-schema store (rest args)))))))))
 
 (defn index-attr
   [deps server skey {:keys [args writing?]}]
@@ -1451,8 +1454,11 @@
       "Don't have permission to alter the database"
       (fn []
         (write-result! deps skey
-                       (i/index-attr (dt-store deps server skey db-name writing?)
-                                     attr))))))
+                       (with-direct-db-transaction-slot
+                         deps server db-name writing?
+                         (fn []
+                           (i/index-attr (dt-store deps server skey db-name writing?)
+                                         attr))))))))
 
 (defn load-datoms
   [deps server skey {:keys [mode args writing?]}]
@@ -1520,6 +1526,9 @@
                      (try (execute) (finally (.release lock)))))
                  :publish-db!
                  (fn [committed]
+                   ;; Publication replaces the Store wrapper, retaining the
+                   ;; raw environment and its collector (including on resize
+                   ;; and schema changes).
                    ((:update-db deps) server db-name
                     #(assoc % :dt-db committed :store (:store committed))))}]
             (if-let [dt-db (:dt-db state)]
@@ -1840,7 +1849,10 @@
         kv                  (kv-store deps server skey db-name writing?)
         args                (rest args)
         dbi-name            (first args)]
-    (apply i/open-dbi kv args)
+    (with-direct-db-transaction-slot
+      deps server db-name writing?
+      (fn []
+        (apply i/open-dbi kv args)))
     ((:update-client deps) server client-id
      (fn [m]
        (update-in m [:stores db-name :dbis] conj dbi-name)))
@@ -1871,7 +1883,10 @@
         kv                  (kv-store deps server skey db-name writing?)
         args                (rest args)
         dbi-name            (first args)]
-    (i/drop-dbi kv dbi-name)
+    (with-direct-db-transaction-slot
+      deps server db-name writing?
+      (fn []
+        (i/drop-dbi kv dbi-name)))
     ((:update-client deps) server client-id
      (fn [m]
        (update-in m [:stores db-name :dbis] disj dbi-name)))
@@ -2199,7 +2214,10 @@
       deps server skey db-name
       "Don't have permission to alter the database"
       (fn []
-        (i/sync kv-store force)
+        (with-direct-db-transaction-slot
+          deps server db-name false
+          (fn []
+            (i/sync kv-store force)))
         (write-complete! deps skey)))))
 
 (defn ha-watermark
@@ -2328,7 +2346,11 @@
       deps server skey db-name
       "Don't have permission to alter the database"
       (fn []
-        (write-result! deps skey (kv/force-txlog-sync! kv-store))))))
+        (write-result!
+          deps skey
+          (with-direct-db-transaction-slot
+            deps server db-name false
+            (fn [] (kv/force-txlog-sync! kv-store))))))))
 
 (defn force-lmdb-sync!
   [deps server skey {:keys [args]}]
@@ -2338,7 +2360,11 @@
       deps server skey db-name
       "Don't have permission to alter the database"
       (fn []
-        (write-result! deps skey (kv/force-lmdb-sync! kv-store))))))
+        (write-result!
+          deps skey
+          (with-direct-db-transaction-slot
+            deps server db-name false
+            (fn [] (kv/force-lmdb-sync! kv-store))))))))
 
 (defn create-snapshot!
   [deps server skey {:keys [args]}]
@@ -2348,7 +2374,11 @@
       deps server skey db-name
       "Don't have permission to alter the database"
       (fn []
-        (write-result! deps skey (kv/create-snapshot! kv-store))))))
+        (write-result!
+          deps skey
+          (with-direct-db-transaction-slot
+            deps server db-name false
+            (fn [] (kv/create-snapshot! kv-store))))))))
 
 (defn gc-txlog-segments!
   [deps server skey {:keys [args]}]
@@ -2360,7 +2390,10 @@
       "Don't have permission to alter the database"
       (fn []
         (write-result!
-          deps skey (kv/gc-txlog-segments! kv-store retain-floor-lsn))))))
+          deps skey
+          (with-direct-db-transaction-slot
+            deps server db-name false
+            (fn [] (kv/gc-txlog-segments! kv-store retain-floor-lsn))))))))
 
 (defn txlog-update-snapshot-floor!
   [deps server skey {:keys [args]}]
@@ -2379,10 +2412,13 @@
             server
             db-name
             (fn []
-              (kv/txlog-update-snapshot-floor!
-               ((:get-kv-store deps) server db-name)
-               snapshot-lsn
-               previous-snapshot-lsn))))))))
+              (with-direct-db-transaction-slot
+                deps server db-name false
+                (fn []
+                  (kv/txlog-update-snapshot-floor!
+                   ((:get-kv-store deps) server db-name)
+                   snapshot-lsn
+                   previous-snapshot-lsn))))))))))
 
 (defn txlog-clear-snapshot-floor!
   [deps server skey {:keys [args]}]
@@ -2399,8 +2435,11 @@
             server
             db-name
             (fn []
-              (kv/txlog-clear-snapshot-floor!
-               ((:get-kv-store deps) server db-name)))))))))
+              (with-direct-db-transaction-slot
+                deps server db-name false
+                (fn []
+                  (kv/txlog-clear-snapshot-floor!
+                   ((:get-kv-store deps) server db-name)))))))))))
 
 (defn txlog-update-replica-floor!
   [deps server skey {:keys [args]}]
@@ -2480,11 +2519,14 @@
             server
             db-name
             (fn []
-              (kv/txlog-pin-backup-floor!
-               ((:get-kv-store deps) server db-name)
-               pin-id
-               floor-lsn
-               expires-ms))))))))
+              (with-direct-db-transaction-slot
+                deps server db-name false
+                (fn []
+                  (kv/txlog-pin-backup-floor!
+                   ((:get-kv-store deps) server db-name)
+                   pin-id
+                   floor-lsn
+                   expires-ms))))))))))
 
 (defn txlog-unpin-backup-floor!
   [deps server skey {:keys [args]}]
@@ -2502,9 +2544,12 @@
             server
             db-name
             (fn []
-              (kv/txlog-unpin-backup-floor!
-               ((:get-kv-store deps) server db-name)
-               pin-id))))))))
+              (with-direct-db-transaction-slot
+                deps server db-name false
+                (fn []
+                  (kv/txlog-unpin-backup-floor!
+                   ((:get-kv-store deps) server db-name)
+                   pin-id))))))))))
 
 (defn transact-kv
   [deps server skey {:keys [mode args writing?] :as message}]
@@ -2721,8 +2766,12 @@
                     i/search))
 
 (defn search-re-index
-  [deps server skey {:keys [args] :as _message}]
-  (sapi/search-re-index deps server skey {:args args}))
+  [deps server skey {:keys [args writing?] :as _message}]
+  (let [db-name (nth args 0)]
+    (with-direct-db-transaction-slot
+      deps server db-name writing?
+      (fn []
+        (sapi/search-re-index deps server skey {:args args})))))
 
 (defn new-vector-index
   [deps server ^SelectionKey skey message]
@@ -2774,16 +2823,33 @@
                     i/search-vec))
 
 (defn vec-re-index
-  [deps server skey {:keys [args] :as _message}]
-  (sapi/vec-re-index deps server skey {:args args}))
+  [deps server skey {:keys [args writing?] :as _message}]
+  (let [db-name (nth args 0)]
+    (with-direct-db-transaction-slot
+      deps server db-name writing?
+      (fn []
+        (sapi/vec-re-index deps server skey {:args args})))))
 
 (defn kv-re-index
-  [deps server skey {:keys [args] :as _message}]
-  (sapi/kv-re-index deps server skey {:args args}))
+  [deps server skey {:keys [args writing?] :as _message}]
+  (let [db-name (nth args 0)]
+    (with-direct-db-transaction-slot
+      deps server db-name writing?
+      (fn []
+        (sapi/kv-re-index deps server skey {:args args})))))
 
 (defn datalog-re-index
-  [deps server skey {:keys [args] :as _message}]
-  (sapi/datalog-re-index deps server skey {:args args}))
+  [deps server skey {:keys [args writing?] :as _message}]
+  (let [db-name (nth args 0)]
+    (with-direct-db-transaction-slot
+      deps server db-name writing?
+      (fn []
+        ;; Re-index closes/drains the old environment before opening the new
+        ;; one. Its temporary local connection must not install an embedded
+        ;; collector: server-write-control attaches the replacement with the
+        ;; server semaphore and publication hooks on its first write.
+        (binding [embedded/*enabled?* false]
+          (sapi/datalog-re-index deps server skey {:args args}))))))
 
 (defn replica-status
   [deps server skey {:keys [args] :as _message}]
@@ -2859,9 +2925,9 @@
    :datalog-register-type register-type
    :init-max-eid (normal-dt-handler i/init-max-eid)
    :max-tx (normal-dt-handler i/max-tx)
-   :swap-attr (deserialized-normal-dt-handler 2 i/swap-attr)
-   :del-attr (normal-dt-handler i/del-attr)
-   :rename-attr (normal-dt-handler i/rename-attr)
+   :swap-attr (deserialized-normal-dt-handler 2 i/swap-attr true)
+   :del-attr (normal-dt-handler i/del-attr true)
+   :rename-attr (normal-dt-handler i/rename-attr true)
    :datom-count (normal-dt-handler i/datom-count)
    :load-datoms load-datoms
    :tx-data tx-data
@@ -2871,7 +2937,7 @@
    :open-transact open-transact
    :close-transact close-transact
    :abort-transact abort-transact
-   :set-env-flags (normal-kv-handler i/set-env-flags)
+   :set-env-flags (normal-kv-handler i/set-env-flags true)
    :get-env-flags (normal-kv-handler i/get-env-flags)
    :sync sync
    :ha-watermark ha-watermark
@@ -2909,7 +2975,7 @@
    :rslice (copying-dt-handler i/rslice)
    :start-sampling (sampling-dt-handler i/start-sampling)
    :stop-sampling (sampling-dt-handler i/stop-sampling)
-   :analyze (normal-dt-handler i/analyze)
+   :analyze (normal-dt-handler i/analyze true)
    :e-datoms (copying-dt-handler i/e-datoms)
    :e-first-datom (normal-dt-handler i/e-first-datom)
    :av-datoms (copying-dt-handler i/av-datoms)
@@ -2928,7 +2994,7 @@
    :closed-kv? (normal-kv-handler i/closed-kv?)
    :open-dbi open-dbi
    :register-type register-type
-   :clear-dbi (normal-kv-handler i/clear-dbi)
+   :clear-dbi (normal-kv-handler i/clear-dbi true)
    :drop-dbi drop-dbi
    :list-dbis list-dbis
    :copy copy

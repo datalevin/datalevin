@@ -4,10 +4,12 @@
             [datalevin.datom :as datom]
             [datalevin.interface :as i]
             [datalevin.interpret :as inter]
+            [datalevin.kv :as kv]
             [datalevin.kv.txlog :as kvtx]
             [datalevin.lmdb :as l]
             [datalevin.server :as server]
             [datalevin.server.handlers :as handlers]
+            [datalevin.tx-group.batch :as batch]
             [datalevin.test.core :refer [allocate-port db-fixture]]
             [datalevin.util :as u])
   (:import [datalevin.storage Store]
@@ -317,3 +319,47 @@
         (doseq [job @jobs] (deref job 10000 nil))
         (kvtx/clear-storage-fault-hook!)
         (doseq [conn connections] (d/close conn))))))
+
+
+(deftest server-collector-lifecycle-across-store-publication-and-reindex
+  (let [name (str (random-uuid))
+        conn (d/create-conn (str *uri* name) {:value {}}
+                            {:wal? true :mapsize 1 :snapshot-scheduler? false
+                             :background-sampling? false
+                             :client-opts {:pool-size 1}})
+        raw #(kv/raw-lmdb (.-lmdb ^Store (#'server/get-store *server* name)))]
+    (try
+      (d/transact! conn [{:db/id 1 :value "initial"}])
+      (let [old-raw (raw)
+            control (:independent-control @(i/kv-info old-raw))
+            collector (:collector control)]
+        (is (:server? control))
+        ;; Schema publication transfers the Store wrapper back onto the
+        ;; existing raw environment, even when a batch adds an attribute.
+        (d/transact! conn [{:db/id 1 :added true}])
+        (is (identical? old-raw (raw)))
+        (is (identical? collector (:collector (:independent-control @(i/kv-info (raw))))))
+        ;; Force native map growth with a value larger than the initial map.
+        (d/transact! conn [{:db/id 1 :value (apply str (repeat 2097152 "x"))}])
+        (is (identical? old-raw (raw)))
+        (is (identical? collector (:collector (:independent-control @(i/kv-info (raw))))))
+        (i/assoc-opt (:store @conn) :validate-data? true)
+        (is (identical? old-raw (raw)))
+        (is (identical? collector (:collector (:independent-control @(i/kv-info (raw))))))
+        ;; A genuine environment replacement must retire its old collector
+        ;; before the replacement can admit writes.
+        (d/re-index conn {} {})
+        (is (not (identical? old-raw (raw))))
+        (is (not (batch/serving? collector)))
+        (is (batch/await-quiescence! collector 0))
+        (is (nil? (:independent-control @(i/kv-info (raw)))))
+        (d/transact! conn [{:db/id 1 :value "reindexed"}])
+        (let [replacement (:independent-control @(i/kv-info (raw)))]
+          (is (:server? replacement))
+          (is (not (identical? collector (:collector replacement))))
+          (is (batch/serving? (:collector replacement))))
+        ;; Check the server publication directly: this test tracks collector
+        ;; ownership, independently of the remote handle's cached read floor.
+        (is (= "reindexed"
+               (:value (d/pull (#'server/get-db *server* name) [:value] 1)))))
+      (finally (d/close conn)))))
