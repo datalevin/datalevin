@@ -1,9 +1,15 @@
 # CI tests
 
 This directory contains the core smoke suite used by `datalevin.test0`, the pod
-checks, and fast unit checks for transaction execution, cache invalidation,
+checks, and focused unit checks for transaction execution, cache invalidation,
 serialization, protocol contexts, and internal API contracts. Run `lein test` for
 the CI suite; `lein run` runs the `test0` subset used by release builds.
+
+`test0` covers Datalog, KV/list transactions and rollback, WAL durability and
+reopen, prepared operations, full-text search, vectors, IDoc maps/vectors, and
+portable unit contracts. A small remote KV/Datalog smoke suite runs on the JVM
+through `lein test`; it is excluded from the native release runner. Fault
+injection, crash recovery, HA and concurrency matrices remain in `dtlvtest`.
 
 Keep broad regression matrices, persistent-store lifecycle tests, WAL recovery,
 query/prepared-read integration, and multi-client/server scenarios in the sibling
