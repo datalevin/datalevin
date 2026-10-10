@@ -1233,6 +1233,11 @@ Only usable for debug output.
   physical auto-combined transaction is capped at
   `datalevin.constants/*datalog-async-batch-max-forms*` top-level transaction
   forms so caller-side batches cannot grow it without bound.
+  Each batch waits up to `datalevin.constants/*datalog-async-coalesce-ms*`
+  (10 ms by default) for more submissions, and runs immediately when full.
+  Arrivals do not extend this window. This can add up to 10 ms to sparse
+  transaction latency. Set the constant's root value to zero to disable
+  waiting; executor threads do not inherit caller bindings.
 
   The 4-arity version of the function takes a `callback` function that will
   be called when the transaction commits, which takes the transaction result

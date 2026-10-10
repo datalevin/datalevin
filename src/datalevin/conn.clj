@@ -27,7 +27,7 @@
    [datalevin.db DB]
    [datalevin.storage Store]
    [datalevin.remote DatalogStore]
-   [datalevin.async IAsyncWork IBoundedAsyncWork AsyncExecutor]
+   [datalevin.async IAsyncWork IBoundedAsyncWork ICoalescingAsyncWork AsyncExecutor]
    [org.eclipse.collections.impl.list.mutable FastList]
    [java.util.concurrent Executors LinkedBlockingQueue ConcurrentHashMap
     ThreadPoolExecutor ArrayBlockingQueue ThreadPoolExecutor$CallerRunsPolicy
@@ -1273,7 +1273,9 @@
   (callback [_] cb)
   IBoundedAsyncWork
   (batch-weight [_] (tx-data-size tx-data))
-  (max-batch-weight [_] c/*datalog-async-batch-max-forms*))
+  (max-batch-weight [_] c/*datalog-async-batch-max-forms*)
+  ICoalescingAsyncWork
+  (coalesce-window-ms [_] c/*datalog-async-coalesce-ms*))
 
 (defn- add-combined-tx-data!
   [^FastList out tx-data]

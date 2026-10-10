@@ -24,7 +24,7 @@
    [datalevin.binding.cpp.buffer DBI IEncodedInput IMultipleBuffer IWriteCursor]
    [datalevin.kv.encoding CommitMetadata WriteBatch StorageRows]
    [datalevin.lmdb DatomKVTxData KVTxData]
-   [datalevin.utl BitOps RowRegions]
+   [datalevin.utl BitOps ByteKeySort RowRegions]
    [java.nio ByteBuffer]
    [java.util Arrays Comparator HashMap List]
    [org.eclipse.collections.impl.list.mutable FastList]))
@@ -489,6 +489,17 @@
                 (throw e))))
           (recur (unchecked-inc i)))))))
 
+(defn- sort-fused-ave-datoms!
+  [^objects datoms ^long n]
+  (if (< n 8192)
+    (Arrays/parallelSort datoms 0 (int n) datom-ave-comparator)
+    ;; EAV sorting has already ordered equal AVG keys by EID. Stable byte-key
+    ;; sorting retains that tie-break without repeatedly comparing row objects.
+    (let [^objects keys (make-array (Class/forName "[B") (int n))]
+      (dotimes [i (int n)]
+        (aset keys i (.-avg ^DatomKVTxData (aget datoms i))))
+      (ByteKeySort/sort datoms keys (int n)))))
+
 (defn- transact-datom-index-passes*
   [^objects datoms n ^HashMap dbis txn ^Boolean add-only?]
   (let [^DBI ave (or (.get dbis c/ave) (raise c/ave " is not open" {}))
@@ -502,7 +513,7 @@
                               (recur (unchecked-inc i))))))
           ^objects eav-datoms (if fused? (Arrays/copyOf datoms n) datoms)
           _ (when fused?
-              (Arrays/parallelSort datoms 0 n datom-ave-comparator)
+              (sort-fused-ave-datoms! datoms n)
               (reserve-unique-datoms! ave txn datoms n))
           all-new-entities?
           (with-open [^Cursor cur (.writeCursor ^IWriteCursor eav txn)]

@@ -18,6 +18,7 @@
     ConcurrentLinkedQueue ConcurrentHashMap Callable TimeUnit
     ThreadPoolExecutor ArrayBlockingQueue ThreadPoolExecutor$CallerRunsPolicy
     Semaphore]
+   [java.util.concurrent.locks LockSupport]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
 (defprotocol IAsyncWork
@@ -42,6 +43,12 @@
     "Return this work item's positive batch weight.")
   (max-batch-weight [_]
     "Return the maximum total weight of one combined batch."))
+
+(defprotocol ICoalescingAsyncWork
+  "Optional collection window for bounded auto-combined work."
+  (coalesce-window-ms [_]
+    "Return the maximum time to wait for more work, in milliseconds.
+     Zero disables waiting; arrivals do not extend the window."))
 
 (deftype WorkItem [work promise cb])
 
@@ -138,7 +145,12 @@
   [^ConcurrentLinkedQueue items ^FastList stage first-work]
   (.clear stage)
   (if (satisfies? IBoundedAsyncWork first-work)
-    (let [limit (bounded-max-batch-weight first-work)]
+    (let [limit      (bounded-max-batch-weight first-work)
+          window     (if (satisfies? ICoalescingAsyncWork first-work)
+                       (.toNanos TimeUnit/MILLISECONDS
+                                 (max 0 (long (coalesce-window-ms first-work))))
+                       0)
+          started-at (System/nanoTime)]
       (loop [weight 0]
         (if-let [^WorkItem item (.peek items)]
           (let [work        (.-work item)
@@ -153,7 +165,18 @@
                 (.poll items)
                 (.add stage item)
                 (recur (+ weight item-weight)))))
-          weight)))
+          (let [remaining (- window (- (System/nanoTime) started-at))]
+            (if (and (pos? weight)
+                     (< weight limit)
+                     (pos? remaining)
+                     (not (.isInterrupted (Thread/currentThread))))
+              (do
+                ;; Producers retain ownership of their submissions. Brief
+                ;; parks let them refill this batch without busy-waiting or
+                ;; extending its original deadline.
+                (LockSupport/parkNanos items (min 50000 remaining))
+                (recur weight))
+              weight)))))
     (loop []
       (when (.peek items)
         (let [^WorkItem item (.poll items)]
