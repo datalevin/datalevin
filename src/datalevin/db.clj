@@ -1230,7 +1230,7 @@
     (i/open-remote-store dir schema opts)
     (s/open dir schema opts)))
 
-(defn- tx-datom-comparator [store index]
+(defn- custom-tx-datom-comparator [store index]
   (let [kv (when (instance? Store store) (.-lmdb ^Store store))
         value-cmp (cd/value-comparator kv #(schema store))]
     (if (= index :eav)
@@ -1250,6 +1250,25 @@
                    (value-cmp (.-a x) (.-v x) (.-v y))
                    (Long/compare (.-e x) (.-e y))
                    (Long/compare (d/datom-tx x) (d/datom-tx y))))))))))
+
+
+(defn- tx-datom-comparator [store index]
+  ;; Store schemas can change inside a transaction. Retain the ordinary datom
+  ;; comparator until a new schema requires custom value ordering.
+  (let [ordinary (if (= index :eav) d/cmp-datoms-eavt d/cmp-datoms-avet)
+        state (volatile! nil)]
+    (reify Comparator
+      (compare [_ x y]
+        (let [current (schema store)
+              cached @state
+              comparator (if (identical? current (first cached))
+                           (second cached)
+                           (let [comparator (if (cd/custom-schema? current)
+                                              (custom-tx-datom-comparator store index)
+                                              ordinary)]
+                             (vreset! state [current comparator])
+                             comparator))]
+          (.compare ^Comparator comparator x y))))))
 
 (defn new-db
   "Construct a current DB view. Rebuilds of the same database can supply
@@ -1859,10 +1878,27 @@
           (.add attrs value')
           true)))))
 
+(defn- blind-write-attr-info
+  [^java.util.HashMap infos store-schema tuple-source-attrs allow-unique? attr]
+  (or (.get infos attr)
+      (let [props (store-schema attr)
+            vt    (:db/valueType props)
+            info  (object-array
+                    [props
+                     (blind-write-attr-supported?
+                       attr props tuple-source-attrs allow-unique?)
+                     (not (or (:db/fulltext props) (:db/embedding props)
+                              (:db/noindex props) (map? vt)
+                              (#{:db.type/vec :db.type/idoc :data} vt)))
+                     (boolean (#{:db.type/string :db.type/keyword
+                                 :db.type/symbol} vt))])]
+        (.put infos attr info)
+        info)))
+
 (defn- prepare-blind-write-entity
   [store-schema store-opts tuple-source-attrs unique-identity-attrs
    allow-unique? ^FastList unique-avs ^java.util.HashSet seen-avs
-   collect-unique-avs? has-unique? fuse-unique-inserts? entity]
+   collect-unique-avs? has-unique? fuse-unique-inserts? attr-infos entity]
   (let [old-eid   (:db/id entity)
         ;; An implicit entity does not need a transaction-scoped tempid: the
         ;; blind stamper assigns its final EID directly and never exposes an
@@ -1876,12 +1912,15 @@
               (fn [_ attr raw-value]
                 (if (identical? attr :db/id)
                   true
-                  (let [props (store-schema attr)]
-                    (if-not (blind-write-attr-supported?
-                              attr props tuple-source-attrs allow-unique?)
+                  (let [^objects info (blind-write-attr-info
+                                        attr-infos store-schema tuple-source-attrs
+                                        allow-unique? attr)
+                        props (aget info 0)]
+                    (if-not (aget info 1)
                       (reduced false)
-                      (let [_ (when (or (:db/fulltext props)
-                                        (:db/embedding props))
+                      (let [_ (when (or (not (aget info 2))
+                                        (and (aget info 3)
+                                             (> (count (str raw-value)) 100)))
                                 (vreset! fuse-unique-inserts? false))
                             supported-values?
                             (if (blind-write-multiple-values?
@@ -2045,6 +2084,9 @@
          seen-tempids      (java.util.HashSet. set-capacity)
          has-unique?       (volatile! false)
          fuse-unique-inserts? (volatile! true)
+         ;; These decisions depend only on the schema snapshot and this call's
+         ;; uniqueness policy. Value bounds and validation remain per value.
+         attr-infos        (java.util.HashMap.)
          entities
          (reduce
            (fn [^FastList acc entity]
@@ -2054,7 +2096,7 @@
                           store-schema store-opts tuple-source-attrs
                           unique-identity-attrs allow-unique? unique-avs
                           seen-avs collect-unique-avs? has-unique?
-                          fuse-unique-inserts? entity)]
+                          fuse-unique-inserts? attr-infos entity)]
                  (if (and (.-tempid prepared)
                           (not (.add seen-tempids (.-tempid prepared))))
                    (reduced nil)

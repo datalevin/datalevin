@@ -24,7 +24,7 @@
    [datalevin.binding.cpp.buffer DBI IEncodedInput IMultipleBuffer IWriteCursor]
    [datalevin.kv.encoding CommitMetadata WriteBatch StorageRows]
    [datalevin.lmdb DatomKVTxData KVTxData]
-   [datalevin.utl BitOps]
+   [datalevin.utl BitOps RowRegions]
    [java.nio ByteBuffer]
    [java.util Arrays Comparator HashMap List]
    [org.eclipse.collections.impl.list.mutable FastList]))
@@ -370,9 +370,8 @@
       (when (< i n)
         (let [^DatomKVTxData tx (aget datoms (int i))]
           (if (.-no-overwrite? tx)
-            (do
-              (put-ave-added-datom! ave cur tx (int 0))
-              (recur (unchecked-inc i)))
+            ;; Unique keys were inserted before the EAV pass.
+            (recur (unchecked-inc i))
             (let [end          (ave-multiple-run-end datoms i n)
                   item-count   (- end i)
                   append-start (if (or all-new-entities?
@@ -388,16 +387,28 @@
 
 (defn add-only-datom-batch?
   ^Boolean [^java.util.List txs]
-  (loop [i          0
-         saw-datom? false]
-    (if (< i (.size txs))
-      (let [tx (.get txs i)]
-        (if (instance? DatomKVTxData tx)
-          (if (.-added? ^DatomKVTxData tx)
-            (recur (unchecked-inc i) true)
-            false)
-          (recur (unchecked-inc i) saw-datom?)))
-      saw-datom?)))
+  (if (instance? RowRegions txs)
+    ;; Region lookup is logarithmic. Traverse its owned lists sequentially.
+    (let [iterator (.iterator txs)]
+      (loop [saw-datom? false]
+        (if (.hasNext iterator)
+          (let [tx (.next iterator)]
+            (if (instance? DatomKVTxData tx)
+              (if (.-added? ^DatomKVTxData tx)
+                (recur true)
+                false)
+              (recur saw-datom?)))
+          saw-datom?)))
+    (loop [i          0
+           saw-datom? false]
+      (if (< i (.size txs))
+        (let [tx (.get txs i)]
+          (if (instance? DatomKVTxData tx)
+            (if (.-added? ^DatomKVTxData tx)
+              (recur (unchecked-inc i) true)
+              false)
+            (recur (unchecked-inc i) saw-datom?)))
+        saw-datom?))))
 
 (defn transact1*
   [txs ^DBI dbi txn kt vt]
@@ -434,16 +445,49 @@
   [^List txs]
   (let [n (.size txs)
         ^objects out (object-array n)]
-    (loop [i 0
-           j 0]
-      (if (< i n)
-        (let [tx (.get txs i)]
-          (if (instance? DatomKVTxData tx)
-            (do
-              (aset out j tx)
-              (recur (unchecked-inc i) (unchecked-inc j)))
-            (recur (unchecked-inc i) j)))
-        [out j]))))
+    (if (instance? RowRegions txs)
+      (let [iterator (.iterator txs)]
+        (loop [j 0]
+          (if (.hasNext iterator)
+            (let [tx (.next iterator)]
+              (if (instance? DatomKVTxData tx)
+                (do (aset out j tx) (recur (unchecked-inc j)))
+                (recur j)))
+            [out j])))
+      (loop [i 0
+             j 0]
+        (if (< i n)
+          (let [tx (.get txs i)]
+            (if (instance? DatomKVTxData tx)
+              (do
+                (aset out j tx)
+                (recur (unchecked-inc i) (unchecked-inc j)))
+              (recur (unchecked-inc i) j)))
+          [out j])))))
+
+(defn- reserve-unique-datoms!
+  "Insert unique AVE keys before touching other rows. On a collision remove
+   only keys inserted by this attempt, leaving the enclosing writer usable."
+  [^DBI ave txn ^objects datoms n]
+  (with-open [^Cursor cur (.writeCursor ^IWriteCursor ave txn)]
+    (loop [i 0]
+      (when (< i (long n))
+        (let [^DatomKVTxData tx (aget datoms i)]
+          (when (.-no-overwrite? tx)
+            (try
+              (put-ave-added-datom! ave cur tx (int 0))
+              (catch Exception e
+                (when (l/blind-unique-collision? e)
+                  (dotimes [j i]
+                    (let [^DatomKVTxData previous (aget datoms j)]
+                      (when (.-no-overwrite? previous)
+                        (.put-key ave (.-avg previous) :raw)
+                        (.del ave txn))))
+                  (throw (ex-info (ex-message e)
+                                 (assoc (ex-data e) :unique-inserts-rolled-back? true)
+                                 e)))
+                (throw e))))
+          (recur (unchecked-inc i)))))))
 
 (defn- transact-datom-index-passes*
   [^objects datoms n ^HashMap dbis txn ^Boolean add-only?]
@@ -451,15 +495,24 @@
         ^DBI eav (or (.get dbis c/eav) (raise c/eav " is not open" {}))
         n         (int n)]
     (Arrays/sort datoms 0 n datom-eav-comparator)
-    (let [all-new-entities?
+    (let [fused? (and add-only?
+                      (loop [i 0]
+                        (when (< i n)
+                          (or (.-no-overwrite? ^DatomKVTxData (aget datoms i))
+                              (recur (unchecked-inc i))))))
+          ^objects eav-datoms (if fused? (Arrays/copyOf datoms n) datoms)
+          _ (when fused?
+              (Arrays/parallelSort datoms 0 n datom-ave-comparator)
+              (reserve-unique-datoms! ave txn datoms n))
+          all-new-entities?
           (with-open [^Cursor cur (.writeCursor ^IWriteCursor eav txn)]
             (let [append? (appendable-new-eav-batch?
-                            datoms n cur add-only?)]
+                            eav-datoms n cur add-only?)]
               (if append?
                 (loop [i 0
                        previous-e Long/MIN_VALUE]
                   (when (< i n)
-                    (let [^DatomKVTxData tx (aget datoms i)
+                    (let [^DatomKVTxData tx (aget eav-datoms i)
                           e                 (.-e tx)]
                       (put-eav-datom-append-tx
                         eav cur tx
@@ -468,7 +521,7 @@
                           DTLV/MDB_APPEND))
                       (recur (unchecked-inc i) e))))
                 (dotimes [i n]
-                  (let [^DatomKVTxData tx (aget datoms i)]
+                  (let [^DatomKVTxData tx (aget eav-datoms i)]
                     (if (.-added? tx)
                       (do
                         (.putKeyId eav (.-e tx))
@@ -476,7 +529,7 @@
                         (.put cur (int 0)))
                       (put-eav-datom-tx eav txn tx)))))
               append?))]
-      (Arrays/parallelSort datoms 0 n datom-ave-comparator)
+      (when-not fused? (Arrays/parallelSort datoms 0 n datom-ave-comparator))
       (with-open [^Cursor cur (if add-only?
                                (.multipleWriteCursor ^IMultipleBuffer ave txn)
                                (.writeCursor ^IWriteCursor ave txn))]
@@ -495,16 +548,22 @@
     (if (or c/*ordered-datom-writes?* add-only?)
       (let [[^objects datoms n] (datom-txs txs)]
         (transact-datom-index-passes* datoms n dbis txn add-only?)
-        (dotimes [i (.size txs)]
-          (let [tx (.get txs i)]
-            (when-not (instance? DatomKVTxData tx)
-              (let [^KVTxData tx (l/->kv-tx-data tx)
-                    dbi-name (.-dbi-name tx)
-                    ^DBI dbi (or (.get dbis dbi-name)
-                                 (raise dbi-name " is not open" {}))
-                    validate? (.-validate-data? dbi)]
-                (vld/validate-kv-tx-data tx validate?)
-                (put-tx dbi txn tx))))))
+        ;; Metadata and other KV rows retain input order after the datom passes.
+        (let [put-metadata! (fn [tx]
+                              (let [^KVTxData tx (l/->kv-tx-data tx)
+                                    dbi-name (.-dbi-name tx)
+                                    ^DBI dbi (or (.get dbis dbi-name)
+                                                 (raise dbi-name " is not open" {}))]
+                                (vld/validate-kv-tx-data tx (.-validate-data? dbi))
+                                (put-tx dbi txn tx)))]
+          (if (instance? RowRegions txs)
+            (doseq [tx txs]
+              (when-not (instance? DatomKVTxData tx)
+                (put-metadata! tx)))
+            (dotimes [i (.size txs)]
+              (let [tx (.get txs i)]
+                (when-not (instance? DatomKVTxData tx)
+                  (put-metadata! tx)))))))
       (let [n (.size txs)]
         (loop [i   0
                ave nil

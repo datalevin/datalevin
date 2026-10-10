@@ -268,6 +268,164 @@ The shared async executor is tested in the main project with:
 lein test datalevin.async-test
 ```
 
+## October 10, 2026 regression investigation
+
+The published tables below are the historical reference. The comparison here
+uses those numbers, with the same one-million-person workload, seed 42, one
+caller, batch sizes, and async limits. Each current case uses a fresh database,
+no warmup, Java 21.0.12.1, a 4 GB initial/maximum heap, and native artifacts
+1.1.6. [All 16 final Datalog WAL cases](results/2026-10-10-fused-ordered/comparison.csv)
+include throughput before fusion, the final throughput, ratio to the published
+reference, and completion P99. Commands, manifests, and source hashes are
+retained alongside the CSV. Historical heap settings and host activity were
+not captured, so the remaining difference is not attributed entirely to source
+changes.
+
+Profiling identified unnecessary sorted resolver indexes on simple collector
+writes. Tree-map frames occurred in 216 of 515 sampled async-worker Java stacks;
+custom-schema comparison frames occurred in 143, overlapping those samples.
+The fixes use ordinary comparators for ordinary schemas, build pending E/A and
+unique AV hash indexes only when a later request needs them, and materialize
+sorted indexes before general resolution. Unconditional storage encoding can
+be deferred; native add-only index passes already supply their ordering.
+The [initial index/encoding fixes](results/2026-10-10-investigation/comparison.csv)
+recovered much of the first regression.
+
+Eligible ordinary inserts now also enforce uniqueness during the AVE put,
+as the archived pre-refactor grouped writer did. Unique keys are inserted in
+AVE order before other rows. A collision removes only the keys inserted by that attempt, allowing
+identity-upsert resolution within the same writer. Transaction IDs and resolver
+state advance after success, and rejected rows never enter frozen replay or
+WAL. Earlier transaction functions are not re-executed. Auxiliary/custom index
+paths retain preflight validation.
+
+| Profile | API | Batch | Published | Before fixes | After fixes | After / published |
+|---|---|---:|---:|---:|---:|---:|
+| Strict | Sync | 1000 | 114,739/s | 78,295/s | 118,875/s | 1.036X |
+| Strict | Async | 1 | 102,133/s | 71,555/s | 101,892/s | 0.998X |
+| Strict | Async | 10 | 195,976/s | 91,529/s | 206,374/s | 1.053X |
+| Strict | Async | 100 | 245,485/s | 86,249/s | 250,401/s | 1.020X |
+| Strict | Async | 1000 | 238,974/s | 81,139/s | 234,532/s | 0.981X |
+| Relaxed | Sync | 1000 | 129,227/s | 78,599/s | 118,421/s | 0.916X |
+| Relaxed | Async | 1 | 110,755/s | 71,394/s | 104,238/s | 0.941X |
+| Relaxed | Async | 10 | 211,238/s | 92,580/s | 205,868/s | 0.975X |
+| Relaxed | Async | 100 | 275,859/s | 83,068/s | 242,606/s | 0.879X |
+| Relaxed | Async | 1000 | 276,797/s | 81,535/s | 238,189/s | 0.861X |
+
+Batch-1000 async improves by 2.89X strict and 2.92X relaxed over the regressed
+implementation. In this run, every strict sync case exceeds its published
+reference; strict async is within 2% of its reference or above it. Relaxed async
+still falls 2.5–13.9% below its reference, and batch-1000 relaxed sync is 8.4%
+below. The published relaxed throughput has not been fully recovered.
+
+[Diagnostic controls](results/2026-10-10-investigation/diagnostics.csv) did not
+close the gap by reducing the async form cap to 10,000/25,000 or using the
+JVM default heap. Before restoring fusion, batch-1000 default non-WAL async
+reached 202,741/s versus its published 284,146/s, indicating that the initial
+remaining cost was not mainly WAL fsync. Native sampling found 32 of 100 worker
+samples in `mdb_get`, used by identity preflight. An isolated unsafe bypass
+reached 250,404/s strict and 247,040/s relaxed; those results measured current
+probe cost and did not establish its contribution to the historical regression.
+The older code also contained preflight checks, but skipped them for eligible
+fused inserts.
+
+The [first safe fused matrix](results/2026-10-10-fused-uniqueness/comparison.csv)
+used entity-order reservations. Moving them to AVE order reached 226,136/s and
+240,765/s in strict batch-1000 diagnostic trials, with an entity-order control
+at 216,430/s; relaxed reached 237,177/s. Those commands and hashes are under
+[the ordering diagnostics](results/2026-10-10-fused-uniqueness/diagnostics/).
+The final matrix above uses the tested AVE-order implementation. Compared with
+the initial index/encoding fixes, it improves async throughput by 6–23% while
+retaining uniqueness validation.
+
+Validation: 112 affected Datalog, custom-schema, batch, recovery, and WAL tests
+passed with 1,629 assertions; the benchmark harness passed 49 tests with 418
+assertions. New tests cover partial uniqueness rollback, identity-upsert
+collisions with persisted and preceding batch writes, value-unique rejection,
+transaction functions executing once, and map growth after a rejected attempt.
+The collector test helper now preserves existing phase observers so the resize
+test verifies that growth actually occurred. Full `clj-kondo --lint src test`
+reported zero errors and 56 existing warnings. Every reported benchmark
+verified its final record count before closing the database.
+
+A [focused async follow-up](results/2026-10-10-async-investigation/findings.md)
+found that over 94% of measured native-batch time preceded WAL append. Eligible
+fused inserts execute before dispatch so collisions can fall back safely; their
+large native writes consequently do not overlap WAL. The strict and relaxed
+traces used 20 and 21 physical transactions for 1,000 API requests, with different
+adaptive batch-size distributions. Strict append, including synchronous-write
+durability I/O, took 83 ms in aggregate versus 46 ms relaxed. Relaxed policy
+completion did not wait for fsync. Repeated profile throughput varied enough
+that the small current strict/relaxed difference is not a reliable durability
+penalty estimate.
+
+The follow-up removes repeated region-boundary binary searches from native
+preparation by scanning `RowRegions` sequentially. Two untraced default-cap
+trials averaged 246,139/s strict and 243,550/s relaxed; the relaxed improvement
+over paired controls was 2.5%, close to trial variation. With this fix, a
+diagnostic 25,000-form cap reached 259,350/s and 255,675/s relaxed, averaging
+0.930X its published batch-1000 reference. A 10,000-form cap was slower. The
+production cap remains 100,000; these focused trials do not replace the complete
+matrix above. Before the non-WAL fusion follow-up below, its grouped path still
+used preflight and the control reached 186,929/s. The retained region
+change passed 125 affected tests with 1,787 assertions; lint reported zero
+errors and the same 56 warnings. Commands, phase traces, profiles, and manifests
+are linked in the follow-up.
+
+Eligible non-WAL grouped inserts now also use safe fused uniqueness checks,
+skipping separate identity preflight and identity-AV collection. Collision
+rollback permits upsert fallback within the same native writer. The
+[non-WAL follow-up](results/2026-10-10-non-wal-fusion/findings.md) uses the same
+fresh one-million-person workload and unchanged async limits:
+
+| Async batch | Published README | With fusion | Fusion / published |
+|---|---:|---:|---:|
+| 1 | 37,357/s | 32,247/s | 0.863X |
+| 10 | 114,960/s | 105,203/s | 0.915X |
+| 100 | 282,470/s | 225,213/s | 0.797X |
+| 1000 | 284,146/s | 227,646/s | 0.801X |
+
+Batch 1000 averages two trials and improves 18.0% over paired controls averaging
+192,951/s. Other batch sizes have one trial each. The historical deficit remains;
+the published tables below are preserved. Source hashes, commands, manifests,
+completion latency, and exact ratios are retained in the linked follow-up.
+Validation passed 128 affected tests with 1,828 assertions; lint reported zero
+errors and the same 56 existing warnings.
+
+A [deeper non-WAL investigation](results/2026-10-10-non-wal-deep/findings.md)
+reproduced the deficit: three unchanged-code controls averaged 226,470/s,
+20.3% below the published batch-1000 reference. Instrumentation measured
+995 ms in EAV insertion, 715 ms in conditional unique AVE insertion, 411 ms in
+storage preparation, 402 ms in AVE sorting and 473 ms in native commit.
+Restoring archived index ordering was slower. Encoding-cache and raw-buffer
+experiments produced only small gains; serial sorting was slower. A tenfold
+larger pipeline reached 241,732/s but changed the protocol and raised completion
+P99 to four seconds. No production changes were retained from these experiments;
+the historical deficit remains unresolved.
+The preparation timing is corrected to remove double-counted nested arity
+delegation in the original profiler.
+A [matched write-stage comparison](results/2026-10-10-write-stage-comparison/findings.md)
+found identical native put primitives and per-datom storage encoders. With ten
+fixed physical transactions and conditional uniqueness enabled in both variants,
+EAV plus AVE insertion totaled 1,803 ms current versus 1,809 ms with archived
+index ordering. The native executor differed by less than 0.4%; these stages
+do not establish the cause of the remaining historical throughput gap.
+
+[Further elapsed-time accounting](results/2026-10-10-gap-accounting/findings.md)
+identified repeated schema-dependent attribute support and fusion eligibility
+checks. Caching those decisions per preparation call reduces blind preparation
+from 598 ms to 286 ms per million entities while retaining value validation and
+all fusion guards. Indexed traversal of ordinary lists reduces the trailing
+metadata scan from 63 ms to 32 ms; region collections retain sequential traversal.
+Two uninstrumented candidate trials average **253,862/s**, versus **231,106/s**
+for two interleaved controls, a **9.8% gain** with unchanged async limits.
+Candidate throughput is **0.893X** the published 284,146/s, leaving a **10.7%**
+deficit. Native insertion comparisons and the roughly 25 ms outside transaction
+bodies and commits do not account for the remaining historical difference.
+These focused trials do not replace the batch-size matrices above.
+The retained changes pass 130 affected tests with 1,823 assertions; lint reports
+zero errors and the same 56 existing warnings.
+
 ## Pure write
 
 Results show throughput: records written per second.

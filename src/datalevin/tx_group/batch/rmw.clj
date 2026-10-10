@@ -58,8 +58,6 @@
   "Append storage owned by this native batch, including a late storage drain."
   [wdb apply-rows! rows wal-rows
    {:keys [defer-rows! capture-context capture-batch]} prepared]
-  (.append ^RowRegions rows (:rows prepared))
-  (.append ^RowRegions wal-rows (:wal-rows prepared))
   (let [context (or capture-context (l/request-context wdb))
         deferred? (boolean (and defer-rows! (defer-rows! wdb prepared context)))]
     (phase/phase! (if deferred? :native-capture-deferred :native-capture-eager)
@@ -67,7 +65,10 @@
                    :storage-tail? (boolean (:storage-tail? prepared))
                    :preparing? (boolean (:datalog-prepare? context))
                    :raw? (boolean l/*raw-kv?*)})
-    (when-not deferred? (apply-rows! (:rows prepared)))))
+    (when-not deferred? (apply-rows! (:rows prepared)))
+    ;; A rejected fused insert leaves no rows in the writer or its replay log.
+    (.append ^RowRegions rows (:rows prepared))
+    (.append ^RowRegions wal-rows (:wal-rows prepared))))
 
 (defn- capture!
   "Freeze writes in the batch transaction, deferring eligible native tails.
@@ -138,6 +139,9 @@
           (apply-rows! [(if (seq flags) (l/kv-tx op name key value :raw :raw flags) forward)]))))))
     :transacted
     (catch Throwable t
+      (when (and (l/blind-unique-collision? t)
+                 (:unique-inserts-rolled-back? (ex-data t)))
+        (throw t))
       (let [failure-error
             (if (and (= :not-committed (:outcome (ex-data t)))
                      (clean-body-failure? t))
@@ -485,6 +489,12 @@
                                              nil
                                              (catch Throwable t t))]
                                (when failure
+                                 (when (and (l/blind-unique-collision? failure)
+                                            (:unique-inserts-rolled-back? (ex-data failure)))
+                                   (when history
+                                     (.remove ^ArrayList history
+                                              (int (dec (.size ^ArrayList history)))))
+                                   (throw failure))
                                  (if (and history (:resized (ex-data failure)))
                                    (do (phase/phase! :native-resized batch)
                                        (refresh!) (recur true))

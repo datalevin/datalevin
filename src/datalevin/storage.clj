@@ -2291,6 +2291,12 @@
                                   tx-lmdb (.-search-engines store)
                                   (.-vector-indices store) (.-embedding-indices store)
                                   (store-idoc-indices store) plan)]
+                         (when *enforce-blind-unique-inserts?*
+                           (.advance-max-tx store)
+                           (when-let [^WriteGroup group (current-write-group tx-lmdb)]
+                             (let [^longs metadata (.-metadata group)]
+                               (aset metadata 0 (long (:tx-id plan)))
+                               (aset metadata 1 (long (:modified-ms plan))))))
                          [res (:secondary-index-job-count plan)
                           (:modified-ms plan)]))]
              (if (cd/custom-schema? (schema store))
@@ -2546,8 +2552,9 @@
                                               (:idoc/patch (meta op))])
                                            changes)})
                            (group-by first ops)))
-           tx-id (long (if reserved-metadata (aget reserved-metadata 0)
-                           (.advance-max-tx store)))
+           tx-id (long (cond reserved-metadata (aget reserved-metadata 0)
+                             *enforce-blind-unique-inserts?* (inc (long (max-tx store)))
+                             :else (.advance-max-tx store)))
            ;; Auto-created attributes can advance this store's schema version
            ;; while the datom plan is built. Never overwrite that newer version
            ;; with a timestamp chosen before preparation.
@@ -2566,9 +2573,10 @@
        ;; Only used to decide whether to wake the worker after staging writes.
        (when id-jobs (aset work id-jobs-slot id-jobs))
        (if group
-         (let [^longs metadata (.-metadata group)]
-           (aset metadata 0 tx-id)
-           (aset metadata 1 modified-ms))
+         (when-not *enforce-blind-unique-inserts?*
+           (let [^longs metadata (.-metadata group)]
+             (aset metadata 0 tx-id)
+             (aset metadata 1 modified-ms)))
          (do
            (.add txs (lmdb/kv-tx :put c/meta :max-tx tx-id :attr :long))
            (.add txs (lmdb/kv-tx :put c/meta :last-modified
@@ -2580,6 +2588,7 @@
          (doseq [tx (extra-kv-txs-fn modified-ms)]
            (.add txs tx)))
        {:txs txs
+        :tx-id tx-id
         :modified-ms modified-ms
         :ft-ds (aget work ft-ds-slot)
         :vi-ds (aget work vi-ds-slot)

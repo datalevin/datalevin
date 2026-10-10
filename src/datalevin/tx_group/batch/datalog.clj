@@ -15,7 +15,7 @@
   (:import [datalevin.db DB TxReport]
            [datalevin.storage Store WriteGroup]
            [clojure.lang Var]
-           [java.util IdentityHashMap]
+           [java.util HashMap IdentityHashMap]
            [org.eclipse.collections.impl.map.mutable.primitive LongObjectHashMap]
            [org.eclipse.collections.impl.list.mutable FastList]))
 
@@ -23,10 +23,25 @@
   [flush! group ^:unsynchronized-mutable ^objects scalar-rows
    ^:unsynchronized-mutable ^boolean scalar-rows-in-use?
    ^LongObjectHashMap scalar-pending
+   ^HashMap unique-pending
    ^:unsynchronized-mutable ^boolean scalar-pending?
-   ^:unsynchronized-mutable ^long pending-start]
+   ^:unsynchronized-mutable ^long pending-start
+   ^:unsynchronized-mutable ^long pending-indexed]
   txcommon/ScalarPendingIndex
   (pending-scalar-index [_] (when scalar-pending? scalar-pending))
+  (pending-unique-index [_] (when scalar-pending? unique-pending))
+  (retain-pending-index? [_] (not scalar-pending?))
+  (prepare-pending-index! [_ tx-db]
+    (when scalar-pending?
+      ;; The native batch can admit more requests during execution. Populate
+      ;; its hash view only when another simple request needs preceding writes.
+      (let [^FastList datoms (.-datoms ^WriteGroup @group)
+            n (.size datoms)]
+        (loop [idx pending-indexed]
+          (when (< idx n)
+            (txcommon/stage-batch-datom! tx-db (.get datoms (int idx)))
+            (recur (unchecked-inc idx))))
+        (set! pending-indexed (long n)))))
   (materialize-scalar-pending! [_ tx-db]
     (when scalar-pending?
       ;; General resolution needs E/A/V tombstones and sorted indexes. Replay
@@ -37,10 +52,13 @@
           (when (< idx (.size datoms))
             (txcommon/stage-batch-datom! tx-db (.get datoms (int idx)))
             (recur (unchecked-inc idx)))))
-      (.clear scalar-pending)))
+      (.clear scalar-pending)
+      (.clear unique-pending)))
   (discard-scalar-pending! [_]
     (.clear scalar-pending)
-    (set! pending-start (long (.size ^FastList (.-datoms ^WriteGroup @group)))))
+    (.clear unique-pending)
+    (set! pending-start (long (.size ^FastList (.-datoms ^WriteGroup @group))))
+    (set! pending-indexed pending-start))
   txcommon/ScalarDatomBuffer
   (acquire-scalar-datom-buffer! [_ capacity]
     (when-not scalar-rows-in-use?
@@ -58,6 +76,7 @@
     ;; needs neither a restore closure nor a request-specific context map.
     (set! scalar-pending? (boolean false))
     (.clear scalar-pending)
+    (.clear unique-pending)
     (db/-clear-tx-cache tx-db)
     (doseq [datom (.-datoms ^WriteGroup @group)]
       (txcommon/stage-batch-datom! tx-db datom))))
@@ -229,7 +248,10 @@
                           (PreparationContext. (:native-prepare-flush! (meta native))
                                                (:group context) nil false
                                                (.-scalar-pending ^WriteGroup @(:group context))
-                                               true
+                                               (HashMap.) true
+                                               (long (.size ^FastList
+                                                            (.-datoms ^WriteGroup
+                                                                      @(:group context))))
                                                (long (.size ^FastList
                                                             (.-datoms ^WriteGroup
                                                                       @(:group context)))))}]
@@ -247,7 +269,10 @@
 (defn- execute-bound-body!
   [context conn tx-db body publication notifications]
   (when-let [preparation (get @(:resolver-bindings context) #'txcommon/*batch-prepare*)]
-    (txcommon/materialize-scalar-pending! preparation tx-db))
+    (if (:datalog-fast? (l/request-context
+                        (kv/raw-lmdb (.-lmdb ^Store (:store tx-db)))))
+      (txcommon/prepare-pending-index! preparation tx-db)
+      (txcommon/materialize-scalar-pending! preparation tx-db)))
   (let [tx (atom tx-db :meta (cond-> (meta conn)
                               notifications (assoc ::notifications notifications)))
         result (body tx)]
@@ -267,6 +292,8 @@
         tx-db (writing-db! context conn (native-kv-view! context native))]
     (Var/pushThreadBindings (resolver-bindings! context tx-db))
     (try
+      (when-let [preparation txcommon/*batch-prepare*]
+        (txcommon/prepare-pending-index! preparation tx-db))
       (if-let [report (stamp! control tx-db prepared tx-meta)]
         (do (record-connection! context conn nil)
             (vreset! (:current context) (:db-after report))

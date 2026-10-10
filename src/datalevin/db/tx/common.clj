@@ -34,6 +34,9 @@
 
 (defprotocol ScalarPendingIndex
   (pending-scalar-index [context])
+  (pending-unique-index [context])
+  (retain-pending-index? [context])
+  (prepare-pending-index! [context db])
   (materialize-scalar-pending! [context db])
   (discard-scalar-pending! [context]))
 
@@ -65,7 +68,10 @@
                              (let [attrs (HashMap. 4)]
                                (.put pending e attrs)
                                attrs))]
-      (.put attrs (.-a datom) datom))
+      (.put attrs (.-a datom) datom)
+      (when (:db/unique ((i/schema (:store db)) (.-a datom)))
+        (.put ^HashMap (pending-unique-index *batch-prepare*)
+              [(.-a datom) (.-v datom)] datom)))
     (let [^TreeSortedSet eavt (:eavt db)
           ^TreeSortedSet avet (:avet db)
           ^SortedSet cached (.subSet eavt
@@ -142,10 +148,15 @@
 (defn av-first-e
   "Resolve the current owner of an indexed value during write preparation."
   [db a v]
-  (if *batch-prepare*
-    (or (cached-av-first-e db a v)
-        (:e (first (visible-stored db (i/av-datoms (:store db) a v)))))
-    (i/av-first-e (:store db) a v)))
+  (if-let [^HashMap pending (when (scalar-pending-index)
+                             (pending-unique-index *batch-prepare*))]
+    (if-let [^Datom datom (.get pending [a v])]
+      (when (d/datom-added datom) (.-e datom))
+      (i/av-first-e (:store db) a v))
+    (if *batch-prepare*
+      (or (cached-av-first-e db a v)
+          (:e (first (visible-stored db (i/av-datoms (:store db) a v)))))
+      (i/av-first-e (:store db) a v))))
 
 (defn ea-datoms
   "Resolve current attribute datoms for CAS and retraction preparation."
