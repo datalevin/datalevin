@@ -347,6 +347,8 @@
                                   (not native-work?) :inline
                                   large-tail? :parallel
                                   :else (schedule-for accepted-weight)))
+   (phase/phase! :schedule-selected
+                 {:schedule (.executionSchedule batch) :weight accepted-weight})
    (.executionSchedule batch)))
 
 (defn refresh-wal-bodies!
@@ -987,7 +989,8 @@
 (defn collect-ready!
   "Add the next ready FIFO prefix while this owner applies native writes.
   Collection ends before WAL dispatch. Count/byte caps and the earliest deadline
-  cover the whole growing batch, including every newly selected member."
+  cover the whole growing batch, including every newly selected member. Once
+  full, leave tail expiry to queued callers and the next batch's sealing."
   [^Batch batch]
   (let [^Collector collector (.collector batch)
         ^ReentrantLock lock (.lock collector)
@@ -1004,7 +1007,7 @@
             now (System/nanoTime)
             ^java.util.Iterator it (.iterator queue)]
         (loop [blocked? (:isolated? (.context ^Descriptor (.get descriptors 0)))]
-          (when (.hasNext it)
+          (when (and (< (.size descriptors) limit) (.hasNext it))
             (let [^Descriptor d (.next it)
                   deadline (.deadline-nanos d)
                   next-bytes (+ (.reservedBytes batch) (.allowance d))]
@@ -1013,8 +1016,7 @@
                 (do (expire-queued! collector it d deadline)
                     (recur blocked?))
 
-                (or blocked? (:isolated? (.context d))
-                    (>= (.size descriptors) limit) (> next-bytes cap))
+                (or blocked? (:isolated? (.context d)) (> next-bytes cap))
                 (recur true)
 
                 :else
@@ -1269,16 +1271,20 @@
   recording belong to this collector."
   [^Batch batch]
   (let [^Collector collector (.collector batch)
-        descriptors ^FastList (.descriptors batch)
-        weight (long (.size descriptors))]
+        descriptors ^FastList (.descriptors batch)]
     (phase/phase! :ordered-work batch)
     (when (expired? batch)
       (throw (cancel-error
               (expired-error "ordered preparation" (.cutoffNanos batch)))))
     (when-not (.get ^AtomicBoolean (.serving collector))
       (throw (cancel-error (fenced-error collector))))
-    (phase/phase! :schedule-selected {:schedule (.executionSchedule batch) :weight weight})
     (let [values ((.executor collector) batch)]
+      ;; Injected collector executors need not use the native dispatch API.
+      ;; Production executors report their final selection before dispatch.
+      (when-not (dispatched? batch)
+        (phase/phase! :schedule-selected
+                      {:schedule (.executionSchedule batch)
+                       :weight (long (.size descriptors))}))
       (when-not (= (batch-count batch) (alength ^objects values))
         (throw (ex-info "Batch executor returned the wrong number of values"
                         {:error :txlog/batch-executor-mismatch

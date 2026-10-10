@@ -6,6 +6,7 @@
    [datalevin.jepsen.core :as core]
    [datalevin.jepsen.integration-harness :as harness]
    [datalevin.jepsen.local :as local]
+   [datalevin.jepsen.local.cluster :as cluster]
    [datalevin.jepsen.local.remote :as lremote]
    [datalevin.jepsen.remote :as remote]
    [datalevin.jepsen.remote-node :as remote-node]
@@ -16,7 +17,6 @@
    [datalevin.util :as u])
   (:import
    [java.io StringWriter]
-   [java.net ServerSocket]
    [java.util UUID]))
 
 (use-fixtures :once test-support/quiet-logs-fixture)
@@ -61,12 +61,10 @@
 
 (defn- reserve-ports
   [n]
-  (let [sockets (repeatedly n #(ServerSocket. 0))]
-    (try
-      (mapv #(.getLocalPort ^ServerSocket %) sockets)
-      (finally
-        (doseq [^ServerSocket socket sockets]
-          (.close socket))))))
+  ;; Ephemeral ports can be claimed by outgoing JRaft connections between
+  ;; reservation and listener startup. Share the local cluster's server range
+  ;; and allocation cursor, including when local and remote tests share a JVM.
+  (#'cluster/reserve-ports @#'local/next-port-block n))
 
 (defn- controller-node
   [root-dir logical-node node-id endpoint-port peer-port]

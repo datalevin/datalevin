@@ -4,6 +4,7 @@
             [datalevin.core :as d]
             [datalevin.interface :as i]
             [datalevin.kv :as kv]
+            [datalevin.kv.txlog :as kvtx]
             [datalevin.tx-group.batch :as batch]
             [datalevin.txlog :as wal]
             [datalevin.txlog.codec :as codec]
@@ -61,7 +62,15 @@
           (kv/transact-kv-without-txlog!
             db [[:put c/kv-info c/wal-local-payload-lsn floor :keyword :data]])
           (is (= next-before @(:next-lsn state)))
-          (is (nil? (d/clear-dbi db "data")))
+          (let [confirmations (atom [])]
+            (binding [kvtx/*after-txlog-append-fn*
+                      (fn [{:keys [txlog-lsn] :as context}]
+                        ;; HA confirmation needs the committed numeric LSN.
+                        (is (integer? txlog-lsn))
+                        (swap! confirmations conj context))]
+              (is (nil? (d/clear-dbi db "data"))))
+            (is (= [{:operation :clear-dbi :txlog-lsn (inc floor)}]
+                   @confirmations)))
           (is (nil? (d/get-value db "data" 1)))
           (is (= (+ floor 2) @(:next-lsn state)))
           (is (= (inc floor) (batch/published-lsn collector)))

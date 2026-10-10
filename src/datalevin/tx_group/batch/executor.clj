@@ -233,6 +233,7 @@
   (fn [batch]
     (let [plan (when prepare-batch! (prepare-batch! batch))]
       (when check-batch! (check-batch! batch))
+      (batch/freeze-schedule! batch (long (or (:weight plan) (batch/batch-count batch))) false)
       (batch/begin-dispatch! batch)
       (if (and plan (zero? (long (:weight plan))))
         (:values plan)
@@ -294,17 +295,19 @@
          ;; Preparation is complete. Recheck serving/deadlines and mark the batch
          ;; dispatched atomically: an overrun preparation phase must cancel here
          ;; rather than commit.
-         (batch/begin-dispatch! batch)
+         (let [schedule (schedule-fn batch)]
+           (phase/phase! :schedule-selected {:schedule schedule :weight weight})
+           (batch/begin-dispatch! batch)
          (if (zero? weight)
            ;; Nothing accepted, nothing to persist: no LSN, no WAL record and no
            ;; native write transaction. Each member completes from the result its
            ;; own preparation already produced.
            (do (phase/phase! :zero-write-complete batch)
                ^objects (:values plan))
-           (let [values (if (= :inline (schedule-fn batch))
+           (let [values (if (= :inline schedule)
                           (run-inline! wal native batch lsn wake-maintenance!)
                           (run-parallel! native batch lsn wal-executor handoff))]
              ;; Both branches have stopped and the WAL outcome is settled; the
              ;; collector's join/publication now follows.
              (phase/phase! :execution-complete batch)
-             values)))))))
+             values))))))))

@@ -17,7 +17,8 @@
             [datalevin.tx-group.batch.factory :as factory]
             [datalevin.tx-group.batch.public :as public]
             [datalevin.tx-group.batch.rmw :as rmw]
-            [datalevin.txlog :as wal])
+            [datalevin.txlog :as wal]
+            [datalevin.txlog.append :as append])
   (:import [datalevin.cpp Util$DTLVException]
            [datalevin.lmdb DatomKVTxData KVTxData]
            [datalevin.utl RowRegions]
@@ -312,7 +313,7 @@
                                                                       (vreset! metadata nil)
                                                                       (when-let [f kvtx/*after-txlog-append-fn*]
                                                                         (f {:operation :clear-dbi
-                                                                            :txlog-lsn (:lsn token)})))) %)
+                                                                            :txlog-lsn (append/last-lsn token)})))) %)
                  :watermarks #(kvtx/txlog-watermarks raw)
                  :force! #(kvtx/with-runtime-txlog-state-guard
                             raw (fn [] (assoc (kvtx/txlog-force-sync! state)

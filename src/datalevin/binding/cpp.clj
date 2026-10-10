@@ -1690,7 +1690,8 @@
         (when (or (nil? @opened) (i/closed-kv? @opened))
           (lifecycle/release-local-kv-handle! local-handle-key)
           (protocol/release-compat-open-lease! compat-open-lease))
-        (raise "Fail to open database: " e {:dir dir})))))
+        (throw (ex-info (str "Fail to open database: " (pr-str e))
+                        {:dir dir} e))))))
 
 (defmethod open-kv :cpp
   ([dir] (open-kv dir {}))
