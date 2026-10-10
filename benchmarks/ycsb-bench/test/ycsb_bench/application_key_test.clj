@@ -3,6 +3,7 @@
             [datalevin.core :as d]
             [datalevin.pull-api :as pull]
             [datalevin.storage.entity :as entity]
+            [datalevin.storage :as storage]
             [datalevin.storage.scan :as scans]
             [ycsb-bench.runner :as runner]
             [ycsb-bench.sql :as sql]
@@ -131,6 +132,8 @@
                 pull-many pull/pull-many
                 select-entities entity/select-entities
                 eav-scan scans/eav-scan-v-list-chunk
+                encoded-reader storage/prepare-encoded-field-reader
+                entity-keys (atom {})
                 projected (atom [])
                 fail (fn [& _] (throw (AssertionError. "Scan materialized an entity")))
                 scan (fn [start n]
@@ -138,7 +141,14 @@
                        ;; Remote permission checks may read unrelated system
                        ;; entities; only reject materializing benchmark fields.
                        (let [rows
-                             (with-redefs [scans/eav-scan-v-list-chunk
+                             (with-redefs [storage/prepare-encoded-field-reader
+                                           (fn [schema attrs]
+                                             (when-let [reader (encoded-reader schema attrs)]
+                                               (fn [view ids]
+                                                 (when (= (set attributes) (set attrs))
+                                                   (swap! projected into (map @entity-keys ids)))
+                                                 (reader view ids))))
+                                           scans/eav-scan-v-list-chunk
                                            (fn [lmdb tuples eid-idx attrs-v & args]
                                              (when (= (set attributes)
                                                       (set (map first attrs-v)))
@@ -155,15 +165,21 @@
                                              (select-entities lmdb ids names aids id?))]
                                (store/scan-records db start n))]
                          (is (= (sort (map first rows)) (sort @projected))
-                             "Only keys selected by the limited AVE access reach EAV")
+                             "Only keys selected by the limited AVE access reach field projection")
                          rows))]
             (store/put-records! db records)
+            (reset! entity-keys
+                    (into {} (map (fn [[key _]]
+                                    [(:db/id (d/pull @(:conn db) [:db/id] [:ycsb/key key])) key])
+                                  records)))
             (is (= :fields (:scan-projection (store/storage-info db))))
             (is (= (vec (sort-by first records)) (scan "" 100)))
             (is (= [["user2" (values 2)] ["user30" (values 1)]] (scan "user11" 2)))
             (is (empty? (scan "zz" 3)))
             (store/update-field! other "user30" 10 "edit")
             (store/put-records! other [["user25" (values 3)]])
+            (swap! entity-keys assoc
+                   (:db/id (d/pull @(:conn db) [:db/id] [:ycsb/key "user25"])) "user25")
             (is (= [["user25" (values 3)] ["user30" (assoc (values 1) 10 "edit")]]
                    (scan "user21" 2))))
           {})))))
@@ -239,7 +255,7 @@
             (is (= 2 (store/record-count db))))
           {})))))
 
-(deftest concurrent-inserts-of-one-string-key-have-one-winner
+(deftest concurrent-inserts-of-one-string-key-preserve-batch-atomicity
   (doseq [workload [:d :e]
           [system api mode] conditions]
     (testing (str [system api mode workload])
@@ -257,14 +273,42 @@
                                        (store/put-records! (store/for-worker group worker)
                                                           [[key record]])
                                        {:status :inserted :values record}
-                                       (catch Exception _ {:status :rejected})))))
+                                       (catch Exception e {:status :rejected :error e})))))
                                [0 1])]
             (deliver start true)
             (let [results (mapv deref attempts)
-                  winner (first (filter #(= :inserted (:status %)) results))]
-              (is (= {:inserted 1 :rejected 1} (frequencies (map :status results))))
-              (is (= 1 (store/record-count group)))
-              (is (= (:values winner) (store/read-record group key)))))
+                  winners (filter #(= :inserted (:status %)) results)
+                  statuses (frequencies (map :status results))]
+              ;; Separate transactions have one winner. Datalevin collector
+              ;; members share one atomic native transaction, so a duplicate
+              ;; rejects both when the requests are grouped together.
+              (is (contains? (if (= system :datalevin)
+                               #{{:inserted 1 :rejected 1} {:rejected 2}}
+                               #{{:inserted 1 :rejected 1}})
+                             statuses)
+                  (pr-str results))
+              (when (= system :datalevin)
+                (doseq [{:keys [error]} results :when error]
+                  (is (some #(re-find #"MDB_KEYEXIST|unique constraint"
+                                      (or (ex-message %) ""))
+                            (take-while some? (iterate ex-cause error)))
+                      (pr-str error))))
+              (is (= (count winners) (store/record-count group)))
+              (is (= (mapv (fn [winner] [key (:values winner)]) winners)
+                     (store/scan-records group "" 3)))
+              (if-let [winner (first winners)]
+                (is (= (:values winner) (store/read-record group key)))
+                (do
+                  (is (thrown? Exception (store/read-record group key)))
+                  ;; A clean rejection must leave a healthy writer and must
+                  ;; not publish either rejected payload or poison later writes.
+                  (store/put-records! group [[key (values 3)]])
+                  (is (= (values 3) (store/read-record group key)))
+                  (is (= 1 (store/record-count group)))))
+              (let [stored (store/read-record group key)]
+                (is (thrown? Exception (store/put-records! group [[key (values 4)]])))
+                (is (= stored (store/read-record group key)))
+                (is (= 1 (store/record-count group))))))
           {})))))
 
 (deftest page-checks-and-final-validation

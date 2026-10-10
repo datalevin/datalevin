@@ -455,6 +455,10 @@ fields of 100 bytes, excluding keys and database overhead.
   entity IDs; those measurements need fresh baselines with the string-key lookup.
 * **Durability:** WAL is enabled with `--durability strict` by default for both
   APIs and modes. `--durability relaxed` selects a separately labeled profile.
+  Concurrent Datalevin writes can share one atomic collector batch. A duplicate
+  insert rejects the entire uncommitted batch, including other requests in it;
+  there is no per-request rollback. The harness assigns distinct keys to timed
+  inserts. Adapter tests also cover collisions, rollback, and writer recovery.
   The adapters inherit the WAL-backed LMDB defaults, including `:writemap`
   and `:nosync`; reports record the effective flags under `:storage :env-flags`.
   The initial LMDB map size is 4096 MiB; normal automatic growth remains enabled.
@@ -610,7 +614,166 @@ using separate CLI invocations to reduce JVM/cache/order effects. Loading touche
 the measured data and warmup exercises the engine, so this is not a cold-cache
 benchmark.
 
-The [September 15 comparison](results/2026-09-15-current/README.md) contains
-the earlier 36-case A–F matrix and sustained remote read controls, with frozen
-sources, validation results, and historical comparisons. It predates the current
-application-key adapters and unindexed payload schema.
+## October 9, 2026 results
+
+The verified 24-case Datalevin run used strict WAL durability, 8 workers,
+10,000 starting records, 20,000 warmup operations, and 100,000 measured operations
+per case, with seed 17 and one trial. Each record contained ten 100-byte fields.
+The client and remote server each used a 4 GiB heap; remote Datalog used
+independent handles. The host ran macOS on arm64 with 12 available processors
+and Java 21.0.12.1.
+
+Throughput is in **thousands of operations per second**:
+
+| Workload | KV embedded | KV remote | Datalog embedded | Datalog remote |
+|---|---:|---:|---:|---:|
+| A | 119.8 | 46.0 | 117.9 | 37.9 |
+| B | 926.8 | 106.7 | 549.4 | 91.8 |
+| C | 3,406.7 | 138.4 | 943.3 | 125.4 |
+| D | 620.1 | 107.6 | 363.4 | 89.4 |
+| E | 98.4 | 34.8 | 37.2 | 25.3 |
+| F | 152.8 | 38.8 | 101.1 | 36.5 |
+
+Aggregate **p99 latency in microseconds**:
+
+| Workload | KV embedded | KV remote | Datalog embedded | Datalog remote |
+|---|---:|---:|---:|---:|
+| A | 187.7 | 516.9 | 216.0 | 613.4 |
+| B | 151.0 | 504.1 | 185.8 | 591.8 |
+| C | 4.5 | 102.3 | 15.7 | 118.8 |
+| D | 222.8 | 463.0 | 347.0 | 655.8 |
+| E | 325.8 | 634.1 | 597.0 | 842.9 |
+| F | 127.1 | 678.8 | 195.6 | 647.0 |
+
+All warmup and measured record-count and structural validations passed.
+The harness suite passed 77 tests with 2,933 assertions; strengthened scan and
+collision checks also passed 134 focused assertions. Timed runs did not record
+value-audit histories; value auditing ran in the harness tests. KV used ordinary
+`update-kv`, so these numbers do not measure prepared-update handles. This is a
+single trial from the live checkout, rather than a frozen-source comparison.
+
+The [full EDN report](results/2026-10-09-current/report.edn) and
+[CSV summary](results/2026-10-09-current/summary.csv) retain exact measurements.
+Reproduce the configuration from this directory:
+
+```sh
+clojure -J-Xms4g -J-Xmx4g -M:jvm:bench \
+  --system datalevin --api all --mode all --workload all \
+  --records 10000 --ops 100000 --warmup 20000 --threads 8 \
+  --seed 17 --durability strict --output /tmp/datalevin-ycsb.edn
+```
+
+### One-worker matrix
+
+A second 24-case run used the same configuration with `--threads 1`. All
+warmup and measured record-count and structural validations passed. This was
+also one trial, without timed value auditing or prepared-update handles.
+
+Throughput is in **thousands of operations per second**:
+
+| Workload | KV embedded | KV remote | Datalog embedded | Datalog remote |
+|---|---:|---:|---:|---:|
+| A | 39.9 | 15.1 | 28.8 | 13.3 |
+| B | 237.9 | 34.7 | 107.4 | 29.2 |
+| C | 702.8 | 33.6 | 177.2 | 25.7 |
+| D | 160.6 | 34.8 | 83.9 | 26.9 |
+| E | 22.5 | 8.0 | 6.7 | 5.4 |
+| F | 40.3 | 13.1 | 26.0 | 11.2 |
+
+Aggregate **p99 latency in microseconds**:
+
+| Workload | KV embedded | KV remote | Datalog embedded | Datalog remote |
+|---|---:|---:|---:|---:|
+| A | 56.9 | 131.9 | 70.6 | 149.6 |
+| B | 49.6 | 151.8 | 67.2 | 182.3 |
+| C | 1.8 | 40.7 | 7.0 | 47.4 |
+| D | 96.9 | 164.3 | 126.3 | 244.0 |
+| E | 117.5 | 262.8 | 293.9 | 419.4 |
+| F | 55.8 | 156.1 | 84.4 | 183.7 |
+
+The [one-worker EDN report](results/2026-10-09-current/report-1-worker.edn) and
+[CSV summary](results/2026-10-09-current/summary-1-worker.csv) retain exact
+measurements. Reproduce it with the command above, changing `--threads 8` to
+`--threads 1`.
+
+Worker count changes the per-worker random streams and operation interleaving,
+so the realized operation mix and inserted record counts differ between the
+two matrices despite the same seed and total operation count.
+
+### SQLite and PostgreSQL comparisons
+
+The SQL matrices used the same record shape, operation counts, seed, 4 GiB
+client heap, and one/eight-worker settings as the Datalevin matrices above.
+SQLite JDBC 3.51.1.0 used WAL with `synchronous=FULL`; PostgreSQL 18.6
+(Homebrew) used loopback TCP with `synchronous_commit=on`, `fsync=on`, and
+`full_page_writes=on`. PostgreSQL used `en_US.UTF-8` collation. Payload fields
+were unindexed, and each SQL worker owned one JDBC connection.
+
+All 48 SQL cases passed warmup and measured structural validations. The
+PostgreSQL-enabled harness suite passed 77 tests with 3,619 assertions and no
+failures or errors. Timed SQL runs did not record value-audit histories.
+
+For SQL, the API column labels the Datalevin comparison partner: SQLite and
+PostgreSQL use the same SQL adapter for both labels, measured on fresh databases
+in separate cases. These are separate single trials, collected after the
+Datalevin runs; engines were not interleaved or run simultaneously.
+
+Ratios divide Datalevin throughput by its SQL counterpart using unrounded
+measurements. Values above 1× mean Datalevin is faster; values below 1× mean
+the SQL counterpart is faster.
+
+**1 worker: thousands of operations per second**
+
+| Workload | API | Datalevin embedded | SQLite | Datalevin / SQLite | Datalevin remote | PostgreSQL | Datalevin / PostgreSQL |
+|---|---|---:|---:|---:|---:|---:|---:|
+| A | KV | 39.9 | 24.4 | 1.64× | 15.1 | 15.6 | 0.97× |
+| A | Datalog | 28.8 | 24.6 | 1.17× | 13.3 | 15.5 | 0.86× |
+| B | KV | 237.9 | 88.4 | 2.69× | 34.7 | 28.6 | 1.21× |
+| B | Datalog | 107.4 | 93.9 | 1.14× | 29.2 | 28.8 | 1.02× |
+| C | KV | 702.8 | 120.3 | 5.84× | 33.6 | 32.7 | 1.03× |
+| C | Datalog | 177.2 | 120.3 | 1.47× | 25.7 | 32.2 | 0.80× |
+| D | KV | 160.6 | 79.6 | 2.02× | 34.8 | 26.9 | 1.29× |
+| D | Datalog | 83.9 | 71.8 | 1.17× | 26.9 | 27.1 | 0.99× |
+| E | KV | 22.5 | 4.9 | 4.55× | 8.0 | 6.7 | 1.21× |
+| E | Datalog | 6.7 | 5.0 | 1.34× | 5.4 | 6.9 | 0.78× |
+| F | KV | 40.3 | 22.5 | 1.79× | 13.1 | 11.6 | 1.13× |
+| F | Datalog | 26.0 | 21.5 | 1.20× | 11.2 | 12.4 | 0.91× |
+
+**8 workers: thousands of operations per second**
+
+| Workload | API | Datalevin embedded | SQLite | Datalevin / SQLite | Datalevin remote | PostgreSQL | Datalevin / PostgreSQL |
+|---|---|---:|---:|---:|---:|---:|---:|
+| A | KV | 119.8 | 27.8 | 4.31× | 46.0 | 71.7 | 0.64× |
+| A | Datalog | 117.9 | 24.2 | 4.87× | 37.9 | 71.6 | 0.53× |
+| B | KV | 926.8 | 156.5 | 5.92× | 106.7 | 132.0 | 0.81× |
+| B | Datalog | 549.4 | 138.8 | 3.96× | 91.8 | 134.5 | 0.68× |
+| C | KV | 3,406.7 | 595.4 | 5.72× | 138.4 | 145.2 | 0.95× |
+| C | Datalog | 943.3 | 577.6 | 1.63× | 125.4 | 140.3 | 0.89× |
+| D | KV | 620.1 | 125.7 | 4.93× | 107.6 | 125.0 | 0.86× |
+| D | Datalog | 363.4 | 120.2 | 3.02× | 89.4 | 124.6 | 0.72× |
+| E | KV | 98.4 | 20.9 | 4.71× | 34.8 | 27.0 | 1.29× |
+| E | Datalog | 37.2 | 20.6 | 1.80× | 25.3 | 26.8 | 0.95× |
+| F | KV | 152.8 | 24.1 | 6.34× | 38.8 | 59.2 | 0.66× |
+| F | Datalog | 101.1 | 16.5 | 6.13× | 36.5 | 59.4 | 0.61× |
+
+The [combined CSV](results/2026-10-09-current/comparison.csv) contains exact
+throughput, p99 latency, record counts, and validation status for all 96
+Datalevin and SQL cases. Full SQL reports are available for
+[SQLite](results/2026-10-09-current/report-sqlite.edn) and
+[PostgreSQL](results/2026-10-09-current/report-postgres.edn).
+
+Reproduce the SQL configuration from this directory (PostgreSQL must be running):
+
+```sh
+clojure -J-Xms4g -J-Xmx4g -M:jvm:bench \
+  --system sqlite --api all --mode embedded --workload all \
+  --records 10000 --ops 100000 --warmup 20000 --client-counts 1,8 \
+  --seed 17 --durability strict --output /tmp/datalevin-ycsb-sqlite.edn
+
+clojure -J-Xms4g -J-Xmx4g -M:jvm:bench \
+  --system postgres --api all --mode remote --workload all \
+  --records 10000 --ops 100000 --warmup 20000 --client-counts 1,8 \
+  --seed 17 --durability strict \
+  --pg-url jdbc:postgresql://127.0.0.1:5432/postgres \
+  --output /tmp/datalevin-ycsb-postgres.edn
+```
