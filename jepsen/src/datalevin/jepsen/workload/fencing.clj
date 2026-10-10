@@ -138,9 +138,10 @@
 
 (defn- write-error-response
   [message err-data]
-  (cond-> {:status (if (expected-write-failure-data? message err-data false)
-                     :rejected
-                     :error)
+  (cond-> {:status (cond
+                     (= :ha/write-indeterminate (:error err-data)) :indeterminate
+                     (expected-write-failure-data? message err-data false) :rejected
+                     :else :error)
            :message message}
     (map? err-data)
     (assoc :err-data (select-keys err-data
@@ -156,14 +157,16 @@
                      (ex-data e))
         message  (or (ex-message e)
                      (.getName (class e)))]
-    (cond-> {:status (if (expected-write-failure-data?
+    (cond-> {:status (cond
+                       (= :ha/write-indeterminate (:error err-data)) :indeterminate
+                       (expected-write-failure-data?
                            message
                            err-data
                            (local/transport-failure? e))
                        (if (local/transport-failure? e)
                          :unreachable
                          :rejected)
-                       :error)
+                       :else :error)
              :message message
              :class (.getName (class e))}
       (map? err-data)
@@ -348,11 +351,11 @@
        sort
        vec))
 
-(defn- write-errors
-  [snapshot]
+(defn- write-results
+  [snapshot status]
   (->> (:writes snapshot)
-       (keep (fn [[logical-node {:keys [status] :as result}]]
-               (when (= :error status)
+       (keep (fn [[logical-node result]]
+               (when (= status (:status result))
                  (assoc result :node logical-node))))
        vec))
 
@@ -446,8 +449,11 @@
                                                              snapshot)})))
                                      vec)
             unexpected-write-errors (->> probes
-                                         (mapcat write-errors)
+                                         (mapcat #(write-results % :error))
                                          vec)
+            indeterminate-writes (->> probes
+                                      (mapcat #(write-results % :indeterminate))
+                                      vec)
             single-writer-count (count (filter (fn [{:keys [written]}]
                                                  (= 1 (count written)))
                                                write-snapshots))
@@ -509,6 +515,8 @@
                 survivor-split-brain))
          :lost-acknowledged-write-count (count lost-writes)
          :lost-acknowledged-write-samples (take-sample lost-writes)
+         :indeterminate-write-count (count indeterminate-writes)
+         :indeterminate-write-samples (take-sample indeterminate-writes)
          :unexpected-write-error-count (count unexpected-write-errors)
          :unexpected-write-error-samples
          (take-sample unexpected-write-errors)}))))

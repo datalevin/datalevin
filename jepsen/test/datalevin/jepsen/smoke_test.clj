@@ -1834,6 +1834,36 @@
         (doseq [node (:nodes test-map)]
           (jdb/teardown! db test-map node))))))
 
+(deftest fencing-checker-handles-indeterminate-confirmation-smoke-test
+  (let [err-data {:error :ha/write-indeterminate
+                  :reason :authority-confirmation-failed}
+        response (#'fencing/write-error-response
+                   "HA write commit confirmation failed" err-data)
+        exception (#'fencing/write-exception-result
+                    (ex-info "Request to Datalevin server failed"
+                             {:err-data err-data}))
+        check (:checker (fencing/workload {}))
+        probe {:probe-id "probe-1"
+               :nodes {"n1" {:status :admitted}}
+               :writes {"n1" response "n2" exception}
+               :survivors {:status :ok :nodes ["n1"]}}
+        run-check (fn [snapshot]
+                    (checker/check check {}
+                                   (history/history [{:type :ok :f :probe
+                                                      :value snapshot}]) nil))
+        result (run-check probe)
+        split (run-check (assoc-in probe [:survivors :nodes] ["n1" "n2"]))]
+    (is (= :indeterminate (:status response)))
+    (is (= :indeterminate (:status exception)))
+    (is (not (false? (:valid? result))))
+    (is (zero? (:unexpected-write-error-count result)))
+    (is (= 2 (:indeterminate-write-count result)))
+    (is (zero? (:single-writer-count result)))
+    (is (false? (:valid? split)))
+    (is (= 1 (:survivor-split-brain-count split)))
+    (is (= :error (:status (#'fencing/write-error-response
+                            "storage failure" {:error :txlog/runtime-fenced}))))))
+
 (deftest fencing-checker-fails-on-write-based-split-brain-smoke-test
   (let [checker (:checker (fencing/workload {}))
         probe   {:probe-id "probe-1"

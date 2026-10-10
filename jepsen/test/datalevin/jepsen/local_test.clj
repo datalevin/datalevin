@@ -3,6 +3,7 @@
    [clojure.edn :as edn]
    [clojure.java.io :as io]
    [clojure.test :refer [deftest is use-fixtures]]
+   [datalevin.client :as cl]
    [datalevin.core :as d]
    [datalevin.interface :as i]
    [datalevin.jepsen.local :as local]
@@ -242,6 +243,25 @@
    :paused-nodes #{"n1"}
    :paused-node-info {"n1" {:paused? true}}
    :stopped-node-info {"n1" {:stopped? true}}})
+
+(deftest paused-server-resumes-accepting-connections-test
+  (let [dir (u/tmp-dir (str "jepsen-pause-resume-" (UUID/randomUUID)))
+        port (first (reserve-ports 1))
+        server (srv/create {:port port :root dir})
+        uri (str "dtlv://datalevin:datalevin@127.0.0.1:" port)]
+    (try
+      (srv/start server)
+      (dotimes [_ 2]
+        (#'lcluster/pause-server-loop! server)
+        (is (false? (.get ^AtomicBoolean (.-running ^Server server))))
+        (#'lcluster/resume-server-loop! server)
+        (let [client (cl/new-client uri {:pool-size 1 :time-out 1000})]
+          (try
+            (is (not (cl/disconnected? client)))
+            (finally (cl/disconnect client)))))
+      (finally
+        (srv/stop server)
+        (u/delete-files dir)))))
 
 (deftest restart-node-keeps-server-live-after-retryable-admin-open-failure-test
   (let [dir                 (u/tmp-dir (str "jepsen-restart-retryable-open-"

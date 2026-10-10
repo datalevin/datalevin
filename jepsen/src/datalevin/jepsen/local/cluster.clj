@@ -15,7 +15,8 @@
    [datalevin.server Server]
    [datalevin.storage Store]
    [java.net InetSocketAddress ServerSocket]
-   [java.util UUID]))
+   [java.util UUID]
+   [java.util.concurrent Callable ExecutorService TimeUnit]))
 
 (def ^:private default-port-base 19001)
 (def ^:private default-port-limit 31999)
@@ -595,7 +596,19 @@
   (let [running  (.-running server)
         selector ^java.nio.channels.Selector (.-selector server)]
     (.set ^java.util.concurrent.atomic.AtomicBoolean running false)
-    (.wakeup selector)))
+    (.wakeup selector)
+    ;; Join the paused accept loop before resume can set running again.
+    (.get (.submit ^ExecutorService (.-dispatcher server)
+                   ^Runnable (fn [] nil))
+          cluster-timeout-ms TimeUnit/MILLISECONDS)))
+
+(defn- resume-server-loop!
+  [^Server server]
+  ;; A pause retains the listener, stores, and :running lifecycle. start is
+  ;; deliberately idempotent for that lifecycle, so resume its loop directly.
+  (.set ^java.util.concurrent.atomic.AtomicBoolean (.-running server) true)
+  (.submit ^ExecutorService (.-dispatcher server)
+           ^Callable (fn [] (#'srv/run-event-loop! server))))
 
 (defn- disconnect-server-client-channels!
   [^Server server]
@@ -1027,7 +1040,7 @@
                          (u/raise "Cannot resume unknown Jepsen node"
                                   {:cluster-id cluster-id
                                    :logical-node logical-node}))]
-          (srv/start server)
+          (resume-server-loop! server)
           (rebuild-node-ha-runtime! control-backend server db-name)
           (swap! clusters
                  (fn [clusters*]
