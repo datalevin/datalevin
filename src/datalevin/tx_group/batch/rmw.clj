@@ -161,6 +161,9 @@
                      (owner-interruption t) (throw (owner-interruption t))
                      (clean-body-failure? t) (batch/cancel-before-dispatch! t)
                      :else (throw t))))]
+    (when @aborted?
+      (when-let [explicit-abort? (::explicit-abort? (batch/context descriptor))]
+        (vreset! explicit-abort? true)))
     (phase/phase! :resolution-complete b)
     (when-let [t @failure]
       (if (and @aborted? (:abort-returns? opts)
@@ -269,10 +272,10 @@
     (vreset! valid? true)
     (vreset! aborted? false)
     (when-let [staged? (:storage-staged? opts)] (vreset! staged? false))
-    ;; Ordinary RMW members may have temporarily installed their own callbacks
-    ;; on the shared view. Restore only on that transition, preserving a writer
-    ;; refreshed after map growth. Consecutive resolvers update the owned scope
-    ;; rather than allocating another native-view metadata map.
+    ;; User-code preparation may have installed a scoped capture. Restore the
+    ;; resolver callbacks, preserving a writer refreshed after map growth.
+    ;; Consecutive resolvers update the owned scope rather than allocating
+    ;; another native-view metadata map.
     (let [updated (if (identical? (:native-row-capture metadata)
                                  (:native-row-capture callbacks))
                     metadata (merge (dissoc metadata :request-context) callbacks))]
@@ -338,11 +341,9 @@
                (RowRegions.) (ArrayList.))
         wal-rows (RowRegions.) valid? (volatile! true)
         aborted? (volatile! false)
-        shared-view (when (or (:datalog-publication (batch/context descriptor))
-                             (:datalog-conn (batch/context descriptor)))
-                      (:datalog-view opts))
-        wdb (or (when shared-view @shared-view) (l/mark-write native-db))
-        _ (when shared-view (vreset! shared-view wdb))
+        ;; Public bodies can retain their handle. Only trusted resolvers may
+        ;; reuse the Datalog view; this handle and its validity never revive.
+        wdb (l/mark-write native-db)
         capture (fn [name txs kt vt]
                   (capture! raw wdb apply-rows! descriptor rows wal-rows valid? failure opts name txs kt vt))
         abort! (fn []
@@ -355,11 +356,8 @@
                            (catch Throwable e e))]
                    (when-not @failure (vreset! failure t))
                    (when-not (:abort-returns? opts) (throw t))))
-        _ (with-meta wdb (assoc (if shared-view
-                                 (assoc (meta wdb)
-                                        :native-write-owner (:native-write-owner (meta native-db))
-                                        :native-write-rtx (:native-write-rtx (meta native-db)))
-                                 (meta wdb))
+        _ (with-meta wdb (assoc (meta wdb)
+                               :native-write-valid? valid?
                                :native-row-capture capture
                                :native-storage-staged!
                                (when-let [staged? (:storage-staged? opts)]
@@ -512,7 +510,7 @@
                (try
                  (when-let [take-rows! (:storage-rows! opts)]
                    (phase/phase! :storage-encode-start batch)
-                   (when-let [txs (take-rows!)]
+                   (when-let [txs (take-rows! wdb)]
                      (let [[view descriptor rows wal-rows state context] @storage-target
                            ;; A trusted resolver can stage storage without
                            ;; allocating carriers. Materialize them at the drain,
@@ -530,8 +528,9 @@
                                           (batch/with-data-rows! (batch/data descriptor)
                                                              rows wal-rows)))
                        ;; The batch owns these carriers after the request view
-                       ;; expires. Never re-enter that request's capture.
-                       (l/write-txn view)
+                       ;; expires. Validate its native writer, without borrowing
+                       ;; the expired request's writer or re-entering its capture.
+                       (l/write-txn wdb)
                        (let [prepared ((:prepare-rows! opts) raw descriptor nil txs
                                        :data :data)]
                          (capture-prepared! view apply-rows! rows wal-rows
@@ -563,7 +562,7 @@
                (let [[view descriptor rows wal-rows _ context] @storage-target]
                  (if (and *defer-storage-encoding?* wal (:shared-datalog-writer? opts)
                           (:storage-tail! opts) (:datalog-prepare? context))
-                   (when-let [plan ((:storage-tail! opts))]
+                   (when-let [plan ((:storage-tail! opts) wdb)]
                      (let [region (DeferredRows.
                                     (int (:row-count plan))
                                     (reify Supplier

@@ -180,15 +180,15 @@
              :finish-preparation! (fn [_ _]
                                     (when-let [group @(:group @context)]
                                       (s/write-group-metadata group)))
-             :storage-rows! (fn []
+             :storage-rows! (fn [native]
                               (when-let [group @(:group @context)]
                                 (binding [s/*write-group* group
                                           s/*enforce-blind-unique-inserts?* false
                                           c/*ordered-datom-writes?* false]
-                                  (s/take-group-storage-rows! group))))
-             :storage-tail! (fn []
+                                  (s/take-group-storage-rows! group native))))
+             :storage-tail! (fn [native]
                               (when-let [group @(:group @context)]
-                                (s/freeze-group-storage-datoms! group)))
+                                (s/freeze-group-storage-datoms! group native)))
              :before-body! (fn [descriptor]
                              (when-not (:datalog-prepare? (batch/context descriptor))
                                (when-let [current @(:current @context)]

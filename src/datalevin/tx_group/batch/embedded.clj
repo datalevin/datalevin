@@ -246,6 +246,7 @@
                         (when-let [check-submission! (:check-submission! hooks)]
                           (check-submission!))
                         (let [result (volatile! nil) completed? (volatile! false)
+                              aborted? (volatile! false)
                               submitter (Thread/currentThread)
                               bindings (get-thread-bindings)
                               run (fn [tx]
@@ -257,9 +258,14 @@
                                                      (run tx)
                                                      (with-bindings bindings (run tx))))
                                                 (assoc opts :ready? true
-                                                       :context (merge (:context opts) (caller-context))))
+                                                       :context (assoc (merge (:context opts) (caller-context))
+                                                                       ::rmw/explicit-abort? aborted?)))
                                (catch Throwable t
-                                 (if (and @completed? (= :txlog/request-aborted (:error (ex-data t))))
+                                 ;; A peer can abort after this body finishes.
+                                 ;; Only this request's own abort may return its
+                                 ;; body result when the shared batch rolls back.
+                                 (if (and @completed? @aborted?
+                                          (= :txlog/request-aborted (:error (ex-data t))))
                                    @result (throw (public-error t)))))))
                 control
                 {:embedded? true :server? (:server? hooks) :datalog-context (:context hooks)

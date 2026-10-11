@@ -82,14 +82,22 @@ policy. On failure, dereferencing it throws the transaction exception. The
 optional callback runs after the future is realized and receives the successful
 transaction result or that exception.
 
-Datalog async batches collect new submissions for up to 10 ms before starting
-the transaction. They start immediately on reaching the 100,000-form cap;
-arrivals do not extend the collection deadline. This reduces durable commit
-calls during producer refill, at the cost of up to 10 ms extra latency for
-sparse traffic and potentially higher completion latency for larger batches.
-The root value of `datalevin.constants/*datalog-async-coalesce-ms*` controls this
-window; set it to zero to disable waiting. Executor threads do not inherit
-caller bindings. This setting also affects the blocking `transact` wrapper.
+Datalog async batches combine queued submissions without waiting for more by
+default. To opt into a collection window, set the root value of
+`datalevin.constants/*datalog-async-coalesce-ms*` to a positive number of
+milliseconds, for example:
+
+```clojure
+(alter-var-root #'datalevin.constants/*datalog-async-coalesce-ms* (constantly 10))
+```
+
+The default is `0`, which disables waiting. With a positive window, batches
+start when the window expires or they reach the 100,000-form cap; arrivals do
+not extend the collection deadline. Waiting can reduce durable commit calls
+during producer refill, at the cost of up to the configured window's extra
+latency for sparse traffic and potentially higher completion latency for
+larger batches. Executor threads do not inherit caller bindings. This setting
+also affects the blocking `transact` wrapper.
 
 `transact` function is a blocked version of `transact-async`, that will block
 until the future is realized. One can call a sequence of `transact-async`,

@@ -107,7 +107,7 @@
          insert-datom delete-datom check load-datoms-with-plan!
          prepare-embedding-plan prepare-datoms-kv-plan commit-datoms-kv-plan!
          migrate-attr-values ->SamplingWork e-sample* default-ratio* analyze*
-         apply-schema-update! transfer-current)
+         apply-schema-update! transfer transfer-current)
 
 ;; Retain the existing entry points for storage callers.
 (def attr-tuples schemas/attr-tuples)
@@ -2232,41 +2232,50 @@
       txs
       (finally (bf/return-array-buffer buffer)))))
 
+(defn- group-storage-store
+  [^objects context lmdb]
+  (let [store (aget context 0)]
+    (if (seq (:db/noindex (rschema store)))
+      ;; The staging request may already have expired. Schema refresh belongs
+      ;; to the batch's writer, while encoding uses the resulting schema only.
+      (ensure-current! (if lmdb (transfer store lmdb) store))
+      store)))
+
 (defn ^:no-doc take-group-storage-rows!
   "Encode and detach the group's pending datoms without advancing metadata again."
-  [^WriteGroup group]
-  (let [^objects context (.-storage-context group)
-        ^FastList datoms (or (aget context 1) (.-storage-datoms group))]
-    (when-not (.isEmpty datoms)
-      (let [store (aget context 0)
-            _ (when (seq (:db/noindex (rschema store))) (ensure-current! store))
-            rows (encode-group-storage-datoms (schema store) datoms)]
-        (.clear datoms)
-        (aset context 0 nil)
-        rows))))
+  ([group] (take-group-storage-rows! group nil))
+  ([^WriteGroup group lmdb]
+   (let [^objects context (.-storage-context group)
+         ^FastList datoms (or (aget context 1) (.-storage-datoms group))]
+     (when-not (.isEmpty datoms)
+       (let [store (group-storage-store context lmdb)
+             rows (encode-group-storage-datoms (schema store) datoms)]
+         (.clear datoms)
+         (aset context 0 nil)
+         rows)))))
 
 (defn ^:no-doc freeze-group-storage-datoms!
   "Detach bounded ordinary datoms for encoding after dispatch. Schema refresh
   stays on the native owner; the returned encoder uses immutable metadata only."
-  [^WriteGroup group]
-  (let [^objects context (.-storage-context group)
-        ^FastList datoms (or (aget context 1) (.-storage-datoms group))]
-    (when-not (.isEmpty datoms)
-      (let [store (aget context 0)
-            _ (when (seq (:db/noindex (rschema store))) (ensure-current! store))
-            store-schema (schema store)
-            ;; This is a scheduling bound, not a charge or serialized length.
-            bytes (reduce (fn [total ^Datom datom]
-                            (let [v (.-v datom)]
-                              (+ (long total) 32
-                                 (if (string? v) (* 4 (count v)) 0))))
-                          0 datoms)]
-        ;; The old region belongs exclusively to the frozen plan. Any later
-        ;; staging gets a fresh region, including an unexpected read boundary.
-        (aset context 1 (FastList. 0))
-        (aset context 0 nil)
-        {:row-count (.size datoms) :native-tail-bytes bytes
-         :encode (fn [] (encode-group-storage-datoms store-schema datoms))}))))
+  ([group] (freeze-group-storage-datoms! group nil))
+  ([^WriteGroup group lmdb]
+   (let [^objects context (.-storage-context group)
+         ^FastList datoms (or (aget context 1) (.-storage-datoms group))]
+     (when-not (.isEmpty datoms)
+       (let [store (group-storage-store context lmdb)
+             store-schema (schema store)
+             ;; This is a scheduling bound, not a charge or serialized length.
+             bytes (reduce (fn [total ^Datom datom]
+                             (let [v (.-v datom)]
+                               (+ (long total) 32
+                                  (if (string? v) (* 4 (count v)) 0))))
+                           0 datoms)]
+         ;; The old region belongs exclusively to the frozen plan. Any later
+         ;; staging gets a fresh region, including an unexpected read boundary.
+         (aset context 1 (FastList. 0))
+         (aset context 0 nil)
+         {:row-count (.size datoms) :native-tail-bytes bytes
+          :encode (fn [] (encode-group-storage-datoms store-schema datoms))})))))
 
 (defn load-datoms-with-plan!
   ([^Store store datoms embedding-plan]

@@ -1621,13 +1621,14 @@
               (when-not s? (prepare-server-tx db0 txs))))
   ([deps db0 txs tx-meta s? server db-name writing? prepared]
    (try
-     ;; db0 is published to concurrent pull/query handlers. Give the writer
-     ;; private mutable overlays while retaining db0 as the report's before DB.
+     ;; Non-simulated paths already supply a private writer DB. Preserve its
+     ;; pending indexes so general resolution sees preceding batch writes.
+     ;; Simulations need fresh overlays because db0 is published to readers.
      (let [transact (fn [db]
                       (or (when-not s?
                             (transact-prepared db prepared (or tx-meta {})))
                           (db/transact-tx-data
-                            (db/->TxReport db (db/transfer db (:store db))
+                            (db/->TxReport db (if s? (db/transfer db (:store db)) db)
                                            [] {} (or tx-meta {}))
                             txs s?)))]
        (cond

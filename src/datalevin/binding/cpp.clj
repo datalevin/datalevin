@@ -626,6 +626,13 @@
                     `(~method ~args (native-call ~'info ~@body)))
                   method)) methods))))
 
+(defn- assert-write-view-valid!
+  [metadata]
+  (when-let [valid? (:native-write-valid? metadata)]
+    (when-not @valid?
+      (throw (ex-info "Write body has finished"
+                      {:error :txlog/transaction-view-invalidated :retryable? false})))))
+
 (def-native-env CppLMDB [^Env env
                   info
                   ^ThreadLocal tl-reader
@@ -684,6 +691,7 @@
   (writing? [_] writing?)
 
   (write-txn [_]
+    (when writing? (assert-write-view-valid! meta))
     (when (and writing?
                (or (not (identical? (:native-write-owner meta) (Thread/currentThread)))
                    (not (identical? (:native-write-rtx meta) @write-txn))))
@@ -823,6 +831,7 @@
   (closed-kv? [_] (.isClosed env))
 
   (check-ready [this]
+    (when writing? (assert-write-view-valid! meta))
     (when (.closed-kv? this)
       (raise "LMDB env is closed." {:type :lmdb/closed})))
 
@@ -1066,8 +1075,8 @@
         (finally (.return-rtx this rtx)))))
 
   (open-transact-kv [this]
-    (when-let [abort! (:native-batch-abort! meta)] (abort!))
     (.check-ready this)
+    (when-let [abort! (:native-batch-abort! meta)] (abort!))
     (try
       (.reset-write this)
       (.mark-write this)
@@ -1075,11 +1084,13 @@
         (raise "Fail to open read/write transaction in LMDB: " e {}))))
 
   (close-transact-kv [_]
+    (when writing? (assert-write-view-valid! meta))
     (when-let [abort! (:native-batch-abort! meta)] (abort!))
     (close-native-write! env write-txn nil
                          (fn [_wdb context] (run-before-write-commit! context))))
 
   (abort-transact-kv [_]
+    (when writing? (assert-write-view-valid! meta))
     (when-let [abort! (:native-batch-abort! meta)] (abort!))
     (when-let [^Rtx wtxn @write-txn]
       (vreset! (.-aborted? wtxn) true)

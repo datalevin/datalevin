@@ -1,5 +1,6 @@
 (ns ycsb-bench.test-runner
   (:require [clojure.test :as test]
+            [datalevin-bench.host-test]
             [ycsb-bench.audit-test]
             [ycsb-bench.cli-test]
             [ycsb-bench.comparison-test]
@@ -11,7 +12,8 @@
             [ycsb-bench.sql-test]))
 
 (defn -main [& _]
-  (let [{:keys [fail error]} (try (test/run-tests 'ycsb-bench.audit-test
+  (let [{:keys [fail error]} (try (test/run-tests 'datalevin-bench.host-test
+                                                'ycsb-bench.audit-test
                                                 'ycsb-bench.cli-test
                                                 'ycsb-bench.comparison-test
                                                 'ycsb-bench.application-key-test

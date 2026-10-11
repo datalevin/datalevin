@@ -734,8 +734,8 @@
   *datalog-async-batch-max-forms* 100000)
 
 (def ^{:dynamic true
-       :doc     "Maximum collection window in milliseconds for Datalog async transactions. Full batches run immediately. Set the root value to zero to disable waiting; executor threads do not inherit caller bindings."}
-  *datalog-async-coalesce-ms* 10)
+       :doc     "Optional collection window in milliseconds for Datalog async transactions. Defaults to zero (no waiting). Set a positive root value to collect more submissions; full batches run immediately and arrivals do not extend the window. Executor threads do not inherit caller bindings."}
+  *datalog-async-coalesce-ms* 0)
 
 (def ^{:dynamic true
        :doc     "Datalog DB starts background sampling or not"}

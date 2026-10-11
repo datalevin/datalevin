@@ -2,13 +2,14 @@
   "Pause the current user's macOS media-analysis daemons while a benchmark runs.
 
   `mediaanalysisd` and `photoanalysisd` can consume substantial CPU and skew
-  timing. This namespace stops the ones owned by the current user for the
-  duration of a measurement and resumes exactly those afterward, so a daemon
-  that was already stopped before the run is left untouched. On other platforms
+  timing. This namespace stops the ones owned by the current user, watches for
+  replacements during a run, and resumes exactly those it stopped afterward.
+  Daemons already stopped before the run are left untouched. On other platforms
   it is a no-op."
   (:require
    [clojure.java.io :as io]
-   [clojure.string :as s]))
+   [clojure.string :as s])
+  (:import [java.util.concurrent CountDownLatch TimeUnit]))
 
 (def ^:private daemons ["mediaanalysisd" "photoanalysisd"])
 
@@ -34,8 +35,10 @@
   (let [r (sh "id" "-u")]
     (when (zero? (:exit r)) (s/trim (:out r)))))
 
-(defn- daemon-pids [daemon]
-  (let [r (sh "pgrep" "-u" (or (current-uid) "") "-x" daemon)]
+(def ^:private uid (delay (current-uid)))
+
+(defn- daemon-pids []
+  (let [r (sh "pgrep" "-u" (or @uid "") "-x" (s/join "|" daemons))]
     (if (zero? (:exit r))
       (->> (s/split-lines (:out r))
            (map s/trim)
@@ -55,13 +58,12 @@
   (if-not (macos?)
     []
     (vec
-     (for [daemon daemons
-           pid    (daemon-pids daemon)
+     (for [pid (daemon-pids)
            :when  (not (stopped? pid))
            :let   [result (sh "kill" "-STOP" (str pid))]
            :when  (do
                     (when-not (zero? (:exit result))
-                      (println (str "Could not pause " daemon " pid " pid ": "
+                      (println (str "Could not pause media analysis pid " pid ": "
                                     (s/trim (:out result)))))
                     (zero? (:exit result)))]
        pid))))
@@ -74,17 +76,62 @@
       (sh "kill" "-CONT" (str pid))))
   nil)
 
+(defn start-pause-monitor!
+  "Pause current daemons and check every 250 ms for replacement processes.
+  Returns a session for `stop-pause-monitor!`; only successfully stopped PIDs
+  are recorded."
+  []
+  (let [mac? (macos?)
+        paused (atom (if mac? (pause!) []))
+        stop (CountDownLatch. 1)
+        monitor (when mac?
+                  (Thread.
+                    ^Runnable
+                    (fn []
+                      (try
+                        (loop []
+                          (when-not (.await stop 250 TimeUnit/MILLISECONDS)
+                            (let [replacement-pids (pause!)]
+                              (swap! paused #(vec (distinct (into % replacement-pids)))))
+                            (recur)))
+                        (catch InterruptedException _)))
+                    "datalevin-bench-media-monitor"))]
+    (when monitor
+      (.setDaemon ^Thread monitor true)
+      (.start ^Thread monitor))
+    {:paused paused :stop stop :thread monitor}))
+
+(defn stop-pause-monitor!
+  "Join the monitor before resuming its recorded PIDs. Preserve the calling
+  thread's interruption status while completing cleanup. Returns resumed PIDs."
+  [{:keys [paused stop thread]}]
+  (let [interrupted? (volatile! (Thread/interrupted))]
+    (try
+      (.countDown ^CountDownLatch stop)
+      (when thread
+        (loop []
+          (when (.isAlive ^Thread thread)
+            (try (.join ^Thread thread)
+                 (catch InterruptedException _ (vreset! interrupted? true)))
+            (recur))))
+      (let [pids @paused]
+        (resume! pids)
+        pids)
+      (finally
+        (when @interrupted? (.interrupt (Thread/currentThread)))))))
+
 (defmacro with-paused-media
-  "Run `body` with media-analysis daemons paused, resuming the ones this call
-  paused when `body` finishes (normally or not)."
+  "Run `body` while watching for media-analysis daemons, then stop the monitor
+  and resume the PIDs this call paused, including when the body throws."
   [& body]
-  `(let [paused# (pause!)]
+  `(let [session# (start-pause-monitor!)
+         paused# @(:paused session#)]
      (println (if (seq paused#)
                 (str "Paused media analysis daemons: " (pr-str paused#))
                 "No media analysis daemons paused."))
      (try
        ~@body
        (finally
-         (resume! paused#)
-         (when (seq paused#)
-           (println (str "Resumed media analysis daemons: " (pr-str paused#))))))))
+         (let [resumed# (stop-pause-monitor! session#)]
+           (when (seq resumed#)
+             (println (str "Resumed media analysis daemons: " (pr-str resumed#)))))))))
