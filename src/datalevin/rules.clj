@@ -1309,27 +1309,30 @@
       (get rules head))))
 
 (defn- expand-rule
-  [context to-rm rules deps src head args]
+  [context rules deps src head args]
   (let [branches (rules head)
         expanded
         (mapv
           (fn [branch]
             (let [[head-clause & body-clauses] branch
 
-                  head-vars  (rest head-clause)
-                  mapping    (zipmap head-vars args)
-                  body-vars  (into
-                               #{}
-                               (mapcat #(u/walk-collect % qu/free-var?))
-                               body-clauses)
-                  local-vars (set/difference body-vars (set head-vars))
-                  local-map  (zipmap local-vars
-                                     (mapv #(gensym (name %)) local-vars))
-                  full-map   (merge mapping local-map)
-                  new-body   (mapv #(ensure-src-where src %)
-                                   (walk/postwalk-replace
-                                     full-map body-clauses))]
-              (expand-clauses context to-rm rules deps new-body true)))
+                  head-vars    (rest head-clause)
+                  mapping      (zipmap head-vars args)
+                  body-vars    (into
+                                 #{}
+                                 (mapcat #(u/walk-collect % qu/free-var?))
+                                 body-clauses)
+                  head-var-set (set head-vars)
+                  full-map     (reduce
+                                 (fn [mapping v]
+                                   (if (contains? head-var-set v)
+                                     mapping
+                                     (assoc mapping v (gensym (name v)))))
+                                 mapping body-vars)
+                  new-body     (mapv #(ensure-src-where src %)
+                                     (walk/postwalk-replace
+                                       full-map body-clauses))]
+              (expand-clauses context rules deps new-body true)))
           branches)]
     (if (= 1 (count expanded))
       (first expanded)
@@ -1353,12 +1356,12 @@
           head (rule-head clause)
           args (rule-args clause)]
       (when-not (recursive? deps head)
-        (expand-rule context (volatile! #{}) rules deps src head args)))))
+        (expand-rule context rules deps src head args)))))
 
 (defn- expand-clauses
   "Expand non-recursive rules, preserving set-valued boundaries below the
    outermost expansion when a rule can have multiple proofs per head tuple."
-  [context to-rm rules deps clauses nested-rule?]
+  [context rules deps clauses nested-rule?]
   (into
     []
     (mapcat
@@ -1380,8 +1383,7 @@
                          (or nested-rule?
                              (rule-depends-on-derived-relation?
                                context rules head)))))
-          (do (vswap! to-rm conj head)
-              (expand-rule context to-rm rules deps src head args))
+          (expand-rule context rules deps src head args)
 
           ;; (or ...)
           (and (sequential? head) (= 'or (first head)))
@@ -1393,7 +1395,7 @@
                  (mapv
                    (fn [branch]
                      (let [expanded
-                           (expand-clauses context to-rm rules deps [branch]
+                           (expand-clauses context rules deps [branch]
                                            nested-rule?)]
                        (if (and (seq expanded) (nil? (next expanded)))
                          (first expanded)
@@ -1406,7 +1408,7 @@
             [(ensure-src
                src
                (cons 'and
-                     (expand-clauses context to-rm rules deps sub-clauses
+                     (expand-clauses context rules deps sub-clauses
                                      nested-rule?)))])
 
           ;; (not ...)
@@ -1415,7 +1417,7 @@
             [(ensure-src
                src
                (cons 'not
-                     (expand-clauses context to-rm rules deps sub-clauses
+                     (expand-clauses context rules deps sub-clauses
                                      nested-rule?)))])
 
           ;; not-join
@@ -1424,7 +1426,7 @@
             [(ensure-src
                src
                (apply list 'not-join (filterv qu/free-var? vars)
-                      (expand-clauses context to-rm rules deps sub-clauses
+                      (expand-clauses context rules deps sub-clauses
                                       nested-rule?)))])
 
           ;; (not-join ...)
@@ -1433,7 +1435,7 @@
             [(ensure-src
                src
                (apply list 'not-join (filterv qu/free-var? vars)
-                      (expand-clauses context to-rm rules deps sub-clauses
+                      (expand-clauses context rules deps sub-clauses
                                       nested-rule?)))])
 
           ;; (or-join ...)
@@ -1446,7 +1448,7 @@
                  (mapv
                    (fn [branch]
                      (let [expanded
-                           (expand-clauses context to-rm rules deps [branch]
+                           (expand-clauses context rules deps [branch]
                                            nested-rule?)]
                        (if (and (seq expanded) (nil? (next expanded)))
                          (first expanded)
@@ -1461,11 +1463,13 @@
   [{:keys [rules rules-deps] :as context}]
   (if (empty? rules)
     context
-    (let [to-remove (volatile! #{})
+    (let [deps (or rules-deps (dependency-graph rules))
           old-where (get-in context [:parsed-q :qorig-where])
           new-where (expand-clauses
-                      context to-remove rules rules-deps old-where false)]
+                      context rules deps old-where false)]
       (-> context
-          (assoc :rules-deps (dependency-graph rules))
+          ;; Expansion changes clauses, not rule definitions. Reuse their
+          ;; graph together with its already computed stratification state.
+          (assoc :rules-deps deps)
           (assoc-in [:parsed-q :qorig-where] new-where)
           (assoc-in [:parsed-q :qwhere] (dp/parse-where new-where))))))

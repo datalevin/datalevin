@@ -41,8 +41,10 @@
                             #'qo/*plan-cache* *plan-cache*})
      (try ~@body (finally (pop-thread-bindings)))))
 
-(defn- source-inputs? [inputs]
-  (QuerySourceDispatch/hasSource inputs DB))
+(defmacro ^:private source-inputs? [inputs]
+  ;; Keep the primitive boolean branch in each caller; a predicate function
+  ;; adds an object-returning Clojure call to native entrypoints.
+  `(QuerySourceDispatch/hasSource ~inputs DB))
 
 (defonce ^:private source-executor
   (delay (requiring-resolve 'datalevin.query.source.driver/run)))

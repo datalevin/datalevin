@@ -1,12 +1,14 @@
 # Query-source SPI
 
-Status: v2 public core/local conformance and native routing gate validated (2026-10-19)
+Status: initial F0–F3 workflow and native performance gate signed off (2026-10-24)
 
 Public `q`/`explain` and the companion mapping compiler/local adapter now use the
 v2 contract in §10, with no version fallback. The earlier envelopes in §§2–9
 are historical. See [current migration status](../spi-v2-cleanup.md#implementation-status)
-for completed work and remaining gates; later preparation notes record the
-stages preceding activation.
+for the original migration checks and the
+[final signoff report](measurements/federation-signoff-2026-10-24.md) for the
+current advertised-path scope, validation and native-performance verdict.
+Later preparation notes record the stages preceding activation.
 
 Release placement: [roadmap source milestones](../roadmap.md#source-milestones); embedded JVM execution  
 Public namespace: `datalevin.query.source`  
@@ -1341,7 +1343,7 @@ regressions cover early envelope rejection, understated byte counts, cancellatio
 inside nested values and metadata, and cleanup after partial progress.
 Core row-sizing regressions also interrupt scratch, distinct/grouping, and output
 charges inside nested values, and reject insufficient scratch space before an
-unneeded traversal. The [runtime tests](../test/datalevin/query/source_runtime_test.clj)
+unneeded traversal. The [runtime tests](../../dtlvtest/test/datalevin/query/source_runtime_test.clj)
 check exact scaled charges, result quotas, and arithmetic overflow.
 Validation cases cancel inside captured input values and constant metadata,
 including native type checks and planning requests/responses. Cancellation keeps
@@ -1353,7 +1355,7 @@ shared aliases, and later-fragment failure/cancellation. Search workspace is
 released before cursor execution; every case checks query cleanup.
 Close-phase cases keep cancellation active through session shutdown, including
 shared aliases, plan-only explain, and nested deadlines. The
-[core cleanup tests](../test/datalevin/query/source_runtime_test.clj) check
+[core cleanup tests](../../dtlvtest/test/datalevin/query/source_runtime_test.clj) check
 reference release, concurrent/reentrant close, cleanup order, and redaction.
 
 The [explain-option regressions](../../dtlvtest/test/datalevin/query/source_explain_test.clj)
@@ -1610,9 +1612,9 @@ uses the same shared comparisons and tests owned byte query results.
 
 In the earlier v1 baseline, unsupported execution shapes reject explicitly:
 prepared execution, function/rule/branch/negation clauses, ordering, pull, and
-nested input destructuring. V2 F1 must replace that rule rejection for the
-[required basic rule cases](../roadmap.md#f1-execution-checks); retaining the
-prototype's rejection behavior does not satisfy the revised gate.
+nested input destructuring. V2 replaces that rule rejection for the
+[required basic rule cases](../roadmap.md#f1-execution-checks), including positive
+nonrecursive mapped rules and native/local recursive rule participation.
 Baseline mixed native queries require platform threads, a local DB with
 neither a pending transaction overlay nor an active write transaction, and
 supported scalar, typed tuple, generic data, or portable registered Nippy values
@@ -1746,11 +1748,12 @@ that read.
 Combining one-shot fragments within a session rejects unless a complete
 reopenable alternative is available.
 
-The earlier v1 F1 baseline is complete. The revised
-[F1 gates](../roadmap.md#f1-execution-checks) remain open for SPI v2, its
-four-shape execution matrix, and native performance sign-off. Control construction,
-plan/batch validation, and provisional size constants remain internal
-implementation details.
+The earlier v1 baseline is superseded. The revised v2
+[F1 gates](../roadmap.md#f1-execution-checks), four-shape fixture matrix and
+native routing gate passed in the [coordinated cleanup](../spi-v2-cleanup.md#implementation-status).
+The roadmap records subsequent provider and integrated-workflow signoff.
+Control construction and plan/batch validation remain internal implementation
+details.
 
 ## 10. SPI v2: revised four-shape contract
 
@@ -3027,10 +3030,11 @@ Estimated zero is never proof of emptiness or zero runtime resource use.
 
 #### Integration, fallback, and bounds
 
-Feed these choices into the existing
+Feed structural choices into the existing
 [access scheduling](../src/datalevin/query/optimizer/access_plan.clj) and
-[costing](../src/datalevin/query/optimizer/plan_cost.clj) boundaries. This is
-planned bridge work; those modules do not already implement the v2 contract.
+[costing](../src/datalevin/query/optimizer/plan_cost.clj) boundaries. The active
+bridge uses shared access plans and dependency scheduling; comparable-cost
+conversion and fused-candidate ranking remain optimization follow-ups.
 The existing planner owns viable join orders, native operations, local joins,
 residuals, and necessary materialization. Keep rule/branch/projection nodes and
 validate coverage and input/export edges region by region; a globally complete
@@ -3039,7 +3043,7 @@ satisfiable, with no unseeded cycles or illegal one-shot reuse. Validate
 the chosen complete query plan before opening any execution cursor. If no valid
 plan is available, raise `:query-source/unsupported`; never execute partial coverage.
 
-The preparatory [`source.access`](../src/datalevin/query/source/access.clj)
+The active [`source.access`](../src/datalevin/query/source/access.clj)
 bridge constructs shared `AccessPlan` records from captured, validated
 alternatives. It schedules one logical region from explicit typed input/export
 columns and checks complete single-pattern coverage without native cardinality
