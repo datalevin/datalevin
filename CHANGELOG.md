@@ -3,7 +3,7 @@
 ## WIP
 
 ### Added
-- [Federation] infrastructure to work with external data sources. Concrete
+- [Federation] infrastructure to query external data sources. Concrete
   implementation of adapters for external data live in
   [federation](https://github.com/datalevin/federation) project.
 - [Search] fuzzy/prefix fulltext search
@@ -12,6 +12,9 @@
 - [Datalog] A re-index bug
   [#353](https://github.com/datalevin/datalevin/issues/353).
 - [Lib] JS `unlistenDb` removes subscription key.
+### Changed
+- [Datalog] `:db.type/idoc`and `:db.type/vect` attributes have `:db/noindex
+  true` by default, as there are secondary index on them by default.
 ### Improved
 - [Datalog] Reduce native query result-key overhead and batch bound-entity reads.
 - [Buffer] Allocate large (> 1 MiB) direct memory buffers on demand and release

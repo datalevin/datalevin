@@ -33,6 +33,12 @@ optional idoc format and a domain name:
 * `:db.idoc/excludedPaths` -- optional collection of path prefix selectors to
   omit from this attribute's domain. Excluded paths win over included paths.
 
+New idoc attributes default to `:db/noindex true`, which omits the whole value
+from AVE while retaining the document index, `idoc-match`, and entity/pull
+reads. Declare `:db/noindex false` to enable AVE as well. Unique attributes stay
+indexed, and existing attributes keep their indexing policy. Use `index-attr`
+to enable AVE after storing data.
+
 ```clojure
 (def schema
   {:doc/edn  {:db/valueType   :db.type/idoc
@@ -319,7 +325,9 @@ a vector, matching follows the same membership semantics as a vector-valued
 map field.
 
 For whole-vector equality, use an ordinary datom clause:
-`[?e :attr1 [1 2 5 3 5]]`. Query vectors passed to `idoc-match` remain logical
+`[?e :attr1 [1 2 5 3 5]]`. When `?e` is unbound, this requires AVE: declare
+`:db/noindex false` when creating the attribute or call `(d/index-attr conn :attr1)`.
+Query vectors passed to `idoc-match` remain logical
 expressions, rather than literal vector values. `idoc-get` with path `[]`
 returns the entire vector. Patch paths such as `[0]` address individual root
 vector elements; empty patch paths remain invalid.

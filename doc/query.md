@@ -72,6 +72,46 @@ collecting facilities and storage. Other range counts take advantage of the
 underlying KV storage's order statistics meta data to have O(log n) counting
 time.
 
+## Attributes without an AVE index
+
+New `:db.type/idoc` and `:db.type/vec` attributes default to `:db/noindex true`,
+unless they are unique or explicitly declare `:db/noindex false`. Other types
+participate in AVE by default. Declare `:db/noindex true` before storing values
+to omit an attribute from AVE. Its values remain in EAV and are available
+through `entity`, `pull`, and EAV datom reads. Full-text, vector, and document
+indexes retain their own schema settings.
+
+The inferred default is stored in the schema. Reopening a database or patching
+an existing attribute preserves its indexing policy, including schemas created
+before these defaults. Adding a type to an existing attribute does not change
+its AVE participation.
+
+Datalog patterns can read an unindexed attribute when the entity is bound by
+an input, a constant, or another clause. For example, the indexed name selects
+entities before their unindexed bodies are read from EAV:
+
+```clojure
+(d/q '[:find ?body
+       :in $ ?name
+       :where [?e :document/name ?name]
+              [?e :document/body ?body]]
+     db "notes")
+```
+
+This also works with `prepare-q`. Missing attributes produce no matching row,
+and cardinality-many attributes produce one match per value. An unindexed
+attribute cannot select entities by itself: `[?e :document/body "text"]`
+requires an entity binding or throws an error. Unique and reference attributes
+cannot have `:db/noindex true`.
+
+To search the attribute without an entity binding, call `(d/index-attr conn :document/body)`.
+This scans EAV and atomically adds its existing values to AVE and removes
+`:db/noindex` from the schema. Subsequent writes maintain AVE normally. The
+operation holds the database write transaction while building the index, works
+locally and remotely, and returns the updated schema. Calling it again is safe.
+Direct schema changes to `:db/noindex` require an empty attribute.
+
+
 ## Query Optimizations
 
 Datalevin query engine employs multiple optimization strategies.
@@ -1321,34 +1361,3 @@ database management system." SIGMOD. 1979.
 
 [15] Zhao, H., et al. "I Can’t Believe It’s Not Yannakakis: Pragmatic Bitmap
 Filters in Microsoft SQL Server.", CIDR, 2026.
-## Attributes without an AVE index
-
-Attributes participate in AVE by default. Declare `:db/noindex true` in an
-attribute's schema before storing its values to omit it from AVE. Its values
-remain in EAV and are available through `entity`, `pull`, and EAV datom reads.
-Full-text, vector, and document indexes retain their own schema settings.
-
-Datalog patterns can read an unindexed attribute when the entity is bound by
-an input, a constant, or another clause. For example, the indexed name selects
-entities before their unindexed bodies are read from EAV:
-
-```clojure
-(d/q '[:find ?body
-       :in $ ?name
-       :where [?e :document/name ?name]
-              [?e :document/body ?body]]
-     db "notes")
-```
-
-This also works with `prepare-q`. Missing attributes produce no matching row,
-and cardinality-many attributes produce one match per value. An unindexed
-attribute cannot select entities by itself: `[?e :document/body "text"]`
-requires an entity binding or throws an error. Unique and reference attributes
-cannot have `:db/noindex true`.
-
-To search the attribute without an entity binding, call `(d/index-attr conn :document/body)`.
-This scans EAV and atomically adds its existing values to AVE and removes
-`:db/noindex` from the schema. Subsequent writes maintain AVE normally. The
-operation holds the database write transaction while building the index, works
-locally and remotely, and returns the updated schema. Calling it again is safe.
-Direct schema changes to `:db/noindex` require an empty attribute.

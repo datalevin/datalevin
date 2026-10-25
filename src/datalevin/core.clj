@@ -1197,6 +1197,9 @@ Only usable for debug output.
        :doc      "Update the schema of an open connection to a Datalog db.
 
   * `schema-update` is a map from attribute keywords to property patches.
+  New `:db.type/idoc` and `:db.type/vec` attributes default to `:db/noindex true`
+  unless unique or explicitly declared with `:db/noindex false`. The default is
+  stored in the schema; existing attributes keep their indexing policy.
   `:db/noindex true` omits an attribute from AVE while retaining entity/pull
   access. Query conditions on it throw; [[index-attr]] enables indexing later.
   Unique and reference attributes cannot opt out. Changing `:db/noindex`

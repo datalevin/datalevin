@@ -879,7 +879,9 @@
 
 (defn not=
   "Negation of query equivalence, including byte content."
-  [& xs] (clojure.core/not (apply = xs)))
+  ([_] false)
+  ([x y] (clojure.core/not (QueryKey/equiv x y)))
+  ([x y & more] (clojure.core/not (apply = x y more))))
 
 (def != not=)
 

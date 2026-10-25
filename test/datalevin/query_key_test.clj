@@ -77,6 +77,18 @@
     (is (built-ins/= (wrap 1.0M) (wrap 1.00M)))
     (is (not (built-ins/not= (wrap 1.0M) (wrap 1.00M))))))
 
+(deftest inequality-arities-preserve-query-equivalence
+  (let [a (byte-array [1]) same (byte-array [1]) other (byte-array [2])]
+    (doseq [[args expected] [[[nil] false] [[a] false]
+                             [[1 1N] false] [[1.0M 1.00M] false]
+                             [[a same] false] [[a other] true]
+                             [[[a] [same]] false] [[nil false] true]
+                             [[a same a] false] [[a other a] true]
+                             [[nil nil nil nil] false]
+                             [["a" "a" "b"] true]]]
+      (is (= expected (apply built-ins/not= args))))
+    (is (thrown? clojure.lang.ArityException (built-ins/not=)))))
+
 (deftest ordered-keys-preserve-container-and-numeric-equality
   (let [leaves [nil (int 1) 1 1N 1.0 1.0M 1.00M -0.0 0.0
                 {:n 1.0M} {:n 1.00M} #{1} #{1N}]

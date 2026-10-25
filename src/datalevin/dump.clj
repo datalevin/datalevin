@@ -291,6 +291,22 @@
     (or opts {})
     legacy-ha-nil-sentinel-keys))
 
+(defn- restore-schema
+  "Preserve stored AVE participation when rebuilding existing attributes."
+  [old-schema schema]
+  (reduce-kv
+    (fn [result attr props]
+      (if (and (contains? old-schema attr)
+               (#{:db.type/idoc :db.type/vec} (:db/valueType props))
+               (not (contains? props :db/noindex)))
+        ;; Older schemas and index-attr represent an enabled AVE index by
+        ;; absence. Make that choice explicit before creating the new store.
+        (assoc result attr
+               (assoc props :db/noindex
+                      (true? (get-in old-schema [attr :db/noindex]))))
+        result))
+    (merge old-schema schema) (merge old-schema schema)))
+
 (defn- load-datalog-from-first*
   [dir read-form first-form schema opts stop?]
   (let [read-maps             #(if (:db/ident first-form)
@@ -298,7 +314,7 @@
                                  [first-form (read-form)])
         [old-opts old-schema] (read-maps)
         new-opts              (merge old-opts opts)
-        new-schema            (merge old-schema schema)
+        new-schema            (restore-schema old-schema schema)
         datoms                (->> (repeatedly read-form)
                                    (take-while #(and (not= ::EOF %)
                                                      (not (stop? %))))
@@ -389,7 +405,7 @@
            (let [[old-opts old-schema datoms] data
                  old-opts (normalize-legacy-ha-nil-sentinels old-opts)
                  new-opts (merge old-opts opts)
-                 new-schema (merge old-schema schema)
+                 new-schema (restore-schema old-schema schema)
                  db (db/init-db (for [d datoms] (load-datom new-schema d))
                                 dir new-schema new-opts)]
              (db/close-db db))))
@@ -409,7 +425,7 @@
                              [nil first-form] [first-form (read-form)])
                  [old-opts old-schema] (read-maps)
                  new-opts (merge old-opts opts)
-                 new-schema (merge old-schema schema)
+                 new-schema (restore-schema old-schema schema)
                  datoms (->> (repeatedly read-form)
                              (take-while #(not= ::EOF %))
                              (map #(load-datom new-schema %)))

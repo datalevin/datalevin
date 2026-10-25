@@ -189,8 +189,10 @@ Here is a simple Clojure code example using Datalevin:
 ;; repeating a completed deletion or rename is safe.
 ;; (d/update-schema conn {:name {:db/unique :db/retract}})
 
-;; All attributes are indexed by default. For values read only through entity
-;; access or pull, declare :db/noindex true before storing data to omit AVE:
+;; New idoc and vec attributes default to :db/noindex true, unless unique or
+;; explicitly declared with :db/noindex false. Existing attributes keep their
+;; indexing policy. Other types participate in AVE by default. For values read
+;; only through entity access or pull, declare :db/noindex true to omit AVE:
 ;; (d/update-schema conn {:document/body {:db/valueType :db.type/string
 ;;                                       :db/noindex true}})
 ;; Query conditions on that attribute throw an error. To enable them later,

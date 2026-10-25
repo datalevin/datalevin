@@ -49,6 +49,20 @@
     {}
     (or schema-update {})))
 
+(defn- default-attr-indexing
+  "Persist AVE defaults only for new document and vector attributes."
+  [old-schema schema-update]
+  (reduce-kv
+    (fn [updates attr props]
+      (if (and (not (contains? old-schema attr))
+               (not (vld/definition? props))
+               (#{:db.type/idoc :db.type/vec} (:db/valueType props))
+               (not (contains? props :db/noindex))
+               (not (:db/unique props)))
+        (assoc updates attr (assoc props :db/noindex true))
+        updates))
+    schema-update schema-update))
+
 (defn- infer-tuple-attr-types
   "Add typed tuple encoding to composite attributes whose schema only declares
   :db/tupleAttrs. Component types come from the source attributes. Attributes
@@ -78,7 +92,9 @@
   [old-schema schema-update]
   (vld/validate-schema-update schema-update)
   (let [prepared (infer-tuple-attr-types
-                   old-schema (apply-schema-patch old-schema schema-update))]
+                   old-schema
+                   (default-attr-indexing
+                     old-schema (apply-schema-patch old-schema schema-update)))]
     (doseq [[entry props] prepared]
       (vld/validate-schema-entry-transition entry (old-schema entry) props))
     prepared))

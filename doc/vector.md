@@ -198,6 +198,12 @@ Vectors can be stored in Datalog as attribute values of data type
 which vector search domains the attribute should participate. By default, each
 vector attribute is its own domain, with domain name the same as attribute name.
 
+New `:db.type/vec` attributes default to `:db/noindex true`. Vector similarity
+search and entity/pull reads remain available; AVE whole-value searches require
+an explicit `:db/noindex false` or a later call to `index-attr`. Unique
+attributes stay indexed. Existing attributes keep their indexing policy when
+the database is reopened or its schema is updated.
+
 A query function `vec-neighbors` is provided to allow vector search in Datalog
 queries. This function takes the DB, the query vector and an optional option map
 (same as `search-vec`), and returns a sequence of matching datoms in the form of
