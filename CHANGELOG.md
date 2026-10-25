@@ -3,13 +3,17 @@
 ## WIP
 
 ### Added
-- [Analytics] infrastructure to work with external data source over virtual
-  relation.
+- [Federation] infrastructure to work with external data sources. Concrete
+  implementation of adapters for external data live in
+  [federation](https://github.com/datalevin/federation) project.
 - [Search] fuzzy/prefix fulltext search
   [#314](https://github.com/datalevin/datalevin/issues/314).
 ### Fixed
-- [Datalog] A re-index bug [#353](https://github.com/datalevin/datalevin/issues/353).
+- [Datalog] A re-index bug
+  [#353](https://github.com/datalevin/datalevin/issues/353).
+- [Lib] JS `unlistenDb` removes subscription key.
 ### Improved
+- [Datalog] Reduce native query result-key overhead and batch bound-entity reads.
 - [Buffer] Allocate large (> 1 MiB) direct memory buffers on demand and release
   them after idle budget (time and space).
 

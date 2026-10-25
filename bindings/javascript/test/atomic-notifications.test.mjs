@@ -6,6 +6,7 @@ import path from "node:path";
 import { after, before, test } from "node:test";
 
 import { connect, listenDb, openKv, q, unlistenDb, updateKv } from "../src/index.js";
+import { javaBridgeModule } from "../src/jvm.js";
 import { clojureCliAvailable, runtimeAvailable, startLiveServer } from "../test-support/live-server.mjs";
 
 const runtime = runtimeAvailable();
@@ -59,6 +60,39 @@ test("atomic KV updates use callbacks, source, extra arguments, and transaction 
   } finally {
     await kv.close();
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("generated database subscription keys stop their polling threads", {
+  skip: !integration, timeout: 30000
+}, async () => {
+  const name = `js-unlisten-${randomUUID()}`;
+  const conn = await connect(server.databaseUri(name));
+  try {
+    const key = await conn.listenDb(() => {});
+    const otherKey = await listenDb(conn, () => {}, null);
+    assert.equal(typeof key, "string");
+    assert.equal(typeof otherKey, "string");
+    assert.notEqual(key, otherKey);
+
+    const { importClass } = await javaBridgeModule();
+    const Thread = importClass("java.lang.Thread");
+    const threads = Thread.getAllStackTracesSync().keySetSync().toArraySync()
+      .filter(thread => thread.getNameSync() === `datalevin-db-listener-${name}`);
+    assert.equal(threads.length, 2);
+    const liveThreads = () => threads.filter(thread => thread.isAliveSync()).length;
+
+    await conn.unlistenDb(key);
+    assert.equal(conn._dbListenerProxies.has(key), false);
+    assert.equal(conn._dbListenerProxies.has(otherKey), true);
+    // Proxy removal alone would also pass when the UUID key fails to round-trip.
+    assert.equal(liveThreads(), 1, "unlistenDb must stop the matching polling thread");
+    await unlistenDb(conn, otherKey);
+    assert.equal(conn._dbListenerProxies.size, 0);
+    assert.equal(liveThreads(), 0, "all subscriptions must stop before connection closure");
+    await conn.unlistenDb(key);
+  } finally {
+    await conn.close();
   }
 });
 

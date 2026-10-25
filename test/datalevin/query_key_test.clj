@@ -1,16 +1,21 @@
 (ns datalevin.query-key-test
   (:require [clojure.test :refer [deftest is]]
+            [clojure.edn :as edn]
+            [clojure.java.io :as io]
             [datalevin.built-ins :as built-ins]
             [datalevin.core :as d]
+            [datalevin.query :as query]
             [datalevin.query.source.fake :as fake]
             [datalevin.query.source-test :refer [row-info]]
             [datalevin.query.source.control :as control]
             [datalevin.query.source.runtime :as rt]
             [datalevin.query.source.value :as value]
             [datalevin.rules.relation :as rule-relation]
-            [datalevin.relation :as relation])
+            [datalevin.relation :as relation]
+            [datalevin.util :as u])
   (:import [datalevin.utl QueryKey QueryKey$KeyMap QueryKey$KeySet]
-           [java.util AbstractList Arrays Objects Random]
+           [java.io ByteArrayInputStream ObjectInputStream]
+           [java.util AbstractList Arrays Base64 Map Objects Random Set]
            [org.eclipse.collections.impl.list.mutable FastList]))
 
 (deftest binary-keys-share-equality-hash-and-lookup
@@ -72,6 +77,23 @@
     (is (built-ins/= (wrap 1.0M) (wrap 1.00M)))
     (is (not (built-ins/not= (wrap 1.0M) (wrap 1.00M))))))
 
+(deftest ordered-keys-preserve-container-and-numeric-equality
+  (let [leaves [nil (int 1) 1 1N 1.0 1.0M 1.00M -0.0 0.0
+                {:n 1.0M} {:n 1.00M} #{1} #{1N}]
+        containers [vector list #(subvec [:prefix % :suffix] 1 2)
+                    #(vector (list %)) #(list (vector %))]]
+    (doseq [wrap-left containers wrap-right containers x leaves y leaves
+            :let [left (wrap-left x) right (wrap-right y)]]
+      (is (= (Objects/equals left right) (QueryKey/equals left right)))
+      (is (= (= left right) (QueryKey/equiv left right))))))
+
+(deftest tuple-byte-inspection-keeps-nested-and-opaque-values
+  (let [tuples (FastList. [(object-array [1 "ordinary"])
+                          (object-array [2 {:nested [(byte-array [3])]}])])]
+    (is (QueryKey/tuplesContainBytes tuples))
+    (is (not (QueryKey/tuplesContainBytes
+               (FastList. [(object-array [1 [2 {:n 3}]])]))))))
+
 (deftest unordered-key-workspace-is-bounded-and-released
   (let [x (into {} (map #(vector % (byte-array [1 2]))) (range 100))
         y (value/owned-copy x)
@@ -91,6 +113,36 @@
               (control/cancel! control {:error :query-source/cancelled})
               (QueryKey/hash x)))))
     (is (QueryKey/equals x y))))
+
+(deftest key-budgets-remain-thread-local-through-nested-runtime-exits
+  (let [ready (promise)
+        proceed (promise)
+        hash-error (promise)
+        worker (future
+                 (try
+                   (rt/with-runtime {}
+                     (fn [{:keys [control]}]
+                       (control/cancel! control {:error :query-source/cancelled})
+                       (deliver ready true)
+                       @proceed
+                       (deliver hash-error
+                         (try (QueryKey/hash [1 2])
+                              (catch clojure.lang.ExceptionInfo e
+                                (:error (ex-data e)))))))
+                   (catch clojure.lang.ExceptionInfo e
+                     (:error (ex-data e)))))]
+    (try
+      @ready
+      (rt/with-runtime {}
+        (fn [_]
+          (rt/with-runtime {} (fn [_] (is (QueryKey/equals [1] '(1)))))
+          (is (QueryKey/equals [1] '(1)))))
+      ;; Clearing this thread's nested budgets must not disable the worker's
+      ;; cancellation check, or apply its cancelled budget to this thread.
+      (is (= (Objects/hashCode [1 2]) (QueryKey/hash [1 2])))
+      (finally (deliver proceed true)))
+    (is (= :query-source/cancelled @worker))
+    (is (= :query-source/cancelled @hash-error))))
 
 (deftest custom-collection-equality-remains-opaque
   (let [make-value (fn [data]
@@ -126,6 +178,59 @@
     (is (= #{[:first 1] [:second 2]} (set (for [[k v] m] [k v]))))
     (is (= #{:first :second} (set (keys m))))
     (is (= #{1 2} (set (vals m))))))
+
+(deftest serialized-key-containers-retain-strategy-compatibility
+  ;; Recorded before the class cache was introduced. Adding helper classes
+  ;; must not change the serialized names of the existing hashing strategies.
+  (let [fixtures (edn/read-string
+                   (slurp (io/resource "data/query-key-serialization.edn")))
+        key [:binary (byte-array [1 2])]]
+    (doseq [[kind encoded] fixtures]
+      (with-open [input (ObjectInputStream.
+                          (ByteArrayInputStream.
+                            (.decode (Base64/getDecoder) ^String encoded)))]
+        (let [container (.readObject input)]
+          (if (= kind :map)
+            (is (= :found (.get ^Map container key)))
+            (is (.contains ^Set container key))))))))
+
+(deftest typed-native-probes-preserve-bound-key-types
+  (let [dir (u/tmp-dir (str "typed-key-probes-" (random-uuid)))
+        conn (d/create-conn dir
+               {:item/value {:db/valueType :db.type/long}
+                :item/ref {:db/valueType :db.type/ref}
+                :item/flag {:db/valueType :db.type/boolean}}
+               {:kv-opts {:wal? false}})
+        entities (vec (range 1 1025))]
+    (try
+      (d/transact! conn (mapv (fn [e] {:db/id e :item/value e
+                                      :item/ref (inc (mod e 1024))
+                                      :item/flag (even? e)}) entities))
+      (binding [query/*cache?* false]
+        (doseq [attr [:item/value :item/ref :item/flag]
+                size [255 256 1024]
+                :let [facts (mapv (fn [datom] [(:e datom) (:a datom) (:v datom)])
+                                  (d/datoms @conn :ave attr))
+                      q {:find '[?e ?v] :in '[$ [?e ...]]
+                         :where [['?e attr '?v]]}
+                      domain (subvec entities 0 size)]]
+          (is (= (d/q q facts domain) (d/q q @conn domain))))
+        (doseq [[attr values] [[:item/value [1 (int 1) 1N 1024 1025]]
+                              [:item/ref [1 (int 1) 1N 1024 1025]]
+                              [:item/flag [false true]]]
+                value values
+                :let [facts (mapv (fn [datom] [(:e datom) (:a datom) (:v datom)])
+                                  (d/datoms @conn :ave attr))
+                      scalar {:find '[?e] :in '[$ [?e ...] ?v]
+                              :where [['?e attr '?v]]}
+                      multiple {:find '[?e ?tag] :in '[$ [[?v ?tag]]]
+                                :where [['?e attr '?v]]}
+                      input [[value :first] [value :second]]]]
+          (is (= (d/q scalar facts entities value)
+                 (d/q scalar @conn entities value)))
+          (is (= (d/q multiple facts input)
+                 (d/q multiple @conn input)))))
+      (finally (d/close conn) (u/delete-files dir)))))
 
 (deftest rule-constants-use-byte-aware-equality-at-every-head-position
   (let [a (byte-array [1 2]) b (byte-array [1 2])

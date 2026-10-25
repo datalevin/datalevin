@@ -148,6 +148,10 @@ documentation](https://cljdoc.org/d/datalevin/datalevin) and
 [JavaDoc](https://javadoc.io/doc/org.datalevin/datalevin-java/latest/datalevin/package-summary.html)
 for API details.
 
+For source integration development, see the
+[federation adapter guide](../federation/doc/adapter-development.md), covering the current
+embedded query-source SPI, mapping examples, and adapter validation.
+
 ## :tada: Quick Examples
 
 Datalevin is aimed to be a versatile database.

@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import {
   toEdnForm,
   toJava,
@@ -324,9 +326,11 @@ export class Connection extends ResourceWrapper {
     const proxy = await createConsumerProxy(callback);
     let registeredKey;
     try {
-      registeredKey = hasValue(key)
-        ? await toJsResult(await _BINDINGS.connectionListenDb(this.rawHandle(), key, proxy), { bridge: true })
-        : await toJsResult(await _BINDINGS.connectionListenDb(this.rawHandle(), proxy), { bridge: true });
+      // Generate string keys here so unlistenDb receives the same type as registration.
+      registeredKey = await toJsResult(
+        await _BINDINGS.connectionListenDb(this.rawHandle(), key ?? randomUUID(), proxy),
+        { bridge: true }
+      );
     } catch (error) {
       proxy.reset?.();
       throw error;

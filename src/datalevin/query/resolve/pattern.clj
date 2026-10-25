@@ -113,11 +113,10 @@
 
 (def ^:const ^long multi-lookup-safety-limit 1000000)
 
-;; Match the storage scan's target chunk size. Below this point individual
-;; probes avoid sorting and projecting an input batch; at and above it one EAV
-;; merge scan can also use the storage layer's CPU-aware parallel chunking.
+;; Amortize cursor setup over medium and large entity domains. Smaller domains
+;; still use point probes to avoid sorting and projecting an input batch.
 
-(def ^:const ^long merged-eav-lookup-threshold 4000)
+(def ^:const ^long merged-eav-lookup-threshold 256)
 
 (defn- estimate-multi-lookup-output
   ^long [^long bound-count ^long scan-count]
@@ -220,22 +219,40 @@
 
     :else (db/-search database pattern)))
 
+(defn- exact-index-key?
+  "Whether an indexed probe preserves this bound key without decoding it.
+  Keep representation-sensitive and generic values on the checked path."
+  [value-type value]
+  (case value-type
+    (:db.type/long :db.type/ref) (instance? Long value)
+    :db.type/boolean (instance? Boolean value)
+    false))
+
 (defn- lookup-pattern-multi-value
   "Perform multiple AV lookups for bound value variable.
    More efficient than full table scan when value is bound to multiple values.
    Returns tuples in format [e v] or [e] depending on pattern."
   [db pattern value-set e-is-var?]
   (let [[_ a _]   pattern
-        ref-attr? (and (keyword? a) (db/ref? db a))
+        value-type (get-in (db/-schema db) [a :db/valueType])
+        ref-attr? (identical? :db.type/ref value-type)
+        native?   (not (db/pending-tx-cache? db))
         acc       (FastList.)]
     (doseq [v value-set]
       (when-some [v' (if (and ref-attr?
                               (or (qu/lookup-ref? v) (keyword? v)))
                        (db/entid db v)
                        v)]
-        (doseq [datom (key-candidates db [nil a v'])
-                :when (QueryKey/equals v' (:v datom))]
-          (.add acc (object-array (if e-is-var? [(:e datom) v] [v]))))))
+        (if (and native? (exact-index-key? value-type v'))
+          (let [^List tuples (db/-search-tuples db [nil a v'])]
+            (dotimes [i (.size tuples)]
+              (.add acc (object-array
+                          (if e-is-var?
+                            [(aget ^objects (.get tuples i) 0) v]
+                            [v])))))
+          (doseq [datom (key-candidates db [nil a v'])
+                  :when (QueryKey/equals v' (:v datom))]
+            (.add acc (object-array (if e-is-var? [(:e datom) v] [v])))))))
     acc))
 
 (defn- resolve-value-pairs
@@ -426,19 +443,45 @@
   An index can normalize a bound value (for example signed floating zero);
   removing its column without checking would lose the binding's equality."
   [context database pattern search-pattern entity-values value]
-  (let [[_ _ resolved-value] search-pattern
+  (let [[_ attr resolved-value] search-pattern
         original-entity (first pattern)
         bound-entity (substitute-constant context original-entity)
         entities (if entity-values
                    (resolve-entity-pairs database entity-values)
                    [[bound-entity (first search-pattern)]])
-        rows (for [[original eid] entities
-                   datom (key-candidates database (assoc search-pattern 0 eid))
-                   :when (QueryKey/equals resolved-value (:v datom))]
-               [(if (some? original) original (:e datom))
-                (:a datom) value])]
+        exact? (and (not (db/pending-tx-cache? database))
+                    (exact-index-key?
+                      (get-in (db/-schema database) [attr :db/valueType])
+                      resolved-value))
+        rows (FastList.)]
+    (if (and entity-values (keyword? attr)
+             (not (db/pending-tx-cache? database)))
+      ;; A scalar value is a one-element domain. Retain the bounded-side cost
+      ;; choice instead of issuing one EAV probe for every input entity.
+      (let [^List tuples ((if (get-in (db/-schema database) [attr :db/noindex])
+                           lookup-pattern-domain-filtered-entity
+                           lookup-pattern-bounded-both)
+                         database [original-entity attr (nth pattern 2)]
+                         entity-values [value])]
+        (dotimes [i (.size tuples)]
+          (let [^objects tuple (.get tuples i)]
+            (.add rows (object-array [(aget tuple 0) attr (aget tuple 1)])))))
+      (doseq [[original eid] entities]
+        (if exact?
+          (when-let [^List tuples
+                     (db/-search-tuples database (assoc search-pattern 0 eid))]
+            (dotimes [i (.size tuples)]
+              (.add rows (object-array
+                           [(if (some? original) original
+                                (aget ^objects (.get tuples i) 0))
+                            attr value]))))
+          (doseq [datom (key-candidates database (assoc search-pattern 0 eid))
+                  :when (QueryKey/equals resolved-value (:v datom))]
+            (.add rows (object-array
+                         [(if (some? original) original (:e datom))
+                          (:a datom) value]))))))
     (r/relation! (into {} (keep-indexed #(when (qu/binding-var? %2) [%2 %1])) pattern)
-                 (u/map-fl to-array rows))))
+                 rows)))
 
 (defn lookup-pattern-db
   [context db pattern]

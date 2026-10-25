@@ -569,8 +569,8 @@
     ;; Keep existing in-memory keys in memory. Once a disk portion exists,
     ;; new keys stay there even when pressure falls, so equal keys cannot
     ;; acquire separate entries in the two portions.
-    (if (or (.containsKey memory k)
-            (and (nil? @disk) (< ^long @memory-pressure spill-threshold)))
+    (if (or (and (nil? @disk) (< ^long @memory-pressure spill-threshold))
+            (.containsKey memory k))
       (.put memory k v)
       (do
         (when (nil? @disk) (.spill this))

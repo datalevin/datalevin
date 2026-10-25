@@ -1,6 +1,7 @@
 # Query-source SPI
 
-Status: initial F0–F3 workflow and native performance gate signed off (2026-10-24)
+Status: initial F0–F3 workflow signed off; broader native query performance
+follow-up open (2026-10-24)
 
 Public `q`/`explain` and the companion mapping compiler/local adapter now use the
 v2 contract in §10, with no version fallback. The earlier envelopes in §§2–9
@@ -8,10 +9,14 @@ are historical. See [current migration status](../spi-v2-cleanup.md#implementati
 for the original migration checks and the
 [final signoff report](measurements/federation-signoff-2026-10-24.md) for the
 current advertised-path scope, validation and native-performance verdict.
+The [query regression sweep](measurements/query-regression-sweep-2026-10-24.md)
+finds release-to-current regressions on larger workloads beyond the original
+64-row gate. Native performance work remains open.
 Later preparation notes record the stages preceding activation.
 
 Release placement: [roadmap source milestones](../roadmap.md#source-milestones); embedded JVM execution  
 Public namespace: `datalevin.query.source`  
+Implementation guide: [developing federation adapters](../../federation/doc/adapter-development.md)  
 Optional contracts: [extensions appendix](query-source-extensions.md)  
 Related plans: [companion federation design](../../federation/federation.md),
 [analytics](../analytics.md)

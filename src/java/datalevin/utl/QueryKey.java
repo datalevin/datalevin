@@ -2,6 +2,7 @@ package datalevin.utl;
 
 import clojure.lang.IRecord;
 import clojure.lang.Murmur3;
+import clojure.lang.PersistentVector;
 import clojure.lang.Util;
 import org.eclipse.collections.api.block.HashingStrategy;
 import org.eclipse.collections.impl.map.strategy.mutable.UnifiedMapWithHashingStrategy;
@@ -15,6 +16,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Query key semantics shared by native and source execution. Byte arrays are
@@ -37,24 +39,48 @@ public final class QueryKey {
     }
 
     private static final ThreadLocal<Budget> BUDGET = new ThreadLocal<>();
+    // Native queries normally have no accounting context. Avoid a ThreadLocal
+    // lookup on every hash collision when no thread has installed a budget.
+    // Count owners, not nesting: replacing/restoring a budget keeps ownership.
+    private static final AtomicInteger BUDGET_OWNERS = new AtomicInteger();
 
     public static Budget setBudget(Budget budget) {
         Budget previous = BUDGET.get();
-        if (budget == null) BUDGET.remove(); else BUDGET.set(budget);
+        if (budget == null) {
+            BUDGET.remove();
+            if (previous != null) BUDGET_OWNERS.decrementAndGet();
+        } else {
+            if (previous == null) BUDGET_OWNERS.incrementAndGet();
+            BUDGET.set(budget);
+        }
         return previous;
     }
 
     private static void check() {
+        if (BUDGET_OWNERS.get() == 0) return;
         Budget budget = BUDGET.get();
         if (budget != null) budget.check();
     }
 
+    // A named class keeps the serialized identities of the existing anonymous
+    // hashing strategies stable (QueryKey$1 and QueryKey$2).
+    private static final class StructuralCollection extends ClassValue<Boolean> {
+        @Override protected Boolean computeValue(Class<?> type) {
+            return !IRecord.class.isAssignableFrom(type)
+                    && type.getName().startsWith("clojure.lang.");
+        }
+    }
+
+    private static final ClassValue<Boolean> STRUCTURAL_COLLECTION = new StructuralCollection();
+
     private static boolean collection(Object value) {
         // User collection classes can define nominal equality, just like
         // records. Only the standard portable Clojure containers are structural.
-        return !(value instanceof IRecord)
-                && (value instanceof List<?> || value instanceof Map<?, ?> || value instanceof Set<?>)
-                && value.getClass().getName().startsWith("clojure.lang.");
+        if (value instanceof List<?> || value instanceof Map<?, ?> || value instanceof Set<?>) {
+            Class<?> type = value.getClass();
+            return type == PersistentVector.class || STRUCTURAL_COLLECTION.get(type);
+        }
+        return false;
     }
 
     public static boolean containsBytes(Object value) {
@@ -68,6 +94,16 @@ public final class QueryKey {
         } else if (value instanceof List<?> || value instanceof Set<?>) {
             for (Object child : (Iterable<?>) value) {
                 if (containsBytes(child)) return true;
+            }
+        }
+        return false;
+    }
+
+    /** Inspect engine tuples without allocating a sequence for each row. */
+    public static boolean tuplesContainBytes(List<Object[]> tuples) {
+        for (Object[] tuple : tuples) {
+            for (Object value : tuple) {
+                if (containsBytes(value)) return true;
             }
         }
         return false;
@@ -110,6 +146,11 @@ public final class QueryKey {
     private static boolean equal(Object left, Object right, boolean equiv) {
         if (left == right) return true;
         if (left == null || right == null) return false;
+        // Entity ids dominate native tuple keys. Keep their comparison
+        // monomorphic even when the same index also sees other key types.
+        if (left instanceof Long a && right instanceof Long b) {
+            return a.longValue() == b.longValue();
+        }
         if (!(left instanceof byte[]) && !(right instanceof byte[])
                 && (!collection(left) || !collection(right))) {
             return equiv ? Util.equiv(left, right) : Objects.equals(left, right);
@@ -119,12 +160,9 @@ public final class QueryKey {
             return right instanceof byte[] b && Arrays.equals(a, b);
         }
         if (right instanceof byte[]) return false;
-        // Preserve the existing semantics of opaque values and collections
-        // without bytes, including records with user-defined equality.
-        if (left instanceof IRecord || right instanceof IRecord
-                || (!containsBytes(left) && !containsBytes(right))) {
-            return equiv ? Util.equiv(left, right) : Objects.equals(left, right);
-        }
+        // Ordered collections can compare each child once. Pre-scanning both
+        // lists for bytes doubles traversal and magnifies hash collisions in
+        // native result sets. Opaque children still take their own equality.
         if (left instanceof List<?> a && right instanceof List<?> b) {
             if (a.size() != b.size()) return false;
             Iterator<?> ai = a.iterator(), bi = b.iterator();
@@ -132,6 +170,12 @@ public final class QueryKey {
                 if (!equal(ai.next(), bi.next(), equiv)) return false;
             }
             return true;
+        }
+        // Preserve the existing semantics of opaque values and collections
+        // without bytes, including records with user-defined equality.
+        if (left instanceof IRecord || right instanceof IRecord
+                || (!containsBytes(left) && !containsBytes(right))) {
+            return equiv ? Util.equiv(left, right) : Objects.equals(left, right);
         }
         if (left instanceof Map<?, ?> a && right instanceof Map<?, ?> b) {
             if (a.size() != b.size()) return false;

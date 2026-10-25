@@ -73,13 +73,12 @@
         materialization-bytes
         (when index-bytes
           (+ (long index-bytes) (* 32 (long size))))
-        ;; UniqueVectorSet uses Clojure hashes. Binary results require the
-        ;; shared content-key set, including membership after serialization.
-        binary? (some (fn [^objects tuple]
-                        (some #(QueryKey/containsBytes %) tuple)) tuples)
-        direct? (and (not binary?) (<= size unique-vector-set-max-size)
+        ;; Inspect values only when the direct index fits. Binary results need
+        ;; the shared content-key set, including membership after serialization.
+        direct? (and (<= size unique-vector-set-max-size)
                      materialization-bytes
-                     (>= headroom (* 2 (long materialization-bytes))))]
+                     (>= headroom (* 2 (long materialization-bytes)))
+                     (not (QueryKey/tuplesContainBytes tuples)))]
     (if direct?
       (UniqueVectorSet/fromUniqueTuples tuples)
       (spillable-result-set tuples))))
