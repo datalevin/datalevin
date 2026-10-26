@@ -162,6 +162,9 @@ accepted for compatibility but has no effect.
 
 Exhausted transaction capacity and expired write-access waits return
 `:error :server/busy` with `:retryable? true` before the operation executes.
+The client automatically retries these responses, including without HA, with
+exponential backoff from 25 ms up to 200 ms. Retries share the request's
+`:time-out` budget and release the pooled connection between attempts.
 Other connections, including transaction commit and abort, continue independently.
 
 ## Database change notifications
@@ -239,7 +242,8 @@ Example:
 
 * `:pool-size` (default `3`): max pooled connections per client instance.
 * `:time-out` (default `60000` ms): time allowed for one request, including
-  connection setup and automatic recovery. Recovery does not restart this timeout.
+  connection setup, automatic recovery and retries of retryable `:server/busy`
+  responses. Recovery and retries do not restart this timeout.
 * `:ha-write-retry-timeout-ms` (default `min(:time-out, 17000)` with current HA
   defaults): extra wall clock budget for retryable HA write failover after an
   endpoint rejects a write because leadership changed. The default is derived

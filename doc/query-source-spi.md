@@ -1,7 +1,7 @@
 # Query-source SPI
 
-Status: initial F0–F3 workflow signed off; broader native query performance
-follow-up open (2026-10-24)
+Status: initial F0–F3 workflow signed off; native performance fixes implemented,
+with residual regression investigation open (2026-10-25)
 
 Public `q`/`explain` and the companion mapping compiler/local adapter now use the
 v2 contract in §10, with no version fallback. The earlier envelopes in §§2–9
@@ -11,7 +11,9 @@ for the original migration checks and the
 current advertised-path scope, validation and native-performance verdict.
 The [query regression sweep](measurements/query-regression-sweep-2026-10-24.md)
 finds release-to-current regressions on larger workloads beyond the original
-64-row gate. Native performance work remains open.
+64-row gate. The [regression fixes and validation](measurements/query-regression-fixes-2026-10-25.md)
+record the optimizations, complete follow-up matrix, final-build checks, and
+remaining performance limits. TPC-H is excluded pending query validation.
 Later preparation notes record the stages preceding activation.
 
 Release placement: [roadmap source milestones](../roadmap.md#source-milestones); embedded JVM execution  
@@ -1645,12 +1647,12 @@ decoding contract, even when that variable is not returned.
 
 Native scans with an unbound entity use the indexed attribute's AVE prefix,
 visiting only its datoms. Bound entities use EAV with both the entity key and
-attribute duplicate range restricted. For `:db/noindex`, an unbound scan visits
-entity keys and seeks that attribute's duplicates, checking cancellation between
-entities even when the attribute has no facts. Missing attributes open no
-cursors. Prefix bounds use the pinned schema's attribute ID without invoking
-value codecs, and include all giant/custom variants. The unindexed fallback
-still scales with the number of entities, since it has no AVE entries.
+attribute duplicate range restricted. A `:db/noindex` pattern requires a bound
+entity, including when it appears inside a rule or union. A bound value or value
+predicate cannot make it a starting access. If no clause or query input supplies
+the entity, planning rejects the query before opening providers. Missing
+attributes open no cursors. Prefix bounds use the pinned schema's attribute ID
+without invoking value codecs, and include all giant/custom variants.
 
 Native constants and scalar/flat-tuple input bindings also restrict value
 candidates for booleans, longs/references, floats/doubles except NaN, UUIDs,

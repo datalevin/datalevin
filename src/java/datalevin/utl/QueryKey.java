@@ -5,8 +5,10 @@ import clojure.lang.Murmur3;
 import clojure.lang.PersistentVector;
 import clojure.lang.Util;
 import org.eclipse.collections.api.block.HashingStrategy;
+import org.eclipse.collections.api.iterator.LongIterator;
 import org.eclipse.collections.impl.map.strategy.mutable.UnifiedMapWithHashingStrategy;
 import org.eclipse.collections.impl.set.strategy.mutable.UnifiedSetWithHashingStrategy;
+import org.eclipse.collections.impl.set.mutable.primitive.LongHashSet;
 
 import java.util.Arrays;
 import java.util.AbstractMap;
@@ -307,6 +309,37 @@ public final class QueryKey {
         @Override public Set<Entry<Object, Object>> entrySet() { return entries.entrySet(); }
         @Override public Set<Object> keySet() { return entries.keySet(); }
         @Override public Collection<Object> values() { return entries.values(); }
+    }
+
+    /**
+     * Invocation-local distinct-key tracking with a primitive path for long
+     * entity ids. Other values promote once to the shared content-key set.
+     */
+    public static final class KeyAccumulator {
+        private LongHashSet longs = new LongHashSet();
+        private KeySet general;
+
+        private KeySet general() {
+            if (general == null) {
+                general = new KeySet(longs.size());
+                LongIterator keys = longs.longIterator();
+                while (keys.hasNext()) general.add(keys.next());
+                longs = null;
+            }
+            return general;
+        }
+
+        public int size() { return general == null ? longs.size() : general.size(); }
+
+        public boolean add(Object key) {
+            if (general == null && key instanceof Long number) return longs.add(number.longValue());
+            return general().add(key);
+        }
+
+        public boolean contains(Object key) {
+            if (general == null && key instanceof Long number) return longs.contains(number.longValue());
+            return general().contains(key);
+        }
     }
 
     public static final class KeySet extends UnifiedSetWithHashingStrategy<Object> {

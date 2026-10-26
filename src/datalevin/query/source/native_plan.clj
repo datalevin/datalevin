@@ -48,8 +48,14 @@
                    (or (instance? Variable v) (instance? Constant v) (instance? Placeholder v))) (unsupported!))
     (let [attribute (:value attribute)
           _ (when (instance? Constant entity) (constant-entity (:value entity)))
+          unindexed? (get-in snapshot [:schema attribute :db/noindex])
+          _ (when (and unindexed? (instance? Placeholder entity)) (unsupported!))
           type (when-not (instance? Placeholder v) (native/logical-type! snapshot attribute))]
-      {:requires []
+      ;; A value bound is not an access path without AVE. Require an actual
+      ;; entity supplier so scheduling cannot start with an unindexed scan.
+      {:requires (if (and unindexed? (instance? Variable entity))
+                   [{:variable (:symbol entity) :type :data :nullable? true}]
+                   [])
        :value-type type
        :constant-constraints (mapv (fn [[variable i]]
                                      {:variable variable :type (case i 0 :long 1 :keyword 2 type) :nullable? false})
@@ -253,7 +259,8 @@
                     (ensure! (= output-cols (mapv key (sort-by val (:attrs result)))))
                     (:tuples result)))))))))
       ;; An independent mapped producer can bound this read before decoding.
-      ;; These are optional keys, never invented required inputs or seeds.
+      ;; These preferences never supply bindings; spec! requires the entity
+      ;; independently for unindexed attributes.
       :binding-bound? (or (instance? Constant e) (instance? Constant v) (seq constraints))
       :binding-enumerate? (get-in snapshot [:schema (:value attribute) :db/noindex])
       :binding-inputs (when (get-in snapshot [:schema (:value attribute)])

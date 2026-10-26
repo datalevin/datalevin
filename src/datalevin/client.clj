@@ -901,6 +901,20 @@
                                   :indeterminate? true})
                       e)))))
 
+(defn- retryable-server-busy?
+  [{:keys [type err-data]}]
+  (and (= type :error-response)
+       (= :server/busy (:error err-data))
+       (true? (:retryable? err-data))))
+
+(defn- wait-server-busy-retry
+  "Back off after releasing the connection, within the existing request budget."
+  ^long [^long delay-ms]
+  (cr/check! :server-busy)
+  (Thread/sleep (min delay-ms (cr/remaining-ms delay-ms)))
+  (cr/check! :server-busy)
+  (min 200 (* 2 delay-ms)))
+
 (deftype ^:no-doc Client [username password host port pool-size time-out
                           ^:volatile-mutable ^UUID id
                           ^:volatile-mutable ^ConnectionPool pool
@@ -930,7 +944,7 @@
   (requestBound [client req]
     (let [success? (volatile! false)
           read?    (and (not (:writing? req)) (cmd/read-only? (:type req)))]
-      (loop []
+      (loop [busy-delay-ms 25]
         (cr/check! :request)
         (let [^ConnectionPool pool' (.-pool ^Client client)
               ;; A read can retry after EOF; mutations still probe idle
@@ -1002,9 +1016,17 @@
                                      res)]
           (when (= :command-complete (:type res)) (cr/response! req res))
           ;; The deadline limits retries, not an already completed response.
-          (if @success?
+          (cond
+            (retryable-server-busy? res')
+            (do
+              (vreset! success? false)
+              (recur (wait-server-busy-retry busy-delay-ms)))
+
+            @success?
             res'
-            (do (cr/check! :retry) (recur)))))))
+
+            :else
+            (do (cr/check! :retry) (recur busy-delay-ms)))))))
 
   IClient
   (request [client req]
@@ -1022,7 +1044,7 @@
                          (cr/register-request! req)
                          (binding [nv/*wire-reader* (or (request-native-reader client req)
                                                         nv/*wire-reader*)]
-                           (loop []
+                           (loop [busy-delay-ms 25]
                              (cr/check! :copy-in)
                              (let [pool' (.-pool ^Client client)
                                    conn (try (get-connection pool')
@@ -1051,15 +1073,21 @@
                                          (cleanup-after-failure! e #(close conn))
                                          (throw e))
                                        (finally (release-connection pool' conn))))]
-                               (if (and conn (not (::retry-unexecuted? result)))
+                               (cond
+                                 (retryable-server-busy? result)
+                                 (recur (wait-server-busy-retry busy-delay-ms))
+
+                                 (and conn (not (::retry-unexecuted? result)))
                                  result
+
+                                 :else
                                  (do
                                    (cr/check! :retry)
                                    (case (:type result)
                                      :reconnect (.renewSession client pool' (cr/deadline))
                                      :reopen (open-database client (:db-name result) (:db-type result))
                                      nil)
-                                   (recur)))))))))
+                                   (recur busy-delay-ms)))))))))
 
   (disconnect [client]
     (disconnect-client! client true))
@@ -1382,7 +1410,8 @@
   * `:pool-size` determines number of connections maintained in the connection
   pool, default is 3.
   * `:time-out` bounds request transport and coordination waits, default 60000 ms.
-  Checkout, registration, renewal and reopening share its remaining budget.
+  Checkout, registration, renewal, reopening and retries of retryable
+  `:server/busy` responses share its remaining budget, including without HA.
   Synchronous DNS and codec callbacks cannot be preempted, but their elapsed time
   consumes the budget and an overrun prevents further network work.
   * `:wire-compression` selects `:none` (default) or `:zstd`, in both directions.
@@ -2561,7 +2590,8 @@
 (defn ^:no-doc normal-request
   "Send a command, routing mutations by command properties. `writing?` only
   selects an existing transaction on the server; it is preserved on the wire.
-  Mutations are retried on explicit HA rejection, never as transport-failed reads."
+  Mutations are retried on explicit retryable HA or server-busy rejection,
+  never as transport-failed reads."
   ([client call args]
    (normal-request client call args false))
   ([client call args writing?]

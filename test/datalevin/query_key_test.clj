@@ -5,6 +5,7 @@
             [datalevin.built-ins :as built-ins]
             [datalevin.core :as d]
             [datalevin.query :as query]
+            [datalevin.query-util :as qu]
             [datalevin.query.source.fake :as fake]
             [datalevin.query.source-test :refer [row-info]]
             [datalevin.query.source.control :as control]
@@ -13,7 +14,7 @@
             [datalevin.rules.relation :as rule-relation]
             [datalevin.relation :as relation]
             [datalevin.util :as u])
-  (:import [datalevin.utl QueryKey QueryKey$KeyMap QueryKey$KeySet]
+  (:import [datalevin.utl QueryKey QueryKey$KeyMap QueryKey$KeySet QueryKey$KeyAccumulator]
            [java.io ByteArrayInputStream ObjectInputStream]
            [java.util AbstractList Arrays Base64 Map Objects Random Set]
            [org.eclipse.collections.impl.list.mutable FastList]))
@@ -87,7 +88,7 @@
                              [[nil nil nil nil] false]
                              [["a" "a" "b"] true]]]
       (is (= expected (apply built-ins/not= args))))
-    (is (thrown? clojure.lang.ArityException (built-ins/not=)))))
+    (is (thrown? clojure.lang.ArityException (apply built-ins/not= [])))))
 
 (deftest ordered-keys-preserve-container-and-numeric-equality
   (let [leaves [nil (int 1) 1 1N 1.0 1.0M 1.00M -0.0 0.0
@@ -190,6 +191,37 @@
     (is (= #{[:first 1] [:second 2]} (set (for [[k v] m] [k v]))))
     (is (= #{:first :second} (set (keys m))))
     (is (= #{1 2} (set (vals m))))))
+
+(deftest native-key-accumulation-preserves-promotion-and-distinct-counts
+  (let [longs [0 1 -1 Long/MIN_VALUE Long/MAX_VALUE 0 1]
+        others [(int 1) 1N 1.0M 1.00M nil "value"
+                (byte-array [0 31]) (byte-array [1 0]) (byte-array [0 31])
+                [(byte-array [2])] [(byte-array [2])]]
+        acc (QueryKey$KeyAccumulator.)
+        expected (QueryKey$KeySet.)]
+    (doseq [x longs]
+      (is (= (.add expected x) (.add acc x))))
+    (is (= 5 (.size acc)))
+    (doseq [x longs] (is (.contains acc x)))
+    (doseq [x others]
+      (is (= (.add expected x) (.add acc x)))
+      (is (= (.size expected) (.size acc))))
+    (doseq [x (concat longs others)]
+      (is (= (.contains expected x) (.contains acc x))))
+    (doseq [xs [longs (concat longs others) (concat others longs) []]
+            :let [rel (relation/relation! {'?v 0}
+                        (FastList. (mapv #(object-array [%]) xs)))]]
+      (is (= (.size ^Set (qu/relation-distinct-values rel '?v))
+             (qu/relation-distinct-count rel '?v)))))
+  (let [acc (QueryKey$KeyAccumulator.)]
+    (.add acc Long/MIN_VALUE)
+    (.add acc Long/MAX_VALUE)
+    (is (not (.contains acc (byte-array [1]))))
+    (is (= 2 (.size acc)))
+    (is (.contains acc Long/MIN_VALUE))
+    (is (.contains acc Long/MAX_VALUE))
+    (is (.add acc (byte-array [1])))
+    (is (not (.add acc (byte-array [1]))))))
 
 (deftest serialized-key-containers-retain-strategy-compatibility
   ;; Recorded before the class cache was introduced. Adding helper classes

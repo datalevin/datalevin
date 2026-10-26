@@ -30,7 +30,7 @@
    [datalevin.util :as u :refer [raise]])
   (:import
    [java.util AbstractCollection ArrayList Collection Collections List]
-   [datalevin.utl QueryKey$KeySet]
+   [datalevin.utl QueryKey$KeyAccumulator]
    [java.util.concurrent Callable CompletableFuture ConcurrentHashMap
     ExecutorService Executors ForkJoinPool ForkJoinWorkerThread Future TimeUnit]
    [datalevin.db DB]
@@ -953,7 +953,7 @@
 
 (defn- prefix-set-sink
   [^long width]
-  (let [^java.util.Set keys (QueryKey$KeySet.)
+  (let [^QueryKey$KeyAccumulator keys (QueryKey$KeyAccumulator.)
         ^objects scratch (when (< 1 width) (object-array width))
         lookup (when scratch (r/array-lookup))
         add-prefix!
@@ -1459,7 +1459,7 @@
 
 (defn- distinct-entity-input
   [^List source ^long index]
-  (let [seen   (QueryKey$KeySet.)
+  (let [seen   (QueryKey$KeyAccumulator.)
         tuples (FastList.)]
     (dotimes [i (.size source)]
       (let [entity (aget ^objects (.get source i) index)]

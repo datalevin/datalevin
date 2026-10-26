@@ -218,7 +218,7 @@
 (defn- binding-inputs!
   "Infer a conjunction's binding interface without executing its clauses.
   Private union variables cannot become inputs of the enclosing scope."
-  [runtime clauses exports initial positions source depth]
+  [runtime clauses exports initial positions source depth pattern-inputs]
   (when (> (long depth) 128) (fail! :query-source/limit :planning))
   (containers! runtime (+ 2 (count clauses)) (+ 2 (count exports)))
   (let [check! #(control/check-active! (:control runtime))
@@ -229,7 +229,8 @@
                 (containers! runtime 0 (count (or (:args node) (:pattern node) (:vars node))))
                 (let [source (source-symbol node source)]
                   (cond
-                    (instance? Pattern node) {:requires #{} :columns (vars (:pattern node))}
+                    (instance? Pattern node)
+                    {:requires (pattern-inputs node source) :columns (vars (:pattern node))}
                     (instance? RuleExpr node)
                     {:requires (vars (map #(nth (:args node) %) (get positions [source (get-in node [:name :symbol])])))
                      :columns (vars (:args node))}
@@ -242,7 +243,7 @@
                           inputs (reduce (fn [inputs clause]
                                            (set/union inputs
                                              (binding-inputs! runtime (if (instance? And clause) (:clauses clause) [clause])
-                                               public required positions source (inc (long depth))))) required (:clauses node))]
+                                               public required positions source (inc (long depth)) pattern-inputs))) required (:clauses node))]
                       {:requires inputs :columns public})
                     (instance? Not node) {:negative (vars (:vars node)) :columns #{}}
                     :else {:requires #{} :columns #{}}))) clauses)
@@ -266,7 +267,7 @@
 (defn- dependency-inputs!
   "Forward missing head bindings through calls and public union interfaces.
   Positive local producers can satisfy a callee input without a caller seed."
-  [runtime ids graph initial]
+  [runtime ids graph initial pattern-inputs]
   (containers! runtime (reduce + 0 (map #(count (:head-vars %)) (vals graph))) 2)
   (loop [positions initial]
     (control/check-active! (:control runtime))
@@ -278,7 +279,7 @@
                                   (let [head (head-vars branch)
                                         inputs (binding-inputs! workspace (:clauses branch) (set head)
                                                  (into #{} (map #(nth head %)) (get positions id))
-                                                 positions (:source (get graph id)) 0)]
+                                                 positions (:source (get graph id)) 0 pattern-inputs)]
                                     (assoc positions id (into [] (keep-indexed #(when (inputs %2) %1)) head))))))
                       positions (:branches (get graph id)))) positions ids)]
       (if (= positions next) positions (recur next)))))
@@ -548,14 +549,15 @@
   "Compile stratified native bodies and their bounded input adornments before
   provider acquisition. Actual step inputs select a complete correlated demand
   interface; unbound observable heads use independently compiled enumeration."
-  [runtime entries rules node source compile-body!]
+  [runtime entries rules node source pattern-inputs compile-body!]
   (let [check! #(control/check-active! (:control runtime))
         logical-graph (graph! runtime entries rules node source)
         logical-ids (vec (sort #(access/compare-keys %1 %2 check!) (keys logical-graph)))
         logical-levels (strata! runtime logical-ids logical-graph)
         observed (input-positions! runtime logical-ids logical-graph)
         minimum (dependency-inputs! runtime logical-ids logical-graph
-                  (into {} (map (fn [[id rule]] [id (vec (range (:required-count rule)))])) logical-graph))
+                  (into {} (map (fn [[id rule]] [id (vec (range (:required-count rule)))])) logical-graph)
+                  pattern-inputs)
         variants (adornments! runtime logical-ids minimum observed)
         reference-headers
         (into {} (map (fn [[id rule]]

@@ -11,13 +11,16 @@
 ### Fixed
 - [Datalog] A re-index bug
   [#353](https://github.com/datalevin/datalevin/issues/353).
+- [Datalog] ensure planner does not look up by `:db/nonidex` attributes.
 - [Lib] JS `unlistenDb` removes subscription key.
 ### Changed
 - [Datalog] `:db.type/idoc`and `:db.type/vect` attributes have `:db/noindex
   true` by default, as there are secondary index on them by default.
 ### Improved
-- [Datalog] Reduce native query result-key overhead and batch bound-entity reads.
-- [Buffer] Allocate large (> 1 MiB) direct memory buffers on demand and release
+- [Datalog] reduce native query key and predicate overhead, use primitive entity
+  distinct counts, and batch bound-entity reads.
+- [Datalog] client retries in non-HA mode for `:server/busy` with `:retryable? true`.
+- [Buffer] allocate large (> 1 MiB) direct memory buffers on demand and release
   them after idle budget (time and space).
 
 ## 1.2.7 (2026-10-21)

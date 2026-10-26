@@ -128,15 +128,11 @@
                    (conj joins join)))
           joins)))))
 
-(defn- input-bound-vars
-  [parsed-q inputs]
-  (qresolve/bound-vars
-    (qresolve/resolve-ins (qplan/make-context parsed-q false) inputs)))
-
 (defn- order-correlated-bindings
   [db parsed-q inputs {:keys [expr]}]
-  (let [required   (set (:requires expr))
-        input-bound (set (input-bound-vars parsed-q inputs))
+  (let [context (qresolve/resolve-ins (qplan/make-context parsed-q false) inputs)
+        required   (set (:requires expr))
+        input-bound (set (qresolve/bound-vars context))
         candidates
         (into []
               (keep-indexed
@@ -148,7 +144,7 @@
                       (let [pattern
                             (access-join-candidate
                               db (:source expr) #{} i clause)
-                            deps (access-clause-deps orig-clause)
+                            deps (access-clause-deps (:sources context) orig-clause)
                             vars (set/union
                                    (set (:requires deps))
                                    (set (:requires-any deps))
@@ -240,7 +236,7 @@
   [form]
   (into #{} (filter qu/binding-var?) (qu/collect-vars form)))
 
-(defn- access-clause-deps
+(defn- raw-access-clause-deps
   [clause]
   (let [clause (if (and (sequential? clause)
                         (qu/source? (first clause)))
@@ -272,15 +268,30 @@
       :else
       {:provides (access-clause-vars clause)})))
 
+(defn- access-clause-deps
+  [sources clause]
+  (let [source-sym (if (qu/source? (first clause)) (first clause) '$)
+        source (get sources source-sym)
+        [entity attr] (if (qu/source? (first clause)) (next clause) clause)
+        deps (raw-access-clause-deps clause)]
+    (if (and (vector? clause) source (db/-searchable? source)
+             (keyword? attr) (get-in (db/-schema source) [attr :db/noindex]))
+      (cond
+        (qu/binding-var? entity) (assoc deps :requires #{entity})
+        (qu/placeholder? entity) (assoc deps :unavailable? true)
+        :else deps)
+      deps)))
+
 (defn- access-clause-ready?
-  [bound {:keys [requires requires-any]}]
-  (and (every? bound requires)
+  [bound {:keys [requires requires-any unavailable?]}]
+  (and (not unavailable?)
+       (every? bound requires)
        (or (empty? requires-any)
            (some bound requires-any))))
 
 (defn- order-access-residuals
-  [bound entries]
-  (let [entries (mapv #(merge % (access-clause-deps (:orig-clause %)))
+  [sources bound entries]
+  (let [entries (mapv #(merge % (access-clause-deps sources (:orig-clause %)))
                       entries)]
     (loop [bound bound
            todo  entries
@@ -333,7 +344,7 @@
   [parsed-q context step joins stages]
   (let [bound   (qresolve/bound-vars context)
         entries (order-access-residuals
-                  bound (access-residual-entries parsed-q step joins))]
+                  (:sources context) bound (access-residual-entries parsed-q step joins))]
     (reduce
       (fn [[context stages] {:keys [clause-idx clause orig-clause]}]
         (let [before   (sample-context-size (:rels context))
@@ -358,7 +369,7 @@
   [parsed-q context step joins]
   (let [bound   (qresolve/bound-vars context)
         entries (order-access-residuals
-                  bound (access-residual-entries parsed-q step joins))]
+                  (:sources context) bound (access-residual-entries parsed-q step joins))]
     (loop [bound bound
            entries entries]
       (if-let [{:keys [clause provides] :as entry} (first entries)]

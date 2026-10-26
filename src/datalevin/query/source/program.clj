@@ -382,14 +382,67 @@
               (if (and progressed? (seq pending)) (recur columns pending)
                   (mapv columns (canonical (keys columns) check!))))))))))
 
-(defn- scope-parent-columns [site schema known-inputs child-schemas check!]
+(defn- scope-required-vars [site region-inputs]
+  (if (= :rule (:kind site))
+    (into #{} (mapcat (fn [branch]
+                       (keep (fn [v]
+                               (let [[tag name] (get (:arguments branch) v)]
+                                 (when (= :var tag) name)))
+                         (set/union (:required-inputs branch) (get region-inputs (child-id branch))))))
+      (:branches site))
+    (into (set (:required-inputs site)) (mapcat #(get region-inputs (child-id %))) (:branches site))))
+
+(defn- region-inputs!
+  "Carry body dependencies through scoped calls. Local producers can satisfy
+  them; a possible caller binding becomes required only when the body needs it."
+  [runtime check! compiled native-specs all-schemas]
+  (reduce
+    (fn [inputs r]
+      (check!)
+      (assoc inputs (:region-id r)
+        (rt/with-workspace runtime
+          (fn [workspace]
+            (let [sites (filter #(= (:region-id r) (:parent-region %)) (:sites compiled))
+                  _ (retain! workspace (containers! workspace
+                                         (+ (count sites) (count (:core-clauses r)) (count (:patterns r)))
+                                         (count (:available-vars r))))
+                  operations
+                  (into (mapv (fn [{:keys [node path]}]
+                                (check!)
+                                (let [spec (if (or (instance? Pattern node) (instance? RuleExpr node) (instance? Not node))
+                                             (get native-specs path)
+                                             (pure-spec node (get all-schemas (:region-id r)) check!))]
+                                  {:requires (set (map :variable (:requires spec)))
+                                   :columns (set (map :variable (:columns spec)))})) (:core-clauses r))
+                    (concat (map #(hash-map :requires #{} :columns (set (map :variable (:columns %)))) (:patterns r))
+                            (map #(hash-map :requires (scope-required-vars % inputs) :columns (:exports %)) sites)))]
+              (loop [required #{}]
+                (check!)
+                (let [[known pending]
+                      (loop [known (into required (keys (:bindings r))) pending operations]
+                        (check!)
+                        (if-let [ready (some #(when (set/subset? (:requires %) known) %) pending)]
+                          (recur (into known (:columns ready)) (filterv #(not (identical? ready %)) pending))
+                          [known pending]))
+                      missing (set/difference (into #{} (mapcat :requires) pending) known)
+                      roots (set/difference missing (into #{} (mapcat :columns) pending))
+                      next (into required (set/intersection (:input-vars r) (if (seq roots) roots missing)))]
+                  (if (= required next) required (recur next)))))))))
+    {} (reverse (:regions compiled))))
+
+(defn- with-region-inputs! [runtime check! compiled native-specs all-schemas f]
+  ;; Only scoped calls consume these dependencies. Their map is planning
+  ;; scratch: no inferred input map survives in an executable operator.
+  (if-not (some #(seq (:branches %)) (:sites compiled))
+    (f {})
+    (let [token (containers! runtime (count (:regions compiled))
+                  (reduce + 0 (map #(count (:input-vars %)) (:regions compiled))))]
+      (try (f (region-inputs! runtime check! compiled native-specs all-schemas))
+           (finally (control/release! token))))))
+
+(defn- scope-parent-columns [site schema known-inputs child-schemas region-inputs check!]
   (let [actual (columns-map known-inputs)
-        required (if (= :rule (:kind site))
-                   (into #{} (mapcat (fn [branch]
-                                      (keep (fn [v]
-                                              (let [[tag name] (get (:arguments branch) v)]
-                                                (when (= :var tag) name))) (:required-inputs branch)))) (:branches site))
-                   (:required-inputs site))
+        required (scope-required-vars site region-inputs)
         needed
         (if (= :rule (:kind site))
           (set/union required (set/intersection (:exports site) (set (keys actual))))
@@ -465,22 +518,25 @@
     {:columns columns :relation (relation/relation! (zipmap (map :variable columns) (range)) tuples)}))
 
 (defn- boundaries! [runtime check! compiled native-specs root-columns]
-  (let [all-schemas (schemas compiled native-specs root-columns check!) boundaries (volatile! [])]
-    (letfn [(region! [id inputs]
-              (check!)
-              (let [schema (add-columns (get all-schemas id) inputs)
-                    seeds (core-seeds! runtime check! compiled id native-specs inputs)]
-                (doseq [[index site] (map-indexed vector (:sites compiled))
-                        :when (and (= id (:parent-region site)) (seq (:branches site)))]
-                  (let [parent (scope-parent-columns site schema seeds all-schemas check!)
-                        outputs (mapv (fn [b] (branch-output (child-id b) (get all-schemas (child-id b)))) (:branches site))
-                        boundary (scope/interfaces! runtime compiled index parent outputs)]
-                    (vswap! boundaries conj boundary)
-                    (doseq [branch (:branches boundary) :when (not (:empty? branch))]
-                      (region! (:region-id branch) (:inputs branch)))))))]
-      (when (get-in compiled [:regions (:root-region compiled) :live?])
-        (region! (:root-region compiled) root-columns))
-      @boundaries)))
+  (let [all-schemas (schemas compiled native-specs root-columns check!)
+        boundaries (volatile! [])]
+    (with-region-inputs! runtime check! compiled native-specs all-schemas
+      (fn [region-inputs]
+        (letfn [(region! [id inputs]
+                  (check!)
+                  (let [schema (add-columns (get all-schemas id) inputs)
+                        seeds (core-seeds! runtime check! compiled id native-specs inputs)]
+                    (doseq [[index site] (map-indexed vector (:sites compiled))
+                            :when (and (= id (:parent-region site)) (seq (:branches site)))]
+                      (let [parent (scope-parent-columns site schema seeds all-schemas region-inputs check!)
+                            outputs (mapv (fn [b] (branch-output (child-id b) (get all-schemas (child-id b)))) (:branches site))
+                            boundary (scope/interfaces! runtime compiled index parent outputs)]
+                        (vswap! boundaries conj boundary)
+                        (doseq [branch (:branches boundary) :when (not (:empty? branch))]
+                          (region! (:region-id branch) (:inputs branch)))))))]
+          (when (get-in compiled [:regions (:root-region compiled) :live?])
+            (region! (:root-region compiled) root-columns))
+          @boundaries)))))
 
 (defn- prune-empty-collections! [runtime compilation specs]
   ;; Unlike a provider estimate, a complete owned local match is an exact
@@ -559,6 +615,11 @@
                                   (instance? RuleExpr node)
                                   (or (native-rules/reference-spec compiled node source)
                                       (native-rules/prepare! runtime (:entries compilation) (:rules compiled) node source
+                                        (fn [pattern source]
+                                          (let [database (:native (get entries source))]
+                                            (if (collection/owned? database) #{}
+                                              (into #{} (map :variable)
+                                                (:requires (native-plan/spec! runtime snapshots database pattern []))))))
                                         (fn [parsed context body-rules columns]
                                           (compile-body! parsed context body-rules {} columns))))
                                   :else
@@ -588,50 +649,52 @@
             (fn [runtime compiled]
                 (let [all-schemas (schemas compiled native-specs root-columns check!)
                       interfaces (atom {})]
-                  (letfn [(region! [id inputs]
-                            (check!)
-                            (let [r (nth (:regions compiled) id)
-                                  schema (add-columns (get all-schemas id) inputs)
-                                  seeds (core-seeds! runtime check! compiled id native-specs inputs)
-                                  core (volatile! {}) operators (volatile! [])
-                                  add! (fn [path requires columns step]
-                                         (let [op-id (count @operators)
-                                               op (access/core-operator! runtime id op-id requires columns #{} step)]
-                                           (vswap! core assoc path op-id) (vswap! operators conj op)))]
-                              (doseq [{:keys [node path]} (:core-clauses r)]
-                                (let [native? (or (instance? Pattern node) (instance? RuleExpr node) (instance? Not node))
-                                      spec (if native? (get native-specs path) (pure-spec node schema check!))
-                                      output (get-in node [:binding :variable :symbol])
-                                      literal-output (when (contains? (:literal-vars r) output) output)
-                                      spec (if literal-output
-                                             (-> spec
-                                                 (update :requires #(conj (filterv (fn [c] (not= literal-output (:variable c))) %)
-                                                                           (column literal-output :data true)))
-                                                 (assoc :columns [])) spec)
-                                      factory (cond (:negation? spec) (negation-factory runtime check! spec)
-                                                    (:collection? spec) (collection-factory runtime check! spec)
-                                                    (or (:rule-reference spec) (:native-rule-program spec))
-                                                    (rule-factory runtime check! node spec)
-                                                    native? (native-plan/factory! runtime snapshots (:database spec) node spec
-                                                              (:core-clauses r) (:bindings r) check! #(joined! runtime check! %1 %2))
-                                                    :else (pure-factory runtime check! node spec literal-output))]
-                                  (add! path (:requires spec) (:columns spec) factory)))
-                              (doseq [[index site] (map-indexed vector (:sites compiled))
-                                      :when (= id (:parent-region site))]
-                                (let [parent (scope-parent-columns site schema seeds all-schemas check!)
-                                      branch-outputs
-                                      (mapv (fn [b]
-                                              (let [id (child-id b)]
-                                                (branch-output id (get all-schemas id)))) (:branches site))
-                                      boundary (scope/interfaces! runtime compiled index parent branch-outputs)]
-                                  (doseq [branch (:branches boundary) :when (not (:empty? branch))]
-                                    (region! (:region-id branch) (:inputs branch)))
-                                  (add! (:path site) (:inputs boundary) (:columns boundary)
-                                        (scope-factory runtime check! boundary run-region))))
-                              (swap! interfaces assoc id {:inputs inputs :operators @operators :core @core})))]
-                    (when (:live? (nth (:regions compiled) root)) (region! root root-columns))
-                    (vreset! tables @interfaces)
-                    @interfaces))))
+                  (with-region-inputs! runtime check! compiled native-specs all-schemas
+                    (fn [region-inputs]
+                      (letfn [(region! [id inputs]
+                                (check!)
+                                (let [r (nth (:regions compiled) id)
+                                      schema (add-columns (get all-schemas id) inputs)
+                                      seeds (core-seeds! runtime check! compiled id native-specs inputs)
+                                      core (volatile! {}) operators (volatile! [])
+                                      add! (fn [path requires columns step]
+                                             (let [op-id (count @operators)
+                                                   op (access/core-operator! runtime id op-id requires columns #{} step)]
+                                               (vswap! core assoc path op-id) (vswap! operators conj op)))]
+                                  (doseq [{:keys [node path]} (:core-clauses r)]
+                                    (let [native? (or (instance? Pattern node) (instance? RuleExpr node) (instance? Not node))
+                                          spec (if native? (get native-specs path) (pure-spec node schema check!))
+                                          output (get-in node [:binding :variable :symbol])
+                                          literal-output (when (contains? (:literal-vars r) output) output)
+                                          spec (if literal-output
+                                                 (-> spec
+                                                     (update :requires #(conj (filterv (fn [c] (not= literal-output (:variable c))) %)
+                                                                               (column literal-output :data true)))
+                                                     (assoc :columns [])) spec)
+                                          factory (cond (:negation? spec) (negation-factory runtime check! spec)
+                                                        (:collection? spec) (collection-factory runtime check! spec)
+                                                        (or (:rule-reference spec) (:native-rule-program spec))
+                                                        (rule-factory runtime check! node spec)
+                                                        native? (native-plan/factory! runtime snapshots (:database spec) node spec
+                                                                  (:core-clauses r) (:bindings r) check! #(joined! runtime check! %1 %2))
+                                                        :else (pure-factory runtime check! node spec literal-output))]
+                                      (add! path (:requires spec) (:columns spec) factory)))
+                                  (doseq [[index site] (map-indexed vector (:sites compiled))
+                                          :when (= id (:parent-region site))]
+                                    (let [parent (scope-parent-columns site schema seeds all-schemas region-inputs check!)
+                                          branch-outputs
+                                          (mapv (fn [b]
+                                                  (let [id (child-id b)]
+                                                    (branch-output id (get all-schemas id)))) (:branches site))
+                                          boundary (scope/interfaces! runtime compiled index parent branch-outputs)]
+                                      (doseq [branch (:branches boundary) :when (not (:empty? branch))]
+                                        (region! (:region-id branch) (:inputs branch)))
+                                      (add! (:path site) (:inputs boundary) (:columns boundary)
+                                            (scope-factory runtime check! boundary run-region))))
+                                  (swap! interfaces assoc id {:inputs inputs :operators @operators :core @core})))]
+                        (when (:live? (nth (:regions compiled) root)) (region! root root-columns))
+                        (vreset! tables @interfaces)
+                        @interfaces))))))
           schedules (planning/schedules runtime planned)
           _ (when (:diagnostics runtime)
               (let [groups (:groups planned)

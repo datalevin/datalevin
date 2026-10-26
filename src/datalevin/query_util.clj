@@ -14,7 +14,7 @@
    [datalevin.util :as u :refer [cond+ raise]])
   (:import
    [java.util List]
-   [datalevin.utl QueryKey$KeySet]))
+   [datalevin.utl QueryKey$KeySet QueryKey$KeyAccumulator]))
 
 (def ^{:dynamic true
        :doc     "List of symbols in current pattern that might potentiall be resolved to refs"}
@@ -168,3 +168,13 @@
     (dotimes [i (.size tuples)]
       (.add values (aget ^objects (.get tuples i) idx)))
     values))
+
+(defn relation-distinct-count
+  "Count distinct relation values with the shared key semantics."
+  ^long [rel sym]
+  (let [idx    (long ((:attrs rel) sym))
+        tuples ^List (:tuples rel)
+        values (QueryKey$KeyAccumulator.)]
+    (dotimes [i (.size tuples)]
+      (.add values (aget ^objects (.get tuples i) idx)))
+    (long (.size values))))

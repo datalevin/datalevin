@@ -403,9 +403,7 @@
         v-rel   (rel-for-var context v)]
     (cond
       e-rel
-      (let [entities (qu/relation-distinct-values e-rel e)
-            entity-count (.size ^java.util.Set entities)
-            value-var? (qu/binding-var? v)
+      (let [value-var? (qu/binding-var? v)
             existence? (or (= v '_) (qu/placeholder? v))
             cardinality-many?
             (= :db.cardinality/many
@@ -415,9 +413,9 @@
         ;; cheaper, this avoids treating stale per-entity count metadata as an
         ;; expansion signal.
         (if (or existence? (not value-var?) (not cardinality-many?))
-          (long entity-count)
+          (qu/relation-distinct-count e-rel e)
           (capped-count-sum
-            entities
+            (qu/relation-distinct-values e-rel e)
             (fn [entity]
               (if-let [entity (resolved-bound-entity source entity)]
                 (db/-count source [entity attr nil])
