@@ -105,7 +105,7 @@
               (let [_ (when-not (every? #(and (integer? %) (<= 0 % Integer/MAX_VALUE))
                                        (map (:attrs body) variables)) (invalid!))
                     ^List input (:tuples body) ^HashSet keys (get @seen id)
-                    rows (new-list! width) probe (relation/array-lookup)
+                    ^List rows (new-list! width) probe (relation/array-lookup)
                     scratch (object-array width) indices (int-array (map (:attrs body) variables))]
                 (dotimes [i (.size input)]
                   (active!)
