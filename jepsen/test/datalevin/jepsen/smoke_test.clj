@@ -1706,7 +1706,7 @@
                                          (System/currentTimeMillis))))
             attempt-timeout-ms
             (long (min remaining-ms
-                       udf-readiness-disruption-attempt-timeout-ms))
+                       (long udf-readiness-disruption-attempt-timeout-ms)))
             result (invoke-udf-readiness-with-attempt-timeout!
                     test
                     invoke-fn

@@ -613,7 +613,8 @@
 
 (def ^:private bootstrap-transient-error-types
   #{:txlog/not-enabled
-    :lmdb/closed})
+    :lmdb/closed
+    :jepsen/store-read-lock-timeout})
 
 (defn- lmdb-closed-message?
   [message]

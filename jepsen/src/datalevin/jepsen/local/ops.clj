@@ -907,7 +907,8 @@
                               :db-name db-name})))))]
         (if (= read-lock-unavailable result)
           (u/raise "Timed out waiting for Jepsen node KV store read access"
-                   {:cluster-id cluster-id
+                   {:type :jepsen/store-read-lock-timeout
+                    :cluster-id cluster-id
                     :logical-node logical-node
                     :db-name db-name
                     :timeout-ms local-store-read-lock-timeout-ms})

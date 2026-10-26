@@ -288,6 +288,25 @@
                    [:ok conn]))))
         (is (= 2 @opens))))))
 
+(deftest rejoin-bootstrap-retry-preserves-terminal-errors-test
+  (doseq [[label timeout-ms error-type]
+          [["lock contention remains terminal after the deadline"
+            0 :jepsen/store-read-lock-timeout]
+           ["unrelated failures are not retried"
+            1000 ::permanent-failure]]]
+    (testing label
+      (let [attempts (atom 0)
+            error    (ex-info "Store access failed" {:type error-type})
+            result   (try
+                       (#'rejoin-bootstrap/with-retrying-bootstrap-gap!
+                        timeout-ms
+                        (fn [_]
+                          (swap! attempts inc)
+                          (throw error)))
+                       (catch clojure.lang.ExceptionInfo e e))]
+        (is (identical? error result))
+        (is (= 1 @attempts))))))
+
 (deftest rejoin-bootstrap-retries-transient-gap-during-bootstrap-wait-test
   (let [attempts (atom 0)]
     (with-redefs [rejoin-bootstrap/wal-gap-retry-sleep-ms 0]

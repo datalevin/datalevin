@@ -10,6 +10,7 @@
    [datalevin.jepsen.local.cluster :as lcluster]
    [datalevin.jepsen.local.ops :as lops]
    [datalevin.jepsen.test-support :as test-support]
+   [datalevin.jepsen.workload.rejoin-bootstrap :as rejoin-bootstrap]
    [datalevin.kv :as kv]
    [datalevin.remote :as r]
    [datalevin.server :as srv]
@@ -406,6 +407,46 @@
     (is (= "Cannot access KV store on unavailable Jepsen node"
            (ex-message error)))
     (is (= :lmdb/closed (:type (ex-data error))))))
+
+(deftest rejoin-bootstrap-retries-runtime-store-read-lock-timeout-test
+  (let [dir          (u/tmp-dir (str "jepsen-rejoin-store-lock-" (UUID/randomUUID)))
+        db-name      "rejoin-store-lock"
+        kv-store     (d/open-kv dir {:wal? true})
+        server       (ha-test-server {db-name {:store kv-store}})
+        deps         (local-ops-test-deps db-name server)
+        swap-started (CountDownLatch. 1)
+        release-swap (CountDownLatch. 1)
+        attempts     (atom 0)
+        read-error   (atom nil)
+        swap-future  (future
+                       (#'srv/with-db-runtime-store-swap
+                        server db-name
+                        (fn []
+                          (.countDown swap-started)
+                          (.await release-swap 5 TimeUnit/SECONDS))))]
+    (try
+      (is (.await swap-started 5 TimeUnit/SECONDS))
+      (let [result (try
+                     (#'rejoin-bootstrap/with-retrying-bootstrap-gap!
+                      3000
+                      (fn [_]
+                        (swap! attempts inc)
+                        (try
+                          (lops/with-node-kv-store deps :test-cluster "n1" identity)
+                          (catch clojure.lang.ExceptionInfo e
+                            (reset! read-error e)
+                            (.countDown release-swap)
+                            (throw e)))))
+                     (catch clojure.lang.ExceptionInfo e e))]
+        (is (= :jepsen/store-read-lock-timeout (:type (ex-data @read-error))))
+        (is (= 100 (:timeout-ms (ex-data @read-error))))
+        (is (identical? kv-store result) (pr-str result))
+        (is (= 2 @attempts)))
+      (finally
+        (.countDown release-swap)
+        (is (not= ::timed-out (deref swap-future 5000 ::timed-out)))
+        (d/close-kv kv-store)
+        (u/delete-files dir)))))
 
 (deftest local-snapshot-creation-waits-for-runtime-store-swap-test
   (let [db-name      "snapshot-store-swap"
