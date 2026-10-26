@@ -2,6 +2,8 @@
   "tests for core operations"
   (:require
    [clojure.test :as t]
+   ;; The adapter's lazy default must be compiled into the native test image.
+   datalevin.test-adapter.reference
    datalevin.test.bits-codec
    datalevin.test.core
    datalevin.test.components

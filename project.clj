@@ -1,5 +1,24 @@
 (def version "1.2.7")
 
+(def common-uberjar-exclusions
+  [#"datalevin/tx_state([$_.]|$)"
+   #"datalevin/tx_state/(kv|view)([/$_.]|$)"
+   #"datalevin/tx_state/[A-Z][^/]*\.class$"
+   #"datalevin/tx_group/(Receipt|Deferred)\.class$"
+   #"datalevin/binding/cpp/IPendingReader\.class$"
+   #"datalevin/tx_group/test_support"
+   #"datalevin/tx_group/batch/(env|private|recovery)([/$_.]|$)"
+   #"pod.huahaiy.datalevin-test"
+   #"^datalevin/client_recovery_chaos([$_.]|$)"
+   #"rust/target/"
+   #"rust/fuzz/target/"
+   #"rust/test-adapter/target/"
+   #"^META-INF/maven/.*"
+   #"^META-INF/leiningen/.*/project\.clj$"
+   #"^META-INF/leiningen/.*/README(\.[^/]+)?$"
+   #"^com/caucho/hessian/test/.*"
+   #"^org/bouncycastle/util/test/.*"])
+
 (defproject datalevin version
   :description "A simple, fast and versatile Datalog database"
   :url "https://github.com/datalevin/datalevin"
@@ -78,7 +97,14 @@
                     :aot          [datalevin.test0],
                     :jar-inclusions
                     [#"_test" #"\/test\/" #"test\d" #"\/data\.json" #"all\.json"
-                     #"\.csv" #"\.edn" #"\.txt"]
+                     #"\.csv" #"\.edn" #"\.txt" #"datalevin/test_adapter"]
+                    ;; Native tests need the adapters, while published jars do
+                    ;; not. Preserve all other exclusions, including Lein's.
+                    :uberjar-exclusions
+                    ~(with-meta
+                       (into (:uberjar-exclusions leiningen.core.project/defaults)
+                             common-uberjar-exclusions)
+                       {:replace true})
                     :uberjar-name "test0.uberjar.jar"}
    :dev            {:main         datalevin.test0
                     :dependencies [[org.clojure/test.check]]}}
@@ -111,24 +137,7 @@
                    #"rust/fuzz/target/"
                    #"rust/test-adapter/target/"
                    #"client_quickstart_check\.clj"]
-  :uberjar-exclusions [#"datalevin/tx_state([$_.]|$)"
-                       #"datalevin/tx_state/(kv|view)([/$_.]|$)"
-                       #"datalevin/tx_state/[A-Z][^/]*\.class$"
-                       #"datalevin/tx_group/(Receipt|Deferred)\.class$"
-                       #"datalevin/binding/cpp/IPendingReader\.class$"
-                       #"datalevin/tx_group/test_support"
-                       #"datalevin/tx_group/batch/(env|private|recovery)([/$_.]|$)"
-                       #"pod.huahaiy.datalevin-test"
-                       #"datalevin/test_adapter"
-                       #"^datalevin/client_recovery_chaos([$_.]|$)"
-                       #"rust/target/"
-                       #"rust/fuzz/target/"
-                       #"rust/test-adapter/target/"
-                       #"^META-INF/maven/.*"
-                       #"^META-INF/leiningen/.*/project\.clj$"
-                       #"^META-INF/leiningen/.*/README(\.[^/]+)?$"
-                       #"^com/caucho/hessian/test/.*"
-                       #"^org/bouncycastle/util/test/.*"]
+  :uberjar-exclusions ~(conj common-uberjar-exclusions #"datalevin/test_adapter")
   :deploy-repositories [["clojars" {:url           "https://repo.clojars.org"
                                     :username      :env/clojars_username
                                     :password      :env/clojars_password
