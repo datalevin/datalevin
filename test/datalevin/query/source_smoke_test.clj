@@ -2,8 +2,9 @@
   (:require [clojure.test :refer [deftest is]]
             [datalevin.core :as d]
             [datalevin.query.source :as source]
-            [datalevin.query.source.fake :as fake]
-            [datalevin.query.source-test :refer [row-info category]]))
+            [datalevin.query.source.fake :as fake]))
+
+(def ^:private row-info (fake/row-info))
 
 (defn- events [provider] (mapv first @(:events provider)))
 (defn- pair-source [info rows]
@@ -38,5 +39,7 @@
                    (-source-info [_] (assoc row-info :spi-versions #{1}))
                    (-open-session [_ _] (swap! events conj :acquire))
                    (-plan-source [_ _ _] (swap! events conj :plan)))]
-    (is (= :query-source/version (category #(d/q pairs-query provider))))
+    (is (= :query-source/version
+           (try (d/q pairs-query provider) nil
+                (catch clojure.lang.ExceptionInfo e (:error (ex-data e))))))
     (is (empty? @events))))
