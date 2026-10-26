@@ -1,6 +1,6 @@
 # Change Log
 
-## WIP
+## 1.2.8 (2026-10-26)
 
 ### Added
 - [Federation] infrastructure to query external data sources. Concrete
