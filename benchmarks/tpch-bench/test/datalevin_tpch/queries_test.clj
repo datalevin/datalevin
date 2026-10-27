@@ -70,3 +70,44 @@
         (is (= [[ratio]] expected))
         (is (v/results-match? 14 expected actual))
         (is (= ratio (d/q q/q-14 datoms)))))))
+
+(defn- q18-datoms [orders]
+  (into [[1 :customer/custkey 1] [1 :customer/name "Customer"]]
+        (mapcat
+          (fn [eid [key date total quantities]]
+            (concat [[eid :orders/orderkey key] [eid :orders/custkey 1]
+                     [eid :orders/orderdate date] [eid :orders/totalprice total]]
+                    (mapcat (fn [line quantity]
+                              [[line :lineitem/orderkey key] [line :lineitem/quantity quantity]])
+                            (range (* 100 eid) (+ (* 100 eid) (count quantities))) quantities)))
+          (iterate inc 2) orders)))
+
+(defn- q18-sqlite-rows [orders]
+  (with-open [conn (DriverManager/getConnection "jdbc:sqlite::memory:")
+              stmt (.createStatement conn)]
+    (.execute stmt "CREATE TABLE customer (c_custkey INTEGER, c_name TEXT)")
+    (.execute stmt "CREATE TABLE orders (o_orderkey INTEGER, o_custkey INTEGER, o_orderdate TEXT, o_totalprice REAL)")
+    (.execute stmt "CREATE TABLE lineitem (l_orderkey INTEGER, l_quantity REAL)")
+    (.execute stmt "INSERT INTO customer VALUES (1, 'Customer')")
+    (doseq [[key date total quantities] orders]
+      (with-open [ps (.prepareStatement conn "INSERT INTO orders VALUES (?, 1, ?, ?)")]
+        (.setLong ps 1 key) (.setString ps 2 date) (.setDouble ps 3 total) (.executeUpdate ps))
+      (with-open [ps (.prepareStatement conn "INSERT INTO lineitem VALUES (?, ?)")]
+        (doseq [quantity quantities]
+          (.setLong ps 1 key) (.setDouble ps 2 quantity) (.executeUpdate ps))))
+    (with-open [rs (.executeQuery stmt (#'v/reference-sql 18))]
+      (loop [rows []]
+        (if (.next rs)
+          (recur (conj rows (mapv #(.getObject rs (int %)) (range 1 7)))) rows)))))
+
+(deftest q18-quantity-witnesses-having-and-ordering
+  (doseq [orders [[]
+                  [[1 "1995-01-01" 100.0 [50.0 50.0 50.0 50.0 50.0 50.0]]]
+                  [[1 "1995-01-02" 100.0 [50.0 50.0 50.0 50.0 50.0 50.0 1.0]]
+                   [2 "1995-01-01" 100.0 [50.0 50.0 50.0 50.0 50.0 50.0 2.0]]
+                   [3 "1995-01-01" 200.0 [50.0 50.0 50.0 50.0 50.0 50.0 3.0]]]
+                  (vec (for [key (range 1 105)]
+                         [key "1995-01-01" (double key) [50.0 50.0 50.0 50.0 50.0 50.0 5.0]]))]]
+    (let [expected (q18-sqlite-rows orders)
+          actual (#'v/datalevin-rows (q18-datoms orders) 18)]
+      (is (v/results-match? 18 expected actual)))))

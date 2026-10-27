@@ -90,22 +90,27 @@
   (is (not (v/results-match? 20 [["Supplier" "Address"]]
                            [["Supplier" "Address"] ["Supplier" "Address"]]))))
 
-(deftest limit-boundary-ties-are-interchangeable
-  ;; Q3 sorts by revenue desc, date asc and keeps ten rows. More than ten
-  ;; orders share the final ordering key, so each backend may legitimately
-  ;; return a different ten.
-  (let [fixed (mapv (fn [i] [i (double (- 20 i)) "1995-03-01" 0])
-                    (range 1 9))
-        tie   (fn [orderkey] [orderkey 5.0 "1995-03-02" 0])
-        a     (into fixed (map tie [100 101]))
-        b     (into fixed (map tie [109 110]))]
-    (is (= 10 (count a) (count b)))
-    (is (v/results-match? 3 a b)
-        "different members of the boundary tie group are both valid")
-    (is (v/results-match? 3 b a) "the check is symmetric")
-    (is (not (v/results-match? 3 a (assoc-in b [9 1] 4.0)))
-        "an untied revenue at the boundary is a real mismatch")
-    (is (not (v/results-match? 3 a (assoc-in b [0 3] 1)))
-        "a mismatch above the boundary is still caught")
-    (is (not (v/results-match? 3 (subvec a 0 9) (subvec b 0 9)))
-        "a result shorter than the limit was not truncated")))
+(deftest limit-boundary-ties-require-complete-oracle-rows
+  (let [fixed (mapv (fn [i] [i (double (- 20 i)) "1995-03-01" 0]) (range 1 9))
+        tie (fn [key] [key 5.0 "1995-03-02" 0])
+        reference (into fixed (map tie [100 101 109 110]))
+        a (into fixed (map tie [100 101]))
+        b (into fixed (map tie [109 110]))]
+    (is (v/results-match? 3 reference a))
+    (is (v/results-match? 3 reference b) "different real boundary rows are valid")
+    (is (not (v/results-match? 3 reference (assoc-in b [9 0] 999)))
+        "a fabricated identifier with the right sort key is invalid")
+    (is (not (v/results-match? 3 reference (assoc-in b [9 3] 1)))
+        "projected values outside the sort key still have to match")
+    (is (not (v/results-match? 3 reference (assoc b 9 (b 8))))
+        "one oracle row cannot supply two output occurrences")
+    (is (not (v/results-match? 3 reference (assoc-in b [9 1] 4.0))))
+    (is (not (v/results-match? 3 reference (assoc-in b [0 3] 1))))
+    (is (not (v/results-match? 3 reference (subvec a 0 9))))
+    (is (not (v/results-match? 3 reference reference)) "LIMIT is enforced")))
+
+(deftest boundary-rows-are-checked-even-without-an-omitted-tie
+  (let [rows (mapv (fn [i] [i (double (- 20 i)) "1995-03-01" 0]) (range 10))]
+    (is (v/results-match? 3 rows rows))
+    (is (not (v/results-match? 3 rows (assoc-in rows [9 0] 999))))
+    (is (not (v/results-match? 3 rows (assoc-in rows [9 3] 1))))))

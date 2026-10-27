@@ -488,10 +488,11 @@
     [(/ ?ep 7.0) ?ep7]])
 
 ;; Q18: Large Volume Customer
+;; The grouped relation already contains each order's complete quantity sum.
+;; Filter it once and project that sum instead of joining every lineitem again
+;; and recomputing the same aggregate in the outer query.
 (def q-18
-  '[:find ?c-name ?c-custkey ?ok ?o-orderdate ?o-totalprice
-    (sum ?l-quantity)
-    :with ?l
+  '[:find ?c-name ?c-custkey ?ok ?o-orderdate ?o-totalprice ?qsum
     :order-by [4 :desc 3 :asc]
     :limit 100
     :where
@@ -506,9 +507,7 @@
     [?o :orders/orderdate ?o-orderdate]
     [?o :orders/totalprice ?o-totalprice]
     [?c :customer/custkey ?c-custkey]
-    [?c :customer/name ?c-name]
-    [?l :lineitem/orderkey ?ok]
-    [?l :lineitem/quantity ?l-quantity]])
+    [?c :customer/name ?c-name]])
 
 ;; Q19: Discounted Revenue
 (def q-19

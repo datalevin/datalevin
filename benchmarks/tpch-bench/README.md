@@ -19,7 +19,9 @@ a chosen scale factor (SF). SF0.01 is a quick smoke scale (~9 MB); SF1 is the
 standard 1 GB scale (~6M lineitem rows).
 
 All three systems load the same pipe-delimited `.tbl` files, so every comparison
-runs on identical values.
+runs on identical values. The benchmark inherits Datalevin's native dependencies
+from the local checkout. Rebuild working databases from these files when moving
+between incompatible native storage versions.
 
 ## Setup
 
@@ -93,14 +95,30 @@ Q12's conditional counts), and Q1/Q18 quantity sums must match exactly. Other
 monetary aggregates, averages, and ratios retain a relative rounding tolerance
 of `1e-6`. Numeric normalization preserves integer precision. Before comparing
 contents, verification checks the output width and each backend's required
-ordering. Rows tied on all sort keys may appear in any order:
+ordering and the required row limit. For limited queries, the oracle removes
+only the final SQL `LIMIT` so every eligible boundary-tie row remains available.
+A different selection of tied rows is valid only when every complete row and
+its multiplicity exist in that oracle; matching sort keys alone is insufficient.
+Both databases must already exist, and all eight nonempty table counts must
+agree before query verification begins:
 
 ```bash
-clj -X:verify '{:queries :all}'
+clj -X:verify '{:queries :all :out "verification.edn"}'
 clj -X:verify '{:queries [1 6] :dump? true}'   # print both sides on mismatch
+clj -X:verify '{:queries :all :timeout-ms 120000 :out "verification.edn"}'
 ```
 
-All 22 queries pass at SF0.01. Because the oracle is SQLite, the runner enables
+The EDN report is updated after each query and records table counts, runtime
+versions, result counts, and diagnostic wall times. These validation timings
+include preparation and result consumption; they are not benchmark passes.
+`:timeout-ms` sets each native query's deadline. For automation without process
+exit, call `datalevin-tpch.verify/run-verification`; the CLI exits nonzero when
+any query fails, after closing the databases.
+
+All 22 queries pass at SF0.1 and SF1 with the current verifier. The
+[validation report](../../doc/measurements/tpch-validation-2026-10-26.md) retains
+the input hashes, per-query reports, and paired Q18 performance checks.
+Because the oracle is SQLite, the runner enables
 `PRAGMA case_sensitive_like=ON`: SQLite's `LIKE` is case-insensitive for ASCII
 by default, whereas TPC-H and PostgreSQL are case-sensitive.
 
@@ -137,34 +155,34 @@ patterns required care:
 - **Correlated subqueries** (Q2, Q17, Q20) use correlated nested `(q ...)`
   queries with scalar bindings.
 - **`GROUP BY ... HAVING`** subqueries (Q11, Q18) are expressed as nested
-  grouped relations filtered in the outer query.
+  grouped relations filtered in the outer query. Q18 returns the already
+  computed quantity sum instead of joining and aggregating lineitems again.
 - **`LEFT OUTER JOIN`** (Q13) uses two mutually exclusive `or-join` branches:
   a correlated count for customers with matching orders, and a `not` branch
   binding zero for the rest.
 - **`CASE` over aggregates** (Q8, Q14) is expressed with `:with` and nested
   aggregates; `if` is not resolvable inside nested queries.
 - **`extract(year ...)`** becomes `(subs date 0 4)` plus `parse-long`.
-- **`LIKE`** uses `re-find` equivalents (`%green%` -> `#"green"`,
-  `%special%requests%` -> `#"special.*requests"`). See the note below.
+- **`LIKE`** generally uses native `like`/`not-like`. Q13 retains the tested
+  `re-find` translation for `%special%requests%`. See the note below.
 
-### Known issue: `like` / `not-like` on scans
+### Q13 comment-pattern translation
 
 Datalevin's `like` and `not-like` produced incorrect results on full scans for
 patterns that begin with `%` during development: on the SF0.01 data,
 `[(like ?comment "%special%requests%")]` matched 135 rows where the correct
 answer is 166, while the same predicate on a single bound row matched
-correctly. `re-find` returns the correct 166. The benchmark therefore uses
-`re-find` for these patterns. This is reported as a Datalevin bug, not a
-property of the benchmark.
+correctly. `re-find` returns the correct 166. Q13 therefore retains
+`re-find` for this pattern. The other translations use the predicates shown in
+`queries.clj`; changing these expressions requires rerunning the SQL gate.
+These historical scan counts do not describe the current validation results.
 
 ## Results
 
-Reference results at SF1 are pending a full run. The table below is a smoke run
-at SF0.01 for harness validation only and is not a performance claim.
-
-| Query | SQLite (ms) | Datalevin (ms) | Datalevin/SQLite |
-|---|---:|---:|---:|
-| pending | | | |
+Current evidence includes complete correctness checks at SF0.1 and SF1,
+a diagnostic SF1 profile, and isolated Q18 before/after timings. See the
+[validation and performance report](../../doc/measurements/tpch-validation-2026-10-26.md).
+Run the benchmark commands above for a complete timing comparison on your machine.
 
 The raw CSVs (`datalevin_pass.csv`, `sqlite_pass.csv`, `postgres_pass.csv`) and
 `results.edn`-style manifests should be retained alongside any published table,

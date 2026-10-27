@@ -78,7 +78,8 @@
                                                                          (q/ordering n)))]))
                     expected (sorted-fixture conn rows ordering)
                     actual (d/q query rows)]
-                (is (v/results-match? n expected actual))
+                (is (v/ordered? n actual))
+                (is (v/results-match? n expected (if-let [limit (q/limit n)] (take limit actual) actual)))
                 (is (= (set rows) (set actual)) "sorting retains every row")))))))))
 
 (deftest verification-checks-original-order
@@ -158,7 +159,7 @@
   (let [orders (vec (for [i (range 1 12)]
                       [(+ 100 i) "1995-03-01" 10.0]))
         rows   (d/q q/q-3 (q3-datoms orders))
-        other  (mapv (fn [i] [(+ 100 i) 20.0 "1995-03-01" 0]) (range 2 12))]
+        oracle (mapv (fn [i] [(+ 100 i) 20.0 "1995-03-01" 0]) (range 1 12))]
     (is (= 10 (count rows)))
-    (is (v/results-match? 3 other rows)
+    (is (v/results-match? 3 oracle rows)
         "a different valid choice of tied boundary rows is accepted")))

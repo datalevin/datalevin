@@ -17,7 +17,7 @@
    [datalevin.util :as u :refer [raise]])
   (:import
    [datalevin.utl QueryKey]
-   [java.util List]
+   [java.util List RandomAccess]
    [datalevin.relation Relation]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
@@ -28,9 +28,12 @@
     (r/relation! (zipmap vars (range)) (FastList.))))
 
 (defn tuple-list->rel
+  "Convert function-result rows to a relation. Materialize sequential lists
+  once before indexing; aggregate subqueries commonly return lazy sequences."
   [binding ^List tuples
    {:keys [attrs source-attrs needed source-width output-width]}]
-  (let [size         (.size tuples)
+  (let [^List tuples (if (instance? RandomAccess tuples) tuples (vec tuples))
+        size         (.size tuples)
         source-width (long source-width)
         output-width (long output-width)]
     (if (zero? size)

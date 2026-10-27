@@ -3,12 +3,13 @@
 
   Required ORDER BY is checked on the original results before canonicalizing
   rows for content comparison, allowing arbitrary order among ties. For a
-  `:limit` query, rows tied on the ORDER BY key at the limit boundary may be
-  chosen differently by each system, so those rows are allowed to differ.
+  `:limit` query, the complete SQL result supplies every eligible boundary-tie
+  row; different selections must still match real oracle rows and multiplicity.
   Singleton values, counts and quantity sums are exact. Other aggregates allow
   relative tolerance for floating-point rounding differences between backends."
   (:require
    [clojure.java.io :as io]
+   [clojure.string :as str]
    [datalevin.core :as d]
    [datalevin-tpch.common :as c]
    [datalevin-tpch.queries :as q]
@@ -16,12 +17,21 @@
   (:import
    [java.sql DriverManager]))
 
+(defn- reference-sql
+  "Keep the full ordered SQL result so LIMIT ties can be checked against real
+  rows, including columns that are not part of the ordering key."
+  [n]
+  (let [sql (slurp (c/query-file :sqlite n))]
+    (if (q/limit n)
+      (str/replace sql #"(?i)\blimit\s+\d+\s*;?\s*$" ";")
+      sql)))
+
 (defn- sqlite-rows
   [^String db-file n]
   (with-open [conn (DriverManager/getConnection (str "jdbc:sqlite:" db-file))
               stmt (.createStatement conn)]
     (.execute stmt "PRAGMA case_sensitive_like=ON")
-    (with-open [rs (.executeQuery stmt (slurp (c/query-file :sqlite n)))]
+    (with-open [rs (.executeQuery stmt (reference-sql n))]
       (let [ncols (.getColumnCount (.getMetaData rs))]
         (loop [rows []]
           (if (.next rs)
@@ -31,11 +41,11 @@
             rows))))))
 
 (defn- datalevin-rows
-  [db n]
-  (let [res (d/q (q/datalog n) db)]
-    (cond
-      (coll? res)  (mapv vec res)
-      :else        [[res]])))
+  ([db n] (datalevin-rows db n nil))
+  ([db n timeout-ms]
+   (let [query (cond-> (q/datalog n) timeout-ms (conj :timeout timeout-ms))
+         res (d/q query db)]
+     (if (coll? res) (mapv vec res) [[res]]))))
 
 (def ^:private column-comparisons
   "Comparison rules in SELECT-list order, per TPC-H 2.1.3.5. Only computed
@@ -123,109 +133,134 @@
                      :relative (c/close-enough? va vb))))
                ordering)))
 
-(defn- tie-groups
-  "Split already-sorted `rows` into maximal runs sharing an ORDER BY key."
-  [rules ordering rows]
-  (reduce
-   (fn [groups row]
-     (let [group (peek groups)]
-       (if (and group (same-ordering-key? rules ordering (peek group) row))
-         (conj (pop groups) (conj group row))
-         (conj groups [row]))))
-   [] rows))
+(defn- rows-subset?
+  "Match complete rows without reusing an oracle occurrence. Boundary sort-key
+  equality alone cannot establish identity, projected values, or multiplicity."
+  [rules expected actual]
+  (loop [remaining (normalize rules expected) rows (seq (normalize rules actual))]
+    (if-let [row (first rows)]
+      (if-let [index (first (keep-indexed
+                             (fn [i candidate]
+                               (when (rows-match? rules [candidate] [row]) i)) remaining))]
+        (recur (into (subvec remaining 0 index) (subvec remaining (inc index))) (next rows))
+        false)
+      true)))
 
 (defn results-match?
-  "Check row shape and required ordering, then compare each output column using
-  its exact or aggregate-rounding rule.
+  "Compare the complete ordered SQL oracle with the Datalevin result.
 
-  When a query has a `:limit`, rows tied on the ORDER BY key at the boundary
-  may be chosen differently by each backend. Only the tie groups wholly above
-  the limit must match cell by cell; the final group is compared on its
-  ordering key alone."
+  Enforce output width, ordering and the query's row limit. At a truncated
+  boundary, every returned row must match an actual oracle occurrence; only
+  which eligible tied rows were selected is unspecified."
   [n expected actual]
-  (let [rules    (or (column-comparisons n)
-                     (throw (ex-info "No result comparison rules for query"
-                                     {:query n})))
-        width    (count rules)
+  (let [rules (or (column-comparisons n)
+                  (throw (ex-info "No result comparison rules for query" {:query n})))
+        width (count rules)
         ordering (vec (or (q/ordering n) []))
-        limit    (q/limit n)]
+        limit (q/limit n)
+        expected-count (if limit (min limit (count expected)) (count expected))]
     (and (every? #(= width (count %)) expected)
          (every? #(= width (count %)) actual)
-         (= (count expected) (count actual))
+         (= expected-count (count actual))
          (ordered? n expected)
          (ordered? n actual)
-         (if (seq ordering)
-           (let [expected-groups (tie-groups rules ordering expected)
-                 actual-groups   (tie-groups rules ordering actual)
-                 ;; A run of tied rows that reaches the limit may be truncated,
-                 ;; so its members are interchangeable with unreturned ones.
-                 truncated?      (and limit (= limit (count expected)))
-                 complete        (if truncated?
-                                   (dec (count expected-groups))
-                                   (count expected-groups))]
-             (and (= (count expected-groups) (count actual-groups))
-                  (every? true?
-                          (map (fn [ga gb]
-                                 (same-ordering-key? rules ordering
-                                                     (first ga) (first gb)))
-                               expected-groups actual-groups))
-                  (every? true?
-                          (map (fn [ga gb]
-                                 (rows-match? rules
-                                              (normalize rules ga)
-                                              (normalize rules gb)))
-                               (take complete expected-groups)
-                               (take complete actual-groups)))))
-           (rows-match? rules (normalize rules expected)
-                        (normalize rules actual))))))
+         (if (and limit (= limit expected-count) (seq ordering))
+           (let [boundary (nth expected (dec limit))
+                 [prefix tail] (split-with #(not (same-ordering-key? rules ordering boundary %)) expected)
+                 tied (take-while #(same-ordering-key? rules ordering boundary %) tail)
+                 [actual-prefix actual-tied] (split-at (count prefix) actual)]
+             (and (rows-match? rules (normalize rules prefix) (normalize rules actual-prefix))
+                  (rows-subset? rules tied actual-tied)))
+           (rows-match? rules (normalize rules expected) (normalize rules actual))))))
+
+(defn- require-store! [file kind]
+  (when-not (.exists (io/file file))
+    (throw (ex-info (str "Missing " (name kind) " database: " file "; load the TPC-H data first")
+                    {:database kind :path (str file)}))))
+
+(defn- table-counts!
+  "Check that neither side is an empty or differently loaded database. Each
+  table's first attribute occurs once per loaded row, including partsupp."
+  [db db-file]
+  (with-open [conn (DriverManager/getConnection (str "jdbc:sqlite:" db-file))
+              stmt (.createStatement conn)]
+    (into (array-map)
+      (for [table c/table-order
+            :let [actual (d/count-datoms db nil (first (c/attrs table)) nil)
+                  expected (with-open [rs (.executeQuery stmt (str "SELECT count(*) FROM " table))]
+                             (.next rs) (.getLong rs 1))]]
+        (do
+          (when-not (and (pos? expected) (= expected actual))
+            (throw (ex-info "TPC-H table row counts do not match"
+                            {:table table :sqlite expected :datalevin actual})))
+          [table expected])))))
+
+(defn- verify-one [db db-file n dump? timeout-ms]
+  (print (format "  q%-2d ... " n))
+  (flush)
+  (try
+    (let [t0 (System/nanoTime)
+          expected (sqlite-rows db-file n)
+          t1 (System/nanoTime)
+          actual (datalevin-rows db n timeout-ms)
+          t2 (System/nanoTime)
+          ok? (results-match? n expected actual)
+          result {:query n :ok? ok? :reference-rows (count expected)
+                  :expected-rows (if-let [limit (q/limit n)] (min limit (count expected)) (count expected))
+                  :actual-rows (count actual)
+                  :sqlite-ms (/ (- t1 t0) 1.0e6) :datalevin-ms (/ (- t2 t1) 1.0e6)}]
+      (println (format "%s (Datalevin %.1f ms; SQLite %.1f ms)"
+                       (if ok? "PASS" "FAIL") (:datalevin-ms result) (:sqlite-ms result)))
+      (when-not (ordered? n expected) (println "    SQLite result violates ORDER BY"))
+      (when-not (ordered? n actual) (println "    Datalevin result violates ORDER BY"))
+      (when (and (not ok?) dump?)
+        (println "    sqlite:   " (pr-str expected))
+        (println "    datalevin:" (pr-str actual)))
+      result)
+    (catch Exception e
+      (println "ERROR:" (.getMessage e))
+      {:query n :ok? false :error (.getMessage e) :data (ex-data e)})))
+
+(defn run-verification
+  "Return a correctness report after closing both databases.
+
+  :out optionally writes a progressively updated EDN report. Diagnostic query
+  timings include preparation and consumption; they are not benchmark passes.
+  :timeout-ms optionally applies the native query deadline to each translation."
+  [{:keys [dir sqlite queries dump? out timeout-ms]
+    :or {dir "db" sqlite sq/default-db-name dump? false}}]
+  (let [db-file (.getPath (io/file c/base-dir sqlite))
+        db-dir (.getPath (io/file c/base-dir dir))
+        ids (if (or (nil? queries) (= queries :all)) (q/query-ids) (vec queries))
+        _ (when-not (and (seq ids) (every? (set (q/query-ids)) ids)
+                         (= (count ids) (count (set ids)))
+                         (or (nil? timeout-ms) (pos-int? timeout-ms)))
+            (throw (ex-info "Invalid verification query selection or timeout" {:queries queries :timeout-ms timeout-ms})))
+        save! (fn [report]
+                (when out (spit (io/file c/base-dir out) (str (pr-str report) "\n")))
+                report)]
+    (save! {:status :preflight :queries ids :results []})
+    (require-store! (io/file db-dir "data.mdb") :datalevin)
+    (require-store! db-file :sqlite)
+    (let [conn (d/get-conn db-dir)]
+      (try
+        (let [db (d/db conn)
+              counts (table-counts! db db-file)
+              report {:status :running :queries ids :table-counts counts
+                      :java-version (System/getProperty "java.version")
+                      :clojure-version (clojure-version) :results []}
+              result (reduce (fn [report n]
+                               (save! (update report :results conj (verify-one db db-file n dump? timeout-ms))))
+                             (save! report) ids)
+              passed (count (filter :ok? (:results result)))]
+          (println (format "\n%d/%d queries passed" passed (count ids)))
+          (save! (assoc result :status :complete :ok? (= passed (count ids)) :passed passed)))
+        (finally (d/close conn))))))
 
 (defn verify
-  "Run the Datalevin translations and check them against SQLite.
-
-  Options:
-    :dir      Datalevin database directory (default \"db\")
-    :sqlite   SQLite database file (default \"sqlite.db\")
-    :queries  vector of query numbers, or :all (default :all)
-    :dump?    print both original result sets for mismatches (default false)"
-  [{:keys [dir sqlite queries dump?]
-    :or   {dir "db" sqlite sq/default-db-name dump? false}}]
-  (let [db-file (.getPath (io/file c/base-dir sqlite))
-        ids     (if (or (nil? queries) (= queries :all))
-                  (q/query-ids)
-                  (mapv long queries))
-        conn    (d/get-conn (.getPath (io/file c/base-dir dir)))]
-    (try
-      (let [results
-            (doall
-             (for [n ids]
-               (do
-                 (print (format "  q%-2d ... " n)) (flush)
-                 (try
-                   (let [expected (sqlite-rows db-file n)
-                         actual   (datalevin-rows (d/db conn) n)
-                         ok?      (results-match? n expected actual)]
-                     (println (if ok? "PASS" "FAIL"))
-                     (when-not (ordered? n expected)
-                       (println "    SQLite result violates ORDER BY"))
-                     (when-not (ordered? n actual)
-                       (println "    Datalevin result violates ORDER BY"))
-                     (when (and (not ok?) dump?)
-                       (println "    sqlite:   " (pr-str expected))
-                       (println "    datalevin:" (pr-str actual)))
-                     {:query n :ok? ok?
-                      :expected-rows (count expected)
-                      :actual-rows (count actual)})
-                   (catch Throwable e
-                     (println "ERROR:" (.getMessage e))
-                     {:query n :ok? false :error (.getMessage e)})))))
-            failed (remove :ok? results)]
-        (println)
-        (println (format "%d/%d queries passed" (- (count results) (count failed))
-                         (count results)))
-        (when (seq failed)
-          (println "Failed:" (mapv :query failed))
-          (System/exit 1)))
-      (finally
-        (d/close conn))))
-  (shutdown-agents)
-  (System/exit 0))
+  "CLI correctness gate. Options: :dir, :sqlite, :queries (:all by default),
+  :dump?, :out (EDN report), and :timeout-ms (native per-query deadline)."
+  [options]
+  (let [result (run-verification options)]
+    (shutdown-agents)
+    (System/exit (if (:ok? result) 0 1))))
