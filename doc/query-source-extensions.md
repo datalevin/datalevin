@@ -7,9 +7,8 @@ This appendix collects work beyond the [baseline query-source SPI](query-source-
 and [companion plan](../../federation/federation.md). Extension negotiation follows
 [the SPI rules](query-source-spi.md#version-negotiation-and-source-information).
 
-Required input bindings are part of the specified
-[SPI v2 revision](query-source-spi.md#10-spi-v2-revised-four-shape-contract),
-which remains implementation and conformance work before F1 sign-off. Probes
+Required input bindings are part of the current
+[query-source contract](query-source-spi.md#dependent-access). Probes
 and the other protocol extensions below still require separate envelope design
 and conformance gates.
 DataFusion/Parquet is a companion backend choice, not an SPI feature keyword.
@@ -47,10 +46,10 @@ The revision also specifies
 [EAV access costs and fallback](query-source-spi.md#106-conditioned-planning-and-deterministic-selection).
 Explicit consumption groups are needed only for independent resources requiring
 separate open budgets or concurrency permissions; ordinary alternatives and
-opens omit group IDs. F1 requires bounded execution and deterministic structural
-EAV selection; estimates may be entirely unknown. Safe fusion and cost-based
-ranking follow the working native/provider join path under the
-[optimization gate](../roadmap.md#federation-optimization-follow-up). This appendix
+opens omit group IDs. The current contract supports bounded execution,
+deterministic structural EAV selection, and safe same-entity fusion; estimates
+may be entirely unknown. Cost-based ranking remains an
+[optimization proposal](../roadmap.md#federation-optimization-follow-up). This appendix
 adds no alternative envelope. The explicit anchor above remains for existing links.
 
 ### Additional conformance
@@ -121,8 +120,8 @@ fixed-attribute accesses. Variable/wildcard attributes are logical EAV terms;
 this handling is required in F1 and needs no optional provider feature.
 [Region coverage and predicate scope](query-source-spi.md#logical-planning-regions)
 apply to every extension; no extension may silently flatten rule/branch or
-projection boundaries. Safe same-entity fusion and comparable-cost ranking are
-the next, separately gated improvements. General cross-entity delegation,
+projection boundaries. Safe same-entity fusion is part of the current contract;
+comparable-cost ranking remains a proposed improvement. General cross-entity delegation,
 separate enumeration and estimate phases, repeated conditioned estimate rounds,
 and broader plan search are later extensions within the existing planner,
 beyond F0–F3 requirements. Specify and negotiate any added envelopes and planning
