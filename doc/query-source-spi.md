@@ -254,15 +254,17 @@ at the existing planning boundaries, without a second general optimizer.
 Requests are scoped to [logical planning regions](#logical-planning-regions);
 rule/branch predicates and coverage cannot leak across those boundaries.
 The first useful release uses separate EAV accesses and structural selection.
-The fusion and comparable-cost rules below specify the next improvement stage,
-not additional F0–F3 exit requirements.
+The fusion and comparable-cost rules below specify improvements beyond those
+F0–F3 exit requirements. Core now admits same-entity fusion under
+`:eav-fusion-v1`; adapters must establish equivalence before advertising it.
+Comparable-cost selection remains follow-up work.
 
 | EAV choice | Required meaning |
 |---|---|
 | Entity lookup | Given an entity constant or required entity binding, return the matching facts for a declared attribute. Many-valued attributes may return several values. |
 | Attribute enumeration | Enumerate the declared attribute's entity/value facts within the accepted scope. A scoped API may still require tenant or parent bindings. |
 | Optional value lookup | Given a typed value constant or required value binding, find matching entities for a declared attribute. No inverse index or endpoint is assumed. |
-| Safe same-entity fusion (follow-up) | Satisfy several clauses sharing an entity through one of those accesses when it is equivalent to their EAV join. Preserve identity, cardinality, reference types, and attribute existence. |
+| Safe same-entity fusion | Satisfy several clauses sharing an entity through one of those accesses when it is equivalent to their EAV join. Preserve identity, cardinality, reference types, and attribute existence. |
 
 These are low-level access choices for fixed attributes, not restrictions on
 logical EAV attribute terms. Core handles bound attribute variables and feasible
@@ -2394,9 +2396,10 @@ legal access alternatives and advisory estimates together. Source grouping alone
 cannot preserve rule, branch, or projection semantics. F1 implements
 single-clause accesses, dependency scheduling, structural selection, and bounded
 native joins. Estimates
-may all be unknown. Same-entity fusion and comparable-cost ranking are the
-[next improvement stage](../roadmap.md#federation-optimization-follow-up), with
-their own validation gates; their absence does not prevent initial v2 use.
+may all be unknown. Core also schedules structurally valid same-entity fused
+alternatives; providers retain responsibility for their physical equivalence.
+Comparable-cost ranking remains part of the
+[optimization follow-up](../roadmap.md#federation-optimization-follow-up).
 Separate estimate phases and broader search remain later extensions of the
 existing planner. Planning performs no source I/O or cursor opens;
 metadata remains bounded and charged as in §5. The common context uses the
@@ -2922,14 +2925,10 @@ declared required binding; value lookup similarly requires its value. Attribute
 enumeration requires neither, although accepted scope inputs may still be required. All other
 correlation is explicit in `:requires`; access kinds do not weaken §10.5.
 
-Initial external accesses cover one EAV pattern per alternative and core joins
-their results. Existing native plans retain native optimization. Until external
-fusion passes its gate, fused candidates are unavailable; choose a complete plan
-from separate legal accesses or reject as unsupported.
-Do not split a one-shot permission or assume a partial spool covers other
-attributes to make that plan feasible.
-
-In the optimization follow-up, one alternative may exactly cover more EAV
+External accesses may cover one EAV pattern or fuse several patterns. Core
+schedules the complete coverage set as one access and joins its wide output
+with the remaining work. Existing native plans retain native optimization.
+One alternative may exactly cover more EAV
 patterns only when they share the anchor's entity variable or the same typed
 entity constant, in the same source, planning region,
 and accepted read scope. This is same-entity fusion, not a fourth source kind.
@@ -2947,6 +2946,14 @@ validation checks the envelope; providers establish physical equivalence under
 the [fusion contract](../../federation/federation.md#61-fusion-prerequisites).
 An unsupported fusion must fall back to separate legal EAV accesses or reject;
 low cost is never evidence of equivalence.
+Each covered pattern is scheduled exactly once. Overlapping alternatives are
+competing choices, not extra reads to finish partial coverage. A fused access
+uses one open permission per invocation; dependent batching may still need
+multiple invocations. Do not split a one-shot permission or assume a partial
+spool covers other attributes to make a plan feasible. Residual predicates
+remain core operators and require their input columns from the selected plan.
+Core does not synthesize fused provider plans: an adapter must advertise legal
+wide alternatives with complete coverage, typed outputs, and explicit inputs.
 
 #### Comparable access estimates
 
@@ -3053,7 +3060,7 @@ plan is available, raise `:query-source/unsupported`; never execute partial cove
 The active [`source.access`](../src/datalevin/query/source/access.clj)
 bridge constructs shared `AccessPlan` records from captured, validated
 alternatives. It schedules one logical region from explicit typed input/export
-columns and checks complete single-pattern coverage without native cardinality
+columns and checks complete, nonoverlapping pattern coverage without native cardinality
 or cost conversion. Its dependency search uses the shared
 [`access.dependency`](../src/datalevin/query/access/dependency.clj) scheduler.
 Captured native/core `IStep` interfaces contribute typed outputs only after
@@ -3071,12 +3078,25 @@ and controlled native participation. Discarded envelope and bridge reservations
 release after complete-query validation. The
 [resource audit](query-source-resource-audit.md) records the active operators.
 
-The initial policy is `:eav-structural-v1`. Among legal, dependency-ready choices
+Regions containing only single-pattern candidates use `:eav-structural-v1`.
+Among legal, dependency-ready choices
 for the same work, prefer bound-entity lookup, then bound-value lookup, then
 attribute enumeration, breaking ties by the canonical access key below.
 Estimates remain advisory metadata and do not affect this policy, even when
 known. Existing native costing remains in place; provider cost calibration and
 conversion into native units are not initial-release requirements.
+
+Regions containing fused candidates use `:eav-fusion-v1`. Choices are ordered
+by source, region, and lowest covered pattern ID. For the same first work item,
+prefer entity lookup, then value lookup, then attribute enumeration; within the
+same kind, prefer more covered patterns, then the canonical access key. This
+preserves single-pattern ordering and does not depend on provider response
+order or advisory estimates. The bounded dependency search backtracks when a
+preferred choice cannot complete the region, including overlapping coverage,
+missing typed inputs, and one-shot conflicts. It selects the first feasible
+complete schedule, not a globally minimum number of opens. Explain reports
+this policy and the full pattern coverage of each selected access. Cost-based
+selection remains a separate follow-up.
 
 After the cost gate passes, compare choices covering the same required work,
 including fused access versus equivalent separate accesses within one region.
@@ -3292,7 +3312,7 @@ integration, and four shapes:
 - single-clause alternatives and structural selection produce the complete
   supported workflow without fusion or cost ranking. All-unknown estimates
   remain valid; malformed envelopes reject, known estimates cannot change the
-  structural choice, and unsupported fused-only plans reject before execution;
+  structural choice, and unsafe or infeasible fused-only plans reject before execution;
 - ties, reordered provider responses, planner bound exhaustion, and OLTP/OLAP
   relabeling preserve deterministic selection; estimates cannot change result
   correctness, completeness, or quota enforcement;

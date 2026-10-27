@@ -198,9 +198,12 @@
   a captured candidate. Envelope ownership is released separately."
   [plan]
   (control/release! (::reservation plan)))
-(defn- work-key [plan]
+(defn- work-keys [plan]
+  (:covers (:expr plan)))
+
+(defn- first-work-key [plan]
   (let [{:keys [source-symbol region-id covers]} (options plan)]
-    [source-symbol region-id (first covers)]))
+    [source-symbol region-id (reduce min covers)]))
 
 (defrecord ^:private CoreOperator [owner region-id id requires columns after step])
 
@@ -298,8 +301,10 @@
   "Validate complete region-local coverage and schedule typed AccessPlans.
   Inputs are actual seeds from the enclosing engine operator. Optional captured
   core operators contribute typed outputs only after their dependencies run.
-  Never infer an export from another region or inspect outer rows. Single-pattern
-  choices use :eav-structural-v1; fused candidates stay unavailable. Feasibility
+  Never infer an export from another region or inspect outer rows. Regions with
+  fused candidates use :eav-fusion-v1: lookup priority, then wider coverage for
+  the same first work item, then canonical identity. Single-pattern regions
+  retain :eav-structural-v1. Feasibility
   search shares the invocation ledger and the existing 4096-state bound.
   Caller-owned candidate/request reservations must live through execution."
   ([runtime region-id input-columns requests plans]
@@ -345,16 +350,18 @@
                                       (assoc-in plan [:path :options :permission]
                                                 (permissions/planning-permission
                                                   (:consumption o) (get-in o [:capture :alternative]))))))
-                             (filter #(= 1 (count (:covers (options %)))))
                              (sort (fn [a b]
                                      (check!)
-                                     (let [work (compare-keys (work-key a) (work-key b) check!)]
+                                     (let [work (compare-keys (first-work-key a) (first-work-key b) check!)]
                                        (if (zero? work)
                                          (let [kind (compare (kind-rank (get-in a [:path :options :access :kind]))
-                                                             (kind-rank (get-in b [:path :options :access :kind])))]
-                                           (if (zero? kind)
-                                             (compare-keys (:canonical-key (options a)) (:canonical-key (options b)) check!)
-                                             kind)) work))))
+                                                             (kind-rank (get-in b [:path :options :access :kind])))
+                                               width (compare (count (work-keys b)) (count (work-keys a)))]
+                                           (cond
+                                             (not (zero? kind)) kind
+                                             (not (zero? width)) width
+                                             :else (compare-keys (:canonical-key (options a))
+                                                                 (:canonical-key (options b)) check!))) work))))
                              vec)
              local-work (into #{} (map #(vector :core region-id (:id %))) operators)
              required (set/union required local-work)
@@ -398,7 +405,7 @@
              choices (into (mapv core-choice (remove deferred? ordered-core))
                            (concat (map (fn [plan]
                                   (let [o (options plan) p (:permission o)]
-                                    {:kind :access :value plan :covers #{(work-key plan)}
+                                    {:kind :access :value plan :covers (work-keys plan)
                                      :requires (:requires o) :columns (:columns o) :after #{}
                                      :resources (if (= :once (:opens p)) #{(:resource p)} #{})
                                      :unavailable? (and (= :once (:opens p)) (:spent? p))})) candidates)
@@ -413,7 +420,10 @@
                plan-count (count (filter #(= :access (:kind %)) selected))]
            (vreset! output-token
              (control/reserve! ctl {:retained-bytes (+ 1024 (* 512 plan-count) (* 1024 (count operators)))}))
-           (let [result {:region-id region-id :policy :eav-structural-v1 :selection :structural
+           (let [result {:region-id region-id
+                         :policy (if (some #(> (count (work-keys %)) 1) candidates)
+                                   :eav-fusion-v1 :eav-structural-v1)
+                         :selection :structural
                          :estimated-access-ns nil :fallback-reasons []
                          :plans (into [] (comp (filter #(= :access (:kind %))) (map :value)) selected)
                          :operators (mapv #(select-keys % [:kind :value]) selected)
@@ -433,7 +443,9 @@
   (let [ctl (:control runtime)]
     (control/check-active! ctl)
     (ensure! (vector? schedules))
-    (let [n (reduce (fn [^long n schedule] (+ n (count (:plans schedule)))) 0 schedules)
+    (let [n (reduce (fn [n schedule]
+                      (reduce (fn [n plan] (value/add-charge n (count (work-keys plan))))
+                              n (:plans schedule))) 0 schedules)
           token (control/reserve! ctl
                   {:retained-bytes
                    (value/add-charge (+ 1024 (* 256 (count schedules)))
@@ -443,21 +455,21 @@
         (loop [remaining (seq schedules) used #{} work #{}]
           (when-let [schedule (first remaining)]
             (control/check-active! ctl)
-            (ensure! (= :eav-structural-v1 (:policy schedule)))
+            (ensure! (#{:eav-structural-v1 :eav-fusion-v1} (:policy schedule)))
             (let [[used work]
                   (reduce (fn [[used work] plan]
                             (control/check-active! ctl)
                             (let [o (options plan)
                                   permission (permissions/planning-permission
                                                (:consumption o) (get-in o [:capture :alternative]))
-                                  key (work-key plan)]
+                                  keys (work-keys plan)]
                               (ensure! (and (= (:region-id schedule) (:region-id o))
-                                            (= 1 (count (:covers o))) (not (contains? work key))))
+                                            (seq keys) (empty? (set/intersection work keys))))
                               (when (and (= :once (:opens permission))
                                          (or (:spent? permission) (contains? used (:resource permission))))
                                 (fail! :query-source/unsupported :planning))
                               [(cond-> used (= :once (:opens permission)) (conj (:resource permission)))
-                               (conj work key)])) [used work] (:plans schedule))]
+                               (into work keys)])) [used work] (:plans schedule))]
               (recur (next remaining) used work))))
         nil
         (finally (control/release! token))))))
