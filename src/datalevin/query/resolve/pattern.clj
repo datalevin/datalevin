@@ -203,9 +203,24 @@
                   (.add acc (object-array [e])))))))))
     acc))
 
+(defn- integer-representations
+  [value]
+  (let [n (long value)]
+    (cond-> [n]
+      (<= Integer/MIN_VALUE n Integer/MAX_VALUE) (conj (int n))
+      (<= Short/MIN_VALUE n Short/MAX_VALUE) (conj (short n))
+      (<= Byte/MIN_VALUE n Byte/MAX_VALUE) (conj (byte n)))))
+
 (defn- key-candidates
   [database [e a v :as pattern]]
   (cond
+    ;; Generic storage retains boxed integer widths in separate encoded keys.
+    ;; Enumerate their finite representations instead of scanning the attribute.
+    (and (keyword? a) (int? v)
+         (= :data (index/value-type (get (db/-schema database) a))))
+    (distinct (mapcat #(db/-search database (assoc pattern 2 %))
+                     (integer-representations v)))
+
     (scan/content-scan? (index/value-type (get (db/-schema database) a)) v)
     (db/-search database (assoc pattern 2 nil))
 
@@ -224,7 +239,7 @@
   Keep representation-sensitive and generic values on the checked path."
   [value-type value]
   (case value-type
-    (:db.type/long :db.type/ref) (instance? Long value)
+    (:db.type/long :db.type/ref) (int? value)
     :db.type/boolean (instance? Boolean value)
     false))
 

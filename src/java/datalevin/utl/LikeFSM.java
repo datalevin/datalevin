@@ -1,185 +1,205 @@
 package datalevin.utl;
 
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Arrays;
+
+/**
+ * Immutable, case-sensitive SQL-style LIKE matcher. Wildcards operate on Unicode
+ * code points; matching uses a percent checkpoint instead of a byte DFA whose
+ * fallback states cannot represent overlapping wildcard alternatives.
+ */
 public class LikeFSM {
+    private static final int ONE = -1;
+    private static final int MANY = -2;
+    private static final char DEFAULT_ESCAPE = '!';
+    private static final int EXACT = 0;
+    private static final int PREFIX = 1;
+    private static final int SUFFIX = 2;
+    private static final int CONTAINS = 3;
+    private static final int SEGMENTS = 4;
+    private static final int WILDCARDS = 5;
 
-    static final int ALPH_SIZE = 256;
-    static final byte S_WILD_BYTE = (byte)95; // _
-    static final byte M_WILD_BYTE = (byte)37; // %
-    static final byte DEFAULT_ESC = (byte)33; // !
+    private final int[] pattern;
+    private final int mode;
+    private final String literal;
+    private final String[] segments;
 
-    static final byte ESC_S_WILD = (byte)-64;
-    static final byte ESC_M_WILD = (byte)-63;
-    static final byte ESC_ESC = (byte)-11;
+    public LikeFSM(String pattern, char escapeCharacter) {
+        this.pattern = compile(pattern, escapeCharacter);
+        int n = this.pattern.length;
+        boolean leading = n != 0 && this.pattern[0] == MANY;
+        boolean trailing = n != 0 && this.pattern[n - 1] == MANY;
+        int from = leading ? 1 : 0;
+        int to = trailing && n > from ? n - 1 : n;
+        boolean simple = true;
+        StringBuilder text = new StringBuilder();
+        for (int i = from; i < to; i++) {
+            if (this.pattern[i] < 0) {
+                simple = false;
+                break;
+            }
+            text.appendCodePoint(this.pattern[i]);
+        }
+        literal = simple ? text.toString() : null;
+        if (simple) {
+            mode = (leading ? SUFFIX : EXACT) + (trailing ? PREFIX : EXACT);
+            segments = null;
+        } else {
+            boolean hasOne = false;
+            for (int token : this.pattern) {
+                if (token == ONE) {
+                    hasOne = true;
+                    break;
+                }
+            }
+            mode = hasOne ? WILDCARDS : SEGMENTS;
+            segments = hasOne ? null : literalSegments(this.pattern);
+        }
+    }
 
-    byte esc;
+    public LikeFSM(String pattern) {
+        this(pattern, DEFAULT_ESCAPE);
+    }
 
-    byte[] pat;
-    int M;
-    int[][] TF;
-
+    /** Retain the UTF-8 byte-array entry points for existing Java callers. */
     public LikeFSM(byte[] pattern, char escapeCharacter) {
-        esc = (byte)escapeCharacter;
-        init(pattern);
+        this(new String(pattern, StandardCharsets.UTF_8), escapeCharacter);
     }
 
     public LikeFSM(byte[] pattern) {
-        esc = DEFAULT_ESC;
-        init(pattern);
+        this(pattern, DEFAULT_ESCAPE);
     }
 
-    public static boolean isValid(byte[] pattern, char escape) {
-        boolean inESC = false;
-        int n = pattern.length;
+    private static void validateEscape(int escaped, char escape) {
+        if (escaped != '%' && escaped != '_' && escaped != escape) {
+            throw new IllegalStateException(
+                    "Can only escape %, _, and escape character itself in like pattern");
+        }
+    }
 
-        for (int i = 0; i < n; i++) {
-            byte cur = pattern[i];
-            if (cur == escape) {
-                if (inESC) inESC = false;
-                else inESC = true;
-            } else {
-                switch (cur) {
-                case S_WILD_BYTE:
-                    if (inESC) inESC = false;
-                    break;
-                case M_WILD_BYTE:
-                    if (inESC) inESC = false;
-                    break;
-                default:
-                    if (inESC) {
-                        throw new IllegalStateException("Can only escape %, _, and escape character itself in like pattern");
-                    }
-                }
+    public static boolean isValid(String pattern, char escape) {
+        for (int i = 0; i < pattern.length();) {
+            int cp = pattern.codePointAt(i);
+            i += Character.charCount(cp);
+            if (cp == escape && i < pattern.length()) {
+                int escaped = pattern.codePointAt(i);
+                validateEscape(escaped, escape);
+                i += Character.charCount(escaped);
             }
         }
         return true;
     }
 
-
-    void init(byte[] pattern) {
-        pat = escape(pattern);
-        M = pat.length;
-        TF = new int[M + 1][ALPH_SIZE];
-        compile();
+    public static boolean isValid(byte[] pattern, char escape) {
+        return isValid(new String(pattern, StandardCharsets.UTF_8), escape);
     }
 
-    byte[] escape(byte[] pattern) {
-        int n = pattern.length;
-        byte[] dst = new byte[n];
+    private static int[] compile(String source, char escape) {
+        int[] tokens = new int[source.length()];
+        int size = 0;
+        for (int i = 0; i < source.length();) {
+            int cp = source.codePointAt(i);
+            i += Character.charCount(cp);
+            if (cp == escape) {
+                // Preserve the established trailing-escape behavior: it adds
+                // no literal. An escaped wildcard remains a literal token.
+                if (i == source.length()) break;
+                cp = source.codePointAt(i);
+                validateEscape(cp, escape);
+                i += Character.charCount(cp);
+            } else if (cp == '%') {
+                if (size != 0 && tokens[size - 1] == MANY) continue;
+                cp = MANY;
+            } else if (cp == '_') {
+                cp = ONE;
+            }
+            tokens[size++] = cp;
+        }
+        return size == tokens.length ? tokens : Arrays.copyOf(tokens, size);
+    }
 
-        int i, j = 0;
-        boolean inESC = false;
-
-        for (i = 0; i < n; i++) {
-            byte cur = pattern[i];
-            if (cur == esc) {
-                if (inESC) {
-                    dst[j++] = ESC_ESC;
-                    inESC = false;
-                } else inESC = true;
+    private static String[] literalSegments(int[] pattern) {
+        ArrayList<String> segments = new ArrayList<>();
+        StringBuilder text = new StringBuilder();
+        for (int cp : pattern) {
+            if (cp == MANY) {
+                if (text.length() != 0) {
+                    segments.add(text.toString());
+                    text.setLength(0);
+                }
             } else {
-                switch (cur) {
-                case S_WILD_BYTE:
-                    if (inESC) {
-                        dst[j++] = ESC_S_WILD;
-                        inESC = false;
-                    } else dst[j++] = cur;
-                    break;
-                case M_WILD_BYTE:
-                    if (inESC) {
-                        dst[j++] = ESC_M_WILD;
-                        inESC = false;
-                    } else dst[j++] = cur;
-                    break;
-                default:
-                    if (inESC) {
-                        throw new IllegalStateException("Can only escape %, _, and escape character itself in like pattern");
-                    } else dst[j++] = cur;
-                }
+                text.appendCodePoint(cp);
             }
         }
-
-        byte[] ret = new byte[j];
-        System.arraycopy(dst, 0, ret, 0, j);
-        return ret;
+        if (text.length() != 0) segments.add(text.toString());
+        return segments.toArray(new String[0]);
     }
 
-    void compile() {
-        int i, lps = 0, x;
-        boolean isMWild = false;
-
-        for (i = 0; i < M; i++) {
-            byte iByte = pat[i];
-            int iInt = iByte & 0xFF;
-            int next = i + 1;
-
-            switch (iByte) {
-            case M_WILD_BYTE:
-                int nnext = next + 1;
-                for (x = 0; x < ALPH_SIZE; x++)
-                    if ((next < M) && ((byte)x == pat[next])) TF[i][x] = nnext;
-                    else TF[i][x] = next;
-                isMWild = true;
-                break;
-            case S_WILD_BYTE:
-                for (x = 0; x < ALPH_SIZE; x++) TF[i][x] = next;
-                isMWild = false;
-                break;
-            default:
-                if (i == 0)
-                    for (x = 0; x < ALPH_SIZE; x++) TF[i][x] = 0;
-                else if (isMWild == true)
-                    for (x = 0; x < ALPH_SIZE; x++) TF[i][x] = i;
-                else
-                    for (x = 0; x < ALPH_SIZE; x++) TF[i][x] = TF[lps][x];
-
-                switch (iByte) {
-                case ESC_ESC:
-                    TF[i][esc & 0xFF] = next;
-                    break;
-                case ESC_M_WILD:
-                    TF[i][M_WILD_BYTE & 0xFF] = next;
-                    break;
-                case ESC_S_WILD:
-                    TF[i][S_WILD_BYTE & 0xFF] = next;
-                    break;
-                default:
-                    TF[i][iInt] = next;
-                }
-
-                isMWild = false;
-            }
-
-            if (i < M) lps = TF[lps][iInt];
+    private boolean matchSegments(String text) {
+        int first = 0;
+        int last = segments.length - 1;
+        int start = 0;
+        int end = text.length();
+        if (pattern[0] != MANY) {
+            String head = segments[first++];
+            if (!text.startsWith(head)) return false;
+            start = head.length();
         }
+        if (pattern[pattern.length - 1] != MANY) {
+            String tail = segments[last--];
+            if (!text.endsWith(tail)) return false;
+            end -= tail.length();
+        }
+        if (start > end) return false;
+        for (int i = first; i <= last; i++) {
+            String segment = segments[i];
+            int at = text.indexOf(segment, start);
+            if (at < 0 || at + segment.length() > end) return false;
+            start = at + segment.length();
+        }
+        return true;
     }
 
-    public boolean match(byte[] txt) {
-
-        int pLast = M - 1;
-        byte eByte = pat[pLast];
-        byte sByte = pat[0];
-
-        int N = txt.length;
-        int i = 0;
-        int j = 0;
-
-        while (i < N) {
-
-            j = TF[j][txt[i] & 0xFF];
-
-            if (j == 0) {
-                if (sByte != M_WILD_BYTE) return false;
-                else continue;
-            }
-
-            if ((j == M) && ((eByte == M_WILD_BYTE) || (i == N - 1)))
-                return true;
-
-            i++;
+    public boolean match(String text) {
+        // Most indexed string filters are literals, prefixes, suffixes, or
+        // contains tests. Keep those on the JVM's optimized String operations.
+        switch (mode) {
+            case EXACT: return text.equals(literal);
+            case PREFIX: return text.startsWith(literal);
+            case SUFFIX: return text.endsWith(literal);
+            case CONTAINS: return text.contains(literal);
+            case SEGMENTS: return matchSegments(text);
+            default: break;
         }
+        int p = 0;
+        int t = 0;
+        int percent = -1;
+        int retry = 0;
+        while (t < text.length()) {
+            int cp = text.codePointAt(t);
+            if (p < pattern.length && (pattern[p] == ONE || pattern[p] == cp)) {
+                p++;
+                t += Character.charCount(cp);
+            } else if (p < pattern.length && pattern[p] == MANY) {
+                percent = p++;
+                if (p == pattern.length) return true;
+                retry = t;
+            } else if (percent != -1) {
+                // Retry the suffix after the latest percent, consuming one
+                // more whole character. No recursive/backtracking stack grows.
+                retry += Character.charCount(text.codePointAt(retry));
+                t = retry;
+                p = percent + 1;
+            } else {
+                return false;
+            }
+        }
+        while (p < pattern.length && pattern[p] == MANY) p++;
+        return p == pattern.length;
+    }
 
-        if ((j == pLast) && (eByte == M_WILD_BYTE)) return true;
-
-        return false;
+    public boolean match(byte[] text) {
+        return match(new String(text, StandardCharsets.UTF_8));
     }
 }

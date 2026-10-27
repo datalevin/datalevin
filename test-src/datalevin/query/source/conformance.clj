@@ -1276,11 +1276,12 @@
                   native-result
                   (set (for [[e a value] stored
                               :when (and (= a attr) (QueryKey/equals v value))]
-                         [e]))]
+                         [e]))
+                  expected (if (#{5 6} id) #{[5] [6]} #{[id]})]
               (doseq [[label source expected]
-                      [[:eager rows #{[id]}]
+                      [[:eager rows expected]
                        [:native @conn native-result]
-                       [:source (:source observed) #{[id]}]]]
+                       [:source (:source observed) expected]]]
                 (testing (name label)
                   (is (= expected (d/q q source input)))))
               ;; The same native input join through source-backed execution.
@@ -1295,7 +1296,7 @@
             (doseq [[label source] [[:eager rows] [:native @conn]
                                     [:source (:source observed)]]]
               (testing (name label)
-                (is (= (if (= label :native) 5 6) (count (d/q q source))))))
+                (is (= (if (= label :native) 4 5) (count (d/q q source))))))
             (closed! observed)))
         (doseq [input [[[3 -0.0 :wrong] [4 -0.0 :wrong-too]]
                        [[3 0.0 :a] [3 -0.0 :wrong] [4 0.0 :b]]]]

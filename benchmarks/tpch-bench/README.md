@@ -159,23 +159,15 @@ patterns required care:
   computed quantity sum instead of joining and aggregating lineitems again.
 - **`LEFT OUTER JOIN`** (Q13) uses two mutually exclusive `or-join` branches:
   one grouped count relation joined to customers, and a `not` branch binding
-  zero for the rest. The comment regex uses dot-all matching for SQL's `%`.
+  zero for the rest.
 - **`CASE` over aggregates** (Q8, Q14) is expressed with `:with` and nested
   aggregates; `if` is not resolvable inside nested queries.
 - **`extract(year ...)`** becomes `(subs date 0 4)` plus `parse-long`.
-- **`LIKE`** generally uses native `like`/`not-like`. Q13 retains the tested
-  `re-find` translation for `%special%requests%`. See the note below.
-
-### Q13 comment-pattern translation
-
-Datalevin's `like` and `not-like` produced incorrect results on full scans for
-patterns that begin with `%` during development: on the SF0.01 data,
-`[(like ?comment "%special%requests%")]` matched 135 rows where the correct
-answer is 166, while the same predicate on a single bound row matched
-correctly. `re-find` returns the correct 166. Q13 therefore retains
-`re-find` for this pattern. The other translations use the predicates shown in
-`queries.clj`; changing these expressions requires rerunning the SQL gate.
-These historical scan counts do not describe the current validation results.
+- **`LIKE`** uses native `like`/`not-like`, including Q13's
+  `%special%requests%` comment filter. Matching is case-sensitive; `%` also
+  matches newlines and `_` matches one Unicode character. The benchmark tests
+  compare these predicates with case-sensitive SQLite `LIKE`. Changing the
+  expressions in `queries.clj` requires rerunning the SQL gate.
 
 ## Results
 
@@ -187,6 +179,11 @@ records verified SF1 improvements for Q1, Q13, and Q19. Q13 groups qualifying
 orders once, Q19 exposes selective brand branches, and Q1 reduces tuple and
 aggregation allocations. Run the benchmark commands above for a complete timing
 comparison on your machine.
+
+The [LIKE correctness follow-up](../../doc/measurements/like-correctness-2026-10-26.md)
+records the matcher fixes, SQL oracle tests, and repeated SF0.1/SF1 gates with
+Q13 restored to native `not-like`. Its isolated Q13 comparison shows performance
+comparable to the regex workaround.
 
 The raw CSVs (`datalevin_pass.csv`, `sqlite_pass.csv`, `postgres_pass.csv`) and
 `results.edn`-style manifests should be retained alongside any published table,

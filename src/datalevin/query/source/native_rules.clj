@@ -449,7 +449,7 @@
       (let [x (:value arg) column (get-in producers [id i])]
         (value/execution-value! x check!)
         (when-not (or (nil? column) (literal-key-safe? x check!)
-                      (and (= :long (:type column)) (instance? Long x)))
+                      (and (= :long (:type column)) (int? x)))
           (fail! :query-source/unsupported :planning))))))
 
 (defn- requests!

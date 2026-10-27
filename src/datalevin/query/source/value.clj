@@ -259,7 +259,7 @@
         false)
       (case t
         :boolean (boolean? x)
-        :long (instance? Long x)
+        :long (int? x)
         :bigint (or (instance? BigInteger x) (instance? clojure.lang.BigInt x))
         :double (instance? Double x)
         :float (instance? Float x)

@@ -185,9 +185,9 @@
       (let [e (when entity? (if fixed? (constant-entity (:value entity)) (aget ^objects (.get tuples i) e-index)))
             value (when value? (aget ^objects (.get tuples i) v-index))
             key (cond-> [] entity? (conj e) value? (conj value))]
-        ;; Native IDs are Long keys. Other bound representations cannot join
-        ;; these facts under shared key equality; a literal uses constant equality.
-        (when (and (or (not entity?) (instance? Long e)) (or (not value?) (some? value)) (.add seen key))
+        ;; Native IDs accept the fixed-width boxed integers admitted by :long.
+        ;; A literal additionally uses predicate/constant numeric equality.
+        (when (and (or (not entity?) (int? e)) (or (not value?) (some? value)) (.add seen key))
           (.add keys (object-array key)))))
     keys))
 

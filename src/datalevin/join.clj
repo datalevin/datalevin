@@ -114,8 +114,8 @@
       (if (< i size)
         (let [x (.get tuples i)
               k (key-fn x)]
-          (if (instance? Long k)
-            (let [k      (.longValue ^Long k)
+          (if (int? k)
+            (let [k      (long k)
                   bucket (.get res k)]
               (if bucket
                 (if (u/array? bucket)
@@ -130,8 +130,8 @@
 
 (defn- long-bucket
   [^LongObjectHashMap hash k]
-  (when (instance? Long k)
-    (.get hash (.longValue ^Long k))))
+  (when (int? k)
+    (.get hash (long k))))
 
 (defn- attr-keys
   "attrs are map, preserve order by val"

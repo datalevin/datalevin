@@ -22,8 +22,9 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Query key semantics shared by native and source execution. Byte arrays are
- * compared by content, including inside ordinary collections. Other leaves
- * retain Java key equality (notably decimal scale and custom nominal values).
+ * compared by content, including inside ordinary collections. Boxed fixed-width
+ * integers share long value equality. Other leaves retain Java key equality
+ * (notably decimal scale and custom nominal values).
  * Keys borrow their values: callers must keep mutable leaves stable while an
  * index owns them. No canonical copies or alternate public values are built.
  */
@@ -112,6 +113,8 @@ public final class QueryKey {
     }
 
     public static int hash(Object value) {
+        if (value instanceof Long number) return Long.hashCode(number.longValue());
+        if (smallInteger(value)) return Long.hashCode(((Number) value).longValue());
         if (!(value instanceof byte[]) && !collection(value)) return Objects.hashCode(value);
         check();
         if (value instanceof byte[] bytes) return Arrays.hashCode(bytes);
@@ -154,6 +157,10 @@ public final class QueryKey {
         return equal(left, right, true);
     }
 
+    private static boolean smallInteger(Object value) {
+        return value instanceof Integer || value instanceof Short || value instanceof Byte;
+    }
+
     private static boolean equal(Object left, Object right, boolean equiv) {
         if (left == right) return true;
         if (left == null || right == null) return false;
@@ -161,6 +168,10 @@ public final class QueryKey {
         // monomorphic even when the same index also sees other key types.
         if (left instanceof Long a && right instanceof Long b) {
             return a.longValue() == b.longValue();
+        }
+        if ((left instanceof Long || smallInteger(left))
+                && (right instanceof Long || smallInteger(right))) {
+            return ((Number) left).longValue() == ((Number) right).longValue();
         }
         if (!(left instanceof byte[]) && !(right instanceof byte[])
                 && (!collection(left) || !collection(right))) {

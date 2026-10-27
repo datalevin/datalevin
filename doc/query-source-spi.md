@@ -293,8 +293,10 @@ categories. Never report these conditions as successful exhaustion.
 Supported scalar type names are `:boolean`, `:long`, `:bigint`, `:double`,
 `:float`, `:bigdec`, `:string`, `:keyword`, `:symbol`, `:uuid`, `:instant`, and
 `:bytes`. `:data` admits supported portable values without a narrower type
-promise. Use Datalevin's representations: for example, `:long` is a JVM `Long`,
-`:bytes` is a byte array, and `:instant` is `java.util.Date`. Immutable
+promise. `:long` accepts JVM `Byte`, `Short`, `Integer`, and `Long` values,
+matching native `:db.type/long` validation. Their boxed representations are
+preserved and equal integer values share query key identity. `:bytes` is a
+byte array, and `:instant` is `java.util.Date`. Immutable
 `java.time.Instant`, `Duration`, and `Period` use `:data`, retaining their exact
 components. Unsupported or lossy conversions must be rejected or defined
 explicitly in the accepted mapping.
@@ -335,6 +337,9 @@ Use shared query equality, not SQL collation or an adapter-specific key
 comparison. [`QueryKey`](../src/java/datalevin/utl/QueryKey.java) supplies binding
 key equality/hash and predicate equivalence. Byte arrays compare by content,
 including inside supported collections; metadata does not change query keys.
+Fixed-width boxed integers compare by their long value and share the same
+key hash, including for negative values. Arbitrary-precision integers and
+decimals retain their separate binding-key representations.
 Pattern constants are predicate operands: a different numeric representation
 can compare equal to a fact even when it is not a valid representation for a
 returned typed column. Do not infer no matches merely from that mismatch.

@@ -32,7 +32,6 @@
   (:import
    [datalevin.utl QueryKey QueryKey$EquivSet]
    [java.util List]
-   [java.nio.charset StandardCharsets]
    [datalevin.utl LikeFSM LRUCache]
    [org.eclipse.collections.impl.list.mutable FastList]
    [org.roaringbitmap PeekableIntIterator RoaringBitmap]
@@ -46,18 +45,15 @@
 
 (defn- compile-like
   [^String pattern escape not?]
-  (let [pb  (.getBytes pattern StandardCharsets/UTF_8)
-        fsm (if escape (LikeFSM. pb escape) (LikeFSM. pb))
-        ;; A scan now retains exact LIKE predicates instead of replacing
-        ;; their variables with constants. The FSM has no accepting-state
-        ;; lookup for an empty pattern, which matches only the empty string.
-        f   (if (.isEmpty pattern)
-              #(.isEmpty ^String %)
-              #(.match fsm (.getBytes ^String % StandardCharsets/UTF_8)))]
+  (let [fsm (if escape (LikeFSM. pattern escape) (LikeFSM. pattern))
+        f   #(.match fsm ^String %)]
     (if not? #(clojure.core/not (f %)) f)))
 
 (defn like
-  "Predicate similar to `LIKE` in SQL, e.g. `[(like ?name \"%Smith\")]`"
+  "Case-sensitive SQL-style `LIKE`, e.g. `[(like ?name \"%Smith\")]`.
+  `%` matches zero or more Unicode characters, `_` matches exactly one,
+  including newlines. Escape wildcards with `!` or a character supplied as
+  `{:escape \\|}`. A trailing escape is ignored for compatibility."
   ([input pattern]
    (like input pattern nil false))
   ([input pattern opts]
@@ -75,7 +71,8 @@
      (matcher input))))
 
 (defn not-like
-  "Predicate similar to `NOT LIKE` in SQL, e.g. `[(no-like ?name \"%Smith\")]`"
+  "The complement of `like`, with the same pattern and escape rules,
+  e.g. `[(not-like ?name \"%Smith\")]`."
   ([input pattern]
    (not-like input pattern nil))
   ([input pattern opts]

@@ -2,6 +2,11 @@
 
 ## WIP
 
+### Fixed
+- [Datalog] `Integer` coercion regression introduced in 1.2.8.
+- [Datalog] `like` and `not-like` wildcard retries.
+### Improved
+- [Federation] same entity attributes fusion support.
 
 ## 1.2.8 (2026-10-26)
 
@@ -12,7 +17,7 @@
 - [Search] fuzzy/prefix fulltext search
   [#314](https://github.com/datalevin/datalevin/issues/314).
 ### Fixed
-- [Datalog] A re-index bug
+- [Datalog] a re-index bug
   [#353](https://github.com/datalevin/datalevin/issues/353).
 - [Datalog] ensure planner does not look up by `:db/nonidex` attributes.
 - [Lib] JS `unlistenDb` removes subscription key.

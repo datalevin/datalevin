@@ -89,8 +89,8 @@
 
 (defn- substitutable-input?
   "Keep key-sensitive inputs as bindings when a literal could broaden a match.
-  Predicate/function-only inputs still substitute. Native Long entity IDs and
-  typed Long values also retain their indexed constant access paths."
+  Predicate/function-only inputs still substitute. Native fixed-width integer
+  entity IDs and typed long values retain their indexed constant access paths."
   [parsed-q inputs sym value]
   (or (nil? value) (boolean? value) (string? value) (keyword? value)
       (symbol? value) (uuid? value) (bytes? value)
@@ -106,7 +106,7 @@
               (every?
                 (fn [[idx term]]
                   (or (not= sym (:symbol term))
-                      (and (instance? Long value)
+                      (and (int? value)
                            (db/-searchable? database)
                            (or (zero? (long idx))
                                (and (= idx 2)

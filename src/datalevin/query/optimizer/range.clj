@@ -248,8 +248,7 @@
   ;; Validate constant patterns before choosing a range. An empty scan may
   ;; never invoke the residual matcher that would otherwise reject them.
   (when (and (= input v) (string? pattern))
-    (LikeFSM/isValid (.getBytes ^String pattern StandardCharsets/UTF_8)
-                     (or escape \!)))
+    (LikeFSM/isValid ^String pattern (or escape \!)))
   (let [m' (update m :pred add-pred (activate-var-pred helpers v pred))]
     ;; A literal prefix is only a superset of LIKE matches. Complementing
     ;; it for NOT LIKE would discard valid rows before the predicate runs.

@@ -361,12 +361,12 @@
                        :where
                        [?o :orders/custkey ?ck]
                        [?o :orders/comment ?oc]
-                       [(not (re-find #"(?s)special.*requests" ?oc))]] $) [[?ck ?c-count]]]
+                       [(not-like ?oc "%special%requests%")]] $) [[?ck ?c-count]]]
                   [?c :customer/custkey ?ck])
              (and [?c :customer/custkey ?ck]
                   (not [?o :orders/custkey ?ck]
                        [?o :orders/comment ?oc]
-                       [(not (re-find #"(?s)special.*requests" ?oc))])
+                       [(not-like ?oc "%special%requests%")])
                   [(ground 0) ?c-count]))])
 
 ;; Q14: Promotion Effect

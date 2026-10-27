@@ -112,6 +112,28 @@ locally and remotely, and returns the updated schema. Calling it again is safe.
 Direct schema changes to `:db/noindex` require an empty attribute.
 
 
+## String pattern predicates
+
+`like` matches the entire string and is case-sensitive. `%` matches zero or
+more Unicode characters; `_` matches exactly one Unicode character, including
+supplementary characters such as `😀`. Both wildcards can match newlines.
+`not-like` returns the complement of `like`.
+
+```clojure
+[(like ?name "%Smith")]                    ; names ending in Smith
+[(like ?label "_猫")]                       ; one character followed by 猫
+[(not-like ?comment "%special%requests%")] ; exclude the ordered substrings
+[(like ?label "50!%")]                     ; the literal string 50%
+[(like ?label "50|%" {:escape \|})]         ; a custom escape character
+```
+
+The default escape is `!`; `{:escape <character>}` overrides it. An escape
+may precede `%`, `_`, or itself; other escaped characters throw an error.
+For compatibility, a trailing escape character is ignored. An empty pattern
+matches only the empty string, while `%` (including repeated `%`) also matches
+the empty string. Matching uses Unicode code points, without normalization or
+case folding.
+
 ## Query Optimizations
 
 Datalevin query engine employs multiple optimization strategies.
