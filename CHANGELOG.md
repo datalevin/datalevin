@@ -1,6 +1,6 @@
 # Change Log
 
-## WIP
+## 1.2.9 (2026-10-27)
 
 ### Fixed
 - [Datalog] `Integer` coercion regression introduced in 1.2.8.
