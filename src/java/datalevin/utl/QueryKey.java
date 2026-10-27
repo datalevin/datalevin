@@ -116,6 +116,15 @@ public final class QueryKey {
         check();
         if (value instanceof byte[] bytes) return Arrays.hashCode(bytes);
         if (value instanceof IRecord) return value.hashCode();
+        if (value instanceof PersistentVector vector) {
+            // Result tuples are usually small vectors. Their sequence iterator
+            // allocates chunk wrappers as it advances; indexed traversal reads
+            // the same values directly from the vector's tail/tree.
+            int hash = 1;
+            int size = vector.count();
+            for (int i = 0; i < size; i++) hash = 31 * hash + hash(vector.nth(i));
+            return hash;
+        }
         if (value instanceof List<?> list) {
             int hash = 1;
             for (Object child : list) hash = 31 * hash + hash(child);
@@ -162,6 +171,14 @@ public final class QueryKey {
             return right instanceof byte[] b && Arrays.equals(a, b);
         }
         if (right instanceof byte[]) return false;
+        if (left instanceof PersistentVector a && right instanceof PersistentVector b) {
+            int size = a.count();
+            if (size != b.count()) return false;
+            for (int i = 0; i < size; i++) {
+                if (!equal(a.nth(i), b.nth(i), equiv)) return false;
+            }
+            return true;
+        }
         // Ordered collections can compare each child once. Pre-scanning both
         // lists for bytes doubles traversal and magnifies hash collisions in
         // native result sets. Opaque children still take their own equality.

@@ -410,14 +410,29 @@
       (check!)
       (cons (f (first items)) (checked-map f check! (rest items))))))
 
+(deftype ^:private ProjectedAggregateColumn [tuples ^long idx]
+  clojure.lang.IReduceInit
+  (reduce [_ rf init]
+    (reduce (fn [acc tuple] (rf acc (nth tuple idx))) init tuples))
+  clojure.lang.Counted
+  (count [_] (count tuples)))
+
 (defn- compute-aggregate
   "Compute an aggregate over tuples at the given tuple index."
   [element aggregate-plans tuples tuple-idx]
   (let [[f args check!] (aggregate-plans element)
-        project #(nth % tuple-idx)
-        vals (if check! (checked-map project check! tuples)
-                 (map project tuples))]
-    (apply f (conj args vals))))
+        project #(nth % tuple-idx)]
+    (if (and (nil? check!) (empty? args)
+             (or (identical? f (built-ins/aggregates 'sum))
+                 (identical? f (built-ins/aggregates 'avg))
+                 (identical? f (built-ins/aggregates 'count))))
+      ;; Keep the exact built-in arithmetic (including decimal/rational avg),
+      ;; while reducing and counting a projection without a lazy value sequence.
+      ;; Custom/wrapped functions keep their collection contract below.
+      (f (ProjectedAggregateColumn. tuples tuple-idx))
+      (let [vals (if check! (checked-map project check! tuples)
+                     (map project tuples))]
+        (apply f (conj args vals))))))
 
 (defn- eval-find-expr
   "Evaluate a FindExpr by computing its inner aggregates and applying the

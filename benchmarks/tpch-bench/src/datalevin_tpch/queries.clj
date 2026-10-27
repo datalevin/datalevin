@@ -34,8 +34,9 @@
     [?l :lineitem/tax ?l-tax]
     [?l :lineitem/shipdate ?l-shipdate]
     [(<= ?l-shipdate "1998-09-02")]
-    [(- 1 ?l-discount) ?disc]
-    [(* ?l-extendedprice ?disc) ?disc-price]
+    ;; Keep the discount factor inside the expression rather than appending
+    ;; an intermediate binding to every qualifying lineitem tuple.
+    [(* ?l-extendedprice (- 1 ?l-discount)) ?disc-price]
     [(* ?disc-price (+ 1 ?l-tax)) ?charge]])
 
 ;; Q6: Forecasting Revenue Change
@@ -349,27 +350,23 @@
              (and [(= ?hi false)] [(ground 0) ?high] [(ground 1) ?low]))])
 
 ;; Q13: Customer Distribution
-;;
-;; SQL uses a LEFT OUTER JOIN so customers with no qualifying orders count as
-;; zero. The two or-join branches are mutually exclusive: the first uses a
-;; correlated count for customers with matching orders, the second uses `not`
-;; to catch the rest and bind zero.
+;; Count qualifying orders for all customers in one grouped relation. The
+;; second, disjoint branch supplies zero for customers absent from that relation.
 (def q-13
   '[:find ?c-count (count ?c)
     :order-by [1 :desc 0 :desc]
     :where
     (or-join [?c ?c-count]
-             (and [?c :customer/custkey ?ck]
-                  [(q [:find (count ?o) .
-                       :in $ ?ck
+             (and [(q [:find ?ck (count ?o)
                        :where
                        [?o :orders/custkey ?ck]
                        [?o :orders/comment ?oc]
-                       [(not (re-find #"special.*requests" ?oc))]] $ ?ck) ?c-count])
+                       [(not (re-find #"(?s)special.*requests" ?oc))]] $) [[?ck ?c-count]]]
+                  [?c :customer/custkey ?ck])
              (and [?c :customer/custkey ?ck]
                   (not [?o :orders/custkey ?ck]
                        [?o :orders/comment ?oc]
-                       [(not (re-find #"special.*requests" ?oc))])
+                       [(not (re-find #"(?s)special.*requests" ?oc))])
                   [(ground 0) ?c-count]))])
 
 ;; Q14: Promotion Effect
@@ -510,43 +507,57 @@
     [?c :customer/name ?c-name]])
 
 ;; Q19: Discounted Revenue
+;; Explicit, mutually exclusive brand branches expose selective part predicates
+;; to the native planner before lineitem expansion and revenue calculation.
 (def q-19
   '[:find (sum ?revenue) .
     :with ?l
     :where
-    [?l :lineitem/partkey ?pk]
-    [?p :part/partkey ?pk]
-    [?l :lineitem/quantity ?q]
-    [?l :lineitem/shipmode ?sm]
-    [?l :lineitem/shipinstruct ?si]
-    [?l :lineitem/extendedprice ?ep]
-    [?l :lineitem/discount ?d]
-    [(- 1 ?d) ?x]
-    [(* ?ep ?x) ?revenue]
-    [?p :part/brand ?brand]
-    [?p :part/container ?cont]
-    [?p :part/size ?psize]
-    [(or (and (= ?brand "Brand#12")
-              (or (= ?cont "SM CASE") (= ?cont "SM BOX")
-                  (= ?cont "SM PACK") (= ?cont "SM PKG"))
-              (>= ?q 1) (<= ?q 11)
-              (>= ?psize 1) (<= ?psize 5)
-              (or (= ?sm "AIR") (= ?sm "AIR REG"))
-              (= ?si "DELIVER IN PERSON"))
-         (and (= ?brand "Brand#23")
-              (or (= ?cont "MED BAG") (= ?cont "MED BOX")
-                  (= ?cont "MED PKG") (= ?cont "MED PACK"))
-              (>= ?q 10) (<= ?q 20)
-              (>= ?psize 1) (<= ?psize 10)
-              (or (= ?sm "AIR") (= ?sm "AIR REG"))
-              (= ?si "DELIVER IN PERSON"))
-         (and (= ?brand "Brand#34")
-              (or (= ?cont "LG CASE") (= ?cont "LG BOX")
-                  (= ?cont "LG PACK") (= ?cont "LG PKG"))
-              (>= ?q 20) (<= ?q 30)
-              (>= ?psize 1) (<= ?psize 15)
-              (or (= ?sm "AIR") (= ?sm "AIR REG"))
-              (= ?si "DELIVER IN PERSON")))]] )
+    (or-join [?l ?ep ?discount]
+             (and [?p :part/brand "Brand#12"]
+                  [?p :part/container ?cont]
+                  [(or (= ?cont "SM CASE") (= ?cont "SM BOX") (= ?cont "SM PACK") (= ?cont "SM PKG"))]
+                  [?p :part/size ?size]
+                  [(>= ?size 1)] [(<= ?size 5)]
+                  [?p :part/partkey ?pk]
+                  [?l :lineitem/partkey ?pk]
+                  [?l :lineitem/quantity ?qty]
+                  [(>= ?qty 1)] [(<= ?qty 11)]
+                  [?l :lineitem/shipmode ?mode]
+                  [(or (= ?mode "AIR") (= ?mode "AIR REG"))]
+                  [?l :lineitem/shipinstruct "DELIVER IN PERSON"]
+                  [?l :lineitem/extendedprice ?ep]
+                  [?l :lineitem/discount ?discount])
+             (and [?p :part/brand "Brand#23"]
+                  [?p :part/container ?cont]
+                  [(or (= ?cont "MED BAG") (= ?cont "MED BOX") (= ?cont "MED PKG") (= ?cont "MED PACK"))]
+                  [?p :part/size ?size]
+                  [(>= ?size 1)] [(<= ?size 10)]
+                  [?p :part/partkey ?pk]
+                  [?l :lineitem/partkey ?pk]
+                  [?l :lineitem/quantity ?qty]
+                  [(>= ?qty 10)] [(<= ?qty 20)]
+                  [?l :lineitem/shipmode ?mode]
+                  [(or (= ?mode "AIR") (= ?mode "AIR REG"))]
+                  [?l :lineitem/shipinstruct "DELIVER IN PERSON"]
+                  [?l :lineitem/extendedprice ?ep]
+                  [?l :lineitem/discount ?discount])
+             (and [?p :part/brand "Brand#34"]
+                  [?p :part/container ?cont]
+                  [(or (= ?cont "LG CASE") (= ?cont "LG BOX") (= ?cont "LG PACK") (= ?cont "LG PKG"))]
+                  [?p :part/size ?size]
+                  [(>= ?size 1)] [(<= ?size 15)]
+                  [?p :part/partkey ?pk]
+                  [?l :lineitem/partkey ?pk]
+                  [?l :lineitem/quantity ?qty]
+                  [(>= ?qty 20)] [(<= ?qty 30)]
+                  [?l :lineitem/shipmode ?mode]
+                  [(or (= ?mode "AIR") (= ?mode "AIR REG"))]
+                  [?l :lineitem/shipinstruct "DELIVER IN PERSON"]
+                  [?l :lineitem/extendedprice ?ep]
+                  [?l :lineitem/discount ?discount]))
+    [(- 1 ?discount) ?factor]
+    [(* ?ep ?factor) ?revenue]])
 
 ;; Q20: Potential Part Promotion
 (def q-20

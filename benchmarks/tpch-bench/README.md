@@ -158,8 +158,8 @@ patterns required care:
   grouped relations filtered in the outer query. Q18 returns the already
   computed quantity sum instead of joining and aggregating lineitems again.
 - **`LEFT OUTER JOIN`** (Q13) uses two mutually exclusive `or-join` branches:
-  a correlated count for customers with matching orders, and a `not` branch
-  binding zero for the rest.
+  one grouped count relation joined to customers, and a `not` branch binding
+  zero for the rest. The comment regex uses dot-all matching for SQL's `%`.
 - **`CASE` over aggregates** (Q8, Q14) is expressed with `:with` and nested
   aggregates; `if` is not resolvable inside nested queries.
 - **`extract(year ...)`** becomes `(subs date 0 4)` plus `parse-long`.
@@ -182,7 +182,11 @@ These historical scan counts do not describe the current validation results.
 Current evidence includes complete correctness checks at SF0.1 and SF1,
 a diagnostic SF1 profile, and isolated Q18 before/after timings. See the
 [validation and performance report](../../doc/measurements/tpch-validation-2026-10-26.md).
-Run the benchmark commands above for a complete timing comparison on your machine.
+The [hotspot follow-up](../../doc/measurements/tpch-hotspots-2026-10-26.md)
+records verified SF1 improvements for Q1, Q13, and Q19. Q13 groups qualifying
+orders once, Q19 exposes selective brand branches, and Q1 reduces tuple and
+aggregation allocations. Run the benchmark commands above for a complete timing
+comparison on your machine.
 
 The raw CSVs (`datalevin_pass.csv`, `sqlite_pass.csv`, `postgres_pass.csv`) and
 `results.edn`-style manifests should be retained alongside any published table,
