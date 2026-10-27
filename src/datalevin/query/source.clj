@@ -1,8 +1,9 @@
 (ns datalevin.query.source
-  "Unreleased embedded query-source SPI prototype; the contract may change in place.
+  "Embedded query-source SPI v2, introduced in Datalevin 1.2.8.
 
   Sources are caller-owned. Sessions and owned-batch cursors belong to one
-  invocation. See doc/query-source-spi.md for the complete contract."
+  invocation. See doc/query-source-spi.md for the current contract and the
+  Datalevin 1.2.9 requirements for fusion and boxed-integer interoperability."
   (:require [datalevin.query.dispatch :as dispatch]
             [datalevin.query.source.contract :as contract]
             [datalevin.query.source.control :as control]

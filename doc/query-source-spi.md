@@ -5,10 +5,10 @@ embedded JVM `d/q` and `d/explain`. An adapter exposes typed entityâ€“attributeâ
 (EAV) facts and access paths for retrieving them. Datalevin handles joins,
 residual predicates, supported rules, aggregation, and query results.
 
-The current SPI revision is **2**. It is unreleased and may change in place;
-develop against matching Datalevin and adapter versions. Revision 2 is the only
-accepted revision. This reference describes the current interface, including
-same-entity fusion. Cost estimates are advisory; they do not select access paths.
+This reference targets **Datalevin 1.2.9** and **SPI revision 2**. The SPI was
+introduced in Datalevin 1.2.8; version 1.2.9 adds same-entity fusion and fixes
+boxed-integer interoperability. Revision 2 is the only accepted revision. Cost
+estimates are advisory; they do not select access paths.
 
 The public namespace is [`datalevin.query.source`](../src/datalevin/query/source.clj).
 For mapping compilation, provider packaging, and implementation examples, see
@@ -17,10 +17,12 @@ in the `datalevin-federation` project. Links to that project assume sibling
 checkouts. Historical envelopes and core development reports are preserved in
 [design and implementation notes](query-source-design-notes.md).
 
+- [Version compatibility](#version-compatibility)
 - [Implementation order](#implementation-order)
 - [Protocols and ownership](#protocols-and-ownership)
 - [Source descriptor](#source-descriptor)
 - [Logical values and identity](#logical-values-and-identity)
+- [Query options](#query-options)
 - [Session acquisition and read guarantees](#session-acquisition-and-read-guarantees)
 - [Planning requests and alternatives](#planning-requests-and-alternatives)
 - [Dependent access](#dependent-access)
@@ -36,6 +38,28 @@ shown in a complete envelope are required unless stated otherwise. Unknown
 unqualified fields are invalid. Namespaced envelope annotations are allowed
 but do not grant capabilities. Logical type parameters and namespaced fields
 inside a type descriptor are part of that type's identity.
+
+## Version compatibility
+
+The [1.2.8 release](../CHANGELOG.md#128-2026-10-26) includes the external-source
+protocols, EAV scans and dependent lookups, shared resource controls, and
+embedded `d/q`/`d/explain` entry points. Adapter artifacts have their own versions
+in the federation project.
+
+| Capability | Datalevin 1.2.8 | Datalevin 1.2.9 |
+|---|---|---|
+| SPI v2 descriptors, single-pattern accesses, dependent bindings | Available | Available |
+| Same-entity multi-pattern fusion and `:eav-fusion-v1` selection | Unavailable | Available |
+| `Integer`, `Short`, and `Byte` values in `:long` columns and native joins | Affected by the integer coercion regression; use `Long` values | Fixed, with shared integer key equality and hashing |
+| Cost-based ranking of external accesses | Unavailable | Unavailable; estimates remain advisory |
+
+Adapters using fusion or boxed-integer interoperability require Datalevin
+**1.2.9**. A provided dependency on `1.2.8` does not supply these changes. The
+SPI revision remains `2`, so checking `:spi-versions` alone does not establish
+compatibility with capabilities added in 1.2.9. Declare and test the minimum
+Datalevin version with your adapter. The
+[PostgreSQL adapter](../../federation/postgres/README.md) uses same-entity fusion.
+See the [changelog](../CHANGELOG.md) for the release changes.
 
 <a id="1-project-boundary"></a>
 <a id="11-four-shape-revision-target"></a>
@@ -290,16 +314,25 @@ categories. Never report these conditions as successful exhaustion.
 
 ## Logical values and identity
 
-Supported scalar type names are `:boolean`, `:long`, `:bigint`, `:double`,
-`:float`, `:bigdec`, `:string`, `:keyword`, `:symbol`, `:uuid`, `:instant`, and
-`:bytes`. `:data` admits supported portable values without a narrower type
-promise. `:long` accepts JVM `Byte`, `Short`, `Integer`, and `Long` values,
-matching native `:db.type/long` validation. Their boxed representations are
-preserved and equal integer values share query key identity. `:bytes` is a
-byte array, and `:instant` is `java.util.Date`. Immutable
-`java.time.Instant`, `Duration`, and `Period` use `:data`, retaining their exact
-components. Unsupported or lossy conversions must be rejected or defined
-explicitly in the accepted mapping.
+Use these representations for values returned in typed columns:
+
+| Logical type | Accepted JVM representation |
+|---|---|
+| `:boolean` | `Boolean` |
+| `:long` | `Byte`, `Short`, `Integer`, or `Long`; see the version table above |
+| `:bigint` | `java.math.BigInteger` or `clojure.lang.BigInt` |
+| `:double`, `:float` | `Double` and `Float`, respectively |
+| `:bigdec` | `java.math.BigDecimal` |
+| `:string`, `:keyword`, `:symbol` | String, Clojure keyword, and Clojure symbol, respectively |
+| `:uuid` | `java.util.UUID` |
+| `:instant` | Exactly `java.util.Date`, with millisecond precision; subclasses such as `java.sql.Timestamp` are not accepted |
+| `:bytes` | JVM byte array (`byte[]`) |
+| `:data` | Supported portable values without a narrower type promise, including immutable `java.time.Instant`, `Duration`, and `Period` |
+
+`:long` follows native `:db.type/long` validation. It preserves the boxed
+representation; it does not convert every value to `Long`. An arbitrary-precision
+integer is a `:bigint`, even when its value fits in a long. Unsupported or lossy
+conversions must be rejected or defined explicitly in the accepted mapping.
 
 Columns have a variable, type, and Boolean nullability:
 
@@ -344,6 +377,20 @@ Pattern constants are predicate operands: a different numeric representation
 can compare equal to a fact even when it is not a valid representation for a
 returned typed column. Do not infer no matches merely from that mismatch.
 
+For example, Datalevin 1.2.9 distinguishes binding-key identity from numeric
+predicate equivalence:
+
+```clojure
+(import '[datalevin.utl QueryKey])
+
+(QueryKey/equals (int -1) (long -1))                 ; true
+(= (QueryKey/hash (int -1)) (QueryKey/hash (long -1))) ; true
+(QueryKey/equals 1 1N)                              ; false
+(QueryKey/equiv 1 1N)                               ; true
+(QueryKey/equals 1.0M 1.00M)                         ; false
+(QueryKey/equiv 1.0M 1.00M)                          ; true
+```
+
 EAV entities and values are non-null. A missing attribute contributes no fact,
 even for `_` or an unprojected value. There is no missing-value sentinel.
 Many-valued mappings expose distinct non-null facts: duplicate collection
@@ -358,6 +405,33 @@ They are not native database entity IDs. Scalar natural-key joins remain
 ordinary scalar joins. If an export has no stable key, an accepted snapshot
 identity can include the export namespace and row locator; reusing an offset in
 a different export must not imply the same entity.
+
+## Query options
+
+The query-map `:query-source` value accepts these options:
+
+| Option | Meaning |
+|---|---|
+| `:authorization` | Invocation-specific authorization context; defaults to `{:principal-id :application}`. |
+| `:consistency` | Default requested read minimum; defaults to `:snapshot`. |
+| `:sources` | Source-symbol map of `{:consistency ...}` overrides for declared external aliases. |
+| `:limits` | Overrides for the shared resource limits shown below. |
+| `:planning` | `:max-alternatives` (default `32`) and `:estimate-max-age-ms` (default `300000`). Estimate age remains advisory. |
+
+For example, put limits inside `:limits`, rather than directly under
+`:query-source`:
+
+```clojure
+(d/q '{:find [?item ?name]
+       :in [$items]
+       :where [[$items ?item :item/name ?name]]
+       :query-source {:limits {:batch-rows 256 :external-requests 32}
+                      :planning {:max-alternatives 16}}}
+     items-source)
+```
+
+The ordinary query `:timeout` supplies the deadline; it is not a
+`:query-source` option. Unknown unqualified options are rejected.
 
 <a id="4-query-context-and-session-lifecycle"></a>
 <a id="103-per-source-read-requirements-and-actual-guarantees"></a>
@@ -667,7 +741,19 @@ must remain within one source, region, and accepted scope. Distinct entity
 variables and separate `_` entity positions do not imply shared identity.
 Cross-entity join pushdown is outside this contract.
 
-For example, two patterns on `?item` can return one wide row shape:
+For example, a request containing these two patterns on `?item` can use one
+wide row shape. The request fragment replaces `:clauses` and `:required-vars`
+in the earlier planning request:
+
+```edn
+{:clauses [{:id 0 :kind :pattern
+            :terms [[:var ?item] [:const :item/name] [:var ?name]]}
+           {:id 1 :kind :pattern
+            :terms [[:var ?item] [:const :item/tag] [:var ?tag]]}]
+ :required-vars #{?item ?name ?tag}}
+```
+
+The corresponding fused alternative includes:
 
 ```edn
 {:covers #{0 1}
@@ -893,7 +979,9 @@ Ordinary `q` and plan-only `explain` need not request metrics.
 ## Resource limits and cancellation
 
 The query-map `:query-source` option accepts these limits. The shown numbers
-are current defaults; always honor the effective request values.
+are current defaults for `:query-source {:limits ...}`; always honor the
+effective request values. The map below is also the complete default `:limits`
+map supplied to provider callbacks.
 
 ```edn
 {:batch-rows 4096 :batch-bytes 1048576
