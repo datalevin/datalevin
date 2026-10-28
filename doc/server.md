@@ -208,8 +208,19 @@ Queries with a single remote data source run on the server to reduce network
 traffic. Queries involving other data sources may also process data on the
 client. The same database APIs work in both cases.
 
-Clients check for remote database changes before reusing cached data. Keep client
-and server clocks synchronized, for example with NTP or chrony.
+Clients cache query, pull, and pull-many results alongside index reads, using
+the Datalog `:cache-limit` (default `512`; `0` disables retention). Ordinary and
+prepared reads share entries. Clients check for remote database changes before
+reusing cached data; writes through the connection invalidate cached results
+immediately. Explicit transactions, pull visitors, mutable inputs/results, and
+queries using UDFs or qualified functions bypass result caching. Keep client and
+server clocks synchronized, for example with NTP or chrony.
+
+KV point, range, list, rank, and batch reads also have a bounded client cache.
+Cache hits validate a committed LMDB revision, which detects updates even when
+the number of entries stays the same. Random sampling and visitor calls always
+execute. KV caching requires an updated server; older servers fall back to
+ordinary reads automatically.
 
 ## Configuration
 
@@ -221,7 +232,8 @@ latency and throughput trade-offs.
 `datalevin.constants/*remote-db-last-modified-check-interval-ms*` (default
 `0`) sets the minimum interval between checks for remote database changes.
 
-* `0` means check on every call (strict freshness, more network round trips).
+* `0` validates every cache hit against the server (strict freshness, more
+  network round trips).
 * A positive value reuses the previous freshness check inside the interval
   (fewer round trips, but remote updates may be observed later, up to the
   interval).
@@ -232,15 +244,37 @@ Example:
 (require '[datalevin.constants :as c]
          '[datalevin.core :as d])
 
+(def conn (d/get-conn "dtlv://user:pass@db-host:8898/app"))
+
 (binding [c/*remote-db-last-modified-check-interval-ms* 250]
-  (d/get-conn "dtlv://user:pass@db-host:8898/app"))
+  (dotimes [_ 100]
+    (d/pull @conn [:name :email] 1)))
 ```
+
+Bind the interval around the reads. Within the interval, repeated cached reads
+need no RPC. With the default `0`, a cache hit still checks database metadata,
+but skips the query or pull RPC. Updates from other connections become visible
+at the next freshness check.
+
+Direct Datalog schema reads and lookup-reference validation, including `entid`,
+honor this interval without requiring an explicit `db?` call. `schema-snapshot`
+always fetches a fresh snapshot.
 
 ### Client connection pool
 
 `datalevin.client/new-client` accepts:
 
 * `:pool-size` (default `3`): max pooled connections per client instance.
+* `:read-cache-limit` (default `512`): client KV and schema cache entries per
+  database. `0` disables this cache. Datalog query and pull results use the
+  database's `:cache-limit`.
+* `:read-cache-check-interval-ms`: freshness interval for cached KV and schema
+  reads. When omitted, these reads use
+  `c/*remote-db-last-modified-check-interval-ms*` (default `0`). A positive
+  interval allows repeated hits without an RPC; writes through the same client
+  invalidate immediately. Other clients' writes are observed at the next check.
+  Datalog store schema access follows
+  `*remote-db-last-modified-check-interval-ms*` independently of this KV option.
 * `:time-out` (default `60000` ms): time allowed for one request, including
   connection setup, automatic recovery and retries of retryable `:server/busy`
   responses. Recovery and retries do not restart this timeout.

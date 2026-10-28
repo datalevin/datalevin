@@ -183,6 +183,7 @@
    :list-dbis unguarded
    :copy runtime-managed
    :stat unguarded
+   :kv-read-cache-token unguarded
    :entries unguarded
    :open-transact-kv transaction-open
    :close-transact-kv transaction-close

@@ -1692,8 +1692,11 @@
                                  #(assoc % :permissions
                                          (user-permissions sys-conn username))))
                 (let [db-info (when (and return-db-info? datalog?)
-                                (assoc (fresh-runtime-db-info store)
-                                       :opts (i/opts store)))]
+                                (let [{:keys [schema revision]} (i/schema-snapshot store)]
+                                  (assoc (fresh-runtime-db-info store)
+                                         :opts (i/opts store)
+                                         :schema schema
+                                         :schema-revision revision)))]
                   (when respond?
                     (write-message skey
                                    (cond-> {:type :command-complete}

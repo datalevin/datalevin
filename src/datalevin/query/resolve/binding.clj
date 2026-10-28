@@ -100,6 +100,10 @@
         attr-keys    (vec (keys attrs))
         n            (count attr-keys)
         ^ints idxs   (int-array (map attrs attr-keys))
+        contiguous?  (loop [i 0]
+                       (or (== i n)
+                           (and (== i (aget idxs i))
+                                (recur (unchecked-inc-int i)))))
         ^List tuples (:tuples production)
         size         (.size tuples)
         res          (FastList. size)]
@@ -108,11 +112,15 @@
             val            (tuple-fn tuple)]
         (when-not (nil? val)
           (let [^objects out (object-array (unchecked-inc n))]
-            (dotimes [j n]
-              (aset out j (aget tuple (aget idxs j))))
+            (if contiguous?
+              (System/arraycopy tuple 0 out 0 n)
+              (dotimes [j n]
+                (aset out j (aget tuple (aget idxs j)))))
             (aset out n val)
             (.add res out)))))
-    (r/relation! (zipmap (conj attr-keys out-var) (range)) res)))
+    (r/with-unique-keys-from
+      (r/relation! (zipmap (conj attr-keys out-var) (range)) res)
+      production)))
 
 (defn compile-tuple-product
   [left-attrs right-attrs]
@@ -195,7 +203,8 @@
                    {:error :query/binding, :value value,
                     :binding (dp/source binding)}))
           (append-flat-tuple-product! res tuple value product-plan))))
-    (r/relation! (aget ^objects product-plan 0) res)))
+    (r/with-unique-keys-from
+      (r/relation! (aget ^objects product-plan 0) res) production)))
 
 (defn- tuple-product-match?
   [^objects left-tuple ^objects right-tuple ^objects product-plan]

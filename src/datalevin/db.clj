@@ -20,6 +20,7 @@
    [datalevin.datom :as d :refer [datom datom?]]
    [datalevin.custom-datalog :as cd]
    [datalevin.db.range-cache :as range-cache]
+   [datalevin.remote-cache :as remote-cache]
    [datalevin.db.tx.common :as txcommon]
    [datalevin.db.tx.execute :as txexec]
    [datalevin.db.tx.prepare :as txprep]
@@ -29,6 +30,7 @@
     :refer [ case-tree defrecord-updatable raise]]
    [datalevin.lmdb :as l]
    [datalevin.storage :as s]
+   [datalevin.storage.metadata :as metadata]
    [datalevin.storage.scan :as scans]
    [datalevin.prepare :as prepare]
    [datalevin.query-util :as qu]
@@ -181,6 +183,7 @@
 (defonce ^:private caches (ConcurrentHashMap.))
 (defonce ^:private remote-cache-check-ms (ConcurrentHashMap.))
 (defonce ^:private remote-cache-max-tx (ConcurrentHashMap.))
+(defonce ^:private remote-cache-schema-revision (ConcurrentHashMap.))
 
 (declare cache-key-dependencies)
 
@@ -207,6 +210,16 @@
     (.put ^ConcurrentHashMap remote-cache-max-tx
           (dir store)
           (long remote-max-tx))))
+
+(defn- remote-schema-changed?
+  [store revision]
+  (and (some? revision)
+       (not= revision (.get ^ConcurrentHashMap remote-cache-schema-revision (dir store)))))
+
+(defn- mark-remote-schema-revision!
+  [store revision]
+  (when (and (remote-store? store) (some? revision))
+    (.put ^ConcurrentHashMap remote-cache-schema-revision (dir store) revision)))
 
 (defn- should-check-remote-cache?
   [store cache]
@@ -245,10 +258,13 @@
   ([store target]
    (ensure-cache store target nil))
   ([store target remote-max-tx]
+   (ensure-cache store target remote-max-tx nil))
+  ([store target remote-max-tx schema-revision]
    (let [target        (long (or target 0))
          cached-max-tx (cached-remote-cache-max-tx store)]
      (if-some [^LRUCache cache (.get ^ConcurrentHashMap caches (dir store))]
        (if (or (< ^long (.target cache) ^long target)
+               (remote-schema-changed? store schema-revision)
                (and (some? remote-max-tx)
                     (some? cached-max-tx)
                     (< (long cached-max-tx)
@@ -258,7 +274,8 @@
            (.setTarget cache target)
            (mark-remote-cache-max-tx! store remote-max-tx)
            (mark-remote-cache-check! store)))
-       (refresh-cache store target remote-max-tx)))))
+       (refresh-cache store target remote-max-tx))
+     (mark-remote-schema-revision! store schema-revision))))
 
 (defn refresh-cache-if-stale
   "Refresh a local read cache only when the store has advanced past its target.
@@ -309,10 +326,37 @@
                    (.get ^ConcurrentHashMap caches (dir store)))
        (.putIfGeneration cache k v (long generation))))
 
+(defn ^:no-doc cached-remote-read
+  "Retain an RPC result in the DB's bounded read cache. Callers either validate
+  freshness before entering or supply a validator, run only for prospective
+  hits. All writes invalidate these opaque results; transaction reads and
+  mutable inputs/results bypass retention."
+  ([store key read-result] (cached-remote-read store key nil read-result))
+  ([store key validate read-result]
+   (when (and validate (nil? (.get ^ConcurrentHashMap caches (dir store))))
+     (validate))
+   (if (and (cache-active? store)
+            (not (and (satisfies? l/IWriting store) (l/writing? store)))
+            (remote-cache/immutable-data? key))
+     (let [key (into [:remote-read] key)
+           cached (cache-get store key)
+           _ (when (and validate cached) (validate))
+           token (cache-token store)
+           cached (if (and validate cached) (cache-get store key) cached)]
+       (if-some [cached cached]
+         (first cached)
+         (let [result (read-result)]
+           ;; Wrap nil and false so both can be distinguished from a miss.
+           (when (remote-cache/immutable-data? result)
+             (cache-put-if-current store token key [result]))
+           result)))
+     (read-result))))
+
 (defn remove-cache
   [store]
   (.remove ^ConcurrentHashMap caches (dir store))
   (.remove ^ConcurrentHashMap remote-cache-max-tx (dir store))
+  (.remove ^ConcurrentHashMap remote-cache-schema-revision (dir store))
   (.remove ^ConcurrentHashMap remote-cache-check-ms (dir store)))
 
 (defmacro wrap-cache
@@ -1230,10 +1274,11 @@
   [store]
   (let [cache (.get ^ConcurrentHashMap caches (dir store))]
     (when (should-check-remote-cache? store cache)
-      (let [{:keys [last-modified max-tx]} (i/db-info store)
+      (let [{:keys [last-modified max-tx schema-revision]} (i/db-info store)
             target        (long (or last-modified 0))
             cached-max-tx (cached-remote-cache-max-tx store)]
         (if (or (nil? cache)
+                (remote-schema-changed? store schema-revision)
                 (< ^long (.target ^LRUCache cache) ^long target)
                 (and (some? max-tx)
                      (some? cached-max-tx)
@@ -1242,7 +1287,8 @@
           (refresh-cache store target max-tx)
           (do
             (mark-remote-cache-max-tx! store max-tx)
-            (mark-remote-cache-check! store)))))))
+            (mark-remote-cache-check! store)))
+        (mark-remote-schema-revision! store schema-revision)))))
 
 (defn db?
   "Check if x is an instance of DB.
@@ -1392,7 +1438,8 @@
      (swap! dbs assoc (db-name store) db)
      (ensure-cache store
                    (if info (:last-modified info) (last-modified store))
-                   (when info (:max-tx info)))
+                   (when info (:max-tx info))
+                   (when info (:schema-revision info)))
      (start-sampling store)
      db)))
 
@@ -1838,9 +1885,11 @@
 
               (#{cop/tx-data+db-info-response-kind
                  cop/tx-data-ack-response-kind} response-kind)
-              (assoc :db-info {:max-eid       (:max-eid db-after)
-                               :max-tx        (:max-tx db-after)
-                               :last-modified last-modified-ms}))]
+              (assoc :db-info {:max-eid         (:max-eid db-after)
+                               :max-tx          (:max-tx db-after)
+                               :last-modified   last-modified-ms
+                               :schema-revision (metadata/schema-revision
+                                                  (.-lmdb ^Store (:store db-after)))}))]
         (cop/committed-record-tx
           client-op-id
           (cop/committed-record request-type

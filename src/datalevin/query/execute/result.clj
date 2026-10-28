@@ -234,7 +234,7 @@
             deferred-base-samples attribute-group-planning
             post-top-k-enrichment access-path-execution
             explain-actual-result-size keyed-group-reduction
-            terminal-result-collection]
+            terminal-result-collection unique-group-aggregation]
      :as context}]
    (when qplan/*explain*
      (let [{:keys [^long planning-time ^long parsing-time ^long building-time]}
@@ -302,6 +302,7 @@
                                           post-top-k-enrichment)
                :keyed-group-reduction keyed-group-reduction
                :terminal-result-collection terminal-result-collection
+               :unique-group-aggregation unique-group-aggregation
                :late-clauses late-clauses
                :access-plans (mapv qaccess/plan-summary access-plans)
                :preferred-access-plan

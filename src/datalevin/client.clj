@@ -21,7 +21,8 @@
    [datalevin.buffer :as bf]
    [datalevin.protocol :as p]
    [datalevin.protocol.context :as context]
-   [datalevin.prepared :as prepared])
+   [datalevin.prepared :as prepared]
+   [datalevin.remote-cache :as read-cache])
   (:import
    [java.nio ByteBuffer]
    [java.nio.channels SocketChannel Selector SelectionKey]
@@ -48,6 +49,8 @@
   (ConcurrentHashMap.))
 
 (deftype ^:no-doc ClientState [^AtomicReference readers
+                               ^AtomicReference read-caches
+                               ^AtomicReference read-cache-options
                                ^ConcurrentHashMap read-endpoints
                                ^AtomicReference endpoint
                                ^AtomicBoolean closed
@@ -72,7 +75,8 @@
 
 (defn- new-client-state
   []
-  (let [state (ClientState. (AtomicReference.) (ConcurrentHashMap.)
+  (let [state (ClientState. (AtomicReference.) (AtomicReference.) (AtomicReference.)
+                            (ConcurrentHashMap.)
                             (AtomicReference.) (AtomicBoolean. false)
                             (AtomicReference.) (ConcurrentHashMap.) (AtomicReference.))]
     (.put client-state-refs state true)
@@ -103,6 +107,35 @@
         (let [readers (ConcurrentHashMap.)]
           (if (.compareAndSet ref nil readers) readers (.get ref))))))
 
+(defn- client-read-caches ^ConcurrentHashMap
+  [client]
+  (let [^AtomicReference ref (.-read-caches (client-state client))]
+    (or (.get ref)
+        (let [caches (ConcurrentHashMap.)]
+          (if (.compareAndSet ref nil caches) caches (.get ref))))))
+
+(defn- request-read-cache
+  [client db-name]
+  (when db-name
+    (when-let [caches (.get ^AtomicReference (.-read-caches (client-state client)))]
+      (get caches db-name))))
+
+(defn- call-with-cache-invalidation
+  [client req execute]
+  (let [db-name (or (:db-name req) (first (:args req)))
+        cache (when-not (cmd/read-only? (:type req))
+                (request-read-cache client db-name))]
+    (try
+      (read-cache/mutate cache execute)
+      (finally
+        (when (#{:close :close-kv} (:type req))
+          (when-let [caches (.get ^AtomicReference (.-read-caches (client-state client)))]
+            (.remove ^ConcurrentHashMap caches db-name)))))))
+
+(defmacro ^:private with-cache-invalidation
+  [client req & body]
+  `(call-with-cache-invalidation ~client ~req (fn [] ~@body)))
+
 (defonce ^:private ^java.util.Map ha-retry-clients
   (Collections/synchronizedMap (WeakHashMap.)))
 
@@ -131,6 +164,8 @@
   (locking client-state-refs
     (doseq [^ClientState state (.keySet client-state-refs)]
       (.set ^AtomicReference (.-readers state) nil)
+      (when-let [caches (.get ^AtomicReference (.-read-caches state))]
+        (.clear ^ConcurrentHashMap caches))
       (.clear ^ConcurrentHashMap (.-read-endpoints state))
       (.set ^AtomicReference (.-retry-settings state) nil)
       (.set ^AtomicReference (.-endpoint state) nil)))
@@ -150,7 +185,11 @@
 (defn- inherit-native-readers! [client source]
   (when source
     (.set ^AtomicReference (.-readers (client-state client))
-          (native-reader-cache source)))
+          (native-reader-cache source))
+    (.set ^AtomicReference (.-read-caches (client-state client))
+          (client-read-caches source))
+    (.set ^AtomicReference (.-read-cache-options (client-state client))
+          (.get ^AtomicReference (.-read-cache-options (client-state source)))))
   client)
 
 (defn- inherit-index-options! [client source]
@@ -1032,14 +1071,16 @@
   (request [client req]
     (with-request client req
       (cr/register-request! req)
-      (let [reader (or (request-native-reader client req) nv/*wire-reader*)]
-        (if (identical? reader nv/*wire-reader*)
-          (.requestBound client req)
-          (binding [nv/*wire-reader* reader]
-            (.requestBound client req))))))
+      (with-cache-invalidation client req
+        (let [reader (or (request-native-reader client req) nv/*wire-reader*)]
+          (if (identical? reader nv/*wire-reader*)
+            (.requestBound client req)
+            (binding [nv/*wire-reader* reader]
+              (.requestBound client req)))))))
 
   (copy-in [client req data batch-size]
-    (call-with-request client req
+    (with-cache-invalidation client req
+      (call-with-request client req
                        (fn []
                          (cr/register-request! req)
                          (binding [nv/*wire-reader* (or (request-native-reader client req)
@@ -1087,7 +1128,7 @@
                                      :reconnect (.renewSession client pool' (cr/deadline))
                                      :reopen (open-database client (:db-name result) (:db-type result))
                                      nil)
-                                   (recur busy-delay-ms)))))))))
+                                   (recur busy-delay-ms))))))))))
 
   (disconnect [client]
     (disconnect-client! client true))
@@ -1266,6 +1307,8 @@
                (.remove ha-retry-open-targets client)
                (.remove ha-write-retry-settings client)
                (.set ^AtomicReference (.-readers state) nil)
+               (when-let [caches (.get ^AtomicReference (.-read-caches state))]
+                 (.clear ^ConcurrentHashMap caches))
                (.remove index-open-options client)
                (.remove ha-retry-disabled-clients client)
                (.set ^AtomicReference (.-endpoint state) nil)
@@ -1343,7 +1386,10 @@
   ([client db-name db-type schema opts]
    (open-database client db-name db-type schema opts false))
   ([client db-name db-type schema opts return-db-info?]
-   (let [_ (when-let [registry (get-in opts [:runtime-opts :udf-registry])]
+   (let [cache-options (merge (.get ^AtomicReference
+                                    (.-read-cache-options (client-state client)))
+                              (:client-opts opts))
+         _ (when-let [registry (get-in opts [:runtime-opts :udf-registry])]
              (.put (native-reader-cache client) db-name
                    (udf/native-value-reader registry)))
          ;; Runtime handles belong to the caller and must never cross the wire.
@@ -1367,6 +1413,11 @@
      (when (= type :error-response)
        (raise "Unable to open database:" db-name " " message
                 {:db-type db-type}))
+     (when (#{c/db-store-kv c/db-store-datalog} db-type)
+       (.putIfAbsent (client-read-caches client) db-name
+                     (read-cache/read-cache
+                       (or (:read-cache-limit cache-options) (:cache-limit opts) 512)
+                       (:read-cache-check-interval-ms cache-options))))
      (when (#{"engine" "index"} db-type)
        (remember-index-options! client
                                 (if (= db-type "index")
@@ -1419,6 +1470,11 @@
   * `:wire-compression-level` sets the Zstd level (default 3).
   * `:max-message-size` limits received payloads before and after decompression
   (default 64 MiB, excluding the five-byte frame header).
+  * `:read-cache-limit` bounds cached KV and schema results per database
+  (default 512; 0 disables retention).
+  * `:read-cache-check-interval-ms` allows cached KV and schema reads to reuse
+  their last freshness check for this interval. When omitted, uses
+  `constants/*remote-db-last-modified-check-interval-ms*` (default 0).
   These settings are captured at creation and retained when connections reconnect.
   * `:ha-write-retry-timeout-ms` bounds extra HA failover retry time after a
   retryable write rejection. By default it is derived from HA lease/promotion
@@ -1443,7 +1499,10 @@
      (initialize-client!
        pool
        #(->Client username password host port pool-size time-out client-id pool)
-       #(set-client-ha-write-retry-settings! % time-out opts)))))
+       (fn [client]
+         (.set ^AtomicReference (.-read-cache-options (client-state client))
+               (select-keys opts [:read-cache-limit :read-cache-check-interval-ms]))
+         (set-client-ha-write-retry-settings! client time-out opts))))))
 
 (defn ^:no-doc wire-client-options
   "Connection policy expressed as client options, for derived clients."
@@ -2579,7 +2638,15 @@
   ([client call args writing?] (normal-request* client call args writing? nil))
   ([client call args writing? prepared-request]
    (with-request client {:type call :args args :writing? writing?}
-     (normal-request-impl client call args writing? prepared-request))))
+     (let [cache (when (and (not writing?) (read-cache/cacheable-call? call args))
+                   (request-read-cache client (first args)))
+           execute #(normal-request-impl client call args writing? prepared-request)]
+       (if (and cache (not (disconnected? client)))
+         (read-cache/read-result
+           cache [call args] c/*remote-db-last-modified-check-interval-ms*
+           #(normal-request-impl client :kv-read-cache-token [(first args)] false)
+           execute)
+         (execute))))))
 
 (defn ^:no-doc normal-prepared-request
   "Use normal routing and replay rules with connection-local preparation."

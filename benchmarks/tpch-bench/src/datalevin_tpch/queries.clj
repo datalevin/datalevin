@@ -486,8 +486,8 @@
 
 ;; Q18: Large Volume Customer
 ;; The grouped relation already contains each order's complete quantity sum.
-;; Filter it once and project that sum instead of joining every lineitem again
-;; and recomputing the same aggregate in the outer query.
+;; Apply HAVING inside the subquery so only qualifying orders cross its binding
+;; boundary, then project the sum without joining and aggregating lines again.
 (def q-18
   '[:find ?c-name ?c-custkey ?ok ?o-orderdate ?o-totalprice ?qsum
     :order-by [4 :desc 3 :asc]
@@ -495,10 +495,10 @@
     :where
     [(q [:find ?ok (sum ?q)
          :with ?l
+         :having [(> (sum ?q) 300)]
          :where
          [?l :lineitem/orderkey ?ok]
          [?l :lineitem/quantity ?q]] $) [[?ok ?qsum]]]
-    [(> ?qsum 300)]
     [?o :orders/orderkey ?ok]
     [?o :orders/custkey ?c-custkey]
     [?o :orders/orderdate ?o-orderdate]

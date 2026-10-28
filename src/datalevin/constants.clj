@@ -766,8 +766,9 @@
 (def ^{:dynamic true
        :doc     "Minimum interval between remote DB freshness checks in `db?`.
 When positive, repeated `db?` calls within this window reuse the previous
-freshness check and skip the remote `last-modified` round trip.
-Set to 0 for strict check-on-every-call behavior."}
+freshness check and skip the remote metadata round trip. Also supplies the
+default freshness interval for client KV and schema read caches.
+Set to 0 to validate every cached read against the server."}
   *remote-db-last-modified-check-interval-ms* 0)
 
 ;; HA control plane (consensus lease)

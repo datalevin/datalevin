@@ -1534,6 +1534,14 @@
   IAdmin
   (re-index [this opts] (l/re-index* this opts)))
 
+(defn committed-txn-id
+  "Return the environment's latest committed LMDB transaction ID."
+  ^long [^CppLMDB lmdb]
+  (native-call (.-info lmdb)
+    (let [^Info info (Info/create (.-env lmdb))]
+      (try (.me_last_txnid ^DTLV$MDB_envinfo (.get info))
+           (finally (.close info))))))
+
 (defn invalidate-thread-reader!
   [lmdb]
   (when (instance? CppLMDB lmdb)

@@ -1,0 +1,108 @@
+;; Copyright (c) Huahai Yang. All rights reserved.
+;; Distributed under the Eclipse Public License 2.0.
+(ns ^:no-doc datalevin.remote-cache
+  "Bounded client read results, validated against committed store revisions."
+  (:require [clojure.string :as str])
+  (:import [datalevin.utl LRUCache]))
+
+(defn immutable-data?
+  [x]
+  (or (nil? x) (string? x) (keyword? x) (symbol? x) (boolean? x)
+      (char? x) (uuid? x) (integer? x) (float? x) (decimal? x) (ratio? x)
+      (and (coll? x) (not (record? x)) (every? immutable-data? x))))
+
+(def ^:private read-ops
+  ;; Schema snapshots refresh the store's metadata cache after revision changes;
+  ;; retaining them here would introduce a second, independent freshness window.
+  #{:get-value :get-rank :get-by-rank :get-first :get-first-n :get-range
+    :key-range :key-range-count :key-range-list-count :range-count
+    :get-list :list-count :in-list? :list-range :list-range-count
+    :list-range-first :list-range-first-n :entries :list-dbis
+    :schema :rschema})
+
+(defn cacheable-call?
+  [op args]
+  (or (contains? read-ops op)
+      (and (= :batch-kv op)
+           (every? #(contains? read-ops (first %)) (second args)))))
+
+(defrecord ReadCache [^LRUCache entries state interval-ms])
+
+(defn read-cache
+  [limit interval-ms]
+  (when-not (and (integer? limit) (<= 0 limit Integer/MAX_VALUE))
+    (throw (ex-info "read-cache-limit must be a non-negative integer"
+                    {:read-cache-limit limit})))
+  (when-not (or (nil? interval-ms)
+                (and (integer? interval-ms) (<= 0 interval-ms Long/MAX_VALUE)))
+    (throw (ex-info "read-cache-check-interval-ms must be a non-negative integer"
+                    {:read-cache-check-interval-ms interval-ms})))
+  (->ReadCache (LRUCache. (int limit))
+               (atom {:token nil :checked-ns 0 :writers 0 :legacy? false})
+               interval-ms))
+
+(defn- invalidate!
+  [^ReadCache cache writer-delta]
+  (let [^LRUCache entries (:entries cache)]
+    (locking entries
+      (.beginInvalidation entries 0)
+      (.clear entries)
+      (swap! (:state cache) #(-> % (assoc :token nil :checked-ns 0)
+                                  (update :writers + writer-delta))))))
+
+(defn mutate
+  "Keep in-flight reads from publishing across a mutation, including failure."
+  [cache execute]
+  (if cache
+    (do
+      (invalidate! cache 1)
+      (try (execute) (finally (invalidate! cache -1))))
+    (execute)))
+
+(defn- check-revision!
+  [^ReadCache cache revision]
+  (let [^LRUCache entries (:entries cache)
+        generation (.generation entries)
+        started (System/nanoTime)
+        token (try (revision)
+                   (catch clojure.lang.ExceptionInfo e
+                     (if (str/includes? (or (:server-message (ex-data e))
+                                            (ex-message e) "")
+                                        "Unknown message type :kv-read-cache-token")
+                       ::legacy
+                       (throw e))))]
+    (locking entries
+      (when (= generation (.generation entries))
+        (when (not= token (:token @(:state cache)))
+          (.beginInvalidation entries 0)
+          (.clear entries))
+        (swap! (:state cache) assoc :token token :checked-ns started
+               :legacy? (= ::legacy token))))))
+
+(defn read-result
+  "Validate hits; unique misses avoid repeated revision RPCs. Positive intervals
+  allow hits without an RPC. Mutable data and older servers bypass retention."
+  [^ReadCache cache key interval-ms revision execute]
+  (let [^LRUCache entries (:entries cache)
+        state @(:state cache)]
+    (if (or (zero? (.capacity entries)) (:legacy? state)
+            (pos? (long (:writers state))) (not (immutable-data? key)))
+      (execute)
+      (let [cached (.get entries key)
+            interval (long (or (:interval-ms cache) interval-ms))]
+        (when (or (nil? (:token state))
+                  (and cached
+                       (>= (quot (- (System/nanoTime) (long (:checked-ns state)))
+                                 1000000)
+                           interval)))
+          (check-revision! cache revision))
+        (let [generation (.generation entries)
+              state @(:state cache)]
+          (if (or (:legacy? state) (pos? (long (:writers state))))
+            (execute)
+            (if-some [cached (when cached (.get entries key))]
+              (first cached)
+              (let [result (execute)]
+                (when (immutable-data? result)
+                  (.putIfGeneration entries key [result] generation))
+                result))))))))

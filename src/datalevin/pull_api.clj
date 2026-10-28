@@ -429,11 +429,19 @@
      (binding [timeout/*deadline* (timeout/to-deadline timeout)]
        (pull-impl (parse-opts db pattern opts) id)))))
 
+(defn- remote-pull-result
+  [db operation pattern ids opts execute]
+  ;; A qualified xform's implementation can change independently of DB writes.
+  (if (some #(and (symbol? %) (namespace %)) (tree-seq coll? seq pattern))
+    (execute)
+    (db/cached-remote-read (.-store ^DB db) [operation pattern ids (or opts {})]
+                           #(db/db? db) execute)))
+
 (defn pull
   ([db pattern id opts]
    (let [store (.-store ^DB db)]
      (if (and (db/remote-store? store) (not (db/pending-tx-cache? db)))
-       (i/pull store pattern id opts)
+       (remote-pull-result db :pull pattern id opts #(i/pull store pattern id opts))
        (pull* db pattern id opts))))
   ([db pattern id]
    (pull db pattern id {})))
@@ -515,7 +523,10 @@
    {:pre [(db/db? db)]}
    (let [store (.-store db)]
      (if (and (db/remote-prepared-store? store) (not (db/pending-tx-cache? db)))
-       (i/prepare-remote-read store :pull [pattern nil opts])
+       (let [remote (i/prepare-remote-read store :pull [pattern nil opts])]
+         (prepared/prepared-read
+           (fn [id]
+             (remote-pull-result db :pull pattern id opts #(remote id)))))
        (let [^LRUCache cache (.-pull-readers db)
              k              [pattern opts]
              reader         (or (.get cache k)
@@ -544,7 +555,7 @@
   ([db pattern id opts]
    (let [store (.-store ^DB db)]
      (if (and (db/remote-store? store) (not (db/pending-tx-cache? db)))
-       (i/pull-many store pattern id opts)
+       (remote-pull-result db :pull-many pattern id opts #(i/pull-many store pattern id opts))
        (pull-many* db pattern id opts))))
   ([db pattern id]
    (pull-many db pattern id {})))

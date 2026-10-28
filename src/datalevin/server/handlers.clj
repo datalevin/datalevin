@@ -36,6 +36,7 @@
             role-obj server-obj privileged-server-option-keys]]
    [datalevin.server.notifications :as notifications]
    [datalevin.storage :as st]
+   [datalevin.storage.metadata :as metadata]
    [datalevin.tx-group.compat :as group]
    [datalevin.tx-group.batch :as batch]
    [datalevin.tx-group.batch.datalog :as datalog]
@@ -46,7 +47,7 @@
   (:import
    [java.nio.channels SelectionKey]
    [java.nio.file Paths]
-   [java.util UUID]
+   [java.util Collections Map UUID WeakHashMap]
    [java.util.concurrent ConcurrentHashMap Semaphore TimeUnit]
    [datalevin.storage Store]))
 
@@ -1690,7 +1691,10 @@
                                             {:max-eid (:max-eid (:db-after report))
                                              :max-tx (:max-tx (:db-after report))
                                              :last-modified
-                                             (i/last-modified (:store (:db-after report)))}
+                                             (i/last-modified (:store (:db-after report)))
+                                             :schema-revision
+                                             (metadata/schema-revision
+                                               (.-lmdb ^Store (:store (:db-after report))))}
                                             ::group-last-modified
                                             (i/last-modified (:store (:db-after report)))))
                body (fn [tx]
@@ -1743,7 +1747,9 @@
                ;; advances it. Response construction must not read this private
                ;; writing Store after the group's native transaction closes.
                (assoc report ::group-committed? true
-                             ::group-last-modified (i/last-modified (:store db-after))))))
+                             ::group-last-modified (i/last-modified (:store db-after))
+                             ::group-schema-revision
+                             (metadata/schema-revision (.-lmdb ^Store (:store db-after)))))))
 
          (or writing? s?)
          (transact db0)
@@ -1791,12 +1797,16 @@
                (or (::group-db-info rp)
                    {:max-eid (:max-eid db1)
                     :max-tx (:max-tx db1)
-                    :last-modified (::group-last-modified rp)})
+                    :last-modified (::group-last-modified rp)
+                    :schema-revision (::group-schema-revision rp)})
                {:max-eid       (:max-eid db1)
                 :max-tx        (i/max-tx
                                 (dt-store deps server skey db-name writing?))
                 :last-modified (i/last-modified
-                                (dt-store deps server skey db-name writing?))})))))
+                                (dt-store deps server skey db-name writing?))
+                :schema-revision
+                (metadata/schema-revision
+                  (.-lmdb ^Store (dt-store deps server skey db-name writing?)))})))))
 
 (defn- transact-response
   [deps server skey {:keys [mode args writing?] :as message} response-kind]
@@ -1851,10 +1861,11 @@
         dt-store (dt-store deps server skey db-name writing?)]
     (ensure-ha-read-floor! deps server db-name writing? message dt-store)
     (write-result! deps skey
-                   {:max-eid       (i/init-max-eid dt-store)
-                    :max-tx        (durable-dt-store-max-tx dt-store)
-                    :last-modified (i/last-modified dt-store)
-                    :opts          (i/opts dt-store)})))
+                   {:max-eid         (i/init-max-eid dt-store)
+                    :max-tx          (durable-dt-store-max-tx dt-store)
+                    :last-modified   (i/last-modified dt-store)
+                    :schema-revision (metadata/schema-revision (.-lmdb ^Store dt-store))
+                    :opts            (i/opts dt-store)})))
 
 (defn tx-data+db-info
   [deps server skey message]
@@ -1922,6 +1933,19 @@
                    (update result :entries dec)
                    result)]
     (write-result! deps skey result)))
+
+(defonce ^:private ^Map read-cache-store-ids
+  (Collections/synchronizedMap (WeakHashMap.)))
+
+(defn kv-read-cache-token
+  [deps server skey {:keys [args]}]
+  (let [kv (kv/raw-lmdb (kv-store deps server skey (first args) false))
+        store-id (locking read-cache-store-ids
+                   (or (.get read-cache-store-ids kv)
+                       (let [id (UUID/randomUUID)]
+                         (.put read-cache-store-ids kv id)
+                         id)))]
+    (write-result! deps skey [store-id (cpp/committed-txn-id kv)])))
 
 (defn drop-dbi
   [deps server ^SelectionKey skey {:keys [args writing?]}]
@@ -3059,6 +3083,7 @@
    :list-dbis list-dbis
    :copy copy
    :stat stat
+   :kv-read-cache-token kv-read-cache-token
    :entries (normal-kv-handler i/entries)
    :open-transact-kv open-transact-kv
    :close-transact-kv close-transact-kv

@@ -1,5 +1,12 @@
 # Change Log
 
+## WIP
+
+### Improved
+- [Server] add connection level client read caches to both DL and KV to reduce
+  network round trips.
+- [Datalog] per entity row aggregation fast path.
+
 ## 1.2.9 (2026-10-27)
 
 ### Fixed

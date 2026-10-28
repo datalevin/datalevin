@@ -1348,24 +1348,53 @@
           (save-intermediate-counts context steps counts)
           (r/relation! attrs tuples))))))
 
+(defn- entity-scan-key
+  "Prove one row per entity for a cardinality-one initialization followed only
+  by cardinality-one lookups on that same entity. Other plans need deduping."
+  [db steps]
+  (when (instance? DB db)
+    (let [init       (first steps)
+          entity     (first (:vars init))
+          schema     (db/-schema db)
+          single?    (fn [attr]
+                       (when-let [props (get schema attr)]
+                         (not= :db.cardinality/many (:db/cardinality props))))
+          entity-idx (get (cols->attrs (:cols init)) entity)]
+      (when (and (instance? InitStep init)
+                 (qu/binding-var? entity)
+                 (= entity (first (:cols init)))
+                 (some? entity-idx)
+                 (single? (:attr init))
+                 (<= (count (:range init)) 1)
+                 (every? (fn [step]
+                           (and (instance? MergeScanStep step)
+                                (= entity-idx (:index step))
+                                (= entity-idx
+                                   (get (cols->attrs (:cols step)) entity))
+                                (every? #(single? (first %)) (:attrs-v step))))
+                         (next steps)))
+        [entity]))))
+
 (defn execute-steps
   "Execute all steps of a component's plan to obtain a relation."
   [context db steps]
   (binding [*sip-domains* (or *sip-domains* (ConcurrentHashMap.))]
     (let [steps (into [] (remove #(identical? :identity (-type %))) steps)
           n     (count steps)
-          attrs (cols->attrs (:cols (peek steps)))]
-      (case n
-        1 (let [tuples (step-execute (first steps) db nil)]
-            (save-intermediates context steps nil tuples)
-            (r/relation! attrs tuples))
-        2 (let [src    (step-execute (first steps) db nil)
-                tuples (step-execute (peek steps) db src)]
-            (save-intermediates context steps (object-array [src]) tuples)
-            (r/relation! attrs tuples))
-        (if (partition-plan? context db steps)
-          (segmented-execution context db attrs steps)
-          (pipelining context db attrs steps n))))))
+          attrs (cols->attrs (:cols (peek steps)))
+          key   (entity-scan-key db steps)
+          rel   (case n
+                  1 (let [tuples (step-execute (first steps) db nil)]
+                      (save-intermediates context steps nil tuples)
+                      (r/relation! attrs tuples))
+                  2 (let [src    (step-execute (first steps) db nil)
+                          tuples (step-execute (peek steps) db src)]
+                      (save-intermediates context steps (object-array [src]) tuples)
+                      (r/relation! attrs tuples))
+                  (if (partition-plan? context db steps)
+                    (segmented-execution context db attrs steps)
+                    (pipelining context db attrs steps n)))]
+      (if key (r/with-unique-key rel key) rel))))
 
 (def ^:private ^:const terminal-composition-min-candidates 65536)
 (def ^:private ^:const terminal-composition-min-fanout 4.0)

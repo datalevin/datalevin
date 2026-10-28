@@ -17,6 +17,7 @@
    [datalevin.interface :as i]
    [datalevin.client :as cl]
    [datalevin.prepared :as prepared]
+   [datalevin.storage.schema :as schema]
    [datalevin.txlog.transfer :as transfer]
    [datalevin.bits :as b]
    [datalevin.lmdb :as l :refer [IWriting]]
@@ -493,6 +494,114 @@
         (txlog-pin-backup-floor! [this pin-id floor-lsn]
           (.txlog-pin-backup-floor! this pin-id floor-lsn nil))])))
 
+;; Keep metadata on each connection's store, including transaction-local stores.
+;; The DB result cache has a separate lifetime and freshness policy.
+(defn- fresh-metadata?
+  [state]
+  (let [interval-ms (long c/*remote-db-last-modified-check-interval-ms*)]
+    (and (:db-info state) (:checked-at state) (pos? interval-ms)
+         (< (quot (- (System/nanoTime) (long (:checked-at state))) 1000000)
+            interval-ms))))
+
+(defn- with-schema
+  [state schema revision]
+  (assoc state :schema schema :rschema (schema/schema->rschema schema)
+         :schema-revision revision))
+
+(defn- with-db-info
+  [state info]
+  (let [changed? (if (contains? info :schema-revision)
+                   (not= (:schema-revision state) (:schema-revision info))
+                   ;; Older servers do not send a schema revision.
+                   (not= (select-keys (:db-info state) [:last-modified :max-tx])
+                         (select-keys info [:last-modified :max-tx])))]
+    (cond-> (assoc state :db-info (merge (select-keys state [:opts])
+                                        (dissoc info :schema))
+                   :checked-at (System/nanoTime))
+      (contains? info :opts) (assoc :opts (:opts info))
+      changed? (dissoc :schema :rschema :schema-revision))))
+
+(defn- new-metadata-cache
+  [info]
+  (atom (cond-> {::generation (Object.)}
+          info (with-db-info info)
+          (:schema info) (with-schema (:schema info) (:schema-revision info)))))
+
+(defn- without-metadata
+  [state]
+  (dissoc state :schema :rschema :schema-revision :db-info :checked-at))
+
+(defn- read-metadata!
+  "Run the RPC independently. A changed cache rejects this response's publication."
+  [cache state execute publish]
+  (let [value (execute)
+        next-state (assoc (publish state value) ::generation (Object.))]
+    (compare-and-set! cache state next-state)
+    {:value value :state next-state}))
+
+(defn- read-db-info!
+  [cache state read-floor-tx client db-name writing?]
+  (let [{:keys [value] :as result}
+        (read-metadata! cache state
+                        #(datalog-request read-floor-tx client :db-info
+                                          [db-name] writing?)
+                        with-db-info)]
+    (update-read-floor-tx! read-floor-tx (:max-tx value))
+    result))
+
+(defn- read-schema!
+  [cache read-floor-tx client db-name writing?]
+  (read-metadata! cache @cache
+                  #(datalog-request read-floor-tx client :schema-snapshot
+                                    [db-name] writing?)
+                  (fn [state {:keys [schema revision]}]
+                    (with-schema state schema revision))))
+
+(defn- schema-state
+  [cache read-floor-tx client db-name writing?]
+  (let [state @cache
+        ;; Direct metadata consumers such as entid do not call db?. Validate
+        ;; before reuse, keeping staged metadata on its transaction-local view.
+        state (if (and (not writing?) (:schema state)
+                       (not (fresh-metadata? state)))
+                (:state (read-db-info! cache state read-floor-tx client db-name false))
+                state)]
+    (if (:schema state)
+      state
+      (:state (read-schema! cache read-floor-tx client db-name writing?)))))
+
+(defn- metadata-write!
+  "Reserve a generation around the RPC without holding the cache monitor.
+  Overlapping metadata updates and failed requests invalidate metadata; only a
+  write with an unchanged generation may publish its response."
+  ([cache execute]
+   (metadata-write! cache execute nil false))
+  ([cache execute publish discard-opts?]
+   (let [generation (Object.)
+         _ (swap! cache assoc ::generation generation)
+         completed? (volatile! false)
+         result (volatile! nil)]
+     (try
+       (let [value (execute)]
+         (vreset! result value)
+         (vreset! completed? true)
+         value)
+       (finally
+         (swap! cache
+                (fn [state]
+                  (let [state (if (and @completed? publish
+                                       (identical? generation (::generation state)))
+                                (publish state @result)
+                                (without-metadata state))]
+                    (cond-> (assoc state ::generation (Object.))
+                      discard-opts? (dissoc :opts))))))))))
+
+(defn- metadata-request
+  [cache read-floor-tx client call args writing?]
+  (metadata-write! cache
+                    #(datalog-request read-floor-tx client call args writing?)
+                    nil (#{:assoc-opt :assoc-opts} call)))
+
 (deftype+ DatalogStore [^String uri
                        ^String db-name
                        ^Client client
@@ -500,12 +609,13 @@
                        write-txn
                        writing?
                        open-db-info
+                       metadata-cache
                        ^AtomicLong read-floor-tx
                        ^AtomicBoolean sampling-started?
                        owns-client?
                        ^AtomicBoolean closed?]
   ICustomTypes
-  (defremote-forward (datalog-request read-floor-tx client)
+  (defremote-forward (metadata-request metadata-cache read-floor-tx client)
     (register-type [_ type-name definition]
       :op :datalog-register-type :serialize definition))
 
@@ -518,14 +628,22 @@
     (DatalogStore. uri db-name tx-client tx-client
                    (volatile! :remote-dl-mutex) true
                    open-db-info
+                   (atom @metadata-cache)
                    read-floor-tx
                    sampling-started?
                    owns-client?
                    closed?))
 
   IStore
-  (defremote-forward (datalog-request read-floor-tx client)
-    (opts [_])
+  (opts [_]
+    (let [state @metadata-cache]
+      (or (:opts state)
+          (:value (read-metadata! metadata-cache state
+                                  #(datalog-request read-floor-tx client :opts
+                                                    [db-name] writing?)
+                                  #(assoc %1 :opts %2))))))
+
+  (defremote-forward (metadata-request metadata-cache read-floor-tx client)
     (assoc-opt [_ k v])
     (assoc-opts [_ kvs]))
 
@@ -536,9 +654,13 @@
   (close [_]
     (when (.compareAndSet closed? false true)
       ;; Closing detaches the session's DB view, outside the write-runner path.
-      (close-remote-store! client tx-client owns-client? db-name
-                           #(datalog-request read-floor-tx client :close
-                                             [db-name] false))))
+      (try
+        (close-remote-store! client tx-client owns-client? db-name
+                             #(datalog-request read-floor-tx client :close
+                                               [db-name] false))
+        (finally
+          (reset! metadata-cache {::generation (Object.)})
+          (vreset! open-db-info (sampling-open-info @open-db-info))))))
 
   (closed? [_]
     (if (or (.get closed?) (cl/disconnected? client))
@@ -547,21 +669,37 @@
 
   (defremote-forward (datalog-request read-floor-tx client)
     (last-modified [_])
-    (schema [_])
-    (schema-snapshot [_])
-    (rschema [_])
-    (set-schema [_ new-schema del-attrs rename-map])
-    (index-attr [_ attr])
     (init-max-eid [_])
     (max-tx [_]))
+
+  (schema [_]
+    (:schema (schema-state metadata-cache read-floor-tx client db-name writing?)))
+
+  (schema-snapshot [_]
+    (:value (read-schema! metadata-cache read-floor-tx client db-name writing?)))
+
+  (rschema [_]
+    (:rschema (schema-state metadata-cache read-floor-tx client db-name writing?)))
 
   (set-schema [this new-schema]
     (.set-schema this new-schema nil nil))
 
+  (set-schema [this new-schema del-attrs rename-map]
+    (.set-schema this new-schema del-attrs rename-map nil))
+
   (set-schema [_ new-schema del-attrs rename-map expected-revision]
     (try
-      (datalog-request read-floor-tx client :set-schema
-                       [db-name new-schema del-attrs rename-map expected-revision] writing?)
+      (let [args (cond-> [db-name new-schema del-attrs rename-map]
+                   (some? expected-revision) (conj expected-revision))]
+        (metadata-write!
+          metadata-cache
+          #(datalog-request read-floor-tx client :set-schema args writing?)
+          (fn [state result]
+            (let [state (without-metadata state)]
+              (if (some? expected-revision)
+                (with-schema state (:schema result) (:revision result))
+                (with-schema state result nil))))
+          false))
       (catch clojure.lang.ExceptionInfo e
         (let [data (:err-data (ex-data e))]
           (if (= :schema/revision-conflict (:error data))
@@ -574,14 +712,18 @@
   (swap-attr [this attr f x]
     (.swap-attr this attr f x nil))
 
-  (defremote-forward (datalog-request read-floor-tx client)
+  (defremote-forward (metadata-request metadata-cache read-floor-tx client)
+    (index-attr [_ attr])
     (swap-attr [_ attr f x y] :serialize f)
     (del-attr [_ attr])
-    (rename-attr [_ attr new-attr])
+    (rename-attr [_ attr new-attr]))
+
+  (defremote-forward (datalog-request read-floor-tx client)
     (datom-count [_ index]))
 
   (load-datoms [_ datoms]
-    (load-datoms* client db-name datoms :raw false writing?))
+    (metadata-write! metadata-cache
+                     #(load-datoms* client db-name datoms :raw false writing?)))
 
   (defremote-forward (datalog-request read-floor-tx client)
     (fetch [_ datom])
@@ -652,31 +794,41 @@
     (fulltext-datoms [_ query opts]))
 
   (db-info [_]
-    (if-let [cached (let [cached @open-db-info]
-                      (when-not (get cached sampling-open-info?)
-                        cached))]
-      (do
-        (vreset! open-db-info (sampling-open-info cached))
-        (update-read-floor-tx! read-floor-tx (:max-tx cached))
-        cached)
-      (let [info (datalog-request read-floor-tx client :db-info
-                                  [db-name] writing?)]
-        (update-read-floor-tx! read-floor-tx (:max-tx info))
-        info)))
+    (let [{:keys [state cached?]}
+          (locking metadata-cache
+            (let [opening @open-db-info
+                  opening? (and opening (not (get opening sampling-open-info?)))
+                  _ (when opening?
+                      (vreset! open-db-info (sampling-open-info opening)))
+                  state @metadata-cache
+                  cached? (or (and opening? (= (dissoc opening :schema) (:db-info state)))
+                              (and (not writing?) (fresh-metadata? state)))]
+              {:state state :cached? cached?}))
+          info (if cached? (:db-info state)
+                   (:value (read-db-info! metadata-cache state read-floor-tx
+                                         client db-name writing?)))]
+      (update-read-floor-tx! read-floor-tx (:max-tx info))
+      info))
 
   (tx-data [_ data simulated?]
-    (let [result (load-datoms* client db-name data :txs+info simulated?
-                               writing? open-db-info)]
-      (update-read-floor-tx! read-floor-tx (get-in result [:db-info :max-tx]))
-      result))
+    (let [execute #(let [result (load-datoms* client db-name data :txs+info simulated?
+                                             writing? open-db-info)]
+                     (update-read-floor-tx! read-floor-tx (get-in result [:db-info :max-tx]))
+                     result)]
+      (if simulated?
+        (execute)
+        (metadata-write! metadata-cache execute
+                         #(with-db-info %1 (:db-info %2)) false))))
 
   (tx-data-ack [_ data]
-    (let [result (load-datoms* client db-name data :txs-ack false
-                               writing? open-db-info)]
-      (update-read-floor-tx! read-floor-tx (get-in result [:db-info :max-tx]))
-      result))
+    (metadata-write! metadata-cache
+                     #(let [result (load-datoms* client db-name data :txs-ack false
+                                                writing? open-db-info)]
+                        (update-read-floor-tx! read-floor-tx (get-in result [:db-info :max-tx]))
+                        result)
+                     #(with-db-info %1 (:db-info %2)) false))
 
-  (open-transact [this]
+  (open-transact [_]
     (#'cl/sync-ha-routing! client tx-client)
     (#'request-ha-open tx-client {:type :open-transact
                                   :args [db-name]
@@ -685,7 +837,8 @@
     (let [active-client (disable-ha-transaction-retry! tx-client)]
       (DatalogStore. uri db-name active-client active-client
                      (volatile! :remote-dl-mutex) true
-                     open-db-info
+                     (volatile! (sampling-open-info @open-db-info))
+                     (atom (select-keys @metadata-cache [:opts]))
                      (AtomicLong. (long (or (current-read-floor-tx
                                                read-floor-tx)
                                              0)))
@@ -693,11 +846,13 @@
                      owns-client?
                      closed?)))
 
-  (abort-transact [this]
-    (abort-ha-transaction! tx-client :abort-transact db-name))
+  (abort-transact [_]
+    (metadata-write! metadata-cache
+                     #(abort-ha-transaction! tx-client :abort-transact db-name)))
 
   (close-transact [_]
-    (let [result (close-ha-transaction! tx-client :close-transact db-name)]
+    (let [result (metadata-write! metadata-cache
+                                  #(close-ha-transaction! tx-client :close-transact db-name))]
       ;; Raw imports can commit before the opening counters are consumed.
       ;; The next DB view must fetch committed metadata and advance its floor.
       (vreset! open-db-info (sampling-open-info @open-db-info))
@@ -714,7 +869,9 @@
 
   IAdmin
   (re-index [_ schema opts]
-    (cl/normal-request client :datalog-re-index [db-name schema opts])))
+    (metadata-write! metadata-cache
+                     #(cl/normal-request client :datalog-re-index [db-name schema opts])
+                     nil true)))
 
 #_{:clj-kondo/ignore [:redefined-var]}
 (defn ->DatalogStore
@@ -723,6 +880,7 @@
    (DatalogStore. uri db-name client client
                   write-txn writing?
                   open-db-info
+                  (new-metadata-cache @open-db-info)
                   (AtomicLong. (long (or (:max-tx @open-db-info) 0)))
                   sampling-started?
                   owns-client?
@@ -732,6 +890,7 @@
    (DatalogStore. uri db-name client tx-client
                   write-txn writing?
                   open-db-info
+                  (new-metadata-cache @open-db-info)
                   (AtomicLong. (long (or (:max-tx @open-db-info) 0)))
                   sampling-started?
                   owns-client?

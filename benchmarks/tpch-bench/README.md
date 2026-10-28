@@ -155,8 +155,9 @@ patterns required care:
 - **Correlated subqueries** (Q2, Q17, Q20) use correlated nested `(q ...)`
   queries with scalar bindings.
 - **`GROUP BY ... HAVING`** subqueries (Q11, Q18) are expressed as nested
-  grouped relations filtered in the outer query. Q18 returns the already
-  computed quantity sum instead of joining and aggregating lineitems again.
+  grouped relations. Q18 applies its quantity threshold inside the nested
+  query and returns the computed sum, so only qualifying orders cross into
+  the outer query.
 - **`LEFT OUTER JOIN`** (Q13) uses two mutually exclusive `or-join` branches:
   one grouped count relation joined to customers, and a `not` branch binding
   zero for the rest.
@@ -184,6 +185,12 @@ The [LIKE correctness follow-up](../../doc/measurements/like-correctness-2026-10
 records the matcher fixes, SQL oracle tests, and repeated SF0.1/SF1 gates with
 Q13 restored to native `not-like`. Its isolated Q13 comparison shows performance
 comparable to the regex workaround.
+
+The [second Q1/Q18 optimization pass](../../doc/measurements/tpch-q1-q18-2026-10-27.md)
+adds direct grouped reduction when native schema and retained entity keys prove
+the aggregate input distinct. Q1 also uses faster scalar-binding copies; Q18
+filters its groups before returning the nested relation. The report retains
+complete SQL gates and repeated SF1 before/after measurements.
 
 The raw CSVs (`datalevin_pass.csv`, `sqlite_pass.csv`, `postgres_pass.csv`) and
 `results.edn`-style manifests should be retained alongside any published table,

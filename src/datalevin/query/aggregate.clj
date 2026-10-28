@@ -14,10 +14,11 @@
    [datalevin.parser :as dp]
    [datalevin.query.resolve :as qresolve]
    [datalevin.relation :as r]
+   [datalevin.timeout :as timeout]
    [datalevin.util :as u :refer [raise]])
   (:import
    [datalevin.parser Constant PlainSymbol SrcVar Variable]
-   [datalevin.utl NumberOps]
+   [datalevin.utl GroupedAggregate NumberOps]
    [java.util Map Set List]
    [datalevin.utl QueryKey$KeyMap QueryKey$KeySet]
    [org.eclipse.collections.impl.list.mutable FastList]))
@@ -401,6 +402,43 @@
         (map (fn [element]
                [element (compile-aggregate element context)]))
         (dp/collect dp/aggregate? find-elements)))
+
+(def ^:dynamic ^:no-doc *unique-group-aggregation?* true)
+
+(defn aggregate-relation
+  "Reduce a relation directly when a retained unique key proves the complete
+  find/with input distinct. Return nil for unsupported aggregate expressions;
+  custom functions and controlled callers keep their collection contracts."
+  [find-elements context rel symbols]
+  (when (and *unique-group-aggregation?* (r/unique-on? rel symbols))
+    (let [attrs (:attrs rel)
+          plans (mapv
+                  (fn [element]
+                    (cond
+                      (instance? Variable element)
+                      [(attrs (:symbol element)) GroupedAggregate/KEY]
+
+                      (and (dp/aggregate? element)
+                           (= 1 (count (:args element)))
+                           (instance? Variable (first (:args element))))
+                      (let [f (resolve-aggregate-fn element context)
+                            op (cond
+                                 (identical? f (built-ins/aggregates 'sum)) GroupedAggregate/SUM
+                                 (identical? f (built-ins/aggregates 'avg)) GroupedAggregate/AVG
+                                 (identical? f (built-ins/aggregates 'count)) GroupedAggregate/COUNT)]
+                        (when op [(attrs (:symbol (first (:args element)))) op]))))
+                  find-elements)]
+      (when (and (every? #(and % (some? (first %))) plans)
+                 (every? #(contains? attrs %) symbols))
+        (let [accumulator (GroupedAggregate. (int-array (map first plans))
+                                              (int-array (map second plans)))
+              ^List tuples (:tuples rel)]
+          (dotimes [i (.size tuples)]
+            (when (zero? (bit-and i 4095)) (timeout/assert-time-left))
+            (.add accumulator (.get tuples i)))
+          {:rows (map vec (.results accumulator))
+           :input-tuples (.size tuples)
+           :group-count (.groupCount accumulator)})))))
 
 (defn- checked-map
   "Keep checks between individual operations, including over chunked inputs."

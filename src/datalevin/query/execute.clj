@@ -962,12 +962,22 @@
         order         (when (:qorder parsed-q)
                         (result/prepare-order find-vars (:qorder parsed-q)))]
     (fn [parsed-q context]
-      (let [context (collect context all-vars)
+      (let [reduced (when (and aggregate?
+                               (nil? (::result-policy context))
+                               (nil? (:result-set context))
+                               (= 1 (count (:rels context))))
+                      (qagg/aggregate-relation find-elements context
+                                               (first (:rels context)) all-vars))
+            context (if reduced
+                      (assoc context
+                             :explain-actual-result-size (:input-tuples reduced)
+                             :unique-group-aggregation (dissoc reduced :rows))
+                      (collect context all-vars))
             result
-            (cond->> (:result-set context)
-              with (mapv #(subvec % 0 result-arity))
+            (cond->> (if reduced (:rows reduced) (:result-set context))
+              (and with (nil? reduced)) (mapv #(subvec % 0 result-arity))
 
-              aggregate?
+              (and aggregate? (nil? reduced))
               (aggregate-results find-elements context)
 
               (seq having)

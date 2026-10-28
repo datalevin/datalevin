@@ -1,0 +1,63 @@
+(ns datalevin.query.grouped-aggregate-test
+  (:require [clojure.test :refer [deftest is]]
+            [datalevin.built-ins :as built-ins]
+            [datalevin.query.resolve.binding :as binding]
+            [datalevin.relation :as relation])
+  (:import [datalevin.utl GroupedAggregate]
+           [org.eclipse.collections.impl.list.mutable FastList]))
+
+(deftest grouped-arithmetic-matches-the-existing-builtins
+  (doseq [values [[1 1 2] [1/2 1/3 1/7] [1.00M 2.0M 3.00M]
+                  [1M 2 (float 3.5) 4.5] [Long/MAX_VALUE 1N]
+                  [(bigint (.shiftLeft java.math.BigInteger/ONE 2000)) 2N]]
+          context [nil java.math.MathContext/DECIMAL64]]
+    (binding [*math-context* context]
+      (let [acc (GroupedAggregate. (int-array [0 1 1 1])
+                                  (int-array [GroupedAggregate/KEY GroupedAggregate/SUM
+                                              GroupedAggregate/AVG GroupedAggregate/COUNT]))
+            evaluate (fn [f] (try (f) (catch ArithmeticException _ :arithmetic-error)))
+            expected (evaluate #(vector :group (built-ins/sum values)
+                                        (built-ins/avg values) (count values)))
+            actual (evaluate #(do (doseq [value values] (.add acc (object-array [:group value])))
+                                  (vec (first (.results acc)))))]
+        (is (= expected actual)))))
+  (let [acc (GroupedAggregate. (int-array [0]) (int-array [GroupedAggregate/SUM]))]
+    (is (empty? (.results acc)))
+    (.add acc (object-array [Long/MAX_VALUE]))
+    (is (thrown? ArithmeticException (.add acc (object-array [1]))))))
+
+(deftest groups-preserve-query-key-equality
+  (doseq [composite? [false true]]
+    (let [acc (GroupedAggregate.
+                (int-array (if composite? [0 1 2] [0 2]))
+                (int-array (if composite?
+                             [GroupedAggregate/KEY GroupedAggregate/KEY GroupedAggregate/SUM]
+                             [GroupedAggregate/KEY GroupedAggregate/SUM])))]
+      (doseq [row [[(byte-array [1 2]) :group 10]
+                   [(byte-array [1 2]) :group 20]
+                   [(int -1) :group 3] [(long -1) :group 4]
+                   [1.0M :group 5] [1.00M :group 6]]]
+        (.add acc (object-array row)))
+      (is (= 4 (.groupCount acc)))
+      (is (= #{5 6 7 30} (into #{} (map #(last (vec %))) (.results acc)))))))
+
+(deftest scalar-bindings-preserve-projections-and-unique-keys
+  (doseq [[attrs tuple] [[(array-map '?e 0 '?v 1) [1 10]]
+                         [(array-map '?e 1 '?v 0) [10 1]]
+                         [(array-map '?e 0 '?v 2) [1 :hidden 10]]]]
+    (let [source (relation/with-unique-key
+                   (relation/relation! attrs (FastList. [(object-array tuple)])) ['?e])
+          result (binding/bind-scalar-tuples source '?x (constantly 20))
+          row (vec (first (:tuples result)))]
+      (is (= [1 10 20] row))
+      (is (relation/unique-on? result ['?e]))
+      (is (not (relation/unique-on? result ['?v '?x]))))))
+
+(deftest rebinding-a-hidden-column-does-not-restore-its-old-key
+  (let [source (relation/with-unique-key
+                 (relation/relation! {'?e 0 '?v 1}
+                   (FastList. [(object-array [1 10]) (object-array [2 10])])) ['?e])
+        projected (assoc source :attrs {'?v 1})
+        result (binding/bind-scalar-tuples projected '?e (constantly 100))]
+    (is (= [[10 100] [10 100]] (mapv vec (:tuples result))))
+    (is (not (relation/unique-on? result ['?e])))))

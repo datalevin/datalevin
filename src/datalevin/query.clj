@@ -124,12 +124,23 @@
         [(.-store ^DB remote-db)
          (assoc (vec inputs) remote-idx :remote-db-placeholder)]))))
 
+(defn- remote-query-result
+  ([store query inputs execute] (remote-query-result store query inputs nil execute))
+  ([store query inputs validate execute]
+  ;; Server function implementations and UDF registries can change without a
+  ;; database transaction. Their result tokens are only available on the server.
+  (if (and *cache?* qcache/*cache?*
+           (not-any? #(and (symbol? %) (or (namespace %) (= 'udf %)))
+                     (tree-seq coll? seq query)))
+    (db/cached-remote-read store [:q query inputs] validate execute)
+    (execute))))
+
 (defn q
   [query & inputs]
   (if (source-inputs? inputs)
     (run-source query inputs nil)
     (if-let [[store inputs'] (only-remote-db inputs)]
-      (i/q store query inputs')
+      (remote-query-result store query inputs' #(i/q store query inputs'))
       (apply perform query inputs))))
 
 (defn- prepared-query [query]
@@ -202,7 +213,8 @@
           (when (some db/-searchable? inputs)
             (raise "Prepared remote queries require exactly one database source"
                    {:error :prepared/query-sources}))
-          (remote (into [:remote-db-placeholder] inputs))))
+          (let [inputs (into [:remote-db-placeholder] inputs)]
+            (remote-query-result store query inputs #(db/db? db) #(remote inputs)))))
       (prepared/prepared-read
         (fn [inputs]
           (check-query-input-count! inputs expected)

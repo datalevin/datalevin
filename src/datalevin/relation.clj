@@ -104,6 +104,16 @@
       (let [vars (set vars)]
         (some #(every? vars %) unique-keys)))))
 
+(defn ^:no-doc with-unique-keys-from
+  "Preserve keys through an operator that emits at most one row per input."
+  [rel source]
+  (reduce (fn [rel key]
+            (if (every? #(and (contains? (:attrs source) %)
+                             (contains? (:attrs rel) %)) key)
+              (with-unique-key rel key)
+              rel))
+          rel (::unique-keys (meta source))))
+
 (defn- exact-tuple-layout?
   [rel attrs]
   (and (= (:attrs rel) attrs)
