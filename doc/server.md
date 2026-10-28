@@ -215,13 +215,16 @@ its cached results. Cache ownership follows database replacements made by
 `reset-conn!`. Clients check for remote database changes before
 reusing cached data; writes through the connection invalidate cached results
 immediately. Explicit transactions, pull visitors, pull transforms using `rand`
-or `rand-int`, mutable inputs/results, and queries using UDFs or qualified
-functions bypass result caching. Keep client and server clocks synchronized,
-for example with NTP or chrony.
+or `rand-int`, mutable inputs/results (including metadata), and queries using UDFs
+or qualified functions bypass result caching. Keep client and server clocks
+synchronized, for example with NTP or chrony.
 
 Client result caching also bypasses Datalog stores with custom value types.
 Their server decoders can change independently of storage commits, so ordinary
 pulls, prepared pulls, and pull-many always observe the current decoder bindings.
+Server query-result caches include the custom codec registry's identity and
+generation, so decoder changes and removal invalidate ordinary and prepared
+query results without a storage commit.
 Server index caches also distinguish codec registry generations when retaining
 decoded custom values.
 

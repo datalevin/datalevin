@@ -288,9 +288,13 @@
                udf-token (when (if analysis (.-udf? analysis)
                                    (query-uses-udf? parsed-q'))
                            (udf-cache-token inputs))
-               k         [:query-result deps :exact-window-v1
-                          qresolve/*resolver-mode* parsed-q' udf-token
-                          (mapv cache-input-token inputs)]]
+               ;; Custom decoders can change without a storage write or an
+               ;; explicit UDF call in the query. Share index-cache identity.
+               k         (db/index-cache-key
+                           store
+                           [:query-result deps :exact-window-v1
+                            qresolve/*resolver-mode* parsed-q' udf-token
+                            (mapv cache-input-token inputs)])]
            (if-let [cached (db/cache-get store k)]
              cached
              (let [res (run parsed-q inputs execute)]

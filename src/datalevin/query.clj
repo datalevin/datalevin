@@ -128,6 +128,7 @@
 (defn- remote-query-result
   ([store query inputs execute] (remote-query-result store query inputs nil execute))
   ([store query inputs validate execute]
+   (db/check-remote-read! store)
    ;; Secondary indexes, server functions and UDF registries can change without
    ;; a source transaction. Their result tokens are only available on the server.
    ;; Inputs can supply index calls through rules or nested queries.

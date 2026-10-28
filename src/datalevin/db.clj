@@ -332,7 +332,8 @@
                    (.get ^ConcurrentHashMap caches (dir store)))
        (.putIfGeneration cache k v (long generation))))
 
-(defn- check-remote-read!
+(defn ^:no-doc check-remote-read!
+  "Validate local lifecycle and cancellation before a remote read, without an RPC."
   [store]
   ;; Cache hits may run without a request budget. Do not clear the interrupt.
   (when (.isInterrupted (Thread/currentThread))
@@ -805,6 +806,18 @@
          (.setTarget cache (long (or target 0))))
        (mark-remote-cache-max-tx! store remote-max-tx))
      (refresh-cache store target remote-max-tx))))
+
+(defn- invalidate-remote-cache!
+  "Discard results after an uncertain write without fetching remote metadata."
+  [store]
+  (let [cache-dir (dir store)]
+    (when-let [^LRUCache cache (.get ^ConcurrentHashMap caches cache-dir)]
+      (locking cache
+        ;; Even an empty cache may have readers awaiting pre-commit responses.
+        ;; Preserve the target until the next successful metadata refresh.
+        (.beginInvalidation cache (.target cache))
+        (.clear cache)))
+    (.remove ^ConcurrentHashMap remote-cache-check-ms cache-dir)))
 
 (defn ^:no-doc invalidate-write-group!
   "Invalidate committed Datalog writes using their consolidated metadata."
@@ -2950,7 +2963,9 @@
                          :tempids tempids)
             (seq new-attributes) (assoc :new-attributes new-attributes)
             simulated? mark-simulated-tx-cache!))
-        (catch Exception e
+        (catch Throwable e
+          (when-not simulated?
+            (invalidate-remote-cache! store))
           (throw e)))
       (let [report (prepare-local-tx-data initial-report initial-es tx-time)]
         (if simulated?
@@ -2965,23 +2980,27 @@
   [^DB db tx-data]
   (vld/validate-tx-data-shape tx-data)
   (let [store (.-store db)
-        txs (sequence (mapcat expand-transactable-entity) tx-data)
-        response (i/tx-data-ack store txs)
-        info (:db-info response)]
-    (when-not (= :transacted (:result response))
-      (raise "Invalid transaction acknowledgement" {:response response}))
-    ;; Without changed datoms we cannot selectively invalidate cached reads.
-    ;; Reuse the cache's capacity without an extra remote `opts` request, and
-    ;; advance its generation so pre-commit readers cannot repopulate it.
-    (if-some [^LRUCache cache (.get ^ConcurrentHashMap caches (dir store))]
-      (do
-        (locking cache
-          (.beginInvalidation cache (long (:last-modified info)))
-          (.clear cache))
-        (mark-remote-cache-max-tx! store (:max-tx info))
-        (mark-remote-cache-check! store))
-      (refresh-cache store (:last-modified info) (:max-tx info)))
-    (carry-runtime-opts (new-db store info db) db)))
+        txs (sequence (mapcat expand-transactable-entity) tx-data)]
+    (try
+      (let [response (i/tx-data-ack store txs)
+            info (:db-info response)]
+        (when-not (= :transacted (:result response))
+          (raise "Invalid transaction acknowledgement" {:response response}))
+        ;; Without changed datoms we cannot selectively invalidate cached reads.
+        ;; Reuse the cache's capacity without an extra remote `opts` request, and
+        ;; advance its generation so pre-commit readers cannot repopulate it.
+        (if-some [^LRUCache cache (.get ^ConcurrentHashMap caches (dir store))]
+          (do
+            (locking cache
+              (.beginInvalidation cache (long (:last-modified info)))
+              (.clear cache))
+            (mark-remote-cache-max-tx! store (:max-tx info))
+            (mark-remote-cache-check! store))
+          (refresh-cache store (:last-modified info) (:max-tx info)))
+        (carry-runtime-opts (new-db store info db) db))
+      (catch Throwable e
+        (invalidate-remote-cache! store)
+        (throw e)))))
 
 (defn tx-data->simulated-report
   [db tx-data]

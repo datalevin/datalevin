@@ -20,14 +20,18 @@
     datalevin.utl.UniqueVectorSet})
 
 (defn immutable-data?
-  "Accept only known immutable containers, recursively checking their contents."
+  "Accept known immutable values, recursively checking contents and metadata."
   [x]
-  (or (nil? x) (string? x) (keyword? x) (symbol? x) (boolean? x)
-      (char? x) (uuid? x) (integer? x) (float? x) (decimal? x) (ratio? x)
-      (and (contains? immutable-collection-types (class x))
-           (if (map? x)
-             (every? (fn [[k v]] (and (immutable-data? k) (immutable-data? v))) x)
-             (every? immutable-data? x)))))
+  (and (or (nil? x) (string? x) (keyword? x) (symbol? x) (boolean? x)
+           (char? x) (uuid? x) (integer? x) (float? x) (decimal? x) (ratio? x)
+           (and (contains? immutable-collection-types (class x))
+                (if (map? x)
+                  (every? (fn [[k v]]
+                            (and (immutable-data? k) (immutable-data? v))) x)
+                  (every? immutable-data? x))))
+       (if-some [metadata (meta x)]
+         (immutable-data? metadata)
+         true)))
 
 (defn serialized-key
   "Own serialized request bytes for representation-sensitive cache identity.
