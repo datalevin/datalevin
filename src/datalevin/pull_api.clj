@@ -431,8 +431,11 @@
 
 (defn- remote-pull-result
   [db operation pattern ids opts execute]
-  ;; A qualified xform's implementation can change independently of DB writes.
-  (if (some #(and (symbol? %) (namespace %)) (tree-seq coll? seq pattern))
+  ;; Random transforms and qualified implementations can change without a write.
+  ;; Inspect nested patterns as well as the root pull attributes.
+  (if (some #(and (symbol? %)
+                  (or (namespace %) (#{'rand 'rand-int} %)))
+            (tree-seq coll? seq pattern))
     (execute)
     (db/cached-remote-read (.-store ^DB db) [operation pattern ids (or opts {})]
                            #(db/db? db) execute)))

@@ -2,14 +2,31 @@
 ;; Distributed under the Eclipse Public License 2.0.
 (ns ^:no-doc datalevin.remote-cache
   "Bounded client read results, validated against committed store revisions."
-  (:require [clojure.string :as str])
-  (:import [datalevin.utl LRUCache]))
+  (:require [clojure.string :as str]
+            [datalevin.bits :as bits])
+  (:import [datalevin.utl LRUCache]
+           [java.nio ByteBuffer]))
+
+(def ^:private immutable-collection-types
+  ;; IPersistentCollection also covers mutable spillable collections. Generic
+  ;; sequence views can expose mutable backing arrays or collections.
+  #{clojure.lang.PersistentVector clojure.lang.APersistentVector$SubVector
+    clojure.lang.PersistentArrayMap clojure.lang.PersistentHashMap
+    clojure.lang.PersistentTreeMap clojure.lang.PersistentStructMap
+    clojure.lang.PersistentHashSet clojure.lang.PersistentTreeSet
+    clojure.lang.PersistentList clojure.lang.PersistentList$EmptyList
+    clojure.lang.PersistentQueue clojure.lang.MapEntry
+    datalevin.utl.UniqueVectorSet})
 
 (defn immutable-data?
+  "Accept only known immutable containers, recursively checking their contents."
   [x]
   (or (nil? x) (string? x) (keyword? x) (symbol? x) (boolean? x)
       (char? x) (uuid? x) (integer? x) (float? x) (decimal? x) (ratio? x)
-      (and (coll? x) (not (record? x)) (every? immutable-data? x))))
+      (and (contains? immutable-collection-types (class x))
+           (if (map? x)
+             (every? (fn [[k v]] (and (immutable-data? k) (immutable-data? v))) x)
+             (every? immutable-data? x)))))
 
 (def ^:private read-ops
   ;; Schema snapshots refresh the store's metadata cache after revision changes;
@@ -81,14 +98,19 @@
 
 (defn read-result
   "Validate hits; unique misses avoid repeated revision RPCs. Positive intervals
-  allow hits without an RPC. Mutable data and older servers bypass retention."
+  allow hits without an RPC. Identity follows serialized request bytes, preserving
+  distinctions such as vector/list :data keys. Mutable data and older servers
+  bypass retention."
   [^ReadCache cache key interval-ms revision execute]
   (let [^LRUCache entries (:entries cache)
         state @(:state cache)]
     (if (or (zero? (.capacity entries)) (:legacy? state)
             (pos? (long (:writers state))) (not (immutable-data? key)))
       (execute)
-      (let [cached (.get entries key)
+      (let [;; Own these bytes and keep the buffer's position fixed for stable
+            ;; content equality/hashing, independently of collection equality.
+            key (.asReadOnlyBuffer (ByteBuffer/wrap (bits/serialize key)))
+            cached (.get entries key)
             interval (long (or (:interval-ms cache) interval-ms))]
         (when (or (nil? (:token state))
                   (and cached

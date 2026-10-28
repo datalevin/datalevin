@@ -1307,8 +1307,8 @@
                (.remove ha-retry-open-targets client)
                (.remove ha-write-retry-settings client)
                (.set ^AtomicReference (.-readers state) nil)
-               (when-let [caches (.get ^AtomicReference (.-read-caches state))]
-                 (.clear ^ConcurrentHashMap caches))
+               ;; Derived clients share this map with other live clients.
+               (.set ^AtomicReference (.-read-caches state) nil)
                (.remove index-open-options client)
                (.remove ha-retry-disabled-clients client)
                (.set ^AtomicReference (.-endpoint state) nil)

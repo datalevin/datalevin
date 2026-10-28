@@ -26,7 +26,8 @@
   (:import
    [datalevin.client Client]
    [datalevin.interface ICustomTypes ILMDB ITxLog IList IAdmin IStore
-    ISearchEngine IVectorIndex IRemoteDB IRemoteKV IRemotePrepared IRemotePreparedUpdate]
+    ISearchEngine IVectorIndex IRemoteDB IRemoteKV IRemoteReadLifecycle
+    IRemotePrepared IRemotePreparedUpdate]
    [clojure.lang Seqable IReduceInit]
    [java.lang AutoCloseable]
    [java.util Collections WeakHashMap Map]
@@ -614,6 +615,14 @@
                        ^AtomicBoolean sampling-started?
                        owns-client?
                        ^AtomicBoolean closed?]
+  IRemoteReadLifecycle
+  (check-remote-read-open! [_]
+    (when (cl/disconnected? client)
+      (raise "This client is closed" {:error :client/closed
+                                      :termination-reason :client-disconnected}))
+    (when (.get closed?)
+      (raise "Database is closed" {:type :lmdb/closed})))
+
   ICustomTypes
   (defremote-forward (metadata-request metadata-cache read-floor-tx client)
     (register-type [_ type-name definition]

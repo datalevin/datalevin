@@ -8,6 +8,7 @@
    [datalevin.query.execute.ordered-range :as ordered-range]
    [datalevin.query.execute.point-lookup :as point]
    [datalevin.query.plan :as qplan]
+   [datalevin.query.resolve :as qresolve]
    [datalevin.query-optimizer :as qo]
    [datalevin.interface :as i]
    [datalevin.util :as u :refer [raise]])
@@ -127,13 +128,16 @@
 (defn- remote-query-result
   ([store query inputs execute] (remote-query-result store query inputs nil execute))
   ([store query inputs validate execute]
-  ;; Server function implementations and UDF registries can change without a
-  ;; database transaction. Their result tokens are only available on the server.
-  (if (and *cache?* qcache/*cache?*
-           (not-any? #(and (symbol? %) (or (namespace %) (= 'udf %)))
-                     (tree-seq coll? seq query)))
-    (db/cached-remote-read store [:q query inputs] validate execute)
-    (execute))))
+   ;; Secondary indexes, server functions and UDF registries can change without
+   ;; a source transaction. Their result tokens are only available on the server.
+   ;; Inputs can supply index calls through rules or nested queries.
+   (if (and *cache?* qcache/*cache?*
+            (not-any? #(and (symbol? %)
+                           (or (namespace %) (= 'udf %)
+                               (contains? qresolve/tuple-producing-fns %)))
+                      (tree-seq coll? seq [query inputs])))
+     (db/cached-remote-read store [:q query inputs] validate execute)
+     (execute))))
 
 (defn q
   [query & inputs]

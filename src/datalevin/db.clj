@@ -326,13 +326,20 @@
                    (.get ^ConcurrentHashMap caches (dir store)))
        (.putIfGeneration cache k v (long generation))))
 
+(defn- check-remote-read-open!
+  [store]
+  (when (satisfies? i/IRemoteReadLifecycle store)
+    (i/check-remote-read-open! store)))
+
 (defn ^:no-doc cached-remote-read
   "Retain an RPC result in the DB's bounded read cache. Callers either validate
   freshness before entering or supply a validator, run only for prospective
   hits. All writes invalidate these opaque results; transaction reads and
-  mutable inputs/results bypass retention."
+  mutable inputs/results bypass retention. Local lifecycle checks apply
+  independently of the freshness interval."
   ([store key read-result] (cached-remote-read store key nil read-result))
   ([store key validate read-result]
+   (check-remote-read-open! store)
    (when (and validate (nil? (.get ^ConcurrentHashMap caches (dir store))))
      (validate))
    (if (and (cache-active? store)
@@ -344,7 +351,11 @@
            token (cache-token store)
            cached (if (and validate cached) (cache-get store key) cached)]
        (if-some [cached cached]
-         (first cached)
+         (do
+           ;; Freshness validation can overlap a close. Cache hits must still
+           ;; enforce the request path's local lifecycle check before return.
+           (check-remote-read-open! store)
+           (first cached))
          (let [result (read-result)]
            ;; Wrap nil and false so both can be distinguished from a miss.
            (when (remote-cache/immutable-data? result)

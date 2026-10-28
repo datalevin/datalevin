@@ -473,6 +473,10 @@ values;")
 ;; that `search`, `idoc`, `vector`, and `db` can dispatch to remote
 ;; implementations without depending on `datalevin.remote`.
 
+(defprotocol IRemoteReadLifecycle
+  (check-remote-read-open! [store]
+    "Throw if the store or its client is locally closed, without an RPC."))
+
 (defprotocol IRemotePrepared
   (prepare-remote-read [store operation args]
     "Prepare fixed operation arguments; execution supplies the key/entity ID."))

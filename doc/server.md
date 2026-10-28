@@ -212,9 +212,10 @@ Clients cache query, pull, and pull-many results alongside index reads, using
 the Datalog `:cache-limit` (default `512`; `0` disables retention). Ordinary and
 prepared reads share entries. Clients check for remote database changes before
 reusing cached data; writes through the connection invalidate cached results
-immediately. Explicit transactions, pull visitors, mutable inputs/results, and
-queries using UDFs or qualified functions bypass result caching. Keep client and
-server clocks synchronized, for example with NTP or chrony.
+immediately. Explicit transactions, pull visitors, pull transforms using `rand`
+or `rand-int`, mutable inputs/results, and queries using UDFs or qualified
+functions bypass result caching. Keep client and server clocks synchronized,
+for example with NTP or chrony.
 
 KV point, range, list, rank, and batch reads also have a bounded client cache.
 Cache hits validate a committed LMDB revision, which detects updates even when
@@ -255,6 +256,9 @@ Bind the interval around the reads. Within the interval, repeated cached reads
 need no RPC. With the default `0`, a cache hit still checks database metadata,
 but skips the query or pull RPC. Updates from other connections become visible
 at the next freshness check.
+
+Cached Datalog queries and pulls still check local connection and store closure,
+including prepared readers and retained DB views, regardless of the freshness interval.
 
 Direct Datalog schema reads and lookup-reference validation, including `entid`,
 honor this interval without requiring an explicit `db?` call. `schema-snapshot`
