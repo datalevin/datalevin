@@ -1,4 +1,4 @@
-(def version "1.2.9")
+(def version "1.2.10")
 
 (def common-uberjar-exclusions
   [#"datalevin/tx_state([$_.]|$)"

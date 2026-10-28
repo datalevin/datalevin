@@ -1,6 +1,6 @@
 # Change Log
 
-## WIP
+## 1.2.10 (2026-10-28)
 
 ### Improved
 - [Server] add connection level client read caches to both DL and KV to reduce
