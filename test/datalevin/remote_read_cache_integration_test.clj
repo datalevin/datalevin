@@ -1,7 +1,9 @@
 (ns datalevin.remote-read-cache-integration-test
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
+            [datalevin.client.request :as cr]
             [datalevin.constants :as c]
             [datalevin.core :as d]
+            [datalevin.interface :as i]
             [datalevin.remote :as remote]
             [datalevin.test.core :refer [server-fixture]]))
 
@@ -82,3 +84,48 @@
           (is (= {:name "external"} (read-pull 1)))
           (is (= [{:name "external"}] (d/pull-many @first [:name] [1])))))
       (finally (d/close first) (d/close second)))))
+
+(defn- outcome [f]
+  (try (f) (catch Throwable t t)))
+
+(defn- interrupted-outcome [f]
+  (let [^Thread thread (Thread/currentThread)]
+    (try
+      (.interrupt thread)
+      [(outcome f) (.isInterrupted thread)]
+      (finally (Thread/interrupted)))))
+
+(deftest datalog-cache-hits-respect-deadlines-and-interruption
+  (let [conn (d/create-conn (uri) {:name {}} opts)
+        query '[:find ?name . :in $ ?id :where [?id :name ?name]]]
+    (try
+      (d/transact! conn [{:db/id 1 :name "one"}])
+      (binding [c/*remote-db-last-modified-check-interval-ms* 60000]
+        (let [view @conn
+              store (:store view)
+              read-query (d/prepare-q view query)
+              read-pull (d/prepare-pull view [:name])
+              direct-query #(i/q store query [:remote-db-placeholder 1])
+              direct-pull #(i/pull store [:name] 1 {})
+              reads {:query ["one" #(d/q query view 1) direct-query]
+                     :prepared-query ["one" #(read-query [1]) direct-query]
+                     :pull [{:name "one"} #(d/pull view [:name] 1) direct-pull]
+                     :prepared-pull [{:name "one"} #(read-pull 1) direct-pull]
+                     :pull-many [[{:name "one"}] #(d/pull-many view [:name] [1])
+                                 #(i/pull-many store [:name] [1] {})]}]
+          (doseq [[operation [expected read direct]] reads]
+            (testing (name operation)
+              (is (= expected (read) (read) (direct)))
+              (doseq [[path request] [[:cached read] [:direct direct]]]
+                (testing (name path)
+                  (let [error (cr/with-budget (cr/budget 0 0 nil nil)
+                                (outcome request))]
+                    (is (= :socket/timeout (:error (ex-data error))))
+                    (is (= :deadline-exceeded (:termination-reason (ex-data error)))))
+                  ;; No enclosing request budget: cached calls must still
+                  ;; recognize cancellation before starting a wire request.
+                  (let [[error interrupted?] (interrupted-outcome request)]
+                    (is (instance? InterruptedException error))
+                    (is (true? interrupted?)))))
+              (is (= expected (read)) "a rejected call leaves the handle usable")))))
+      (finally (d/close conn)))))

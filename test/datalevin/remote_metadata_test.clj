@@ -124,10 +124,44 @@
       (swap! info assoc :schema-revision 2)
       (binding [c/*remote-db-last-modified-check-interval-ms* 0]
         (i/db-info store))
+      (i/prepare-remote-read-cache! store)
       (dotimes [_ 3] (is (false? (i/remote-read-cacheable? store))))
       (is (= [:db-info :schema-snapshot] @calls)
           "a cold schema is fetched once; decoder policy then stays local")
       (finally (i/close store)))))
+
+(deftest rpc-result-cache-policy-does-not-fetch-missing-metadata
+  (let [{:keys [store calls]} (remote-store false)]
+    (try
+      (i/db-info store)
+      (dotimes [_ 3]
+        (is (false? (i/remote-read-cacheable? store))))
+      (is (empty? @calls) "an eligibility check must stay local")
+      (i/prepare-remote-read-cache! store)
+      (is (true? (i/remote-read-cacheable? store)))
+      (is (= [:schema-snapshot] @calls)
+          "only explicit preparation fetches missing policy metadata")
+      (finally (i/close store)))))
+
+(deftest rpc-result-cache-publication-skips-missing-metadata
+  (doseq [result [{:name "completed"} nil false]]
+    (let [{:keys [store calls]} (remote-store true)]
+      (try
+        (binding [c/*remote-db-last-modified-check-interval-ms* 60000]
+          (db/new-db store)
+          (is (= result (db/cached-remote-read
+                          store [:completed-read]
+                          #(do (i/assoc-opt store :cache-limit 64) result))))
+          (is (= [:assoc-opt] @calls)
+              "metadata invalidation after decoding must not cause another RPC")
+          (let [reads (atom 0)
+                read #(db/cached-remote-read
+                        store [:completed-read]
+                        (fn [] (swap! reads inc) :next))]
+            (is (= :next (read) (read)))
+            (is (= 1 @reads) "a later read can prepare metadata and retain results")
+            (is (= [:assoc-opt :schema-snapshot] @calls))))
+        (finally (db/remove-cache store) (i/close store))))))
 
 (deftest direct-options-honor-the-freshness-window
   (let [{:keys [store info calls]} (remote-store true)]

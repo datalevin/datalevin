@@ -132,6 +132,7 @@
    ;; a source transaction. Their result tokens are only available on the server.
    ;; Inputs can supply index calls through rules or nested queries.
    (if (and *cache?* qcache/*cache?*
+            (db/cache-active? store)
             (not-any? #(and (symbol? %)
                            (or (namespace %) (= 'udf %)
                                (contains? qresolve/tuple-producing-fns %)))

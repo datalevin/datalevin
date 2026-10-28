@@ -240,6 +240,50 @@
 (defn- outcome [f]
   (try (f) (catch Throwable t t)))
 
+(deftest datalog-cache-hits-recheck-termination-after-validation
+  (doseq [stop [:deadline :interrupt]]
+    (testing (name stop)
+      (with-remote 16
+        (fn [{:keys [db store]}]
+          (binding [c/*remote-db-last-modified-check-interval-ms* 60000]
+            (db/db? db)
+            (let [reads (atom 0)
+                  read #(do (swap! reads inc) :value)
+                  ^Thread thread (Thread/currentThread)]
+              (is (= :value (db/cached-remote-read store :key read)))
+              (let [[error interrupted?]
+                    (try
+                      (cr/with-budget (when (= :deadline stop) (cr/budget 20 0 nil nil))
+                        [(outcome
+                           #(db/cached-remote-read
+                              store :key
+                              (fn []
+                                (case stop
+                                  :deadline (while (not (cr/expired?)) (Thread/sleep 1))
+                                  :interrupt (.interrupt thread)))
+                              read))
+                         (.isInterrupted thread)])
+                      (finally (Thread/interrupted)))]
+                (case stop
+                  :deadline (is (= :deadline-exceeded
+                                   (:termination-reason (ex-data error))))
+                  :interrupt (do (is (instance? InterruptedException error))
+                                 (is (true? interrupted?)))))
+              (is (= 1 @reads))
+              (is (= :value (db/cached-remote-read store :key read))))))))))
+
+(deftest datalog-cache-misses-preserve-completed-results
+  (with-remote 16
+    (fn [{:keys [db store]}]
+      (db/db? db)
+      (is (= :completed
+             (cr/with-budget (cr/budget 20 0 nil nil)
+               (db/cached-remote-read
+                 store :key
+                 #(do
+                    (while (not (cr/expired?)) (Thread/sleep 1))
+                    :completed))))))))
+
 (deftest cached-kv-requests-respect-deadlines-and-interruption
   (doseq [kind [:ordinary :prepared]]
     (testing (name kind)

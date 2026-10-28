@@ -64,7 +64,7 @@
       (raise "Datalog DB does not expose a KV handle"
                {:store store}))))
 
-(deftype ^:private CloseableConn [^clojure.lang.Atom state release-cache!]
+(deftype ^:private CloseableConn [^clojure.lang.Atom state]
   clojure.lang.IDeref
   (deref [_]
     @state)
@@ -107,9 +107,32 @@
     (.-state ^CloseableConn conn)
     conn))
 
+(defn- update-cache-owner!
+  [state owner]
+  (locking owner
+    ;; Watches can run out of order after concurrent atom updates. Re-read the
+    ;; current value while serializing ownership so a late watch cannot restore
+    ;; an earlier database's reference.
+    (let [current @state
+          store (when (instance? DB current) (.-store ^DB current))
+          cache-dir (when store (i/dir store))
+          previous @owner]
+      (when (not= cache-dir (:dir previous))
+        (let [next-owner (when store
+                           {:dir cache-dir :release! (db/retain-cache! store)})]
+          ;; Acquire the new reference before releasing the old one. Updates
+          ;; within the same database keep their cache and ownership unchanged.
+          (reset! owner next-owner)
+          (when-let [release! (:release! previous)]
+            (release!)))))))
+
 (defn- wrap-conn
-  [state release-cache!]
-  (CloseableConn. state release-cache!))
+  [state]
+  (let [owner (atom nil)]
+    (update-cache-owner! state owner)
+    (add-watch state ::cache-owner
+               (fn [_ _ _ _] (update-cache-owner! state owner)))
+    (CloseableConn. state)))
 
 (defn- alter-conn-meta!
   [conn f & args]
@@ -122,8 +145,7 @@
   (wrap-conn
    (atom db :meta {:listeners (atom {})
                    :db-listeners (atom {})
-                   :runtime-opts (db/runtime-opts db)})
-   (db/retain-cache! (.-store ^DB db))))
+                   :runtime-opts (db/runtime-opts db)})))
 
 (defn conn-from-datoms
   ([datoms] (conn-from-db (db/init-db datoms)))
@@ -227,14 +249,13 @@
                 (vreset! detached? true))))))
       (finally
         (when (or @detached? (closed? conn))
-          (when (instance? CloseableConn conn)
-            ((.-release-cache! ^CloseableConn conn)))
+          ;; Clearing the state releases the current database's cache owner.
+          (when (instance? clojure.lang.IAtom conn)
+            (reset! conn nil))
           (remove-conn (:dir (meta conn)) conn)
           (when-let [listeners (:listeners (meta conn))]
             (when (instance? clojure.lang.IAtom listeners)
               (reset! listeners {})))
-          (when (instance? clojure.lang.IAtom conn)
-            (reset! conn nil))
           (alter-conn-meta! conn dissoc :dir :remote-store-opts-cache))
         (shutdown-transact-async-executor-if-idle!)))))
   nil)

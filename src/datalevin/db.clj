@@ -16,6 +16,7 @@
    [clojure.set]
    [datalevin.bits :as b]
    [datalevin.client-op :as cop]
+   [datalevin.client.request :as cr]
    [datalevin.constants :as c :refer [e0 emax v0 vmax]]
    [datalevin.datom :as d :refer [datom datom?]]
    [datalevin.custom-datalog :as cd]
@@ -331,45 +332,55 @@
                    (.get ^ConcurrentHashMap caches (dir store)))
        (.putIfGeneration cache k v (long generation))))
 
-(defn- check-remote-read-open!
+(defn- check-remote-read!
   [store]
+  ;; Cache hits may run without a request budget. Do not clear the interrupt.
+  (when (.isInterrupted (Thread/currentThread))
+    (throw (InterruptedException. "Request interrupted")))
+  (cr/check! :request)
   (when (satisfies? i/IRemoteReadLifecycle store)
     (i/check-remote-read-open! store)))
 
 (defn- remote-read-cacheable?
-  [store]
-  (and (not nv/*wire-reader*)
-       (or (not (satisfies? i/IRemoteReadCache store))
-           (i/remote-read-cacheable? store))))
+  ([store] (remote-read-cacheable? store false))
+  ([store prepare?]
+   (and (not nv/*wire-reader*)
+        (or (not (satisfies? i/IRemoteReadCache store))
+            (do
+              (when prepare? (i/prepare-remote-read-cache! store))
+              (i/remote-read-cacheable? store))))))
 
 (defn ^:no-doc cached-remote-read
   "Retain an RPC result in the DB's bounded read cache. Callers either validate
   freshness before entering or supply a validator, run only for prospective
   hits. All writes invalidate these opaque results. Transaction reads,
   receiver bindings, and mutable inputs/results bypass retention. Local lifecycle
-  checks apply independently of the freshness interval. Request identity uses
-  serialized bytes."
+  and cancellation checks apply independently of the freshness interval. Request
+  identity uses serialized bytes."
   ([store key read-result] (cached-remote-read store key nil read-result))
   ([store key validate read-result]
-   (check-remote-read-open! store)
+   (check-remote-read! store)
    (when (and validate (nil? (.get ^ConcurrentHashMap caches (dir store))))
      (validate))
    (if (and (cache-active? store)
             (not (and (satisfies? l/IWriting store) (l/writing? store)))
             (remote-cache/immutable-data? key)
-            (remote-read-cacheable? store))
+            (remote-read-cacheable? store true))
      (let [key [:remote-read (remote-cache/serialized-key key)]
            cached (cache-get store key)
            _ (when (and validate cached) (validate))
            token (cache-token store)
            cached (if (and validate cached) (cache-get store key) cached)]
        (if-some [cached cached]
-         (do
-           ;; Freshness validation can overlap a close. Cache hits must still
-           ;; enforce the request path's local lifecycle check before return.
-           (check-remote-read-open! store)
-           (if (remote-read-cacheable? store) (first cached) (read-result)))
+         (if (remote-read-cacheable? store)
+           (do
+             ;; Validation and policy checks can overlap close or cancellation.
+             (check-remote-read! store)
+             (first cached))
+           (read-result))
          (let [result (read-result)]
+           ;; Publication only inspects local policy. Missing metadata skips
+           ;; retention without another RPC that could discard this success.
            ;; Wrap nil and false so both can be distinguished from a miss.
            (when (and (remote-read-cacheable? store)
                       (remote-cache/immutable-data? result))
@@ -412,19 +423,32 @@
               (remove-cache-by-dir! cache-dir)
               (swap! cache-owners dissoc cache-dir))))))))
 
+(defn ^:no-doc index-cache-key
+  "Keep decoded custom values within their runtime registry generation. Append
+  the token to preserve dependency and write-invalidation key positions."
+  [store pattern]
+  (if-let [registry (when (instance? Store store)
+                     (get-in @(kv-info (.-lmdb ^Store store))
+                             [:runtime-opts :udf-registry]))]
+    (if (cd/custom-schema? (schema store))
+      (conj pattern ::codec [registry (udf/generation registry)])
+      pattern)
+    pattern))
+
 (defmacro wrap-cache
   [store pattern body]
   `(let [store# ~store
          cache# ^LRUCache (.get ^ConcurrentHashMap caches (dir store#))
          cache?# (and cache# (pos? (.capacity cache#)) (not (.isDisabled cache#)))
-         generation# (if cache?# (.generation cache#) 0)]
+         generation# (if cache?# (.generation cache#) 0)
+         key# (when cache?# (index-cache-key store# ~pattern))]
      ;; A zero entry limit bypasses key construction and the LRU monitor as
      ;; well as retention. Keep the native read and transaction-overlay paths.
-     (if-some [cached# (when cache?# (.get ^LRUCache cache# ~pattern))]
+     (if-some [cached# (when cache?# (.get ^LRUCache cache# key#))]
        cached#
        (let [res# ~body]
          (when cache?#
-           (.putIfGeneration cache# ~pattern res# generation#))
+           (.putIfGeneration cache# key# res# generation#))
          res#))))
 
 (defn- sample-init-cache-key

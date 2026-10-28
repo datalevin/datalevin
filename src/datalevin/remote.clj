@@ -631,12 +631,16 @@
       (raise "Database is closed" {:type :lmdb/closed})))
 
   IRemoteReadCache
-  (remote-read-cacheable? [this]
+  (prepare-remote-read-cache! [this]
+    (when (and (not (cl/native-reader-bound? client db-name))
+               (nil? (:schema @metadata-cache)))
+      (i/schema-snapshot this)))
+
+  (remote-read-cacheable? [_]
     (and (not (cl/native-reader-bound? client db-name))
          ;; Server-side codecs can be rebound without a storage transaction.
          ;; A custom value decoded into an immutable map is still not stable.
-         (let [schema (or (:schema @metadata-cache)
-                          (:schema (i/schema-snapshot this)))]
+         (let [schema (:schema @metadata-cache)]
            (and (some? schema) (not (cd/custom-schema? schema))))))
 
   ICustomTypes

@@ -478,9 +478,11 @@ values;")
     "Throw if the store or its client is locally closed, without an RPC."))
 
 (defprotocol IRemoteReadCache
+  (prepare-remote-read-cache! [store]
+    "Fetch missing cache-policy metadata before executing a read.")
   (remote-read-cacheable? [store]
-    "Whether RPC results can be retained under the store's codec policy and
-     current receiver bindings."))
+    "Check cache eligibility using only local metadata and receiver bindings.
+     Missing metadata disables retention; this check must not issue an RPC."))
 
 (defprotocol IRemotePrepared
   (prepare-remote-read [store operation args]
