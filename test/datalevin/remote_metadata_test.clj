@@ -22,13 +22,15 @@
         info (atom {:max-eid 1 :max-tx c/tx0 :last-modified 1
                     :schema-revision 1
                     :opts {:cache-limit 64 :background-sampling? false}})
+        db-info-opts? (atom true)
         snapshot (atom {:schema lookup-schema :revision 1})
         client (reify client/IClient
                  (request [_ request]
                    (swap! calls conj (:type request))
                    {:type :command-complete
                     :result (case (:type request)
-                              :db-info @info
+                              :db-info (cond-> @info (not @db-info-opts?) (dissoc :opts))
+                              :tx-data+db-info {:db-info (dissoc @info :opts)}
                               :schema-snapshot @snapshot
                               :av-first-e (when (= "one" (nth (:args request) 2)) 1)
                               :opts (:opts @info)
@@ -45,11 +47,13 @@
                 (volatile! nil) false
                 (volatile! (cond-> @info opening-schema? (assoc :schema lookup-schema)))
                 (AtomicBoolean.) false (AtomicBoolean.))]
-    {:store store :info info :snapshot snapshot :calls calls}))
+    {:store store :info info :db-info-opts? db-info-opts?
+     :snapshot snapshot :calls calls}))
 
 (deftest lookup-refs-only-request-the-entity-id-within-freshness-window
   (let [{:keys [store calls]} (remote-store true)
-        database (db/new-db store)]
+        database (binding [c/*remote-db-last-modified-check-interval-ms* 60000]
+                   (db/new-db store))]
     (try
       (binding [c/*remote-db-last-modified-check-interval-ms* 60000]
         (doseq [_ (range 3)]
@@ -61,7 +65,8 @@
 
 (deftest older-opening-responses-fetch-schema-once
   (let [{:keys [store calls]} (remote-store false)
-        database (db/new-db store)]
+        database (binding [c/*remote-db-last-modified-check-interval-ms* 60000]
+                   (db/new-db store))]
     (try
       (binding [c/*remote-db-last-modified-check-interval-ms* 60000]
         (dotimes [_ 3] (is (= 1 (d/entid database [:user/id "one"]))))
@@ -106,6 +111,72 @@
       (is (= 64 (:cache-limit (i/opts store))))
       (i/assoc-opt store :cache-limit 8)
       (is (= 8 (:cache-limit (i/opts store))))
+      (finally (i/close store)))))
+
+(deftest rpc-result-cache-policy-follows-custom-schema
+  (let [{:keys [store info snapshot calls]} (remote-store true)]
+    (try
+      (i/db-info store)
+      (is (true? (i/remote-read-cacheable? store)))
+      (is (empty? @calls) "a warm plain schema needs no policy RPC")
+      (swap! snapshot update :schema assoc :task/value {:db/valueType :test/value})
+      (swap! snapshot assoc :revision 2)
+      (swap! info assoc :schema-revision 2)
+      (binding [c/*remote-db-last-modified-check-interval-ms* 0]
+        (i/db-info store))
+      (dotimes [_ 3] (is (false? (i/remote-read-cacheable? store))))
+      (is (= [:db-info :schema-snapshot] @calls)
+          "a cold schema is fetched once; decoder policy then stays local")
+      (finally (i/close store)))))
+
+(deftest direct-options-honor-the-freshness-window
+  (let [{:keys [store info calls]} (remote-store true)]
+    (try
+      (i/db-info store)
+      (binding [c/*remote-db-last-modified-check-interval-ms* 60000]
+        (is (= 64 (:cache-limit (i/opts store))))
+        (swap! info assoc-in [:opts :cache-limit] 8)
+        (dotimes [_ 3] (is (= 64 (:cache-limit (i/opts store)))))
+        (is (empty? @calls))
+        ;; Expire the check deterministically without waiting for the interval.
+        (swap! (.-metadata-cache ^DatalogStore store) update :opts-checked-at
+               (fn [^long checked-at] (- checked-at 60000000001)))
+        (is (= 8 (:cache-limit (i/opts store))))
+        (dotimes [_ 3] (is (= 8 (:cache-limit (i/opts store)))))
+        (is (= [:db-info] @calls)))
+      (binding [c/*remote-db-last-modified-check-interval-ms* 0]
+        (swap! info assoc-in [:opts :cache-limit] 4)
+        (dotimes [_ 3] (is (= 4 (:cache-limit (i/opts store)))))
+        (is (= (vec (repeat 4 :db-info)) @calls)))
+      (finally (i/close store)))))
+
+(deftest options-refresh-falls-back-when-db-info-omits-options
+  (let [{:keys [store info db-info-opts? calls]} (remote-store true)]
+    (try
+      (i/db-info store)
+      (binding [c/*remote-db-last-modified-check-interval-ms* 0]
+        (is (= 64 (:cache-limit (i/opts store))))
+        (reset! db-info-opts? false)
+        (swap! info assoc-in [:opts :cache-limit] 8)
+        (is (= 8 (:cache-limit (i/opts store))))
+        (is (= [:db-info :db-info :opts] @calls)))
+      (finally (i/close store)))))
+
+(deftest transaction-metadata-without-options-does-not-extend-options-freshness
+  (let [{:keys [store info calls]} (remote-store true)]
+    (try
+      (i/db-info store)
+      (binding [c/*remote-db-last-modified-check-interval-ms* 60000]
+        (is (= 64 (:cache-limit (i/opts store))))
+        (swap! (.-metadata-cache ^DatalogStore store)
+               (fn [state]
+                 (let [expired (- (long (:checked-at state)) 60000000001)]
+                   (assoc state :checked-at expired :opts-checked-at expired))))
+        (swap! info assoc-in [:opts :cache-limit] 8)
+        (i/tx-data store [] false)
+        (is (= [:tx-data+db-info] @calls))
+        (is (= 8 (:cache-limit (i/opts store))))
+        (is (= [:tx-data+db-info :db-info] @calls)))
       (finally (i/close store)))))
 
 (deftest remote-schema-cache-follows-commits-and-rollbacks

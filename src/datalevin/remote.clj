@@ -14,6 +14,7 @@
    [datalevin.client-op :as cop]
    [datalevin.util :as u :refer [ deftype+ raise]]
    [datalevin.constants :as c]
+   [datalevin.custom-datalog :as cd]
    [datalevin.interface :as i]
    [datalevin.client :as cl]
    [datalevin.prepared :as prepared]
@@ -26,7 +27,7 @@
   (:import
    [datalevin.client Client]
    [datalevin.interface ICustomTypes ILMDB ITxLog IList IAdmin IStore
-    ISearchEngine IVectorIndex IRemoteDB IRemoteKV IRemoteReadLifecycle
+    ISearchEngine IVectorIndex IRemoteDB IRemoteKV IRemoteReadLifecycle IRemoteReadCache
     IRemotePrepared IRemotePreparedUpdate]
    [clojure.lang Seqable IReduceInit]
    [java.lang AutoCloseable]
@@ -498,11 +499,14 @@
 ;; Keep metadata on each connection's store, including transaction-local stores.
 ;; The DB result cache has a separate lifetime and freshness policy.
 (defn- fresh-metadata?
-  [state]
-  (let [interval-ms (long c/*remote-db-last-modified-check-interval-ms*)]
-    (and (:db-info state) (:checked-at state) (pos? interval-ms)
-         (< (quot (- (System/nanoTime) (long (:checked-at state))) 1000000)
-            interval-ms))))
+  ([state]
+   (and (:db-info state) (fresh-metadata? state :checked-at)))
+  ([state checked-at-key]
+   (let [interval-ms (long c/*remote-db-last-modified-check-interval-ms*)
+         checked-at (get state checked-at-key)]
+     (and checked-at (pos? interval-ms)
+          (< (quot (- (System/nanoTime) (long checked-at)) 1000000)
+             interval-ms)))))
 
 (defn- with-schema
   [state schema revision]
@@ -511,15 +515,16 @@
 
 (defn- with-db-info
   [state info]
-  (let [changed? (if (contains? info :schema-revision)
+  (let [checked-at (System/nanoTime)
+        changed? (if (contains? info :schema-revision)
                    (not= (:schema-revision state) (:schema-revision info))
                    ;; Older servers do not send a schema revision.
                    (not= (select-keys (:db-info state) [:last-modified :max-tx])
                          (select-keys info [:last-modified :max-tx])))]
     (cond-> (assoc state :db-info (merge (select-keys state [:opts])
                                         (dissoc info :schema))
-                   :checked-at (System/nanoTime))
-      (contains? info :opts) (assoc :opts (:opts info))
+                   :checked-at checked-at)
+      (contains? info :opts) (assoc :opts (:opts info) :opts-checked-at checked-at)
       changed? (dissoc :schema :rschema :schema-revision))))
 
 (defn- new-metadata-cache
@@ -546,7 +551,9 @@
         (read-metadata! cache state
                         #(datalog-request read-floor-tx client :db-info
                                           [db-name] writing?)
-                        with-db-info)]
+                        ;; Older servers may omit options from db-info. Do not
+                        ;; carry an unvalidated options map across this check.
+                        #(with-db-info (dissoc %1 :opts :opts-checked-at) %2))]
     (update-read-floor-tx! read-floor-tx (:max-tx value))
     result))
 
@@ -595,7 +602,7 @@
                                 (publish state @result)
                                 (without-metadata state))]
                     (cond-> (assoc state ::generation (Object.))
-                      discard-opts? (dissoc :opts))))))))))
+                      discard-opts? (dissoc :opts :opts-checked-at))))))))))
 
 (defn- metadata-request
   [cache read-floor-tx client call args writing?]
@@ -623,6 +630,15 @@
     (when (.get closed?)
       (raise "Database is closed" {:type :lmdb/closed})))
 
+  IRemoteReadCache
+  (remote-read-cacheable? [this]
+    (and (not (cl/native-reader-bound? client db-name))
+         ;; Server-side codecs can be rebound without a storage transaction.
+         ;; A custom value decoded into an immutable map is still not stable.
+         (let [schema (or (:schema @metadata-cache)
+                          (:schema (i/schema-snapshot this)))]
+           (and (some? schema) (not (cd/custom-schema? schema))))))
+
   ICustomTypes
   (defremote-forward (metadata-request metadata-cache read-floor-tx client)
     (register-type [_ type-name definition]
@@ -645,12 +661,18 @@
 
   IStore
   (opts [_]
-    (let [state @metadata-cache]
+    (let [state @metadata-cache
+          state (if (and (not writing?) (:opts state)
+                         (not (fresh-metadata? state :opts-checked-at)))
+                  (:state (read-db-info! metadata-cache state read-floor-tx
+                                         client db-name false))
+                  state)]
       (or (:opts state)
           (:value (read-metadata! metadata-cache state
                                   #(datalog-request read-floor-tx client :opts
                                                     [db-name] writing?)
-                                  #(assoc %1 :opts %2))))))
+                                  #(assoc %1 :opts %2
+                                          :opts-checked-at (System/nanoTime)))))))
 
   (defremote-forward (metadata-request metadata-cache read-floor-tx client)
     (assoc-opt [_ k v])

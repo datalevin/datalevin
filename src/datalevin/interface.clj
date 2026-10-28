@@ -477,6 +477,11 @@ values;")
   (check-remote-read-open! [store]
     "Throw if the store or its client is locally closed, without an RPC."))
 
+(defprotocol IRemoteReadCache
+  (remote-read-cacheable? [store]
+    "Whether RPC results can be retained under the store's codec policy and
+     current receiver bindings."))
+
 (defprotocol IRemotePrepared
   (prepare-remote-read [store operation args]
     "Prepare fixed operation arguments; execution supplies the key/entity ID."))

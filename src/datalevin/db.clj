@@ -20,6 +20,7 @@
    [datalevin.datom :as d :refer [datom datom?]]
    [datalevin.custom-datalog :as cd]
    [datalevin.db.range-cache :as range-cache]
+   [datalevin.native-value :as nv]
    [datalevin.remote-cache :as remote-cache]
    [datalevin.db.tx.common :as txcommon]
    [datalevin.db.tx.execute :as txexec]
@@ -59,6 +60,7 @@
    [java.util Arrays Comparator]
    [clojure.lang LazilyPersistentVector]
    [java.util.concurrent ConcurrentHashMap]
+   [java.util.concurrent.atomic AtomicBoolean]
    [java.util.function Function]
    [org.eclipse.collections.impl.list.mutable FastList]
    [org.eclipse.collections.impl.map.mutable.primitive LongObjectHashMap]
@@ -181,6 +183,7 @@
     :else (satisfies? i/IRemotePrepared store)))
 
 (defonce ^:private caches (ConcurrentHashMap.))
+(defonce ^:private cache-owners (atom {}))
 (defonce ^:private remote-cache-check-ms (ConcurrentHashMap.))
 (defonce ^:private remote-cache-max-tx (ConcurrentHashMap.))
 (defonce ^:private remote-cache-schema-revision (ConcurrentHashMap.))
@@ -297,7 +300,7 @@
   "Whether results can be retained. Zero capacity avoids the LRU monitor."
   [store]
   (let [cache ^LRUCache (.get ^ConcurrentHashMap caches (dir store))]
-    (and (pos? (.capacity cache)) (not (.isDisabled cache)))))
+    (and cache (pos? (.capacity cache)) (not (.isDisabled cache)))))
 
 (defn disable-cache
   [store]
@@ -309,7 +312,8 @@
 
 (defn cache-get
   [store k]
-  (.get ^LRUCache (.get ^ConcurrentHashMap caches (dir store)) k))
+  (when-let [^LRUCache cache (.get ^ConcurrentHashMap caches (dir store))]
+    (.get cache k)))
 
 (defn cache-put
   [store k v]
@@ -317,12 +321,13 @@
 
 (defn ^:no-doc cache-token
   [store]
-  (let [cache ^LRUCache (.get ^ConcurrentHashMap caches (dir store))]
+  (when-let [^LRUCache cache (.get ^ConcurrentHashMap caches (dir store))]
     [cache (.generation cache)]))
 
 (defn ^:no-doc cache-put-if-current
   [store [^LRUCache cache generation] k v]
-  (and (identical? cache
+  (and cache
+       (identical? cache
                    (.get ^ConcurrentHashMap caches (dir store)))
        (.putIfGeneration cache k v (long generation))))
 
@@ -331,12 +336,19 @@
   (when (satisfies? i/IRemoteReadLifecycle store)
     (i/check-remote-read-open! store)))
 
+(defn- remote-read-cacheable?
+  [store]
+  (and (not nv/*wire-reader*)
+       (or (not (satisfies? i/IRemoteReadCache store))
+           (i/remote-read-cacheable? store))))
+
 (defn ^:no-doc cached-remote-read
   "Retain an RPC result in the DB's bounded read cache. Callers either validate
   freshness before entering or supply a validator, run only for prospective
-  hits. All writes invalidate these opaque results; transaction reads and
-  mutable inputs/results bypass retention. Local lifecycle checks apply
-  independently of the freshness interval."
+  hits. All writes invalidate these opaque results. Transaction reads,
+  receiver bindings, and mutable inputs/results bypass retention. Local lifecycle
+  checks apply independently of the freshness interval. Request identity uses
+  serialized bytes."
   ([store key read-result] (cached-remote-read store key nil read-result))
   ([store key validate read-result]
    (check-remote-read-open! store)
@@ -344,8 +356,9 @@
      (validate))
    (if (and (cache-active? store)
             (not (and (satisfies? l/IWriting store) (l/writing? store)))
-            (remote-cache/immutable-data? key))
-     (let [key (into [:remote-read] key)
+            (remote-cache/immutable-data? key)
+            (remote-read-cacheable? store))
+     (let [key [:remote-read (remote-cache/serialized-key key)]
            cached (cache-get store key)
            _ (when (and validate cached) (validate))
            token (cache-token store)
@@ -355,26 +368,55 @@
            ;; Freshness validation can overlap a close. Cache hits must still
            ;; enforce the request path's local lifecycle check before return.
            (check-remote-read-open! store)
-           (first cached))
+           (if (remote-read-cacheable? store) (first cached) (read-result)))
          (let [result (read-result)]
            ;; Wrap nil and false so both can be distinguished from a miss.
-           (when (remote-cache/immutable-data? result)
+           (when (and (remote-read-cacheable? store)
+                      (remote-cache/immutable-data? result))
              (cache-put-if-current store token key [result]))
            result)))
      (read-result))))
 
+(defn- remove-cache-by-dir!
+  [cache-dir]
+  (when-let [^LRUCache cache (.remove ^ConcurrentHashMap caches cache-dir)]
+    (locking cache
+      (.beginInvalidation cache (.target cache))
+      (.clear cache)))
+  (.remove ^ConcurrentHashMap remote-cache-max-tx cache-dir)
+  (.remove ^ConcurrentHashMap remote-cache-schema-revision cache-dir)
+  (.remove ^ConcurrentHashMap remote-cache-check-ms cache-dir))
+
 (defn remove-cache
   [store]
-  (.remove ^ConcurrentHashMap caches (dir store))
-  (.remove ^ConcurrentHashMap remote-cache-max-tx (dir store))
-  (.remove ^ConcurrentHashMap remote-cache-schema-revision (dir store))
-  (.remove ^ConcurrentHashMap remote-cache-check-ms (dir store)))
+  (remove-cache-by-dir! (dir store)))
+
+(defn ^:no-doc retain-cache!
+  "Retain a connection's shared result cache and return an idempotent release.
+  The last release retires results and freshness metadata. Capture only the
+  directory so closed connections do not retain their Store through this hook."
+  [store]
+  (let [cache-dir (dir store)
+        released? (AtomicBoolean.)]
+    (locking cache-owners
+      ;; A prior connection can close between new-db and connection creation.
+      (when-not (.containsKey ^ConcurrentHashMap caches cache-dir)
+        (refresh-cache store))
+      (swap! cache-owners update cache-dir (fnil inc 0)))
+    (fn []
+      (when (.compareAndSet released? false true)
+        (locking cache-owners
+          (if (> (long (get @cache-owners cache-dir 0)) 1)
+            (swap! cache-owners update cache-dir dec)
+            (do
+              (remove-cache-by-dir! cache-dir)
+              (swap! cache-owners dissoc cache-dir))))))))
 
 (defmacro wrap-cache
   [store pattern body]
   `(let [store# ~store
          cache# ^LRUCache (.get ^ConcurrentHashMap caches (dir store#))
-         cache?# (and (pos? (.capacity cache#)) (not (.isDisabled cache#)))
+         cache?# (and cache# (pos? (.capacity cache#)) (not (.isDisabled cache#)))
          generation# (if cache?# (.generation cache#) 0)]
      ;; A zero entry limit bypasses key construction and the LRU monitor as
      ;; well as retention. Keep the native read and transaction-overlay paths.

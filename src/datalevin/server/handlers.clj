@@ -1945,7 +1945,9 @@
                        (let [id (UUID/randomUUID)]
                          (.put read-cache-store-ids kv id)
                          id)))]
-    (write-result! deps skey [store-id (cpp/committed-txn-id kv)])))
+    (write-result! deps skey
+                   [store-id (cpp/committed-txn-id kv)
+                    {:custom-dbis (or (:custom-dbis @(i/kv-info kv)) #{})}])))
 
 (defn drop-dbi
   [deps server ^SelectionKey skey {:keys [args writing?]}]

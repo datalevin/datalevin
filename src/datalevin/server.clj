@@ -235,12 +235,29 @@
 
 (defn- shutdown-executor!
   [^ExecutorService es label]
-  (.shutdown es)
-  (when-not (.awaitTermination es 5000 TimeUnit/MILLISECONDS)
-    (log/warn label "did not terminate in 5s, forcing shutdown")
-    (.shutdownNow es)
-    (when-not (.awaitTermination es 5000 TimeUnit/MILLISECONDS)
-      (log/warn label "did not terminate after forced shutdown"))))
+  ;; Interrupts cannot skip termination or restart either five-second budget.
+  (let [interrupted? (volatile! (Thread/interrupted))
+        await! (fn []
+                 (let [deadline (+ (System/nanoTime) 5000000000)]
+                   (loop []
+                     (let [result
+                           (try
+                             (.awaitTermination es
+                                                (max 0 (- deadline (System/nanoTime)))
+                                                TimeUnit/NANOSECONDS)
+                             (catch InterruptedException _
+                               (vreset! interrupted? true)
+                               ::interrupted))]
+                       (if (= ::interrupted result) (recur) result)))))]
+    (try
+      (.shutdown es)
+      (when-not (await!)
+        (log/warn label "did not terminate in 5s, forcing shutdown")
+        (.shutdownNow es)
+        (when-not (await!)
+          (log/warn label "did not terminate after forced shutdown")))
+      (finally
+        (when @interrupted? (.interrupt (Thread/currentThread)))))))
 
 (defn- default-worker-thread-count
   []
@@ -365,65 +382,84 @@
 (defn- shutdown-server!
   [^Server server]
   (let [^Selector selector (.-selector server)
+        interrupted?       (volatile! (Thread/interrupted))
         failure            (volatile! nil)
         cleanup!           (fn [f]
                              (try
                                (f)
                                (catch Throwable t
+                                 (when (instance? InterruptedException t)
+                                   (vreset! interrupted? true))
                                  (if-let [^Throwable first-error @failure]
                                    (when-not (identical? first-error t)
                                      (.addSuppressed first-error t))
-                                   (vreset! failure t)))))]
-    ;; A failed close must not skip the remaining resources now that the
-    ;; lifecycle is terminal. Report the first failure after all cleanup.
-    ;; A closed selector has already discarded its keys. Wake all runners and
-    ;; retain socket ownership independently so terminal failure can clean up.
-    (doseq [[db-name {:keys [runner]}] (.-dbs server)
-            :when runner]
-      (cleanup! #(abort-run runner
-                           (fn [] (cleanup-abandoned-transaction!
-                                    server db-name runner)))))
-    (cleanup! #(stop-ha-background-loops! server))
-    (cleanup! #(.wakeup selector))
-    (cleanup!
-      #(when (.isOpen selector)
-         (doseq [skey (.keys selector)]
-           (cleanup! (fn [] (cleanup-connection-transactions! server skey)))
-           (cleanup! (fn [] (close-conn skey))))))
-    (cleanup! #(.close ^ServerSocketChannel (.-server-socket server)))
-    (cleanup! #(.close selector))
-    (cleanup! #(shutdown-executor! (.-dispatcher server) "Server dispatcher"))
-    (cleanup! #(shutdown-executor! (:session-maintenance (.-execution server))
-                                  "Server session maintenance"))
-    (cleanup! #(shutdown-executor! (:connection-maintenance (.-execution server))
-                                  "Server connection maintenance"))
-    ;; Acceptance has stopped. Cancel every owner, then join it before stores
-    ;; close; each owner aborts its native transaction in its read-loop finally.
-    (doseq [key (vals (:connection-keys (.-execution server)))]
-      (cleanup! #(close-conn key)))
-    (doseq [^Thread thread (vals (:connection-threads (.-execution server)))]
-      (cleanup! #(.join thread)))
-    (doseq [^SocketChannel ch (:connections (.-execution server))]
-      (cleanup! #(.close ch)))
-    (.clear ^Set (:connections (.-execution server)))
-    (loop []
-      (when-let [[^SocketChannel ch] (.poll ^ConcurrentLinkedQueue
-                                          (.-register-queue server))]
-        (cleanup! #(.close ch))
-        (recur)))
-    (cleanup! #(shutdown-executor! (.-work-executor server)
-                                  "Server worker executor"))
-    (doseq [executor (distinct (vals (select-keys (.-execution server)
-                                                [:routing :transactions :background])))
-            :when (not (identical? executor (.-work-executor server)))]
-      (cleanup! #(shutdown-executor! executor "Server routing/runner executor")))
-    (doseq [db-name (keys (.-dbs server))]
-      (cleanup! #(remove-store server db-name)))
-    (cleanup! #(sess/flush-sessions! session-deps server))
-    (cleanup! #(d/close (.-sys-conn server)))
-    (if-let [t @failure]
-      (throw t)
-      (log/info "Datalevin server shuts down."))))
+                                   (vreset! failure t)))
+                               (finally
+                                 ;; Carry executor-wait interrupts through the
+                                 ;; rest of cleanup without cancelling storage I/O.
+                                 (when (Thread/interrupted)
+                                   (vreset! interrupted? true)))))]
+    (try
+      ;; A failed close must not skip the remaining resources now that the
+      ;; lifecycle is terminal. Report the first failure after all cleanup.
+      ;; A closed selector has already discarded its keys. Wake all runners and
+      ;; retain socket ownership independently so terminal failure can clean up.
+      (doseq [[db-name {:keys [runner]}] (.-dbs server)
+              :when runner]
+        (cleanup! #(abort-run runner
+                             (fn [] (cleanup-abandoned-transaction!
+                                      server db-name runner)))))
+      (cleanup! #(stop-ha-background-loops! server))
+      (cleanup! #(.wakeup selector))
+      (cleanup!
+        #(when (.isOpen selector)
+           (doseq [skey (.keys selector)]
+             (cleanup! (fn [] (cleanup-connection-transactions! server skey)))
+             (cleanup! (fn [] (close-conn skey))))))
+      (cleanup! #(.close ^ServerSocketChannel (.-server-socket server)))
+      (cleanup! #(.close selector))
+      (cleanup! #(shutdown-executor! (.-dispatcher server) "Server dispatcher"))
+      (cleanup! #(shutdown-executor! (:session-maintenance (.-execution server))
+                                    "Server session maintenance"))
+      (cleanup! #(shutdown-executor! (:connection-maintenance (.-execution server))
+                                    "Server connection maintenance"))
+      ;; Acceptance has stopped. Cancel every owner, then join it before stores
+      ;; close; each owner aborts its native transaction in its read-loop finally.
+      (doseq [key (vals (:connection-keys (.-execution server)))]
+        (cleanup! #(close-conn key)))
+      (doseq [^Thread thread (vals (:connection-threads (.-execution server)))]
+        (cleanup!
+          #(loop []
+             (when-not (try
+                         (.join thread)
+                         true
+                         (catch InterruptedException _
+                           (vreset! interrupted? true)
+                           false))
+               (recur)))))
+      (doseq [^SocketChannel ch (:connections (.-execution server))]
+        (cleanup! #(.close ch)))
+      (.clear ^Set (:connections (.-execution server)))
+      (loop []
+        (when-let [[^SocketChannel ch] (.poll ^ConcurrentLinkedQueue
+                                            (.-register-queue server))]
+          (cleanup! #(.close ch))
+          (recur)))
+      (cleanup! #(shutdown-executor! (.-work-executor server)
+                                    "Server worker executor"))
+      (doseq [executor (distinct (vals (select-keys (.-execution server)
+                                                  [:routing :transactions :background])))
+              :when (not (identical? executor (.-work-executor server)))]
+        (cleanup! #(shutdown-executor! executor "Server routing/runner executor")))
+      (doseq [db-name (keys (.-dbs server))]
+        (cleanup! #(remove-store server db-name)))
+      (cleanup! #(sess/flush-sessions! session-deps server))
+      (cleanup! #(d/close (.-sys-conn server)))
+      (if-let [t @failure]
+        (throw t)
+        (log/info "Datalevin server shuts down."))
+      (finally
+        (when @interrupted? (.interrupt (Thread/currentThread)))))))
 
 (defn- get-client [^Server server client-id]
   (sess/get-client (.-clients server) client-id))

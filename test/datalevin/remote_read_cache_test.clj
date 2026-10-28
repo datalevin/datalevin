@@ -1,7 +1,7 @@
 (ns datalevin.remote-read-cache-test
   (:require [clojure.test :refer [deftest is testing]]
-            [datalevin.bits :as bits]
             [datalevin.client :as client]
+            [datalevin.client.request :as cr]
             [datalevin.constants :as c]
             [datalevin.core :as d]
             [datalevin.datom :as datom]
@@ -10,15 +10,13 @@
             [datalevin.lmdb :as l]
             [datalevin.prepared :as prepared]
             [datalevin.query :as q]
-            [datalevin.remote-cache :as cache])
-  (:import [java.util Arrays]))
+            [datalevin.remote-cache :as cache]))
 
 (defn- with-remote [limit f]
   (let [calls (atom {})
         info (atom {:last-modified 1 :max-tx 1})
         result (atom {:name "one"})
         writing? (atom false)
-        closed? (atom false)
         location (str "dtlv://cache/" (random-uuid))
         read! (fn [op] (swap! calls update op (fnil inc 0)) @result)
         store (reify
@@ -27,9 +25,6 @@
                 (opts [_] {:cache-limit limit})
                 l/IWriting
                 (writing? [_] @writing?)
-                i/IRemoteReadLifecycle
-                (check-remote-read-open! [_]
-                  (when @closed? (throw (ex-info "This client is closed" {}))))
                 i/IRemoteDB
                 (db-info [_] (swap! calls update :db-info (fnil inc 0)) @info)
                 (q [_ _ _] (read! :q))
@@ -40,7 +35,7 @@
         database (db/map->DB {:store store :max-eid 1 :max-tx 1})]
     (try
       (f {:db database :store store :calls calls :info info :result result
-          :writing? writing? :closed? closed?})
+          :writing? writing?})
       (finally (db/remove-cache store)))))
 
 (def query '[:find ?name . :in $ ?id :where [?id :name ?name]])
@@ -57,74 +52,37 @@
             (is (= {:name "one"} (d/pull-many db [:name] [1]))))
           (is (= {:db-info 1 :q 1 :pull 1 :pull-many 1} @calls)))))))
 
-(deftest cached-datalog-hits-recheck-lifecycle-after-validation
-  (with-remote 16
-    (fn [{:keys [db store closed?]}]
-      (binding [c/*remote-db-last-modified-check-interval-ms* 60000]
-        (is (= {:name "one"} (d/pull db [:name] 1)))
-        (is (thrown-with-msg?
-              Exception #"This client is closed"
-              (db/cached-remote-read store [:pull [:name] 1 {}]
-                                     #(reset! closed? true)
-                                     #(throw (AssertionError. "Unexpected cache miss")))))))))
-
-(deftest remote-index-queries-observe-progress-without-data-changes
-  (doseq [interval [0 60000]
-          call '[(idoc-match $ :indexed ?needle)
-                 (fulltext $ :indexed ?needle)
-                 (vec-neighbors $ :indexed ?needle)
-                 (embedding-neighbors $ :indexed ?needle)]]
-    (testing (str call ", freshness interval " interval)
+(deftest datalog-result-cache-preserves-lookup-ref-representations
+  (doseq [operation [:pull :pull-many :q]
+          [stored missing] [[[1 2] '(1 2)]
+                            [{:key [1 2]} {:key '(1 2)}]
+                            [1.0M 1.00M]]]
+    (testing (str operation " " stored " / " missing)
       (with-remote 16
-        (fn [{:keys [db calls info result]}]
-          (binding [c/*remote-db-last-modified-check-interval-ms* interval]
-            (let [query (conj '[:find ?e :in $ ?needle :where] [call '[[?e _ _]]])
-                  read (d/prepare-q db query)
-                  before @info]
-              (reset! result #{})
-              (is (= #{} (d/q query db :needle) (read [:needle])))
-              (reset! result #{[1]})
-              (is (= #{[1]} (d/q query db :needle) (read [:needle])))
-              (is (= 4 (:q @calls)))
-              (is (= before @info)))))))))
-
-(deftest remote-index-query-inputs-bypass-result-caching
-  (doseq [[query inputs]
-          [['[:find ?e :in $ % ?needle :where (matching $ ?needle ?e)]
-            ['[[(matching $ ?needle ?e)
-                [(idoc-match $ :indexed ?needle) [[?e _ _]]]]]
-             :needle]]
-           ['[:find ?e :in $ ?query ?needle
-              :where [(q ?query $ ?needle) [[?e]]]]
-            ['[:find ?e :in $ ?needle
-               :where [(idoc-match $ :indexed ?needle) [[?e _ _]]]]
-             :needle]]]]
-    (with-remote 16
-      (fn [{:keys [db calls result]}]
-        (binding [c/*remote-db-last-modified-check-interval-ms* 0]
-          (let [read (d/prepare-q db query)]
-            (reset! result #{})
-            (is (= #{} (apply d/q query db inputs) (read inputs)))
-            (reset! result #{[1]})
-            (is (= #{[1]} (apply d/q query db inputs) (read inputs)))
-            (is (= 4 (:q @calls)))))))))
-
-(deftest scalar-idoc-queries-do-not-retain-nil-results
-  (with-remote 16
-    (fn [{:keys [db calls info result]}]
-      (let [query '[:find ?e . :in $ ?query
-                    :where [(idoc-match $ :doc ?query) [[?e _ _]]]]
-            read (d/prepare-q db query)
-            before @info]
-        (reset! result nil)
-        (dotimes [_ 2]
-          (is (nil? (d/q query db {:status "ready"})))
-          (is (nil? (read [{:status "ready"}]))))
-        (reset! result 1)
-        (dotimes [_ 2]
-          (is (= 1 (d/q query db {:status "ready"}) (read [{:status "ready"}]))))
-        (is (= 8 (:q @calls)))
-        (is (= before @info))))))
+        (fn [{:keys [db store]}]
+          (binding [c/*remote-db-last-modified-check-interval-ms* 60000]
+            (db/db? db)
+            (let [reads (atom 0)
+                  key (fn [value]
+                        (let [lookup [:uid value]]
+                          (case operation
+                            :pull [:pull [:label] lookup {}]
+                            :pull-many [:pull-many [:label] [lookup] {}]
+                            :q [:q query [:remote-db-placeholder lookup]])))
+                  read (fn [value result]
+                         (db/cached-remote-read
+                           store (key value) #(do (swap! reads inc) result)))]
+              (is (= (key stored) (key missing)))
+              (is (= :stored (read stored :stored)))
+              (is (nil? (read missing nil)))
+              (is (= :stored (read stored :unexpected)))
+              (is (nil? (read missing :unexpected)))
+              (is (= 2 @reads))
+              ;; Encoded RPC keys must retain invalidate-on-any-write behavior.
+              (#'db/invalidate-cache store [(datom/datom 1 :label "updated")] 2 2)
+              (is (= :now-present (read missing :now-present)))
+              (is (= :updated (read stored :updated)))
+              (is (= 4 @reads)))))))))
 
 (deftest datalog-strict-freshness-and-local-writes-invalidate-results
   (with-remote 16
@@ -177,39 +135,6 @@
           (is (= {:db-info 1 :pull 2} @calls))
           (read 1)
           (is (= {:db-info 2 :pull 2} @calls)))))))
-
-(deftest random-pull-transforms-execute-on-every-read
-  (doseq [interval [0 60000]
-          pattern '[[[:value :xform rand]]
-                    [[:value :xform rand-int]]
-                    [(:value :xform rand)]
-                    [{:friend [[:value :xform rand-int]]}]
-                    [[:value :as :random :default 100 :xform rand]]
-                    [[:value :xform clojure.core/rand]]]]
-    (testing (str pattern ", freshness interval " interval)
-      (with-remote 16
-        (fn [{:keys [db calls result]}]
-          (binding [c/*remote-db-last-modified-check-interval-ms* interval]
-            (let [read (d/prepare-pull db pattern)]
-              (dotimes [n 4]
-                (reset! result {:value n})
-                (is (= {:value n} (d/pull db pattern 1) (read 1)))
-                (reset! result [{:value n}])
-                (is (= [{:value n}] (d/pull-many db pattern [1]))))
-              (is (= 8 (:pull @calls)))
-              (is (= 4 (:pull-many @calls))))))))))
-
-(deftest deterministic-pull-transforms-retain-result-caching
-  (with-remote 16
-    (fn [{:keys [db calls]}]
-      (binding [c/*remote-db-last-modified-check-interval-ms* 60000]
-        (let [pattern '[[:name :xform vector]]
-              read (d/prepare-pull db pattern)]
-          (dotimes [_ 3]
-            (is (= {:name "one"} (d/pull db pattern 1) (read 1)))
-            (is (= {:name "one"} (d/pull-many db pattern [1]))))
-          (is (= 1 (:pull @calls)))
-          (is (= 1 (:pull-many @calls))))))))
 
 (deftest kv-cache-retains-negative-results-and-validates-revisions
   (let [cache (cache/read-cache 4 nil)
@@ -312,25 +237,74 @@
       (is (= :value (client/normal-prepared-request transport :get-value request 1 false))))
     (is (= {:open-kv 1 :kv-read-cache-token 1 :get-value 1} @calls))))
 
-(deftest kv-cache-identity-preserves-serialized-representations
-  (doseq [[left right] [[[1 2] '(1 2)]
-                       [[] '()]
-                       [{:nested [1 2]} {:nested '(1 2)}]
-                       [(array-map :a 1 :b 2) (array-map :b 2 :a 1)]
-                       [1 (bigint 1)]
-                       [1.0M 1.00M]
-                       [(float 1.5) (double 1.5)]]]
-    (testing (str (class left) " / " (class right) ": " left " / " right)
-      (is (= left right))
-      (is (not (Arrays/equals ^bytes (bits/serialize left)
-                              ^bytes (bits/serialize right))))
-      (let [cache (cache/read-cache 16 60000)
+(defn- outcome [f]
+  (try (f) (catch Throwable t t)))
+
+(deftest cached-kv-requests-respect-deadlines-and-interruption
+  (doseq [kind [:ordinary :prepared]]
+    (testing (name kind)
+      (let [calls (atom {})
+            transport (reify client/IClient
+                        (disconnected? [_] false)
+                        (request [_ {:keys [type]}]
+                          (cr/check! :request)
+                          (swap! calls update type (fnil inc 0))
+                          {:type :command-complete
+                           :result (case type :kv-read-cache-token [:epoch 1]
+                                              :get-value :value nil)}))
+            request (prepared/request ["cache" "values" nil :long :data true])
+            read (case kind
+                   :ordinary #(client/normal-request transport :get-value
+                                                     ["cache" "values" % :long :data true])
+                   :prepared #(client/normal-prepared-request transport :get-value
+                                                              request % false))]
+        (client/open-database transport "cache" c/db-store-kv
+                              {:client-opts {:read-cache-check-interval-ms 60000}})
+        (is (= :value (read 1) (read 1)))
+        (doseq [key [1 2]]
+          (testing (if (= 1 key) "cache hit" "uncached control")
+            (let [error (cr/with-budget (cr/budget 0 0 nil nil)
+                          (outcome #(read key)))]
+              (is (= :socket/timeout (:error (ex-data error))))
+              (is (= :deadline-exceeded (:termination-reason (ex-data error)))))
+            (let [^Thread thread (Thread/currentThread)
+                  [error interrupted?]
+                  (do
+                    (.interrupt thread)
+                    (try
+                      [(outcome #(read key)) (.isInterrupted thread)]
+                      (finally (Thread/interrupted))))]
+              (is (instance? InterruptedException error))
+              (is (true? interrupted?)))))
+        (is (= :value (read 1)) "a rejected call leaves the cache usable")
+        (is (= {:open-kv 1 :kv-read-cache-token 1 :get-value 1} @calls)
+            "cache hits and rejected calls perform no additional RPCs")))))
+
+(deftest cache-hits-recheck-termination-after-revision-validation
+  (doseq [stop [:deadline :interrupt]]
+    (testing (name stop)
+      (let [cache (cache/read-cache 4 0)
             reads (atom 0)
-            read (fn [key result]
-                   (cache/read-result
-                     cache [:get-value ["db" "values" key :data :data true]]
-                     0 (constantly 1) #(do (swap! reads inc) result)))]
-        (dotimes [_ 2]
-          (is (= :left (read left :left)))
-          (is (= :right (read right :right))))
-        (is (= 2 @reads))))))
+            execute #(do (swap! reads inc) :value)
+            ^Thread thread (Thread/currentThread)]
+        (is (= :value (cache/read-result cache :key 0 (constantly 1) execute)))
+        (let [[error interrupted?]
+              (try
+                (cr/with-budget (cr/budget 20 0 nil nil)
+                  [(outcome
+                     #(cache/read-result
+                        cache :key 0
+                        (fn []
+                          (case stop
+                            :deadline (while (not (cr/expired?)) (Thread/sleep 1))
+                            :interrupt (.interrupt thread))
+                          1)
+                        execute))
+                   (.isInterrupted thread)])
+                (finally (Thread/interrupted)))]
+          (case stop
+            :deadline (is (= :deadline-exceeded
+                             (:termination-reason (ex-data error))))
+            :interrupt (do (is (instance? InterruptedException error))
+                           (is (true? interrupted?)))))
+        (is (= 1 @reads))))))

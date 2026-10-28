@@ -64,7 +64,7 @@
       (raise "Datalog DB does not expose a KV handle"
                {:store store}))))
 
-(deftype ^:private CloseableConn [^clojure.lang.Atom state]
+(deftype ^:private CloseableConn [^clojure.lang.Atom state release-cache!]
   clojure.lang.IDeref
   (deref [_]
     @state)
@@ -108,8 +108,8 @@
     conn))
 
 (defn- wrap-conn
-  [state]
-  (CloseableConn. state))
+  [state release-cache!]
+  (CloseableConn. state release-cache!))
 
 (defn- alter-conn-meta!
   [conn f & args]
@@ -122,7 +122,8 @@
   (wrap-conn
    (atom db :meta {:listeners (atom {})
                    :db-listeners (atom {})
-                   :runtime-opts (db/runtime-opts db)})))
+                   :runtime-opts (db/runtime-opts db)})
+   (db/retain-cache! (.-store ^DB db))))
 
 (defn conn-from-datoms
   ([datoms] (conn-from-db (db/init-db datoms)))
@@ -226,6 +227,8 @@
                 (vreset! detached? true))))))
       (finally
         (when (or @detached? (closed? conn))
+          (when (instance? CloseableConn conn)
+            ((.-release-cache! ^CloseableConn conn)))
           (remove-conn (:dir (meta conn)) conn)
           (when-let [listeners (:listeners (meta conn))]
             (when (instance? clojure.lang.IAtom listeners)

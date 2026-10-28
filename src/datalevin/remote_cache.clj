@@ -3,7 +3,8 @@
 (ns ^:no-doc datalevin.remote-cache
   "Bounded client read results, validated against committed store revisions."
   (:require [clojure.string :as str]
-            [datalevin.bits :as bits])
+            [datalevin.bits :as bits]
+            [datalevin.client.request :as cr])
   (:import [datalevin.utl LRUCache]
            [java.nio ByteBuffer]))
 
@@ -27,6 +28,12 @@
            (if (map? x)
              (every? (fn [[k v]] (and (immutable-data? k) (immutable-data? v))) x)
              (every? immutable-data? x)))))
+
+(defn serialized-key
+  "Own serialized request bytes for representation-sensitive cache identity.
+  Keep the read-only buffer's position fixed for stable equality and hashing."
+  ^ByteBuffer [key]
+  (.asReadOnlyBuffer (ByteBuffer/wrap (bits/serialize key))))
 
 (def ^:private read-ops
   ;; Schema snapshots refresh the store's metadata cache after revision changes;
@@ -96,21 +103,28 @@
         (swap! (:state cache) assoc :token token :checked-ns started
                :legacy? (= ::legacy token))))))
 
+(defn- custom-type-read?
+  [token key]
+  (let [dbis (:custom-dbis (get token 2))]
+    (when (seq dbis)
+      (let [[op args] key]
+        (if (= op :batch-kv)
+          (some (fn [[_ dbi]] (contains? dbis dbi)) (second args))
+          (contains? dbis (second args)))))))
+
 (defn read-result
   "Validate hits; unique misses avoid repeated revision RPCs. Positive intervals
   allow hits without an RPC. Identity follows serialized request bytes, preserving
-  distinctions such as vector/list :data keys. Mutable data and older servers
-  bypass retention."
+  distinctions such as vector/list :data keys. Mutable data, custom DBIs whose
+  codecs can change independently of commits, and older servers bypass retention."
   [^ReadCache cache key interval-ms revision execute]
   (let [^LRUCache entries (:entries cache)
         state @(:state cache)]
     (if (or (zero? (.capacity entries)) (:legacy? state)
             (pos? (long (:writers state))) (not (immutable-data? key)))
       (execute)
-      (let [;; Own these bytes and keep the buffer's position fixed for stable
-            ;; content equality/hashing, independently of collection equality.
-            key (.asReadOnlyBuffer (ByteBuffer/wrap (bits/serialize key)))
-            cached (.get entries key)
+      (let [cache-key (serialized-key key)
+            cached (.get entries cache-key)
             interval (long (or (:interval-ms cache) interval-ms))]
         (when (or (nil? (:token state))
                   (and cached
@@ -120,11 +134,12 @@
           (check-revision! cache revision))
         (let [generation (.generation entries)
               state @(:state cache)]
-          (if (or (:legacy? state) (pos? (long (:writers state))))
+          (if (or (:legacy? state) (pos? (long (:writers state)))
+                  (custom-type-read? (:token state) key))
             (execute)
-            (if-some [cached (when cached (.get entries key))]
-              (first cached)
+            (if-some [cached (when cached (.get entries cache-key))]
+              (do (cr/check! :request) (first cached))
               (let [result (execute)]
                 (when (immutable-data? result)
-                  (.putIfGeneration entries key [result] generation))
+                  (.putIfGeneration entries cache-key [result] generation))
                 result))))))))

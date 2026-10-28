@@ -210,12 +210,17 @@ client. The same database APIs work in both cases.
 
 Clients cache query, pull, and pull-many results alongside index reads, using
 the Datalog `:cache-limit` (default `512`; `0` disables retention). Ordinary and
-prepared reads share entries. Clients check for remote database changes before
+prepared reads share entries. Closing the last connection to a database retires
+its cached results. Clients check for remote database changes before
 reusing cached data; writes through the connection invalidate cached results
 immediately. Explicit transactions, pull visitors, pull transforms using `rand`
 or `rand-int`, mutable inputs/results, and queries using UDFs or qualified
 functions bypass result caching. Keep client and server clocks synchronized,
 for example with NTP or chrony.
+
+Client result caching also bypasses Datalog stores with custom value types.
+Their server decoders can change independently of storage commits, so ordinary
+pulls, prepared pulls, and pull-many always observe the current decoder bindings.
 
 KV point, range, list, rank, and batch reads also have a bounded client cache.
 Cache hits validate a committed LMDB revision, which detects updates even when
@@ -314,6 +319,8 @@ the original resources to still exist; dropping and recreating a resource with
 the same name does not preserve an old handle.
 
 Each request shares its timeout across recovery attempts and HA endpoints.
+Cached KV reads check this budget and thread interruption even when their
+freshness interval allows returning a result without an RPC.
 Synchronous DNS resolution and custom codecs can delay completion beyond the
 deadline, but their elapsed time counts toward it. A request whose encoding
 finishes after expiry is never sent. A successful response already decoded is
@@ -707,6 +714,11 @@ one connection from transaction open through commit or abort.
 Pauses between transaction requests have no default timeout. Use the explicit
 transaction `:timeout-ms` option or `set-explicit-transaction-timeout!` to bound
 the transaction body; see [transaction timeouts](transact.md#explicit-synchronous-transaction).
+
+Server shutdown closes connections and waits for their owning threads before
+closing database stores. Interrupting the shutdown caller does not skip these
+waits; its interrupt flag is restored after cleanup. Synchronous application or
+native work must return before store closure can finish.
 
 ## Security
 

@@ -182,6 +182,12 @@
     (when-let [readers (.get ^AtomicReference (.-readers (client-state client)))]
       (get readers db-name))))
 
+(defn ^:no-doc native-reader-bound?
+  "Whether decoding uses a receiver that can change without a storage commit."
+  [client db-name]
+  (boolean (or nv/*wire-reader*
+               (request-native-reader client {:db-name db-name}))))
+
 (defn- inherit-native-readers! [client source]
   (when source
     (.set ^AtomicReference (.-readers (client-state client))
@@ -2638,7 +2644,10 @@
   ([client call args writing?] (normal-request* client call args writing? nil))
   ([client call args writing? prepared-request]
    (with-request client {:type call :args args :writing? writing?}
-     (let [cache (when (and (not writing?) (read-cache/cacheable-call? call args))
+     (cr/check! :request)
+     (let [cache (when (and (not writing?) (read-cache/cacheable-call? call args)
+                            ;; Receiver bindings can change without a storage commit.
+                            (not (native-reader-bound? client (first args))))
                    (request-read-cache client (first args)))
            execute #(normal-request-impl client call args writing? prepared-request)]
        (if (and cache (not (disconnected? client)))
