@@ -218,7 +218,8 @@
           k              (.key cur)
           v              (.val cur)
           value-compressor (dbi-value-codec db)
-          iter           (DTLV$dtlv_list_key_range_full_val_iter.)]
+          iter           (DTLV$dtlv_list_key_range_full_val_iter.)
+          borrowed       (->KV k v (dbi-key-codec db) value-compressor rtx)]
       (Util/checkRc
        (DTLV/dtlv_list_key_range_full_val_iter_create
         iter (.ptr cur) (.ptr k) (.ptr v)
@@ -228,6 +229,9 @@
         (hasNext [_]
           (dtlv-rc (DTLV/dtlv_list_key_range_full_val_iter_has_next iter)))
         (next [_] (->KV k v (dbi-key-codec db) value-compressor rtx))
+
+        l/IBorrowedKVIterator
+        (current-kv [_] borrowed)
 
         AutoCloseable
         (close [_] (DTLV/dtlv_list_key_range_full_val_iter_destroy iter))))))

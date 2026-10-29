@@ -411,7 +411,7 @@
   (decode-float (.getInt bb)))
 
 (defn- decode-double
-  [x]
+  ^double [^long x]
   (if (bit-test x double-sign-idx)
     (Double/longBitsToDouble (bit-flip x double-sign-idx))
     (Double/longBitsToDouble (bit-not ^long x))))

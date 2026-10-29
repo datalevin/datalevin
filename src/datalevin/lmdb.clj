@@ -138,6 +138,12 @@
   (k [this] "Key of a key value pair")
   (v [this] "Value of a key value pair"))
 
+(defprotocol IBorrowedKVIterator
+  (current-kv [this]
+    "A reusable KV view of the current iterator position. Read only after a
+     successful hasNext; consume synchronously before advancing or closing.
+     Neither the view nor its buffers may be retained."))
+
 (defprotocol IListRandKeyValIterable
   (val-iterator [this]
     "Return an IListRandKeyValIterator that can seek random key and iterate

@@ -226,6 +226,29 @@ from 7.78 to 1.41 seconds (5.53×), with 93.1% less main-thread allocation in a
 separate profile. Q1 and Q18 controls improve 2.54× and 3.42×; all 22 queries
 pass at SF0.1 and SF1. The report includes component timings and JOB controls.
 
+The [refreshed three-engine comparison](../../doc/measurements/tpch-engine-comparison-2026-10-29.md)
+measures all 22 queries after these changes. Summed medians are 28.33 seconds
+for Datalevin, 21.22 for SQLite, and 6.77 for PostgreSQL: gaps of 1.34× and
+4.18×. Q1, Q21, Q7, Q18, and Q9 are the largest remaining absolute gaps to
+PostgreSQL. Q13 is 1.37× SQLite and 5.19× PostgreSQL in that snapshot. Its table
+and interactive chart provide the three-engine baseline for the updates below.
+
+The [Q1 cache regression audit](../../doc/measurements/tpch-q1-cache-audit-2026-10-29.md)
+finds the same Q1 query and plan on the older and current builds, with cache
+ownership copying accounting for much of the regression. Safe copy fast paths
+and fresh native EAV miss returns improve full-sweep Q1 from 8.02 to 6.30 seconds.
+The native sum falls from 28.33 to 22.74 seconds; all 22 queries pass again at
+SF0.1 and SF1. That audit identified scan/expression/aggregation fusion as the
+remaining Q1 target.
+
+The [native fusion implementation](../../doc/measurements/tpch-fusion-2026-10-29.md)
+streams eligible grouped queries through one scratch row and per-group states,
+with schema revision checks and conventional-plan fallbacks. Isolated SF1 Q1
+improves from 6.28 to 5.51 seconds with 58.8% less Java allocation across live
+threads. Fresh native sweep medians sum to 23.34 → 21.51 seconds; all 22 queries
+pass at SF0.1 and SF1. The report retains slower sweep samples and focused
+TPC-H/JOB confirmations alongside the plan and profile evidence.
+
 The raw CSVs (`datalevin_pass.csv`, `sqlite_pass.csv`, `postgres_pass.csv`) and
 `results.edn`-style manifests should be retained alongside any published table,
 together with the machine, JVM, database versions, and scale factor.

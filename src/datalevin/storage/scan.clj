@@ -26,7 +26,7 @@
    [datalevin.scan :as scan :refer [visit-list*]]
    [datalevin.util :as u :refer [raise]])
   (:import
-   [java.util ArrayList List Comparator Collection Map]
+   [java.util ArrayList List Comparator Collection Map Arrays Iterator]
    [datalevin.utl QueryKey TupleSort]
    [java.util.concurrent Callable ForkJoinPool ForkJoinWorkerThread Future]
    [java.nio ByteBuffer]
@@ -447,6 +447,84 @@
 (defn group-starts
   [counts]
   (int-array (->> counts (reductions +) butlast (into [0]))))
+
+(defn bounded-attribute-cardinality
+  "Count an attribute's distinct AVE keys, stopping at limit + 1. This bounds
+  the cost of rejecting a high-cardinality grouping during physical planning."
+  [lmdb schema attr limit]
+  (let [seen (long-array 1)
+        limit (long limit)]
+    (i/visit-key-range
+      lmdb c/ave
+      (fn [_]
+        (let [n (inc (aget seen 0))]
+          (aset seen 0 n)
+          (when (> n limit) :datalevin/terminate-visit)))
+      [:closed
+       (datom->indexable lmdb schema (d/datom c/e0 attr nil) false)
+       (datom->indexable lmdb schema (d/datom c/emax attr nil) true)]
+      :avg true)
+    (aget seen 0)))
+
+(defn- snapshot-schema-revision [lmdb rtx]
+  (let [dbi (i/get-dbi lmdb c/meta false)]
+    (lmdb/put-key rtx :schema-revision :attr)
+    (if-let [buffer (lmdb/get-kv dbi rtx)]
+      (b/read-buffer buffer :long) 0)))
+
+(defn fold-entity-rows
+  "Stream required cardinality-one attributes in entity order into a borrowed
+  scratch row. `consume!` must not retain the row. Unrequested attributes are
+  never decoded; incomplete entities are skipped. The caller supplies sorted
+  attribute ids, their output columns, a row with entity in column zero, and
+  an invocation-local cancellation check. Return true on completion, or nil
+  before delivering any rows if the optional schema revision has changed."
+  ([lmdb aids columns row consume! check!]
+   (fold-entity-rows lmdb aids columns row consume! check! nil))
+  ([lmdb ^ints aids ^ints columns ^objects row consume! check! revision]
+   (let [n (alength aids)
+         low (aget aids 0)
+         high (aget aids (dec n))
+         slots (int-array (inc (- high low)))]
+     (Arrays/fill slots (int -1))
+     (dotimes [i n] (aset-int slots (- (aget aids i) low) (aget columns i)))
+     (check!)
+     (scan/scan lmdb c/eav
+       (when (or (nil? revision) (= revision (snapshot-schema-revision lmdb rtx)))
+         (with-open [^AutoCloseable iterator
+                     (.iterator ^Iterable
+                       (lmdb/iterate-list-key-range-val-full dbi rtx cur [:all] :id))]
+           (let [^Iterator iterator iterator
+                 borrowed (when (satisfies? lmdb/IBorrowedKVIterator iterator)
+                            (lmdb/current-kv iterator))]
+             (loop [entity (long -1)
+                    seen (long 0)
+                    previous-aid (long -1)
+                    visited (long 0)]
+               (if (.hasNext iterator)
+                 (let [entry (or borrowed (.next iterator))
+                       eid (.getLong ^ByteBuffer (lmdb/k entry) 0)
+                       same? (== entity eid)
+                       _ (when (zero? (bit-and visited 4095)) (check!))
+                       _ (when (and (not same?) (== seen n))
+                           (aset row 0 (Long/valueOf entity))
+                           (consume! row))
+                       ^ByteBuffer value (lmdb/v entry)
+                       aid (.getInt value 0)
+                       column (if (and (<= low aid) (<= aid high))
+                                (aget slots (- aid low)) -1)
+                       read? (and (not (neg? column))
+                                  (or (not same?) (not= aid previous-aid)))
+                       seen (if same? seen 0)]
+                   (when read? (aset row column (idx/avg-buffer->v lmdb value)))
+                   (recur eid (if read? (inc seen) seen) aid (inc visited)))
+                 (do
+                   (when (== seen n)
+                     (aset row 0 (Long/valueOf entity))
+                     (consume! row))
+                   (check!)
+                   true))))))
+       (throw e)))))
 
 (defn read-entity-values
   "Read and filter one entity's scalar attributes in aid order. Returns a values

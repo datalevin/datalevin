@@ -43,7 +43,7 @@ public final class GroupedAggregate {
         lookup = new GroupKey(new Object[n]);
     }
 
-    /** Consume one immutable engine tuple, retaining only per-group state. */
+    /** Consume a borrowed engine tuple, retaining only per-group state. */
     public void add(Object[] tuple) {
         Object key;
         if (groupColumns.length == 1) {
@@ -66,7 +66,29 @@ public final class GroupedAggregate {
         group.count++;
         for (int i = 0; i < operations.length; i++) {
             if (operations[i] == SUM || operations[i] == AVG) {
-                group.values[i] = Numbers.add(group.values[i], tuple[columns[i]]);
+                Object value = tuple[columns[i]];
+                if (group.doubles != null && group.doubles[i] && value instanceof Double number) {
+                    // Exactly the same left-to-right DoubleOps addition, with
+                    // boxing deferred until output or a numeric-tower change.
+                    group.sums[i] += number.doubleValue();
+                } else {
+                    Object previous = group.doubles != null && group.doubles[i]
+                        ? Double.valueOf(group.sums[i]) : group.values[i];
+                    Object sum = Numbers.add(previous, value);
+                    // Small groups keep the compact boxed state. Allocate
+                    // primitive storage only when a group repeatedly adds.
+                    if (sum instanceof Double number && group.count >= 32) {
+                        if (group.doubles == null) {
+                            group.doubles = new boolean[operations.length];
+                            group.sums = new double[operations.length];
+                        }
+                        group.doubles[i] = true;
+                        group.sums[i] = number.doubleValue();
+                    } else {
+                        if (group.doubles != null) group.doubles[i] = false;
+                        group.values[i] = sum;
+                    }
+                }
             }
         }
     }
@@ -85,6 +107,9 @@ public final class GroupedAggregate {
                 Group group = (Group) iterator.next();
                 Object[] row = group.values.clone();
                 for (int i = 0; i < operations.length; i++) {
+                    if (group.doubles != null && group.doubles[i]) {
+                        row[i] = Double.valueOf(group.sums[i]);
+                    }
                     if (operations[i] == COUNT) row[i] = Math.toIntExact(group.count);
                     else if (operations[i] == AVG) {
                         row[i] = ((Number) Numbers.divide(row[i],
@@ -98,8 +123,12 @@ public final class GroupedAggregate {
 
     private static final class Group {
         private final Object[] values;
+        private double[] sums;
+        private boolean[] doubles;
         private long count;
-        private Group(int width) { values = new Object[width]; }
+        private Group(int width) {
+            values = new Object[width];
+        }
     }
 
     private static final class GroupKey {

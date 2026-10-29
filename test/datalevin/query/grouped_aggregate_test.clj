@@ -10,7 +10,11 @@
 
 (deftest grouped-arithmetic-matches-the-existing-builtins
   (doseq [values [[1 1 2] [1/2 1/3 1/7] [1.00M 2.0M 3.00M]
-                  [1M 2 (float 3.5) 4.5] [Long/MAX_VALUE 1N]
+                  [1M 2 (float 3.5) 4.5]
+                  [1.0 2.0 3.0 4M 5.0 6.0 7/2 8.0]
+                  [1.0e16 1.0 -1.0e16 0.5]
+                  (vec (concat (repeat 40 1.5) [2.0M] (repeat 40 0.5) [1/3]))
+                  [Long/MAX_VALUE 1N]
                   [(bigint (.shiftLeft java.math.BigInteger/ONE 2000)) 2N]]
           context [nil java.math.MathContext/DECIMAL64]]
     (binding [*math-context* context]
@@ -84,3 +88,14 @@
         (doseq [values [rows (mapv object-array rows)]]
           (is (= expected (mapv first (filter keep? values)))))))
     (is (nil? (aggregate/compile-having [] [])))))
+
+(deftest primitive-double-sums-preserve-order-and-ieee-values
+  (doseq [values [[0.0 -0.0] [-0.0 -0.0] [Double/MAX_VALUE Double/MAX_VALUE]
+                  [Double/POSITIVE_INFINITY Double/NEGATIVE_INFINITY]
+                  [Double/NaN 1.0] [1.0e16 1.0 -1.0e16 0.5]]]
+    (let [acc (GroupedAggregate. (int-array [0]) (int-array [GroupedAggregate/SUM]))
+          row (object-array 1)
+          values (concat values (repeat 64 0.0))]
+      (doseq [value values] (aset row 0 value) (.add acc row))
+      (is (= (Double/doubleToLongBits (double (built-ins/sum values)))
+             (Double/doubleToLongBits (double (aget ^objects (first (.results acc)) 0))))))))

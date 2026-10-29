@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [datalevin.constants :as c]
             [datalevin.core :as d]
+            [datalevin.db :as db]
             [datalevin.interface :as i]
             [datalevin.test.core :refer [server-fixture]]))
 
@@ -65,3 +66,32 @@
           (is (= ["old"] (mapv :v (read)))))
         (binding [c/*remote-db-last-modified-check-interval-ms* 0]
           (is (= ["new"] (mapv :v (read)))))))))
+
+(deftest local-writes-do-not-hide-unobserved-external-commits
+  (doseq [interval [0 60000]
+          tx [[{:db/id 2 :name "unrelated"}] [] [[:db/add 1 :name "new"]]]]
+    (testing (str "interval=" interval ", local transaction=" tx)
+      (with-connections
+        (fn [reader writer]
+          (d/transact! reader [{:db/id 1 :name "old"}])
+          (binding [c/*remote-db-last-modified-check-interval-ms* interval]
+            (let [view @reader
+                  query '[:find ?name . :where [1 :name ?name]]
+                  prepared (d/prepare-q view query)
+                  reads [[#(mapv :v (d/datoms view :eav 1 :name)) ["old"] ["new"]]
+                         [#(d/pull view [:name] 1) {:name "old"} {:name "new"}]
+                         [#(d/q query view) "old" "new"]
+                         [#(prepared []) "old" "new"]]]
+              (doseq [[read before] reads]
+                (is (= before (read))))
+              ;; A reader that already captured the old generation must also
+              ;; be prevented from publishing after a no-op write completes.
+              (let [token (db/cache-token (:store view))]
+                (d/transact! writer [[:db/add 1 :name "new"]])
+                (d/transact! reader tx)
+                (is (false? (db/cache-put-if-current
+                              (:store view) token ::old-read ["old"]))))
+              (is (= {:name "new"} (i/pull (:store view) [:name] 1 {})))
+              (dotimes [_ 2]
+                (doseq [[read _ after] reads]
+                  (is (= after (read))))))))))))

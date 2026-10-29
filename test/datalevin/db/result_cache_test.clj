@@ -3,7 +3,8 @@
             [datalevin.constants :as c]
             [datalevin.core :as d]
             [datalevin.db :as db]
-            [datalevin.db.result-cache :as cache])
+            [datalevin.db.result-cache :as cache]
+            [datalevin.storage :as storage])
   (:import [java.util Date]
            [org.eclipse.collections.impl.list.mutable FastList]))
 
@@ -51,7 +52,9 @@
                              {:background-sampling? false :kv-opts {:inmemory? true}})]
     (let [store (:store @conn)]
       (doseq [pattern [[:init-tuples :value nil nil true]
-                       [:search-tuples nil :value nil]]]
+                       [:search-tuples nil :value nil]
+                       [:eav-scan-v (doto (FastList.) (.add (object-array [1])))
+                        0 [[:value {}]]]]]
         (let [source (doto (FastList.) (.add (object-array [(byte-array [1 2])])))
               key (db/index-cache-key store pattern)
               result (db/cache-result store (db/cache-token store) key source)]
@@ -107,3 +110,44 @@
             (aset row index :changed)
             (.clear rows)
             (is (= expected (value (:v (first (d/datoms view :eav 1 attr))))))))))))
+
+(deftest native-eav-misses-and-hits-own-scalar-many-and-presence-results
+  (with-open [^java.io.Closeable conn
+              (d/create-conn nil {:bytes {:db/valueType :db.type/bytes}
+                                  :instant {:db/valueType :db.type/instant}
+                                  :many {:db/valueType :db.type/bytes
+                                         :db/cardinality :db.cardinality/many}}
+                             {:background-sampling? false})]
+    (d/transact! conn [{:db/id 1 :bytes (byte-array [1 2]) :instant (Date. 1234)
+                       :many [(byte-array [3]) (byte-array [4])]}])
+    (let [view @conn
+          input (doto (FastList.)
+                  (.add (object-array [1 :left]))
+                  (.add (object-array [1 :right])))]
+      (doseq [[attrs expected decode mutate]
+              [[[[:bytes {:skip? false}]] [[1 2]] vec #(aset-byte ^bytes % 0 (byte 9))]
+               [[[:bytes {:skip? true}] [:instant {:skip? false}]] [1234]
+                #(.getTime ^Date %) #(.setTime ^Date % 9)]
+               [[[:many {:skip? false}]] [[3] [4]] vec #(aset-byte ^bytes % 0 (byte 9))]
+               [[[:bytes {:skip? true}]] nil nil nil]]
+              prepared? [false true]]
+        (testing (pr-str {:attrs attrs :prepared? prepared?})
+          (db/refresh-cache (:store view))
+          (let [reader (storage/prepare-eav-scan-v-list (d/schema conn) attrs)
+                read (if prepared?
+                       #(db/-eav-scan-v-list view input 0 attrs reader)
+                       #(db/-eav-scan-v-list view input 0 attrs))]
+            (dotimes [_ 3]
+              (let [^FastList rows (read)]
+                (if expected
+                  (is (= (frequencies (for [marker [:left :right] v expected] [marker v]))
+                         (frequencies (map (fn [^objects row] [(aget row 1) (decode (aget row 2))]) rows))))
+                  (is (= #{:left :right} (set (map #(aget ^objects % 1) rows)))))
+                (doseq [^objects row rows]
+                  (is (not (identical? row (.get input 0))))
+                  (is (not (identical? row (.get input 1))))
+                  (when mutate (mutate (aget row 2)))
+                  (aset row 0 :changed)
+                  (aset row 1 :changed))
+                (.clear rows)
+                (is (= [[1 :left] [1 :right]] (mapv vec input)))))))))))

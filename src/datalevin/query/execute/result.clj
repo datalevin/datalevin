@@ -234,13 +234,16 @@
             deferred-base-samples attribute-group-planning
             post-top-k-enrichment access-path-execution
             explain-actual-result-size keyed-group-reduction
-            terminal-result-collection unique-group-aggregation]
+            terminal-result-collection unique-group-aggregation
+            fused-aggregation-plan]
      :as context}]
    (when qplan/*explain*
      (let [{:keys [^long planning-time ^long parsing-time ^long building-time]}
            @qplan/*explain*
            memo-summary (some-> property-memo qo/property-memo-summary)
-           selected-summary (:selected memo-summary)
+           selected-summary (if fused-aggregation-plan
+                              {:kind :fused-aggregate}
+                              (:selected memo-summary))
            runtime-post-top-k (:post-top-k-enrichment @qplan/*explain*)
            conventional-cost
            (some #(when (= :conventional (:kind %)) (:cost %))
@@ -260,10 +263,11 @@
                                       [(:out (last steps))
                                        :tuples-count]))))
                    e)) plan))
-           explained-plan (or access-path-execution conventional-plan)
+           explained-plan (or fused-aggregation-plan access-path-execution conventional-plan)
            executed-summary
            (cond
              (not run?) {:kind :not-run}
+             fused-aggregation-plan {:kind :fused-aggregate}
              access-path-execution
              (cond-> selected-summary
                (:fallback access-path-execution)
@@ -303,6 +307,7 @@
                :keyed-group-reduction keyed-group-reduction
                :terminal-result-collection terminal-result-collection
                :unique-group-aggregation unique-group-aggregation
+               :fused-aggregation fused-aggregation-plan
                :late-clauses late-clauses
                :access-plans (mapv qaccess/plan-summary access-plans)
                :preferred-access-plan

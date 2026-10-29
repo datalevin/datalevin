@@ -11,6 +11,7 @@
            [org.eclipse.collections.impl.list.mutable FastList]))
 
 (def ^:private unsupported (Object.))
+(def ^:private object-array-class (Class/forName "[Ljava.lang.Object;"))
 
 (declare copy-value)
 
@@ -48,11 +49,13 @@
         (loop [i 0]
           (if (= i n)
             copy
-            (let [item (copy-value (aget copy i) (inc (long depth)))]
-              (if (or (identical? unsupported item)
-                      (and (some? item) (not (.isInstance component item))))
-                unsupported
-                (do (aset copy i item) (recur (inc i)))))))))))
+            (let [value (aget copy i)
+                  item (copy-value value (inc (long depth)))]
+              (cond
+                (identical? unsupported item) unsupported
+                (identical? value item) (recur (inc i))
+                (and (some? item) (not (.isInstance component item))) unsupported
+                :else (do (aset copy i item) (recur (inc i)))))))))))
 
 (defn- copy-tuple-list
   [^FastList xs depth]
@@ -71,6 +74,10 @@
   (cond
     ;; Cyclic mutable containers and excessive nesting bypass retention.
     (> depth 128) unsupported
+    (instance? object-array-class x) (copy-array x depth)
+    (identical? FastList (class x)) (copy-tuple-list x depth)
+    ;; These final classes cannot carry metadata or mutable contents.
+    (or (nil? x) (string? x) (instance? Long x) (instance? Double x)) x
     (remote-cache/immutable-data? x)
     x
     :else

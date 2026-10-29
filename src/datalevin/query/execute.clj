@@ -24,6 +24,7 @@
    [datalevin.query.access.idoc :as qidoc]
    [datalevin.query.access.vector :as qvector]
    [datalevin.query.aggregate :as qagg]
+   [datalevin.query.execute.fused-aggregate :as fused]
    [datalevin.query.execute.enrichment :refer [plan-post-top-k-enrichment]]
    [datalevin.query.execute.group-reduction
     :refer [plan-keyed-group-reduction resolve-terminal-keyed-group-reduction]]
@@ -321,7 +322,7 @@
                  (qo/build-property-memo)))
            context)))))
 
-(defn execute-plan
+(defn- execute-materialized-plan
   [{:keys [plan sources] :as context}]
   (if (= 1 (transduce (map (fn [[_ components]] (count components))) + plan))
     (let [[src components] (first plan)
@@ -367,6 +368,23 @@
                                  [db (mapcat :steps plans)]))))
                    (map+ #(apply qplan/execute-steps context %))
                    (sort-by #(count (:tuples %)))))))
+
+(declare prepare-context)
+
+(defn execute-plan
+  [context]
+  (if-let [plan (::fused/plan context)]
+    (or (fused/execute context plan)
+        ;; A schema commit after admission invalidates both the fusion proof
+        ;; and the ordinary plan's uniqueness assumptions. Rebuild once using
+        ;; the current schema, with the conventional executor in control.
+        (binding [fused/*enabled?* false]
+          (execute-materialized-plan
+            (assoc (prepare-context (:parsed-q context)
+                                    (into [(:database plan)] (:input-values plan))
+                                    [] false)
+                   :run? true))))
+    (execute-materialized-plan context)))
 
 (defn- resolve-late-clause
   [context clause]
@@ -464,7 +482,15 @@
 (defn -q
   [context run?]
   (binding [qu/*implicit-source* (get (:sources context) '$)]
-    (let [{:keys [result-set] :as context} (planning context)]
+    (let [{:keys [result-set] :as context} (planning context)
+          fused-plan (when (and (not= result-set #{})
+                                qagg/*unique-group-aggregation?*
+                                (nil? (::result-policy context))
+                                (= *access-methods* default-access-methods))
+                       (fused/plan context))
+          context (cond-> context
+                    fused-plan (assoc ::fused/plan fused-plan
+                                      :fused-aggregation-plan (:summary fused-plan)))]
       (if (= result-set #{})
         (do (plan-explain) context)
         (as-> context c
@@ -963,13 +989,17 @@
         order         (when (:qorder parsed-q)
                         (result/prepare-order find-vars (:qorder parsed-q)))]
     (fn [parsed-q context]
-      (let [reduced (when (and aggregate?
-                               (nil? (::result-policy context))
-                               (nil? (:result-set context))
-                               (= 1 (count (:rels context))))
-                      (qagg/aggregate-relation find-elements context
-                                               (first (:rels context)) all-vars
-                                               keep-group?))
+      (let [fused-result (:fused-aggregation context)
+            reduced (or (when fused-result
+                          (cond-> fused-result
+                            keep-group? (update :rows #(filter keep-group? %))))
+                        (when (and aggregate?
+                                   (nil? (::result-policy context))
+                                   (nil? (:result-set context))
+                                   (= 1 (count (:rels context))))
+                          (qagg/aggregate-relation find-elements context
+                                                   (first (:rels context)) all-vars
+                                                   keep-group?)))
             context (if reduced
                       (assoc context
                              :explain-actual-result-size (:input-tuples reduced)

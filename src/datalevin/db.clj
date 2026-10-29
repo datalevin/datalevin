@@ -346,9 +346,16 @@
     false))
 
 (def ^:private owned-tuple-cache-ops
-  ;; These native readers allocate their result lists and rows. Samples and
-  ;; lazy/public reads retain normalization through snapshot/restore.
+  ;; These native readers allocate their result lists and rows.
   #{:init-tuples :search-tuples})
+
+(defn- owned-native-tuple-result?
+  [k]
+  (or (contains? owned-tuple-cache-ops (first k))
+      ;; EAV readers allocate new rows whenever they append values. A
+      ;; presence-only scan can return the input row and must stay detached.
+      (and (= :eav-scan-v (first k))
+           (some (fn [[_ opts]] (not (:skip? opts))) (nth k 3 nil)))))
 
 (defn ^:no-doc cache-result
   "Publish an owned snapshot. Fresh native tuple lists already belong to the
@@ -358,7 +365,7 @@
     (do
       (cache-entry-if-current store token k entry)
       (if (and (instance? Store store) (instance? FastList result)
-               (contains? owned-tuple-cache-ops (first k)))
+               (owned-native-tuple-result? k))
         result
         (result-cache/restore entry)))
     result))
@@ -872,28 +879,35 @@
   ([store tx-data target remote-max-tx]
    (if-some [^LRUCache cache (.get ^ConcurrentHashMap caches (dir store))]
      (do
-       (when (seq tx-data)
-         ;; Pure ingestion normally has no cached reads. Avoid constructing
-         ;; four touch sets and a values-by-attribute map from every datom in
-         ;; that common case, while still advancing the cache generation.
-         (if (.isEmpty cache)
-           (locking cache
-             (.beginInvalidation cache (long (or target 0)))
-             ;; A cache entry may have appeared between the optimistic empty
-             ;; check and acquiring the monitor. Handle that race normally.
-             (when-not (.isEmpty cache)
-               (let [touches (tx-touch-summary tx-data)]
-                 (remove-affected-cache-entries! store cache touches tx-data))))
-           (let [touches (tx-touch-summary tx-data)]
-             ;; Prevent a reader that started before this commit from publishing
-             ;; its old snapshot after the affected entries have been removed.
-             ;; LRUCache methods synchronize on the cache monitor, so this also
-             ;; keeps cache hits out of the invalidation window.
+       (if (remote-store? store)
+         ;; A remote report describes only this transaction, not intervening
+         ;; commits from other clients. Before adopting its revision, discard
+         ;; every retained result, even for empty or idempotent transactions.
+         ;; Advance the generation too so older in-flight reads cannot publish.
+         (locking cache
+           (.beginInvalidation cache (long (or target 0)))
+           (.clear cache))
+         (if (seq tx-data)
+           ;; Pure ingestion normally has no cached reads. Avoid constructing
+           ;; four touch sets and a values-by-attribute map from every datom in
+           ;; that common case, while still advancing the cache generation.
+           (if (.isEmpty cache)
              (locking cache
                (.beginInvalidation cache (long (or target 0)))
-               (remove-affected-cache-entries! store cache touches tx-data)))))
-       (when-not (seq tx-data)
-         (.setTarget cache (long (or target 0))))
+               ;; A cache entry may have appeared between the optimistic empty
+               ;; check and acquiring the monitor. Handle that race normally.
+               (when-not (.isEmpty cache)
+                 (let [touches (tx-touch-summary tx-data)]
+                   (remove-affected-cache-entries! store cache touches tx-data))))
+             (let [touches (tx-touch-summary tx-data)]
+               ;; Prevent a reader that started before this commit from publishing
+               ;; its old snapshot after the affected entries have been removed.
+               ;; LRUCache methods synchronize on the cache monitor, so this also
+               ;; keeps cache hits out of the invalidation window.
+               (locking cache
+                 (.beginInvalidation cache (long (or target 0)))
+                 (remove-affected-cache-entries! store cache touches tx-data))))
+           (.setTarget cache (long (or target 0)))))
        (mark-remote-cache-max-tx! store remote-max-tx))
      (refresh-cache store target remote-max-tx))))
 
