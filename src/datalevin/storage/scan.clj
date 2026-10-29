@@ -27,7 +27,7 @@
    [datalevin.util :as u :refer [raise]])
   (:import
    [java.util ArrayList List Comparator Collection Map]
-   [datalevin.utl QueryKey]
+   [datalevin.utl QueryKey TupleSort]
    [java.util.concurrent Callable ForkJoinPool ForkJoinWorkerThread Future]
    [java.nio ByteBuffer]
    [java.lang AutoCloseable]
@@ -304,10 +304,7 @@
 (defn sort-tuples-by-eid
   [^List tuples ^long eid-idx]
   (doto tuples
-    (.sort (reify Comparator
-             (compare [_ a b]
-               (Long/compare ^long (aget ^objects a eid-idx)
-                             ^long (aget ^objects b eid-idx)))))))
+    (TupleSort/sortByLong (int eid-idx))))
 
 (defn sort-tuples-by-val
   [^List tuples ^long v-idx vt]

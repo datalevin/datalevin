@@ -13,6 +13,7 @@ $ dtlv help
 Usage: dtlv [options] [command] [arguments]
 
 Commands:
+  admin Inspect databases on a remote server
   copy  Copy a database, regardless of whether it is now in use
   drop  Drop or clear a database
   dump  Dump the content of a database to standard output
@@ -45,6 +46,41 @@ Options:
 Type 'dtlv help <command>' to read about a specific command.
 
 ```
+
+## Remote Administration
+
+`dtlv admin status` reports the databases on the contacted server without opening
+closed databases. Supply the server URI through an environment variable; it is
+never echoed. Select named databases with repeatable `--database`, or use
+`--all-databases` for that node's full catalog:
+
+```sh
+dtlv admin --uri-env DATALEVIN_URI status --database orders --database users
+dtlv admin --timeout-ms 5000 status --all-databases
+```
+
+The URI variable defaults to `DATALEVIN_URI`. Database names are normalized and
+deduplicated in the supplied order. `-a/--all` retains its existing sub-database
+meaning and is not an admin selector. `--timeout-ms` defaults to 60000 and bounds
+authentication and each request individually; the entire sweep can take longer.
+
+Each stdout line is an EDN map containing `:db-name`, `:operation :status`, and
+either a native `:result` or an `:error` map. Closed databases have `:open? false`
+and nil `:stat`, `:replica`, and `:watermarks`. Server filesystem paths are
+removed and credentials in nested URIs are redacted. Diagnostics go to stderr.
+Exit codes are `0` for success, `1` for target failures, and `2` for invalid
+invocations, missing URI, connection/authentication failure, or failed global
+discovery. Determinate target failures do not prevent later targets from running;
+authentication loss or an indeterminate transport failure stops the sweep.
+
+Named status needs only database view permission. `--all-databases` additionally
+needs untargeted database create permission and server view permission. This
+selection describes the contacted node; it does not discover HA members.
+
+An operator can schedule status collection with cron using a protected URI
+environment and ordinary output redirection. Scheduling and log retention remain
+with that script. The initial admin release implements status; guarded WAL GC
+and standalone backups follow their shared maintenance prerequisites.
 
 ## Interactive Console
 

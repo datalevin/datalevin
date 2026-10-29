@@ -71,7 +71,8 @@
      :server-copy-store! :store :store->db-name :store-closed?
      :sync-copy-response-store! :sys-conn :unpin-server-copy-backup-floor!
      :update-cached-permission :update-cached-role :update-client :update-db
-     :vector-index :with-db-runtime-store-read-access :write-message
+     :vector-index :with-db-lifecycle-access :with-db-lifecycle-write-access
+     :with-db-runtime-store-read-access :write-message
      :with-index-write-admission :write-txn-runner :transaction-lock-timeout-ms}})
 
 (defn- skey-state
@@ -1003,22 +1004,27 @@
 
 (defn drop-database
   [deps server skey {:keys [args]}]
-  (let [sys-conn  (sys-conn deps server)
-        [db-name] args
-        did       (auth/db-eid sys-conn db-name)]
-    (if did
-      (with-permission!
-        deps server skey create-act database-obj did
-        "Don't have permission to drop the database"
-        (fn []
-          (if ((:db-in-use? deps) server db-name)
-            (raise "Cannot drop a database currently in use." {})
-            (do
-              (auth/transact-drop-db sys-conn did)
-              (u/delete-files
-               ((:db-dir deps) ((:root deps) server) db-name))
-              (write-complete! deps skey)))))
-      (raise "Database does not exist." {}))))
+  (let [db-name (u/lisp-case (first args))]
+    (when-not (auth/db-eid (sys-conn deps server) db-name)
+      (raise "Database does not exist." {}))
+    ((:with-db-lifecycle-write-access deps)
+     server db-name
+     (fn []
+       (let [sys-conn (sys-conn deps server)
+             did (auth/db-eid sys-conn db-name)]
+         (if did
+           (with-permission!
+             deps server skey create-act database-obj did
+             "Don't have permission to drop the database"
+             (fn []
+               (if ((:db-in-use? deps) server db-name)
+                 (raise "Cannot drop a database currently in use." {})
+                 (do
+                   (auth/transact-drop-db sys-conn did)
+                   (u/delete-files
+                    ((:db-dir deps) ((:root deps) server) db-name))
+                   (write-complete! deps skey)))))
+           (raise "Database does not exist." {})))))))
 
 (defn list-databases
   [deps server skey _]
@@ -1922,17 +1928,76 @@
         visible (into [] (remove internal-kv-dbi?) (i/list-dbis kv))]
     (write-result! deps skey visible)))
 
+(defn- visible-stat
+  [kv dbi-name]
+  (cond-> (i/stat kv dbi-name)
+    (and (nil? dbi-name) (internal-kv-dbi-open? kv c/ha-client-ops))
+    (update :entries dec)))
+
 (defn stat
   [deps server skey {:keys [args writing?]}]
-  (let [db-name  (nth args 0)
-        dbi-name (nth args 1 nil)
-        kv       (kv-store deps server skey db-name writing?)
-        result   (i/stat kv dbi-name)
-        result   (if (and (nil? dbi-name)
-                          (internal-kv-dbi-open? kv c/ha-client-ops))
-                   (update result :entries dec)
-                   result)]
-    (write-result! deps skey result)))
+  (let [[db-name dbi-name] args]
+    (write-result! deps skey
+                   (visible-stat (kv-store deps server skey db-name writing?) dbi-name))))
+
+(defn- replica-status-value
+  [db-name state]
+  (assoc (select-keys state
+                     [:replica/read-only? :replica/source :replica/id
+                      :replica/poll-ms :replica/report-ms :replica/batch-records
+                      :replica-applied-lsn :replica-source-durable-lsn
+                      :replica-source-committed-lsn :replica-lag-lsn
+                      :replica-last-sync-ms :replica-last-status-ms
+                      :replica-last-floor-report-ms :replica-last-floor-reported-lsn
+                      :replica-degraded-reason :replica-last-error])
+         :db-name db-name
+         :replica-running?
+         (boolean (some-> ^java.util.concurrent.atomic.AtomicBoolean
+                          (:replica-loop-running? state) .get))))
+
+(defn admin-status
+  "Inspect catalog identity and an existing runtime without opening a store."
+  [deps server skey {:keys [args]}]
+  (let [[db-name {:keys [runtime?] :or {runtime? true}}] args
+        db-name (u/lisp-case db-name)]
+    ;; Do not allocate permanent per-name locks for nonexistent targets.
+    (when-not (auth/db-eid (sys-conn deps server) db-name)
+      (raise "Database does not exist"
+             {:error :admin/database-not-found :db-name db-name}))
+    ((:with-db-lifecycle-access deps)
+     server db-name
+     (fn []
+       (let [catalog (auth/pull-db (sys-conn deps server) db-name)
+             did (:db/id catalog)]
+         (when-not did
+           (raise "Database does not exist"
+                  {:error :admin/database-not-found :db-name db-name}))
+         (with-permission!
+           deps server skey view-act database-obj did
+           "Don't have permission to view database status"
+           (fn []
+             (let [identity {:db-name db-name :db-type (:database/type catalog)
+                             :db-id did :admin-capabilities #{}}
+                   result
+                   (if-not runtime?
+                     identity
+                     (try
+                       (let [store ((:get-store deps) server db-name)
+                             raw (when store
+                                   (if (instance? Store store) (.-lmdb ^Store store) store))]
+                         (assoc identity :open? (boolean store)
+                                :stat (when raw (visible-stat raw nil))
+                                :replica (when store
+                                           (replica-status-value db-name
+                                                                 (db-state deps server db-name)))
+                                :watermarks (when raw (kv/txlog-watermarks raw))))
+                       (catch Exception e
+                         ;; A diagnostic must never trigger the client's implicit open.
+                         (throw (ex-info "Unable to read database status"
+                                         {:error :admin/runtime-read-failed
+                                          :db-name db-name
+                                          :cause-data (dissoc (ex-data e) :type)} e)))))]
+               (write-result! deps skey result)))))))))
 
 (defonce ^:private ^Map read-cache-store-ids
   (Collections/synchronizedMap (WeakHashMap.)))
@@ -2941,32 +3006,7 @@
   (let [db-name (u/lisp-case (nth args 0 nil))
         m       ((:db-state deps) server db-name)]
     (if m
-      (write-result!
-       deps skey
-       (assoc (select-keys
-               m
-               [:replica/read-only?
-                :replica/source
-                :replica/id
-                :replica/poll-ms
-                :replica/report-ms
-                :replica/batch-records
-                :replica-applied-lsn
-                :replica-source-durable-lsn
-                :replica-source-committed-lsn
-                :replica-lag-lsn
-                :replica-last-sync-ms
-                :replica-last-status-ms
-                :replica-last-floor-report-ms
-                :replica-last-floor-reported-lsn
-                :replica-degraded-reason
-                :replica-last-error])
-              :db-name db-name
-              :replica-running?
-              (boolean
-               (some-> ^java.util.concurrent.atomic.AtomicBoolean
-                       (:replica-loop-running? m)
-                       .get))))
+      (write-result! deps skey (replica-status-value db-name m))
       (raise "Database is not open" {:db-name db-name}))))
 
 (def ^:private base-handler-map
@@ -2986,6 +3026,7 @@
    :drop-database drop-database
    :list-databases list-databases
    :list-databases-in-use list-databases-in-use
+   :admin-status admin-status
    :assign-role assign-role
    :withdraw-role withdraw-role
    :list-user-roles list-user-roles

@@ -5,6 +5,15 @@
 Using the same native command line tool, `dtlv serv` will run in the server mode
 and accepts network connections on `127.0.0.1:8898` by default.
 
+For read-only administration, `dtlv admin status --database NAME` inspects open
+or closed databases without opening them. The server URI comes from
+`DATALEVIN_URI` or `--uri-env VAR`. Named status requires the database's view
+permission; global `--all-databases` also requires database create and server
+view permission. See [the CLI guide](dtlv.md#remote-administration) for output,
+timeouts, and exit codes. The read-only `:admin-status` endpoint also supports
+`{:runtime? false}` discovery and reports an empty `:admin-capabilities` set
+until guarded maintenance paths are implemented.
+
 * Use option `--host` to specify the address that the server listens on. The
   default is `127.0.0.1`. Binding to a non-loopback address, such as
   `0.0.0.0`, requires setting `DATALEVIN_DEFAULT_PASSWORD`.

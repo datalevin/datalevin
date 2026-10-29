@@ -192,6 +192,11 @@ the aggregate input distinct. Q1 also uses faster scalar-binding copies; Q18
 filters its groups before returning the nested relation. The report retains
 complete SQL gates and repeated SF1 before/after measurements.
 
+The [Q1/Q18 follow-up on 1.2.10](../../doc/measurements/tpch-q1-q18-2026-10-28.md)
+reduces entity sorting costs and compiles HAVING before filtering groups.
+SF1 paired medians improve from 7.03 to 5.78 seconds for Q1 and from 3.38 to
+2.58 seconds for Q18; all 22 queries still pass at SF0.1 and SF1.
+
 The raw CSVs (`datalevin_pass.csv`, `sqlite_pass.csv`, `postgres_pass.csv`) and
 `results.edn`-style manifests should be retained alongside any published table,
 together with the machine, JVM, database versions, and scale factor.

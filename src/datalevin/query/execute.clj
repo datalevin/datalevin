@@ -954,6 +954,7 @@
         result-arity  (count find-elements)
         with          (:qwith parsed-q)
         having        (:qhaving parsed-q)
+        keep-group?   (qagg/compile-having having find-elements)
         find-vars     (dp/find-vars find)
         all-vars      (concatv find-vars (map :symbol with))
         aggregate?    (some #(or (dp/aggregate? %) (dp/find-expr? %)) find-elements)
@@ -967,7 +968,8 @@
                                (nil? (:result-set context))
                                (= 1 (count (:rels context))))
                       (qagg/aggregate-relation find-elements context
-                                               (first (:rels context)) all-vars))
+                                               (first (:rels context)) all-vars
+                                               keep-group?))
             context (if reduced
                       (assoc context
                              :explain-actual-result-size (:input-tuples reduced)
@@ -980,8 +982,8 @@
               (and aggregate? (nil? reduced))
               (aggregate-results find-elements context)
 
-              (seq having)
-              (qagg/apply-having having find-elements)
+              (and keep-group? (nil? reduced))
+              (filter keep-group?)
 
               pull?
               (pull find-elements context)

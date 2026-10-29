@@ -1031,6 +1031,10 @@
                                          :error-response    result
                                          :reopen
                                          (let [{:keys [db-name db-type]} result]
+                                           (when (= :admin-status (:type req))
+                                             (raise "Admin status cannot reopen a database"
+                                                    {:error :admin/unexpected-reopen
+                                                     :db-name db-name}))
                                            (vreset! success? false)
                                            {:request-status :reopen
                                             :db-name        db-name
@@ -2759,6 +2763,22 @@
   "List databases that are in use."
   [client]
   (normal-request client :list-databases-in-use []))
+
+(defn ^:no-doc endpoint-request
+  "Read from this client's endpoint, without HA discovery or read routing."
+  [client call args]
+  (let [req {:type call :args args :writing? false}
+        {:keys [type message result err-data]} (request client req)]
+    (if (= type :error-response)
+      (raise-normal-request-error req message err-data nil)
+      result)))
+
+(defn admin-status
+  "Inspect a named database on the contacted endpoint without opening it.
+  Set :runtime? false for catalog identity and supported admin capabilities only."
+  ([client db-name] (admin-status client db-name {}))
+  ([client db-name opts]
+   (endpoint-request client :admin-status [(u/lisp-case db-name) opts])))
 
 (defn assign-role
   "Assign a role to a user. "

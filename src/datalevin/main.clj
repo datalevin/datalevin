@@ -16,6 +16,7 @@
    [clojure.pprint :as p]
    [clojure.stacktrace :as st]
    [sci.core :as sci]
+   [datalevin.admin :as admin]
    [datalevin.binding.cpp :as cpp]
    [datalevin.core :as d]
    [datalevin.dump :as dump]
@@ -39,7 +40,7 @@
   Datalevin (version: " c/version ")"))
 
 (def ^:private commands
-  #{"copy" "drop" "dump" "exec" "help" "load" "mcp" "repl" "serv" "stat"})
+  #{"admin" "copy" "drop" "dump" "exec" "help" "load" "mcp" "repl" "serv" "stat"})
 
 (def ^:private serv-help
   "
@@ -204,6 +205,7 @@
         "Usage: dtlv [options] [command] [arguments]"
         ""
         "Commands:"
+        "  admin Inspect databases on a remote server"
         "  copy  Copy a database, regardless of whether it is now in use"
         "  drop  Drop or clear a database"
         "  dump  Dump the content of a database to standard output"
@@ -290,17 +292,21 @@
   indicating the action the program should take and the options provided."
   [args]
   (let [{:keys [options arguments errors summary]}
-        (parse-opts args cli-opts)
+        (parse-opts args (into cli-opts admin/cli-options))
 
         command (first arguments)
         pod?    (= "true" (System/getenv "BABASHKA_POD"))]
     (cond
       pod?               {:command "pods"}
       (:version options) {:exit-message version-str :ok? true}
+      (and (= command "admin") (:help options))
+      {:exit-message admin/help :ok? true}
       (:help options)    {:exit-message (usage summary) :ok? true}
       errors             {:exit-message (str (error-msg errors)
                                              \newline
-                                             (usage summary))}
+                                             (usage summary))
+                          :exit-code (when (= command "admin") 2)}
+      (= command "admin") (admin/validate-options options (rest arguments))
       (commands command) {:command   command
                           :options   options
                           :arguments (rest arguments)
@@ -321,6 +327,7 @@
   (if (seq arguments)
     (let [command (s/lower-case (first arguments))]
       (exit 0 (case command
+                "admin" admin/help
                 "repl" (repl-help)
                 "exec" exec-help
                 "copy" copy-help
@@ -579,11 +586,14 @@
                     (recur))))))))
 
 (defn -main [& args]
-  (let [{:keys [command options arguments summary exit-message ok?]}
+  (let [{:keys [command options arguments summary exit-message ok? exit-code]}
         (validate-args args)]
     (if exit-message
-      (exit (if ok? 0 1) exit-message)
+      (if (and (= exit-code 2) (not ok?))
+        (binding [*out* *err*] (exit 2 exit-message))
+        (exit (if ok? 0 1) exit-message))
       (case command
+        "admin" (exit (admin/run! options arguments))
         "copy" (dtlv-copy options arguments)
         "drop" (dtlv-drop options arguments)
         "dump" (dtlv-dump options arguments)

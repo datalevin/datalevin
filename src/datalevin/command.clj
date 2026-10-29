@@ -80,9 +80,10 @@
    :list-roles unguarded
    :create-database unguarded-write
    :close-database runtime-write
-   :drop-database local-write
+   :drop-database (assoc local-write :runtime-read-access-exempt? true)
    :list-databases unguarded
    :list-databases-in-use unguarded
+   :admin-status runtime-managed
    :assign-role unguarded-write
    :withdraw-role unguarded-write
    :list-user-roles unguarded

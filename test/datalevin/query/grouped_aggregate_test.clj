@@ -1,6 +1,8 @@
 (ns datalevin.query.grouped-aggregate-test
   (:require [clojure.test :refer [deftest is]]
             [datalevin.built-ins :as built-ins]
+            [datalevin.parser :as parser]
+            [datalevin.query.aggregate :as aggregate]
             [datalevin.query.resolve.binding :as binding]
             [datalevin.relation :as relation])
   (:import [datalevin.utl GroupedAggregate]
@@ -61,3 +63,24 @@
         result (binding/bind-scalar-tuples projected '?e (constantly 100))]
     (is (= [[10 100] [10 100]] (mapv vec (:tuples result))))
     (is (not (relation/unique-on? result ['?e])))))
+
+(deftest compiled-having-preserves-argument-and-nil-semantics
+  (let [rows [[:a -1 1 0] [:b 0 2 1] [:c 10 2 11] [:d 20 3 21]
+              [:e nil 0 nil]]
+        query '[:find ?g (sum ?v) (count ?e) (+ (sum ?v) 1)
+                :where [?e :group ?g] [?e :value ?v]]]
+    (doseq [[having expected]
+            [['[[(pos? (sum ?v))]] [:c :d]]
+             ['[[(> (sum ?v) 10)]] [:d]]
+             ['[[(< 10 (sum ?v))]] [:d]]
+             ['[[(<= 0 (sum ?v) 10)]] [:b :c]]
+             ['[[(pos? (sum ?v))] [(> (count ?e) 2)]] [:d]]
+             ['[[(> (+ (sum ?v) 1) 11)]] [:d]]
+             ['[[(= false false)]] [:a :b :c :d :e]]
+             ['[[(= nil nil)]] []]]]
+      (let [parsed (parser/parse-query (into query (cons :having having)))
+            elements (parser/find-elements (:qfind parsed))
+            keep? (aggregate/compile-having (:qhaving parsed) elements)]
+        (doseq [values [rows (mapv object-array rows)]]
+          (is (= expected (mapv first (filter keep? values)))))))
+    (is (nil? (aggregate/compile-having [] [])))))

@@ -377,7 +377,9 @@
                    :event-loop-stop (CountDownLatch. 1)
                    :connections (ConcurrentHashMap/newKeySet)
                    :connection-keys (ConcurrentHashMap.)
-                   :connection-threads (ConcurrentHashMap.)))))
+                   :connection-threads (ConcurrentHashMap.)
+                   :db-open-locks (ConcurrentHashMap.)
+                   :db-runtime-locks (ConcurrentHashMap.)))))
 
 (defn- shutdown-server!
   [^Server server]
@@ -1624,12 +1626,10 @@
 
 (defn- db-open-lock
   [^Server server db-name]
-  (let [dbs (.-dbs server)]
-    (locking dbs
-      (or (get-in dbs [db-name :open-lock])
-          (let [lock (Object.)]
-            (update-db server db-name #(assoc % :open-lock lock))
-            lock)))))
+  (let [^ConcurrentHashMap locks (:db-open-locks (.-execution server))]
+    (or (.get locks db-name)
+        (let [lock (Object.)]
+          (or (.putIfAbsent locks db-name lock) lock)))))
 
 (defn- db-write-admission-lock
   [^Server server db-name]
@@ -1983,13 +1983,11 @@
 
 (defn- get-runtime-access-lock
   [^Server server db-name]
-  (let [dbs (.-dbs server)]
-    (or (get-in dbs [db-name :runtime-access-lock])
-        (locking dbs
-          (or (get-in dbs [db-name :runtime-access-lock])
-              (let [lock (ReentrantReadWriteLock. true)]
-                (update-db server db-name #(assoc % :runtime-access-lock lock))
-                lock))))))
+  (let [^ConcurrentHashMap locks (:db-runtime-locks (.-execution server))]
+    (or (.get locks db-name)
+        (let [lock (or (get-in (.-dbs server) [db-name :runtime-access-lock])
+                       (ReentrantReadWriteLock. true))]
+          (or (.putIfAbsent locks db-name lock) lock)))))
 
 (defn with-db-runtime-store-read-access
   "Run `f` while holding the runtime-store read lock for `db-name`.
@@ -2052,6 +2050,16 @@
         (finally
           (.unlock write-lock))))
     (f)))
+
+(defn- with-db-lifecycle-access
+  [server db-name f]
+  (locking (db-open-lock server db-name)
+    (with-db-runtime-store-read-access server db-name f)))
+
+(defn- with-db-lifecycle-write-access
+  [server db-name f]
+  (locking (db-open-lock server db-name)
+    (with-db-runtime-store-swap server db-name f)))
 
 (defn- get-kv-store
   [server db-name]
@@ -2254,6 +2262,8 @@
      :update-client #'update-client
      :update-db #'update-db
      :vector-index #'vector-index
+     :with-db-lifecycle-access #'with-db-lifecycle-access
+     :with-db-lifecycle-write-access #'with-db-lifecycle-write-access
      :with-db-runtime-store-read-access #'with-db-runtime-store-read-access
      :with-index-write-admission #'with-index-write-admission
      :write-message #'write-message

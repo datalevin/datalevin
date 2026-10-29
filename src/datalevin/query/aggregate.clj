@@ -409,7 +409,7 @@
   "Reduce a relation directly when a retained unique key proves the complete
   find/with input distinct. Return nil for unsupported aggregate expressions;
   custom functions and controlled callers keep their collection contracts."
-  [find-elements context rel symbols]
+  [find-elements context rel symbols keep-group?]
   (when (and *unique-group-aggregation?* (r/unique-on? rel symbols))
     (let [attrs (:attrs rel)
           plans (mapv
@@ -436,7 +436,11 @@
           (dotimes [i (.size tuples)]
             (when (zero? (bit-and i 4095)) (timeout/assert-time-left))
             (.add accumulator (.get tuples i)))
-          {:rows (map vec (.results accumulator))
+          ;; Reject groups before allocating their public result vectors.
+          {:rows (if keep-group?
+                   (sequence (comp (filter keep-group?) (map vec))
+                             (.results accumulator))
+                   (map vec (.results accumulator)))
            :input-tuples (.size tuples)
            :group-count (.groupCount accumulator)})))))
 
@@ -626,41 +630,61 @@
             :else
             (recur (rest elems) (inc idx))))))))
 
-(defn- eval-having-arg
-  "Evaluate a having predicate argument against an aggregated result tuple."
-  [arg find-elements result-tuple]
+(defn- compile-having-arg
+  "Resolve an aggregate column once, before visiting the result groups."
+  [arg find-elements]
   (cond
     (dp/aggregate? arg)
-    (let [idx (find-aggregate-idx arg find-elements)]
-      (when idx (nth result-tuple idx)))
+    (if-some [idx (find-aggregate-idx arg find-elements)]
+      #(nth % idx)
+      (constantly nil))
 
     (dp/find-expr? arg)
-    (let [idx (u/index-of #(and (dp/find-expr? %)
-                                (= (:fn %) (:fn arg)))
-                          find-elements)]
-      (when idx (nth result-tuple idx)))
+    (if-some [idx (u/index-of #(and (dp/find-expr? %)
+                                   (= (:fn %) (:fn arg)))
+                             find-elements)]
+      #(nth % idx)
+      (constantly nil))
 
     (instance? Constant arg)
-    (:value arg)
+    (constantly (:value arg))
 
     :else
-    arg))
+    (constantly arg)))
 
-(defn- eval-having-pred
-  "Evaluate a single having predicate on an aggregated result tuple."
-  [pred find-elements result-tuple]
+(defn- compile-having-pred
+  [pred find-elements]
   (let [pred-fn (get built-ins/query-fns (-> pred :fn :symbol))
-        args    (mapv #(eval-having-arg % find-elements result-tuple)
-                      (:args pred))]
-    (when (and pred-fn (every? some? args))
-      (apply pred-fn args))))
+        readers (mapv #(compile-having-arg % find-elements) (:args pred))]
+    (if-not pred-fn
+      (constantly nil)
+      (case (count readers)
+        0 (fn [_] (pred-fn))
+        1 (let [read-arg (first readers)]
+            (fn [row]
+              (when-some [arg (read-arg row)] (pred-fn arg))))
+        2 (let [[read-left read-right] readers]
+            (fn [row]
+              (let [left (read-left row)
+                    right (read-right row)]
+                (when (and (some? left) (some? right))
+                  (pred-fn left right)))))
+        (fn [row]
+          (let [args (mapv #(% row) readers)]
+            (when (every? some? args) (apply pred-fn args))))))))
+
+(defn compile-having
+  "Compile HAVING once for vector or native array rows. Nil means no filter."
+  [having find-elements]
+  (when (seq having)
+    (let [predicates (mapv #(compile-having-pred % find-elements) having)]
+      (if (= 1 (count predicates))
+        (first predicates)
+        (fn [row] (every? #(% row) predicates))))))
 
 (defn apply-having
   "Filter aggregated results by having predicates."
   [having find-elements results]
-  (if (seq having)
-    (filter (fn [result-tuple]
-              (every? #(eval-having-pred % find-elements result-tuple)
-                      having))
-            results)
+  (if-let [keep-group? (compile-having having find-elements)]
+    (filter keep-group? results)
     results))
