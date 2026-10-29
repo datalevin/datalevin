@@ -293,7 +293,8 @@ values;")
   (gc-txlog-segments!
     [db]
     [db retain-floor-lsn]
-    "Run txn-log segment GC. Optional `retain-floor-lsn` keeps records from that floor and newer.")
+    "Run explicit txn-log segment GC. The optional argument is a retain floor,
+     or an options map with :retain-floor-lsn and :dry-run?.")
   (txlog-update-snapshot-floor!
     [db snapshot-lsn]
     [db snapshot-lsn previous-snapshot-lsn]

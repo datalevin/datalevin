@@ -21,6 +21,7 @@
    [datalevin.datom :as d :refer [datom datom?]]
    [datalevin.custom-datalog :as cd]
    [datalevin.db.range-cache :as range-cache]
+   [datalevin.db.result-cache :as result-cache]
    [datalevin.native-value :as nv]
    [datalevin.remote-cache :as remote-cache]
    [datalevin.db.tx.common :as txcommon]
@@ -58,7 +59,7 @@
    [datalevin.storage Store WriteGroup]
    [datalevin.utl LRUCache QueryKey]
    [java.nio ByteBuffer]
-   [java.util Arrays Comparator]
+   [java.util Arrays Comparator Date]
    [clojure.lang LazilyPersistentVector]
    [java.util.concurrent ConcurrentHashMap]
    [java.util.concurrent.atomic AtomicBoolean]
@@ -189,7 +190,7 @@
 (defonce ^:private remote-cache-max-tx (ConcurrentHashMap.))
 (defonce ^:private remote-cache-schema-revision (ConcurrentHashMap.))
 
-(declare cache-key-dependencies)
+(declare cache-key-dependencies refresh-remote-cache!)
 
 (def ^:private cache-dependencies
   (reify Function
@@ -314,23 +315,41 @@
 (defn cache-get
   [store k]
   (when-let [^LRUCache cache (.get ^ConcurrentHashMap caches (dir store))]
-    (.get cache k)))
+    (when-some [entry (.get cache k)]
+      (result-cache/restore entry))))
 
 (defn cache-put
   [store k v]
-  (.put ^LRUCache (.get ^ConcurrentHashMap caches (dir store)) k v))
+  (when-some [entry (result-cache/snapshot v)]
+    (.put ^LRUCache (.get ^ConcurrentHashMap caches (dir store)) k entry)))
 
 (defn ^:no-doc cache-token
   [store]
   (when-let [^LRUCache cache (.get ^ConcurrentHashMap caches (dir store))]
     [cache (.generation cache)]))
 
-(defn ^:no-doc cache-put-if-current
-  [store [^LRUCache cache generation] k v]
+(defn- cache-entry-if-current
+  [store [^LRUCache cache generation] k entry]
   (and cache
        (identical? cache
                    (.get ^ConcurrentHashMap caches (dir store)))
-       (.putIfGeneration cache k v (long generation))))
+       (.putIfGeneration cache k entry (long generation))))
+
+(defn ^:no-doc cache-put-if-current
+  [store token k v]
+  (if-some [entry (result-cache/snapshot v)]
+    (cache-entry-if-current store token k entry)
+    false))
+
+(defn ^:no-doc cache-result
+  "Publish an owned snapshot and return a separate caller's view, even on the
+  first read. Materialized immutable sequences can then stay shared on hits."
+  [store token k result]
+  (if-some [entry (result-cache/snapshot result)]
+    (do
+      (cache-entry-if-current store token k entry)
+      (result-cache/restore entry))
+    result))
 
 (defn ^:no-doc check-remote-read!
   "Validate local lifecycle and cancellation before a remote read, without an RPC."
@@ -424,33 +443,66 @@
               (remove-cache-by-dir! cache-dir)
               (swap! cache-owners dissoc cache-dir))))))))
 
+(def ^:private stored-value-cache-ops
+  #{:search :search-tuples :first :count :populated? :datoms :av-datoms
+    :e-datoms :range-datoms :seek :rseek :index-range :index-range-size})
+
+(defn- representation-sensitive?
+  [value]
+  (if (d/datom? value)
+    (or (representation-sensitive? (.-a ^Datom value))
+        (representation-sensitive? (.-v ^Datom value)))
+    (or (some? (meta value))
+        (not (or (nil? value) (instance? Long value) (string? value)
+                 (keyword? value) (symbol? value) (boolean? value)
+                 (char? value) (uuid? value))))))
+
+(defn- portable-index-input?
+  [value]
+  (if (d/datom? value)
+    (and (portable-index-input? (.-a ^Datom value))
+         (portable-index-input? (.-v ^Datom value))
+         (remote-cache/immutable-data? (meta value)))
+    (or (bytes? value) (= Date (class value))
+        (remote-cache/immutable-data? value))))
+
 (defn ^:no-doc index-cache-key
-  "Keep decoded custom values within their runtime registry generation. Append
-  the token to preserve dependency and write-invalidation key positions."
+  "Distinguish storage representations and custom-codec generations. Append
+  identity tokens to retain dependency and write-invalidation key positions.
+  Opaque representation-sensitive inputs bypass retention."
   [store pattern]
-  (if-let [registry (when (instance? Store store)
-                     (get-in @(kv-info (.-lmdb ^Store store))
-                             [:runtime-opts :udf-registry]))]
-    (if (cd/custom-schema? (schema store))
-      (conj pattern ::codec [registry (udf/generation registry)])
-      pattern)
-    pattern))
+  (when-let [pattern
+             (if (and (stored-value-cache-ops (first pattern))
+                      (some representation-sensitive? (next pattern)))
+               (when (every? portable-index-input? pattern)
+                 (conj pattern ::storage-key (remote-cache/serialized-key pattern)))
+               pattern)]
+    (if-let [registry (when (instance? Store store)
+                       (get-in @(kv-info (.-lmdb ^Store store))
+                               [:runtime-opts :udf-registry]))]
+      (if (cd/custom-schema? (schema store))
+        (conj pattern ::codec [registry (udf/generation registry)])
+        pattern)
+      pattern)))
 
 (defmacro wrap-cache
   [store pattern body]
   `(let [store# ~store
+         ;; Direct index reads can bypass db?, including on retained DB views.
+         _# (when (and (remote-store? store#) (cache-active? store#))
+              (refresh-remote-cache! store#))
          cache# ^LRUCache (.get ^ConcurrentHashMap caches (dir store#))
          cache?# (and cache# (pos? (.capacity cache#)) (not (.isDisabled cache#)))
          generation# (if cache?# (.generation cache#) 0)
          key# (when cache?# (index-cache-key store# ~pattern))]
      ;; A zero entry limit bypasses key construction and the LRU monitor as
      ;; well as retention. Keep the native read and transaction-overlay paths.
-     (if-some [cached# (when cache?# (.get ^LRUCache cache# key#))]
-       cached#
+     (if-some [cached# (when key# (.get ^LRUCache cache# key#))]
+       (result-cache/restore cached#)
        (let [res# ~body]
-         (when cache?#
-           (.putIfGeneration cache# key# res# generation#))
-         res#))))
+         (if key#
+           (cache-result store# [cache# generation#] key# res#)
+           res#)))))
 
 (defn- sample-init-cache-key
   [a mcount v-ranges pred get-v?]

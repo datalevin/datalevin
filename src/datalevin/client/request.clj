@@ -191,6 +191,11 @@
     (when (and (not (cmd/read-only? (:type message))) (original? b message))
       (.set ^AtomicBoolean (.-tracked? b) true))))
 
+(defn exchanged?
+  "Whether the enclosing mutation reached a transport exchange."
+  []
+  (boolean (when-let [^Budget b (current)] (.get ^AtomicBoolean (.-tracked? b)))))
+
 (defn failed-attempt! []
   (when-let [^Budget b (current)]
     (when (.getAndSet ^AtomicBoolean (.-sent? b) false)

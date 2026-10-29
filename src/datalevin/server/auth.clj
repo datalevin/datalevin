@@ -49,6 +49,8 @@
                           :db/valueType :db.type/string}
           :database/type {:db/doc       "Database type, :datalog or :key-value"
                           :db/valueType :db.type/keyword}
+          :database/retired? {:db/doc "Retain dropped catalog IDs so maintenance identities cannot be reused"
+                             :db/valueType :db.type/boolean}
 
           :role/key {:db/doc       "Role name, a keyword, must be unique"
                      :db/valueType :db.type/keyword
@@ -538,7 +540,8 @@
                          pids)
         rp-txs   (mapv (fn [rpid] [:db/retractEntity rpid]) rpids)]
     (d/transact! sys-conn (u/concatv rp-txs pids-txs
-                                     [[:db/retractEntity did]]))))
+                                   [[:db/retractEntity did]
+                                    [:db/add did :database/retired? true]]))))
 
 (defn has-permission?
   [req-act req-obj req-tgt user-permissions]

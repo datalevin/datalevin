@@ -1,5 +1,10 @@
 # Change Log
 
+## WIP
+
+### Added
+- [Admin] server wide administrative tool `dtlv admin` commands.
+
 ## 1.2.10 (2026-10-28)
 
 ### Improved

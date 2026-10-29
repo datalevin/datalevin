@@ -56,6 +56,7 @@
     [(* ?l-extendedprice ?l-discount) ?revenue]])
 
 ;; Q2: Minimum Cost Supplier
+;; Compute European minimum costs once per eligible part and join the relation.
 (def q-2
   '[:find ?s-acctbal ?s-name ?n-name ?p-partkey ?p-mfgr ?s-address ?s-phone
     ?s-comment
@@ -82,9 +83,12 @@
     [?n :nation/regionkey ?n-regionkey]
     [?r :region/regionkey ?n-regionkey]
     [?r :region/name "EUROPE"]
-    [(q [:find (min ?sc) .
-         :in $ ?pk
+    [(q [:find ?pk (min ?sc)
          :where
+         [?p2 :part/partkey ?pk]
+         [?p2 :part/size 15]
+         [?p2 :part/type ?pt2]
+         [(like ?pt2 "%BRASS")]
          [?ps2 :partsupp/partkey ?pk]
          [?ps2 :partsupp/supplycost ?sc]
          [?ps2 :partsupp/suppkey ?sk2]
@@ -93,7 +97,7 @@
          [?n2 :nation/nationkey ?nk2]
          [?n2 :nation/regionkey ?rk2]
          [?r2 :region/regionkey ?rk2]
-         [?r2 :region/name "EUROPE"]] $ ?p-partkey) ?mincost]
+         [?r2 :region/name "EUROPE"]] $) [[?p-partkey ?mincost]]]
     [(= ?ps-supplycost ?mincost)]])
 
 ;; Q3: Shipping Priority
@@ -464,6 +468,7 @@
          [(like ?sc "%Customer%Complaints%")])])
 
 ;; Q17: Small-Quantity-Order Revenue
+;; Group all quantities for the selected parts once, preserving lineitem rows.
 (def q-17
   '[:find (sum ?ep7) .
     :with ?l
@@ -473,12 +478,14 @@
     [?p :part/container "MED BOX"]
     [?l :lineitem/partkey ?pk]
     [?l :lineitem/quantity ?q]
-    [(q [:find (avg ?q2) .
+    [(q [:find ?pk (avg ?q2)
          :with ?l2
-         :in $ ?pk
          :where
+         [?p2 :part/partkey ?pk]
+         [?p2 :part/brand "Brand#23"]
+         [?p2 :part/container "MED BOX"]
          [?l2 :lineitem/partkey ?pk]
-         [?l2 :lineitem/quantity ?q2]] $ ?pk) ?avgq]
+         [?l2 :lineitem/quantity ?q2]] $) [[?pk ?avgq]]]
     [(* 0.2 ?avgq) ?thr]
     [(< ?q ?thr)]
     [?l :lineitem/extendedprice ?ep]
@@ -560,6 +567,8 @@
     [(* ?ep ?factor) ?revenue]])
 
 ;; Q20: Potential Part Promotion
+;; Sum 1994 quantities once per eligible part/supplier pair. Missing groups
+;; stay absent, retaining SQL's NULL-sum behavior for pairs without shipments.
 (def q-20
   '[:find ?s-name ?s-address
     :order-by [0 :asc]
@@ -576,16 +585,22 @@
     [?p :part/partkey ?pk]
     [?p :part/name ?pname]
     [(like ?pname "forest%")]
-    [(q [:find (sum ?lq) .
+    [(q [:find ?pk ?sk (sum ?lq)
          :with ?l
-         :in $ ?pk ?sk
          :where
+         [?p2 :part/partkey ?pk]
+         [?p2 :part/name ?pname2]
+         [(like ?pname2 "forest%")]
+         [?s2 :supplier/suppkey ?sk]
+         [?s2 :supplier/nationkey ?snk2]
+         [?n2 :nation/nationkey ?snk2]
+         [?n2 :nation/name "CANADA"]
          [?l :lineitem/partkey ?pk]
          [?l :lineitem/suppkey ?sk]
          [?l :lineitem/shipdate ?sd]
          [(>= ?sd "1994-01-01")]
          [(< ?sd "1995-01-01")]
-         [?l :lineitem/quantity ?lq]] $ ?pk ?sk) ?sumq]
+         [?l :lineitem/quantity ?lq]] $) [[?pk ?sk ?sumq]]]
     [(* 0.5 ?sumq) ?thr]
     [(> ?avail ?thr)]])
 

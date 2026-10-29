@@ -13,7 +13,7 @@ $ dtlv help
 Usage: dtlv [options] [command] [arguments]
 
 Commands:
-  admin Inspect databases on a remote server
+  admin Administer databases on a remote server
   copy  Copy a database, regardless of whether it is now in use
   drop  Drop or clear a database
   dump  Dump the content of a database to standard output
@@ -57,6 +57,8 @@ never echoed. Select named databases with repeatable `--database`, or use
 ```sh
 dtlv admin --uri-env DATALEVIN_URI status --database orders --database users
 dtlv admin --timeout-ms 5000 status --all-databases
+dtlv admin wal-gc --database orders --dry-run
+dtlv admin wal-gc --all-databases
 ```
 
 The URI variable defaults to `DATALEVIN_URI`. Database names are normalized and
@@ -64,7 +66,8 @@ deduplicated in the supplied order. `-a/--all` retains its existing sub-database
 meaning and is not an admin selector. `--timeout-ms` defaults to 60000 and bounds
 authentication and each request individually; the entire sweep can take longer.
 
-Each stdout line is an EDN map containing `:db-name`, `:operation :status`, and
+Each stdout line is an EDN map containing `:db-name`, `:operation` (`:status` or
+`:wal-gc`), and
 either a native `:result` or an `:error` map. Closed databases have `:open? false`
 and nil `:stat`, `:replica`, and `:watermarks`. Server filesystem paths are
 removed and credentials in nested URIs are redacted. Diagnostics go to stderr.
@@ -77,10 +80,25 @@ Named status needs only database view permission. `--all-databases` additionally
 needs untargeted database create permission and server view permission. This
 selection describes the contacted node; it does not discover HA members.
 
+WAL GC requires database alter permission. Its dry run selects the same targets
+as apply without deleting files. Explicit GC deletes every floor-safe segment
+and ignores retention age/byte caps. A closed target may be opened for GC or its
+dry run, and stays open afterwards; the CLI never force-closes databases.
+Capability discovery must succeed before maintenance is sent. Existing-only
+opens and execution preserve the discovered catalog identity across reconnects;
+an unsupported server stops the sweep before sending maintenance to it.
+
+GC failures remain native `:result` maps, including partial deletions, per-file
+errors, maintenance contention, and final-report or directory-sync failures.
+Directory sync can be unsupported on Windows after files have been deleted;
+that still exits `1`. Only the `:wal-disabled` and `:rollback` skip reasons map
+an `:ok? false` result to exit `0`. Other determinate failures continue to later
+targets; a timeout or indeterminate transport failure stops further mutations.
+
 An operator can schedule status collection with cron using a protected URI
 environment and ordinary output redirection. Scheduling and log retention remain
-with that script. The initial admin release implements status; guarded WAL GC
-and standalone backups follow their shared maintenance prerequisites.
+with that script. Status and guarded WAL GC are implemented. Standalone backups
+follow their shared copy hardening prerequisites.
 
 ## Interactive Console
 

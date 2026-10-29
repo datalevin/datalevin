@@ -19,8 +19,7 @@
    [datalevin.read-encode :as enc]
    [datalevin.scan :as scan]
    [datalevin.kv.snapshot :refer [list-snapshot-entries]]
-   [datalevin.kv.retention :refer [delete-txlog-segment!
-                                   gc-txlog-segments-local!
+   [datalevin.kv.retention :as retention :refer [gc-txlog-segments-local!
                                    txlog-log-dbi-drop!
                                    txlog-log-dbi-registration!
                                    txlog-retention-state-local
@@ -233,25 +232,11 @@
   ([db]
    (gc-txlog-segments! db nil))
   ([db retain-floor-lsn]
-   (if-let [before (txlog-retention-state-map db retain-floor-lsn true)]
-     (let [targets (:gc-target-segments before)
-           deleted (mapv delete-txlog-segment! targets)
-           deleted-bytes (reduce (fn [acc {:keys [bytes]}]
-                                   (+ ^long acc ^long bytes))
-                                 0 targets)
-           _ (when-let [state (txlog/state db)]
-               (txlog/note-gc-deleted-bytes! state deleted-bytes))
-           after (txlog-retention-state-map db retain-floor-lsn false)]
-       {:ok? true
-        :deleted-count (count deleted)
-        :deleted-bytes deleted-bytes
-        :deleted-segment-ids (mapv :segment-id targets)
-        :deleted-segments deleted
-        :operator-retain-floor-lsn
-        (get-in before [:floors :operator-retain-floor-lsn])
-        :before (dissoc before :gc-target-segments)
-        :after (dissoc after :gc-target-segments)})
-     (i/gc-txlog-segments! db retain-floor-lsn))))
+   (if (some? (i/kv-info db))
+     (retention/gc-txlog-segments-local! db retain-floor-lsn)
+     (i/gc-txlog-segments! db retain-floor-lsn)))
+  ([db retain-floor-lsn opts]
+   (gc-txlog-segments! db (assoc opts :retain-floor-lsn retain-floor-lsn))))
 
 (defn txlog-update-snapshot-floor!
   ([db snapshot-lsn]

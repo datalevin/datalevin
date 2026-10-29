@@ -1640,10 +1640,27 @@
             (update-db server db-name #(assoc % :ha-write-admission-lock lock))
             lock)))))
 
+(defn- check-maintenance-identity!
+  [db-name catalog {:keys [expected-db-id expected-db-type existing-only?] :as message}]
+  (when (or existing-only? (contains? message :admin-required-capabilities)
+            (contains? message :expected-db-id)
+            (contains? message :expected-db-type))
+    (when-not (:db/id catalog)
+      (raise "Maintenance database does not exist"
+             {:error :admin/database-not-found :db-name db-name}))
+    (when-not (and (integer? expected-db-id)
+                   (#{:datalog :key-value} expected-db-type)
+                   (= expected-db-id (:db/id catalog))
+                   (= expected-db-type (:database/type catalog)))
+      (raise "Database identity changed before maintenance"
+             {:error :admin/identity-mismatch :db-name db-name
+              :expected {:db-id expected-db-id :db-type expected-db-type}
+              :actual {:db-id (:db/id catalog) :db-type (:database/type catalog)}}))))
+
 (defn- open-server-store
   "Open a store. NB. stores are left open"
   [^Server server ^SelectionKey skey
-   {:keys [db-name schema opts return-db-info? respond?]
+   {:keys [db-name schema opts return-db-info? respond? existing-only?] :as message
     :or   {respond? true}} requested-db-type]
   (wrap-error
     (let [{:keys [client-id]}       @(.attachment skey)
@@ -1651,7 +1668,12 @@
                   permissions]}     (get-client server client-id)
           db-name                   (u/lisp-case db-name)
           existing-db?              (db-exists? server db-name)
+          guarded?                  (or existing-only? (contains? message :admin-required-capabilities)
+                                        (contains? message :expected-db-id)
+                                        (contains? message :expected-db-type))
           sys-conn                  (.-sys-conn server)]
+      (when existing-only?
+        (check-maintenance-identity! db-name (auth/pull-db sys-conn db-name) message))
       (log/debug "open" db-name "that exist?" existing-db?)
       (wrap-permission
           (if existing-db? ::view ::create)
@@ -1664,7 +1686,15 @@
             server
             db-name
             (fn []
-              (let [dir              (db-dir (.-root server) db-name)
+              (let [_ (when guarded?
+                        (check-maintenance-identity! db-name (auth/pull-db sys-conn db-name) message))
+                    _ (when existing-only?
+                        (when-not (auth/has-permission? ::view ::database
+                                                       (db-eid sys-conn db-name)
+                                                       (:permissions (get-client server client-id)))
+                          (raise "Don't have permission to open the maintenance database"
+                                 {:error :admin/permission-denied :db-name db-name})))
+                    dir              (db-dir (.-root server) db-name)
                     open-opts        opts
                     opts             (replica/local-open-opts open-opts)
                     existing-db-now? (db-exists? server db-name)
@@ -1714,6 +1744,8 @@
                     datalog?         (instance? Store store)
                     consensus-ha?    (and datalog?
                                           (some? (*consensus-ha-opts-fn* store)))]
+                (when guarded?
+                  (check-maintenance-identity! db-name (auth/pull-db sys-conn db-name) message))
                 (update-client server client-id
                                #(cond-> %
                                   true     (update :stores assoc db-name
@@ -2061,6 +2093,38 @@
   (locking (db-open-lock server db-name)
     (with-db-runtime-store-swap server db-name f)))
 
+(defn- with-maintenance-source
+  "Validate the catalog and source under lifecycle/read access. Release lifecycle
+  access before invoking work that can wait for the database writer slot."
+  [^Server server db-name message authorize work]
+  (let [^ReentrantReadWriteLock lock (get-runtime-access-lock server db-name)
+        read-lock (.readLock lock)
+        acquired? (volatile! false)
+        source (locking (db-open-lock server db-name)
+                 (.lock read-lock)
+                 (vreset! acquired? true)
+                 (try
+                   (let [catalog (auth/pull-db (.-sys-conn server) db-name)]
+                     (when-not (:db/id catalog)
+                       (if (or (:expected-db-id message) (:expected-db-type message)
+                               (:admin-required-capabilities message))
+                         (raise "Maintenance database does not exist"
+                                {:error :admin/database-not-found :db-name db-name})
+                         (raise "Database is closed"
+                                {:type :reopen :db-name db-name :db-type "kv"})))
+                     (when (authorize catalog)
+                       (check-maintenance-identity! db-name catalog message)
+                       (or (get-store server db-name)
+                           (raise "Maintenance database is closed"
+                                  {:type :reopen :db-name db-name
+                                   :db-type (if (= :datalog (:database/type catalog)) "datalog" "kv")}))))
+                   (catch Throwable t
+                     (.unlock read-lock)
+                     (vreset! acquired? false)
+                     (throw t))))]
+    (try (when source (work source))
+         (finally (when @acquired? (.unlock read-lock))))))
+
 (defn- get-kv-store
   [server db-name]
   (let [s (get-store server db-name)]
@@ -2264,6 +2328,7 @@
      :vector-index #'vector-index
      :with-db-lifecycle-access #'with-db-lifecycle-access
      :with-db-lifecycle-write-access #'with-db-lifecycle-write-access
+     :with-maintenance-source #'with-maintenance-source
      :with-db-runtime-store-read-access #'with-db-runtime-store-read-access
      :with-index-write-admission #'with-index-write-admission
      :write-message #'write-message

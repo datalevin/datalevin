@@ -30,7 +30,7 @@
    [datalevin.prepared Request]
    [java.util.concurrent ConcurrentHashMap TimeUnit]
    [java.util.concurrent.locks ReentrantLock]
-   [java.util.concurrent.atomic AtomicBoolean AtomicInteger AtomicReference]
+   [java.util.concurrent.atomic AtomicBoolean AtomicInteger AtomicLong AtomicReference]
    [java.net InetSocketAddress StandardSocketOptions URI]))
 
 (defprotocol ^:no-doc IConnection
@@ -51,6 +51,7 @@
 (deftype ^:no-doc ClientState [^AtomicReference readers
                                ^AtomicReference read-caches
                                ^AtomicReference read-cache-options
+                               ^AtomicReference admin-support
                                ^ConcurrentHashMap read-endpoints
                                ^AtomicReference endpoint
                                ^AtomicBoolean closed
@@ -75,7 +76,7 @@
 
 (defn- new-client-state
   []
-  (let [state (ClientState. (AtomicReference.) (AtomicReference.) (AtomicReference.)
+  (let [state (ClientState. (AtomicReference.) (AtomicReference.) (AtomicReference.) (AtomicReference.)
                             (ConcurrentHashMap.)
                             (AtomicReference.) (AtomicBoolean. false)
                             (AtomicReference.) (ConcurrentHashMap.) (AtomicReference.))]
@@ -164,6 +165,7 @@
   (locking client-state-refs
     (doseq [^ClientState state (.keySet client-state-refs)]
       (.set ^AtomicReference (.-readers state) nil)
+      (.set ^AtomicReference (.-admin-support state) nil)
       (when-let [caches (.get ^AtomicReference (.-read-caches state))]
         (.clear ^ConcurrentHashMap caches))
       (.clear ^ConcurrentHashMap (.-read-endpoints state))
@@ -234,6 +236,8 @@
          disconnect-client!
          request-budget
          call-with-request
+         ensure-admin-support!
+         admin-support-for-pool?
          disconnect)
 
 (defn- clear-conn-wire-opts!
@@ -577,7 +581,8 @@
                                   ^ConcurrentHashMap owners
                                   ^ThreadLocal preferred
                                   ^AtomicBoolean closed?
-                                  ^AtomicInteger waiters]
+                                  ^AtomicInteger waiters
+                                  ^AtomicLong generation]
   IConnectionPool
   (get-connection [this]
     (borrow-connection this true))
@@ -664,6 +669,7 @@
   (let [^AtomicReference reference (.-connection slot)
         ^ConcurrentHashMap owners (.-owners pool)]
     (when-let [previous (.get reference)]
+      (.incrementAndGet ^AtomicLong (.-generation pool))
       (.remove owners previous))
     (.put owners conn slot)
     (.set reference conn))
@@ -721,7 +727,7 @@
                                                  (AtomicReference.)
                                                  (AtomicBoolean. false))))
                       (ConcurrentHashMap.) (ThreadLocal.) (AtomicBoolean. false)
-                      (AtomicInteger. 0))))
+                      (AtomicInteger. 0) (AtomicLong. 0))))
 
 (defn- authenticate
   "Send an authenticate message to server, and wait to receive the response.
@@ -981,6 +987,7 @@
         (check-pool-open! observed-pool)
         (set! (.-id ^Client client) client-id)
         (set! (.-pool ^Client client) replacement)
+        (.set ^AtomicReference (.-admin-support state) nil)
         (when-let [^Set resources (get-in attempt [:transport-owner :resources])]
           (.clear resources))
         true)))
@@ -991,6 +998,7 @@
           read?    (and (not (:writing? req)) (cmd/read-only? (:type req)))]
       (loop [busy-delay-ms 25]
         (cr/check! :request)
+        (when (:admin-required-capabilities req) (ensure-admin-support! client req))
         (let [^ConnectionPool pool' (.-pool ^Client client)
               ;; A read can retry after EOF; mutations still probe idle
               ;; sockets before sending anything with an ambiguous outcome.
@@ -1006,7 +1014,9 @@
                                        (when (identical? (.-pool ^Client client) pool')
                                          (throw e))
                                        nil))
-              response             (when conn
+              response             (when (and conn
+                                              (or (nil? (:admin-required-capabilities req))
+                                                  (admin-support-for-pool? client req pool')))
                                      (try
                                        (send-n-receive conn req)
                                        (catch Exception e
@@ -1059,14 +1069,20 @@
 
                                      :reopen
                                      (let [{:keys [db-name db-type]} res]
-                                       (open-database client db-name db-type)
+                                       (if (:admin-required-capabilities req)
+                                         (open-database client db-name db-type nil nil false
+                                                        (assoc (select-keys req
+                                                                [:expected-db-id :expected-db-type
+                                                                 :admin-required-capabilities])
+                                                               :existing-only? true))
+                                         (open-database client db-name db-type))
                                        nil)
 
                                      res)]
           (when (= :command-complete (:type res)) (cr/response! req res))
           ;; The deadline limits retries, not an already completed response.
           (cond
-            (retryable-server-busy? res')
+            (and (not (:admin-required-capabilities req)) (retryable-server-busy? res'))
             (do
               (vreset! success? false)
               (recur (wait-server-busy-retry busy-delay-ms)))
@@ -1319,6 +1335,7 @@
                (.set ^AtomicReference (.-readers state) nil)
                ;; Derived clients share this map with other live clients.
                (.set ^AtomicReference (.-read-caches state) nil)
+               (.set ^AtomicReference (.-admin-support state) nil)
                (.remove index-open-options client)
                (.remove ha-retry-disabled-clients client)
                (.set ^AtomicReference (.-endpoint state) nil)
@@ -1386,6 +1403,56 @@
   [client req f]
   (with-request client req (f)))
 
+(defn- admin-session
+  [client]
+  (when (instance? Client client)
+    (let [pool (get-pool client)]
+      [(.-host ^Client client) (.-port ^Client client) (get-id client)
+       (when (instance? ConnectionPool pool) (.get ^AtomicLong (.-generation ^ConnectionPool pool)))
+       pool])))
+
+(defn- remember-admin-support!
+  [client session result]
+  (when (and session (= session (admin-session client))
+             (set? (:admin-capabilities result)))
+    (.set ^AtomicReference (.-admin-support (client-state client))
+          {:session session :capabilities (:admin-capabilities result)})))
+
+(defn- admin-support-for-pool?
+  [client req pool]
+  (let [{:keys [session capabilities]} (.get ^AtomicReference
+                                           (.-admin-support (client-state client)))]
+    (and session (identical? pool (peek session))
+         (= session (admin-session client))
+         (every? #(contains? capabilities %) (:admin-required-capabilities req)))))
+
+(defn- ensure-admin-support!
+  [client req]
+  (loop []
+    (if (and (instance? Client client)
+             (admin-support-for-pool? client req (get-pool client)))
+      true
+      (let [session (admin-session client)
+            db-name (or (:db-name req) (first (:args req)))
+            response (request client {:type :admin-status :args [db-name {:runtime? false}]
+                                      :writing? false})
+            result (:result response)]
+        (when (and (= :error-response (:type response))
+                   (not (s/includes? (or (:message response) "")
+                                     "Unknown message type :admin-status")))
+          (raise (:message response)
+                 {:error (get-in response [:err-data :error])
+                  :err-data (:err-data response) :server-message (:message response)}))
+        (when-not (and (= :command-complete (:type response))
+                       (set? (:admin-capabilities result))
+                       (every? #(contains? (:admin-capabilities result) %)
+                               (:admin-required-capabilities req)))
+          (raise "Server does not support the required administration capabilities"
+                 {:error :admin/unsupported-server
+                  :required (:admin-required-capabilities req)}))
+        (remember-admin-support! client session result)
+        (if (and session (not= session (admin-session client))) (recur) true)))))
+
 (defn open-database
   "Open a database on server. `db-type` can be \"datalog\", \"kv\",
   \"engine\", or \"index\""
@@ -1396,6 +1463,8 @@
   ([client db-name db-type schema opts]
    (open-database client db-name db-type schema opts false))
   ([client db-name db-type schema opts return-db-info?]
+   (open-database client db-name db-type schema opts return-db-info? nil))
+  ([client db-name db-type schema opts return-db-info? maintenance]
    (let [cache-options (merge (.get ^AtomicReference
                                     (.-read-cache-options (client-state client)))
                               (:client-opts opts))
@@ -1406,9 +1475,9 @@
          opts (dissoc (or opts (get (.get index-open-options client)
                                     [db-name db-type]))
                       :runtime-opts :client-opts)
-         {:keys [type message result]}
+         {:keys [type message result err-data]}
          (request client
-                  (cond
+                  (merge maintenance (cond
                     (= db-type c/db-store-kv)
                     {:type :open-kv :db-name db-name :opts opts}
                     (= db-type c/db-store-datalog)
@@ -1419,10 +1488,12 @@
                     :else
                     {:type (if (= db-type "index")
                              :new-vector-index :new-search-engine)
-                     :args [db-name opts]}))]
+                     :args [db-name opts]})))]
      (when (= type :error-response)
        (raise "Unable to open database:" db-name " " message
-                {:db-type db-type}))
+              (cond-> {:db-type db-type}
+                maintenance (assoc :err-data err-data :error (:error err-data)
+                                   :server-message message))))
      (when (#{c/db-store-kv c/db-store-datalog} db-type)
        (.putIfAbsent (client-read-caches client) db-name
                      (read-cache/read-cache
@@ -2765,13 +2836,17 @@
   (normal-request client :list-databases-in-use []))
 
 (defn ^:no-doc endpoint-request
-  "Read from this client's endpoint, without HA discovery or read routing."
-  [client call args]
-  (let [req {:type call :args args :writing? false}
-        {:keys [type message result err-data]} (request client req)]
-    (if (= type :error-response)
-      (raise-normal-request-error req message err-data nil)
-      result)))
+  "Use this client's endpoint, without HA discovery or routing."
+  ([client call args]
+   (endpoint-request client {:type call :args args :writing? false}))
+  ([client req]
+   (let [session (admin-session client)
+         {:keys [type message result err-data]} (request client req)]
+     (if (= type :error-response)
+       (raise-normal-request-error req message err-data nil)
+       (do
+         (when (= :admin-status (:type req)) (remember-admin-support! client session result))
+         result)))))
 
 (defn admin-status
   "Inspect a named database on the contacted endpoint without opening it.
@@ -2779,6 +2854,23 @@
   ([client db-name] (admin-status client db-name {}))
   ([client db-name opts]
    (endpoint-request client :admin-status [(u/lisp-case db-name) opts])))
+
+(defn admin-gc!
+  "Collect WAL segments on the contacted endpoint, preserving discovered catalog
+  identity through retries and existing-only opens. Capability discovery has its
+  own initial budget; session rechecks share the maintenance request's budget."
+  [client {:keys [db-name db-id db-type]} {:keys [dry-run?] :as opts}]
+  (let [req {:type :gc-txlog-segments! :args [db-name nil opts] :writing? false
+             :expected-db-id db-id :expected-db-type db-type
+             :admin-required-capabilities (cond-> #{:guarded-maintenance}
+                                            dry-run? (conj :wal-gc-dry-run))}]
+    (ensure-admin-support! client req)
+    (call-with-request
+      client req
+      #(try (endpoint-request client req)
+            (catch Exception e
+              (throw (ex-info (ex-message e)
+                              (assoc (ex-data e) :admin/maintenance-sent? (cr/exchanged?)) e)))))))
 
 (defn assign-role
   "Assign a role to a user. "

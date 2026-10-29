@@ -205,7 +205,7 @@
         "Usage: dtlv [options] [command] [arguments]"
         ""
         "Commands:"
-        "  admin Inspect databases on a remote server"
+        "  admin Administer databases on a remote server"
         "  copy  Copy a database, regardless of whether it is now in use"
         "  drop  Drop or clear a database"
         "  dump  Dump the content of a database to standard output"
@@ -306,6 +306,8 @@
                                              \newline
                                              (usage summary))
                           :exit-code (when (= command "admin") 2)}
+      (and (:dry-run options) (not= command "admin"))
+      {:exit-message "--dry-run is only supported by admin wal-gc" :exit-code 2}
       (= command "admin") (admin/validate-options options (rest arguments))
       (commands command) {:command   command
                           :options   options

@@ -764,10 +764,10 @@
   *async-secondary-index-retry-max-ms* 60000)
 
 (def ^{:dynamic true
-       :doc     "Minimum interval between remote DB freshness checks in `db?`.
-When positive, repeated `db?` calls within this window reuse the previous
-freshness check and skip the remote metadata round trip. Also supplies the
-default freshness interval for client KV and schema read caches.
+       :doc     "Minimum interval between remote DB freshness checks.
+When positive, cached reads and repeated `db?` calls within this window reuse
+the previous freshness check and skip the remote metadata round trip. Also
+supplies the default freshness interval for client KV and schema read caches.
 Set to 0 to validate every cached read against the server."}
   *remote-db-last-modified-check-interval-ms* 0)
 

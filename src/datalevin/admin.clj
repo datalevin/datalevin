@@ -20,25 +20,33 @@
     :assoc-fn (fn [options key value]
                 (update options key (fnil conj []) (u/lisp-case value)))
     :validate [#(not (str/blank? %)) "Must name a database"]]
-   [nil "--all-databases" "Select the contacted node's complete database catalog"]])
+   [nil "--all-databases" "Select the contacted node's complete database catalog"]
+   [nil "--dry-run" "Plan WAL GC without deleting segments (wal-gc only)"]])
 
 (def help
-  "Command admin - inspect databases on a remote server.
+  "Command admin - administer databases on the contacted server.
 
 Usage: dtlv admin [options] status (--all-databases | --database NAME ...)
+       dtlv admin [options] wal-gc (--all-databases | --database NAME ...) [--dry-run]
 
 Options:
   --uri-env VAR       Server URI environment variable (default DATALEVIN_URI)
   --timeout-ms MS     Per-request timeout in milliseconds (default 60000)
   --database NAME     Select a database; repeatable, normalized and deduplicated
   --all-databases     Select the contacted node's catalog, including closed DBs
+  --dry-run          Plan WAL GC without unlinking files (wal-gc only)
   -h, --help          Show this help
 
 Status does not open closed databases. Named status requires database view
-permission. Global enumeration also requires database create and server view.
+permission. WAL GC requires database alter permission. Global enumeration also
+requires database create and server view. WAL GC opens closed targets and leaves
+them open, including in dry runs; it never closes other clients' databases.
+Explicit GC deletes every floor-safe segment, ignoring retention age/byte caps.
+Partial failures retain native results and exit 1. Directory sync may fail or be
+unsupported (including Windows) after deletion; such a result also exits 1.
 Results are one EDN map per target. Diagnostics go to stderr.
 Exit codes: 0 success; 1 target failure; 2 invalid invocation or discovery failure.
-Backup and WAL GC will be added after their shared maintenance prerequisites.
+WAL-disabled and rollback GC skips exit 0. Standalone backup is not yet available.
 
 Example:
   dtlv admin --uri-env DATALEVIN_URI status --database orders --database users")
@@ -47,7 +55,10 @@ Example:
   [options arguments]
   (let [names (vec (distinct (:database options)))
         error (cond
-                (not= ["status"] (vec arguments)) "Expected the admin status subcommand"
+                (not (and (= 1 (count arguments)) (#{"status" "wal-gc"} (first arguments))))
+                "Expected the admin status or wal-gc subcommand"
+                (and (:dry-run options) (not= "wal-gc" (first arguments)))
+                "--dry-run is only supported by wal-gc"
                 (:all options) "--all selects sub-databases; use --all-databases for admin"
                 (= (boolean (:all-databases options)) (boolean (seq names)))
                 "Select exactly one of --all-databases or --database NAME"
@@ -125,12 +136,13 @@ Example:
             causes))))
 
 (defn- read-status
-  [request connection {:keys [db-name db-id db-type] :as target}]
+  ([request connection target] (read-status request connection target true))
+  ([request connection {:keys [db-name db-id db-type] :as target} runtime?]
   (when (and (contains? target :db-id) (nil? db-id))
     (throw (ex-info "Database disappeared during discovery"
                     {:error :admin/database-not-found :db-name db-name})))
   (let [result (try
-                 (request connection :admin-status [db-name {:runtime? true}])
+                 (request connection :admin-status [db-name {:runtime? runtime?}])
                  (catch Exception e
                    (if (str/includes? (or (:server-message (ex-data e)) (ex-message e) "")
                                       "Unknown message type :admin-status")
@@ -148,7 +160,7 @@ Example:
       (throw (ex-info "Database identity changed during discovery"
                       {:error :admin/identity-mismatch :expected target
                        :actual (select-keys result [:db-name :db-type :db-id])})))
-    result))
+    result)))
 
 (defn- sweep
   [request connection targets emit]
@@ -166,14 +178,57 @@ Example:
           (recur (next targets) (or failed? (contains? outcome :error)))))
       (if failed? 1 0))))
 
+(defn- require-gc-support!
+  [discovery dry-run?]
+  (let [required (cond-> #{:guarded-maintenance} dry-run? (conj :wal-gc-dry-run))]
+    (when-not (every? #(contains? (:admin-capabilities discovery) %) required)
+      (throw (ex-info "Server does not support guarded WAL GC"
+                      {:error :admin/unsupported-server :required required})))))
+
+(defn- gc-success? [result]
+  (or (true? (:ok? result))
+      (and (false? (:ok? result)) (#{:wal-disabled :rollback} (:reason result)))))
+
+(defn- gc-sweep
+  [request maintenance connection targets options emit]
+  (loop [targets (seq targets) failed? false attempted? false]
+    (if-let [target (first targets)]
+      (let [sent? (volatile! false)
+            outcome
+            (try
+              (let [discovery (read-status request connection target false)
+                    _ (require-gc-support! discovery (:dry-run options))
+                    result (maintenance connection
+                                        (select-keys discovery [:db-name :db-id :db-type])
+                                        {:dry-run? (boolean (:dry-run options))})]
+                (vreset! sent? true)
+                (when-not (and (map? result) (boolean? (:ok? result)))
+                  (throw (ex-info "Invalid WAL GC result" {:error :admin/invalid-result})))
+                {:result result})
+              (catch Exception e
+                (when (:admin/maintenance-sent? (ex-data e)) (vreset! sent? true))
+                {:error {:message (ex-message e) :data (ex-data e)}
+                 :stop? (terminal-error? e)
+                 :unsupported? (= :admin/unsupported-server (:error (ex-data e)))}))
+            attempted? (or attempted? @sent?)]
+        (emit (merge {:db-name (:db-name target) :operation :wal-gc}
+                     (select-keys outcome [:result :error])))
+        (if (:stop? outcome)
+          (if (and (:unsupported? outcome) (not attempted?)) 2 1)
+          (recur (next targets)
+                 (or failed? (:error outcome) (not (gc-success? (:result outcome))))
+                 attempted?)))
+      (if failed? 1 0))))
+
 (defn run!
   "Execute an admin sweep, returning an exit code. Dependencies are injectable
   for transport, output and environment tests; normal calls use the real client."
   ([options arguments] (run! options arguments {}))
   ([options arguments dependencies]
-   (let [{:keys [getenv connect disconnect request emit diagnostic]}
+   (let [{:keys [getenv connect disconnect request maintenance emit diagnostic]}
          (merge {:getenv u/env :connect client/new-client
                  :disconnect client/close-client :request client/endpoint-request
+                 :maintenance client/admin-gc!
                  :emit print-result :diagnostic #(binding [*out* *err*] (println %))}
                 dependencies)
          validation (validate-options options arguments)]
@@ -184,7 +239,7 @@ Example:
          (if (str/blank? uri)
            (do (diagnostic "The server URI environment variable is missing or blank") 2)
            (let [connection (try
-                              (connect uri {:time-out (or (:timeout-ms options) 60000)})
+                              (connect uri {:pool-size 1 :time-out (or (:timeout-ms options) 60000)})
                               (catch Exception _ nil))]
              (if-not connection
                (do (diagnostic "Unable to connect or authenticate to the server") 2)
@@ -194,7 +249,9 @@ Example:
                                    (all-targets request connection)
                                    (mapv #(hash-map :db-name %) (:database options)))]
                      (vreset! started? true)
-                     (sweep request connection targets #(emit (sanitize uri %))))
+                     (if (= "wal-gc" (first arguments))
+                       (gc-sweep request maintenance connection targets options #(emit (sanitize uri %)))
+                       (sweep request connection targets #(emit (sanitize uri %)))))
                    (catch Exception e
                      (diagnostic (str "Admin status failed: "
                                       (safe-string uri (or (ex-message e) "Error"))))

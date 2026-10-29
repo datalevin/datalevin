@@ -36,6 +36,9 @@
                 ["admin" "status" "--database" " "]
                 ["admin" "status" "--database" "one" "--timeout-ms" "0"]
                 ["admin" "status" "--database" "one" "--timeout-ms" "no"]
+                ["admin" "status" "--database" "one" "--dry-run"]
+                ["--dry-run" "--dir" "/tmp/example" "drop" "values"]
+                ["--dry-run" "--dir" "/tmp/example" "copy" "/tmp/destination"]
                 ["admin" "backup" "--database" "one" "dest"]
                 ["admin" "status" "--all"]]]
     (testing (pr-str args)
@@ -68,7 +71,7 @@
     (is (= ["missing" "good"] (mapv :db-name (:results result))))
     (is (get-in result [:results 0 :error]))
     (is (= 2 (get-in result [:results 1 :result :db-id])))
-    (is (= [:connect {:time-out 25}] (first (:calls result))))
+    (is (= [:connect {:pool-size 1 :time-out 25}] (first (:calls result))))
     (is (= 1 (:closed result)))))
 
 (deftest transport-and-unsupported-servers-stop-the-sweep
@@ -120,3 +123,93 @@
     (is (= 1 (:db-id (client/admin-status transport "Orders_DB" {:runtime? false}))))
     (is (= [{:type :admin-status :args ["orders-db" {:runtime? false}] :writing? false}]
            @requests))))
+
+(defn- run-gc [options request maintenance]
+  (let [results (atom []) diagnostics (atom [])
+        exit (admin/run! options ["wal-gc"]
+                         {:getenv (constantly "dtlv://user:secret@localhost")
+                          :connect (fn [& _] :client) :disconnect (fn [_])
+                          :request (fn [_ op args] (request op args))
+                          :maintenance maintenance :emit #(swap! results conj %)
+                          :diagnostic #(swap! diagnostics conj %)})]
+    {:exit exit :results @results :diagnostics @diagnostics}))
+
+(defn- supported [name]
+  (assoc (status name 1) :admin-capabilities #{:guarded-maintenance :wal-gc-dry-run}))
+
+(deftest wal-gc-validates-cli-and-requires-capabilities-for-both-selectors
+  (is (= "admin" (:command (main/validate-args ["admin" "wal-gc" "--database" "one" "--dry-run"]))))
+  (doseq [all? [false true]]
+    (let [sent (atom 0)
+          result (run-gc (if all? {:all-databases true :dry-run true} {:database ["one"] :dry-run true})
+                         (fn [op _]
+                           (case op
+                             :list-databases ["one"] :list-databases-in-use []
+                             :query-system [["one" :key-value 1]]
+                             :admin-status (status "one" 1)))
+                         (fn [& _] (swap! sent inc)))]
+      (is (= 2 (:exit result)))
+      (is (zero? @sent))
+      (is (= :admin/unsupported-server (get-in result [:results 0 :error :data :error]))))))
+
+(deftest wal-gc-preserves-partial-results-and-continues
+  (let [native {:ok? false :deleted-count 2 :deleted-bytes 100 :failed-count 1
+                :segment-results [{:segment-id 1 :deleted? true :bytes 100 :path "/server/txn-1"}]
+                :errors [{:error :gc/delete-failed :message "unlink failed" :data {}}]
+                :after nil :durability {:status :synced}}
+        calls (atom [])
+        result (run-gc {:database ["partial" "good"]}
+                       (fn [op [name opts]]
+                         (is (= :admin-status op))
+                         (is (= {:runtime? false} opts))
+                         (supported name))
+                       (fn [_ target opts]
+                         (swap! calls conj [target opts])
+                         (if (= "partial" (:db-name target)) native {:ok? true})))]
+    (is (= 1 (:exit result)))
+    (is (= ["partial" "good"] (mapv :db-name (:results result))))
+    (is (= [:wal-gc :wal-gc] (mapv :operation (:results result))))
+    (is (= (admin/sanitize nil native) (get-in result [:results 0 :result])))
+    (is (= [{:db-name "partial" :db-type :key-value :db-id 1}
+            {:db-name "good" :db-type :key-value :db-id 1}]
+           (mapv first @calls)))))
+
+(deftest gc-exit-mapping-preserves-native-skips-and-failures
+  (doseq [[reason exit] [[:wal-disabled 0] [:rollback 0] [:maintenance-busy 1]
+                         [:directory-sync-unsupported 1] [:report-failed 1]]]
+    (let [native {:ok? false :skipped? true :reason reason}
+          result (run-gc {:database ["one"]}
+                         (fn [_ [name]] (supported name))
+                         (fn [& _] native))]
+      (is (= exit (:exit result)))
+      (is (= native (get-in result [:results 0 :result]))))))
+
+(deftest unsupported-after-earlier-maintenance-preserves-results-and-exits-one
+  (let [sent (atom [])
+        result (run-gc {:database ["first" "older" "later"]}
+                       (fn [_ [name]] (if (= name "older") (status name 1) (supported name)))
+                       (fn [_ target _] (swap! sent conj (:db-name target)) {:ok? true}))]
+    (is (= 1 (:exit result)))
+    (is (= ["first"] @sent))
+    (is (= ["first" "older"] (mapv :db-name (:results result))))))
+
+(deftest support-loss-before-the-first-send-exits-two
+  (let [result (run-gc {:database ["first" "later"]}
+                       (fn [_ [name]] (supported name))
+                       (fn [& _]
+                         (throw (ex-info "Server changed after discovery"
+                                         {:error :admin/unsupported-server
+                                          :admin/maintenance-sent? false}))))]
+    (is (= 2 (:exit result)))
+    (is (= 1 (count (:results result))))))
+
+(deftest indeterminate-gc-never-starts-a-later-mutation
+  (let [sent (atom [])
+        result (run-gc {:database ["first" "later"]}
+                       (fn [_ [name]] (supported name))
+                       (fn [_ target _]
+                         (swap! sent conj (:db-name target))
+                         (throw (java.net.SocketTimeoutException. "Reply lost"))))]
+    (is (= 1 (:exit result)))
+    (is (= ["first"] @sent))
+    (is (= 1 (count (:results result))))))

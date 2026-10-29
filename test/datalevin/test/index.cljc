@@ -14,19 +14,23 @@
         db  (-> (d/empty-db dir)
                 (d/db-with [{:db/id 1 :path [1 2]}
                             {:db/id 2 :path [1 2 3]}])) ]
+    ;; Generic :data index keys use their serialized representation. Warming
+    ;; the vector lookup must not make an equal list match its storage key.
     (are [value result] (= result (mapv :e (d/datoms db :ave :path value)))
       [1]                 []
       [1 1]               []
       [1 2]               [1]
-      (list 1 2)          [1]
-      (butlast [1 2 3])   [1]
+      (list 1 2)          []
+      (butlast [1 2 3])   []
       [1 3]               []
       [1 2 2]             []
       [1 2 3]             [2]
-      (list 1 2 3)        [2]
-      (butlast [1 2 3 4]) [2]
+      (list 1 2 3)        []
+      (butlast [1 2 3 4]) []
       [1 2 4]             []
-      [1 2 3 4]           [])
+      [1 2 3 4]           []
+      [1 2]               [1]
+      [1 2 3]             [2])
     (d/close-db db)
     (u/delete-files dir)))
 

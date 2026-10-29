@@ -1720,8 +1720,9 @@ set of keywords. See [[set-env-flags]] for their meanings."}
   list-snapshots kv/list-snapshots)
 
 (def ^{:arglists '([db]
-                   [db retain-floor-lsn])
-       :doc      "Run WAL segment GC. Optional `retain-floor-lsn` keeps records from that floor and newer."}
+                   [db retain-floor-lsn]
+                   [db retain-floor-lsn opts])
+       :doc      "Run explicit WAL segment GC, ignoring retention age/byte caps. Optional `retain-floor-lsn` keeps records from that floor and newer. Pass `{:dry-run? true}` as the second argument, or as `opts`, to select targets without deleting. Partial failures retain actual deletion counts, per-segment outcomes, errors, and directory-sync status."}
   gc-txlog-segments! kv/gc-txlog-segments!)
 
 (def ^{:arglists '([db dbi-name k]

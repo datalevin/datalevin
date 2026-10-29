@@ -298,8 +298,7 @@
            (if-let [cached (db/cache-get store k)]
              cached
              (let [res (run parsed-q inputs execute)]
-               (db/cache-put-if-current store token k res)
-               res)))
+               (db/cache-result store token k res))))
          (run parsed-q inputs execute))
        (run parsed-q inputs execute)))))
 

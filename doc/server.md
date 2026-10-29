@@ -11,8 +11,17 @@ or closed databases without opening them. The server URI comes from
 permission; global `--all-databases` also requires database create and server
 view permission. See [the CLI guide](dtlv.md#remote-administration) for output,
 timeouts, and exit codes. The read-only `:admin-status` endpoint also supports
-`{:runtime? false}` discovery and reports an empty `:admin-capabilities` set
-until guarded maintenance paths are implemented.
+`{:runtime? false}` discovery and advertises `:guarded-maintenance` and
+`:wal-gc-dry-run`. `dtlv admin wal-gc --database NAME [--dry-run]` requires that
+database's alter permission, checks its discovered identity, and uses an
+existing-only open if needed. Targets opened for maintenance stay open.
+Capabilities are checked per live client session/endpoint and rechecked after
+renewal or connection replacement. Standalone copy is not advertised yet.
+
+Dropped catalog database entities retain a small retired marker after their
+name/type and permissions are removed. Their IDs therefore cannot be reused
+by a replacement database, including after restart; maintenance never follows
+a replacement just because it has the same name and type.
 
 * Use option `--host` to specify the address that the server listens on. The
   default is `127.0.0.1`. Binding to a non-loopback address, such as

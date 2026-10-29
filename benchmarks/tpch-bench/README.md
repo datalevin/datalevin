@@ -152,8 +152,10 @@ patterns required care:
   in `:find`, so `(sum ?x)` can collapse duplicate values. Queries that sum a
   derived value add `:with` over the lineitem entity to preserve row
   multiplicity. Verified against SQLite.
-- **Correlated subqueries** (Q2, Q17, Q20) use correlated nested `(q ...)`
-  queries with scalar bindings.
+- **Grouped subqueries** (Q2, Q17, Q20) compute a relation once and join it by
+  part key, or part/supplier key. They restrict aggregation to eligible parts
+  and suppliers while retaining every relevant lineitem. Nested `q` calls
+  receive only the database; no outer row values are passed as scalar inputs.
 - **`GROUP BY ... HAVING`** subqueries (Q11, Q18) are expressed as nested
   grouped relations. Q18 applies its quantity threshold inside the nested
   query and returns the computed sum, so only qualifying orders cross into
@@ -196,6 +198,15 @@ The [Q1/Q18 follow-up on 1.2.10](../../doc/measurements/tpch-q1-q18-2026-10-28.m
 reduces entity sorting costs and compiles HAVING before filtering groups.
 SF1 paired medians improve from 7.03 to 5.78 seconds for Q1 and from 3.38 to
 2.58 seconds for Q18; all 22 queries still pass at SF0.1 and SF1.
+
+The [SF1 three-engine comparison](../../doc/measurements/tpch-engine-comparison-2026-10-28.md)
+checks all 22 queries on Datalevin, SQLite, and PostgreSQL, then records three
+fully consumed wall-time samples per query after warmup. Summed medians are
+28.42, 22.01, and 7.51 seconds respectively. Q1, Q13, Q21, Q7, and Q18 account
+for most of the gap to PostgreSQL. The report includes an interactive chart,
+raw samples, PostgreSQL plans, and replay scripts. Some SQL samples overlap
+other JVM work; small differences need confirmation. Its PostgreSQL wall-time
+protocol differs from the server-only EXPLAIN times emitted by `:pg-bench`.
 
 The raw CSVs (`datalevin_pass.csv`, `sqlite_pass.csv`, `postgres_pass.csv`) and
 `results.edn`-style manifests should be retained alongside any published table,

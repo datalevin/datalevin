@@ -19,12 +19,17 @@
     clojure.lang.PersistentQueue clojure.lang.MapEntry
     datalevin.utl.UniqueVectorSet})
 
+(defn immutable-collection?
+  "Recognize persistent value containers; their contents may still be mutable."
+  [x]
+  (contains? immutable-collection-types (class x)))
+
 (defn immutable-data?
   "Accept known immutable values, recursively checking contents and metadata."
   [x]
   (and (or (nil? x) (string? x) (keyword? x) (symbol? x) (boolean? x)
            (char? x) (uuid? x) (integer? x) (float? x) (decimal? x) (ratio? x)
-           (and (contains? immutable-collection-types (class x))
+           (and (immutable-collection? x)
                 (if (map? x)
                   (every? (fn [[k v]]
                             (and (immutable-data? k) (immutable-data? v))) x)

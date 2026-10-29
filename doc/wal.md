@@ -344,17 +344,38 @@ Lists available snapshots and metadata.
 Deletes old WAL segments that are safe to remove.
 
 ```clojure
-(d/gc-txlog-segments! kv)        ; normal GC
+(d/gc-txlog-segments! kv)        ; explicit GC of every floor-safe segment
 (d/gc-txlog-segments! kv 5000)   ; keep LSN >= 5000
+(d/gc-txlog-segments! kv {:dry-run? true}) ; plan without deleting
 ```
 Default WAL retention policy is:
 
   - :wal-retention-bytes = 8 GiB
   - :wal-retention-ms = 7 days
 
-And enforcement is effectively OR (bytes exceeded or age exceeded) during GC.
-Also, retention floors/safety can delay deletion, so actual retained data can
-temporarily exceed either cap.
+The retention report uses these caps to describe pressure. Explicit
+`gc-txlog-segments!` ignores the age/byte caps and deletes every segment permitted
+by the snapshot, vector, replica, backup-pin, operator, and applied-LSN floors.
+Those floors can keep retained data above either cap.
+
+Dry run returns `:targets`, `:would-delete-count`, and `:would-delete-bytes`
+without unlinking files. Apply returns a `:segment-results` entry for each
+attempted segment, actual deletion counts/bytes, aggregate `:errors`, and
+`:durability`. Missing files are successful already-deleted no-ops. Failures on
+one file do not discard other deletions, and a final-report failure retains
+those outcomes with `:after nil`.
+
+Selection, deletion, directory sync, and final reporting share the snapshot
+maintenance lock. A busy lock returns a zero-deletion `:maintenance-busy`
+failure. Directory sync follows actual deletions even when another unlink
+failed; no-deletion apply and dry run skip sync. Sync failure or unsupported
+directory sync (including Windows) returns `:ok? false` while retaining any
+completed deletions. Callers must inspect `:ok?` and the native error list.
+
+For remote administration, use `dtlv admin wal-gc --database NAME --dry-run`
+with the URI in `DATALEVIN_URI`. The CLI checks server capabilities and catalog
+identity, may open a closed target, and leaves it open. It prints native partial
+results and exits `1` on failure. Only WAL-disabled and rollback skips exit `0`.
 
 ## Typical Operational Loop
 

@@ -72,7 +72,7 @@
      :sync-copy-response-store! :sys-conn :unpin-server-copy-backup-floor!
      :update-cached-permission :update-cached-role :update-client :update-db
      :vector-index :with-db-lifecycle-access :with-db-lifecycle-write-access
-     :with-db-runtime-store-read-access :write-message
+     :with-db-runtime-store-read-access :with-maintenance-source :write-message
      :with-index-write-admission :write-txn-runner :transaction-lock-timeout-ms}})
 
 (defn- skey-state
@@ -1977,7 +1977,7 @@
            "Don't have permission to view database status"
            (fn []
              (let [identity {:db-name db-name :db-type (:database/type catalog)
-                             :db-id did :admin-capabilities #{}}
+                             :db-id did :admin-capabilities #{:guarded-maintenance :wal-gc-dry-run}}
                    result
                    (if-not runtime?
                      identity
@@ -2042,7 +2042,11 @@
                     :pin-id pin-id})))))
 
 (defn copy
-  [deps server skey {:keys [args writing?]}]
+  [deps server skey {:keys [args writing?] :as message}]
+  (when (or (:admin-required-capabilities message) (:expected-db-id message)
+            (:expected-db-type message))
+    (raise "Guarded standalone copy is not implemented"
+           {:error :admin/unsupported-server :required #{:standalone-copy}}))
   (let [[db-name compact?] args
         started-ms         (System/currentTimeMillis)
         copy-backup-pin    (atom nil)
@@ -2519,19 +2523,25 @@
             (fn [] (kv/create-snapshot! kv-store))))))))
 
 (defn gc-txlog-segments!
-  [deps server skey {:keys [args]}]
+  [deps server skey {:keys [args] :as message}]
   (let [db-name          (nth args 0)
         retain-floor-lsn (nth args 1 nil)
-        kv-store         ((:get-kv-store deps) server db-name)]
-    (db-alter-permission!
-      deps server skey db-name
-      "Don't have permission to alter the database"
-      (fn []
-        (write-result!
-          deps skey
-          (with-direct-db-transaction-slot
-            deps server db-name false
-            (fn [] (kv/gc-txlog-segments! kv-store retain-floor-lsn))))))))
+        opts (merge (when (map? retain-floor-lsn) retain-floor-lsn) (nth args 2 {}))
+        floor (if (map? retain-floor-lsn) (:retain-floor-lsn retain-floor-lsn) retain-floor-lsn)]
+    (when-not (or (nil? (:dry-run? opts)) (boolean? (:dry-run? opts)))
+      (raise "GC dry-run flag must be boolean" {:error :admin/invalid-options}))
+    ((:with-maintenance-source deps)
+     server db-name message
+     (fn [catalog]
+       (with-permission! deps server skey alter-act database-obj (:db/id catalog)
+         "Don't have permission to alter the database" (constantly true)))
+     (fn [source]
+       (let [kv-store (if (instance? Store source) (.-lmdb ^Store source) source)]
+         (write-result!
+           deps skey
+           (with-direct-db-transaction-slot
+             deps server db-name false
+             #(kv/gc-txlog-segments! kv-store floor opts))))))))
 
 (defn txlog-update-snapshot-floor!
   [deps server skey {:keys [args]}]

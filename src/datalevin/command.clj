@@ -138,7 +138,7 @@
    :list-snapshots unguarded
    :snapshot-scheduler-state unguarded
    :txlog-retention-state unguarded
-   :gc-txlog-segments! local-write
+   :gc-txlog-segments! (assoc local-write :runtime-read-access-exempt? true)
    :txlog-update-snapshot-floor! local-write
    :txlog-clear-snapshot-floor! local-write
    :txlog-update-replica-floor! local-write
