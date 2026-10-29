@@ -26,6 +26,7 @@
             [datalevin.query.source.native-rules :as native-rules]
             [datalevin.query.source.planning :as planning]
             [datalevin.query.source.region :as region]
+            [datalevin.query.source.relational :as relational]
             [datalevin.query.source.runtime :as rt]
             [datalevin.query.source.scope :as scope]
             [datalevin.query.source.session :as session]
@@ -890,6 +891,14 @@
                   (let [input (input-program/prepare! child parsed arguments #(joined! child check! %1 %2))
                         compilation (planning/capture! child (:entries input) (:parsed input) (:rules input)
                                       (:bindings input) (set (map :variable (:columns input))) options)]
+                    (if-let [delegation (relational/plan! child compilation input)]
+                      (let [result (when execute? (relational/run! child delegation))]
+                        (if (nil? explain-options) result
+                            (diagnostics/finish! child execute? (:result-rows (control/usage (:control child)))
+                              {:storage :memory :spill-policy :reject :relational? true
+                               :distinct :find-and-with :grouping (boolean (some parser/aggregate?
+                                                                            (parser/find-elements (:qfind parsed))))
+                               :result :retained})))
                     (native/with-views (filter db/db? (keep :native (:entries compilation)))
                       (fn [snapshots]
                         (let [program (compile-program! child compilation nil nil snapshots (select-keys input [:columns :relation]))
@@ -900,7 +909,7 @@
                                  :empty-input? (.isEmpty ^List (get-in program [:input :tuples]))
                                  :join-indexes :bounded-hash :distinct :find-and-with
                                  :grouping (boolean (some parser/aggregate? (parser/find-elements (:qfind parsed))))
-                                 :result :retained}))))))))))))
+                                 :result :retained})))))))))))))
       (catch Throwable e
         (let [e (rt/active-error @active e)
               error (rt/redacted-error @active (or (:phase (ex-data e)) :inputs) e)]

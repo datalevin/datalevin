@@ -5,10 +5,12 @@ embedded JVM `d/q` and `d/explain`. An adapter exposes typed entity–attribute�
 (EAV) facts and access paths for retrieving them. Datalevin handles joins,
 residual predicates, supported rules, aggregation, and query results.
 
-This reference targets **Datalevin 1.2.9** and **SPI revision 2**. The SPI was
+This reference targets **Datalevin 1.2.10** and **SPI revision 2**. The SPI was
 introduced in Datalevin 1.2.8; version 1.2.9 adds same-entity fusion and fixes
 boxed-integer interoperability. Revision 2 is the only accepted revision. Cost
-estimates are advisory; they do not select access paths.
+estimates are advisory; they do not select access paths. Version 1.2.10 adds
+eligible scalar-predicate export and the optional relational protocols described
+below. Existing EAV adapters need not implement those protocols.
 
 The public namespace is [`datalevin.query.source`](../src/datalevin/query/source.clj).
 For mapping compilation, provider packaging, and implementation examples, see
@@ -25,6 +27,7 @@ checkouts. Historical envelopes and core development reports are preserved in
 - [Query options](#query-options)
 - [Session acquisition and read guarantees](#session-acquisition-and-read-guarantees)
 - [Planning requests and alternatives](#planning-requests-and-alternatives)
+- [Optional relational delegation](#optional-relational-delegation)
 - [Dependent access](#dependent-access)
 - [Cursor batches](#cursor-batches)
 - [Resource limits and cancellation](#resource-limits-and-cancellation)
@@ -60,6 +63,10 @@ compatibility with capabilities added in 1.2.9. Declare and test the minimum
 Datalevin version with your adapter. The
 [PostgreSQL adapter](../../federation/postgres/README.md) uses same-entity fusion.
 See the [changelog](../CHANGELOG.md) for the release changes.
+
+The optional `IRelationalQuerySource` and `IRelationalQuerySession` protocols
+require the matching 1.2.10 development build. They are absent from 1.2.8 and
+1.2.9; SPI revision 2 by itself does not advertise their availability.
 
 <a id="1-project-boundary"></a>
 <a id="11-four-shape-revision-target"></a>
@@ -1122,7 +1129,93 @@ Keep provider-specific fixtures, fault injection, backend integration, and
 performance evidence with the adapter project. Test-only helpers are not part
 of the runtime SPI and must not become production dependencies.
 
-Features outside this reference—such as borrowed batches, delegated ordering
-or aggregation, and planning probes—require an additional supported contract.
+Features outside this reference—such as borrowed batches, delegated ordering,
+arbitrary aggregation, and planning probes—require an additional supported contract.
 See the [extensions appendix](query-source-extensions.md) for design proposals;
 those proposals do not authorize current adapters to use their envelopes.
+
+## Optional relational delegation
+
+Revision 2 also supports an optional, whole-conjunction contract. Existing
+adapters retain the ordinary EAV path. A source opts in by implementing
+`IRelationalQuerySource/-plan-relational`; its acquired session also implements
+`IRelationalQuerySession/-open-relational-cursor`.
+
+Core considers this path only for a flat conjunction whose sources all belong
+to one physical session group, with no rules, scoped branches, host functions,
+or `:having`. Inputs must consist entirely of captured scalar values in a
+single input tuple. A source may decline any shape by returning `nil`, before
+acquisition or reads. Ordering combined with return maps currently uses the
+ordinary path. Other ordering and public result windows remain core operations.
+
+The planning callback is pure and performs no provider I/O. It receives the
+prepared common context (including borrowed `:control`, read requirements,
+and captured source descriptors), plus:
+
+```edn
+{:mode :relational :semantics-version 1
+ :sources [{:symbol $orders :descriptor orders-descriptor}
+           {:symbol $customers :descriptor customers-descriptor}]
+ :clauses [{:id 0 :kind :pattern :source-symbol $orders
+            :terms [[:var ?order] [:const :order/customer] [:var ?customer]]}
+           {:id 1 :kind :pattern :source-symbol $customers
+            :terms [[:var ?customer] [:const :customer/name] [:var ?name]]}]
+ :bindings {}
+ :find [{:kind :variable :variable ?name}
+        {:kind :aggregate :operator :count :variable ?order}]
+ :with []
+ :columns [{:variable ?relational_result_0 :type :string :nullable? false}
+           {:variable ?relational_result_1 :type :long :nullable? false}]}
+```
+
+Patterns include their source alias. Predicates use the ordinary version-1
+binary predicate envelope and remain within the conjunction. Core exports
+only variables visible in the fact patterns and substitutes captured scalar
+bounds; another operator's possible output never becomes a constant. Original
+parser nodes, scoped bodies, native sources, and host callbacks are not exported.
+
+The initial projection grammar accepts variable projections and unary
+`count`, `count-distinct`, `sum`, `min`, and `max` aggregates over variables.
+This is a request grammar, not a promise that every provider supports every
+aggregate or type. Count columns use logical `:long`; other aggregate columns
+use `:data`, with nullable min/max. Providers must return exactly the requested
+column schema and decline any expression whose semantics are unproved.
+
+A successful planning response is exactly:
+
+```edn
+{:plan provider-owned-value-tree :columns requested-columns}
+```
+
+The plan must be a map containing only owned row-value trees. Connections,
+functions, borrowed resources, and opaque handles are invalid. Core admits the
+borrowed response including backing storage, copies its values, and retains
+the owned plan under the query memory ledger. The plan remains private to the
+adapter; core does not interpret provider instructions or SQL. No candidate
+estimates or alternative ranking are involved in this optional path.
+
+After acceptance, core acquires and authorizes the normal session group once.
+The open contains the captured common context, `:plan`, `:columns`, first
+source's symbol/fingerprint/scope, `:region-id 0`, and
+`:alternative-id "relational"`. There are no dependent `:bindings`. The
+session must validate the entire plan against its authorized views and pinned
+snapshot. This version uses the session's default consumption resource and
+reserves one open through the standard consumption ledger.
+
+The returned cursor implements `IQuerySourceCursor` and emits ordinary owned,
+typed, nondependent batches. Existing row/byte bounds, request admission,
+cancellation, reservation transfer, and close rules all apply. Core applies
+the shared final result processor for shapes, return maps, ordering, offset,
+and limit, and enforces final result and retained-memory quotas. Plan-only
+explain acquires the read view but never opens an execution cursor. Explanations
+identify this path with `:policy :relational-v1` and retain structural metadata
+and validated counters; plans, SQL, parameters, and authorization stay private.
+
+The provider implements the complete conjunction exactly. Shared variables
+use query-key equality, pattern constants use predicate equivalence, null
+contributes no fact, and reference domains remain nominal. Establish distinct
+tuples across the find variables and `:with` variables before grouping;
+`count-distinct` uses aggregate equivalence separately. Empty input creates no
+groups. Do not replace these rules with SQL's default numeric scale, collation,
+null, empty-aggregate, or arithmetic behavior unless equivalence is established.
+Input conversion and row-size failures must remain enforced during aggregation.

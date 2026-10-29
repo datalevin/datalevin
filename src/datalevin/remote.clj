@@ -34,8 +34,8 @@
    [java.util Collections WeakHashMap Map]
    [java.util.concurrent ConcurrentHashMap]
    [java.util.concurrent.atomic AtomicBoolean AtomicLong]
-   [java.nio.file Files Paths StandardOpenOption LinkOption]
-   [java.security MessageDigest]
+   [java.nio.file CopyOption Files LinkOption Paths StandardCopyOption]
+   [java.nio.file.attribute FileAttribute]
    [java.net URI]))
 
 (defonce ^:private ^Map legacy-txlog-clients
@@ -1282,58 +1282,25 @@
 
   (copy [db dest] (.copy db dest false))
   (copy [_ dest compact?]
-    (let [{:keys [type message result copy-meta copy-format checksum
-                  checksum-algo bytes]}
-          (cl/request client {:type     :copy
-                              :mode     :request
-                              :writing? writing?
-                              :args     [db-name compact?]})
-          _    (when (= type :error-response)
-                 (raise "Request to Datalevin server failed: "
-                          message
-                          {:type :copy
-                           :args [db-name compact?]
-                           :writing? writing?}))
-          dir  (Paths/get dest (into-array String []))
-          file (Paths/get (str dest u/+separator+ c/data-file-name)
-                          (into-array String []))
-          opts (into-array StandardOpenOption
-                           [StandardOpenOption/CREATE
-                            StandardOpenOption/TRUNCATE_EXISTING
-                            StandardOpenOption/WRITE])]
-      (when-not (Files/exists dir (into-array LinkOption []))
-        (u/create-dirs dest))
-      (if (= :binary-chunks copy-format)
-        (let [^MessageDigest md (MessageDigest/getInstance "SHA-256")
-              written-bytes
-              (with-open [out (Files/newOutputStream file opts)]
-                (reduce
-                  (fn ^long [^long n chunk]
-                    (let [^bytes bs chunk
-                          len       (alength bs)]
-                      (.write out bs 0 len)
-                      (.update md bs 0 len)
-                      (unchecked-add n len)))
-                  0 result))
-              actual-checksum (u/hexify (.digest md))]
-          (when (and checksum-algo (not= :sha-256 checksum-algo))
-            (raise "Unsupported checksum algorithm from server"
-                     {:checksum-algo checksum-algo}))
-          (when (and bytes (not= (long bytes) (long written-bytes)))
-            (raise "Copy size mismatch"
-                     {:expected-bytes (long bytes)
-                      :actual-bytes   (long written-bytes)}))
-          (when (and checksum (not= checksum actual-checksum))
-            (raise "Copy checksum mismatch"
-                     {:expected-checksum checksum
-                      :actual-checksum   actual-checksum})))
-        (let [bs (->> result
-                      (apply str)
-                      b/decode-base64)]
-          (Files/write file ^bytes bs
-                       ^"[Ljava.nio.file.StandardOpenOption;" opts)))
-      (spit (str dest u/+separator+ c/version-file-name) c/version)
-      copy-meta))
+    (u/create-dirs dest)
+    (let [dir  (Paths/get dest (make-array String 0))
+          file (.resolve dir c/data-file-name)
+          stage (Files/createTempFile dir "data.mdb." ".incomplete"
+                                      (make-array FileAttribute 0))]
+      (try
+        (let [response (cl/copy-to-file client db-name stage
+                                        {:compact? compact? :writing? writing?
+                                         :version-file nil})]
+          (Files/move stage file (into-array CopyOption
+                                            [StandardCopyOption/REPLACE_EXISTING]))
+          (spit (str dest u/+separator+ c/version-file-name) c/version)
+          (:copy-meta response))
+        (catch Exception e
+          (throw (ex-info (ex-message e)
+                          (cond-> (assoc (ex-data e) :data-file (str file))
+                            (Files/exists stage (make-array LinkOption 0))
+                            (assoc :incomplete-file (str stage)))
+                          e))))))
 
   (stat [db] (.stat db nil))
 

@@ -18,6 +18,16 @@ existing-only open if needed. Targets opened for maintenance stay open.
 Capabilities are checked per live client session/endpoint and rechecked after
 renewal or connection replacement. Standalone copy is not advertised yet.
 
+Remote KV `copy` receives chunks directly into a temporary file, validates its
+SHA-256 and byte count, then replaces `data.mdb` and writes `VERSION`. A failed
+transfer preserves an existing backup and leaves a `data.mdb.*.incomplete` file
+whose path is included in the exception. The shared
+`datalevin.client/copy-to-file` API also accepts a Datalog database name and an
+explicit incomplete file path. Its parent directory must exist. It returns
+transfer metadata without retaining payload chunks, and writes `VERSION` only
+after validation and sink close. Transfer failures after the response header
+are never replayed.
+
 Dropped catalog database entities retain a small retired marker after their
 name/type and permissions are removed. Their IDs therefore cannot be reused
 by a replacement database, including after restart; maintenance never follows

@@ -208,6 +208,11 @@ raw samples, PostgreSQL plans, and replay scripts. Some SQL samples overlap
 other JVM work; small differences need confirmation. Its PostgreSQL wall-time
 protocol differs from the server-only EXPLAIN times emitted by `:pg-bench`.
 
+The [grouped-query follow-up](../../doc/measurements/tpch-decorrelation-2026-10-28.md)
+replaces correlated aggregate calls in Q2, Q17, and Q20 with grouped relations.
+Focused SF1 paired medians improve by 2.77×, 2.41×, and 2.35×; all 22 queries
+pass again at SF0.1 and SF1. The three-engine table records the earlier forms.
+
 The raw CSVs (`datalevin_pass.csv`, `sqlite_pass.csv`, `postgres_pass.csv`) and
 `results.edn`-style manifests should be retained alongside any published table,
 together with the machine, JVM, database versions, and scale factor.

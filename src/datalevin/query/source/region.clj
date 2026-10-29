@@ -9,7 +9,7 @@
             [datalevin.query.source.lowering :as lowering]
             [datalevin.query.source.runtime :as rt]
             [datalevin.query.source.value :as value :refer [fail!]])
-  (:import [datalevin.parser And Constant DefaultSrc Function Not Or Pattern Rule RuleExpr Variable]))
+  (:import [datalevin.parser And Constant DefaultSrc Function Not Or Pattern Predicate Rule RuleExpr Variable]))
 
 (defn- ensure! [ok]
   (when-not ok (fail! :query-source/invalid :planning)))
@@ -349,6 +349,29 @@
             (doseq [f (reverse @children)] (f))
             (doseq [token @tokens] (control/release! token))))))))
 
+(defn predicate-clauses
+  "Export only binary scalar predicates within this conjunction and visible
+  fact variables. Captured scalar bindings may become constants; potential
+  producers and values from another scope never become predicate constants."
+  [region variables]
+  (let [bindings (:bindings region)
+        base (inc (reduce max -1 (map (comp :id :clause) (:patterns region))))]
+    (into []
+      (keep-indexed
+        (fn [i {:keys [node]}]
+          (let [operator ({'= := 'not= :not= '< :< '<= :<= '> :> '>= :>=} (get-in node [:fn :symbol]))
+                args (:args node)]
+            (when (and (instance? Predicate node) operator (= 2 (count args))
+                       (every? #(or (instance? Variable %) (instance? Constant %)) args))
+              (let [args (mapv #(if (and (instance? Variable %) (contains? bindings (:symbol %)))
+                                 [:const (get bindings (:symbol %))] (term %)) args)
+                    used (into #{} (keep #(when (= :var (first %)) (second %))) args)]
+                (when (and (seq used) (set/subset? used variables))
+                  (let [id (+' base i)]
+                    (when (> id Long/MAX_VALUE) (fail! :query-source/limit :planning))
+                    {:id id :kind :predicate :operator operator :semantics-version 1 :args args})))))))
+      (:core-clauses region))))
+
 (defn request!
   "Build one source's flat planning envelope from a region annotation and
   explicit typed exports supplied by the existing planner. Core nodes, rule
@@ -376,8 +399,9 @@
             (let [visible (:available-vars region)]
               (ensure! (every? #(contains? visible (:variable %)) available-inputs)))
             (finally (control/release! token))))
-        (let [clauses (mapv :clause patterns)
-              variables (into #{} (mapcat contract/variables) clauses)
+        (let [patterns (mapv :clause patterns)
+              variables (into #{} (mapcat contract/variables) patterns)
+              clauses (into patterns (predicate-clauses region variables))
               inputs (set (map :variable available-inputs))
               bindings (select-keys (:bindings region) (set/union variables inputs))
               output {:source-symbol (:symbol entry) :source-descriptor descriptor

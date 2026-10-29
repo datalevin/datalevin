@@ -3,7 +3,8 @@
 
   Sources are caller-owned. Sessions and owned-batch cursors belong to one
   invocation. See doc/query-source-spi.md for the current contract and the
-  Datalevin 1.2.9 requirements for fusion and boxed-integer interoperability."
+  Datalevin 1.2.9 requirements for fusion and boxed-integer interoperability.
+  Optional whole-conjunction relational protocols are available in 1.2.10."
   (:require [datalevin.query.dispatch :as dispatch]
             [datalevin.query.source.contract :as contract]
             [datalevin.query.source.control :as control]
@@ -64,6 +65,19 @@
   (-next-batch! [cursor request] "Return one owned, bounded batch.")
   (-cursor-metrics [cursor] "Return cumulative metrics, including after close.")
   (-close-cursor! [cursor] "Release cursor resources idempotently; return nil."))
+
+(defprotocol IRelationalQuerySource
+  (-plan-relational [source request]
+    "Optional pure planning of an entire flat relational request. Return nil
+    to use fact accesses, or {:plan owned-value :columns request-columns}.
+    Plans contain only owned value trees, never resources or callbacks.
+    No provider I/O or session acquisition is permitted here."))
+
+(defprotocol IRelationalQuerySession
+  (-open-relational-cursor [session request]
+    "Open a selected relational plan under the acquired authorization and
+    snapshot. Return an ordinary owned-batch IQuerySourceCursor. Implementers
+    validate plan scope against this session; SQL is never part of the SPI."))
 
 (defn validate-source-info!
   "Validate a descriptor without acquisition; return it unchanged."

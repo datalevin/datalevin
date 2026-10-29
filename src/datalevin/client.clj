@@ -15,6 +15,7 @@
    [datalevin.constants :as c]
    [datalevin.command :as cmd]
    [datalevin.client.request :as cr]
+   [datalevin.client.copy :as file-copy]
    [datalevin.native-value :as nv]
    [datalevin.udf :as udf]
    [clojure.string :as s]
@@ -849,30 +850,36 @@
   ([conn req]
    (copy-out conn req nil))
   ([conn req copy-out-response]
-   (try
-     (let [data (transient [])]
-       (loop []
-         (let [msg (receive conn)]
-           (if (map? msg)
-             (let [{:keys [type]} msg]
-               (if (= type :copy-done)
-                 (merge
-                   {:type :command-complete
-                    :result (let [items (persistent! data)]
-                              (case (:copy-result-type copy-out-response)
-                                :map (into {} items)
-                                :set (set items)
-                                items))}
-                   (when (map? copy-out-response)
-                     (dissoc copy-out-response :type :copy-result-type))
-                   (dissoc msg :type))
-                 (raise "Server error while copying out data" {:msg msg})))
-             (do (doseq [d msg] (conj! data d))
-                 (recur))))))
-     (catch Exception e
-       (close conn)
-       (when (nv/decoding-error? e) (throw e))
-       (raise "Unable to receive copy:" e {:req req})))))
+   (if (and file-copy/*receiver* (= :copy (:type req)))
+     (try
+       (file-copy/receive! file-copy/*receiver* #(receive conn) copy-out-response)
+       (catch Throwable failure
+         (cleanup-after-failure! failure #(close conn))
+         (throw failure)))
+     (try
+       (let [data (transient [])]
+         (loop []
+           (let [msg (receive conn)]
+             (if (map? msg)
+               (let [{:keys [type]} msg]
+                 (if (= type :copy-done)
+                   (merge
+                     {:type :command-complete
+                      :result (let [items (persistent! data)]
+                                (case (:copy-result-type copy-out-response)
+                                  :map (into {} items)
+                                  :set (set items)
+                                  items))}
+                     (when (map? copy-out-response)
+                       (dissoc copy-out-response :type :copy-result-type))
+                     (dissoc msg :type))
+                   (raise "Server error while copying out data" {:msg msg})))
+               (do (doseq [d msg] (conj! data d))
+                   (recur))))))
+       (catch Exception e
+         (close conn)
+         (when (nv/decoding-error? e) (throw e))
+         (raise "Unable to receive copy:" e {:req req}))))))
 
 (defn ^:no-doc decode-tx-response
   "Decode an inline or copy-out transaction response into a transaction result.
@@ -998,6 +1005,8 @@
           read?    (and (not (:writing? req)) (cmd/read-only? (:type req)))]
       (loop [busy-delay-ms 25]
         (cr/check! :request)
+        (when (and file-copy/*receiver* (= :copy (:type req)))
+          (file-copy/reset-before-request! file-copy/*receiver*))
         (when (:admin-required-capabilities req) (ensure-admin-support! client req))
         (let [^ConnectionPool pool' (.-pool ^Client client)
               ;; A read can retry after EOF; mutations still probe idle
@@ -2871,6 +2880,48 @@
             (catch Exception e
               (throw (ex-info (ex-message e)
                               (assoc (ex-data e) :admin/maintenance-sent? (cr/exchanged?)) e)))))))
+
+(defn copy-to-file
+  "Receive an LMDB payload into an explicit incomplete file using bounded memory.
+  The parent directory must exist. Destination bytes may be truncated on a
+  pre-header retry; after a header, failures never replay the transfer.
+
+  Options: :compact?, :require-binary?, :sink-factory (Path -> owned
+  SeekableByteChannel), and :version-file (defaults to VERSION beside the data
+  file; nil skips it). VERSION is written only after integrity validation and
+  successful sink close. Legacy base64 is retained for ordinary callers.
+  :standalone? requires guarded standalone-copy support before any copy request."
+  ([client db-name file] (copy-to-file client db-name file {}))
+  ([client db-name file {:keys [compact? writing? standalone?] :as opts}]
+   (let [req (cond-> (merge (select-keys opts [:expected-db-id :expected-db-type
+                                             :admin-required-capabilities])
+                            {:type :copy :mode :request :writing? (boolean writing?)
+                             :args [(u/lisp-case db-name) (boolean compact?)]})
+               standalone? (assoc :standalone? true
+                                  :admin-required-capabilities #{:guarded-maintenance :standalone-copy}))
+         file (.toAbsolutePath (file-copy/path file))
+         version-file (if (contains? opts :version-file) (:version-file opts)
+                          (.resolve (.getParent file) c/version-file-name))]
+     (when (:admin-required-capabilities req) (ensure-admin-support! client req))
+     (call-with-request
+       client req
+       (fn []
+         (cr/check! :copy-open-sink)
+         (let [receiver (file-copy/receiver file (cond-> opts standalone? (assoc :require-binary? true)))]
+           (try
+             (let [response (binding [file-copy/*receiver* receiver]
+                              (request client req))]
+               (when (= :error-response (:type response))
+                 (raise-normal-request-error req (:message response) (:err-data response) nil))
+               (when-not (and (= :command-complete (:type response)) (file-copy/completed? receiver))
+                 (throw (ex-info "Client did not complete file reception" {:error :copy/incomplete})))
+               (when version-file
+                 (cr/check! :copy-version)
+                 (spit (.toFile (file-copy/path version-file)) c/version))
+               response)
+             (catch Throwable failure
+               (cleanup-after-failure! failure #(file-copy/close! receiver))
+               (throw failure)))))))))
 
 (defn assign-role
   "Assign a role to a user. "
