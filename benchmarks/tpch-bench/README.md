@@ -160,9 +160,10 @@ patterns required care:
   grouped relations. Q18 applies its quantity threshold inside the nested
   query and returns the computed sum, so only qualifying orders cross into
   the outer query.
-- **`LEFT OUTER JOIN`** (Q13) uses two mutually exclusive `or-join` branches:
-  one grouped count relation joined to customers, and a `not` branch binding
-  zero for the rest.
+- **`LEFT OUTER JOIN`** (Q13) groups qualifying orders once into a customer-key
+  count map. Each customer looks up its count with a default of zero, including
+  customers whose orders all fail the comment predicate. Iterating customers
+  also excludes orphan order keys from the distribution.
 - **`CASE` over aggregates** (Q8, Q14) is expressed with `:with` and nested
   aggregates; `if` is not resolvable inside nested queries.
 - **`extract(year ...)`** becomes `(subs date 0 4)` plus `parse-long`.
@@ -212,6 +213,18 @@ The [grouped-query follow-up](../../doc/measurements/tpch-decorrelation-2026-10-
 replaces correlated aggregate calls in Q2, Q17, and Q20 with grouped relations.
 Focused SF1 paired medians improve by 2.77×, 2.41×, and 2.35×; all 22 queries
 pass again at SF0.1 and SF1. The three-engine table records the earlier forms.
+
+The [Q13 audit](../../doc/measurements/tpch-q13-audit-2026-10-28.md) validates
+query semantics against both SQL engines, inspects native and PostgreSQL plans,
+then records warmed JFR profiles. It identifies generic negation/joins,
+cache-result copying, and per-row LIKE matcher-cache lookup as priority costs.
+
+The [Q13 optimization follow-up](../../doc/measurements/tpch-q13-optimization-2026-10-28.md)
+shares the grouped counts with zero-count customers, reduces tuple-cache copy
+costs, and prepares literal LIKE matchers once. Paired SF1 Q13 medians improve
+from 7.78 to 1.41 seconds (5.53×), with 93.1% less main-thread allocation in a
+separate profile. Q1 and Q18 controls improve 2.54× and 3.42×; all 22 queries
+pass at SF0.1 and SF1. The report includes component timings and JOB controls.
 
 The raw CSVs (`datalevin_pass.csv`, `sqlite_pass.csv`, `postgres_pass.csv`) and
 `results.edn`-style manifests should be retained alongside any published table,

@@ -37,17 +37,34 @@
 
 (defn- copy-array
   [x depth]
-  (let [component (.getComponentType ^Class (class x))
-        n (Array/getLength x)]
+  (let [component (.getComponentType ^Class (class x))]
     (if (.isPrimitive component)
-      (let [copy (Array/newInstance component (int n))]
+      (let [n (Array/getLength x)
+            copy (Array/newInstance component (int n))]
         (System/arraycopy x 0 copy 0 n)
         copy)
-      (let [items (copy-items x depth)]
-        (if (or (identical? unsupported items)
-                (not-every? #(or (nil? %) (.isInstance component %)) items))
-          unsupported
-          (into-array component items))))))
+      (let [^objects copy (aclone ^objects x)
+            n (alength copy)]
+        (loop [i 0]
+          (if (= i n)
+            copy
+            (let [item (copy-value (aget copy i) (inc (long depth)))]
+              (if (or (identical? unsupported item)
+                      (and (some? item) (not (.isInstance component item))))
+                unsupported
+                (do (aset copy i item) (recur (inc i)))))))))))
+
+(defn- copy-tuple-list
+  [^FastList xs depth]
+  (let [n (.size xs)
+        copy (FastList. n)]
+    (loop [i 0]
+      (if (= i n)
+        copy
+        (let [item (copy-value (.get xs i) (inc (long depth)))]
+          (if (identical? unsupported item)
+            unsupported
+            (do (.add copy item) (recur (inc i)))))))))
 
 (defn- copy-value
   [x ^long depth]
@@ -76,10 +93,7 @@
                      unsupported
                      (apply list items)))
                  (instance? FastList x)
-                 (let [items (copy-items x depth)]
-                   (if (identical? unsupported items)
-                     unsupported
-                     (FastList. ^java.util.Collection items)))
+                 (copy-tuple-list x depth)
                  (symbol? x) x
                  :else unsupported)]
       (if (or (identical? unsupported copy) (nil? (meta x)))

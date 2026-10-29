@@ -266,6 +266,28 @@
     (let [fname (subs (name f) 1)] #(dot-call fname %))
     #(opt-apply f %)))
 
+(defn prepare-call
+  "Prepare a call with known static argument positions. Constant LIKE matchers
+  are resolved lazily, preserving errors for predicates that actually run."
+  [f ^objects args dynamic-positions]
+  (let [n (alength args)
+        opts (when (= n 3) (aget args 2))]
+    (if (and (or (identical? f built-ins/like)
+                 (identical? f built-ins/not-like))
+             (<= 2 n 3)
+             (not (contains? dynamic-positions 1))
+             (or (= n 2) (not (contains? dynamic-positions 2)))
+             (or (nil? opts)
+                 (and (map? opts)
+                      (or (nil? (:escape opts)) (false? (:escape opts))
+                          (char? (:escape opts)))))
+             (string? (aget args 1)))
+      (let [pattern (aget args 1)
+            not? (identical? f built-ins/not-like)
+            matcher (delay (built-ins/like-matcher pattern opts not?))]
+        (fn [^objects values] (@matcher (aget values 0))))
+      (make-call f))))
+
 (defn resolve-sym
   [sym]
   (when (symbol? sym)
@@ -349,13 +371,7 @@
          len                  (count args)
          ^objects static-args (make-array Object len)
          ^objects tuples-args (make-array Object len)
-         invoke               (make-call (resolve-pred f context))
-         ;; Projection metadata belongs on resolved values, not query symbols
-         ;; or nested expressions whose evaluation would discard it.
-         call                 (if needed
-                                #(invoke (object-array
-                                           (attach-needed-meta % needed)))
-                                invoke)]
+         resolved             (resolve-pred f context)]
      (dotimes [i len]
        (let [arg (nth args i)]
          (cond
@@ -376,7 +392,16 @@
 
            :else
            (aset static-args i arg))))
-     (let [tuple-bindings
+     (let [dynamic-positions (when (or (identical? resolved built-ins/like)
+                                      (identical? resolved built-ins/not-like))
+                               (into #{} (keep-indexed #(when (some? %2) %1)) tuples-args))
+           invoke (prepare-call resolved static-args dynamic-positions)
+           ;; Projection metadata belongs on resolved values, not query symbols
+           ;; or nested expressions whose evaluation would discard it.
+           call (if needed
+                  #(invoke (object-array (attach-needed-meta % needed)))
+                  invoke)
+           tuple-bindings
            (into []
                  (keep-indexed
                    (fn [i tuple-arg]

@@ -3,7 +3,7 @@
   (:import [clojure.lang APersistentVector$SubVector BigInt Ratio RT Sorted]
            [datalevin.utl QueryKey]
            [java.math BigDecimal BigInteger]
-           [java.time Duration Instant Period]
+           [java.time Duration Instant LocalDate LocalDateTime LocalTime OffsetTime Period]
            [java.util Date UUID]))
 
 (def scalar-types
@@ -191,8 +191,11 @@
       (if-let [m (meta x)] (value-charge* m observe! backing? metadata-phase (inc (long depth))) 0))
     (instance? UUID x) (charge-part 48 observe!)
     (= Date (class x)) (charge-part 64 observe!)
-    (or (instance? Instant x) (instance? Duration x) (instance? Period x))
+    (or (instance? Instant x) (instance? Duration x) (instance? Period x)
+        (instance? LocalDate x) (instance? LocalTime x))
     (charge-part 64 observe!)
+    (or (instance? LocalDateTime x) (instance? OffsetTime x))
+    (charge-part 96 observe!)
     (bytes? x) (charge-part (+' 32 (alength ^bytes x)) observe!)
     (instance? BigInteger x)
     (charge-part (+' 64 (quot (+ 7 (.bitLength ^BigInteger x)) 8)) observe!)

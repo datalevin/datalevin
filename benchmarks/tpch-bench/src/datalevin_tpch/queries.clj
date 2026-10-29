@@ -354,24 +354,20 @@
              (and [(= ?hi false)] [(ground 0) ?high] [(ground 1) ?low]))])
 
 ;; Q13: Customer Distribution
-;; Count qualifying orders for all customers in one grouped relation. The
-;; second, disjoint branch supplies zero for customers absent from that relation.
+;; Count qualifying orders once and look up each customer's count. An absent
+;; key supplies zero, including customers whose orders all fail the predicate.
 (def q-13
   '[:find ?c-count (count ?c)
     :order-by [1 :desc 0 :desc]
     :where
-    (or-join [?c ?c-count]
-             (and [(q [:find ?ck (count ?o)
-                       :where
-                       [?o :orders/custkey ?ck]
-                       [?o :orders/comment ?oc]
-                       [(not-like ?oc "%special%requests%")]] $) [[?ck ?c-count]]]
-                  [?c :customer/custkey ?ck])
-             (and [?c :customer/custkey ?ck]
-                  (not [?o :orders/custkey ?ck]
-                       [?o :orders/comment ?oc]
-                       [(not-like ?oc "%special%requests%")])
-                  [(ground 0) ?c-count]))])
+    [(q [:find ?ck (count ?o)
+         :where
+         [?o :orders/custkey ?ck]
+         [?o :orders/comment ?oc]
+         [(not-like ?oc "%special%requests%")]] $) ?order-counts]
+    [(into {} ?order-counts) ?counts-by-customer]
+    [?c :customer/custkey ?ck]
+    [(get ?counts-by-customer ?ck 0) ?c-count]])
 
 ;; Q14: Promotion Effect
 ;;

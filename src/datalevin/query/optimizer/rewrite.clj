@@ -565,6 +565,7 @@
   (qog/build-graph
     {:resolve-pattern-lookup-refs qresolve/resolve-pattern-lookup-refs
      :make-call qresolve/make-call
+     :prepare-call qresolve/prepare-call
      :resolve-pred qresolve/resolve-pred
      :map->Clause qresolve/map->Clause
      :map->Node qplan/map->Node

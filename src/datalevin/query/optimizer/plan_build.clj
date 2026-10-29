@@ -116,6 +116,7 @@
 (defn- activate-var-pred
   [var clause]
   (qor/activate-var-pred {:make-call qresolve/make-call
+                          :prepare-call qresolve/prepare-call
                           :resolve-pred qresolve/resolve-pred}
                          var clause))
 

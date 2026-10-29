@@ -49,6 +49,20 @@
         f   #(.match fsm ^String %)]
     (if not? #(clojure.core/not (f %)) f)))
 
+(defn ^:no-doc like-matcher
+  "Resolve the immutable matcher once for a prepared query call."
+  [^String pattern {:keys [escape]} not?]
+  (let [^LRUCache cache (if escape
+                         like-options-cache
+                         (if not? not-like-cache like-cache))
+        k               (if escape [pattern escape not?] pattern)
+        matcher         (clojure.core/or
+                          (.get cache k)
+                          (let [mf (compile-like pattern escape not?)]
+                            (.put cache k mf)
+                            mf))]
+    matcher))
+
 (defn like
   "Case-sensitive SQL-style `LIKE`, e.g. `[(like ?name \"%Smith\")]`.
   `%` matches zero or more Unicode characters, `_` matches exactly one,
@@ -58,17 +72,8 @@
    (like input pattern nil false))
   ([input pattern opts]
    (like input pattern opts false))
-  ([input ^String pattern {:keys [escape]} not?]
-   (let [^LRUCache cache (if escape
-                           like-options-cache
-                           (if not? not-like-cache like-cache))
-         k               (if escape [pattern escape not?] pattern)
-         matcher         (clojure.core/or
-                           (.get cache k)
-                           (let [mf (compile-like pattern escape not?)]
-                             (.put cache k mf)
-                             mf))]
-     (matcher input))))
+  ([input pattern opts not?]
+   ((like-matcher pattern opts not?) input)))
 
 (defn not-like
   "The complement of `like`, with the same pattern and escape rules,

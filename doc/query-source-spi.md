@@ -334,7 +334,11 @@ Use these representations for values returned in typed columns:
 | `:uuid` | `java.util.UUID` |
 | `:instant` | Exactly `java.util.Date`, with millisecond precision; subclasses such as `java.sql.Timestamp` are not accepted |
 | `:bytes` | JVM byte array (`byte[]`) |
-| `:data` | Supported portable values without a narrower type promise, including immutable `java.time.Instant`, `Duration`, and `Period` |
+| `:data` | Supported portable values without a narrower type promise, including immutable `java.time.Instant`, `Duration`, `Period`, `LocalDate`, `LocalTime`, `LocalDateTime`, and `OffsetTime` |
+
+Calendar values supplied by adapters retain their local fields and offsets.
+This value contract does not enable Java-serialized temporal payloads in the
+bounded native decoder; native storage compatibility is a separate contract.
 
 `:long` follows native `:db.type/long` validation. It preserves the boxed
 representation; it does not convert every value to `Long`. An arbitrary-precision

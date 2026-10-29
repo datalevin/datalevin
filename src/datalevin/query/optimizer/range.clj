@@ -205,7 +205,7 @@
       m)))
 
 (defn activate-var-pred
-  [{:keys [make-call resolve-pred]} var clause]
+  [{:keys [make-call resolve-pred prepare-call]} var clause]
   (when clause
     (if (fn? clause)
       clause
@@ -214,7 +214,10 @@
             ni         (count idxs)
             idxs-arr   (int-array idxs)
             args       (object-array args)
-            call       (make-call (resolve-pred f nil))
+            resolved   (resolve-pred f nil)
+            call       (if prepare-call
+                         (prepare-call resolved args (set idxs))
+                         (make-call resolved))
             factory
             (fn []
               (let [args-arr (aclone ^objects args)]

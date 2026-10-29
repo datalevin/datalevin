@@ -192,9 +192,13 @@
 
 (declare cache-key-dependencies refresh-remote-cache!)
 
+(defn- cache-key-pattern
+  [k]
+  (or (::index-pattern (meta k)) k))
+
 (def ^:private cache-dependencies
   (reify Function
-    (apply [_ k] (cache-key-dependencies k))))
+    (apply [_ k] (cache-key-dependencies (cache-key-pattern k)))))
 
 (defn- mark-remote-cache-check!
   [store]
@@ -341,14 +345,22 @@
     (cache-entry-if-current store token k entry)
     false))
 
+(def ^:private owned-tuple-cache-ops
+  ;; These native readers allocate their result lists and rows. Samples and
+  ;; lazy/public reads retain normalization through snapshot/restore.
+  #{:init-tuples :search-tuples})
+
 (defn ^:no-doc cache-result
-  "Publish an owned snapshot and return a separate caller's view, even on the
-  first read. Materialized immutable sequences can then stay shared on hits."
+  "Publish an owned snapshot. Fresh native tuple lists already belong to the
+  caller; other results retain normalization through the cache entry."
   [store token k result]
   (if-some [entry (result-cache/snapshot result)]
     (do
       (cache-entry-if-current store token k entry)
-      (result-cache/restore entry))
+      (if (and (instance? Store store) (instance? FastList result)
+               (contains? owned-tuple-cache-ops (first k)))
+        result
+        (result-cache/restore entry)))
     result))
 
 (defn ^:no-doc check-remote-read!
@@ -466,16 +478,36 @@
     (or (bytes? value) (= Date (class value))
         (remote-cache/immutable-data? value))))
 
+(defn- mutable-index-input?
+  [value]
+  (if (d/datom? value)
+    (or (mutable-index-input? (.-a ^Datom value))
+        (mutable-index-input? (.-v ^Datom value)))
+    (or (bytes? value) (= Date (class value)))))
+
 (defn ^:no-doc index-cache-key
-  "Distinguish storage representations and custom-codec generations. Append
-  identity tokens to retain dependency and write-invalidation key positions.
+  "Distinguish storage representations and custom-codec generations. Keep an
+  owned snapshot of mutable lookup inputs for dependency and range checks.
   Opaque representation-sensitive inputs bypass retention."
   [store pattern]
   (when-let [pattern
              (if (and (stored-value-cache-ops (first pattern))
                       (some representation-sensitive? (next pattern)))
                (when (every? portable-index-input? pattern)
-                 (conj pattern ::storage-key (remote-cache/serialized-key pattern)))
+                 (let [mutable? (some mutable-index-input? pattern)
+                       owned (if mutable?
+                               (result-cache/restore (result-cache/snapshot pattern))
+                               pattern)
+                       ;; Keep immutable components, including signed zero,
+                       ;; which serialization alone does not distinguish.
+                       identity (if mutable?
+                                  (mapv #(if (mutable-index-input? %)
+                                           ::mutable-input %) owned)
+                                  owned)
+                       key (conj identity ::storage-key
+                                 (remote-cache/serialized-key owned))]
+                   ;; Metadata is excluded from key equality and hashing.
+                   (if mutable? (with-meta key {::index-pattern owned}) key)))
                pattern)]
     (if-let [registry (when (instance? Store store)
                        (get-in @(kv-info (.-lmdb ^Store store))
@@ -488,19 +520,24 @@
 (defmacro wrap-cache
   [store pattern body]
   `(let [store# ~store
+         remote?# (remote-store? store#)
          ;; Direct index reads can bypass db?, including on retained DB views.
-         _# (when (and (remote-store? store#) (cache-active? store#))
+         _# (when (and remote?# (cache-active? store#))
               (refresh-remote-cache! store#))
          cache# ^LRUCache (.get ^ConcurrentHashMap caches (dir store#))
-         cache?# (and cache# (pos? (.capacity cache#)) (not (.isDisabled cache#)))
+         cache?# (and cache# (pos? (.capacity cache#)) (not (.isDisabled cache#))
+                      (or (not remote?#) (remote-read-cacheable? store# true)))
          generation# (if cache?# (.generation cache#) 0)
          key# (when cache?# (index-cache-key store# ~pattern))]
      ;; A zero entry limit bypasses key construction and the LRU monitor as
      ;; well as retention. Keep the native read and transaction-overlay paths.
      (if-some [cached# (when key# (.get ^LRUCache cache# key#))]
-       (result-cache/restore cached#)
+       (do
+         ;; A positive freshness interval can skip the RPC's termination checks.
+         (when remote?# (check-remote-read! store#))
+         (result-cache/restore cached#))
        (let [res# ~body]
-         (if key#
+         (if (and key# (or (not remote?#) (remote-read-cacheable? store#)))
            (cache-result store# [cache# generation#] key# res#)
            res#)))))
 
@@ -823,9 +860,10 @@
                        (when (instance? Store store) (schema store)) tx-data))]
     (doseq [k (.candidateKeys cache (cache-invalidation-dependencies
                                      touches (instance? Store store)))
-            :when (if (and (instance? Store store) (range-cache/range-key? k))
-                    (range-cache/affected? @ranges k)
-                    (tx-affects-cache-key? touches k))]
+            :let [pattern (cache-key-pattern k)]
+            :when (if (and (instance? Store store) (range-cache/range-key? pattern))
+                    (range-cache/affected? @ranges pattern)
+                    (tx-affects-cache-key? touches pattern))]
       (.remove cache k))))
 
 (defn- invalidate-cache

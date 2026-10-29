@@ -623,6 +623,7 @@
 (defn build-graph
   [deps context]
   (let [helpers {:make-call    (fn [f] (make-call deps f))
+                 :prepare-call (:prepare-call deps)
                  :resolve-pred (fn [f ctx] (resolve-pred deps f ctx))
                  :attr-value-type
                  (fn [source attr]

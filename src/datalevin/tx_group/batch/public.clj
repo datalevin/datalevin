@@ -202,7 +202,9 @@
   Its WAL record preserves the admin effect on snapshot-based recovery; this
   operation is never submitted as a data request or run in a user transaction."
   [raw state collector wake! options name]
-  (when (Thread/holdsLock (l/write-txn raw))
+  ;; Index maintenance can own the monitor without opening a native writer.
+  ;; Reject actual transaction bodies, including one-shot batch owners.
+  (when (cpp/native-write-active? raw)
     (unsupported! :admin-inside-transaction))
   (locking (l/write-txn raw)
     (batch/check-serving! collector)

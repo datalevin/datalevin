@@ -813,6 +813,24 @@
      :limit  limit
      :top    top}))
 
+(def ^:dynamic ^:no-doc *document-write-observer*
+  "Optional local phase observer for contention tests: (phase lmdb documents)."
+  nil)
+
+(defmacro ^:private with-document-write-lock
+  [lmdb documents & body]
+  `(let [lmdb# ~lmdb
+         documents# ~documents
+         observer# *document-write-observer*]
+     (when observer# (observer# :before-lmdb-lock lmdb# documents#))
+     ;; Secondary-job completion and snapshot capture already own this monitor.
+     ;; Direct mutations must acquire it before the shared document state too.
+     (locking (l/write-txn lmdb#)
+       (when observer# (observer# :lmdb-locked lmdb# documents#))
+       (locking documents#
+         (when observer# (observer# :documents-locked lmdb# documents#))
+         ~@body))))
+
 (deftype SearchEngine [lmdb
                        analyzer
                        query-analyzer
@@ -832,7 +850,7 @@
                        search-opts]
   ISearchEngine
   (add-doc [this doc-ref doc-text check-exist?]
-    (locking docs
+    (with-document-write-lock lmdb docs
       (when-not (s/blank? doc-text)
         (when check-exist?
           (when-let [[doc-id stored-ref] (stored-doc-entry this doc-ref)]
@@ -842,20 +860,22 @@
     (.add-doc this doc-ref doc-text true))
 
   (remove-doc [this doc-ref]
-    (if-let [[doc-id stored-ref] (stored-doc-entry this doc-ref)]
-      (remove-doc* this doc-id stored-ref)
-      (raise "Document does not exist." {:doc-ref doc-ref})))
+    (with-document-write-lock lmdb docs
+      (if-let [[doc-id stored-ref] (stored-doc-entry this doc-ref)]
+        (remove-doc* this doc-id stored-ref)
+        (raise "Document does not exist." {:doc-ref doc-ref}))))
 
   (clear-docs [_]
-    (.empty docs)
-    (.empty terms)
-    (.clear dictionary)
-    (.clear norms)
-    (.clear ^LRUCache cache)
-    (clear-dbi lmdb terms-dbi)
-    (clear-dbi lmdb docs-dbi)
-    (clear-dbi lmdb positions-dbi)
-    (clear-dbi lmdb rawtext-dbi))
+    (with-document-write-lock lmdb docs
+      (.empty docs)
+      (.empty terms)
+      (.clear dictionary)
+      (.clear norms)
+      (.clear ^LRUCache cache)
+      (clear-dbi lmdb terms-dbi)
+      (clear-dbi lmdb docs-dbi)
+      (clear-dbi lmdb positions-dbi)
+      (clear-dbi lmdb rawtext-dbi)))
 
   (doc-indexed? [this doc-ref] (some-> (stored-doc-entry this doc-ref) first))
 
@@ -912,26 +932,27 @@
 
   IAdmin
   (re-index [this opts]
-    (if include-text?
-      (try
-        (let [dfname (str (env-dir lmdb) u/+separator+ "search.dump")
-              dos    (DataOutputStream. (FileOutputStream. ^String dfname))]
-          (nippy/freeze-to-out!
-            dos (for [[doc-id doc-ref] docs]
-                  [doc-ref (get-rawtext this doc-id)]))
-          (.flush dos)
-          (.close dos)
-          (.clear-docs this)
-          (let [new (new-search-engine* lmdb opts)
-                dis (DataInputStream. (FileInputStream. ^String dfname))]
-            (doseq [[doc-ref rawtext] (nippy/thaw-from-in! dis)]
-              (if/add-doc new doc-ref rawtext))
-            (.close dis)
-            (u/delete-files dfname)
-            new))
-        (catch Exception e
-          (raise "Unable to re-index search. " e {:dir (env-dir lmdb)})))
-      (raise "Can only re-index search when :include-text? is true" {}))))
+    (with-document-write-lock lmdb docs
+      (if include-text?
+        (try
+          (let [dfname (str (env-dir lmdb) u/+separator+ "search.dump")
+                dos    (DataOutputStream. (FileOutputStream. ^String dfname))]
+            (nippy/freeze-to-out!
+              dos (for [[doc-id doc-ref] docs]
+                    [doc-ref (get-rawtext this doc-id)]))
+            (.flush dos)
+            (.close dos)
+            (.clear-docs this)
+            (let [new (new-search-engine* lmdb opts)
+                  dis (DataInputStream. (FileInputStream. ^String dfname))]
+              (doseq [[doc-ref rawtext] (nippy/thaw-from-in! dis)]
+                (if/add-doc new doc-ref rawtext))
+              (.close dis)
+              (u/delete-files dfname)
+              new))
+          (catch Exception e
+            (raise "Unable to re-index search. " e {:dir (env-dir lmdb)})))
+        (raise "Can only re-index search when :include-text? is true" {})))))
 
 (defn- phrase-stats-empty
   [query]
@@ -1300,7 +1321,7 @@
   "Add a batch of unchecked `[doc-ref doc-text]` object arrays in one LMDB
   transaction. Intended for synchronous secondary indexing."
   [^SearchEngine engine ^List docs]
-  (locking (.-docs engine)
+  (with-document-write-lock (.-lmdb engine) (.-docs engine)
     (let [terms-dbi       (.-terms-dbi engine)
           positions-dbi   (.-positions-dbi engine)
           terms           ^SpillableMap (.-terms engine)
@@ -1375,7 +1396,7 @@
   "Apply ordered `[:add|:delete doc-ref doc-text]` object arrays in one LMDB
   transaction. Intended for synchronous secondary indexing."
   [^SearchEngine engine ^List ops]
-  (locking (.-docs engine)
+  (with-document-write-lock (.-lmdb engine) (.-docs engine)
     (let [terms-dbi       (.-terms-dbi engine)
           positions-dbi   (.-positions-dbi engine)
           rawtext-dbi     (.-rawtext-dbi engine)
@@ -1728,7 +1749,9 @@
                          (identical? owner (if/kv-info (.-lmdb engine)))
                          (identical? lmdb (.-lmdb engine)))
                        (= terms-dbi (.-terms-dbi engine)))]
-      (locking (.-docs engine)
+      ;; Registered views can outlive their native transaction. Publish through
+      ;; the committing handle's monitor, which belongs to this same environment.
+      (with-document-write-lock lmdb (.-docs engine)
         (let [^SpillableMap terms (.-terms engine)
               ^TermDictionary dictionary (.-dictionary engine)
               ^SpillableMap docs (.-docs engine)
