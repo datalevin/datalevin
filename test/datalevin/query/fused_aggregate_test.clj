@@ -87,3 +87,25 @@
               (explain @conn '[:find ?g (sum ?v) (count ?e)
                                :where [?e :g ?g] [?e :v ?v]])
               (finally (Thread/interrupted))))))))
+
+(deftest entity-values-are-materialized-when-read
+  (with-open [^java.io.Closeable conn
+              (d/create-conn nil schema {:background-sampling? false})]
+    (d/transact! conn [{:db/id 130 :g "a" :v 10}
+                       {:db/id 258 :g "a" :v 20}])
+    (doseq [project? [false true]
+            [q expected]
+            [['[:find ?g (sum ?e) (count ?e)
+                :where [?e :g ?g] [?e :v ?v]] [["a" 388 2]]]
+             ['[:find ?g (sum ?x) :with ?e
+                :where [?e :g ?g] [?e :v ?v] [(* ?e 2) ?x]] [["a" 776]]]
+             ['[:find ?g (sum ?x) :with ?e
+                :where [?e :g ?g] [?e :v ?v] [(* ?v (+ 1 ?e)) ?x]] [["a" 6490]]]
+             ['[:find ?g (sum ?v) (count ?e)
+                :where [?e :g ?g] [?e :v ?v] [(> ?e 200)]] [["a" 20 1]]]
+             ['[:find ?g (sum ?v) (count ?e)
+                :where [?e :g ?g] [?e :v ?v]] [["a" 30 2]]]]]
+      (binding [scan/*project-entity-rows?* project?]
+        (let [actual (explain @conn q)]
+          (is (some? (:fused-aggregation actual)))
+          (is (= expected (:result actual))))))))

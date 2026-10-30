@@ -11,6 +11,7 @@
   "Datom conversion, indexed tuple scans, and ordered parallel scan chunks."
   (:require
    [datalevin.binding.cpp :as cpp]
+   [datalevin.binding.cpp.iter :as cpp-iter]
    [datalevin.bits :as b]
    [datalevin.constants :as c]
    [datalevin.custom-datalog :as cd]
@@ -33,7 +34,8 @@
    [java.lang AutoCloseable]
    [org.eclipse.collections.impl.list.mutable FastList]
    [org.eclipse.collections.impl.map.mutable.primitive LongObjectHashMap]
-   [datalevin.bits Indexable Retrieved]))
+   [datalevin.bits Indexable Retrieved]
+   [datalevin.cpp Cursor EavProjection]))
 
 (defn e-aid-v->datom
   [store e-aid-v]
@@ -472,59 +474,95 @@
     (if-let [buffer (lmdb/get-kv dbi rtx)]
       (b/read-buffer buffer :long) 0)))
 
+(def ^:dynamic *project-entity-rows?*
+  "Use native EAV projection when the binding and uncompressed DBI support it."
+  true)
+
+(defn- fold-projected-entity-rows
+  [^EavProjection projection lmdb ^ints columns ^objects row consume! check! entity-value?]
+  (let [n (alength columns)]
+    (with-open [projection projection]
+      (loop [visited (long 0)]
+        (when (zero? (bit-and visited 4095)) (check!))
+        (let [status (.advance projection)]
+          (if (neg? status)
+            (do (check!) true)
+            (do
+              (when (pos? status)
+                (when entity-value?
+                  (aset row 0 (Long/valueOf (.entity projection))))
+                (dotimes [i n]
+                  (aset row (aget columns i)
+                        (idx/avg-buffer->v lmdb (.value projection i))))
+                (consume! row))
+              (recur (inc visited)))))))))
+
+(defn- fold-unprojected-entity-rows
+  [dbi rtx cur lmdb ^ints aids ^ints columns ^objects row consume! check! entity-value?]
+  (let [n (alength aids)
+        low (aget aids 0)
+        high (aget aids (dec n))
+        slots (int-array (inc (- high low)))]
+    (Arrays/fill slots (int -1))
+    (dotimes [i n] (aset-int slots (- (aget aids i) low) (aget columns i)))
+    (with-open [^AutoCloseable iterator
+                (.iterator ^Iterable
+                  (lmdb/iterate-list-key-range-val-full dbi rtx cur [:all] :id))]
+      (let [^Iterator iterator iterator
+            borrowed (when (satisfies? lmdb/IBorrowedKVIterator iterator)
+                       (lmdb/current-kv iterator))]
+        (loop [entity (long -1)
+               seen (long 0)
+               previous-aid (long -1)
+               visited (long 0)]
+          (if (.hasNext iterator)
+            (let [entry (or borrowed (.next iterator))
+                  eid (.getLong ^ByteBuffer (lmdb/k entry) 0)
+                  same? (== entity eid)
+                  _ (when (zero? (bit-and visited 4095)) (check!))
+                  _ (when (and (not same?) (== seen n))
+                      (when entity-value? (aset row 0 (Long/valueOf entity)))
+                      (consume! row))
+                  ^ByteBuffer value (lmdb/v entry)
+                  aid (.getInt value 0)
+                  column (if (and (<= low aid) (<= aid high))
+                           (aget slots (- aid low)) -1)
+                  read? (and (not (neg? column))
+                             (or (not same?) (not= aid previous-aid)))
+                  seen (if same? seen 0)]
+              (when read? (aset row column (idx/avg-buffer->v lmdb value)))
+              (recur eid (if read? (inc seen) seen) aid (inc visited)))
+            (do
+              (when (== seen n)
+                (when entity-value? (aset row 0 (Long/valueOf entity)))
+                (consume! row))
+              (check!)
+              true)))))))
+
 (defn fold-entity-rows
   "Stream required cardinality-one attributes in entity order into a borrowed
   scratch row. `consume!` must not retain the row. Unrequested attributes are
   never decoded; incomplete entities are skipped. The caller supplies sorted
   attribute ids, their output columns, a row with entity in column zero, and
   an invocation-local cancellation check. Return true on completion, or nil
-  before delivering any rows if the optional schema revision has changed."
+  before delivering any rows if the optional schema revision has changed.
+  Set entity-value? false only when the consumer does not read column zero."
   ([lmdb aids columns row consume! check!]
    (fold-entity-rows lmdb aids columns row consume! check! nil))
-  ([lmdb ^ints aids ^ints columns ^objects row consume! check! revision]
-   (let [n (alength aids)
-         low (aget aids 0)
-         high (aget aids (dec n))
-         slots (int-array (inc (- high low)))]
-     (Arrays/fill slots (int -1))
-     (dotimes [i n] (aset-int slots (- (aget aids i) low) (aget columns i)))
-     (check!)
-     (scan/scan lmdb c/eav
-       (when (or (nil? revision) (= revision (snapshot-schema-revision lmdb rtx)))
-         (with-open [^AutoCloseable iterator
-                     (.iterator ^Iterable
-                       (lmdb/iterate-list-key-range-val-full dbi rtx cur [:all] :id))]
-           (let [^Iterator iterator iterator
-                 borrowed (when (satisfies? lmdb/IBorrowedKVIterator iterator)
-                            (lmdb/current-kv iterator))]
-             (loop [entity (long -1)
-                    seen (long 0)
-                    previous-aid (long -1)
-                    visited (long 0)]
-               (if (.hasNext iterator)
-                 (let [entry (or borrowed (.next iterator))
-                       eid (.getLong ^ByteBuffer (lmdb/k entry) 0)
-                       same? (== entity eid)
-                       _ (when (zero? (bit-and visited 4095)) (check!))
-                       _ (when (and (not same?) (== seen n))
-                           (aset row 0 (Long/valueOf entity))
-                           (consume! row))
-                       ^ByteBuffer value (lmdb/v entry)
-                       aid (.getInt value 0)
-                       column (if (and (<= low aid) (<= aid high))
-                                (aget slots (- aid low)) -1)
-                       read? (and (not (neg? column))
-                                  (or (not same?) (not= aid previous-aid)))
-                       seen (if same? seen 0)]
-                   (when read? (aset row column (idx/avg-buffer->v lmdb value)))
-                   (recur eid (if read? (inc seen) seen) aid (inc visited)))
-                 (do
-                   (when (== seen n)
-                     (aset row 0 (Long/valueOf entity))
-                     (consume! row))
-                   (check!)
-                   true))))))
-       (throw e)))))
+  ([lmdb aids columns row consume! check! revision]
+   (fold-entity-rows lmdb aids columns row consume! check! revision true))
+  ([lmdb ^ints aids ^ints columns ^objects row consume! check! revision entity-value?]
+   (check!)
+   (scan/scan lmdb c/eav
+     (when (or (nil? revision) (= revision (snapshot-schema-revision lmdb rtx)))
+       (if (and *project-entity-rows?* (EavProjection/available)
+                (nil? (cpp-iter/dbi-key-codec dbi))
+                (nil? (cpp-iter/dbi-value-codec dbi)))
+         (fold-projected-entity-rows (EavProjection. ^Cursor cur aids)
+                                    lmdb columns row consume! check! entity-value?)
+         (fold-unprojected-entity-rows dbi rtx cur lmdb aids columns row
+                                       consume! check! entity-value?)))
+     (throw e))))
 
 (defn read-entity-values
   "Read and filter one entity's scalar attributes in aid order. Returns a values

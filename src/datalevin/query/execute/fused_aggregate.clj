@@ -53,15 +53,17 @@
                             (every? #(pure-expression? bound %) (rest expression)))
     :else (scalar? expression)))
 
+(defn- expression-arguments [clause]
+  ;; Specialization changes parsed arguments while source metadata can retain
+  ;; the original input symbols. Nested arithmetic remains inside Constants.
+  (mapv #(if (instance? Constant %) (:value %) (:symbol %)) (:args clause)))
+
 (defn- row-program [clauses columns context]
   (let [base-vars (set (keys columns))]
     (loop [clauses (seq clauses) columns columns operations []]
       (if-let [clause (first clauses)]
         (let [f (get-in clause [:fn :symbol])
-              ;; Input specialization updates the parsed arguments while source
-              ;; metadata can still contain the original parameter symbols.
-              args (mapv #(if (instance? Constant %) (:value %) (:symbol %))
-                         (:args clause))
+              args (expression-arguments clause)
               output (when (instance? Function clause)
                        (when (and (instance? BindScalar (:binding clause))
                                   (instance? Variable (get-in clause [:binding :variable])))
@@ -112,7 +114,14 @@
                (set/subset? retained (set (keys columns)))
                (every? some? plans))
       {:aggregate-columns (int-array (map first plans))
-       :aggregate-operations (int-array (map second plans))})))
+       :aggregate-operations (int-array (map second plans))
+       ;; Counting rows and proving their identity do not read the entity value.
+       :entity-value? (or (some #(and (zero? (first %))
+                                     (not= GroupedAggregate/COUNT (second %))) plans)
+                         (some #(= entity %)
+                               (tree-seq sequential? seq
+                                 (mapcat expression-arguments
+                                   (remove #(instance? Pattern %) (:qwhere parsed))))))})))
 
 (defn- small-group-domain? [parsed fields database schema]
   (let [attributes (into {} (map (juxt :variable :attr)) fields)
@@ -216,7 +225,7 @@
   Return nil when the admitted schema differs from the read transaction."
   [context {:keys [database aids scan-columns columns input-columns input-values
                    aggregate-columns aggregate-operations operations summary
-                   schema-revision]}]
+                   schema-revision entity-value?]}]
   (let [accumulator (GroupedAggregate. aggregate-columns aggregate-operations)
         row (object-array (count columns))
         input-count (long-array 1)
@@ -230,7 +239,8 @@
           (loop [i 0]
             (if (= i n)
               (do (.add accumulator row)
-                  (aset input-count 0 (unchecked-inc (aget input-count 0))))
+                  (aset input-count 0 (unchecked-inc (aget input-count 0)))
+                  nil)
               (let [[index call] (aget operations i)
                     value (call row)]
                 (if (nil? index)
@@ -238,7 +248,7 @@
                   (when-not (nil? value)
                     (aset row (int index) value)
                     (recur (inc i))))))))
-        check! schema-revision)
+        check! schema-revision (boolean entity-value?))
       (let [result {:rows (mapv vec (.results accumulator))
                     :input-tuples (aget input-count 0)
                     :group-count (.groupCount accumulator)}]

@@ -215,15 +215,22 @@
           include-stop?  (dtlv-bool (.-include-stop? ctx))
           sk             (dtlv-val (.-start-bf ctx))
           ek             (dtlv-val (.-stop-bf ctx))
-          k              (.key cur)
-          v              (.val cur)
+          ;; Decoding a giant value can issue a nested read on the same
+          ;; transaction. Keep cursor outputs separate from its scratch buffers.
+          k              (BufVal. 0)
+          v              (BufVal. 0)
           value-compressor (dbi-value-codec db)
           iter           (DTLV$dtlv_list_key_range_full_val_iter.)
           borrowed       (->KV k v (dbi-key-codec db) value-compressor rtx)]
-      (Util/checkRc
-       (DTLV/dtlv_list_key_range_full_val_iter_create
-        iter (.ptr cur) (.ptr k) (.ptr v)
-        ^int include-start? ^int include-stop? sk ek))
+      (try
+        (Util/checkRc
+          (DTLV/dtlv_list_key_range_full_val_iter_create
+            iter (.ptr cur) (.ptr k) (.ptr v)
+            ^int include-start? ^int include-stop? sk ek))
+        (catch Throwable e
+          (.close v)
+          (.close k)
+          (throw e)))
       (reify
         Iterator
         (hasNext [_]
@@ -234,7 +241,10 @@
         (current-kv [_] borrowed)
 
         AutoCloseable
-        (close [_] (DTLV/dtlv_list_key_range_full_val_iter_destroy iter))))))
+        (close [_]
+          (try
+            (DTLV/dtlv_list_key_range_full_val_iter_destroy iter)
+            (finally (.close v) (.close k))))))))
 
 (deftype ListFullValIterable [lmdb
                               db

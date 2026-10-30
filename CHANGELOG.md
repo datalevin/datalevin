@@ -5,6 +5,9 @@
 ### Added
 - [Admin] server wide administrative tool `dtlv admin` commands.
 
+### Changed
+- [Storage] update dtlvnative to 1.2.0 with prepared-copy native bindings.
+
 ## 1.2.10 (2026-10-28)
 
 ### Improved

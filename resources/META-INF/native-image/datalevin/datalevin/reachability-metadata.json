@@ -293,7 +293,8 @@
             "allDeclaredFields" : true
         },
         {
-            "type": "datalevin.dtlvnative.DTLV"
+            "type": "datalevin.dtlvnative.DTLV",
+            "allPublicMethods": true
         },
         {
             "type": "datalevin.dtlvnative.DTLV$MDB_assert_func"
