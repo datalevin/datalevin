@@ -16,6 +16,7 @@
    [datalevin.storage.scan :as scans]
    [datalevin.parser :as dp]
    [datalevin.query.optimizer.range :as qor]
+   [datalevin.query.optimizer.existence :as existence]
    [datalevin.query-util :as qu]
    [datalevin.util :as u :refer [raise]])
   (:import
@@ -91,6 +92,14 @@
   (some #(residual-pattern? sources %)
         (dp/collect #(instance? Pattern %) clause)))
 
+(defn- not-join-body-clause?
+  [clause]
+  (cond
+    (instance? Pattern clause) true
+    (instance? Predicate clause) (existence/simple-predicate? (dp/source clause))
+    (instance? Not clause) (every? not-join-body-clause? (:clauses clause))
+    :else false))
+
 (defn- not-join-optimizable?
   "Conservative check for planner-handled not-join."
   [sources parsed-clause orig-clause]
@@ -100,9 +109,9 @@
                                  (:vars parsed-clause))
           clauses          (:clauses parsed-clause)
           src              (get-not-join-source orig-clause)
-          pattern-only?    (every? #(instance? Pattern %) clauses)
+          supported-body?  (every? not-join-body-clause? clauses)
           clause-sources   (into #{} (map #(clause-source-symbol (:source %)))
-                                 clauses)
+                                 (dp/collect #(instance? Pattern %) clauses))
           body-vars        (qu/collect-vars clauses)
           all-vars-used?   (set/subset? (set vars) body-vars)
           searchable-src?  (when-let [db (get sources src)]
@@ -110,7 +119,7 @@
       (when (and (not (contains-residual-pattern? sources parsed-clause))
                  searchable-src?
                  (seq vars)
-                 pattern-only?
+                 supported-body?
                  (= 1 (count clause-sources))
                  (= src (first clause-sources))
                  all-vars-used?)

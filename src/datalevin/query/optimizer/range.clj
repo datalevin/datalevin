@@ -400,8 +400,56 @@
      (assoc graph source (add-pred-clause-to-source helpers source nodes clause v)))
    {} graph))
 
+(defn- implied-equalities
+  "Project Boolean equality filters onto individual variables. Conjunctions
+  retain every known restriction; disjunctions retain only variables restricted
+  in every branch. Unknown expressions impose no restriction."
+  [form]
+  (when (list? form)
+    (let [[op & args] form]
+      (case op
+        = (when (= 2 (count args))
+            (let [[left right] args
+                  [v value] (if (qu/binding-var? left)
+                              [left right] [right left])]
+              (when (and (qu/binding-var? v)
+                         (not (qu/free-var? value))
+                         (not (coll? value))
+                         (not (source-form? value)))
+                {v (list '= v value)})))
+        and (reduce #(merge-with (fn [a b] (list 'and a b))
+                                 %1 (implied-equalities %2))
+                    {} args)
+        or (when (seq args)
+             (reduce
+               (fn [known branch]
+                 (let [other (implied-equalities branch)]
+                   (reduce-kv
+                     (fn [m v pred]
+                       (if-let [other-pred (get other v)]
+                         (assoc m v (list 'or pred other-pred))
+                         m))
+                     {} known)))
+               (or (implied-equalities (first args)) {}) (next args)))
+        nil))))
+
+(defn- pushdown-implied-equalities
+  [context helpers clause gseq]
+  (reduce-kv
+    (fn [context v pred]
+      (if (some #(= v (:var %)) gseq)
+        ;; Keep equality as a residual predicate: serialized index ordering
+        ;; need not implement logical equality (e.g. bytes or numeric types).
+        (let [inferred [(list 'or pred)]]
+          (-> context
+              (update :opt-clauses conj inferred)
+              (update :graph #(add-pred-clause helpers % inferred v))))
+        context))
+    context (implied-equalities (first clause))))
+
 (defn pushdown-predicates
-  "Optimization that pushes predicates down to value scans."
+  "Push unary predicates and implied equality restrictions into value scans.
+  Multi-variable predicates remain late to enforce correlations between vars."
   [{:keys [parsed-q graph] :as context} helpers]
   (let [gseq (tree-seq coll? seq graph)]
     (u/reduce-indexed
@@ -414,5 +462,10 @@
                ;; Keep :var even for exact LIKE so projection and later joins
                ;; retain the binding. A singleton range still uses the index.
                (update :graph #(add-pred-clause helpers % clause v))))
-         c))
+         (if (and (instance? Predicate where)
+                  (< 1 (count (qu/collect-vars (:args where))))
+                  (not (source-form? (:args where))))
+           (pushdown-implied-equalities
+             c helpers (nth (:qorig-where parsed-q) i) gseq)
+           c)))
      context (:qwhere parsed-q))))

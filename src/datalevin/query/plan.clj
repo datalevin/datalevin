@@ -613,6 +613,22 @@
          (when (:sip-domain-id this) " while capturing a reusable domain")
          ".")))
 
+(defrecord TuplePredicateStep [clause in out cols strata seen-or-joins]
+  IStep
+  (-type [_] :tuple-predicate)
+  (-execute [_ _ tuples]
+    (let [[[f & args]] clause
+          pred (qresolve/-call-fn {} (r/relation! (cols->attrs cols) tuples) f args)]
+      (r/select-tuples pred tuples)))
+  (-execute-pipe [_ _ src sink]
+    (let [[[f & args]] clause
+          pred (qresolve/-call-fn {} (r/relation! (cols->attrs cols) nil) f args)]
+      (loop []
+        (when-let [tuple (p/produce src)]
+          (when (pred tuple) (.add ^Collection sink tuple))
+          (recur)))))
+  (-explain [_ _] (str "Filter by " (first clause) ".")))
+
 (defrecord NotJoinStep [clause vars sources rules in out cols strata seen-or-joins]
 
   IStep
@@ -643,7 +659,13 @@
       (p/add-batch sink (-execute this db input))))
 
   (-explain [_ _]
-    (str "Anti-join by " vars ".")))
+    (str (if (and (= 3 (count clause))
+                  (seq? (nth clause 2))
+                  (= 'not-join (first (nth clause 2)))
+                  (= (second clause) (second (nth clause 2))))
+           "Semi-join by "
+           "Anti-join by ")
+         vars ".")))
 
 (defrecord Node [links mpath mcount bound free])
 

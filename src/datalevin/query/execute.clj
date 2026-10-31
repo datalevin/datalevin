@@ -48,6 +48,7 @@
             #_{:clj-kondo/ignore [:unused-referred-var]}
             tuple->persistent-vector]]
    [datalevin.query.execute.rewrite :as rewrite]
+   [datalevin.query.optimizer.existence :as existence]
    [datalevin.query.plan :as qplan]
    [datalevin.query.resolve :as qresolve]
    [datalevin.relation :as r]
@@ -978,11 +979,11 @@
   ([parsed-q options]
    (let [find          (:qfind parsed-q)
          find-elements (dp/find-elements find)
-         result-arity  (count find-elements)
          with          (:qwith parsed-q)
          having        (:qhaving parsed-q)
          keep-group?   (qagg/compile-having having find-elements options)
          find-vars     (dp/find-vars find)
+         find-width    (count find-vars)
          all-vars      (concatv find-vars (map :symbol with))
          aggregate?    (some #(or (dp/aggregate? %) (dp/find-expr? %)) find-elements)
          pull?         (some dp/pull? find-elements)
@@ -1010,7 +1011,9 @@
                        (collect context all-vars))
              result
              (cond->> (if reduced (:rows reduced) (:result-set context))
-               (and with (nil? reduced)) (mapv #(subvec % 0 result-arity))
+               ;; Find expressions can consume several input columns while
+               ;; producing one result column. Remove only the :with columns.
+               (and with (nil? reduced)) (mapv #(subvec % 0 find-width))
 
                (and aggregate? (nil? reduced))
                (aggregate-results find-elements context)
@@ -1087,6 +1090,7 @@
           (rules/rewrite)
           (push-down-equality-disjunctions)
           (rewrite-unused-vars)
+          (existence/rewrite)
           (materialize-selective-value-lookups)
           (materialize-selective-rule-anchors)
           (-q execute?)))))

@@ -1,6 +1,7 @@
 (ns datalevin-tpch.queries-test
   (:require
    [clojure.test :refer [deftest is testing]]
+   [clojure.string :as str]
    [datalevin.core :as d]
    [datalevin-tpch.common :as c]
    [datalevin-tpch.datalevin :as dt]
@@ -8,6 +9,94 @@
    [datalevin-tpch.verify :as v])
   (:import
    [java.sql DriverManager]))
+
+(defn- check-fixture
+  "Run the actual SQL and Datalog queries over the same small table fixture."
+  [n tables]
+  (with-open [conn (DriverManager/getConnection "jdbc:sqlite::memory:")
+              stmt (.createStatement conn)]
+    (let [datoms (atom [])
+          eid (atom 0)]
+      (doseq [[table columns attrs rows] tables]
+        (.execute stmt (str "CREATE TABLE " table " (" (str/join ", " columns) ")"))
+        (with-open [ps (.prepareStatement conn
+                        (str "INSERT INTO " table " VALUES ("
+                             (str/join ", " (repeat (count columns) "?")) ")"))]
+          (doseq [row rows]
+            (let [id (swap! eid inc)]
+              (swap! datoms into (map #(vector id %1 %2) attrs row)))
+            (doseq [[i value] (map-indexed vector row)]
+              (.setObject ps (int (inc i)) value))
+            (.executeUpdate ps))))
+      (with-open [rs (.executeQuery stmt (#'v/reference-sql n))]
+        (let [width (.getColumnCount (.getMetaData rs))
+              expected (loop [rows []]
+                         (if (.next rs)
+                           (recur (conj rows (mapv #(.getObject rs (int %))
+                                                  (range 1 (inc width)))))
+                           rows))
+              actual (#'v/datalevin-rows @datoms n)]
+          (is (v/results-match? n expected actual)
+              (str "Q" n ": expected " expected ", got " actual))
+          actual)))))
+
+(deftest q8-retains-duplicate-volume-and-years-without-brazil
+  (doseq [lines [[]
+                [[1 1 1 100.0 0.0] [1 1 1 100.0 0.0] [1 2 1 100.0 0.0]
+                 [1 2 2 100.0 0.0]]]]
+    (let [actual
+          (check-fixture 8
+            [["part" ["p_partkey INTEGER" "p_type TEXT"]
+              [:part/partkey :part/type] [[1 "ECONOMY ANODIZED STEEL"]]]
+             ["supplier" ["s_suppkey INTEGER" "s_nationkey INTEGER"]
+              [:supplier/suppkey :supplier/nationkey] [[1 1] [2 2]]]
+             ["customer" ["c_custkey INTEGER" "c_nationkey INTEGER"]
+              [:customer/custkey :customer/nationkey] [[1 2]]]
+             ["orders" ["o_orderkey INTEGER" "o_custkey INTEGER" "o_orderdate TEXT"]
+              [:orders/orderkey :orders/custkey :orders/orderdate]
+              [[1 1 "1995-01-01"] [2 1 "1996-12-31"]]]
+             ["nation" ["n_nationkey INTEGER" "n_name TEXT" "n_regionkey INTEGER"]
+              [:nation/nationkey :nation/name :nation/regionkey]
+              [[1 "BRAZIL" 1] [2 "CANADA" 1]]]
+             ["region" ["r_regionkey INTEGER" "r_name TEXT"]
+              [:region/regionkey :region/name] [[1 "AMERICA"]]]
+             ["lineitem" ["l_partkey INTEGER" "l_suppkey INTEGER" "l_orderkey INTEGER"
+                          "l_extendedprice REAL" "l_discount REAL"]
+              [:lineitem/partkey :lineitem/suppkey :lineitem/orderkey
+               :lineitem/extendedprice :lineitem/discount] lines]])]
+      (if (empty? lines)
+        (is (empty? actual))
+        (is (= [[1995 (/ 2.0 3.0)] [1996 0.0]] actual))))))
+
+(deftest q11-shares-stock-values-without-losing-equal-part-totals
+  (doseq [stock [[]
+                [[1 1 1 2500.0] [1 2 1 2500.0]
+                 [2 1 1 5000.0] [3 1 1 1.0] [4 3 1 1.0e9]]
+                [[1 1 1 9999.0] [2 1 1 1.0]]]]
+    (check-fixture 11
+      [["nation" ["n_nationkey INTEGER" "n_name TEXT"]
+        [:nation/nationkey :nation/name] [[1 "GERMANY"] [2 "FRANCE"]]]
+       ["supplier" ["s_suppkey INTEGER" "s_nationkey INTEGER"]
+        [:supplier/suppkey :supplier/nationkey] [[1 1] [2 1] [3 2]]]
+       ["partsupp" ["ps_partkey INTEGER" "ps_suppkey INTEGER"
+                    "ps_availqty INTEGER" "ps_supplycost REAL"]
+        [:partsupp/partkey :partsupp/suppkey :partsupp/availqty :partsupp/supplycost]
+        stock]])))
+
+(deftest q15-retains-all-maxima-and-handles-empty-revenue
+  (doseq [lines [[]
+                [[1 "1996-04-01" 100.0 0.0]]
+                [[1 "1996-01-01" 100.0 0.0] [1 "1996-01-01" 100.0 0.0]
+                 [2 "1996-03-31" 200.0 0.0] [3 "1996-02-01" 150.0 0.0]
+                 [3 "1996-04-01" 1000.0 0.0]]]]
+    (check-fixture 15
+      [["supplier" ["s_suppkey INTEGER" "s_name TEXT" "s_address TEXT" "s_phone TEXT"]
+        [:supplier/suppkey :supplier/name :supplier/address :supplier/phone]
+        [[1 "A" "Addr A" "111"] [2 "B" "Addr B" "222"] [3 "C" "Addr C" "333"]]]
+       ["lineitem" ["l_suppkey INTEGER" "l_shipdate TEXT"
+                    "l_extendedprice REAL" "l_discount REAL"]
+        [:lineitem/suppkey :lineitem/shipdate :lineitem/extendedprice :lineitem/discount]
+        lines]])))
 
 (defn- q14-datoms [lines]
   (into [[1 :part/partkey 1] [1 :part/type "PROMO SMALL"]

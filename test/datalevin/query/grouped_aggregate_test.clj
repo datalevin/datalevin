@@ -1,12 +1,33 @@
 (ns datalevin.query.grouped-aggregate-test
   (:require [clojure.test :refer [deftest is]]
             [datalevin.built-ins :as built-ins]
+            [datalevin.core :as d]
             [datalevin.parser :as parser]
             [datalevin.query.aggregate :as aggregate]
             [datalevin.query.resolve.binding :as binding]
             [datalevin.relation :as relation])
   (:import [datalevin.utl GroupedAggregate]
            [org.eclipse.collections.impl.list.mutable FastList]))
+
+(deftest find-expressions-retain-aggregate-inputs-with-witnesses
+  (let [rows [[1 :a 10 2] [2 :a 10 2] [3 :a 20 8] [4 :b 6 3]]]
+    (is (= #{[:a 10/3] [:b 2]}
+           (set (d/q '[:find ?g (/ (sum ?x) (sum ?y))
+                       :with ?id :in [[?id ?g ?x ?y]]] rows))))
+    (is (= #{[:a 3] [:b 2]}
+           (set (d/q '[:find ?g (/ (sum ?x) (sum ?y))
+                       :in [[?id ?g ?x ?y]]] rows))))
+    (is (= 46/15
+           (d/q '[:find (/ (sum ?x) (sum ?y)) .
+                  :with ?id ?g :in [[?id ?g ?x ?y]]] rows)))
+    (is (= [46/15 46]
+           (d/q '[:find [(/ (sum ?x) (sum ?y)) (sum ?x)]
+                  :with ?id :in [[?id ?g ?x ?y]]] rows)))
+    (is (= #{[:a 40/3 40] [:b 6 6]}
+           (set (d/q '[:find ?g (/ (sum ?x) (count ?x)) (sum ?x)
+                       :with ?id :in [[?id ?g ?x ?y]]] rows))))
+    (is (nil? (d/q '[:find (/ (sum ?x) (sum ?y)) .
+                     :with ?id :in [[?id ?x ?y]]] [])))))
 
 (deftest grouped-arithmetic-matches-the-existing-builtins
   (doseq [values [[1 1 2] [1/2 1/3 1/7] [1.00M 2.0M 3.00M]

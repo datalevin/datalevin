@@ -196,48 +196,43 @@
     [(* ?ep ?x) ?volume]])
 
 ;; Q8: National Market Share
-;;
-;; A single aggregate relation computes total and Brazil-only volume with a
-;; mutually exclusive or-join, avoiding a second relation that can be empty for
-;; a given year.
+;; Aggregate both contributions together, then divide in the find expression.
+;; The zero contribution retains years without Brazilian volume.
 (def q-8
-  '[:find ?o-year ?mkt
+  '[:find ?o-year (/ (sum ?bz) (sum ?volume))
     :order-by [0 :asc]
+    :with ?l
     :where
-    [(q [:find ?y (sum ?volume) (sum ?bz)
-         :with ?l
-         :where
-         [?p :part/partkey ?p-partkey]
-         [?p :part/type "ECONOMY ANODIZED STEEL"]
-         [?l :lineitem/partkey ?p-partkey]
-         [?s :supplier/suppkey ?s-suppkey]
-         [?l :lineitem/suppkey ?s-suppkey]
-         [?l :lineitem/orderkey ?l-orderkey]
-         [?o :orders/orderkey ?l-orderkey]
-         [?o :orders/custkey ?o-custkey]
-         [?o :orders/orderdate ?o-orderdate]
-         [(>= ?o-orderdate "1995-01-01")]
-         [(<= ?o-orderdate "1996-12-31")]
-         [?c :customer/custkey ?o-custkey]
-         [?c :customer/nationkey ?c-nationkey]
-         [?n1 :nation/nationkey ?c-nationkey]
-         [?n1 :nation/regionkey ?n1-regionkey]
-         [?r :region/regionkey ?n1-regionkey]
-         [?r :region/name "AMERICA"]
-         [?s :supplier/nationkey ?s-nationkey]
-         [?n2 :nation/nationkey ?s-nationkey]
-         [?n2 :nation/name ?nation]
-         [?l :lineitem/extendedprice ?ep]
-         [?l :lineitem/discount ?disc]
-         [(- 1 ?disc) ?x]
-         [(* ?ep ?x) ?volume]
-         (or-join [?nation ?weight]
-                  (and [(= ?nation "BRAZIL")] [(ground 1.0) ?weight])
-                  (and [(not= ?nation "BRAZIL")] [(ground 0.0) ?weight]))
-         [(* ?volume ?weight) ?bz]
-         [(subs ?o-orderdate 0 4) ?ys]
-         [(parse-long ?ys) ?y]] $) [[?o-year ?total ?brazil]]]
-    [(/ ?brazil ?total) ?mkt]])
+    [?p :part/partkey ?p-partkey]
+    [?p :part/type "ECONOMY ANODIZED STEEL"]
+    [?l :lineitem/partkey ?p-partkey]
+    [?s :supplier/suppkey ?s-suppkey]
+    [?l :lineitem/suppkey ?s-suppkey]
+    [?l :lineitem/orderkey ?l-orderkey]
+    [?o :orders/orderkey ?l-orderkey]
+    [?o :orders/custkey ?o-custkey]
+    [?o :orders/orderdate ?o-orderdate]
+    [(>= ?o-orderdate "1995-01-01")]
+    [(<= ?o-orderdate "1996-12-31")]
+    [?c :customer/custkey ?o-custkey]
+    [?c :customer/nationkey ?c-nationkey]
+    [?n1 :nation/nationkey ?c-nationkey]
+    [?n1 :nation/regionkey ?n1-regionkey]
+    [?r :region/regionkey ?n1-regionkey]
+    [?r :region/name "AMERICA"]
+    [?s :supplier/nationkey ?s-nationkey]
+    [?n2 :nation/nationkey ?s-nationkey]
+    [?n2 :nation/name ?nation]
+    [?l :lineitem/extendedprice ?ep]
+    [?l :lineitem/discount ?disc]
+    [(- 1 ?disc) ?x]
+    [(* ?ep ?x) ?volume]
+    (or-join [?nation ?weight]
+             (and [(= ?nation "BRAZIL")] [(ground 1.0) ?weight])
+             (and [(not= ?nation "BRAZIL")] [(ground 0.0) ?weight]))
+    [(* ?volume ?weight) ?bz]
+    [(subs ?o-orderdate 0 4) ?ys]
+    [(parse-long ?ys) ?o-year]])
 
 ;; Q9: Product Type Profit Measure
 (def q-9
@@ -300,6 +295,7 @@
     [(* ?ep ?x) ?revenue]])
 
 ;; Q11: Important Stock Identification
+;; Reuse per-part values for the grand total instead of scanning stock twice.
 (def q-11
   '[:find ?ps-partkey ?value
     :order-by [1 :desc]
@@ -315,18 +311,9 @@
          [?s :supplier/nationkey ?nk]
          [?n :nation/nationkey ?nk]
          [?n :nation/name "GERMANY"]
-         [(* ?sc ?q) ?v]] $) [[?ps-partkey ?value]]]
-    [(q [:find (sum ?v) .
-         :with ?ps
-         :where
-         [?ps :partsupp/suppkey ?sk]
-         [?ps :partsupp/availqty ?q]
-         [?ps :partsupp/supplycost ?sc]
-         [?s :supplier/suppkey ?sk]
-         [?s :supplier/nationkey ?nk]
-         [?n :nation/nationkey ?nk]
-         [?n :nation/name "GERMANY"]
-         [(* ?sc ?q) ?v]] $) ?total]
+         [(* ?sc ?q) ?v]] $) ?part-values]
+    [(apply + (map second ?part-values)) ?total]
+    [(identity ?part-values) [[?ps-partkey ?value]]]
     [(* ?total 0.0001) ?threshold]
     [(> ?value ?threshold)]])
 
@@ -370,63 +357,32 @@
     [(get ?counts-by-customer ?ck 0) ?c-count]])
 
 ;; Q14: Promotion Effect
-;;
-;; `if` is not resolvable inside a nested query, so the SQL CASE becomes a
-;; per-row contribution: `(or (and ?promo? ?v) 0.0)`. Aggregating that over
-;; every in-range lineitem keeps the numerator row present (0.0 when no promo
-;; part qualifies) instead of the empty result a promo-only filter produces.
-;; A scalar result preserves SQL's NULL when no lineitems qualify; the verifier
-;; wraps it as one row, just as it does for the other ungrouped aggregates.
+;; Sum promotional and total revenue over the same joined lineitems. A zero
+;; contribution preserves non-promotional rows; an empty input returns nil,
+;; which the verifier represents as SQL's single NULL aggregate row.
 (def q-14
-  '[:find ?promo .
+  '[:find (/ (* 100.0 (sum ?contrib)) (sum ?v)) .
+    :with ?l
     :where
-    [(q [:find (sum ?contrib) .
-         :with ?l
-         :where
-         [?l :lineitem/shipdate ?sd]
-         [(>= ?sd "1995-09-01")]
-         [(< ?sd "1995-10-01")]
-         [?l :lineitem/partkey ?pk]
-         [?p :part/partkey ?pk]
-         [?p :part/type ?pt]
-         [(like ?pt "PROMO%") ?promo?]
-         [?l :lineitem/extendedprice ?ep]
-         [?l :lineitem/discount ?d]
-         [(- 1 ?d) ?x]
-         [(* ?ep ?x) ?v]
-         [(or (and ?promo? ?v) 0.0) ?contrib]] $) ?pvsum]
-    [(q [:find (sum ?v) .
-         :with ?l
-         :where
-         [?l :lineitem/shipdate ?sd]
-         [(>= ?sd "1995-09-01")]
-         [(< ?sd "1995-10-01")]
-         [?l :lineitem/partkey ?pk]
-         [?p :part/partkey ?pk]
-         [?l :lineitem/extendedprice ?ep]
-         [?l :lineitem/discount ?d]
-         [(- 1 ?d) ?x]
-         [(* ?ep ?x) ?v]] $) ?vsum]
-    [(/ (* 100.0 ?pvsum) ?vsum) ?promo]])
+    [?l :lineitem/shipdate ?sd]
+    [(>= ?sd "1995-09-01")]
+    [(< ?sd "1995-10-01")]
+    [?l :lineitem/partkey ?pk]
+    [?p :part/partkey ?pk]
+    [?p :part/type ?pt]
+    [(like ?pt "PROMO%") ?promo?]
+    [?l :lineitem/extendedprice ?ep]
+    [?l :lineitem/discount ?d]
+    [(- 1 ?d) ?x]
+    [(* ?ep ?x) ?v]
+    [(or (and ?promo? ?v) 0.0) ?contrib]])
 
 ;; Q15: Top Supplier
+;; Compute supplier totals once and retain every supplier tied for the maximum.
 (def q-15
   '[:find ?s-suppkey ?s-name ?s-address ?s-phone ?total
     :order-by [0 :asc]
     :where
-    [(q [:find (max ?t) .
-         :where
-         [(q [:find ?sk (sum ?rev)
-              :with ?l
-              :where
-              [?l :lineitem/shipdate ?sd]
-              [(>= ?sd "1996-01-01")]
-              [(< ?sd "1996-04-01")]
-              [?l :lineitem/suppkey ?sk]
-              [?l :lineitem/extendedprice ?ep]
-              [?l :lineitem/discount ?d]
-              [(- 1 ?d) ?x]
-              [(* ?ep ?x) ?rev]] $) [[?sk ?t]]]] $) ?max]
     [(q [:find ?sk (sum ?rev)
          :with ?l
          :where
@@ -437,7 +393,10 @@
          [?l :lineitem/extendedprice ?ep]
          [?l :lineitem/discount ?d]
          [(- 1 ?d) ?x]
-         [(* ?ep ?x) ?rev]] $) [[?s-suppkey ?total]]]
+         [(* ?ep ?x) ?rev]] $) ?revenues]
+    [(not-empty ?revenues)]
+    [(apply max (map second ?revenues)) ?max]
+    [(identity ?revenues) [[?s-suppkey ?total]]]
     [(= ?total ?max)]
     [?s :supplier/suppkey ?s-suppkey]
     [?s :supplier/name ?s-name]

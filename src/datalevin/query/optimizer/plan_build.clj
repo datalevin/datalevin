@@ -23,6 +23,7 @@
             count-or-join-follows estimate-hash-join-cost estimate-link-cost
             estimate-round final-plan-size incoming-link-counts recount-node]]
    [datalevin.query.optimizer.graph :as qog]
+   [datalevin.query.optimizer.existence :as existence]
    [datalevin.query.optimizer.plan-cost
     :refer [estimate-base-cost estimate-scan-v-cost estimate-scan-v-size
             fast-clause-count final-plan-cost zero-count-clause-size]]
@@ -1842,6 +1843,51 @@
     (let [cols (:cols step)]
       (every? #(some? (find-index % cols)) vars))))
 
+(defn- insert-filter-step
+  "Insert after the first step that supplies every dependency."
+  [plans vars make-step]
+  (loop [idx 0]
+    (when (< idx (count plans))
+      (let [steps (vec (:steps (nth plans idx)))
+            pos (first (keep-indexed
+                         (fn [i step]
+                           (when (every? #(some? (find-index % (:cols step))) vars) i))
+                         steps))]
+        (if (some? pos)
+          (let [pos (+ pos (count (take-while
+                                   #(#{:tuple-predicate :not-join} (-type %))
+                                   (subvec steps (inc pos)))))]
+            (assoc (vec plans) idx
+                   (update (nth plans idx) :steps
+                           (fn [_] (into (conj (subvec steps 0 (inc pos))
+                                              (make-step (nth steps pos)))
+                                         (subvec steps (inc pos)))))))
+          (recur (inc idx)))))))
+
+(defn- plan-tuple-predicates
+  [{:keys [plan late-clauses] :as context}]
+  (let [[planned late]
+        (reduce
+          (fn [[plans late] clause]
+            (let [vars (qu/collect-vars clause)
+                  sites (when (existence/simple-predicate? clause)
+                          (for [[src components] plans
+                                [i component] (map-indexed vector components)
+                                :when (component-binds-vars? component vars)]
+                            [src i]))]
+              (if (= 1 (count sites))
+                (let [[src i] (first sites)
+                      updated (insert-filter-step
+                                (get-in plans [src i]) vars
+                                (fn [step]
+                                  (qplan/->TuplePredicateStep
+                                    clause (:out step) (:out step) (:cols step)
+                                    (:strata step) (:seen-or-joins step))))]
+                  [(assoc-in plans [src i] updated) late])
+                [plans (conj late clause)])))
+          [plan []] late-clauses)]
+    (assoc context :plan planned :late-clauses late)))
+
 (defn- add-not-join-step
   [plans clause sources rules]
   (let [plans     (vec plans)
@@ -1853,11 +1899,10 @@
                                     (:out last-step) (:out last-step)
                                     (:cols last-step) (:strata last-step)
                                     (:seen-or-joins last-step))]
+    ;; Let selective positive joins constrain the key domain first.
     (assoc plans plan-idx (update last-plan :steps conj nstep))))
 
-(defn plan-not-joins
-  "Attach optimizable not-join clauses to source plans when all join vars are
-   bound by a single component. Unlinked clauses remain in :late-clauses."
+(defn- attach-not-joins
   [{:keys [plan sources rules optimizable-not-joins] :as context}]
   (if (seq optimizable-not-joins)
     (let [plan'                (into {} (map (fn [[src comps]]
@@ -1889,3 +1934,9 @@
           (update :late-clauses into unlinked)
           (assoc :optimizable-not-joins [])))
     context))
+
+(defn plan-not-joins
+  "Schedule scalar comparisons at their first bound site, then attach keyed
+  existence checks after selective positive joins. Unlinked clauses stay late."
+  [context]
+  (-> context plan-tuple-predicates attach-not-joins))
