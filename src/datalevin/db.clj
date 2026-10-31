@@ -553,6 +553,12 @@
   [:sample-init-tuples a mcount v-ranges pred get-v?
    u/*reservoir-sampling-seed*])
 
+(defn cached-string-capacity
+  "Cache advisory string-dictionary eligibility until the attribute changes.
+  compute-capacity is called outside the cache monitor on a miss."
+  [store attr compute-capacity]
+  (wrap-cache store [:string-cache-capacity attr] (compute-capacity)))
+
 (defn- e-sample-cache-key
   [a mcount]
   [:e-sample a mcount c/init-exec-size-threshold
@@ -715,7 +721,8 @@
           [::native-range [::entity (.-e ^Datom low)]]
           [::all]))
 
-      (:init-tuples :sample-init-tuples :e-sample :default-ratio :cardinality)
+      (:init-tuples :sample-init-tuples :e-sample :default-ratio :cardinality
+       :string-cache-capacity)
       [[::attribute (get k 1)]]
 
       (:val-eq-scan-e :val-eq-filter-e)
@@ -841,7 +848,7 @@
                   (tx-affects-pattern? touches e* a nil)))
             true))
 
-        :cardinality
+        (:cardinality :string-cache-capacity)
         (let [[_ a] k]
           (contains? attrs a))
 

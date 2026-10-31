@@ -257,11 +257,11 @@ See [README on Docker hub](https://hub.docker.com/r/huahaiy/datalevin) for usage
 
 Or download the executable binary from github:
 
-* [MacOS](https://github.com/datalevin/datalevin/releases/download/0.10.18/dtlv-0.10.18-macos-14-aarch64.zip)
+* [MacOS](https://github.com/datalevin/datalevin/releases/download/0.10.18/dtlv-0.10.18-macos-aarch64.zip)
   on arm64 (AARCH64)
-* [Linux](https://github.com/datalevin/datalevin/releases/download/0.10.18/dtlv-0.10.18-ubuntu-22.04-amd64.zip)
+* [Linux](https://github.com/datalevin/datalevin/releases/download/0.10.18/dtlv-0.10.18-linux-amd64.zip)
   on x86_64 (AMD64)
-* [Linux](https://github.com/datalevin/datalevin/releases/download/0.10.18/dtlv-0.10.18-ubuntu-24.04-arm-aarch64.zip)
+* [Linux](https://github.com/datalevin/datalevin/releases/download/0.10.18/dtlv-0.10.18-linux-aarch64.zip)
   on arm64 (AARCH64)
 * [Windows](https://github.com/datalevin/datalevin/releases/download/0.10.18/dtlv-0.10.18-windows-amd64.zip)
   on x86-64 (AMD64)

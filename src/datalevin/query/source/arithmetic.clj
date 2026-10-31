@@ -1,5 +1,5 @@
 (ns ^:no-doc datalevin.query.source.arithmetic
-  "Reserve arbitrary-precision aggregate arithmetic before invoking native reducers."
+  "Reserve arbitrary-precision arithmetic before invoking native operators."
   (:require [datalevin.query.source :as source]
             [datalevin.query.source.runtime :as rt]
             [datalevin.query.source.value :as value])
@@ -48,6 +48,43 @@
     (when-let [items (seq values)]
       (source/check-active! control)
       (cons (first items) (checked-values control (rest items))))))
+
+(defn wrap-scalar
+  "Bound scalar numeric scratch before calling the ordinary query function.
+  Unlike a sum, a product/quotient can grow with every operand, so include all
+  coefficient sizes and absolute decimal scales, including the implicit 1 of
+  inc/dec and unary division. Never compute decimal precision or powers here."
+  [runtime f]
+  (fn [values]
+    (let [control (:control runtime)
+          [width wide? decimal?]
+          (reduce (fn [[width wide? decimal?] x]
+                    (source/check-active! control)
+                    [(value/add-charge width
+                       (if (wide-number? x)
+                         (value/add-charge (value/value-charge x)
+                           (if (instance? BigDecimal x)
+                             (abs (long (.scale ^BigDecimal x))) 0))
+                         32))
+                     (or wide? (wide-number? x))
+                     (or decimal? (instance? BigDecimal x))])
+                  [128 false false] values)
+          precision (if (and decimal? *math-context*)
+                      (long (.getPrecision ^MathContext *math-context*)) 0)
+          token (when wide?
+                  (source/reserve! control
+                    {:retained-bytes (value/add-charge 4096
+                                       (value/multiply-charge 32 (value/add-charge width precision)))}))]
+      (try
+        (let [result (f values)]
+          (source/check-active! control)
+          ;; Arithmetic values are immutable but newly allocated, and may
+          ;; outlive scratch in a following scalar step or aggregate.
+          (when (wide-number? result)
+            (let [retained (rt/charge! runtime result)]
+              (rt/own! runtime #(source/release! retained))))
+          result)
+        (finally (when token (source/release! token)))))))
 
 (defn wrap-aggregate
   "Keep native sum/avg semantics while reserving their arithmetic workspace.

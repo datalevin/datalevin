@@ -37,12 +37,13 @@ permissions:
 jobs:
   build:
     # runs-on: ${{ matrix.os }}
-    # Keep matrix.os stable so a rebuild replaces the existing platform asset.
+    # Runner labels select build machines; release filenames use stable OS names.
     runs-on: ${{ matrix.os == 'macos-14' && (github.event_name == 'release' || inputs.macos_runner == 'self-hosted') && fromJSON('["self-hosted","macOS","ARM64","datalevin-release"]') || matrix.os }}
     timeout-minutes: ${{ matrix.os == 'macos-14' && 180 || 360 }}
     env:
       RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
       # RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag || github.sha }}
+      RELEASE_OS: ${{ matrix.os == 'macos-14' && 'macos' || matrix.os == 'windows-latest' && 'windows' || 'linux' }}
       RELEASE_ARCH: ${{ contains(fromJSON('["macos-14","ubuntu-24.04-arm"]'), matrix.os) && 'aarch64' || 'amd64' }}
       # The local Mac runs a newer OS than the minimum supported release target.
       MACOSX_DEPLOYMENT_TARGET: ${{ matrix.os == 'macos-14' && '14.0' || '' }}
@@ -57,6 +58,10 @@ jobs:
       #     - windows-latest
 
     steps:
+      - name: Set binary asset name
+        shell: bash
+        run: echo "RELEASE_ASSET=dtlv-${RELEASE_TAG}-${RELEASE_OS}-${RELEASE_ARCH}.zip" >> "$GITHUB_ENV"
+
       - name: Checkout repository and submodules
         uses: actions/checkout@v3
         with:
@@ -128,7 +133,7 @@ jobs:
       - name: Build Native Datalevin (Unix)
         if: matrix.os != 'windows-latest'
         run: |
-          export DTLV_OS=${{ runner.os == 'macOS' && 'macos' || 'linux' }}
+          export DTLV_OS=${{ env.RELEASE_OS }}
           export DTLV_ARCH=${{ env.RELEASE_ARCH }}
 
 
@@ -165,21 +170,21 @@ jobs:
         if: matrix.os != 'windows-latest'
         run: |
           if [ "${{ runner.os }}" == "macOS" ]; then
-            7zz a -tzip dtlv-${{ env.RELEASE_TAG }}-${{ matrix.os }}-${{ env.RELEASE_ARCH }}.zip dtlv
+            7zz a -tzip "$RELEASE_ASSET" dtlv
           else
-            7z a -tzip dtlv-${{ env.RELEASE_TAG }}-${{ matrix.os }}-${{ env.RELEASE_ARCH }}.zip dtlv
+            7z a -tzip "$RELEASE_ASSET" dtlv
           fi
 
       - name: Zip Binary (Windows)
         if: matrix.os == 'windows-latest'
-        run: 7z a -tzip dtlv-${{ env.RELEASE_TAG }}-${{ matrix.os }}-${{ env.RELEASE_ARCH }}.zip dtlv.exe
+        run: 7z a -tzip "$env:RELEASE_ASSET" dtlv.exe
 
       - name: Upload Binary
         if: github.event_name == 'release'
         uses: shogo82148/actions-upload-release-asset@v1
         with:
           upload_url: ${{ github.event.release.upload_url }}
-          asset_path: dtlv-${{ env.RELEASE_TAG }}-${{ matrix.os }}-${{ env.RELEASE_ARCH }}.zip
+          asset_path: ${{ env.RELEASE_ASSET }}
           overwrite: true
 
       - name: Replace Binary on Existing Release
@@ -187,4 +192,4 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "$RELEASE_TAG" "dtlv-${RELEASE_TAG}-${{ matrix.os }}-${RELEASE_ARCH}.zip" --clobber
+        run: gh release upload "$RELEASE_TAG" "$RELEASE_ASSET" --clobber

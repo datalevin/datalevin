@@ -392,10 +392,17 @@
 
            :else
            (aset static-args i arg))))
-     (let [dynamic-positions (when (or (identical? resolved built-ins/like)
+     (let [prepare (:prepare-call context)
+           dynamic-positions (when (or prepare
+                                      (identical? resolved built-ins/like)
                                       (identical? resolved built-ins/not-like))
                                (into #{} (keep-indexed #(when (some? %2) %1)) tuples-args))
-           invoke (prepare-call resolved static-args dynamic-positions)
+           ;; Bounded source programs admit scalar calls before execution.
+           ;; Their preparer supplies workspace/ownership accounting while
+           ;; binding and filtering continue through the ordinary resolver.
+           invoke (if prepare
+                    (prepare f resolved static-args dynamic-positions)
+                    (prepare-call resolved static-args dynamic-positions))
            ;; Projection metadata belongs on resolved values, not query symbols
            ;; or nested expressions whose evaluation would discard it.
            call (if needed

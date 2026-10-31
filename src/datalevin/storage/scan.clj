@@ -35,7 +35,7 @@
    [org.eclipse.collections.impl.list.mutable FastList]
    [org.eclipse.collections.impl.map.mutable.primitive LongObjectHashMap]
    [datalevin.bits Indexable Retrieved]
-   [datalevin.cpp Cursor EavProjection]))
+   [datalevin.cpp Cursor EavProjection EavStringCache]))
 
 (defn e-aid-v->datom
   [store e-aid-v]
@@ -478,24 +478,186 @@
   "Use native EAV projection when the binding and uncompressed DBI support it."
   true)
 
-(defn- fold-projected-entity-rows
+(def ^:dynamic *selective-materialization?*
+  "Choose native EAV materialization once per fused scan. The default :auto
+  compares requested fields with the anchor population's estimated row width.
+  Bind true/false to force selective/full materialization for diagnostics.
+  The datalevin.eav.selective-materialization JVM property accepts auto, true,
+  or false. Direct folds without an estimate conservatively use full mode."
+  (case (System/getProperty "datalevin.eav.selective-materialization" "auto")
+    "auto" :auto
+    "true" true
+    "false" false
+    (throw (IllegalArgumentException.
+             "datalevin.eav.selective-materialization must be auto, true, or false"))))
+
+(def ^:dynamic *cache-string-values?*
+  "Reuse short decoded strings within one projected entity scan. Bind false
+  for diagnostic comparisons; caches never survive a scan or read snapshot."
+  true)
+
+(defn- first-short-string?
+  [lmdb key-range]
+  (let [short? (volatile! false)]
+    (i/visit-key-range lmdb c/ave
+      (fn [^ByteBuffer key]
+        (let [n (.limit key)]
+          (vreset! short? (and (<= 7 n EavStringCache/MAX_KEY_BYTES)
+                              (= c/type-string (.get key 4))
+                              (= c/false-value (.get key (dec n))))))
+        :datalevin/terminate-visit)
+      key-range :avg true)
+    @short?))
+
+(defn string-value-cache-capacity
+  "Compute advisory dictionary capacity from distinct AVE keys and the first
+  encoded key's width. The caller can memoize this metadata by attribute."
+  [lmdb schema attr]
+  (let [key-range
+        [:closed
+         (datom->indexable lmdb schema (d/datom c/e0 attr nil) false)
+         (datom->indexable lmdb schema (d/datom c/emax attr nil) true)]
+        cardinality (long (i/key-range-count lmdb c/ave key-range :avg))]
+    (if (and (<= 1 cardinality EavStringCache/MAX_ENTRIES)
+             (first-short-string? lmdb key-range))
+      cardinality 0)))
+
+(defn string-value-cache-plan
+  "Choose bounded string dictionaries. capacity-for supplies attribute-cached
+  metadata; runtime misses always retain the ordinary decoder."
+  [schema attributes capacity-for]
+  (when *cache-string-values?*
+    (let [capacities
+          (int-array
+            (map (fn [attr]
+                   (if (= :db.type/string (get-in schema [attr :db/valueType]))
+                     (capacity-for attr)
+                     0))
+                 attributes))]
+      (when (some pos? capacities)
+        {:capacities capacities
+         :summary {:max-entries EavStringCache/MAX_ENTRIES
+                   :max-key-bytes EavStringCache/MAX_KEY_BYTES
+                   :attributes (into {} (keep (fn [[attr capacity]]
+                                                (when (pos? capacity) [attr capacity])))
+                                     (map vector attributes capacities))}}))))
+
+(defn- sampled-entity-widths
+  [lmdb schema anchor population-size]
+  (when (pos? (long population-size))
+    (let [n (min 8 (long population-size))
+          indices (long-array
+                    (map #(quot (*' % (dec (long population-size)))
+                                (max 1 (dec n)))
+                         (range n)))
+          entities (volatile! [])]
+      ;; Spread the bounded sample across the anchor population: early entity
+      ;; ids can have a different shape (including co-located entity types).
+      (i/visit-list-sample lmdb c/ave indices
+        (fn [entry]
+          (vswap! entities conj (.getLong ^ByteBuffer (lmdb/v entry) 0)))
+        [:closed
+         (datom->indexable lmdb schema (d/datom c/e0 anchor nil) false)
+         (datom->indexable lmdb schema (d/datom c/emax anchor nil) true)]
+        :avg :id true)
+      (mapv #(long (i/list-count lmdb c/eav % :id)) @entities))))
+
+(defn entity-materialization-plan
+  "Estimate row width from at most eight entities carrying the anchor attribute.
+  Count EAV duplicates, including cardinality-many values, without materializing
+  whole rows. The smallest observed width conservatively estimates the
+  population rather than treating unrelated schema attributes as one row type.
+  This is advisory costing only; it never changes row eligibility or results."
+  [lmdb schema anchor requested population-size]
+  (let [dbi (i/get-dbi lmdb c/eav false)
+        native? (and *project-entity-rows?*
+                     (nil? (cpp-iter/dbi-key-codec dbi))
+                     (nil? (cpp-iter/dbi-value-codec dbi)))
+        auto? (= :auto *selective-materialization?*)
+        widths (when (and native? auto? (EavProjection/selectiveAvailable))
+                 (sampled-entity-widths lmdb schema anchor population-size))
+        width (when (seq widths) (reduce min widths))
+        ;; End-to-end controls admit 12-value rows, while smaller wide-string
+        ;; rows can regress despite cheaper JNI arguments. Keep dense rows full.
+        selective? (if auto?
+                     (and width (<= 12 width) (< (* 2 (long requested)) width))
+                     (true? *selective-materialization?*))
+        mode (cond
+               (not native?) :ordinary
+               (and selective? (EavProjection/selectiveAvailable)) :selective
+               (EavProjection/available false) :full
+               :else :ordinary)]
+    {:mode mode :requested-attributes requested
+     :estimated-row-values width :sampled-entities (count widths)
+     :decision (if auto? :estimated :override)}))
+
+(defn- fold-projected-uncached-rows
   [^EavProjection projection lmdb ^ints columns ^objects row consume! check! entity-value?]
   (let [n (alength columns)]
-    (with-open [projection projection]
-      (loop [visited (long 0)]
-        (when (zero? (bit-and visited 4095)) (check!))
-        (let [status (.advance projection)]
-          (if (neg? status)
-            (do (check!) true)
-            (do
-              (when (pos? status)
-                (when entity-value?
-                  (aset row 0 (Long/valueOf (.entity projection))))
-                (dotimes [i n]
-                  (aset row (aget columns i)
-                        (idx/avg-buffer->v lmdb (.value projection i))))
-                (consume! row))
-              (recur (inc visited)))))))))
+    (loop [visited (long 0)]
+      (when (zero? (bit-and visited 4095)) (check!))
+      (let [status (.advance projection)]
+        (if (neg? status)
+          (do (check!) true)
+          (do
+            (when (pos? status)
+              (when entity-value?
+                (aset row 0 (Long/valueOf (.entity projection))))
+              (dotimes [i n]
+                (aset row (aget columns i)
+                      (idx/avg-buffer->v lmdb (.value projection i))))
+              (consume! row))
+            (recur (inc visited))))))))
+
+(defn- fold-projected-cached-rows
+  [^EavProjection projection lmdb ^ints columns ^objects row consume! check! entity-value?
+   ^objects caches ^ints active]
+  (let [n (alength columns)]
+    (loop [visited (long 0)]
+      (if (zero? (aget active 0))
+        (fold-projected-uncached-rows projection lmdb columns row consume! check! entity-value?)
+        (do
+          (when (zero? (bit-and visited 4095)) (check!))
+          (let [status (.advance projection)]
+            (if (neg? status)
+              (do (check!) true)
+              (do
+                (when (pos? status)
+                  (when entity-value?
+                    (aset row 0 (Long/valueOf (.entity projection))))
+                  (dotimes [i n]
+                    (let [value (.value projection i)
+                          ^EavStringCache cache (aget caches i)]
+                      (aset row (aget columns i)
+                            (if cache
+                              (or (.lookup cache value)
+                                  (let [decoded (idx/avg-buffer->v lmdb value)]
+                                    (if (.isEnabled cache)
+                                      (.remember cache decoded)
+                                      (do
+                                        (aset caches i nil)
+                                        (aset active 0 (dec (aget active 0)))
+                                        decoded))))
+                              (idx/avg-buffer->v lmdb value)))))
+                  (consume! row))
+                (recur (inc visited))))))))))
+
+(defn- fold-projected-entity-rows
+  [^EavProjection projection lmdb ^ints columns ^objects row consume! check! entity-value?
+   ^ints string-cache-capacities]
+  (with-open [projection projection]
+    (if (and *cache-string-values?* string-cache-capacities)
+      (let [n (alength columns)
+            caches (object-array n)
+            active (int-array 1)]
+        (dotimes [i n]
+          (let [capacity (aget string-cache-capacities i)]
+            (when (pos? capacity)
+              (aset caches i (EavStringCache. capacity c/type-string c/false-value))
+              (aset active 0 (inc (aget active 0))))))
+        (fold-projected-cached-rows projection lmdb columns row consume! check! entity-value?
+                                    caches active))
+      (fold-projected-uncached-rows projection lmdb columns row consume! check! entity-value?))))
 
 (defn- fold-unprojected-entity-rows
   [dbi rtx cur lmdb ^ints aids ^ints columns ^objects row consume! check! entity-value?]
@@ -551,15 +713,21 @@
    (fold-entity-rows lmdb aids columns row consume! check! nil))
   ([lmdb aids columns row consume! check! revision]
    (fold-entity-rows lmdb aids columns row consume! check! revision true))
-  ([lmdb ^ints aids ^ints columns ^objects row consume! check! revision entity-value?]
+  ([lmdb aids columns row consume! check! revision entity-value?]
+   (fold-entity-rows lmdb aids columns row consume! check! revision entity-value? nil))
+  ([lmdb ^ints aids ^ints columns ^objects row consume! check! revision entity-value?
+    string-cache-capacities]
    (check!)
    (scan/scan lmdb c/eav
      (when (or (nil? revision) (= revision (snapshot-schema-revision lmdb rtx)))
-       (if (and *project-entity-rows?* (EavProjection/available)
+       (if (and *project-entity-rows?*
+                (EavProjection/available (true? *selective-materialization?*))
                 (nil? (cpp-iter/dbi-key-codec dbi))
                 (nil? (cpp-iter/dbi-value-codec dbi)))
-         (fold-projected-entity-rows (EavProjection. ^Cursor cur aids)
-                                    lmdb columns row consume! check! entity-value?)
+         (fold-projected-entity-rows (EavProjection. ^Cursor cur aids
+                                                    (true? *selective-materialization?*))
+                                    lmdb columns row consume! check! entity-value?
+                                    string-cache-capacities)
          (fold-unprojected-entity-rows dbi rtx cur lmdb aids columns row
                                        consume! check! entity-value?)))
      (throw e))))

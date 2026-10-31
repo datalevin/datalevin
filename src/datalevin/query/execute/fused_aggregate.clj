@@ -183,7 +183,8 @@
                  (every? #(and (= 1 (count (:tuples %)))
                                (set/subset? (set (keys (:attrs %))) (set input-vars))) rels)
                  (number? size) (<= *min-input* size))
-        (let [total (max (long (i/a-size store (:attr anchor)))
+        (let [population-size (long (i/a-size store (:attr anchor)))
+              total (max population-size
                          (long (.-max-eid ^DB database)))
               fields (sort-by #(get-in schema [(:attr %) :db/aid]) fields)
               aids (mapv #(get-in schema [(:attr %) :db/aid]) fields)
@@ -202,17 +203,33 @@
                 (when (small-group-domain? parsed-q fields database schema)
                   (let [snapshot (i/schema-snapshot store)]
                     (when (= schema (:schema snapshot))
-                      (merge aggregate program
-                        {:database database :aids (int-array aids)
-                         :schema-revision (:revision snapshot)
-                         :scan-columns (int-array (map columns (map :variable fields)))
-                         :input-columns (int-array (map columns input-vars))
-                         :input-values values
-                         :summary {:operator :fused-aggregate :scan :eav
-                                   :attributes (mapv :attr fields)
-                                   :expressions (count (filter #(instance? Function %) clauses))
-                                   :estimated-input size :retained-input-tuples 0
-                                   :scratch-width (count (:columns program))}}))))))))))))
+                      (let [materialization
+                            (scan/entity-materialization-plan
+                              (.-lmdb ^Store store) schema (:attr anchor)
+                              (count fields) population-size)
+                            string-cache
+                            (when (#{:full :selective} (:mode materialization))
+                              (scan/string-value-cache-plan
+                                schema (mapv :attr fields)
+                                (fn [attr]
+                                  (db/cached-string-capacity store attr
+                                    #(scan/string-value-cache-capacity
+                                       (.-lmdb ^Store store) schema attr)))))]
+                        (merge aggregate program
+                          {:database database :aids (int-array aids)
+                           :materialization materialization
+                           :string-cache-capacities (:capacities string-cache)
+                           :schema-revision (:revision snapshot)
+                           :scan-columns (int-array (map columns (map :variable fields)))
+                           :input-columns (int-array (map columns input-vars))
+                           :input-values values
+                           :summary {:operator :fused-aggregate :scan :eav
+                                     :attributes (mapv :attr fields)
+                                     :eav-materialization materialization
+                                     :string-value-cache (:summary string-cache)
+                                     :expressions (count (filter #(instance? Function %) clauses))
+                                     :estimated-input size :retained-input-tuples 0
+                                     :scratch-width (count (:columns program))}})))))))))))))
 
 (defn- check! []
   (when (.isInterrupted (Thread/currentThread))
@@ -225,7 +242,7 @@
   Return nil when the admitted schema differs from the read transaction."
   [context {:keys [database aids scan-columns columns input-columns input-values
                    aggregate-columns aggregate-operations operations summary
-                   schema-revision entity-value?]}]
+                   schema-revision entity-value? materialization string-cache-capacities]}]
   (let [accumulator (GroupedAggregate. aggregate-columns aggregate-operations)
         row (object-array (count columns))
         input-count (long-array 1)
@@ -233,22 +250,24 @@
         n (alength operations)]
     (dotimes [i (count input-values)]
       (aset row (aget ^ints input-columns i) (nth input-values i)))
-    (when (scan/fold-entity-rows
-        (.-lmdb ^Store (.-store ^DB database)) aids scan-columns row
-        (fn [^objects row]
-          (loop [i 0]
-            (if (= i n)
-              (do (.add accumulator row)
-                  (aset input-count 0 (unchecked-inc (aget input-count 0)))
-                  nil)
-              (let [[index call] (aget operations i)
-                    value (call row)]
-                (if (nil? index)
-                  (when value (recur (inc i)))
-                  (when-not (nil? value)
-                    (aset row (int index) value)
-                    (recur (inc i))))))))
-        check! schema-revision (boolean entity-value?))
+    (when (binding [scan/*selective-materialization?*
+                    (= :selective (:mode materialization))]
+            (scan/fold-entity-rows
+              (.-lmdb ^Store (.-store ^DB database)) aids scan-columns row
+              (fn [^objects row]
+                (loop [i 0]
+                  (if (= i n)
+                    (do (.add accumulator row)
+                        (aset input-count 0 (unchecked-inc (aget input-count 0)))
+                        nil)
+                    (let [[index call] (aget operations i)
+                          value (call row)]
+                      (if (nil? index)
+                        (when value (recur (inc i)))
+                        (when-not (nil? value)
+                          (aset row (int index) value)
+                          (recur (inc i))))))))
+              check! schema-revision (boolean entity-value?) string-cache-capacities))
       (let [result {:rows (mapv vec (.results accumulator))
                     :input-tuples (aget input-count 0)
                     :group-count (.groupCount accumulator)}]

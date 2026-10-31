@@ -587,6 +587,68 @@ handling used `:producer-unique`, `:producer-disjoint`,
 `:virtual-producer-feed?`, `:virtual-producer-count`, and the expanded
 `:stream-producer-domains` used for its disjointness proof.
 
+### Native EAV materialization
+
+Eligible fused aggregate scans automatically choose full or selective native
+materialization once per execution. Both collect the required EAV attributes
+with one JNI advance per entity. Selective mode reconstructs only matching
+values and uses a reusable native handle with fewer JNI arguments.
+
+The planner estimates the entity population's row width from at most eight
+entities spread across the scan's anchor population. It counts their stored EAV
+values without materializing all their payloads and uses the smallest observed
+width as a conservative estimate. This counts cardinality-many values too,
+because they contribute to full materialization cost. Unrelated or unused
+schema attributes do not inflate the estimate.
+
+The cost rule chooses selective mode when the estimate is at least
+12 stored values and the query requests fewer than half of them. Otherwise it
+keeps full mode. Q1 therefore selects selective materialization for its seven
+requested LINEITEM attributes out of 16; dense projections keep full mode.
+The estimate is advisory and does not change which entities or values match.
+It is recomputed for each execution, including prepared queries.
+
+`explain` reports the decision under `:fused-aggregation :eav-materialization`,
+including `:mode`, `:requested-attributes`, `:estimated-row-values`, and
+`:sampled-entities`. Native availability and DBI codecs can retain the ordinary
+reader instead.
+
+This is a cost heuristic. Value width, compression, and JNI overhead also
+matter. The [DLMDB measurements](https://github.com/huahaiy/dlmdb/blob/main/duplicate-projection.md#performance-tradeoff)
+isolate native materialization; the [Q1 measurements](measurements/tpch-dlmdb-projection-2026-10-29.md)
+include the reusable-handle integration as well. Neither provides a universal
+selection-density crossover. The minimum was lowered from 16 to 12 after
+testing smaller numeric and wide-string rows. Removing the minimum entirely
+regressed some wide-string cases below 12 values.
+
+For diagnostic comparisons, bind `datalevin.storage.scan/*selective-materialization?*`
+to `true` or `false` to force selective or full mode. The startup property
+`-Ddatalevin.eav.selective-materialization=auto` is the default; `true` and
+`false` force either mode. It is read when the storage scan namespace loads.
+For remote databases, configure the server JVM; a client's binding does not
+cross the network. Disable the query result cache and consume complete results
+when comparing timings so that both runs execute the scan.
+
+Projected fused scans also reuse decoded values for eligible string columns.
+The planner admits a column when its distinct AVE key count is at most 4,096
+and its first encoded value is a short inline string. The complete encoded
+key must fit in 24 bytes, allowing up to 17 UTF-8 payload bytes in the normal
+EAV encoding. Eligibility metadata uses the existing attribute-invalidated
+index cache; decoded strings belong to a fresh dictionary for each scan.
+
+Each dictionary owns copies of the complete encoded keys as primitive words,
+so borrowed native buffers can be reused safely. A miss uses the ordinary
+decoder. An unsupported, long, or giant value retires that column's dictionary;
+growth beyond the estimated cardinality remains bounded and repeated overflow
+misses retire it too. When all dictionaries retire, the scan resumes its
+ordinary projected decoding loop. These checks preserve decoding, predicate,
+and grouping semantics when the advisory metadata does not describe every row.
+
+`explain` reports eligible columns and capacities under
+`:fused-aggregation :string-value-cache`. For diagnostic comparisons, bind
+`datalevin.storage.scan/*cache-string-values?*` to `false`. This binding applies
+where the query executes, including the server JVM for remote queries.
+
 ### Adaptive unordered limits
 
 A finite unordered relation query can also avoid producing every source match

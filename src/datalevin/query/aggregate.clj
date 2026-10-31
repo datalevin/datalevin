@@ -653,34 +653,48 @@
     (constantly arg)))
 
 (defn- compile-having-pred
-  [pred find-elements]
+  [pred find-elements {:keys [check! prepare-call]}]
   (let [pred-fn (get built-ins/query-fns (-> pred :fn :symbol))
         readers (mapv #(compile-having-arg % find-elements) (:args pred))]
     (if-not pred-fn
       (constantly nil)
-      (case (count readers)
-        0 (fn [_] (pred-fn))
-        1 (let [read-arg (first readers)]
-            (fn [row]
-              (when-some [arg (read-arg row)] (pred-fn arg))))
-        2 (let [[read-left read-right] readers]
-            (fn [row]
-              (let [left (read-left row)
-                    right (read-right row)]
-                (when (and (some? left) (some? right))
-                  (pred-fn left right)))))
-        (fn [row]
-          (let [args (mapv #(% row) readers)]
-            (when (every? some? args) (apply pred-fn args))))))))
+      (if prepare-call
+        (let [n (count readers)
+              args (object-array (map #(when (instance? Constant %) (:value %)) (:args pred)))
+              dynamic (into #{} (keep-indexed #(when-not (instance? Constant %2) %1)) (:args pred))
+              invoke (prepare-call (-> pred :fn :symbol) pred-fn args dynamic)]
+          (fn [row]
+            (when check! (check!))
+            (dotimes [i n]
+              (when check! (check!))
+              (aset args i ((nth readers i) row)))
+            ;; HAVING suppresses calls with any nil argument, including nil
+            ;; constants. Keep that native behavior, even for nil?/some?.
+            (when (every? some? args) (invoke args))))
+        (case (count readers)
+          0 (fn [_] (pred-fn))
+          1 (let [read-arg (first readers)]
+              (fn [row]
+                (when-some [arg (read-arg row)] (pred-fn arg))))
+          2 (let [[read-left read-right] readers]
+              (fn [row]
+                (let [left (read-left row)
+                      right (read-right row)]
+                  (when (and (some? left) (some? right))
+                    (pred-fn left right)))))
+          (fn [row]
+            (let [args (mapv #(% row) readers)]
+              (when (every? some? args) (apply pred-fn args)))))))))
 
 (defn compile-having
   "Compile HAVING once for vector or native array rows. Nil means no filter."
-  [having find-elements]
-  (when (seq having)
-    (let [predicates (mapv #(compile-having-pred % find-elements) having)]
-      (if (= 1 (count predicates))
-        (first predicates)
-        (fn [row] (every? #(% row) predicates))))))
+  ([having find-elements] (compile-having having find-elements nil))
+  ([having find-elements options]
+   (when (seq having)
+     (let [predicates (mapv #(compile-having-pred % find-elements options) having)]
+       (if (= 1 (count predicates))
+         (first predicates)
+         (fn [row] (every? #(% row) predicates)))))))
 
 (defn apply-having
   "Filter aggregated results by having predicates."

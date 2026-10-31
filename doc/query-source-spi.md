@@ -1223,3 +1223,102 @@ tuples across the find variables and `:with` variables before grouping;
 groups. Do not replace these rules with SQL's default numeric scale, collation,
 null, empty-aggregate, or arithmetic behavior unless equivalence is established.
 Input conversion and row-size failures must remain enforced during aggregation.
+
+
+## Bounded relational results
+
+Finite relational and fragment results now use a budgeted distinct top-k
+collector. It retains at most `offset + limit` find tuples and releases replaced
+rows immediately; it does not retain a callback or dedup key for every consumed
+row. Native-only `:with` witnesses are not final-result distinctness keys after
+aggregation. Unordered windows keep a bounded distinct prefix. All batches are
+still consumed and validated, so a small result window cannot mask a later
+provider error. Unlimited results retain the existing full-collection policy.
+
+## Optional exact whole-query result windows
+
+The matching development build adds `IRelationalWindowSource` with
+`-plan-relational-window`. It reuses `IRelationalQuerySession` and ordinary owned
+cursor batches, and leaves both older relational and EAV protocols unchanged.
+Core tries this optional planner first for finite `FindRel` results, including
+eligible single-entity queries. Nil declines to the ordinary relational planner.
+
+The request is the whole-query relational grammar with `:mode :relational-window`
+and `:window {:order [{:column 0 :direction :desc} ...] :offset 0 :limit 20}`.
+Order columns are zero-based final find positions. Directions are `:asc`/`:desc`;
+limit is a positive long and offset a nonnegative long. An empty order permits
+any distinct result window. Dynamic scalar windows are resolved before planning.
+Acceptance is exactly `{:plan owned-value-tree :columns request-columns}` and
+promises the complete final window after find/with distinctness, grouping, and
+projection. Apply offset exactly once. SQL ordering, equality, null behavior,
+and decoding/conversion failures must be proved compatible; otherwise decline.
+Ties need not identify a unique boundary subset; providers still promise
+identical replay under the acquired session.
+
+Core shapes accepted window rows with offset zero, retains at most the finite
+window, and rejects a provider returning more than its requested limit. Existing
+batch/result quotas, owned-buffer rules, cancellation, planning purity, scope
+validation, and cleanup contracts apply. Plan-only explain does not open a cursor;
+the normal `:relational-v1` region includes structural `:result-window` metadata.
+Without acceptance, the bounded collector reduces host retention but cannot
+reduce transfer. With acceptance, provider work may still scan/group/sort a
+larger input, and providers must enforce their backend resource limits.
+
+## Optional parameterized relational fragments
+
+The matching development compiler adds `IRelationalFragmentSource` and
+`IRelationalFragmentSession`. These optional protocols are independent of the
+whole-query relational methods and leave the ordinary v2 EAV contract intact.
+A provider without these methods receives the existing fact-access requests.
+
+`-plan-relational-fragment` is pure: it receives common invocation/session-group
+context, `:mode :relational-fragment`, `:semantics-version 1`, participating
+`:sources`, flat normalized `:clauses`, captured scalar `:bindings`, `:find`,
+`:with`, result `:columns`, and nonempty typed `:inputs`. It may decline with nil.
+Acceptance returns exactly:
+
+```clojure
+{:plan {:provider/portable-plan ...}
+ :columns request-columns
+ :constraints {:max-binding-rows 256 :max-binding-bytes 262144}}
+```
+
+Plans contain owned value trees only. No provider data I/O or acquisition is
+allowed during planning. Core currently isolates one external session group
+from a flat native/local conjunction with a shared typed variable. Native
+prefix compilation and execution use the existing shared compiler and pinned
+read views. Source-specific joins and supported aggregate expressions stay in
+the provider fragment. Aggregate arguments must be source-side variables;
+unsupported functions, scopes, cross-boundary residuals, or types decline.
+
+`-open-relational-fragment-cursor` receives normal common context, source/definition
+fingerprint, scope, region, `:alternative-id "relational-fragment"`, the portable
+`:plan`, result `:columns`, and a nonempty vector of typed `:bindings` with unique
+IDs and query-key-distinct value tuples. Input values follow `:inputs` order.
+Both provider constraints and invocation binding limits apply. Providers must
+validate the plan against every acquired scope and own retained parameters,
+including byte arrays, before returning from open.
+
+The cursor returns **input-free ordinary owned batches** validated against result
+columns. There are no batch-level binding IDs: an aggregate can combine several
+input keys into one result. Correlation/group IDs are explicit compiler-generated
+long input/output columns. Every returned ID must belong to the current open;
+core rejects IDs from other batches or unknown groups. Input IDs and source data
+never appear in diagnostic output. Standard request admission, cancellation,
+consumption permissions, batch ownership, snapshot, and close contracts apply.
+
+Core uses opaque native group/witness IDs to preserve native find grouping,
+`:with` multiplicity, and query-key distinctness before aggregation. A native
+aggregate group is indivisible. Complete groups may share an input batch; if
+any group cannot fit a binding batch, core falls back before source acquisition.
+It never merges partial sums/counts or assumes unique customer names. Source-only
+`:with` variables remain in the delegated projection; native-only witnesses are
+represented by an opaque ID in `:with`. Non-aggregate fragments correlate rows
+back to their native witnesses before shared final result processing.
+
+All fragment opens use one authorized session group/snapshot. Native and external
+stores still have independent snapshots. Empty prefixes produce no groups; they
+still undergo normal external acquisition/definition checks. Plan-only explain
+compiles the native prefix and acquires the source session but opens no cursor.
+It marks the plan `:policy :relational-fragment-v1` and `:conditional-inputs true`,
+since binding group sizes cannot be proven without execution.

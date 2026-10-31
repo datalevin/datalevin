@@ -19,7 +19,9 @@
             [datalevin.query.source.control :as control]
             [datalevin.query.source.context :as context]
             [datalevin.query.source.diagnostics :as diagnostics]
+            [datalevin.query.source.expression :as expression]
             [datalevin.query.source.input-program :as input-program]
+            [datalevin.query.source.fragment :as fragment]
             [datalevin.query.source.inputs :as inputs]
             [datalevin.query.source.native :as native]
             [datalevin.query.source.native-plan :as native-plan]
@@ -174,30 +176,36 @@
 
 (defn- pure-spec [node schema check!]
   (let [args (:args node)
+        f (get-in node [:fn :symbol])
         variables (into #{} (keep #(when (instance? Variable %) (:symbol %))) args)
         ;; A local predicate consumes bindings, including nulls, before a fact
         ;; can narrow their schema. Possible fact outputs are not its inputs.
         inputs (mapv #(column % :data true) (canonical variables check!))]
+    (when-not (and (expression/scalar-functions f)
+                  (every? #(or (instance? Variable %)
+                               ;; The native resolver evaluates list arguments
+                               ;; as nested calls. They need a separate proof;
+                               ;; accepting a Constant must not bypass admission.
+                               (and (instance? Constant %) (not (list? (:value %))))) args))
+      (unsupported!))
     (cond
       (instance? Predicate node)
-      (do (when-not (and (#{'= 'not= '< '<= '> '>= 'nil? 'some?} (get-in node [:fn :symbol]))
-                        (every? #(or (instance? Variable %) (instance? Constant %)) args))
-            (unsupported!))
-          {:requires inputs
-           :columns (if (and (= 'some? (get-in node [:fn :symbol])) (= 1 (count args))
-                             (instance? Variable (first args)))
-                      [(column (:symbol (first args)) :data false)] [])})
+      {:requires inputs
+       :columns (if (and (= 'some? f) (= 1 (count args))
+                         (instance? Variable (first args)))
+                  [(column (:symbol (first args)) :data false)] [])}
       (instance? Function node)
-      (let [f (get-in node [:fn :symbol]) arg (first args)
+      (let [arg (first args)
+            copy? (and (#{'identity 'ground} f) (= 1 (count args)))
             variable (get-in node [:binding :variable :symbol])]
-        (when-not (and (#{'identity 'ground} f) (= 1 (count args)) variable
-                      (or (instance? Variable arg) (instance? Constant arg))) (unsupported!))
-        {:requires (if (instance? Variable arg)
+        (when-not variable (unsupported!))
+        {:requires (if (and copy? (instance? Variable arg))
                      [(assoc (or (schema (:symbol arg)) (column (:symbol arg) :data true)) :nullable? true)] inputs)
-         :columns [(if (instance? Constant arg)
-                     (column variable (value/inferred-type (:value arg)) false)
-                     (assoc (or (schema (:symbol arg)) (column variable :data true))
-                            :variable variable :nullable? false))]})
+         :columns [(cond
+                     (not copy?) (column variable :data false)
+                     (instance? Constant arg) (column variable (value/inferred-type (:value arg)) false)
+                     :else (assoc (or (schema (:symbol arg)) (column variable :data true))
+                                  :variable variable :nullable? false))]})
       :else (unsupported!))))
 
 (defn- pure-factory [runtime check! node spec literal-output]
@@ -226,10 +234,9 @@
                                        (+ (count output-cols) (if temporary 1 0)))
                     success? (volatile! false)]
                 (try
-                  ;; These admitted scalar operators cannot decode a source,
-                  ;; expand a collection, or allocate arithmetic workspaces.
                   (let [context {:rels [(relation/relation! attrs (checked-list check! tuples))]
-                                 :sources {} :rules {}}
+                                 :sources {} :rules {}
+                                 :prepare-call (partial expression/prepare-call runtime)}
                         resolved (reduce resolve/resolve-clause context forms)
                         result (reduce #(joined! runtime check! %1 %2) (:rels resolved))
                         ^List rows (:tuples result)
@@ -479,13 +486,16 @@
 
 (defn- terminal-query! [compiled]
   (let [parsed (:parsed compiled) constants (get-in compiled [:regions (:root-region compiled) :bindings])]
-    (when (or (seq (:qorder parsed)) (seq (:qhaving parsed))) (unsupported!))
-    (doseq [element (parser/find-elements (:qfind parsed))]
-      (when-not (or (instance? Variable element)
-                    (and (parser/aggregate? element)
-                         (#{'count 'sum 'avg 'min 'max} (get-in element [:fn :symbol]))
-                         (= 1 (count (:args element))) (instance? Variable (first (:args element)))))
-        (unsupported!)))
+    (let [aggregate? (fn [element]
+                       (and (parser/aggregate? element)
+                            (#{'count 'count-distinct 'sum 'avg 'min 'max} (get-in element [:fn :symbol]))
+                            (= 1 (count (:args element))) (instance? Variable (first (:args element)))))]
+      (doseq [element (parser/find-elements (:qfind parsed))]
+        (when-not (or (instance? Variable element) (aggregate? element)) (unsupported!)))
+      (doseq [predicate (:qhaving parsed)]
+        (when-not (and (expression/scalar-functions (get-in predicate [:fn :symbol]))
+                      (every? #(or (instance? Constant %) (aggregate? %)) (:args predicate)))
+          (unsupported!))))
     (when (and (not (instance? FindRel (:qfind parsed))) (or (:qlimit parsed) (:qoffset parsed)))
       (unsupported!))
     (reduce (fn [parsed key]
@@ -820,6 +830,7 @@
             :else (execute/-post-process find return-map tuples)))
         process (execute/result-processor parsed
                   {:check! check! :wrap-aggregate #(arithmetic/wrap-aggregate runtime %1 %2)
+                   :prepare-call (partial expression/prepare-call runtime)
                    :post-process post-process})
         raw (process parsed context)
         own-row! (fn [row]
@@ -901,15 +912,27 @@
                                :result :retained})))
                     (native/with-views (filter db/db? (keep :native (:entries compilation)))
                       (fn [snapshots]
-                        (let [program (compile-program! child compilation nil nil snapshots (select-keys input [:columns :relation]))
-                              result (when execute? (result! child program))]
-                          (if (nil? explain-options) result
+                        (if-let [delegated
+                                 (fragment/try! child compilation input execute?
+                                   (fn [prefix-runtime shape execute?]
+                                     (let [prefix (planning/capture! prefix-runtime (:native-entries shape) (:prefix-query shape) []
+                                                    (:bindings input) (set (map :variable (:columns input))) nil)
+                                           program (compile-program! prefix-runtime prefix nil nil snapshots (select-keys input [:columns :relation]))]
+                                       (when execute? (execute! prefix-runtime program)))))]
+                          (if (nil? explain-options) (:result delegated)
                               (diagnostics/finish! child execute? (:result-rows (control/usage (:control child)))
-                                {:storage :memory :spill-policy :reject :replay-spools :none
-                                 :empty-input? (.isEmpty ^List (get-in program [:input :tuples]))
-                                 :join-indexes :bounded-hash :distinct :find-and-with
-                                 :grouping (boolean (some parser/aggregate? (parser/find-elements (:qfind parsed))))
-                                 :result :retained})))))))))))))
+                                {:storage :memory :spill-policy :reject :relational-fragment? true
+                                 :distinct :find-and-with :grouping (boolean (some parser/aggregate? (parser/find-elements (:qfind parsed))))
+                                 :result :retained}))
+                          (let [program (compile-program! child compilation nil nil snapshots (select-keys input [:columns :relation]))
+                                result (when execute? (result! child program))]
+                            (if (nil? explain-options) result
+                                (diagnostics/finish! child execute? (:result-rows (control/usage (:control child)))
+                                  {:storage :memory :spill-policy :reject :replay-spools :none
+                                   :empty-input? (.isEmpty ^List (get-in program [:input :tuples]))
+                                   :join-indexes :bounded-hash :distinct :find-and-with
+                                   :grouping (boolean (some parser/aggregate? (parser/find-elements (:qfind parsed))))
+                                   :result :retained}))))))))))))))
       (catch Throwable e
         (let [e (rt/active-error @active e)
               error (rt/redacted-error @active (or (:phase (ex-data e)) :inputs) e)]

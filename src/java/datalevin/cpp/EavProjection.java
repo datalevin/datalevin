@@ -23,7 +23,7 @@ public final class EavProjection implements AutoCloseable {
         }
     }
 
-    private static final MethodHandle LEGACY_NEXT = find("dtlv_eav_project_next",
+    private static final MethodHandle FULL_NEXT = find("dtlv_eav_project_next",
         int.class, DTLV.MDB_cursor.class, DTLV.MDB_val.class,
         DTLV.MDB_val.class, IntPointer.class, int.class, int.class);
     private static final MethodHandle CREATE = find("dtlv_eav_projector_create",
@@ -44,7 +44,12 @@ public final class EavProjection implements AutoCloseable {
     }
 
     public static boolean available() {
-        return selectiveAvailable() || LEGACY_NEXT != null;
+        return available(false);
+    }
+
+    /** Whether the binding can project with the requested materialization mode. */
+    public static boolean available(boolean selective) {
+        return (selective && selectiveAvailable()) || FULL_NEXT != null;
     }
 
     private static RuntimeException failure(Throwable error) {
@@ -63,8 +68,14 @@ public final class EavProjection implements AutoCloseable {
     private boolean first = true;
     private boolean closed;
 
+    /** Use full native duplicate materialization unless explicitly opted in. */
     public EavProjection(Cursor cursor, int[] attributes) {
-        if (!available()) throw new IllegalStateException("Native projection unavailable");
+        this(cursor, attributes, false);
+    }
+
+    /** Set selective to false to materialize full duplicate pages in native code. */
+    public EavProjection(Cursor cursor, int[] attributes, boolean selective) {
+        if (!available(selective)) throw new IllegalStateException("Native projection unavailable");
         if (attributes.length == 0) throw new IllegalArgumentException("Empty projection");
         for (int i = 0; i < attributes.length; i++) {
             if (attributes[i] < 0 || (i > 0 && attributes[i - 1] >= attributes[i])) {
@@ -89,7 +100,7 @@ public final class EavProjection implements AutoCloseable {
             throw e;
         }
         try {
-            if (selectiveAvailable()) {
+            if (selective && selectiveAvailable()) {
                 try (PointerPointer<Pointer> out = new PointerPointer<>(1)) {
                     int rc = (int) CREATE.invokeExact(out, cursor.ptr(), key.ptr(),
                         values, aids, count);
@@ -116,7 +127,7 @@ public final class EavProjection implements AutoCloseable {
         final int rc;
         try {
             rc = projector != null ? (int) NEXT.invokeExact(projector)
-                : (int) LEGACY_NEXT.invokeExact(cursor.ptr(), key.ptr(),
+                : (int) FULL_NEXT.invokeExact(cursor.ptr(), key.ptr(),
                     values, aids, count, first ? 1 : 0);
         } catch (Throwable e) {
             throw failure(e);

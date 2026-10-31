@@ -72,10 +72,39 @@
       (doseq [key [[:datoms :ave :value 1 nil]
                    [:search 1 :value "one"]
                    [:cardinality :value]
+                   [:string-cache-capacity :value]
                    [:query-result {:attrs #{:value}} :parsed :inputs]]]
         (is (identical? key (db/index-cache-key store key))))
       (doseq [value [(->OpaqueValue 1) (Object.)]]
         (is (nil? (db/index-cache-key store [:search nil :value value])))))))
+
+(deftest string-dictionary-metadata-has-attribute-invalidation
+  (with-cache
+    (fn [store]
+      (let [key #(db/index-cache-key store [:string-cache-capacity %])]
+        (db/cache-put store (key :value) 3)
+        (db/cache-put store (key :other) 4)
+        (#'db/invalidate-cache store [(datom/datom 1 :value "changed")] 1 2)
+        (is (nil? (db/cache-get store (key :value))))
+        (is (= 4 (db/cache-get store (key :other))))
+        ;; Exercise the dependency index after its first invalidation built it.
+        (db/cache-put store (key :value) 2)
+        (#'db/invalidate-cache store [(datom/datom 2 :other "changed")] 2 3)
+        (is (= 2 (db/cache-get store (key :value))))
+        (is (nil? (db/cache-get store (key :other))))))))
+
+(deftest ineligible-string-dictionary-metadata-is-cached-too
+  (with-cache
+    (fn [store]
+      (let [calls (atom 0)
+            read #(db/cached-string-capacity store :value
+                    (fn [] (swap! calls inc) 0))]
+        (is (zero? (read)))
+        (is (zero? (read)))
+        (is (= 1 @calls))
+        (#'db/invalidate-cache store [(datom/datom 1 :value "changed")] 1 2)
+        (is (zero? (read)))
+        (is (= 2 @calls))))))
 
 (def ^:private mutable-lookups
   [[:bytes :db.type/bytes #(byte-array [1 2])

@@ -4,7 +4,8 @@
   Sources are caller-owned. Sessions and owned-batch cursors belong to one
   invocation. See doc/query-source-spi.md for the current contract and the
   Datalevin 1.2.9 requirements for fusion and boxed-integer interoperability.
-  Optional whole-conjunction relational protocols are available in 1.2.10."
+  Optional whole-conjunction relational protocols are available in 1.2.10.
+  Parameterized fragment protocols require the matching development build."
   (:require [datalevin.query.dispatch :as dispatch]
             [datalevin.query.source.contract :as contract]
             [datalevin.query.source.control :as control]
@@ -78,6 +79,28 @@
     "Open a selected relational plan under the acquired authorization and
     snapshot. Return an ordinary owned-batch IQuerySourceCursor. Implementers
     validate plan scope against this session; SQL is never part of the SPI."))
+
+(defprotocol IRelationalWindowSource
+  (-plan-relational-window [source request]
+    "Optional exact final result window, after find/with distinctness and any
+    grouping. Request adds :mode :relational-window and :window containing
+    indexed :order, :offset and finite :limit. Nil declines; acceptance returns
+    {:plan owned-value :columns request-columns}. Reuses IRelationalQuerySession
+    and ordinary owned batches. No planning I/O or acquisition is permitted."))
+
+(defprotocol IRelationalFragmentSource
+  (-plan-relational-fragment [source request]
+    "Pure planning of a parameterized flat fragment within one source session.
+    Return nil or {:plan owned-value :columns request-columns :constraints
+    {:max-binding-rows positive-integer :max-binding-bytes positive-integer}}.
+    Typed :inputs are supplied as distinct owned :bindings on each open.
+    No data I/O, resources, callbacks, or acquisition is permitted here."))
+
+(defprotocol IRelationalFragmentSession
+  (-open-relational-fragment-cursor [session request]
+    "Open an accepted fragment with bounded typed :bindings. Return ordinary
+    input-free owned batches: correlation/group IDs are explicit output columns,
+    since aggregation can combine multiple input bindings into one result."))
 
 (defn validate-source-info!
   "Validate a descriptor without acquisition; return it unchanged."

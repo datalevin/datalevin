@@ -11,6 +11,7 @@
             [datalevin.query.source.diagnostics :as diagnostics]
             [datalevin.query.source.permissions :as permissions]
             [datalevin.query.source.region :as region]
+            [datalevin.query.source.result-window :as window]
             [datalevin.query.source.runtime :as rt]
             [datalevin.query.source.session :as session]
             [datalevin.query.source.value :as value :refer [fail!]]
@@ -22,7 +23,7 @@
 (defn- ensure! [ok] (when-not ok (fail! :query-source/invalid :planning)))
 (defn- retain! [runtime token] (rt/own! runtime #(control/release! token)))
 
-(defn- projection [element]
+(defn projection [element]
   (cond
     (instance? Variable element) {:kind :variable :variable (:symbol element)}
     (and (instance? Aggregate element) (= 1 (count (:args element)))
@@ -57,7 +58,8 @@
                (seq patterns) (every? some? elements)
                (every? variables (concat (map :variable elements) (map :symbol (:qwith parsed))))
                (not-any? #{::mixed} (vals types))
-               (or (> (count groups) 1) (some #(= :aggregate (:kind %)) elements)))
+               (or (> (count groups) 1) (some #(= :aggregate (:kind %)) elements)
+                   (window/specification parsed)))
       ;; Every scalar operator must be represented. A function, ternary
       ;; predicate, scoped body, or unknown operator keeps the core path.
       (let [predicates (region/predicate-clauses root variables)]
@@ -78,11 +80,19 @@
   incurs no reads and leaves the existing fact-access compiler untouched."
   [runtime compilation input]
   (let [provider (get-in compilation [:entries 0 :source])]
-    (when (satisfies? source/IRelationalQuerySource provider)
+    (when (or (satisfies? source/IRelationalQuerySource provider)
+              (satisfies? source/IRelationalWindowSource provider))
       (when-let [request (request compilation input)]
         (let [request-token (rt/charge-copy! runtime (dissoc request :control))
               _ (retain! runtime request-token)
-              response (rt/invoke runtime :planning #(source/-plan-relational provider request))]
+              window (window/specification (get-in compilation [:compiled :parsed]))
+              _ (when window (retain! runtime (rt/charge-copy! runtime window)))
+              bounded (when (and window (satisfies? source/IRelationalWindowSource provider))
+                        (rt/invoke runtime :planning
+                          #(source/-plan-relational-window provider (assoc request :mode :relational-window :window window))))
+              request (if bounded (assoc request :mode :relational-window :window window) request)
+              response (or bounded (when (satisfies? source/IRelationalQuerySource provider)
+                                     (rt/invoke runtime :planning #(source/-plan-relational provider request))))]
           (when-not response (control/release! request-token))
           (when response
           (ensure! (and (value/plain-map? response) (= #{:plan :columns} (set (keys response)))
@@ -110,8 +120,9 @@
                  :steps [{:source-symbol (get-in compilation [:entries 0 :symbol])
                           :alternative-id "relational" :covers (set (map :id (:clauses request)))
                           :access {:kind :relational} :columns (:columns request)}]
-                 :operators []}))
-            {:group group :response response :request request :parsed (get-in input [:parsed])})))))))
+                 :operators [] :result-window (when bounded window)}))
+            {:group group :response response :request request
+             :parsed (cond-> (get-in input [:parsed]) bounded (assoc :qoffset 0))})))))))
 
 (defn- result-query [parsed columns]
   (let [elements (mapv #(parser/->Variable (:variable %)) columns)
@@ -123,6 +134,30 @@
     (assoc parsed :qfind find :qwith nil :qhaving nil
                   :qorder (when (:qorder parsed)
                             (mapv #(if (symbol? %) (positions %) %) (:qorder parsed))))))
+
+(defn finish!
+  "Shape already collected relational rows. Aggregated rows use synthetic find
+  variables; non-aggregate fragments retain the original find/with projection."
+  [runtime parsed columns collected aggregated?]
+  (let [check! #(control/check-active! (:control runtime))
+        _ (retain! runtime (control/reserve! (:control runtime)
+                            {:retained-bytes (+ 8192 (* 512 (count columns))
+                                                (* (count collected) (+ 4096 (* 128 (count columns)))))}))
+        query (if aggregated? (result-query parsed columns) parsed)
+        vars (if aggregated? (mapv :variable columns)
+                 (into (vec (parser/find-vars (:qfind parsed))) (map :symbol) (:qwith parsed)))
+        raw ((execute/result-processor query {:check! check!}) query {:result-set collected :terminal-collected-symbols vars})
+        own! (fn [row]
+               (check!) (retain! runtime (rt/charge-result! runtime row))
+               (retain! runtime (rt/charge-copy! runtime row)) (value/owned-copy row check!))
+        find (:qfind parsed)]
+    (check!)
+    (cond
+      (instance? FindScalar find) (when (seq collected) (first (own! [raw])))
+      (instance? FindTuple find) (when (some? raw) (own! raw))
+      (instance? FindColl find) (mapv #(first (own! [%])) raw)
+      (set? raw) (into (spill/new-spillable-set nil {:spill-threshold Long/MAX_VALUE}) (map own!) raw)
+      :else (mapv own! raw))))
 
 (defn run!
   "Consume an exact relational cursor, enforce batch/result quotas, and use
@@ -146,7 +181,9 @@
       (let [cursor (rt/invoke runtime :open #(source/-open-relational-cursor (:session group) open))]
         (ensure! (satisfies? source/IQuerySourceCursor cursor))
         (vreset! close-cursor (rt/own! runtime #(source/-close-cursor! cursor)))
-        (let [collected (spill/new-spillable-set nil {:spill-threshold Long/MAX_VALUE})
+        (let [bounded (window/collector! runtime (result-query parsed columns))
+              collected (when-not bounded (spill/new-spillable-set nil {:spill-threshold Long/MAX_VALUE}))
+              seen (volatile! 0)
               fetch {:control ctl :max-rows (get-in request [:limits :batch-rows])
                      :max-bytes (get-in request [:limits :batch-bytes])}]
           (retain! runtime (control/reserve! ctl {:retained-bytes 4096}))
@@ -156,16 +193,21 @@
               (try
                 (doseq [row (:rows batch)]
                   (check!)
-                  (retain! runtime (rt/charge-copy! runtime row))
-                  (retain! runtime (control/reserve! ctl {:retained-bytes 128}))
-                  (.cons ^clojure.lang.IPersistentCollection collected (value/owned-copy row check!)))
+                  (when (= :relational-window (:mode request))
+                    (when (> (vswap! seen inc) (get-in request [:window :limit]))
+                      (fail! :query-source/invalid :fetch)))
+                  (if bounded ((:add! bounded) row)
+                    (do (retain! runtime (rt/charge-copy! runtime row))
+                        (retain! runtime (control/reserve! ctl {:retained-bytes 128}))
+                        (.cons ^clojure.lang.IPersistentCollection collected (value/owned-copy row check!)))))
                 (diagnostics/batch! runtime trace (:row-count batch) (:byte-count batch))
                 (finally (control/release! (:reservation batch))))
               (when-not (:exhausted? batch) (recur))))
           (when (:diagnostics runtime)
             (diagnostics/metrics! runtime trace (rt/invoke runtime :metrics #(source/-cursor-metrics cursor))))
           (let [query (result-query parsed columns)
-                raw ((execute/result-processor query)
+                collected (if bounded ((:rows bounded)) collected)
+                raw ((execute/result-processor query {:check! check!})
                      query {:result-set collected :terminal-collected-symbols vars})
                 own! (fn [row]
                        (retain! runtime (rt/charge-result! runtime row))

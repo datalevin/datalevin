@@ -974,62 +974,61 @@
   "Compile shared result processing. An explicit bounded caller may supply
   aggregate cancellation/workspace hooks and an owned post-processing policy;
   ordinary queries use the existing operators and result representations."
-  ([parsed-q]
-  (let [find          (:qfind parsed-q)
-        find-elements (dp/find-elements find)
-        result-arity  (count find-elements)
-        with          (:qwith parsed-q)
-        having        (:qhaving parsed-q)
-        keep-group?   (qagg/compile-having having find-elements)
-        find-vars     (dp/find-vars find)
-        all-vars      (concatv find-vars (map :symbol with))
-        aggregate?    (some #(or (dp/aggregate? %) (dp/find-expr? %)) find-elements)
-        pull?         (some dp/pull? find-elements)
-        return-map    (:qreturn-map parsed-q)
-        order         (when (:qorder parsed-q)
-                        (result/prepare-order find-vars (:qorder parsed-q)))]
-    (fn [parsed-q context]
-      (let [fused-result (:fused-aggregation context)
-            reduced (or (when fused-result
-                          (cond-> fused-result
-                            keep-group? (update :rows #(filter keep-group? %))))
-                        (when (and aggregate?
-                                   (nil? (::result-policy context))
-                                   (nil? (:result-set context))
-                                   (= 1 (count (:rels context))))
-                          (qagg/aggregate-relation find-elements context
-                                                   (first (:rels context)) all-vars
-                                                   keep-group?)))
-            context (if reduced
-                      (assoc context
-                             :explain-actual-result-size (:input-tuples reduced)
-                             :unique-group-aggregation (dissoc reduced :rows))
-                      (collect context all-vars))
-            result
-            (cond->> (if reduced (:rows reduced) (:result-set context))
-              (and with (nil? reduced)) (mapv #(subvec % 0 result-arity))
-
-              (and aggregate? (nil? reduced))
-              (aggregate-results find-elements context)
-
-              (and keep-group? (nil? reduced))
-              (filter keep-group?)
-
-              pull?
-              (pull find-elements context)
-
-              true
-              (post-process-results find return-map context))]
-        (result-explain context result)
-        (if (instance? FindRel find)
-          (if order
-            (order result (:qlimit parsed-q) (:qoffset parsed-q))
-            (result-window result (:qlimit parsed-q) (:qoffset parsed-q)))
-          result)))))
+  ([parsed-q] (result-processor parsed-q nil))
   ([parsed-q options]
-   (let [process (result-processor parsed-q)]
+   (let [find          (:qfind parsed-q)
+         find-elements (dp/find-elements find)
+         result-arity  (count find-elements)
+         with          (:qwith parsed-q)
+         having        (:qhaving parsed-q)
+         keep-group?   (qagg/compile-having having find-elements options)
+         find-vars     (dp/find-vars find)
+         all-vars      (concatv find-vars (map :symbol with))
+         aggregate?    (some #(or (dp/aggregate? %) (dp/find-expr? %)) find-elements)
+         pull?         (some dp/pull? find-elements)
+         return-map    (:qreturn-map parsed-q)
+         order         (when (:qorder parsed-q)
+                         (result/prepare-order find-vars (:qorder parsed-q)
+                           (assoc options :return-map return-map)))]
      (fn [parsed-q context]
-       (process parsed-q (assoc context ::result-policy options))))))
+       (let [context (if options (assoc context ::result-policy options) context)
+             fused-result (:fused-aggregation context)
+             reduced (or (when fused-result
+                           (cond-> fused-result
+                             keep-group? (update :rows #(filter keep-group? %))))
+                         (when (and aggregate?
+                                    (nil? (::result-policy context))
+                                    (nil? (:result-set context))
+                                    (= 1 (count (:rels context))))
+                           (qagg/aggregate-relation find-elements context
+                                                    (first (:rels context)) all-vars
+                                                    keep-group?)))
+             context (if reduced
+                       (assoc context
+                              :explain-actual-result-size (:input-tuples reduced)
+                              :unique-group-aggregation (dissoc reduced :rows))
+                       (collect context all-vars))
+             result
+             (cond->> (if reduced (:rows reduced) (:result-set context))
+               (and with (nil? reduced)) (mapv #(subvec % 0 result-arity))
+
+               (and aggregate? (nil? reduced))
+               (aggregate-results find-elements context)
+
+               (and keep-group? (nil? reduced))
+               (filter keep-group?)
+
+               pull?
+               (pull find-elements context)
+
+               true
+               (post-process-results find return-map context))]
+         (result-explain context result)
+         (if (instance? FindRel find)
+           (if order
+             (order result (:qlimit parsed-q) (:qoffset parsed-q))
+             (result-window result (:qlimit parsed-q) (:qoffset parsed-q)))
+           result))))))
 
 (defn- finish-query
   [parsed-q context]

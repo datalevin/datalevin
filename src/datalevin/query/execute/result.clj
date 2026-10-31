@@ -322,29 +322,32 @@
                :executed-plan-alternative executed-summary)))))
 
 (defn order-comps
-  [tg find-vars order]
-  (let [pairs     (vec (partition-all 2 order))
-        n         (count pairs)
-        idxs      (long-array n)
-        ascending (boolean-array n)]
-    (dotimes [i n]
-      (let [[v direction] (pairs i)]
-        (aset idxs i (long (if (integer? v)
-                             v
-                             (u/index-of #(= v %) find-vars))))
-        (aset ascending i (identical? direction :asc))))
-    (reify Comparator
-      (compare [_ t1 t2]
-        (loop [i 0]
-          (if (< i n)
-            (let [idx (aget idxs i)
-                  res (if (aget ascending i)
-                        (compare (tg t1 idx) (tg t2 idx))
-                        (compare (tg t2 idx) (tg t1 idx)))]
-              (if (zero? res)
-                (recur (unchecked-inc-int i))
-                res))
-            0))))))
+  ([tg find-vars order] (order-comps tg find-vars order nil))
+  ([tg find-vars order check!]
+   (let [pairs     (vec (partition-all 2 order))
+         n         (count pairs)
+         idxs      (long-array n)
+         ascending (boolean-array n)]
+     (dotimes [i n]
+       (let [[v direction] (pairs i)]
+         (aset idxs i (long (if (integer? v)
+                              v
+                              (u/index-of #(= v %) find-vars))))
+         (aset ascending i (identical? direction :asc))))
+     (reify Comparator
+       (compare [_ t1 t2]
+         (loop [i 0]
+           (if (< i n)
+             (let [idx (aget idxs i)
+                   _ (when check! (check!))
+                   res (if (aget ascending i)
+                         (compare (tg t1 idx) (tg t2 idx))
+                         (compare (tg t2 idx) (tg t1 idx)))]
+               (when check! (check!))
+               (if (zero? res)
+                 (recur (unchecked-inc-int i))
+                 res))
+             0)))))))
 
 (defn- finite-limit?
   [limit]
@@ -363,7 +366,7 @@
 (defn- top-k-result
   [^Comparator cmp result limit offset]
   (let [offset     (long (or offset 0))
-        window-end (+ offset (long limit))]
+        window-end (+' offset (long limit))]
     (if (or (zero? window-end) (> window-end Integer/MAX_VALUE))
       (if (zero? window-end)
         []
@@ -372,7 +375,9 @@
             (reify Comparator
               (compare [_ a b] (.compare cmp b a)))
             ^PriorityQueue heap
-            (PriorityQueue. (int (max 1 window-end)) worst-first)]
+            ;; A tiny result must not allocate limit+offset slots in advance.
+            ;; Bounded source callers have admitted the actual result width.
+            (PriorityQueue. 1 worst-first)]
         (doseq [tuple result]
           (if (< (.size heap) window-end)
             (.add heap tuple)
@@ -393,16 +398,20 @@
 (defn prepare-order
   "Retain column indexes and comparators, while accepting a fresh result and
   window on every execution. Both internal arrays and public tuples are valid."
-  [find-vars order]
-  (let [vector-cmp (delay (order-comps get find-vars order))
-        array-cmp  (delay (order-comps typed-aget find-vars order))]
-    (fn [result limit offset]
-      (if (seq result)
-        (let [cmp (if (u/array? (first result)) @array-cmp @vector-cmp)]
-          (if (finite-limit? limit)
-            (top-k-result cmp result limit offset)
-            (result-window (sort cmp result) limit offset)))
-        result))))
+  ([find-vars order] (prepare-order find-vars order nil))
+  ([find-vars order {:keys [check! return-map]}]
+   (let [get-column (if return-map
+                      (fn [row i] (get row (nth (:symbols return-map) i))) get)
+         vector-cmp (delay (order-comps get-column find-vars order check!))
+         array-cmp  (delay (order-comps typed-aget find-vars order check!))]
+     (fn [result limit offset]
+       (when check! (check!))
+       (if (seq result)
+         (let [cmp (if (u/array? (first result)) @array-cmp @vector-cmp)]
+           (if (finite-limit? limit)
+             (top-k-result cmp result limit offset)
+             (result-window (sort cmp result) limit offset)))
+         result)))))
 
 (defn query-result-size
   [parsed-q result]
