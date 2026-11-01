@@ -25,7 +25,7 @@
    [datalevin.query.access.vector :as qvector]
    [datalevin.query.aggregate :as qagg]
    [datalevin.query.execute.fused-aggregate :as fused]
-   [datalevin.query.execute.enrichment :refer [plan-post-top-k-enrichment]]
+   [datalevin.query.execute.enrichment :as enrichment :refer [plan-post-top-k-enrichment]]
    [datalevin.query.execute.group-reduction
     :refer [plan-keyed-group-reduction resolve-terminal-keyed-group-reduction]]
    [datalevin.query.execute.late
@@ -1035,7 +1035,17 @@
 
 (defn- finish-query
   [parsed-q context]
-  (let [[parsed-q context] (apply-post-top-k-enrichment parsed-q context)
+  (if-let [{:keys [outer-query source-vars summary]} (:aggregate-enrichment context)]
+    (let [selected (finish-query (:parsed-q context)
+                                (dissoc context :aggregate-enrichment))
+          inputs (conj (mapv (:sources context) source-vars) selected)
+          result (binding [qplan/*explain* nil *result-processor* nil]
+                   (execute-query outer-query inputs))]
+      (when qplan/*explain*
+        (vswap! qplan/*explain* assoc :aggregate-enrichment
+                (assoc summary :selected-count (count selected)) :result result))
+      result)
+    (let [[parsed-q context] (apply-post-top-k-enrichment parsed-q context)
         [original process] *result-processor*
         ;; Rewrites and access subqueries can change the projection. Only the
         ;; matching result shape may reuse this processor; windows stay dynamic.
@@ -1045,7 +1055,7 @@
                        (identical? (:qhaving original) (:qhaving parsed-q))
                        (identical? (:qreturn-map original) (:qreturn-map parsed-q))
                        (identical? (:qorder original) (:qorder parsed-q)))]
-    ((if reusable? process (result-processor parsed-q)) parsed-q context)))
+      ((if reusable? process (result-processor parsed-q)) parsed-q context))))
 
 (defn- run-planned-context
   [{:keys [result-set sources] :as context}]
@@ -1089,6 +1099,7 @@
           (materialize-input-bound-patterns)
           (resolve-redudants)
           (rules/rewrite)
+          (enrichment/plan-aggregate-enrichment)
           (push-down-equality-disjunctions)
           (rewrite-unused-vars)
           (existence/rewrite)

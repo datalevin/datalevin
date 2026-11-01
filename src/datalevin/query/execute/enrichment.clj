@@ -11,6 +11,7 @@
   "Planning attribute enrichment after top-k selection."
   (:refer-clojure :exclude [assoc])
   (:require
+   [clojure.set :as set]
    [datalevin.built-ins :as built-ins]
    [datalevin.db :as db]
    [datalevin.inline
@@ -23,7 +24,151 @@
    [datalevin.query.execute.result
     :refer [adaptive-limit-query?]])
   (:import
-   [datalevin.parser BindTuple]))
+   [datalevin.db DB]
+   [datalevin.parser BindTuple FindRel Variable]
+   [datalevin.storage Store]))
+
+(def ^:dynamic *aggregate-enrichment?* true)
+
+(defn- dependency-patterns
+  [{:keys [parsed-q sources]}]
+  (into []
+    (keep-indexed
+      (fn [idx form]
+        (when-let [{:keys [source attr] :as pattern}
+                   (data-pattern-parts form '$)]
+          (let [database (get sources source)
+                props (when (and (instance? DB database)
+                                 (instance? Store (:store database))
+                                 (not (db/pending-tx-cache? database)))
+                        (get (db/-schema database) attr))]
+            (when (and (:db/aid props) (not (:db/noindex props))
+                       (not= :db.cardinality/many (:db/cardinality props)))
+              (assoc pattern :idx idx :form form
+                     :unique? (and (:db/unique props)
+                                   (contains? #{:db.type/long :db.type/ref
+                                                :db.type/string :db.type/keyword
+                                                :db.type/symbol :db.type/uuid
+                                                :db.type/instant :db.type/boolean}
+                                              (:db/valueType props)))))))))
+    (:qorig-where parsed-q)))
+
+(defn- dependency-closure
+  "Each new variable records one schema-backed proof edge. Cardinality one
+  proves entity -> value; declared uniqueness also proves value -> entity."
+  [patterns seeds]
+  (let [edges (mapcat (fn [{:keys [entity value unique?] :as pattern}]
+                        (cond-> [(assoc pattern :from entity :to value)]
+                          unique? (conj (assoc pattern :from value :to entity))))
+                      patterns)]
+    (loop [known (set seeds) proofs {} ordered []]
+      (let [[next-known next-proofs next-ordered]
+            (reduce
+              (fn [[known proofs ordered] {:keys [from to] :as edge}]
+                (if (and (known from) (not (known to)))
+                  [(conj known to) (assoc proofs to edge) (conj ordered edge)]
+                  [known proofs ordered]))
+              [known proofs ordered] edges)]
+        (if (= known next-known)
+          {:known known :proofs proofs :ordered ordered}
+          (recur next-known next-proofs next-ordered))))))
+
+(defn- dependency-frontier
+  [{:keys [proofs ordered]} outputs]
+  (let [needed (loop [pending (seq outputs) seen #{}]
+                 (if-let [v (first pending)]
+                   (if (seen v)
+                     (recur (next pending) seen)
+                     (recur (cond-> (next pending)
+                              (get proofs v) (conj (:from (get proofs v))))
+                            (conj seen v)))
+                   seen))]
+    (into [] (comp (filter #(needed (:to %)))
+                   (map :form) (distinct)) ordered)))
+
+(defn- projection-only?
+  [parsed-q ordering-vars value]
+  (and (not (ordering-vars value))
+       (not-any? #(contains? (clause-vars %) value)
+                 [(:qin parsed-q) (:qwith parsed-q) (:qhaving parsed-q)])
+       (= 1 (count (filter #(contains? (clause-vars %) value)
+                           (:qorig-where parsed-q))))))
+
+(defn plan-aggregate-enrichment
+  "Reduce aggregate keys only when retained group keys functionally determine
+  projection-only attributes. Keep their EAV existence tests before aggregation;
+  ordinary bound lookups reconstruct the selected rows after the result window."
+  [{:keys [parsed-q sources] :as context}]
+  (let [find (:qfind parsed-q)
+        elements (dp/find-elements find)
+        limit (:qlimit parsed-q)]
+    (if (and *aggregate-enrichment?*
+             (instance? FindRel find)
+             (some dp/aggregate? elements)
+             (every? #(or (instance? Variable %) (dp/aggregate? %)) elements)
+             (seq (:qorder parsed-q))
+             (some? limit) (pos? (long limit))
+             (not (:aggregate-enrichment context)))
+      (let [find-vars (vec (dp/find-vars find))
+            groups (into #{} (keep #(when (instance? Variable %) (:symbol %))) elements)
+            order-indices (mapv (fn [[v direction]]
+                                  [(if (integer? v) v
+                                     (.indexOf ^java.util.List find-vars v)) direction])
+                                (partition 2 (:qorder parsed-q)))
+            ordering-vars (into #{} (map #(nth find-vars (first %))) order-indices)
+            aggregate-vars (into #{} (mapcat #(dp/find-vars (dp/->FindRel [%])))
+                                 (filter dp/aggregate? elements))
+            patterns (dependency-patterns context)
+            unique-vars (into #{} (map :value) (filter :unique? patterns))
+            candidates (into #{}
+                         (comp (map :value)
+                               (filter #(and (groups %) (not (unique-vars %))
+                                             (not (aggregate-vars %))
+                                             (projection-only? parsed-q ordering-vars %))))
+                         patterns)
+            retained (set/difference groups candidates)
+            closure (dependency-closure patterns retained)
+            deferred (set/intersection candidates (:known closure))]
+        (if (seq deferred)
+          (let [indices (into [] (keep-indexed #(when-not (deferred (:symbol %2)) %1)) elements)
+                inner-elements (mapv elements indices)
+                forms (mapv
+                        (fn [form]
+                          (if-let [{:keys [value]} (data-pattern-parts form '$)]
+                            (if (deferred value)
+                              (assoc form (dec (count form)) '_) form)
+                            form))
+                        (:qorig-where parsed-q))
+                inner (assoc parsed-q
+                             :qfind (dp/->FindRel inner-elements)
+                             :qorig-find (mapv (vec (:qorig-find parsed-q)) indices)
+                             :qwhere (dp/parse-where forms) :qorig-where forms
+                             :qreturn-map nil
+                             :qorder (into [] (mapcat (fn [[idx direction]]
+                                                      [(.indexOf ^java.util.List indices idx) direction]))
+                                           order-indices))
+                output-vars (mapv #(if (dp/aggregate? %) (gensym "?aggregate") (:symbol %)) elements)
+                binding-vars (mapv output-vars indices)
+                source-vars (vec (sort (keys sources)))
+                outer-forms (dependency-frontier closure deferred)
+                outer (assoc parsed-q
+                             :qfind (dp/->FindRel (mapv dp/->Variable output-vars))
+                             :qorig-find output-vars :qwith nil :qhaving nil
+                             :qorder (vec (mapcat identity order-indices)) :qoffset 0
+                             :qin (conj (mapv dp/parse-binding source-vars)
+                                        (dp/parse-binding [binding-vars]))
+                             :qwhere (dp/parse-where outer-forms) :qorig-where outer-forms)
+                summary {:deferred-vars (vec (sort deferred))
+                         :group-vars (into [] (keep #(when (instance? Variable %) (:symbol %))) inner-elements)
+                         :presence-clauses (into [] (filter #(and (vector? %) (= '_ (peek %)))) forms)
+                         :proof {:schema-functional-dependencies true
+                                 :presence-before-aggregation true
+                                 :projection-only true}}]
+            (assoc context :parsed-q inner
+                   :aggregate-enrichment {:outer-query outer :source-vars source-vars
+                                          :summary summary}))
+          context))
+      context)))
 
 (defn- post-top-k-enrichment-entry
   [clause]

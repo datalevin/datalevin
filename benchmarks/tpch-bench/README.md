@@ -161,6 +161,9 @@ by default, whereas TPC-H and PostgreSQL are case-sensitive.
 
 The [2026-11-01 two-pass comparison and planning breakdown](../../doc/measurements/tpch-native-plans-2026-10-28.md#job-two-pass-schedule-and-revised-planning-share-2026-11-01)
 retains the raw warmup and measurement CSVs for all three engines.
+The [comparison after the JOB fixes](../../doc/measurements/tpch-native-plans-2026-10-28.md#tpc-h-sql-gaps-after-the-job-fixes-2026-11-01)
+refreshes all three timings with intermediate-tuple caching removed and the
+selective planner's existing plan reused.
 
 ## Translation notes
 

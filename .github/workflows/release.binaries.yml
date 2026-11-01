@@ -18,7 +18,7 @@ on:
           - macos-14
           - ubuntu-22.04
           - ubuntu-24.04-arm
-          - windows-latest
+          - windows-2022
       macos_runner:
         description: Machine to use for a macOS rebuild
         required: true
@@ -43,19 +43,19 @@ jobs:
     env:
       RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
       # RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag || github.sha }}
-      RELEASE_OS: ${{ matrix.os == 'macos-14' && 'macos' || matrix.os == 'windows-latest' && 'windows' || 'linux' }}
+      RELEASE_OS: ${{ matrix.os == 'macos-14' && 'macos' || matrix.os == 'windows-2022' && 'windows' || 'linux' }}
       RELEASE_ARCH: ${{ contains(fromJSON('["macos-14","ubuntu-24.04-arm"]'), matrix.os) && 'aarch64' || 'amd64' }}
       # The local Mac runs a newer OS than the minimum supported release target.
       MACOSX_DEPLOYMENT_TARGET: ${{ matrix.os == 'macos-14' && '14.0' || '' }}
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(github.event_name == 'workflow_dispatch' && format('{{"os":["{0}"]}}', inputs.runner) || '{"os":["macos-14","ubuntu-22.04","ubuntu-24.04-arm","windows-latest"]}') }}
+      matrix: ${{ fromJSON(github.event_name == 'workflow_dispatch' && format('{{"os":["{0}"]}}', inputs.runner) || '{"os":["macos-14","ubuntu-22.04","ubuntu-24.04-arm","windows-2022"]}') }}
       # matrix:
       #   os:
       #     # - macos-14
       #     # - ubuntu-22.04
       #     # - ubuntu-24.04-arm
-      #     - windows-latest
+      #     - windows-2022
 
     steps:
       - name: Set binary asset name
@@ -127,11 +127,11 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Setup Visual Studio shell
-        if: matrix.os == 'windows-latest'
+        if: matrix.os == 'windows-2022'
         uses: ilammy/msvc-dev-cmd@v1
 
       - name: Build Native Datalevin (Unix)
-        if: matrix.os != 'windows-latest'
+        if: matrix.os != 'windows-2022'
         run: |
           export DTLV_OS=${{ env.RELEASE_OS }}
           export DTLV_ARCH=${{ env.RELEASE_ARCH }}
@@ -147,13 +147,13 @@ jobs:
           fi
 
       - name: Build Native Datalevin (Windows)
-        if: matrix.os == 'windows-latest'
+        if: matrix.os == 'windows-2022'
         shell: cmd
         run: |
           call script\compile-native.bat
 
       - name: Run Native Tests
-        if: matrix.os != 'windows-latest'
+        if: matrix.os != 'windows-2022'
         run: ./dtlv-test0
 
       - name: Check macOS deployment target
@@ -167,7 +167,7 @@ jobs:
           fi
 
       - name: Zip Binary (Unix)
-        if: matrix.os != 'windows-latest'
+        if: matrix.os != 'windows-2022'
         run: |
           if [ "${{ runner.os }}" == "macOS" ]; then
             7zz a -tzip "$RELEASE_ASSET" dtlv
@@ -176,7 +176,7 @@ jobs:
           fi
 
       - name: Zip Binary (Windows)
-        if: matrix.os == 'windows-latest'
+        if: matrix.os == 'windows-2022'
         run: 7z a -tzip "$env:RELEASE_ASSET" dtlv.exe
 
       - name: Upload Binary

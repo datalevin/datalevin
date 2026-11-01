@@ -17,6 +17,7 @@
     :refer [av-size]]
    [datalevin.parser :as dp]
    [datalevin.query-util :as qu]
+   [datalevin.query.optimizer.domains :as domains]
    [datalevin.query.optimizer.bound-patterns
     :refer [materialize-bound-patterns-with-cost
             project-bound-patterns-with-cost project-seed-propagation-with-cost
@@ -463,7 +464,7 @@
                   (assoc (:context trial) :datalevin.query-optimizer/selective-preplanned? true)
                   (assoc planned :datalevin.query-optimizer/selective-preplanned? true))))))))))
 
-(defn materialize-selective-value-lookups
+(defn- materialize-selective-value-lookups*
   "Cost non-unique constant AVE lookups as possible pre-planning entity
    relations. A candidate first has to beat the normal plan step that would
    introduce its entity. The fully propagated relation and residual plan must
@@ -521,3 +522,48 @@
                 (recur (:context trial) #{} trial-planned)
                 (recur context (conj rejected (:key candidate))
                        planned)))))))))
+
+(defn- propagate-bounded-domain
+  [planned]
+  (if-let [candidate (first (domains/candidates planned))]
+    (let [domain (domains/materialize candidate)
+          baseline-cost (estimated-context-work planned)
+          trial (when (and domain (domains/profitable? domain))
+                  (-> planned
+                      (domains/restrict-context domain)
+                      reset-cost-planning
+                      planned-context-for-cost))
+          trial-cost (when trial
+                       (+ (double (:producer-cost domain))
+                          (estimated-context-work trial)))
+          selected? (and trial-cost (< (double trial-cost) baseline-cost))]
+      (when qplan/*explain*
+        (vswap! qplan/*explain* update :bounded-domain-decisions (fnil conj [])
+                {:anchor (get-in candidate [:anchor :form])
+                 :target (get-in candidate [:target :form])
+                 :equality-vars (:equality-vars candidate)
+                 :path (mapv :form (:path candidate))
+                 :domain-size (some-> domain :values count)
+                 :producer-rows (:producer-rows domain)
+                 :producer-cost (:producer-cost domain)
+                 :stages (:stages domain)
+                 :baseline-cost baseline-cost
+                 :candidate-cost trial-cost
+                 :selected? (boolean selected?)
+                 :reason (cond
+                           (nil? domain) :producer-budget
+                           (nil? trial) :insufficient-savings
+                           selected? :lower-cost
+                           :else :baseline-cheaper)}))
+      (assoc (if selected? trial planned)
+             :datalevin.query-optimizer/selective-preplanned? true))
+    planned))
+
+(defn materialize-selective-value-lookups
+  "Compare selective anchors with the ordinary plan, then consider one bounded
+  dimension domain. Reuse the baseline when neither alternative wins."
+  [context]
+  (let [planned (materialize-selective-value-lookups* context)]
+    (if (and (:plan planned) (not= #{} (:result-set planned)))
+      (propagate-bounded-domain planned)
+      planned)))
