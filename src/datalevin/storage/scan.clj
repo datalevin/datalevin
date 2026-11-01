@@ -539,16 +539,21 @@
          :summary {:max-entries EavStringCache/MAX_ENTRIES
                    :max-key-bytes EavStringCache/MAX_KEY_BYTES
                    :attributes (into {} (keep (fn [[attr capacity]]
-                                                (when (pos? capacity) [attr capacity])))
+                                                (when (pos? (long capacity)) [attr capacity])))
                                      (map vector attributes capacities))}}))))
 
 (defn- sampled-entity-widths
   [lmdb schema anchor population-size]
   (when (pos? (long population-size))
     (let [n (min 8 (long population-size))
+          last-index (dec (long population-size))
+          denominator (max 1 (dec n))
+          step (quot last-index denominator)
+          remainder (rem last-index denominator)
+          ;; Divide before multiplying so offsets stay within the long range.
           indices (long-array
-                    (map #(quot (*' % (dec (long population-size)))
-                                (max 1 (dec n)))
+                    (map (fn [^long i]
+                           (+ (* i step) (quot (* i remainder) denominator)))
                          (range n)))
           entities (volatile! [])]
       ;; Spread the bounded sample across the anchor population: early entity
@@ -580,7 +585,7 @@
         ;; End-to-end controls admit 12-value rows, while smaller wide-string
         ;; rows can regress despite cheaper JNI arguments. Keep dense rows full.
         selective? (if auto?
-                     (and width (<= 12 width) (< (* 2 (long requested)) width))
+                     (and width (<= 12 (long width)) (< (* 2 (long requested)) (long width)))
                      (true? *selective-materialization?*))
         mode (cond
                (not native?) :ordinary
@@ -688,7 +693,7 @@
                   ^ByteBuffer value (lmdb/v entry)
                   aid (.getInt value 0)
                   column (if (and (<= low aid) (<= aid high))
-                           (aget slots (- aid low)) -1)
+                           (aget slots (- aid low)) (int -1))
                   read? (and (not (neg? column))
                              (or (not same?) (not= aid previous-aid)))
                   seen (if same? seen 0)]

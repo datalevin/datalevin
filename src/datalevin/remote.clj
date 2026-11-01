@@ -1284,7 +1284,7 @@
   (copy [_ dest compact?]
     (u/create-dirs dest)
     (let [dir  (Paths/get dest (make-array String 0))
-          file (.resolve dir c/data-file-name)
+          file (.resolve dir ^String c/data-file-name)
           stage (Files/createTempFile dir "data.mdb." ".incomplete"
                                       (make-array FileAttribute 0))]
       (try

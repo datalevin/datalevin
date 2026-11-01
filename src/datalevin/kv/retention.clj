@@ -203,7 +203,7 @@
                                                     (select-keys target [:segment-id :path]))}))))
                   targets))
         deleted (filterv :deleted? segment-results)
-        deleted-bytes (reduce (fn [^long total item] (+ total (long (:bytes item)))) 0 deleted)
+        deleted-bytes (long (reduce (fn [^long total item] (+ total (long (:bytes item)))) 0 deleted))
         errors (into [] (keep :error) segment-results)
         errors (try
                  (when (pos? deleted-bytes)

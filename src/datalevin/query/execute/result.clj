@@ -366,7 +366,11 @@
 (defn- top-k-result
   [^Comparator cmp result limit offset]
   (let [offset     (long (or offset 0))
-        window-end (+' offset (long limit))]
+        limit      (long limit)
+        ;; Only windows within the heap's int capacity need an exact sum.
+        window-end (if (> limit (- Integer/MAX_VALUE offset))
+                     (inc (long Integer/MAX_VALUE))
+                     (+ offset limit))]
     (if (or (zero? window-end) (> window-end Integer/MAX_VALUE))
       (if (zero? window-end)
         []

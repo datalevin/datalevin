@@ -928,6 +928,15 @@ must be capable of saving before the planner expands their placement states."}
   hash-join-min-input-size 20000)
 
 (def ^{:dynamic true
+       :doc     "Restrict large native multi-key hash targets with batched index
+                 probes when the runtime domain is sufficiently selective."}
+  hash-join-batched-probes? true)
+
+(def ^{:dynamic true
+       :doc     "Maximum distinct keys considered for a batched hash target."}
+  hash-join-max-probe-keys 32768)
+
+(def ^{:dynamic true
        :doc     "Maximum size of a small runtime SIP domain. In a hash join,
                  domains at or below this threshold become single-value ranges
                  instead of a bitmap predicate."}

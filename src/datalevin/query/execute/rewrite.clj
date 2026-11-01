@@ -15,12 +15,178 @@
    [datalevin.inline :refer [update]]
    [datalevin.parser :as dp]
    [datalevin.query-util :as qu]
+   [datalevin.query.plan :as qplan]
    [datalevin.query.resolve :as qresolve]
    [datalevin.relation :as r]
    [datalevin.util :as u])
   (:import
-   [datalevin.parser Constant Pattern Variable]
+   [java.util List]
+   [datalevin.parser BindColl BindScalar BindTuple Constant FindScalar Function
+    Pattern Predicate Variable]
    [org.eclipse.collections.impl.list.mutable FastList]))
+
+(defn- native-subquery-output?
+  [context outputs]
+  (some
+    (fn [clause]
+      (when (instance? Pattern clause)
+        (let [source (get (:sources context)
+                          (or (get-in clause [:source :symbol]) '$))]
+          (and source (db/-searchable? source)
+               (some #(outputs (:symbol %)) (:pattern clause))))))
+    (get-in context [:parsed-q :qwhere])))
+
+(defn- independent-grouped-subquery?
+  [context parsed clause]
+  (when (and (instance? Function parsed)
+             (= 'q (get-in parsed [:fn :symbol]))
+             (instance? BindColl (:binding parsed))
+             (instance? BindTuple (get-in parsed [:binding :binding])))
+    (let [[[_ query & inputs] _] clause
+          outputs (qu/collect-vars (second clause))]
+      (when (and (or (vector? query) (map? query))
+                 ;; Query literals contain their own logic variables. Only
+                 ;; the call's inputs can depend on outer tuple bindings.
+                 (every? #(if (qu/source? %)
+                            (contains? (:sources context) %)
+                            (and (not (symbol? %)) (not (list? %))))
+                         inputs)
+                 (native-subquery-output? context outputs))
+        (let [query (dp/parse-query query)]
+          (and (seq (:qhaving query))
+               (seq (dp/collect dp/aggregate? (:qfind query)))))))))
+
+(defn- scalar-comparison?
+  [parsed output]
+  (and (instance? Predicate parsed)
+       (contains? '#{< <= > >=} (get-in parsed [:fn :symbol]))
+       (= 2 (count (:args parsed)))
+       (every? #(or (instance? Variable %) (instance? Constant %)) (:args parsed))
+       (some #(= output (:symbol %)) (:args parsed))))
+
+(defn- independent-scalar-subquery?
+  [context parsed clause]
+  (when (and (instance? Function parsed)
+             (= 'q (get-in parsed [:fn :symbol]))
+             (instance? BindScalar (:binding parsed)))
+    (let [[[_ query & inputs] output] clause
+          clauses (get-in context [:parsed-q :qwhere])]
+      (when (and (qu/binding-var? output)
+                 (or (vector? query) (map? query))
+                 (not (contains? (qresolve/bound-vars context) output))
+                 (every? #(if (qu/source? %)
+                            (contains? (:sources context) %)
+                            (and (not (symbol? %)) (not (list? %))))
+                         inputs)
+                 ;; A comparison supplies a native access bound. Keep other
+                 ;; producers and scoped uses on the ordinary execution path.
+                 (every? #(or (= parsed %) (instance? Predicate %)
+                              (not (contains? (qu/collect-vars %) output)))
+                         clauses)
+                 (some (fn [pred]
+                         (and (scalar-comparison? pred output)
+                              (native-subquery-output?
+                                context (disj (qu/collect-vars (:args pred)) output))))
+                       clauses))
+        (let [query (dp/parse-query query)]
+          (and (instance? FindScalar (:qfind query))
+               (dp/aggregate? (:element (:qfind query)))))))))
+
+(defn- compatible-scalar-bound?
+  [context pred output value]
+  (let [vars (disj (qu/collect-vars (:args pred)) output)]
+    (every?
+      (fn [pattern]
+        (let [[_ attr term] (:pattern pattern)
+              source (get (:sources context)
+                          (or (get-in pattern [:source :symbol]) '$))]
+          (or (not (vars (:symbol term)))
+              (not (and source (db/-searchable? source)))
+              ;; Do not narrow a fractional mean to an integer/float index
+              ;; boundary. Keeping the binding preserves exact comparison.
+              (case (get-in (db/-schema source) [(:value attr) :db/valueType])
+                (:db.type/long :db.type/ref) (int? value)
+                :db.type/double (instance? Double value)
+                :db.type/float (instance? Float value)
+                (nil :db.type/data :db.type/bigdec) true
+                false))))
+      (filter #(instance? Pattern %) (get-in context [:parsed-q :qwhere])))))
+
+(defn- specialize-scalar-comparisons
+  [context parsed rels]
+  (let [output (get-in parsed [:binding :variable :symbol])
+        rel (first rels)
+        tuples ^List (:tuples rel)]
+    (if (and output (= 1 (.size tuples)))
+      (let [value (aget ^objects (.get tuples 0) (int ((:attrs rel) output)))]
+        (if (number? value)
+          (let [forms (mapv
+                        (fn [pred form]
+                          (if (and (scalar-comparison? pred output)
+                                   (compatible-scalar-bound? context pred output value))
+                            [(apply list (ffirst form)
+                                    (map #(if (= output %) value %)
+                                         (rest (first form))))]
+                            form))
+                        (get-in context [:parsed-q :qwhere])
+                        (get-in context [:parsed-q :qorig-where]))
+                needed? (or (contains? (qu/collect-vars forms) output)
+                            (some #{output} (dp/find-vars (get-in context [:parsed-q :qfind])))
+                            (some #(= output (:symbol %))
+                                  (get-in context [:parsed-q :qwith])))]
+            ;; Preserve projected bindings; a bound used only for planning
+            ;; need not be cross-joined back onto every candidate tuple.
+            (cond-> (-> context
+                        (assoc-in [:parsed-q :qorig-where] forms)
+                        (assoc-in [:parsed-q :qwhere] (dp/parse-where forms)))
+              (not needed?) (update :rels #(filterv (fn [r] (not (identical? r rel))) %))))
+          context))
+      context)))
+
+(defn materialize-independent-subqueries
+  "Resolve independent aggregates before native planning. Grouped relations
+  seed indexed lookups; scalar results specialize comparisons into ranges.
+  Correlated calls and plan-only explanations retain late-clause execution."
+  [context]
+  (cond
+    (not (:run? context)) context
+    (some r/rel-empty (:rels context)) (assoc context :result-set #{})
+    :else
+    (loop [context context]
+      (if-let [idx (when (not= #{} (:result-set context))
+                     (first
+                       (keep-indexed
+                         (fn [idx [parsed clause]]
+                           (when (or (independent-grouped-subquery?
+                                       context parsed clause)
+                                     (independent-scalar-subquery?
+                                       context parsed clause))
+                             idx))
+                         (map vector
+                              (get-in context [:parsed-q :qwhere])
+                              (get-in context [:parsed-q :qorig-where])))))]
+        (let [clause (nth (get-in context [:parsed-q :qorig-where]) idx)
+              parsed (nth (get-in context [:parsed-q :qwhere]) idx)
+              resolved (binding [qu/*implicit-source* (get (:sources context) '$)]
+                         (qresolve/resolve-clause (assoc context :rels []) clause))
+              rels (:rels resolved)
+              bound-rels (reduce qresolve/collapse-rels (:rels context) rels)
+              rows (.size ^List (:tuples (first rels)))
+              stage {:clause clause :rows rows
+                     :vars (vec (keys (:attrs (first rels))))}]
+          (when qplan/*explain*
+            (vswap! qplan/*explain* update :pre-materialized-subqueries
+                    (fnil conj []) stage))
+          (recur
+            (cond-> (-> context
+                        (assoc :rels bound-rels)
+                        (update-in [:parsed-q :qwhere]
+                                   #(u/remove-idxs #{idx} %))
+                        (update-in [:parsed-q :qorig-where]
+                                   #(u/remove-idxs #{idx} %))
+                        (specialize-scalar-comparisons parsed rels))
+              (some r/rel-empty bound-rels) (assoc :result-set #{}))))
+        context))))
 
 (defn- redundant-pattern-group-strategy
   [sources patterns]

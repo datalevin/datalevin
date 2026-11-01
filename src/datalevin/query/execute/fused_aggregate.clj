@@ -116,7 +116,7 @@
       {:aggregate-columns (int-array (map first plans))
        :aggregate-operations (int-array (map second plans))
        ;; Counting rows and proving their identity do not read the entity value.
-       :entity-value? (or (some #(and (zero? (first %))
+       :entity-value? (or (some #(and (zero? (long (first %)))
                                      (not= GroupedAggregate/COUNT (second %))) plans)
                          (some #(= entity %)
                                (tree-seq sequential? seq
@@ -131,7 +131,7 @@
       (if-let [group (first groups)]
         (when-let [attr (attributes (:symbol group))]
           (let [budget (quot (long *max-groups*) product)
-                cardinality (scan/bounded-attribute-cardinality lmdb schema attr budget)]
+                cardinality (long (scan/bounded-attribute-cardinality lmdb schema attr budget))]
             (when (and (pos? cardinality) (<= cardinality budget))
               (recur (next groups) (* product cardinality)))))
         true))))
@@ -182,7 +182,7 @@
                                (integer? (get-in schema [(:attr %) :db/aid]))) fields)
                  (every? #(and (= 1 (count (:tuples %)))
                                (set/subset? (set (keys (:attrs %))) (set input-vars))) rels)
-                 (number? size) (<= *min-input* size))
+                 (number? size) (<= (double *min-input*) (double size)))
         (let [population-size (long (i/a-size store (:attr anchor)))
               total (max population-size
                          (long (.-max-eid ^DB database)))
@@ -194,9 +194,9 @@
               values (mapv #(resolve/context-resolve-val context %) input-vars)
               clauses (remove #(instance? Pattern %) (:qwhere parsed-q))]
           (when (and total (pos? total)
-                     (<= *min-scan-fraction* (/ (double size) (double total)))
+                     (<= (double *min-scan-fraction*) (/ (double size) (double total)))
                      (< (long (last aids)) Integer/MAX_VALUE)
-                     (<= (inc (- (last aids) (first aids))) 4096)
+                     (<= (inc (- (long (last aids)) (long (first aids)))) 4096)
                      (every? scalar? values))
             (when-let [program (row-program clauses columns context)]
               (when-let [aggregate (aggregate-plan parsed-q (:columns program) entity)]

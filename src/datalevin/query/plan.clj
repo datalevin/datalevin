@@ -16,6 +16,7 @@
    [datalevin.constants :as c]
    [datalevin.db :as db]
    [datalevin.inline :refer [update assoc]]
+   [datalevin.interface :as i]
    [datalevin.join :as j]
    [datalevin.lmdb :as l]
    [datalevin.pipe :as p]
@@ -95,7 +96,8 @@
          normal-hash-join-execute-pipe reusable-sip-bitmap
          reusable-sip-hash-join-execute reusable-sip-hash-join-execute-pipe
          sip-execute-pipe sip-hash-join-execute index-semi-join-execute
-         index-semi-join-execute-into)
+         index-semi-join-execute-into batched-hash-target
+         batched-hash-join-execute-into)
 
 (defn- read-access-prefix
   ([path demand bounds work source]
@@ -524,7 +526,11 @@
         db (:sip-target-attr this) in-cols tgt-steps src bitmap)
       (if (late-sip? link (long in-size) (long tgt-size))
         (sip-hash-join-execute db link link-e in-cols tgt-steps src)
-        (hash-join-execute db in-cols tgt-steps src))))
+        (if-let [target (batched-hash-target db this)]
+          (let [out (FastList.)]
+            (batched-hash-join-execute-into db this target src out)
+            out)
+          (hash-join-execute db in-cols tgt-steps src)))))
 
   (-execute-pipe [this db src sink]
     (if-let [bitmap (reusable-sip-bitmap this)]
@@ -539,7 +545,15 @@
                 (recur))))
           (when (pos? (.size input))
             (sip-execute-pipe db link link-e in-cols tgt-steps input sink)))
-        (normal-hash-join-execute-pipe db in-cols tgt-steps src sink))))
+        (if-let [target (batched-hash-target db this)]
+          (let [input (FastList.)]
+            (when src
+              (loop []
+                (when-let [tuple (p/produce src)]
+                  (.add input tuple)
+                  (recur))))
+            (batched-hash-join-execute-into db this target input sink))
+          (normal-hash-join-execute-pipe db in-cols tgt-steps src sink)))))
 
   (-explain [this _]
     (str "Hash join to " (:tgt link) " by " (case (:type link)
@@ -782,6 +796,119 @@
   [a-or-v cols]
   (when a-or-v
     (u/index-of (fn [x] (if (set? x) (x a-or-v) (= x a-or-v))) cols)))
+
+(defn batched-hash-target
+  "Admit only native, unfiltered initializations with a bound integer key.
+  Multi-key joins are the measured use case; existing SIP handles other cases."
+  [database {:keys [in-cols tgt-steps tgt-size]}]
+  (when (and c/hash-join-batched-probes?
+             (instance? DB database)
+             (instance? Store (.-store ^DB database))
+             (>= (long tgt-size) (long c/hash-join-min-input-size)))
+    (let [init       (first tgt-steps)
+          attr       (:attr init)
+          props      (get (db/-schema database) attr)
+          input-vars (cols->attrs in-cols)
+          init-vars  (:vars init)
+          key-var    (second init-vars)
+          index      (get input-vars key-var)]
+      (when (and (instance? InitStep init)
+                 (= 2 (count init-vars))
+                 (every? symbol? init-vars)
+                 (= (:cols init) [(first init-vars) #{attr key-var}])
+                 (not= (first init-vars) key-var)
+                 (some? index)
+                 (not-any? #(some? (get init %)) [:val :range :pred :result])
+                 (not (:know-e? init))
+                 (pos? (long (or (:mcount init) 0)))
+                 (not (:db/noindex props))
+                 (#{:db.type/long :db.type/ref} (:db/valueType props))
+                 (every? #(and (instance? MergeScanStep %)
+                               (nil? (:result %)))
+                         (rest tgt-steps))
+                 (< 1 (count (set/intersection
+                               (set (keys input-vars))
+                               (set (keys (cols->attrs
+                                            (:cols (peek tgt-steps)))))))))
+        {:attr attr :index index :initial-rows (:mcount init)}))))
+
+(defn- hash-probe-domain
+  [^List input ^long index]
+  (let [bitmap (b/bitmap64)
+        limit  (long c/hash-join-max-probe-keys)]
+    (loop [n 0]
+      (if (< n (.size input))
+        (let [_ (when (zero? (bit-and n 4095)) (timeout/assert-time-left))
+              v (aget ^objects (.get input n) index)]
+          ;; Do not truncate floating point, arbitrary precision or nil keys.
+          ;; The full hash join retains their normal comparison semantics.
+          (if (int? v)
+            (do
+              (b/bitmap64-add bitmap (long v))
+              (if (<= (b/bitmap64-cardinality bitmap) limit)
+                (recur (inc n))
+                {:reason :domain-limit}))
+            {:reason :unsupported-key}))
+        {:keys (b/bitmap64->longs bitmap)
+         :domain-size (b/bitmap64-cardinality bitmap)}))))
+
+(defn- hash-probe-cost
+  [database {:keys [attr initial-rows]} domain]
+  (let [keys       (:keys domain)
+        probe-cost (* (double (:domain-size domain))
+                      (double c/magic-cost-link-probe))
+        row-cost   (double c/magic-cost-link-retrieval)
+        limit      (/ (* (double initial-rows) row-cost)
+                      (double c/sip-ratio-threshold))]
+    (loop [remaining (seq keys) rows 0]
+      (let [cost (+ probe-cost (* (double rows) row-cost))]
+        (cond
+          (> cost limit) (assoc domain :reason :dense-domain
+                               :candidate-rows rows :probe-cost cost)
+          remaining
+          (do
+            (timeout/assert-time-left)
+            ;; Counts decide which physical path to take, never which keys
+            ;; exist. Every domain key is still probed if this path is used.
+            (recur (next remaining)
+                   (+ rows (long (i/av-size (.-store ^DB database)
+                                           attr (first remaining))))))
+          :else (assoc domain :candidate-rows rows :probe-cost cost))))))
+
+(defn- probe-hash-target
+  [database tgt-steps attr keys]
+  (let [input (FastList.)]
+    (doseq [key keys] (.add input (object-array [key])))
+    (let [matches (db/-val-eq-scan-e-list database input 0 attr)
+          tuples  (FastList. (.size ^List matches))]
+      ;; The batched lookup emits [key entity]; InitStep emits [entity key].
+      (doseq [^objects tuple matches]
+        (.add tuples (object-array [(aget tuple 1) (aget tuple 0)])))
+      (r/relation! (cols->attrs (:cols (peek tgt-steps)))
+                   (reduce #(step-execute %2 database %1)
+                           tuples (rest tgt-steps))))))
+
+(defn batched-hash-join-execute-into
+  "Restrict only the target initialization, then run the original projection
+  and hash join with every shared key and its original multiplicity."
+  [database {:keys [in-cols tgt-steps]} target ^List input sink]
+  (when (and input (pos? (.size input)))
+    (let [domain   (hash-probe-domain input (:index target))
+          decision (if (:reason domain) domain
+                       (hash-probe-cost database target domain))
+          used?    (nil? (:reason decision))
+          tgt-rel  (if used?
+                     (probe-hash-target database tgt-steps (:attr target)
+                                        (:keys decision))
+                     (execute-steps nil database tgt-steps))]
+      (when *explain*
+        (locking *explain*
+          (vswap! *explain* update :batched-hash-targets (fnil conj [])
+                  (assoc (dissoc decision :keys)
+                         :attr (:attr target) :used? used?
+                         :initial-rows (:initial-rows target)
+                         :target-rows (.size ^List (:tuples tgt-rel))))))
+      (hash-join-execute-into in-cols tgt-rel input sink))))
 
 (defn- build-sip-bitmap
   "Build a 64-bit bitmap from the values at col-idx in input tuples"
@@ -1166,6 +1293,9 @@
   [step]
   (case (-type step)
     :link true
+    ;; Each execution compiles its own callable and argument scratch space.
+    ;; The planner admits only pure comparisons into TuplePredicateStep.
+    :tuple-predicate true
     :merge
     (and (nil? (:result step))
          (every? (fn [[_ opts]]

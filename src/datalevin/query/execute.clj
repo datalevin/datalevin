@@ -1085,6 +1085,7 @@
             (reduce qresolve/resolve-clause context clauses)
             context)))
       (-> context
+          (rewrite/materialize-independent-subqueries)
           (materialize-input-bound-patterns)
           (resolve-redudants)
           (rules/rewrite)

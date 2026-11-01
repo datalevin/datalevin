@@ -23,6 +23,7 @@
             count-or-join-follows estimate-hash-join-cost estimate-link-cost
             estimate-round final-plan-size incoming-link-counts recount-node]]
    [datalevin.query.optimizer.graph :as qog]
+   [datalevin.query.optimizer.join-sampling :as js]
    [datalevin.query.optimizer.existence :as existence]
    [datalevin.query.optimizer.plan-cost
     :refer [estimate-base-cost estimate-scan-v-cost estimate-scan-v-size
@@ -663,28 +664,31 @@
   (when (set? col)
     (some #(when (keyword? %) %) col)))
 
-(defn multi-key-result-size
-  "Dampen a join estimate for equality keys already present on both sides but
-  not represented by the selected graph link. Full independence is too
-  aggressive for graph data, so each additional key contributes only the
-  square root of its observed value-domain cardinality."
-  [db link-e link prev-plan new-base-plan result-size]
-  (let [result-size (long result-size)
-        in-cols     (:cols (peek (:steps prev-plan)))
+(defn- extra-join-cols
+  [link-e link prev-plan new-base-plan]
+  (let [in-cols     (:cols (peek (:steps prev-plan)))
         tgt-cols    (some-> new-base-plan :steps peek :cols)
         primary-var (case (:type link)
                       :val-eq (:var link)
                       :_ref   link-e
                       :ref    (:tgt link)
                       nil)
-        in-vars     (into #{} (keep col-var) in-cols)
-        extra-cols  (filter (fn [col]
-                              (let [v (col-var col)]
-                                (and v
-                                     (not= v primary-var)
-                                     (contains? in-vars v)
-                                     (col-attr col))))
-                            tgt-cols)
+        in-vars     (into #{} (keep col-var) in-cols)]
+    (filter (fn [col]
+              (let [v (col-var col)]
+                (and v
+                     (not= v primary-var)
+                     (contains? in-vars v)
+                     (col-attr col))))
+            tgt-cols)))
+
+(defn multi-key-result-size
+  "Fallback for additional equality keys without a supported join sample.
+  Full independence is too aggressive for graph data, so each extra key
+  contributes the square root of its observed value-domain cardinality."
+  [db link-e link prev-plan new-base-plan result-size]
+  (let [result-size (long result-size)
+        extra-cols  (extra-join-cols link-e link prev-plan new-base-plan)
         divisor     (double
                       (reduce
                         (fn ^double [^double d col]
@@ -983,7 +987,7 @@
                (- ^long (find-index link-e (:strata last-step))))))
 
 (defn- attribute-group-plan
-  [{:keys [steps cost size recency]} new-key
+  [{:keys [steps cost size recency] :as parent} new-key
    {:keys [id owner role clauses selectivity]}]
   (let [last-step (peek steps)
         index     (find-index owner (:cols last-step))]
@@ -1018,9 +1022,11 @@
               (zero? (double selectivity)) 0
               :else (max 1 (estimate-round
                              (* (double size) (double selectivity)))))]
-        (make-plan [step]
-                   (+ ^long cost ^long (estimate-scan-v-cost step size))
-                   result-size recency)))))
+        (js/with-source
+          (make-plan [step]
+                     (+ ^long cost ^long (estimate-scan-v-cost step size))
+                     result-size recency)
+          parent [step])))))
 
 (defn- index-semi-join-plan
   [db prev-plan link-e link new-key new-base-plan e-size result-size]
@@ -1080,6 +1086,16 @@
                                 prev-plan index new-base)
             link-plan  (e-plan db prev-plan index link-e link new-key
                                new-base e-size result-size)
+            sampled    (when (and js/*enabled?*
+                                 (seq (extra-join-cols link-e link prev-plan new-base)))
+                         (js/join-estimate db build-cache prev-plan new-base
+                                           link (:steps link-plan)))
+            e-size     (or (:candidate-size sampled) e-size)
+            result-size (if sampled (:size sampled) result-size)
+            link-plan  (if sampled
+                         (e-plan db prev-plan index link-e link new-key
+                                 new-base e-size result-size)
+                         link-plan)
             regular    (if (and (#{:_ref :val-eq} link-type)
                                 new-base
                                 (<= ^long c/hash-join-min-input-size
@@ -1092,10 +1108,16 @@
             index-semi (when semi-join?
                          (index-semi-join-plan
                            db prev-plan link-e link new-key new-base e-size
-                           result-size))]
-        (reduce compare-plans regular
-                (cond-> []
-                  index-semi (conj index-semi)))))))
+                           result-size))
+            selected (reduce compare-plans regular
+                             (cond-> [] index-semi (conj index-semi)))]
+        (cond-> selected
+          (and js/*budget* (not= :semi-join (-type (peek (:steps selected)))))
+          (js/with-source prev-plan (:steps link-plan)
+                          {:target new-base :link link
+                           :multi? (boolean (seq (extra-join-cols
+                                                  link-e link prev-plan new-base)))})
+          sampled (assoc :join-sample sampled))))))
 
 (defn- binary-plan
   [db sources rules nodes incoming-link-counts required-vars base-plans ratios
@@ -1279,24 +1301,35 @@
                  initial-plans (if node-ids
                                  (dp-initial-plans initial-bases node-ids)
                                  initial-bases)
-                 tables        (FastList. n)
                  ratios        (ConcurrentHashMap.)
                  build-cache   (IdentityHashMap.)
                  n-1           (dec n)
                  pn            ^long (min (long c/plan-search-max)
-                                          (long (u/n-permutations n 2)))]
-             (.add tables initial-plans)
-             (dotimes [i n-1]
-               (let [plans (plans db sources rules nodes node-ids
-                                  incoming-link-counts required-vars pairs
-                                  base-plans groups predecessors
-                                  (.get tables i) ratios build-cache)]
-                 (if (< pn (count plans))
-                   (.add tables (shrink-space plans node-ids))
-                   (.add tables plans))))
-             (if (empty? (.get tables n-1))
-               [nil]
-               (trace-steps tables n-1 node-ids)))))))))
+                                          (long (u/n-permutations n 2)))
+                 search
+                 (fn []
+                   (let [tables (FastList. n)]
+                     (.add tables initial-plans)
+                     (dotimes [i n-1]
+                       (let [plans (plans db sources rules nodes node-ids
+                                          incoming-link-counts required-vars pairs
+                                          base-plans groups predecessors
+                                          (.get tables i) ratios build-cache)]
+                         (.add tables (if (< pn (count plans))
+                                        (shrink-space plans node-ids) plans))))
+                     (if (empty? (.get tables n-1))
+                       [nil]
+                       (trace-steps tables n-1 node-ids))))
+                 initial (binding [js/*enabled?* false] (search))]
+             (loop [current initial round 0]
+               (if (and js/*enabled?* (< round 8)
+                        (js/prime-plan! db build-cache current))
+                 (let [_ (.clear ratios)
+                       refined (binding [js/*cached-only?* true] (search))]
+                   (if (js/same-plan? current refined)
+                     refined
+                     (recur refined (inc round))))
+                 current)))))))))
 
 (def ^:private connected-components qog/connected-components)
 
@@ -1604,31 +1637,34 @@
 
 (defn build-plan*
   [db sources rules nodes required-vars projected-vars]
-  (let [cc              (connected-components nodes)
-        incoming-counts (incoming-link-counts nodes)
-        components      (mapv
-                          (fn [component]
-                            [component
-                             (deferred-base-sample-entities
-                               db nodes component projected-vars)])
-                          cc)
-        deferred        (into #{} (mapcat second) components)
-        alternatives
-        (if (= 1 (count components))
-          (let [[component deferred] (first components)]
-            [(component-plan-alternatives
-               db sources rules nodes incoming-counts required-vars
-               component deferred)])
-          (map+ (bound-fn [[component deferred]]
-                  (component-plan-alternatives
-                    db sources rules nodes incoming-counts required-vars
-                    component deferred))
-                components))]
-    {:plans (mapv #(annotate-reusable-sip-domains db (:plan %)) alternatives)
-     :deferred deferred
-     :attribute-group-planning
-     (not-empty (mapv :attribute-group-planning
-                      (filter :attribute-group-planning alternatives)))}))
+  (binding [js/*budget* (when js/*enabled?*
+                         (or js/*budget* (js/new-budget)))]
+    (let [cc              (connected-components nodes)
+          incoming-counts (incoming-link-counts nodes)
+          components      (mapv
+                            (fn [component]
+                              [component
+                               (deferred-base-sample-entities
+                                 db nodes component projected-vars)])
+                            cc)
+          deferred        (into #{} (mapcat second) components)
+          alternatives
+          (if (= 1 (count components))
+            (let [[component deferred] (first components)]
+              [(component-plan-alternatives
+                 db sources rules nodes incoming-counts required-vars
+                 component deferred)])
+            (map+ (bound-fn [[component deferred]]
+                    (component-plan-alternatives
+                      db sources rules nodes incoming-counts required-vars
+                      component deferred))
+                  components))]
+      {:plans (mapv #(annotate-reusable-sip-domains
+                       db (mapv js/strip-source (:plan %))) alternatives)
+       :deferred deferred
+       :attribute-group-planning
+       (not-empty (mapv :attribute-group-planning
+                        (filter :attribute-group-planning alternatives)))})))
 
 (defn- required-plan-vars
   [{:keys [parsed-q rels late-clauses optimizable-not-joins graph]} src]
@@ -1781,61 +1817,63 @@
   :op here means step type.
   :result-set will be #{} if there is any clause that matches nothing."
   [{:keys [graph sources rules parsed-q] :as context}]
-  (if graph
-    (let [runtime-key (plan-runtime-key parsed-q rules)]
-      (unreduced
-        (reduce-kv
-          (fn [c src nodes]
-            (let [^DB db        (sources src)
-                  required-vars (required-plan-vars context src)
-                  projected-vars (set (dp/find-vars (:qfind parsed-q)))
-                  k             [(pc/store-key (.-store db)) nodes required-vars
-                                 projected-vars runtime-key]
-                  cache         (plan-cache)
-                  cached        (.get ^LRUCache cache k)]
-              (if (and cached (current-plan-sources? (:sources cached) sources))
-                (assoc-source-plan c src
-                                   (if (:bind-sources? cached)
-                                     (bind-plan-sources (:plans cached) sources rules)
-                                     (:plans cached))
-                                   (:deferred cached)
-                                   (:attribute-group-planning cached))
-                (let [source-state (plan-sources sources)
-                      nodes (update-nodes db nodes)]
-                  ;; A zero count has already been verified against the actual
-                  ;; index by zero-count-clause-size. Since every graph node is
-                  ;; conjunctive, no base sampling or join enumeration can make
-                  ;; this source component satisfiable.
-                  (if (some #(zero? (long (:mcount %))) (vals nodes))
-                    (reduced (assoc c :result-set #{}))
-                    (let [{:keys [plans deferred attribute-group-planning]}
-                          (if (< 1 (count nodes))
-                            (build-plan* db sources rules nodes required-vars
-                                         projected-vars)
-                            {:plans [[(base-plan
-                                        db nodes (ffirst nodes) true true
-                                        (plan-materialized-vars
-                                          nodes required-vars))]]
-                             :deferred #{}
-                             :attribute-group-planning nil})]
-                      (if (some #(some nil? %) plans)
-                        (reduced (assoc c :result-set #{}))
-                        (do (pc/put! cache k
-                                  {:sources source-state
-                                   :store-keys (into [] (keep :store-key)
-                                                     (vals source-state))
-                                   :bind-sources?
-                                   (boolean (some source-bound-step?
-                                                  (mapcat :steps (mapcat identity plans))))
-                                   :plans (strip-result plans)
-                                   :deferred deferred
-                                   :attribute-group-planning
-                                   attribute-group-planning}
-                                  #(current-plan-sources? source-state sources))
-                            (assoc-source-plan c src plans deferred
-                                               attribute-group-planning)))))))))
-          context graph)))
-    context))
+  (binding [js/*budget* (when js/*enabled?*
+                         (or js/*budget* (js/new-budget)))]
+    (if graph
+      (let [runtime-key (plan-runtime-key parsed-q rules)]
+        (unreduced
+          (reduce-kv
+            (fn [c src nodes]
+              (let [^DB db        (sources src)
+                    required-vars (required-plan-vars context src)
+                    projected-vars (set (dp/find-vars (:qfind parsed-q)))
+                    k             [(pc/store-key (.-store db)) nodes required-vars
+                                   projected-vars runtime-key (boolean js/*enabled?*)]
+                    cache         (plan-cache)
+                    cached        (.get ^LRUCache cache k)]
+                (if (and cached (current-plan-sources? (:sources cached) sources))
+                  (assoc-source-plan c src
+                                     (if (:bind-sources? cached)
+                                       (bind-plan-sources (:plans cached) sources rules)
+                                       (:plans cached))
+                                     (:deferred cached)
+                                     (:attribute-group-planning cached))
+                  (let [source-state (plan-sources sources)
+                        nodes (update-nodes db nodes)]
+                    ;; A zero count has already been verified against the actual
+                    ;; index by zero-count-clause-size. Since every graph node is
+                    ;; conjunctive, no base sampling or join enumeration can make
+                    ;; this source component satisfiable.
+                    (if (some #(zero? (long (:mcount %))) (vals nodes))
+                      (reduced (assoc c :result-set #{}))
+                      (let [{:keys [plans deferred attribute-group-planning]}
+                            (if (< 1 (count nodes))
+                              (build-plan* db sources rules nodes required-vars
+                                           projected-vars)
+                              {:plans [[(base-plan
+                                          db nodes (ffirst nodes) true true
+                                          (plan-materialized-vars
+                                            nodes required-vars))]]
+                               :deferred #{}
+                               :attribute-group-planning nil})]
+                        (if (some #(some nil? %) plans)
+                          (reduced (assoc c :result-set #{}))
+                          (do (pc/put! cache k
+                                    {:sources source-state
+                                     :store-keys (into [] (keep :store-key)
+                                                       (vals source-state))
+                                     :bind-sources?
+                                     (boolean (some source-bound-step?
+                                                    (mapcat :steps (mapcat identity plans))))
+                                     :plans (strip-result plans)
+                                     :deferred deferred
+                                     :attribute-group-planning
+                                     attribute-group-planning}
+                                    #(current-plan-sources? source-state sources))
+                              (assoc-source-plan c src plans deferred
+                                                 attribute-group-planning)))))))))
+            context graph)))
+      context)))
 
 (defn- component-binds-vars?
   [plans vars]
@@ -1854,7 +1892,8 @@
                            (when (every? #(some? (find-index % (:cols step))) vars) i))
                          steps))]
         (if (some? pos)
-          (let [pos (+ pos (count (take-while
+          (let [pos (long pos)
+                pos (+ pos (count (take-while
                                    #(#{:tuple-predicate :not-join} (-type %))
                                    (subvec steps (inc pos)))))]
             (assoc (vec plans) idx

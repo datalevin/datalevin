@@ -45,7 +45,7 @@
 
 (defn- compile-like
   [^String pattern escape not?]
-  (let [fsm (if escape (LikeFSM. pattern escape) (LikeFSM. pattern))
+  (let [fsm (if escape (LikeFSM. pattern ^char escape) (LikeFSM. pattern))
         f   #(.match fsm ^String %)]
     (if not? #(clojure.core/not (f %)) f)))
 

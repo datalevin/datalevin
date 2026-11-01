@@ -2901,7 +2901,7 @@
                                   :admin-required-capabilities #{:guarded-maintenance :standalone-copy}))
          file (.toAbsolutePath (file-copy/path file))
          version-file (if (contains? opts :version-file) (:version-file opts)
-                          (.resolve (.getParent file) c/version-file-name))]
+                          (.resolve (.getParent file) ^String c/version-file-name))]
      (when (:admin-required-capabilities req) (ensure-admin-support! client req))
      (call-with-request
        client req
