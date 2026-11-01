@@ -25,6 +25,7 @@
    [datalevin.query.optimizer.graph :as qog]
    [datalevin.query.optimizer.join-sampling :as js]
    [datalevin.query.optimizer.existence :as existence]
+   [datalevin.query.optimizer.existence-placement :as placement]
    [datalevin.query.optimizer.plan-cost
     :refer [estimate-base-cost estimate-scan-v-cost estimate-scan-v-size
             fast-clause-count final-plan-cost zero-count-clause-size]]
@@ -1927,47 +1928,81 @@
           [plan []] late-clauses)]
     (assoc context :plan planned :late-clauses late)))
 
-(defn- add-not-join-step
-  [plans clause sources rules]
-  (let [plans     (vec plans)
-        plan-idx  (dec (count plans))
-        last-plan (plans plan-idx)
-        last-step (some-> last-plan :steps peek)
-        vars      (get-not-join-vars clause)
-        nstep     (mk-not-join-step clause vars sources rules
-                                    (:out last-step) (:out last-step)
-                                    (:cols last-step) (:strata last-step)
-                                    (:seen-or-joins last-step))]
-    ;; Let selective positive joins constrain the key domain first.
-    (assoc plans plan-idx (update last-plan :steps conj nstep))))
+(defn- existence-placement
+  [{:keys [parsed-q sources rules rels]} src plans clauses]
+  (let [database (sources src)
+        fallback {:site (dec (count plans)) :strategy :late :reason :unsupported-context}
+        simple? (every? #(or (instance? datalevin.parser.Pattern %)
+                             (instance? datalevin.parser.Not %)
+                             (and (instance? datalevin.parser.Predicate %)
+                                  (existence/simple-predicate? (dp/source %))))
+                        (:qwhere parsed-q))]
+    (if-not (and (= '$ src) (empty? rels) (instance? DB database) simple?
+                 (not (writing? database)) (not (db/pending-tx-cache? database)))
+      fallback
+      (let [store (.-store ^DB database)
+            tx (i/max-tx store)
+            cache (plan-cache)
+            key [::existence-placement (pc/store-key store) tx
+                 (select-keys parsed-q [:qorig-where :qorig-find :qwith]) clauses
+                 (mapv (fn [p]
+                         [(:cost p) (:size p)
+                          (mapv (fn [s] [(-type s) (:cols s) (:attr s) (:index s)
+                                         (mapv first (:attrs-v s))]) (:steps p))]) plans)
+                 (plan-runtime-key parsed-q rules) (placement/settings)]
+            cached (.get ^LRUCache cache key)]
+        (if (and cached (current-plan-sources? (:sources cached) sources))
+          (assoc (:decision cached) :cache-hit? true)
+          (let [state (plan-sources sources)
+                decision (placement/select database plans clauses)]
+            (pc/put! cache key
+                     {:sources state :store-keys (into [] (keep :store-key) (vals state))
+                      :decision decision}
+                     #(and (= tx (i/max-tx store)) (current-plan-sources? state sources)))
+            (assoc decision :cache-hit? false)))))))
+
+(defn- add-not-join-steps
+  [{:keys [sources rules] :as context} src plans clauses]
+  (let [plans (vec plans)
+        decision (existence-placement context src plans clauses)
+        plan-idx (:site decision)
+        selected (plans plan-idx)
+        previous (peek (:steps selected))
+        steps (mapv (fn [clause]
+                      (mk-not-join-step clause (get-not-join-vars clause) sources rules
+                                        (:out previous) (:out previous) (:cols previous)
+                                        (:strata previous) (:seen-or-joins previous))) clauses)]
+    (when qplan/*explain*
+      (vswap! qplan/*explain* update :existence-placement (fnil conj [])
+              (assoc decision :clauses clauses)))
+    (assoc plans plan-idx (update selected :steps into steps))))
 
 (defn- attach-not-joins
-  [{:keys [plan sources rules optimizable-not-joins] :as context}]
+  [{:keys [plan optimizable-not-joins] :as context}]
   (if (seq optimizable-not-joins)
     (let [plan'                (into {} (map (fn [[src comps]]
                                                [src (mapv vec comps)]))
                                     plan)
-          [planned unlinked]
+          [groups unlinked]
           (reduce
-            (fn [[p u] clause]
+            (fn [[groups u] clause]
               (let [src        (get-not-join-source clause)
                     vars       (get-not-join-vars clause)
-                    components (get p src)]
+                    components (get plan' src)]
                 (if (and (seq vars) (seq components))
                   (let [idxs (keep-indexed
                                (fn [i comp]
                                  (when (component-binds-vars? comp vars) i))
                                components)]
                     (if (= 1 (count idxs))
-                      (let [idx (first idxs)]
-                        [(assoc-in p [src idx]
-                                   (add-not-join-step
-                                     (nth components idx) clause sources rules))
-                         u])
-                      [p (conj u clause)]))
-                  [p (conj u clause)])))
-            [plan' []]
-            optimizable-not-joins)]
+                      [(update groups [src (first idxs)] (fnil conj []) clause) u]
+                      [groups (conj u clause)]))
+                  [groups (conj u clause)])))
+            [{} []] optimizable-not-joins)
+          planned (reduce-kv
+                    (fn [p [src idx] clauses]
+                      (update-in p [src idx] #(add-not-join-steps context src % clauses)))
+                    plan' groups)]
       (-> context
           (assoc :plan planned)
           (update :late-clauses into unlinked)
@@ -1975,7 +2010,7 @@
     context))
 
 (defn plan-not-joins
-  "Schedule scalar comparisons at their first bound site, then attach keyed
-  existence checks after selective positive joins. Unlinked clauses stay late."
+  "Schedule scalar comparisons at their first bound site, then place keyed
+  existence checks by estimated total work. Unlinked clauses stay late."
   [context]
   (-> context plan-tuple-predicates attach-not-joins))

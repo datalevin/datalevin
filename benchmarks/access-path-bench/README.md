@@ -1,19 +1,20 @@
 # Access-path Benchmark
 
 This benchmark measures the query-engine benefit of Datalevin physical access
-paths. It covers AVE, idoc, fulltext, and vector access, plus a conventional
-control query. Each query runs in two modes:
+paths. It covers AVE, idoc, fulltext, and vector access, plus an ordinary
+unordered fan-out query named `control`. Each query runs in two modes:
 
 1. **Conventional**: physical access methods are disabled and the query uses
    its normal complete plan.
 2. **Access**: physical access methods are enabled. Eligible queries use
-   `:adaptive-top-k` or `:adaptive-limit`; the control remains conventional.
+   `:adaptive-top-k` or `:adaptive-limit`, including the unordered control query.
 
 Before timing, the runner requires both modes to return exactly the same ordered
-result for AVE, fulltext, vector, and control queries. Idoc uses an unordered
-limit, so both windows are instead checked against the complete conventional
-result. Query-result caching is disabled in both modes. Measurements alternate
-the execution order of the two modes and report median and p95 latency.
+result for AVE, fulltext, and vector queries. Idoc and control use unordered
+limits, so both windows are checked for distinctness and membership in the
+complete conventional result. Query-result caching is disabled in both modes.
+Measurements alternate the execution order of the two modes and report median
+and p95 latency.
 
 The synthetic workload deliberately asks the source function for a wide top-N
 window, joins it with a selective boolean attribute and multi-valued metadata,
@@ -21,9 +22,17 @@ and asks the root query for a small ordered result. Conventional execution
 expands the full ranked window through those joins; access execution only
 expands the candidate prefix needed to prove the top-k. This is the workload
 shape the access path is designed to improve. The idoc workload exercises
-adaptive unordered limits. The control workload has no eligible access path and
-measures the overhead of leaving access discovery enabled for an ordinary
-bounded query.
+adaptive unordered limits. The control workload joins 2,000 qualifying entities
+to 64 tags each and requests 10 rows. Its unordered AVE alternative lets the
+existing adaptive executor stop after enough distinct results, avoiding the
+complete 128,000-pair intermediate. This alternative is available for finite,
+unordered relation queries over typed, indexed attributes with variable
+projections, patterns, and predicates. Aggregates, `:with`, rules, and function
+clauses retain their existing planning paths.
+
+The runner also accepts a conventional control plan for comparisons with older
+engines. See the [early-limit comparison](../results/2026-11-01-early-limit/README.md)
+for before/after measurements and scope.
 
 ## Vector benchmark scope
 
@@ -107,6 +116,7 @@ The most useful fields are:
   unchanged for the current eager vector source.
 
 The runner fails before timing if an access workload does not select its
-expected adaptive mode, the control unexpectedly selects an access path, an
-ordered result differs, an idoc window contains a row outside the complete
-result, or a root result window is not full.
+expected adaptive mode, the control selects a mode other than conventional or
+adaptive limit, an ordered result differs, an unordered window contains
+duplicates or rows outside the complete result, or a root result window is not
+full.

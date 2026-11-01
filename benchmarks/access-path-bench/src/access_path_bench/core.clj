@@ -247,7 +247,9 @@
 (defn- require-valid-unordered-windows!
   [workload query inputs conventional access]
   (let [complete (set (execute false (query-with-limit query -1) inputs))]
-    (when-not (and (every? complete conventional)
+    (when-not (and (= (count conventional) (count (set conventional)))
+                   (= (count access) (count (set access)))
+                   (every? complete conventional)
                    (every? complete access))
       (throw
         (ex-info "A bounded query returned rows outside its complete result"
@@ -261,8 +263,14 @@
                         :idoc    :adaptive-limit
                         :control nil
                         :adaptive-top-k)
-        expect-access? (some? expected-mode)
         plan         (explain query inputs)
+        mode         (get-in plan [:selected-plan-alternative :mode])
+        ;; Preserve comparisons against older engines where this ordinary
+        ;; query remained conventional. New engines may push down its limit.
+        expected-modes (if (= name :control)
+                         #{nil :adaptive-limit}
+                         #{expected-mode})
+        expect-access? (if (= name :control) (some? mode) (some? expected-mode))
         conventional (execute false query inputs)
         access       (execute true query inputs)]
     (when-not (= expect-access? (boolean (:access-path-selected? plan)))
@@ -271,14 +279,13 @@
                  {:workload name
                   :expected-mode expected-mode
                   :explain plan})))
-    (when-not (= expected-mode
-                 (get-in plan [:selected-plan-alternative :mode]))
+    (when-not (contains? expected-modes mode)
       (throw
         (ex-info "The benchmark query selected an unexpected mode"
                  {:workload name
-                  :expected expected-mode
-                  :mode (get-in plan [:selected-plan-alternative :mode])})))
-    (if (= name :idoc)
+                  :expected expected-modes
+                  :mode mode})))
+    (if (#{:idoc :control} name)
       (require-valid-unordered-windows!
         name query inputs conventional access)
       (require-equal-results! name conventional access))

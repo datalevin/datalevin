@@ -594,7 +594,7 @@
     :where
     [?c :customer/custkey ?ck]
     [?c :customer/phone ?phone]
-    [(subs ?phone 0 2) ?cntrycode]
+    [(subs ?phone 0 (min 2 (count ?phone))) ?cntrycode]
     [(or (= ?cntrycode "13") (= ?cntrycode "31") (= ?cntrycode "23")
          (= ?cntrycode "29") (= ?cntrycode "30") (= ?cntrycode "18")
          (= ?cntrycode "17"))]
@@ -605,7 +605,7 @@
          [?c2 :customer/acctbal ?b]
          [(> ?b 0.0)]
          [?c2 :customer/phone ?p2]
-         [(subs ?p2 0 2) ?cc2]
+         [(subs ?p2 0 (min 2 (count ?p2))) ?cc2]
          [(or (= ?cc2 "13") (= ?cc2 "31") (= ?cc2 "23") (= ?cc2 "29")
               (= ?cc2 "30") (= ?cc2 "18") (= ?cc2 "17"))]] $) ?avgbal]
     [(> ?c-acctbal ?avgbal)]

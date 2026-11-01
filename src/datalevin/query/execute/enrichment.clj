@@ -106,6 +106,8 @@
              (instance? FindRel find)
              (some dp/aggregate? elements)
              (every? #(or (instance? Variable %) (dp/aggregate? %)) elements)
+             (let [groups (keep #(when (instance? Variable %) (:symbol %)) elements)]
+               (= (count groups) (count (distinct groups))))
              (seq (:qorder parsed-q))
              (some? limit) (pos? (long limit))
              (not (:aggregate-enrichment context)))
@@ -136,7 +138,8 @@
                         (fn [form]
                           (if-let [{:keys [value]} (data-pattern-parts form '$)]
                             (if (deferred value)
-                              (assoc form (dec (count form)) '_) form)
+                              (assoc form (dec (count form))
+                                     (qu/placeholder-sym value)) form)
                             form))
                         (:qorig-where parsed-q))
                 inner (assoc parsed-q
@@ -155,12 +158,12 @@
                              :qfind (dp/->FindRel (mapv dp/->Variable output-vars))
                              :qorig-find output-vars :qwith nil :qhaving nil
                              :qorder (vec (mapcat identity order-indices)) :qoffset 0
-                             :qin (conj (mapv dp/parse-binding source-vars)
-                                        (dp/parse-binding [binding-vars]))
+                             :qin (dp/parse-in (conj source-vars [binding-vars]))
                              :qwhere (dp/parse-where outer-forms) :qorig-where outer-forms)
                 summary {:deferred-vars (vec (sort deferred))
                          :group-vars (into [] (keep #(when (instance? Variable %) (:symbol %))) inner-elements)
-                         :presence-clauses (into [] (filter #(and (vector? %) (= '_ (peek %)))) forms)
+                         :presence-clauses (into [] (filter #(and (vector? %)
+                                                                 (qu/placeholder? (peek %)))) forms)
                          :proof {:schema-functional-dependencies true
                                  :presence-before-aggregation true
                                  :projection-only true}}]

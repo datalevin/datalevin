@@ -232,7 +232,7 @@
   ([{:keys [graph result-set plan opt-clauses late-clauses run?
             access-plans preferred-access-plan property-memo
             deferred-base-samples attribute-group-planning
-            post-top-k-enrichment access-path-execution
+            post-top-k-enrichment aggregate-enrichment access-path-execution
             explain-actual-result-size keyed-group-reduction
             terminal-result-collection unique-group-aggregation
             fused-aggregation-plan]
@@ -304,6 +304,8 @@
                :attribute-group-planning attribute-group-planning
                :post-top-k-enrichment (or runtime-post-top-k
                                           post-top-k-enrichment)
+               :aggregate-enrichment (or (:aggregate-enrichment @qplan/*explain*)
+                                          (:summary aggregate-enrichment))
                :keyed-group-reduction keyed-group-reduction
                :terminal-result-collection terminal-result-collection
                :unique-group-aggregation unique-group-aggregation

@@ -8,8 +8,9 @@
 ;; You must not remove this notice, or any other, from this software.
 ;;
 (ns ^:no-doc datalevin.query.access.ave
-  "Ordered AVE access paths."
+  "AVE access paths for ordered and unordered bounded queries."
   (:require
+   [datalevin.constants :as c]
    [datalevin.db :as db]
    [datalevin.parser :as dp]
    [datalevin.query.access :as access])
@@ -34,6 +35,7 @@
             continuation (:continuation cursor)
             cursor-v     (:key continuation)
             cursor-n     (long (or (:ties continuation) 0))
+            seek-value   (if (some? cursor-v) cursor-v start-value)
             remaining    (when (some? max-candidates)
                            (max 0 (- (long max-candidates)
                                      (long emitted))))
@@ -46,14 +48,14 @@
             (if (zero? page-size)
               (FastList.)
               (if reverse?
-                (db/-rseek-datoms db :ave attr (or cursor-v start-value)
+                (db/-rseek-datoms db :ave attr seek-value
                                   nil requested)
-                (db/-seek-datoms db :ave attr (or cursor-v start-value)
+                (db/-seek-datoms db :ave attr seek-value
                                  nil requested)))
             size         (.size found)
             start        (long
                            (loop [i 0]
-                             (if (and cursor-v (< i size) (< i cursor-n)
+                             (if (and (some? cursor-v) (< i size) (< i cursor-n)
                                       (= cursor-v
                                          (.-v ^Datom (.get found i))))
                                (recur (unchecked-inc-int i))
@@ -63,7 +65,7 @@
                            (.-v ^Datom (.get found (dec end))))
             boundary-count
             (long
-              (if boundary
+              (if (some? boundary)
                 (loop [i (dec end)
                        n 0]
                   (if (and (<= start i)
@@ -80,13 +82,13 @@
                               (not more?)
                               (< size requested))
             boundary-complete?
-            (and boundary
+            (and (some? boundary)
                  (or exhausted?
                      (and more?
                           (not= boundary
                                 (.-v ^Datom (.get found end))))))
             tuples       (FastList. (int (- end start)))
-            frontier     (when boundary
+            frontier     (when (some? boundary)
                            (access/->AccessFrontier
                              {:key boundary :ties consumed-ties}
                              (when boundary-complete? boundary)))]
@@ -240,7 +242,7 @@
             :else nil))))
     (:qwhere parsed-q)))
 
-(defn discover-plans
+(defn- discover-ordered-plans
   [{:keys [parsed-q inputs input-values demand]}]
   (let [find          (:qfind parsed-q)
         find-elements (dp/find-elements find)
@@ -314,3 +316,90 @@
           [])
         [])
       [])))
+
+(defn- limit-pattern
+  [schema bound clause]
+  (when (and (instance? Pattern clause)
+             (instance? DefaultSrc (:source ^Pattern clause)))
+    (let [[e a v :as pattern] (:pattern ^Pattern clause)
+          attr (when (instance? Constant a) (:value ^Constant a))
+          evar (when (instance? Variable e) (:symbol ^Variable e))
+          vvar (when (instance? Variable v) (:symbol ^Variable v))
+          props (get schema attr)]
+      (when (and (= 3 (count pattern)) evar vvar (not= evar vvar)
+                 (not (bound evar)) (not (bound vvar))
+                 (keyword? attr) (not (:db/noindex props))
+                 ;; The cursor resumes by value/tie equality. Only offer new
+                 ;; candidates for scalars and tuples of scalars, not arrays
+                 ;; or untyped values whose equality is unknown here.
+                 (or (c/tuple-value-types (:db/valueType props))
+                     (= :db.type/tuple (:db/valueType props))))
+        {:attr attr :entity-var evar :value-var vvar}))))
+
+(defn- limit-access-plan
+  [source parsed-q demand i clause {:keys [attr entity-var value-var]}]
+  (let [range-rows (long (db/-index-range-size source attr nil nil))
+        batch-size (min default-batch-size (long (:required-count demand)))
+        rows (min range-rows batch-size)]
+    (when (pos? range-rows)
+      (access/->AccessPlan
+        (access/map->AccessExpr
+          {:method :ave :covers #{clause}
+           :covered-originals #{(nth (:qorig-where parsed-q) i)}
+           :requires #{} :produces #{entity-var value-var}
+           :join-vars #{entity-var} :cols [entity-var value-var] :source '$})
+        (assoc (ordered-path source attr :asc nil value-var)
+               :strategy :unordered-scan
+               :ordering nil
+               :capabilities #{:complete :resumable})
+        (access/source-bounds)
+        ;; Match the reusable planning sample to the small root demand.
+        ;; Existing adaptive execution handles residual filters, duplicates,
+        ;; continuation and fallback when the sampled yield was optimistic.
+        (access/->AccessWork batch-size batch-size nil nil 0)
+        (assoc (access/->AccessEstimate
+                 1.0 1.0 rows (+ 1.0 (double rows)) :low)
+               :range-rows range-rows)))))
+
+(defn- discover-limit-plans
+  [{:keys [parsed-q inputs demand] :as planning-context}]
+  (let [find  (:qfind parsed-q)
+        limit (:qlimit parsed-q)]
+    (if (and (instance? FindRel find)
+             (finite-limit? limit)
+             (pos? (long limit))
+             (empty? (:qorder parsed-q))
+             (nil? (:qwith parsed-q))
+             (empty? (:qhaving parsed-q))
+             (nil? (:qreturn-map parsed-q))
+             (every? #(instance? Variable %) (dp/find-elements find))
+             ;; Function access, rules and disjunctions keep their existing
+             ;; planning paths. This alternative covers patterns and filters.
+             (every? #(or (instance? Pattern %) (instance? Predicate %))
+                     (:qwhere parsed-q)))
+      (let [values (access/planning-input-values planning-context)
+            source (access/resolve-source values '$)]
+        (if (and (db/db? source)
+                 (= 1 (count (filter db/db? inputs)))
+                 (not (db/pending-tx-cache? source)))
+          (let [schema (db/-schema source)
+                bound (into #{} (map :symbol)
+                            (dp/collect-vars-distinct (:qin parsed-q)))
+                demand (or demand
+                           (access/limit-demand (:qoffset parsed-q) limit
+                                                :exact nil))]
+            (into []
+                  (keep-indexed
+                    (fn [i clause]
+                      (when-let [pattern (limit-pattern schema bound clause)]
+                        (limit-access-plan source parsed-q demand i clause
+                                           pattern))))
+                  (:qwhere parsed-q)))
+          []))
+      [])))
+
+(defn discover-plans
+  [planning-context]
+  (if (seq (get-in planning-context [:parsed-q :qorder]))
+    (discover-ordered-plans planning-context)
+    (discover-limit-plans planning-context)))

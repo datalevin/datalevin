@@ -1039,22 +1039,23 @@
     (let [selected (finish-query (:parsed-q context)
                                 (dissoc context :aggregate-enrichment))
           inputs (conj (mapv (:sources context) source-vars) selected)
-          result (binding [qplan/*explain* nil *result-processor* nil]
+          result (binding [qplan/*explain* nil *result-processor* nil
+                           *deferred-result-explain* nil]
                    (execute-query outer-query inputs))]
       (when qplan/*explain*
         (vswap! qplan/*explain* assoc :aggregate-enrichment
                 (assoc summary :selected-count (count selected)) :result result))
       result)
     (let [[parsed-q context] (apply-post-top-k-enrichment parsed-q context)
-        [original process] *result-processor*
-        ;; Rewrites and access subqueries can change the projection. Only the
-        ;; matching result shape may reuse this processor; windows stay dynamic.
-        reusable? (and process
-                       (identical? (:qfind original) (:qfind parsed-q))
-                       (identical? (:qwith original) (:qwith parsed-q))
-                       (identical? (:qhaving original) (:qhaving parsed-q))
-                       (identical? (:qreturn-map original) (:qreturn-map parsed-q))
-                       (identical? (:qorder original) (:qorder parsed-q)))]
+          [original process] *result-processor*
+          ;; Rewrites and access subqueries can change the projection. Only the
+          ;; matching result shape may reuse this processor; windows stay dynamic.
+          reusable? (and process
+                         (identical? (:qfind original) (:qfind parsed-q))
+                         (identical? (:qwith original) (:qwith parsed-q))
+                         (identical? (:qhaving original) (:qhaving parsed-q))
+                         (identical? (:qreturn-map original) (:qreturn-map parsed-q))
+                         (identical? (:qorder original) (:qorder parsed-q)))]
       ((if reusable? process (result-processor parsed-q)) parsed-q context))))
 
 (defn- run-planned-context

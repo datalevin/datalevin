@@ -10,6 +10,7 @@
 (ns ^:no-doc datalevin.query.optimizer.range
   "Range and predicate pushdown helpers."
   (:require
+   [clojure.set :as set]
    [clojure.walk :as w]
    [datalevin.constants :as c]
    [datalevin.query.predicate :as qpred]
@@ -146,11 +147,10 @@
 (defn- add-range
   [m & rs]
   (let [old-range (:range m)]
-    (assoc m :range (if old-range
-                      (if-let [new-range (intersect-ranges old-range rs)]
-                        new-range
-                        :empty-range)
-                      (combine-ranges rs)))))
+    (assoc m :range (cond
+                      (= old-range :empty-range) :empty-range
+                      old-range (or (intersect-ranges old-range rs) :empty-range)
+                      :else (combine-ranges rs)))))
 
 (defn- prefix-successor
   "An exclusive upper bound for a string prefix in both UTF-8 index order and
@@ -173,6 +173,15 @@
   ;; Giant keys truncate their value and append an allocated ID, so they
   ;; cannot serve as exact logical range endpoints.
   (< (alength (.getBytes s StandardCharsets/UTF_8)) c/+val-bytes-wo-hdr+))
+
+(defn- literal-prefix-range
+  [^String prefix]
+  (when (and (pos? (.length prefix))
+             (.canEncode (.newEncoder StandardCharsets/UTF_8) prefix)
+             (inline-string-bound? prefix))
+    (let [upper (prefix-successor prefix)]
+      (when (or (nil? upper) (inline-string-bound? upper))
+        [[:closed prefix] (if upper [:open upper] [:closed c/vmax])]))))
 
 (defn- like-convert-range
   "Restrict scans only where the literal pattern proves a safe bound.
@@ -197,11 +206,9 @@
           (zero? end) m
 
           :else
-          (let [upper (prefix-successor prefix)]
-            (if (and upper (not (inline-string-bound? upper)))
-              m
-              (add-range m [[:closed prefix]
-                            (if upper [:open upper] [:closed c/vmax])])))))
+          (if-let [range (literal-prefix-range prefix)]
+            (add-range m range)
+            m)))
       m)))
 
 (defn activate-var-pred
@@ -447,11 +454,110 @@
         context))
     context (implied-equalities (first clause))))
 
+(defn- total-prefix-expression
+  "Recognize a prefix that is total on strings. Plain subs can throw on short
+  inputs and must not acquire a range that hides that exception."
+  [form]
+  (when (and (vector? form) (= 2 (count form)))
+    (let [[call output] form
+          [op input start end] (when (list? call) call)]
+      (when (and (= op 'subs) (= 4 (count call)) (= start 0)
+                 (qu/binding-var? input) (qu/binding-var? output)
+                 (list? end) (= 'min (first end)) (= 3 (count end)))
+        (let [[a b] (rest end)
+              [n length] (if (int? a) [a b] [b a])]
+          (when (and (int? n) (<= 0 n) (= length (list 'count input)))
+            {:input input :output output :length n}))))))
+
+(def ^:private ^:const max-prefix-alternatives 64)
+
+(defn- string-domain
+  "A necessary finite string domain. Every disjunct must constrain the output;
+  a conjunct can supply a restriction while other conjuncts remain residual."
+  [form var]
+  (let [bounded #(when (and (some? %) (<= (count %) max-prefix-alternatives)) %)]
+    (when (list? form)
+      (let [[op & args] form]
+        (case op
+          = (when (= 2 (count args))
+              (let [[a b] args]
+                (cond
+                  (and (= a var) (string? b)) #{b}
+                  (and (= b var) (string? a)) #{a})))
+          in (when (and (= 2 (count args)) (= var (first args))
+                        (coll? (second args)) (not (map? (second args)))
+                        (<= (count (second args)) max-prefix-alternatives)
+                        (every? string? (second args)))
+               (set (second args)))
+          and (when-let [domains (seq (keep #(string-domain % var) args))]
+                (reduce set/intersection domains))
+          or (let [domains (mapv #(string-domain % var) args)]
+               (when (and (seq domains) (every? some? domains))
+                 (bounded (reduce set/union domains))))
+          nil)))))
+
+(defn- prefix-output-ranges
+  [length values]
+  (loop [values (seq values) ranges []]
+    (if-let [^String value (first values)]
+      (let [n (.length value)]
+        (cond
+          ;; A truncated prefix cannot equal a longer constant.
+          (< length n) (recur (next values) ranges)
+          (not (and (.canEncode (.newEncoder StandardCharsets/UTF_8) value)
+                    (inline-string-bound? value))) nil
+          ;; A shorter output means the complete input is that string.
+          (< n length) (recur (next values)
+                             (conj ranges [[:closed value] [:closed value]]))
+          (zero? n) nil ; length zero produces "" for every string
+          :else (when-let [range (literal-prefix-range value)]
+                  (recur (next values) (conj ranges range)))))
+      (if (seq ranges) (combine-ranges ranges) :empty-range))))
+
+(defn- pushdown-prefix-expressions
+  [{:keys [parsed-q] :as context} helpers]
+  (let [forms (:qorig-where parsed-q)
+        producers (keep total-prefix-expression forms)]
+    (if (seq producers)
+      (let [predicates (into []
+                             (keep (fn [[parsed form]]
+                                     (when (instance? Predicate parsed)
+                                       (first form))))
+                             (map vector (:qwhere parsed-q) forms))]
+        (reduce
+          (fn [context {:keys [input output length]}]
+            (if-let [domains (seq (keep #(string-domain % output) predicates))]
+              (if-let [ranges (prefix-output-ranges
+                               length (reduce set/intersection domains))]
+                (update context :graph
+                        (fn [graph]
+                          (into {}
+                                (map (fn [[source nodes]]
+                                       [source
+                                        (w/postwalk
+                                          (fn [m]
+                                            (if (and (map? m) (= input (:var m))
+                                                     (#{:string :db.type/string}
+                                                       (when-let [value-type
+                                                                  (:attr-value-type helpers)]
+                                                         (value-type source (:attr m)))))
+                                              (if (= ranges :empty-range)
+                                                (assoc m :range :empty-range)
+                                                (apply add-range m ranges))
+                                              m))
+                                          nodes)]))
+                                graph)))
+                context)
+              context))
+          context producers))
+      context)))
+
 (defn pushdown-predicates
   "Push unary predicates and implied equality restrictions into value scans.
   Multi-variable predicates remain late to enforce correlations between vars."
   [{:keys [parsed-q graph] :as context} helpers]
-  (let [gseq (tree-seq coll? seq graph)]
+  (let [context (pushdown-prefix-expressions context helpers)
+        gseq (tree-seq coll? seq graph)]
     (u/reduce-indexed
      (fn [c where i]
        (if-let [v (pushdownable where gseq)]
