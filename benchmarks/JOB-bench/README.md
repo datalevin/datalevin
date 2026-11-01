@@ -76,8 +76,11 @@ The `queries` directory contains 113 SQL queries for this benchmark. These
 queries all involve more than 5 tables and often have 10 or more where clauses,
 
 We manually translated the SQL queries to equivalent Datalevin queries, and
-manually verified that PostgreSQL and Datalevin produce exactly the same results
-for the same query (Note 1).
+manually verified the results under the comparison conventions in Note 1.
+The Datalog port omits constant or repeated output columns and represents an
+empty aggregate input as `[]`. Unfiltered reference-target joins can also be
+omitted when the imported references are valid; an entity reference does not
+require an extra attribute clause merely to mimic a SQL table.
 
 For example, the query 1b of the benchmark:
 
@@ -123,7 +126,27 @@ Most queries in the benchmark are more complex than this example.
 For Datalevin, both `lein` and `clj` build tools are needed, the former is for
 building the main project, and the later for running tests and benchmarks.
 
-Run tests to see results are correct.
+Run tests to see results are correct. Focused translation tests use temporary
+fixtures and can run without the full IMDb database:
+
+```bash
+clj -Xtest :nses '[datalevin-bench.query-audit-test]'
+python3 scripts/audit_queries.py
+```
+
+The structural audit checks all 113 pairs, accounts for the documented output
+simplifications, and reports reference-integrity assumptions separately from
+translation differences. To check those assumptions against PostgreSQL:
+
+```bash
+psql -X -v ON_ERROR_STOP=1 -d postgres -f scripts/check_reference_integrity.sql
+```
+
+Every `dangling` count should be zero. The [2026-10-31 query audit](query-audit.md)
+records four corrected translations and the validation results. The existing
+locale-collation caveat in Note 1 still applies.
+
+Run the full dataset result tests with:
 
 ```bash
 clj -Xtest
@@ -178,10 +201,28 @@ for the query, because that would be mainly benchmarking caching behavior of the
 databases, as they all have various caches. In this test, we are mainly
 interested in the behavior of query optimizer.
 
+For the grid runner, use the same two separate invocations:
+
+```bash
+clj -Xgrid
+clj -Xgrid
+```
+
+`grid` disables query-result caching and clears the plan cache before every
+query. It uses an initial execution threshold of 1,000 and a pipeline batch
+size of 12,384. Its per-query timings cover `d/q`; the final total also includes
+the loop's cache clears and reporting. Compare grid totals with other grid
+runs using the same queries and dependencies. The explain-based `-Xbench`
+runner reports different timing boundaries and does not clear the plan cache
+between queries.
+
 ## Results
 
 The table below reports the second pass of each benchmark command described
-above and is retained with the raw CSV files for reproducibility.
+above and is retained with the raw CSV files for reproducibility. These timings
+predate the query corrections in the [2026-10-31 audit](query-audit.md), including
+the corrected output expression in 15d. They have not been refreshed for the
+corrected queries.
 
 The PostgreSQL and SQLite columns were regenerated on 2026-08-23. The Datalevin
 column was regenerated on 2026-09-01 at revision `e0152efe` after the query

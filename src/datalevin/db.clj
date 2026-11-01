@@ -349,14 +349,6 @@
   ;; These native readers allocate their result lists and rows.
   #{:init-tuples :search-tuples})
 
-(defn- owned-native-tuple-result?
-  [k]
-  (or (contains? owned-tuple-cache-ops (first k))
-      ;; EAV readers allocate new rows whenever they append values. A
-      ;; presence-only scan can return the input row and must stay detached.
-      (and (= :eav-scan-v (first k))
-           (some (fn [[_ opts]] (not (:skip? opts))) (nth k 3 nil)))))
-
 (defn ^:no-doc cache-result
   "Publish an owned snapshot. Fresh native tuple lists already belong to the
   caller; other results retain normalization through the cache entry."
@@ -365,7 +357,7 @@
     (do
       (cache-entry-if-current store token k entry)
       (if (and (instance? Store store) (instance? FastList result)
-               (owned-native-tuple-result? k))
+               (contains? owned-tuple-cache-ops (first k)))
         result
         (result-cache/restore entry)))
     result))
@@ -1172,17 +1164,16 @@
 
   (-eav-scan-v-list
     [_ in eid-idx attrs-v]
-    (wrap-cache
-      store [:eav-scan-v in eid-idx attrs-v]
-      (eav-scan-v-list store in eid-idx attrs-v)))
+    ;; Derived rows belong to this query's operators. Their keys contain
+    ;; mutable input tuples, not stable lookup parameters. Keep them out of
+    ;; the shared read cache. Presence filters may reuse input rows.
+    (eav-scan-v-list store in eid-idx attrs-v))
 
   (-eav-scan-v-list
     [_ in eid-idx attrs-v prepared]
-    (wrap-cache
-      store [:eav-scan-v in eid-idx attrs-v]
-      (if (instance? Store store)
-        (prepared (.-lmdb ^Store store) in eid-idx)
-        (eav-scan-v-list store in eid-idx attrs-v))))
+    (if (instance? Store store)
+      (prepared (.-lmdb ^Store store) in eid-idx)
+      (eav-scan-v-list store in eid-idx attrs-v)))
 
   (-eav-filter-presence-list
     [_ in eid-idx attr]
@@ -1194,9 +1185,7 @@
 
   (-val-eq-scan-e-list
     [_ in v-idx attr]
-    (wrap-cache
-      store [:val-eq-scan-e in v-idx attr]
-      (val-eq-scan-e-list store in v-idx attr)))
+    (val-eq-scan-e-list store in v-idx attr))
 
   (-val-eq-scan-e
     [_ in out v-idx attr bound]
@@ -1204,9 +1193,7 @@
 
   (-val-eq-scan-e-list
     [_ in v-idx attr bound]
-    (wrap-cache
-      store [:val-eq-scan-e in v-idx attr bound]
-      (val-eq-scan-e-list store in v-idx attr bound)))
+    (val-eq-scan-e-list store in v-idx attr bound))
 
   (-val-eq-filter-e
     [_ in out v-idx attr f-idx]
@@ -1214,9 +1201,7 @@
 
   (-val-eq-filter-e-list
     [_ in v-idx attr f-idx]
-    (wrap-cache
-      store [:val-eq-filter-e in v-idx attr f-idx]
-      (val-eq-filter-e-list store in v-idx attr f-idx)))
+    (val-eq-filter-e-list store in v-idx attr f-idx))
 
   ISearch
   (-search

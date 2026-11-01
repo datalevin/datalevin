@@ -19,7 +19,8 @@
    [datalevin.query-util :as qu]
    [datalevin.query.optimizer.bound-patterns
     :refer [materialize-bound-patterns-with-cost
-            project-bound-patterns-with-cost remove-materialized-clause]]
+            project-bound-patterns-with-cost project-seed-propagation-with-cost
+            remove-materialized-clause]]
    [datalevin.query.optimizer.estimates
     :refer [estimated-plan-size materialize-pattern-with-cost
             materialized-output-cost relation-size reset-cost-planning
@@ -174,7 +175,7 @@
         candidates))
 
 (defn- try-selective-value-candidate
-  [context {:keys [^long clause-idx source pattern fanout anchor-cost]
+  [context {:keys [^long clause-idx source pattern entity-sym fanout anchor-cost]
             :as candidate}
    ^double budget]
   (if (<= budget (double anchor-cost))
@@ -188,29 +189,39 @@
                        :budget budget}
            :materialization-cost 0.0
            :materialization-stages [])
-    (let [seed         (materialize-pattern-with-cost context source pattern 1)
-          seed-context (remove-materialized-clause
-                         (:context seed) clause-idx)
-          budget       (max 0.0 (- budget (double (:cost seed))))
-          preflight    (project-bound-patterns-with-cost
-                         seed-context budget)]
+    (let [preflight (project-seed-propagation-with-cost
+                      (remove-materialized-clause context clause-idx)
+                      entity-sym fanout (max 0.0 (- budget (double anchor-cost))))]
       (if-not (:eligible? preflight)
         (assoc candidate
                :context context
                :eligible? false
                :guardrail (:guardrail preflight)
-               :materialization-cost (double (:cost seed))
-               :materialization-stages [(:stage seed)])
-        (let [propagated (materialize-bound-patterns-with-cost
-                           seed-context budget)]
-          (assoc candidate
-                 :context              (:context propagated)
-                 :eligible?            (:eligible? propagated)
-                 :guardrail            (:guardrail propagated)
-                 :materialization-cost (+ (double (:cost seed))
-                                          (double (:cost propagated)))
-                 :materialization-stages
-                 (into [(:stage seed)] (:stages propagated))))))))
+               :materialization-cost 0.0
+               :materialization-stages [])
+        (let [seed         (materialize-pattern-with-cost context source pattern 1)
+              seed-context (remove-materialized-clause
+                             (:context seed) clause-idx)
+              budget       (max 0.0 (- budget (double (:cost seed))))
+              preflight    (project-bound-patterns-with-cost
+                             seed-context budget)]
+          (if-not (:eligible? preflight)
+            (assoc candidate
+                   :context context
+                   :eligible? false
+                   :guardrail (:guardrail preflight)
+                   :materialization-cost (double (:cost seed))
+                   :materialization-stages [(:stage seed)])
+            (let [propagated (materialize-bound-patterns-with-cost
+                               seed-context budget)]
+              (assoc candidate
+                     :context              (:context propagated)
+                     :eligible?            (:eligible? propagated)
+                     :guardrail            (:guardrail propagated)
+                     :materialization-cost (+ (double (:cost seed))
+                                              (double (:cost propagated)))
+                     :materialization-stages
+                     (into [(:stage seed)] (:stages propagated))))))))))
 
 (defn- record-selective-value-decision!
   [decision]
@@ -401,7 +412,7 @@
                                (< (double candidate-cost) baseline-cost))
                :guardrail (:guardrail propagated))))))
 
-;; Preserve the qualified context marker from plan-build across the split.
+;; Keep the executor's qualified context marker across the namespace split.
 (defn materialize-selective-rule-anchors
   "Materialize an exact non-recursive rule relation before planning when the
    late rule would otherwise permit a much larger physical intermediate. A
@@ -417,14 +428,14 @@
             baseline-size (long (estimated-plan-size planned))
             baseline-cost (double (estimated-context-work planned))]
         (if (< baseline-size selective-rule-anchor-min-plan-size)
-          (assoc planned :datalevin.query.optimizer.plan-build/selective-preplanned? true)
+          (assoc planned :datalevin.query-optimizer/selective-preplanned? true)
           (let [candidates
                 (into []
                       (keep #(cost-selective-rule-anchor
                                planned baseline-size baseline-cost %))
                       (selective-rule-anchor-candidates planned))]
             (if (empty? candidates)
-              (assoc planned :datalevin.query.optimizer.plan-build/selective-preplanned? true)
+              (assoc planned :datalevin.query-optimizer/selective-preplanned? true)
               (let [candidate (apply max-key :saving candidates)
                     trial     (try-selective-rule-anchor
                                 planned candidate baseline-cost)
@@ -449,8 +460,8 @@
                      :guardrail (:guardrail trial)}]
                 (record-selective-value-decision! decision)
                 (if selected?
-                  (assoc (:context trial) :datalevin.query.optimizer.plan-build/selective-preplanned? true)
-                  (assoc planned :datalevin.query.optimizer.plan-build/selective-preplanned? true))))))))))
+                  (assoc (:context trial) :datalevin.query-optimizer/selective-preplanned? true)
+                  (assoc planned :datalevin.query-optimizer/selective-preplanned? true))))))))))
 
 (defn materialize-selective-value-lookups
   "Cost non-unique constant AVE lookups as possible pre-planning entity
@@ -465,14 +476,14 @@
                                  (selective-value-candidates context))]
       (if (empty? raw-candidates)
         (cond-> (or preplanned context)
-          preplanned (assoc :datalevin.query.optimizer.plan-build/selective-preplanned? true))
+          preplanned (assoc :datalevin.query-optimizer/selective-preplanned? true))
         (let [planned        (or preplanned
                                  (planned-context-for-cost context))
               base-cost      (estimated-context-work planned)
               candidates     (costed-selective-value-candidates
                                planned base-cost raw-candidates)]
           (if (empty? candidates)
-            (assoc planned :datalevin.query.optimizer.plan-build/selective-preplanned? true)
+            (assoc planned :datalevin.query-optimizer/selective-preplanned? true)
             (let [candidate     (apply max-key :saving candidates)
                   trial         (try-selective-value-candidate
                                   context candidate

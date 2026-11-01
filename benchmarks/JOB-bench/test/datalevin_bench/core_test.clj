@@ -62,7 +62,7 @@
       sut/q-15a [["USA:1 June 2007" "Battlestar Galactica: The Resistance"]]
       sut/q-15b [["USA:27 April 2007" "RoboCop vs Terminator"]]
       sut/q-15c [["USA:1 April 2003" "24: Day Six - Debrief"]]
-      sut/q-15d [["Australia:1 January 2013" "06/05"]]
+      sut/q-15d [["(Not So) Instant Photo" "06/05"]]
       sut/q-16a [["Adams, Stan" "Carol Burnett vs. Anthony Perkins"]]
       sut/q-16b [["!!!, Toy" "& Teller"]]
       sut/q-16c [["\"Brooklyn\" Tony Danza" "(#1.5)"]]

@@ -52,9 +52,7 @@
                              {:background-sampling? false :kv-opts {:inmemory? true}})]
     (let [store (:store @conn)]
       (doseq [pattern [[:init-tuples :value nil nil true]
-                       [:search-tuples nil :value nil]
-                       [:eav-scan-v (doto (FastList.) (.add (object-array [1])))
-                        0 [[:value {}]]]]]
+                       [:search-tuples nil :value nil]]]
         (let [source (doto (FastList.) (.add (object-array [(byte-array [1 2])])))
               key (db/index-cache-key store pattern)
               result (db/cache-result store (db/cache-token store) key source)]
@@ -66,14 +64,6 @@
               (is (= [1 2] (vec (aget ^objects (.get cached 0) 0))))
               (aset-byte ^bytes (aget ^objects (.get cached 0) 0) 0 (byte 8))
               (.clear cached)))))
-      (testing "presence scans can share input rows and keep the detached return"
-        (let [input-row (object-array [:original])
-              source (doto (FastList.) (.add input-row))
-              key [:eav-scan-v source 0 [[:value {:skip? true}]]]
-              ^FastList result (db/cache-result store (db/cache-token store) key source)]
-          (is (not (identical? source result)))
-          (aset ^objects (.get result 0) 0 :changed)
-          (is (= :original (aget input-row 0)))))
       (testing "lazy results remain materialized on their first return"
         (let [source (lazy-seq (list 1 2))
               result (db/cache-result store (db/cache-token store) [:lazy] source)]
@@ -111,7 +101,7 @@
             (.clear rows)
             (is (= expected (value (:v (first (d/datoms view :eav 1 attr))))))))))))
 
-(deftest native-eav-misses-and-hits-own-scalar-many-and-presence-results
+(deftest native-eav-reads-do-not-retain-derived-tuples
   (with-open [^java.io.Closeable conn
               (d/create-conn nil {:bytes {:db/valueType :db.type/bytes}
                                   :instant {:db/valueType :db.type/instant}
@@ -139,15 +129,38 @@
                        #(db/-eav-scan-v-list view input 0 attrs))]
             (dotimes [_ 3]
               (let [^FastList rows (read)]
+                (is (nil? (db/cache-get (:store view) [:eav-scan-v input 0 attrs])))
                 (if expected
                   (is (= (frequencies (for [marker [:left :right] v expected] [marker v]))
                          (frequencies (map (fn [^objects row] [(aget row 1) (decode (aget row 2))]) rows))))
                   (is (= #{:left :right} (set (map #(aget ^objects % 1) rows)))))
                 (doseq [^objects row rows]
-                  (is (not (identical? row (.get input 0))))
-                  (is (not (identical? row (.get input 1))))
-                  (when mutate (mutate (aget row 2)))
-                  (aset row 0 :changed)
-                  (aset row 1 :changed))
+                  (if expected
+                    (do
+                      (is (not (identical? row (.get input 0))))
+                      (is (not (identical? row (.get input 1))))
+                      (mutate (aget row 2))
+                      (aset row 0 :changed)
+                      (aset row 1 :changed))
+                    ;; A presence filter borrows this invocation's input rows.
+                    (is (some #(identical? row %) input))))
                 (.clear rows)
                 (is (= [[1 :left] [1 :right]] (mapv vec input)))))))))))
+
+(deftest native-ave-reads-do-not-retain-derived-tuples
+  (with-open [conn (d/create-conn nil {:value {:db/valueType :db.type/long}}
+                                 {:background-sampling? false})]
+    (d/transact! conn [{:db/id 1 :value 7} {:db/id 2 :value 7}])
+    (let [view @conn
+          input (doto (FastList.) (.add (object-array [7])))
+          filtered (doto (FastList.) (.add (object-array [7 1])))
+          read #(mapv vec (db/-val-eq-scan-e-list view input 0 :value))]
+      (is (= #{[7 1] [7 2]} (set (read))))
+      (is (= [[7 1]] (mapv vec (db/-val-eq-scan-e-list view input 0 :value 1))))
+      (is (= [[7 1]] (mapv vec (db/-val-eq-filter-e-list view filtered 0 :value 1))))
+      (doseq [key [[:val-eq-scan-e input 0 :value]
+                   [:val-eq-scan-e input 0 :value 1]
+                   [:val-eq-filter-e filtered 0 :value 1]]]
+        (is (nil? (db/cache-get (:store view) key))))
+      (d/transact! conn [[:db/retract 2 :value 7] {:db/id 3 :value 7}])
+      (is (= #{[7 1] [7 3]} (set (read)))))))

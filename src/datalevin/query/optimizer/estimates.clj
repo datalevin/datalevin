@@ -263,7 +263,7 @@
       (dissoc :optimizable-not-joins
               :deferred-base-samples
               :attribute-group-planning
-              ::selective-preplanned?)))
+              :datalevin.query-optimizer/selective-preplanned?)))
 
 (defn conventional-access-cost
   [access-plans]

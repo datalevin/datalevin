@@ -5,13 +5,14 @@
 ### Added
 - [Admin] server wide administrative tool `dtlv admin` commands.
 
-### Changed
+### Improved
 - [Storage] update dtlvnative to 1.2.2 with prepared-copy and projected EAV
   native bindings. Automatically choose full or selective EAV materialization
   from the requested fields and the anchor population's estimated row width,
   including sparse projections from rows with at least 12 stored values.
 - [Datalog] reuse decoded short strings in bounded per-scan dictionaries for
   eligible fused aggregates, reducing repeated string and byte-array allocation.
+- deps update
 
 ## 1.2.10 (2026-10-28)
 

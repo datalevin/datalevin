@@ -66,6 +66,7 @@ Run all commands from this directory.
 
 ```bash
 clj -X:datalevin-db                              # load data
+clj -X:datalevin-bench '{:queries :all :out "datalevin_warmup.csv"}'
 clj -X:datalevin-bench '{:queries :all :out "datalevin_pass.csv"}'
 ```
 
@@ -73,6 +74,7 @@ clj -X:datalevin-bench '{:queries :all :out "datalevin_pass.csv"}'
 
 ```bash
 clj -X:sqlite-db
+clj -X:sqlite-bench '{:queries :all :out "sqlite_warmup.csv"}'
 clj -X:sqlite-bench '{:queries :all :out "sqlite_pass.csv"}'
 ```
 
@@ -80,6 +82,7 @@ clj -X:sqlite-bench '{:queries :all :out "sqlite_pass.csv"}'
 
 ```bash
 clj -X:pg-db  '{:url "jdbc:postgresql://localhost:5432/postgres"}'
+clj -X:pg-bench '{:url "jdbc:postgresql://localhost:5432/postgres" :out "postgres_warmup.csv"}'
 clj -X:pg-bench '{:url "jdbc:postgresql://localhost:5432/postgres"}'
 ```
 
@@ -124,6 +127,17 @@ by default, whereas TPC-H and PostgreSQL are case-sensitive.
 
 ## Methodology
 
+- Use the JOB two-pass schedule for comparisons: run Q1–Q22 once in order
+  for warmup, then run Q1–Q22 once in a new JVM and report that second pass.
+  Each command above starts a separate process. Retain the warmup CSV for
+  reproducibility, but use only the measurement CSV in comparisons. Do not
+  repeat individual queries or average/median repeated passes for the headline
+  results. Earlier repeated-run measurements below remain diagnostic evidence.
+- The warmup establishes warm filesystem/database pages. The measurement JVM
+  starts with fresh Datalevin parsed-query and plan caches. Within that single
+  pass, ordinary plan-cache behavior remains enabled, matching JOB. Datalevin
+  query-result caching is disabled in both timing modes and nested queries.
+  An execution failure is reported without retrying the query in another mode.
 - Data generation, loading, index creation, correctness checks, and warmup are
   outside the measured interval.
 - SQLite uses WAL and a 1 GiB memory map for reads.
@@ -136,12 +150,17 @@ by default, whereas TPC-H and PostgreSQL are case-sensitive.
   execution times, matching the JOB-bench protocol.
 - SQL `ORDER BY` and matching Datalog `:order-by` clauses run inside the timed
   query, with identical sort keys and directions across all three backends.
-- Datalevin wall time covers the complete `d/q` or `d/explain` call and result
-  consumption. With `:explain? true`, execution time is wall time minus reported
-  preparation time, including final sorting and explain overhead. The engine's
-  execution counter can stop before sorting on some query paths.
-- Publishable results should use one warmup pass followed by one measurement
-  pass in separate JVM processes, and a fixed data set, seed, and machine.
+- Datalevin wall time covers the complete `d/q` call and result consumption.
+  With `:explain? true`, the call collects explain timings while retaining the
+  final result after sorting and `LIMIT`. Execution time is wall time minus
+  reported preparation time, including final sorting and explain overhead.
+  The engine's execution counter can stop before sorting on some query paths.
+  Preparation can include nested query execution and materialization; use
+  separate phase instrumentation to attribute optimizer overhead.
+- Keep the data set, query order, seed, and machine fixed between passes.
+
+The [2026-11-01 two-pass comparison and planning breakdown](../../doc/measurements/tpch-native-plans-2026-10-28.md#job-two-pass-schedule-and-revised-planning-share-2026-11-01)
+retains the raw warmup and measurement CSVs for all three engines.
 
 ## Translation notes
 

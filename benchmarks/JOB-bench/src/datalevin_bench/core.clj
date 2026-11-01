@@ -532,7 +532,18 @@
 
 ;; queries that beat postgres are labeled 'good plan'
 
-(def q-1a '[:find (min ?mc.note) (min ?t.title) (min ?t.production-year)
+(defn sql-min
+  "MIN for a nullable projection. SQL NULL is represented by ::sql-null."
+  [values]
+  (reduce (fn [result value]
+            (if (= value ::sql-null)
+              result
+              (if (or (nil? result) (neg? (compare value result)))
+                value result)))
+          nil values))
+
+(def q-1a '[:find (min ?mc.note) (min ?t.title)
+            (datalevin-bench.core/sql-min ?t.production-year)
             :where
             [?ct :company-type/kind "production companies"]
             [?it :info-type/info "top 250 rank"]
@@ -545,7 +556,8 @@
             [?mi :movie-info-idx/movie ?t]
             [?mi :movie-info-idx/info-type ?it]
             [?t :title/title ?t.title]
-            [?t :title/production-year ?t.production-year]
+            [(get-else $ ?t :title/production-year
+                        :datalevin-bench.core/sql-null) ?t.production-year]
             ])
 
 ;; good plan
@@ -1040,7 +1052,7 @@
             [(or (like ?mc.note "%(USA)%") (like ?mc.note "%(worldwide)%"))]
             [?n :name/gender "f"]
             [?n :name/name ?n.name]
-            [(like ?n.name "%Ang%")]
+            [(like ?n.name "%Angel%")]
             [?rt :role-type/role "actress"]
             [?t :title/production-year ?t.production-year]
             [(<= 2007 ?t.production-year 2010)]
@@ -1443,7 +1455,7 @@
              [(in ?kt.kind ["movie" "episode"])]
              [?mi :movie-info/info ?mi.info]
              [(in ?mi.info ["Sweden", "Norway", "Germany", "Denmark", "Swedish",
-                            "Denish", "Norwegian", "German", "USA", "American"])]
+                            "Danish", "Norwegian", "German", "USA", "American"])]
              [?mi-idx :movie-info-idx/info ?mi-idx.info]
              [(< ?mi-idx.info "8.5")]
              [?t :title/production-year ?t.production-year]
@@ -1531,13 +1543,13 @@
              [?mc :movie-companies/company-type ?ct]
              ])
 
-(def q-15d '[:find (min ?mi.info) (min ?t.title)
+(def q-15d '[:find (min ?at.title) (min ?t.title)
              :where
              [?cn :company-name/country-code "[us]"]
              [?it1 :info-type/info "release dates"]
              [?mi :movie-info/note ?mi.note]
              [(like ?mi.note "%internet%")]
-             [?mi :movie-info/info ?mi.info]
+             [?at :aka-title/title ?at.title]
              [?t :title/production-year ?t.production-year]
              [(< 1990 ?t.production-year)]
              [?at :aka-title/movie ?t]

@@ -3,6 +3,9 @@
   (:require
    [clojure.java.io :as io]
    [datalevin.core :as d]
+   [datalevin.query :as query]
+   [datalevin.query.cache :as cache]
+   [datalevin.query.plan :as plan]
    [datalevin.util :as u]
    [datalevin-bench.host :as host]
    [datalevin-tpch.common :as c]
@@ -88,14 +91,22 @@
 
 (defn- run-one
   "Run one Datalog query and return elapsed milliseconds. `explain?` also
-  reports preparation time and the remaining wall time, including sorting."
+  reports preparation time and the remaining wall time, including sorting.
+  Result caching is disabled in both modes, including nested queries."
   [db n explain?]
-  (let [query (q/datalog n)
-        t0    (System/nanoTime)]
-    (if explain?
-      (try
-        (let [res        (d/explain {:run? true :intermediate-counts? false} query db)
-              rows       (result-rows (:result res))
+  (binding [query/*cache?* false cache/*cache?* false]
+    (let [query (q/datalog n)
+          t0    (System/nanoTime)]
+      (if explain?
+        (let [explanation (volatile! {})
+              ;; Explain's :result can precede ORDER BY/LIMIT. Retain the
+              ;; actual return value while collecting the same phase timings.
+              result     (binding [plan/*explain* explanation
+                                   plan/*intermediate-counts?* false
+                                   plan/*start-time* t0]
+                           (d/q query db))
+              res        @explanation
+              rows       (result-rows result)
               wall-ms    (/ (- (System/nanoTime) t0) 1.0e6)
               prepare-ms (some-> (:prepare-time res) str parse-double)]
           {:query n
@@ -106,12 +117,10 @@
            :exec-ms (when prepare-ms
                       (format "%.3f" (max 0.0 (- wall-ms prepare-ms))))
            :wall-ms wall-ms})
-        (catch Throwable _
-          (run-one db n false)))
-      (let [res (d/q query db)]
-        {:query n
-         :rows  (result-rows res)
-         :wall-ms (/ (- (System/nanoTime) t0) 1.0e6)}))))
+        (let [res (d/q query db)]
+          {:query n
+           :rows  (result-rows res)
+           :wall-ms (/ (- (System/nanoTime) t0) 1.0e6)})))))
 
 (defn bench
   "Run the TPC-H Datalog query set against an existing Datalevin database.

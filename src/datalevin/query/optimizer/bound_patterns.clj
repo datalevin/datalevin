@@ -511,6 +511,31 @@
       (map vector (:qwhere parsed-q)
            (:qorig-where parsed-q)))))
 
+(defn project-seed-propagation-with-cost
+  "Reject a proposed entity seed when even the first follow-up's zero-output
+  probe cost exhausts its propagation budget. Uses counts, never seed tuples."
+  [context entity ^long rows ^double budget]
+  (let [groups (abstract-bound-groups context)
+        seed-index (count groups)
+        groups (conj groups {:vars #{entity} :rows rows :exact? false})
+        follow (abstract-materializable-bound-pattern context groups #{})]
+    (if (and (:entity-bound? follow) (= seed-index (:group-idx follow)))
+      (let [{:keys [source pattern]} follow
+            cost (projected-pattern-materialization-cost
+                   source (second pattern) rows 0)]
+        (if (<= budget cost)
+          {:eligible? false
+           :guardrail {:phase :seed-propagation-preflight
+                       :pattern pattern
+                       :probes rows
+                       :projected-rows 0
+                       :projected-cost cost
+                       :lower-bound? true
+                       :accumulated-cost 0.0
+                       :budget budget}}
+          {:eligible? true}))
+      {:eligible? true})))
+
 (defn- abstract-pattern-output-count
   [context source pattern group entity-bound? cap]
   (let [cap (long cap)]

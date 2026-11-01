@@ -150,7 +150,10 @@
                       [(+ 100 i) "1995-03-01" (double (- 100 i))]))
         rows   (d/q q/q-3 (q3-datoms orders))]
     (is (= 10 (count rows)))
-    (is (= (mapv #(+ 100 %) (range 1 11)) (mapv first rows)))))
+    (is (= (mapv #(+ 100 %) (range 1 11)) (mapv first rows)))
+    (doseq [explain? [false true]]
+      (is (= 10 (:rows (#'dt/run-one (q3-datoms orders) 3 explain?)))
+          "both timing modes count the final limited result"))))
 
 (deftest q3-limit-boundary-ties-are-validated
   ;; Eleven orders share the same revenue and date, so any ten satisfy Q3's
