@@ -56,7 +56,8 @@
     [(* ?l-extendedprice ?l-discount) ?revenue]])
 
 ;; Q2: Minimum Cost Supplier
-;; Compute European minimum costs once per eligible part and join the relation.
+;; Retain every minimum-cost tie by rejecting only strictly cheaper European
+;; offers for the same part.
 (def q-2
   '[:find ?s-acctbal ?s-name ?n-name ?p-partkey ?p-mfgr ?s-address ?s-phone
     ?s-comment
@@ -83,22 +84,17 @@
     [?n :nation/regionkey ?n-regionkey]
     [?r :region/regionkey ?n-regionkey]
     [?r :region/name "EUROPE"]
-    [(q [:find ?pk (min ?sc)
-         :where
-         [?p2 :part/partkey ?pk]
-         [?p2 :part/size 15]
-         [?p2 :part/type ?pt2]
-         [(like ?pt2 "%BRASS")]
-         [?ps2 :partsupp/partkey ?pk]
-         [?ps2 :partsupp/supplycost ?sc]
-         [?ps2 :partsupp/suppkey ?sk2]
-         [?s2 :supplier/suppkey ?sk2]
-         [?s2 :supplier/nationkey ?nk2]
-         [?n2 :nation/nationkey ?nk2]
-         [?n2 :nation/regionkey ?rk2]
-         [?r2 :region/regionkey ?rk2]
-         [?r2 :region/name "EUROPE"]] $) [[?p-partkey ?mincost]]]
-    [(= ?ps-supplycost ?mincost)]])
+    (not-join [?p-partkey ?ps-supplycost]
+      [?ps2 :partsupp/partkey ?p-partkey]
+      [?ps2 :partsupp/supplycost ?sc2]
+      [(< ?sc2 ?ps-supplycost)]
+      [?ps2 :partsupp/suppkey ?sk2]
+      [?s2 :supplier/suppkey ?sk2]
+      [?s2 :supplier/nationkey ?nk2]
+      [?n2 :nation/nationkey ?nk2]
+      [?n2 :nation/regionkey ?rk2]
+      [?r2 :region/regionkey ?rk2]
+      [?r2 :region/name "EUROPE"])])
 
 ;; Q3: Shipping Priority
 (def q-3
@@ -522,24 +518,13 @@
     [(* ?ep ?factor) ?revenue]])
 
 ;; Q20: Potential Part Promotion
-;; Sum 1994 quantities once per eligible part/supplier pair. Missing groups
+;; Drive stock lookups with 1994 totals for eligible part/supplier pairs.
+;; The grouped query establishes the part and nation filters. Missing groups
 ;; stay absent, retaining SQL's NULL-sum behavior for pairs without shipments.
 (def q-20
   '[:find ?s-name ?s-address
     :order-by [0 :asc]
     :where
-    [?s :supplier/suppkey ?sk]
-    [?s :supplier/name ?s-name]
-    [?s :supplier/address ?s-address]
-    [?s :supplier/nationkey ?snk]
-    [?n :nation/nationkey ?snk]
-    [?n :nation/name "CANADA"]
-    [?ps :partsupp/suppkey ?sk]
-    [?ps :partsupp/partkey ?pk]
-    [?ps :partsupp/availqty ?avail]
-    [?p :part/partkey ?pk]
-    [?p :part/name ?pname]
-    [(like ?pname "forest%")]
     [(q [:find ?pk ?sk (sum ?lq)
          :with ?l
          :where
@@ -556,8 +541,14 @@
          [(>= ?sd "1994-01-01")]
          [(< ?sd "1995-01-01")]
          [?l :lineitem/quantity ?lq]] $) [[?pk ?sk ?sumq]]]
+    [?ps :partsupp/partkey ?pk]
+    [?ps :partsupp/suppkey ?sk]
+    [?ps :partsupp/availqty ?avail]
     [(* 0.5 ?sumq) ?thr]
-    [(> ?avail ?thr)]])
+    [(> ?avail ?thr)]
+    [?s :supplier/suppkey ?sk]
+    [?s :supplier/name ?s-name]
+    [?s :supplier/address ?s-address]])
 
 ;; Q21: Suppliers Who Kept Orders Waiting
 (def q-21

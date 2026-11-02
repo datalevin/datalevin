@@ -48,7 +48,9 @@ public final class TupleSort {
         // A difference larger than Long.MAX_VALUE wraps negative. Check this
         // before narrowing or allocating, including for MIN_VALUE/MAX_VALUE.
         long span = maximum - minimum;
-        if (span < 0 || span >= Math.min(2L * size, MAX_BUCKETS)) {
+        // Keep counting work linear in the tuple count while allowing moderately
+        // selective scans. The bucket and heap limits also bound workspace.
+        if (span < 0 || span >= Math.min(8L * size, MAX_BUCKETS)) {
             tuples.sort(comparator);
             return;
         }

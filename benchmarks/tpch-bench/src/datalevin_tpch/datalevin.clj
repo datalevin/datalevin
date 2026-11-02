@@ -14,22 +14,52 @@
 ;; ---------------------------------------------------------------------------
 ;; Schema
 
+(def ^:private primary-keys
+  ;; The components of partsupp and lineitem's composite keys are not unique.
+  #{:region/regionkey :nation/nationkey :part/partkey :supplier/suppkey
+    :customer/custkey :orders/orderkey})
+
+(def ^:private composite-keys
+  {"partsupp" [:partsupp/partkey+suppkey
+               [:partsupp/partkey :partsupp/suppkey]]
+   "lineitem" [:lineitem/orderkey+linenumber
+               [:lineitem/orderkey :lineitem/linenumber]]})
+
 (def schema
-  (into {}
+  (into (into {}
+              (for [[_ [attr components]] composite-keys]
+                [attr {:db/valueType :db.type/tuple
+                       :db/tupleAttrs components
+                       :db/unique :db.unique/value}]))
         (for [table c/table-order
               :let  [{:keys [types]} (c/table-specs table)]
               [a t] (map vector (c/attrs table) types)]
-          [a {:db/valueType (c/type->db-type t)}])))
+          [a (cond-> {:db/valueType (c/type->db-type t)}
+               (primary-keys a) (assoc :db/unique :db.unique/value))])))
 
 ;; ---------------------------------------------------------------------------
 ;; Load
 
+(defn- table-row-datoms
+  "Build a row converter that includes derived keys for the bulk loader."
+  [table]
+  (let [attrs                   (c/attrs table)
+        types                   (:types (c/table-specs table))
+        [tuple-attr components] (composite-keys table)
+        positions               (mapv #(.indexOf ^java.util.List attrs %)
+                                      components)]
+    (fn [e row]
+      (let [values (mapv c/parse-value types row)
+            datoms (mapv #(d/datom e %1 %2) attrs values)]
+        ;; fill-db accepts trusted datoms and does not derive tuple values.
+        (cond-> datoms
+          tuple-attr (conj (d/datom e tuple-attr (mapv values positions))))))))
+
 (defn- load-table!
   [db table]
-  (let [{:keys [types]} (c/table-specs table)
-        as   (c/attrs table)
-        eid  (atom 0)
-        t0   (System/nanoTime)]
+  (let [row-datoms (table-row-datoms table)
+        eid        (atom 0)
+        t0         (System/nanoTime)]
     (c/tbl-rows
      table
      (fn [rows]
@@ -38,9 +68,7 @@
         (eduction
          (mapcat
           (fn [row]
-            (let [e (swap! eid inc)]
-              (mapv (fn [a t v] (d/datom e a (c/parse-value t v)))
-                    as types row))))
+            (row-datoms (swap! eid inc) row)))
          rows))))
     (println (format "  %-9s %10d rows  %6.2fs" table @eid
                      (/ (- (System/nanoTime) t0) 1.0e9)))))

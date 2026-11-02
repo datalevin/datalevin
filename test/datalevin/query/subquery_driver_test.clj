@@ -79,6 +79,41 @@
         (is (= [0] (mapv :rows (:pre-materialized-subqueries explain))))
         (is (not-any? :actual-size (tree-seq coll? seq (:plan explain))))))))
 
+(deftest grouping-keys-drive-lookups-without-having
+  (fixture
+    (fn [conn]
+      (let [inner '{:find [(sum ?quantity) ?order]
+                    :with [?line]
+                    :in [$ ?minimum]
+                    :where [[?line :line/order ?order]
+                            [?line :line/quantity ?quantity]
+                            [(> ?quantity ?minimum)]]}
+            query (assoc-in query [:where 0]
+                            [(list 'q inner '$ 75.0) '[[?total ?ok]]])
+            expected [(first expected) ["C3" 3 300.0 3.0]
+                      (second expected) (last expected)]
+            explain (d/explain {:run? true} query @conn)]
+        (testing "renamed grouping keys and literal inputs retain every witness"
+          (is (= expected (d/q query @conn)))
+          (is (= [5] (mapv :rows (:pre-materialized-subqueries explain))))
+          (is (not-any? #{'[?o :order/key ?ok]} (:opt-clauses explain)))
+          (is (empty? (:late-clauses explain))))
+        (testing "input restrictions intersect the grouped keys"
+          (is (= [["C3" 3 300.0 3.0]]
+                 (d/q (assoc query :in '[$ [?ok ...]]) @conn [3]))))
+        (testing "an empty grouped driver short-circuits the outer plan"
+          (let [query (assoc-in query [:where 0 0] (list 'q inner '$ 100000.0))
+                explain (d/explain {:run? true} query @conn)]
+            (is (empty? (:result explain)))
+            (is (= [0] (mapv :rows (:pre-materialized-subqueries explain))))))
+        (testing "plan-only explanations leave the producer deferred"
+          (is (empty? (:pre-materialized-subqueries (d/explain {} query @conn)))))
+        (testing "prepared executions refresh grouped totals after writes"
+          (let [read! (d/prepare-q @conn query)]
+            (is (= expected (read! [])))
+            (d/transact! conn [{:line/order 3 :line/quantity 80.0}])
+            (is (= (assoc-in expected [1 2] 380.0) (read! [])))))))))
+
 (deftest plan-only-and-correlated-subqueries-stay-deferred
   (fixture
     (fn [conn]

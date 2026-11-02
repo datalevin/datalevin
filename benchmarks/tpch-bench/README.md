@@ -17,7 +17,8 @@ scripts/generate-data.sh 1
 
 Scale factor 1 generates about 1 GB of data, including six million lineitems.
 Use `0.01` for a quick check. All three databases load the same `.tbl` files
-from `data/tbl/`. Rebuild databases when changing incompatible storage versions.
+from `data/tbl/`. Rebuild databases when the storage format or benchmark schema
+changes.
 
 Queries use the default `qgen -d` parameters. SQL files are under
 `queries/postgres/` and `queries/sqlite/`; Datalog translations are in
@@ -91,6 +92,13 @@ The command exits nonzero on failure. Use `:dump? true` to print mismatches or
   Preparation can include nested-query execution.
 - SQLite uses WAL and a 1 GiB read memory map. On macOS, the harness temporarily
   pauses the current user's media-analysis daemons during measurement.
+
+The [nested-query audit](../../doc/measurements/tpch-nested-audit-2026-11-01/summary.json)
+examined eight nested `q` calls. Q2 now uses the
+[tested anti-join](../../doc/measurements/tpch-q2-antijoin-2026-11-01/summary.json). The remaining
+seven receive only the database. Six preserve distinct aggregation scopes;
+Q18's grouped child avoids joining detail rows before its selective HAVING.
+The audit retains candidate forms, SQL checks, diagnostic timings, and test logs.
 
 ## Tests
 

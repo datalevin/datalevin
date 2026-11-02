@@ -85,6 +85,7 @@
             resolve-renamed-schema-patches schema-rename-plans
             schema-update-required? transact-schema update-schema
             validate-schema-operations]]
+   [datalevin.storage.tuples :as tuples]
    [datalevin.util :as u :refer [conjv raise]]
    [datalevin.validate :as vld]
    [datalevin.vector :as v])
@@ -106,6 +107,7 @@
 (declare with-open-opts close-store-resources! release-shared-local-store!
          enqueue-secondary-index-work! enqueue-secondary-index-work-if-needed!
          insert-datom delete-datom check load-datoms-with-plan!
+         load-datoms-with-tuples!
          prepare-embedding-plan prepare-datoms-kv-plan commit-datoms-kv-plan!
          migrate-attr-values ->SamplingWork e-sample* default-ratio* analyze*
          apply-schema-update! transfer transfer-current)
@@ -710,7 +712,9 @@
     (entries lmdb (if (string? index) index (index->dbi index))))
 
   (load-datoms [this datoms]
-    (load-datoms-with-plan! this datoms (prepare-embedding-plan this datoms)))
+    (if (and (seq (:db/tupleAttrs rschema)) (seq datoms))
+      (load-datoms-with-tuples! this datoms)
+      (load-datoms-with-plan! this datoms (prepare-embedding-plan this datoms))))
 
   (fetch [_ datom]
     (cd/with-snapshot lmdb
@@ -2363,6 +2367,23 @@
      (when (pos? (long (or secondary-index-job-count 0)))
        (enqueue-secondary-index-work! store))
      (if return-modified-ms? modified-ms res))))
+
+(defn- load-datoms-with-tuples!
+  [^Store store datoms]
+  (let [lmdb (.-lmdb store)
+        run (fn [writer]
+              (let [datoms (tuples/prepare-bulk-datoms
+                             (transfer store writer) datoms)]
+                (load-datoms-with-plan!
+                  store datoms (prepare-embedding-plan store datoms))))]
+    (locking (.-write-txn store)
+      ;; Local bulk loads already own an outer transaction even when their
+      ;; Store retains the ordinary read handle. Use its writer for tuple
+      ;; lookups without opening or committing another transaction.
+      (if @(.-write-txn store)
+        (run (lmdb/mark-write lmdb))
+        (lmdb/with-transaction-kv [writer lmdb]
+          (run writer))))))
 
 (defn- write-attr-info
   [^Store store ^HashMap attr-infos attr value insert?]

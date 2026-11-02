@@ -358,6 +358,13 @@ directly load a collection of prepared datoms using `init-db` function. However,
 it is the caller's responsibility to ensure these datoms are correct because data
 integrity checks and temporary entity ID resolution are not performed.
 
+Composite attributes declared with `:db/tupleAttrs` are maintained automatically
+by both `init-db` and `fill-db`. Each batch derives the affected tuples from its
+final source values, replacing stale tuples and removing tuples whose sources
+are all absent. Source attributes may arrive in different batches. Composite
+datoms supplied in an import are recomputed from their sources, so callers do
+not need to generate them or run a separate maintenance pass.
+
 For both local and remote databases, `init-db` commits all datom batches in
 one transaction. A failed load rolls back its datom writes, including earlier
 batches. Database creation and schema setup happen before loading and are not

@@ -36,6 +36,28 @@
                (some #(outputs (:symbol %)) (:pattern clause))))))
     (get-in context [:parsed-q :qwhere])))
 
+(defn- indexed-group-output?
+  [context elements bindings]
+  (let [outputs (into #{}
+                      (keep (fn [[element binding]]
+                              (when (and (instance? Variable element)
+                                         (qu/binding-var? binding))
+                                binding)))
+                      (map vector elements bindings))]
+    (some
+      (fn [clause]
+        (when (instance? Pattern clause)
+          (let [[entity attr value] (:pattern clause)
+                source (get (:sources context)
+                            (or (get-in clause [:source :symbol]) '$))]
+            (and source (db/-searchable? source)
+                 (or (outputs (:symbol entity))
+                     (and (keyword? (:value attr))
+                          (not (get-in (db/-schema source)
+                                       [(:value attr) :db/noindex]))
+                          (outputs (:symbol value))))))))
+      (get-in context [:parsed-q :qwhere]))))
+
 (defn- independent-grouped-subquery?
   [context parsed clause]
   (when (and (instance? Function parsed)
@@ -52,9 +74,15 @@
                             (and (not (symbol? %)) (not (list? %))))
                          inputs)
                  (native-subquery-output? context outputs))
-        (let [query (dp/parse-query query)]
-          (and (seq (:qhaving query))
-               (seq (dp/collect dp/aggregate? (:qfind query)))))))))
+        (let [query    (dp/parse-query query)
+              elements (dp/find-elements (:qfind query))]
+          (and (seq (dp/collect dp/aggregate? elements))
+               ;; HAVING already produces an early driver. Without it, a
+               ;; grouping key must supply an entity or indexed value lookup;
+               ;; an aggregate used only by a late predicate is not enough.
+               (or (seq (:qhaving query))
+                   (indexed-group-output? context elements
+                                          (first (second clause))))))))))
 
 (defn- scalar-comparison?
   [parsed output]

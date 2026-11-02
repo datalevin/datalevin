@@ -12,33 +12,78 @@
 
 (defn- check-fixture
   "Run the actual SQL and Datalog queries over the same small table fixture."
-  [n tables]
-  (with-open [conn (DriverManager/getConnection "jdbc:sqlite::memory:")
-              stmt (.createStatement conn)]
-    (let [datoms (atom [])
-          eid (atom 0)]
-      (doseq [[table columns attrs rows] tables]
-        (.execute stmt (str "CREATE TABLE " table " (" (str/join ", " columns) ")"))
-        (with-open [ps (.prepareStatement conn
-                        (str "INSERT INTO " table " VALUES ("
-                             (str/join ", " (repeat (count columns) "?")) ")"))]
-          (doseq [row rows]
-            (let [id (swap! eid inc)]
-              (swap! datoms into (map #(vector id %1 %2) attrs row)))
-            (doseq [[i value] (map-indexed vector row)]
-              (.setObject ps (int (inc i)) value))
-            (.executeUpdate ps))))
-      (with-open [rs (.executeQuery stmt (#'v/reference-sql n))]
-        (let [width (.getColumnCount (.getMetaData rs))
-              expected (loop [rows []]
-                         (if (.next rs)
-                           (recur (conj rows (mapv #(.getObject rs (int %))
-                                                  (range 1 (inc width)))))
-                           rows))
-              actual (#'v/datalevin-rows @datoms n)]
-          (is (v/results-match? n expected actual)
-              (str "Q" n ": expected " expected ", got " actual))
-          actual)))))
+  ([n tables] (check-fixture n tables false))
+  ([n tables native?]
+   (with-open [conn (DriverManager/getConnection "jdbc:sqlite::memory:")
+               stmt (.createStatement conn)]
+     (let [datoms (atom [])
+           eid (atom 0)]
+       (doseq [[table columns attrs rows] tables]
+         (.execute stmt (str "CREATE TABLE " table " (" (str/join ", " columns) ")"))
+         (with-open [ps (.prepareStatement conn
+                         (str "INSERT INTO " table " VALUES ("
+                              (str/join ", " (repeat (count columns) "?")) ")"))]
+           (doseq [row rows]
+             (let [id (swap! eid inc)]
+               (swap! datoms into (map #(vector id %1 %2) attrs row)))
+             (doseq [[i value] (map-indexed vector row)]
+               (.setObject ps (int (inc i)) value))
+             (.executeUpdate ps))))
+       (with-open [rs (.executeQuery stmt (#'v/reference-sql n))]
+         (let [width (.getColumnCount (.getMetaData rs))
+               expected (loop [rows []]
+                          (if (.next rs)
+                            (recur (conj rows (mapv #(.getObject rs (int %))
+                                                   (range 1 (inc width)))))
+                            rows))
+               actual (if native?
+                        (with-open [native (d/create-conn nil dt/schema
+                                              {:background-sampling? false})]
+                          (d/transact! native (mapv #(into [:db/add] %) @datoms))
+                          (#'v/datalevin-rows @native n))
+                        (#'v/datalevin-rows @datoms n))]
+           (is (v/results-match? n expected actual)
+               (str "Q" n ": expected " expected ", got " actual))
+           actual))))))
+
+(deftest q10-enriches-selected-customers-with-primary-key-proofs
+  (with-open [conn (d/create-conn nil dt/schema
+                                {:background-sampling? false})]
+    (d/transact!
+      conn
+      (into [{:nation/nationkey 10 :nation/name "FRANCE"}]
+            (mapcat
+              (fn [k]
+                (cons
+                  (cond-> {:customer/custkey k :customer/name "Customer"
+                           :customer/acctbal 1.0 :customer/nationkey 10
+                           :customer/address "Address" :customer/comment "Comment"}
+                    ;; The highest-revenue customer lacks a required field.
+                    ;; Its presence must be checked before selecting the top 20.
+                    (< k 22) (assoc :customer/phone "Phone"))
+                  (mapcat
+                    (fn [orderkey]
+                      [{:orders/orderkey orderkey :orders/custkey k
+                        :orders/orderdate "1993-11-01"}
+                       {:lineitem/orderkey orderkey :lineitem/linenumber 1
+                        :lineitem/returnflag "R"
+                        :lineitem/extendedprice (double k) :lineitem/discount 0.0}
+                       {:lineitem/orderkey orderkey :lineitem/linenumber 2
+                        :lineitem/returnflag "R"
+                        :lineitem/extendedprice (double k) :lineitem/discount 0.0}])
+                    [(* 2 k) (inc (* 2 k))]))))
+            (range 1 23)))
+    (let [expected (mapv (fn [k]
+                           [k "Customer" (* 4.0 k) 1.0 "FRANCE"
+                            "Address" "Phone" "Comment"])
+                         (range 21 1 -1))
+          actual (d/q q/q-10 @conn)
+          decision (:aggregate-enrichment (d/explain {:run? true} q/q-10 @conn))]
+      (is (v/results-match? 10 expected actual))
+      (is (= ['?c-custkey] (:group-vars decision)))
+      (is (= #{'?c-name '?c-acctbal '?n-name '?c-address '?c-phone '?c-comment}
+             (set (:deferred-vars decision))))
+      (is (= 20 (:selected-count decision))))))
 
 (deftest q8-retains-duplicate-volume-and-years-without-brazil
   (doseq [lines [[]
@@ -200,3 +245,58 @@
     (let [expected (q18-sqlite-rows orders)
           actual (#'v/datalevin-rows (q18-datoms orders) 18)]
       (is (v/results-match? 18 expected actual)))))
+
+(def ^:private q20-suppliers
+  (mapv (fn [k]
+          [k (str (char (+ 64 k))) (str "Address " k) (if (= k 4) 2 1)])
+        (range 1 11)))
+
+(def ^:private q20-offers
+  [[1 1 11] [2 1 100] [1 2 10] [2 2 100]
+   [1 3 7] [1 4 100] [3 5 100] [1 6 11] [1 7 11]
+   [4 9 100] [4 10 50]])
+
+(def ^:private q20-shipments
+  [[1 1 "1994-01-01" 10.0] [1 1 "1994-06-01" 10.0]
+   [2 1 "1994-06-01" 50.0]
+   [1 2 "1994-06-01" 20.0] [2 2 "1993-12-31" 20.0]
+   [1 3 "1994-06-01" 10.0] [1 3 "1994-07-01" 10.0]
+   [1 4 "1994-06-01" 20.0] [3 5 "1994-06-01" 20.0]
+   [1 6 "1994-01-01" 20.0] [1 6 "1995-01-01" 1000.0]
+   [1 7 "1993-12-31" 1000.0]
+   [4 8 "1994-06-01" 20.0]
+   [4 9 "1994-12-31" 100.0] [4 10 "1994-12-31" 100.0]])
+
+(def ^:private q20-tables
+  [["nation" ["n_nationkey INTEGER" "n_name TEXT"]
+    [:nation/nationkey :nation/name] [[1 "CANADA"] [2 "FRANCE"]]]
+   ["supplier" ["s_suppkey INTEGER" "s_name TEXT" "s_address TEXT" "s_nationkey INTEGER"]
+    [:supplier/suppkey :supplier/name :supplier/address :supplier/nationkey] q20-suppliers]
+   ["part" ["p_partkey INTEGER" "p_name TEXT"]
+    [:part/partkey :part/name] [[1 "forest small"] [2 "forest big"] [3 "green"] [4 "forest"]]]
+   ["partsupp" ["ps_partkey INTEGER" "ps_suppkey INTEGER" "ps_availqty INTEGER"]
+    [:partsupp/partkey :partsupp/suppkey :partsupp/availqty] q20-offers]
+   ["lineitem" ["l_orderkey INTEGER" "l_linenumber INTEGER" "l_partkey INTEGER"
+                "l_suppkey INTEGER" "l_shipdate TEXT" "l_quantity REAL"]
+    [:lineitem/orderkey :lineitem/linenumber :lineitem/partkey
+     :lineitem/suppkey :lineitem/shipdate :lineitem/quantity]
+    (mapv (fn [i row] (into [(inc i) 1] row)) (range) q20-shipments)]])
+
+(deftest q20-grouped-pairs-retain-shipment-witnesses-and-boundaries
+  (doseq [native? [false true]
+          empty-table [nil "lineitem" "partsupp" "part" "nation"]]
+    (testing (str (if native? "native indexes" "collection source")
+                  ", empty table: " empty-table)
+      (let [tables (mapv (fn [[table :as definition]]
+                           (if (= table empty-table)
+                             (assoc definition 3 [])
+                             definition))
+                         q20-tables)
+            actual (check-fixture 20 tables native?)]
+        ;; A has two qualifying parts but appears once. F requires the lower
+        ;; date endpoint to be included and the upper endpoint excluded.
+        ;; Equal shipment quantities must contribute separately; exact stock
+        ;; thresholds, missing pairs and absent shipment groups must fail.
+        (is (= (if empty-table []
+                   [["A" "Address 1"] ["F" "Address 6"] ["I" "Address 9"]])
+               actual))))))

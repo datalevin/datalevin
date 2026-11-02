@@ -9,6 +9,12 @@
           [[:empty []]
            [:small [3 1 3 2 1]]
            [:dense (mapv #(long (mod % 503)) (range 9000))]
+           [:wider-domain (mapv #(* 10 (long (mod % 6000))) (range 9000))]
+           [:near-min (mapv #(+ Long/MIN_VALUE (* 10 (long (mod % 6000))))
+                            (range 9000))]
+           [:near-max (mapv #(- Long/MAX_VALUE (* 10 (long (mod % 6000))))
+                            (range 9000))]
+           [:density-boundary (conj (mapv #(* 8 (long %)) (range 8999)) 72000)]
            [:negative (mapv #(- (long (mod % 503)) 1000) (range 9000))]
            [:sparse (mapv #(* 1000000 (long %)) (range 9000))]
            [:extremes (vec (take 9000 (cycle [Long/MAX_VALUE 0 Long/MIN_VALUE -1 1])))]]

@@ -340,6 +340,9 @@ Only usable for debug output.
                    [datoms dir schema opts])
        :doc      "Low-level function for creating a Datalog database quickly from a sequence of trusted datoms, useful for bulk data loading. `dir` could be a local directory path or a dtlv connection URI string. Does no validation on inputs, so `datoms` must be well-formed and match schema.
 
+ Composite attributes declared with `:db/tupleAttrs` are maintained automatically.
+ Supplied composite datoms are recomputed from their source attributes.
+
  All datom batches commit in one transaction, for both local and remote loads.
  If a batch fails, all datoms written by this load are rolled back. Database
  creation and schema setup precede the load and are not rolled back.
@@ -383,6 +386,9 @@ Only usable for debug output.
 
 (def ^{:arglists '([db datoms])
        :doc      "Low-level function for filling a Datalog database quickly with a sequence of trusted datoms, useful for bulk data loading. Does no validation on inputs, so `datoms` must be well-formed and match schema.
+
+ Composite attributes declared with `:db/tupleAttrs` are maintained automatically.
+ Supplied composite datoms are recomputed from their source attributes.
 
  Supports local and remote databases. Outside an explicit transaction, remote
  loads commit in batches controlled by `datalevin.constants/*fill-db-batch-size*`,

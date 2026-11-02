@@ -758,7 +758,11 @@
 
   (load-datoms [_ datoms]
     (metadata-write! metadata-cache
-                     #(load-datoms* client db-name datoms :raw false writing?)))
+                     ;; Java collection fallback serialization can print datoms
+                     ;; without their add/retract flag. Use the wire's native
+                     ;; vector encoding for both request and copy-in loads.
+                     #(load-datoms* client db-name (vec datoms)
+                                    :raw false writing?)))
 
   (defremote-forward (datalog-request read-floor-tx client)
     (fetch [_ datom])
