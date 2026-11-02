@@ -350,8 +350,8 @@
                                           (or candidate-pairs
                                               (aget ^longs input-count 0)))
                          :result-tuples (count result-set)}
-                        (= :dense-eav-composition
-                           (:operator physical-operator))
+                        (#{:dense-eav-composition :unique-projection}
+                          (:operator physical-operator))
                         (assoc :physical-operator physical-operator))]
                   (assoc context
                          :result-set result-set

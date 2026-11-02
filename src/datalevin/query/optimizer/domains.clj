@@ -137,7 +137,7 @@
                anchor ps
                :when (not (qu/binding-var? (:value anchor)))
                :let [anchor-idx (first-bound-index trace (:entity anchor))]
-               :when (and anchor-idx (< 1 anchor-idx))
+               :when (and anchor-idx (< 1 (long anchor-idx)))
                [key path] (paths-from ps classes (:entity anchor))
                target ps
                :when (and (qu/binding-var? (:value target))
@@ -146,16 +146,18 @@
                              (if (= :ave (:direction (peek path)))
                                :db.type/long (:value-type (peek path)))))
                :let [idx (first-bound-index trace (:value target))]
-               :when (and idx (< (inc idx) anchor-idx)
+               :when (and idx (< (inc (long idx)) (long anchor-idx))
                           (= idx (first-bound-index trace (:entity target))))
-               :let [rows (long (or (:size (nth trace idx)) 0))
+               :let [idx (long idx)
+                     anchor-idx (long anchor-idx)
+                     rows (long (or (:size (nth trace idx)) 0))
                      before (final-plan-cost (subvec (vec trace) 0 (inc idx)))
                      downstream (- (double (final-plan-cost
                                              (subvec (vec trace) 0 anchor-idx)))
                                    (double before))
-                     expansion (reduce max 0 (map #(long (or (:size %) 0))
-                                                  (subvec (vec trace)
-                                                          (inc idx) anchor-idx)))]
+                     expansion (long (reduce max 0 (map #(long (or (:size %) 0))
+                                                        (subvec (vec trace)
+                                                                (inc idx) anchor-idx))))]
                :when (and (<= min-consumer-rows rows)
                           (< rows expansion)
                           (< (* rows (double c/magic-cost-pred) 4.0)
@@ -165,26 +167,27 @@
             :equality-vars (vec (sort (get classes (:value target)
                                           #{(:value target)})))})
          ;; Prefer a short proof over exploring a longer route through facts.
-         (sort-by (juxt #(count (:path %)) #(- (:downstream-cost %)))))))
+         (sort-by (juxt #(count (:path %)) #(- (double (:downstream-cost %))))))))
 
 (defn- bounded-values
   [source direction attr inputs budget]
-  (loop [inputs (seq inputs) values #{} rows 0 probes 0]
-    (if (seq inputs)
-      (let [input (first inputs)]
-        (when (and (< rows budget) (index-value? input)
-                   (or (= direction :ave)
-                       (and (int? input) (not (neg? input)))))
-          (let [limit (inc (min max-domain-size (- budget rows)))
-                datoms (if (= direction :ave)
-                         (db/-datoms source :ave attr input nil limit)
-                         (db/-datoms source :eav input attr nil limit))
-                n (count datoms)
-                values (into values (map (if (= direction :ave) :e :v)) datoms)]
-            (when (and (< n limit) (<= (count values) max-domain-size)
-                       (every? index-value? values))
-              (recur (next inputs) values (+ rows n) (inc probes))))))
-      {:values (vec (sort values)) :rows rows :probes probes})))
+  (let [budget (long budget)]
+    (loop [inputs (seq inputs) values #{} rows 0 probes 0]
+      (if (seq inputs)
+        (let [input (first inputs)]
+          (when (and (< rows budget) (index-value? input)
+                     (or (= direction :ave)
+                         (and (int? input) (not (neg? (long input))))))
+            (let [limit (inc (min max-domain-size (- budget rows)))
+                  datoms (if (= direction :ave)
+                           (db/-datoms source :ave attr input nil limit)
+                           (db/-datoms source :eav input attr nil limit))
+                  n (count datoms)
+                  values (into values (map (if (= direction :ave) :e :v)) datoms)]
+              (when (and (< n limit) (<= (count values) max-domain-size)
+                         (every? index-value? values))
+                (recur (next inputs) values (+ rows n) (inc probes))))))
+        {:values (vec (sort values)) :rows rows :probes probes}))))
 
 (defn materialize
   "Produce a complete necessary domain within a fixed lookup/row budget.
@@ -192,14 +195,14 @@
   [{:keys [anchor path] :as candidate}]
   (let [{:keys [source attr value]} anchor]
     (when-let [seed (bounded-values source :ave attr [value] max-producer-rows)]
-      (loop [values (:values seed) steps path rows (:rows seed)
+      (loop [values (:values seed) steps path rows (long (:rows seed))
              cost (+ (double (estimate-link-cost (:probes seed) (:rows seed)))
                      (materialized-output-cost (:rows seed) 1))
              stages [(assoc (dissoc seed :values) :pattern (:form anchor))]]
         (if-let [{:keys [direction attr form]} (first steps)]
           (when-let [result (bounded-values source direction attr values
                                             (- max-producer-rows rows))]
-            (recur (:values result) (next steps) (+ rows (:rows result))
+            (recur (:values result) (next steps) (+ rows (long (:rows result)))
                    (+ cost (double (estimate-link-cost
                                      (:probes result) (:rows result)))
                       (materialized-output-cost (:rows result) 1))
@@ -212,8 +215,11 @@
   Counts select an alternative; only complete index reads establish its domain."
   [{:keys [target values producer-cost downstream-cost input-rows]}]
   (let [{:keys [source attr]} target
+        producer-cost (double producer-cost)
+        downstream-cost (double downstream-cost)
+        input-rows (long input-rows)
         total (long (db/-count source [nil attr nil]))
-        matched (reduce (fn [n value]
+        matched (reduce (fn [^long n value]
                           (+ n (long (db/-count source [nil attr value]))))
                         0 values)
         fraction (if (pos? total) (min 1.0 (/ (double matched) total)) 1.0)

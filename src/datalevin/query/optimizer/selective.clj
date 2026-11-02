@@ -43,7 +43,7 @@
    [datalevin.util :as u])
   (:import
    [datalevin.db DB]
-   [datalevin.parser Constant Variable Pattern RuleExpr]))
+   [datalevin.parser Constant FindRel Variable Pattern RuleExpr]))
 
 (def ^:private ^:const ^double selective-anchor-dominance-margin
   2.0)
@@ -148,10 +148,32 @@
       (+ (double (estimated-plan-cost planned))
          (double (:cost late))))))
 
+(defn- standalone-entity-scan?
+  "The native single-entity plan already applies all its filters and
+  projections. Binding an anchor in planning would duplicate that work."
+  [planned source-sym entity-sym]
+  (let [parsed-q (:parsed-q planned)
+        components (get-in planned [:plan source-sym])
+        trace (first components)
+        steps (:steps (first trace))]
+    (and (instance? FindRel (:qfind parsed-q))
+         (every? #(instance? Variable %) (dp/find-elements (:qfind parsed-q)))
+         (nil? (:qreturn-map parsed-q)) (nil? (:qwith parsed-q))
+         (= 1 (count (:plan planned)))
+         (= 1 (count components)) (= 1 (count trace))
+         (empty? (:rels planned)) (empty? (:late-clauses planned))
+         (= :init (some-> steps first qplan/-type))
+         (= entity-sym (first (:vars (first steps))))
+         (every? #(and (= :merge (qplan/-type %))
+                       (= 0 (:index %)))
+                 (next steps)))))
+
 (defn- costed-selective-value-candidates
   [planned ^double base-cost candidates]
   (into []
         (comp
+          (remove (fn [{:keys [source-sym entity-sym]}]
+                    (standalone-entity-scan? planned source-sym entity-sym)))
           (map (fn [{:keys [source-sym entity-sym fanout] :as candidate}]
                  (let [delayed-cost (delayed-anchor-cost
                                       planned source-sym entity-sym)

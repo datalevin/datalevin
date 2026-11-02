@@ -184,20 +184,6 @@ clojure -M:bench --system all --records 10000 --ops 10000 \
 - `--run-role warmup|measurement` Complete-pass role (default measurement)
 - `--keep`            Keep DB artifacts after run
 
-## Performance update (2026-10-10)
-
-Average completion time for 10,000 operations improved most in the ten-thread
-A (16.05%) and F (13.91%) workloads.
-
-| Workload | Threads | Before total (ms) | After total (ms) | Change |
-|---|---:|---:|---:|---:|
-| C | 1 | 1,223.46 | 1,112.87 | -9.04% |
-| A | 1 | 3,674.81 | 3,595.70 | -2.15% |
-| F | 1 | 4,675.26 | 4,411.36 | -5.64% |
-| C | 10 | 315.64 | 292.19 | -7.43% |
-| A | 10 | 2,375.99 | 1,994.64 | -16.05% |
-| F | 10 | 3,887.12 | 3,346.24 | -13.91% |
-
 ## Results
 
 The completed study used 10,000 documents, 1,000 within-pass warmup operations,

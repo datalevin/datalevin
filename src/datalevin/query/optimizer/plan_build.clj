@@ -254,7 +254,9 @@
                                   (update :pred add-pred
                                           (qpred/shareable-predicate
                                             #(= val %)))
-                                  (assoc :var (gensym "?bound"))))
+                                  ;; A constant is checked by the predicate;
+                                  ;; no later operator consumes its value.
+                                  (assoc :var '_)))
                             (if (= k :bound) (u/vec-remove bound i) bound))
               all     (->> (concatv bound1
                                     (if (= k :free) (u/vec-remove free i) free))

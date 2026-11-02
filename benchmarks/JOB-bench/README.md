@@ -126,31 +126,13 @@ Most queries in the benchmark are more complex than this example.
 For Datalevin, both `lein` and `clj` build tools are needed, the former is for
 building the main project, and the later for running tests and benchmarks.
 
-Run tests to see results are correct. Focused translation tests use temporary
-fixtures and can run without the full IMDb database:
-
-```bash
-clj -Xtest :nses '[datalevin-bench.query-audit-test]'
-python3 scripts/audit_queries.py
-```
-
-The structural audit checks all 113 pairs, accounts for the documented output
-simplifications, and reports reference-integrity assumptions separately from
-translation differences. To check those assumptions against PostgreSQL:
-
-```bash
-psql -X -v ON_ERROR_STOP=1 -d postgres -f scripts/check_reference_integrity.sql
-```
-
-Every `dangling` count should be zero. The [2026-10-31 query audit](query-audit.md)
-records four corrected translations and the validation results. The existing
-locale-collation caveat in Note 1 still applies.
-
-Run the full dataset result tests with:
+After loading the IMDb database, check query results with:
 
 ```bash
 clj -Xtest
 ```
+
+See Note 1 below for collation differences between systems.
 
 ## Run Benchmark
 
@@ -209,26 +191,22 @@ clj -Xgrid
 ```
 
 `grid` disables query-result caching and clears the plan cache before every
-query. It uses an initial execution threshold of 1,000 and a pipeline batch
-size of 12,384. Its per-query timings cover `d/q`; the final total also includes
-the loop's cache clears and reporting. Compare grid totals with other grid
-runs using the same queries and dependencies. The explain-based `-Xbench`
-runner reports different timing boundaries and does not clear the plan cache
-between queries.
+query. Per-query timings cover `d/q`; the final total also includes cache
+clearing and reporting. Compare grid totals with other grid runs using the same
+queries and dependencies. The explain-based `-Xbench` runner reports preparation
+and execution separately and does not clear the plan cache between queries.
 
 ## Results
 
 The table below reports the second pass of each benchmark command described
-above and is retained with the raw CSV files for reproducibility. These timings
-predate the query corrections in the [2026-10-31 audit](query-audit.md), including
-the corrected output expression in 15d. They have not been refreshed for the
-corrected queries.
+above. These historical results predate later query corrections. Rerun the
+benchmark to measure the current query set.
 
 The PostgreSQL and SQLite columns were regenerated on 2026-08-23. The Datalevin
-column was regenerated on 2026-09-01 at revision `e0152efe` after the query
-engine and DLMDB changes. Each system ran one complete warmup pass followed by
-one complete measurement pass in a separate runner/JVM process. The Datalevin
-and JDBC runners used Clojure 1.12.5; Datalevin used direct linking.
+column was regenerated on 2026-09-01 at revision `e0152efe`. Each system ran
+one complete warmup pass followed by one complete measurement pass in a
+separate runner/JVM process. The runners used Clojure 1.12.5; Datalevin used
+direct linking.
 
 Before the retained PostgreSQL pair, the macOS filesystem cache was purged and
 PostgreSQL was restarted to clear `shared_buffers`; its first pass therefore

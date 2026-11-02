@@ -295,6 +295,18 @@
               (.add output (object-array 0))
               (relation! output-attrs output))
 
+            (unique-on? rel vars)
+            (do
+              ;; Projection retains a proven key, so it cannot introduce
+              ;; duplicate rows even when columns are reordered or dropped.
+              (dotimes [i size]
+                (let [^objects tuple (.get tuples i)
+                      row (object-array width)]
+                  (dotimes [j width]
+                    (aset row j (aget tuple (aget idxs j))))
+                  (.add output row)))
+              (relation! output-attrs output))
+
             (= 1 width)
             (let [idx  (aget idxs 0)
                   seen (QueryKey$KeySet. (int size))]

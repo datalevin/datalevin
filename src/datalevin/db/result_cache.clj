@@ -13,6 +13,11 @@
 (def ^:private unsupported (Object.))
 (def ^:private object-array-class (Class/forName "[Ljava.lang.Object;"))
 
+(defn- immutable-leaf?
+  [x]
+  ;; These final classes cannot carry metadata or mutable contents.
+  (or (nil? x) (string? x) (instance? Long x) (instance? Double x)))
+
 (declare copy-value)
 
 (defn- copy-items
@@ -50,7 +55,9 @@
           (if (= i n)
             copy
             (let [value (aget copy i)
-                  item (copy-value value (inc (long depth)))]
+                  item (if (and (< (long depth) 128) (immutable-leaf? value))
+                         value
+                         (copy-value value (inc (long depth))))]
               (cond
                 (identical? unsupported item) unsupported
                 (identical? value item) (recur (inc i))
@@ -74,10 +81,11 @@
   (cond
     ;; Cyclic mutable containers and excessive nesting bypass retention.
     (> depth 128) unsupported
+    ;; Most tuple cells are immutable scalars. Check them before testing
+    ;; container layouts; mutable arrays and lists still receive owned copies.
+    (immutable-leaf? x) x
     (instance? object-array-class x) (copy-array x depth)
     (identical? FastList (class x)) (copy-tuple-list x depth)
-    ;; These final classes cannot carry metadata or mutable contents.
-    (or (nil? x) (string? x) (instance? Long x) (instance? Double x)) x
     (remote-cache/immutable-data? x)
     x
     :else

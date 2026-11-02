@@ -30,9 +30,8 @@ unordered relation queries over typed, indexed attributes with variable
 projections, patterns, and predicates. Aggregates, `:with`, rules, and function
 clauses retain their existing planning paths.
 
-The runner also accepts a conventional control plan for comparisons with older
-engines. See the [early-limit comparison](../results/2026-11-01-early-limit/README.md)
-for before/after measurements and scope.
+The runner also accepts a conventional control plan when an engine does not
+support unordered adaptive limits.
 
 ## Vector benchmark scope
 

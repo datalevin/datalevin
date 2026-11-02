@@ -1711,35 +1711,47 @@
        (when (zero? n)
          (raise "Cannot execute an empty query plan" {}))
        (when-not (and (< 2 n) (partition-plan? context db steps))
-         (case n
-           1
-           (do
-             (step-execute-pipe (first steps) db nil sink)
-             (save-intermediates context steps (object-array 0) sink)
-             {:operator :pipeline})
+         (if-let [key (when (and terminal-symbols
+                                 (= (count terminal-symbols)
+                                    (count (distinct terminal-symbols)))
+                                 (satisfies? ITerminalDistinctSink sink))
+                        (when-let [key (entity-scan-key db steps)]
+                          (when (every? (set terminal-symbols) key) key)))]
+           (let [relation (r/project-distinct
+                            (execute-steps context db steps) terminal-symbols)]
+             ;; Transfer a fresh list: a materialized plan step may retain its
+             ;; own tuple container, while the terminal sink clears its list.
+             (-add-distinct-batch! sink (FastList. ^Collection (:tuples relation)))
+             {:operator :unique-projection :key key})
+           (case n
+             1
+             (do
+               (step-execute-pipe (first steps) db nil sink)
+               (save-intermediates context steps (object-array 0) sink)
+               {:operator :pipeline})
 
-           2
-           (let [src (or (step-execute (first steps) db nil) (FastList.))]
-             (if-some [{:keys [relation] :as composition}
-                       (when (and terminal-symbols
-                                  (satisfies? ITerminalDistinctSink sink))
-                         (terminal-eav-composition
-                           db steps src terminal-symbols))]
-               (do
-                 (-add-distinct-batch! sink (:tuples relation))
-                 (save-intermediates
-                   context steps (object-array [src]) sink)
-                 (dissoc composition :relation))
-               (do
-                 (step-execute-pipe
-                   (peek steps) db (p/list-tuple-pipe src) sink)
-                 (save-intermediates
-                   context steps (object-array [src]) sink)
-                 {:operator :pipeline})))
+             2
+             (let [src (or (step-execute (first steps) db nil) (FastList.))]
+               (if-some [{:keys [relation] :as composition}
+                         (when (and terminal-symbols
+                                    (satisfies? ITerminalDistinctSink sink))
+                           (terminal-eav-composition
+                             db steps src terminal-symbols))]
+                 (do
+                   (-add-distinct-batch! sink (:tuples relation))
+                   (save-intermediates
+                     context steps (object-array [src]) sink)
+                   (dissoc composition :relation))
+                 (do
+                   (step-execute-pipe
+                     (peek steps) db (p/list-tuple-pipe src) sink)
+                   (save-intermediates
+                     context steps (object-array [src]) sink)
+                   {:operator :pipeline})))
 
-           (let [pipes (run-pipeline-into db steps n sink)]
-             (save-intermediates context steps pipes sink)
-             {:operator :pipeline})))))))
+             (let [pipes (run-pipeline-into db steps n sink)]
+               (save-intermediates context steps pipes sink)
+               {:operator :pipeline}))))))))
 
 (defn count-steps
   "Execute a component plan and count its output without retaining the final

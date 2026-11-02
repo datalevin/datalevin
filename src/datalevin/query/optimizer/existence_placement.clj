@@ -14,7 +14,7 @@
             [datalevin.storage.scan :as scan]
             [datalevin.timeout :as timeout]
             [datalevin.util :as u])
-  (:import [java.util List]
+  (:import [java.util Collection List]
            [org.eclipse.collections.impl.list.mutable FastList]))
 
 (def ^:dynamic *strategy* :cost)
@@ -32,14 +32,16 @@
   ([reason] (throw (ex-info "Existence placement sample unavailable"
                            {::unavailable true :reason reason}))))
 
-(defn- charge! [budget n]
+(defn- charge! [budget ^long n]
   (timeout/assert-time-left)
-  (when (> (vswap! budget + (long n)) (long *max-rows*)) (unsupported! :sample-budget)))
+  (let [used (+ (long @budget) n)]
+    (vreset! budget used)
+    (when (> used (long *max-rows*)) (unsupported! :sample-budget))))
 
 (defn- bounded [^List tuples]
   (if (<= (.size tuples) (long *sample-size*)) tuples
-      (FastList. (mapv #(.get tuples (int %))
-                      (u/reservoir-sampling (.size tuples) *sample-size*)))))
+      (FastList. ^Collection (mapv #(.get tuples (int %))
+                                  (u/reservoir-sampling (.size tuples) *sample-size*)))))
 
 (defn- sampled-props [database attr]
   (let [props (get (db/-schema database) attr)]
@@ -55,7 +57,7 @@
   [database attr values entity? budget]
   (let [schema (db/-schema database) props (sampled-props database attr)
         _ (when (some #(and (string? %) (> (count %) 128)) values) (unsupported!))
-        keys (FastList. (mapv #(object-array [%]) (distinct values)))
+        keys (FastList. ^Collection (mapv #(object-array [%]) (distinct values)))
         output (FastList.)
         policy {:schema schema :check! timeout/assert-time-left
                 :unsupported! unsupported! :admit-row! (fn [])
@@ -90,22 +92,22 @@
         keys (mapv #(aget ^objects % (int (attrs key))) tuples)
         ;; Limit the input cohort before a wide indexed expansion. Actual row
         ;; admission still enforces the bound if counted metadata is stale.
-        n (if entity? (.size tuples)
-              (loop [n 0 total 0]
-                (if (< n (.size tuples))
-                  (let [cnt (long (i/av-size (:store database) attr (nth keys n)))]
-                    (if (> (+ total cnt) (min 4096 (max 1 (quot (long *max-rows*) 4))))
-                      (max 1 n) (recur (inc n) (+ total cnt)))) n)))
+        n (long (if entity? (.size tuples)
+                    (loop [n 0 total 0]
+                      (if (< n (.size tuples))
+                        (let [cnt (long (i/av-size (:store database) attr (nth keys n)))]
+                          (if (> (+ total cnt) (min 4096 (max 1 (quot (long *max-rows*) 4))))
+                            (max 1 n) (recur (inc n) (+ total cnt)))) n))))
         input (if (= n (.size tuples)) rel
                   (assoc rel :tuples (FastList. (.subList tuples 0 n))))
         keys (subvec keys 0 n)
-        found ^List (facts database attr keys entity? budget)
+        ^List found (facts database attr keys entity? budget)
         produced (if entity? value entity)
         free? (qu/binding-var? produced)
         fact-attrs (if entity? {entity 0} {value 0})
         fact-attrs (if free? (assoc fact-attrs produced 1) fact-attrs)
-        found (if (or free? (= produced '_) (qu/placeholder? produced)) found
-                  (FastList. (filterv #(= produced (aget ^objects % 1)) found)))
+        ^List found (if (or free? (= produced '_) (qu/placeholder? produced)) found
+                        (FastList. ^Collection (filterv #(= produced (aget ^objects % 1)) found)))
         ;; Bound the join's multiplicity before allocating output tuples.
         frequencies (frequencies keys)
         pairs (reduce + 0 (map #(long (get frequencies (aget ^objects % 0) 0)) found))
@@ -134,7 +136,7 @@
         ;; Subsampling inside an existence body would change its meaning.
         (when (and (:input result) (not= (:input result) (.size ^List (:tuples rel))))
           (unsupported! :body-fanout))
-        {:rel (:rel result) :work (+ work (:work result))}))
+        {:rel (:rel result) :work (+ (double work) (double (:work result)))}))
     {:rel rel :work 0.0} clauses))
 
 (defn- filter-existence [database outer clause budget]
@@ -148,12 +150,12 @@
         matched (r/project-distinct (:rel sampled) vars)
         rejected (if semi? (join/subtract-rel keys matched) matched)]
     {:rel (join/subtract-rel outer rejected)
-     :work (+ (:work sampled) (.size ^List (:tuples outer)))}))
+     :work (+ (double (:work sampled)) (.size ^List (:tuples outer)))}))
 
 (defn- filters [database rel clauses budget]
   (reduce (fn [{:keys [rel work]} clause]
             (let [result (filter-existence database rel clause budget)]
-              {:rel (:rel result) :work (+ work (:work result))}))
+              {:rel (:rel result) :work (+ (double work) (double (:work result)))}))
           {:rel rel :work 0.0} clauses))
 
 (defn- step [database rel previous physical budget]
@@ -183,7 +185,7 @@
                            (assoc result-rel :tuples
                                   (r/select-tuples #(pred (aget ^objects % (int value-idx)))
                                                    (:tuples result-rel))) result-rel)]
-            {:rel selected :input input :work (+ work (:work result))}))
+            {:rel selected :input input :work (+ (double work) (double (:work result)))}))
         {:rel rel :work 0.0} (sort-by #(get-in (db/-schema database) [(first %) :db/aid]) (:attrs-v physical)))
       (unsupported! (keyword (str "unsupported-" (name (plan/step-type physical))))))))
 
@@ -192,7 +194,7 @@
     (when (:know-e? physical) (unsupported! :unsupported-initialization))
     (if (some? value)
       (let [found (facts database attr [value] false budget)
-            rows (FastList. (mapv #(object-array [(aget ^objects % 1)]) found))]
+            rows (FastList. ^Collection (mapv #(object-array [(aget ^objects % 1)]) found))]
         {:rel (r/relation! {entity 0} (bounded rows)) :rows (.size rows)})
       (let [props (get (db/-schema database) attr)
             _ (when-not (#{:db.type/long :db.type/ref :db.type/boolean
@@ -209,7 +211,7 @@
   retain the conventional order; sample zeros never establish emptiness."
   [alternatives]
   (let [late (last alternatives) best (apply min-key :cost alternatives)]
-    (if (< (* (double *min-improvement*) (:cost best)) (:cost late)) best late)))
+    (if (< (* (double *min-improvement*) (double (:cost best))) (double (:cost late))) best late)))
 
 (defn select
   [database plans clauses]
@@ -242,14 +244,14 @@
                                           result (step database rel previous s budget)
                                           input (long (or (:input result) n))
                                           output (:rel result)
-                                          factor (/ rows input)]
+                                          factor (/ (double rows) input)]
                                       {:rel (assoc output :tuples (bounded (:tuples output)))
                                        :rows (* factor (.size ^List (:tuples output)))
-                                       :work (+ work (* factor (:work result))) :previous s}))
+                                       :work (+ (double work) (* factor (double (:work result)))) :previous s}))
                                   {:rel rel :rows rows :work work :previous previous} physical)]
-                      (recur (inc idx) (:rel state) (:rows state) (:work state) (:previous state)
+                      (recur (inc idx) (:rel state) (double (:rows state)) (double (:work state)) (:previous state)
                              (conj snapshots state)))))
-              total-work (:work (peek snapshots))
+              total-work (double (:work (peek snapshots)))
               alternatives
               (mapv (fn [site]
                       (let [{:keys [rel rows work]} (snapshots site)
@@ -259,11 +261,11 @@
                             survivors (.size ^List (:tuples (:rel result)))
                             ;; Smooth rare outcomes and keep all estimates finite.
                             yield (/ (double (inc survivors)) (+ n 2.0))
-                            check-cost (* (/ rows n) (:work result))
-                            suffix (- total-work work)]
+                            check-cost (* (/ (double rows) n) (double (:work result)))
+                            suffix (- total-work (double work))]
                         {:site site :input-rows rows :sample-input n :sample-output survivors
                          :yield yield :existence-cost check-cost :suffix-cost suffix
-                         :cost (+ work check-cost (* yield suffix))})) sites)
+                         :cost (+ (double work) check-cost (* yield suffix))})) sites)
               chosen (choose-placement alternatives)]
           {:site (:site chosen) :strategy :cost :alternatives alternatives
            :sample-work @budget :reason :estimated-total-work})

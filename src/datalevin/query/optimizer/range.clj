@@ -466,7 +466,7 @@
                  (list? end) (= 'min (first end)) (= 3 (count end)))
         (let [[a b] (rest end)
               [n length] (if (int? a) [a b] [b a])]
-          (when (and (int? n) (<= 0 n) (= length (list 'count input)))
+          (when (and (int? n) (<= 0 (long n)) (= length (list 'count input)))
             {:input input :output output :length n}))))))
 
 (def ^:private ^:const max-prefix-alternatives 64)
@@ -497,7 +497,7 @@
           nil)))))
 
 (defn- prefix-output-ranges
-  [length values]
+  [^long length values]
   (loop [values (seq values) ranges []]
     (if-let [^String value (first values)]
       (let [n (.length value)]

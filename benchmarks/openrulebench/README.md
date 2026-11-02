@@ -170,19 +170,6 @@ reported separately.
 All 53 completed measurements passed their independent count oracle, and the
 cross-system input-digest check passed.
 
-## Performance update (2026-10-10)
-
-Average total latency for the four recursive tasks decreased from 332.91 to
-215.02 ms, a 35.41% improvement.
-
-| Task | Before (ms) | After (ms) | Change |
-|---|---:|---:|---:|
-| TC 50K cyclic FF | 126.78 | 76.76 | -39.46% |
-| TC 50K acyclic FF | 57.68 | 44.25 | -23.28% |
-| SG 6K cyclic FF | 122.97 | 74.23 | -39.64% |
-| SG 6K acyclic FF | 25.48 | 19.78 | -22.38% |
-| Total | 332.91 | 215.02 | -35.41% |
-
 ## Representative results (2026-08-26)
 
 This published-scale matrix covers all three portable families without the
