@@ -1638,6 +1638,165 @@
               :plan)]
       (if trace-vector? annotated (seq annotated)))))
 
+(defn- swap-column-index
+  [index a b]
+  (cond (= index a) b (= index b) a :else index))
+
+(defn- swap-step-columns
+  "Retarget native operators after exchanging two columns in their input."
+  [step a b]
+  (let [swap-index #(swap-column-index % a b)
+        swap-cols  (fn [cols] (assoc (vec cols) a (nth cols b) b (nth cols a)))
+        swap-attrs (fn [attrs]
+                     (mapv (fn [[attr opts]]
+                             [attr (cond-> opts (some? (:fidx opts))
+                                     (update :fidx swap-index))]) attrs))]
+    (cond-> (update step :cols swap-cols)
+      (some? (:index step)) (update :index swap-index)
+      (some? (:fidx step)) (update :fidx swap-index)
+      (:in-cols step) (update :in-cols swap-cols)
+      (:attrs-v step) (update :attrs-v swap-attrs)
+      (:cost-attrs-v step) (update :cost-attrs-v swap-attrs)
+      (:eav-provenance step)
+      (update :eav-provenance
+              (fn [provenance]
+                (into {} (map (fn [[entity attrs]]
+                               [(swap-index entity)
+                                (into {} (map (fn [[attr value]]
+                                                [attr (swap-index value)]))
+                                      attrs)]))
+                      provenance))))))
+
+(defn- filter-before-projection
+  "Move an adjacent scalar range scan before same-entity payload retrieval.
+  Retain its value and remap later operators, so neither attribute is reread."
+  [db trace idx]
+  (let [previous    (nth trace (dec idx))
+        current     (nth trace idx)
+        before      (:steps previous)
+        projection  (peek before)
+        filter-step (first (:steps current))]
+    (when (and (< 1 (count before))
+               (= 1 (count (:steps current)))
+               (= :merge (-type projection))
+               (= :merge (-type filter-step))
+               (= :local-filter (:attribute-group-role filter-step))
+               (= 1 (count (:attrs-v projection))
+                    (count (:attrs-v filter-step))))
+      (let [input   (nth before (- (count before) 2))
+            [pa po] (first (:attrs-v projection))
+            [fa fo] (first (:attrs-v filter-step))
+            n       (long (or (:size previous) 0))
+            m       (long (or (:size current) n))
+            a       (count (:cols input))
+            b       (inc a)
+            tail    (subvec trace (inc idx))
+            schema  (db/-schema db)]
+        (when (and (= :link (-type input))
+                   (= (:index projection) (:index filter-step))
+                   (< (long (:index projection)) a)
+                   (= (inc a) (count (:cols projection)))
+                   (= (inc b) (count (:cols filter-step)))
+                   (= 1 (count (:vars projection)) (count (:vars filter-step)))
+                   (not= pa fa)
+                   ;; Only native typed ranges are total comparisons. Moving
+                   ;; an arbitrary predicate could expose errors on rows that
+                   ;; the original projection would reject for missing data.
+                   (contains? #{:db.type/string :db.type/long :db.type/ref
+                                :db.type/float :db.type/double :db.type/bigint
+                                :db.type/bigdec :db.type/instant :db.type/uuid}
+                              (get-in schema [fa :db/valueType]))
+                   (nil? (:pred po)) (:pred fo) (:range-pred? fo)
+                   (not (:skip? po)) (not (:skip? fo))
+                   (nil? (:fidx po)) (nil? (:fidx fo))
+                   (every? #(not= :db.cardinality/many
+                                  (get-in schema [% :db/cardinality]))
+                           [pa fa])
+                   (not-any? #(or (:result %) (:sample %))
+                             [projection filter-step])
+                   (< (long c/init-exec-size-threshold) n)
+                   (< m n)
+                   ;; These operators preserve their input column prefix.
+                   ;; Other operators require their own mapping proof.
+                   (every? (fn [step]
+                             (and (#{:merge :link :hash-join} (-type step))
+                                  (< b (count (:cols step)))
+                                  (or (nil? (:in-cols step))
+                                      (< b (count (:in-cols step))))
+                                  (not (:result step)) (not (:sample step))))
+                           (mapcat :steps tail)))
+          (let [early          (assoc filter-step
+                                     :in (:in projection) :out (:out projection)
+                                     :cols (conj (:cols input)
+                                                 (nth (:cols filter-step) b))
+                                     :strata (conj (:strata input)
+                                                   (set (:vars filter-step))))
+                fetch          (assoc projection
+                                     :in (:in filter-step) :out (:out filter-step)
+                                     :cols (assoc (:cols filter-step)
+                                                  a (nth (:cols filter-step) b)
+                                                  b (nth (:cols filter-step) a))
+                                     :strata (conj (:strata early)
+                                                   (set (:vars projection))))
+                old-projection (estimate-round
+                                 (estimate-scan-v-cost projection n))
+                old-filter     (estimate-round
+                                 (estimate-scan-v-cost filter-step n))
+                new-filter     (estimate-round
+                                 (estimate-scan-v-cost early n))
+                new-projection (estimate-round
+                                 (estimate-scan-v-cost fetch m))
+                saving         (- (+ old-projection old-filter)
+                                  (+ new-filter new-projection))]
+            (when (> (double saving)
+                     (* (+ old-projection old-filter)
+                        (double c/deferred-eav-min-cost-improvement)))
+              (into (conj (assoc (subvec trace 0 idx) (dec idx)
+                                 (-> previous
+                                     (assoc :steps (assoc (vec before)
+                                                          (dec (count before))
+                                                          early)
+                                            :size m)
+                                     (update :cost #(+ (long %)
+                                                       (- new-filter old-projection)))))
+                          (-> current
+                              (assoc :steps [fetch])
+                              (update :cost #(- (long %) saving))))
+                    (map (fn [plan]
+                           (-> plan
+                               (update :cost #(- (long %) saving))
+                               (update :steps #(mapv (fn [step]
+                                                       (swap-step-columns step a b))
+                                                     %)))))
+                    tail))))))))
+
+(defn- order-local-filters
+  [db trace]
+  (loop [trace (vec trace) idx 1]
+    (if (< idx (count trace))
+      (recur (or (filter-before-projection db trace idx) trace) (inc idx))
+      trace)))
+
+(defn- order-local-filter-alternative
+  [db {:keys [plan attribute-group-planning] :as alternative}]
+  (if (and (= :deferred (:selected attribute-group-planning))
+           (some #(= :local-filter (:role %)) (:groups attribute-group-planning)))
+    (let [ordered (order-local-filters db plan)]
+      (if (= ordered plan)
+        alternative
+        (let [placements (attribute-group-placements ordered)
+              cost       (final-plan-cost ordered)]
+          (-> alternative
+              (assoc :plan ordered)
+              (update-in [:attribute-group-planning :groups]
+                         #(mapv (fn [group]
+                                  (merge group (get placements (:id group)))) %))
+              (update-in [:attribute-group-planning :alternatives]
+                         #(mapv (fn [candidate]
+                                  (cond-> candidate (= :deferred (:kind candidate))
+                                    (assoc :cost cost))) %))))))
+    alternative))
+
 (defn build-plan*
   [db sources rules nodes required-vars projected-vars]
   (binding [js/*budget* (when js/*enabled?*
@@ -1661,7 +1820,8 @@
                     (component-plan-alternatives
                       db sources rules nodes incoming-counts required-vars
                       component deferred))
-                  components))]
+                  components))
+          alternatives    (mapv #(order-local-filter-alternative db %) alternatives)]
       {:plans (mapv #(annotate-reusable-sip-domains
                        db (mapv js/strip-source (:plan %))) alternatives)
        :deferred deferred
