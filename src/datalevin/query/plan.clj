@@ -24,6 +24,7 @@
    [datalevin.query.optimizer.range :as qor]
    [datalevin.query.predicate :as qpred]
    [datalevin.query.resolve :as qresolve]
+   [datalevin.query.resolve.witness :as witness]
    [datalevin.query-util :as qu]
    [datalevin.relation :as r]
    [datalevin.storage :as storage]
@@ -653,7 +654,8 @@
       (let [context {:sources sources
                      :rules   rules
                      :rels    [(r/relation! (cols->attrs cols) tuples)]}
-            result  (binding [qu/*implicit-source* (get sources '$)]
+            result  (binding [qu/*implicit-source* (get sources '$)
+                              witness/*explain* *explain*]
                       (qresolve/resolve-clause context clause))
             rels    (:rels result)]
         (if (seq rels)

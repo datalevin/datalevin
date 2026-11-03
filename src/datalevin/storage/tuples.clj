@@ -36,17 +36,19 @@
                   v (.-v datom)
                   tuples (get sources a)
                   composite? (contains? tuple-attrs a)]
-              (when-not composite? (.add result datom))
+              (when-not (or composite? tuples) (.add result datom))
               [(if tuples
                  (let [key [e a]]
                    (if (d/datom-added datom)
-                     (assoc values key v)
+                     (do (.add result datom)
+                         (assoc values key v))
                      (let [current (if-some [entry (find values key)]
                                      (val entry)
-                                     (i/ea-first-v store e a))]
+                                     (i/ea-first-v store e a))
+                           matches? (Objects/deepEquals current v)]
+                       (when matches? (.add result datom))
                        (assoc values key
-                              (when-not (Objects/deepEquals current v)
-                                current)))))
+                              (when-not matches? current)))))
                  values)
                (cond-> (reduce #(conj %1 [e %2]) affected (keys tuples))
                  composite? (conj [e a]))]))

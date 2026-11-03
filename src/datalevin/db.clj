@@ -1786,24 +1786,28 @@
   [^Store store datoms]
   (let [lmdb    (.-lmdb store)
         flags   (get-env-flags lmdb)
-        nosync? (:nosync flags)]
+        nosync? (:nosync flags)
+        loaded  (volatile! nil)]
     (set-env-flags lmdb #{:nosync} true)
     (try
       (with-bulk-load-direct-write-path
         lmdb
         #(binding [c/*ordered-datom-writes?* true]
-           (l/with-transaction-kv [_ lmdb]
-             (pour store datoms))))
+           (l/with-transaction-kv [writer lmdb]
+             (let [tx-store (s/transfer store writer)]
+               (pour tx-store datoms)
+               (vreset! loaded tx-store)))))
       (finally
         (when-not nosync? (set-env-flags lmdb #{:nosync} false))))
-    (sync lmdb)))
+    (sync lmdb)
+    (s/transfer @loaded lmdb)))
 
 (defn- quick-fill
   [store datoms]
   (if (remote-store? store)
     ;; Each bounded batch uses the server's regular write path, preserving
     ;; its WAL/HA settings. Large batches use the copy-in wire protocol.
-    (pour store datoms)
+    (do (pour store datoms) store)
     (quick-fill-local store datoms)))
 
 (defn init-db
@@ -1816,25 +1820,28 @@
    (let [[_ runtime-opts] (split-runtime-opts opts)
          store            (open-store dir schema opts)]
      (try
-       (if (remote-store? store)
-         (locking (l/write-txn store)
-           ;; Map growth discards earlier batches in the native transaction.
-           ;; Abort each failed attempt and replay the entire import.
-           (u/repeat-try-catch c/+in-tx-overflow-times+ l/resized?
-             (let [tx-store (i/open-transact store)]
-               (try
-                 (pour tx-store datoms)
-                 (i/close-transact store)
-                 (catch Throwable failure
-                   (try
-                     (i/abort-transact store)
-                     (catch Throwable abort-error
-                       (when-not (identical? failure abort-error)
-                         (.addSuppressed failure abort-error))))
-                   (throw failure))))))
-         (quick-fill store datoms))
-       (cond-> (new-db store)
-         (some? runtime-opts) (with-runtime-opts runtime-opts))
+       (let [loaded-store
+             (if (remote-store? store)
+               (do
+                 (locking (l/write-txn store)
+                   ;; Map growth discards earlier batches in the native
+                   ;; transaction. Abort and replay the entire import.
+                   (u/repeat-try-catch c/+in-tx-overflow-times+ l/resized?
+                     (let [tx-store (i/open-transact store)]
+                       (try
+                         (pour tx-store datoms)
+                         (i/close-transact store)
+                         (catch Throwable failure
+                           (try
+                             (i/abort-transact store)
+                             (catch Throwable abort-error
+                               (when-not (identical? failure abort-error)
+                                 (.addSuppressed failure abort-error))))
+                           (throw failure))))))
+                 store)
+               (quick-fill store datoms))]
+         (cond-> (new-db loaded-store)
+           (some? runtime-opts) (with-runtime-opts runtime-opts)))
        (catch Throwable failure
          ;; Only the returned DB can own this opened store. Release it after
          ;; transaction retries have ended, including lazy input failures.
@@ -1849,12 +1856,12 @@
   [db datoms]
   (let [store (.-store ^DB db)]
     (try
-      (quick-fill store datoms)
-      (let [target (last-modified store)]
-        (when (instance? Store store)
-          (s/mark-state-current! ^Store store target))
-        (refresh-cache store target))
-      (carry-runtime-opts (new-db store nil db) db)
+      (let [loaded-store (quick-fill store datoms)
+            target (last-modified loaded-store)]
+        (when (instance? Store loaded-store)
+          (s/mark-state-current! ^Store loaded-store target))
+        (refresh-cache loaded-store target)
+        (carry-runtime-opts (new-db loaded-store nil db) db))
       (catch Throwable failure
         (when (remote-store? store)
           ;; Earlier remote batches can commit before a later batch fails.

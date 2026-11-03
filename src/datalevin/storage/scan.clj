@@ -906,6 +906,26 @@
           (when seen (.put seen te vst))
           (.addAll out (r/prod-tuples (r/single-tuples tuple) vst)))))))
 
+(defn visit-ave-entities
+  "Visit entity ids for fixed-width indexed value keys using one cursor.
+   The caller supplies the pinned aid/type and checks cancellation. Returning
+   :datalevin/terminate-visit stops only the current key's witness scan."
+  [lmdb aid vt ^List keys check! visitor]
+  (scan/scan lmdb c/ave
+    (with-open [^AutoCloseable iter
+                (lmdb/val-iterator (lmdb/iterate-list-val-full dbi rtx cur))]
+      (dotimes [i (.size keys)]
+        (check!)
+        (let [value (aget ^objects (.get keys i) 0)]
+          (loop [next? (lmdb/seek-key iter (b/indexable nil aid value vt c/g0) :avg)]
+            (when next?
+              (check!)
+              (let [^ByteBuffer value-buffer (lmdb/next-val iter)
+                    result (visitor value (.getLong value-buffer 0))]
+                (when-not (identical? result :datalevin/terminate-visit)
+                  (recur (lmdb/has-next-val iter)))))))))
+    (throw e)))
+
 (defn val-eq-scan-e*
   [lmdb iter ^Collection out tuple ^Map seen aid v vt]
   (if-let [ts (.get seen v)]

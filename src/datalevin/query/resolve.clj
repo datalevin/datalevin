@@ -41,6 +41,7 @@
             multi-lookup-cheaper?
             #_{:clj-kondo/ignore [:unused-referred-var]}
             resolve-entity-pairs]]
+   [datalevin.query.resolve.witness :as witness]
    [datalevin.query.tuple :as qtuple]
    [datalevin.relation :as r]
    [datalevin.rules :as rules]
@@ -945,7 +946,9 @@
            context1           (assoc context :rels
                                      [(reduce j/hash-join (:rels context))])
            outer-rel          (single (:rels context1))
-           neg-rel            (or (resolve-not-join-prefix
+           neg-rel            (or (witness/resolve-existence
+                                    context outer-rel vars clauses -call-fn)
+                                  (resolve-not-join-prefix
                                     context1 outer-rel vars clauses)
                                   (resolve-not-join-negation
                                     context1 outer-rel vars clauses))]

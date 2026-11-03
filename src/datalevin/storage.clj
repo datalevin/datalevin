@@ -713,7 +713,16 @@
 
   (load-datoms [this datoms]
     (if (and (seq (:db/tupleAttrs rschema)) (seq datoms))
-      (load-datoms-with-tuples! this datoms)
+      (locking write-txn
+        (let [[result tx-store] (load-datoms-with-tuples! this datoms)]
+          (set! schema (datalevin.interface/schema tx-store))
+          (set! rschema (datalevin.interface/rschema tx-store))
+          (set! attrs (datalevin.interface/attrs tx-store))
+          (set! max-aid (datalevin.interface/max-aid tx-store))
+          (set! max-gt (datalevin.interface/max-gt tx-store))
+          (set! max-tx (datalevin.interface/max-tx tx-store))
+          (mark-state-current! this (observed-state-sync-ms tx-store))
+          result))
       (load-datoms-with-plan! this datoms (prepare-embedding-plan this datoms))))
 
   (fetch [_ datom]
@@ -2372,10 +2381,13 @@
   [^Store store datoms]
   (let [lmdb (.-lmdb store)
         run (fn [writer]
-              (let [datoms (tuples/prepare-bulk-datoms
-                             (transfer store writer) datoms)]
-                (load-datoms-with-plan!
-                  store datoms (prepare-embedding-plan store datoms))))]
+              (let [tx-store (transfer store writer)
+                    datoms (tuples/prepare-bulk-datoms tx-store datoms)]
+                (sync-giant-id! tx-store)
+                [(when (seq datoms)
+                   (load-datoms-with-plan!
+                     tx-store datoms (prepare-embedding-plan tx-store datoms)))
+                 tx-store]))]
     (locking (.-write-txn store)
       ;; Local bulk loads already own an outer transaction even when their
       ;; Store retains the ordinary read handle. Use its writer for tuple
