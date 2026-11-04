@@ -51,6 +51,7 @@
    [datalevin.query.optimizer.existence :as existence]
    [datalevin.query.plan :as qplan]
    [datalevin.query.resolve :as qresolve]
+   [datalevin.query.resolve.witness :as witness]
    [datalevin.relation :as r]
    [datalevin.rules :as rules]
    [datalevin.timeout :as timeout]
@@ -482,7 +483,8 @@
 
 (defn -q
   [context run?]
-  (binding [qu/*implicit-source* (get (:sources context) '$)]
+  (binding [qu/*implicit-source* (get (:sources context) '$)
+            witness/*explain* qplan/*explain*]
     (let [{:keys [result-set] :as context} (planning context)
           fused-plan (when (and (not= result-set #{})
                                 qagg/*unique-group-aggregation?*
@@ -1060,7 +1062,8 @@
 
 (defn- run-planned-context
   [{:keys [result-set sources] :as context}]
-  (binding [qu/*implicit-source* (get sources '$)]
+  (binding [qu/*implicit-source* (get sources '$)
+            witness/*explain* qplan/*explain*]
     (if (= result-set #{})
       context
       (let [context (execute-plan context)]

@@ -11,8 +11,10 @@
   "Elimination and materialization of redundant data patterns."
   (:refer-clojure :exclude [update])
   (:require
+   [clojure.set :as set]
    [datalevin.db :as db]
    [datalevin.inline :refer [update]]
+   [datalevin.join :as j]
    [datalevin.parser :as dp]
    [datalevin.query-util :as qu]
    [datalevin.query.plan :as qplan]
@@ -21,7 +23,7 @@
    [datalevin.util :as u])
   (:import
    [java.util List]
-   [datalevin.parser BindColl BindScalar BindTuple Constant FindScalar Function
+   [datalevin.parser BindColl BindScalar BindTuple Constant FindRel FindScalar Function
     Pattern Predicate Variable]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
@@ -91,6 +93,62 @@
        (= 2 (count (:args parsed)))
        (every? #(or (instance? Variable %) (instance? Constant %)) (:args parsed))
        (some #(= output (:symbol %)) (:args parsed))))
+
+(defn- independent-extremum-subquery
+  "Recognize a guarded min/max selection over an independent aggregate relation.
+  Evaluate the complete block before indexed enrichment, retaining every tie."
+  [context idx parsed clause]
+  (when (and (instance? Function parsed)
+             (= 'q (get-in parsed [:fn :symbol]))
+             (instance? BindScalar (:binding parsed)))
+    (let [outer (:parsed-q context)
+          forms (:qorig-where outer)
+          [[_ query & inputs] relation-var] clause]
+      (when (and (qu/binding-var? relation-var)
+                 (or (vector? query) (map? query))
+                 (<= (+ idx 5) (count forms))
+                 (every? #(if (qu/source? %)
+                            (contains? (:sources context) %)
+                            (and (not (symbol? %)) (not (list? %)))) inputs))
+        (let [[_ guard extreme expansion equality :as clauses]
+              (subvec (vec forms) idx (+ idx 5))]
+          (when (and (= guard [(list 'not-empty relation-var)])
+                     (qresolve/looks-like? '[(apply _ (map _ _)) _] extreme)
+                     (qresolve/looks-like? '[(identity _) [[*]]] expansion))
+            (let [[[_ operator [_ selector collection]] extreme-var] extreme
+                  bindings (first (second expansion))
+                  idxs (set (range idx (+ idx 5)))
+                  private-vars (set [relation-var extreme-var])
+                  outside (set/union
+                            (qresolve/bound-vars context)
+                            (set (dp/find-vars (:qfind outer)))
+                            (qu/collect-vars
+                              [(:qwith outer) (:qorder outer) (:qhaving outer)
+                               (u/remove-idxs idxs forms)]))]
+              (when (and (qu/binding-var? extreme-var)
+                         (#{'min 'max} operator)
+                         (= relation-var collection)
+                         (#{'first 'second 'last} selector)
+                         (vector? bindings) (every? qu/binding-var? bindings)
+                         (= expansion [(list 'identity relation-var) [bindings]])
+                         (= (+ 2 (count bindings))
+                            (count (set (concat [relation-var extreme-var] bindings))))
+                         (empty? (set/intersection private-vars outside)))
+                (let [inner (dp/parse-query query)
+                      elements (vec (dp/find-elements (:qfind inner)))
+                      position (case selector first 0 second 1 last (dec (count elements)))
+                      aggregate (get elements position)
+                      value-var (get bindings position)]
+                  (when (and (instance? FindRel (:qfind inner))
+                             (= (count elements) (count bindings))
+                             (dp/aggregate? aggregate)
+                             (#{'sum 'avg 'count 'count-distinct}
+                              (get-in aggregate [:fn :symbol]))
+                             (or (= equality [(list '= value-var extreme-var)])
+                                 (= equality [(list '= extreme-var value-var)]))
+                             (indexed-group-output? context elements bindings))
+                    {:idxs idxs :clauses clauses :parsed parsed :bindings bindings
+                     :relation-var relation-var :extremum operator}))))))))))
 
 (defn- independent-scalar-subquery?
   [context parsed clause]
@@ -173,7 +231,7 @@
 
 (defn materialize-independent-subqueries
   "Resolve independent aggregates before native planning. Grouped relations
-  seed indexed lookups; scalar results specialize comparisons into ranges.
+  and guarded extrema seed indexed lookups; scalar results specialize ranges.
   Correlated calls and plan-only explanations retain late-clause execution."
   [context]
   (cond
@@ -181,27 +239,41 @@
     (some r/rel-empty (:rels context)) (assoc context :result-set #{})
     :else
     (loop [context context]
-      (if-let [idx (when (not= #{} (:result-set context))
-                     (first
-                       (keep-indexed
-                         (fn [idx [parsed clause]]
-                           (when (or (independent-grouped-subquery?
-                                       context parsed clause)
-                                     (independent-scalar-subquery?
-                                       context parsed clause))
-                             idx))
-                         (map vector
-                              (get-in context [:parsed-q :qwhere])
-                              (get-in context [:parsed-q :qorig-where])))))]
-        (let [clause (nth (get-in context [:parsed-q :qorig-where]) idx)
-              parsed (nth (get-in context [:parsed-q :qwhere]) idx)
-              resolved (binding [qu/*implicit-source* (get (:sources context) '$)]
-                         (qresolve/resolve-clause (assoc context :rels []) clause))
-              rels (:rels resolved)
+      (if-let [{:keys [idxs clauses parsed bindings relation-var extremum]}
+               (when (not= #{} (:result-set context))
+                 (first
+                   (keep-indexed
+                     (fn [idx [parsed clause]]
+                       (if (or (independent-grouped-subquery? context parsed clause)
+                               (independent-scalar-subquery? context parsed clause))
+                         {:idxs #{idx} :clauses [clause] :parsed parsed}
+                         (independent-extremum-subquery context idx parsed clause)))
+                     (map vector
+                          (get-in context [:parsed-q :qwhere])
+                          (get-in context [:parsed-q :qorig-where])))))]
+        (let [clause (first clauses)
+              [produced resolved]
+              (binding [qu/*implicit-source* (get (:sources context) '$)]
+                (let [produced (qresolve/resolve-clause (assoc context :rels []) clause)]
+                  [produced (reduce qresolve/resolve-clause produced (next clauses))]))
+              rels (if bindings
+                     ;; Drop the aggregate collection and extremum scalar before
+                     ;; joining dimensions. Neither is visible outside the block.
+                     [(if (some r/rel-empty (:rels resolved))
+                        (r/relation! (zipmap bindings (range)) (FastList.))
+                        (r/project-distinct (reduce j/hash-join (:rels resolved)) bindings))]
+                     (:rels resolved))
               bound-rels (reduce qresolve/collapse-rels (:rels context) rels)
               rows (.size ^List (:tuples (first rels)))
-              stage {:clause clause :rows rows
-                     :vars (vec (keys (:attrs (first rels))))}]
+              stage (cond-> {:clause clause :rows rows
+                             :vars (vec (keys (:attrs (first rels))))}
+                      bindings
+                      (assoc :kind :aggregate-extremum :extremum extremum
+                             :clauses clauses
+                             :group-count
+                             (let [rel (first (:rels produced))]
+                               (count (aget ^objects (first (:tuples rel))
+                                            (int ((:attrs rel) relation-var)))))))]
           (when qplan/*explain*
             (vswap! qplan/*explain* update :pre-materialized-subqueries
                     (fnil conj []) stage))
@@ -209,10 +281,10 @@
             (cond-> (-> context
                         (assoc :rels bound-rels)
                         (update-in [:parsed-q :qwhere]
-                                   #(u/remove-idxs #{idx} %))
+                                   #(u/remove-idxs idxs %))
                         (update-in [:parsed-q :qorig-where]
-                                   #(u/remove-idxs #{idx} %))
-                        (specialize-scalar-comparisons parsed rels))
+                                   #(u/remove-idxs idxs %)))
+              (not bindings) (specialize-scalar-comparisons parsed rels)
               (some r/rel-empty bound-rels) (assoc :result-set #{}))))
         context))))
 

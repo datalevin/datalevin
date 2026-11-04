@@ -928,12 +928,16 @@
                                   negation-vars " is bound in " orig-clause
                                   {:error :query/where :form orig-clause}))
            context1      (assoc context :rels
-                                [(reduce j/hash-join (:rels context))])]
+                                [(reduce j/hash-join (:rels context))])
+           outer-rel     (single (:rels context1))
+           neg-rel       (or (witness/resolve-single-pattern
+                               context1 outer-rel
+                               (vec (set/intersection bound negation-vars))
+                               clauses)
+                             (reduce j/hash-join
+                                     (:rels (reduce resolve-clause context1 clauses))))]
        (assoc context1 :rels
-              [(j/subtract-rel
-                 (single (:rels context1))
-                 (reduce j/hash-join
-                         (:rels (reduce resolve-clause context1 clauses))))]))
+              [(j/subtract-rel outer-rel neg-rel)]))
 
      '[not-join [*] *]
      (let [[_ vars & clauses] clause

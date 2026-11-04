@@ -135,22 +135,16 @@
                   :qorder (when (:qorder parsed)
                             (mapv #(if (symbol? %) (positions %) %) (:qorder parsed))))))
 
-(defn finish!
-  "Shape already collected relational rows. Aggregated rows use synthetic find
-  variables; non-aggregate fragments retain the original find/with projection."
-  [runtime parsed columns collected aggregated?]
+(defn- shape-result!
+  "Process collected rows and charge and detach each public result. Staging
+  reservations belong to the caller that collected the rows."
+  [runtime query vars collected]
   (let [check! #(control/check-active! (:control runtime))
-        _ (retain! runtime (control/reserve! (:control runtime)
-                            {:retained-bytes (+ 8192 (* 512 (count columns))
-                                                (* (count collected) (+ 4096 (* 128 (count columns)))))}))
-        query (if aggregated? (result-query parsed columns) parsed)
-        vars (if aggregated? (mapv :variable columns)
-                 (into (vec (parser/find-vars (:qfind parsed))) (map :symbol) (:qwith parsed)))
         raw ((execute/result-processor query {:check! check!}) query {:result-set collected :terminal-collected-symbols vars})
         own! (fn [row]
                (check!) (retain! runtime (rt/charge-result! runtime row))
                (retain! runtime (rt/charge-copy! runtime row)) (value/owned-copy row check!))
-        find (:qfind parsed)]
+        find (:qfind query)]
     (check!)
     (cond
       (instance? FindScalar find) (when (seq collected) (first (own! [raw])))
@@ -158,6 +152,18 @@
       (instance? FindColl find) (mapv #(first (own! [%])) raw)
       (set? raw) (into (spill/new-spillable-set nil {:spill-threshold Long/MAX_VALUE}) (map own!) raw)
       :else (mapv own! raw))))
+
+(defn finish!
+  "Shape already collected relational rows. Aggregated rows use synthetic find
+  variables; non-aggregate fragments retain the original find/with projection."
+  [runtime parsed columns collected aggregated?]
+  (retain! runtime (control/reserve! (:control runtime)
+                     {:retained-bytes (+ 8192 (* 512 (count columns))
+                                         (* (count collected) (+ 4096 (* 128 (count columns)))))}))
+  (let [query (if aggregated? (result-query parsed columns) parsed)
+        vars (if aggregated? (mapv :variable columns)
+                 (into (vec (parser/find-vars (:qfind parsed))) (map :symbol) (:qwith parsed)))]
+    (shape-result! runtime query vars collected)))
 
 (defn run!
   "Consume an exact relational cursor, enforce batch/result quotas, and use
@@ -206,21 +212,8 @@
           (when (:diagnostics runtime)
             (diagnostics/metrics! runtime trace (rt/invoke runtime :metrics #(source/-cursor-metrics cursor))))
           (let [query (result-query parsed columns)
-                collected (if bounded ((:rows bounded)) collected)
-                raw ((execute/result-processor query {:check! check!})
-                     query {:result-set collected :terminal-collected-symbols vars})
-                own! (fn [row]
-                       (retain! runtime (rt/charge-result! runtime row))
-                       (retain! runtime (rt/charge-copy! runtime row))
-                       (value/owned-copy row check!))
-                find (:qfind parsed)]
-            (check!)
-            (cond
-              (instance? FindScalar find) (when (seq collected) (first (own! [raw])))
-              (instance? FindTuple find) (when (some? raw) (own! raw))
-              (instance? FindColl find) (mapv #(first (own! [%])) raw)
-              (set? raw) (into (spill/new-spillable-set nil {:spill-threshold Long/MAX_VALUE}) (map own!) raw)
-              :else (mapv own! raw)))))
+                collected (if bounded ((:rows bounded)) collected)]
+            (shape-result! runtime query vars collected))))
       (catch Throwable e (vreset! primary e) (throw e))
       (finally
         (try

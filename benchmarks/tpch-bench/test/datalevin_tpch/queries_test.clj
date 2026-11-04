@@ -129,7 +129,8 @@
         stock]])))
 
 (deftest q15-retains-all-maxima-and-handles-empty-revenue
-  (doseq [lines [[]
+  (doseq [native? [false true]
+          lines [[]
                 [[1 "1996-04-01" 100.0 0.0]]
                 [[1 "1996-01-01" 100.0 0.0] [1 "1996-01-01" 100.0 0.0]
                  [2 "1996-03-31" 200.0 0.0] [3 "1996-02-01" 150.0 0.0]
@@ -141,7 +142,7 @@
        ["lineitem" ["l_suppkey INTEGER" "l_shipdate TEXT"
                     "l_extendedprice REAL" "l_discount REAL"]
         [:lineitem/suppkey :lineitem/shipdate :lineitem/extendedprice :lineitem/discount]
-        lines]])))
+        lines]] native?)))
 
 (defn- q14-datoms [lines]
   (into [[1 :part/partkey 1] [1 :part/type "PROMO SMALL"]

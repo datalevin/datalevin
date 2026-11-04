@@ -1,7 +1,8 @@
 (ns ^:no-doc datalevin.query.resolve.witness
-  "Bounded grouped reads for flat, single-entity existence bodies."
+  "Bounded index probes and grouped reads for single-entity existence bodies."
   (:require [clojure.set :as set]
             [datalevin.db :as db]
+            [datalevin.interface :as i]
             [datalevin.lmdb :as lmdb]
             [datalevin.query.optimizer.existence :as existence]
             [datalevin.query-util :as qu]
@@ -17,6 +18,65 @@
 (def ^:dynamic *enabled?* true)
 (def ^:dynamic *explain* nil)
 (def ^:private ^:const ^long batch-size 256)
+
+(defn- native-read?
+  [context database]
+  (and (db/db? database)
+       (instance? Store (:store database))
+       (not (lmdb/writing? (.-lmdb ^Store (:store database))))
+       (not (db/pending-tx-cache? database))
+       (nil? (:delta-bound-values context))))
+
+(defn resolve-single-pattern
+  "Match distinct correlation keys with one bounded index probe per key.
+  Admit one bound entity or value and a local witness; leave equality between
+  pattern positions, lookup refs and unsupported value domains to the resolver."
+  [context outer vars clauses]
+  (when (and *enabled?* (= 1 (count clauses)) (= 1 (count vars)))
+    (let [clause   (first clauses)
+          sourced? (and (vector? clause) (qu/source? (first clause)))
+          database (if sourced? (get (:sources context) (first clause))
+                       qu/*implicit-source*)
+          pattern  (if sourced? (subvec clause 1) clause)
+          key-var  (first vars)]
+      (when (and (vector? pattern) (= 3 (count pattern))
+                 (keyword? (second pattern)) (native-read? context database))
+        (let [[entity attr value] pattern
+              props (get (db/-schema database) attr)
+              local? #(or (and (qu/binding-var? %) (not= key-var %))
+                          (= '_ %) (qu/placeholder? %))
+              index (when (:db/aid props)
+                      (cond
+                        (and (= entity key-var) (local? value)) :eav
+                        (and (= value key-var) (local? entity)
+                             (not (:db/noindex props))
+                             (#{:db.type/long :db.type/ref :db.type/string}
+                              (:db/valueType props))) :ave))]
+          (when index
+            (let [keys (r/project-distinct outer vars)
+                  ^List tuples (:tuples keys)
+                  key-idx (int ((:attrs keys) key-var))
+                  valid? (if (= :eav index)
+                           #(and (int? %) (not (neg? (long %))))
+                           (if (= :db.type/string (:db/valueType props))
+                             string? int?))]
+              ;; Check the entire domain before taking the specialized path.
+              (when (every? #(valid? (aget ^objects % key-idx)) tuples)
+                (let [matches (FastList.)
+                      store (:store database)]
+                  (doseq [^objects tuple tuples]
+                    (timeout/assert-time-left)
+                    (let [key (aget tuple key-idx)]
+                      (when (if (= :eav index)
+                              (db/-ea-populated? database key attr)
+                              (some? (i/av-first-e store attr key)))
+                        (.add matches tuple))))
+                  (when *explain*
+                    (vswap! *explain* update :existence-witness-plans (fnil conj [])
+                            {:strategy :index-presence :index index :attribute attr
+                             :correlation-vars vars :input-keys (.size tuples)
+                             :probes (.size tuples) :matched-keys (.size matches)}))
+                  (r/relation! (:attrs keys) matches))))))))))
 
 (defn- pattern? [clause]
   (and (vector? clause) (= 3 (count clause))
@@ -220,10 +280,8 @@
   relations. Unsupported bodies and transactional overlays use the resolver."
   [context outer vars clauses compile-predicate]
   (let [database qu/*implicit-source*]
-    (when (and *enabled?* (db/db? database)
-               (instance? Store (:store database))
-               (not (lmdb/writing? (.-lmdb ^Store (:store database))))
-               (not (db/pending-tx-cache? database))
-               (nil? (:delta-bound-values context)))
-      (when-let [shape (shape database vars clauses)]
-        (execute database outer vars (prepare shape vars compile-predicate context))))))
+    (or (resolve-single-pattern context outer vars clauses)
+        (when (and *enabled?* (native-read? context database))
+          (when-let [shape (shape database vars clauses)]
+            (execute database outer vars
+                     (prepare shape vars compile-predicate context)))))))

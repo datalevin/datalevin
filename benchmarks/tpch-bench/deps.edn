@@ -2,6 +2,7 @@
  :deps  {
          datalevin-bench/host                          {:local/root "../host-control"}
          datalevin/datalevin                           {:local/root "../.."}
+         org.clojure/clojure                           {:mvn/version "1.12.6"}
          org.xerial/sqlite-jdbc                        {:mvn/version "3.51.1.0"}
          org.postgresql/postgresql                     {:mvn/version "42.7.5"}
          }

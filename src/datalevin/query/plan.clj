@@ -572,17 +572,20 @@
   IStep
   (-type [_] :semi-join)
 
-  (-execute [_ db src]
-    (index-semi-join-execute db in-cols join-steps src))
+  (-execute [this db src]
+    (index-semi-join-execute db (or (:key-indices this) (range (count in-cols)))
+                           join-steps src))
 
-  (-execute-pipe [_ db src sink]
+  (-execute-pipe [this db src sink]
     (let [input (FastList.)]
       (when src
         (loop []
           (when-let [tuple (p/produce src)]
             (.add input tuple)
             (recur))))
-      (index-semi-join-execute-into db in-cols join-steps input sink)))
+      (index-semi-join-execute-into
+        db (or (:key-indices this) (range (count in-cols)))
+        join-steps input sink)))
 
   (-explain [_ _]
     "Semi-join by indexed link scan."))
@@ -1102,47 +1105,69 @@
   [db]
   (l/writing? (.-lmdb ^Store (.-store ^DB db))))
 
-(defn- prefix-set-sink
-  [^long width]
-  (let [^QueryKey$KeyAccumulator keys (QueryKey$KeyAccumulator.)
+(defn- key-set-sink
+  [indices]
+  (let [indices (int-array indices)
+        width (alength indices)
+        ^QueryKey$KeyAccumulator keys (QueryKey$KeyAccumulator.)
         ^objects scratch (when (< 1 width) (object-array width))
         lookup (when scratch (r/array-lookup))
-        add-prefix!
+        add-key!
         (if (= width 1)
-          (fn [^objects tuple]
-            (.add keys (aget tuple 0)))
+          (let [index (aget indices 0)]
+            (fn [^objects tuple]
+              (.add keys (aget tuple index))))
           (fn [^objects tuple]
             (dotimes [i width]
-              (aset scratch i (aget tuple i)))
+              (aset scratch i (aget tuple (aget indices i))))
             (r/reset-array-lookup! lookup scratch)
             (if (.contains keys lookup)
               false
               (.add keys (r/wrap-array (aclone scratch))))))
-        contains-prefix?
+        contains-key?
         (if (= width 1)
-          (fn [^objects tuple]
-            (.contains keys (aget tuple 0)))
+          (let [index (aget indices 0)]
+            (fn [^objects tuple]
+              (.contains keys (aget tuple index))))
           (fn [^objects tuple]
             (dotimes [i width]
-              (aset scratch i (aget tuple i)))
+              (aset scratch i (aget tuple (aget indices i))))
             (r/reset-array-lookup! lookup scratch)
             (.contains keys lookup)))
         sink
         (proxy [AbstractCollection] []
           (iterator [] (.iterator (Collections/emptyList)))
           (size [] (.size keys))
-          (add [tuple] (boolean (add-prefix! tuple))))]
-    [sink contains-prefix?]))
+          (add [tuple] (boolean (add-key! tuple))))]
+    [sink contains-key?]))
 
 (defn- execute-join-steps-into
   [db join-steps ^List tuples sink]
-  (let [join-steps (vec join-steps)]
+  (let [filters (take-while #(= :tuple-predicate (-type %)) (rseq (vec join-steps)))
+        predicates (mapv (fn [{:keys [clause cols]}]
+                           (let [[[f & args]] clause]
+                             (qresolve/-call-fn
+                               {} (r/relation! (cols->attrs cols) nil) f args)))
+                         (reverse filters))
+        pred (when (seq predicates)
+               (if (= 1 (count predicates))
+                 (first predicates)
+                 (apply every-pred predicates)))
+        sink (if (seq predicates)
+               (proxy [AbstractCollection] []
+                 (iterator [] (.iterator (Collections/emptyList)))
+                 (size [] (.size ^Collection sink))
+                 (add [tuple]
+                   (boolean (and (pred tuple)
+                                 (.add ^Collection sink tuple)))))
+               sink)
+        join-steps (subvec (vec join-steps) 0 (- (count join-steps) (count filters)))]
     (case (count join-steps)
       1
       (step-execute-pipe (first join-steps) db (p/list-tuple-pipe tuples) sink)
 
       2
-      (if (writing? db)
+      (if (or (writing? db) (not storage/*parallel-list-scan?*))
         (let [middle (step-execute (first join-steps) db tuples)]
           (step-execute-pipe (peek join-steps) db
                              (p/list-tuple-pipe middle) sink))
@@ -1167,20 +1192,20 @@
                {:step-count (count join-steps)}))))
 
 (defn index-semi-join-execute-into
-  [db in-cols join-steps tuples sink]
+  [db key-indices join-steps tuples sink]
   (when (and tuples (pos? (.size ^List tuples)))
-    (let [[prefix-sink contains-prefix?] (prefix-set-sink (count in-cols))]
-      (execute-join-steps-into db join-steps tuples prefix-sink)
+    (let [[key-sink contains-key?] (key-set-sink key-indices)]
+      (execute-join-steps-into db join-steps tuples key-sink)
       (dotimes [i (.size ^List tuples)]
         (let [tuple (.get ^List tuples i)]
-          (when (contains-prefix? tuple)
+          (when (contains-key? tuple)
             (.add ^Collection sink tuple))))))
   sink)
 
 (defn index-semi-join-execute
-  [db in-cols join-steps tuples]
+  [db key-indices join-steps tuples]
   (index-semi-join-execute-into
-    db in-cols join-steps tuples
+    db key-indices join-steps tuples
     (FastList. (int (if tuples (.size ^List tuples) 0)))))
 
 (defn- run-pipeline-into
@@ -1298,12 +1323,21 @@
     ;; Each execution compiles its own callable and argument scratch space.
     ;; The planner admits only pure comparisons into TuplePredicateStep.
     :tuple-predicate true
+    :semi-join (every? partition-safe-step? (:join-steps step))
     :merge
     (and (nil? (:result step))
          (every? (fn [[_ opts]]
                    (qpred/forkable-predicate? (:pred opts)))
                  (:attrs-v step)))
     false))
+
+(defn- partition-step-count
+  ^long [steps]
+  (reduce (fn [^long n step]
+            (+ n (if (= :semi-join (-type step))
+                   (partition-step-count (:join-steps step))
+                   1)))
+          0 steps))
 
 (defn- next-partition-segment
   [steps start]
@@ -1318,7 +1352,7 @@
                                  (partition-safe-step? (nth steps end)))
                           (recur (u/long-inc end))
                           end)))]
-            (if (<= minimum (- end idx))
+            (if (<= minimum (partition-step-count (subvec steps idx end)))
               [idx end]
               (recur (long end))))
           (recur (u/long-inc idx)))))))
@@ -1332,7 +1366,6 @@
          (pos? (long c/query-partition-target-size))
          (pos? (long c/query-partition-min-input-size))
          (pos? minimum)
-         (<= (inc minimum) (count steps))
          (identical? :init (-type (first steps)))
          (some? (next-partition-segment steps 1)))))
 
@@ -1447,7 +1480,8 @@
           :else
           (let [tuple-count  (.size tuples)
                 participants
-                (if (>= remaining (long c/query-partition-min-step-count))
+                (if (>= (partition-step-count (subvec steps idx segment-end))
+                        (long c/query-partition-min-step-count))
                   (partition-participant-count tuple-count)
                   1)]
             (if (< 1 participants)

@@ -349,12 +349,12 @@ plots query latency for all 113 queries in the benchmark.
 <img src="benchmarks/JOB-bench/job_benchmark_log_bars.svg" alt="JOB benchmark" height="300"></img>
 </p>
 
-In the current second-pass snapshot, Datalevin completed the 113 queries in
-38.1 seconds. PostgreSQL's retained 128.2-second total is 3.37X Datalevin's,
-while SQLite's 281.8-second completed-query subtotal is 7.40X Datalevin's, with
-another nine queries reaching the one-minute timeout. The gain is mainly due to
-shorter query execution time as Datalevin's query optimizer generates better
-plans.
+In the November 3, 2026 second-pass snapshot, Datalevin completed the 113 queries
+in 33.0 seconds, including planning. PostgreSQL's retained 128.2-second total is
+3.89X Datalevin's, while SQLite's 281.8-second completed-query subtotal is 8.55X
+Datalevin's, with another nine queries reaching the one-minute timeout. The
+PostgreSQL and SQLite measurements are from August 23, 2026; the benchmark
+README records the dates, procedure, and raw timings for each system.
 
 #### Graph
 
