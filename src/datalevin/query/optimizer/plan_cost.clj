@@ -144,14 +144,18 @@
                    (double (dec n))))))))
 
 (defn estimate-scan-v-cost
-  [{:keys [attrs-v vars cost-attrs-v cost-var-count]} ^long size]
-  (let [cost-attrs-v (or cost-attrs-v attrs-v)
-        var-count    (long (or cost-var-count (count vars)))]
+  "Price a materialized scan or its column/predicate counts during join search."
+  ([{:keys [attrs-v vars cost-attrs-v cost-var-count]} size]
+   (let [cost-attrs-v (or cost-attrs-v attrs-v)]
+     (estimate-scan-v-cost size (long (or cost-var-count (count vars)))
+                           (n-costly-preds cost-attrs-v)
+                           (n-items cost-attrs-v :fidx))))
+  ([^long size ^long var-count ^long pred-count ^long fidx-count]
     (* size
        ^double c/magic-cost-merge-scan-v
        ^long (fused-var-factor var-count)
-       ^long (factor c/magic-cost-pred (n-costly-preds cost-attrs-v))
-       ^long (factor c/magic-cost-fidx (n-items cost-attrs-v :fidx)))))
+       ^long (factor c/magic-cost-pred pred-count)
+       ^long (factor c/magic-cost-fidx fidx-count))))
 
 (defn estimate-base-cost
   [{:keys [mcount]} steps]

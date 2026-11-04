@@ -666,6 +666,53 @@
   (when (set? col)
     (some #(when (keyword? %) %) col)))
 
+(defn- merge-scan-cost
+  "Count the work of merge-scan-step without building its predicates, sorted
+  columns or operator. Elided EAV checks still contribute to the existing cost
+  model, and predicate-only variables still contribute to its logical width."
+  [input-cols new-steps size]
+  (let [[init merge] new-steps
+        [_ first-var] (:vars init)
+        columns (:cols (peek new-steps))
+        initial-pred? (or (:pred init) (some identity (:range init))
+                          (some? (:val init)))
+        initial? (or initial-pred? (nil? first-var))
+        attrs-v (:attrs-v merge)]
+    (loop [columns (next columns)
+           vars (long (if (and initial? first-var
+                                (some? (find-index first-var
+                                                  (:cols (peek new-steps))))) 1 0))
+           preds (long (if (and initial-pred?
+                                 (or (some? (:val init))
+                                     (not (simple-range-pred? init)))) 1 0))
+           fidxs (long 0)]
+      (if-let [col (first columns)]
+        (let [v (col-var col)]
+          (if (and initial-pred? (= v first-var))
+            (recur (next columns) vars preds fidxs)
+            (let [a (col-attr col)
+                  options (or (some (fn [[attr options]]
+                                      (when (and (= a attr) (:pred options))
+                                        options)) attrs-v)
+                              (some (fn [[attr options]]
+                                      (when (= a attr) options)) attrs-v))
+                  bound? (some? (find-index v input-cols))]
+              (recur (next columns)
+                     (if bound? vars (inc vars))
+                     (if (and (:pred options) (not (:range-pred? options)))
+                       (inc preds) preds)
+                     (if bound? (inc fidxs) fidxs)))))
+        (estimate-scan-v-cost (long size) vars preds fidxs)))))
+
+(defn- join-output-width
+  "Count merge-join-cols' output without constructing merged column sets."
+  [input-cols target-cols]
+  (let [^HashSet input-vars (HashSet.)]
+    (doseq [col input-cols] (.add input-vars (col-var col)))
+    (reduce (fn [^long n col]
+              (if (.contains input-vars (col-var col)) n (inc n)))
+            (long (count input-cols)) target-cols)))
+
 (defn- extra-join-cols
   [link-e link prev-plan new-base-plan]
   (let [in-cols     (:cols (peek (:steps prev-plan)))
@@ -988,6 +1035,27 @@
                result-size
                (- ^long (find-index link-e (:strata last-step))))))
 
+(defn- indexed-join-cost
+  "Price the indexed extension before allocating its link and merge steps."
+  [prev-plan link new-base-plan e-size]
+  (let [steps (:steps new-base-plan)
+        input-cols (:cols (peek (:steps prev-plan)))
+        size (:size prev-plan)
+        work
+        (if (= :ref (:type link))
+          (if (seq steps) (long (merge-scan-cost input-cols steps size)) 0)
+          (+ (long (estimate-link-cost size e-size))
+             (if (< 1 (count steps))
+               (let [target (:tgt link)
+                     cols (cond-> input-cols
+                            (nil? (find-index target input-cols)) (conj target))]
+                 (long (merge-scan-cost cols steps e-size)))
+               0)))]
+    (+ (long (:cost prev-plan)) work)))
+
+(defrecord ^:private JoinChoice
+    [cost size recency kind link index base e-size result-size])
+
 (defn- attribute-group-plan
   [{:keys [steps cost size recency]} new-key
    {:keys [id owner role clauses selectivity]}]
@@ -1084,23 +1152,39 @@
             [e-size result-size]
             (estimate-join-size db sources rules link-e link ratios build-cache
                                 prev-plan index new-base)
-            link-plan  (e-plan db prev-plan index link-e link new-key
-                               new-base e-size result-size)
-            regular    (if (and (#{:_ref :val-eq} link-type)
-                                new-base
-                                (<= ^long c/hash-join-min-input-size
-                                    ^long (:size prev-plan)))
-                         (compare-plans
-                           link-plan
-                           (hash-join-plan db prev-plan link-e link new-key
-                                           new-base result-size))
-                         link-plan)
-            index-semi (when semi-join?
-                         (index-semi-join-plan
-                           db prev-plan link-e link new-key new-base e-size
-                           result-size))]
-        (reduce compare-plans regular
-                (cond-> [] index-semi (conj index-semi)))))))
+            indexed-cost (indexed-join-cost prev-plan link new-base e-size)
+            hash-cost (when (and (#{:_ref :val-eq} link-type) new-base
+                                  (<= ^long c/hash-join-min-input-size
+                                      ^long (:size prev-plan)))
+                        (+ (long (:cost prev-plan))
+                           (long (or (:cost new-base) 0))
+                           (long (estimate-hash-join-cost
+                                   (or (:size prev-plan) 0)
+                                   (or (:size new-base) 0) result-size
+                                   (join-output-width
+                                     (:cols last-step)
+                                     (:cols (peek (:steps new-base))))))))
+            hash? (and hash-cost (< (long hash-cost) (long indexed-cost)))
+            semi? (and semi-join? (< (long (:size prev-plan)) (long result-size)))]
+        ;; Equal-cost regular joins keep the indexed path. An eligible semi
+        ;; join has that same cost and a smaller size, so it wins the same tie.
+        (->JoinChoice (if hash? hash-cost indexed-cost)
+                      (if (and semi? (not hash?)) (:size prev-plan) result-size)
+                      (- ^long (find-index link-e (:strata last-step)))
+                      (cond hash? :hash semi? :semi :else :indexed)
+                      link index new-base e-size result-size)))))
+
+(defn- materialize-join-choice
+  [db prev-plan link-e new-key choice]
+  (if (instance? JoinChoice choice)
+    (let [{:keys [kind link index base e-size result-size]} choice]
+      (case kind
+        :hash (hash-join-plan db prev-plan link-e link new-key base result-size)
+        :semi (index-semi-join-plan db prev-plan link-e link new-key base
+                                    e-size result-size)
+        :indexed (e-plan db prev-plan index link-e link new-key base e-size
+                         result-size)))
+    choice))
 
 (defn- binary-plan
   [db sources rules nodes incoming-link-counts required-vars base-plans ratios
@@ -1174,7 +1258,13 @@
                                (identical?
                                  new-plan
                                  (compare-plans cur-plan new-plan))))
-                    (assoc! plans plan-key new-plan)
+                    (assoc! plans plan-key
+                            (materialize-join-choice
+                              db prev-plan link-e
+                              (if node-ids
+                                (conj (:out (peek (:steps prev-plan))) new-e)
+                                plan-key)
+                              new-plan))
                     plans))
                 plans))
             plans pairs)))
