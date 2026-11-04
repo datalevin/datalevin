@@ -798,9 +798,16 @@
       (when useful? bitmap))))
 
 (defn find-index
+  "Return the first column matching an attribute or variable, including aliases."
   [a-or-v cols]
   (when a-or-v
-    (u/index-of (fn [x] (if (set? x) (x a-or-v) (= x a-or-v))) cols)))
+    (let [n (count cols)]
+      (loop [i 0]
+        (when (< i n)
+          (let [col (nth cols i)]
+            (if (if (set? col) (contains? col a-or-v) (= col a-or-v))
+              i
+              (recur (inc i)))))))))
 
 (defn batched-hash-target
   "Admit only native, unfiltered initializations with a bound integer key.

@@ -97,7 +97,7 @@
 (defn- independent-extremum-subquery
   "Recognize a guarded min/max selection over an independent aggregate relation.
   Evaluate the complete block before indexed enrichment, retaining every tie."
-  [context idx parsed clause]
+  [context ^long idx parsed clause]
   (when (and (instance? Function parsed)
              (= 'q (get-in parsed [:fn :symbol]))
              (instance? BindScalar (:binding parsed)))

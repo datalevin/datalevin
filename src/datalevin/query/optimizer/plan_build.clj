@@ -1154,16 +1154,21 @@
                 (let [plan-key  (if node-ids
                                   (.append ^DPKey prev-key (int new-id))
                                   (conj prev-key new-e))
-                      new-key   (if node-ids
-                                  (conj (:out (peek (:steps prev-plan))) new-e)
-                                  plan-key)
                       cur-plan  (plans plan-key)
                       new-plan
-                      (if-let [group (get groups new-e)]
-                        (attribute-group-plan prev-plan new-key group)
-                        (binary-plan db sources rules nodes incoming-link-counts
-                                     required-vars base-plans ratios build-cache
-                                     prev-plan link-e new-e new-key))]
+                      ;; Extensions add nonnegative cost. Keep equal-cost
+                      ;; prefixes: a zero-cost extension can win on size.
+                      (when (or (nil? cur-plan)
+                                (<= (long (:cost prev-plan))
+                                    (long (:cost cur-plan))))
+                        (let [new-key (if node-ids
+                                        (conj (:out (peek (:steps prev-plan))) new-e)
+                                        plan-key)]
+                          (if-let [group (get groups new-e)]
+                            (attribute-group-plan prev-plan new-key group)
+                            (binary-plan db sources rules nodes incoming-link-counts
+                                         required-vars base-plans ratios build-cache
+                                         prev-plan link-e new-e new-key))))]
                   (if (and new-plan
                            (or (nil? cur-plan)
                                (identical?
@@ -1638,7 +1643,7 @@
 (defn- filter-before-projection
   "Move an adjacent scalar range scan before same-entity payload retrieval.
   Retain its value and remap later operators, so neither attribute is reread."
-  [db trace idx]
+  [db trace ^long idx]
   (let [previous    (nth trace (dec idx))
         current     (nth trace idx)
         before      (:steps previous)
