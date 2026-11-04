@@ -5,9 +5,7 @@
    [datalevin.util :as u]
    [datalevin-tpcc.check :as check]
    [datalevin-tpcc.datalevin :as bench]
-   [datalevin-tpcc.txns :as t])
-  (:import
-   [java.lang.management ManagementFactory ThreadInfo]))
+   [datalevin-tpcc.txns :as t]))
 
 (def ^:dynamic *test-dir* nil)
 
@@ -59,38 +57,26 @@
   (get (d/entity (d/db conn) eid) attr))
 
 (defn- concurrently
-  "Hold the connection until every worker reaches its transaction boundary.
-  In the old implementation both workers have already read the shared totals
-  at this point. In the fixed implementation they wait before those reads."
+  "Hold a real write transaction while all workers start, then release it.
+  This exercises the native WAL owner as well as the non-WAL writer path."
   [conn jobs]
-  (let [threads (mapv (fn [_] (promise)) jobs)
-        bean (ManagementFactory/getThreadMXBean)
-        futures
-        (locking conn
-          (let [fs (mapv (fn [job thread]
-                           (future
-                             (deliver thread (Thread/currentThread))
-                             (job)))
-                         jobs threads)
-                deadline (+ (System/nanoTime) 10000000000)]
-            (is
-             (loop []
-               (if (every?
-                    (fn [thread]
-                      (when (realized? thread)
-                        (let [^ThreadInfo info (.getThreadInfo bean (.getId ^Thread @thread))]
-                          (and info
-                               (= Thread$State/BLOCKED (.getThreadState info))
-                               (= (System/identityHashCode conn)
-                                  (some-> info .getLockInfo .getIdentityHashCode))))))
-                    threads)
-                 true
-                 (when (< (System/nanoTime) deadline)
-                   (Thread/sleep 1)
-                   (recur))))
-             "all workers reached the connection's transaction boundary")
-            fs))]
-    (mapv deref futures)))
+  (let [held (promise)
+        release (promise)
+        owner (future (d/with-transaction [_tx conn]
+                        (deliver held true)
+                        @release))]
+    (try
+      (is (deref held 5000 false) "the writer transaction is open")
+      (let [started (mapv (fn [_] (promise)) jobs)
+            workers (mapv (fn [job signal]
+                            (future (deliver signal true) (job))) jobs started)]
+        (is (every? #(deref % 5000 false) started) "every worker has started")
+        (is (every? #(= ::waiting (deref % 20 ::waiting)) workers)
+            "workers cannot finish while the writer transaction is held")
+        (deliver release true)
+        @owner
+        (mapv deref workers))
+      (finally (deliver release true) @owner))))
 
 (defn- payment [district customer]
   {:w 1 :d district :c customer :amount 5.0 :by-name? false})
@@ -104,8 +90,8 @@
 
 (deftest concurrent-payments-preserve-accounting
   (doseq [kv-opts [{:wal? false}
-                  {:wal? true :wal-durability-profile :strict}
-                  {:wal? true :wal-durability-profile :relaxed}]
+                   {:wal? true :wal-durability-profile :strict}
+                   {:wal? true :wal-durability-profile :relaxed}]
           inputs [[(payment 1 1) (payment 1 2)]
                   [(payment 1 1) (payment 2 2)]
                   [(payment 1 1) (payment 1 1)]]]
@@ -131,7 +117,7 @@
     (fn [conn]
       (let [before (check/payment-state conn)
             result (t/payment! conn (assoc (payment 1 1)
-                                          :by-name? true :last-name "CUSTOMER2"))]
+                                           :by-name? true :last-name "CUSTOMER2"))]
         (is (= 2 (:c result)))
         (is (= -15.0 (value conn (customer-eid 1 2) :customer/balance)))
         (is (= -10.0 (value conn (customer-eid 1 1) :customer/balance)))
@@ -150,7 +136,7 @@
       (t/new-order! conn order-input)
       (let [before (check/payment-state conn)
             [pay delivery] (concurrently conn [#(t/payment! conn (payment 1 1))
-                                                #(t/delivery! conn {:w 1 :carrier 1})])]
+                                               #(t/delivery! conn {:w 1 :carrier 1})])]
         (is (= :ok (:status pay)))
         (is (= 1 (:delivered delivery)))
         (is (= -11.0 (value conn (customer-eid 1 1) :customer/balance)))
@@ -176,6 +162,30 @@
         (is (= -2.0 (value conn (customer-eid 1 1) :customer/balance)))
         (is (= 2 (value conn (customer-eid 1 1) :customer/delivery-cnt)))))))
 
+(deftest concurrent-invalid-orders-do-not-abort-peers
+  (doseq [profile [:strict :relaxed]]
+    (with-db {:wal? true :wal-durability-profile profile}
+      (fn [conn]
+        (t/new-order! conn order-input)
+        (let [before (check/payment-state conn)
+              invalid (update order-input :ol conj {:i-id 100001 :supply-w 1 :qty 1})
+              [pay1 bad pay2 good delivered]
+              (concurrently conn [#(t/payment! conn (payment 1 1))
+                                  #(t/new-order! conn invalid)
+                                  #(t/payment! conn (payment 1 2))
+                                  #(t/new-order! conn order-input)
+                                  #(t/delivery! conn {:w 1 :carrier 1})])]
+          (is (= [:ok :invalid-item :ok :ok :ok]
+                 (mapv :status [pay1 bad pay2 good delivered])))
+          (is (= 1 (:delivered delivered)))
+          (is (= 3003 (t/district-next-o-id conn 1 1)))
+          (is (= 2 (t/order-count conn 1 1)))
+          (is (= 1 (t/new-order-count conn 1 1)))
+          (is (= 96 (value conn 3 :stock/quantity)))
+          (is (= 2 (value conn 3 :stock/order-cnt)))
+          (is (empty? (check/payment-errors before (check/payment-state conn)
+                                            (committed-payments [pay1 pay2])))))))))
+
 (deftest failed-payment-rolls-back-and-propagates
   (with-db {}
     (fn [conn]
@@ -186,7 +196,7 @@
                      (swap! calls inc)
                      (throw (ex-info "injected transaction failure" {}))))
         (is (thrown-with-msg? clojure.lang.ExceptionInfo #"injected transaction failure"
-                             (t/payment! conn (payment 1 1))))
+                              (t/payment! conn (payment 1 1))))
         (d/unlisten! conn :fail-payment)
         (is (= 1 @calls) "transaction errors are not swallowed and retried")
         (is (= before (check/payment-state conn)))
@@ -231,7 +241,24 @@
                 (range 2981 3001))
         [{:db/id 300001 :order-line/o-id 2980 :order-line/d-id 1
           :order-line/w-id 1 :order-line/i-id 3 :order-line/number 1}]))
-      (is (= 1 (:low-stock (t/stock-level! conn {:w 1 :d 1 :threshold 200})))))))
+      (is (= 1 (:low-stock (t/stock-level! conn {:w 1 :d 1 :threshold 200}))))
+      ;; The upper boundary and neighboring districts/warehouses must not add
+      ;; item 3. Remote supply still checks the home warehouse's stock.
+      (d/transact!
+       conn
+       [{:stock/w-id 2 :stock/i-id 2 :stock/quantity 1}
+        {:order-line/o-id 3001 :order-line/d-id 1 :order-line/w-id 1
+         :order-line/i-id 3 :order-line/number 1}
+        {:order-line/o-id 2981 :order-line/d-id 2 :order-line/w-id 1
+         :order-line/i-id 3 :order-line/number 1}
+        {:order-line/o-id 2981 :order-line/d-id 1 :order-line/w-id 2
+         :order-line/i-id 3 :order-line/number 1}
+        [:db/add [:order-line/key [1 1 2981 2]] :order-line/supply-w-id 2]])
+      (doseq [[district threshold expected] [[1 100 0] [1 101 1] [1 301 2]
+                                             [3 200 0] [99 200 0]]]
+        (is (= expected (:low-stock (t/stock-level! conn {:w 1 :d district :threshold threshold})))))
+      (d/transact! conn [[:db/add 3 :stock/quantity 5]])
+      (is (= 1 (:low-stock (t/stock-level! conn {:w 1 :d 1 :threshold 10})))))))
 
 (deftest order-status-selects-latest-order
   (with-db {}
@@ -285,3 +312,32 @@
                           [:type :status :lines])))
       (is (= :no-order
              (:status (t/order-status! conn {:w 1 :d 1 :c 1 :by-name? false})))))))
+
+(deftest remote-payments-check-home-and-customer-accounting-separately
+  (with-db {}
+    (fn [conn]
+      (let [customer (d/pull (d/db conn) '[*] (customer-eid 1 1))]
+        (d/transact! conn [(-> customer
+                               (dissoc :customer/key :customer/name-key)
+                               (assoc :db/id 500 :customer/w-id 2 :customer/d-id 3))]))
+      (let [before (check/payment-state conn)
+            input {:w 1 :d 4 :c-w 2 :c-d 3 :c 1 :amount 5.0}
+            results [(t/payment! conn input)
+                     (t/payment! conn (assoc input :by-name? true :last-name "CUSTOMER1"))]
+            after (check/payment-state conn)]
+        (is (= [:ok :ok] (mapv :status results)))
+        (is (= -20.0 (value conn 500 :customer/balance)))
+        (is (= -10.0 (value conn (customer-eid 1 1) :customer/balance)))
+        (is (= #{[1 4 2 3 1]}
+               (d/q '[:find ?w ?d ?cw ?cd ?c
+                      :where [?h :history/amount 5.0]
+                      [?h :history/w-id ?w] [?h :history/d-id ?d]
+                      [?h :history/c-w-id ?cw] [?h :history/c-d-id ?cd]
+                      [?h :history/c-id ?c]] (d/db conn))))
+        (is (empty? (check/payment-errors before after
+                                          {[1 4] {:amount 10.0 :count 2}}
+                                          {[2 3] {:amount 10.0 :count 2}})))
+        (is (= #{:customer-ytd-payment :customer-payment-cnt}
+               (set (map :invariant
+                         (check/payment-errors before after
+                                               {[1 4] {:amount 10.0 :count 2}})))))))))

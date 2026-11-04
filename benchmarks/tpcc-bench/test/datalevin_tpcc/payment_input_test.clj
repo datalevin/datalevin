@@ -44,3 +44,24 @@
           (is (<= 5800 (count (filter :by-name? inputs)) 6200)
               "about 60% of Payments use the surname index")
           (is (every? #(= (:by-name? %) (some? (:last-name %))) inputs)))))))
+
+(deftest remote-payment-and-terminal-locations
+  (doseq [generate drivers
+          warehouses [1 3]]
+    (let [r (Random. 42)
+          opts (g/terminal-options {:warehouses warehouses :c-cust 127 :c-last 37} 4)
+          inputs (vec (repeatedly 10000 #(generate r opts :payment)))
+          remote (filter #(not= (:w %) (:c-w %)) inputs)]
+      (is (every? #(= (:home-w opts) (:w %)) inputs))
+      (is (every? #(and (<= 1 (:c-w %) warehouses) (<= 1 (:c-d %) 10)) inputs))
+      (is (every? #(= (:d %) (:c-d %)) (remove (set remote) inputs)))
+      (if (= warehouses 1)
+        (is (empty? remote))
+        (is (<= 1350 (count remote) 1650)))
+      (is (= #{[(:home-w opts) (:home-d opts)]}
+             (set (repeatedly 100 #(let [input (generate r opts :stock-level)]
+                                     [(:w input) (:d input)])))))
+      (is (= (* warehouses 10)
+             (count (set (map #(select-keys (g/terminal-options {:warehouses warehouses} %)
+                                            [:home-w :home-d])
+                              (range (* warehouses 10))))))))))

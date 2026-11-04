@@ -383,6 +383,9 @@
 
   `body` should refer to `conn`.
 
+  In local WAL mode, the outer explicit body is isolated from other queued
+  requests, so its abort cannot roll back another caller's writes.
+
   The binding vector can include an optional opts map. `:timeout-ms` sets a
   timeout for the user body in milliseconds. Nil disables the timeout. A timeout
   interrupts the transaction thread and aborts the transaction when control

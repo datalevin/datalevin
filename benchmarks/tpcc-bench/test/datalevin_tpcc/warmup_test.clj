@@ -1,75 +1,45 @@
 (ns datalevin-tpcc.warmup-test
   (:require
-   [clojure.test :refer [deftest is testing use-fixtures]]
-   [datalevin-bench.host :as host]
-   [datalevin.core :as d]
+   [clojure.test :refer [deftest is testing]]
    [datalevin-tpcc.datalevin]
    [datalevin-tpcc.postgres]
-   [datalevin-tpcc.sqlite]
-   [datalevin-tpcc.txns :as t])
+   [datalevin-tpcc.sqlite])
   (:import [java.util Random]))
 
 (def ^:private drivers
   '[datalevin-tpcc.datalevin datalevin-tpcc.sqlite datalevin-tpcc.postgres])
 
-(use-fixtures :once
-  (fn [f]
-    ;; Keep the real benchmark loops and input generators, but allow their
-    ;; database boundaries to be stubbed even under the direct-linking profile.
-    (try
-      (binding [*compiler-options* (assoc *compiler-options* :direct-linking false)]
-        (doseq [driver drivers] (require driver :reload)))
-      (f)
-      (finally
-        (doseq [driver drivers] (require driver :reload))))))
-
 (defn- warmup-stream [driver seed n & [load-seed]]
-  (let [calls    (atom [])
-        done     (ex-info "Warmup complete" {})
-        conn     (reify java.sql.Connection (close [_]))
+  (let [calls (atom [])
+        done (ex-info "Warmup complete" {})
+        conn (reify java.sql.Connection (close [_]))
         generate (var-get (ns-resolve driver 'gen-input))
-        capture  (fn [r opts type]
-                   (let [input (generate r opts type)]
-                     (swap! calls conj {:rng r :type type :input input
-                                        :constants (select-keys opts [:c-last :c-cust :c-item])})
-                     input))
-        stop     (fn [& _] (throw done))
-        db-stubs (case driver
-                   datalevin-tpcc.datalevin
-                   {#'d/get-conn (constantly conn)
-                    #'d/close (constantly nil)
-                    #'t/district-next-o-id stop}
-
-                   datalevin-tpcc.sqlite
-                   {(ns-resolve driver 'enable-wal!) (constantly nil)
-                    (ns-resolve driver 'open-conn) (constantly conn)
-                    (ns-resolve driver 'district-next-o-id) stop}
-
-                   datalevin-tpcc.postgres
-                   {(ns-resolve driver 'get-connection) (constantly conn)
-                    (ns-resolve driver 'district-next-o-id) stop})
-        stubs (assoc db-stubs
-                     #'host/pause! (constantly [])
-                     #'host/resume! (constantly nil)
-                     (ns-resolve driver 'gen-input) capture
-                     (ns-resolve driver 'do-txn)
-                     (if (= driver 'datalevin-tpcc.sqlite)
-                       (fn [_ _ _] {:status :probe})
-                       (fn [_ r opts type]
-                         [type (capture r opts type) {:status :probe} 0.0])))]
-    (with-redefs-fn stubs
-      (fn []
-        ;; Stop at the first accounting baseline read, after warmup and before
-        ;; measured transactions. No database is opened or modified.
-        (with-out-str
-          (is (identical? done
-                          (try
-                            ((ns-resolve driver 'bench)
-                             (cond-> {:seed seed :warehouses 1 :warmup n
-                                      :threads 1 :txns 1}
-                               (some? load-seed) (assoc :load-seed load-seed)))
-                            nil
-                            (catch clojure.lang.ExceptionInfo e e)))))))
+        capture (fn [r opts type]
+                  (let [input (generate r opts type)]
+                    (swap! calls conj {:rng r :type type :input input
+                                       :constants (select-keys opts [:c-last :c-cust :c-item])})
+                    input))
+        dependencies
+        {:open-conn (constantly conn) :get-connection (constantly conn)
+         :close-conn (constantly nil) :enable-wal! (constantly nil)
+         :measure! (fn [f] (f))
+         :district-next-o-id (fn [& _] (throw done))
+         :gen-input capture
+         :do-txn (if (= driver 'datalevin-tpcc.sqlite)
+                   (fn [_ _ _] {:status :probe})
+                   (fn [_ r opts type]
+                     [type (capture r opts type) {:status :probe} 0.0]))}]
+    ;; Exercise the driver loop with explicit database dependencies, keeping
+    ;; direct linking enabled. Stop at the first baseline read after warmup.
+    (with-out-str
+      (is (identical? done
+                      (try
+                        ((ns-resolve driver 'bench)
+                         (cond-> {:seed seed :warehouses 1 :warmup n :threads 1 :txns 1}
+                           (some? load-seed) (assoc :load-seed load-seed))
+                         dependencies)
+                        nil
+                        (catch clojure.lang.ExceptionInfo e e)))))
     @calls))
 
 (defn- inputs [calls]

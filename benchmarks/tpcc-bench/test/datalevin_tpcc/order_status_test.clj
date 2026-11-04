@@ -101,8 +101,8 @@
 (defn- check-sql-order-status! [^Connection conn dialect order-status!]
   (with-open [stmt (.createStatement conn)]
     (doseq [sql (-> (slurp (io/file (c/data-dir) (str "schema-" dialect ".sql")))
-                   (str/replace #"(?m)--[^\n]*" "")
-                   (str/split #";"))
+                    (str/replace #"(?m)--[^\n]*" "")
+                    (str/split #";"))
             :when (not (str/blank? sql))]
       (.execute stmt sql)))
   (doseq [[table rows] (seed-rows)
@@ -118,8 +118,8 @@
 (deftest postgres-order-status
   (if-let [url (System/getenv "TPCC_TEST_PG_URL")]
     (with-open [conn (DriverManager/getConnection
-                     url (or (System/getenv "TPCC_TEST_PG_USER") (System/getenv "USER"))
-                     (or (System/getenv "TPCC_TEST_PG_PASS") ""))]
+                      url (or (System/getenv "TPCC_TEST_PG_USER") (System/getenv "USER"))
+                      (or (System/getenv "TPCC_TEST_PG_PASS") ""))]
       (let [schema (str "tpcc_order_status_" (str/replace (str (random-uuid)) "-" ""))]
         (#'sqlite/exec! conn (str "CREATE SCHEMA " schema))
         (try
@@ -130,3 +130,45 @@
             (.setAutoCommit conn true)
             (#'sqlite/exec! conn (str "DROP SCHEMA " schema " CASCADE"))))))
     (println "Skipping PostgreSQL Order-Status test; set TPCC_TEST_PG_URL to enable it.")))
+
+(deftest datalevin-order-status-does-not-mix-committed-states
+  (doseq [kv-opts [{:wal? false}
+                   {:wal? true :wal-durability-profile :strict}
+                   {:wal? true :wal-durability-profile :relaxed}]]
+    (testing (str kv-opts)
+      (let [conn (d/get-conn (str *test-dir* "/" (random-uuid)) datalevin/schema
+                             {:kv-opts kv-opts})
+            running (atom true)
+            ready (promise)]
+        (try
+          (d/transact! conn
+                       [{:db/id 1 :customer/w-id 1 :customer/d-id 1 :customer/id 1
+                         :customer/first "A" :customer/middle "OE" :customer/last "B"
+                         :customer/balance 0.0}
+                        {:db/id 2 :orders/w-id 1 :orders/d-id 1 :orders/id 1
+                         :orders/c-id 1 :orders/entry-d "initial" :orders/carrier-id 0}
+                        {:db/id 3 :order-line/w-id 1 :order-line/d-id 1 :order-line/o-id 1
+                         :order-line/number 1 :order-line/i-id 1 :order-line/supply-w-id 1
+                         :order-line/quantity 1 :order-line/amount 1.0 :order-line/delivery-d "0"}])
+          (let [writer (future
+                         (try
+                           (loop [state 1]
+                             (when @running
+                               (d/transact! conn [[:db/add 1 :customer/balance (double state)]
+                                                  [:db/add 2 :orders/carrier-id state]
+                                                  [:db/add 3 :order-line/delivery-d (str state)]])
+                               (deliver ready true)
+                               (recur (- 1 state))))
+                           (catch Throwable e (deliver ready e) (throw e))))]
+            (try
+              (is (= true (deref ready 5000 ::timeout)))
+              (let [states (mapv (fn [_]
+                                   (let [result (t/order-status! conn {:w 1 :d 1 :c 1})]
+                                     [(get-in result [:customer :balance])
+                                      (get-in result [:order :carrier-id])
+                                      (get-in result [:order-lines 0 :delivery-d])]))
+                                 (range 1000))]
+                (is (every? #{[0.0 0 "0"] [1.0 1 "1"]} states)
+                    "customer, order and line fields must come from one committed state"))
+              (finally (reset! running false) @writer)))
+          (finally (reset! running false) (d/close conn)))))))

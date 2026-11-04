@@ -117,6 +117,10 @@
         (is (not (contains? result :amount)) "rolled-back orders have no final total")
         (is (= (:next before) (:o-id result)))
         (is (= 999 (:i-id result)))
+        (is (= 1 (get-in result [:customer :id])))
+        (is (= "BARBARBAR" (get-in result [:customer :last])))
+        (is (#{"GC" "BC"} (get-in result [:customer :credit])))
+        (is (= "Item number is not valid" (:message result)))
         ;; The transaction really advanced the counter, inserted both headers,
         ;; and applied every valid line, including repeated and remote stock.
         (is (= (-> (select-keys before [:next :orders :new-orders :lines :stocks])
@@ -143,13 +147,13 @@
    :stocks (into {} (map (fn [[w i & values]] [[w i] (vec values)]))
                  (d/q '[:find ?w ?i ?q ?y ?o ?r
                         :where [?e :stock/w-id ?w] [?e :stock/i-id ?i]
-                               [?e :stock/quantity ?q] [?e :stock/ytd ?y]
-                               [?e :stock/order-cnt ?o] [?e :stock/remote-cnt ?r]] db))})
+                        [?e :stock/quantity ?q] [?e :stock/ytd ?y]
+                        [?e :stock/order-cnt ?o] [?e :stock/remote-cnt ?r]] db))})
 
 (deftest datalevin-stock-updates
   (doseq [kv-opts [{:wal? false}
-                  {:wal? true :wal-durability-profile :strict}
-                  {:wal? true :wal-durability-profile :relaxed}]]
+                   {:wal? true :wal-durability-profile :strict}
+                   {:wal? true :wal-durability-profile :relaxed}]]
     (testing (str kv-opts)
       (let [conn (d/get-conn (str *test-dir* "/" (random-uuid))
                              datalevin/schema {:kv-opts kv-opts})]
@@ -174,17 +178,17 @@
               #(into {} (map (fn [[w i & values]] [[w i] (vec values)]))
                      (d/q '[:find ?w ?i ?qty ?ytd ?ocnt ?rcnt
                             :where [?e :stock/w-id ?w] [?e :stock/i-id ?i]
-                                   [?e :stock/quantity ?qty] [?e :stock/ytd ?ytd]
-                                   [?e :stock/order-cnt ?ocnt] [?e :stock/remote-cnt ?rcnt]]
+                            [?e :stock/quantity ?qty] [?e :stock/ytd ?ytd]
+                            [?e :stock/order-cnt ?ocnt] [?e :stock/remote-cnt ?rcnt]]
                           (d/db conn)))
               :order-lines
               (fn [o-id]
                 (vec (sort (d/q '[:find ?n ?i ?w ?qty :in $ ?o
                                   :where [?e :order-line/o-id ?o]
-                                         [?e :order-line/number ?n]
-                                         [?e :order-line/i-id ?i]
-                                         [?e :order-line/supply-w-id ?w]
-                                         [?e :order-line/quantity ?qty]]
+                                  [?e :order-line/number ?n]
+                                  [?e :order-line/i-id ?i]
+                                  [?e :order-line/supply-w-id ?w]
+                                  [?e :order-line/quantity ?qty]]
                                 (d/db conn) o-id))))
               :order-count #(t/order-count conn 1 1)}))
           (check-rollback-work!
@@ -193,11 +197,10 @@
             :observed-order!
             (fn [input]
               (let [pending (atom nil)]
-                (d/listen! conn ::rollback-work
-                           #(reset! pending (datalevin-state (:db-after %))))
-                (try
-                  [(t/new-order! conn input) @pending]
-                  (finally (d/unlisten! conn ::rollback-work)))))})
+                [(d/with-transaction [tx conn]
+                   (#'t/new-order-tx! tx input
+                                      #(reset! pending (datalevin-state %))))
+                 @pending]))})
           (finally (d/close conn)))))))
 
 (defn- sql-exec! [^Connection conn sql params]
@@ -219,7 +222,7 @@
 
 (defn- sql-state [^Connection conn]
   {:rows (into {} (for [table c/table-order]
-                   [table (set (sql-rows conn (str "SELECT * FROM " table) []))]))
+                    [table (set (sql-rows conn (str "SELECT * FROM " table) []))]))
    :next (ffirst (sql-rows conn "SELECT d_next_o_id FROM district" []))
    :orders (ffirst (sql-rows conn "SELECT count(*) FROM orders" []))
    :new-orders (ffirst (sql-rows conn "SELECT count(*) FROM new_order" []))
@@ -246,8 +249,8 @@
 (defn- check-sql-stock! [^Connection conn dialect new-order!]
   (with-open [st (.createStatement conn)]
     (doseq [sql (-> (slurp (io/file (c/data-dir) (str "schema-" dialect ".sql")))
-                   (str/replace #"(?m)--[^\n]*" "")
-                   (str/split #";"))
+                    (str/replace #"(?m)--[^\n]*" "")
+                    (str/split #";"))
             :when (not (str/blank? sql))]
       (.execute st sql)))
   (doseq [[table rows] (seed-rows)
@@ -270,8 +273,8 @@
                              "SELECT s_w_id, s_i_id, s_quantity, s_ytd, s_order_cnt, s_remote_cnt FROM stock"
                              []))
     :order-lines #(sql-rows conn
-                           "SELECT ol_number, ol_i_id, ol_supply_w_id, ol_quantity FROM order_line WHERE ol_o_id=? ORDER BY ol_number"
-                           [%])
+                            "SELECT ol_number, ol_i_id, ol_supply_w_id, ol_quantity FROM order_line WHERE ol_o_id=? ORDER BY ol_number"
+                            [%])
     :order-count #(ffirst (sql-rows conn "SELECT count(*) FROM orders" []))})
   (check-rollback-work!
    {:snapshot #(sql-state conn)
@@ -285,8 +288,8 @@
 (deftest postgres-stock-updates
   (if-let [url (System/getenv "TPCC_TEST_PG_URL")]
     (with-open [conn (DriverManager/getConnection
-                     url (or (System/getenv "TPCC_TEST_PG_USER") (System/getenv "USER"))
-                     (or (System/getenv "TPCC_TEST_PG_PASS") ""))]
+                      url (or (System/getenv "TPCC_TEST_PG_USER") (System/getenv "USER"))
+                      (or (System/getenv "TPCC_TEST_PG_PASS") ""))]
       (let [schema (str "tpcc_stock_" (str/replace (str (random-uuid)) "-" ""))]
         (sql-exec! conn (str "CREATE SCHEMA " schema) [])
         (try

@@ -9,23 +9,16 @@ read/write transactions, and a strict ACID contract with hot-row contention.
 > result and must not be presented as official. See the [TPC fair-use
 > rules](https://www.tpc.org/information/other/policy_fair_use5.asp).
 
-## Status
-
-- Deterministic population generator: complete.
-- Datalevin loader: complete.
-- Datalevin transactions (New-Order, Payment, Order-Status, Delivery,
-  Stock-Level): implemented; write transactions use explicit transactions.
-- SQLite loader and transactions: complete.
-- Driver with tpmC and per-transaction latency: complete for Datalevin and
-  SQLite.
-- PostgreSQL implementation: pending.
+The generator, loaders, transaction implementations, and drivers are available
+for Datalevin, SQLite, and PostgreSQL.
 
 ## Schema and population
 
 The nine TPC-C tables are `warehouse`, `district`, `customer`, `history`,
 `orders`, `new_order`, `order_line`, `item`, and `stock`. Monetary values are
-stored as doubles/REAL and dates as ISO-8601 strings in every system so results
-compare directly.
+stored as doubles/REAL in Datalevin and SQLite and fixed-precision numerics in
+PostgreSQL. Dates are ISO-8601 strings; returned monetary fields are normalized
+to doubles.
 
 Population follows the specification's cardinalities for `w` warehouses:
 
@@ -55,6 +48,17 @@ Each district's 3,000 orders map bijectively to its 3,000 customers, the first
 2,100 orders are delivered, and orders 2,101-3,000 are the open new orders.
 Generation is deterministic per table from a seed, so reloads are reproducible.
 
+Datalevin uses unique item and warehouse IDs and unique composite business keys
+for districts, customers, stock, orders, new orders, and order lines. Secondary
+composites index customer surnames and orders by customer. Point reads use lookup
+refs and pulls; Delivery and Order-Status seek the first or last matching index
+entry, and line reads use bounded key ranges. Descriptive strings are stored
+without value indexes. Both bulk loads and transactions maintain the composite
+attributes automatically.
+
+Reload Datalevin databases created with the previous schema before running this
+version. The driver rejects databases missing the required keys.
+
 ## Transactions
 
 | Transaction | Mix | Writes |
@@ -66,7 +70,11 @@ Generation is deterministic per table from a seed, so reloads are reproducible.
 | Stock-Level | 4% | none |
 
 All drivers select Payment customers by last name 60% of the time and by
-customer ID 40% of the time.
+customer ID 40% of the time. Each terminal keeps a fixed home warehouse and
+Stock-Level district. Terminals are assigned round-robin across warehouses,
+then across their ten districts. With multiple warehouses, 1% of New-Order lines
+use another supplying warehouse, and 15% of Payments select a customer in another
+warehouse and a random district. One-warehouse runs use local customers and stock.
 
 All drivers share New-Order line generation: 5-15 lines per order, with one
 random 1-in-100 rollback decision per order. A rollback order has only its
@@ -74,13 +82,17 @@ final item id replaced with an unused value, as specified in
 [TPC-C §2.4.1.3-5](https://www.tpc.org/tpc_documents_current_versions/pdf/tpc-c_v5.11.0.pdf#page=28).
 
 New-Order reads the warehouse tax, the district counter and tax, and the customer
-discount, then advances the counter and inserts the order and new-order headers.
+discount, last name, and credit, then advances the counter and inserts the order
+and new-order headers.
 It processes each line in input order, updating stock and inserting the line
 before looking up the next item. All backends return the successful order's
 `:amount` as `sum(OL_AMOUNT) * (1 - C_DISCOUNT) * (1 + W_TAX + D_TAX)`
-(TPC-C §2.4.2.2); stored line amounts remain quantity times item price.
-An invalid item rolls back the header and all
-preceding valid-line writes, exercising the rollback workload required by
+(TPC-C §2.4.2.2); stored line amounts remain quantity times item price. Results also
+include the customer details, taxes, entry date, and line count. Each line returns
+its item name, price, retrieved stock quantity, and brand flag (`B` when both item
+and stock data contain `ORIGINAL`, otherwise `G`). Invalid-item results retain the
+customer ID, name, credit, attempted order ID, and error message.
+An invalid item rolls back the header and all preceding valid-line writes, exercising the rollback workload required by
 TPC-C §2.4.2.3. Payment updates the warehouse and district year-to-date
 totals, the customer balance/payment count, and appends a history row. Delivery
 removes the oldest new-order in each district and delivers its lines.
@@ -91,15 +103,20 @@ warehouse, quantity, amount, and delivery date, as required by
 [TPC-C §2.6.2.2](https://www.tpc.org/TPC_Documents_Current_Versions/pdf/tpc-c_v5.11.0.pdf#page=38).
 All three backends return these fields in `:customer`, `:order`, and
 `:order-lines`, with lines ordered by `:number`. Undelivered carriers and dates
-are `nil`. The `:lines` count remains available. Earlier Order-Status timings
-measured incomplete reads and should be rerun before comparison.
+are `nil`. The `:lines` count remains available. All dependent reads execute
+inside a single transaction.
 
 New-Order copies `S_DIST_xx` from each supplying stock row into `OL_DIST_INFO`,
 where `xx` is the order's district. For bad-credit customers, Payment prepends
 `C_ID`, `C_D_ID`, `C_W_ID`, `D_ID`, `W_ID`, and the amount to `C_DATA`, preserving
 the first 500 characters of the combined text. Good-credit `C_DATA` is unchanged.
-`H_DATA` contains the payment warehouse and district names separated by four
-spaces. These payloads follow [TPC-C §§2.4.2.2 and 2.5.2.2](https://www.tpc.org/tpc_documents_current_versions/pdf/tpc-c_v5.11.0.pdf).
+Payment returns warehouse and district addresses, the customer's name, address,
+phone, registration date, credit details, discount, and updated balance and payment
+counters. Only the selected bad-credit customer's `C_DATA` is read; its first 200
+characters are returned. `H_DATA` contains the payment warehouse and district names
+separated by four spaces. Remote payments update the home warehouse/district and
+the customer's own warehouse/district separately. These payloads follow
+[TPC-C §§2.4.2.2 and 2.5.2.2](https://www.tpc.org/tpc_documents_current_versions/pdf/tpc-c_v5.11.0.pdf).
 
 ## Concurrency and correctness
 
@@ -107,19 +124,22 @@ SQLite and PostgreSQL terminals own separate JDBC connections, so one terminal's
 rollback cannot affect another terminal's transaction. Datalevin terminals share
 a connection and use its explicit transaction boundary:
 
-- **Datalevin** performs every New-Order, Payment, and Delivery inside
+- **Datalevin** performs New-Order, Payment, Order-Status, and Delivery inside
   `d/with-transaction`, using the connection bound by that macro for all reads
   and writes. Concurrent writers wait before reading values they will update.
   `d/db` alone returns a database reference and does not establish a transaction
-  snapshot. Transaction errors propagate and abort the run.
+  snapshot. Stock-Level uses committed reads with the specification's relaxed
+  isolation. Transaction errors propagate and abort the run.
 - **SQLite** has a single writer and no row locking. Terminals use independent
   connections, and every transaction is serialized on one JVM lock so the
   read-modify-write sequences are atomic. WAL is enabled once before terminals
-  start; connections use a 30 s busy timeout.
+  start; connections use a 30 s busy timeout. Order-Status also opens a database
+  transaction so separate JDBC callers get a consistent snapshot.
 - **PostgreSQL** supports concurrent writers. Read-then-write statements use
   `SELECT ... FOR UPDATE` (warehouse, district, customer, stock, and the oldest
   new-order row), and the driver retries transactions that fail with a
-  serialization or deadlock SQLSTATE (`40001`/`40P01`).
+  serialization or deadlock SQLSTATE (`40001`/`40P01`). Order-Status uses a
+  serializable transaction and restores the connection's previous isolation level.
 
 All backends share the stock calculation from
 [TPC-C §2.4.2](https://www.tpc.org/TPC_Documents_Current_Versions/pdf/tpc-c_v5.11.0.pdf#page=30):
@@ -141,14 +161,15 @@ The Datalevin driver also checks Payment accounting:
    successful Payments to it.
 4. Each district's history amount and row count increased by the successful
    Payment amount and count, respectively.
-5. Each district's customer year-to-date payments and payment counts increased
-   by those same amounts and counts. Delivery does not change these fields.
+5. Each customer district's year-to-date payments and payment counts increased
+   by the Payments received by its customers, including remote Payments. Delivery
+   does not change these fields.
 
 All drivers capture baselines after warmup and use only committed measured
 transactions for these invariants. Every configured district is checked,
 including districts with zero committed New-Orders. Counts must match exactly;
-Datalevin's monetary deltas allow less than half a cent of floating point error. Checks run after all
-terminals finish, outside the timed interval. Any mismatch throws with an
+Datalevin's monetary deltas allow less than half a cent of floating point error.
+Checks run after all terminals finish, outside the timed interval. Any mismatch throws with an
 `:errors` vector containing the invariant, affected key, expected value, and
 actual value, before throughput or latency metrics are reported. Successful
 runs return `:invariants :ok`.
@@ -160,8 +181,9 @@ types, and unexpected failures do not contribute. All three drivers calculate
 The console and result map report the completed total (`:new-orders`) and
 separate counts for `:committed-new-orders` and `:rolled-back-new-orders`.
 
-PostgreSQL New-Order stock updates are covered by integration tests against
-PostgreSQL 18.6. A full PostgreSQL transaction-mix run has not been validated.
+PostgreSQL transaction payloads, customer selection, Order-Status, remote Payments,
+and stock updates are covered by integration tests against PostgreSQL 18.6.
+The full transaction mix also passed the one- and two-warehouse runs below.
 
 ## Host control
 
@@ -211,7 +233,7 @@ integration cases for PostgreSQL with a test database URL:
 
 ```bash
 TPCC_TEST_PG_URL=jdbc:postgresql://localhost:5432/postgres \
-  clojure -M:test -n datalevin-tpcc.stock-test
+  clojure -M:test
 ```
 
 `TPCC_TEST_PG_USER` and `TPCC_TEST_PG_PASS` optionally supply credentials. The
@@ -230,44 +252,49 @@ map to the same strict/relaxed split used by the `write-bench`. A publishable
 durability comparison should create one database per condition and report them
 separately; the runner does not yet switch modes.
 
-## Smoke results (not performance claims)
+## Measured results
 
-The figures below predate completed-New-Order accounting: their New-Order counts
-and tpmC exclude required rollbacks. Rerun the benchmark for corrected tpmC.
-They also predate the constrained load/run surname constants and do not measure
-the current surname lookup distribution.
+Recorded November 4, 2026 on an Apple M3 Pro (36 GiB RAM), OpenJDK 21.0.13,
+Clojure 1.12.5, native 1.2.2, and an 8 GiB JVM heap. Each run starts from a fresh
+copy of the seed-42 population, with 1,000 warmup and 10,000 measured transactions.
+Runs execute sequentially without a profiler. These are single-pass local
+measurements, not audited TPC-C results or steady-state capacity estimates.
 
-Recorded Datalevin smoke runs use fresh one-warehouse databases, seed 42, 100
-warmup transactions, and native 1.1.1 with default durability:
+Throughput is completed New-Orders per minute, including required invalid-item
+rollbacks. Higher is better.
 
-| Terminals | Measured txns | New-Orders | tpmC | New-Order and Payment invariants |
-|---|---:|---:|---:|---|
-| 1 | 400 | 171 | ~2,961 | OK |
-| 4 | 400 | 172 | ~3,323 | OK |
+| Warehouses | Terminals | Datalevin default LMDB | Datalevin strict WAL | SQLite | PostgreSQL |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 1 | 9,573.5 | 35,351.3 | 62,073.8 | 26,822.1 |
+| 1 | 4 | 9,989.1 | 39,035.9 | 62,136.7 | 77,734.3 |
+| 2 | 4 | 8,236.0 | 35,081.6 | 60,926.6 | 81,829.8 |
 
-Stock quantities remained within [10, 100] in both runs.
+Default Datalevin uses synchronous LMDB commits with WAL disabled. The separate
+WAL runs enable `:wal? true` with `:wal-durability-profile :strict`. SQLite 3.51.1
+uses WAL and `synchronous=FULL`; PostgreSQL 18.6 uses `fsync=on`,
+`synchronous_commit=on`, and `full_page_writes=on`. These are different storage
+and synchronization implementations; settings and connection costs are recorded
+in the measurement notes.
 
-Historical results, single warehouse, seed 42, on the development host:
+All six Datalevin runs passed New-Order invariants and independent Payment
+accounting over warmup plus measurement. Concurrent WAL runs include the required
+invalid-item rollbacks; each explicit transaction has an independent outcome.
+SQL figures are from the preceding same-day comparison, with the same population
+and inputs. Transaction and rollback counts match across backends.
 
-| System | Terminals | Txns | New-Orders | tpmC | Invariants |
-|---|---|---:|---:|---:|---|
-| Datalevin (old implementation) | 1 | 300 | 120 | ~1,780 | New-Order only |
-| Datalevin (old implementation) | 4 | 400 | 180 | ~4,750 | New-Order only |
-| SQLite | 1 | 200 | 93 | ~11,900 | OK |
-| SQLite | 1 | 100 | 37 | ~20,200 | OK |
+Datalevin still shows limited throughput scaling with terminals. Order-Status
+shares the writer boundary to preserve its snapshot. These short runs also vary
+with commit timing; see the supporting repeated measurements.
 
-The old Datalevin results predate the Payment concurrency fix and do not
-establish Payment correctness or describe the current transaction strategy.
-Per-transaction latency is printed by each driver. Use a fresh database, a fixed
-seed, and the same durability setting for any comparison. SQLite serializes
-writers, so its multi-terminal comparison is not meaningful without a
-shared-cache or WAL configuration.
+See the [measurement report](../../doc/measurements/tpcc-fixes-2026-11-04/README.md)
+for before/after results, latency, regression checks, and profiles, and the
+[preceding comparison](../../doc/measurements/tpcc-gaps-2026-11-04/README.md)
+for SQL settings and results.
 
 ## Notes
 
 - Datalevin's explicit write transactions hold the writer for their reads as
-  well as their writes. Reported latency includes waiting for that transaction.
-- The workload is single-warehouse; remote warehouses (`ol_supply_w_id` other
-  than the home warehouse) are part of the schema but not yet generated.
+  well as their writes. Order-Status uses this boundary too. Reported latency
+  includes waiting for the transaction.
 - TPC-C naming and cardinalities are reproduced, but dictionary text is
   generated rather than taken from the specification's appendix.

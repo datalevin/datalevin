@@ -200,18 +200,10 @@ and execution separately and does not clear the plan cache between queries.
 
 The table below uses the latest Datalevin timing CSV, saved on 2026-11-04,
 and the PostgreSQL and SQLite second-pass measurements from 2026-08-23.
-The Datalevin queries include the corrections described in the
-[query audit](query-audit.md).
 
 The benchmark procedure uses one complete warmup pass followed by one complete
 measurement pass in a separate runner/JVM process. The Datalevin benchmark
-enables direct linking and uses the JVM's default heap. The retained
-[November 3 run evidence](../../doc/measurements/job-refresh-2026-11-03/REPORT.md)
-documents the preceding Datalevin snapshot's passes, source hashes, commands,
-machine activity, and successful correctness checks (5 tests, 118 assertions).
-The latest raw timings are linked below. These snapshots span engine,
-dependency, and query changes, so their difference does not isolate the effect
-of a single optimization.
+enables direct linking and uses the JVM's default heap.
 
 Before the retained PostgreSQL pair, the macOS filesystem cache was purged and
 PostgreSQL was restarted to clear `shared_buffers`; its first pass therefore

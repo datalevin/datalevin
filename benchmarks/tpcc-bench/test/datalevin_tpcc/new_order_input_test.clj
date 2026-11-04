@@ -48,13 +48,13 @@
         (is (<= 9.85 (/ (reduce + counts) 10000.0) 10.15))
         (is (<= 70 (count invalid) 130) "about 1% of orders request rollback")
         (is (every? (fn [{:keys [ol]}]
-                       (= [(dec (count ol))] (vec (invalid-line-indexes ol))))
+                      (= [(dec (count ol))] (vec (invalid-line-indexes ol))))
                     invalid)
             "rollback orders contain exactly one invalid item, at the end")
         (is (every? (fn [{:keys [ol]}]
-                       (and (every? #(<= 1 (:i-id %) c/item-count) (butlast ol))
-                            (<= 1 (:i-id (peek ol)) (inc c/item-count))
-                            (every? #(<= 1 (:qty %) 10) ol)))
+                      (and (every? #(<= 1 (:i-id %) c/item-count) (butlast ol))
+                           (<= 1 (:i-id (peek ol)) (inc c/item-count))
+                           (every? #(<= 1 (:qty %) 10) ol)))
                     orders))))))
 
 (deftest new-order-inputs-match-across-drivers
@@ -65,3 +65,19 @@
                             (vec (repeatedly 1000 #(generate r opts :new-order)))))
                         drivers)]
       (is (apply = samples) "the same seed produces the same order stream"))))
+
+(deftest new-order-remote-supply-distribution
+  (doseq [generate drivers
+          warehouses [1 3]]
+    (let [r (Random. 42)
+          opts (g/terminal-options {:warehouses warehouses :c-item 751 :c-cust 127} 1)
+          orders (vec (repeatedly 10000 #(generate r opts :new-order)))
+          lines (mapcat :ol orders)
+          remote (filter #(not= (:home-w opts) (:supply-w %)) lines)]
+      (is (every? #(= (:home-w opts) (:w %)) orders))
+      (is (every? #(<= 1 (:supply-w %) warehouses) lines))
+      (if (= warehouses 1)
+        (is (empty? remote))
+        (do (is (<= 0.0085 (/ (count remote) (double (count lines))) 0.0115))
+            (is (= (disj (set (range 1 (inc warehouses))) (:home-w opts))
+                   (set (map :supply-w remote)))))))))

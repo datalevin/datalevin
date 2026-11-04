@@ -62,28 +62,33 @@
         ;; Reuse bounds for all changed datoms in this range. Most invalidation
         ;; checks finish using entity/attribute IDs and never encode values.
         lo (delay (b/indexable-bytes (idx/datom->indexable schema low false)))
-        hi (delay (b/indexable-bytes (idx/datom->indexable schema high true)))]
-    (boolean
-      (some
-        (fn [^Datom datom]
-          (let [e (.-e datom)
-                a (.-a datom)
-                aid (:db/aid (get schema a))]
-            (and (<= le e he)
-                 (or (nil? aid)
-                     (and (<= la (long aid) ha)
-                          (or (< la (long aid) ha)
-                              ;; Custom order functions can access a transaction
-                              ;; or throw. A commit must not call them again.
-                              (custom-attr? schema a)
-                              (custom-attr? schema (.-a low))
-                              (custom-attr? schema (.-a high))
-                              (let [[^bytes dl ^bytes dh] (encoded-datom context datom)]
-                                (and (or (< la (long aid))
-                                         (not (neg? (Arrays/compareUnsigned dh ^bytes @lo))))
-                                     (or (< (long aid) ha)
-                                         (not (pos? (Arrays/compareUnsigned dl ^bytes @hi))))))))))))
-        (.-datoms context)))))
+        hi (delay (b/indexable-bytes (idx/datom->indexable schema high true)))
+        ;; Avoid per-datom seq allocation and captured-bound boxing while
+        ;; scanning changed datoms for each cached range.
+        datoms (clojure.lang.RT/iter (.-datoms context))]
+    (loop []
+      (if (.hasNext datoms)
+        (let [^Datom datom (.next datoms)
+              e (.-e datom)
+              a (.-a datom)
+              aid (:db/aid (get schema a))]
+          (if (and (<= le e he)
+                   (or (nil? aid)
+                       (and (<= la (long aid) ha)
+                            (or (< la (long aid) ha)
+                                ;; Custom order functions can access a transaction
+                                ;; or throw. A commit must not call them again.
+                                (custom-attr? schema a)
+                                (custom-attr? schema (.-a low))
+                                (custom-attr? schema (.-a high))
+                                (let [[^bytes dl ^bytes dh] (encoded-datom context datom)]
+                                  (and (or (< la (long aid))
+                                           (not (neg? (Arrays/compareUnsigned dh ^bytes @lo))))
+                                       (or (< (long aid) ha)
+                                           (not (pos? (Arrays/compareUnsigned dl ^bytes @hi))))))))))
+            true
+            (recur)))
+        false))))
 
 (defn affected?
   "Return false only when no changed datom can fall within both inclusive

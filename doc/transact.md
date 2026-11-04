@@ -181,6 +181,12 @@ client/server, or babashka pod. For usage examples, see tests in
 Rollback from within the transaction can be done with `abort-transact-kv` and
 `abort-transact`.
 
+In local WAL mode, each outer explicit transaction has its own native commit or
+rollback outcome. Aborting or throwing from its body does not cancel unrelated
+queued writes, and the collector does not replay the body. Ordinary prepared
+writes can still share a batch. Nested explicit transactions join their outer
+transaction, so aborting a nested transaction rolls back the outer one.
+
 Explicit transactions can be given a timeout:
 
 ```clojure

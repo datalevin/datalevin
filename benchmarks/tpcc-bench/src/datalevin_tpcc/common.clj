@@ -46,6 +46,52 @@
   (when (seq customers)
     (nth customers (quot (dec (count customers)) 2))))
 
+(defn new-order-line-result
+  "Materialize each line's retrieved stock quantity, item fields and brand flag."
+  [number item supply quantity item-name stock-quantity price item-data stock-data]
+  {:number number :i-id item :supply-w-id supply :quantity quantity
+   :item-name item-name :stock-quantity stock-quantity :price (double price)
+   :brand (if (and (s/includes? (or item-data "") "ORIGINAL")
+                   (s/includes? (or stock-data "") "ORIGINAL")) "B" "G")
+   :amount (* (double quantity) (double price))})
+
+(defn new-order-result
+  [w d customer o-id entry c-last credit discount w-tax d-tax lines]
+  {:type :new-order :status :ok :w w :d d :o-id o-id :entry-d entry
+   :customer {:id customer :last c-last :credit credit :discount (double discount)}
+   :w-tax (double w-tax) :d-tax (double d-tax) :ol-cnt (count lines)
+   :order-lines lines
+   :amount (new-order-total (reduce + 0.0 (map :amount lines)) discount w-tax d-tax)})
+
+(defn new-order-rollback-result [w d customer o-id item c-last credit]
+  {:type :new-order :status :invalid-item :w w :d d :o-id o-id :i-id item
+   :customer {:id customer :last c-last :credit credit}
+   :message "Item number is not valid"})
+
+(def payment-location-fields [:name :street-1 :street-2 :city :state :zip])
+(def payment-customer-fields
+  [:id :first :middle :last :street-1 :street-2 :city :state :zip :phone :since
+   :credit :credit-lim :discount :balance :ytd-payment :payment-cnt])
+
+(defn payment-result
+  "Return Payment's addresses and updated customer fields. BC data is displayed
+  up to 200 characters; the database retains the full 500-character value."
+  [w d c-w c-d amount date warehouse district customer new-data]
+  (let [customer (reduce (fn [row field] (update row field #(some-> % double)))
+                         customer [:credit-lim :discount :balance :ytd-payment])
+        customer (-> customer (update :id long) (update :payment-cnt long)
+                     (update :zip #(some-> % s/trimr)))]
+    {:type :payment :status :ok :w w :d d :c (:id customer)
+     :c-w c-w :c-d c-d :amount amount :date date :credit (:credit customer)
+     :warehouse (-> warehouse (assoc :id w) (update :zip #(some-> % s/trimr)))
+     :district (-> district (assoc :id d :w-id w) (update :zip #(some-> % s/trimr)))
+     :customer (cond-> (-> customer
+                           (assoc :w-id c-w :d-id c-d)
+                           (update :balance - (double amount))
+                           (update :ytd-payment + (double amount))
+                           (update :payment-cnt inc))
+                 new-data (assoc :data (subs new-data 0 (min 200 (count new-data)))))}))
+
 (defn order-status-result
   "Materialize the TPC-C 2.6.2.2 fields in the same shape for every backend.
   Rows are customer [id balance first middle last], order [id entry carrier],
@@ -106,8 +152,8 @@
   tpmC. Callers must exclude warmup records."
   [samples elapsed]
   (let [statuses    (frequencies (for [[type _ status] samples
-                                      :when (= type :new-order)]
-                                  status))
+                                       :when (= type :new-order)]
+                                   status))
         committed   (get statuses :ok 0)
         rolled-back (get statuses :invalid-item 0)
         completed   (+ committed rolled-back)]

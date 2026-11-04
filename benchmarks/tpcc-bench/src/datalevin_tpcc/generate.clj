@@ -41,21 +41,26 @@
      :c-cust (rint r 0 1023)
      :c-last (run-c-last r (load-c-last load-seed))}))
 
+(defn- other-warehouse [r w warehouses]
+  (let [other (rint r 1 (dec warehouses))]
+    (if (>= other w) (inc other) other)))
+
 (defn new-order-lines
-  "TPC-C 2.4.1.3-5: generate 5-15 lines and choose rollback once per order.
-  `item-id-fn` draws a valid NURand item using the driver's PRNG. In 1% of
-  orders, replace only the final item id with an unused value."
-  [^Random r w item-id-fn]
-  (let [n         (rint r 5 15)
-        rollback? (= 1 (rint r 1 100))
-        lines     (mapv (fn [_]
-                          {:i-id (item-id-fn)
-                           :supply-w w
-                           :qty (rint r 1 10)})
-                        (range n))]
-    (if rollback?
-      (assoc-in lines [(dec n) :i-id] (inc c/item-count))
-      lines)))
+  "Generate 5-15 lines, 1% remote supply per line when possible, and 1% rollback
+  per order. Only the final item is replaced for an invalid-item rollback."
+  ([r w item-id-fn] (new-order-lines r w 1 item-id-fn))
+  ([^Random r w warehouses item-id-fn]
+   (let [n (rint r 5 15)
+         rollback? (= 1 (rint r 1 100))
+         lines (mapv (fn [_]
+                       {:i-id (item-id-fn)
+                        :supply-w (if (and (> warehouses 1) (= 1 (rint r 1 100)))
+                                    (other-warehouse r w warehouses) w)
+                        :qty (rint r 1 10)})
+                     (range n))]
+     (if rollback?
+       (assoc-in lines [(dec n) :i-id] (inc c/item-count))
+       lines))))
 
 (defn- rand-string [^Random r ^long min-len ^long max-len]
   (let [n  (rint r min-len max-len)
@@ -94,6 +99,42 @@
   [r a x y c]
   (+ x (mod (+ (bit-or (.nextInt r (inc a)) (rint r x y)) c)
             (inc (- y x)))))
+
+(defn terminal-options
+  "Assign a fixed warehouse and Stock-Level district to a terminal."
+  [{:keys [warehouses] :as opts} terminal]
+  (assoc opts :home-w (inc (mod terminal warehouses))
+         :home-d (inc (mod (quot terminal warehouses) c/districts-per-warehouse))))
+
+(defn gen-input
+  "Shared input stream for all backends. Payment selects a remote customer in
+  15% of requests when multiple warehouses are available."
+  [^Random r {:keys [warehouses c-item c-cust c-last home-w home-d]
+              :or {home-w 1 home-d 1}} type]
+  (let [w home-w]
+    (case type
+      :new-order
+      {:w w :d (rint r 1 10) :c (nurand r 1023 1 3000 c-cust)
+       :ol (new-order-lines r w warehouses #(nurand r 8191 1 c/item-count c-item))}
+
+      :payment
+      (let [by-name? (<= (rint r 1 100) 60)
+            d (rint r 1 10)
+            remote? (and (> warehouses 1) (> (rint r 1 100) 85))]
+        {:w w :d d :c-w (if remote? (other-warehouse r w warehouses) w)
+         :c-d (if remote? (rint r 1 10) d)
+         :c (nurand r 1023 1 3000 c-cust) :by-name? by-name?
+         :last-name (when by-name? (nth last-names (nurand r 255 0 999 c-last)))
+         :amount (/ (rint r 100 500000) 100.0)})
+
+      :order-status
+      (let [by-name? (<= (rint r 1 100) 60)]
+        {:w w :d (rint r 1 10) :c (nurand r 1023 1 3000 c-cust)
+         :by-name? by-name?
+         :last-name (when by-name? (nth last-names (nurand r 255 0 999 c-last)))})
+
+      :delivery {:w w :carrier (rint r 1 10)}
+      :stock-level {:w w :d home-d :threshold (rint r 10 20)})))
 
 (defn- customer-last
   "TPC-C 4.3.3.1: the first 1000 customers in each district iterate the 1000
@@ -191,7 +232,7 @@
     (doseq [wid (range 1 (inc w))
             did (range 1 (inc c/districts-per-warehouse))]
       (let [custs (ArrayList. ^java.util.Collection
-                              (vec (range 1 (inc c/customers-per-district))))]
+                   (vec (range 1 (inc c/customers-per-district))))]
         (Collections/shuffle custs r)
         (doseq [oid (range 1 (inc c/initial-orders-per-district))]
           (let [cid     (nth custs (dec oid))

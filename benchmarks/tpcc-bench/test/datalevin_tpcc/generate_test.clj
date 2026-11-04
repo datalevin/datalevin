@@ -2,8 +2,7 @@
   (:require
    [clojure.test :refer [deftest is testing]]
    [datalevin-tpcc.common :as c]
-   [datalevin-tpcc.generate :as g]
-   [datalevin-tpcc.txns :as t])
+   [datalevin-tpcc.generate :as g])
   (:import
    [java.util Random]))
 
@@ -35,7 +34,7 @@
 (deftest nurand-range
   (let [r (Random. 1)]
     (dotimes [_ 1000]
-      (let [x (t/nurand r 8191 1 100000 0)]
+      (let [x (#'g/nurand r 8191 1 100000 0)]
         (is (<= 1 x 100000))))))
 
 (deftest population-cardinality

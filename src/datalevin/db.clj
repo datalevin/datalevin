@@ -558,18 +558,25 @@
 
 (defn- tx-touch-summary
   [tx-data]
-  (reduce
-    (fn [acc ^Datom datom]
+  (loop [datoms (seq tx-data)
+         eids (transient #{})
+         attrs (transient #{})
+         values (transient #{})
+         values-by-attr (transient {})]
+    (if-let [^Datom datom (first datoms)]
       (let [e (.-e datom)
             a (.-a datom)
             v (.-v datom)]
-        (-> acc
-            (update :eids conj e)
-            (update :attrs conj a)
-            (update :values conj v)
-            (update-in [:values-by-attr a] (fnil conj #{}) v))))
-    {:eids #{} :attrs #{} :values #{} :values-by-attr {}}
-    tx-data))
+        (recur (next datoms) (conj! eids e) (conj! attrs a) (conj! values v)
+               (assoc! values-by-attr a
+                       (conj! (or (get values-by-attr a) (transient #{})) v))))
+      {:eids (persistent! eids)
+       :attrs (persistent! attrs)
+       :values (persistent! values)
+       :values-by-attr
+       (persistent!
+         (reduce-kv (fn [m a vs] (assoc! m a (persistent! vs)))
+                    (transient {}) (persistent! values-by-attr)))})))
 
 (defn- value-equal?
   [expected actual]
@@ -735,13 +742,17 @@
 
 (defn- cache-invalidation-dependencies
   [{:keys [eids attrs values-by-attr]} local?]
-  (into (if local? [::all] [::all ::native-range])
-        (concat (map (fn [e] [::entity e]) eids)
-                (map (fn [a] [::attribute a]) attrs)
-                (for [[a vs] values-by-attr
-                      v     vs
-                      :when (exact-cache-value? v)]
-                  [::attribute-value a v]))))
+  (let [deps (reduce (fn [deps e] (conj! deps [::entity e]))
+                     (transient (if local? [::all] [::all ::native-range])) eids)
+        deps (reduce (fn [deps a] (conj! deps [::attribute a])) deps attrs)]
+    (persistent!
+      (reduce-kv
+        (fn [deps a vs]
+          (reduce (fn [deps v]
+                    (if (exact-cache-value? v)
+                      (conj! deps [::attribute-value a v])
+                      deps)) deps vs))
+        deps values-by-attr))))
 
 (defn- tx-affects-cache-key?
   [touches k]
@@ -1572,8 +1583,8 @@
        (compare [_ x y]
          (let [current (schema-fn)
                cached @state
-               comparator (if (identical? current (first cached))
-                            (second cached)
+               comparator (if (identical? current (nth cached 0 nil))
+                            (nth cached 1)
                             (let [custom? (cd/custom-schema? current)
                                   ;; Preserve equal-prefix value ordinals when
                                   ;; attributes are added to a live overlay.

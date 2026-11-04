@@ -95,15 +95,18 @@ The command exits nonzero on failure. Use `:dump? true` to print mismatches or
 
 ## Results
 
-Scale factor 1 (6,001,215 lineitems), measured on 2026-11-03 on a 12-core Apple
-M3 Pro with 36 GiB RAM and macOS 26.6.2. Versions: Datalevin 1.2.10 development
-checkout on Java 21 (8 GiB heap), SQLite 3.51.1, and PostgreSQL 18.6.
+Scale factor 1 (6,001,215 lineitems), measured on a 12-core Apple M3 Pro with
+36 GiB RAM and macOS 26.6.2. Datalevin and SQLite were measured on 2026-11-04;
+the PostgreSQL measurements are from 2026-11-03. Versions: Datalevin 1.2.10
+development checkout on Clojure 1.12.6 and Java 21.0.13.0.3 (8 GiB heap),
+SQLite 3.51.1, and PostgreSQL 18.6.
 PostgreSQL used 128 MiB shared buffers, 4 MiB work memory, and up to two parallel
 workers per gather.
 
 Times below are from the second complete pass, with warmup and measurement in
-separate JVMs. PostgreSQL was restarted before warmup and kept running between
-passes; the OS filesystem cache was not purged.
+separate JVMs. Datalevin and SQLite were rebuilt from the same generated SF1
+files before verification and warmup. PostgreSQL was restarted before its
+warmup and kept running between passes; the OS filesystem cache was not purged.
 
 Units are milliseconds; lower is better. PostgreSQL times include planning and
 execution; Datalevin and SQLite also include consuming results. All 22
@@ -111,29 +114,30 @@ Datalevin queries passed the SQLite correctness check.
 
 | Query | Datalevin (ms) | SQLite (ms) | PostgreSQL (ms) |
 |---|---:|---:|---:|
-| Q1 | 3,169.6 | 3,812.3 | 918.1 |
-| Q2 | 172.7 | 144.8 | 179.0 |
-| Q3 | 483.6 | 543.9 | 207.8 |
-| Q4 | 202.9 | 134.5 | 110.9 |
-| Q5 | 504.4 | 346.7 | 338.0 |
-| Q6 | 470.2 | 343.9 | 129.7 |
-| Q7 | 384.9 | 4,094.6 | 372.7 |
-| Q8 | 112.7 | 127.2 | 146.3 |
-| Q9 | 1,279.9 | 1,550.3 | 1,168.7 |
-| Q10 | 338.4 | 1,039.0 | 193.6 |
-| Q11 | 94.8 | 37.2 | 76.0 |
-| Q12 | 358.2 | 859.7 | 236.6 |
-| Q13 | 749.7 | 1,035.5 | 322.5 |
-| Q14 | 178.2 | 4,746.7 | 133.3 |
-| Q15 | 177.4 | 345.6 | 145.0 |
-| Q16 | 281.3 | 105.1 | 110.0 |
-| Q17 | 49.9 | 50.7 | 485.4 |
-| Q18 | 1,653.3 | 555.6 | 1,499.3 |
-| Q19 | 100.8 | 28.8 | 28.8 |
-| Q20 | 60.2 | 68.8 | 166.9 |
-| Q21 | 840.1 | 1,448.5 | 269.8 |
-| Q22 | 103.5 | 37.9 | 34.7 |
-| **Total** | **11,766.9** | **21,457.2** | **7,273.2** |
+| Q1 | 3,060.9 | 3,753.3 | 918.1 |
+| Q2 | 189.9 | 144.5 | 179.0 |
+| Q3 | 485.8 | 542.9 | 207.8 |
+| Q4 | 183.1 | 134.1 | 110.9 |
+| Q5 | 478.2 | 327.0 | 338.0 |
+| Q6 | 421.9 | 337.9 | 129.7 |
+| Q7 | 442.0 | 4,016.8 | 372.7 |
+| Q8 | 119.4 | 125.7 | 146.3 |
+| Q9 | 1,334.4 | 1,490.1 | 1,168.7 |
+| Q10 | 404.7 | 1,019.7 | 193.6 |
+| Q11 | 78.2 | 35.5 | 76.0 |
+| Q12 | 405.8 | 876.5 | 236.6 |
+| Q13 | 804.6 | 1,063.9 | 322.5 |
+| Q14 | 135.8 | 4,767.9 | 133.3 |
+| Q15 | 198.8 | 347.1 | 145.0 |
+| Q16 | 236.4 | 105.1 | 110.0 |
+| Q17 | 47.2 | 51.0 | 485.4 |
+| Q18 | 1,417.6 | 554.7 | 1,499.3 |
+| Q19 | 106.3 | 29.0 | 28.8 |
+| Q20 | 64.9 | 69.3 | 166.9 |
+| Q21 | 944.0 | 1,447.6 | 269.8 |
+| Q22 | 113.9 | 38.9 | 34.7 |
+| **Total** | **11,673.9** | **21,278.4** | **7,273.2** |
+
 
 ## Tests
 

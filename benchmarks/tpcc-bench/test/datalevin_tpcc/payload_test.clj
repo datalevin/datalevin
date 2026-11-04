@@ -37,7 +37,7 @@
     {"warehouse" (for [row (g/warehouse-rows 42 2)]
                    (assoc row 2 (if (= 2 (first row)) 0.07 0.01)
                           3 (str "WAREHOUSE" (first row))))
-     "district" (for [row (g/district-rows 42 2) :when (= 2 (second row))]
+     "district" (for [row (g/district-rows 42 2)]
                   (assoc row 3 (if (odd? (first row)) 0.13 0.0)
                          5 (str "DISTRICT" (first row))))
      "customer" (for [district (range 1 11)
@@ -45,12 +45,14 @@
                       [[17 "ALICE" "BC" old-data] [29 "ZOE" "GC" "good-credit-data"]]]
                   (assoc customer 0 cid 1 district 2 2 3 first-name 5 "SHARED"
                          13 credit 15 (if (= cid 17) 0.2 0.0) 20 data))
-     "item" (mapv (fn [row price] (assoc row 3 price))
+     "item" (mapv (fn [row price] (assoc row 2 (str "ITEM" (first row)) 3 price
+                                         4 (if (= 1 (first row)) "xORIGINALx" "generic")))
                   (take 2 (g/item-rows 42)) [1.0 3.5])
      "stock" (for [w [1 2] item [1 2]]
                (reduce (fn [row district]
                          (assoc row (+ 2 district) (dist-info w item district)))
-                       (assoc stock 0 item 1 w)
+                       (assoc stock 0 item 1 w 2 100
+                              16 (if (= w 2) "stockORIGINAL" "generic"))
                        (range 1 11)))}))
 
 (deftest payment-payload-formatting
@@ -84,13 +86,27 @@
             result (new-order! {:w 2 :d district :c customer :ol lines})]
         (is (= :ok (:status result)))
         (is (c/close-enough? expected-total (:amount result)))
+        (is (= {:id customer :last "SHARED" :credit (if (= customer 17) "BC" "GC")
+                :discount (if (= customer 17) 0.2 0.0)} (:customer result)))
+        (is (= [0.07 (if (odd? district) 0.13 0.0) 5]
+               ((juxt :w-tax :d-tax :ol-cnt) result)))
+        (is (string? (:entry-d result)))
+        (is (= [["ITEM1" "B" 1.0 5.0] ["ITEM1" "G" 1.0 5.0]
+                ["ITEM2" "G" 3.5 17.5] ["ITEM2" "G" 3.5 17.5]
+                ["ITEM1" "B" 1.0 5.0]]
+               (mapv (juxt :item-name :brand :price :amount) (:order-lines result))))
+        (when (and (= district 1) (= customer 17))
+          (is (= [100 100 100 100 95] (mapv :stock-quantity (:order-lines result)))
+              "each line reports stock read before its own update"))
         (is (= (mapv (fn [n {:keys [supply-w i-id]} amount]
                        [(inc n) i-id supply-w (dist-info supply-w i-id district) amount])
                      (range) lines [5.0 5.0 17.5 17.5 5.0])
                (order-lines district (:o-id result)))
             "S_DIST_xx comes from the supplying stock row and ordering district"))))
   (testing "Payment stores selected IDs, amount, prior C_DATA, and current names"
-    (let [expected-history (atom [])]
+    (let [expected-history (atom [])
+          totals (atom {})
+          rows (seed-rows)]
       (doseq [district [1 7 10]
               [input selected prefix]
               [[{:by-name? true :c 29 :amount 12.34} 17
@@ -106,11 +122,45 @@
           (is (= selected (:c result)) "surname selection uses the real customer ID")
           (is (= expected after) "only bad-credit data is prepended and truncated")
           (is (= "good-credit-data" (customer-data district 29)))
+          (let [customer-row (first (filter #(and (= selected (nth % 0))
+                                                  (= district (nth % 1))) (rows "customer")))
+                [paid count] (get @totals [district selected] [0.0 0])
+                expected (zipmap [:id :first :middle :last :street-1 :street-2 :city
+                                  :state :zip :phone :since :credit :credit-lim :discount]
+                                 (map customer-row [0 3 4 5 6 7 8 9 10 11 12 13 14 15]))]
+            (is (= expected (select-keys (:customer result) (keys expected))))
+            (is (c/close-enough? (- -10.0 paid (:amount input))
+                                 (get-in result [:customer :balance])))
+            (is (c/close-enough? (+ 10.0 paid (:amount input))
+                                 (get-in result [:customer :ytd-payment])))
+            (is (= (+ 2 count) (get-in result [:customer :payment-cnt])))
+            (swap! totals assoc [district selected] [(+ paid (:amount input)) (inc count)]))
+          (doseq [[table id row] [["warehouse" 2 (second (rows "warehouse"))]
+                                  ["district" district
+                                   (first (filter #(and (= district (first %)) (= 2 (second %)))
+                                                  (rows "district")))]]]
+            (let [offset (if (= table "warehouse") 3 5)]
+              (is (= (zipmap [:name :street-1 :street-2 :city :state :zip]
+                             (subvec row offset (+ offset 6)))
+                     (dissoc (get result (keyword table)) :id :w-id)))
+              (is (= id (get-in result [(keyword table) :id])))))
+          (if prefix
+            (is (= (subs after 0 200) (get-in result [:customer :data])))
+            (is (not (contains? (:customer result) :data))))
           (swap! expected-history conj
                  [selected district 2 district 2 (:amount input)
                   (str "WAREHOUSE2    DISTRICT" district)])))
       (is (= (set @expected-history) (set (history))))
-      (is (= 9 (count (history)))))))
+      (is (= 9 (count (history))))))
+  (testing "remote Payment keeps the home and customer locations distinct"
+    (doseq [by-name? [false true]]
+      (let [before (customer-data 3 17)
+            result (payment! {:w 1 :d 4 :c-w 2 :c-d 3 :c 17
+                              :last-name "SHARED" :by-name? by-name? :amount 2.5})]
+        (is (= [1 4 2 3 17] ((juxt :w :d :c-w :c-d :c) result)))
+        (is (= (subs (str "17 3 2 4 1 2.50 | " before) 0 500)
+               (customer-data 3 17)))
+        (is (some #{[17 3 2 4 1 2.5 "WAREHOUSE1    DISTRICT4"]} (history)))))))
 
 (deftest datalevin-transaction-payloads
   (let [conn (d/get-conn *test-dir* datalevin/schema)]
@@ -125,33 +175,33 @@
         (fn [district order]
           (vec (sort (d/q '[:find ?n ?item ?supply ?info ?amount :in $ ?d ?o
                             :where [?e :order-line/w-id 2]
-                                   [?e :order-line/d-id ?d] [?e :order-line/o-id ?o]
-                                   [?e :order-line/number ?n] [?e :order-line/i-id ?item]
-                                   [?e :order-line/supply-w-id ?supply]
-                                   [?e :order-line/dist-info ?info]
-                                   [?e :order-line/amount ?amount]]
+                            [?e :order-line/d-id ?d] [?e :order-line/o-id ?o]
+                            [?e :order-line/number ?n] [?e :order-line/i-id ?item]
+                            [?e :order-line/supply-w-id ?supply]
+                            [?e :order-line/dist-info ?info]
+                            [?e :order-line/amount ?amount]]
                           (d/db conn) district order))))
         :customer-data
         (fn [district customer]
           (d/q '[:find ?data . :in $ ?d ?c
                  :where [?e :customer/w-id 2] [?e :customer/d-id ?d]
-                        [?e :customer/id ?c] [?e :customer/data ?data]]
+                 [?e :customer/id ?c] [?e :customer/data ?data]]
                (d/db conn) district customer))
         :history
         #(d/q '[:find ?cid ?cd ?cw ?district ?w ?amount ?data
                 :with ?e
                 :where [?e :history/c-id ?cid] [?e :history/c-d-id ?cd]
-                       [?e :history/c-w-id ?cw] [?e :history/d-id ?district]
-                       [?e :history/w-id ?w] [?e :history/amount ?amount]
-                       [?e :history/data ?data]] (d/db conn))})
+                [?e :history/c-w-id ?cw] [?e :history/d-id ?district]
+                [?e :history/w-id ?w] [?e :history/amount ?amount]
+                [?e :history/data ?data]] (d/db conn))})
       (finally (d/close conn)))))
 
 (defn- check-sql-payloads!
   [^Connection conn dialect new-order! payment!]
   (with-open [stmt (.createStatement conn)]
     (doseq [sql (-> (slurp (io/file (c/data-dir) (str "schema-" dialect ".sql")))
-                   (str/replace #"(?m)--[^\n]*" "")
-                   (str/split #";"))
+                    (str/replace #"(?m)--[^\n]*" "")
+                    (str/split #";"))
             :when (not (str/blank? sql))]
       (.execute stmt sql)))
   (doseq [[table rows] (seed-rows)
@@ -162,12 +212,12 @@
    {:new-order! #(new-order! conn %)
     :payment! #(payment! conn %)
     :order-lines #(mapv (fn [row] (update row 4 double))
-                       (#'sqlite/qall conn
-                                      "SELECT ol_number, ol_i_id, ol_supply_w_id, ol_dist_info, ol_amount FROM order_line WHERE ol_w_id=2 AND ol_d_id=? AND ol_o_id=? ORDER BY ol_number"
-                                      %1 %2))
-    :customer-data #(first (#'sqlite/q1 conn
-                                       "SELECT c_data FROM customer WHERE c_w_id=2 AND c_d_id=? AND c_id=?"
+                        (#'sqlite/qall conn
+                                       "SELECT ol_number, ol_i_id, ol_supply_w_id, ol_dist_info, ol_amount FROM order_line WHERE ol_w_id=2 AND ol_d_id=? AND ol_o_id=? ORDER BY ol_number"
                                        %1 %2))
+    :customer-data #(first (#'sqlite/q1 conn
+                                        "SELECT c_data FROM customer WHERE c_w_id=2 AND c_d_id=? AND c_id=?"
+                                        %1 %2))
     :history #(mapv (fn [row] (update row 5 double))
                     (#'sqlite/qall conn
                                    "SELECT h_c_id, h_c_d_id, h_c_w_id, h_d_id, h_w_id, h_amount, h_data FROM history"))}))
@@ -179,8 +229,8 @@
 (deftest postgres-transaction-payloads
   (if-let [url (System/getenv "TPCC_TEST_PG_URL")]
     (with-open [conn (DriverManager/getConnection
-                     url (or (System/getenv "TPCC_TEST_PG_USER") (System/getenv "USER"))
-                     (or (System/getenv "TPCC_TEST_PG_PASS") ""))]
+                      url (or (System/getenv "TPCC_TEST_PG_USER") (System/getenv "USER"))
+                      (or (System/getenv "TPCC_TEST_PG_PASS") ""))]
       (let [schema (str "tpcc_payload_" (str/replace (str (random-uuid)) "-" ""))]
         (#'sqlite/exec! conn (str "CREATE SCHEMA " schema))
         (try

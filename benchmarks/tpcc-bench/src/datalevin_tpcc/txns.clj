@@ -1,377 +1,239 @@
 (ns datalevin-tpcc.txns
-  "TPC-C-derived transactions for Datalevin.
-
-  Each write transaction performs all reads and writes inside one explicit
-  Datalevin transaction. The transaction-bound connection keeps shared totals,
-  counters, and dependent reads consistent while concurrent terminals wait."
+  "TPC-C-derived transactions using business-key lookups and ordered indexes.
+  All transactions except the intentionally relaxed Stock-Level read run inside
+  one explicit transaction, including Order-Status's dependent reads."
   (:require
    [datalevin.core :as d]
-   [datalevin-tpcc.common :as common])
-  (:import
-   [java.time Instant]
-   [java.util Random]))
-
-(defn- rint ^long [^Random r ^long lo ^long hi]
-  (+ lo (.nextInt r (inc (- hi lo)))))
-
-(defn nurand
-  "NURand(A, x, y) as defined by TPC-C, with constant `c` chosen per run."
-  [r a x y c]
-  (+ x (mod (+ (bit-or (.nextInt r (inc a)) (rint r x y)) c)
-            (inc (- y x)))))
+   [datalevin-tpcc.common :as common]
+   [datalevin-tpcc.schema :as schema])
+  (:import [java.time Instant]))
 
 (defn- now-str [] (str (Instant/now)))
 
-;; ---------------------------------------------------------------------------
-;; Lookups
+(defn- customer-ref [db w district customer last-name by-name?]
+  (if by-name?
+    ;; Select the lower median from the surname index, without reading balances
+    ;; or the large C_DATA payload of every matching customer.
+    (some->> (d/datoms db :ave :customer/name-key [w district last-name])
+             (map :e)
+             (d/pull-many db [:db/id :customer/id :customer/first])
+             (sort-by (juxt :customer/first :customer/id))
+             common/middle-customer
+             :db/id)
+    [:customer/key [w district customer]]))
 
-(defn- warehouse [db w]
-  (first (d/q '[:find ?e ?ytd ?tax :in $ ?w
-                :where [?e :warehouse/id ?w]
-                       [?e :warehouse/ytd ?ytd]
-                       [?e :warehouse/tax ?tax]]
-              db w)))
+(defn- edge
+  "Read at most one index entry and reject a neighboring district/customer."
+  [db attr prefix backwards?]
+  (let [bound (conj prefix (if backwards? Long/MAX_VALUE Long/MIN_VALUE))
+        datom (first ((if backwards? d/rseek-datoms d/seek-datoms)
+                      db :ave attr bound nil 1))]
+    (when (and (= attr (:a datom))
+               (= prefix (pop (:v datom))))
+      datom)))
 
-(defn- district [db w d]
-  (first (d/q '[:find ?e ?ytd ?tax ?next :in $ ?w ?d
-                :where
-                [?e :district/w-id ?w]
-                [?e :district/id ?d]
-                [?e :district/ytd ?ytd]
-                [?e :district/tax ?tax]
-                [?e :district/next-o-id ?next]]
-              db w d)))
+(defn- order-lines [db w district order pattern]
+  (d/pull-many db pattern
+               (map :e (d/index-range db :order-line/key
+                                      [w district order 0]
+                                      [w district order Long/MAX_VALUE]))))
 
-(defn- customer-by-id [db w d c]
-  (first (d/q '[:find ?e ?c ?discount ?credit ?data :in $ ?w ?d ?c
-                :where
-                [?e :customer/w-id ?w]
-                [?e :customer/d-id ?d]
-                [?e :customer/id ?c]
-                [?e :customer/discount ?discount]
-                [?e :customer/credit ?credit]
-                [?e :customer/data ?data]]
-              db w d c)))
+(defn- new-order-tx!
+  "Execute on a transaction-bound connection. An optional observer can inspect
+  the staged work immediately before an invalid item aborts the transaction."
+  [tx {:keys [w d c ol]} before-rollback]
+  (let [db (d/db tx)
+        warehouse (d/pull db [:warehouse/tax] [:warehouse/id w])
+        district (d/pull db [:db/id :district/tax :district/next-o-id]
+                         [:district/key [w d]])
+        customer (d/pull db [:customer/discount :customer/last :customer/credit]
+                         [:customer/key [w d c]])
+        o-id (:district/next-o-id district)
+        entry (now-str)
+        dist-attr (common/stock-dist-attr d)
+        stock-pattern [:db/id dist-attr :stock/quantity :stock/ytd
+                       :stock/order-cnt :stock/remote-cnt :stock/data]
+        all-local (long (if (every? #(= w (:supply-w %)) ol) 1 0))]
+    (when (nil? (:db/id district))
+      (throw (ex-info "No such district" {:w w :d d})))
+    (d/transact!
+     tx
+     [[:db/add (:db/id district) :district/next-o-id (inc o-id)]
+      {:db/id -1 :orders/id o-id :orders/d-id d :orders/w-id w
+       :orders/c-id c :orders/entry-d entry
+       :orders/ol-cnt (count ol) :orders/all-local all-local}
+      {:db/id -2 :new-order/o-id o-id :new-order/d-id d :new-order/w-id w}])
+    ;; Preserve valid-prefix work before rollback and read our own stock writes
+    ;; for repeated items. No item prevalidation or cached stock snapshots.
+    (loop [lines (seq ol) number 1 results []]
+      (if-let [{:keys [i-id supply-w qty]} (first lines)]
+        (let [db (d/db tx)]
+          (if-let [item (d/pull db [:item/price :item/name :item/data] [:item/id i-id])]
+            (let [stock (d/pull db stock-pattern [:stock/key [supply-w i-id]])
+                  [quantity ytd ocnt rcnt]
+                  (common/stock-after-lines
+                   ((juxt :stock/quantity :stock/ytd :stock/order-cnt :stock/remote-cnt) stock)
+                   [qty] (not= supply-w w))
+                  result (common/new-order-line-result
+                          number i-id supply-w qty (:item/name item)
+                          (:stock/quantity stock) (:item/price item)
+                          (:item/data item) (:stock/data stock))
+                  s-eid (:db/id stock)]
+              (d/transact!
+               tx
+               [[:db/add s-eid :stock/quantity quantity]
+                [:db/add s-eid :stock/ytd ytd]
+                [:db/add s-eid :stock/order-cnt ocnt]
+                [:db/add s-eid :stock/remote-cnt rcnt]
+                {:db/id -1 :order-line/o-id o-id :order-line/d-id d
+                 :order-line/w-id w :order-line/number number
+                 :order-line/i-id i-id :order-line/supply-w-id supply-w
+                 :order-line/quantity (long qty) :order-line/amount (:amount result)
+                 :order-line/dist-info (get stock dist-attr)}])
+              (recur (next lines) (inc number) (conj results result)))
+            (do
+              (when before-rollback (before-rollback db))
+              (d/abort-transact tx)
+              (common/new-order-rollback-result
+               w d c o-id i-id (:customer/last customer) (:customer/credit customer)))))
+        (common/new-order-result
+         w d c o-id entry (:customer/last customer) (:customer/credit customer)
+         (:customer/discount customer) (:warehouse/tax warehouse)
+         (:district/tax district) results)))))
 
-(defn- customer-by-last
-  "The middle customer by c_first with the given last name in the district.
-  Returns the customer entity and its real business id, not the transaction
-  input."
-  [db w d last-name]
-  (let [rows (d/q '[:find ?e ?id ?discount ?credit ?data ?first
-                    :in $ ?w ?d ?last
-                    :where
-                    [?e :customer/w-id ?w]
-                    [?e :customer/d-id ?d]
-                    [?e :customer/last ?last]
-                    [?e :customer/id ?id]
-                    [?e :customer/discount ?discount]
-                    [?e :customer/credit ?credit]
-                    [?e :customer/data ?data]
-                    [?e :customer/first ?first]]
-                  db w d last-name)
-        sorted (sort-by #(nth % 5) rows)]
-    (common/middle-customer sorted)))
+(defn new-order! [conn input]
+  (d/with-transaction [tx conn]
+    (new-order-tx! tx input nil)))
 
-(defn- item [db i-id]
-  (first (d/q '[:find ?e ?price :in $ ?i
-                :where [?e :item/id ?i] [?e :item/price ?price]]
-              db i-id)))
+(def ^:private warehouse-payment-pattern
+  (into [:db/id :warehouse/ytd] (schema/attrs "warehouse" common/payment-location-fields)))
+(def ^:private district-payment-pattern
+  (into [:db/id :district/ytd] (schema/attrs "district" common/payment-location-fields)))
+(def ^:private customer-payment-pattern
+  (into [:db/id] (schema/attrs "customer" common/payment-customer-fields)))
 
-(defn- stock [db w i-id district]
-  (first (d/q '[:find ?e ?dist ?qty ?ytd ?ocnt ?rcnt
-                :in $ ?w ?i ?dist-attr
-                :where
-                [?e :stock/w-id ?w]
-                [?e :stock/i-id ?i]
-                [?e ?dist-attr ?dist]
-                [?e :stock/quantity ?qty]
-                [?e :stock/ytd ?ytd]
-                [?e :stock/order-cnt ?ocnt]
-                [?e :stock/remote-cnt ?rcnt]]
-              db w i-id (common/stock-dist-attr district))))
-
-;; ---------------------------------------------------------------------------
-;; New-Order
-
-(defn new-order!
-  [conn {:keys [w d c ol]}]
-  (d/with-transaction [tx-conn conn]
-    (let [db                    (d/db tx-conn)
-          [_ _ w-tax]           (warehouse db w)
-          [d-eid _ d-tax o-id]   (district db w d)
-          [_c-eid _c-id c-disc]  (customer-by-id db w d c)
-          all-local             (long (if (every? #(= w (:supply-w %)) ol) 1 0))]
-      (when (nil? d-eid)
-        (throw (ex-info "No such district" {:w w :d d})))
-      (d/transact!
-       tx-conn
-       [[:db/add d-eid :district/next-o-id (inc o-id)]
-        {:db/id -1 :orders/id o-id :orders/d-id d :orders/w-id w
-         :orders/c-id c :orders/entry-d (now-str)
-         :orders/ol-cnt (count ol) :orders/all-local all-local}
-        {:db/id -2 :new-order/o-id o-id :new-order/d-id d :new-order/w-id w}])
-      ;; TPC-C 2.4.2.3 requires the valid prefix to perform its writes before
-      ;; discovering the invalid item. Prevalidating the order skips that work.
-      (loop [lines (seq ol) number 1 subtotal 0.0]
-        (if-let [{:keys [i-id supply-w qty]} (first lines)]
-          (let [db (d/db tx-conn)]
-            (if-let [[_ price] (item db i-id)]
-              (let [[s-eid dist-info & values] (stock db supply-w i-id d)
-                    [quantity ytd ocnt rcnt]
-                    (common/stock-after-lines values [qty] (not= supply-w w))
-                    amount (* (double qty) (double price))]
-                (d/transact!
-                 tx-conn
-                 [[:db/add s-eid :stock/quantity quantity]
-                  [:db/add s-eid :stock/ytd ytd]
-                  [:db/add s-eid :stock/order-cnt ocnt]
-                  [:db/add s-eid :stock/remote-cnt rcnt]
-                  {:db/id -1 :order-line/o-id o-id :order-line/d-id d
-                   :order-line/w-id w :order-line/number number
-                   :order-line/i-id i-id :order-line/supply-w-id supply-w
-                   :order-line/quantity (long qty) :order-line/amount amount
-                   :order-line/dist-info dist-info}])
-                (recur (next lines) (inc number) (+ subtotal amount)))
-              (do
-                (d/abort-transact tx-conn)
-                {:type :new-order :status :invalid-item :w w :d d
-                 :o-id o-id :i-id i-id})))
-          {:type :new-order :status :ok :w w :d d :o-id o-id
-           :amount (common/new-order-total subtotal c-disc w-tax d-tax)})))))
-
-;; ---------------------------------------------------------------------------
-;; Payment
+(defn- row-values [table fields row]
+  (zipmap fields (map row (schema/attrs table fields))))
 
 (defn payment!
-  [conn {:keys [w d c last-name amount by-name?]}]
-  (d/with-transaction [tx-conn conn]
-    (let [db                      (d/db tx-conn)
-          [w-eid w-ytd _]         (warehouse db w)
-          [d-eid d-ytd _ _]       (district db w d)
-          cust                    (if by-name?
-                                    (customer-by-last db w d last-name)
-                                    (customer-by-id db w d c))]
-      (if (nil? cust)
+  [conn {:keys [w d c c-w c-d last-name amount by-name?]}]
+  (d/with-transaction [tx conn]
+    (let [db (d/db tx)
+          c-w (or c-w w)
+          c-d (or c-d d)
+          warehouse (d/pull db warehouse-payment-pattern [:warehouse/id w])
+          district (d/pull db district-payment-pattern [:district/key [w d]])
+          ref (customer-ref db c-w c-d c last-name by-name?)
+          customer (when ref (d/pull db customer-payment-pattern ref))]
+      (if-not customer
         {:type :payment :status :no-customer :w w :d d}
-        (let [[c-eid c-id _ c-credit c-data] cust
-              w-name (:warehouse/name (d/entity db w-eid))
-              d-name (:district/name (d/entity db d-eid))
-              [cb]  (first (d/q '[:find ?v :in $ ?e
-                                  :where [?e :customer/balance ?v]] db c-eid))
-              [cyp] (first (d/q '[:find ?v :in $ ?e
-                                  :where [?e :customer/ytd-payment ?v]] db c-eid))
-              [cpc] (first (d/q '[:find ?v :in $ ?e
-                                  :where [?e :customer/payment-cnt ?v]] db c-eid))
-              new-data (when (= "BC" c-credit)
-                         (common/bad-credit-data c-id d w d w amount c-data))
-              tx (cond-> [[:db/add w-eid :warehouse/ytd
-                           (+ (double w-ytd) (double amount))]
-                          [:db/add d-eid :district/ytd
-                           (+ (double d-ytd) (double amount))]
-                          [:db/add c-eid :customer/balance
-                           (- (double cb) (double amount))]
-                          [:db/add c-eid :customer/ytd-payment
-                           (+ (double cyp) (double amount))]
-                          [:db/add c-eid :customer/payment-cnt (inc (long cpc))]
-                          {:db/id -1 :history/c-id c-id :history/c-d-id d
-                           :history/c-w-id w :history/d-id d :history/w-id w
-                           :history/date (now-str) :history/amount (double amount)
-                           :history/data (common/payment-history-data w-name d-name)}]
-                    new-data (conj [:db/add c-eid :customer/data new-data]))]
-          (d/transact! tx-conn tx)
-          {:type :payment :status :ok :w w :d d :c c-id :amount amount
-           :credit c-credit})))))
-
-;; ---------------------------------------------------------------------------
-;; Order-Status (read only)
+        (let [c-eid (:db/id customer)
+              c-id (:customer/id customer)
+              date (now-str)
+              new-data (when (= "BC" (:customer/credit customer))
+                         (common/bad-credit-data
+                          c-id c-d c-w d w amount
+                          (:customer/data (d/pull db [:customer/data] c-eid))))
+              updates
+              (cond-> [[:db/add (:db/id warehouse) :warehouse/ytd
+                        (+ (:warehouse/ytd warehouse) (double amount))]
+                       [:db/add (:db/id district) :district/ytd
+                        (+ (:district/ytd district) (double amount))]
+                       [:db/add c-eid :customer/balance
+                        (- (:customer/balance customer) (double amount))]
+                       [:db/add c-eid :customer/ytd-payment
+                        (+ (:customer/ytd-payment customer) (double amount))]
+                       [:db/add c-eid :customer/payment-cnt
+                        (inc (:customer/payment-cnt customer))]
+                       {:db/id -1 :history/c-id c-id :history/c-d-id c-d
+                        :history/c-w-id c-w :history/d-id d :history/w-id w
+                        :history/date date :history/amount (double amount)
+                        :history/data (common/payment-history-data
+                                       (:warehouse/name warehouse) (:district/name district))}]
+                new-data (conj [:db/add c-eid :customer/data new-data]))]
+          (d/transact! tx updates)
+          (common/payment-result
+           w d c-w c-d amount date
+           (row-values "warehouse" common/payment-location-fields warehouse)
+           (row-values "district" common/payment-location-fields district)
+           (row-values "customer" common/payment-customer-fields customer) new-data))))))
 
 (defn order-status!
   [conn {:keys [w d c last-name by-name?]}]
-  (let [db   (d/db conn)
-        rows (d/q '[:find ?id ?balance ?first ?middle ?last
-                     :in $ ?w ?d ?attr ?value
-                     :where
-                     [?e :customer/w-id ?w]
-                     [?e :customer/d-id ?d]
-                     [?e ?attr ?value]
-                     [?e :customer/id ?id]
-                     [?e :customer/balance ?balance]
-                     [?e :customer/first ?first]
-                     [?e :customer/middle ?middle]
-                     [?e :customer/last ?last]]
-                   db w d (if by-name? :customer/last :customer/id)
-                   (if by-name? last-name c))
-        cust (if by-name?
-               (common/middle-customer (sort-by (juxt #(nth % 2) first) rows))
-               (first rows))]
-    (if (nil? cust)
-      {:type :order-status :status :no-customer}
-      (let [c-id (first cust)
-            ;; TPC-C 2.6: inspect the customer's most recent order, i.e. the
-            ;; greatest order id, matching the SQL backends' ORDER BY o_id DESC.
-            o-id (ffirst (d/q '[:find (max ?id)
-                                :in $ ?w ?d ?c
-                                :where
-                                [?e :orders/w-id ?w]
-                                [?e :orders/d-id ?d]
-                                [?e :orders/c-id ?c]
-                                [?e :orders/id ?id]]
-                              db w d c-id))]
-        (if o-id
-          ;; Pull keeps orders and lines whose optional carrier/delivery
-          ;; attributes are absent, the equivalent of SQL NULL.
-          (let [order (ffirst
-                       (d/q '[:find (pull ?e [:orders/id :orders/entry-d
-                                              :orders/carrier-id])
-                              :in $ ?w ?d ?o
-                              :where
-                              [?e :orders/w-id ?w]
-                              [?e :orders/d-id ?d]
-                              [?e :orders/id ?o]]
-                            db w d o-id))
-                lines (d/q '[:find (pull ?l [:order-line/number :order-line/i-id
-                                            :order-line/supply-w-id
-                                            :order-line/quantity :order-line/amount
-                                            :order-line/delivery-d])
-                             :in $ ?w ?d ?o
-                             :where
-                             [?l :order-line/w-id ?w]
-                             [?l :order-line/d-id ?d]
-                             [?l :order-line/o-id ?o]]
-                           db w d o-id)]
+  ;; A DB value alone does not pin an LMDB snapshot across multiple API calls.
+  (d/with-transaction [tx conn]
+    (let [db (d/db tx)
+          ref (customer-ref db w d c last-name by-name?)
+          customer (when ref
+                     (d/pull db [:customer/id :customer/balance :customer/first
+                                 :customer/middle :customer/last] ref))]
+      (if-not customer
+        {:type :order-status :status :no-customer}
+        (if-let [latest (edge db :orders/customer-key [w d (:customer/id customer)] true)]
+          (let [order (d/pull db [:orders/id :orders/entry-d :orders/carrier-id] (:e latest))
+                lines (order-lines db w d (:orders/id order)
+                                   [:order-line/number :order-line/i-id :order-line/supply-w-id
+                                    :order-line/quantity :order-line/amount :order-line/delivery-d])]
             (common/order-status-result
-             cust ((juxt :orders/id :orders/entry-d :orders/carrier-id) order)
-             (->> lines
-                  (map first)
-                  (sort-by :order-line/number)
-                  (map (juxt :order-line/number :order-line/i-id
-                             :order-line/supply-w-id :order-line/quantity
-                             :order-line/amount :order-line/delivery-d)))))
+             ((juxt :customer/id :customer/balance :customer/first :customer/middle :customer/last) customer)
+             ((juxt :orders/id :orders/entry-d :orders/carrier-id) order)
+             (map (juxt :order-line/number :order-line/i-id :order-line/supply-w-id
+                        :order-line/quantity :order-line/amount :order-line/delivery-d) lines)))
           {:type :order-status :status :no-order})))))
 
-;; ---------------------------------------------------------------------------
-;; Delivery
+(defn delivery! [conn {:keys [w carrier]}]
+  (d/with-transaction [tx conn]
+    (let [db (d/db tx)
+          districts (d/index-range db :district/key [w 0] [w Long/MAX_VALUE])
+          plans (into [] (keep (fn [district]
+                                 (let [did (peek (:v district))]
+                                   (when-let [oldest (edge db :new-order/key [w did] false)]
+                                     [did oldest])))) districts)
+          now (now-str)
+          updates
+          (into []
+                (mapcat
+                 (fn [[did oldest]]
+                   (let [o-id (peek (:v oldest))
+                         order (d/pull db [:db/id :orders/c-id] [:orders/key [w did o-id]])
+                         lines (order-lines db w did o-id [:db/id :order-line/amount])
+                         customer (d/pull db [:db/id :customer/balance :customer/delivery-cnt]
+                                          [:customer/key [w did (:orders/c-id order)]])]
+                     (into [[:db.fn/retractEntity (:e oldest)]
+                            [:db/add (:db/id order) :orders/carrier-id carrier]
+                            [:db/add (:db/id customer) :customer/balance
+                             (+ (:customer/balance customer) (reduce + 0.0 (map :order-line/amount lines)))]
+                            [:db/add (:db/id customer) :customer/delivery-cnt
+                             (inc (:customer/delivery-cnt customer))]]
+                           (map (fn [line] [:db/add (:db/id line) :order-line/delivery-d now]))
+                           lines)))) plans)]
+      (when (seq updates) (d/transact! tx updates))
+      {:type :delivery :status :ok :delivered (count plans)})))
 
-(defn delivery!
-  [conn {:keys [w carrier]}]
-  (d/with-transaction [tx-conn conn]
-    (let [db     (d/db tx-conn)
-          dids   (d/q '[:find ?d :in $ ?w
-                        :where [?e :district/w-id ?w] [?e :district/id ?d]]
-                      db w)
-          plans  (for [[did] dids
-                       :let [no (ffirst (d/q '[:find (min ?o) :in $ ?w ?d
-                                               :where
-                                               [?n :new-order/w-id ?w]
-                                               [?n :new-order/d-id ?d]
-                                               [?n :new-order/o-id ?o]]
-                                             db w did))]
-                       :when no]
-                   [did no])]
-      (if (empty? plans)
-        {:type :delivery :status :ok :delivered 0}
-        (let [now (now-str)
-              tx  (into []
-                        (mapcat
-                         (fn [[did no]]
-                           (let [n-eid (ffirst (d/q '[:find ?n :in $ ?w ?d ?o
-                                                      :where [?n :new-order/w-id ?w]
-                                                             [?n :new-order/d-id ?d]
-                                                             [?n :new-order/o-id ?o]]
-                                                    db w did no))
-                                 [o-eid c-id] (first
-                                               (d/q '[:find ?e ?c :in $ ?w ?d ?o
-                                                      :where
-                                                      [?e :orders/w-id ?w]
-                                                      [?e :orders/d-id ?d]
-                                                      [?e :orders/id ?o]
-                                                      [?e :orders/c-id ?c]]
-                                                    db w did no))
-                                 lines (d/q '[:find ?l ?amount :in $ ?w ?d ?o
-                                              :where
-                                              [?l :order-line/w-id ?w]
-                                              [?l :order-line/d-id ?d]
-                                              [?l :order-line/o-id ?o]
-                                              [?l :order-line/amount ?amount]]
-                                            db w did no)
-                                 total (reduce + 0.0 (map second lines))
-                                 [c-eid c-bal c-dc] (first
-                                                     (d/q '[:find ?e ?bal ?dc
-                                                            :in $ ?w ?d ?c
-                                                            :where
-                                                            [?e :customer/w-id ?w]
-                                                            [?e :customer/d-id ?d]
-                                                            [?e :customer/id ?c]
-                                                            [?e :customer/balance ?bal]
-                                                            [?e :customer/delivery-cnt ?dc]]
-                                                          db w did c-id))]
-                             (concat
-                              [[:db.fn/retractEntity n-eid]]
-                              [[:db/add o-eid :orders/carrier-id carrier]]
-                              (map (fn [[l-eid _]]
-                                     [:db/add l-eid :order-line/delivery-d now])
-                                   lines)
-                              [[:db/add c-eid :customer/balance
-                                (+ (double c-bal) (double total))]]
-                              [[:db/add c-eid :customer/delivery-cnt
-                                (inc (long c-dc))]])))
-                         plans))]
-          (d/transact! tx-conn tx)
-          {:type :delivery :status :ok :delivered (count plans)})))))
-
-;; ---------------------------------------------------------------------------
-;; Stock-Level (read only)
-
-(defn stock-level!
-  [conn {:keys [w d threshold]}]
-  (let [db      (d/db conn)
-        next-id (ffirst (d/q '[:find ?n :in $ ?w ?d
-                               :where
-                               [?e :district/w-id ?w]
-                               [?e :district/id ?d]
-                               [?e :district/next-o-id ?n]]
-                             db w d))
-        low     (if next-id
-                  ;; TPC-C 2.8: examine the last 20 orders, [d_next_o_id - 20,
-                  ;; d_next_o_id), including orders already delivered.
-                  (count (d/q '[:find ?i :in $ ?w ?d ?lo ?hi ?t
-                                :where
-                                [?l :order-line/w-id ?w]
-                                [?l :order-line/d-id ?d]
-                                [?l :order-line/o-id ?o]
-                                [(>= ?o ?lo)]
-                                [(< ?o ?hi)]
-                                [?l :order-line/i-id ?i]
-                                [?s :stock/w-id ?w]
-                                [?s :stock/i-id ?i]
-                                [?s :stock/quantity ?q]
-                                [(< ?q ?t)]]
-                              db w d (- (long next-id) 20) (long next-id)
-                              threshold))
-                  0)]
+(defn stock-level! [conn {:keys [w d threshold]}]
+  (let [db (d/db conn)
+        next-id (:district/next-o-id (d/pull db [:district/next-o-id] [:district/key [w d]]))
+        low (if next-id
+              (let [items (into #{}
+                                (map :order-line/i-id)
+                                (d/pull-many
+                                 db [:order-line/i-id]
+                                 (map :e (d/index-range db :order-line/key
+                                                        [w d (- next-id 20) 0]
+                                                        [w d (dec next-id) Long/MAX_VALUE]))))
+                    stock (d/prepare-pull db [:stock/quantity])]
+                (count (filter #(< (:stock/quantity (stock [:stock/key [w %]]))
+                                   threshold)
+                               items)))
+              0)]
     {:type :stock-level :status :ok :low-stock low}))
 
-;; ---------------------------------------------------------------------------
-;; Verification helpers
+;; Verification helpers run while benchmark terminals are stopped.
+(defn district-next-o-id [conn w district]
+  (:district/next-o-id (d/pull (d/db conn) [:district/next-o-id] [:district/key [w district]])))
 
-(defn district-next-o-id [conn w d]
-  (ffirst (d/q '[:find ?n :in $ ?w ?d
-                 :where [?e :district/w-id ?w]
-                        [?e :district/id ?d]
-                        [?e :district/next-o-id ?n]]
-               (d/db conn) w d)))
+(defn new-order-count [conn w district]
+  (count (d/index-range (d/db conn) :new-order/key [w district 0] [w district Long/MAX_VALUE])))
 
-(defn new-order-count [conn w d]
-  (count (d/q '[:find ?o :in $ ?w ?d
-                :where [?n :new-order/w-id ?w]
-                       [?n :new-order/d-id ?d]
-                       [?n :new-order/o-id ?o]]
-              (d/db conn) w d)))
-
-(defn order-count [conn w d]
-  (count (d/q '[:find ?o :in $ ?w ?d
-                :where [?e :orders/w-id ?w]
-                       [?e :orders/d-id ?d]
-                       [?e :orders/id ?o]]
-              (d/db conn) w d)))
+(defn order-count [conn w district]
+  (count (d/index-range (d/db conn) :orders/key [w district 0] [w district Long/MAX_VALUE])))

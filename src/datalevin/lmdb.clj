@@ -758,6 +758,7 @@
 (defmacro with-transaction-kv
   "Evaluate one atomic KV write body. WAL bodies run once on the elected batch
   owner with the caller's dynamic bindings. Reads use the native transaction.
+  Each outer explicit body has an independent commit or rollback outcome.
   :timeout-ms bounds the body."
   [[db orig-db opts] & body]
   `(let [orig-db# ~orig-db

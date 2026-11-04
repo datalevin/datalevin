@@ -8,16 +8,12 @@
    [datalevin-tpcc.check :as check]
    [datalevin-tpcc.common :as c]
    [datalevin-tpcc.generate :as g]
+   [datalevin-tpcc.schema :as schema]
    [datalevin-tpcc.txns :as t])
   (:import
    [java.util Random]))
 
-(def schema
-  (into {}
-        (for [table c/table-order
-              :let  [spec (c/table-specs table)]
-              [a t] (map vector (c/attrs table) (:types spec))]
-          [a {:db/valueType (c/type->db-type t)}])))
+(def schema schema/schema)
 
 (defn- load-table!
   [db table rows eid]
@@ -86,31 +82,8 @@
       (<= x 96)  :delivery
       :else      :stock-level)))
 
-(defn- gen-input [^Random r {:keys [warehouses c-item c-cust c-last]} type]
-  (let [w (rint r 1 warehouses)]
-    (case type
-      :new-order
-      {:w w :d (rint r 1 10) :c (t/nurand r 1023 1 3000 c-cust)
-       :ol (g/new-order-lines r w #(t/nurand r 8191 1 c/item-count c-item))}
-
-      :payment
-      (let [by-name? (<= (rint r 1 100) 60)]
-        {:w w :d (rint r 1 10) :c (t/nurand r 1023 1 3000 c-cust)
-         :by-name? by-name?
-         :last-name (when by-name? (nth g/last-names (t/nurand r 255 0 999 c-last)))
-         :amount (/ (rint r 100 500000) 100.0)})
-
-      :order-status
-      (let [by-name? (<= (rint r 1 100) 60)]
-        {:w w :d (rint r 1 10) :c (t/nurand r 1023 1 3000 c-cust)
-         :by-name? by-name?
-         :last-name (when by-name? (nth g/last-names (t/nurand r 255 0 999 c-last)))})
-
-      :delivery
-      {:w w :carrier (rint r 1 10)}
-
-      :stock-level
-      {:w w :d (rint r 1 10) :threshold (rint r 10 20)})))
+(defn- gen-input [r opts type]
+  (g/gen-input r opts type))
 
 (defn- do-txn [conn ^Random r opts type]
   (let [input (gen-input r opts type)
@@ -128,6 +101,20 @@
     (nth sorted (min (dec (count sorted))
                      (int (Math/floor (* (double p) (count sorted))))))))
 
+(defn- open-bench-conn [path]
+  (let [conn (d/get-conn path)
+        actual (d/schema conn)
+        required (concat [:warehouse/id :item/id]
+                         (keys schema/primary-keys) (keys schema/secondary-keys))]
+    (if (every? (fn [attr]
+                  (let [expected (get schema attr)]
+                    (= expected (select-keys (get actual attr) (keys expected)))))
+                required)
+      conn
+      (do (d/close conn)
+          (throw (ex-info "TPC-C schema is outdated; reload with :datalevin-db before running"
+                          {:path path}))))))
+
 (defn bench
   "Run the TPC-C-derived transaction mix against a loaded Datalevin database.
 
@@ -139,94 +126,112 @@
     :warmup     warmup transactions (default 1000)
     :seed       input seed (default 42)
     :load-seed  seed used to populate the database (default 42)"
-  [{:keys [dir warehouses txns threads warmup seed load-seed]
-    :or   {dir "db-w1" warehouses 1 txns 10000 threads 1 warmup 1000
-           seed 42 load-seed 42}}]
-  (let [conn      (d/get-conn (.getPath (io/file c/base-dir dir)))
-        opts      (assoc (g/run-constants seed load-seed) :warehouses warehouses)
-        committed (atom {})
-        payments  (atom {})
-        lat       (atom [])
-        run       (fn [^long ti ^long n record?]
-                    (let [r (Random. (+ seed ti 1))]
-                      (dotimes [_ n]
-                        (let [[type input res ms] (do-txn conn r opts (pick-type r))]
-                          (when record?
-                            (when (= :ok (:status res))
-                              (let [k [(:w input) (:d input)]]
-                                (case type
-                                  :new-order
-                                  (swap! committed update k (fnil inc 0))
-                                  :payment
-                                  (swap! payments
-                                         (fn [m]
-                                           (-> m
-                                               (update-in [k :amount] (fnil + 0.0)
-                                                          (:amount res))
-                                               (update-in [k :count] (fnil inc 0)))))
-                                  nil)))
-                            (swap! lat conj [type ms (:status res)]))))))]
-    (try
-      (println (format "TPC-C-derived: %d warehouse(s), %d terminal(s), %d txns"
-                       warehouses threads txns))
-      (run 0 warmup false)
-      (host/with-paused-media
-        (let [dists    (for [w (range 1 (inc warehouses)) d (range 1 11)] [w d])
-            baseline (into {} (map (fn [[w d]] [[w d] (t/district-next-o-id conn w d)])
-                                   dists))
-            base-ord (into {} (map (fn [[w d]] [[w d] (t/order-count conn w d)])
-                                   dists))
-            base-pay (check/payment-state conn)
-            t0       (System/nanoTime)
-            per      (quot txns threads)
-            futs     (mapv (fn [ti]
-                             (future (run ti (+ per (if (= ti (dec threads))
-                                                      (mod txns threads)
-                                                      0))
-                                          true)))
-                           (range threads))
+  ([opts] (bench opts {}))
+  ([{:keys [dir warehouses txns threads warmup seed load-seed]
+     :or   {dir "db-w1" warehouses 1 txns 10000 threads 1 warmup 1000
+            seed 42 load-seed 42}}
+    {:keys [do-txn pick-type district-next-o-id order-count
+            measure! start-terminal open-conn close-conn payment-state payment-errors]
+     :or {do-txn do-txn
+          pick-type pick-type
+          district-next-o-id t/district-next-o-id
+          order-count t/order-count
+          measure! (fn [f] (host/with-paused-media (f)))
+          start-terminal future-call
+          open-conn open-bench-conn
+          close-conn d/close
+          payment-state check/payment-state
+          payment-errors check/payment-errors}}]
+   (let [conn      (open-conn (.getPath (io/file c/base-dir dir)))
+         opts      (assoc (g/run-constants seed load-seed) :warehouses warehouses)
+         committed (atom {})
+         payments  (atom {})
+         customer-payments (atom {})
+         lat       (atom [])
+         run       (fn [^long ti ^long n record?]
+                     (let [r (Random. (+ seed ti 1))
+                           opts (g/terminal-options opts ti)]
+                       (dotimes [_ n]
+                         (let [[type input res ms] (do-txn conn r opts (pick-type r))]
+                           (when record?
+                             (when (= :ok (:status res))
+                               (let [k [(:w input) (:d input)]]
+                                 (case type
+                                   :new-order
+                                   (swap! committed update k (fnil inc 0))
+                                   :payment
+                                   (doseq [[totals location]
+                                           [[payments k]
+                                            [customer-payments [(:c-w res) (:c-d res)]]]]
+                                     (swap! totals
+                                            (fn [m]
+                                              (-> m
+                                                  (update-in [location :amount] (fnil + 0.0) (:amount res))
+                                                  (update-in [location :count] (fnil inc 0))))))
+                                   nil)))
+                             (swap! lat conj [type ms (:status res)]))))))]
+     (try
+       (println (format "TPC-C-derived: %d warehouse(s), %d terminal(s), %d txns"
+                        warehouses threads txns))
+       (run 0 warmup false)
+       (measure!
+        (fn []
+          (let [dists    (for [w (range 1 (inc warehouses)) d (range 1 11)] [w d])
+                baseline (into {} (map (fn [[w d]] [[w d] (district-next-o-id conn w d)])
+                                       dists))
+                base-ord (into {} (map (fn [[w d]] [[w d] (order-count conn w d)])
+                                       dists))
+                base-pay (payment-state conn)
+                t0       (System/nanoTime)
+                per      (quot txns threads)
+                futs     (mapv (fn [ti]
+                                 (start-terminal #(run ti (+ per (if (= ti (dec threads))
+                                                                   (mod txns threads)
+                                                                   0))
+                                                       true)))
+                               (range threads))
             ;; Drain every terminal before checking totals or closing the store,
             ;; including when one terminal has failed.
-            results  (mapv (fn [f] (try @f (catch Throwable e e))) futs)
-            elapsed  (/ (- (System/nanoTime) t0) 1.0e9)]
-        (when-let [error (some #(when (instance? Throwable %) %) results)]
-          (throw error))
-        (let [order-errors
-              (vec (for [[w d :as k] dists
-                         [invariant base actual]
-                         [[:district-next-o-id baseline (t/district-next-o-id conn w d)]
-                          [:order-count base-ord (t/order-count conn w d)]]
-                         :let [expected (+ (get base k) (get @committed k 0))]
-                         :when (not= actual expected)]
-                     {:invariant invariant :key k :expected expected :actual actual}))
-              payment-errors (check/payment-errors base-pay (check/payment-state conn)
-                                                   @payments)
-              errors (into order-errors payment-errors)]
-          (when (seq errors)
-            (throw (ex-info "TPC-C accounting invariant failure" {:errors errors}))))
-        (let [{:keys [new-orders committed-new-orders rolled-back-new-orders tpmc]
-               :as metrics} (c/new-order-metrics @lat elapsed)
-              by-type    (group-by first @lat)
-              stats      (into {}
-                               (for [[ty xs] by-type]
-                                 (let [ms (vec (sort (map second xs)))]
-                                   [ty {:count (count ms)
-                                        :mean  (/ (reduce + 0.0 ms) (count ms))
-                                        :p50   (percentile ms 0.50)
-                                        :p95   (percentile ms 0.95)
-                                        :p99   (percentile ms 0.99)}])))]
-          (println "district next_o_id invariant: OK")
-          (println "order count invariant: OK")
-          (println "Payment accounting invariants: OK")
-          (println (format "Elapsed: %.2fs  New-Orders: %d (%d committed, %d rolled back)  tpmC: %.1f"
-                           elapsed new-orders committed-new-orders rolled-back-new-orders tpmc))
-          (doseq [[ty {:keys [count mean p50 p95 p99]}] (sort-by key stats)]
-            (println (format "  %-13s n=%-6d mean=%7.3fms p50=%7.3f p95=%7.3f p99=%7.3f"
-                             (name ty) count mean p50 p95 p99)))
-          (assoc metrics :elapsed elapsed :stats stats
-                 :payments @payments :invariants :ok))))
-      (finally
-        (d/close conn)))))
+                results  (mapv (fn [f] (try @f (catch Throwable e e))) futs)
+                elapsed  (/ (- (System/nanoTime) t0) 1.0e9)]
+            (when-let [error (some #(when (instance? Throwable %) %) results)]
+              (throw error))
+            (let [order-errors
+                  (vec (for [[w d :as k] dists
+                             [invariant base actual]
+                             [[:district-next-o-id baseline (district-next-o-id conn w d)]
+                              [:order-count base-ord (order-count conn w d)]]
+                             :let [expected (+ (get base k) (get @committed k 0))]
+                             :when (not= actual expected)]
+                         {:invariant invariant :key k :expected expected :actual actual}))
+                  payment-errors (payment-errors base-pay (payment-state conn)
+                                                 @payments @customer-payments)
+                  errors (into order-errors payment-errors)]
+              (when (seq errors)
+                (throw (ex-info "TPC-C accounting invariant failure" {:errors errors}))))
+            (let [{:keys [new-orders committed-new-orders rolled-back-new-orders tpmc]
+                   :as metrics} (c/new-order-metrics @lat elapsed)
+                  by-type    (group-by first @lat)
+                  stats      (into {}
+                                   (for [[ty xs] by-type]
+                                     (let [ms (vec (sort (map second xs)))]
+                                       [ty {:count (count ms)
+                                            :mean  (/ (reduce + 0.0 ms) (count ms))
+                                            :p50   (percentile ms 0.50)
+                                            :p95   (percentile ms 0.95)
+                                            :p99   (percentile ms 0.99)}])))]
+              (println "district next_o_id invariant: OK")
+              (println "order count invariant: OK")
+              (println "Payment accounting invariants: OK")
+              (println (format "Elapsed: %.2fs  New-Orders: %d (%d committed, %d rolled back)  tpmC: %.1f"
+                               elapsed new-orders committed-new-orders rolled-back-new-orders tpmc))
+              (doseq [[ty {:keys [count mean p50 p95 p99]}] (sort-by key stats)]
+                (println (format "  %-13s n=%-6d mean=%7.3fms p50=%7.3f p95=%7.3f p99=%7.3f"
+                                 (name ty) count mean p50 p95 p99)))
+              (assoc metrics :elapsed elapsed :stats stats
+                     :payments @payments :customer-payments @customer-payments :invariants :ok)))))
+       (finally
+         (close-conn conn))))))
 
 (defn -main [& _args]
   (bench {})

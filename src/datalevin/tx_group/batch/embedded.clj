@@ -254,6 +254,14 @@
                                                      (with-bindings bindings (run tx))))
                                                 (assoc opts :ready? true
                                                        :context (assoc (merge (:context opts) (caller-context))
+                                                                       ;; Explicit bodies can abort after arbitrary
+                                                                       ;; caller effects. Give them their own native
+                                                                       ;; outcome without replaying the body or
+                                                                       ;; cancelling unrelated queued requests.
+                                                                       ;; Internal prepared Datalog requests retain
+                                                                       ;; their existing collection policy.
+                                                                       :isolated? (or (not (get-in opts [:context :datalog-fast?]))
+                                                                                      (get-in opts [:context :isolated?]))
                                                                        ::rmw/explicit-abort? aborted?)))
                                (catch Throwable t
                                  ;; A peer can abort after this body finishes.
