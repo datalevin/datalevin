@@ -259,7 +259,7 @@
                            :input-columns (int-array (map columns input-vars))
                            :input-values values
                            :program-clauses clauses :program-columns columns
-                           :parallel? (and (= :full (:mode materialization))
+                           :parallel? (and (#{:full :selective} (:mode materialization))
                                            (parallel-aggregates? parsed-q fields schema clauses
                                                                  input-vars values entity))
                            :summary {:operator :fused-aggregate :scan :eav

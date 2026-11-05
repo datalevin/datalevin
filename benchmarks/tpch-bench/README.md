@@ -113,7 +113,9 @@ Scale factor 1 (6,001,215 lineitems), measured on a 12-core Apple M3 Pro with
 development checkout on Clojure 1.12.6 and Java 21.0.13.0.3 (8 GiB heap),
 SQLite 3.51.1, and PostgreSQL 18.6.
 PostgreSQL used 128 MiB shared buffers, 4 MiB work memory, and up to two parallel
-workers per gather.
+workers per gather. Datalevin's parallel aggregate scans and grouped witness
+checks use up to four participants, including the calling thread; existing join
+execution uses its normal worker budget.
 
 Times below are from the second complete pass, with warmup and measurement in
 separate JVMs. Datalevin and SQLite were rebuilt from the same generated SF1
@@ -126,33 +128,33 @@ Datalevin queries passed the SQLite correctness check.
 
 | Query | Datalevin (ms) | SQLite (ms) | PostgreSQL (ms) |
 |---|---:|---:|---:|
-| Q1 | 3,087.1 | 3,753.3 | 918.1 |
-| Q2 | 124.2 | 144.5 | 179.0 |
-| Q3 | 506.2 | 542.9 | 207.8 |
-| Q4 | 186.7 | 134.1 | 110.9 |
-| Q5 | 301.3 | 327.0 | 338.0 |
-| Q6 | 361.0 | 337.9 | 129.7 |
-| Q7 | 322.8 | 4,016.8 | 372.7 |
-| Q8 | 76.4 | 125.7 | 146.3 |
-| Q9 | 1,137.8 | 1,490.1 | 1,168.7 |
-| Q10 | 303.7 | 1,019.7 | 193.6 |
-| Q11 | 73.0 | 35.5 | 76.0 |
-| Q12 | 375.3 | 876.5 | 236.6 |
-| Q13 | 716.4 | 1,063.9 | 322.5 |
-| Q14 | 142.7 | 4,767.9 | 133.3 |
-| Q15 | 216.6 | 347.1 | 145.0 |
-| Q16 | 246.0 | 105.1 | 110.0 |
-| Q17 | 40.0 | 51.0 | 485.4 |
-| Q18 | 1,402.9 | 554.7 | 1,499.3 |
-| Q19 | 59.4 | 29.0 | 28.8 |
-| Q20 | 47.1 | 69.3 | 166.9 |
-| Q21 | 1,105.2 | 1,447.6 | 269.8 |
-| Q22 | 94.8 | 38.9 | 34.7 |
-| **Total** | **10,926.5** | **21,278.4** | **7,273.2** |
+| Q1 | 1,122.3 | 3,753.3 | 918.1 |
+| Q2 | 115.4 | 144.5 | 179.0 |
+| Q3 | 474.9 | 542.9 | 207.8 |
+| Q4 | 183.9 | 134.1 | 110.9 |
+| Q5 | 335.2 | 327.0 | 338.0 |
+| Q6 | 337.2 | 337.9 | 129.7 |
+| Q7 | 274.4 | 4,016.8 | 372.7 |
+| Q8 | 71.7 | 125.7 | 146.3 |
+| Q9 | 984.1 | 1,490.1 | 1,168.7 |
+| Q10 | 287.1 | 1,019.7 | 193.6 |
+| Q11 | 80.8 | 35.5 | 76.0 |
+| Q12 | 367.8 | 876.5 | 236.6 |
+| Q13 | 659.8 | 1,063.9 | 322.5 |
+| Q14 | 134.0 | 4,767.9 | 133.3 |
+| Q15 | 153.7 | 347.1 | 145.0 |
+| Q16 | 285.5 | 105.1 | 110.0 |
+| Q17 | 39.7 | 51.0 | 485.4 |
+| Q18 | 1,416.8 | 554.7 | 1,499.3 |
+| Q19 | 71.4 | 29.0 | 28.8 |
+| Q20 | 45.4 | 69.3 | 166.9 |
+| Q21 | 647.0 | 1,447.6 | 269.8 |
+| Q22 | 89.9 | 38.9 | 34.7 |
+| **Total** | **8,178.2** | **21,278.4** | **7,273.2** |
 
 
-[Optimizer validation and comparison runs](../../doc/measurements/tpch-or-branches-2026-11-05/README.md)
-include the Q19 branch plans and the complete correctness report.
+[Parallel execution validation and comparison runs](../../doc/measurements/tpch-parallel-2026-11-05/README.md)
+include scan and witness plans, scaling controls, and the complete correctness report.
 
 ## Tests
 

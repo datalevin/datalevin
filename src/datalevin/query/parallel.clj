@@ -50,7 +50,7 @@
     (try
       (doseq [input (rest inputs)]
         (.add futures (.submit pool ^Callable (fn [] (run input)))))
-      (vswap! result conj (run (first inputs)))
+      (when (seq inputs) (vswap! result conj (run (first inputs))))
       (catch Throwable error (compare-and-set! failure nil error))
       (finally
         ;; Future.cancel can complete before its task releases native resources.

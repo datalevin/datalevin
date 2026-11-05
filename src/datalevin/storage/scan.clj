@@ -718,7 +718,9 @@
   attribute ids, their output columns, a row with entity in column zero, and
   an invocation-local cancellation check. Return true on completion, or nil
   before delivering any rows if the optional schema revision has changed.
-  Set entity-value? false only when the consumer does not read column zero."
+  Set entity-value? false only when the consumer does not read column zero.
+  Optional entity-range is [inclusive-start exclusive-end], with nil end
+  meaning unbounded. Every entity belongs to exactly one adjacent range."
   ([lmdb aids columns row consume! check!]
    (fold-entity-rows lmdb aids columns row consume! check! nil))
   ([lmdb aids columns row consume! check! revision]
@@ -739,7 +741,8 @@
                 (nil? (cpp-iter/dbi-key-codec dbi))
                 (nil? (cpp-iter/dbi-value-codec dbi)))
          (fold-projected-entity-rows (if-let [[start end] entity-range]
-                                      (EavProjection. ^Cursor cur aids (long start)
+                                      (EavProjection. ^Cursor cur aids
+                                                       (true? *selective-materialization?*) (long start)
                                                        (long (or end -1)))
                                       (EavProjection. ^Cursor cur aids
                                                        (true? *selective-materialization?*)))
@@ -757,7 +760,9 @@
         boundaries (volatile! [0])]
     (when (pos? total)
       (i/visit-list-sample lmdb c/eav
-        (long-array (map #(quot (* total (long %)) (long participants))
+        (long-array (map #(+ (* (quot total (long participants)) (long %))
+                             (quot (* (rem total (long participants)) (long %))
+                                   (long participants)))
                          (range 1 participants)))
         (fn [entry] (vswap! boundaries conj (.getLong ^ByteBuffer (lmdb/k entry) 0)))
         [:all] :id :raw true))

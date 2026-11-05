@@ -5,6 +5,8 @@
             [datalevin.interface :as i]
             [datalevin.lmdb :as lmdb]
             [datalevin.query.optimizer.existence :as existence]
+            [datalevin.query.optimizer.parallel :as parallel-plan]
+            [datalevin.query.parallel :as parallel]
             [datalevin.query-util :as qu]
             [datalevin.relation :as r]
             [datalevin.storage :as storage]
@@ -195,12 +197,11 @@
                                             (if constant? value (aget row (int value))))) checks)
                   (every? #(% row) preds))))))
 
-(defn- execute [database outer vars plan]
+(defn- execute-partition [database outer-keys plan]
   (let [{:keys [anchor schema width attributes attrs-v reader matches?]} plan
         [_ attr anchor-var] anchor
         width (long width)
         props (schema attr)
-        outer-keys (r/project-distinct outer vars)
         anchor-idx (int ((:attrs outer-keys) anchor-var))
         ^List tuples (:tuples outer-keys)]
     ;; A mismatched input domain stays on the ordinary resolver path.
@@ -224,7 +225,7 @@
         (let [flush!
               (fn []
                 (when-not (.isEmpty buffer)
-                  (timeout/assert-time-left)
+                  (parallel/check!)
                   (aset-long counts 1 (+ (aget counts 1) (.size buffer)))
                   (aset-long counts 2 (inc (aget counts 2)))
                   (let [^List rows (if reader
@@ -253,6 +254,7 @@
               visit!
               (fn [value eid]
                  (aset-long counts 0 (inc (aget counts 0)))
+                 (when (zero? (bit-and (aget counts 0) 4095)) (parallel/check!))
                  (if (.containsKey active value)
                    (do (.add buffer (object-array [value eid]))
                        (aset-long counts 3 (max (aget counts 3) (.size buffer)))
@@ -263,17 +265,58 @@
             (.-lmdb ^Store (:store database)) (:db/aid props) (:db/valueType props)
             keys timeout/assert-time-left visit!)
           (flush!)
-          (when *explain*
-            (vswap! *explain* update :existence-witness-plans (fnil conj [])
-                    {:strategy :grouped-witness :anchor-attribute attr
-                     :correlation-vars vars :attributes attributes
+          {:statistics {:strategy :grouped-witness :anchor-attribute attr
+                     :attributes attributes
                      :input-keys (.size tuples) :anchor-keys (.size keys)
                      :visited-witnesses (aget counts 0)
                      :grouped-read-witnesses (aget counts 1)
                      :read-batches (aget counts 2)
                      :max-buffered-witnesses (aget counts 3)
-                     :matched-keys (aget counts 4)}))
-          (r/relation! (:attrs outer-keys) matches))))))
+                     :matched-keys (aget counts 4)}
+           :relation (r/relation! (:attrs outer-keys) matches)})))))
+
+(defn- partition-keys [outer-keys anchor-var participants]
+  (let [column (int ((:attrs outer-keys) anchor-var))
+        parts (mapv (fn [_] (FastList.)) (range participants))]
+    (doseq [^objects tuple (:tuples outer-keys)]
+      (.add ^FastList (nth parts (mod (hash (aget tuple column)) participants)) tuple))
+    (mapv #(r/relation! (:attrs outer-keys) %)
+          (remove #(.isEmpty ^FastList %) parts))))
+
+(defn- execute [database outer vars shape compile-predicate context]
+  (let [outer-keys (r/project-distinct outer vars)
+        anchor-var (nth (:anchor shape) 2)
+        participants (parallel-plan/participants (.size ^List (:tuples outer-keys))
+                                                 parallel-plan/*witness-keys-per-worker*)
+        lmdb (.-lmdb ^Store (:store database))
+        run (fn [keys]
+              (binding [storage/*parallel-list-scan?* false]
+                (execute-partition database keys
+                  (prepare shape vars compile-predicate context))))
+        parts (when (< 1 participants) (partition-keys outer-keys anchor-var participants))
+        results (when (< 1 (count parts))
+                  (let [rtx (i/get-rtx lmdb)]
+                    (try
+                      (parallel/map-read lmdb (parallel/snapshot-id rtx) run parts)
+                      (finally (i/return-rtx lmdb rtx)))))
+        results (if (and (seq results) (every? some? results)) results [(run outer-keys)])]
+    (when (every? some? results)
+      (when *explain*
+        (let [statistics (mapv :statistics results)
+              combined (reduce (fn [a b]
+                                 (reduce (fn [a k] (update a k + (long (b k)))) a
+                                         [:input-keys :anchor-keys :visited-witnesses
+                                          :grouped-read-witnesses :read-batches :matched-keys]))
+                               (first statistics) (rest statistics))]
+          (vswap! *explain* update :existence-witness-plans (fnil conj [])
+                  (assoc combined :correlation-vars vars :partitions (count results)
+                         :partition-key anchor-var
+                         :max-buffered-witnesses (reduce max (map :max-buffered-witnesses statistics))))))
+      (if (= 1 (count results))
+        (:relation (first results))
+        (let [tuples (FastList.)]
+          (doseq [result results] (.addAll tuples ^List (get-in result [:relation :tuples])))
+          (r/relation! (:attrs outer-keys) tuples))))))
 
 (defn resolve-existence
   "Return distinct matched correlation keys without retaining complete witness
@@ -283,5 +326,4 @@
     (or (resolve-single-pattern context outer vars clauses)
         (when (and *enabled?* (native-read? context database))
           (when-let [shape (shape database vars clauses)]
-            (execute database outer vars
-                     (prepare shape vars compile-predicate context)))))))
+            (execute database outer vars shape compile-predicate context))))))

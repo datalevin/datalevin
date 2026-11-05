@@ -2,7 +2,9 @@
   "Admission and worker budgets for independent read partitions."
   (:import [java.util.concurrent ForkJoinPool ForkJoinWorkerThread]))
 
-(def ^:dynamic *max-workers* 4)
+(def ^:dynamic *max-workers*
+  "Maximum participants including the caller; 1 keeps these read paths serial."
+  4)
 (def ^:dynamic *scan-rows-per-worker* 131072)
 (def ^:dynamic *witness-keys-per-worker* 8192)
 

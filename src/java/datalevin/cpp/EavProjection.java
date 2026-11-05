@@ -69,6 +69,7 @@ public final class EavProjection implements AutoCloseable {
     private boolean closed;
     private long endExclusive = -1;
     private boolean exhausted;
+    private int pending = -2;
 
     /** Use full native duplicate materialization unless explicitly opted in. */
     public EavProjection(Cursor cursor, int[] attributes) {
@@ -125,12 +126,26 @@ public final class EavProjection implements AutoCloseable {
 
     /** Full projection over [start, endExclusive); a negative end is unbounded. */
     public EavProjection(Cursor cursor, int[] attributes, long start, long endExclusive) {
-        this(cursor, attributes, false);
+        this(cursor, attributes, false, start, endExclusive);
+    }
+
+    /** Bounded projection with either native materialization strategy. */
+    public EavProjection(Cursor cursor, int[] attributes, boolean selective,
+                         long start, long endExclusive) {
+        this(cursor, attributes, selective);
         this.endExclusive = endExclusive;
         try (BufVal lower = new BufVal(Long.BYTES)) {
             if (start < 0 || (endExclusive >= 0 && endExclusive <= start)) {
                 exhausted = true;
             } else {
+                // The selective iterator initializes at FIRST. Preserve that
+                // borrowed row when it belongs to this range; otherwise position
+                // before the lower bound so its next advance enters the range.
+                if (projector != null) {
+                    int status = advance();
+                    if (status < 0) { exhausted = true; return; }
+                    if (entity() >= start) { pending = status; return; }
+                }
                 lower.inBuf().putLong(0, start);
                 if (!cursor.get(lower, DTLV.MDB_SET_RANGE)) exhausted = true;
                 else first = !cursor.seek(DTLV.MDB_PREV_NODUP);
@@ -145,6 +160,11 @@ public final class EavProjection implements AutoCloseable {
     public int advance() {
         if (closed) throw new IllegalStateException("Projection is closed");
         if (exhausted) return -1;
+        if (pending != -2) {
+            int status = pending;
+            pending = -2;
+            return status;
+        }
         final int rc;
         try {
             rc = projector != null ? (int) NEXT.invokeExact(projector)
