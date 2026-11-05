@@ -377,16 +377,20 @@
 (defn execute-plan
   [context]
   (if-let [plan (::fused/plan context)]
-    (or (fused/execute context plan)
+    (let [executed (fused/execute context plan)]
+      (if (and executed (nil? (:fallback executed))) executed
         ;; A schema commit after admission invalidates both the fusion proof
         ;; and the ordinary plan's uniqueness assumptions. Rebuild once using
         ;; the current schema, with the conventional executor in control.
+        ;; Ordered reduction also reverts here if its runtime checks disprove
+        ;; the sampled order. No partially aggregated output is reused.
         (binding [fused/*enabled?* false]
-          (execute-materialized-plan
-            (assoc (prepare-context (:parsed-q context)
-                                    (into [(:database plan)] (:input-values plan))
-                                    [] false)
-                   :run? true))))
+          (cond-> (execute-materialized-plan
+                    (assoc (prepare-context (:parsed-q context)
+                                            (into [(:database plan)] (:input-values plan))
+                                            [] false)
+                           :run? true))
+            (:fallback executed) (assoc :fused-aggregation-fallback (:fallback executed))))))
     (execute-materialized-plan context)))
 
 (defn- resolve-late-clause
@@ -999,7 +1003,8 @@
              fused-result (:fused-aggregation context)
              reduced (or (when fused-result
                            (cond-> fused-result
-                             keep-group? (update :rows #(filter keep-group? %))))
+                             (and keep-group? (not (:having-applied? fused-result)))
+                             (update :rows #(filter keep-group? %))))
                          (when (and aggregate?
                                     (nil? (::result-policy context))
                                     (nil? (:result-set context))

@@ -7,17 +7,21 @@
             [datalevin.interface :as i]
             [datalevin.lmdb :as lmdb]
             [datalevin.parser :as parser]
+            [datalevin.query.aggregate :as aggregate]
+            [datalevin.query.optimizer.ordered-aggregate :as ordered-plan]
             [datalevin.query.optimizer.sampling :as sampling]
             [datalevin.query.optimizer.parallel :as parallel-plan]
             [datalevin.query.parallel :as parallel]
             [datalevin.query.resolve :as resolve]
             [datalevin.relation :as relation]
+            [datalevin.storage.metadata :as metadata]
             [datalevin.storage.scan :as scan])
   (:import [datalevin.db DB]
            [datalevin.storage Store]
            [datalevin.parser Aggregate BindScalar Constant DefaultSrc FindRel
             Function Pattern PlainSymbol Predicate SrcVar Variable]
-           [datalevin.utl GroupedAggregate]
+           [datalevin.utl GroupedAggregate OrderedAggregate OrderedAggregate$OrderViolation]
+           [java.util.function Consumer]
            [org.eclipse.collections.impl.list.mutable FastList]))
 
 (def ^:dynamic *enabled?*
@@ -235,40 +239,47 @@
                      (every? scalar? values))
             (when-let [program (row-program clauses columns context)]
               (when-let [aggregate (aggregate-plan parsed-q (:columns program) entity)]
-                (when (small-group-domain? parsed-q fields database schema)
-                  (let [snapshot (i/schema-snapshot store)]
-                    (when (= schema (:schema snapshot))
-                      (let [materialization
-                            (scan/entity-materialization-plan
-                              (.-lmdb ^Store store) schema (:attr anchor)
-                              (count fields) population-size)
-                            string-cache
-                            (when (#{:full :selective} (:mode materialization))
-                              (scan/string-value-cache-plan
-                                schema (mapv :attr fields)
-                                (fn [attr]
-                                  (db/cached-string-capacity store attr
-                                    #(scan/string-value-cache-capacity
-                                       (.-lmdb ^Store store) schema attr)))))]
-                        (merge aggregate program
-                          {:database database :aids (int-array aids)
-                           :materialization materialization
-                           :string-cache-capacities (:capacities string-cache)
-                           :schema-revision (:revision snapshot)
-                           :scan-columns (int-array (map columns (map :variable fields)))
-                           :input-columns (int-array (map columns input-vars))
-                           :input-values values
-                           :program-clauses clauses :program-columns columns
-                           :parallel? (and (#{:full :selective} (:mode materialization))
-                                           (parallel-aggregates? parsed-q fields schema clauses
-                                                                 input-vars values entity))
-                           :summary {:operator :fused-aggregate :scan :eav
-                                     :attributes (mapv :attr fields)
-                                     :eav-materialization materialization
-                                     :string-value-cache (:summary string-cache)
-                                     :expressions (count (filter #(instance? Function %) clauses))
-                                     :estimated-input size :retained-input-tuples 0
-                                     :scratch-width (count (:columns program))}})))))))))))))
+                (let [small? (small-group-domain? parsed-q fields database schema)
+                      ordered (when-not small?
+                                (ordered-plan/plan parsed-q fields database schema size))]
+                  (when (or small? ordered)
+                    (let [snapshot (i/schema-snapshot store)]
+                      (when (= schema (:schema snapshot))
+                        (let [materialization
+                              (scan/entity-materialization-plan
+                                (.-lmdb ^Store store) schema (:attr anchor)
+                                (count fields) population-size)
+                              string-cache
+                              (when (#{:full :selective} (:mode materialization))
+                                (scan/string-value-cache-plan
+                                  schema (mapv :attr fields)
+                                  (fn [attr]
+                                    (db/cached-string-capacity store attr
+                                      #(scan/string-value-cache-capacity
+                                         (.-lmdb ^Store store) schema attr)))))]
+                          (when (or (nil? ordered) (#{:full :selective} (:mode materialization)))
+                            (merge aggregate program
+                              {:database database :aids (int-array aids)
+                               :ordered-aggregation ordered
+                               :materialization materialization
+                               :string-cache-capacities (:capacities string-cache)
+                               :schema-revision (:revision snapshot)
+                               :scan-columns (int-array (map columns (map :variable fields)))
+                               :input-columns (int-array (map columns input-vars))
+                               :input-values values
+                               :program-clauses clauses :program-columns columns
+                               :parallel? (and (#{:full :selective} (:mode materialization))
+                                               (or ordered
+                                                   (parallel-aggregates? parsed-q fields schema clauses
+                                                                         input-vars values entity)))
+                               :summary {:operator :fused-aggregate :scan :eav
+                                         :aggregation (if ordered :ordered :hash)
+                                         :attributes (mapv :attr fields)
+                                         :eav-materialization materialization
+                                         :string-value-cache (:summary string-cache)
+                                         :expressions (count (filter #(instance? Function %) clauses))
+                                         :estimated-input size :retained-input-tuples 0
+                                         :scratch-width (count (:columns program))}})))))))))))))))
 
 (defn- reduce-range
   [{:keys [database aids scan-columns columns input-columns input-values
@@ -303,33 +314,93 @@
               entity-range))
       {:accumulator accumulator :input-tuples (aget input-count 0)})))
 
+(defn- reduce-ordered-range
+  [{:keys [database aids scan-columns columns aggregate-columns aggregate-operations
+           schema-revision entity-value? materialization string-cache-capacities]}
+   {:keys [entity-range lower upper]} keep-group?]
+  (let [rows (FastList.)
+        accumulator (OrderedAggregate. aggregate-columns aggregate-operations lower upper
+                      (reify Consumer
+                        (accept [_ row]
+                          (when (or (nil? keep-group?) (keep-group? row))
+                            (.add rows (vec (aclone ^objects row)))))))]
+    (when (binding [scan/*selective-materialization?*
+                    (= :selective (:mode materialization))]
+            (scan/fold-entity-rows
+              (.-lmdb ^Store (.-store ^DB database)) aids scan-columns
+              (object-array (count columns)) #(.add accumulator %)
+              parallel/check! schema-revision (boolean entity-value?) string-cache-capacities
+              entity-range))
+      (.finish accumulator)
+      {:rows rows :input-tuples (.inputCount accumulator)
+       :group-count (.groupCount accumulator)})))
+
+(defn- execute-ordered
+  [context {:keys [database summary ordered-aggregation schema-revision] :as plan}]
+  (let [lmdb (.-lmdb ^Store (.-store ^DB database))
+        participants (parallel-plan/participants (:estimated-input summary)
+                                                  parallel-plan/*scan-rows-per-worker*)
+        parsed (:parsed-q context)
+        keep-group? (aggregate/compile-having (:qhaving parsed)
+                                              (parser/find-elements (:qfind parsed)))
+        rtx (i/get-rtx lmdb)]
+    (try
+      ;; Check before decoding partition keys, not only before projecting rows.
+      ;; Metadata reads share the coordinator's pinned thread-local snapshot.
+      (when (= schema-revision (metadata/schema-revision lmdb))
+        (if-let [ranges (ordered-plan/partitions lmdb ordered-aggregation participants)]
+          (let [partials (parallel/map-read lmdb (parallel/snapshot-id rtx)
+                           #(reduce-ordered-range plan % keep-group?) ranges)
+                ;; A worker may see a newer commit. Discard every partial and
+                ;; retry serially under the coordinator's still-pinned snapshot.
+                partials (if (and (seq partials) (every? some? partials)) partials
+                           [(reduce-ordered-range plan {} keep-group?)])]
+            (when (every? some? partials)
+              (let [result {:rows (into [] (mapcat :rows) partials)
+                            :input-tuples (reduce + (map :input-tuples partials))
+                            :group-count (reduce + (map :group-count partials))
+                            :partitions (count partials) :retained-groups (count partials)
+                            :having-applied? true}]
+                (assoc context :rels [] :late-clauses []
+                       :fused-aggregation result
+                       :fused-aggregation-plan
+                       (merge summary (dissoc result :rows)
+                              {:aggregation :ordered :order-verified true
+                               :group-attribute (:attribute ordered-aggregation)
+                               :order-sampled-entities (:sampled-entities ordered-aggregation)})))))
+          {:fallback :unordered-boundaries}))
+      (catch OrderedAggregate$OrderViolation _ {:fallback :unordered-input})
+      (finally (i/return-rtx lmdb rtx)))))
+
 (defn execute
   "Consume borrowed rows into private aggregate states, then combine them.
   Snapshot mismatches fall back to a single scan; schema mismatches return nil."
   [context {:keys [database summary parallel? program-clauses program-columns] :as plan}]
-  (let [participants (if parallel?
-                       (parallel-plan/participants (:estimated-input summary)
-                                                   parallel-plan/*scan-rows-per-worker*) 1)
-        lmdb (.-lmdb ^Store (.-store ^DB database))
-        partials
-        (when (< 1 participants)
-          (let [rtx (i/get-rtx lmdb)]
-            (try
-              (parallel/map-read lmdb (parallel/snapshot-id rtx)
-                (fn [entity-range]
-                  (let [program (row-program program-clauses program-columns context)]
-                    (reduce-range (assoc plan :operations (:operations program)) entity-range)))
-                (scan/entity-ranges lmdb participants))
-              (finally (i/return-rtx lmdb rtx)))))
-        partials (if (and (seq partials) (every? some? partials))
-                   partials [(reduce-range plan nil)])]
-    (when (every? some? partials)
-      (let [^GroupedAggregate accumulator (:accumulator (first partials))
-            _ (doseq [part (rest partials)] (.merge accumulator (:accumulator part)))
-            result {:rows (mapv vec (.results accumulator))
-                    :input-tuples (reduce + (map :input-tuples partials))
-                    :group-count (.groupCount accumulator)
-                    :partitions (count partials)}]
-        (assoc context :rels [] :late-clauses []
-               :fused-aggregation result
-               :fused-aggregation-plan (merge summary (dissoc result :rows)))))))
+  (if (:ordered-aggregation plan)
+    (execute-ordered context plan)
+    (let [participants (if parallel?
+                         (parallel-plan/participants (:estimated-input summary)
+                                                     parallel-plan/*scan-rows-per-worker*) 1)
+          lmdb (.-lmdb ^Store (.-store ^DB database))
+          partials
+          (when (< 1 participants)
+            (let [rtx (i/get-rtx lmdb)]
+              (try
+                (parallel/map-read lmdb (parallel/snapshot-id rtx)
+                  (fn [entity-range]
+                    (let [program (row-program program-clauses program-columns context)]
+                      (reduce-range (assoc plan :operations (:operations program)) entity-range)))
+                  (scan/entity-ranges lmdb participants))
+                (finally (i/return-rtx lmdb rtx)))))
+          partials (if (and (seq partials) (every? some? partials))
+                     partials [(reduce-range plan nil)])]
+      (when (every? some? partials)
+        (let [^GroupedAggregate accumulator (:accumulator (first partials))
+              _ (doseq [part (rest partials)] (.merge accumulator (:accumulator part)))
+              result {:rows (mapv vec (.results accumulator))
+                      :input-tuples (reduce + (map :input-tuples partials))
+                      :group-count (.groupCount accumulator)
+                      :partitions (count partials)}]
+          (assoc context :rels [] :late-clauses []
+                 :fused-aggregation result
+                 :fused-aggregation-plan (merge summary (dissoc result :rows))))))))

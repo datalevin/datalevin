@@ -235,7 +235,7 @@
             post-top-k-enrichment aggregate-enrichment access-path-execution
             explain-actual-result-size keyed-group-reduction
             terminal-result-collection unique-group-aggregation
-            fused-aggregation-plan]
+            fused-aggregation-plan fused-aggregation-fallback]
      :as context}]
    (when qplan/*explain*
      (let [{:keys [^long planning-time ^long parsing-time ^long building-time]}
@@ -310,6 +310,7 @@
                :terminal-result-collection terminal-result-collection
                :unique-group-aggregation unique-group-aggregation
                :fused-aggregation fused-aggregation-plan
+               :fused-aggregation-fallback fused-aggregation-fallback
                :late-clauses late-clauses
                :access-plans (mapv qaccess/plan-summary access-plans)
                :preferred-access-plan
