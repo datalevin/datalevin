@@ -1,6 +1,6 @@
 -- TPC-C schema for SQLite (derived; not an audited TPC-C schema).
--- Monetary columns are REAL and dates ISO-8601 TEXT, matching the other
--- systems so results compare directly.
+-- Monetary columns are REAL, matching Datalevin and PostgreSQL doubles.
+-- Dates use ISO-8601 strings in all drivers.
 
 CREATE TABLE warehouse (
   w_id       INTEGER NOT NULL PRIMARY KEY,
@@ -128,4 +128,4 @@ CREATE TABLE stock (
 );
 
 CREATE INDEX customer_name_idx ON customer (c_w_id, c_d_id, c_last, c_first);
-CREATE INDEX orders_customer_idx ON orders (o_w_id, o_d_id, o_c_id);
+CREATE INDEX orders_customer_idx ON orders (o_w_id, o_d_id, o_c_id, o_id);

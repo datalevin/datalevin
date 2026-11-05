@@ -69,31 +69,25 @@
     [?p :part/type ?p-type]
     [(like ?p-type "%BRASS")]
     [?p :part/mfgr ?p-mfgr]
-    [?ps :partsupp/partkey ?p-partkey]
+    [?ps :partsupp/part ?p]
     [?ps :partsupp/supplycost ?ps-supplycost]
-    [?s :supplier/suppkey ?s-suppkey]
-    [?ps :partsupp/suppkey ?s-suppkey]
+    [?ps :partsupp/supplier ?s]
     [?s :supplier/name ?s-name]
     [?s :supplier/address ?s-address]
     [?s :supplier/phone ?s-phone]
     [?s :supplier/acctbal ?s-acctbal]
     [?s :supplier/comment ?s-comment]
-    [?s :supplier/nationkey ?s-nationkey]
-    [?n :nation/nationkey ?s-nationkey]
+    [?s :supplier/nation ?n]
     [?n :nation/name ?n-name]
-    [?n :nation/regionkey ?n-regionkey]
-    [?r :region/regionkey ?n-regionkey]
+    [?n :nation/region ?r]
     [?r :region/name "EUROPE"]
-    (not-join [?p-partkey ?ps-supplycost]
-      [?ps2 :partsupp/partkey ?p-partkey]
+    (not-join [?p ?ps-supplycost]
+      [?ps2 :partsupp/part ?p]
       [?ps2 :partsupp/supplycost ?sc2]
       [(< ?sc2 ?ps-supplycost)]
-      [?ps2 :partsupp/suppkey ?sk2]
-      [?s2 :supplier/suppkey ?sk2]
-      [?s2 :supplier/nationkey ?nk2]
-      [?n2 :nation/nationkey ?nk2]
-      [?n2 :nation/regionkey ?rk2]
-      [?r2 :region/regionkey ?rk2]
+      [?ps2 :partsupp/supplier ?s2]
+      [?s2 :supplier/nation ?n2]
+      [?n2 :nation/region ?r2]
       [?r2 :region/name "EUROPE"])])
 
 ;; Q3: Shipping Priority
@@ -104,13 +98,12 @@
     :with ?l
     :where
     [?c :customer/mktsegment "BUILDING"]
-    [?c :customer/custkey ?c-custkey]
-    [?o :orders/custkey ?c-custkey]
+    [?o :orders/customer ?c]
     [?o :orders/orderkey ?l-orderkey]
     [?o :orders/orderdate ?o-orderdate]
     [(< ?o-orderdate "1995-03-15")]
     [?o :orders/shippriority ?o-shippriority]
-    [?l :lineitem/orderkey ?l-orderkey]
+    [?l :lineitem/order ?o]
     [?l :lineitem/shipdate ?l-shipdate]
     [(> ?l-shipdate "1995-03-15")]
     [?l :lineitem/extendedprice ?ep]
@@ -127,8 +120,7 @@
     [(>= ?od "1993-07-01")]
     [(< ?od "1993-10-01")]
     [?o :orders/orderpriority ?o-orderpriority]
-    [?o :orders/orderkey ?ok]
-    [?l :lineitem/orderkey ?ok]
+    [?l :lineitem/order ?o]
     [?l :lineitem/commitdate ?cd]
     [?l :lineitem/receiptdate ?rd]
     [(< ?cd ?rd)]])
@@ -139,22 +131,16 @@
     :order-by [1 :desc]
     :with ?l
     :where
-    [?c :customer/custkey ?c-custkey]
-    [?o :orders/custkey ?c-custkey]
-    [?o :orders/orderkey ?o-orderkey]
+    [?o :orders/customer ?c]
     [?o :orders/orderdate ?od]
     [(>= ?od "1994-01-01")]
     [(< ?od "1995-01-01")]
-    [?l :lineitem/orderkey ?o-orderkey]
-    [?l :lineitem/suppkey ?l-suppkey]
-    [?s :supplier/suppkey ?l-suppkey]
-    [?c :customer/nationkey ?c-nationkey]
-    [?s :supplier/nationkey ?c-nationkey]
-    [?s :supplier/nationkey ?s-nationkey]
-    [?n :nation/nationkey ?s-nationkey]
+    [?l :lineitem/order ?o]
+    [?l :lineitem/supplier ?s]
+    [?c :customer/nation ?n]
+    [?s :supplier/nation ?n]
     [?n :nation/name ?n-name]
-    [?n :nation/regionkey ?nrk]
-    [?r :region/regionkey ?nrk]
+    [?n :nation/region ?r]
     [?r :region/name "ASIA"]
     [?l :lineitem/extendedprice ?ep]
     [?l :lineitem/discount ?disc]
@@ -167,20 +153,15 @@
     :order-by [0 :asc 1 :asc 2 :asc]
     :with ?l
     :where
-    [?s :supplier/suppkey ?s-suppkey]
-    [?l :lineitem/suppkey ?s-suppkey]
-    [?s :supplier/nationkey ?s-nationkey]
-    [?n1 :nation/nationkey ?s-nationkey]
+    [?l :lineitem/supplier ?s]
+    [?s :supplier/nation ?n1]
     [?n1 :nation/name ?supp-nation]
-    [?l :lineitem/orderkey ?l-orderkey]
+    [?l :lineitem/order ?o]
     [?l :lineitem/shipdate ?l-shipdate]
     [(>= ?l-shipdate "1995-01-01")]
     [(<= ?l-shipdate "1996-12-31")]
-    [?o :orders/orderkey ?l-orderkey]
-    [?o :orders/custkey ?c-custkey]
-    [?c :customer/custkey ?c-custkey]
-    [?c :customer/nationkey ?c-nationkey]
-    [?n2 :nation/nationkey ?c-nationkey]
+    [?o :orders/customer ?c]
+    [?c :customer/nation ?n2]
     [?n2 :nation/name ?cust-nation]
     [(or (and (= ?supp-nation "FRANCE") (= ?cust-nation "GERMANY"))
          (and (= ?supp-nation "GERMANY") (= ?cust-nation "FRANCE")))]
@@ -199,25 +180,18 @@
     :order-by [0 :asc]
     :with ?l
     :where
-    [?p :part/partkey ?p-partkey]
     [?p :part/type "ECONOMY ANODIZED STEEL"]
-    [?l :lineitem/partkey ?p-partkey]
-    [?s :supplier/suppkey ?s-suppkey]
-    [?l :lineitem/suppkey ?s-suppkey]
-    [?l :lineitem/orderkey ?l-orderkey]
-    [?o :orders/orderkey ?l-orderkey]
-    [?o :orders/custkey ?o-custkey]
+    [?l :lineitem/part ?p]
+    [?l :lineitem/supplier ?s]
+    [?l :lineitem/order ?o]
+    [?o :orders/customer ?c]
     [?o :orders/orderdate ?o-orderdate]
     [(>= ?o-orderdate "1995-01-01")]
     [(<= ?o-orderdate "1996-12-31")]
-    [?c :customer/custkey ?o-custkey]
-    [?c :customer/nationkey ?c-nationkey]
-    [?n1 :nation/nationkey ?c-nationkey]
-    [?n1 :nation/regionkey ?n1-regionkey]
-    [?r :region/regionkey ?n1-regionkey]
+    [?c :customer/nation ?n1]
+    [?n1 :nation/region ?r]
     [?r :region/name "AMERICA"]
-    [?s :supplier/nationkey ?s-nationkey]
-    [?n2 :nation/nationkey ?s-nationkey]
+    [?s :supplier/nation ?n2]
     [?n2 :nation/name ?nation]
     [?l :lineitem/extendedprice ?ep]
     [?l :lineitem/discount ?disc]
@@ -236,20 +210,16 @@
     :order-by [0 :asc 1 :desc]
     :with ?l
     :where
-    [?p :part/partkey ?p-partkey]
     [?p :part/name ?p-name]
     [(like ?p-name "%green%")]
-    [?l :lineitem/partkey ?p-partkey]
-    [?s :supplier/suppkey ?s-suppkey]
-    [?l :lineitem/suppkey ?s-suppkey]
-    [?s :supplier/nationkey ?s-nationkey]
-    [?n :nation/nationkey ?s-nationkey]
+    [?l :lineitem/part ?p]
+    [?l :lineitem/supplier ?s]
+    [?s :supplier/nation ?n]
     [?n :nation/name ?nation]
-    [?l :lineitem/orderkey ?l-orderkey]
-    [?o :orders/orderkey ?l-orderkey]
+    [?l :lineitem/order ?o]
     [?o :orders/orderdate ?o-orderdate]
-    [?ps :partsupp/partkey ?p-partkey]
-    [?ps :partsupp/suppkey ?s-suppkey]
+    [?ps :partsupp/part ?p]
+    [?ps :partsupp/supplier ?s]
     [?ps :partsupp/supplycost ?ps-supplycost]
     [?l :lineitem/quantity ?l-quantity]
     [?l :lineitem/extendedprice ?ep]
@@ -275,15 +245,13 @@
     [?c :customer/address ?c-address]
     [?c :customer/phone ?c-phone]
     [?c :customer/comment ?c-comment]
-    [?c :customer/nationkey ?c-nationkey]
-    [?n :nation/nationkey ?c-nationkey]
+    [?c :customer/nation ?n]
     [?n :nation/name ?n-name]
-    [?o :orders/custkey ?c-custkey]
-    [?o :orders/orderkey ?o-orderkey]
+    [?o :orders/customer ?c]
     [?o :orders/orderdate ?od]
     [(>= ?od "1993-10-01")]
     [(< ?od "1994-01-01")]
-    [?l :lineitem/orderkey ?o-orderkey]
+    [?l :lineitem/order ?o]
     [?l :lineitem/returnflag "R"]
     [?l :lineitem/extendedprice ?ep]
     [?l :lineitem/discount ?disc]
@@ -299,13 +267,12 @@
     [(q [:find ?pk (sum ?v)
          :with ?ps
          :where
-         [?ps :partsupp/suppkey ?sk]
-         [?ps :partsupp/partkey ?pk]
+         [?ps :partsupp/supplier ?s]
+         [?ps :partsupp/part ?p]
+         [?p :part/partkey ?pk]
          [?ps :partsupp/availqty ?q]
          [?ps :partsupp/supplycost ?sc]
-         [?s :supplier/suppkey ?sk]
-         [?s :supplier/nationkey ?nk]
-         [?n :nation/nationkey ?nk]
+         [?s :supplier/nation ?n]
          [?n :nation/name "GERMANY"]
          [(* ?sc ?q) ?v]] $) ?part-values]
     [(apply + (map second ?part-values)) ?total]
@@ -319,7 +286,7 @@
     :order-by [0 :asc]
     :with ?l
     :where
-    [?l :lineitem/orderkey ?ok]
+    [?l :lineitem/order ?o]
     [?l :lineitem/shipmode ?l-shipmode]
     [(or (= ?l-shipmode "MAIL") (= ?l-shipmode "SHIP"))]
     [?l :lineitem/commitdate ?cd]
@@ -329,7 +296,6 @@
     [(< ?sd ?cd)]
     [(>= ?rd "1994-01-01")]
     [(< ?rd "1995-01-01")]
-    [?o :orders/orderkey ?ok]
     [?o :orders/orderpriority ?o-pri]
     [(or (= ?o-pri "1-URGENT") (= ?o-pri "2-HIGH")) ?hi]
     (or-join [?hi ?high ?low]
@@ -343,14 +309,14 @@
   '[:find ?c-count (count ?c)
     :order-by [1 :desc 0 :desc]
     :where
-    [(q [:find ?ck (count ?o)
+    [(q [:find ?c (count ?o)
          :where
-         [?o :orders/custkey ?ck]
+         [?o :orders/customer ?c]
          [?o :orders/comment ?oc]
          [(not-like ?oc "%special%requests%")]] $) ?order-counts]
     [(into {} ?order-counts) ?counts-by-customer]
     [?c :customer/custkey ?ck]
-    [(get ?counts-by-customer ?ck 0) ?c-count]])
+    [(get ?counts-by-customer ?c 0) ?c-count]])
 
 ;; Q14: Promotion Effect
 ;; Sum promotional and total revenue over the same joined lineitems. A zero
@@ -363,8 +329,7 @@
     [?l :lineitem/shipdate ?sd]
     [(>= ?sd "1995-09-01")]
     [(< ?sd "1995-10-01")]
-    [?l :lineitem/partkey ?pk]
-    [?p :part/partkey ?pk]
+    [?l :lineitem/part ?p]
     [?p :part/type ?pt]
     [(like ?pt "PROMO%") ?promo?]
     [?l :lineitem/extendedprice ?ep]
@@ -379,20 +344,20 @@
   '[:find ?s-suppkey ?s-name ?s-address ?s-phone ?total
     :order-by [0 :asc]
     :where
-    [(q [:find ?sk (sum ?rev)
+    [(q [:find ?s (sum ?rev)
          :with ?l
          :where
          [?l :lineitem/shipdate ?sd]
          [(>= ?sd "1996-01-01")]
          [(< ?sd "1996-04-01")]
-         [?l :lineitem/suppkey ?sk]
+         [?l :lineitem/supplier ?s]
          [?l :lineitem/extendedprice ?ep]
          [?l :lineitem/discount ?d]
          [(- 1 ?d) ?x]
          [(* ?ep ?x) ?rev]] $) ?revenues]
     [(not-empty ?revenues)]
     [(apply max (map second ?revenues)) ?max]
-    [(identity ?revenues) [[?s-suppkey ?total]]]
+    [(identity ?revenues) [[?s ?total]]]
     [(= ?total ?max)]
     [?s :supplier/suppkey ?s-suppkey]
     [?s :supplier/name ?s-name]
@@ -401,10 +366,9 @@
 
 ;; Q16: Parts/Supplier Relationship
 (def q-16
-  '[:find ?p-brand ?p-type ?p-size (count-distinct ?ps-suppkey)
+  '[:find ?p-brand ?p-type ?p-size (count-distinct ?s)
     :order-by [3 :desc 0 :asc 1 :asc 2 :asc]
     :where
-    [?p :part/partkey ?pk]
     [?p :part/brand ?p-brand]
     [?p :part/type ?p-type]
     [?p :part/size ?p-size]
@@ -412,10 +376,9 @@
     [(not-like ?p-type "MEDIUM POLISHED%")]
     [(or (= ?p-size 49) (= ?p-size 14) (= ?p-size 23) (= ?p-size 45)
          (= ?p-size 19) (= ?p-size 3) (= ?p-size 36) (= ?p-size 9))]
-    [?ps :partsupp/partkey ?pk]
-    [?ps :partsupp/suppkey ?ps-suppkey]
-    (not [?s :supplier/suppkey ?ps-suppkey]
-         [?s :supplier/comment ?sc]
+    [?ps :partsupp/part ?p]
+    [?ps :partsupp/supplier ?s]
+    (not [?s :supplier/comment ?sc]
          [(like ?sc "%Customer%Complaints%")])])
 
 ;; Q17: Small-Quantity-Order Revenue
@@ -424,19 +387,17 @@
   '[:find (sum ?ep7) .
     :with ?l
     :where
-    [?p :part/partkey ?pk]
     [?p :part/brand "Brand#23"]
     [?p :part/container "MED BOX"]
-    [?l :lineitem/partkey ?pk]
+    [?l :lineitem/part ?p]
     [?l :lineitem/quantity ?q]
-    [(q [:find ?pk (avg ?q2)
+    [(q [:find ?p2 (avg ?q2)
          :with ?l2
          :where
-         [?p2 :part/partkey ?pk]
          [?p2 :part/brand "Brand#23"]
          [?p2 :part/container "MED BOX"]
-         [?l2 :lineitem/partkey ?pk]
-         [?l2 :lineitem/quantity ?q2]] $) [[?pk ?avgq]]]
+         [?l2 :lineitem/part ?p2]
+         [?l2 :lineitem/quantity ?q2]] $) [[?p ?avgq]]]
     [(* 0.2 ?avgq) ?thr]
     [(< ?q ?thr)]
     [?l :lineitem/extendedprice ?ep]
@@ -451,14 +412,14 @@
     :order-by [4 :desc 3 :asc]
     :limit 100
     :where
-    [(q [:find ?ok (sum ?q)
+    [(q [:find ?o (sum ?q)
          :with ?l
          :having [(> (sum ?q) 300)]
          :where
-         [?l :lineitem/orderkey ?ok]
-         [?l :lineitem/quantity ?q]] $) [[?ok ?qsum]]]
+         [?l :lineitem/order ?o]
+         [?l :lineitem/quantity ?q]] $) [[?o ?qsum]]]
     [?o :orders/orderkey ?ok]
-    [?o :orders/custkey ?c-custkey]
+    [?o :orders/customer ?c]
     [?o :orders/orderdate ?o-orderdate]
     [?o :orders/totalprice ?o-totalprice]
     [?c :customer/custkey ?c-custkey]
@@ -477,8 +438,7 @@
                   [(or (= ?cont "SM CASE") (= ?cont "SM BOX") (= ?cont "SM PACK") (= ?cont "SM PKG"))]
                   [?p :part/size ?size]
                   [(>= ?size 1)] [(<= ?size 5)]
-                  [?p :part/partkey ?pk]
-                  [?l :lineitem/partkey ?pk]
+                  [?l :lineitem/part ?p]
                   [?l :lineitem/quantity ?qty]
                   [(>= ?qty 1)] [(<= ?qty 11)]
                   [?l :lineitem/shipmode ?mode]
@@ -491,8 +451,7 @@
                   [(or (= ?cont "MED BAG") (= ?cont "MED BOX") (= ?cont "MED PKG") (= ?cont "MED PACK"))]
                   [?p :part/size ?size]
                   [(>= ?size 1)] [(<= ?size 10)]
-                  [?p :part/partkey ?pk]
-                  [?l :lineitem/partkey ?pk]
+                  [?l :lineitem/part ?p]
                   [?l :lineitem/quantity ?qty]
                   [(>= ?qty 10)] [(<= ?qty 20)]
                   [?l :lineitem/shipmode ?mode]
@@ -505,8 +464,7 @@
                   [(or (= ?cont "LG CASE") (= ?cont "LG BOX") (= ?cont "LG PACK") (= ?cont "LG PKG"))]
                   [?p :part/size ?size]
                   [(>= ?size 1)] [(<= ?size 15)]
-                  [?p :part/partkey ?pk]
-                  [?l :lineitem/partkey ?pk]
+                  [?l :lineitem/part ?p]
                   [?l :lineitem/quantity ?qty]
                   [(>= ?qty 20)] [(<= ?qty 30)]
                   [?l :lineitem/shipmode ?mode]
@@ -525,28 +483,24 @@
   '[:find ?s-name ?s-address
     :order-by [0 :asc]
     :where
-    [(q [:find ?pk ?sk (sum ?lq)
+    [(q [:find ?p ?s (sum ?lq)
          :with ?l
          :where
-         [?p2 :part/partkey ?pk]
-         [?p2 :part/name ?pname2]
+         [?p :part/name ?pname2]
          [(like ?pname2 "forest%")]
-         [?s2 :supplier/suppkey ?sk]
-         [?s2 :supplier/nationkey ?snk2]
-         [?n2 :nation/nationkey ?snk2]
+         [?s :supplier/nation ?n2]
          [?n2 :nation/name "CANADA"]
-         [?l :lineitem/partkey ?pk]
-         [?l :lineitem/suppkey ?sk]
+         [?l :lineitem/part ?p]
+         [?l :lineitem/supplier ?s]
          [?l :lineitem/shipdate ?sd]
          [(>= ?sd "1994-01-01")]
          [(< ?sd "1995-01-01")]
-         [?l :lineitem/quantity ?lq]] $) [[?pk ?sk ?sumq]]]
-    [?ps :partsupp/partkey ?pk]
-    [?ps :partsupp/suppkey ?sk]
+         [?l :lineitem/quantity ?lq]] $) [[?p ?s ?sumq]]]
+    [?ps :partsupp/part ?p]
+    [?ps :partsupp/supplier ?s]
     [?ps :partsupp/availqty ?avail]
     [(* 0.5 ?sumq) ?thr]
     [(> ?avail ?thr)]
-    [?s :supplier/suppkey ?sk]
     [?s :supplier/name ?s-name]
     [?s :supplier/address ?s-address]])
 
@@ -556,34 +510,30 @@
     :order-by [1 :desc 0 :asc]
     :limit 100
     :where
-    [?s :supplier/suppkey ?sk]
     [?s :supplier/name ?s-name]
-    [?s :supplier/nationkey ?snk]
-    [?n :nation/nationkey ?snk]
+    [?s :supplier/nation ?n]
     [?n :nation/name "SAUDI ARABIA"]
-    [?l1 :lineitem/suppkey ?sk]
-    [?l1 :lineitem/orderkey ?ok]
+    [?l1 :lineitem/supplier ?s]
+    [?l1 :lineitem/order ?o]
     [?l1 :lineitem/receiptdate ?r1]
     [?l1 :lineitem/commitdate ?c1]
     [(> ?r1 ?c1)]
-    [?o :orders/orderkey ?ok]
     [?o :orders/orderstatus "F"]
-    (not [?l3 :lineitem/orderkey ?ok]
-         [?l3 :lineitem/suppkey ?s3]
-         [(not= ?s3 ?sk)]
+    (not [?l3 :lineitem/order ?o]
+         [?l3 :lineitem/supplier ?s3]
+         [(not= ?s3 ?s)]
          [?l3 :lineitem/receiptdate ?r3]
          [?l3 :lineitem/commitdate ?c3]
          [(> ?r3 ?c3)])
-    [?l2 :lineitem/orderkey ?ok]
-    [?l2 :lineitem/suppkey ?s2]
-    [(not= ?s2 ?sk)]])
+    [?l2 :lineitem/order ?o]
+    [?l2 :lineitem/supplier ?s2]
+    [(not= ?s2 ?s)]])
 
 ;; Q22: Global Sales Opportunity
 (def q-22
   '[:find ?cntrycode (count ?c) (sum ?c-acctbal)
     :order-by [0 :asc]
     :where
-    [?c :customer/custkey ?ck]
     [?c :customer/phone ?phone]
     [(subs ?phone 0 (min 2 (count ?phone))) ?cntrycode]
     [(or (= ?cntrycode "13") (= ?cntrycode "31") (= ?cntrycode "23")
@@ -600,7 +550,7 @@
          [(or (= ?cc2 "13") (= ?cc2 "31") (= ?cc2 "23") (= ?cc2 "29")
               (= ?cc2 "30") (= ?cc2 "18") (= ?cc2 "17"))]] $) ?avgbal]
     [(> ?c-acctbal ?avgbal)]
-    (not [?o :orders/custkey ?ck])])
+    (not [?o :orders/customer ?c])])
 
 ;; ---------------------------------------------------------------------------
 ;; Registry

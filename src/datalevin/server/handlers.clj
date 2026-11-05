@@ -79,11 +79,6 @@
   ^clojure.lang.Volatile [^SelectionKey skey]
   (.attachment skey))
 
-(defn- aborted-transaction-close-marker
-  [^SelectionKey skey close-type]
-  {:client-id (:client-id @(skey-state skey))
-   :type close-type})
-
 (defn- db-lock
   ^Semaphore [deps server db-name]
   ((:get-lock deps) server db-name))
@@ -2284,7 +2279,6 @@
         db-state        (get ((:dbs deps) server) db-name)
         ^Semaphore lock (:lock db-state)
         aborted?        (volatile! false)
-        marker          (aborted-transaction-close-marker skey close-type)
         completed?
         (group/with-confirmation
           (fn []
@@ -2320,9 +2314,11 @@
                 ((:halt-run deps) (:runner db-state))
                 ((:update-db deps) server db-name
                  (fn [m]
-                   (cond-> (dissoc m :runner :runner-skey :wlmdb :wstore :wdt-db
-                                    :notification-dirty?)
-                     @aborted? (assoc :aborted-transaction-close marker))))
+                   (dissoc m :runner :runner-skey :wlmdb :wstore :wdt-db
+                           :notification-dirty?)))
+                (when @aborted?
+                  (vswap! (skey-state skey) assoc-in
+                          [:aborted-transaction-closes db-name] close-type))
                 (.release lock)))))]
     (when (true? completed?)
       (write-complete! deps skey))))

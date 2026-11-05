@@ -1,8 +1,14 @@
 # TPC-C-Derived Benchmark
 
-This benchmark runs a TPC-C-derived transactional workload against Datalevin.
-TPC-C is the standard OLTP benchmark: nine normalized tables, five short
-read/write transactions, and a strict ACID contract with hot-row contention.
+This benchmark compares two deployment modes separately:
+
+- **Embedded:** SQLite WAL and Datalevin WAL.
+- **Client/server:** PostgreSQL and Datalevin WAL over loopback TCP, each with a
+  separate database server process.
+
+All use the same generated population, transaction inputs, scalar types, terminal
+lifecycle, and synchronous WAL commit contract. The workload has nine normalized
+tables and five short transactions with hot-row contention.
 
 > **Derived, not audited.** This is a TPC-C-derived implementation. It follows
 > the published schema and transaction definitions but is not an audited TPC-C
@@ -16,9 +22,12 @@ for Datalevin, SQLite, and PostgreSQL.
 
 The nine TPC-C tables are `warehouse`, `district`, `customer`, `history`,
 `orders`, `new_order`, `order_line`, `item`, and `stock`. Monetary values are
-stored as doubles/REAL in Datalevin and SQLite and fixed-precision numerics in
-PostgreSQL. Dates are ISO-8601 strings; returned monetary fields are normalized
-to doubles.
+stored as IEEE-754 doubles in every backend: Datalevin `:db.type/double`, SQLite
+`REAL`, and PostgreSQL `double precision`. IDs and counters use signed 64-bit
+integers (`:db.type/long`, `INTEGER`, `bigint`); strings use Datalevin strings and
+SQL `TEXT`. Dates are ISO-8601 strings. Floating-point money is an intentional
+deviation from the official specification, applied equally to all drivers. Use PostgreSQL `LC_COLLATE=C` to match SQLite
+`BINARY` and Datalevin ordering of the generated ASCII customer names.
 
 Population follows the specification's cardinalities for `w` warehouses:
 
@@ -52,12 +61,22 @@ Datalevin uses unique item and warehouse IDs and unique composite business keys
 for districts, customers, stock, orders, new orders, and order lines. Secondary
 composites index customer surnames and orders by customer. Point reads use lookup
 refs and pulls; Delivery and Order-Status seek the first or last matching index
-entry, and line reads use bounded key ranges. Descriptive strings are stored
-without value indexes. Both bulk loads and transactions maintain the composite
-attributes automatically.
+entry, and line reads use bounded key ranges. Only these application lookup keys
+have value indexes; all other fields, including balances, counters, quantities,
+names, and composite-key components, use `:db/noindex true`. Both bulk loads and
+transactions maintain the composite attributes from those components automatically.
 
-Reload Datalevin databases created with the previous schema before running this
-version. The driver rejects databases missing the required keys.
+Stock-Level reads the district counter with a query, selects the last 20 orders'
+line IDs with a bounded index range, and supplies them to a fixed query. That query
+joins stock through business-key lookup references, filters quantity, and counts
+distinct item IDs in the database. Remote execution uses three requests, with the
+join and aggregate on the server. This avoids per-item pulls and full scans when
+tuple bounds passed through query inputs remain late filters in the planner.
+
+Reload databases created with older schemas before running this version. Drivers
+reject mismatched scalar types, missing Datalevin business keys, or the previous
+extra scalar indexes. Both SQL
+schemas index orders by warehouse, district, customer, and order ID.
 
 ## Transactions
 
@@ -120,9 +139,15 @@ the customer's own warehouse/district separately. These payloads follow
 
 ## Concurrency and correctness
 
-SQLite and PostgreSQL terminals own separate JDBC connections, so one terminal's
-rollback cannot affect another terminal's transaction. Datalevin terminals share
-a connection and use its explicit transaction boundary:
+Every terminal owns a separate connection and worker thread, including embedded
+and remote Datalevin. One client JVM runs all terminals; in client/server mode,
+the database runs in a separate process. The same worker and connection survive
+warmup and measurement. Terminals synchronize at a common measurement barrier.
+Connection opening, warmup, baseline reads, verification, and closing are outside
+the throughput clock. Transaction latency excludes input generation; total
+throughput includes it. There is no process per terminal in either comparison.
+
+Transaction coordination follows each engine's native model:
 
 - **Datalevin** performs New-Order, Payment, Order-Status, and Delivery inside
   `d/with-transaction`, using the connection bound by that macro for all reads
@@ -131,10 +156,10 @@ a connection and use its explicit transaction boundary:
   snapshot. Stock-Level uses committed reads with the specification's relaxed
   isolation. Transaction errors propagate and abort the run.
 - **SQLite** has a single writer and no row locking. Terminals use independent
-  connections, and every transaction is serialized on one JVM lock so the
-  read-modify-write sequences are atomic. WAL is enabled once before terminals
-  start; connections use a 30 s busy timeout. Order-Status also opens a database
-  transaction so separate JDBC callers get a consistent snapshot.
+  connections with `IMMEDIATE` transactions and a 60 s native busy timeout.
+  There is no JVM lock around the transaction mix. WAL is enabled before terminal
+  connections open. Order-Status also opens a transaction for a consistent
+  snapshot; Stock-Level uses relaxed committed reads.
 - **PostgreSQL** supports concurrent writers. Read-then-write statements use
   `SELECT ... FOR UPDATE` (warehouse, district, customer, stock, and the oldest
   new-order row), and the driver retries transactions that fail with a
@@ -155,7 +180,7 @@ All drivers check two New-Order invariants after every run:
    transactions that district committed.
 2. Each district's order count grew by exactly that same number.
 
-The Datalevin driver also checks Payment accounting:
+All drivers also check Payment accounting:
 
 3. Each warehouse's and district's year-to-date total increased by the sum of
    successful Payments to it.
@@ -168,7 +193,7 @@ The Datalevin driver also checks Payment accounting:
 All drivers capture baselines after warmup and use only committed measured
 transactions for these invariants. Every configured district is checked,
 including districts with zero committed New-Orders. Counts must match exactly;
-Datalevin's monetary deltas allow less than half a cent of floating point error.
+Monetary deltas allow less than half a cent of floating point error.
 Checks run after all terminals finish, outside the timed interval. Any mismatch throws with an
 `:errors` vector containing the invariant, affected key, expected value, and
 actual value, before throughput or latency metrics are reported. Successful
@@ -195,106 +220,115 @@ or where the signal is not permitted, it is a no-op and the driver still runs.
 
 ## Running
 
-```bash
-# Load a one-warehouse database
-clj -X:datalevin-db '{:warehouses 1 :seed 42 :dir "db-w1"}'
-clj -X:sqlite-db    '{:warehouses 1 :seed 42 :path "sqlite-tpcc.db"}'
+Run commands from `benchmarks/tpcc-bench`. Use fresh seed copies for every measured
+run; the workload changes the database. `TPCC_DIR` selects the data directory
+(default: this directory). Keep the supplied `data/schema-*.sql` files there when
+loading SQL databases.
 
-# Run the transaction mix (same options for either system)
-clj -X:datalevin-bench '{:dir "db-w1" :warehouses 1 :txns 10000 :threads 4 :warmup 1000 :seed 42}'
-clj -X:sqlite-bench    '{:path "sqlite-tpcc.db" :warehouses 1 :txns 10000 :warmup 1000 :seed 42}'
+The Datalevin loader starts with a 100,000 MiB map, matching JOB. Pass
+`:mapsize` in MiB when a larger initial reservation is needed.
+
+```bash
+# Embedded pair: identical population and terminal options
+clj -X:datalevin-db '{:warehouses 1 :seed 42 :dir "db-w1"}'
+clj -X:sqlite-db    '{:warehouses 1 :seed 42 :path "sqlite-w1.db"}'
+clj -J-Xmx8g -X:datalevin-bench '{:dir "db-w1" :warehouses 1 :threads 4 :warmup 1000 :txns 100000 :seed 42 :load-seed 42}'
+clj -J-Xmx8g -X:sqlite-bench '{:path "sqlite-w1.db" :warehouses 1 :threads 4 :warmup 1000 :txns 100000 :seed 42 :load-seed 42}'
+
+# Client/server pair: PostgreSQL must use the settings below.
+# Use C collation so generated ASCII customer names sort identically.
+createdb --host=127.0.0.1 --port=5432 --template=template0 --locale=C tpcc_w1
+clj -X:pg-db '{:url "jdbc:postgresql://127.0.0.1:5432/tpcc_w1" :warehouses 1 :seed 42}'
+clj -J-Xmx8g -X:pg-bench '{:url "jdbc:postgresql://127.0.0.1:5432/tpcc_w1" :warehouses 1 :threads 4 :warmup 1000 :txns 100000 :seed 42 :load-seed 42}'
+clj -J-Xmx8g -X:datalevin-bench '{:uri "dtlv://datalevin:datalevin@127.0.0.1:18898/tpcc" :warehouses 1 :threads 4 :warmup 1000 :txns 100000 :seed 42 :load-seed 42}'
 ```
 
-Options: `:warehouses`, `:txns`, `:threads`, `:warmup`, and `:seed` for both.
-The Datalevin runner takes `:dir`; the SQLite runner takes `:path`.
+The Datalevin server example uses the default credentials for an isolated local
+benchmark. Start a separate server process with a populated database and a 60 s
+transaction lock timeout. The [reproduction scripts](../../doc/measurements/tpcc-stock-query-2026-11-04/README.md)
+show how to clone a closed embedded seed into a fresh server root, start the
+server, run the client, and stop the server.
 
-All three runners also accept `:load-seed` (default 42). Set it to the `:seed`
-used when loading the database so the surname constant is checked against the
-actual population. The run's `:seed` controls transaction inputs independently;
-for example, a database loaded with `:seed 123` can be benchmarked with
-`{:load-seed 123 :seed 42 ...}`. The load seed is supplied by the caller; it is
-not read from database metadata.
+`:warmup` is **per terminal** (default 1,000); `:txns` is the **total measured
+count** (default 100,000), divided across terminals. `:threads` defaults to 1.
+Each terminal gets its own seed-derived input stream; measurement restarts that
+stream after warmup. Every backend consumes identical inputs for a given set of
+options. `:load-seed` must match the population seed (default 42); it is supplied
+by the caller, not inferred from database metadata.
 
-Run generator and transaction regression tests from this directory:
+Run the generator, transaction, connection-lifecycle, and remote concurrency tests:
 
 ```bash
 clojure -M:test
+TPCC_TEST_PG_URL=jdbc:postgresql://localhost:5432/postgres clojure -M:test
 ```
 
-Transaction tests use temporary databases and cover concurrent Payments to the
-same and different customers/districts, Payment with Delivery, concurrent
-New-Order and Delivery, rollback, and detection of lost Payment totals. Payment
-concurrency is checked with WAL disabled and with strict and relaxed WAL.
-Stock tests cover the threshold, repeated items, multiple replenishments, local
-and remote supply, and rollback using Datalevin and SQLite. Rollback tests observe
-the pending header, counter, stock, and line writes and verify that every row is
-restored afterward. Enable the same
-integration cases for PostgreSQL with a test database URL:
+The PostgreSQL tests create and remove unique schemas. `TPCC_TEST_PG_USER` and
+`TPCC_TEST_PG_PASS` optionally supply test credentials. Tests cover transaction
+payloads, rollback of staged writes, concurrent accounting, and a remote abort
+whose wrapper closes after another terminal acquires the writer.
 
-```bash
-TPCC_TEST_PG_URL=jdbc:postgresql://localhost:5432/postgres \
-  clojure -M:test
-```
+## Durability and comparison boundaries
 
-`TPCC_TEST_PG_USER` and `TPCC_TEST_PG_PASS` optionally supply credentials. The
-PostgreSQL test creates and removes its own unique schema; the database user
-needs permission to create schemas.
+Datalevin throughput runs always enable `:wal? true`,
+`:wal-durability-profile :strict`, and `:wal-sync-mode :fsync`; the driver checks
+the effective options. SQLite uses WAL, `synchronous=FULL`, and `fullfsync=OFF`.
+PostgreSQL requires `fsync=on`, `synchronous_commit=on`, `wal_sync_method=fsync`,
+and `full_page_writes=on`; the driver checks these settings on each connection.
+These comparisons use synchronous operating-system WAL flushes. On macOS they
+do not request the additional `F_FULLFSYNC` hardware-cache flush.
 
-Datalevin's native and supporting dependency versions come from the local root
-project. Databases created with the former native 0.19.4 override need to be
-regenerated in a fresh directory for the current native storage format.
+Data representation and business operations are matched, while native storage
+and concurrency remain engine-specific. Datalevin stores entities, datoms, and
+composite indexes; SQL engines store rows and B-tree indexes. Datalevin and SQLite
+serialize writers; PostgreSQL uses row locks and retries. Each engine retains
+its native cache and checkpoint mechanisms. Selected settings are recorded with
+the results.
 
-## Durability
-
-The driver runs against whatever durability configuration the database was
-created with. Datalevin's default LMDB path, WAL `:strict`, and WAL `:relaxed`
-map to the same strict/relaxed split used by the `write-bench`. A publishable
-durability comparison should create one database per condition and report them
-separately; the runner does not yet switch modes.
+Client/server transaction logic runs in the client for both databases, using
+native APIs. No driver replaces a transaction with a server-side procedure.
+Both keep a server transaction open across client requests until commit or abort.
+PostgreSQL holds the affected row locks; Datalevin holds its single writer.
+Within `with-transaction`, all `transact!` calls join the outer commit. Explicit
+Datalevin bodies currently have separate native commit outcomes to keep an abort
+from cancelling another terminal's writes.
+SQL statements and Datalevin pull/transaction requests have different sizes and
+round-trip counts, so the client/server figures measure those complete API paths.
+Remote Datalevin uses an ordinary request connection and a dedicated transaction
+connection internally for each application connection; PostgreSQL uses one JDBC
+socket per terminal. Terminals otherwise have the same lifecycle and threading.
 
 ## Measured results
 
-Recorded November 4, 2026 on an Apple M3 Pro (36 GiB RAM), OpenJDK 21.0.13,
-Clojure 1.12.5, native 1.2.2, and an 8 GiB JVM heap. Each run starts from a fresh
-copy of the seed-42 population, with 1,000 warmup and 10,000 measured transactions.
-Runs execute sequentially without a profiler. These are single-pass local
-measurements, not audited TPC-C results or steady-state capacity estimates.
+Results use the paired WAL protocol above. Full row counts and
+order-independent SHA-256 fingerprints verify that every seed row matches the
+shared generator across all backends.
 
-Throughput is completed New-Orders per minute, including required invalid-item
-rollbacks. Higher is better.
+Datalevin was rerun with query-based Stock-Level; the unchanged SQL results
+are from the same day. Recorded November 4, 2026 on an Apple M3 Pro (36 GiB RAM),
+with 8 GiB client heaps. Each entry is one sequential run from a fresh seed copy: 1,000 warmup
+transactions per terminal and 100,000 measured transactions. These are bounded
+local measurements, not repeated estimates of steady-state capacity. Throughput
+is completed New-Orders per minute, including required rollbacks; higher is better.
 
-| Warehouses | Terminals | Datalevin default LMDB | Datalevin strict WAL | SQLite | PostgreSQL |
-|---:|---:|---:|---:|---:|---:|
-| 1 | 1 | 9,573.5 | 35,351.3 | 62,073.8 | 26,822.1 |
-| 1 | 4 | 9,989.1 | 39,035.9 | 62,136.7 | 77,734.3 |
-| 2 | 4 | 8,236.0 | 35,081.6 | 60,926.6 | 81,829.8 |
+**Embedded — tpmC**
 
-Default Datalevin uses synchronous LMDB commits with WAL disabled. The separate
-WAL runs enable `:wal? true` with `:wal-durability-profile :strict`. SQLite 3.51.1
-uses WAL and `synchronous=FULL`; PostgreSQL 18.6 uses `fsync=on`,
-`synchronous_commit=on`, and `full_page_writes=on`. These are different storage
-and synchronization implementations; settings and connection costs are recorded
-in the measurement notes.
+| Warehouses | Terminals | SQLite WAL | Datalevin WAL |
+|---:|---:|---:|---:|
+| 1 | 1 | 69,516.0 | 41,405.9 |
+| 2 | 4 | 70,566.9 | 39,012.4 |
 
-All six Datalevin runs passed New-Order invariants and independent Payment
-accounting over warmup plus measurement. Concurrent WAL runs include the required
-invalid-item rollbacks; each explicit transaction has an independent outcome.
-SQL figures are from the preceding same-day comparison, with the same population
-and inputs. Transaction and rollback counts match across backends.
+**Client/server — tpmC**
 
-Datalevin still shows limited throughput scaling with terminals. Order-Status
-shares the writer boundary to preserve its snapshot. These short runs also vary
-with commit timing; see the supporting repeated measurements.
+| Warehouses | Terminals | PostgreSQL | Datalevin WAL |
+|---:|---:|---:|---:|
+| 1 | 1 | 39,761.4 | 12,135.1 |
+| 2 | 4 | 112,896.8 | 13,049.4 |
 
-See the [measurement report](../../doc/measurements/tpcc-fixes-2026-11-04/README.md)
-for before/after results, latency, regression checks, and profiles, and the
-[preceding comparison](../../doc/measurements/tpcc-gaps-2026-11-04/README.md)
-for SQL settings and results.
+All eight runs passed New-Order and Payment accounting. Every backend completed
+45,150 New-Orders (449 rollbacks) in the one-terminal configuration and 44,970
+(460 rollbacks) in the four-terminal configuration. Counts of all five transaction
+types also match exactly within each configuration.
 
-## Notes
-
-- Datalevin's explicit write transactions hold the writer for their reads as
-  well as their writes. Order-Status uses this boundary too. Reported latency
-  includes waiting for the transaction.
-- TPC-C naming and cardinalities are reproduced, but dictionary text is
-  generated rather than taken from the specification's appendix.
+See the [measurement report](../../doc/measurements/tpcc-stock-query-2026-11-04/README.md)
+for raw results, actual settings, source hashes, and reproduction commands.

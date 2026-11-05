@@ -6,6 +6,7 @@
    [datalevin.core :as d]
    [datalevin.parser :as parser]
    [datalevin-tpch.common :as c]
+   [datalevin-tpch.fixtures :as f]
    [datalevin-tpch.datalevin :as dt]
    [datalevin-tpch.queries :as q]
    [datalevin-tpch.sqlite :as sq]
@@ -126,7 +127,7 @@
                   (range 1 (inc (count entities))) entities)))))
 
 (deftest q3-orders-aggregates-inside-the-query
-  (let [datoms (q3-datoms)
+  (let [datoms (f/reference-facts (q3-datoms))
         expected [[20 30.0 "1995-03-01" 0]
                   [30 20.0 "1995-03-01" 0]
                   [10 20.0 "1995-03-02" 0]]]
@@ -148,11 +149,11 @@
   ;; return ten, highest revenue first.
   (let [orders (vec (for [i (range 1 12)]
                       [(+ 100 i) "1995-03-01" (double (- 100 i))]))
-        rows   (d/q q/q-3 (q3-datoms orders))]
+        rows   (d/q q/q-3 (f/reference-facts (q3-datoms orders)))]
     (is (= 10 (count rows)))
     (is (= (mapv #(+ 100 %) (range 1 11)) (mapv first rows)))
     (doseq [explain? [false true]]
-      (is (= 10 (:rows (#'dt/run-one (q3-datoms orders) 3 explain?)))
+      (is (= 10 (:rows (#'dt/run-one (f/reference-facts (q3-datoms orders)) 3 explain?)))
           "both timing modes count the final limited result"))))
 
 (deftest q3-limit-boundary-ties-are-validated
@@ -161,7 +162,7 @@
   ;; must still verify.
   (let [orders (vec (for [i (range 1 12)]
                       [(+ 100 i) "1995-03-01" 10.0]))
-        rows   (d/q q/q-3 (q3-datoms orders))
+        rows   (d/q q/q-3 (f/reference-facts (q3-datoms orders)))
         oracle (mapv (fn [i] [(+ 100 i) 20.0 "1995-03-01" 0]) (range 1 12))]
     (is (= 10 (count rows)))
     (is (v/results-match? 3 oracle rows)

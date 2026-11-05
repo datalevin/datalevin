@@ -48,10 +48,6 @@
    :db-name db-name
    :type type})
 
-(defn- selection-key-client-id
-  [^SelectionKey skey]
-  (some-> skey .attachment deref :client-id))
-
 (defn- transaction-owner?
   [skey runner-skey]
   ;; A transaction belongs to this exact TCP connection and its native thread.
@@ -65,36 +61,19 @@
     :abort-transact-kv :close-transact-kv
     nil))
 
-(defn- aborted-close-marker
-  [^SelectionKey skey close-type]
-  (when-let [client-id (selection-key-client-id skey)]
-    {:client-id client-id
-     :type close-type}))
-
 (defn- remember-idempotent-abort!
-  [deps server db-name skey abort-type]
-  (when-let [marker (aborted-close-marker skey
-                                          (close-type-for-abort abort-type))]
-    ((:update-db-fn deps) server db-name
-     (fn [state]
-       (if (:runner state)
-         state
-         (assoc state :aborted-transaction-close marker))))))
+  [_deps _server db-name ^SelectionKey skey abort-type]
+  ;; Completion belongs to the socket that aborted, independently of whoever
+  ;; acquires the database writer next.
+  (vswap! (.attachment skey) assoc-in [:aborted-transaction-closes db-name]
+          (close-type-for-abort abort-type)))
 
 (defn- consume-aborted-close!
-  [deps server db-name skey close-type]
-  (let [marker    (aborted-close-marker skey close-type)
-        consumed? (volatile! false)]
-    (when marker
-      ((:update-db-fn deps) server db-name
-       (fn [state]
-         (if (and (nil? (:runner state))
-                  (= marker (:aborted-transaction-close state)))
-           (do
-             (vreset! consumed? true)
-             (dissoc state :aborted-transaction-close))
-           state))))
-    @consumed?))
+  [_deps _server db-name ^SelectionKey skey close-type]
+  (let [state (.attachment skey)]
+    (when (= close-type (get-in @state [:aborted-transaction-closes db-name]))
+      (vswap! state update :aborted-transaction-closes dissoc db-name)
+      true)))
 
 (defn- message-db-name
   [{:keys [args db-name]}]
@@ -301,6 +280,10 @@
         (and runner (transaction-owner? skey runner-skey))
         ((:new-message-fn deps) runner skey message)
 
+        (and (= :close (cmd/transaction-control type))
+             (consume-aborted-close! deps server db-name skey type))
+        ((:write-message-fn deps) skey {:type :command-complete})
+
         runner
         (raise "Active transaction belongs to another client"
                  (missing-withtxn-error db-name type
@@ -310,10 +293,6 @@
         (do
           (remember-idempotent-abort! deps server db-name skey type)
           ((:write-message-fn deps) skey {:type :command-complete}))
-
-        (and (= :close (cmd/transaction-control type))
-             (consume-aborted-close! deps server db-name skey type))
-        ((:write-message-fn deps) skey {:type :command-complete})
 
         (= :close (cmd/transaction-control type))
         (raise "Cannot confirm a transaction that is no longer active"

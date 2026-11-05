@@ -2,8 +2,9 @@
   "TPC-C-derived benchmark against PostgreSQL.
 
   Loads the same generated data set as the Datalevin and SQLite drivers into a
-  PostgreSQL database and runs the same transaction mix and invariants, so the
-  systems can be compared directly.
+  PostgreSQL database and runs the same transaction mix and invariants. Results
+  include client/server transport and the connection lifecycle described in
+  the README.
 
   PostgreSQL is optional: it requires a running server reachable through a JDBC
   URL. Connection settings come from the options map or JVM properties
@@ -11,8 +12,9 @@
   (:require
    [clojure.java.io :as io]
    [clojure.string :as s]
-   [datalevin-bench.host :as host]
+   [datalevin-tpcc.runner :as runner]
    [datalevin-tpcc.common :as c]
+   [datalevin-tpcc.check :as check]
    [datalevin-tpcc.generate :as g])
   (:import
    [java.sql Connection DriverManager PreparedStatement ResultSet Types]
@@ -466,119 +468,34 @@
                      :stock-level  (stock-level! conn input)))]
     [type input res ms]))
 
-(defn- percentile [sorted p]
-  (when (seq sorted)
-    (nth sorted (min (dec (count sorted))
-                     (int (Math/floor (* (double p) (count sorted))))))))
+(defn- open-bench-connection [opts]
+  (let [conn (get-connection opts)]
+    (try
+      (check/sql-schema! conn :postgres qall)
+      (.setTransactionIsolation conn Connection/TRANSACTION_READ_COMMITTED)
+      (with-open [statement (.createStatement conn)]
+        (.execute statement "SET synchronous_commit=on"))
+      (let [settings (into {} (qall conn "SELECT name,setting FROM pg_settings WHERE name IN ('fsync','synchronous_commit','wal_sync_method','full_page_writes')"))]
+        (when-not (= {"fsync" "on" "synchronous_commit" "on"
+                      "wal_sync_method" "fsync" "full_page_writes" "on"} settings)
+          (throw (ex-info "TPC-C requires synchronous WAL with wal_sync_method=fsync"
+                          {:settings settings}))))
+      conn
+      (catch Throwable error (.close conn) (throw error)))))
 
 (defn bench
-  "Run the TPC-C-derived transaction mix against a loaded PostgreSQL database.
-
-  Options:
-    :url         JDBC URL (default jdbc:postgresql://localhost:5432/postgres)
-    :user        PostgreSQL user (default $USER)
-    :pass        PostgreSQL password
-    :warehouses  number of warehouses (default 1)
-    :txns        measured transactions (default 10000)
-    :threads     terminals (default 1)
-    :warmup      warmup transactions (default 1000)
-    :seed        input seed (default 42)
-    :load-seed   seed used to populate the database (default 42)
-
-  Throws with accounting errors before reporting metrics if any district's
-  next order id or order count disagrees with committed New-Orders."
+  "Run PostgreSQL with one warmed connection per terminal. :warmup is per
+  terminal and :txns is the total measured count. See runner/bench."
   ([opts] (bench opts {}))
-  ([{:keys [warehouses txns threads warmup seed load-seed]
-     :or   {warehouses 1 txns 10000 threads 1 warmup 1000 seed 42 load-seed 42}
-     :as   opts}
-    {:keys [do-txn pick-type district-next-o-id order-count
-            measure! start-terminal get-connection]
-     :or {do-txn do-txn
-          pick-type pick-type
-          district-next-o-id district-next-o-id
-          order-count order-count
-          measure! (fn [f] (host/with-paused-media (f)))
-          start-terminal future-call
-          get-connection get-connection}}]
-   (with-open [conn (get-connection (conn-opts opts))]
-     (let [txn-opts (assoc (g/run-constants seed load-seed) :warehouses warehouses)
-           committed (atom {})
-           lat       (atom [])
-           run       (fn [^Connection cnn ^long ti ^long n record?]
-                       (let [r (Random. (+ seed ti 1))
-                             txn-opts (g/terminal-options txn-opts ti)]
-                         (dotimes [_ n]
-                           (let [[type input res ms] (do-txn cnn r txn-opts (pick-type r))]
-                             (when (and (= :new-order type) (= :ok (:status res)))
-                               (swap! committed update [(:w input) (:d input)]
-                                      (fnil inc 0)))
-                             (when record?
-                               (swap! lat conj [type ms (:status res)]))))))]
-       (println (format "TPC-C-derived: %d warehouse(s), %d terminal(s), %d txns"
-                        warehouses threads txns))
-      ;; Each terminal uses its own connection so transactions are isolated.
-      ;; A run owns its RNG, so execute the whole warmup as one batch.
-       (let [warm-conn (get-connection (conn-opts opts))]
-         (try (run warm-conn 0 warmup false)
-              (finally (.close warm-conn))))
-       (measure!
-        (fn []
-          (let [dists    (for [w (range 1 (inc warehouses)) d (range 1 11)] [w d])
-                baseline (into {} (map (fn [[w d]] [[w d] (district-next-o-id conn w d)])
-                                       dists))
-                base-ord (into {} (map (fn [[w d]] [[w d] (order-count conn w d)])
-                                       dists))]
-            (reset! committed {})
-            (reset! lat [])
-            (let [t0       (System/nanoTime)
-                  per      (quot txns threads)
-                  futs     (mapv (fn [ti]
-                                   (start-terminal
-                                    (fn []
-                                      (let [c (get-connection (conn-opts opts))]
-                                        (try
-                                          (run c ti (+ per (if (= ti (dec threads))
-                                                             (mod txns threads)
-                                                             0))
-                                               true)
-                                          (finally (.close c)))))))
-                                 (range threads))
-                ;; Drain every terminal before leaving the run, including
-                ;; when one has failed, so all terminal connections close.
-                  results  (mapv (fn [f] (try @f (catch Throwable e e))) futs)]
-              (when-let [error (some #(when (instance? Throwable %) %) results)]
-                (throw error))
-              (let [elapsed    (/ (- (System/nanoTime) t0) 1.0e9)
-                    errors
-                    (vec (for [[w d :as k] dists
-                               [invariant base actual]
-                               [[:district-next-o-id baseline (district-next-o-id conn w d)]
-                                [:order-count base-ord (order-count conn w d)]]
-                               :let [expected (+ (get base k) (get @committed k 0))]
-                               :when (not= actual expected)]
-                           {:invariant invariant :key k :expected expected :actual actual}))
-                    {:keys [new-orders committed-new-orders rolled-back-new-orders tpmc]
-                     :as metrics} (c/new-order-metrics @lat elapsed)
-                    by-type    (group-by first @lat)
-                    stats      (into {}
-                                     (for [[ty xs] by-type]
-                                       (let [ms (vec (sort (map second xs)))]
-                                         [ty {:count (count ms)
-                                              :mean  (/ (reduce + 0.0 ms) (count ms))
-                                              :p50   (percentile ms 0.50)
-                                              :p95   (percentile ms 0.95)
-                                              :p99   (percentile ms 0.99)}])))]
-                (when (seq errors)
-                  (throw (ex-info "TPC-C accounting invariant failure" {:errors errors})))
-                (println "district next_o_id invariant: OK")
-                (println "order count invariant: OK")
-                (println (format "Elapsed: %.2fs  New-Orders: %d (%d committed, %d rolled back)  tpmC: %.1f"
-                                 elapsed new-orders committed-new-orders rolled-back-new-orders tpmc))
-                (doseq [[ty {:keys [count mean p50 p95 p99]}] (sort-by key stats)]
-                  (println (format "  %-13s n=%-6d mean=%7.3fms p50=%7.3f p95=%7.3f p99=%7.3f"
-                                   (name ty) count mean p50 p95 p99)))
-                (assoc metrics :elapsed elapsed :stats stats
-                       :invariants :ok))))))))))
+  ([opts dependencies]
+   (let [open (or (:get-connection dependencies) open-bench-connection)]
+     (runner/bench opts
+       (merge {:do-txn do-txn :pick-type pick-type
+               :close-conn #(.close ^Connection %)
+               :district-next-o-id district-next-o-id :order-count order-count
+               :payment-state #(check/sql-payment-state % qall)
+               :payment-errors check/payment-errors}
+              dependencies {:open-conn #(open (conn-opts opts))})))))
 
 (defn -main [& _args]
   (bench {})

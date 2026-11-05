@@ -25,6 +25,14 @@ Queries use the default `qgen -d` parameters. SQL files are under
 `src/datalevin_tpch/queries.clj`. Dates use ISO strings, and queries preserve
 the required ordering and row limits.
 
+Datalevin uses normalized entities linked by references. Following the JOB
+loader, each table has a separate entity-ID range, and foreign keys become
+target entity IDs before bulk loading. Ranges use actual source-key maxima,
+including sparse order keys and zero-based region keys. Composite-key rows
+use deterministic row ordinals within their own ranges; their unique tuples
+contain references. Queries join entity IDs and project business keys where
+the SQL result requires them.
+
 ## Run
 
 Run each complete query set twice in separate processes. The first pass warms
@@ -38,6 +46,9 @@ clj -X:datalevin-db
 clj -X:datalevin-bench '{:queries :all :out "datalevin_warmup.csv"}'
 clj -X:datalevin-bench '{:queries :all :out "datalevin_pass.csv"}'
 ```
+
+The loader starts with a 100,000 MiB map, matching JOB, so SF1 loading needs
+no map growth. Override `:mapsize` in MiB for larger datasets.
 
 ### SQLite
 
@@ -73,8 +84,9 @@ After loading Datalevin and SQLite, compare all 22 query results:
 clj -X:verify '{:queries :all :out "verification.edn"}'
 ```
 
-Verification checks table counts, result values, ordering, and limits. Monetary
-aggregates use a relative tolerance of `1e-6`; identifiers, counts, and quantity
+Verification checks table counts, disjoint entity-ID ranges, reference targets,
+result values, ordering, and limits. Old scalar-key databases require a rebuild.
+Monetary aggregates use a relative tolerance of `1e-6`; identifiers, counts, and quantity
 sums must match exactly. SQLite uses case-sensitive `LIKE` to match the queries.
 The command exits nonzero on failure. Use `:dump? true` to print mismatches or
 `:timeout-ms 120000` to set a per-query deadline.
@@ -96,8 +108,8 @@ The command exits nonzero on failure. Use `:dump? true` to print mismatches or
 ## Results
 
 Scale factor 1 (6,001,215 lineitems), measured on a 12-core Apple M3 Pro with
-36 GiB RAM and macOS 26.6.2. Datalevin and SQLite were measured on 2026-11-04;
-the PostgreSQL measurements are from 2026-11-03. Versions: Datalevin 1.2.10
+36 GiB RAM and macOS 26.6.2. Datalevin was measured on 2026-11-05, SQLite on
+2026-11-04, and PostgreSQL on 2026-11-03. Versions: Datalevin 1.2.10
 development checkout on Clojure 1.12.6 and Java 21.0.13.0.3 (8 GiB heap),
 SQLite 3.51.1, and PostgreSQL 18.6.
 PostgreSQL used 128 MiB shared buffers, 4 MiB work memory, and up to two parallel
@@ -114,30 +126,33 @@ Datalevin queries passed the SQLite correctness check.
 
 | Query | Datalevin (ms) | SQLite (ms) | PostgreSQL (ms) |
 |---|---:|---:|---:|
-| Q1 | 3,060.9 | 3,753.3 | 918.1 |
-| Q2 | 189.9 | 144.5 | 179.0 |
-| Q3 | 485.8 | 542.9 | 207.8 |
-| Q4 | 183.1 | 134.1 | 110.9 |
-| Q5 | 478.2 | 327.0 | 338.0 |
-| Q6 | 421.9 | 337.9 | 129.7 |
-| Q7 | 442.0 | 4,016.8 | 372.7 |
-| Q8 | 119.4 | 125.7 | 146.3 |
-| Q9 | 1,334.4 | 1,490.1 | 1,168.7 |
-| Q10 | 404.7 | 1,019.7 | 193.6 |
-| Q11 | 78.2 | 35.5 | 76.0 |
-| Q12 | 405.8 | 876.5 | 236.6 |
-| Q13 | 804.6 | 1,063.9 | 322.5 |
-| Q14 | 135.8 | 4,767.9 | 133.3 |
-| Q15 | 198.8 | 347.1 | 145.0 |
-| Q16 | 236.4 | 105.1 | 110.0 |
-| Q17 | 47.2 | 51.0 | 485.4 |
-| Q18 | 1,417.6 | 554.7 | 1,499.3 |
-| Q19 | 106.3 | 29.0 | 28.8 |
-| Q20 | 64.9 | 69.3 | 166.9 |
-| Q21 | 944.0 | 1,447.6 | 269.8 |
-| Q22 | 113.9 | 38.9 | 34.7 |
-| **Total** | **11,673.9** | **21,278.4** | **7,273.2** |
+| Q1 | 3,087.1 | 3,753.3 | 918.1 |
+| Q2 | 124.2 | 144.5 | 179.0 |
+| Q3 | 506.2 | 542.9 | 207.8 |
+| Q4 | 186.7 | 134.1 | 110.9 |
+| Q5 | 301.3 | 327.0 | 338.0 |
+| Q6 | 361.0 | 337.9 | 129.7 |
+| Q7 | 322.8 | 4,016.8 | 372.7 |
+| Q8 | 76.4 | 125.7 | 146.3 |
+| Q9 | 1,137.8 | 1,490.1 | 1,168.7 |
+| Q10 | 303.7 | 1,019.7 | 193.6 |
+| Q11 | 73.0 | 35.5 | 76.0 |
+| Q12 | 375.3 | 876.5 | 236.6 |
+| Q13 | 716.4 | 1,063.9 | 322.5 |
+| Q14 | 142.7 | 4,767.9 | 133.3 |
+| Q15 | 216.6 | 347.1 | 145.0 |
+| Q16 | 246.0 | 105.1 | 110.0 |
+| Q17 | 40.0 | 51.0 | 485.4 |
+| Q18 | 1,402.9 | 554.7 | 1,499.3 |
+| Q19 | 59.4 | 29.0 | 28.8 |
+| Q20 | 47.1 | 69.3 | 166.9 |
+| Q21 | 1,105.2 | 1,447.6 | 269.8 |
+| Q22 | 94.8 | 38.9 | 34.7 |
+| **Total** | **10,926.5** | **21,278.4** | **7,273.2** |
 
+
+[Optimizer validation and comparison runs](../../doc/measurements/tpch-or-branches-2026-11-05/README.md)
+include the Q19 branch plans and the complete correctness report.
 
 ## Tests
 

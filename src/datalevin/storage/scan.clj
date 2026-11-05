@@ -665,7 +665,8 @@
       (fold-projected-uncached-rows projection lmdb columns row consume! check! entity-value?))))
 
 (defn- fold-unprojected-entity-rows
-  [dbi rtx cur lmdb ^ints aids ^ints columns ^objects row consume! check! entity-value?]
+  [dbi rtx cur lmdb ^ints aids ^ints columns ^objects row consume! check! entity-value?
+   entity-range]
   (let [n (alength aids)
         low (aget aids 0)
         high (aget aids (dec n))
@@ -674,7 +675,11 @@
     (dotimes [i n] (aset-int slots (- (aget aids i) low) (aget columns i)))
     (with-open [^AutoCloseable iterator
                 (.iterator ^Iterable
-                  (lmdb/iterate-list-key-range-val-full dbi rtx cur [:all] :id))]
+                  (lmdb/iterate-list-key-range-val-full
+                    dbi rtx cur
+                    (if-let [[start end] entity-range]
+                      (if end [:closed-open start end] [:at-least start])
+                      [:all]) :id))]
       (let [^Iterator iterator iterator
             borrowed (when (satisfies? lmdb/IBorrowedKVIterator iterator)
                        (lmdb/current-kv iterator))]
@@ -722,6 +727,10 @@
    (fold-entity-rows lmdb aids columns row consume! check! revision entity-value? nil))
   ([lmdb ^ints aids ^ints columns ^objects row consume! check! revision entity-value?
     string-cache-capacities]
+   (fold-entity-rows lmdb aids columns row consume! check! revision entity-value?
+                     string-cache-capacities nil))
+  ([lmdb ^ints aids ^ints columns ^objects row consume! check! revision entity-value?
+    string-cache-capacities entity-range]
    (check!)
    (scan/scan lmdb c/eav
      (when (or (nil? revision) (= revision (snapshot-schema-revision lmdb rtx)))
@@ -729,13 +738,30 @@
                 (EavProjection/available (true? *selective-materialization?*))
                 (nil? (cpp-iter/dbi-key-codec dbi))
                 (nil? (cpp-iter/dbi-value-codec dbi)))
-         (fold-projected-entity-rows (EavProjection. ^Cursor cur aids
-                                                    (true? *selective-materialization?*))
+         (fold-projected-entity-rows (if-let [[start end] entity-range]
+                                      (EavProjection. ^Cursor cur aids (long start)
+                                                       (long (or end -1)))
+                                      (EavProjection. ^Cursor cur aids
+                                                       (true? *selective-materialization?*)))
                                     lmdb columns row consume! check! entity-value?
                                     string-cache-capacities)
          (fold-unprojected-entity-rows dbi rtx cur lmdb aids columns row
-                                       consume! check! entity-value?)))
+                                       consume! check! entity-value? entity-range)))
      (throw e))))
+
+(defn entity-ranges
+  "Partition an EAV walk at entity boundaries sampled by datom rank. This
+  balances stored work even with sparse IDs and never splits one entity."
+  [lmdb participants]
+  (let [total (long (i/entries lmdb c/eav))
+        boundaries (volatile! [0])]
+    (when (pos? total)
+      (i/visit-list-sample lmdb c/eav
+        (long-array (map #(quot (* total (long %)) (long participants))
+                         (range 1 participants)))
+        (fn [entry] (vswap! boundaries conj (.getLong ^ByteBuffer (lmdb/k entry) 0)))
+        [:all] :id :raw true))
+    (mapv vec (partition 2 1 (conj (vec (distinct @boundaries)) nil)))))
 
 (defn read-entity-values
   "Read and filter one entity's scalar attributes in aid order. Returns a values

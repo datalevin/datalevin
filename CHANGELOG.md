@@ -4,6 +4,7 @@
 
 ### Added
 - [Admin] server wide administrative tool `dtlv admin` commands.
+- [Bench] TPC-C and TPC-H benchmarks.
 
 ### Improved
 - [Storage] update dtlvnative to 1.2.2 with prepared-copy and projected EAV
@@ -11,6 +12,7 @@
 - [Datalog] reuse decoded short strings in bounded per-scan dictionaries for
   eligible fused aggregates, reducing repeated string and byte-array allocation.
 - [Datalog] `init-db` and `fill-db` handle composite attributes.
+- [Datalog] faster planning and more optimization cases.
 - deps update
 
 ## 1.2.10 (2026-10-28)

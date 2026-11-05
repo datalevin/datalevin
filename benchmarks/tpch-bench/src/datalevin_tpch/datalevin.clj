@@ -20,10 +20,25 @@
     :customer/custkey :orders/orderkey})
 
 (def ^:private composite-keys
-  {"partsupp" [:partsupp/partkey+suppkey
-               [:partsupp/partkey :partsupp/suppkey]]
-   "lineitem" [:lineitem/orderkey+linenumber
-               [:lineitem/orderkey :lineitem/linenumber]]})
+  {"partsupp" [:partsupp/part+supplier [:partsupp/part :partsupp/supplier]]
+   "lineitem" [:lineitem/order+linenumber [:lineitem/order :lineitem/linenumber]]})
+
+(def references
+  "SQL foreign-key columns mapped to [reference attribute target table]."
+  {:nation/regionkey   [:nation/region "region"]
+   :supplier/nationkey [:supplier/nation "nation"]
+   :customer/nationkey [:customer/nation "nation"]
+   :partsupp/partkey   [:partsupp/part "part"]
+   :partsupp/suppkey   [:partsupp/supplier "supplier"]
+   :orders/custkey     [:orders/customer "customer"]
+   :lineitem/orderkey  [:lineitem/order "orders"]
+   :lineitem/partkey   [:lineitem/part "part"]
+   :lineitem/suppkey   [:lineitem/supplier "supplier"]})
+
+(defn attribute
+  "Datalevin attribute corresponding to a SQL column attribute."
+  [a]
+  (if-let [[ref] (references a)] ref a))
 
 (def schema
   (into (into {}
@@ -34,51 +49,114 @@
         (for [table c/table-order
               :let  [{:keys [types]} (c/table-specs table)]
               [a t] (map vector (c/attrs table) types)]
-          [a (cond-> {:db/valueType (c/type->db-type t)}
-               (primary-keys a) (assoc :db/unique :db.unique/value))])))
+          [(attribute a)
+           (cond-> {:db/valueType (if (references a)
+                                   :db.type/ref
+                                   (c/type->db-type t))}
+             (primary-keys a) (assoc :db/unique :db.unique/value))])))
 
 ;; ---------------------------------------------------------------------------
 ;; Load
 
+(defn entity-layout
+  "Allocate disjoint ranges as in JOB. Single-column keys use base + key;
+  composite-key rows use base + row ordinal, since no table references them.
+  Scan actual maxima (orders have sparse keys), not row counts or assumed SF.
+  `read-rows` has the same interface as common/tbl-rows."
+  [read-rows]
+  (first
+    (reduce
+      (fn [[layout base] table]
+        (let [composite? (contains? composite-keys table)
+              [row-count maximum]
+              (read-rows table
+                (fn [rows]
+                  (reduce (fn [[n maximum] row]
+                            (if composite?
+                              [(inc n) (inc n)]
+                              (let [key (Long/parseLong (first row))]
+                                (when (neg? key)
+                                  (throw (ex-info "Negative TPC-H key"
+                                                  {:table table :key key})))
+                                [(inc n) (max maximum key)])))
+                          [0 0] rows)))]
+          [(assoc layout table {:base base :maximum maximum :rows row-count})
+           (+ base maximum 1)]))
+      [{} 1] c/table-order)))
+
+(defn entity-id
+  "Convert a source key (or composite-row ordinal) to its positive entity ID."
+  [layout table key]
+  (let [{:keys [base maximum]} (get layout table)]
+    (when-not (and base (integer? key) (<= 0 key maximum))
+      (throw (ex-info "TPC-H key outside allocated entity range"
+                      {:table table :key key :range (get layout table)})))
+    (+ base key)))
+
 (defn- table-row-datoms
-  "Build a row converter that includes derived keys for the bulk loader."
-  [table]
-  (let [attrs                   (c/attrs table)
+  "Construct entity IDs and refs directly before passing trusted datoms to fill-db."
+  [layout table]
+  (let [columns                 (c/attrs table)
+        attrs                   (mapv attribute columns)
         types                   (:types (c/table-specs table))
         [tuple-attr components] (composite-keys table)
         positions               (mapv #(.indexOf ^java.util.List attrs %)
                                       components)]
-    (fn [e row]
-      (let [values (mapv c/parse-value types row)
+    (fn [ordinal row]
+      (let [parsed (mapv c/parse-value types row)
+            e (entity-id layout table (if tuple-attr ordinal (first parsed)))
+            values (mapv (fn [a value]
+                           (if-let [[_ target] (references a)]
+                             (entity-id layout target value)
+                             value)) columns parsed)
             datoms (mapv #(d/datom e %1 %2) attrs values)]
-        ;; fill-db accepts trusted datoms and does not derive tuple values.
         (cond-> datoms
           tuple-attr (conj (d/datom e tuple-attr (mapv values positions))))))))
 
 (defn- load-table!
-  [db table]
-  (let [row-datoms (table-row-datoms table)
-        eid        (atom 0)
+  [db layout read-rows table]
+  (let [row-datoms (table-row-datoms layout table)
         t0         (System/nanoTime)]
-    (c/tbl-rows
+    (read-rows
      table
      (fn [rows]
        (d/fill-db
         db
         (eduction
-         (mapcat
-          (fn [row]
-            (row-datoms (swap! eid inc) row)))
+         ;; map-indexed starts afresh if a map resize retries the bulk load.
+         ;; An external counter would assign different IDs on the retry.
+         (comp (map-indexed (fn [i row] (row-datoms (inc i) row))) cat)
          rows))))
-    (println (format "  %-9s %10d rows  %6.2fs" table @eid
+    (println (format "  %-9s %10d rows  %6.2fs" table (get-in layout [table :rows])
                      (/ (- (System/nanoTime) t0) 1.0e9)))))
+
+(defn load-data!
+  "Load every table using one shared entity layout. Returns the layout."
+  ([db] (load-data! db c/tbl-rows))
+  ([db read-rows]
+   (let [layout (entity-layout read-rows)]
+     (doseq [table c/table-order]
+       (load-table! db layout read-rows table))
+     layout)))
+
+(defn require-reference-schema!
+  "Reject databases built with the former scalar-key model; they need a rebuild."
+  [conn]
+  (let [actual (d/schema conn)]
+    (doseq [[_ [a _]] references]
+      (when-not (= :db.type/ref (:db/valueType (actual a)))
+        (throw (ex-info "TPC-H reference schema missing; rebuild with :datalevin-db"
+                        {:attribute a}))))))
 
 (defn db
   "Load TPC-H .tbl files into a fresh Datalevin database.
 
   Options:
-    :dir  database directory (default \"db\" under the project root)"
-  [{:keys [dir] :or {dir "db"}}]
+    :dir      database directory (default \"db\" under the project root)
+    :mapsize  initial map size in MiB (default 100000, as in JOB)"
+  [{:keys [dir mapsize] :or {dir "db" mapsize 100000}}]
+  (when-not (pos-int? mapsize)
+    (throw (ex-info ":mapsize must be a positive number of MiB" {:mapsize mapsize})))
   (c/require-data!)
   (let [dir (io/file c/base-dir dir)]
     (when (.exists dir)
@@ -86,10 +164,10 @@
       (u/delete-files dir))
     (println "Loading TPC-H data into Datalevin at" (.getPath dir))
     (let [t0 (System/nanoTime)
-          db (d/empty-db (.getPath dir) schema {:closed-schema? true})]
+          db (d/empty-db (.getPath dir) schema
+                         {:closed-schema? true :kv-opts {:mapsize mapsize}})]
       (try
-        (doseq [table c/table-order]
-          (load-table! db table))
+        (load-data! db)
         (println (format "Load time: %.2fs" (/ (- (System/nanoTime) t0) 1.0e9)))
         (println "Running analyze...")
         (let [a0 (System/nanoTime)]
@@ -163,6 +241,7 @@
   (let [conn (d/get-conn (.getPath (io/file c/base-dir dir)))
         ids  (selected-ids queries)]
     (try
+      (require-reference-schema! conn)
       (host/with-paused-media
         (with-open [w (io/writer (io/file c/base-dir out))]
           (d/write-csv w [["Query" "Rows" "Prepare (ms)" "Execution (ms)"

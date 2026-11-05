@@ -26,9 +26,10 @@
    [datalevin.query.optimizer.existence :as existence]
    [datalevin.query.optimizer.existence-placement :as placement]
    [datalevin.query.optimizer.plan-cost
-    :refer [estimate-base-cost estimate-scan-v-cost estimate-scan-v-size
+    :refer [estimate-base-cost estimate-base-size estimate-scan-v-cost estimate-scan-v-size
             fast-clause-count final-plan-cost zero-count-clause-size]]
    [datalevin.query.optimizer.range :as qor]
+   [datalevin.query.optimizer.reference-filters :as reference-filters]
    [datalevin.query.optimizer.rewrite
     :refer [get-not-join-source get-not-join-vars]]
    [datalevin.query.optimizer.sampling
@@ -242,7 +243,16 @@
 
                (and (not single?) sample?)
                (#(if (< ^long c/init-exec-size-threshold ^long mcount)
-                   (assoc % :sample (-sample % db nil))
+                   (cond-> (assoc % :sample (-sample % db nil))
+                     (and pred (= 1 (+ (count bound) (count free))))
+                     ;; Init sampling already applies its predicate. Retain
+                     ;; the input count so that yield is not lost when the
+                     ;; node has only this one attribute.
+                     (assoc :sample-input-size
+                            (if (or range (some? val))
+                              (min (long mcount)
+                                   (long c/init-exec-size-threshold))
+                              (.size ^List (-sample (assoc % :pred nil) db nil)))))
                    (assoc % :result (-execute % db nil)))))]
     (cond-> [init]
       (< 1 (+ (count bound) (count free)))
@@ -338,7 +348,7 @@
            (make-plan isteps
                       (estimate-base-cost node isteps)
                       (if sample?
-                        (estimate-scan-v-size mcount isteps)
+                        (estimate-base-size mcount isteps)
                         mcount)
                       0)))))))
 
@@ -547,8 +557,11 @@
                            (add-pred
                              (qpred/shareable-predicate #(= % val1))))
         ip-options       (cond-> (assoc ip-options :pred ip)
-                           (some? val1) (dissoc :range-pred?))
-        attrs-v2         (:attrs-v s2)
+                           (some? val1) (dissoc :range-pred?)
+                           (and (some? val1) (nil? (:pred s1)) (nil? (:range s1)))
+                           (assoc :constant-pred? true))
+        checks           (filterv (comp :skip? second) (:attrs-v s2))
+        attrs-v2         (remove (comp :skip? second) (:attrs-v s2))
         get-a            (fn [coll] (some #(when (keyword? %) %) coll))
         [raw-attrs-v vars cols elided predicate-vars]
         (reduce
@@ -571,11 +584,6 @@
                                        [:pred :range-pred?
                                         :predicate-only?])
                                      {:pred nil})
-                      skip?        (boolean
-                                     (some (fn [[attr options]]
-                                             (when (= a attr)
-                                               (:skip? options)))
-                                           attrs-v2))
                       predicate?   (boolean (:predicate-only? options))]
                   (if-let [f (find-index v lcols)]
                     (if (and (nil? (:pred options))
@@ -593,7 +601,7 @@
                        vars cols elided (conj predicate-vars v)]
                       [(conj attrs-v
                              [a (assoc options
-                                       :skip? skip?
+                                       :skip? false
                                        :fidx nil)])
                        (conj vars v) (conj cols col) elided
                        predicate-vars]))))))
@@ -607,6 +615,10 @@
              (if predicate-v1? [v1] [])]
             [[] [] [] [] []])
           (rest ncols))
+        ;; Constants and wildcards have no output column, but remain physical
+        ;; checks. Keep them separate from a projected value of the same
+        ;; attribute: on cardinality-many data those are independent clauses.
+        raw-attrs-v     (into raw-attrs-v checks)
         ;; MergeScanStep requires at least one physical attribute. Retain one
         ;; otherwise redundant check for degenerate duplicate-clause queries.
         [scan-attrs-v remaining-elided]
@@ -677,14 +689,17 @@
         initial-pred? (or (:pred init) (some identity (:range init))
                           (some? (:val init)))
         initial? (or initial-pred? (nil? first-var))
-        attrs-v (:attrs-v merge)]
+        checks (filter (comp :skip? second) (:attrs-v merge))
+        attrs-v (remove (comp :skip? second) (:attrs-v merge))]
     (loop [columns (next columns)
            vars (long (if (and initial? first-var
                                 (some? (find-index first-var
                                                   (:cols (peek new-steps))))) 1 0))
-           preds (long (if (and initial-pred?
-                                 (or (some? (:val init))
-                                     (not (simple-range-pred? init)))) 1 0))
+           preds (long (+ (count (filter (fn [[_ {:keys [pred range-pred?]}]]
+                                          (and pred (not range-pred?))) checks))
+                          (if (and initial-pred?
+                                   (or (some? (:val init))
+                                       (not (simple-range-pred? init)))) 1 0)))
            fidxs (long 0)]
       (if-let [col (first columns)]
         (let [v (col-var col)]
@@ -1860,6 +1875,22 @@
                                     (assoc :cost cost))) %))))))
     alternative))
 
+(defn- order-reference-filter-alternative
+  [db {:keys [plan attribute-group-planning] :as alternative}]
+  (let [ordered (reference-filters/order-filters db plan)]
+    (cond-> (assoc alternative :plan ordered)
+      (and attribute-group-planning (not= ordered plan))
+      (update :attribute-group-planning
+              (fn [summary]
+                (let [placements (attribute-group-placements ordered)]
+                  (-> summary
+                      (update :groups #(mapv (fn [group]
+                                              (merge group (get placements (:id group)))) %))
+                      (update :alternatives
+                              #(mapv (fn [candidate]
+                                       (cond-> candidate (= (:selected summary) (:kind candidate))
+                                         (assoc :cost (final-plan-cost ordered)))) %)))))))))
+
 (defn build-plan*
   [db sources rules nodes required-vars projected-vars]
   (let [cc              (connected-components nodes)
@@ -1882,7 +1913,9 @@
                     db sources rules nodes incoming-counts required-vars
                     component deferred))
                 components))
-        alternatives    (mapv #(order-local-filter-alternative db %) alternatives)]
+        alternatives    (mapv #(->> %
+                                    (order-local-filter-alternative db)
+                                    (order-reference-filter-alternative db)) alternatives)]
     {:plans (mapv #(annotate-reusable-sip-domains
                      db (vec (:plan %))) alternatives)
      :deferred deferred

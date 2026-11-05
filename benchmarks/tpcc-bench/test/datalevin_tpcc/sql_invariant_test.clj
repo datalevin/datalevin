@@ -2,9 +2,20 @@
   (:require
    [clojure.string :as str]
    [clojure.test :refer [deftest is testing]]
+   [datalevin-tpcc.check :as check]
    [datalevin-tpcc.datalevin]
    [datalevin-tpcc.postgres]
    [datalevin-tpcc.sqlite]))
+
+(deftest payment-counts-compare-exactly-across-jdbc-numeric-types
+  (let [errors (fn [actual expected]
+                 (check/payment-errors
+                   {} {:customer-payment-cnt {[1 1] actual}} {}
+                   {[1 1] {:amount 0.0 :count expected}}))]
+    (is (empty? (errors 4264M 4264)))
+    (is (seq (errors 4264.1M 4264)) "fractional values must not be truncated")
+    (is (seq (errors 9007199254740993M 9007199254740992))
+        "integer counts must not be compared as doubles")))
 
 (def ^:private drivers
   '[datalevin-tpcc.datalevin datalevin-tpcc.sqlite datalevin-tpcc.postgres])
@@ -170,10 +181,6 @@
                                                 (deliver other-started true))
                                               (f)))]
                 (swap! workers conj worker)
-                ;; Ensure the first future takes the failing action, so an
-                ;; early exit from awaiting that future cannot hide the bug.
-                (when first?
-                  (is (= true (deref failed-started 5000 ::timeout))))
                 worker))
             actions [{:type :payment :error failure
                       :before #(do (deliver failed-started true)

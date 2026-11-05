@@ -13,6 +13,7 @@ import clojure.lang.Numbers;
 
 import java.util.Iterator;
 import java.util.Map;
+import java.util.Arrays;
 
 /**
  * One-pass sum/avg/count over an input already proven distinct in the complete
@@ -96,6 +97,31 @@ public final class GroupedAggregate {
     /** Number of groups retained, without materializing the final rows. */
     public int groupCount() { return groups.size(); }
 
+    /** Combine disjoint input partitions before finalizing averages. */
+    public void merge(GroupedAggregate other) {
+        if (other == this || !Arrays.equals(columns, other.columns)
+                || !Arrays.equals(operations, other.operations)) {
+            throw new IllegalArgumentException("Incompatible aggregate states");
+        }
+        for (Map.Entry<Object, Object> entry : other.groups.entrySet()) {
+            Group source = (Group) entry.getValue();
+            Group target = (Group) groups.get(entry.getKey());
+            if (target == null) {
+                target = new Group(operations.length);
+                System.arraycopy(source.values, 0, target.values, 0, operations.length);
+                groups.put(entry.getKey(), target);
+            }
+            for (int i = 0; i < operations.length; i++) {
+                if (operations[i] == SUM || operations[i] == AVG) {
+                    Object a = target.count == 0 ? 0L : target.value(i);
+                    target.values[i] = Numbers.add(a, source.value(i));
+                    if (target.doubles != null) target.doubles[i] = false;
+                }
+            }
+            target.count = Math.addExact(target.count, source.count);
+        }
+    }
+
     /** Iterate final rows after consumption, preserving built-in average rounding. */
     public Iterable<Object[]> results() {
         return () -> new Iterator<>() {
@@ -128,6 +154,9 @@ public final class GroupedAggregate {
         private long count;
         private Group(int width) {
             values = new Object[width];
+        }
+        private Object value(int i) {
+            return doubles != null && doubles[i] ? Double.valueOf(sums[i]) : values[i];
         }
     }
 

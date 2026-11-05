@@ -48,6 +48,7 @@
             #_{:clj-kondo/ignore [:unused-referred-var]}
             tuple->persistent-vector]]
    [datalevin.query.execute.rewrite :as rewrite]
+   [datalevin.query.optimizer.or-branches :as or-branches]
    [datalevin.query.optimizer.existence :as existence]
    [datalevin.query.plan :as qplan]
    [datalevin.query.resolve :as qresolve]
@@ -1105,6 +1106,7 @@
           (rules/rewrite)
           (enrichment/plan-aggregate-enrichment)
           (push-down-equality-disjunctions)
+          (or-branches/rewrite)
           (rewrite-unused-vars)
           (existence/rewrite)
           (materialize-selective-value-lookups)

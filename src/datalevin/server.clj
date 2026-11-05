@@ -2190,9 +2190,10 @@
   [^Server server db-name skey tx-state]
   (let [runner (->TransactionOwner server skey (Thread/currentThread)
                                    (:release-slot! tx-state))]
+    (vswap! (.attachment ^SelectionKey skey) update
+            :aborted-transaction-closes dissoc db-name)
     (update-db server db-name
-               #(merge (dissoc % :aborted-transaction-close)
-                       (dissoc tx-state :release-slot!)
+               #(merge % (dissoc tx-state :release-slot!)
                        {:runner runner :runner-skey skey}))
     ;; Track owners on the socket so idle reads need not scan all databases.
     ;; A set keeps halt idempotent and permits multiple database transactions.

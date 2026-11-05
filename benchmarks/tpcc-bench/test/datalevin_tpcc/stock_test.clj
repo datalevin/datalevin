@@ -140,13 +140,15 @@
 
 (defn- datalevin-state [db]
   {:rows (mapv (juxt :e :a :v) (d/datoms db :eav))
-   :next (d/q '[:find ?n . :where [?e :district/next-o-id ?n]] db)
-   :orders (count (d/q '[:find ?e :where [?e :orders/id]] db))
-   :new-orders (count (d/q '[:find ?e :where [?e :new-order/o-id]] db))
-   :lines (count (d/q '[:find ?e :where [?e :order-line/o-id]] db))
+   :next (d/q '[:find ?n . :where [?e :district/key]
+               [?e :district/next-o-id ?n]] db)
+   :orders (count (d/datoms db :ave :orders/key))
+   :new-orders (count (d/datoms db :ave :new-order/key))
+   :lines (count (d/datoms db :ave :order-line/key))
    :stocks (into {} (map (fn [[w i & values]] [[w i] (vec values)]))
                  (d/q '[:find ?w ?i ?q ?y ?o ?r
-                        :where [?e :stock/w-id ?w] [?e :stock/i-id ?i]
+                        :where [?e :stock/key]
+                        [?e :stock/w-id ?w] [?e :stock/i-id ?i]
                         [?e :stock/quantity ?q] [?e :stock/ytd ?y]
                         [?e :stock/order-cnt ?o] [?e :stock/remote-cnt ?r]] db))})
 
@@ -163,7 +165,8 @@
                               (zipmap (c/attrs table) row))))
           (let [eids (into {} (map (fn [[e w i]] [[w i] e]))
                            (d/q '[:find ?e ?w ?i
-                                  :where [?e :stock/w-id ?w] [?e :stock/i-id ?i]]
+                                  :where [?e :stock/key]
+                                  [?e :stock/w-id ?w] [?e :stock/i-id ?i]]
                                 (d/db conn)))]
             (check-new-orders!
              {:reset-stock!
@@ -177,14 +180,16 @@
               :stocks
               #(into {} (map (fn [[w i & values]] [[w i] (vec values)]))
                      (d/q '[:find ?w ?i ?qty ?ytd ?ocnt ?rcnt
-                            :where [?e :stock/w-id ?w] [?e :stock/i-id ?i]
+                            :where [?e :stock/key]
+                            [?e :stock/w-id ?w] [?e :stock/i-id ?i]
                             [?e :stock/quantity ?qty] [?e :stock/ytd ?ytd]
                             [?e :stock/order-cnt ?ocnt] [?e :stock/remote-cnt ?rcnt]]
                           (d/db conn)))
               :order-lines
               (fn [o-id]
                 (vec (sort (d/q '[:find ?n ?i ?w ?qty :in $ ?o
-                                  :where [?e :order-line/o-id ?o]
+                                  :where [?e :order-line/key]
+                                  [?e :order-line/o-id ?o]
                                   [?e :order-line/number ?n]
                                   [?e :order-line/i-id ?i]
                                   [?e :order-line/supply-w-id ?w]

@@ -210,23 +210,35 @@
       (when (seq updates) (d/transact! tx updates))
       {:type :delivery :status :ok :delivered (count plans)})))
 
+(def ^:private district-next-order-query
+  '[:find [?next]
+    :in $ ?district-key
+    :where [?district :district/key ?district-key]
+    [?district :district/next-o-id ?next]])
+
+(def ^:private stock-level-query
+  '[:find (count-distinct ?item) .
+    :in $ ?w [?line ...] ?threshold
+    :where [?line :order-line/i-id ?item]
+    [(tuple ?w ?item) ?stock-key]
+    [(tuple :stock/key ?stock-key) ?stock]
+    [?stock :stock/quantity ?quantity]
+    [(< ?quantity ?threshold)]])
+
 (defn stock-level! [conn {:keys [w d threshold]}]
   (let [db (d/db conn)
-        next-id (:district/next-o-id (d/pull db [:district/next-o-id] [:district/key [w d]]))
-        low (if next-id
-              (let [items (into #{}
-                                (map :order-line/i-id)
-                                (d/pull-many
-                                 db [:order-line/i-id]
-                                 (map :e (d/index-range db :order-line/key
-                                                        [w d (- next-id 20) 0]
-                                                        [w d (dec next-id) Long/MAX_VALUE]))))
-                    stock (d/prepare-pull db [:stock/quantity])]
-                (count (filter #(< (:stock/quantity (stock [:stock/key [w %]]))
-                                   threshold)
-                               items)))
-              0)]
-    {:type :stock-level :status :ok :low-stock low}))
+        next-id (first (d/q district-next-order-query db [w d]))]
+    {:type :stock-level :status :ok
+     :low-stock
+     (if next-id
+       ;; Supply only the last 20 orders' line IDs to a fixed query. Tuple
+       ;; :in bounds currently do not become index ranges in the planner.
+       ;; The stock join, quantity filter, and distinct count run in the DB.
+       (let [lines (mapv :e (d/index-range db :order-line/key
+                                          [w d (- next-id 20) 0]
+                                          [w d next-id 0]))]
+         (or (d/q stock-level-query db w lines threshold) 0))
+       0)}))
 
 ;; Verification helpers run while benchmark terminals are stopped.
 (defn district-next-o-id [conn w district]

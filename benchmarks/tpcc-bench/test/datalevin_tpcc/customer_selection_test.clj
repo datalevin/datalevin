@@ -82,11 +82,12 @@
        {:payment! #(t/payment! conn %)
         :order-status! #(t/order-status! conn %)
         :balances #(into {} (d/q '[:find ?id ?balance
-                                   :where [?e :customer/id ?id]
+                                   :where [?e :customer/key]
+                                          [?e :customer/id ?id]
                                           [?e :customer/balance ?balance]]
                                  (d/db conn)))
         :history-customers #(map second (d/q '[:find ?h ?cid
-                                              :where [?h :history/c-id ?cid]]
+                                              :where [?h _] [?h :history/c-id ?cid]]
                                             (d/db conn)))})
       (finally (d/close conn)))))
 

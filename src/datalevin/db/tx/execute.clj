@@ -25,7 +25,7 @@
   (:import
    [datalevin.datom Datom]
    [datalevin.storage Store]
-   [java.util List SortedSet]
+   [java.util ArrayList Collection List SortedSet]
    [org.eclipse.collections.impl.set.sorted.mutable TreeSortedSet]))
 
 (deftype ^:private TxStep [report entities])
@@ -97,6 +97,11 @@
     (new-eid? db eid)
     (assoc :max-eid eid)))
 
+(defn- append-tx-datom!
+  [report datom]
+  (.add ^ArrayList (:tx-data report) datom)
+  report)
+
 (defn- allocate-eid
   ([_ report eid]
    (update report :db-after advance-max-eid eid))
@@ -119,7 +124,7 @@
        (update :tempids assoc eid eid)
 
        (and new? (db-opts :auto-entity-time?))
-       (update :tx-data conj (d/datom eid :db/created-at tx-time))
+       (append-tx-datom! (d/datom eid :db/created-at tx-time))
 
        true
        (update :db-after advance-max-eid eid)))))
@@ -171,17 +176,18 @@
 
 (defn- track-retraction
   [report datom]
-  (if (and (not (datom-added datom)) (::tx-retracted report))
-    (update report ::tx-retracted conj! datom)
-    report))
+  (when-let [retracted (and (not (datom-added datom)) (::tx-retracted report))]
+    (conj! retracted datom))
+  report)
 
 (defn- transact-report
   [report ^Datom datom]
   (let [db      (:db-after report)
         a       (.-a datom)
+        db'     (with-datom db datom)
         report' (-> report
-                    (assoc :db-after (with-datom db datom))
-                    (update :tx-data conj datom)
+                    (cond-> (not (identical? db db')) (assoc :db-after db'))
+                    (append-tx-datom! datom)
                     (track-retraction datom))]
     (if (txcommon/tuple-source? db a)
       (let [e      (.-e datom)
@@ -211,12 +217,14 @@
 
 (defn- pending-attr-state
   [report e a]
-  (loop [xs (seq (rseq (vec (:tx-data report))))]
-    (if-some [^Datom d (first xs)]
-      (if (and (= e (.-e d)) (= a (.-a d)))
-        (if (datom-added d) (.-v d) ::retracted-attr-state)
-        (recur (next xs)))
-      ::missing-attr-state)))
+  (let [^List datoms (:tx-data report)]
+    (loop [i (dec (.size datoms))]
+      (if (neg? i)
+        ::missing-attr-state
+        (let [^Datom d (.get datoms i)]
+          (if (and (= e (.-e d)) (= a (.-a d)))
+            (if (datom-added d) (.-v d) ::retracted-attr-state)
+            (recur (dec i))))))))
 
 (defn- effective-attr-value
   [report db e a]
@@ -434,6 +442,9 @@
   (let [new-attrs (::new-attributes report)
         report    (check-value-tempids report)
         report    (-> report
+                      ;; No attempt-local mutable collection escapes in the
+                      ;; published report or in a simulated transaction view.
+                      (assoc :tx-data (vec (:tx-data report)))
                       (dissoc-present ::upserted-tempids)
                       (dissoc-present ::reverse-tempids)
                       (dissoc-present ::max-eid-before)
@@ -725,6 +736,58 @@
       :else
       (vld/validate-map-entity-id-syntax old-eid))))
 
+(defn- regular-attr?
+  "An attribute that needs no identity, reference or tuple input resolution.
+  Composite source attributes still use the shared tuple maintenance below."
+  [props]
+  (and (not (identical? (:db/valueType props) :db.type/ref))
+       (not (identical? (:db/unique props) :db.unique/identity))
+       (not (contains? props :db/tupleAttrs))
+       (not (contains? props :db/tupleType))
+       (not (contains? props :db/tupleTypes))))
+
+(defn- regular-map?
+  [schema entity]
+  (let [eid (:db/id entity)]
+    (and (or (txprep/tempid? eid)
+             (and (integer? eid) (not (neg? ^long eid))))
+         (reduce-kv
+           (fn [_ a _]
+             (if (identical? a :db/id)
+               true
+               (let [props (schema a)]
+                 (if (and (keyword? a)
+                          (not= "db" (namespace a))
+                          (not (txcommon/reverse-ref? a))
+                          (regular-attr? props)
+                          (not (identical? (:db/cardinality props)
+                                           :db.cardinality/many))
+                          (not (:db.attr/preds props)))
+                   true
+                   (reduced false)))))
+           true entity))))
+
+(defn- transact-regular-map
+  "Feed a flat map directly to the shared add operation. Input forms requiring
+  expansion or upsert retries remain in handle-map-entity; both paths use the
+  same validation, pending indexes, retractions, and composite maintenance."
+  [report schema store-opts entity tx-time]
+  (if (= 1 (count entity))
+    report
+    (let [old-eid (:db/id entity)
+          temporary? (txprep/tempid? old-eid)
+          allocated (when temporary? (get (:tempids report) old-eid))
+          eid (if temporary? (or allocated (next-eid (:db-after report))) old-eid)
+          report (if (and temporary? (nil? allocated))
+                   (allocate-eid tx-time report old-eid eid)
+                   report)]
+      (reduce-kv
+        (fn [report a v]
+          (if (identical? a :db/id)
+            report
+            (transact-add report [:db/add eid a v] (schema a) store-opts)))
+        report entity))))
+
 (defn- handle-sequential-entity
   [initial-report report db store schema store-opts tempids entity entities
    initial-es tx-time]
@@ -835,6 +898,12 @@
                              (long (init-max-eid store)))
         initial-report' (-> initial-report
                             (dissoc-present ::tx-retracted)
+                            ;; Each retry owns a fresh append buffer. Complex
+                            ;; handlers and regular adds share it, and only the
+                            ;; finalized report exposes an immutable vector.
+                            (assoc :tx-data
+                                   (doto (ArrayList. 32)
+                                     (.addAll ^Collection (:tx-data initial-report))))
                             (assoc ::max-eid-before max-eid-before)
                             (update :db-after
                                     #(-> % clear-tx-cache
@@ -862,30 +931,39 @@
               tempids (:tempids report)]
 
         (map? entity)
-        (let [result (handle-map-entity initial-report report db entity
-                                        entities initial-es tx-time)]
-          (if (or (instance? TxRetry result) (map? result))
-            result
-            (let [[r' es'] result]
-              (recur r' es'))))
+        (if (regular-map? schema entity)
+          (recur (transact-regular-map report schema store-opts entity tx-time)
+                 entities)
+          (let [result (handle-map-entity initial-report report db entity
+                                          entities initial-es tx-time)]
+            (if (or (instance? TxRetry result) (map? result))
+              result
+              (let [[r' es'] result]
+                (recur r' es')))))
 
         (sequential? entity)
-        (let [result (handle-sequential-entity
-                       initial-report report db store schema store-opts
-                       tempids entity entities initial-es tx-time)]
-          (cond
-            (instance? TxRetry result)
-            result
+        (let [[op e a] entity
+              props (schema a)]
+          (if (and (identical? op :db/add)
+                   (integer? e) (not (neg? ^long e))
+                   (regular-attr? props))
+            (recur (transact-add report entity props store-opts) entities)
+            (let [result (handle-sequential-entity
+                           initial-report report db store schema store-opts
+                           tempids entity entities initial-es tx-time)]
+              (cond
+                (instance? TxRetry result)
+                result
 
-            (instance? TxStep result)
-            (recur (.-report ^TxStep result) (.-entities ^TxStep result))
+                (instance? TxStep result)
+                (recur (.-report ^TxStep result) (.-entities ^TxStep result))
 
-            (map? result)
-            result
+                (map? result)
+                result
 
-            :else
-            (let [[r' es'] result]
-              (recur r' es'))))
+                :else
+                (let [[r' es'] result]
+                  (recur r' es'))))))
 
         (datom? entity)
         (let [[e a v tx added] entity]

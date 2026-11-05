@@ -174,7 +174,8 @@
         :order-lines
         (fn [district order]
           (vec (sort (d/q '[:find ?n ?item ?supply ?info ?amount :in $ ?d ?o
-                            :where [?e :order-line/w-id 2]
+                            :where [?e :order-line/key]
+                            [?e :order-line/w-id 2]
                             [?e :order-line/d-id ?d] [?e :order-line/o-id ?o]
                             [?e :order-line/number ?n] [?e :order-line/i-id ?item]
                             [?e :order-line/supply-w-id ?supply]
@@ -183,14 +184,12 @@
                           (d/db conn) district order))))
         :customer-data
         (fn [district customer]
-          (d/q '[:find ?data . :in $ ?d ?c
-                 :where [?e :customer/w-id 2] [?e :customer/d-id ?d]
-                 [?e :customer/id ?c] [?e :customer/data ?data]]
-               (d/db conn) district customer))
+          (:customer/data (d/pull (d/db conn) [:customer/data]
+                                 [:customer/key [2 district customer]])))
         :history
         #(d/q '[:find ?cid ?cd ?cw ?district ?w ?amount ?data
                 :with ?e
-                :where [?e :history/c-id ?cid] [?e :history/c-d-id ?cd]
+                :where [?e _] [?e :history/c-id ?cid] [?e :history/c-d-id ?cd]
                 [?e :history/c-w-id ?cw] [?e :history/d-id ?district]
                 [?e :history/w-id ?w] [?e :history/amount ?amount]
                 [?e :history/data ?data]] (d/db conn))})

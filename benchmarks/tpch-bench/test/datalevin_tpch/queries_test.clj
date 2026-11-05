@@ -4,6 +4,7 @@
    [clojure.string :as str]
    [datalevin.core :as d]
    [datalevin-tpch.common :as c]
+   [datalevin-tpch.fixtures :as f]
    [datalevin-tpch.datalevin :as dt]
    [datalevin-tpch.queries :as q]
    [datalevin-tpch.verify :as v])
@@ -39,9 +40,9 @@
                actual (if native?
                         (with-open [native (d/create-conn nil dt/schema
                                               {:background-sampling? false})]
-                          (d/transact! native (mapv #(into [:db/add] %) @datoms))
+                          (d/transact! native (mapv #(into [:db/add] %) (f/reference-facts @datoms)))
                           (#'v/datalevin-rows @native n))
-                        (#'v/datalevin-rows @datoms n))]
+                        (#'v/datalevin-rows (f/reference-facts @datoms) n))]
            (is (v/results-match? n expected actual)
                (str "Q" n ": expected " expected ", got " actual))
            actual))))))
@@ -56,19 +57,19 @@
               (fn [k]
                 (cons
                   (cond-> {:customer/custkey k :customer/name "Customer"
-                           :customer/acctbal 1.0 :customer/nationkey 10
+                           :customer/acctbal 1.0 :customer/nation [:nation/nationkey 10]
                            :customer/address "Address" :customer/comment "Comment"}
                     ;; The highest-revenue customer lacks a required field.
                     ;; Its presence must be checked before selecting the top 20.
                     (< k 22) (assoc :customer/phone "Phone"))
                   (mapcat
                     (fn [orderkey]
-                      [{:orders/orderkey orderkey :orders/custkey k
+                      [{:orders/orderkey orderkey :orders/customer [:customer/custkey k]
                         :orders/orderdate "1993-11-01"}
-                       {:lineitem/orderkey orderkey :lineitem/linenumber 1
+                       {:lineitem/order [:orders/orderkey orderkey] :lineitem/linenumber 1
                         :lineitem/returnflag "R"
                         :lineitem/extendedprice (double k) :lineitem/discount 0.0}
-                       {:lineitem/orderkey orderkey :lineitem/linenumber 2
+                       {:lineitem/order [:orders/orderkey orderkey] :lineitem/linenumber 2
                         :lineitem/returnflag "R"
                         :lineitem/extendedprice (double k) :lineitem/discount 0.0}])
                     [(* 2 k) (inc (* 2 k))]))))
@@ -119,7 +120,8 @@
                  [2 1 1 5000.0] [3 1 1 1.0] [4 3 1 1.0e9]]
                 [[1 1 1 9999.0] [2 1 1 1.0]]]]
     (check-fixture 11
-      [["nation" ["n_nationkey INTEGER" "n_name TEXT"]
+      [["part" ["p_partkey INTEGER"] [:part/partkey] [[1] [2] [3] [4]]]
+       ["nation" ["n_nationkey INTEGER" "n_name TEXT"]
         [:nation/nationkey :nation/name] [[1 "GERMANY"] [2 "FRANCE"]]]
        ["supplier" ["s_suppkey INTEGER" "s_nationkey INTEGER"]
         [:supplier/suppkey :supplier/nationkey] [[1 1] [2 1] [3 2]]]
@@ -180,7 +182,7 @@
             [[1 "1995-08-31" 100.0 0.0] [2 "1995-10-01" 200.0 0.0]]]
            ["no matching part" [[99 "1995-09-15" 100.0 0.0]]]]]
     (testing label
-      (let [datoms (q14-datoms lines)
+      (let [datoms (f/reference-facts (q14-datoms lines))
             expected (q14-sqlite-rows lines)
             actual (#'v/datalevin-rows datoms 14)]
         (is (= [[nil]] expected))
@@ -199,7 +201,7 @@
              [1 "1995-09-01" 100.0 0.2]
              [2 "1995-09-30" 200.0 0.2]] 50.0]]]
     (testing label
-      (let [datoms (q14-datoms lines)
+      (let [datoms (f/reference-facts (q14-datoms lines))
             expected (q14-sqlite-rows lines)
             actual (#'v/datalevin-rows datoms 14)]
         (is (= [[ratio]] expected))
@@ -244,7 +246,7 @@
                   (vec (for [key (range 1 105)]
                          [key "1995-01-01" (double key) [50.0 50.0 50.0 50.0 50.0 50.0 5.0]]))]]
     (let [expected (q18-sqlite-rows orders)
-          actual (#'v/datalevin-rows (q18-datoms orders) 18)]
+          actual (#'v/datalevin-rows (f/reference-facts (q18-datoms orders)) 18)]
       (is (v/results-match? 18 expected actual)))))
 
 (def ^:private q20-suppliers

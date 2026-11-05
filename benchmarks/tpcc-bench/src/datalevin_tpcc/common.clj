@@ -16,6 +16,10 @@
 
 (defn data-dir ^File [] (io/file base-dir "data"))
 
+(defn local-path [path]
+  (.getPath ^File (if (.isAbsolute (io/file path))
+                    (io/file path) (io/file base-dir path))))
+
 (defn query-file ^File [dialect n]
   (io/file base-dir "queries" (name dialect) (str n ".sql")))
 

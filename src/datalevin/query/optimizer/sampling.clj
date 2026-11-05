@@ -11,14 +11,39 @@
   "Sampling helpers"
   (:require
    [datalevin.constants :as c]
+   [datalevin.interface :as i]
+   [datalevin.lmdb :as lmdb]
    [datalevin.parser :as dp]
    [datalevin.query.access :as qaccess]
    [datalevin.query.plan :as qplan]
    [datalevin.query.optimizer.estimates
     :refer [estimate-link-cost estimate-round materialized-output-cost
-            relation-size]])
+            relation-size]]
+   [datalevin.util :as u])
   (:import
+   [java.nio ByteBuffer]
    [datalevin.parser Function Variable Predicate]))
+
+(defn estimated-entity-count
+  "Estimate EAV keys with at most 256 rank probes, independent of ID density.
+  Sampling datoms weights wide entities more heavily, so each sampled datom
+  contributes the inverse of its entity's value count. No rows are decoded."
+  ^long [lmdb]
+  (let [total (long (i/entries lmdb c/eav))
+        n (min total 256)]
+    (if (zero? n)
+      0
+      (let [entities (volatile! [])]
+        (i/visit-list-sample lmdb c/eav (u/reservoir-sampling total n)
+          (fn [entry]
+            (vswap! entities conj (.getLong ^ByteBuffer (lmdb/k entry) 0)))
+          [:all] :id :raw true)
+        (long
+          (Math/ceil
+            (* (/ (double total) n)
+               (reduce (fn [^double sum e]
+                         (+ sum (/ 1.0 (max 1 (long (i/list-count lmdb c/eav e :id))))))
+                       0.0 @entities))))))))
 
 (defn -sample [step db source]
   (qplan/step-sample step db source))

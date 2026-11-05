@@ -122,7 +122,8 @@
         (is (= -15.0 (value conn (customer-eid 1 2) :customer/balance)))
         (is (= -10.0 (value conn (customer-eid 1 1) :customer/balance)))
         (is (= #{[2]} (d/q '[:find ?c
-                             :where [?h :history/amount 5.0] [?h :history/c-id ?c]]
+                             :where [?h _]
+                             [?h :history/amount 5.0] [?h :history/c-id ?c]]
                            (d/db conn))))
         (is (empty? (check/payment-errors before (check/payment-state conn)
                                           (committed-payments [result]))))))))
@@ -330,7 +331,7 @@
         (is (= -10.0 (value conn (customer-eid 1 1) :customer/balance)))
         (is (= #{[1 4 2 3 1]}
                (d/q '[:find ?w ?d ?cw ?cd ?c
-                      :where [?h :history/amount 5.0]
+                      :where [?h _] [?h :history/amount 5.0]
                       [?h :history/w-id ?w] [?h :history/d-id ?d]
                       [?h :history/c-w-id ?cw] [?h :history/c-d-id ?cd]
                       [?h :history/c-id ?c]] (d/db conn))))

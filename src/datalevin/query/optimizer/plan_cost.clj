@@ -130,6 +130,22 @@
                              (.size ^List sample))
                     :else c/magic-scan-ratio))))))
 
+(defn estimate-base-size
+  "Use a single initialization's observed yield against its input population.
+  A sample with no matches supplies no positive selectivity evidence. This
+  fixes the no-merge root case; existing merge and incoming-reference
+  estimates retain their own selectivity model."
+  [^long size steps]
+  (let [{:keys [know-e? pred mcount sample-input-size]} (first steps)
+        {:keys [result sample]} (peek steps)
+        input-size (if result mcount sample-input-size)
+        output-size (cond result (.size ^List result)
+                          sample (.size ^List sample))]
+    (if (and (= 1 (count steps)) (not know-e?) pred input-size output-size
+             (pos? (long input-size)) (pos? (long output-size)))
+      (estimate-round (* size (/ (double output-size) (double input-size))))
+      (estimate-scan-v-size size steps))))
+
 (defn- factor
   [magic ^long n]
   (if (zero? n) 1 ^long (estimate-round (* ^double magic n))))

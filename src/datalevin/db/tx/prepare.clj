@@ -60,29 +60,27 @@
   [db entity]
   (cond+
     (map? entity)
-    (persistent!
+    (let [entity (if (contains? entity :db/id)
+                   entity
+                   (assoc entity :db/id (auto-tempid)))
+          refs   (txcommon/attrs-by db :db.type/ref)]
+      ;; Scalar fields already have their final shape. Only rebuild entries
+      ;; whose reference values can contain entities needing an implicit ID.
       (reduce-kv
         (fn [entity a v]
           (cond
-            (and (txcommon/ref? db a)
-                 (txcommon/multi-value? db a v))
-            (assoc! entity a (assoc-auto-tempids db v))
-
-            (txcommon/ref? db a)
-            (assoc! entity a (assoc-auto-tempid db v))
-
-            (and (txcommon/reverse-ref? a) (sequential? v))
-            (assoc! entity a (assoc-auto-tempids db v))
+            (contains? refs a)
+            (assoc entity a (if (txcommon/multi-value? db a v)
+                              (assoc-auto-tempids db v)
+                              (assoc-auto-tempid db v)))
 
             (txcommon/reverse-ref? a)
-            (assoc! entity a (assoc-auto-tempid db v))
+            (assoc entity a (if (sequential? v)
+                              (assoc-auto-tempids db v)
+                              (assoc-auto-tempid db v)))
 
-            :else
-            (assoc! entity a v)))
-        (transient {})
-        (if (contains? entity :db/id)
-          entity
-          (assoc entity :db/id (auto-tempid)))))
+            :else entity))
+        entity entity))
 
     (not (sequential? entity))
     entity

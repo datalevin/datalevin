@@ -12,6 +12,7 @@
    [clojure.string :as str]
    [datalevin.core :as d]
    [datalevin-tpch.common :as c]
+   [datalevin-tpch.datalevin :as dt]
    [datalevin-tpch.queries :as q]
    [datalevin-tpch.sqlite :as sq])
   (:import
@@ -186,7 +187,7 @@
               stmt (.createStatement conn)]
     (into (array-map)
       (for [table c/table-order
-            :let [actual (d/count-datoms db nil (first (c/attrs table)) nil)
+            :let [actual (d/count-datoms db nil (dt/attribute (first (c/attrs table))) nil)
                   expected (with-open [rs (.executeQuery stmt (str "SELECT count(*) FROM " table))]
                              (.next rs) (.getLong rs 1))]]
         (do
@@ -194,6 +195,36 @@
             (throw (ex-info "TPC-H table row counts do not match"
                             {:table table :sqlite expected :datalevin actual})))
           [table expected])))))
+
+(defn- model-checks!
+  "Check the loader's disjoint ranges and every required reference target."
+  [db counts]
+  (let [ranges
+        (mapv (fn [table]
+                (let [marker (dt/attribute (first (c/attrs table)))
+                      [lo hi] (first (d/q [:find '(min ?e) '(max ?e)
+                                          :where ['?e marker]] db))]
+                  {:table table :first lo :last hi}))
+              c/table-order)]
+    (doseq [[a b] (partition 2 1 ranges)]
+      (when-not (and (pos? (:first a)) (< (:last a) (:first b)))
+        (throw (ex-info "TPC-H entity ranges overlap" {:left a :right b}))))
+    {:entity-ranges ranges
+     :reference-counts
+     (into {}
+       (for [[column [ref target]] dt/references
+             :let [expected (counts (namespace column))
+                   actual (d/count-datoms db nil ref nil)
+                   key (first (c/attrs target))
+                   dangling (d/q [:find '?target :limit 1 :where
+                                  ['?e ref '?target]
+                                  (list 'not ['?target key])] db)]]
+         (do
+           (when-not (and (= actual expected) (empty? dangling))
+             (throw (ex-info "TPC-H reference integrity check failed"
+                             {:attribute ref :expected expected :actual actual
+                              :missing-targets dangling})))
+           [ref actual])))}))
 
 (defn- verify-one [db db-file n dump? timeout-ms]
   (print (format "  q%-2d ... " n))
@@ -245,8 +276,11 @@
     (let [conn (d/get-conn db-dir)]
       (try
         (let [db (d/db conn)
+              _ (dt/require-reference-schema! conn)
               counts (table-counts! db db-file)
+              model (model-checks! db counts)
               report {:status :running :queries ids :table-counts counts
+                      :model model
                       :java-version (System/getProperty "java.version")
                       :clojure-version (clojure-version) :results []}
               result (reduce (fn [report n]

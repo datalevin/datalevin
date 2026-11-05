@@ -383,6 +383,14 @@
 
   `body` should refer to `conn`.
 
+  Synchronous writes through `conn` join the enclosing transaction. Individual
+  `transact!` calls do not commit independently; successful completion of the
+  outer body commits them together.
+
+  For a remote connection, the body runs on the client. Database calls make
+  requests against one server-side write transaction, which remains open until
+  the body completes or aborts. The body is not sent to the server for execution.
+
   In local WAL mode, the outer explicit body is isolated from other queued
   requests, so its abort cannot roll back another caller's writes.
 

@@ -2,13 +2,14 @@
   "TPC-C-derived benchmark against SQLite.
 
   Loads the same generated data set as the Datalevin driver into a SQLite file
-  and runs the same transaction mix and invariants, so the two can be compared
-  directly."
+  and runs the same transaction mix and invariants. Results include the embedded
+  execution model and the driver serialization described in the README."
   (:require
    [clojure.java.io :as io]
    [clojure.string :as s]
-   [datalevin-bench.host :as host]
+   [datalevin-tpcc.runner :as runner]
    [datalevin-tpcc.common :as c]
+   [datalevin-tpcc.check :as check]
    [datalevin-tpcc.generate :as g])
   (:import
    [java.sql Connection DriverManager PreparedStatement ResultSet Types]
@@ -122,7 +123,7 @@
   [{:keys [path warehouses seed] :or {path "sqlite.db" warehouses 1 seed 42}}]
   (println (format "Generating TPC-C data: %d warehouse(s), seed %d"
                    warehouses seed))
-  (let [db-file (io/file c/base-dir path)
+  (let [db-file (io/file (c/local-path path))
         rows    (g/population-rows seed warehouses)]
     (when (.exists db-file)
       (println "Removing existing database at" (.getPath db-file))
@@ -408,166 +409,59 @@
     :delivery     (delivery! conn input)
     :stock-level  (stock-level! conn input)))
 
-(defn- with-write-lock
-  "Run `f` while holding the shared SQLite writer lock, returning
-  `[result elapsed-ms]`. The wait to acquire the lock is inside the timed
-  region, so writer contention is part of the reported latency."
-  [^java.util.concurrent.locks.ReentrantLock lock f]
-  (let [t0 (System/nanoTime)]
-    (.lock lock)
-    (try
-      [(f) (/ (- (System/nanoTime) t0) 1.0e6)]
-      (finally (.unlock lock)))))
-
-(defn- percentile [sorted p]
-  (when (seq sorted)
-    (nth sorted (min (dec (count sorted))
-                     (int (Math/floor (* (double p) (count sorted))))))))
-
 (defn- open-conn
   "A fresh connection for one terminal. Each terminal must own its connection:
   sharing one connection lets a failed transaction roll back another terminal's
   work."
   ^java.sql.Connection [path]
   (let [cfg  (doto (org.sqlite.SQLiteConfig.)
-               (.setBusyTimeout 30000)
+               (.setBusyTimeout 60000)
+               (.setSynchronous org.sqlite.SQLiteConfig$SynchronousMode/FULL)
+               (.setPragma org.sqlite.SQLiteConfig$Pragma/FULL_SYNC "false")
                ;; Take the write lock when the transaction starts, before any
                ;; read, so a later write cannot fail with BUSY_SNAPSHOT.
                (.setTransactionMode
                 org.sqlite.SQLiteConfig$TransactionMode/IMMEDIATE))
         conn (DriverManager/getConnection
-              (str "jdbc:sqlite:" (.getPath (io/file c/base-dir path)))
+              (str "jdbc:sqlite:" (.getPath (io/file (c/local-path path))))
               (.toProperties cfg))]
-    conn))
+    (try
+      (check/sql-schema! conn :sqlite qall)
+      conn
+      (catch Throwable error (.close conn) (throw error)))))
 
 (defn- enable-wal!
   "WAL is a persistent database property and must be set before other
   connections open the file."
   [path]
   (with-open [conn (DriverManager/getConnection
-                    (str "jdbc:sqlite:" (.getPath (io/file c/base-dir path))))]
+                    (str "jdbc:sqlite:" (.getPath (io/file (c/local-path path)))))]
     (with-open [stmt (.createStatement conn)]
       (.execute stmt "PRAGMA journal_mode=WAL")
-      (.execute stmt "PRAGMA busy_timeout=30000"))))
+      (.execute stmt "PRAGMA busy_timeout=60000"))))
 
 (defn bench
-  "Run the TPC-C-derived transaction mix against a loaded SQLite database.
-
-  Options:
-    :path       database file (default \"sqlite.db\")
-    :warehouses number of warehouses (default 1)
-    :txns       measured transactions (default 10000)
-    :threads    terminals (default 1)
-    :warmup     warmup transactions (default 1000)
-    :seed       input seed (default 42)
-    :load-seed  seed used to populate the database (default 42)
-
-  Throws with accounting errors before reporting metrics if any district's
-  next order id or order count disagrees with committed New-Orders."
+  "Run SQLite WAL with one warmed connection per terminal. Native IMMEDIATE
+  transactions serialize writers; there is no driver-wide transaction lock.
+  :warmup is per terminal and :txns is the total measured count."
   ([opts] (bench opts {}))
-  ([{:keys [path warehouses txns threads warmup seed load-seed]
-     :or   {path "sqlite.db" warehouses 1 txns 10000 threads 1 warmup 1000
-            seed 42 load-seed 42}}
-    {:keys [do-txn pick-type district-next-o-id order-count
-            measure! start-terminal open-conn enable-wal! gen-input]
-     :or {do-txn do-txn
-          pick-type pick-type
-          district-next-o-id district-next-o-id
-          order-count order-count
-          measure! (fn [f] (host/with-paused-media (f)))
-          start-terminal future-call
-          open-conn open-conn
-          enable-wal! enable-wal!
-          gen-input gen-input}}]
-   (enable-wal! path)
-   (with-open [conn (open-conn path)]
-     (let [opts      (assoc (g/run-constants seed load-seed) :warehouses warehouses)
-           committed (atom {})
-           lat       (atom [])
-           ;; Serialize the complete transaction mix on one JVM lock,
-           ;; including Order-Status's snapshot transaction.
-           write-lock (java.util.concurrent.locks.ReentrantLock.)
-           run       (fn [^java.sql.Connection cnn ^long ti ^long n record?]
-                       (let [r (Random. (+ seed ti 1))
-                             opts (g/terminal-options opts ti)]
-                         (dotimes [_ n]
-                           (let [type     (pick-type r)
-                                 input    (gen-input r opts type)
-                                ;; SQLite has a single writer, so write
-                                ;; transactions serialize on one lock. Waiting
-                                ;; for that lock is part of the latency.
-                                 [res ms] (with-write-lock
-                                            write-lock
-                                            #(do-txn cnn input type))]
-                             (when (and (= :new-order type) (= :ok (:status res)))
-                               (swap! committed update [(:w input) (:d input)]
-                                      (fnil inc 0)))
-                             (when record?
-                               (swap! lat conj [type ms (:status res)]))))))]
-       (println (format "TPC-C-derived: %d warehouse(s), %d terminal(s), %d txns"
-                        warehouses threads txns))
-      ;; A run owns its RNG, so execute the whole warmup as one batch.
-       (let [warm-conn (open-conn path)]
-         (try (run warm-conn 0 warmup false)
-              (finally (.close warm-conn))))
-       (measure!
-        (fn []
-          (let [dists    (for [w (range 1 (inc warehouses)) d (range 1 11)] [w d])
-                baseline (into {} (map (fn [[w d]] [[w d] (district-next-o-id conn w d)])
-                                       dists))
-                base-ord (into {} (map (fn [[w d]] [[w d] (order-count conn w d)])
-                                       dists))]
-            (reset! committed {})
-            (reset! lat [])
-            (let [t0       (System/nanoTime)
-                  per      (quot txns threads)
-                  futs     (mapv (fn [ti]
-                                   (start-terminal
-                                    (fn []
-                                      (let [c (open-conn path)]
-                                        (try
-                                          (run c ti (+ per (if (= ti (dec threads))
-                                                             (mod txns threads)
-                                                             0))
-                                               true)
-                                          (finally (.close c)))))))
-                                 (range threads))
-                ;; Drain every terminal before leaving the run, including
-                ;; when one has failed, so all terminal connections close.
-                  results  (mapv (fn [f] (try @f (catch Throwable e e))) futs)]
-              (when-let [error (some #(when (instance? Throwable %) %) results)]
-                (throw error))
-              (let [elapsed    (/ (- (System/nanoTime) t0) 1.0e9)
-                    errors
-                    (vec (for [[w d :as k] dists
-                               [invariant base actual]
-                               [[:district-next-o-id baseline (district-next-o-id conn w d)]
-                                [:order-count base-ord (order-count conn w d)]]
-                               :let [expected (+ (get base k) (get @committed k 0))]
-                               :when (not= actual expected)]
-                           {:invariant invariant :key k :expected expected :actual actual}))
-                    {:keys [new-orders committed-new-orders rolled-back-new-orders tpmc]
-                     :as metrics} (c/new-order-metrics @lat elapsed)
-                    by-type    (group-by first @lat)
-                    stats      (into {}
-                                     (for [[ty xs] by-type]
-                                       (let [ms (vec (sort (map second xs)))]
-                                         [ty {:count (count ms)
-                                              :mean  (/ (reduce + 0.0 ms) (count ms))
-                                              :p50   (percentile ms 0.50)
-                                              :p95   (percentile ms 0.95)
-                                              :p99   (percentile ms 0.99)}])))]
-                (when (seq errors)
-                  (throw (ex-info "TPC-C accounting invariant failure" {:errors errors})))
-                (println "district next_o_id invariant: OK")
-                (println "order count invariant: OK")
-                (println (format "Elapsed: %.2fs  New-Orders: %d (%d committed, %d rolled back)  tpmC: %.1f"
-                                 elapsed new-orders committed-new-orders rolled-back-new-orders tpmc))
-                (doseq [[ty {:keys [count mean p50 p95 p99]}] (sort-by key stats)]
-                  (println (format "  %-13s n=%-6d mean=%7.3fms p50=%7.3f p95=%7.3f p99=%7.3f"
-                                   (name ty) count mean p50 p95 p99)))
-                (assoc metrics :elapsed elapsed :stats stats
-                       :invariants :ok))))))))))
+  ([{:keys [path] :or {path "sqlite.db"} :as opts} dependencies]
+   (let [open (or (:open-conn dependencies) open-conn)
+         transact (or (:do-txn dependencies) do-txn)
+         generate (or (:gen-input dependencies) gen-input)]
+     ((or (:enable-wal! dependencies) enable-wal!) path)
+     (runner/bench opts
+       (merge {:pick-type pick-type :close-conn #(.close ^Connection %)
+               :district-next-o-id district-next-o-id :order-count order-count
+               :payment-state #(check/sql-payment-state % qall)
+               :payment-errors check/payment-errors}
+              dependencies
+              {:open-conn #(open path)
+               :do-txn (fn [conn rng options type]
+                         (let [input (generate rng options type)
+                               t0 (System/nanoTime)
+                               result (transact conn input type)]
+                           [type input result (/ (- (System/nanoTime) t0) 1e6)]))})))))
 
 (defn -main [& _args]
   (bench {})

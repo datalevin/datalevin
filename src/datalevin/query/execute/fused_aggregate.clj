@@ -3,15 +3,16 @@
 (ns ^:no-doc datalevin.query.execute.fused-aggregate
   "Streaming scan/expression/group reduction for proven-distinct native rows."
   (:require [clojure.set :as set]
-            [datalevin.client.request :as request]
             [datalevin.db :as db]
             [datalevin.interface :as i]
             [datalevin.lmdb :as lmdb]
             [datalevin.parser :as parser]
+            [datalevin.query.optimizer.sampling :as sampling]
+            [datalevin.query.optimizer.parallel :as parallel-plan]
+            [datalevin.query.parallel :as parallel]
             [datalevin.query.resolve :as resolve]
             [datalevin.relation :as relation]
-            [datalevin.storage.scan :as scan]
-            [datalevin.timeout :as timeout])
+            [datalevin.storage.scan :as scan])
   (:import [datalevin.db DB]
            [datalevin.storage Store]
            [datalevin.parser Aggregate BindScalar Constant DefaultSrc FindRel
@@ -26,8 +27,8 @@
   "Minimum estimated qualifying entities before a full EAV walk is considered."
   4096)
 (def ^:dynamic *min-scan-fraction*
-  "Minimum estimated coverage of both the anchor population and entity-id span.
-  Sparse identifiers conservatively keep the existing indexed executor."
+  "Minimum estimated coverage of the anchor population and stored entities.
+  Entity-ID offsets and gaps do not add work to a native EAV walk."
   0.5)
 
 (def ^:dynamic *max-groups*
@@ -136,6 +137,40 @@
               (recur (next groups) (* product cardinality)))))
         true))))
 
+(defn- numeric-type [types expression]
+  (cond
+    (symbol? expression) (types expression)
+    (double? expression) :double
+    (integer? expression) :long
+    (seq? expression)
+    (let [[op & args] expression
+          kinds (map #(numeric-type types %) args)]
+      (when (and (#{'+ '- '* '/ 'inc 'dec} op)
+                 (every? #{:double :long} kinds))
+        (cond (some #{:double} kinds) :double
+              (not= op '/) :long)))))
+
+(defn- parallel-aggregates? [parsed fields schema clauses input-vars values entity]
+  ;; Floating aggregates allow reassociation; keep exact numeric towers and
+  ;; overflow-sensitive integer sums on their existing serial path.
+  (let [types (into {entity :long}
+                    (map (fn [{:keys [variable attr]}]
+                           [variable ({:db.type/double :double :db.type/long :long}
+                                       (get-in schema [attr :db/valueType]))])) fields)
+        types (into types (map (fn [var value] [var (numeric-type {} value)])
+                               input-vars values))
+        types (reduce (fn [types clause]
+                        (if (instance? Function clause)
+                          (assoc types (get-in clause [:binding :variable :symbol])
+                                 (numeric-type types
+                                   (cons (get-in clause [:fn :symbol])
+                                         (expression-arguments clause))))
+                          types)) types clauses)]
+    (every? #(or (not (instance? Aggregate %))
+                 (= 'count (get-in % [:fn :symbol]))
+                 (= :double (types (get-in % [:args 0 :symbol]))))
+            (parser/find-elements (:qfind parsed)))))
+
 (defn plan
   "Admit a broad, single-entity native scan. Schema, bindings and the ordinary
   plan's selectivity estimate are checked for each execution. Return nil when
@@ -185,7 +220,7 @@
                  (number? size) (<= (double *min-input*) (double size)))
         (let [population-size (long (i/a-size store (:attr anchor)))
               total (max population-size
-                         (long (.-max-eid ^DB database)))
+                         (sampling/estimated-entity-count (.-lmdb ^Store store)))
               fields (sort-by #(get-in schema [(:attr %) :db/aid]) fields)
               aids (mapv #(get-in schema [(:attr %) :db/aid]) fields)
               entity (:entity (first fields))
@@ -223,6 +258,10 @@
                            :scan-columns (int-array (map columns (map :variable fields)))
                            :input-columns (int-array (map columns input-vars))
                            :input-values values
+                           :program-clauses clauses :program-columns columns
+                           :parallel? (and (= :full (:mode materialization))
+                                           (parallel-aggregates? parsed-q fields schema clauses
+                                                                 input-vars values entity))
                            :summary {:operator :fused-aggregate :scan :eav
                                      :attributes (mapv :attr fields)
                                      :eav-materialization materialization
@@ -231,18 +270,11 @@
                                      :estimated-input size :retained-input-tuples 0
                                      :scratch-width (count (:columns program))}})))))))))))))
 
-(defn- check! []
-  (when (.isInterrupted (Thread/currentThread))
-    (throw (InterruptedException. "Query interrupted")))
-  (timeout/assert-time-left)
-  (request/check! :request))
-
-(defn execute
-  "Consume borrowed rows synchronously and retain only aggregate states.
-  Return nil when the admitted schema differs from the read transaction."
-  [context {:keys [database aids scan-columns columns input-columns input-values
-                   aggregate-columns aggregate-operations operations summary
-                   schema-revision entity-value? materialization string-cache-capacities]}]
+(defn- reduce-range
+  [{:keys [database aids scan-columns columns input-columns input-values
+                   aggregate-columns aggregate-operations operations
+                   schema-revision entity-value? materialization string-cache-capacities]}
+   entity-range]
   (let [accumulator (GroupedAggregate. aggregate-columns aggregate-operations)
         row (object-array (count columns))
         input-count (long-array 1)
@@ -267,10 +299,37 @@
                         (when-not (nil? value)
                           (aset row (int index) value)
                           (recur (inc i))))))))
-              check! schema-revision (boolean entity-value?) string-cache-capacities))
-      (let [result {:rows (mapv vec (.results accumulator))
-                    :input-tuples (aget input-count 0)
-                    :group-count (.groupCount accumulator)}]
+              parallel/check! schema-revision (boolean entity-value?) string-cache-capacities
+              entity-range))
+      {:accumulator accumulator :input-tuples (aget input-count 0)})))
+
+(defn execute
+  "Consume borrowed rows into private aggregate states, then combine them.
+  Snapshot mismatches fall back to a single scan; schema mismatches return nil."
+  [context {:keys [database summary parallel? program-clauses program-columns] :as plan}]
+  (let [participants (if parallel?
+                       (parallel-plan/participants (:estimated-input summary)
+                                                   parallel-plan/*scan-rows-per-worker*) 1)
+        lmdb (.-lmdb ^Store (.-store ^DB database))
+        partials
+        (when (< 1 participants)
+          (let [rtx (i/get-rtx lmdb)]
+            (try
+              (parallel/map-read lmdb (parallel/snapshot-id rtx)
+                (fn [entity-range]
+                  (let [program (row-program program-clauses program-columns context)]
+                    (reduce-range (assoc plan :operations (:operations program)) entity-range)))
+                (scan/entity-ranges lmdb participants))
+              (finally (i/return-rtx lmdb rtx)))))
+        partials (if (and (seq partials) (every? some? partials))
+                   partials [(reduce-range plan nil)])]
+    (when (every? some? partials)
+      (let [^GroupedAggregate accumulator (:accumulator (first partials))
+            _ (doseq [part (rest partials)] (.merge accumulator (:accumulator part)))
+            result {:rows (mapv vec (.results accumulator))
+                    :input-tuples (reduce + (map :input-tuples partials))
+                    :group-count (.groupCount accumulator)
+                    :partitions (count partials)}]
         (assoc context :rels [] :late-clauses []
                :fused-aggregation result
                :fused-aggregation-plan (merge summary (dissoc result :rows)))))))

@@ -67,6 +67,8 @@ public final class EavProjection implements AutoCloseable {
     private final Pointer projector;
     private boolean first = true;
     private boolean closed;
+    private long endExclusive = -1;
+    private boolean exhausted;
 
     /** Use full native duplicate materialization unless explicitly opted in. */
     public EavProjection(Cursor cursor, int[] attributes) {
@@ -121,9 +123,28 @@ public final class EavProjection implements AutoCloseable {
         }
     }
 
+    /** Full projection over [start, endExclusive); a negative end is unbounded. */
+    public EavProjection(Cursor cursor, int[] attributes, long start, long endExclusive) {
+        this(cursor, attributes, false);
+        this.endExclusive = endExclusive;
+        try (BufVal lower = new BufVal(Long.BYTES)) {
+            if (start < 0 || (endExclusive >= 0 && endExclusive <= start)) {
+                exhausted = true;
+            } else {
+                lower.inBuf().putLong(0, start);
+                if (!cursor.get(lower, DTLV.MDB_SET_RANGE)) exhausted = true;
+                else first = !cursor.seek(DTLV.MDB_PREV_NODUP);
+            }
+        } catch (Throwable error) {
+            close();
+            throw error;
+        }
+    }
+
     /** Return 1 for a complete entity, 0 for an incomplete one, or -1 at EOF. */
     public int advance() {
         if (closed) throw new IllegalStateException("Projection is closed");
+        if (exhausted) return -1;
         final int rc;
         try {
             rc = projector != null ? (int) NEXT.invokeExact(projector)
@@ -134,6 +155,11 @@ public final class EavProjection implements AutoCloseable {
         }
         first = false;
         if (rc == DTLV.MDB_NOTFOUND) return -1;
+        if ((rc == DTLV.DTLV_TRUE || rc == DTLV.DTLV_FALSE)
+                && endExclusive >= 0 && entity() >= endExclusive) {
+            exhausted = true;
+            return -1;
+        }
         if (rc == DTLV.DTLV_TRUE) return 1;
         if (rc == DTLV.DTLV_FALSE) return 0;
         Util.checkRc(rc);
