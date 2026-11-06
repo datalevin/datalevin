@@ -6,7 +6,9 @@
             [datalevin-tpcc.check :as check]
             [datalevin-tpcc.datalevin :as bench]
             [datalevin-tpcc.generate :as g]
-            [datalevin-tpcc.txns :as tx])
+            [datalevin-tpcc.txns :as tx]
+            [datalevin-tpcc.schema :as schema]
+            [datalevin-tpcc.test-data :as td])
   (:import [java.net ServerSocket]))
 
 (deftest separate-remote-terminal-connections-preserve-mixed-transaction-accounting
@@ -29,9 +31,9 @@
                     "customer" (for [w [1 2]] (assoc customer 0 1 1 1 2 w))
                     "item" (take 2 (g/item-rows 42))
                     "stock" (for [w [1 2] item [1 2]] (assoc stock 0 item 1 w 2 100))}
-              eid (atom 0)]
+              layout (schema/entity-layout 2)]
           (with-out-str
-            (doseq [[table rows] rows] (#'bench/load-table! @conn table rows eid))))
+            (doseq [[table rows] rows] (bench/load-table! @conn table rows layout))))
         (let [peers (mapv (fn [_] (#'bench/open-bench-conn uri)) (range 4))
               _ (swap! connections into peers)
               _ (is (apply distinct? (map #(System/identityHashCode %) peers)))
@@ -56,8 +58,8 @@
           (is (empty? (check/payment-errors before (check/payment-state conn)
                                             {[1 1] {:amount 10.0 :count 2}}
                                             {[2 1] {:amount 10.0 :count 2}})))
-          (is (= 98 (:stock/quantity (d/pull @conn [:stock/quantity] [:stock/key [1 1]]))))
-          (is (= 97 (:stock/quantity (d/pull @conn [:stock/quantity] [:stock/key [2 2]]))))
+          (is (= 98 (:stock/quantity (d/pull @conn [:stock/quantity] (td/lookup-ref @conn "stock" [1 1])))))
+          (is (= 97 (:stock/quantity (d/pull @conn [:stock/quantity] (td/lookup-ref @conn "stock" [2 2])))))
           (is (= 2 (:lines (tx/order-status! conn {:w 1 :d 1 :c 1}))))
           (is (= 2 (:low-stock (tx/stock-level! conn {:w 1 :d 1 :threshold 101}))))
           (is (= 1 (:delivered (tx/delivery! conn {:w 1 :carrier 2}))))
@@ -74,16 +76,16 @@
                 b (future
                     @aborted
                     (d/with-transaction [tx (peers 1)]
-                      (d/transact! tx [[:db/add [:stock/key [1 1]] :stock/quantity 96]])
+                      (d/transact! tx [[:db/add (td/lookup-ref @conn "stock" [1 1]) :stock/quantity 96]])
                       (deliver owned true)
                       @release
                       :committed))]
             (try
               (is (= :aborted (deref a 10000 :timeout)))
-              (is (= 98 (:stock/quantity (d/pull @conn [:stock/quantity] [:stock/key [1 1]]))))
+              (is (= 98 (:stock/quantity (d/pull @conn [:stock/quantity] (td/lookup-ref @conn "stock" [1 1])))))
               (finally (deliver release true)))
             (is (= :committed @b))
-            (is (= 96 (:stock/quantity (d/pull @conn [:stock/quantity] [:stock/key [1 1]])))))))
+            (is (= 96 (:stock/quantity (d/pull @conn [:stock/quantity] (td/lookup-ref @conn "stock" [1 1]))))))))
       (finally
         (doseq [conn @connections] (d/close conn))
         (server/stop srv)

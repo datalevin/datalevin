@@ -7,6 +7,7 @@
    [datalevin.core :as d]
    [datalevin.datom :as datom]
    [datalevin.db :as db]
+   [datalevin.db.tx.execute :as execute]
    [datalevin.test.core :refer [db-fixture]]
    [datalevin.util :as u]))
 
@@ -20,6 +21,16 @@
    :row/value {:db/valueType :db.type/long}
    :row/name {:db/valueType :db.type/string :db/unique :db.unique/identity}
    :row/child {:db/valueType :db.type/ref :db/isComponent true}})
+
+(deftest resolved-reference-map-eligibility
+  (testing "resolved references can use the flat map path"
+    (is (#'execute/regular-map? schema
+         {:db/id -1 :row/child 1 :row/part 2 :row/number 1})))
+  (testing "reference forms requiring resolution or expansion retain the general path"
+    (doseq [ref [-2 "child" [:row/name "child"] {:row/name "child"}
+                 :db/current-tx :child nil 1.5]]
+      (is (not (#'execute/regular-map? schema {:db/id -1 :row/child ref}))
+          (pr-str ref)))))
 
 (deftest regular-maps-compose-with-complex-operations
   (doseq [wal? [false true]]

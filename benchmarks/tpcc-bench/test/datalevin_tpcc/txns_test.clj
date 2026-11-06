@@ -5,7 +5,8 @@
    [datalevin.util :as u]
    [datalevin-tpcc.check :as check]
    [datalevin-tpcc.datalevin :as bench]
-   [datalevin-tpcc.txns :as t]))
+   [datalevin-tpcc.txns :as t]
+   [datalevin-tpcc.test-data :as td]))
 
 (def ^:dynamic *test-dir* nil)
 
@@ -24,7 +25,7 @@
 (defn- with-db [opts f]
   (let [conn (d/get-conn (str *test-dir* "/" (random-uuid)) bench/schema opts)]
     (try
-      (d/transact!
+      (td/transact!
        conn
        (into [{:db/id 1 :warehouse/id 1 :warehouse/ytd 300000.0 :warehouse/tax 0.1
                :warehouse/name "WAREHOUSE"}
@@ -123,7 +124,7 @@
         (is (= -10.0 (value conn (customer-eid 1 1) :customer/balance)))
         (is (= #{[2]} (d/q '[:find ?c
                              :where [?h _]
-                             [?h :history/amount 5.0] [?h :history/c-id ?c]]
+                             [?h :history/amount 5.0] [?h :history/customer ?customer] [?customer :customer/id ?c]]
                            (d/db conn))))
         (is (empty? (check/payment-errors before (check/payment-state conn)
                                           (committed-payments [result]))))))))
@@ -211,7 +212,7 @@
             expected (committed-payments results)]
         (is (empty? (check/payment-errors before (check/payment-state conn) expected)))
         ;; Recreate the original lost update while preserving both history rows.
-        (d/transact! conn [[:db/add 1 :warehouse/ytd 300005.0]
+        (td/transact! conn [[:db/add 1 :warehouse/ytd 300005.0]
                            [:db/add 11 :district/ytd 30005.0]])
         (is (= #{:warehouse-ytd :district-ytd}
                (set (map :invariant
@@ -225,7 +226,7 @@
       ;; [2981, 3001). Item 1 is low and appears in every order of the window,
       ;; so it must be counted once, not once per order. Item 3 is low but its
       ;; only order (2980) is outside the window and must not be counted.
-      (d/transact!
+      (td/transact!
        conn
        (concat
         [{:db/id 50 :item/id 2 :item/price 3.0}
@@ -234,31 +235,39 @@
           :stock/ytd 0 :stock/order-cnt 0 :stock/remote-cnt 0}
          {:db/id 53 :stock/w-id 1 :stock/i-id 3 :stock/quantity 50
           :stock/ytd 0 :stock/order-cnt 0 :stock/remote-cnt 0}]
+        (for [oid (range 2980 3001)]
+          {:db/id (+ 400000 oid) :orders/id oid :orders/w-id 1 :orders/d-id 1 :orders/c-id 1})
         (mapcat (fn [oid]
                   [{:db/id (+ 100000 oid) :order-line/o-id oid :order-line/d-id 1
-                    :order-line/w-id 1 :order-line/i-id 1 :order-line/number 1}
+                    :order-line/w-id 1 :order-line/i-id 1 :order-line/supply-w-id 1 :order-line/number 1}
                    {:db/id (+ 200000 oid) :order-line/o-id oid :order-line/d-id 1
-                    :order-line/w-id 1 :order-line/i-id 2 :order-line/number 2}])
+                    :order-line/w-id 1 :order-line/i-id 2 :order-line/supply-w-id 1 :order-line/number 2}])
                 (range 2981 3001))
         [{:db/id 300001 :order-line/o-id 2980 :order-line/d-id 1
-          :order-line/w-id 1 :order-line/i-id 3 :order-line/number 1}]))
+          :order-line/w-id 1 :order-line/i-id 3 :order-line/supply-w-id 1 :order-line/number 1}]))
       (is (= 1 (:low-stock (t/stock-level! conn {:w 1 :d 1 :threshold 200}))))
       ;; The upper boundary and neighboring districts/warehouses must not add
       ;; item 3. Remote supply still checks the home warehouse's stock.
-      (d/transact!
+      (td/transact!
        conn
-       [{:stock/w-id 2 :stock/i-id 2 :stock/quantity 1}
+       [{:db/id 400010 :warehouse/id 2}
+        {:db/id 400011 :district/w-id 2 :district/id 1}
+        {:db/id 400012 :customer/w-id 2 :customer/d-id 1 :customer/id 1}
+        {:db/id 400013 :orders/w-id 1 :orders/d-id 1 :orders/id 3001 :orders/c-id 1}
+        {:db/id 400014 :orders/w-id 1 :orders/d-id 2 :orders/id 2981 :orders/c-id 1}
+        {:db/id 400015 :orders/w-id 2 :orders/d-id 1 :orders/id 2981 :orders/c-id 1}
+        {:db/id 400016 :stock/w-id 2 :stock/i-id 2 :stock/quantity 1}
         {:order-line/o-id 3001 :order-line/d-id 1 :order-line/w-id 1
-         :order-line/i-id 3 :order-line/number 1}
+         :order-line/i-id 3 :order-line/supply-w-id 1 :order-line/number 1}
         {:order-line/o-id 2981 :order-line/d-id 2 :order-line/w-id 1
-         :order-line/i-id 3 :order-line/number 1}
+         :order-line/i-id 3 :order-line/supply-w-id 1 :order-line/number 1}
         {:order-line/o-id 2981 :order-line/d-id 1 :order-line/w-id 2
-         :order-line/i-id 3 :order-line/number 1}
-        [:db/add [:order-line/key [1 1 2981 2]] :order-line/supply-w-id 2]])
+         :order-line/i-id 3 :order-line/supply-w-id 1 :order-line/number 1}
+        [:db/add (td/lookup-ref (d/db conn) "order_line" [1 1 2981 2]) :order-line/stock 400016]])
       (doseq [[district threshold expected] [[1 100 0] [1 101 1] [1 301 2]
                                              [3 200 0] [99 200 0]]]
         (is (= expected (:low-stock (t/stock-level! conn {:w 1 :d district :threshold threshold})))))
-      (d/transact! conn [[:db/add 3 :stock/quantity 5]])
+      (td/transact! conn [[:db/add 3 :stock/quantity 5]])
       (is (= 1 (:low-stock (t/stock-level! conn {:w 1 :d 1 :threshold 10})))))))
 
 (deftest order-status-selects-latest-order
@@ -267,7 +276,7 @@
       ;; Customer 1 in district 1 has three orders; the most recent (30) has
       ;; three lines, while the older ones have fewer. Order-Status must
       ;; inspect order 30 rather than an arbitrary order from the result set.
-      (d/transact!
+      (td/transact!
        conn
        (concat
         [{:db/id 500010 :orders/id 10 :orders/d-id 1 :orders/w-id 1
@@ -295,7 +304,7 @@
       ;; Only customer 2 has an order. The input :c is customer 1, but the
       ;; name resolves to customer 2, so Order-Status must report customer 2's
       ;; order rather than looking up the unrelated input id.
-      (d/transact! conn
+      (td/transact! conn
                    [{:db/id 600001 :orders/id 40 :orders/d-id 1 :orders/w-id 1
                      :orders/c-id 2 :orders/entry-d "2026-01-01T00:00:00"
                      :orders/ol-cnt 2 :orders/all-local 1}
@@ -318,7 +327,9 @@
   (with-db {}
     (fn [conn]
       (let [customer (d/pull (d/db conn) '[*] (customer-eid 1 1))]
-        (d/transact! conn [(-> customer
+        (td/transact! conn [{:db/id 501 :warehouse/id 2}
+                            {:db/id 502 :district/w-id 2 :district/id 3}
+                            (-> customer
                                (dissoc :customer/key :customer/name-key)
                                (assoc :db/id 500 :customer/w-id 2 :customer/d-id 3))]))
       (let [before (check/payment-state conn)
@@ -332,9 +343,11 @@
         (is (= #{[1 4 2 3 1]}
                (d/q '[:find ?w ?d ?cw ?cd ?c
                       :where [?h _] [?h :history/amount 5.0]
-                      [?h :history/w-id ?w] [?h :history/d-id ?d]
-                      [?h :history/c-w-id ?cw] [?h :history/c-d-id ?cd]
-                      [?h :history/c-id ?c]] (d/db conn))))
+                      [?h :history/district ?district] [?district :district/id ?d]
+                      [?district :district/warehouse ?warehouse] [?warehouse :warehouse/id ?w]
+                      [?h :history/customer ?customer] [?customer :customer/id ?c]
+                      [?customer :customer/district ?customer-district] [?customer-district :district/id ?cd]
+                      [?customer-district :district/warehouse ?customer-warehouse] [?customer-warehouse :warehouse/id ?cw]] (d/db conn))))
         (is (empty? (check/payment-errors before after
                                           {[1 4] {:amount 10.0 :count 2}}
                                           {[2 3] {:amount 10.0 :count 2}})))

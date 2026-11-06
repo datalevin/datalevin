@@ -10,7 +10,8 @@
    [datalevin-tpcc.generate :as g]
    [datalevin-tpcc.postgres :as postgres]
    [datalevin-tpcc.sqlite :as sqlite]
-   [datalevin-tpcc.txns :as t])
+   [datalevin-tpcc.txns :as t]
+   [datalevin-tpcc.test-data :as td])
   (:import
    [java.sql Connection DriverManager]
    [java.util Locale Locale$Category]))
@@ -165,9 +166,7 @@
 (deftest datalevin-transaction-payloads
   (let [conn (d/get-conn *test-dir* datalevin/schema)]
     (try
-      (d/transact! conn
-                   (vec (for [[table rows] (seed-rows) row rows]
-                          (zipmap (c/attrs table) row))))
+      (td/transact-rows! conn (seed-rows))
       (check-payloads!
        {:new-order! #(t/new-order! conn %)
         :payment! #(t/payment! conn %)
@@ -175,23 +174,27 @@
         (fn [district order]
           (vec (sort (d/q '[:find ?n ?item ?supply ?info ?amount :in $ ?d ?o
                             :where [?e :order-line/key]
-                            [?e :order-line/w-id 2]
-                            [?e :order-line/d-id ?d] [?e :order-line/o-id ?o]
-                            [?e :order-line/number ?n] [?e :order-line/i-id ?item]
-                            [?e :order-line/supply-w-id ?supply]
+                            [?e :order-line/order ?order] [?order :orders/id ?o]
+                            [?order :orders/district ?district] [?district :district/id ?d]
+                            [?district :district/warehouse ?warehouse] [?warehouse :warehouse/id 2]
+                            [?e :order-line/number ?n] [?e :order-line/stock ?stock]
+                            [?stock :stock/item ?i] [?i :item/id ?item]
+                            [?stock :stock/warehouse ?sw] [?sw :warehouse/id ?supply]
                             [?e :order-line/dist-info ?info]
                             [?e :order-line/amount ?amount]]
                           (d/db conn) district order))))
         :customer-data
         (fn [district customer]
           (:customer/data (d/pull (d/db conn) [:customer/data]
-                                 [:customer/key [2 district customer]])))
+                                 (td/lookup-ref (d/db conn) "customer" [2 district customer]))))
         :history
         #(d/q '[:find ?cid ?cd ?cw ?district ?w ?amount ?data
                 :with ?e
-                :where [?e _] [?e :history/c-id ?cid] [?e :history/c-d-id ?cd]
-                [?e :history/c-w-id ?cw] [?e :history/d-id ?district]
-                [?e :history/w-id ?w] [?e :history/amount ?amount]
+                :where [?e _] [?e :history/customer ?customer] [?customer :customer/id ?cid]
+                [?customer :customer/district ?customer-district] [?customer-district :district/id ?cd]
+                [?customer-district :district/warehouse ?customer-warehouse] [?customer-warehouse :warehouse/id ?cw]
+                [?e :history/district ?home-district] [?home-district :district/id ?district]
+                [?home-district :district/warehouse ?home-warehouse] [?home-warehouse :warehouse/id ?w] [?e :history/amount ?amount]
                 [?e :history/data ?data]] (d/db conn))})
       (finally (d/close conn)))))
 

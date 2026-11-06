@@ -34,16 +34,17 @@
         customers (d/q '[:find ?w ?d (sum ?amount) (sum ?count)
                          :with ?e
                          :where [?e :customer/key]
-                         [?e :customer/w-id ?w]
-                         [?e :customer/d-id ?d]
+                         [?e :customer/district ?district]
+                         [?district :district/id ?d]
+                         [?district :district/warehouse ?warehouse]
+                         [?warehouse :warehouse/id ?w]
                          [?e :customer/ytd-payment ?amount]
                          [?e :customer/payment-cnt ?count]] db)
         history (d/q '[:find ?w ?d (sum ?amount) (count ?e)
-                       ;; History has no application index, like the SQL table.
-                       ;; Bind entities by scanning before reading its fields.
-                       :where [?e _]
-                       [?e :history/w-id ?w]
-                       [?e :history/d-id ?d]
+                       :where [?e :history/district ?district]
+                       [?district :district/id ?d]
+                       [?district :district/warehouse ?warehouse]
+                       [?warehouse :warehouse/id ?w]
                        [?e :history/amount ?amount]] db)
         amounts (fn [rows]
                   (into {} (map (fn [[w d amount _]] [[w d] amount])) rows))
@@ -57,7 +58,8 @@
      (into {} (map (fn [[w d amount]] [[w d] amount]))
            (d/q '[:find ?w ?d ?amount
                   :where [?e :district/key]
-                  [?e :district/w-id ?w]
+                  [?e :district/warehouse ?warehouse]
+                  [?warehouse :warehouse/id ?w]
                   [?e :district/id ?d]
                   [?e :district/ytd ?amount]] db))
      :customer-ytd-payment (amounts customers)

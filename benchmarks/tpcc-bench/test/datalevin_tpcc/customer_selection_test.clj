@@ -10,7 +10,8 @@
    [datalevin-tpcc.generate :as g]
    [datalevin-tpcc.postgres :as postgres]
    [datalevin-tpcc.sqlite :as sqlite]
-   [datalevin-tpcc.txns :as t])
+   [datalevin-tpcc.txns :as t]
+   [datalevin-tpcc.test-data :as td])
   (:import
    [java.sql Connection DriverManager]))
 
@@ -44,7 +45,9 @@
                         [rank cid] (reverse (map-indexed vector ids))]
                     {:cid cid :rank (inc rank) :last (last-name ids)})
         date "2026-01-01T00:00:00"]
-    {"warehouse" (take 1 (g/warehouse-rows 42 1))
+    {"item" (take 1 (g/item-rows 42))
+     "stock" (take 1 (g/stock-rows 42 1))
+     "warehouse" (take 1 (g/warehouse-rows 42 1))
      "district" (take 1 (g/district-rows 42 1))
      "customer" (for [{:keys [cid rank last]} customers]
                   (assoc customer 0 cid 3 (format "FIRST%02d" rank) 5 last 13 "GC"))
@@ -75,9 +78,7 @@
 (deftest datalevin-customer-selection
   (let [conn (d/get-conn *test-dir* datalevin/schema)]
     (try
-      (d/transact! conn
-                   (vec (for [[table rows] (seed-rows) row rows]
-                          (zipmap (c/attrs table) row))))
+      (td/transact-rows! conn (seed-rows))
       (check-customer-selection!
        {:payment! #(t/payment! conn %)
         :order-status! #(t/order-status! conn %)
@@ -87,7 +88,7 @@
                                           [?e :customer/balance ?balance]]
                                  (d/db conn)))
         :history-customers #(map second (d/q '[:find ?h ?cid
-                                              :where [?h _] [?h :history/c-id ?cid]]
+                                              :where [?h _] [?h :history/customer ?customer] [?customer :customer/id ?cid]]
                                             (d/db conn)))})
       (finally (d/close conn)))))
 

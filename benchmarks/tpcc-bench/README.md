@@ -57,26 +57,48 @@ Each district's 3,000 orders map bijectively to its 3,000 customers, the first
 2,100 orders are delivered, and orders 2,101-3,000 are the open new orders.
 Generation is deterministic per table from a seed, so reloads are reproducible.
 
-Datalevin uses unique item and warehouse IDs and unique composite business keys
-for districts, customers, stock, orders, new orders, and order lines. Secondary
-composites index customer surnames and orders by customer. Point reads use lookup
-refs and pulls; Delivery and Order-Status seek the first or last matching index
-entry, and line reads use bounded key ranges. Only these application lookup keys
-have value indexes; all other fields, including balances, counters, quantities,
-names, and composite-key components, use `:db/noindex true`. Both bulk loads and
-transactions maintain the composite attributes from those components automatically.
+Datalevin represents each row as an entity and each foreign key as a
+`:db.type/ref`. Composite SQL foreign keys become a single reference to the
+target entity. The scalar foreign-key columns are not duplicated:
 
-Stock-Level reads the district counter with a query, selects the last 20 orders'
-line IDs with a bounded index range, and supplies them to a fixed query. That query
-joins stock through business-key lookup references, filters quantity, and counts
-distinct item IDs in the database. Remote execution uses three requests, with the
-join and aggregate on the server. This avoids per-item pulls and full scans when
-tuple bounds passed through query inputs remain late filters in the planner.
+| Entity | References |
+|---|---|
+| district | warehouse |
+| customer | district |
+| stock | warehouse, item |
+| orders | district, customer |
+| new_order | order |
+| order_line | order, supplying stock |
+| history | customer, paying district |
 
-Reload databases created with older schemas before running this version. Drivers
-reject mismatched scalar types, missing Datalevin business keys, or the previous
-extra scalar indexes. Both SQL
-schemas index orders by warehouse, district, customer, and order ID.
+An order line's item and supplying warehouse follow its stock reference. History
+keeps the paying district separate from the customer's district for remote
+payments. All nine SQL rows can be reconstructed by following these relationships.
+
+The loader computes entity IDs from disjoint table ranges and complete business
+keys, following JOB's approach. It constructs references arithmetically without
+an entity lookup map. Runtime inserts use normal transaction tempids; New-Order
+reuses the returned order ID and retrieved stock IDs for its line references.
+
+Unique composite keys contain references plus local IDs: district
+`[warehouse id]`, customer `[district id]`, stock `[warehouse item]`, order
+`[district id]`, and line `[order number]`. Customer surnames and orders by
+customer have secondary tuple indexes. A new-order entity has a unique order
+reference and an explicit `[district order-number]` queue index for oldest-first
+Delivery. Other composite attributes are maintained automatically. References,
+lookup keys, and these secondary indexes have value indexes; remaining scalar
+fields use `:db/noindex true`.
+
+Order-Status and Delivery query lines through their order references.
+Stock-Level selects the last 20 order IDs with a bounded index range, then queries
+their lines and follows supplying stock to item. It checks that item's **home
+warehouse** stock quantity, including when a line was supplied remotely, and
+counts distinct items in the database.
+
+Reload databases created with older schemas before running this version. The
+Datalevin driver rejects databases with legacy scalar foreign keys or incompatible
+indexes. Both SQL schemas index orders by warehouse, district, customer, and
+order ID.
 
 ## Transactions
 
@@ -208,7 +230,7 @@ separate counts for `:committed-new-orders` and `:rolled-back-new-orders`.
 
 PostgreSQL transaction payloads, customer selection, Order-Status, remote Payments,
 and stock updates are covered by integration tests against PostgreSQL 18.6.
-The full transaction mix also passed the one- and two-warehouse runs below.
+The earlier SQL transaction-mix results are retained in the measurement report linked below.
 
 ## Host control
 
@@ -231,6 +253,7 @@ The Datalevin loader starts with a 100,000 MiB map, matching JOB. Pass
 ```bash
 # Embedded pair: identical population and terminal options
 clj -X:datalevin-db '{:warehouses 1 :seed 42 :dir "db-w1"}'
+clj -J-Xmx8g -X:verify '{:warehouses 1 :seed 42 :dir "db-w1"}'
 clj -X:sqlite-db    '{:warehouses 1 :seed 42 :path "sqlite-w1.db"}'
 clj -J-Xmx8g -X:datalevin-bench '{:dir "db-w1" :warehouses 1 :threads 4 :warmup 1000 :txns 100000 :seed 42 :load-seed 42}'
 clj -J-Xmx8g -X:sqlite-bench '{:path "sqlite-w1.db" :warehouses 1 :threads 4 :warmup 1000 :txns 100000 :seed 42 :load-seed 42}'
@@ -248,6 +271,11 @@ benchmark. Start a separate server process with a populated database and a 60 s
 transaction lock timeout. The [reproduction scripts](../../doc/measurements/tpcc-stock-query-2026-11-04/README.md)
 show how to clone a closed embedded seed into a fresh server root, start the
 server, run the client, and stop the server.
+
+Run `:verify` on a fresh Datalevin seed before warmup. It checks reference
+targets and the pending-order queue index, reconstructs all nine tables, and
+compares row counts and order-independent SHA-256 fingerprints against the shared
+generator. Pass `:out "verification.edn"` to save its report.
 
 `:warmup` is **per terminal** (default 1,000); `:txns` is the **total measured
 count** (default 100,000), divided across terminals. `:threads` defaults to 1.
@@ -292,7 +320,7 @@ PostgreSQL holds the affected row locks; Datalevin holds its single writer.
 Within `with-transaction`, all `transact!` calls join the outer commit. Explicit
 Datalevin bodies currently have separate native commit outcomes to keep an abort
 from cancelling another terminal's writes.
-SQL statements and Datalevin pull/transaction requests have different sizes and
+SQL statements and Datalevin query/pull/transaction requests have different sizes and
 round-trip counts, so the client/server figures measure those complete API paths.
 Remote Datalevin uses an ordinary request connection and a dedicated transaction
 connection internally for each application connection; PostgreSQL uses one JDBC
@@ -300,35 +328,37 @@ socket per terminal. Terminals otherwise have the same lifecycle and threading.
 
 ## Measured results
 
-Results use the paired WAL protocol above. Full row counts and
-order-independent SHA-256 fingerprints verify that every seed row matches the
-shared generator across all backends.
+The current Datalevin reference model was measured November 6, 2026 on an Apple
+M3 Pro (36 GiB RAM), with 8 GiB client/server heaps. Both fresh one- and
+two-warehouse seeds passed complete row-count and SHA-256 fingerprint checks
+against the shared generator, reconstructed through references.
 
-Datalevin was rerun with query-based Stock-Level; the unchanged SQL results
-are from the same day. Recorded November 4, 2026 on an Apple M3 Pro (36 GiB RAM),
-with 8 GiB client heaps. Each entry is one sequential run from a fresh seed copy: 1,000 warmup
-transactions per terminal and 100,000 measured transactions. These are bounded
-local measurements, not repeated estimates of steady-state capacity. Throughput
-is completed New-Orders per minute, including required rollbacks; higher is better.
+The table below compares the previous scalar model with the current reference
+model under strict WAL/fsync. Each entry is one sequential run from a fresh seed
+copy: 1,000 warmup transactions per terminal and **10,000 measured transactions**.
+Throughput is completed New-Orders per minute, including required rollbacks;
+higher is better. These short runs are controls for the model change, not repeated
+estimates of steady-state capacity.
 
-**Embedded — tpmC**
+| Mode | Warehouses | Terminals | Scalar model tpmC | Reference model tpmC | Change |
+|---|---:|---:|---:|---:|---:|
+| embedded | 1 | 1 | 34,791.3 | 29,193.0 | -16.1% |
+| remote | 1 | 1 | 11,325.6 | 10,490.0 | -7.4% |
+| embedded | 2 | 4 | 37,300.2 | 33,826.7 | -9.3% |
+| remote | 2 | 4 | 12,616.2 | 11,784.4 | -6.6% |
 
-| Warehouses | Terminals | SQLite WAL | Datalevin WAL |
-|---:|---:|---:|---:|
-| 1 | 1 | 69,516.0 | 41,405.9 |
-| 2 | 4 | 70,566.9 | 39,012.4 |
+Overall throughput is lower in these controls. Embedded W1/T1 New-Order mean
+latency is nearly unchanged (1.034 → 1.045 ms); the larger latency increases
+occur in Payment, Order-Status, Delivery, and Stock-Level.
 
-**Client/server — tpmC**
+All runs passed New-Order and Payment accounting, with identical transaction
+counts in each paired configuration. The final runs also passed post-workload
+reference-target and pending-order queue checks. Full PostgreSQL, SQLite,
+embedded Datalevin, and remote Datalevin tests passed: 65 tests and 12,140
+assertions.
 
-| Warehouses | Terminals | PostgreSQL | Datalevin WAL |
-|---:|---:|---:|---:|
-| 1 | 1 | 39,761.4 | 12,135.1 |
-| 2 | 4 | 112,896.8 | 13,049.4 |
-
-All eight runs passed New-Order and Payment accounting. Every backend completed
-45,150 New-Orders (449 rollbacks) in the one-terminal configuration and 44,970
-(460 rollbacks) in the four-terminal configuration. Counts of all five transaction
-types also match exactly within each configuration.
-
-See the [measurement report](../../doc/measurements/tpcc-stock-query-2026-11-04/README.md)
-for raw results, actual settings, source hashes, and reproduction commands.
+See the [reference-model measurement report](../../doc/measurements/tpcc-references-2026-11-05/README.md)
+for per-transaction latencies, raw results, seed verification, and reproduction.
+The [earlier SQL comparison](../../doc/measurements/tpcc-stock-query-2026-11-04/README.md)
+used the scalar Datalevin model and 100,000 measured transactions; its throughput
+figures are historical and should not be combined with these shorter runs.

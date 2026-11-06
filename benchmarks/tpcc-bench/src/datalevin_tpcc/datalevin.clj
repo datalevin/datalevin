@@ -15,26 +15,18 @@
 
 (def schema schema/schema)
 
-(defn- load-table!
-  [db table rows eid]
-  (let [{:keys [types]} (c/table-specs table)
-        as   (c/attrs table)
-        cnt  (atom 0)
-        t0   (System/nanoTime)]
-    (d/fill-db
-     db
-     (eduction
-      (mapcat
-       (fn [row]
-         (let [e (swap! eid inc)]
-           (swap! cnt inc)
-           (into []
-                 (comp (map (fn [[a t v]]
-                              (when (some? v)
-                                (d/datom e a (c/parse-value t v)))))
-                       (remove nil?))
-                 (map vector as types row)))))
-      rows))
+(defn load-table!
+  "Bulk-load normalized entities using precomputed table ranges."
+  [db table rows layout]
+  (let [cnt (volatile! 0)
+        t0 (System/nanoTime)]
+    (d/fill-db db
+      (eduction
+        (mapcat (fn [row]
+                  (let [entity (schema/entity-map layout table row (vswap! cnt inc))
+                        eid (:db/id entity)]
+                    (map (fn [[a v]] (d/datom eid a v)) (dissoc entity :db/id)))))
+        rows))
     (println (format "  %-10s %9d rows  %6.2fs" table @cnt
                      (/ (- (System/nanoTime) t0) 1.0e9)))))
 
@@ -62,10 +54,10 @@
                          {:closed-schema? true :wal? true
                           :kv-opts {:mapsize mapsize}
                           :wal-durability-profile :strict :wal-sync-mode :fsync})
-          eid (atom 0)]
+          layout (schema/entity-layout warehouses)]
       (try
         (doseq [table c/table-order]
-          (load-table! db table (get rows table) eid))
+          (load-table! db table (get rows table) layout))
         (println (format "Load time: %.2fs"
                          (/ (- (System/nanoTime) t0) 1.0e9)))
         (finally
@@ -110,10 +102,11 @@
                              :client-opts {:pool-size 1 :read-cache-limit 0}})
         actual (d/schema conn)
         required (keys schema)]
-    (if (every? (fn [attr]
+    (if (and (not-any? #(contains? actual %) schema/foreign-key-columns)
+             (every? (fn [attr]
                   (let [expected (get schema attr)]
                     (= expected (select-keys (get actual attr) (keys expected)))))
-                required)
+                required))
       (let [expected {:wal? true :wal-durability-profile :strict :wal-sync-mode :fsync}
             actual (select-keys (d/opts conn) (keys expected))]
         (if (= expected actual)

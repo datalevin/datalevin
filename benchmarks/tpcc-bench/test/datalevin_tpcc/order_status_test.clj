@@ -10,7 +10,8 @@
    [datalevin-tpcc.generate :as g]
    [datalevin-tpcc.postgres :as postgres]
    [datalevin-tpcc.sqlite :as sqlite]
-   [datalevin-tpcc.txns :as t])
+   [datalevin-tpcc.txns :as t]
+   [datalevin-tpcc.test-data :as td])
   (:import
    [java.sql Connection DriverManager]))
 
@@ -27,14 +28,21 @@
 
 (defn- seed-rows []
   (let [customer (first (g/customer-rows 42 1))]
-    {"customer"
+    {"warehouse" (g/warehouse-rows 42 2)
+     "district" (g/district-rows 42 2)
+     "item" (take 999 (g/item-rows 42))
+     "stock" (for [w [1 2] item [1 101 303 404 505 777 888 999]]
+               (assoc (first (g/stock-rows 42 1)) 0 item 1 w))
+     "customer"
      (for [[w district cid first-name balance]
            [[1 1 3 "CY" 3.0] [1 1 7 "BEA" -123.45] [1 1 9 "ADA" 98.76]
             [2 1 7 "OTHER-W" 777.0] [1 2 7 "OTHER-D" 888.0]]]
        (assoc customer 0 cid 1 district 2 w 3 first-name 4 "OE"
               5 "SHARED" 16 balance))
      ;; Order 30 is newest by ID, even though order 20 has a later date.
-     "orders" [[20 1 1 7 "2026-02-01T01:02:03" 4 1 1]
+     "orders" [[30 1 2 7 "neighbor" nil 1 1]
+               [30 2 1 7 "neighbor" nil 1 1]
+               [20 1 1 7 "2026-02-01T01:02:03" 4 1 1]
                [30 1 1 7 "2026-01-01T01:02:03" nil 3 0]
                [40 1 1 9 "2026-03-01T01:02:03" 6 2 0]
                [900 1 2 7 "2026-04-01T01:02:03" 8 1 1]
@@ -91,10 +99,7 @@
 (deftest datalevin-order-status
   (let [conn (d/get-conn *test-dir* datalevin/schema)]
     (try
-      (d/transact! conn
-                   (vec (for [[table rows] (seed-rows) row rows]
-                          (into {} (remove (comp nil? val))
-                                (zipmap (c/attrs table) row)))))
+      (td/transact-rows! conn (seed-rows))
       (check-order-status! #(t/order-status! conn %))
       (finally (d/close conn)))))
 
@@ -141,8 +146,12 @@
             running (atom true)
             ready (promise)]
         (try
-          (d/transact! conn
-                       [{:db/id 1 :customer/w-id 1 :customer/d-id 1 :customer/id 1
+          (td/transact! conn
+                       [{:db/id 10 :warehouse/id 1}
+                        {:db/id 11 :district/id 1 :district/w-id 1}
+                        {:db/id 12 :item/id 1}
+                        {:db/id 13 :stock/w-id 1 :stock/i-id 1}
+                        {:db/id 1 :customer/w-id 1 :customer/d-id 1 :customer/id 1
                          :customer/first "A" :customer/middle "OE" :customer/last "B"
                          :customer/balance 0.0}
                         {:db/id 2 :orders/w-id 1 :orders/d-id 1 :orders/id 1

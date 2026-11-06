@@ -752,14 +752,24 @@
     (and (or (txprep/tempid? eid)
              (and (integer? eid) (not (neg? ^long eid))))
          (reduce-kv
-           (fn [_ a _]
+           (fn [_ a v]
              (if (identical? a :db/id)
                true
                (let [props (schema a)]
                  (if (and (keyword? a)
                           (not= "db" (namespace a))
                           (not (txcommon/reverse-ref? a))
-                          (regular-attr? props)
+                          (or (regular-attr? props)
+                              ;; Resolved reference values need no map expansion.
+                              ;; Keep scalar operation dispatch on its existing
+                              ;; path; unresolved/identity/tuple inputs still
+                              ;; require the general resolver.
+                              (and (identical? (:db/valueType props) :db.type/ref)
+                                   (integer? v) (not (neg? ^long v))
+                                   (not (identical? (:db/unique props) :db.unique/identity))
+                                   (not (contains? props :db/tupleAttrs))
+                                   (not (contains? props :db/tupleType))
+                                   (not (contains? props :db/tupleTypes))))
                           (not (identical? (:db/cardinality props)
                                            :db.cardinality/many))
                           (not (:db.attr/preds props)))

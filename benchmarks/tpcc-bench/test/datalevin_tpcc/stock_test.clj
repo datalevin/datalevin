@@ -10,7 +10,8 @@
    [datalevin-tpcc.generate :as g]
    [datalevin-tpcc.postgres :as postgres]
    [datalevin-tpcc.sqlite :as sqlite]
-   [datalevin-tpcc.txns :as t])
+   [datalevin-tpcc.txns :as t]
+   [datalevin-tpcc.test-data :as td])
   (:import
    [java.lang.reflect InvocationHandler InvocationTargetException Proxy]
    [java.sql Connection DriverManager]))
@@ -148,7 +149,8 @@
    :stocks (into {} (map (fn [[w i & values]] [[w i] (vec values)]))
                  (d/q '[:find ?w ?i ?q ?y ?o ?r
                         :where [?e :stock/key]
-                        [?e :stock/w-id ?w] [?e :stock/i-id ?i]
+                        [?e :stock/warehouse ?warehouse] [?warehouse :warehouse/id ?w]
+                        [?e :stock/item ?item] [?item :item/id ?i]
                         [?e :stock/quantity ?q] [?e :stock/ytd ?y]
                         [?e :stock/order-cnt ?o] [?e :stock/remote-cnt ?r]] db))})
 
@@ -160,13 +162,12 @@
       (let [conn (d/get-conn (str *test-dir* "/" (random-uuid))
                              datalevin/schema {:kv-opts kv-opts})]
         (try
-          (d/transact! conn
-                       (vec (for [[table rows] (seed-rows) row rows]
-                              (zipmap (c/attrs table) row))))
+          (td/transact-rows! conn (seed-rows))
           (let [eids (into {} (map (fn [[e w i]] [[w i] e]))
                            (d/q '[:find ?e ?w ?i
                                   :where [?e :stock/key]
-                                  [?e :stock/w-id ?w] [?e :stock/i-id ?i]]
+                                  [?e :stock/warehouse ?warehouse] [?warehouse :warehouse/id ?w]
+                        [?e :stock/item ?item] [?item :item/id ?i]]
                                 (d/db conn)))]
             (check-new-orders!
              {:reset-stock!
@@ -181,7 +182,8 @@
               #(into {} (map (fn [[w i & values]] [[w i] (vec values)]))
                      (d/q '[:find ?w ?i ?qty ?ytd ?ocnt ?rcnt
                             :where [?e :stock/key]
-                            [?e :stock/w-id ?w] [?e :stock/i-id ?i]
+                            [?e :stock/warehouse ?warehouse] [?warehouse :warehouse/id ?w]
+                        [?e :stock/item ?item] [?item :item/id ?i]
                             [?e :stock/quantity ?qty] [?e :stock/ytd ?ytd]
                             [?e :stock/order-cnt ?ocnt] [?e :stock/remote-cnt ?rcnt]]
                           (d/db conn)))
@@ -189,10 +191,11 @@
               (fn [o-id]
                 (vec (sort (d/q '[:find ?n ?i ?w ?qty :in $ ?o
                                   :where [?e :order-line/key]
-                                  [?e :order-line/o-id ?o]
+                                  [?e :order-line/order ?order] [?order :orders/id ?o]
                                   [?e :order-line/number ?n]
-                                  [?e :order-line/i-id ?i]
-                                  [?e :order-line/supply-w-id ?w]
+                                  [?e :order-line/stock ?stock] [?stock :stock/item ?item]
+                                  [?item :item/id ?i] [?stock :stock/warehouse ?warehouse]
+                                  [?warehouse :warehouse/id ?w]
                                   [?e :order-line/quantity ?qty]]
                                 (d/db conn) o-id))))
               :order-count #(t/order-count conn 1 1)}))
