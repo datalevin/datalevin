@@ -126,6 +126,28 @@
   (when (= :del-list op) (charge! charge/vector-wrapper))
   (.add rows (l/kv-tx op name key (if (= :del-list op) [value] value) :raw :raw flags)))
 
+(defn freeze-owned-eav-row
+  "Freeze an EAV-only datom emitted by storage, whose AVG bytes are already
+  detached and whose user value was validated before encoding. Return nil for
+  other shapes so they still pass through ordinary KV validation. Keep the
+  existing WAL representation, including serialized lists for deletion."
+  [^KVTxData tx scratch]
+  (when (and (= c/eav (.-dbi-name tx)) (= :id (.-kt tx))
+             (= :raw (.-vt tx)) (integer? (.-k tx)) (nil? (.-flags tx)))
+    (let [op (.-op tx)
+          value (.-v tx)
+          avg (case op
+                :put value
+                :del-list (when (and (vector? value) (= 1 (count value)))
+                            (nth value 0))
+                nil)]
+      (when (and (bytes? avg) (<= 1 (alength ^bytes avg) c/+max-key-size+))
+        (OwnedKVTxData. op c/eav
+                        (.array (.putLong (ByteBuffer/allocate 8) (long (.-k tx))))
+                        (if (= :put op) avg
+                            (encode (fn [_]) value :data false scratch))
+                        :id :raw nil)))))
+
 (defn prepare-rows
   "Freeze typed KV input for native application and WAL; existing stores allow
   internal DBIs and native flags, which are retained in the WAL for replay."

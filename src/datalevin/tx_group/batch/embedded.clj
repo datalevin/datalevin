@@ -21,7 +21,7 @@
             [datalevin.txlog :as wal]
             [datalevin.txlog.append :as append])
   (:import [datalevin.lmdb DatomKVTxData KVTxData]
-           [datalevin.utl RowRegions]
+           [datalevin.kv.encoding StorageRows]
            [org.eclipse.collections.impl.list.mutable FastList]
            [java.util.concurrent.atomic AtomicBoolean]
            [java.util ArrayList Arrays]))
@@ -69,10 +69,20 @@
   ([raw name txs kt vt] (prepare raw name txs kt vt false))
   ([raw name txs kt vt owned-datoms?] (prepare raw name txs kt vt owned-datoms? nil))
   ([raw name txs kt vt owned-datoms? scratch]
-  (let [log-rows (ArrayList.) datom? (l/datom-kv-txs? txs)
+  (let [storage? (instance? StorageRows txs)
+        txs (if storage? (.-rows ^StorageRows txs) txs)
+        owned-datoms? (or owned-datoms? storage?)
+        log-rows (ArrayList.)
+        datom? (l/datom-kv-txs? txs)
         datom-bytes (when datom? (long-array 1))
-        rows (if datom?
-               (let [datoms (FastList.) other (FastList.)]
+        rows (if (or owned-datoms? datom?)
+               (let [rows (FastList. (count txs)) other (FastList.)
+                     flush-other! (fn []
+                                    (when-not (.isEmpty other)
+                                      (.addAll rows ^FastList
+                                               (public/prepare-rows raw (fn [_]) name other
+                                                                    kt vt false true log-rows scratch))
+                                      (.clear other)))]
                  (doseq [tx txs]
                    (if (instance? DatomKVTxData tx)
                      (let [^DatomKVTxData tx tx
@@ -83,16 +93,18 @@
                                       (l/->DatomKVTxData
                                         (.-e tx) (Arrays/copyOf avg (alength avg))
                                         (.-added? tx) (.-no-overwrite? tx)))]
-                       (.add datoms frozen)
+                       (flush-other!)
+                       (.add rows frozen)
                        (aset datom-bytes 0 (+ (aget datom-bytes 0) 8 (alength avg)))
                        (.add log-rows frozen))
-                     (.add other tx)))
-                 ;; Storage emits fused datoms before giant/schema/job rows.
-                 (let [rows (RowRegions.)]
-                   (.append rows datoms)
-                   (.append rows (public/prepare-rows raw (fn [_]) name other
-                                                     kt vt false true log-rows scratch))
-                   rows))
+                     (if-let [frozen (when (and storage? (instance? KVTxData tx))
+                                       (public/freeze-owned-eav-row tx scratch))]
+                       (do (flush-other!)
+                           (.add rows tx)
+                           (.add log-rows frozen))
+                       (.add other tx))))
+                 (flush-other!)
+                 rows)
                (public/prepare-rows raw (fn [_]) name txs
                                     kt vt false true log-rows scratch))]
     ;; Only a substantial unconditional datom region can repay the worker

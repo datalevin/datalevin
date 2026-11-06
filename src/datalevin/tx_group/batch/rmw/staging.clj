@@ -3,6 +3,7 @@
 (ns ^:no-doc datalevin.tx-group.batch.rmw.staging
   "Storage drains and native tails, owned by one writer's preparation."
   (:require [datalevin.lmdb :as l]
+            [datalevin.kv.encoding :as encoding]
             [datalevin.tx-group.batch :as batch]
             [datalevin.tx-group.batch.rmw.application :as application]
             [datalevin.tx-group.phase :as phase]
@@ -68,7 +69,8 @@
             ;; expires. Validate its native writer, without borrowing
             ;; the expired request's writer or re-entering its capture.
             (l/write-txn wdb)
-            (let [prepared ((:prepare-rows! opts) raw descriptor nil txs
+            (let [prepared ((:prepare-rows! opts) raw descriptor nil
+                                                  (encoding/storage-rows txs)
                                                   :data :data)]
               (capture-prepared! view apply-rows! rows wal-rows
                                  (assoc @capture-options :capture-context context)

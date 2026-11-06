@@ -31,6 +31,8 @@
 (deftype ^:private TxStep [report entities])
 (deftype ^:private TxRetry [report])
 
+(deftype ^:private ResolvedTuple [^long e a value before])
+
 (defn- cached-ea-first-datom
   [db ^long e a]
   (if txcommon/*batch-prepare*
@@ -215,6 +217,23 @@
       (transact-report report datom)
       (update report ::tx-redundant conjv datom))))
 
+(defn- apply-add
+  "Apply a normalized value against its known previous value. Ordinary input,
+  CAS and derived tuples share datom publication and constraint maintenance."
+  [report ^Datom new-datom old-value]
+  (cond
+    (nil? old-value)
+    (transact-report report new-datom)
+
+    (= old-value (.-v new-datom))
+    (transact-same-value report new-datom)
+
+    :else
+    (-> report
+        (transact-report (datom (.-e new-datom) (.-a new-datom) old-value
+                               (d/datom-tx new-datom) false))
+        (transact-report new-datom))))
+
 (defn- pending-attr-state
   [report e a]
   (let [^List datoms (:tx-data report)]
@@ -231,7 +250,8 @@
   (let [pending (pending-attr-state report e a)]
     (cond
       (identical? pending ::missing-attr-state)
-      (txcommon/ea-first-v db e a)
+      (when (<= (long e) ^long (::max-eid-before report))
+        (txcommon/ea-first-v db e a))
 
       (identical? pending ::retracted-attr-state)
       nil
@@ -267,6 +287,30 @@
 
     nil))
 
+(defn- transact-resolved-add
+  "Publish a normalized datom. IDs, value, transaction and metadata are already
+  carried by the datom; old-value reads do not repeat input resolution."
+  [report ^Datom new-datom props]
+  (let [e (.-e new-datom)
+        a (.-a new-datom)
+        value (.-v new-datom)
+        db (:db-after report)
+        store (:store db)
+        report (if (or props (contains? (::new-attributes report) a))
+                 report
+                 (update report ::new-attributes u/conjv a))
+        ^Datom old-datom
+        (if (identical? (:db/cardinality props) :db.cardinality/many)
+          (or (cached-eav-first-datom db e a value)
+              (when (<= (long e) ^long (::max-eid-before report))
+                (first (txcommon/visible-stored db (fetch store (datom e a value))))))
+          (or (cached-ea-first-datom db e a)
+              ;; Capture the store boundary before allocation, including writes
+              ;; made by other connections since db-before was obtained.
+              (when (<= (long e) ^long (::max-eid-before report))
+                (txcommon/ea-first-datom db e a))))]
+    (apply-add report new-datom (when old-datom (.-v old-datom)))))
+
 (defn- transact-add
   ([report [_ _ a _ _ :as ent]]
    (let [store (:store (:db-after report))
@@ -275,48 +319,20 @@
   ([report [_ e a v tx :as ent] props store-opts]
    (vld/validate-attr a ent)
    (vld/validate-val v ent)
-   (let [tx        (or tx (current-tx report))
-         db        (:db-after report)
-         store     (:store db)
-         report    (if (or (contains? (::new-attributes report) a) props)
-                     report
-                     (update report ::new-attributes u/conjv a))
-         e         (long (txcommon/entid-strict db e))
-         _         (validate-installed-callable-write report db e a v ent)
-         ref?      (identical? (:db/valueType props) :db.type/ref)
-         v         (if ref? (txcommon/entid-strict db v) v)
-         v'        (coreprep/correct-value-with-props
-                     store-opts props a v)
-         _         (when (:db.attr/preds props)
-                     (txcommon/flush-batch-prepare!)
-                     (vld/validate-attr-preds
-                       e a v' props #(txprep/resolve-attr-pred-udf db %)))
-         meta*     (meta ent)
-         new-datom (cond-> (datom e a v' tx)
-                     meta* (with-meta meta*))
-         multival? (identical? (:db/cardinality props)
-                               :db.cardinality/many)
-         ^Datom old-datom
-         (if multival?
-           (or (cached-eav-first-datom db e a v')
-               (when (<= e ^long (::max-eid-before report))
-                 (first (txcommon/visible-stored db (fetch store (datom e a v'))))))
-           (or (cached-ea-first-datom db e a)
-               ;; Use the store boundary captured before allocation: another
-               ;; connection may have advanced past db-before's cached max-eid.
-               (when (<= e ^long (::max-eid-before report))
-                 (txcommon/ea-first-datom db e a))))]
-     (cond
-       (nil? old-datom)
-       (transact-report report new-datom)
-
-       (= (.-v old-datom) v')
-       (transact-same-value report new-datom)
-
-       :else
-       (let [report' (transact-report report
-                                      (datom e a (.-v old-datom) tx false))]
-         (transact-report report' new-datom))))))
+   (let [db (:db-after report)
+         e (long (txcommon/entid-strict db e))
+         _ (validate-installed-callable-write report db e a v ent)
+         v (if (identical? (:db/valueType props) :db.type/ref)
+             (txcommon/entid-strict db v) v)
+         value (coreprep/correct-value-with-props store-opts props a v)]
+     (when (:db.attr/preds props)
+       (txcommon/flush-batch-prepare!)
+       (vld/validate-attr-preds
+         e a value props #(txprep/resolve-attr-pred-udf db %)))
+     (let [meta* (meta ent)
+           new-datom (cond-> (datom e a value (or tx (current-tx report)))
+                       meta* (with-meta meta*))]
+       (transact-resolved-add report new-datom props)))))
 
 (defn- transact-retract-datom [report ^Datom d]
   (let [tx (current-tx report)]
@@ -336,17 +352,7 @@
         meta*     (meta entity)
         new-datom (cond-> (datom e a nv' tx)
                     meta* (with-meta meta*))]
-    (cond
-      (nil? old-datom)
-      (transact-report report new-datom)
-
-      (= (.-v old-datom) nv')
-      (transact-same-value report new-datom)
-
-      :else
-      (let [report' (transact-report report
-                                     (datom e a (.-v old-datom) tx false))]
-        (transact-report report' new-datom)))))
+    (apply-add report new-datom (when old-datom (.-v old-datom)))))
 
 (defn- retract-components
   ([db datoms]
@@ -418,24 +424,48 @@
           (when-let [restore! (:restore! context)] (restore!))))
       (TxRetry. report'))))
 
-(defn- flush-tuples [report]
-  (let [db (:db-after report)]
-    (reduce-kv
-      (fn [entities eid tuples+values]
-        (persistent!
+(defn- flush-tuples
+  [report schema]
+  (let [db (:db-after report)
+        queued (::queued-tuples report)
+        ;; Identity tuples can restart resolution; predicates can execute user
+        ;; code. Preserve ordered general dispatch for that whole flush.
+        resolved? (every? (fn [[_ tuples]]
+                            (every? (fn [a]
+                                      (let [props (schema a)]
+                                        (and (not= :db.unique/identity (:db/unique props))
+                                             (not (:db.attr/preds props)))))
+                                    (keys tuples)))
+                          queued)]
+    (persistent!
+      (reduce-kv
+        (fn [entities eid tuples+values]
           (reduce-kv
             (fn [entities tuple value]
-              (let [value   (if (every? nil? value) nil value)
+              (let [value (when-not (every? nil? value) value)
                     current (or (:v (cached-ea-first-datom db eid tuple))
-                                (txcommon/ea-first-v db eid tuple))]
-                (cond
-                  (= value current) entities
-                  (nil? value)
-                  (conj! entities ^::internal [:db/retract eid tuple current])
-                  :else
-                  (conj! entities ^::internal [:db/add eid tuple value]))))
-            (transient entities) tuples+values)))
-      [] (::queued-tuples report))))
+                                (when (<= (long eid) ^long (::max-eid-before report))
+                                  (txcommon/ea-first-v db eid tuple)))]
+                (if (= value current)
+                  entities
+                  (conj! entities
+                    (if resolved?
+                      (ResolvedTuple. eid tuple value current)
+                      (if (nil? value)
+                        ^::internal [:db/retract eid tuple current]
+                        ^::internal [:db/add eid tuple value]))))))
+            entities tuples+values))
+        (transient []) queued))))
+
+(defn- transact-resolved-tuple
+  [report schema store-opts ^ResolvedTuple change]
+  (let [e (.-e change) a (.-a change) value (.-value change)
+        tx (current-tx report)]
+    (if (nil? value)
+      (transact-report report (datom e a (.-before change) tx false))
+      (let [value (coreprep/correct-value-with-props store-opts (schema a) a value)
+            new-datom (with-meta (datom e a value tx) {::internal true})]
+        (apply-add report new-datom (.-before change))))))
 
 (defn- finalize-report
   [report]
@@ -459,10 +489,10 @@
       (seq new-attrs) (assoc :new-attributes new-attrs))))
 
 (defn- handle-flush-tuples
-  [report entities]
+  [report schema entities]
   (if (contains? report ::queued-tuples)
     [(dissoc report ::queued-tuples)
-     (concat (flush-tuples report) entities)]
+     (concat (flush-tuples report schema) entities)]
     [report entities]))
 
 (defn- handle-cas
@@ -795,7 +825,15 @@
         (fn [report a v]
           (if (identical? a :db/id)
             report
-            (transact-add report [:db/add eid a v] (schema a) store-opts)))
+            (let [props (schema a)]
+              ;; The map gate checked attribute syntax and resolved references.
+              ;; Materialize an operation only for a value error's context.
+              (when (nil? v) (vld/validate-val v [:db/add eid a v]))
+              (transact-resolved-add
+                report
+                (datom eid a (coreprep/correct-value-with-props store-opts props a v)
+                       (current-tx report))
+                props))))
         report entity))))
 
 (defn- handle-sequential-entity
@@ -934,11 +972,14 @@
         :let [[entity & entities] es]
 
         (identical? ::flush-tuples entity)
-        (let [[r' es'] (handle-flush-tuples report entities)]
+        (let [[r' es'] (handle-flush-tuples report schema entities)]
           (recur r' es'))
 
         :let [db      (:db-after report)
               tempids (:tempids report)]
+
+        (instance? ResolvedTuple entity)
+        (recur (transact-resolved-tuple report schema store-opts entity) entities)
 
         (map? entity)
         (if (regular-map? schema entity)

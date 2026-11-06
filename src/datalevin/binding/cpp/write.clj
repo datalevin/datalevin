@@ -88,7 +88,7 @@
   (if (l/datom-kv-txs? rows)
     ;; Keep the existing fused datom/index passes after freezing. Expanding
     ;; those rows into generic physical puts loses the native write fast path.
-    (transact-datom-list* rows dbis txn)
+    (transact-datom-list* rows dbis txn false)
   (when rows
     (dotimes [index (.size rows)]
       (let [^KVTxData tx (.get rows index)
@@ -554,18 +554,20 @@
                 (put-ave-datom-tx ave txn tx)))))))))
 
 (defn- transact-datom-list*
-  [^java.util.List txs ^HashMap dbis txn]
+  ([txs dbis txn] (transact-datom-list* txs dbis txn true))
+  ([^java.util.List txs ^HashMap dbis txn validate?]
   (let [add-only? (add-only-datom-batch? txs)]
     (if (or c/*ordered-datom-writes?* add-only?)
       (let [[^objects datoms n] (datom-txs txs)]
         (transact-datom-index-passes* datoms n dbis txn add-only?)
         ;; Metadata and other KV rows retain input order after the datom passes.
         (let [put-metadata! (fn [tx]
-                              (let [^KVTxData tx (l/->kv-tx-data tx)
+                              (let [^KVTxData tx (if validate? (l/->kv-tx-data tx) tx)
                                     dbi-name (.-dbi-name tx)
                                     ^DBI dbi (or (.get dbis dbi-name)
                                                  (raise dbi-name " is not open" {}))]
-                                (vld/validate-kv-tx-data tx (.-validate-data? dbi))
+                                (when validate?
+                                  (vld/validate-kv-tx-data tx (.-validate-data? dbi)))
                                 (put-tx dbi txn tx)))]
           (if (instance? RowRegions txs)
             (doseq [tx txs]
@@ -588,14 +590,14 @@
                                     (raise c/eav " is not open" {}))]
                   (put-datom-tx ave* eav* txn t)
                   (recur (unchecked-inc i) ave* eav*))
-                (let [^KVTxData tx (l/->kv-tx-data t)
+                (let [^KVTxData tx (if validate? (l/->kv-tx-data t) t)
                       dbi-name (.-dbi-name tx)
                       ^DBI dbi (or (.get dbis dbi-name)
-                                   (raise dbi-name " is not open" {}))
-                      validate? (.-validate-data? dbi)]
-                  (vld/validate-kv-tx-data tx validate?)
+                                   (raise dbi-name " is not open" {}))]
+                  (when validate?
+                    (vld/validate-kv-tx-data tx (.-validate-data? dbi)))
                   (put-tx dbi txn tx)
-                  (recur (unchecked-inc i) ave eav))))))))))
+                  (recur (unchecked-inc i) ave eav)))))))))))
 
 (defn ^:redef transact*
   [txs ^HashMap dbis txn]

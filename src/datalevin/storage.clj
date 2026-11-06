@@ -34,6 +34,7 @@
             open-list-dbi open-dbi attrs add-doc opts swap-attr add-vec
             remove-vec close-vecs vec-closed? schema closed? a-size db-name]]
    [datalevin.kv :as kv]
+   [datalevin.kv.encoding :as encoding]
    [datalevin.lmdb :as lmdb :refer [IWriting]]
    [datalevin.pipe :as p]
    [datalevin.prepare :as prep]
@@ -2733,7 +2734,7 @@
     ;; freezes the storage rows without repeating public KV routing.
     (if-let [capture (when *write-group*
                       (lmdb/row-capture (kv/raw-lmdb lmdb)))]
-      (capture nil txs :data :data)
+      (capture nil (encoding/storage-rows txs) :data :data)
       (transact-kv lmdb txs))
     (idoc/apply-state-actions! idoc-state-actions)))
 

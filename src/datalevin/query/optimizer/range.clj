@@ -609,7 +609,7 @@
       (if (seq ranges) (combine-ranges ranges) :empty-range))))
 
 (defn- ascii-prefix-domain?
-  [length values]
+  [^long length values]
   (and (pos? length)
          (every? (fn [^String value]
                    (and (<= (.length value) length)
