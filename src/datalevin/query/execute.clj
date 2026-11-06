@@ -48,6 +48,7 @@
             #_{:clj-kondo/ignore [:unused-referred-var]}
             tuple->persistent-vector]]
    [datalevin.query.execute.rewrite :as rewrite]
+   [datalevin.query.optimizer.aggregate :as aggregate-plan]
    [datalevin.query.optimizer.or-branches :as or-branches]
    [datalevin.query.optimizer.existence :as existence]
    [datalevin.query.plan :as qplan]
@@ -993,13 +994,23 @@
          find-width    (count find-vars)
          all-vars      (concatv find-vars (map :symbol with))
          aggregate?    (some #(or (dp/aggregate? %) (dp/find-expr? %)) find-elements)
+         count-plan    (when (and aggregate? (nil? options))
+                         (aggregate-plan/distinct-count-plan parsed-q))
          pull?         (some dp/pull? find-elements)
          return-map    (:qreturn-map parsed-q)
          order         (when (:qorder parsed-q)
                          (result/prepare-order find-vars (:qorder parsed-q)
                            (assoc options :return-map return-map)))]
      (fn [parsed-q context]
-       (let [context (if options (assoc context ::result-policy options) context)
+       (let [simplified (when (and (seq count-plan)
+                                   (nil? (::result-policy context)))
+                          (aggregate-plan/simplify-distinct-counts
+                            find-elements count-plan (:sources context)))
+             aggregate-elements (or (:elements simplified) find-elements)
+             _ (when (and qplan/*explain* simplified)
+                 (vswap! qplan/*explain* assoc :aggregate-count-rewrites
+                         (:rewrites simplified)))
+             context (if options (assoc context ::result-policy options) context)
              fused-result (:fused-aggregation context)
              reduced (or (when fused-result
                            (cond-> fused-result
@@ -1009,7 +1020,7 @@
                                     (nil? (::result-policy context))
                                     (nil? (:result-set context))
                                     (= 1 (count (:rels context))))
-                           (qagg/aggregate-relation find-elements context
+                           (qagg/aggregate-relation aggregate-elements context
                                                     (first (:rels context)) all-vars
                                                     keep-group?)))
              context (if reduced
@@ -1024,7 +1035,7 @@
                (and with (nil? reduced)) (mapv #(subvec % 0 find-width))
 
                (and aggregate? (nil? reduced))
-               (aggregate-results find-elements context)
+               (aggregate-results aggregate-elements context)
 
                (and keep-group? (nil? reduced))
                (filter keep-group?)

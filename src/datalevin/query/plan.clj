@@ -1560,14 +1560,15 @@
                  (= entity (first (:cols init)))
                  (some? entity-idx)
                  (single? (:attr init))
-                 (<= (count (:range init)) 1)
                  (every? (fn [step]
                            (and (instance? MergeScanStep step)
                                 (= entity-idx (:index step))
                                 (= entity-idx
                                    (get (cols->attrs (:cols step)) entity))
                                 (every? #(single? (first %)) (:attrs-v step))))
-                         (next steps)))
+                         (next steps))
+                 (qor/disjoint-scan-ranges?
+                   (get-in schema [(:attr init) :db/valueType]) (:range init)))
         [entity]))))
 
 (defn execute-steps

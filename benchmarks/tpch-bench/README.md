@@ -108,8 +108,8 @@ The command exits nonzero on failure. Use `:dump? true` to print mismatches or
 ## Results
 
 Scale factor 1 (6,001,215 lineitems), measured on a 12-core Apple M3 Pro with
-36 GiB RAM and macOS 26.6.2. Datalevin was measured on 2026-11-05, SQLite on
-2026-11-04, and PostgreSQL on 2026-11-03. Versions: Datalevin 1.2.10
+36 GiB RAM and macOS 26.6.2. All three engines were measured on 2026-11-05.
+Versions: Datalevin 1.2.10
 development checkout on Clojure 1.12.6 and Java 21.0.13.0.3 (8 GiB heap),
 SQLite 3.51.1, and PostgreSQL 18.6.
 PostgreSQL used 128 MiB shared buffers, 4 MiB work memory, and up to two parallel
@@ -118,9 +118,9 @@ checks use up to four participants, including the calling thread; existing join
 execution uses its normal worker budget.
 
 Times below are from the second complete pass, with warmup and measurement in
-separate JVMs. Datalevin and SQLite were rebuilt from the same generated SF1
-files before verification and warmup. PostgreSQL was restarted before its
-warmup and kept running between passes; the OS filesystem cache was not purged.
+separate JVMs. The existing SF1 databases were reused, with matching row counts
+for all eight tables. PostgreSQL stayed running before and between its passes;
+neither its shared buffers nor the OS filesystem cache was reset for this run.
 
 Units are milliseconds; lower is better. PostgreSQL times include planning and
 execution; Datalevin and SQLite also include consuming results. All 22
@@ -128,35 +128,30 @@ Datalevin queries passed the SQLite correctness check.
 
 | Query | Datalevin (ms) | SQLite (ms) | PostgreSQL (ms) |
 |---|---:|---:|---:|
-| Q1 | 1,052.5 | 3,753.3 | 918.1 |
-| Q2 | 131.2 | 144.5 | 179.0 |
-| Q3 | 566.8 | 542.9 | 207.8 |
-| Q4 | 190.7 | 134.1 | 110.9 |
-| Q5 | 370.5 | 327.0 | 338.0 |
-| Q6 | 398.6 | 337.9 | 129.7 |
-| Q7 | 312.6 | 4,016.8 | 372.7 |
-| Q8 | 70.1 | 125.7 | 146.3 |
-| Q9 | 1,052.8 | 1,490.1 | 1,168.7 |
-| Q10 | 271.8 | 1,019.7 | 193.6 |
-| Q11 | 74.1 | 35.5 | 76.0 |
-| Q12 | 378.2 | 876.5 | 236.6 |
-| Q13 | 776.6 | 1,063.9 | 322.5 |
-| Q14 | 127.5 | 4,767.9 | 133.3 |
-| Q15 | 138.5 | 347.1 | 145.0 |
-| Q16 | 258.4 | 105.1 | 110.0 |
-| Q17 | 40.3 | 51.0 | 485.4 |
-| Q18 | 552.7 | 554.7 | 1,499.3 |
-| Q19 | 59.1 | 29.0 | 28.8 |
-| Q20 | 49.6 | 69.3 | 166.9 |
-| Q21 | 570.5 | 1,447.6 | 269.8 |
-| Q22 | 105.0 | 38.9 | 34.7 |
-| **Total** | **7,548.1** | **21,278.4** | **7,273.2** |
+| Q1 | 1,115.9 | 3,790.7 | 902.5 |
+| Q2 | 130.7 | 141.0 | 175.1 |
+| Q3 | 451.9 | 542.6 | 204.2 |
+| Q4 | 158.3 | 135.3 | 106.9 |
+| Q5 | 354.4 | 339.7 | 325.5 |
+| Q6 | 369.6 | 338.2 | 131.2 |
+| Q7 | 271.4 | 3,991.3 | 366.8 |
+| Q8 | 91.6 | 125.2 | 142.1 |
+| Q9 | 1,136.8 | 1,465.5 | 1,070.6 |
+| Q10 | 269.0 | 1,006.5 | 188.0 |
+| Q11 | 74.2 | 36.7 | 75.3 |
+| Q12 | 412.5 | 857.2 | 236.0 |
+| Q13 | 718.8 | 1,022.9 | 299.1 |
+| Q14 | 144.4 | 4,558.2 | 128.9 |
+| Q15 | 151.0 | 344.5 | 176.2 |
+| Q16 | 156.1 | 105.5 | 107.7 |
+| Q17 | 48.4 | 51.0 | 482.2 |
+| Q18 | 571.8 | 548.7 | 1,504.3 |
+| Q19 | 54.5 | 28.7 | 28.1 |
+| Q20 | 46.4 | 70.2 | 169.0 |
+| Q21 | 516.1 | 1,450.9 | 268.4 |
+| Q22 | 82.3 | 38.0 | 35.0 |
+| **Total** | **7,326.1** | **20,988.5** | **7,123.2** |
 
-
-[Ordered aggregation validation and comparison runs](../../doc/measurements/tpch-q18-2026-11-05/README.md)
-include complete-pass measurements, memory diagnostics, and correctness results.
-[Parallel execution methodology](../../doc/measurements/tpch-parallel-2026-11-05/README.md)
-describes scan and witness partitioning.
 
 ## Tests
 

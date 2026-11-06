@@ -12,12 +12,14 @@
   (:require
    [clojure.set :as set]
    [clojure.walk :as w]
+   [datalevin.bits :as b]
    [datalevin.constants :as c]
    [datalevin.query.predicate :as qpred]
    [datalevin.query-util :as qu]
    [datalevin.util :as u])
   (:import
    [java.nio.charset StandardCharsets]
+   [java.util Arrays]
    [datalevin.utl LikeFSM QueryKey]
    [datalevin.parser Predicate SrcVar]))
 
@@ -173,6 +175,52 @@
   ;; Giant keys truncate their value and append an allocated ID, so they
   ;; cannot serve as exact logical range endpoints.
   (< (alength (.getBytes s StandardCharsets/UTF_8)) c/+val-bytes-wo-hdr+))
+
+(defn disjoint-scan-ranges?
+  "Prove that native scans cannot visit a value twice. Compare encoded index
+  keys, including sentinels and endpoint inclusion. Unknown encodings and giant
+  bounds retain deduplication; a single scan needs no endpoint comparison."
+  [value-type ranges]
+  (if (<= (count ranges) 1)
+    true
+    (let [native-type (case value-type
+                        (:string :db.type/string) :db.type/string
+                        (:long :db.type/long) :db.type/long
+                        (:ref :db.type/ref) :db.type/ref
+                        nil)
+          valid? (fn [value]
+                   (or (#{c/v0 c/vmax} value)
+                       (if (= native-type :db.type/string)
+                         (and (string? value)
+                              (.canEncode (.newEncoder StandardCharsets/UTF_8)
+                                          ^String value)
+                              (inline-string-bound? value))
+                         (int? value))))
+          cmp (fn [^bytes a ^bytes b] (Arrays/compareUnsigned a b))]
+      (boolean
+        (when (and native-type
+                   (every? (fn [[[cl lo] [ch hi]]]
+                             (and (#{:open :closed} cl) (#{:open :closed} ch)
+                                  (valid? lo) (valid? hi))) ranges))
+          (let [encoded (mapv (fn [interval]
+                               (mapv (fn [[edge value]]
+                                       [edge (b/indexable-bytes
+                                               (b/indexable nil 0 value
+                                                            native-type c/gmax))])
+                                     interval)) ranges)]
+            (and (every? (fn [[[cl lo] [ch hi]]]
+                           (let [order (long (cmp lo hi))]
+                             (or (neg? order)
+                                 (and (zero? order) (= cl ch :closed)))))
+                         encoded)
+                 (every? (fn [[[_ [ch hi]] [[cl lo] _]]]
+                           (let [order (long (cmp hi lo))]
+                             (or (neg? order)
+                                 (and (zero? order)
+                                      (not= [ch cl] [:closed :closed])))))
+                         (partition 2 1 (sort #(cmp (second (first %1))
+                                                   (second (first %2)))
+                                              encoded))))))))))
 
 (defn- literal-prefix-range
   [^String prefix]
@@ -363,6 +411,44 @@
                   (or (split-and-clauses arg) [arg]))
                 args)))))
 
+(defn- equality-union-values
+  [form v]
+  (when (seq? form)
+    (let [[op & args] form]
+      (case op
+        = (when (= 2 (count args))
+            (let [[left right] args
+                  value (cond (= left v) right (= right v) left)]
+              (when (and (some? value) (not (qu/free-var? value))
+                         (not (coll? value)) (not (source-form? value)))
+                [value])))
+        or (when (seq args)
+             (let [values (mapv #(equality-union-values % v) args)]
+               (when (every? some? values) (into [] cat values))))
+        nil))))
+
+(defn- exact-equality-value?
+  [value-type value]
+  (case value-type
+    (:db.type/long :db.type/ref) (int? value)
+    :db.type/string (and (string? value) (inline-string-bound? value))
+    :db.type/keyword (and (keyword? value) (inline-string-bound? (str value)))
+    :db.type/boolean (boolean? value)
+    :db.type/uuid (uuid? value)
+    :db.type/instant (= java.util.Date (class value))
+    false))
+
+(defn- equality-union-range
+  "Use point ranges only for a complete equality union in an exact native
+  domain. Unknown branches, decimal scale, signed zero and serialized values
+  keep the original predicate; no inferred bound may discard their matches."
+  [helpers source m pred v]
+  (when-let [attr-value-type (:attr-value-type helpers)]
+    (when-let [values (equality-union-values pred v)]
+      (let [value-type (attr-value-type source (:attr m))]
+        (when (every? #(exact-equality-value? value-type %) values)
+          (in-convert-range m [v values] false))))))
+
 (defn- add-pred-clause-to-source
   [helpers source nodes clause v]
   (let [pred        (first clause)
@@ -371,8 +457,10 @@
         apply-pred  (fn [m pred]
                       (let [[f & args] pred]
                         (if (some list? pred)
-                          (update m :pred add-pred
-                                  (nested-pred helpers f args v))
+                          (or (when (= f 'or)
+                                (equality-union-range helpers source m pred v))
+                              (update m :pred add-pred
+                                      (nested-pred helpers f args v)))
                           (case f
                             (< <= > >=)
                             (if (inexact-inequality-range-attr?
@@ -474,27 +562,33 @@
 (defn- string-domain
   "A necessary finite string domain. Every disjunct must constrain the output;
   a conjunct can supply a restriction while other conjuncts remain residual."
-  [form var]
-  (let [bounded #(when (and (some? %) (<= (count %) max-prefix-alternatives)) %)]
-    (when (list? form)
-      (let [[op & args] form]
-        (case op
-          = (when (= 2 (count args))
-              (let [[a b] args]
-                (cond
-                  (and (= a var) (string? b)) #{b}
-                  (and (= b var) (string? a)) #{a})))
-          in (when (and (= 2 (count args)) (= var (first args))
-                        (coll? (second args)) (not (map? (second args)))
-                        (<= (count (second args)) max-prefix-alternatives)
-                        (every? string? (second args)))
-               (set (second args)))
-          and (when-let [domains (seq (keep #(string-domain % var) args))]
-                (reduce set/intersection domains))
-          or (let [domains (mapv #(string-domain % var) args)]
-               (when (and (seq domains) (every? some? domains))
-                 (bounded (reduce set/union domains))))
-          nil)))))
+  ([form var] (string-domain form var false))
+  ([form var complete?]
+   (let [bounded #(when (and (some? %) (<= (count %) max-prefix-alternatives)) %)]
+     (when (list? form)
+       (let [[op & args] form]
+         (case op
+           = (when (= 2 (count args))
+               (let [[a b] args]
+                 (cond
+                   (and (= a var) (string? b)) #{b}
+                   (and (= b var) (string? a)) #{a})))
+           in (when (and (= 2 (count args)) (= var (first args))
+                         (coll? (second args)) (not (map? (second args)))
+                         (or (not complete?)
+                             (vector? (second args)) (set? (second args)))
+                         (<= (count (second args)) max-prefix-alternatives)
+                         (every? string? (second args)))
+                (set (second args)))
+           and (let [domains (mapv #(string-domain % var complete?) args)]
+                 (when (and (seq domains)
+                            (or (not complete?) (every? some? domains)))
+                   (when-let [known (seq (keep identity domains))]
+                     (reduce set/intersection known))))
+           or (let [domains (mapv #(string-domain % var complete?) args)]
+                (when (and (seq domains) (every? some? domains))
+                  (bounded (reduce set/union domains))))
+           nil))))))
 
 (defn- prefix-output-ranges
   [^long length values]
@@ -514,10 +608,103 @@
                   (recur (next values) (conj ranges range)))))
       (if (seq ranges) (combine-ranges ranges) :empty-range))))
 
+(defn- ascii-prefix-domain?
+  [length values]
+  (and (pos? length)
+         (every? (fn [^String value]
+                   (and (<= (.length value) length)
+                        (inline-string-bound? value)
+                        (every? #(<= 32 (int %) 126) value)))
+                 values)))
+
+(defn- exact-prefix-predicate?
+  [form output length]
+  (when-let [values (string-domain form output true)]
+    (ascii-prefix-domain? length values)))
+
+(defn- guarded-prefix-ranges
+  [^long length values]
+  (if (seq values)
+    (combine-ranges
+      (mapv (fn [^String value]
+              (if (< (.length value) length)
+                [[:closed value] [:closed value]]
+                ;; Native string keys have trailing flags. NUL suffixes can
+                ;; sort before the bare prefix, including the upper prefix.
+                ;; Widen the lower bound; a native predicate or retained
+                ;; residual handles both edges. Bounds remain necessary when a
+                ;; lookup reconstructs logical inequality predicates.
+                (let [last-index (dec (.length value))
+                      lower (str (.substring value 0 last-index)
+                                 (char (dec (int (.charAt value last-index)))))]
+                  [[:open lower] [:open (prefix-successor value)]])))
+            values))
+    :empty-range))
+
+(defn- prefix-domain-predicate
+  [^long length values]
+  (let [prefixes (vec (sort values))
+        n (count prefixes)]
+    (qpred/shareable-predicate
+      (fn [^String value]
+        (loop [i 0]
+          (if (< i n)
+            (let [^String prefix (nth prefixes i)]
+              (if (if (= (.length prefix) length)
+                    (.startsWith value prefix)
+                    (.equals value prefix))
+                true
+                (recur (inc i))))
+            false))))))
+
+(defn- remove-proven-prefix-work
+  [{:keys [parsed-q late-clauses] :as context} producer predicates]
+  (let [{:keys [output length]} (total-prefix-expression producer)
+        proven (into #{}
+                     (comp (filter #(exact-prefix-predicate? % output length))
+                           (map vector)) predicates)
+        remaining (into [] (remove proven) late-clauses)
+        ;; Ignore the predicates just proved, while retaining all other uses,
+        ;; including scoped clauses, find/with, inputs and function bindings.
+        used? (or (contains? (qu/collect-vars
+                              [(dissoc parsed-q :qwhere :qorig-where)
+                               (:rels context)]) output)
+                  (some #(contains? (qu/collect-vars %) output)
+                        (remove (conj proven producer)
+                                (:qorig-where parsed-q))))]
+    (if (empty? proven)
+      context
+      (cond-> (assoc context :late-clauses remaining)
+        (not used?) (update :late-clauses #(into [] (remove #{producer}) %))
+        used? (update :range-proven-prefixes (fnil conj #{}) producer)))))
+
+(defn defer-prefix-projections
+  "Compute a proven total string projection after adjacent absence filters
+  that do not mention its output. Keep scoped negation dependencies intact,
+  and never move a binding that also filters an already-bound output."
+  [clauses proven initial-bound]
+  (loop [todo (seq clauses) bound initial-bound result []]
+    (if-let [clause (first todo)]
+      (let [{:keys [input output]} (when (contains? proven clause)
+                                    (total-prefix-expression clause))
+            [filters tail]
+            (when (and input (contains? bound input)
+                       (not (contains? bound output)))
+              (split-with #(and (seq? %) (#{'not 'not-join} (first %))
+                                (not (contains? (qu/collect-vars %) output)))
+                          (next todo)))]
+        (if (seq filters)
+          (recur tail (conj bound output)
+                 (conj (into result filters) clause))
+          (recur (next todo) (into bound (qu/collect-vars clause))
+                 (conj result clause))))
+      result)))
+
 (defn- pushdown-prefix-expressions
   [{:keys [parsed-q] :as context} helpers]
   (let [forms (:qorig-where parsed-q)
-        producers (keep total-prefix-expression forms)]
+        producers (keep #(when-let [expression (total-prefix-expression %)]
+                           (assoc expression :form %)) forms)]
     (if (seq producers)
       (let [predicates (into []
                              (keep (fn [[parsed form]]
@@ -525,11 +712,18 @@
                                        (first form))))
                              (map vector (:qwhere parsed-q) forms))]
         (reduce
-          (fn [context {:keys [input output length]}]
+          (fn [context {:keys [input output length form]}]
             (if-let [domains (seq (keep #(string-domain % output) predicates))]
-              (if-let [ranges (prefix-output-ranges
-                               length (reduce set/intersection domains))]
-                (update context :graph
+              (let [values (reduce set/intersection domains)
+                    guarded? (some #(exact-prefix-predicate? % output length)
+                                   predicates)
+                    guard (when guarded? (prefix-domain-predicate length values))]
+               (if-let [ranges (if (ascii-prefix-domain? length values)
+                                 (guarded-prefix-ranges length values)
+                                 (prefix-output-ranges length values))]
+                (let [restricted? (volatile! false)
+                      context
+                      (update context :graph
                         (fn [graph]
                           (into {}
                                 (map (fn [[source nodes]]
@@ -541,13 +735,19 @@
                                                        (when-let [value-type
                                                                   (:attr-value-type helpers)]
                                                          (value-type source (:attr m)))))
-                                              (if (= ranges :empty-range)
-                                                (assoc m :range :empty-range)
-                                                (apply add-range m ranges))
+                                              (do
+                                                (vreset! restricted? true)
+                                                (if (= ranges :empty-range)
+                                                  (assoc m :range :empty-range)
+                                                  (cond-> (apply add-range m ranges)
+                                                    guard (update :pred add-pred guard))))
                                               m))
                                           nodes)]))
-                                graph)))
-                context)
+                                graph)))]
+                  (if @restricted?
+                    (remove-proven-prefix-work context form predicates)
+                    context))
+                context))
               context))
           context producers))
       context)))

@@ -165,11 +165,15 @@
 
 (defn sort-planned-late-clauses
   [{:keys [late-clauses rules] :as context}]
-  (cond-> context
-    (seq late-clauses)
-    (assoc :late-clauses
-           (sort-late-clauses (planned-bound-vars context) rules
-                              late-clauses (:sources context)))))
+  (if (seq late-clauses)
+    (let [bound (planned-bound-vars context)
+          clauses (sort-late-clauses bound rules late-clauses (:sources context))
+          prefixes (:range-proven-prefixes context)]
+      (assoc context :late-clauses
+             (if (seq prefixes)
+               (qor/defer-prefix-projections clauses prefixes bound)
+               clauses)))
+    context))
 
 (defn- context-bound-values
   [context sym]
