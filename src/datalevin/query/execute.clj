@@ -974,10 +974,12 @@
     (qagg/aggregate find-elements context tuples (:check! options) (:wrap-aggregate options))
     (qagg/aggregate find-elements context tuples)))
 
-(defn- post-process-results [find return-map context tuples]
+(defn- post-process-results [find return-map context ordered? tuples]
   (if-let [post-process (:post-process (::result-policy context))]
-    (post-process find return-map tuples)
-    (-post-process find return-map tuples)))
+    (post-process find return-map tuples ordered?)
+    (if (and ordered? return-map (instance? FindRel find))
+      (tuples->return-map return-map tuples nil true)
+      (-post-process find return-map tuples))))
 
 (defn ^:no-doc result-processor
   "Compile shared result processing. An explicit bounded caller may supply
@@ -998,9 +1000,16 @@
                          (aggregate-plan/distinct-count-plan parsed-q))
          pull?         (some dp/pull? find-elements)
          return-map    (:qreturn-map parsed-q)
+         ;; Collection shaping removes the tuple columns, and pull replaces IDs
+         ;; with maps. Select their order/window while the sort keys still exist.
+         select-before-projection?
+         (or (instance? FindColl find)
+             (and (instance? FindRel find) pull? (:qorder parsed-q)))
          order         (when (:qorder parsed-q)
                          (result/prepare-order find-vars (:qorder parsed-q)
-                           (assoc options :return-map return-map)))]
+                           (cond-> options
+                             (not select-before-projection?)
+                             (assoc :return-map return-map))))]
      (fn [parsed-q context]
        (let [simplified (when (and (seq count-plan)
                                    (nil? (::result-policy context)))
@@ -1040,17 +1049,34 @@
                (and keep-group? (nil? reduced))
                (filter keep-group?)
 
+               (and select-before-projection? order)
+               ;; Return maps can collapse equal pulls or duplicate column names.
+               ;; Apply their window after shaping and deduplication.
+               (#(order % (when-not return-map (:qlimit parsed-q))
+                        (if return-map 0 (:qoffset parsed-q))))
+
+               (and select-before-projection? (nil? order))
+               (#(result-window % (:qlimit parsed-q) (:qoffset parsed-q)))
+
                pull?
                (pull find-elements context)
 
                true
-               (post-process-results find return-map context))]
+               (post-process-results find return-map context
+                                     (boolean (and select-before-projection? order))))]
          (result-explain context result)
-         (if (instance? FindRel find)
+         (cond
+           select-before-projection?
+           (if return-map
+             (result-window result (:qlimit parsed-q) (:qoffset parsed-q))
+             result)
+
+           (instance? FindRel find)
            (if order
              (order result (:qlimit parsed-q) (:qoffset parsed-q))
              (result-window result (:qlimit parsed-q) (:qoffset parsed-q)))
-           result))))))
+
+           :else result))))))
 
 (defn- finish-query
   [parsed-q context]

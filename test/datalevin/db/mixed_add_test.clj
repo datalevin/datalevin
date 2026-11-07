@@ -20,6 +20,8 @@
 (def ^:private schema
   {:stock/value {:db/valueType :db.type/long :db/noindex true}
    :stock/flag {:db/valueType :db.type/boolean}
+   :stock/ytd {:db/valueType :db.type/long :db/noindex true}
+   :stock/count {:db/valueType :db.type/long :db/noindex true}
    :line/parent {:db/valueType :db.type/ref}
    :line/number {:db/valueType :db.type/long :db/noindex true}
    :line/key {:db/tupleAttrs [:line/parent :line/number] :db/unique :db.unique/value}
@@ -33,7 +35,8 @@
         conn (d/create-conn dir schema {:wal? wal? :wal-durability-profile :strict
                                         :snapshot-scheduler? false})]
     (try
-      (d/transact! conn [{:db/id 1 :stock/value 5 :stock/flag false}
+      (d/transact! conn [{:db/id 1 :stock/value 5 :stock/flag false
+                         :stock/ytd 10 :stock/count 20}
                         {:db/id 2 :identity "existing"}])
       (f conn)
       (finally (d/close conn) (u/delete-files dir)))))
@@ -55,13 +58,16 @@
             result
             (tc/quick-check 100
               (prop/for-all [value (gen/choose -10 10)
+                             eid (gen/elements [1 2])
                              flag gen/boolean
                              size (gen/choose 1 12)
                              first-map? gen/boolean]
                 (let [insert {:db/id "parent" :line/parent 1 :line/number 30
                               :line/alias [1 30] :line/name 42}
-                      updates [[:db/add 1 :stock/value value]
-                               [:db/add 1 :stock/flag flag]]
+                      updates [[:db/add eid :stock/value value]
+                               [:db/add eid :stock/flag flag]
+                               [:db/add eid :stock/ytd (inc value)]
+                               [:db/add eid :stock/count (+ value 2)]]
                       txs (into (if first-map? (into [insert] updates)
                                     (conj updates insert))
                                 (map (fn [n] {:db/id (str "line-" n)
@@ -80,6 +86,27 @@
         (is (:pass? result) (pr-str result))
         (is (= eav (vec (:eavt before))))
         (is (= ave (vec (:avet before))))))))
+
+(deftest writer-old-values-survive-buffer-reuse-and-abort
+  (with-store true
+    (fn [conn]
+      (d/update-schema conn {:stock/text {:db/valueType :db.type/string :db/noindex true}
+                             :stock/bytes {:db/valueType :db.type/bytes :db/noindex true}})
+      (let [text (apply str (repeat 2000 "value"))
+            bytes (byte-array 2000 (byte 3))]
+        (d/transact! conn [{:db/id 1 :stock/text text :stock/bytes bytes}])
+        (d/with-transaction [tx conn]
+          (let [store (:store @tx)
+                saved (i/ea-first-v store 1 :stock/bytes)]
+            (dotimes [_ 4]
+              (is (= text (i/ea-first-v store 1 :stock/text)))
+              (is (false? (i/ea-first-v store 1 :stock/flag)))
+              (is (nil? (i/ea-first-v store 2 :stock/text)))
+              (d/transact! tx [[:db/add 1 :stock/value 8]])
+              (is (= 8 (i/ea-first-v store 1 :stock/value))))
+            (is (= (vec bytes) (vec saved)))
+            (d/abort-transact tx)))
+        (is (= 5 (:stock/value (d/entity @conn 1))))))))
 
 (deftest mixed-add-preserves-visibility-rollback-and-report-ownership
   (doseq [wal? [false true] prepare? [false true]]
@@ -184,15 +211,32 @@
                         (when (= :mixed-add path)
                           (swap! modes conj (some? (txcommon/scalar-pending-index)))))]
               (collected! conn
-                [#(d/transact! conn [[:db/add 1 :stock/value 6]])
+                [#(d/transact! conn [[:db/add 1 :stock/value 6]
+                                      [:db/add 1 :stock/ytd 11]])
                  #(d/transact! conn [[:db/add 1 :stock/value 7]
+                                    [:db/add 1 :stock/ytd 12]
+                                    [:db/add 1 :stock/count 21]
+                                    [:db/add 1 :stock/flag true]
                                     {:db/id "line" :line/parent 1 :line/number 7}])
-                 #(d/transact! conn [[:db/add [:line/key [1 7]] :line/name "pending"]])
+                 #(d/transact! conn [[:db/add [:line/key [1 7]] :line/name "pending"]
+                                    [:db/retract 1 :stock/count 21]])
                  #(d/transact! conn [[:db/cas 1 :stock/value 7 8]])
                  #(d/transact! conn [[:db/add 1 :stock/value 9]
+                                    [:db/add 1 :stock/ytd 13]
+                                    [:db/add 1 :stock/count 22]
+                                    [:db/add 1 :stock/flag false]
                                     {:db/id "line" :line/parent 1 :line/number 8}])]))]
         (is (every? map? reports) (pr-str reports))
         (is (= [true false] @modes))
+        ;; A scalar-pending update wins over native state; a sorted-index
+        ;; tombstone must prevent the following mixed request retracting it again.
+        (is (= [[11 false] [12 true]]
+               (mapv (juxt :v datom/datom-added)
+                     (filter #(= :stock/ytd (:a %)) (:tx-data (reports 1))))))
+        (is (= [[22 true]]
+               (mapv (juxt :v datom/datom-added)
+                     (filter #(= :stock/count (:a %)) (:tx-data (reports 4))))))
+        (is (false? (:stock/flag (d/entity @conn 1))))
         (is (= [[[5 false] [6 true]] [[6 false] [7 true]]
                 [[7 false] [8 true]] [[8 false] [9 true]]]
                (mapv (fn [r] (mapv (juxt :v datom/datom-added)

@@ -951,8 +951,20 @@
         (when-let [aid (:db/aid (schema a))]
           (cpp/read-resolution-value native lmdb e aid idx/avg-buffer->v))
         (cd/with-snapshot lmdb
-          (when-let [bf (ea->avg-buffer schema lmdb e a)]
-            (idx/avg-buffer->v lmdb bf))))))
+          (if (and (lmdb/writing? native)
+                   (Thread/holdsLock (lmdb/write-txn native))
+                   ;; Ordinary scalar decoding cannot reenter user codecs.
+                   (case (:db/valueType (schema a))
+                     (:db.type/long :db.type/float :db.type/double
+                      :db.type/boolean :db.type/string :db.type/keyword
+                      :db.type/symbol :db.type/instant :db.type/uuid
+                      :db.type/bytes :db.type/bigint :db.type/bigdec
+                      :db.type/ref) true
+                     false))
+            (cpp/read-resolution-value native lmdb e (:db/aid (schema a))
+                                       idx/avg-buffer->v)
+            (when-let [bf (ea->avg-buffer schema lmdb e a)]
+              (idx/avg-buffer->v lmdb bf)))))))
 
   (v-datoms [_ v]
     (mapcat
@@ -2424,12 +2436,11 @@
 
 (defn- insert-datom
   [^Store store ^Datom d ^FastList txs work
-   ^HashMap giants ^HashMap attr-infos embedding-plan
+   ^HashMap giants ^objects ai embedding-plan
    ^ByteBuffer avg-bf]
   (let [attr       (.-a d)
         e          (.-e d)
         v          (.-v d)
-        ^objects ai (write-attr-info store attr-infos attr v true)
         props      (aget ai 0)
         vt         (aget ai 1)
         aid        (aget ai 2)
@@ -2504,11 +2515,10 @@
 
 (defn- delete-datom
   [^Store store ^Datom d ^FastList txs work
-   ^HashMap giants ^HashMap attr-infos ^ByteBuffer avg-bf]
+   ^HashMap giants ^objects ai ^ByteBuffer avg-bf]
   (let [e          (.-e d)
         attr       (.-a d)
         v          (.-v d)
-        ^objects ai (write-attr-info store attr-infos attr v false)
         props      (aget ai 0)
         vt         (aget ai 1)
         aid        (aget ai 2)
@@ -2557,7 +2567,7 @@
       (let [domain (or (props :db/domain) (u/keyword->string attr))]
         (collect-idoc store work domain
                       (if gt [:r [e aid gt v]] [:d [e aid v]]))))
-    (let [ii (Indexable. nil aid v (.-f i) (.-b i) (or gt c/normal))]
+    (let [ii (if gt (Indexable. nil aid v (.-f i) (.-b i) gt) i)]
       (.add txs (lmdb/datom-kv-tx e (b/indexable-bytes ii avg-bf)
                                  false false (:db/noindex props)))
       (when gt
@@ -2644,9 +2654,9 @@
                ((if (d/datom-added datom) cd/put-datom! cd/delete-datom!)
                 writer (.-e datom) (aget ai 2) type (.-v datom) noindex?))
              (if (d/datom-added datom)
-               (insert-datom store datom datom-txs work giants attr-infos embedding-plan
+               (insert-datom store datom datom-txs work giants ai embedding-plan
                              avg-bf)
-               (delete-datom store datom datom-txs work giants attr-infos avg-bf)))))
+               (delete-datom store datom datom-txs work giants ai avg-bf)))))
        (finally
          (bf/return-array-buffer avg-bf)))
      ;; Keep primitive datom operations first for native executor selection.

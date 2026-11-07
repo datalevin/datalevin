@@ -1583,7 +1583,7 @@
 
 (defn read-resolution-value
   "Decode an EAV point lookup while its transaction-owned cursor is live.
-  Only native Datalog preparation calls this; pending datoms stay in the resolver."
+  The caller owns the native writer; pending datoms stay in the resolver."
   [^CppLMDB native lmdb e aid decode]
   (i/check-ready native)
   (let [^Rtx rtx @(l/write-txn native)

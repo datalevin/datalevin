@@ -176,18 +176,29 @@
 (defn tuples->return-map
   ([return-map tuples] (tuples->return-map return-map tuples nil))
   ([return-map tuples set-options]
-  (if (seq tuples)
-    (let [symbols (:symbols return-map)
-          idxs    (range 0 (count symbols))
-          get-i   (tuple-get (first tuples))
-          rows    (mapv (fn [tuple]
-                          (persistent!
-                            (reduce (fn [m i] (assoc! m (nth symbols i) (get-i tuple i)))
-                                    (transient {}) idxs))) tuples)]
-      ;; Return-map shaping must retain the query's key semantics too, including
-      ;; decimal scale and signed zero, rather than applying Clojure set equality.
-      (sp/new-spillable-set rows (assoc (or set-options {}) :initial-capacity (count rows))))
-    #{})))
+   (tuples->return-map return-map tuples set-options false))
+  ([return-map tuples set-options ordered?]
+   (if (seq tuples)
+     (let [symbols (:symbols return-map)
+           idxs    (range 0 (count symbols))
+           get-i   (tuple-get (first tuples))
+           rows    (mapv (fn [tuple]
+                           (persistent!
+                             (reduce (fn [m i] (assoc! m (nth symbols i) (get-i tuple i)))
+                                     (transient {}) idxs))) tuples)
+           options (assoc (or set-options {}) :initial-capacity (count rows))]
+       ;; Return-map shaping must retain the query's key semantics too, including
+       ;; decimal scale and signed zero, rather than applying Clojure set equality.
+       (if ordered?
+         (let [seen (sp/new-spillable-set nil options)]
+           (try
+             (filterv (fn [row]
+                        (when-not (contains? seen row)
+                          (.cons ^IPersistentCollection seen row)
+                          true)) rows)
+             (finally (empty seen))))
+         (sp/new-spillable-set rows options)))
+     (if ordered? [] #{}))))
 
 (defn pull
   [find-elements context resultset]

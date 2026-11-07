@@ -481,7 +481,17 @@ Only usable for debug output.
 (def ^{:arglists '([query & inputs])
        :doc      "Executes a Datalog query, which supports [Datomic Query Format](https://docs.datomic.com/query/query-data-reference.html).
 
-  In addition, when `:find` spec is a relation, `:order-by` clause is supported, which can be followed by a single variable or a vector. The vector includes one or more variables, each optionally followed by a keyword `:asc` or `:desc`, specifying ascending or descending order, respectively. The default is `:asc`. `:limit` is also supported to specify the number of tuples to be returned; both `:limit` and `:offset` may name a scalar `:in` binding and are resolved for each execution.
+  Relation and collection `:find` specs support `:order-by`, followed by a
+  single variable, a zero-based column index, or a vector of variables and
+  column indexes. Each vector entry may be followed by `:asc` or `:desc`;
+  the default is `:asc`. Order variables must appear in `:find`.
+
+  A pull expression contributes its entity variable, which sorts by entity ID
+  before pulling. To sort pulls by an attribute, include the attribute variable
+  as another column in a relation `:find`, then select the pull column from the
+  ordered result. Return maps (`:keys`, `:syms`, and `:strs`) preserve explicit
+  ordering. `:limit` and `:offset` select a window of the ordered result; both
+  may name a scalar `:in` binding and are resolved for each execution.
 
   Nested queries can be used as derived relations. Bind a nested relation
   result with a relation binding such as `[[?key ?weight]]`; its columns then
@@ -497,7 +507,7 @@ Only usable for debug output.
                :order-by [?value :desc]
                :timeout 5000]
              db)
-          ; => #{[\"pizza\"] [\"pie\"] [\"fries\"] [\"candy\"]}
+          ; => ([\"pizza\"] [\"pie\"] [\"fries\"] [\"candy\"])
 
           (q '[:find (sum ?subtotal) .
                :where

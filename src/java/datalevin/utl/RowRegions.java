@@ -10,6 +10,7 @@ import java.util.Iterator;
 import java.util.ConcurrentModificationException;
 import java.util.NoSuchElementException;
 import java.util.RandomAccess;
+import java.util.function.Consumer;
 
 /** Ordered, owned row lists retained without copying their row references.
  * Regions must not change after attachment. The owner finishes building this
@@ -37,6 +38,17 @@ public final class RowRegions extends AbstractList<Object> implements RandomAcce
     }
 
     @Override public int size() { return size; }
+
+    /** Visit owned regions in order without copying rows or indexed lookups.
+     * The visitor must not modify this view or the retained lists.
+     */
+    public void forEachRegion(Consumer<? super List<?>> visitor) {
+        final int expectedModCount = modCount;
+        for (List<?> region : regions) {
+            visitor.accept(region);
+            if (modCount != expectedModCount) throw new ConcurrentModificationException();
+        }
+    }
 
     @Override public Iterator<Object> iterator() {
         return new Iterator<>() {

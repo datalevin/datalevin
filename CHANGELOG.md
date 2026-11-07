@@ -13,6 +13,8 @@
   eligible fused aggregates, reducing repeated string and byte-array allocation.
 - [Datalog] `init-db` and `fill-db` handle composite attributes.
 - [Datalog] faster planning and more optimization cases.
+- [Datalog] faster transaction.
+- [Datalog] better support for `:order-by` for collection results.
 - deps update
 
 ## 1.2.10 (2026-10-28)

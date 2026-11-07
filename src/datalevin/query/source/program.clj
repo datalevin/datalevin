@@ -496,7 +496,9 @@
         (when-not (and (expression/scalar-functions (get-in predicate [:fn :symbol]))
                       (every? #(or (instance? Constant %) (aggregate? %)) (:args predicate)))
           (unsupported!))))
-    (when (and (not (instance? FindRel (:qfind parsed))) (or (:qlimit parsed) (:qoffset parsed)))
+    (when (and (not (or (instance? FindRel (:qfind parsed))
+                       (instance? FindColl (:qfind parsed))))
+               (or (:qlimit parsed) (:qoffset parsed)))
       (unsupported!))
     (reduce (fn [parsed key]
               (let [x (get parsed key) x (if (symbol? x) (get constants x ::missing) x)]
@@ -819,12 +821,12 @@
         context (assoc context :result-set collected :terminal-collected-symbols all-vars)
         scalar-row? (volatile! false)
         post-process
-        (fn [find return-map tuples]
+        (fn [find return-map tuples ordered?]
           (check!)
           (when (instance? FindScalar find) (vreset! scalar-row? (boolean (seq tuples))))
           (cond
             (and return-map (instance? FindRel find))
-            (result/tuples->return-map return-map tuples {:spill-threshold Long/MAX_VALUE})
+            (result/tuples->return-map return-map tuples {:spill-threshold Long/MAX_VALUE} ordered?)
             (and return-map (instance? FindTuple find))
             (first (result/tuples->return-map return-map [(first tuples)] {:spill-threshold Long/MAX_VALUE}))
             :else (execute/-post-process find return-map tuples)))

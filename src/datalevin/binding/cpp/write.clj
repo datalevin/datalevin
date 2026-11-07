@@ -27,6 +27,7 @@
    [datalevin.utl BitOps ByteKeySort RowRegions]
    [java.nio ByteBuffer]
    [java.util Arrays Comparator HashMap List]
+   [java.util.function Consumer]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
 (def ^:private ^:const ave-multiple-min-items 2)
@@ -81,6 +82,70 @@
 
 (declare transact-datom-list*)
 
+(defn- eav-row?
+  [tx]
+  (and (instance? KVTxData tx)
+       (let [^KVTxData tx tx]
+         (and (= c/eav (.-dbi-name tx))
+              (= :id (.-kt tx)) (= :raw (.-vt tx))
+              (nil? (.-flags tx))
+              (case (.-op tx)
+                :put (bytes? (.-v tx))
+                :del-list (let [vs (.-v tx)]
+                            (and (vector? vs) (= 1 (count vs))
+                                 (bytes? (nth vs 0))))
+                false)))))
+
+(defn- put-eav-rows!
+  "Apply a contiguous run of validated EAV-only rows with one write cursor.
+  Preserve input order, including repeated adds and missing-value deletions."
+  [^List rows start ^DBI eav txn]
+  (with-open [^Cursor cur (.writeCursor ^IWriteCursor eav txn)]
+    (loop [i (long start)]
+      (if (and (< i (.size rows)) (eav-row? (.get rows i)))
+        (let [^KVTxData tx (.get rows i)
+              added? (= :put (.-op tx))]
+          (.putKeyId eav (long (.-k tx)))
+          (.put-val eav (if added? (.-v tx) (nth (.-v tx) 0)) :raw)
+          (if added?
+            (.put cur (int 0))
+            (do (.del eav txn false)
+                ;; A missing duplicate can overwrite the native key pointer.
+                (.reset ^BufVal (.-kp eav))))
+          (recur (unchecked-inc i)))
+        i))))
+
+(defn- transact-kv-rows*
+  "Apply the KV portion of a row list after any datom index passes. Only
+  preparation-validated EAV runs batch; other rows keep ordinary KV semantics."
+  [^List rows ^HashMap dbis txn validate?]
+  (if (instance? RowRegions rows)
+    ;; Grouped requests retain separate owned lists. Walk each region directly
+    ;; instead of paying a binary search for every row in the combined view.
+    (.forEachRegion ^RowRegions rows
+                    (reify Consumer
+                      (accept [_ region]
+                        (transact-kv-rows* region dbis txn validate?))))
+    (let [n (.size rows)]
+      (loop [i 0]
+        (when (< i n)
+          (let [t (.get rows i)]
+            (if (instance? DatomKVTxData t)
+              (recur (unchecked-inc i))
+              (let [^KVTxData tx (if validate? (l/->kv-tx-data t) t)
+                    name (.-dbi-name tx)
+                    ^DBI dbi (or (.get dbis name) (raise name " is not open" {}))]
+                (when validate?
+                  (vld/validate-kv-tx-data tx (.-validate-data? dbi)))
+                ;; Opening a cursor is not worthwhile for a lone replacement.
+                (if (and (not validate?) (<= (+ i 4) n)
+                         (eav-row? tx) (eav-row? (.get rows (inc i)))
+                         (eav-row? (.get rows (+ i 2)))
+                         (eav-row? (.get rows (+ i 3))))
+                  (recur (long (put-eav-rows! rows i dbi txn)))
+                  (do (put-tx dbi txn tx)
+                      (recur (unchecked-inc i))))))))))))
+
 (defn apply-frozen-rows*
   "Apply preparation-validated KVTxData or DatomKVTxData rows in an owned transaction.
   Reuse native operation semantics without generic row conversion or validation."
@@ -89,12 +154,7 @@
     ;; Keep the existing fused datom/index passes after freezing. Expanding
     ;; those rows into generic physical puts loses the native write fast path.
     (transact-datom-list* rows dbis txn false)
-  (when rows
-    (dotimes [index (.size rows)]
-      (let [^KVTxData tx (.get rows index)
-            name (.-dbi-name tx)
-            ^DBI dbi (or (.get dbis name) (raise name " is not open" {}))]
-        (put-tx dbi txn tx))))))
+    (when rows (transact-kv-rows* rows dbis txn false))))
 
 (defn- put-captured-tx
   [^DBI dbi txn ^KVTxData tx ^WriteBatch batch]
@@ -561,22 +621,7 @@
       (let [[^objects datoms n] (datom-txs txs)]
         (transact-datom-index-passes* datoms n dbis txn add-only?)
         ;; Metadata and other KV rows retain input order after the datom passes.
-        (let [put-metadata! (fn [tx]
-                              (let [^KVTxData tx (if validate? (l/->kv-tx-data tx) tx)
-                                    dbi-name (.-dbi-name tx)
-                                    ^DBI dbi (or (.get dbis dbi-name)
-                                                 (raise dbi-name " is not open" {}))]
-                                (when validate?
-                                  (vld/validate-kv-tx-data tx (.-validate-data? dbi)))
-                                (put-tx dbi txn tx)))]
-          (if (instance? RowRegions txs)
-            (doseq [tx txs]
-              (when-not (instance? DatomKVTxData tx)
-                (put-metadata! tx)))
-            (dotimes [i (.size txs)]
-              (let [tx (.get txs i)]
-                (when-not (instance? DatomKVTxData tx)
-                  (put-metadata! tx)))))))
+        (transact-kv-rows* txs dbis txn validate?))
       (let [n (.size txs)]
         (loop [i   0
                ave nil
