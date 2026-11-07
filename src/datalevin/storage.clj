@@ -1231,6 +1231,19 @@
   [^Store store ids names aids id?]
   (entity/select-entities (.-lmdb store) ids names aids id?))
 
+(defn ^:no-doc ea-first-v-reader
+  "Prepare repeated scalar reads inside the currently owned native writer.
+  Return nil outside an owned writer. Callers must establish that attributes
+  use built-in scalar types. The reader must not escape or cross a callback."
+  [^Store store]
+  (let [lmdb (.-lmdb store)
+        native (kv/raw-lmdb lmdb)
+        schema (schema store)]
+    (when (and (lmdb/writing? native)
+               (Thread/holdsLock (lmdb/write-txn native)))
+      (let [read (cpp/resolution-value-reader native lmdb idx/avg-buffer->v)]
+        (fn [e a] (read e (:db/aid (schema a))))))))
+
 (defn ^:no-doc ref-attr-adjacency
   "Scan a ref-valued AVE attribute directly into a primitive adjacency map.
    `bound-side` selects whether entity IDs or ref values are map keys."

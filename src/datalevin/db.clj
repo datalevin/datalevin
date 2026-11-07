@@ -2389,14 +2389,16 @@
 (def ^:private ^:const scalar-entity-read-min-attrs 8)
 
 (defn- prepare-scalar-entity-read
-  [store-schema attributes]
+  ([store-schema attributes]
+   (prepare-scalar-entity-read store-schema attributes scalar-entity-read-min-attrs))
+  ([store-schema attributes min-attrs]
   ;; Four-attribute projections cost more CPU on Linux. Use point seeks for
   ;; narrow updates; retain a layout for wider updates so stamping can read
   ;; their attributes with one shared cursor inside the write transaction.
-  (when (>= (count attributes) scalar-entity-read-min-attrs)
+  (when (>= (count attributes) (long min-attrs))
     (let [names (sort-by #(:db/aid (store-schema %)) attributes)]
       (ScalarEntityRead. (object-array names)
-                         (long-array (map #(:db/aid (store-schema %)) names))))))
+                         (long-array (map #(:db/aid (store-schema %)) names)))))))
 
 (defn- read-scalar-entity
   [store eid ^ScalarEntityRead layout]
@@ -3036,10 +3038,29 @@
           db-after (assoc db :max-tx tx-id)]
       (->TxReport db db-after tx-data {:db/current-tx tx-id} tx-meta))))
 
+(defn- read-mixed-update-entities
+  [db ^java.util.HashMap updates]
+  (let [store-schema (schema (:store db))
+        entries (.iterator (.entrySet updates))]
+    (while (.hasNext entries)
+      (let [^java.util.Map$Entry entry (.next entries)
+            ^java.util.HashSet attributes (.getValue entry)]
+        (if-let [layout (when (and (>= (.size attributes) 2)
+                                  (every? #(some? (:db/valueType (store-schema %)))
+                                          attributes))
+                         ;; Mixed requests already collect their updated E/A
+                         ;; pairs. Reuse that index for narrow entity reads;
+                         ;; scalar-only admission keeps its Linux-tested limit.
+                         (prepare-scalar-entity-read store-schema attributes 2))]
+          (.setValue entry (or (read-scalar-update-entity db (.getKey entry) layout) {}))
+          (.remove entries))))
+    updates))
+
 (defn ^:no-doc prepare-mixed-add-tx
   "Prepare ordinary mixed updates/inserts against an already owned writer."
   [db tx-data tx-meta]
-  (txadd/prepare-mixed-report (->TxReport db db [] {} tx-meta) tx-data))
+  (txadd/prepare-mixed-report (->TxReport db db [] {} tx-meta) tx-data
+                            read-mixed-update-entities))
 
 (defn ^:no-doc prepare-local-tx-data
   "Resolve local transaction data without committing or constructing the final

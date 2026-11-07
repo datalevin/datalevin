@@ -26,6 +26,7 @@
             with-var-symbols]]
    [datalevin.query.plan :as qplan]
    [datalevin.query.resolve :as qresolve]
+   [datalevin.relation :as r]
    [datalevin.util :as u])
   (:import
    [java.util List]
@@ -243,10 +244,9 @@
       candidates)))
 
 (defn- input-bound-eav-group
-  [context]
+  [context candidates]
   (let [candidates
-        (->> (materializable-bound-patterns
-               context small-bound-relation?)
+        (->> candidates
              (filter
                (fn [{:keys [source attr entity-sym value-sym
                             entity-bound? value-bound?]}]
@@ -265,38 +265,83 @@
                          (filter #(and (= source-sym (:source-sym %))
                                        (= entity-sym (:entity-sym %))))
                          distinct-value-candidates)]
-          (when (<= 2 (count group))
+          ;; The shared EAV operator also extends a single projection without
+          ;; materializing distinct keys and hash-joining them back to the input.
+          (when (seq group)
             (let [rel (rel-for-var context entity-sym)]
               (when (integer-entity-relation? rel entity-sym)
                 group)))))
       candidates)))
 
-(defn- materialize-input-bound-eav-group
+(defn- input-bound-scan-group
+  [context]
+  (let [candidates (vec (materializable-bound-patterns
+                         context small-bound-relation?))]
+    (or (input-bound-eav-group context candidates)
+        (some
+          (fn [{:keys [source attr entity-sym value-sym value-bound?]
+                :as candidate}]
+            ;; Ref keys have an exact native representation. Other value types
+            ;; retain the resolver's representation-sensitive key checks.
+            (when (and value-bound?
+                       (not (db/pending-tx-cache? source))
+                       (db/ref? source attr)
+                       (qu/binding-var? entity-sym)
+                       (not= entity-sym value-sym)
+                       (some? (get-in (db/-schema source) [attr :db/aid]))
+                       (let [rel (rel-for-var context value-sym)
+                             idx (int (get (:attrs rel) value-sym))]
+                         (every? #(let [value (aget ^objects % idx)]
+                                    (and (int? value) (not (neg? (long value)))))
+                                 (:tuples rel))))
+              [candidate]))
+          candidates))))
+
+(defn- bound-scan-strategy
+  [candidates]
+  (if (:value-bound? (first candidates))
+    :bound-ave
+    :grouped-bound-eav))
+
+(defn- materialize-input-bound-scan-group
   [context candidates]
-  (let [{:keys [source source-sym entity-sym]} (first candidates)
+  (let [{:keys [source source-sym entity-sym value-sym value-bound? attr]}
+        (first candidates)
         schema       (db/-schema source)
         candidates   (vec
                        (sort-by #(get-in schema [(:attr %) :db/aid])
                                 candidates))
-        rel          (rel-for-var context entity-sym)
+        bound-sym    (if value-bound? value-sym entity-sym)
+        rel          (rel-for-var context bound-sym)
         ^List input  (:tuples rel)
-        eid-idx      (long (get (:attrs rel) entity-sym))
+        bound-idx    (long (get (:attrs rel) bound-sym))
         attrs-v      (mapv (fn [{:keys [attr]}]
                              [attr {:skip? false}])
                            candidates)
-        tuples       (or (db/-eav-scan-v-list source input eid-idx attrs-v)
+        tuples       (or (if value-bound?
+                           (db/-val-eq-scan-e-list source input bound-idx attr)
+                           (db/-eav-scan-v-list source input bound-idx attrs-v))
                          (FastList.))
         base-idx     (long (count (:attrs rel)))
         attrs        (reduce-kv
-                       (fn [attrs idx {:keys [value-sym]}]
-                         (assoc attrs value-sym
+                       (fn [attrs idx candidate]
+                         (assoc attrs (if value-bound?
+                                        (:entity-sym candidate)
+                                        (:value-sym candidate))
                                 (unchecked-add base-idx (long idx))))
                        (:attrs rel) candidates)
-        enriched     (assoc rel :attrs attrs :tuples tuples)
+        single?      (if value-bound?
+                       (unique-attr? source attr)
+                       (not-any? #(= :db.cardinality/many
+                                     (get-in schema [(:attr %) :db/cardinality]))
+                                 candidates))
+        enriched     (cond-> (r/relation! attrs tuples)
+                       single? (r/with-unique-keys-from rel))
         clause-idxs  (into #{} (map :clause-idx) candidates)
-        stage        {:strategy      :grouped-bound-eav
+        stage        {:strategy      (bound-scan-strategy candidates)
                       :source        source-sym
                       :entity        entity-sym
+                      :bound         bound-sym
                       :attributes    (mapv :attr candidates)
                       :patterns      (mapv :pattern candidates)
                       :input-tuples  (.size input)
@@ -320,14 +365,15 @@
 
 (defn materialize-input-bound-patterns
   "Materialize patterns constrained by small input-bound relations before
-   planning. When a query has multiple unique constant anchors whose entity
+   planning, extending their tuples with shared EAV and reverse-ref AVE scans
+   when eligible. When a query has multiple unique constant anchors whose entity
    variables must remain bound, seed all anchors first so they constrain the
    same join component instead of leaving one as a late filter."
   [context]
   (loop [context (materialize-protected-unique-anchors context)]
-    (if-let [group (input-bound-eav-group context)]
+    (if-let [group (input-bound-scan-group context)]
       (let [{:keys [context stage]}
-            (materialize-input-bound-eav-group context group)]
+            (materialize-input-bound-scan-group context group)]
         (record-input-bound-eav-group! stage)
         (recur context))
       (if-let [{:keys [^long clause-idx source pattern]}
@@ -610,7 +656,7 @@
                    (conj stages stage)))))
       {:eligible? true :cost cost :stages stages})))
 
-(defn- grouped-bound-eav-projected-cost
+(defn- bound-scan-projected-cost
   ^double [context candidates ^double budget]
   (loop [candidates candidates
          cost       0.0]
@@ -630,23 +676,23 @@
   (loop [context context
          cost    0.0
          stages  []]
-    (if-let [group (input-bound-eav-group context)]
+    (if-let [group (input-bound-scan-group context)]
       (let [remaining-cost (double (max 0.0 (- budget cost)))
             projected-cost (double
-                             (grouped-bound-eav-projected-cost
+                             (bound-scan-projected-cost
                                context group remaining-cost))]
         (if (<= budget (+ cost projected-cost))
           {:context context
            :cost cost
            :stages stages
            :eligible? false
-           :guardrail {:strategy :grouped-bound-eav
+           :guardrail {:strategy (bound-scan-strategy group)
                        :patterns (mapv :pattern group)
                        :projected-cost projected-cost
                        :accumulated-cost cost
                        :budget budget}}
           (let [{:keys [context stage]}
-                (materialize-input-bound-eav-group context group)
+                (materialize-input-bound-scan-group context group)
                 output-cost (double
                               (materialized-output-cost
                                 (long (:output-tuples stage))
@@ -662,7 +708,7 @@
                :cost new-cost
                :stages (conj stages stage)
                :eligible? false
-               :guardrail {:strategy :grouped-bound-eav
+               :guardrail {:strategy (bound-scan-strategy group)
                            :patterns (:patterns stage)
                            :actual-cost new-cost
                            :budget budget}}

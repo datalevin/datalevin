@@ -1116,7 +1116,7 @@
   (entries [this dbi-name]
     (.check-ready this)
     (let [^DBI dbi (.get-dbi this dbi-name)
-          ^Rtx rtx (if writing? @write-txn (.get-rtx this))
+          ^Rtx rtx (if writing? @(l/write-txn this) (.get-rtx this))
           ^Dbi db  (.-db dbi)
           ^Txn txn (.-txn rtx)]
       (try
@@ -1580,6 +1580,34 @@
        (.get ^LongPointer ptr)))
    (raise "Fail to count list in key range: " e {:dbi dbi-name})))
 
+
+(defn resolution-value-reader
+  "Prepare scalar lookups for one callback on an owned writer. Reuse the
+  cursor, codecs and encoded entity key; decoded values never enter the reader.
+  The decoder must not invoke user code or replace the native transaction."
+  [^CppLMDB native lmdb decode]
+  (i/check-ready native)
+  (let [^Rtx rtx @(l/write-txn native)
+        ^DBI dbi (i/get-dbi native c/eav false)
+        ^Cursor cur (resolution-cursor! rtx dbi)
+        ^BufVal key (.-start-kp rtx)
+        ^BufVal value (.-start-vp rtx)
+        key-codec (.-key-codec dbi)
+        value-codec (buffer/dbi-val-compressor dbi)
+        entity (long-array [-1])]
+    (fn [e aid]
+      (try
+        (when (not= (long e) (aget entity 0))
+          (buffer/put-id-bufval key (long e) key-codec (l/key-bf rtx))
+          (aset entity 0 (long e)))
+        (buffer/put-bufval value aid :int value-codec (l/val-bf rtx))
+        (when (.get cur key value DTLV/MDB_GET_BOTH_RANGE)
+          (let [^ByteBuffer bf (iter/v-bf (.val cur) value-codec rtx)]
+            (when (= (int aid) (.getInt bf 0))
+              (decode lmdb bf))))
+        (catch Throwable error
+          (scan/record-native-read-failure! native error)
+          (throw error))))))
 
 (defn read-resolution-value
   "Decode an EAV point lookup while its transaction-owned cursor is live.

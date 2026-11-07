@@ -14,10 +14,13 @@
             [datalevin.tx-group.batch.embedded :as embedded])
   (:import [datalevin.db DB TxReport]
            [datalevin.storage Store WriteGroup]
+           [datalevin.utl WriterContext]
            [clojure.lang Var]
-           [java.util HashMap IdentityHashMap]
+           [java.util HashMap IdentityHashMap Set]
            [org.eclipse.collections.impl.map.mutable.primitive LongObjectHashMap]
            [org.eclipse.collections.impl.list.mutable FastList]))
+
+(def ^:dynamic *explicit-body* nil)
 
 (deftype ^:private PreparationContext
   [flush! group ^:unsynchronized-mutable ^objects scalar-rows
@@ -341,6 +344,102 @@
       (aset scope 1 (kv/->KVLMDB native nil)))
     (aget scope 1)))
 
+(defn- prepare-explicit-request!
+  [context conn tx-data tx-meta transact!]
+  (let [before @conn
+        [eavt avet] (resolver-indexes! context (:store before))
+        tx-db (assoc before :eavt eavt :avet avet)]
+    (reset! conn tx-db)
+    (Var/pushThreadBindings (resolver-bindings! context tx-db))
+    (try
+      (txcommon/prepare-pending-index! txcommon/*batch-prepare* tx-db)
+      (let [report (transact! conn tx-data tx-meta)
+            after (assoc @conn :eavt (:eavt before) :avet (:avet before))]
+        ;; Resolver tombstones are private. Public lookup refs must not
+        ;; interpret a pending retraction as a live identity.
+        (reset! conn after)
+        (assoc report :db-before before :db-after after))
+      (catch Throwable t
+        ;; A caught validation/CAS failure must not leave partial resolver
+        ;; state for the next inner request. Rebuild from accepted datoms.
+        (try (txcommon/restore-preparation! txcommon/*batch-prepare* tx-db)
+             (catch Throwable restore-error
+               (when-not (identical? t restore-error)
+                 (.addSuppressed t restore-error))))
+        (reset! conn before)
+        (throw t))
+      (finally
+        (Var/popThreadBindings)
+        (swap! conn assoc :eavt (:eavt before) :avet (:avet before))))))
+
+(defn run-explicit-request!
+  "Share preparation once adjacent inner writes form a burst. The first user
+  read drains its writes and resumes eager execution for the rest of the body."
+  [conn tx-data tx-meta transact!]
+  (let [{:keys [context before-read! last-write native-read]} *explicit-body*
+        native (kv/raw-lmdb (.-lmdb ^Store (:store @conn)))
+        ^WriterContext writer (l/writer-context native)
+        request-context (.requestContext writer)
+        preparing? (some? @last-write)]
+    (i/check-ready native)
+    (when-not (identical? (Thread/currentThread) (.owner writer))
+      (l/write-txn native))
+    ;; Ownership checks borrow the writer too. Resolution handles its own
+    ;; pending state, after any earlier eager native tail has been applied.
+    (.setBeforeRead writer nil)
+    (when-let [read! @native-read]
+      (vreset! native-read nil)
+      (read!))
+    (when preparing?
+      (.setRequestContext writer (assoc request-context :datalog-prepare? true)))
+    (vreset! last-write :resolving)
+    (try
+      (let [report (if preparing?
+                     (prepare-explicit-request! context conn tx-data tx-meta transact!)
+                     (transact! conn tx-data tx-meta))]
+        (vreset! last-write (if preparing? :prepared :eager))
+        report)
+      (catch Throwable t
+        ;; Accepted writes before a rejected request still need a read drain.
+        (vreset! last-write (when preparing? :prepared))
+        (throw t))
+      (finally
+        (vreset! native-read (.beforeRead writer))
+        (.setRequestContext writer request-context)
+        (.setBeforeRead writer before-read!)))))
+
+(defn- execute-explicit-body!
+  [context tx body]
+  (let [native (kv/raw-lmdb (.-lmdb ^Store (:store @tx)))
+        ^WriterContext writer (l/writer-context native)
+        last-write (volatile! nil)
+        native-read (volatile! nil)
+        before-read! (fn []
+                       ;; Detach before draining: native application may grow
+                       ;; the map or borrow this view again while applying rows.
+                       ;; Read/modify/write bodies keep their eager path after
+                       ;; this boundary, without wrapping each remaining write.
+                       (set! *explicit-body* nil)
+                       (.setBeforeRead writer nil)
+                       (let [prepared? (= :prepared @last-write)
+                             read! @native-read]
+                         (vreset! last-write nil)
+                         (vreset! native-read nil)
+                         (if prepared?
+                           (when-let [flush! (l/prepare-flush native)] (flush!))
+                           (when read! (read!))))
+                       (when-let [preparation
+                                  (get @(:resolver-bindings context)
+                                       #'txcommon/*batch-prepare*)]
+                         (txcommon/discard-scalar-pending! preparation))
+                       (doseq [^Set index @(:resolver-indexes context)]
+                         (.clear index)))]
+    (binding [*explicit-body* {:connection tx :context context
+                              :before-read! before-read! :last-write last-write
+                              :native-read native-read}]
+      (try (body tx)
+           (finally (.setBeforeRead writer nil))))))
+
 (defn- execute-bound-body!
   [context conn tx-db body publication notifications]
   (when-let [preparation (get @(:resolver-bindings context) #'txcommon/*batch-prepare*)]
@@ -350,7 +449,10 @@
       (txcommon/materialize-scalar-pending! preparation tx-db)))
   (let [tx (atom tx-db :meta (cond-> (meta conn)
                               notifications (assoc ::notifications notifications)))
-        result (body tx)]
+        result (if (:datalog-prepare?
+                     (l/request-context (kv/raw-lmdb (.-lmdb ^Store (:store tx-db)))))
+                 (body tx)
+                 (execute-explicit-body! context tx body))]
     (record-connection! context conn publication)
     (vreset! (:current context) @tx)
     result))

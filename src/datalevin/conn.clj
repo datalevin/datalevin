@@ -986,54 +986,64 @@
   (when-let [report (db/stamp-scalar-update-tx before prepared tx-meta)]
     (commit-writing-report! before report false :scalar-update)))
 
+(defn- transact-request!
+  [conn tx-data tx-meta]
+  ;; Remote preparation must run under the server's writer, including when
+  ;; callers share a connection. Client-side simulated batching could otherwise
+  ;; race transactions submitted by another client between prepare and commit.
+  (if (standalone-remote-transaction? conn)
+    (let [report (direct-remote-transact! conn tx-data tx-meta)]
+      (observe-txlog-sync-path! :direct-remote)
+      (notify-listeners! conn report)
+      report)
+    (if-let [control (datalog/control conn)]
+      (let [opts (l/read-env-opts (.-lmdb ^Store (:store @conn)))
+            ;; Type correction and read-layout construction do not depend on
+            ;; the eventual native snapshot. Keep that work on the caller;
+            ;; resolve lookup refs and read old values on the native owner.
+            prepared (db/prepare-scalar-update-tx
+                       @conn tx-data {:defer-entity-resolution? true})
+            report (if (and prepared (nil? (l/explicit-transaction-timeout)))
+                     (datalog/run-scalar! control conn prepared tx-data tx-meta
+                                          stamp-collected-scalar! -transact!)
+                     (datalog/with-transaction!
+                       control conn
+                       (fn [tx]
+                         (observe-embedded-path! (:wal-durability-profile opts)
+                                                 (datalog/batched? control))
+                         (or (when prepared
+                               (when-let [report (db/stamp-scalar-update-tx
+                                                   @tx prepared tx-meta)]
+                                 (let [report (commit-writing-report!
+                                                @tx report false :scalar-update)]
+                                   (reset! tx (:db-after report))
+                                   report)))
+                             (-transact! tx tx-data tx-meta)))
+                       {:context {:datalog-prepare? true :datalog-fast? true}}))]
+        (notify-listeners! conn report)
+        report)
+    (if-let [g (embedded-write-group conn)]
+      (transact-embedded-group! g conn tx-data tx-meta)
+      (do
+        (let [store (.-store ^DB @conn)
+              opts (when (and (instance? Store store)
+                              (not (l/writing? (.-lmdb ^Store store)))
+                              (not (current-thread-holds-store-write-lock? store)))
+                     (l/read-env-opts (.-lmdb ^Store store)))]
+          (observe-embedded-path!
+           (when (:wal? opts) (:wal-durability-profile opts)) false))
+        (run-transact-now! conn tx-data tx-meta))))))
+
 (defn transact!
   ([conn tx-data] (transact! conn tx-data nil))
   ([conn tx-data tx-meta]
-   ;; Remote preparation must run under the server's writer, including when
-   ;; callers share a connection. Client-side simulated batching could otherwise
-   ;; race transactions submitted by another client between prepare and commit.
-   (if (standalone-remote-transaction? conn)
-     (let [report (direct-remote-transact! conn tx-data tx-meta)]
-       (observe-txlog-sync-path! :direct-remote)
-       (notify-listeners! conn report)
-       report)
-     (if-let [control (datalog/control conn)]
-       (let [opts (l/read-env-opts (.-lmdb ^Store (:store @conn)))
-             ;; Type correction and read-layout construction do not depend on
-             ;; the eventual native snapshot. Keep that work on the caller;
-             ;; resolve lookup refs and read old values on the native owner.
-             prepared (db/prepare-scalar-update-tx
-                        @conn tx-data {:defer-entity-resolution? true})
-             report (if (and prepared (nil? (l/explicit-transaction-timeout)))
-                      (datalog/run-scalar! control conn prepared tx-data tx-meta
-                                           stamp-collected-scalar! -transact!)
-                      (datalog/with-transaction!
-                        control conn
-                        (fn [tx]
-                          (observe-embedded-path! (:wal-durability-profile opts)
-                                                  (datalog/batched? control))
-                          (or (when prepared
-                                (when-let [report (db/stamp-scalar-update-tx
-                                                    @tx prepared tx-meta)]
-                                  (let [report (commit-writing-report!
-                                                 @tx report false :scalar-update)]
-                                    (reset! tx (:db-after report))
-                                    report)))
-                              (-transact! tx tx-data tx-meta)))
-                        {:context {:datalog-prepare? true :datalog-fast? true}}))]
-         (notify-listeners! conn report)
-         report)
-     (if-let [g (embedded-write-group conn)]
-       (transact-embedded-group! g conn tx-data tx-meta)
-       (do
-         (let [store (.-store ^DB @conn)
-               opts (when (and (instance? Store store)
-                               (not (l/writing? (.-lmdb ^Store store)))
-                               (not (current-thread-holds-store-write-lock? store)))
-                      (l/read-env-opts (.-lmdb ^Store store)))]
-           (observe-embedded-path!
-            (when (:wal? opts) (:wal-durability-profile opts)) false))
-         (run-transact-now! conn tx-data tx-meta)))))))
+   (if (and datalog/*explicit-body*
+            (identical? conn (:connection datalog/*explicit-body*))
+            (not= :resolving @(:last-write datalog/*explicit-body*))
+            ;; Global watchdogs retain their existing nested transaction scope.
+            (nil? (l/explicit-transaction-timeout)))
+     (datalog/run-explicit-request! conn tx-data tx-meta transact-request!)
+     (transact-request! conn tx-data tx-meta))))
 
 (defn transact-ack!
   ([conn tx-data] (transact-ack! conn tx-data nil))

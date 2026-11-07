@@ -13,7 +13,8 @@
             [datalevin.test.core :refer [db-fixture]]
             [datalevin.tx-group.batch :as batch]
             [datalevin.tx-group.phase :as phase]
-            [datalevin.util :as u]))
+            [datalevin.util :as u])
+  (:import [org.eclipse.collections.impl.map.mutable.primitive LongObjectHashMap]))
 
 (use-fixtures :each db-fixture)
 
@@ -155,6 +156,7 @@
             update [:db/add 1 :stock/value 6]
             eav (vec (:eavt before)) ave (vec (:avet before))]
         (doseq [txs [[update insert update]
+                     [[:db/add 1N :stock/value 6] insert update]
                      [update insert {:db/id "new" :line/number 8}]
                      [update insert [:db.fn/call (fn [_] [])]]
                      [update insert [:db/retract 1 :stock/value 6]]
@@ -175,6 +177,70 @@
                            {:db/id "alias" :identity "existing"}])
         (is (= 2 (d/entid @conn [:line/key [1 7]])))
         (is (= 8 (:stock/value (d/entity @conn 1))))))))
+
+(deftest mixed-grouped-reads-merge-native-and-pending-values
+  (doseq [mode [:scalar :sorted]]
+    (testing (name mode)
+      (with-store true
+        (fn [conn]
+          (d/transact! conn [[:db/add 1 :stock/flag true]])
+          (d/with-transaction [tx conn]
+            (let [view (db/transfer @tx (:store @tx))
+                  pending (LongObjectHashMap.)
+                  context (if (= mode :scalar)
+                            (reify txcommon/ScalarPendingIndex
+                              (pending-scalar-index [_] pending)
+                              (pending-unique-index [_] nil)
+                              (retain-pending-index? [_] false)
+                              (prepare-pending-index! [_ _])
+                              (materialize-scalar-pending! [_ _])
+                              (discard-scalar-pending! [_]))
+                            {:test true})]
+              (binding [txcommon/*batch-prepare* context]
+                (doseq [row [(datom/datom 1 :stock/value 5 100 false)
+                              (datom/datom 1 :stock/value 8 100 true)
+                              (datom/datom 1 :stock/flag true 100 false)
+                              (datom/datom 1 :stock/flag false 100 true)
+                              (datom/datom 1 :stock/ytd 10 100 false)]]
+                  (txcommon/stage-batch-datom! view row))
+                (let [eav (vec (:eavt view)) ave (vec (:avet view))
+                      report (db/prepare-mixed-add-tx
+                               view
+                               [[:db/add 1 :stock/value 9]
+                                [:db/add 1 :stock/flag true]
+                                [:db/add 1 :stock/ytd 11]
+                                [:db/add 1 :stock/count 21]
+                                {:db/id "line" :line/parent 1 :line/number 9}] nil)]
+                  (is (some? report))
+                  (is (= [[:stock/value 8 false] [:stock/value 9 true]
+                          [:stock/flag false false] [:stock/flag true true]
+                          [:stock/ytd 11 true]
+                          [:stock/count 20 false] [:stock/count 21 true]]
+                         (mapv (juxt :a :v datom/datom-added)
+                               (filter #(= 1 (:e %)) (:tx-data report)))))
+                  (is (= eav (vec (:eavt view))))
+                  (is (= ave (vec (:avet view)))))))))))))
+
+(deftest mixed-grouped-reads-own-giant-old-values
+  (with-store true
+    (fn [conn]
+      (d/update-schema conn {:stock/text {:db/valueType :db.type/string}
+                             :stock/bytes {:db/valueType :db.type/bytes}})
+      (let [text (apply str (repeat 2000 "value"))
+            bytes (byte-array 2000 (byte 3))]
+        (d/transact! conn [{:db/id 1 :stock/text text :stock/bytes bytes}])
+        (d/with-transaction [tx conn]
+          (let [txs [[:db/add 1 :stock/text "new"]
+                     [:db/add 1 :stock/bytes (byte-array [1 2])]
+                     {:db/id "line" :line/parent 1 :line/number 9}]
+                report (db/prepare-mixed-add-tx @tx txs nil)
+                retractions (filter (comp not datom/datom-added) (:tx-data report))
+                old (into {} (map (juxt :a :v)) retractions)]
+            (dotimes [_ 4] (db/prepare-mixed-add-tx @tx txs nil))
+            (is (= text (:stock/text old)))
+            (is (= (vec bytes) (vec (:stock/bytes old))))
+            (d/abort-transact tx)))
+        (is (= text (:stock/text (d/entity @conn 1))))))))
 
 (defn- collected! [conn ops]
   (let [collector (get-in @(i/kv-info (d/datalog-kv conn)) [:independent-control :collector])

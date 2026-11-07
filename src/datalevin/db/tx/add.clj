@@ -15,7 +15,7 @@
             [datalevin.interface :as i]
             [datalevin.prepare :as prepare])
   (:import [datalevin.datom Datom]
-           [java.util ArrayList HashSet]))
+           [java.util ArrayList HashMap HashSet]))
 
 (def ^:private scalar-types
   #{nil :db.type/long :db.type/string :db.type/keyword :db.type/symbol
@@ -110,8 +110,8 @@
   [db entities schema options max-eid tx]
   (let [sources (:db/attrTuples (i/rschema (:store db)))
         additions (ArrayList.)
-        updates (HashSet.)]
-    (loop [es (seq entities) eid (long max-eid) tempids {}]
+        updates (HashMap.)]
+    (loop [es (seq entities) eid (long max-eid) tempids {} read-safe? true n-updates 0]
       (if es
         (let [entity (first es)]
           (cond
@@ -128,7 +128,7 @@
                       tempids' (cond-> tempids tempid (assoc tempid next-eid))]
                   (when (append-new-entity! additions schema options sources
                                            tempids' next-eid tx entity)
-                    (recur (next es) next-eid tempids')))))
+                    (recur (next es) next-eid tempids' read-safe? n-updates)))))
 
             (and (vector? entity) (= 4 (count entity))
                  (= :db/add (nth entity 0)))
@@ -138,13 +138,24 @@
                          (contains? scalar-types (:db/valueType props))
                          (nil? (:db/unique props))
                          (not (:db/tupleAttrs props)) (not (get sources a))
-                         (some? v) (.add updates [e a]))
+                         (some? v)
+                         (let [entity-id (long e)
+                               ^HashSet attributes
+                               (or (.get updates entity-id)
+                                   (let [attributes (HashSet. 4)]
+                                     (.put updates entity-id attributes)
+                                     attributes))]
+                           (.add attributes a)))
                 (.add additions (datom e a (prepare/correct-value-with-props
                                             options props a v) tx))
-                (recur (next es) eid tempids)))
+                (recur (next es) eid tempids
+                       (and read-safe? (some? (:db/valueType props)))
+                       (inc n-updates))))
 
             :else nil))
-        {:additions additions :max-eid eid :tempids tempids}))))
+        (cond-> {:additions additions :updates updates :max-eid eid :tempids tempids}
+          (and (> n-updates 1) read-safe?)
+          (assoc :prepare-reader? true))))))
 
 (defn- unique-values-available?
   [db schema ^ArrayList additions]
@@ -164,7 +175,7 @@
   intermediate pending-index maintenance unnecessary. Unsupported shapes and
   uniqueness conflicts return nil without changing either resolver index.
   The caller publishes the resulting datoms through the shared commit path."
-  [report entities]
+  [report entities read-old-values]
   ;; Scalar-only and insert-only requests already have preparation paths.
   (when (and (some map? entities) (some vector? entities))
     (let [db (:db-after report) store (:store db)
@@ -175,12 +186,22 @@
           (when-let [plan (plan-additions db entities schema options before tx)]
             (let [^ArrayList additions (:additions plan)]
               (when (unique-values-available? db schema additions)
-                (let [datoms
+                (let [^HashMap updates (:updates plan)
+                      n-entities (.size updates)
+                      ^HashMap old-values (read-old-values db updates)
+                      read-old (when (and (:prepare-reader? plan)
+                                          (< (.size old-values) n-entities))
+                                 (common/ea-first-v-reader db))
+                      datoms
                       (loop [idx 0 out (transient [])]
                         (if (< idx (.size additions))
                           (let [^Datom addition (.get additions idx)
                                 e (.-e addition) a (.-a addition) v (.-v addition)
-                                old (when (<= e before) (common/ea-first-v db e a))]
+                                old (when (<= e before)
+                                      (if-let [values (.get old-values e)]
+                                        (get values a)
+                                        (if read-old (read-old e a)
+                                            (common/ea-first-v db e a))))]
                             (recur (unchecked-inc idx)
                                    (cond
                                      (= old v) out
