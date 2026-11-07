@@ -12,6 +12,8 @@
             [datalevin.interface :as i]
             [datalevin.test.core :refer [db-fixture]]
             [datalevin.tx-group.batch :as batch]
+            [datalevin.tx-group.batch.embedded :as embedded]
+            [datalevin.tx-group.compat :as group]
             [datalevin.tx-group.phase :as phase]
             [datalevin.util :as u])
   (:import [org.eclipse.collections.impl.map.mutable.primitive LongObjectHashMap]))
@@ -87,6 +89,108 @@
         (is (:pass? result) (pr-str result))
         (is (= eav (vec (:eavt before))))
         (is (= ave (vec (:avet before))))))))
+
+(deftest blind-preparation-rejects-mixed-shapes-before-correcting-values
+  (with-store false
+    (fn [conn]
+      (let [corrections (atom 0)
+            value (proxy [Object] []
+                    (toString [] (swap! corrections inc) "corrected"))
+            insert {:db/id "line" :line/name value}
+            update [:db/add 1 :stock/value 6]]
+        (doseq [txs [[insert update] [update insert]
+                     (list insert update) (map identity [insert update])]]
+          (is (nil? (db/prepare-blind-local-tx @conn txs true)))
+          (is (zero? @corrections)))
+        (is (some? (db/prepare-blind-local-tx @conn [insert] true)))
+        (is (pos? @corrections))))))
+
+(deftest top-level-mixed-adds-use-the-owned-writer
+  (doseq [wal? [false true] prepare? [false true] map-first? [false true]
+          grouped? [false true]]
+    (testing (str "WAL " wal? ", preparation " prepare? ", map first " map-first?
+                  ", grouped " grouped?)
+      (binding [embedded/*defer-attachment?* (not grouped?)]
+        (with-store wal?
+          (fn [conn]
+            (binding [c/*use-prepare-path* prepare? group/*enabled?* grouped?]
+              (let [before @conn
+                    indexes [(vec (:eavt before)) (vec (:avet before))]
+                    paths (atom [])
+                    notifications (atom [])
+                    insert {:db/id "line" :line/parent 1 :line/number 7}
+                    updates [[:db/add 1 :stock/value 6]
+                             [:db/add 1 :stock/flag true]]
+                    txs (if map-first? (into [insert] updates) (conj updates insert))]
+                (d/listen! conn :mixed #(swap! notifications conj %))
+                (let [report (binding [conn/*local-wal-tx-path-observer* #(swap! paths conj %)]
+                               (d/transact! conn txs {:source :top-level}))
+                      eid (get (:tempids report) "line")
+                      saved (datoms report)]
+                  (is (= [:mixed-add] @paths))
+                  (is (= (select-keys before [:max-eid :max-tx])
+                         (select-keys (:db-before report) [:max-eid :max-tx])))
+                  (is (identical? @conn (:db-after report)))
+                  (is (= {:source :top-level} (:tx-meta report)))
+                  (is (= [report] @notifications))
+                  (is (= eid (d/entid @conn [:line/key [1 7]])))
+                  (is (= 6 (:stock/value (d/entity @conn 1))))
+                  (is (true? (:stock/flag (d/entity @conn 1))))
+                  (is (= indexes [(vec (:eavt before)) (vec (:avet before))]))
+                  (d/transact! conn [[:db/add 1 :stock/value 7]])
+                  (is (= saved (datoms report))))
+                (let [before (rows @conn)]
+                  (is (instance? Exception
+                        (failure-of #(d/transact! conn
+                                       [[:db/add 1 :stock/value 99]
+                                        {:db/id "conflict" :line/parent 1 :line/number 7}]))))
+                  (is (= before (rows @conn))))))))))))
+
+(deftest top-level-mixed-adds-refresh-a-stale-connection-under-the-writer
+  (doseq [wal? [false true]]
+    (let [dir (u/tmp-dir (str "mixed-stale-" (random-uuid)))
+          opts {:wal? wal? :snapshot-scheduler? false :background-sampling? false}]
+      (try
+        (binding [embedded/*defer-attachment?* true group/*enabled?* false]
+          (with-open [first-conn (d/create-conn dir schema opts)
+                      stale (d/create-conn dir schema opts)]
+            (d/transact! first-conn [{:db/id 1 :stock/value 5}
+                                    {:db/id 100 :line/name "peer"}])
+            (d/transact! first-conn [[:db/add 1 :stock/value 6]])
+            (is (< (:max-eid @stale) 100))
+            (let [tx (:max-tx @first-conn)
+                  report (d/transact! stale
+                           [{:db/id "new" :line/name "new"}
+                            [:db/add 1 :stock/value 7]])]
+              (is (= 101 (get (:tempids report) "new")))
+              (is (= (inc tx) (get (:tempids report) :db/current-tx)))
+              (is (= [6 7] (mapv :v (filter #(= :stock/value (:a %))
+                                             (:tx-data report)))))
+              (is (= "peer" (:line/name (d/entity @stale 100))))
+              (is (= "new" (:line/name (d/entity @stale 101)))))))
+        (finally (u/delete-files dir))))))
+
+(deftest direct-mixed-fallback-preserves-pending-values-and-new-attributes
+  (doseq [wal? [false true]]
+    (binding [embedded/*defer-attachment?* true group/*enabled?* false]
+      (with-store wal?
+        (fn [conn]
+          (let [report (d/transact! conn
+                         [[:db/add 1 :stock/value 6]
+                          {:db/id "new" :identity "fresh" :line/name "before" :new/flag true}
+                          [:db/add 1 :stock/value 7]
+                          [:db.fn/call
+                           (fn [database]
+                             (let [eid (d/entid database [:identity "fresh"])]
+                               (is (some? eid))
+                               [[:db/cas 1 :stock/value 7 8]
+                                [:db/add eid :line/name "after"]]))]])
+                eid (get (:tempids report) "new")]
+            (is (= "after" (:line/name (d/entity @conn eid))))
+            (is (= 8 (:stock/value (d/entity @conn 1))))
+            (is (true? (:new/flag (d/entity @conn eid))))
+            (d/transact! conn [[:db/add eid :new/flag false]])
+            (is (false? (:new/flag (d/entity @conn eid))))))))))
 
 (deftest writer-old-values-survive-buffer-reuse-and-abort
   (with-store true
@@ -178,7 +282,20 @@
         (is (= 2 (d/entid @conn [:line/key [1 7]])))
         (is (= 8 (:stock/value (d/entity @conn 1))))))))
 
-(deftest mixed-grouped-reads-merge-native-and-pending-values
+(deftest mixed-noncanonical-entity-ids-retain-ordered-resolution
+  (doseq [wal? [false true]]
+    (with-store wal?
+      (fn [conn]
+        (let [report (d/transact! conn
+                                [[:db/add 1N :stock/value 6]
+                                 {:db/id "line" :line/parent 1 :line/number 9}
+                                 [:db/add 1 :stock/value 7]])]
+          (is (= [7] (mapv :v (d/datoms @conn :eav 1 :stock/value))))
+          (is (= [[5 false] [6 true] [6 false] [7 true]]
+                 (mapv (juxt :v datom/datom-added)
+                       (filter #(= :stock/value (:a %)) (:tx-data report))))))))))
+
+(deftest mixed-old-value-reads-merge-native-and-pending-values
   (doseq [mode [:scalar :sorted]]
     (testing (name mode)
       (with-store true
@@ -221,7 +338,7 @@
                   (is (= eav (vec (:eavt view))))
                   (is (= ave (vec (:avet view)))))))))))))
 
-(deftest mixed-grouped-reads-own-giant-old-values
+(deftest mixed-old-value-reads-own-giant-values
   (with-store true
     (fn [conn]
       (d/update-schema conn {:stock/text {:db/valueType :db.type/string}

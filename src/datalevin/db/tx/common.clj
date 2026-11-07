@@ -13,7 +13,6 @@
    [datalevin.constants :refer [e0 tx0 emax txmax v0 vmax]]
    [datalevin.datom :as d :refer [datom]]
    [datalevin.interface :as i :refer [rschema]]
-   [datalevin.storage :as storage]
    [datalevin.validate :as vld])
   (:import
    [datalevin.datom Datom]
@@ -145,23 +144,6 @@
                          db (i/slice (:store db) :eav
                                      (datom e a v0) (datom e a vmax))))))))
       (i/ea-first-v (:store db) e a))))
-
-(defn ea-first-v-reader
-  "Prepare one request's old-value reads. Pending additions and retractions
-  retain their existing resolution; native misses share cursor/key setup."
-  [db]
-  (when-let [read (storage/ea-first-v-reader (:store db))]
-    (if (nil? *batch-prepare*)
-      read
-      (fn [e a]
-        (let [^LongObjectHashMap pending (scalar-pending-index)
-              ^HashMap values (when pending (.get pending (long e)))
-              pending? (if pending
-                         (and values (.containsKey values a))
-                         (not (.isEmpty
-                                (.subSet ^TreeSortedSet (:eavt db)
-                                         (datom e a nil tx0) (datom e a nil txmax)))))]
-          (if pending? (ea-first-v db e a) (read e a)))))))
 
 (defn av-first-e
   "Resolve the current owner of an indexed value during write preparation."

@@ -2389,16 +2389,14 @@
 (def ^:private ^:const scalar-entity-read-min-attrs 8)
 
 (defn- prepare-scalar-entity-read
-  ([store-schema attributes]
-   (prepare-scalar-entity-read store-schema attributes scalar-entity-read-min-attrs))
-  ([store-schema attributes min-attrs]
+  [store-schema attributes]
   ;; Four-attribute projections cost more CPU on Linux. Use point seeks for
   ;; narrow updates; retain a layout for wider updates so stamping can read
   ;; their attributes with one shared cursor inside the write transaction.
-  (when (>= (count attributes) (long min-attrs))
+  (when (>= (count attributes) scalar-entity-read-min-attrs)
     (let [names (sort-by #(:db/aid (store-schema %)) attributes)]
       (ScalarEntityRead. (object-array names)
-                         (long-array (map #(:db/aid (store-schema %)) names)))))))
+                         (long-array (map #(:db/aid (store-schema %)) names))))))
 
 (defn- read-scalar-entity
   [store eid ^ScalarEntityRead layout]
@@ -2470,37 +2468,40 @@
   ([^DB db initial-es allow-small-unique?]
    (prepare-blind-local-tx db initial-es allow-small-unique? true))
   ([^DB db initial-es allow-small-unique? collect-unique-avs?]
-   (let [store             (.-store db)
-         store-schema      (schema store)
-         store-opts        (opts store)
-         store-rschema     (rschema store)
-         tuple-source-attrs (:db/attrTuples store-rschema)
-         unique-identity-attrs (:db.unique/identity store-rschema)
-         auto-entity-time? (boolean (:auto-entity-time? store-opts))
-         allow-unique?     (or allow-small-unique?
-                               (>= (long (bounded-count
-                                          blind-unique-write-threshold
-                                          initial-es))
-                                   blind-unique-write-threshold))
-         initial-count     (int
-                             (if (instance? java.util.Collection initial-es)
-                               (.size ^java.util.Collection initial-es)
-                               0))
-         set-capacity      (int (max 1 (inc (quot (* 4 (long initial-count))
-                                                  3))))
-         ^FastList unique-avs (FastList. initial-count)
-         seen-avs          (when collect-unique-avs?
-                              (java.util.HashSet. set-capacity))
-         seen-tempids      (java.util.HashSet. set-capacity)
-         has-unique?       (volatile! false)
-         fuse-unique-inserts? (volatile! true)
-         ;; These decisions depend only on the schema snapshot and this call's
-         ;; uniqueness policy. Value bounds and validation remain per value.
-         attr-infos        (java.util.HashMap.)
-         entities
-         (reduce
-           (fn [^FastList acc entity]
-             (if (map? entity)
+   ;; Reject mixed requests before allocating preparation state or correcting
+   ;; map values that the general or mixed preparer would process again.
+   (when (reduce (fn [_ entity] (if (map? entity) true (reduced false)))
+                 true initial-es)
+     (let [store             (.-store db)
+           store-schema      (schema store)
+           store-opts        (opts store)
+           store-rschema     (rschema store)
+           tuple-source-attrs (:db/attrTuples store-rschema)
+           unique-identity-attrs (:db.unique/identity store-rschema)
+           auto-entity-time? (boolean (:auto-entity-time? store-opts))
+           allow-unique?     (or allow-small-unique?
+                                 (>= (long (bounded-count
+                                            blind-unique-write-threshold
+                                            initial-es))
+                                     blind-unique-write-threshold))
+           initial-count     (int
+                               (if (instance? java.util.Collection initial-es)
+                                 (.size ^java.util.Collection initial-es)
+                                 0))
+           set-capacity      (int (max 1 (inc (quot (* 4 (long initial-count))
+                                                    3))))
+           ^FastList unique-avs (FastList. initial-count)
+           seen-avs          (when collect-unique-avs?
+                                (java.util.HashSet. set-capacity))
+           seen-tempids      (java.util.HashSet. set-capacity)
+           has-unique?       (volatile! false)
+           fuse-unique-inserts? (volatile! true)
+           ;; These decisions depend only on the schema snapshot and this call's
+           ;; uniqueness policy. Value bounds and validation remain per value.
+           attr-infos        (java.util.HashMap.)
+           entities
+           (reduce
+             (fn [^FastList acc entity]
                (if-let [^PreparedBlindEntity prepared
                         (prepare-blind-write-entity
                           store-schema store-opts tuple-source-attrs
@@ -2514,46 +2515,45 @@
                            auto-entity-time?)
                      (doto acc (.add prepared))
                      acc))
-                 (reduced nil))
-               (reduced nil)))
-           (FastList. initial-count)
-           initial-es)
-         fuse-unique-inserts?
-         (and @has-unique? @fuse-unique-inserts?)
-         unique-avs
-         (if (and entities
-                  @has-unique?
-                  (not collect-unique-avs?)
-                  (not fuse-unique-inserts?))
-           (collect-prepared-blind-unique-avs
-             store-schema entities initial-count)
-           unique-avs)
-         identity-upsert-av
-         (when (and entities
-                    (not auto-entity-time?)
-                    (= 1 (.size ^FastList entities)))
-           (blind-identity-upsert-av
-             store-schema (.get ^FastList entities 0)))]
-     (when (and entities unique-avs (not (.isEmpty ^FastList entities)))
-       (->PreparedBlindTx store-schema
-                          store-opts
-                          auto-entity-time?
-                          entities
-                          unique-avs
-                          @has-unique?
-                          fuse-unique-inserts?
-                          identity-upsert-av
-                          (when identity-upsert-av
-                            (let [^PreparedBlindEntity entity
-                                  (.get ^FastList entities 0)
-                                  ^FastList attrs (.-attrs entity)
-                                  identity-attr (first identity-upsert-av)]
-                              (prepare-scalar-entity-read
-                                store-schema
-                                (for [index (range 0 (.size attrs) 2)
-                                      :let [attr (.get attrs index)]
-                                      :when (not= attr identity-attr)]
-                                  attr)))))))))
+                 (reduced nil)))
+             (FastList. initial-count)
+             initial-es)
+           fuse-unique-inserts?
+           (and @has-unique? @fuse-unique-inserts?)
+           unique-avs
+           (if (and entities
+                    @has-unique?
+                    (not collect-unique-avs?)
+                    (not fuse-unique-inserts?))
+             (collect-prepared-blind-unique-avs
+               store-schema entities initial-count)
+             unique-avs)
+           identity-upsert-av
+           (when (and entities
+                      (not auto-entity-time?)
+                      (= 1 (.size ^FastList entities)))
+             (blind-identity-upsert-av
+               store-schema (.get ^FastList entities 0)))]
+       (when (and entities unique-avs (not (.isEmpty ^FastList entities)))
+         (->PreparedBlindTx store-schema
+                            store-opts
+                            auto-entity-time?
+                            entities
+                            unique-avs
+                            @has-unique?
+                            fuse-unique-inserts?
+                            identity-upsert-av
+                            (when identity-upsert-av
+                              (let [^PreparedBlindEntity entity
+                                    (.get ^FastList entities 0)
+                                    ^FastList attrs (.-attrs entity)
+                                    identity-attr (first identity-upsert-av)]
+                                (prepare-scalar-entity-read
+                                  store-schema
+                                  (for [index (range 0 (.size attrs) 2)
+                                        :let [attr (.get attrs index)]
+                                        :when (not= attr identity-attr)]
+                                    attr))))))))))
 
 (defn ^:no-doc blind-local-tx-unique-values-absent?
   "Check a prepared batch's unique values against the current store snapshot.
@@ -3038,29 +3038,13 @@
           db-after (assoc db :max-tx tx-id)]
       (->TxReport db db-after tx-data {:db/current-tx tx-id} tx-meta))))
 
-(defn- read-mixed-update-entities
-  [db ^java.util.HashMap updates]
-  (let [store-schema (schema (:store db))
-        entries (.iterator (.entrySet updates))]
-    (while (.hasNext entries)
-      (let [^java.util.Map$Entry entry (.next entries)
-            ^java.util.HashSet attributes (.getValue entry)]
-        (if-let [layout (when (and (>= (.size attributes) 2)
-                                  (every? #(some? (:db/valueType (store-schema %)))
-                                          attributes))
-                         ;; Mixed requests already collect their updated E/A
-                         ;; pairs. Reuse that index for narrow entity reads;
-                         ;; scalar-only admission keeps its Linux-tested limit.
-                         (prepare-scalar-entity-read store-schema attributes 2))]
-          (.setValue entry (or (read-scalar-update-entity db (.getKey entry) layout) {}))
-          (.remove entries))))
-    updates))
-
 (defn ^:no-doc prepare-mixed-add-tx
-  "Prepare ordinary mixed updates/inserts against an already owned writer."
-  [db tx-data tx-meta]
-  (txadd/prepare-mixed-report (->TxReport db db [] {} tx-meta) tx-data
-                            read-mixed-update-entities))
+  "Prepare ordinary mixed updates/inserts. An owned writer may supply its
+  current maximum entity ID to avoid rescanning the native index."
+  ([db tx-data tx-meta]
+   (prepare-mixed-add-tx db tx-data tx-meta nil))
+  ([db tx-data tx-meta owned-max-eid]
+   (txadd/prepare-mixed-report (->TxReport db db [] {} tx-meta) tx-data owned-max-eid)))
 
 (defn ^:no-doc prepare-local-tx-data
   "Resolve local transaction data without committing or constructing the final
@@ -3073,47 +3057,54 @@
      (txexec/local-transact-tx-data initial-report entities tx-time))))
 
 (defn transact-tx-data
-  [initial-report initial-es simulated?]
-  (let [^DB db  (:db-before initial-report)
-        store   (.-store db)
-        tx-time (System/currentTimeMillis)]
-    (if (remote-store? store)
-      (try
-        (let [txs                                    (sequence
-                                                      (mapcat
-                                                        expand-transactable-entity)
-                                                      initial-es)
-              res                                    (i/tx-data store txs simulated?)
-              db-info                                (when (map? res) (:db-info res))
-              res                                    (if db-info (dissoc res :db-info) res)
-              [tx-data tempids max-eid new-attributes] (remote-tx-result res)
-              info (resolved-remote-db-info
-                     store db (or db-info {}) max-eid simulated?)]
-          (when-not simulated?
-            (invalidate-cache store
-                              tx-data
-                              (:last-modified info)
-                              (:max-tx info)))
-          (cond-> (assoc initial-report
-                         :db-after (-> (carry-runtime-opts (new-db store info db) db)
-                                       (assoc :max-eid (:max-eid info))
-                                     (#(if simulated?
-                                         (update % :max-tx u/long-inc)
-                                         %)))
-                         :tx-data tx-data
-                         :tempids tempids)
-            (seq new-attributes) (assoc :new-attributes new-attributes)
-            simulated? mark-simulated-tx-cache!))
-        (catch Throwable e
-          (when-not simulated?
-            (invalidate-remote-cache! store))
-          (throw e)))
-      (let [report (prepare-local-tx-data initial-report initial-es tx-time)]
-        (if simulated?
-          (mark-simulated-tx-cache! report)
-          (assoc report :db-after
-                 (commit-prepared-tx-data!
-                   (:db-after report) (:tx-data report) report)))))))
+  "Resolve transaction data. owned-max-eid may be supplied only for a current
+  local DB view whose native writer is owned by the caller."
+  ([initial-report initial-es simulated?]
+   (transact-tx-data initial-report initial-es simulated? nil))
+  ([initial-report initial-es simulated? owned-max-eid]
+   (let [^DB db  (:db-before initial-report)
+         store   (.-store db)
+         tx-time (System/currentTimeMillis)]
+     (if (remote-store? store)
+       (try
+         (let [txs                                    (sequence
+                                                       (mapcat
+                                                         expand-transactable-entity)
+                                                       initial-es)
+               res                                    (i/tx-data store txs simulated?)
+               db-info                                (when (map? res) (:db-info res))
+               res                                    (if db-info (dissoc res :db-info) res)
+               [tx-data tempids max-eid new-attributes] (remote-tx-result res)
+               info (resolved-remote-db-info
+                      store db (or db-info {}) max-eid simulated?)]
+           (when-not simulated?
+             (invalidate-cache store
+                               tx-data
+                               (:last-modified info)
+                               (:max-tx info)))
+           (cond-> (assoc initial-report
+                          :db-after (-> (carry-runtime-opts (new-db store info db) db)
+                                        (assoc :max-eid (:max-eid info))
+                                      (#(if simulated?
+                                          (update % :max-tx u/long-inc)
+                                          %)))
+                          :tx-data tx-data
+                          :tempids tempids)
+             (seq new-attributes) (assoc :new-attributes new-attributes)
+             simulated? mark-simulated-tx-cache!))
+         (catch Throwable e
+           (when-not simulated?
+             (invalidate-remote-cache! store))
+           (throw e)))
+       (let [initial-report (cond-> initial-report
+                              (some? owned-max-eid)
+                              (assoc ::txexec/max-eid-before owned-max-eid))
+             report (prepare-local-tx-data initial-report initial-es tx-time)]
+         (if simulated?
+           (mark-simulated-tx-cache! report)
+           (assoc report :db-after
+                  (commit-prepared-tx-data!
+                    (:db-after report) (:tx-data report) report))))))))
 
 (defn transact-ack
   "Transact on a remote store without fetching a transaction report.

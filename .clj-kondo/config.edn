@@ -12,6 +12,7 @@
    datalevin.conn/with-conn hooks.datalevin/with-binding
    datalevin.conn/with-kv hooks.datalevin/with-binding
    datalevin.conn/with-transaction hooks.datalevin/with-binding
+   datalevin.conn/with-compatibility-transaction hooks.datalevin/with-binding
    datalevin.core/with-conn hooks.datalevin/with-binding
    datalevin.core/with-kv hooks.datalevin/with-binding
    datalevin.core/with-transaction hooks.datalevin/with-binding

@@ -13,9 +13,11 @@
             [datalevin.db.tx.common :as common]
             [datalevin.db.tx.prepare :as txprep]
             [datalevin.interface :as i]
-            [datalevin.prepare :as prepare])
+            [datalevin.prepare :as prepare]
+            [datalevin.storage :as storage])
   (:import [datalevin.datom Datom]
-           [java.util ArrayList HashMap HashSet]))
+           [java.util ArrayList HashSet SortedSet]
+           [org.eclipse.collections.impl.map.mutable.primitive LongObjectHashMap]))
 
 (def ^:private scalar-types
   #{nil :db.type/long :db.type/string :db.type/keyword :db.type/symbol
@@ -106,12 +108,19 @@
           nil tuples))
       true)))
 
+(defn- pending-values?
+  [db]
+  (and common/*batch-prepare*
+       (if-let [^LongObjectHashMap pending (common/scalar-pending-index)]
+         (not (.isEmpty pending))
+         (not (.isEmpty ^SortedSet (:eavt db))))))
+
 (defn- plan-additions
   [db entities schema options max-eid tx]
   (let [sources (:db/attrTuples (i/rschema (:store db)))
         additions (ArrayList.)
-        updates (HashMap.)]
-    (loop [es (seq entities) eid (long max-eid) tempids {} read-safe? true n-updates 0]
+        updates (HashSet.)]
+    (loop [es (seq entities) eid (long max-eid) tempids {} read-safe? true]
       (if es
         (let [entity (first es)]
           (cond
@@ -128,33 +137,30 @@
                       tempids' (cond-> tempids tempid (assoc tempid next-eid))]
                   (when (append-new-entity! additions schema options sources
                                            tempids' next-eid tx entity)
-                    (recur (next es) next-eid tempids' read-safe? n-updates)))))
+                    (recur (next es) next-eid tempids' read-safe?)))))
 
             (and (vector? entity) (= 4 (count entity))
                  (= :db/add (nth entity 0)))
             (let [[_ e a v] entity props (schema a)]
-              (when (and (integer? e) (pos? (long e)) (<= (long e) (long max-eid))
+              ;; Java set keys must use the datom's canonical Long entity ID.
+              ;; Other integer representations need ordered resolution.
+              (when (and (instance? Long e) (pos? (long e))
+                         (<= (long e) (long max-eid))
                          (ordinary-attr? a props)
                          (contains? scalar-types (:db/valueType props))
                          (nil? (:db/unique props))
                          (not (:db/tupleAttrs props)) (not (get sources a))
-                         (some? v)
-                         (let [entity-id (long e)
-                               ^HashSet attributes
-                               (or (.get updates entity-id)
-                                   (let [attributes (HashSet. 4)]
-                                     (.put updates entity-id attributes)
-                                     attributes))]
-                           (.add attributes a)))
+                         (some? v) (.add updates [(long e) a]))
                 (.add additions (datom e a (prepare/correct-value-with-props
                                             options props a v) tx))
                 (recur (next es) eid tempids
-                       (and read-safe? (some? (:db/valueType props)))
-                       (inc n-updates))))
+                       (and read-safe? (some? (:db/valueType props))))))
 
             :else nil))
-        (cond-> {:additions additions :updates updates :max-eid eid :tempids tempids}
-          (and (> n-updates 1) read-safe?)
+        (cond-> {:additions additions :max-eid eid :tempids tempids}
+          ;; Pending lookups already avoid native setup. Keep their shared
+          ;; resolver rather than preparing an unused native reader.
+          (and (> (.size updates) 1) read-safe? (not (pending-values? db)))
           (assoc :prepare-reader? true))))))
 
 (defn- unique-values-available?
@@ -174,43 +180,41 @@
   Each existing E/A is written once; new maps own distinct IDs. This makes
   intermediate pending-index maintenance unnecessary. Unsupported shapes and
   uniqueness conflicts return nil without changing either resolver index.
-  The caller publishes the resulting datoms through the shared commit path."
-  [report entities read-old-values]
-  ;; Scalar-only and insert-only requests already have preparation paths.
-  (when (and (some map? entities) (some vector? entities))
-    (let [db (:db-after report) store (:store db)
-          schema (i/schema store) options (i/opts store)]
-      (when-not (:auto-entity-time? options)
-        (let [before (max (long (:max-eid db)) (long (i/init-max-eid store)))
-              tx (inc (long (:max-tx db)))]
-          (when-let [plan (plan-additions db entities schema options before tx)]
-            (let [^ArrayList additions (:additions plan)]
-              (when (unique-values-available? db schema additions)
-                (let [^HashMap updates (:updates plan)
-                      n-entities (.size updates)
-                      ^HashMap old-values (read-old-values db updates)
-                      read-old (when (and (:prepare-reader? plan)
-                                          (< (.size old-values) n-entities))
-                                 (common/ea-first-v-reader db))
-                      datoms
-                      (loop [idx 0 out (transient [])]
-                        (if (< idx (.size additions))
-                          (let [^Datom addition (.get additions idx)
-                                e (.-e addition) a (.-a addition) v (.-v addition)
-                                old (when (<= e before)
-                                      (if-let [values (.get old-values e)]
-                                        (get values a)
-                                        (if read-old (read-old e a)
-                                            (common/ea-first-v db e a))))]
-                            (recur (unchecked-inc idx)
-                                   (cond
-                                     (= old v) out
-                                     (nil? old) (conj! out addition)
-                                     :else (-> out
-                                               (conj! (datom e a old tx false))
-                                               (conj! addition)))))
-                          (persistent! out)))]
-                  (assoc report
-                         :db-after (assoc db :max-eid (:max-eid plan) :max-tx tx)
-                         :tx-data datoms
-                         :tempids (assoc (:tempids plan) :db/current-tx tx)))))))))))
+  The caller publishes the resulting datoms through the shared commit path.
+  An owned writer may supply its current maximum; other callers scan the store."
+  ([report entities]
+   (prepare-mixed-report report entities nil))
+  ([report entities owned-max-eid]
+   ;; Scalar-only and insert-only requests already have preparation paths.
+   (when (and (some map? entities) (some vector? entities))
+     (let [db (:db-after report) store (:store db)
+           schema (i/schema store) options (i/opts store)]
+       (when-not (:auto-entity-time? options)
+         (let [before (max (long (:max-eid db))
+                           (long (or owned-max-eid (i/init-max-eid store))))
+               tx (inc (long (:max-tx db)))]
+           (when-let [plan (plan-additions db entities schema options before tx)]
+             (let [^ArrayList additions (:additions plan)]
+               (when (unique-values-available? db schema additions)
+                 (let [read-old (when (:prepare-reader? plan)
+                                 (storage/ea-first-v-reader store))
+                       datoms
+                       (loop [idx 0 out (transient [])]
+                         (if (< idx (.size additions))
+                           (let [^Datom addition (.get additions idx)
+                                 e (.-e addition) a (.-a addition) v (.-v addition)
+                                 old (when (<= e before)
+                                       (if read-old (read-old e a)
+                                           (common/ea-first-v db e a)))]
+                             (recur (unchecked-inc idx)
+                                    (cond
+                                      (= old v) out
+                                      (nil? old) (conj! out addition)
+                                      :else (-> out
+                                                (conj! (datom e a old tx false))
+                                                (conj! addition)))))
+                           (persistent! out)))]
+                   (assoc report
+                          :db-after (assoc db :max-eid (:max-eid plan) :max-tx tx)
+                          :tx-data datoms
+                          :tempids (assoc (:tempids plan) :db/current-tx tx))))))))))))

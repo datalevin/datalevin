@@ -946,8 +946,11 @@
   [initial-report initial-es tx-time]
   (let [db              (:db-before initial-report)
         store           (:store db)
+        ;; The owning writer supplies its current maximum. Preserve the
+        ;; attempt boundary on the initial report so upsert retries reuse it.
         max-eid-before  (max (long (:max-eid db))
-                             (long (init-max-eid store)))
+                             (long (or (::max-eid-before initial-report)
+                                       (init-max-eid store))))
         initial-report' (-> initial-report
                             (dissoc-present ::tx-retracted)
                             ;; Each retry owns a fresh append buffer. Complex
@@ -1104,7 +1107,7 @@
                    ctx initial-es tx-time
                    (fn [es t]
                      (execute-tx-loop initial-report es t)))]
-      (cond-> (assoc initial-report
+      (cond-> (assoc (dissoc-present initial-report ::max-eid-before)
                      :db-after (:db-after ptx)
                      :tx-data (:tx-data ptx)
                      :tempids (:tempids ptx))

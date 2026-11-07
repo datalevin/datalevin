@@ -1583,7 +1583,7 @@
 
 (defn resolution-value-reader
   "Prepare scalar lookups for one callback on an owned writer. Reuse the
-  cursor, codecs and encoded entity key; decoded values never enter the reader.
+  cursor and codecs; decoded values never enter the reader.
   The decoder must not invoke user code or replace the native transaction."
   [^CppLMDB native lmdb decode]
   (i/check-ready native)
@@ -1593,13 +1593,11 @@
         ^BufVal key (.-start-kp rtx)
         ^BufVal value (.-start-vp rtx)
         key-codec (.-key-codec dbi)
-        value-codec (buffer/dbi-val-compressor dbi)
-        entity (long-array [-1])]
+        value-codec (buffer/dbi-val-compressor dbi)]
     (fn [e aid]
       (try
-        (when (not= (long e) (aget entity 0))
-          (buffer/put-id-bufval key (long e) key-codec (l/key-bf rtx))
-          (aset entity 0 (long e)))
+        ;; Other internal reads can reuse these transaction-owned buffers.
+        (buffer/put-id-bufval key (long e) key-codec (l/key-bf rtx))
         (buffer/put-bufval value aid :int value-codec (l/val-bf rtx))
         (when (.get cur key value DTLV/MDB_GET_BOTH_RANGE)
           (let [^ByteBuffer bf (iter/v-bf (.val cur) value-codec rtx)]

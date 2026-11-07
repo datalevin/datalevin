@@ -351,10 +351,20 @@
                  (reset! orig-conn# new-db#)
                  res#))
              (let [kv#     (.-lmdb ^Store s#)
+                   owned?# (and (l/writing? kv#)
+                                (Thread/holdsLock (l/write-txn kv#)))
                    s1#     (volatile! nil)
                    res1#   (l/with-transaction-kv [kv1# kv# tx-timeout-opt#]
-                             (let [conn1# (atom (db/transfer
-                                                  db# (s/transfer s# kv1#))
+                             (let [store1# (s/transfer s# kv1#)
+                                   db1# (db/transfer db# store1#)
+                                   ;; Refresh once after acquiring the writer;
+                                   ;; a different connection may have written.
+                                   db1# (cond-> db1#
+                                          (not owned?#)
+                                          (assoc :max-eid
+                                                 (max (long (:max-eid db1#))
+                                                      (long (i/init-max-eid store1#)))))
+                                   conn1# (atom db1#
                                                 :meta (meta orig-conn#))
                                    res#   (let [~conn conn1#]
                                             ~@body)]
@@ -808,7 +818,8 @@
                               (s/current-write-group
                                 (.-lmdb ^Store (.-store db)))))]
     (or
-      (when-let [report (db/prepare-mixed-add-tx db1 tx-data tx-meta)]
+      (when-let [report (db/prepare-mixed-add-tx db1 tx-data tx-meta
+                                               (:max-eid db1))]
         (commit-writing-report! db report false :mixed-add))
       (when-let [prepared (db/prepare-scalar-update-tx db1 tx-data)]
         (when-let [report (db/stamp-scalar-update-tx db1 prepared tx-meta)]
@@ -841,18 +852,53 @@
         (when-let [preparation txcommon/*batch-prepare*]
           (txcommon/materialize-scalar-pending! preparation db1))
         (let [report (db/transact-tx-data (db/->TxReport db db1 [] {} tx-meta)
-                                          tx-data false)]
+                                          tx-data false (:max-eid db1))]
           (observe-local-wal-tx-path! :general)
           report)))))
+
+(defn- maybe-transact-local-mixed!
+  [conn tx-data tx-meta]
+  (when (and (some map? tx-data) (some vector? tx-data))
+    ;; Resolve old values and allocate new IDs after acquiring the writer, just
+    ;; as for nested requests. Unsupported shapes use the same interpreter
+    ;; inside that transaction, preserving ordered resolution and rollback.
+    (locking conn
+      (let [before ^DB @conn
+            store ^Store (.-store before)
+            old (db/cache-disabled? store)]
+        (db/disable-cache store)
+        (try
+          (let [kv (.-lmdb store)
+                report (l/with-transaction-kv [kv1 kv]
+                         (let [store1 (s/transfer store kv1)
+                               database (assoc (db/transfer before store1)
+                                               :max-eid
+                                               (max (long (:max-eid before))
+                                                    (long (i/init-max-eid store1)))
+                                               :max-tx
+                                               (max (long (:max-tx before))
+                                                    (long (i/max-tx store1))))]
+                           (transact-local-in-write-txn! database tx-data tx-meta)))
+                after (-> (:db-after report)
+                          (db/transfer (s/transfer (:store (:db-after report)) kv))
+                          (db/carry-runtime-opts before)
+                          (db/adopt-current-db!))]
+            (reset! conn after)
+            (assoc report :db-before before :db-after after))
+          (finally
+            (when-not old
+              (db/enable-cache (.-store ^DB @conn)))))))))
 
 (defn- -transact! [conn tx-data tx-meta]
   (if (local-direct-transact-eligible? conn)
     (or (maybe-direct-local-identity-transact! conn tx-data tx-meta)
         (maybe-direct-local-scalar-update! conn tx-data tx-meta)
         (maybe-direct-local-blind-transact! conn tx-data tx-meta)
+        (maybe-transact-local-mixed! conn tx-data tx-meta)
         (direct-local-transact! conn tx-data tx-meta))
     (if (local-wal-transact-eligible? conn)
       (or (maybe-direct-local-wal-transact! conn tx-data tx-meta)
+          (maybe-transact-local-mixed! conn tx-data tx-meta)
           (prepared-local-wal-transact! conn tx-data tx-meta))
       (let [store (.-store ^DB @conn)]
         (if (and (instance? Store store)
