@@ -808,6 +808,8 @@
                               (s/current-write-group
                                 (.-lmdb ^Store (.-store db)))))]
     (or
+      (when-let [report (db/prepare-mixed-add-tx db1 tx-data tx-meta)]
+        (commit-writing-report! db report false :mixed-add))
       (when-let [prepared (db/prepare-scalar-update-tx db1 tx-data)]
         (when-let [report (db/stamp-scalar-update-tx db1 prepared tx-meta)]
           (commit-writing-report! db report false :scalar-update)))

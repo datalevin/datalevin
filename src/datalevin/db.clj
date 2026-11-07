@@ -24,6 +24,7 @@
    [datalevin.db.result-cache :as result-cache]
    [datalevin.native-value :as nv]
    [datalevin.remote-cache :as remote-cache]
+   [datalevin.db.tx.add :as txadd]
    [datalevin.db.tx.common :as txcommon]
    [datalevin.db.tx.execute :as txexec]
    [datalevin.db.tx.prepare :as txprep]
@@ -3034,6 +3035,11 @@
                   (persistent! out)))))
           db-after (assoc db :max-tx tx-id)]
       (->TxReport db db-after tx-data {:db/current-tx tx-id} tx-meta))))
+
+(defn ^:no-doc prepare-mixed-add-tx
+  "Prepare ordinary mixed updates/inserts against an already owned writer."
+  [db tx-data tx-meta]
+  (txadd/prepare-mixed-report (->TxReport db db [] {} tx-meta) tx-data))
 
 (defn ^:no-doc prepare-local-tx-data
   "Resolve local transaction data without committing or constructing the final

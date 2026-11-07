@@ -247,17 +247,21 @@
 
 (defn- effective-attr-value
   [report db e a]
-  (let [pending (pending-attr-state report e a)]
-    (cond
-      (identical? pending ::missing-attr-state)
-      (when (<= (long e) ^long (::max-eid-before report))
-        (txcommon/ea-first-v db e a))
+  (if (> (long e) ^long (::max-eid-before report))
+    ;; New entities have no stored values to mask. The existing EAV overlay
+    ;; already reflects their additions and retractions; avoid scanning all
+    ;; preceding transaction datoms each time a new tuple is queued.
+    (when-let [^Datom d (cached-ea-first-datom db e a)] (.-v d))
+    (let [pending (pending-attr-state report e a)]
+      (cond
+        (identical? pending ::missing-attr-state)
+        (txcommon/ea-first-v db e a)
 
-      (identical? pending ::retracted-attr-state)
-      nil
+        (identical? pending ::retracted-attr-state)
+        nil
 
-      :else
-      pending)))
+        :else
+        pending))))
 
 (defn- validate-installed-callable-write
   [report db e a v ent]

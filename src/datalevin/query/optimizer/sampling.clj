@@ -41,9 +41,10 @@
         (long
           (Math/ceil
             (* (/ (double total) n)
-               (reduce (fn [^double sum e]
-                         (+ sum (/ 1.0 (max 1 (long (i/list-count lmdb c/eav e :id))))))
-                       0.0 @entities))))))))
+               (double
+                 (reduce (fn [^double sum e]
+                           (+ sum (/ 1.0 (max 1 (long (i/list-count lmdb c/eav e :id))))))
+                         0.0 @entities)))))))))
 
 (defn -sample [step db source]
   (qplan/step-sample step db source))

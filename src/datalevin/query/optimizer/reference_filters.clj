@@ -69,7 +69,10 @@
 
 (defn- relocate
   [trace index position step ratio]
-  (let [previous (peek (:steps (nth trace (dec position))))
+  (let [index (long index)
+        position (long position)
+        ratio (double ratio)
+        previous (peek (:steps (nth trace (dec position))))
         prefix (nth trace (dec position))
         old-filter (nth trace index)
         old-before (nth trace (dec index))
@@ -107,16 +110,18 @@
           result)))))
 
 (defn- place-filter [db schema trace index]
-  (let [candidate (nth trace index)
+  (let [index (long index)
+        candidate (nth trace index)
         step (first (:steps candidate))]
     (when (and (= 1 (count (:steps candidate))) (filter-only? schema step)
                ;; The ordinary estimate gives this check no selectivity credit.
                (= (:size candidate) (:size (nth trace (dec index)))))
       (when-let [position
                  (first (filter #(dependencies-ready?
-                                   step (peek (:steps (nth trace (dec %)))))
+                                   step (peek (:steps (nth trace (dec (long %))))))
                                 (range 1 index)))]
-        (let [crossed (mapcat :steps (subvec trace position index))]
+        (let [position (long position)
+              crossed (mapcat :steps (subvec trace position index))]
           (when (and (< (long c/init-exec-size-threshold)
                         (long (:size (nth trace (dec position)))))
                      (every? #(and (not (:result %)) (not (:sample %))
