@@ -89,3 +89,56 @@
       (is (= 2 (get (:tempids report) "new")))
       (is (= 2 (:counter (d/entity after :root))))
       (is (= 1 (:db/id (:link (d/entity after 2))))))))
+
+(deftest large-preflight-rejects-unsupported-attributes-before-correction
+  (let [extra-schema {:many {:db/valueType :db.type/long :db/cardinality :db.cardinality/many}
+                      :unique {:db/valueType :db.type/string :db/unique :db.unique/value}
+                      :source {:db/valueType :db.type/long}
+                      :part {:db/valueType :db.type/long}
+                      :pair {:db/tupleAttrs [:source :part]}}]
+    (with-open [conn (d/create-conn nil (merge schema extra-schema)
+                      {:background-sampling? false :snapshot-scheduler? false})]
+      (d/transact! conn [{:db/id 1 :counter 0 :name "existing"}])
+      (let [corrections (atom 0)
+            value (proxy [Object] [] (toString [] (swap! corrections inc) "corrected"))
+            txs (prefix 128 value)
+            database @conn
+            indexes [(vec (:eavt database)) (vec (:avet database))]]
+        (doseq [tail [[:db/add 1 :link 1]
+                      [:db/add 1 :many 1]
+                      [:db/add 1 :unique "new"]
+                      [:db/add 1 :source 1]
+                      [:db/add 1 :pair [1 1]]
+                      [:db/add 1 :missing 1]
+                      {:db/id "late" :many 1}
+                      {:db/id "late" :pair [1 1]}
+                      {:db/id "late" :missing 1}]]
+          (is (nil? (db/prepare-mixed-add-tx database (conj txs tail) nil
+                                           (:max-eid database))))
+          (is (zero? @corrections))
+          (is (= indexes [(vec (:eavt database)) (vec (:avet database))])))))))
+
+(deftest large-mixed-requests-use-two-input-traversals
+  (with-open [conn (d/create-conn nil schema
+                    {:background-sampling? false :snapshot-scheduler? false})]
+    (d/transact! conn [{:db/id 1 :counter 0}])
+    (doseq [forms [(prefix 128 "value")
+                   (conj (vec (rest (prefix 128 "value"))) [:db/add 1 :counter 1])]]
+      (let [traversals (atom 0)
+            input (reify
+                    clojure.lang.Counted
+                    (count [_] (count forms))
+                    clojure.lang.Seqable
+                    (seq [_] (swap! traversals inc) (seq forms)))
+            report (db/prepare-mixed-add-tx @conn input nil (:max-eid @conn))]
+        (is (some? report))
+        (is (= 2 @traversals))
+        (is (= (report-datoms (db/prepare-mixed-add-tx @conn forms nil (:max-eid @conn)))
+               (report-datoms report)))))))
+
+(deftest large-pure-requests-still-decline-mixed-preparation
+  (with-open [conn (d/create-conn nil schema {:background-sampling? false})]
+    (d/transact! conn [{:db/id 1 :counter 0}])
+    (doseq [forms [(vec (rest (prefix 128 "value")))
+                   (mapv #(vector :db/add % :counter 1) (range 1 129))]]
+      (is (nil? (db/prepare-mixed-add-tx @conn forms nil (:max-eid @conn)))))))

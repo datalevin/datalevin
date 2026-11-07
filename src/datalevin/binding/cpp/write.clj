@@ -26,7 +26,7 @@
    [datalevin.lmdb DatomKVTxData KVTxData]
    [datalevin.utl BitOps ByteKeySort RowRegions]
    [java.nio ByteBuffer]
-   [java.util Arrays Comparator HashMap List]
+   [java.util Arrays Comparator HashMap Iterator List]
    [java.util.function Consumer]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
@@ -150,11 +150,10 @@
   "Apply preparation-validated KVTxData or DatomKVTxData rows in an owned transaction.
   Reuse native operation semantics without generic row conversion or validation."
   [^List rows ^HashMap dbis ^Txn txn]
-  (if (l/datom-kv-txs? rows)
-    ;; Keep the existing fused datom/index passes after freezing. Expanding
-    ;; those rows into generic physical puts loses the native write fast path.
-    (transact-datom-list* rows dbis txn false)
-    (when rows (transact-kv-rows* rows dbis txn false))))
+  (when rows
+    ;; Collection classifies the rows too; a separate detection pass would
+    ;; repeat that work for KV-only batches and batches with a late datom.
+    (transact-datom-list* rows dbis txn false)))
 
 (defn- put-captured-tx
   [^DBI dbi txn ^KVTxData tx ^WriteBatch batch]
@@ -502,28 +501,26 @@
             (recur (next xs) ave eav)))))))
 
 (defn- datom-txs
-  [^List txs]
+  "Collect datoms and classify the same prefix. Return nil when a retraction
+  requires scalar input order; KV-only input never allocates a datom array."
+  [^List txs stop-on-retract?]
   (let [n (.size txs)
-        ^objects out (object-array n)]
-    (if (instance? RowRegions txs)
-      (let [iterator (.iterator txs)]
-        (loop [j 0]
-          (if (.hasNext iterator)
-            (let [tx (.next iterator)]
-              (if (instance? DatomKVTxData tx)
-                (do (aset out j tx) (recur (unchecked-inc j)))
-                (recur j)))
-            [out j])))
-      (loop [i 0
-             j 0]
-        (if (< i n)
-          (let [tx (.get txs i)]
-            (if (instance? DatomKVTxData tx)
-              (do
-                (aset out j tx)
-                (recur (unchecked-inc i) (unchecked-inc j)))
-              (recur (unchecked-inc i) j)))
-          [out j])))))
+        ;; Region iteration visits owned lists directly instead of performing
+        ;; a binary search for each row in the combined view.
+        ^Iterator iterator (.iterator txs)]
+    (loop [j 0
+           ^objects out nil
+           all-added? true]
+      (if (.hasNext iterator)
+        (let [tx (.next iterator)]
+          (if (instance? DatomKVTxData tx)
+            (let [added? (.-added? ^DatomKVTxData tx)]
+              (when-not (and stop-on-retract? (not added?))
+                (let [^objects out (or out (object-array n))]
+                  (aset out j tx)
+                  (recur (unchecked-inc j) out (and all-added? added?)))))
+            (recur j out all-added?)))
+        [out j (= j n) (and (pos? j) all-added?)]))))
 
 (defn- reserve-unique-datoms!
   "Insert unique AVE keys before touching other rows. On a collision remove
@@ -616,33 +613,35 @@
 (defn- transact-datom-list*
   ([txs dbis txn] (transact-datom-list* txs dbis txn true))
   ([^java.util.List txs ^HashMap dbis txn validate?]
-  (let [add-only? (add-only-datom-batch? txs)]
-    (if (or c/*ordered-datom-writes?* add-only?)
-      (let [[^objects datoms n] (datom-txs txs)]
-        (transact-datom-index-passes* datoms n dbis txn add-only?)
-        ;; Metadata and other KV rows retain input order after the datom passes.
-        (transact-kv-rows* txs dbis txn validate?))
-      (let [n (.size txs)]
-        (loop [i   0
-               ave nil
-               eav nil]
-          (when (< i n)
-            (let [t (.get txs i)]
-              (if (instance? DatomKVTxData t)
-                (let [^DBI ave* (or ave (.get dbis c/ave)
-                                    (raise c/ave " is not open" {}))
-                      ^DBI eav* (or eav (.get dbis c/eav)
-                                    (raise c/eav " is not open" {}))]
-                  (put-datom-tx ave* eav* txn t)
-                  (recur (unchecked-inc i) ave* eav*))
-                (let [^KVTxData tx (if validate? (l/->kv-tx-data t) t)
-                      dbi-name (.-dbi-name tx)
-                      ^DBI dbi (or (.get dbis dbi-name)
-                                   (raise dbi-name " is not open" {}))]
-                  (when validate?
-                    (vld/validate-kv-tx-data tx (.-validate-data? dbi)))
-                  (put-tx dbi txn tx)
-                  (recur (unchecked-inc i) ave eav)))))))))))
+  (if-let [[^objects datoms n all-datoms? all-added?]
+           (datom-txs txs (not c/*ordered-datom-writes?*))]
+    (do
+      (when (pos? (long n))
+        (transact-datom-index-passes* datoms n dbis txn all-added?))
+      ;; Metadata and other KV rows retain input order after the datom passes.
+      (when-not all-datoms?
+        (transact-kv-rows* txs dbis txn validate?)))
+    (let [n (.size txs)]
+      (loop [i   0
+             ave nil
+             eav nil]
+        (when (< i n)
+          (let [t (.get txs i)]
+            (if (instance? DatomKVTxData t)
+              (let [^DBI ave* (or ave (.get dbis c/ave)
+                                  (raise c/ave " is not open" {}))
+                    ^DBI eav* (or eav (.get dbis c/eav)
+                                  (raise c/eav " is not open" {}))]
+                (put-datom-tx ave* eav* txn t)
+                (recur (unchecked-inc i) ave* eav*))
+              (let [^KVTxData tx (if validate? (l/->kv-tx-data t) t)
+                    dbi-name (.-dbi-name tx)
+                    ^DBI dbi (or (.get dbis dbi-name)
+                                 (raise dbi-name " is not open" {}))]
+                (when validate?
+                  (vld/validate-kv-tx-data tx (.-validate-data? dbi)))
+                (put-tx dbi txn tx)
+                (recur (unchecked-inc i) ave eav))))))))))
 
 (defn ^:redef transact*
   [txs ^HashMap dbis txn]

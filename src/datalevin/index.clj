@@ -16,10 +16,12 @@
    [datalevin.datom :as d]
    [datalevin.lmdb :as l]
    [datalevin.constants :as c]
-   [datalevin.util :refer [raise]])
+   [datalevin.util :refer [raise]]
+   [taoensso.nippy :as nippy])
   (:import
    [com.github.luben.zstd ZstdCompressCtx ZstdDecompressCtx]
    [java.nio ByteBuffer]
+   [java.io DataOutput]
    [java.lang.ref WeakReference]
    [java.util Arrays]
    [java.util.concurrent ArrayBlockingQueue]
@@ -179,14 +181,35 @@
             (.put bb ^bytes compressed)
             out))))))
 
+(deftype ^:private EncodedGiantDatom [^Datom datom ^bytes value])
+
+;; Use the existing datom wire ID and fields. The standalone value owns its
+;; Nippy cache: the preceding attribute is a single uncached keyword and the
+;; following transaction ID cannot introduce references into that value.
+(nippy/extend-freeze EncodedGiantDatom :datalevin/datom
+  [^EncodedGiantDatom x ^DataOutput out]
+  (let [^Datom datom (.-datom x)]
+    (.writeLong out (.-e datom))
+    (nippy/freeze-to-out! out (.-a datom))
+    (.write out ^bytes (.-value x))
+    (when-let [tx (.-tx datom)]
+      (nippy/freeze-to-out! out tx))))
+
 (defn encode-giant-datom
   "Encode a datom for `datalevin/giants`.
-  Returns owned bytes as {:value bytes :vtype :raw}."
-  [^Datom datom]
-  (let [raw (b/serialize datom)]
-    ;; The compression probe already serialized the datom. Reuse those bytes
-    ;; when compression is skipped instead of serializing it again in storage.
-    {:value (or (maybe-compress-giant-datom-bytes raw) raw) :vtype :raw}))
+  Returns owned bytes as {:value bytes :vtype :raw}. An optional standalone
+  Nippy value encoding avoids serializing an untyped index payload again.
+  The latter form takes a storage datom with a keyword attribute, no metadata."
+  ([datom] (encode-giant-datom datom nil))
+  ([^Datom datom encoded-value]
+   (let [encoded (if encoded-value (EncodedGiantDatom. datom encoded-value) datom)
+         raw (if (and encoded-value nippy/*shared-dict*)
+               ;; Let the value's own marker activate its shared dictionary.
+               ;; A preceding attribute marker would reset the same thaw cache.
+               (binding [nippy/*shared-dict* nil]
+                 (b/serialize encoded))
+               (b/serialize encoded))]
+     {:value (or (maybe-compress-giant-datom-bytes raw) raw) :vtype :raw})))
 
 (defn decode-giant-datom
   "Decode `datalevin/giants` value bytes (supports both legacy :data encoding

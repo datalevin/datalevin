@@ -1084,11 +1084,14 @@
     out))
 
 (defn ea->avg-buffer
-  [schema lmdb e a]
-  (when-let [aid (:db/aid (schema a))]
-    (when-let [^ByteBuffer bf (near-list lmdb c/eav e aid :id :int)]
-      (when (= ^int aid (.getInt bf 0))
-        bf))))
+  "Read the first EAV value buffer, optionally using a resolved attribute ID."
+  ([schema lmdb e a]
+   (ea->avg-buffer lmdb e (:db/aid (schema a))))
+  ([lmdb e aid]
+   (when aid
+     (when-let [^ByteBuffer bf (near-list lmdb c/eav e aid :id :int)]
+       (when (= ^int aid (.getInt bf 0))
+         bf)))))
 
 (defn vpred
   [v]

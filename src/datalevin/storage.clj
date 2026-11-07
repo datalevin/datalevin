@@ -109,7 +109,8 @@
          enqueue-secondary-index-work! enqueue-secondary-index-work-if-needed!
          insert-datom delete-datom check load-datoms-with-plan!
          load-datoms-with-tuples!
-         prepare-embedding-plan prepare-datoms-kv-plan commit-datoms-kv-plan!
+         prepare-embedding-plan prepare-secondary-index-plan
+         prepare-datoms-kv-plan commit-datoms-kv-plan!
          migrate-attr-values ->SamplingWork e-sample* default-ratio* analyze*
          apply-schema-update! transfer transfer-current)
 
@@ -349,24 +350,25 @@
 
 (defn- read-ea-first-value
   [lmdb schema e a decode]
-  (let [native (kv/raw-lmdb lmdb)]
+  (let [native (kv/raw-lmdb lmdb)
+        props  (schema a)
+        aid    (:db/aid props)]
     (if (:datalog-prepare? (lmdb/request-context native))
-      (when-let [aid (:db/aid (schema a))]
+      (when aid
         (cpp/read-resolution-value native lmdb e aid decode))
       (cd/with-snapshot lmdb
         (if (and (lmdb/writing? native)
                  (Thread/holdsLock (lmdb/write-txn native))
                  ;; Ordinary scalar decoding cannot reenter user codecs.
-                 (case (:db/valueType (schema a))
+                 (case (:db/valueType props)
                    (:db.type/long :db.type/float :db.type/double
                     :db.type/boolean :db.type/string :db.type/keyword
                     :db.type/symbol :db.type/instant :db.type/uuid
                     :db.type/bytes :db.type/bigint :db.type/bigdec
                     :db.type/ref) true
                    false))
-          (cpp/read-resolution-value native lmdb e (:db/aid (schema a))
-                                     decode)
-          (when-let [bf (ea->avg-buffer schema lmdb e a)]
+          (cpp/read-resolution-value native lmdb e aid decode)
+          (when-let [bf (ea->avg-buffer lmdb e aid)]
             (decode lmdb bf)))))))
 
 (deftype Store [lmdb
@@ -751,7 +753,7 @@
           (set! max-tx (datalevin.interface/max-tx tx-store))
           (mark-state-current! this (observed-state-sync-ms tx-store))
           result))
-      (load-datoms-with-plan! this datoms (prepare-embedding-plan this datoms))))
+      (load-datoms-with-plan! this datoms)))
 
   (fetch [_ datom]
     (cd/with-snapshot lmdb
@@ -2214,69 +2216,136 @@
     (enqueue-secondary-index-work! store))
   store)
 
-(defn prepare-embedding-plan
+(defn- embedding-candidates
+  "Find text additions and cancellations within one storage commit segment."
   [^Store store datoms]
-  ;; Ordinary commits need only attribute membership checks, even when this
-  ;; store has embedding domains. Keep provider work before KV preparation.
-  (when (and (seq (.-embedding-indices store))
-             (when-let [embedding-attrs (:db/embedding (rschema store))]
-               (reduce (fn [_ ^Datom datom]
-                         (if (and (contains? embedding-attrs (.-a datom))
-                                  (d/datom-added datom)
-                                  (string? (.-v datom)))
-                           (reduced true)
-                           false))
-                       false datoms)))
-    (let [schema  (schema store)
-          batches (reduce
-                    (fn [m ^Datom datom]
-                      (let [attr  (.-a datom)
-                            props (schema attr)
-                            v     (.-v datom)]
-                        (if (and props
-                                 (props :db/embedding)
-                                 (d/datom-added datom)
-                                 (string? v))
-                          (reduce
-                            (fn [m domain]
-                              (update m domain conj
-                                      {:datom datom
-                                       :text  v
-                                       :attr  attr
-                                       :ref   [(.-e datom) attr v]
-                                       :kind  :document
-                                       :domain domain}))
-                            m
-                            (remove #(async-embedding-domain? store %)
-                                    (embedding-attr-domains attr props)))
-                          m)))
-                    {}
-                    datoms)]
-      (when (seq batches)
-        (let [plan (IdentityHashMap.)]
-          (doseq [[domain items] batches
-                  :let [provider    (or (embedding-provider store domain)
-                                        (raise "Embedding provider is not initialized"
-                                                 {:domain domain}))
-                        dimensions (get-in (embedding-domain-config store domain)
-                                           [:dimensions])
-                        vectors    (emb/embedding provider
-                                                  (mapv #(dissoc % :datom) items)
-                                                  nil)]]
-            (when-not (= (count items) (count vectors))
-              (raise "Embedding provider returned the wrong number of vectors"
-                       {:domain  domain
-                        :items   (count items)
-                        :vectors (count vectors)}))
-            (doseq [[item vec-data] (map vector items vectors)]
-              (let [datom      (:datom item)
-                    domain-map (or (.get plan datom)
-                                   (let [m (HashMap.)]
-                                     (.put plan datom m)
-                                     m))]
-                (.put ^HashMap domain-map domain
-                      (ensure-embedding-vector! domain dimensions vec-data)))))
-          plan)))))
+  (when-let [embedding-attrs (when (seq (.-embedding-indices store))
+                              (:db/embedding (rschema store)))]
+    (let [state
+          (reduce
+            (fn [state ^Datom datom]
+              (let [added? (d/datom-added datom)]
+                (if (or state added?)
+                  (let [attr (.-a datom)
+                        value (.-v datom)]
+                    (if (and (string? value) (contains? embedding-attrs attr))
+                      (let [^objects state (or state (object-array [(FastList.) nil nil]))
+                            ^FastList additions (aget state 0)
+                            ^HashMap pending (aget state 1)]
+                        (if added?
+                          (do
+                            (.add additions datom)
+                            (when pending
+                              (let [key [(.-e datom) attr value]]
+                                (.put pending key (cons datom (.get pending key))))))
+                          ;; Most commits have no retractions after an addition.
+                          ;; Build cancellation state only at that first boundary.
+                          (let [key [(.-e datom) attr value]
+                                ^HashMap pending
+                                (or pending
+                                    (let [pending (HashMap.)]
+                                      (doseq [^Datom addition additions]
+                                        (let [key [(.-e addition) (.-a addition) (.-v addition)]]
+                                          (.put pending key
+                                                (cons addition (.get pending key)))))
+                                      (aset state 1 pending)
+                                      pending))]
+                            (when-let [cancelled (.remove pending key)]
+                              (let [^IdentityHashMap skipped
+                                    (or (aget state 2)
+                                        (let [skipped (IdentityHashMap.)]
+                                          (aset state 2 skipped)
+                                          skipped))]
+                                (doseq [addition cancelled] (.put skipped addition true))
+                                (.put skipped datom true)))))
+                        state)
+                      state))
+                  state)))
+            nil datoms)]
+      (when state
+        (let [^objects state state
+              ^IdentityHashMap skipped (aget state 2)
+              ;; A bulk loader may reuse the same Datom at distinct positions.
+              ;; Only cancel work when identity distinguishes its occurrences.
+              repeated? (when skipped
+                          (let [seen (IdentityHashMap.)]
+                            (reduce (fn [_ datom]
+                                      (when (and (.containsKey skipped datom)
+                                                 (.put seen datom true))
+                                        (reduced true)))
+                                    nil datoms)))]
+          {:additions (aget state 0)
+           :embedding-skips (when-not repeated? skipped)})))))
+
+(defn prepare-embedding-plan
+  ([^Store store datoms]
+   (:embedding-plan (prepare-secondary-index-plan store datoms)))
+  ([^Store store datoms ^IdentityHashMap skipped]
+   ;; Ordinary commits need only attribute membership checks, even when this
+   ;; store has embedding domains. Keep provider work before KV preparation.
+   (when-let [embedding-attrs (when (seq (.-embedding-indices store))
+                               (:db/embedding (rschema store)))]
+     (let [schema  (schema store)
+           batches (reduce
+                     (fn [m ^Datom datom]
+                       (let [attr  (.-a datom)
+                             props (when (and (d/datom-added datom)
+                                              (string? (.-v datom))
+                                              (contains? embedding-attrs attr)
+                                              (not (and skipped
+                                                        (.containsKey skipped datom))))
+                                     (schema attr))]
+                         (if (and props
+                                  (props :db/embedding))
+                           (let [v (.-v datom)]
+                             (reduce
+                               (fn [m domain]
+                                 (update m domain conj
+                                         {:datom datom
+                                          :text  v
+                                          :attr  attr
+                                          :ref   [(.-e datom) attr v]
+                                          :kind  :document
+                                          :domain domain}))
+                               m
+                               (remove #(async-embedding-domain? store %)
+                                       (embedding-attr-domains attr props))))
+                           m)))
+                     {}
+                     datoms)]
+       (when (seq batches)
+         (let [plan (IdentityHashMap.)]
+           (doseq [[domain items] batches
+                   :let [provider    (or (embedding-provider store domain)
+                                         (raise "Embedding provider is not initialized"
+                                                  {:domain domain}))
+                         dimensions (get-in (embedding-domain-config store domain)
+                                            [:dimensions])
+                         vectors    (emb/embedding provider
+                                                   (mapv #(dissoc % :datom) items)
+                                                   nil)]]
+             (when-not (= (count items) (count vectors))
+               (raise "Embedding provider returned the wrong number of vectors"
+                        {:domain  domain
+                         :items   (count items)
+                         :vectors (count vectors)}))
+             (doseq [[item vec-data] (map vector items vectors)]
+               (let [datom      (:datom item)
+                     domain-map (or (.get plan datom)
+                                    (let [m (HashMap.)]
+                                      (.put plan datom m)
+                                      m))]
+                 (.put ^HashMap domain-map domain
+                       (ensure-embedding-vector! domain dimensions vec-data)))))
+           plan))))))
+
+(defn ^:no-doc prepare-secondary-index-plan
+  "Plan embedding and associated fulltext work for one commit segment.
+   Reports, primary writes and their validation retain every original datom."
+  [^Store store datoms]
+  (when-let [{:keys [additions embedding-skips]} (embedding-candidates store datoms)]
+    {:embedding-plan (prepare-embedding-plan store additions embedding-skips)
+     :embedding-skips embedding-skips}))
 
 (defn- buffered-datom-value?
   [value]
@@ -2400,10 +2469,14 @@
           :encode (fn [] (encode-group-storage-datoms store-schema datoms))})))))
 
 (defn load-datoms-with-plan!
+  ([^Store store datoms]
+   ;; Raw bulk input can add an already stored fact before retracting it.
+   ;; Cancel provider work, but retain its index deletions for existing facts.
+   (load-datoms-with-plan! store datoms (prepare-embedding-plan store datoms)))
   ([^Store store datoms embedding-plan]
    (load-datoms-with-plan! store datoms embedding-plan nil))
   ([^Store store datoms embedding-plan
-    {:keys [extra-kv-txs extra-kv-txs-fn last-modified-ms
+    {:keys [extra-kv-txs extra-kv-txs-fn last-modified-ms embedding-skips
             return-modified-ms?]}]
    (let [[res secondary-index-job-count modified-ms]
          (locking (.-write-txn store)
@@ -2417,7 +2490,7 @@
            (let [run (fn [tx-lmdb]
                        (let [plan (prepare-datoms-kv-plan
                                     store datoms embedding-plan extra-kv-txs
-                                    extra-kv-txs-fn last-modified-ms)
+                                    extra-kv-txs-fn last-modified-ms nil embedding-skips)
                              res (commit-datoms-kv-plan!
                                   tx-lmdb (.-search-engines store)
                                   (.-vector-indices store) (.-embedding-indices store)
@@ -2445,8 +2518,7 @@
                     datoms (tuples/prepare-bulk-datoms tx-store datoms)]
                 (sync-giant-id! tx-store)
                 [(when (seq datoms)
-                   (load-datoms-with-plan!
-                     tx-store datoms (prepare-embedding-plan tx-store datoms)))
+                   (load-datoms-with-plan! tx-store datoms))
                  tx-store]))]
     (locking (.-write-txn store)
       ;; Local bulk loads already own an outer transaction even when their
@@ -2485,7 +2557,7 @@
 (defn- insert-datom
   "Append a datom's writes and return the next giant ID."
   [^Store store ^Datom d ^FastList txs work
-   ^HashMap giants ^objects ai embedding-plan
+   ^HashMap giants ^objects ai embedding-plan embedding-work?
    ^ByteBuffer avg-bf max-gt]
   (let [attr       (.-a d)
         e          (.-e d)
@@ -2493,10 +2565,11 @@
         props      (aget ai 0)
         vt         (aget ai 1)
         aid        (aget ai 2)
-        embedding? (aget ai 3)
-        fulltext?  (aget ai 4)
+        embedding? (and embedding-work? (aget ai 3))
+        fulltext?  (and embedding-work? (aget ai 4))
         noindex?   (aget ai 5)
-        i          (b/indexable nil aid v vt max-gt)
+        vb         (b/value-bytes v vt)
+        i          ^Indexable (b/indexable nil aid v vt max-gt vb)
         giant?     (b/giant? i)]
     ;; Reports can retain repeated adds after a retraction. Reuse their
     ;; logical identity instead of allocating another physical giant key.
@@ -2513,8 +2586,9 @@
                     noindex?))
         (let [next-gt (if giant? (.advance-max-gt store) max-gt)]
           (when giant?
-            (let [gd [e attr v]
-                  {:keys [value vtype]} (encode-giant-datom (apply d/datom gd))]
+            (let [{:keys [value vtype]}
+                  (encode-giant-datom (d/datom e attr v)
+                                      (when (zero? (.-f i)) vb))]
               (.put giants (giant-datom-key e attr v) max-gt)
               (.add txs (lmdb/kv-tx :put c/giants max-gt value
                                     :id vtype (when-not noindex?
@@ -2567,15 +2641,15 @@
 
 (defn- delete-datom
   [^Store store ^Datom d ^FastList txs work
-   ^HashMap giants ^objects ai ^ByteBuffer avg-bf]
+   ^HashMap giants ^objects ai embedding-work? ^ByteBuffer avg-bf]
   (let [e          (.-e d)
         attr       (.-a d)
         v          (.-v d)
         props      (aget ai 0)
         vt         (aget ai 1)
         aid        (aget ai 2)
-        embedding? (aget ai 3)
-        fulltext?  (aget ai 4)
+        embedding? (and embedding-work? (aget ai 3))
+        fulltext?  (and embedding-work? (aget ai 4))
         noindex?   (aget ai 5)
         i          ^Indexable (b/indexable nil aid v vt c/g0)
         giant?     (b/giant? i)
@@ -2659,6 +2733,10 @@
                           last-modified-ms nil))
   ([^Store store datoms embedding-plan extra-kv-txs extra-kv-txs-fn
     last-modified-ms ^longs reserved-metadata]
+   (prepare-datoms-kv-plan store datoms embedding-plan extra-kv-txs extra-kv-txs-fn
+                          last-modified-ms reserved-metadata nil))
+  ([^Store store datoms embedding-plan extra-kv-txs extra-kv-txs-fn
+    last-modified-ms ^longs reserved-metadata ^IdentityHashMap embedding-skips]
    ;; Another connection may have enabled AVE since this wrapper was created.
    ;; The caller holds the write lock, so index participation cannot change
    ;; between this refresh and the commit.
@@ -2707,7 +2785,9 @@
                                              added?)
                  vt (aget ai 1)
                  noindex? (aget ai 5)
-                 datom-txs (if noindex? unindexed-txs txs)]
+                 datom-txs (if noindex? unindexed-txs txs)
+                 embedding-work? (not (and embedding-skips
+                                           (.containsKey embedding-skips datom)))]
              (if-let [type (when (map? vt) (:custom/type vt))]
                (let [lmdb (.-lmdb store)
                      ;; Serializer callbacks can grow the map. The collector
@@ -2719,8 +2799,10 @@
                  max-gt)
                (if added?
                  (insert-datom store datom datom-txs work giants ai embedding-plan
+                               embedding-work?
                                avg-bf max-gt)
-                 (do (delete-datom store datom datom-txs work giants ai avg-bf)
+                 (do (delete-datom store datom datom-txs work giants ai
+                                   embedding-work? avg-bf)
                      max-gt)))))
          (max-gt store)
          datoms)

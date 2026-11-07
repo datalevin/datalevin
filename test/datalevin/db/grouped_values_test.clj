@@ -4,6 +4,10 @@
             [datalevin.datom :as datom]
             [datalevin.db :as db]
             [datalevin.db.tx.common :as common]
+            [datalevin.index :as idx]
+            [datalevin.interface :as i]
+            [datalevin.kv :as kv]
+            [datalevin.lmdb :as l]
             [datalevin.storage :as storage]
             [datalevin.test.core :refer [db-fixture]]))
 
@@ -26,6 +30,30 @@
 
 (defn- comparable [values]
   (mapv #(if (bytes? %) (vec %) %) values))
+
+(deftest point-reads-resolve-attribute-properties-once
+  (with-open [conn (d/create-conn nil (assoc schema :opaque {})
+                                 {:wal? false :background-sampling? false})]
+    (let [opaque {:nested [1 2]}]
+      (d/transact! conn [{:db/id 1 :value 5 :flag false :text "text" :opaque opaque}])
+      (let [schema (i/schema (:store @conn))
+            calls (atom 0)
+            lookup (fn [attr] (swap! calls inc) (schema attr))
+            read (fn [lmdb attr]
+                   (reset! calls 0)
+                   (let [value (#'storage/read-ea-first-value
+                                 lmdb lookup 1 attr idx/avg-buffer->v)]
+                     (is (= 1 @calls) (str attr))
+                     value))
+            attrs [:value :flag :text :opaque :absent :unknown]
+            expected [5 false "text" opaque nil nil]]
+        (is (= expected (mapv #(read (d/datalog-kv conn) %) attrs)))
+        (d/with-transaction-kv [writer (d/datalog-kv conn)]
+          (let [native (kv/raw-lmdb writer)]
+            (is (l/writing? native))
+            (is (Thread/holdsLock (l/write-txn native)))
+            (is (not (:datalog-prepare? (l/request-context native))))
+            (is (= expected (mapv #(read writer %) attrs)))))))))
 
 (deftest grouped-reads-match-point-reads-and-own-decoded-values
   (with-open [conn (d/create-conn nil schema {:background-sampling? false})]

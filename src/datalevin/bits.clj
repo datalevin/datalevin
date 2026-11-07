@@ -924,8 +924,11 @@
                        (min (- Integer/MAX_VALUE Integer/BYTES)
                             (* 2 (long (.capacity tuple-bf))))))))))))
 
-(defn- val-bytes
-  "Turn datalog value into bytes according to :db/valueType"
+(defn value-bytes
+  "Encode a variable-width datalog value according to :db/valueType, or return
+  nil for fixed-width values. Untyped payloads return owned Nippy bytes; typed
+  bytes and range sentinels can retain their input arrays. These complete bytes
+  can be shared by index-prefix and giant construction."
   [v t]
   (case t
     (:db.type/boolean :db.type/long :db.type/double :db.type/float
@@ -1026,20 +1029,24 @@
 (defn indexable
   "Turn datom parts into a form that is suitable for putting in indices,
   where aid is the integer id of an attribute, vt is its :db/valueType
-  max-gt is current max giant id"
-  [eid aid val vt max-gt]
-  (if (map? vt)
-    ((:custom/indexable vt) eid aid val max-gt)
-    (let [hdr (long (or (val-header val vt) c/type-nil))]
-      (if-let [vb (val-bytes val vt)]
-        (let [bl   (alength ^bytes vb)
-              cut? (> bl c/+val-bytes-wo-hdr+)
-              bas  (if cut?
-                     (Arrays/copyOf ^bytes vb c/+val-bytes-trunc+)
-                     vb)
-              gid  (if cut? max-gt c/normal)]
-          (Indexable. eid aid val hdr bas gid))
-        (Indexable. eid aid val hdr nil c/normal)))))
+  max-gt is current max giant id. For built-in types, the six-argument form
+  consumes complete value-bytes already encoded by the caller; Indexable
+  retains only the prefix."
+  ([eid aid val vt max-gt]
+   (if (map? vt)
+     ((:custom/indexable vt) eid aid val max-gt)
+     (indexable eid aid val vt max-gt (value-bytes val vt))))
+  ([eid aid val vt max-gt vb]
+   (let [hdr (long (or (val-header val vt) c/type-nil))]
+     (if vb
+       (let [bl   (alength ^bytes vb)
+             cut? (> bl c/+val-bytes-wo-hdr+)
+             bas  (if cut?
+                    (Arrays/copyOf ^bytes vb c/+val-bytes-trunc+)
+                    vb)
+             gid  (if cut? max-gt c/normal)]
+         (Indexable. eid aid val hdr bas gid))
+       (Indexable. eid aid val hdr nil c/normal)))))
 
 (defn giant? [^Indexable i] (not= (.-g i) c/normal))
 

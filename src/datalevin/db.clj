@@ -2136,7 +2136,8 @@
                modified-ms
                (long
                  (or staged-ms
-                     (let [embedding-plan (s/prepare-embedding-plan store tx-data)
+                     (let [{:keys [embedding-plan embedding-skips]}
+                           (s/prepare-secondary-index-plan store tx-data)
                            ;; Preparation may create attributes and advance the
                            ;; schema version. Storage chooses the final floor.
                            commit-ms (max (long (s/observed-state-sync-ms store))
@@ -2148,6 +2149,9 @@
                            commit-opts
                            (cond-> {:last-modified-ms commit-ms
                                     :return-modified-ms? true}
+                             embedding-skips
+                             (assoc :embedding-skips embedding-skips)
+
                              client-op?
                              (assoc :extra-kv-txs-fn
                                     (fn [modified-ms]
@@ -2773,13 +2777,15 @@
 (defn ^:no-doc stamp-local-patch-idoc-tx
   "Stamp a prepared patchIdoc request against the current store snapshot.
    Returns {:report TxReport :doc resulting-doc}, or nil when its immutable
-   schema/options epochs are stale. The four-argument arity accepts a virtual
-   current document so queued patches to the same entity can be prepared in
-   order before any side index is mutated."
+   schema/options epochs are stale. An empty patch in the three-argument form
+   leaves :doc nil without reading the stored document. The four-argument arity
+   accepts a virtual current document so queued patches to the same entity can
+   be prepared in order before any side index is mutated."
   ([^DB db ^PreparedLocalPatchIdocTx prepared tx-meta]
    (when (local-patch-idoc-tx-valid? db prepared)
      (let [e         (entid-strict db (:e prepared))
-           old-datom (txcommon/ea-first-datom db e (:attr prepared))
+           old-datom (when (seq (:ops prepared))
+                       (txcommon/ea-first-datom db e (:attr prepared)))
            old-doc   (idx/datom-prepared-value old-datom)]
        (stamp-local-patch-idoc-doc db prepared tx-meta old-doc))))
   ([^DB db ^PreparedLocalPatchIdocTx prepared tx-meta old-doc]
@@ -2829,60 +2835,118 @@
         validate?    (:validate-data? store-opts)
         tuple-source-attrs (:db/attrTuples (rschema store))]
     (when-not (:auto-entity-time? store-opts)
-      (loop [es      (seq initial-es)
-             seen    nil
-             entries (transient [])]
-        (if es
-          (let [entity (first es)]
-            (if (and (sequential? entity)
-                     (= 4 (count entity))
-                     (identical? :db/add (nth entity 0)))
-              (let [[_ e attr value] entity
-                    props            (store-schema attr)
-                    vt               (:db/valueType props)]
-                (when (and (keyword? attr)
-                           props
-                           (not= "db" (namespace attr))
-                           (some? (:db/aid props))
-                           (not (identical? (:db/cardinality props)
-                                            :db.cardinality/many))
-                           (nil? (:db/unique props))
-                           (nil? (:db/tupleAttrs props))
-                           (not (contains? props :db/tupleType))
-                           (nil? (:db/tupleTypes props))
-                           (not (contains? tuple-source-attrs attr))
-                           (nil? (:db.attr/preds props))
-                           (or (nil? vt) (contains? scalar-update-value-types vt))
-                           (some? value))
-                  (let [eid (if (and defer-entity-resolution?
-                                     (or (keyword? e)
-                                         (and (sequential? e) (= 2 (count e)))))
-                              e
-                              (scalar-update-entity-id db e))]
-                    (when (and eid (or (nil? seen) (.add ^java.util.HashSet seen [eid attr])))
-                      ;; The scalar gate already checked keyword attr/non-nil
-                      ;; value and excluded special types and tuple properties.
-                      (let [v (prepare/correct-scalar-value validate? vt value)
-                            remaining (next es)]
-                        (recur remaining
-                               (or seen
-                                   (when remaining
-                                     (doto (java.util.HashSet.) (.add [eid attr]))))
-                               (conj! entries [eid attr v])))))))
-              nil))
-          (when (pos? (count entries))
-            (let [entries (persistent! entries)
-                  deferred? (and defer-entity-resolution?
-                                 (some #(not (integer? (first %))) entries))]
-              (cond-> (->PreparedScalarUpdate
-                        store-schema store-opts entries
-                        (when-not deferred?
-                          (scalar-update-entity-reads store-schema entries)))
-                deferred? (assoc :deferred-entity-resolution? true)))))))))
+      (let [^FastList candidates
+            (FastList. (int (* 4 (if (instance? java.util.Collection initial-es)
+                                  (.size ^java.util.Collection initial-es) 0))))]
+        ;; Retain resolved IDs and types, but do not coerce any values until
+        ;; every form is eligible and all entity/attribute pairs are distinct.
+        (loop [es      (seq initial-es)
+               seen    nil]
+          (if es
+            (let [entity (first es)]
+              (if (and (sequential? entity)
+                       (= 4 (count entity))
+                       (identical? :db/add (nth entity 0)))
+                (let [[_ e attr value] entity
+                      props            (store-schema attr)
+                      vt               (:db/valueType props)]
+                  (when (and (keyword? attr)
+                             props
+                             (not= "db" (namespace attr))
+                             (some? (:db/aid props))
+                             (not (identical? (:db/cardinality props)
+                                              :db.cardinality/many))
+                             (nil? (:db/unique props))
+                             (nil? (:db/tupleAttrs props))
+                             (not (contains? props :db/tupleType))
+                             (nil? (:db/tupleTypes props))
+                             (not (contains? tuple-source-attrs attr))
+                             (nil? (:db.attr/preds props))
+                             (or (nil? vt) (contains? scalar-update-value-types vt))
+                             (some? value))
+                    (let [eid (if (and defer-entity-resolution?
+                                       (or (keyword? e)
+                                           (and (sequential? e) (= 2 (count e)))))
+                                e
+                                (scalar-update-entity-id db e))]
+                      (when (and eid (or (nil? seen) (.add ^java.util.HashSet seen [eid attr])))
+                        (let [remaining (next es)]
+                          (.add candidates eid)
+                          (.add candidates attr)
+                          (.add candidates value)
+                          (.add candidates vt)
+                          (recur remaining
+                                 (or seen
+                                     (when remaining
+                                       (doto (java.util.HashSet.) (.add [eid attr]))))))))))
+                nil))
+            (when-not (.isEmpty candidates)
+              (let [entries
+                    (loop [i 0 entries (transient [])]
+                      (if (< i (.size candidates))
+                        (let [eid (.get candidates i)
+                              attr (.get candidates (+ i 1))
+                              value (.get candidates (+ i 2))
+                              vt (.get candidates (+ i 3))]
+                          (recur (+ i 4)
+                                 (conj! entries
+                                        [eid attr (prepare/correct-scalar-value
+                                                    validate? vt value)])))
+                        (persistent! entries)))
+                    deferred? (and defer-entity-resolution?
+                                   (some #(not (integer? (first %))) entries))]
+                (cond-> (->PreparedScalarUpdate
+                          store-schema store-opts entries
+                          (when-not deferred?
+                            (scalar-update-entity-reads store-schema entries)))
+                  deferred? (assoc :deferred-entity-resolution? true))))))))))
+
+(defn- scalar-update-forms
+  "Feed explicit-ID maps to scalar preparation in their attribute iteration order.
+   Ordinary operation batches retain their original input without normalization."
+  [db initial-es]
+  (let [shape
+        (reduce
+          (fn [maps? entity]
+            (cond
+              (and (sequential? entity) (= 4 (count entity))
+                   (identical? :db/add (nth entity 0))) maps?
+
+              (and (map? entity) (nil? (meta entity)) (> (count entity) 1)
+                   (let [e (:db/id entity)]
+                     (and (integer? e) (pos? e)))) true
+
+              :else (reduced ::ineligible)))
+          false initial-es)]
+    (case shape
+      false initial-es
+      true
+      (when-not (:auto-entity-time? (opts (:store db)))
+        (let [additions (FastList.)]
+          (when (reduce
+                  (fn [_ entity]
+                    (if (map? entity)
+                      (if (let [e (:db/id entity)]
+                            (when (<= e (:max-eid db))
+                              (reduce-kv
+                                (fn [_ attr value]
+                                  (cond
+                                    (identical? attr :db/id) true
+                                    (and (keyword? attr) (pos? (count (name attr)))
+                                         (not (txcommon/reverse-ref? attr)))
+                                    (do (.add additions [:db/add e attr value]) true)
+                                    :else (reduced false)))
+                                true entity)))
+                        true
+                        (reduced false))
+                      (do (.add additions entity) true)))
+                  true initial-es)
+            additions)))
+      nil)))
 
 (defn ^:no-doc prepare-scalar-update-tx
-  "Recognize a transaction made only of ordinary scalar [:db/add eid attr value]
-  updates to existing entities with simple cardinality-one, non-unique,
+  "Recognize ordinary scalar add operations and explicit numeric-ID maps
+  updating existing entities with simple cardinality-one, non-unique,
   non-reference attributes. The caller must stamp it against the current LMDB
   write snapshot before committing. Returns nil for shapes that retain the
   general transaction path. With :defer-entity-resolution?, lookup references
@@ -2890,21 +2954,15 @@
   ([db initial-es]
    (prepare-scalar-update-tx db initial-es nil))
   ([db initial-es {:keys [defer-entity-resolution?]}]
-   ;; Reject mixed and other operation shapes before correcting values or
+   ;; Reject unsupported request shapes before correcting values or
    ;; resolving entities, including preparation on the collector's caller.
-   (when (reduce (fn [_ entity]
-                   (if (and (sequential? entity)
-                            (= 4 (count entity))
-                            (identical? :db/add (nth entity 0)))
-                     true
-                     (reduced false)))
-                 true initial-es)
+   (when-let [entities (scalar-update-forms db initial-es)]
      (if defer-entity-resolution?
        ;; Collector preparation reads no persisted identities. The owner resolves
        ;; them and consults the pending transaction indexes when stamping.
-       (prepare-scalar-update-tx* db initial-es true)
+       (prepare-scalar-update-tx* db entities true)
        (txcommon/with-lookup-ref-cache db
-         (prepare-scalar-update-tx* db initial-es false))))))
+         (prepare-scalar-update-tx* db entities false))))))
 
 (defn ^:no-doc scalar-update-tx-valid?
   [^DB db ^PreparedScalarUpdate prepared]
