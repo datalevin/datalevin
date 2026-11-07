@@ -668,19 +668,18 @@
           report)))
     (when-let [prepared (db/prepare-blind-local-tx
                           ^DB @conn tx-data true false)]
-      (when (:has-unique? prepared)
-        (if (and *local-wal-identity-upsert?*
-                 (:identity-upsert-av prepared))
-          (when-let [[report upsert?]
-                     (direct-local-identity-transact!
-                       conn prepared tx-meta)]
-            (observe-local-wal-tx-path!
-              (if upsert? :identity-upsert :blind-insert))
-            report)
-          (when-let [report (direct-local-blind-transact!
-                              conn prepared tx-meta)]
-            (observe-local-wal-tx-path! :blind-insert)
-            report))))))
+      (if (and *local-wal-identity-upsert?*
+               (:identity-upsert-av prepared))
+        (when-let [[report upsert?]
+                   (direct-local-identity-transact!
+                     conn prepared tx-meta)]
+          (observe-local-wal-tx-path!
+            (if upsert? :identity-upsert :blind-insert))
+          report)
+        (when-let [report (direct-local-blind-transact!
+                            conn prepared tx-meta)]
+          (observe-local-wal-tx-path! :blind-insert)
+          report)))))
 
 (defn- single-identity-entity?
   "Cheap gate for the single-entity identity-upsert specialization: exactly one

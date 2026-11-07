@@ -95,6 +95,15 @@
     :else
     entity))
 
+(deftype IdentityResolution [attr value stored-eid])
+(deftype ResolvedIdentityAdd [e resolution])
+
+(defn identity-owner
+  "Overlay current pending writes on a plan's native identity resolution."
+  [db ^IdentityResolution resolution]
+  (txcommon/av-first-e db (.-attr resolution) (.-value resolution)
+                      (.-stored-eid resolution)))
+
 (defn resolve-upserts
   "Returns [entity' upserts]. Upsert attributes that resolve to existing entities
    are removed from entity, rest are kept in entity for insertion. Performs the
@@ -155,6 +164,17 @@
         [{} {}]
         entity))
     [entity nil]))
+
+(defn resolve-identity-map
+  "Resolve a flat map whose plan has validated its single scalar identity.
+  Preserve map syntax checks and overlay the pending owner at execution time."
+  [db entity ^IdentityResolution resolution]
+  (reduce-kv (fn [_ a v]
+               (vld/validate-attr a entity)
+               (vld/validate-val v entity))
+             nil entity)
+  (let [owner (identity-owner db resolution)]
+    [(if owner (dissoc entity (.-attr resolution)) entity) owner]))
 
 (defn validate-upserts
   [entity upserts]
@@ -322,32 +342,39 @@
             [:db/add eid straight-a v]))))
 
 (defn explode
-  [db entity]
-  (let [eid        (:db/id entity)
-        txs        (ArrayList. (count entity))
-        tuple-txs  (ArrayList.)]
-    (reduce-kv
-      (fn [_ a vs]
-        (when-not (identical? a :db/id)
-          (let [reverse?   (txcommon/reverse-ref? a)
-                straight-a (if reverse?
-                             (txcommon/reverse-ref a)
-                             a)
-                ^ArrayList target (if (txcommon/tuple-attr? db a)
-                                    tuple-txs
-                                    txs)]
-            (when reverse?
-              (vld/validate-reverse-ref-type
-                (txcommon/ref? db straight-a) a eid vs))
-            (if (expand-multival? db a vs)
-              (doseq [v vs]
-                (add-exploded-value! target db eid a reverse? straight-a v))
-              (add-exploded-value! target db eid a reverse? straight-a vs))))
-        nil)
-      nil
-      entity)
-    (.addAll txs tuple-txs)
-    txs))
+  ([db entity] (explode db entity nil))
+  ([db entity ^IdentityResolution resolution]
+   (let [eid        (:db/id entity)
+         txs        (ArrayList. (count entity))
+         tuple-txs  (ArrayList.)]
+     (reduce-kv
+       (fn [_ a vs]
+         (when-not (identical? a :db/id)
+           (let [reverse?   (txcommon/reverse-ref? a)
+                 straight-a (if reverse?
+                              (txcommon/reverse-ref a)
+                              a)
+                 ^ArrayList target (if (txcommon/tuple-attr? db a)
+                                     tuple-txs
+                                     txs)]
+             (when reverse?
+               (vld/validate-reverse-ref-type
+                 (txcommon/ref? db straight-a) a eid vs))
+             (cond
+               (and resolution (= a (.-attr resolution)))
+               (.add target (ResolvedIdentityAdd. eid resolution))
+
+               (expand-multival? db a vs)
+               (doseq [v vs]
+                 (add-exploded-value! target db eid a reverse? straight-a v))
+
+               :else
+               (add-exploded-value! target db eid a reverse? straight-a vs))))
+         nil)
+       nil
+       entity)
+     (.addAll txs tuple-txs)
+     txs)))
 
 (def de-entity? (delay (resolve 'datalevin.entity/entity?)))
 (def de-entity->txs (delay (resolve 'datalevin.entity/->txs)))

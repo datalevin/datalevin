@@ -968,16 +968,16 @@
 
   (v-datoms [_ v]
     (mapcat
-      (fn [[attr props]]
-        (when (identical? (:db/valueType props) :db.type/ref)
-          (let [aid (:db/aid props)
-                vt  (idx/storage-type lmdb props)]
-            (when-let [es (not-empty (get-list
-                                       lmdb c/ave
-                                       (b/indexable nil aid v vt c/gmax)
-                                       :avg :id))]
-              (map #(d/datom % attr v) es)))))
-      schema))
+      (fn [attr]
+        (let [props (schema attr)
+              aid   (:db/aid props)
+              vt    (idx/storage-type lmdb props)]
+          (when-let [es (not-empty (get-list
+                                     lmdb c/ave
+                                     (b/indexable nil aid v vt c/gmax)
+                                     :avg :id))]
+            (map #(d/datom % attr v) es))))
+      (:db.type/ref rschema)))
 
   (size-filter [_ index pred low-datom high-datom]
     (list-range-filter-count

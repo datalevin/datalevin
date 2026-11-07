@@ -144,17 +144,32 @@
       (i/ea-first-v (:store db) e a))))
 
 (defn av-first-e
-  "Resolve the current owner of an indexed value during write preparation."
-  [db a v]
-  (if-let [^HashMap pending (when (scalar-pending-index)
-                             (pending-unique-index *batch-prepare*))]
-    (if-let [^Datom datom (.get pending [a v])]
-      (when (d/datom-added datom) (.-e datom))
-      (i/av-first-e (:store db) a v))
-    (if *batch-prepare*
-      (or (cached-av-first-e db a v)
-          (:e (first (visible-stored db (i/av-datoms (:store db) a v)))))
-      (i/av-first-e (:store db) a v))))
+  "Resolve the current owner of an indexed value during write preparation.
+  The four-argument form carries a planned native result, including absence;
+  the changing pending indexes still determine its current visibility."
+  ([db a v]
+   (if-let [^HashMap pending (when (scalar-pending-index)
+                              (pending-unique-index *batch-prepare*))]
+     (if-let [^Datom datom (.get pending [a v])]
+       (when (d/datom-added datom) (.-e datom))
+       (i/av-first-e (:store db) a v))
+     (if *batch-prepare*
+       (or (cached-av-first-e db a v)
+           (:e (first (visible-stored db (i/av-datoms (:store db) a v)))))
+       (i/av-first-e (:store db) a v))))
+  ([db a v stored-eid]
+   (if-let [^HashMap pending (when (scalar-pending-index)
+                              (pending-unique-index *batch-prepare*))]
+     (if-let [^Datom datom (.get pending [a v])]
+       (when (d/datom-added datom) (.-e datom))
+       stored-eid)
+     (or (cached-av-first-e db a v)
+         (when (and stored-eid
+                    (or (nil? *batch-prepare*)
+                        (.isEmpty (.subSet ^TreeSortedSet (:eavt db)
+                                           (datom stored-eid a v tx0)
+                                           (datom stored-eid a v txmax)))))
+           stored-eid)))))
 
 (defn ea-datoms
   "Resolve current attribute datoms for CAS and retraction preparation."

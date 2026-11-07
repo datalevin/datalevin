@@ -2889,12 +2889,19 @@
   ([db initial-es]
    (prepare-scalar-update-tx db initial-es nil))
   ([db initial-es {:keys [defer-entity-resolution?]}]
-   (if defer-entity-resolution?
-     ;; Collector preparation reads no persisted identities. The owner resolves
-     ;; them and consults the pending transaction indexes when stamping.
-     (prepare-scalar-update-tx* db initial-es true)
-     (txcommon/with-lookup-ref-cache db
-       (prepare-scalar-update-tx* db initial-es false)))))
+   ;; Reject mixed and other operation shapes before correcting values or
+   ;; resolving entities, including preparation on the collector's caller.
+   (when (every? (fn [entity]
+                   (and (sequential? entity)
+                        (= 4 (count entity))
+                        (identical? :db/add (nth entity 0))))
+                 initial-es)
+     (if defer-entity-resolution?
+       ;; Collector preparation reads no persisted identities. The owner resolves
+       ;; them and consults the pending transaction indexes when stamping.
+       (prepare-scalar-update-tx* db initial-es true)
+       (txcommon/with-lookup-ref-cache db
+         (prepare-scalar-update-tx* db initial-es false))))))
 
 (defn ^:no-doc scalar-update-tx-valid?
   [^DB db ^PreparedScalarUpdate prepared]
