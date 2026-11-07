@@ -765,90 +765,91 @@
       (assoc report :db-after after))))
 
 (defn- commit-writing-report!
-  ([db report ordered? path]
-   (commit-writing-report! db report ordered? path false))
-  ([db report ordered? path fused?]
-    (let [preparation txcommon/*batch-prepare*
-          ;; Add-only native batches already select ordered index passes. Avoid
-          ;; forcing eager encoding when the collector can freeze ordinary datoms.
-          ordered? (and ordered? (nil? preparation))]
-      (when (and preparation (not fused?))
-        (when (some #(identical? :db.cardinality/many
-                                (:db/cardinality ((i/schema (:store db)) (:a %))))
-                    (:tx-data report))
-          (txcommon/materialize-scalar-pending! preparation db))
-        ;; Simple requests build the hash view at the next request boundary.
-        ;; General bodies materialize before running and retain sorted indexes.
-        (when (txcommon/retain-pending-index? preparation)
-          (doseq [datom (:tx-data report)]
-            (txcommon/stage-batch-datom! (:db-after report) datom))))
-      (if (and preparation
-               (not fused?)
-               (not s/*enforce-blind-unique-inserts?*)
-               (= c/*ordered-datom-writes?* ordered?))
-        (db/commit-prepared-tx-data! (:db-after report) (:tx-data report) report)
-        (binding [s/*enforce-blind-unique-inserts?* fused?
-                  c/*ordered-datom-writes?* ordered?]
-          (db/commit-prepared-tx-data! (:db-after report) (:tx-data report) report)))
-      ;; Publish resolver state only after conditional native inserts succeed.
-      (when (and preparation fused?)
-        (if (txcommon/retain-pending-index? preparation)
-          (doseq [datom (:tx-data report)]
-            (txcommon/stage-batch-datom! (:db-after report) datom))
-          ;; The eager conditional put also drained preceding frozen writes.
-          ;; Subsequent simple requests can read LMDB without rebuilding hashes.
-          (txcommon/discard-scalar-pending! preparation))))
-    (observe-local-wal-tx-path! path)
-    (if (identical? (:db-before report) db)
-      report
-      (assoc report :db-before db))))
+  [db report ordered? path known-scalar? fused?]
+  (let [preparation txcommon/*batch-prepare*
+        ;; Add-only native batches already select ordered index passes. Avoid
+        ;; forcing eager encoding when the collector can freeze ordinary datoms.
+        ordered? (and ordered? (nil? preparation))]
+    (when (and preparation (not fused?))
+      ;; Scalar preparers already established this for every emitted datom.
+      (when-not known-scalar?
+        (let [schema (i/schema (:store db))]
+          (when (some #(identical? :db.cardinality/many
+                                  (:db/cardinality (schema (:a %))))
+                      (:tx-data report))
+            (txcommon/materialize-scalar-pending! preparation db))))
+      ;; Simple requests build the hash view at the next request boundary.
+      ;; General bodies materialize before running and retain sorted indexes.
+      (when (txcommon/retain-pending-index? preparation)
+        (doseq [datom (:tx-data report)]
+          (txcommon/stage-batch-datom! (:db-after report) datom))))
+    (if (and preparation
+             (not fused?)
+             (not s/*enforce-blind-unique-inserts?*)
+             (= c/*ordered-datom-writes?* ordered?))
+      (db/commit-prepared-tx-data! (:db-after report) (:tx-data report) report)
+      (binding [s/*enforce-blind-unique-inserts?* fused?
+                c/*ordered-datom-writes?* ordered?]
+        (db/commit-prepared-tx-data! (:db-after report) (:tx-data report) report)))
+    ;; Publish resolver state only after conditional native inserts succeed.
+    (when (and preparation fused?)
+      (if (txcommon/retain-pending-index? preparation)
+        (doseq [datom (:tx-data report)]
+          (txcommon/stage-batch-datom! (:db-after report) datom))
+        ;; The eager conditional put also drained preceding frozen writes.
+        ;; Subsequent simple requests can read LMDB without rebuilding hashes.
+        (txcommon/discard-scalar-pending! preparation))))
+  (observe-local-wal-tx-path! path)
+  (if (identical? (:db-before report) db)
+    report
+    (assoc report :db-before db)))
 
 (defn- ^:redef transact-local-in-write-txn!
   "Apply one request to an already owned local writer. Prepare and resolve
   against preceding writes, retaining the general interpreter for other shapes."
   [^DB db tx-data tx-meta]
-  ;; The collector retains resolver indexes until frozen writes are applied.
-  ;; Other native transactions continue to isolate each request's indexes.
-  (let [db1 (if txcommon/*batch-prepare*
-              db (db/transfer db (.-store db)))
-        ;; Both collectors own one native writer. Conditional inserts can
-        ;; roll back their reservations before falling back to upsert resolution.
-        fuse-unique? (and (not (:client-op/id tx-meta))
+  ;; Both collectors own one native writer. Conditional inserts can roll back
+  ;; their reservations before falling back to upsert resolution.
+  (let [fuse-unique? (and (not (:client-op/id tx-meta))
                           (or txcommon/*batch-prepare*
                               (s/current-write-group
                                 (.-lmdb ^Store (.-store db)))))]
     (or
-      (when-let [report (db/prepare-mixed-add-tx db1 tx-data tx-meta
-                                               (:max-eid db1))]
-        (commit-writing-report! db report false :mixed-add))
-      (when-let [prepared (db/prepare-scalar-update-tx db1 tx-data)]
-        (when-let [report (db/stamp-scalar-update-tx db1 prepared tx-meta)]
-          (commit-writing-report! db report false :scalar-update)))
+      (when-let [report (db/prepare-mixed-add-tx db tx-data tx-meta
+                                               (:max-eid db))]
+        (commit-writing-report! db report false :mixed-add true false))
+      (when-let [prepared (db/prepare-scalar-update-tx db tx-data)]
+        (when-let [report (db/stamp-scalar-update-tx db prepared tx-meta)]
+          (commit-writing-report! db report false :scalar-update true false)))
       (when *local-wal-patch-idoc?*
-        (when-let [prepared (db/prepare-local-patch-idoc-tx db1 tx-data)]
+        (when-let [prepared (db/prepare-local-patch-idoc-tx db tx-data)]
           (when-let [{:keys [report]}
-                     (db/stamp-local-patch-idoc-tx db1 prepared tx-meta)]
-            (commit-writing-report! db report false :patch-idoc))))
+                     (db/stamp-local-patch-idoc-tx db prepared tx-meta)]
+            (commit-writing-report! db report false :patch-idoc true false))))
       (when-let [prepared (db/prepare-blind-local-tx
-                           db1 tx-data true
+                           db tx-data true
                            (not fuse-unique?))]
         (if (and *local-wal-identity-upsert?* (:identity-upsert-av prepared))
           (when-let [[report upsert?]
-                     (db/stamp-blind-local-identity-tx db1 prepared tx-meta)]
+                     (db/stamp-blind-local-identity-tx db prepared tx-meta)]
             (commit-writing-report! db report (not upsert?)
-                                   (if upsert? :identity-upsert :blind-insert)))
+                                   (if upsert? :identity-upsert :blind-insert)
+                                   false false))
           (if (and fuse-unique? (:fuse-unique-inserts? prepared))
             (try
-              (commit-writing-report! db (db/stamp-blind-local-tx db1 prepared tx-meta)
-                                     true :blind-insert true)
+              (commit-writing-report! db (db/stamp-blind-local-tx db prepared tx-meta)
+                                     true :blind-insert false true)
               (catch Exception e
                 (when-not (and (l/blind-unique-collision? e)
                                (:unique-inserts-rolled-back? (ex-data e)))
                   (throw e))))
-            (when (db/blind-local-tx-unique-values-absent? db1 prepared)
-              (commit-writing-report! db (db/stamp-blind-local-tx db1 prepared tx-meta)
-                                     true :blind-insert)))))
-      (do
+            (when (db/blind-local-tx-unique-values-absent? db prepared)
+              (commit-writing-report! db (db/stamp-blind-local-tx db prepared tx-meta)
+                                     true :blind-insert false false)))))
+      ;; Specialized preparers leave resolver indexes unchanged. Only the
+      ;; interpreter needs fresh indexes outside collected batches.
+      (let [db1 (if txcommon/*batch-prepare*
+                  db (db/transfer db (.-store db)))]
         (when-let [preparation txcommon/*batch-prepare*]
           (txcommon/materialize-scalar-pending! preparation db1))
         (let [report (db/transact-tx-data (db/->TxReport db db1 [] {} tx-meta)
@@ -910,9 +911,9 @@
                  (nil? (l/explicit-transaction-timeout)))
           (locking conn
             ;; The enclosing transaction already owns this Store and writer.
-            ;; Only the mutable datom overlays need isolation for preparation;
-            ;; retain the resulting DB view for subsequent transaction-local
-            ;; reads and writes. The owner commits and publishes the base view.
+            ;; The general interpreter isolates its mutable indexes. Retain the
+            ;; resulting DB view for subsequent transaction-local reads and
+            ;; writes. The owner commits and publishes the base view.
             (let [db     ^DB @conn
                   report (transact-local-in-write-txn! db tx-data tx-meta)
                   after  (db/carry-runtime-opts (:db-after report) db)]
@@ -1030,7 +1031,7 @@
       (observe-embedded-path! (:wal-durability-profile opts)
                               (datalog/batched? control))))
   (when-let [report (db/stamp-scalar-update-tx before prepared tx-meta)]
-    (commit-writing-report! before report false :scalar-update)))
+    (commit-writing-report! before report false :scalar-update true false)))
 
 (defn- transact-request!
   [conn tx-data tx-meta]
@@ -1061,7 +1062,7 @@
                                (when-let [report (db/stamp-scalar-update-tx
                                                    @tx prepared tx-meta)]
                                  (let [report (commit-writing-report!
-                                                @tx report false :scalar-update)]
+                                                @tx report false :scalar-update true false)]
                                    (reset! tx (:db-after report))
                                    report)))
                              (-transact! tx tx-data tx-meta)))

@@ -86,15 +86,23 @@
 
 (defn datom? [x] (instance? Datom x))
 
+(defn value-equal?
+  "Compare byte arrays by content and other datom values with Clojure equality."
+  [expected actual]
+  (if (bytes? expected)
+    (and (bytes? actual) (Arrays/equals ^bytes expected ^bytes actual))
+    (= expected actual)))
+
 (defn- hash-datom [^Datom d]
-  (-> (hash (.-e d))
-      (combine-hashes (hash (.-a d)))
-      (combine-hashes (hash (.-v d)))))
+  (let [v (.-v d)]
+    (-> (hash (.-e d))
+        (combine-hashes (hash (.-a d)))
+        (combine-hashes (if (bytes? v) (Arrays/hashCode ^bytes v) (hash v))))))
 
 (defn- equiv-datom [^Datom d ^Datom o]
   (and (== (.-e d) (.-e o))
        (= (.-a d) (.-a o))
-       (= (.-v d) (.-v o))))
+       (value-equal? (.-v d) (.-v o))))
 
 (defn- seq-datom [^Datom d] (list [:e (.-e d)] [:a (.-a d)] [:v (.-v d)]))
 

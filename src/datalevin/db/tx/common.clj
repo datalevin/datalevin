@@ -47,8 +47,6 @@
     (when (instance? datalevin.db.tx.common.ScalarPendingIndex context)
       (pending-scalar-index context))))
 
-(declare ref?)
-
 (defn flush-batch-prepare!
   "Make previously frozen writes visible to ordinary native reads in user code."
   []
@@ -185,8 +183,14 @@
   [db e]
   (let [stored (i/v-datoms (:store db) e)]
     (if *batch-prepare*
-      (vec (concat (filter #(and (d/datom-added %)
-                                (ref? db (:a %)) (= e (:v %))) (:eavt db))
+      (vec (concat (filter d/datom-added
+                           ;; Reference attributes are always indexed. Seek each
+                           ;; A/V range instead of scanning unrelated writes.
+                           (mapcat (fn [a]
+                                     (.subSet ^TreeSortedSet (:avet db)
+                                              (datom e0 a e tx0)
+                                              (datom emax a e txmax)))
+                                   (:db.type/ref (rschema (:store db)))))
                    (visible-stored db stored)))
       stored)))
 

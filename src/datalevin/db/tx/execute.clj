@@ -158,15 +158,18 @@
 
 (defn- queue-tuple
   [queue tuple idx report db e _ v]
-  (let [tuple-value  (or (get queue tuple)
-                         (effective-attr-value report db e tuple)
-                         (vec (repeat (-> (schema (:store db))
-                                          (get tuple)
-                                          :db/tupleAttrs
-                                          count)
-                                      nil)))
-        tuple-value' (assoc tuple-value idx v)]
-    (assoc queue tuple tuple-value')))
+  (let [^ResolvedTuple queued (get queue tuple)
+        before (if queued
+                 (.-before queued)
+                 (effective-attr-value report db e tuple))
+        value (or (when queued (.-value queued))
+                  before
+                  (vec (repeat (-> (schema (:store db))
+                                   (get tuple)
+                                   :db/tupleAttrs
+                                   count)
+                               nil)))]
+    (assoc queue tuple (ResolvedTuple. e tuple (assoc value idx v) before))))
 
 (defn- queue-tuples
   [queue tuples report db e a v]
@@ -225,7 +228,7 @@
     (nil? old-value)
     (transact-report report new-datom)
 
-    (= old-value (.-v new-datom))
+    (d/value-equal? old-value (.-v new-datom))
     (transact-same-value report new-datom)
 
     :else
@@ -430,8 +433,7 @@
 
 (defn- flush-tuples
   [report schema]
-  (let [db (:db-after report)
-        queued (::queued-tuples report)
+  (let [queued (::queued-tuples report)
         ;; Identity tuples can restart resolution; predicates can execute user
         ;; code. Preserve ordered general dispatch for that whole flush.
         resolved? (every? (fn [[_ tuples]]
@@ -445,16 +447,17 @@
       (reduce-kv
         (fn [entities eid tuples+values]
           (reduce-kv
-            (fn [entities tuple value]
-              (let [value (when-not (every? nil? value) value)
-                    current (or (:v (cached-ea-first-datom db eid tuple))
-                                (when (<= (long eid) ^long (::max-eid-before report))
-                                  (txcommon/ea-first-v db eid tuple)))]
+            (fn [entities tuple ^ResolvedTuple change]
+              (let [queued-value (.-value change)
+                    value (when-not (every? nil? queued-value) queued-value)
+                    current (.-before change)]
                 (if (= value current)
                   entities
                   (conj! entities
                     (if resolved?
-                      (ResolvedTuple. eid tuple value current)
+                      (if (nil? value)
+                        (ResolvedTuple. eid tuple nil current)
+                        change)
                       (if (nil? value)
                         ^::internal [:db/retract eid tuple current]
                         ^::internal [:db/add eid tuple value]))))))
@@ -491,13 +494,6 @@
         report    (update report :db-after update :max-tx u/long-inc)]
     (cond-> report
       (seq new-attrs) (assoc :new-attributes new-attrs))))
-
-(defn- handle-flush-tuples
-  [report schema entities]
-  (if (contains? report ::queued-tuples)
-    [(dissoc report ::queued-tuples)
-     (concat (flush-tuples report schema) entities)]
-    [report entities]))
 
 (defn- handle-cas
   [report db store entity entities]
@@ -963,41 +959,46 @@
                             (update :db-after
                                     #(-> % clear-tx-cache
                                          (advance-max-eid max-eid-before))))
-        initial-es'     (if (seq (txcommon/attrs-by db :db.type/tuple))
-                          (sequence
-                            (mapcat vector)
-                            initial-es (repeat ::flush-tuples))
-                          initial-es)
+        tuples?         (seq (txcommon/attrs-by db :db.type/tuple))
         schema          (schema store)
         store-opts      (opts store)]
-    (loop [report initial-report'
-           es     initial-es']
+    (loop [report    initial-report'
+           es        (when-not tuples? initial-es)
+           remaining (when tuples? (seq initial-es))]
       (cond+
         (empty? es)
-        (finalize-report report)
+        ;; Finish all expansions of one input before deriving its tuples.
+        ;; Empty queues need neither synthetic operations nor a handler result.
+        (cond
+          (::queued-tuples report)
+          (recur (dissoc report ::queued-tuples)
+                 (seq (flush-tuples report schema)) remaining)
+
+          (seq remaining)
+          (recur report (list (first remaining)) (next remaining))
+
+          :else
+          (finalize-report report))
 
         :let [[entity & entities] es]
-
-        (identical? ::flush-tuples entity)
-        (let [[r' es'] (handle-flush-tuples report schema entities)]
-          (recur r' es'))
 
         :let [db      (:db-after report)
               tempids (:tempids report)]
 
         (instance? ResolvedTuple entity)
-        (recur (transact-resolved-tuple report schema store-opts entity) entities)
+        (recur (transact-resolved-tuple report schema store-opts entity)
+               entities remaining)
 
         (map? entity)
         (if (regular-map? schema entity)
           (recur (transact-regular-map report schema store-opts entity tx-time)
-                 entities)
+                 entities remaining)
           (let [result (handle-map-entity initial-report report db entity
                                           entities initial-es tx-time)]
             (if (or (instance? TxRetry result) (map? result))
               result
               (let [[r' es'] result]
-                (recur r' es')))))
+                (recur r' es' remaining)))))
 
         (sequential? entity)
         (let [[op e a] entity
@@ -1005,7 +1006,7 @@
           (if (and (identical? op :db/add)
                    (integer? e) (not (neg? ^long e))
                    (regular-attr? props))
-            (recur (transact-add report entity props store-opts) entities)
+            (recur (transact-add report entity props store-opts) entities remaining)
             (let [result (handle-sequential-entity
                            initial-report report db store schema store-opts
                            tempids entity entities initial-es tx-time)]
@@ -1014,23 +1015,24 @@
                 result
 
                 (instance? TxStep result)
-                (recur (.-report ^TxStep result) (.-entities ^TxStep result))
+                (recur (.-report ^TxStep result) (.-entities ^TxStep result)
+                       remaining)
 
                 (map? result)
                 result
 
                 :else
                 (let [[r' es'] result]
-                  (recur r' es'))))))
+                  (recur r' es' remaining))))))
 
         (datom? entity)
         (let [[e a v tx added] entity]
           (if added
-            (recur (transact-add report [:db/add e a v tx]) entities)
-            (recur report (cons [:db/retract e a v] entities))))
+            (recur (transact-add report [:db/add e a v tx]) entities remaining)
+            (recur report (cons [:db/retract e a v] entities) remaining)))
 
         (nil? entity)
-        (recur report entities)
+        (recur report entities remaining)
 
         :else
         (vld/validate-tx-entity-type entity)))))
@@ -1040,45 +1042,49 @@
   Restrict this to distinct explicit tempids and immutable scalar identities;
   ordered mutations, nested entities and user predicates use ordinary retries."
   [db entities]
-  (let [store (:store db)
-        schema (schema store)
-        identity? #(identical? :db.unique/identity (:db/unique (schema %)))
-        scalar-types #{nil :db.type/string :db.type/long :db.type/keyword
-                       :db.type/symbol :db.type/uuid :db.type/instant
-                       :db.type/boolean :db.type/float :db.type/double
-                       :db.type/bigint :db.type/bigdec :db.type/bytes}]
-    (when (and (next entities)
-               (not (:auto-entity-time? (opts store)))
-               (empty? (txcommon/attrs-by db :db.type/tuple))
-               (every? (fn [entity]
-                         (and (map? entity)
-                              (txprep/tempid? (:db/id entity))
-                              (not-any? coll? (vals entity))
-                              (every? #(and (keyword? %)
-                                            (or (= :db/id %)
-                                                (not= "db" (namespace %))))
-                                      (keys entity))
-                              (every? #(nil? (:db.attr/preds (schema %))) (keys entity))
-                              (<= (count (filter identity? (keys entity))) 1)
-                              (every? (fn [[a v]]
-                                        (or (not (identity? a))
-                                            (let [props (schema a)]
-                                              (and (some? v) (not (coll? v))
-                                                   (contains? scalar-types (:db/valueType props))
-                                                   (not= :db.cardinality/many (:db/cardinality props))
-                                                   (nil? (:db.attr/preds props))))))
-                                      entity)))
-                       entities)
-               (= (count entities) (count (set (map :db/id entities)))))
-      (reduce (fn [tempids entity]
-                (if-let [a (first (filter identity? (keys entity)))]
-                  (let [v (coreprep/correct-value-with-props
-                            (opts store) (schema a) a (get entity a))]
-                    (if-some [eid (txcommon/av-first-e db a v)]
-                      (assoc tempids (:db/id entity) eid)
-                      tempids))
-                  tempids))
-              {} entities))))
+  ;; :db/ident is implicit, but db-namespaced keys cannot enter this flat
+  ;; path. Only identities that an eligible map can name justify the walk.
+  (when (some #(not= "db" (namespace %))
+              (txcommon/attrs-by db :db.unique/identity))
+    (let [store (:store db)
+          schema (schema store)
+          identity? #(identical? :db.unique/identity (:db/unique (schema %)))
+          scalar-types #{nil :db.type/string :db.type/long :db.type/keyword
+                         :db.type/symbol :db.type/uuid :db.type/instant
+                         :db.type/boolean :db.type/float :db.type/double
+                         :db.type/bigint :db.type/bigdec :db.type/bytes}]
+      (when (and (next entities)
+                 (not (:auto-entity-time? (opts store)))
+                 (empty? (txcommon/attrs-by db :db.type/tuple))
+                 (every? (fn [entity]
+                           (and (map? entity)
+                                (txprep/tempid? (:db/id entity))
+                                (not-any? coll? (vals entity))
+                                (every? #(and (keyword? %)
+                                              (or (= :db/id %)
+                                                  (not= "db" (namespace %))))
+                                        (keys entity))
+                                (every? #(nil? (:db.attr/preds (schema %))) (keys entity))
+                                (<= (count (filter identity? (keys entity))) 1)
+                                (every? (fn [[a v]]
+                                          (or (not (identity? a))
+                                              (let [props (schema a)]
+                                                (and (some? v) (not (coll? v))
+                                                     (contains? scalar-types (:db/valueType props))
+                                                     (not= :db.cardinality/many (:db/cardinality props))
+                                                     (nil? (:db.attr/preds props))))))
+                                        entity)))
+                         entities)
+                 (= (count entities) (count (set (map :db/id entities)))))
+        (reduce (fn [tempids entity]
+                  (if-let [a (first (filter identity? (keys entity)))]
+                    (let [v (coreprep/correct-value-with-props
+                              (opts store) (schema a) a (get entity a))]
+                      (if-some [eid (txcommon/av-first-e db a v)]
+                        (assoc tempids (:db/id entity) eid)
+                        tempids))
+                    tempids))
+                {} entities)))))
 
 (defn execute-tx-loop
   [initial-report initial-es tx-time]

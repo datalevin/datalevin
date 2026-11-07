@@ -49,6 +49,36 @@
       (is (= 1 @callbacks))
       (is (= 4 (:value (d/entity @conn 1)))))))
 
+(deftest scalar-and-mixed-writes-compose-with-blind-many-values
+  (doseq [wal? [false true] prepare? [false true]]
+    (testing (str "WAL " wal? ", preparation " prepare?)
+      (binding [c/*use-prepare-path* prepare?]
+        (with-open [conn (d/create-conn nil schema (assoc opts :wal? wal?))]
+          (d/transact! conn [{:db/id 1 :value 0}])
+          (let [many-id
+                (d/with-transaction [tx conn]
+                  (d/transact! tx [[:db/add 1 :value 1]])
+                  (d/transact! tx [[:db/add 1 :value 2]])
+                  (d/transact! tx [[:db/add 1 :value 3]
+                                  {:db/id "scalar" :value 10}])
+                  (let [report (d/transact! tx [{:db/id "many" :tags ["a" "b"]}])
+                        eid (get (:tempids report) "many")]
+                    (d/transact! tx [[:db/add 1 :value 4]])
+                    (d/transact! tx [[:db/retract eid :tags "a"]])
+                    (is (= #{"b"} (:tags (d/entity @tx eid))))
+                    (is (= 4 (:value (d/entity @tx 1))))
+                    (is (= 0 (:value (d/entity @conn 1))))
+                    eid))]
+            (is (= #{"b"} (:tags (d/entity @conn many-id))))
+            (is (= 4 (:value (d/entity @conn 1))))
+            (d/with-transaction [tx conn]
+              (d/transact! tx [[:db/add 1 :value 5]])
+              (d/transact! tx [[:db/add 1 :value 6]])
+              (d/transact! tx [{:tags ["c" "d"]}])
+              (d/abort-transact tx))
+            (is (= 4 (:value (d/entity @conn 1))))
+            (is (= #{"b"} (set (map :v (d/datoms @conn :ave :tags)))))))))))
+
 (deftest explicit-preparation-composes-with-simulation-and-nested-bodies
   (with-open [conn (d/create-conn nil schema opts)]
     (d/transact! conn [{:db/id 1 :value 0 :name "one"}])

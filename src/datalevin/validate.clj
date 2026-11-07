@@ -1612,11 +1612,11 @@
    For single-val attrs, checks if the single datom value equals ov."
   [multival? e a ov nv datoms]
   (if multival?
-    (when-not (some (fn [^Datom d] (= (.-v d) ov)) datoms)
+    (when-not (some (fn [^Datom d] (d/value-equal? (.-v d) ov)) datoms)
       (raise ":db.fn/cas failed on datom [" e " " a " " (map :v datoms) "], expected " ov
                {:error :transact/cas, :old datoms, :expected ov, :new nv}))
     (let [v (:v (first datoms))]
-      (when-not (= v ov)
+      (when-not (d/value-equal? v ov)
         (raise ":db.fn/cas failed on datom [" e " " a " " v "], expected " ov
                  {:error :transact/cas, :old (first datoms), :expected ov, :new nv})))))
 

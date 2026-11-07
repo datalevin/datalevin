@@ -579,12 +579,6 @@
          (reduce-kv (fn [m a vs] (assoc! m a (persistent! vs)))
                     (transient {}) (persistent! values-by-attr)))})))
 
-(defn- value-equal?
-  [expected actual]
-  (if (bytes? expected)
-    (and (bytes? actual) (Arrays/equals ^bytes expected ^bytes actual))
-    (= expected actual)))
-
 (defn- full-index-value-match?
   [db ^Datom low]
   (let [schema (-schema db)]
@@ -600,7 +594,7 @@
              ;; Stored datoms decode fresh arrays, so identity-based set
              ;; membership cannot invalidate a cached byte-value lookup.
              (if (bytes? v)
-               (boolean (some #(value-equal? v %) vs))
+               (boolean (some #(d/value-equal? v %) vs))
                (contains? vs v))))))
 
 (defn- unresolved-entid?
@@ -1352,7 +1346,7 @@
         ;; Giant physical keys retain only a prefix and an allocated ID.
         ;; Match the complete resolved value, including byte-array contents.
         (if (and (some? v) (full-index-value-match? db low))
-          (filterv #(value-equal? (:v low) (:v %)) ds)
+          (filterv #(d/value-equal? (:v low) (:v %)) ds)
           ds))))
   (-datoms
     [db index c1 c2 c3 n]
@@ -2626,7 +2620,7 @@
                            (conj! tx-data
                                   (d/datom eid attr value tx-id)))
 
-                    (= old-value value)
+                    (d/value-equal? old-value value)
                     (recur (+ i 2) tx-data)
 
                     :else
@@ -2944,7 +2938,7 @@
             old-value (txcommon/ea-first-v db e attr)]
         (cond
           (nil? old-value) [(datom e attr value tx-id)]
-          (= old-value value) []
+          (d/value-equal? old-value value) []
           :else [(datom e attr old-value tx-id false)
                  (datom e attr value tx-id)]))
       (if-let [^objects buffer
@@ -2961,7 +2955,7 @@
                     value (nth entry 2)
                     old-value (txcommon/ea-first-v db e attr)]
                 (cond
-                  (= old-value value) (recur (unchecked-inc i) out)
+                  (d/value-equal? old-value value) (recur (unchecked-inc i) out)
                   (nil? old-value)
                   (do (aset buffer out (datom e attr value tx-id))
                       (recur (unchecked-inc i) (unchecked-inc out)))
@@ -2986,7 +2980,7 @@
                   old-value (txcommon/ea-first-v db e attr)]
               (recur (unchecked-inc i)
                      (cond
-                       (= old-value value) out
+                       (d/value-equal? old-value value) out
                        (nil? old-value) (conj! out (datom e attr value tx-id))
                        :else (-> out
                                  (conj! (datom e attr old-value tx-id false))
@@ -3026,7 +3020,7 @@
                       (recur (unchecked-inc i)
                              (conj! out (datom e attr value tx-id)))
 
-                      (= old-value value)
+                      (d/value-equal? old-value value)
                       (recur (unchecked-inc i) out)
 
                       :else
