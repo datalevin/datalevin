@@ -18,6 +18,7 @@ public class LRUCache {
     private final Function<Object, ? extends Iterable<?>> dependencies;
     private final Map<Object, List<Object>> keyDependencies;
     private final Map<Object, Set<Object>> dependencyKeys;
+    private final Map<Object, Map<Object, Integer>> dependencyGroups;
     private boolean indexReady;
 
     public LRUCache(int capacity) {
@@ -36,6 +37,7 @@ public class LRUCache {
         this.dependencies = dependencies;
         keyDependencies = dependencies == null ? null : new HashMap<>();
         dependencyKeys = dependencies == null ? null : new HashMap<>();
+        dependencyGroups = dependencies == null ? null : new HashMap<>();
         disabled = false;
         map = Collections.synchronizedMap(new LinkedHashMap<Object, Object>(capacity,
                                                                             0.75f,
@@ -63,8 +65,37 @@ public class LRUCache {
             Set<Object> keys = dependencyKeys.get(token);
             if (keys != null) {
                 keys.remove(key);
-                if (keys.isEmpty()) dependencyKeys.remove(token);
+                if (keys.isEmpty()) {
+                    dependencyKeys.remove(token);
+                    removeDependencyGroup(token);
+                }
             }
+        }
+    }
+
+    // Count populated buckets under the first two parts of list dependencies.
+    // Exact candidate selection still uses the original complete tokens. No
+    // duplicate key memberships are needed to inspect a dependency prefix.
+    private void addDependencyGroup(Object token) {
+        if (!(token instanceof List<?>)) return;
+        List<?> parts = (List<?>) token;
+        if (parts.size() < 3) return;
+        dependencyGroups.computeIfAbsent(parts.get(0), ignored -> new HashMap<>())
+            .merge(parts.get(1), 1, Integer::sum);
+    }
+
+    private void removeDependencyGroup(Object token) {
+        if (!(token instanceof List<?>)) return;
+        List<?> parts = (List<?>) token;
+        if (parts.size() < 3) return;
+        Object group = parts.get(0), member = parts.get(1);
+        Map<Object, Integer> members = dependencyGroups.get(group);
+        int count = members.get(member);
+        if (count == 1) {
+            members.remove(member);
+            if (members.isEmpty()) dependencyGroups.remove(group);
+        } else {
+            members.put(member, count - 1);
         }
     }
 
@@ -74,8 +105,9 @@ public class LRUCache {
         for (Object token : dependencies.apply(key)) tokens.add(token);
         keyDependencies.put(key, tokens);
         for (Object token : tokens) {
-            dependencyKeys.computeIfAbsent(token, ignored -> new HashSet<>())
-                .add(key);
+            Set<Object> keys = dependencyKeys.computeIfAbsent(token, ignored -> new HashSet<>());
+            if (keys.isEmpty()) addDependencyGroup(token);
+            keys.add(key);
         }
     }
 
@@ -142,17 +174,44 @@ public class LRUCache {
         return map.remove(key);
     }
 
+    private void ensureDependencyIndex() {
+        if (dependencies == null || indexReady) return;
+        // Read-only caches need no dependency bookkeeping. Build once, when
+        // the first invalidation needs candidates, under the cache monitor.
+        keyDependencies.clear();
+        dependencyKeys.clear();
+        dependencyGroups.clear();
+        for (Object key : map.keySet()) addDependencies(key);
+        indexReady = true;
+    }
+
+    /** Inspect a dependency bucket without copying keys or changing LRU order.
+     * Unindexed caches conservatively depend on every token while nonempty. */
+    public synchronized boolean hasDependency(Object token) {
+        if (dependencies == null) return !map.isEmpty();
+        ensureDependencyIndex();
+        return dependencyKeys.containsKey(token);
+    }
+
+    /** Inspect the populated three-part (or longer) dependency prefixes. */
+    public synchronized boolean hasDependencyGroup(Object group) {
+        if (dependencies == null) return !map.isEmpty();
+        ensureDependencyIndex();
+        return dependencyGroups.containsKey(group);
+    }
+
+    /** Inspect one member of a three-part (or longer) dependency prefix. */
+    public synchronized boolean hasDependencyGroup(Object group, Object member) {
+        if (dependencies == null) return !map.isEmpty();
+        ensureDependencyIndex();
+        Map<Object, Integer> members = dependencyGroups.get(group);
+        return members != null && members.containsKey(member);
+    }
+
     /** Snapshot keys in the requested dependency buckets; does not affect LRU order. */
     public synchronized Set<Object> candidateKeys(Iterable<?> tokens) {
         if (dependencies == null) return keys();
-        // Read-only caches need no dependency bookkeeping. Build once, when
-        // the first invalidation needs candidates, under the cache monitor.
-        if (!indexReady) {
-            keyDependencies.clear();
-            dependencyKeys.clear();
-            for (Object key : map.keySet()) addDependencies(key);
-            indexReady = true;
-        }
+        ensureDependencyIndex();
         Set<Object> candidates = new HashSet<>();
         for (Object token : tokens) {
             Set<Object> keys = dependencyKeys.get(token);
@@ -178,6 +237,7 @@ public class LRUCache {
         if (dependencies != null) {
             keyDependencies.clear();
             dependencyKeys.clear();
+            dependencyGroups.clear();
             indexReady = false;
         }
     }

@@ -125,7 +125,9 @@
             (vld/validate-attr-preds
               (:db/id entity) a v (schema a)
               #(resolve-attr-pred-udf db %)))
-          resolve (fn [a v]
+          ;; Multi-value inputs reach resolution one scalar at a time.
+          resolve (fn [a v at]
+                    (vld/validate-val v at)
                     (when-some [v' (upsert-value a v)]
                       (when-some [e (or (txcommon/cached-av-first-e db a v')
                                        (txcommon/av-first-e db a v'))]
@@ -133,8 +135,7 @@
           split   (fn [a vs]
                     (reduce
                       (fn [acc v]
-                        (vld/validate-val v entity)
-                        (if-some [[e v'] (resolve a v)]
+                        (if-some [[e v'] (resolve a v entity)]
                           (do
                             (validate-upsert-preds a v')
                             (update acc 1 assoc v e))
@@ -143,10 +144,11 @@
       (reduce-kv
         (fn [[entity' upserts] a v]
           (vld/validate-attr a entity)
-          (vld/validate-val v entity)
           (cond
             (not (contains? idents a))
-            [(assoc entity' a v) upserts]
+            (do
+              (vld/validate-val v entity)
+              [(assoc entity' a v) upserts])
 
             (txcommon/multi-value? db a v)
             (let [[insert upsert] (split a v)]
@@ -156,7 +158,7 @@
                  (seq upsert) (assoc a upsert))])
 
             :else
-            (if-some [[e v'] (resolve a v)]
+            (if-some [[e v'] (resolve a v entity)]
               (do
                 (validate-upsert-preds a v')
                 [entity' (assoc upserts a {v e})])
@@ -331,6 +333,30 @@
 (defn maybe-wrap-multival
   [db a vs]
   (if (expand-multival? db a vs) vs [vs]))
+
+(defn contains-nested-map?
+  "Whether explode will emit a nested entity map, without building operations.
+   Opaque map values and maps inside lookup references remain ordinary values."
+  ([db entity] (contains-nested-map? db entity nil))
+  ([db entity ^IdentityResolution resolution]
+   (reduce-kv
+     (fn [_ a vs]
+       (if (and (not (identical? a :db/id))
+                (not (and resolution (= a (.-attr resolution))))
+                ;; Most values cannot emit entity maps; avoid schema work for
+                ;; those before considering reference and cardinality rules.
+                (or (map? vs)
+                    (and (coll? vs)
+                         (reduce (fn [_ value]
+                                   (if (map? value) (reduced true) false))
+                                 false vs)))
+                (let [straight-a (if (txcommon/reverse-ref? a)
+                                   (txcommon/reverse-ref a) a)]
+                  (and (txcommon/ref? db straight-a)
+                       (or (map? vs) (expand-multival? db a vs)))))
+         (reduced true)
+         false))
+     false entity)))
 
 (defn- add-exploded-value!
   [^ArrayList txs db eid a reverse? straight-a v]

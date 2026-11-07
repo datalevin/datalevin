@@ -1,7 +1,8 @@
 (ns datalevin.cache-invalidation-test
   (:require [clojure.test :refer [deftest is testing]]
             [datalevin.datom :as d]
-            [datalevin.db :as db])
+            [datalevin.db :as db]
+            [datalevin.interface :as i])
   (:import [datalevin.utl LRUCache]
            [java.util.function Function]))
 
@@ -51,6 +52,12 @@
             expected (set (filter affected? keys))
             candidates (.candidateKeys cache (#'db/cache-invalidation-dependencies touches false))]
         (is (= expected (set (filter affected? candidates))) (str tx))
+        (let [selective (#'db/tx-touch-summary tx cache)]
+          (is (= expected
+                 (set (filter #(#'db/tx-affects-cache-key? selective %)
+                              (.candidateKeys cache
+                                (#'db/cache-invalidation-dependencies selective false)))))
+              (str "selective summary: " tx)))
         ;; Local native range checks can be broader than the remote predicate.
         ;; They must all remain candidates, including unresolved reference bounds.
         (is (every? (set candidates)
@@ -127,4 +134,139 @@
         (is (not (contains? candidates seek-other)))
         (is (contains? candidates seek-unresolved))
         (is (not (contains? candidates seek-entity)))))))
+
+(deftype HashObserved [calls]
+  clojure.lang.IHashEq
+  (hasheq [_] (swap! calls inc) 7)
+  Object
+  (hashCode [_] (swap! calls inc) 7))
+
+(deftest summaries-hash-only-values-required-by-retained-patterns
+  (let [cache (indexed-cache 8)
+        calls (atom 0)
+        value (HashObserved. calls)
+        tx [(d/datom 1 :a value) (d/datom 2 :b value)]]
+    (doseq [key [[:e-datoms 1] [:cardinality :a]
+                 [:query-result {:attrs #{:a}} :query :inputs]]]
+      (.put cache key :cached))
+    (let [order (.orderedKeys cache)
+          touches (#'db/tx-touch-summary tx cache)]
+      (is (= #{1 2} (:eids touches)))
+      (is (= #{:a :b} (:attrs touches)))
+      (is (empty? (:values touches)))
+      (is (empty? (:values-by-attr touches)))
+      (is (zero? @calls))
+      (is (= order (.orderedKeys cache))))
+    (let [key [:av-datoms :a "retained"]]
+      (.put cache key :cached)
+      (let [touches (#'db/tx-touch-summary
+                      [(d/datom 1 :a "same") (d/datom 2 :a "same")
+                       (d/datom 3 :b value) (d/datom 4 :b value)] cache)]
+        (is (= {:a #{"same"}} (:values-by-attr touches)))
+        (is (empty? (:values touches)))
+        (is (zero? @calls)))
+      (.remove cache key)
+      (is (empty? (:values-by-attr (#'db/tx-touch-summary tx cache))))
+      (is (zero? @calls)))))
+
+(deftest unknown-attribute-patterns-collect-global-values-only
+  (let [cache (indexed-cache 4)]
+    (.put cache [:search nil nil "needle"] :cached)
+    (let [touches (#'db/tx-touch-summary
+                    [(d/datom 1 :a "needle") (d/datom 2 :b "other")] cache)]
+      (is (= #{"needle" "other"} (:values touches)))
+      (is (empty? (:values-by-attr touches)))
+      (is (#'db/tx-affects-cache-key? touches [:search nil nil "needle"])))
+    (.clear cache)
+    (.put cache [:search 1 :a "needle"] :cached)
+    (let [touches (#'db/tx-touch-summary [(d/datom 1 :a "needle")] cache)]
+      (is (empty? (:values touches)))
+      (is (= {:a #{"needle"}} (:values-by-attr touches)))
+      (is (#'db/tx-affects-cache-key? touches [:search 1 :a "needle"])))
+    ;; Eviction must remove the last global-value requirement as well.
+    (.clear cache)
+    (doseq [key [[:search nil nil "needle"] [:e-datoms 1]
+                 [:e-datoms 2] [:e-datoms 3]]]
+      (.put cache key :cached))
+    (#'db/tx-touch-summary [(d/datom 1 :a "needle")] cache)
+    (.put cache [:e-datoms 4] :cached)
+    (is (empty? (:values (#'db/tx-touch-summary [(d/datom 1 :a "needle")] cache))))))
+
+(deftest dependency-prefixes-count-buckets-and-survive-shared-keys
+  (let [cache (indexed-cache 4)
+        kind :datalevin.db/attribute-value
+        search [:search nil :a 10]
+        exact [:av-datoms :a 10]
+        other [:av-datoms :a 20]]
+    (is (not (.hasDependencyGroup cache kind)))
+    (doseq [key [search exact other]] (.put cache key :cached))
+    (is (.hasDependencyGroup cache kind :a))
+    (is (not (.hasDependencyGroup cache kind :b)))
+    (.remove cache search)
+    (is (.hasDependencyGroup cache kind :a))
+    (.remove cache exact)
+    (is (.hasDependencyGroup cache kind :a))
+    (.remove cache other)
+    (is (not (.hasDependencyGroup cache kind)))
+    (.put cache exact :cached)
+    (is (.hasDependencyGroup cache kind :a))
+    (.clear cache)
+    (is (not (.hasDependencyGroup cache kind)))))
+
+(defn- with-shared-cache [f]
+  (let [cache-dir (str ::demand "-" (random-uuid))
+        store (reify i/IStore
+                (dir [_] cache-dir)
+                (opts [_] {:cache-limit 64}))]
+    (db/refresh-cache store 1)
+    (try (f store) (finally (db/remove-cache store)))))
+
+(deftest broader-candidate-buckets-retain-precise-value-invalidation
+  (doseq [[pattern value different]
+          [[[:search 1 :a "needle"] "needle" "different"]
+           [[:search 1 nil "needle"] "needle" "different"]
+           [[:search nil nil "needle"] "needle" "different"]
+           [[:search nil :a (byte-array [1 2])]
+            (byte-array [1 2]) (byte-array [3 4])]]]
+    (with-shared-cache
+      (fn [store]
+        (let [key (db/index-cache-key store pattern)]
+          (db/cache-put store key :retained)
+          (#'db/invalidate-cache store [(d/datom 1 :a different)] 2)
+          (is (= :retained (db/cache-get store key)))
+          (#'db/invalidate-cache store [(d/datom 1 :a value)] 3)
+          (is (nil? (db/cache-get store key))))))))
+
+(deftest dependency-inspection-and-removal-exclude-stale-publication
+  (with-shared-cache
+    (fn [store]
+      (db/cache-put store [:e-datoms 1] :retained)
+      (let [[^LRUCache cache generation] (db/cache-token store)
+            entered (promise) release (promise) calls (atom 0)
+            tx (reify clojure.lang.Seqable
+                 (seq [_]
+                   (when (= 2 (swap! calls inc))
+                     (is (Thread/holdsLock cache))
+                     (deliver entered true)
+                     (assert (deref release 10000 false)))
+                   (seq [(d/datom 1 :a "needle")])))
+            writer (future (#'db/invalidate-cache store tx 2))]
+        (try
+          (is (deref entered 10000 false))
+          (let [started (promise)
+                publisher (future
+                            (deliver started true)
+                            (.putIfGeneration cache [:av-datoms :a "needle"]
+                                              :stale generation))]
+            (is (deref started 10000 false))
+            (deliver release true)
+            (deref writer 10000 ::timeout)
+            (is (false? (deref publisher 10000 ::timeout)))
+            (is (nil? (db/cache-get store [:av-datoms :a "needle"])))
+            (db/cache-put store [:av-datoms :a "needle"] :current)
+            (#'db/invalidate-cache store [(d/datom 1 :a "needle")] 3)
+            (is (nil? (db/cache-get store [:av-datoms :a "needle"]))))
+          (finally
+            (deliver release true)
+            (future-cancel writer)))))))
 

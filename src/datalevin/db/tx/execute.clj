@@ -425,14 +425,6 @@
     (u/removem txprep/auto-tempid? tempids)
     tempids))
 
-(defn- contains-map-entity?
-  ^Boolean [^List entities]
-  (loop [i 0]
-    (cond
-      (== i (.size entities)) false
-      (map? (.get entities i)) true
-      :else (recur (unchecked-inc i)))))
-
 (defn- check-value-tempids [report]
   (let [tx-data (:tx-data report)]
     (if-let [tempids (::value-tempids report)]
@@ -788,21 +780,17 @@
                    entities)]))
 
       (txprep/tempid? old-eid)
-      (let [allocated-eid (get (:tempids report) old-eid)
-            eid           (or allocated-eid (next-eid db))
-            txs           (txprep/explode db (assoc entity :db/id eid) resolution)]
-        (cond
-          (.isEmpty ^List txs)
-          [report entities]
-
-          (contains-map-entity? txs)
-          [report (concat (txprep/explode db entity) entities)]
-
-          :else
-          [(if allocated-eid
-             report
-             (allocate-eid tx-time report old-eid eid))
-           (concat txs entities)]))
+      (if (txprep/contains-nested-map? db entity resolution)
+        [report (concat (txprep/explode db entity) entities)]
+        (let [allocated-eid (get (:tempids report) old-eid)
+              eid           (or allocated-eid (next-eid db))
+              txs           (txprep/explode db (assoc entity :db/id eid) resolution)]
+          (if (.isEmpty ^List txs)
+            [report entities]
+            [(if allocated-eid
+               report
+               (allocate-eid tx-time report old-eid eid))
+             (concat txs entities)])))
 
       (or (number? old-eid)
           (nil? old-eid)

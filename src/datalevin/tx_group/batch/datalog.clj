@@ -60,6 +60,9 @@
   (discard-scalar-pending! [_]
     (.clear scalar-pending)
     (.clear unique-pending)
+    ;; Every discard follows a native drain. The next segment can start with
+    ;; the simple pending view even if its predecessor needed sorted indexes.
+    (set! scalar-pending? (boolean true))
     (set! pending-start (long (.size ^FastList (.-datoms ^WriteGroup @group))))
     (set! pending-indexed pending-start))
   txcommon/ScalarDatomBuffer
@@ -81,8 +84,11 @@
     (.clear scalar-pending)
     (.clear unique-pending)
     (db/-clear-tx-cache tx-db)
-    (doseq [datom (.-datoms ^WriteGroup @group)]
-      (txcommon/stage-batch-datom! tx-db datom))))
+    (let [^FastList datoms (.-datoms ^WriteGroup @group)]
+      (loop [idx pending-start]
+        (when (< idx (.size datoms))
+          (txcommon/stage-batch-datom! tx-db (.get datoms (int idx)))
+          (recur (unchecked-inc idx)))))))
 
 (defn control
   "Return the collector for a standalone local Datalog connection."
@@ -373,8 +379,8 @@
         (swap! conn assoc :eavt (:eavt before) :avet (:avet before))))))
 
 (defn run-explicit-request!
-  "Share preparation once adjacent inner writes form a burst. The first user
-  read drains its writes and resumes eager execution for the rest of the body."
+  "Share preparation once adjacent inner writes form a burst. User reads drain
+  each segment; later bursts can reuse the same preparation context."
   [conn tx-data tx-meta transact!]
   (let [{:keys [context before-read! last-write native-read]} *explicit-body*
         native (kv/raw-lmdb (.-lmdb ^Store (:store @conn)))
@@ -417,13 +423,12 @@
         before-read! (fn []
                        ;; Detach before draining: native application may grow
                        ;; the map or borrow this view again while applying rows.
-                       ;; Read/modify/write bodies keep their eager path after
-                       ;; this boundary, without wrapping each remaining write.
-                       (set! *explicit-body* nil)
                        (.setBeforeRead writer nil)
                        (let [prepared? (= :prepared @last-write)
                              read! @native-read]
-                         (vreset! last-write nil)
+                         ;; Reentrant callbacks during the drain use their
+                         ;; existing native scope, just as request resolution.
+                         (vreset! last-write :resolving)
                          (vreset! native-read nil)
                          (if prepared?
                            (when-let [flush! (l/prepare-flush native)] (flush!))
@@ -433,7 +438,11 @@
                                        #'txcommon/*batch-prepare*)]
                          (txcommon/discard-scalar-pending! preparation))
                        (doseq [^Set index @(:resolver-indexes context)]
-                         (.clear index)))]
+                         (.clear index))
+                       ;; Keep the explicit body active and rearm its burst
+                       ;; gate. A single write/read pair stays eager; a second
+                       ;; consecutive write can share preparation again.
+                       (vreset! last-write nil))]
     (binding [*explicit-body* {:connection tx :context context
                               :before-read! before-read! :last-write last-write
                               :native-read native-read}]

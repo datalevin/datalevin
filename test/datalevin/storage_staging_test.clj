@@ -18,7 +18,12 @@
 (def ^:private schema
   {:number {:db/valueType :db.type/long}
    :text {:db/valueType :db.type/string}
-   :blob {:db/valueType :db.type/bytes}})
+   :blob {:db/valueType :db.type/bytes}
+   :ints {:db/valueType :db.type/tuple :db/tupleType :db.type/long}
+   :pair {:db/valueType :db.type/tuple :db/tupleTypes [:db.type/long :db.type/string]}
+   :strings {:db/valueType :db.type/tuple :db/tupleType :db.type/string}
+   :mutable {:db/valueType :db.type/tuple :db/tupleTypes [:db.type/long :db.type/instant]}
+   :untyped {}})
 
 (defn- with-group [f]
   (with-open [conn (d/create-conn nil schema
@@ -122,3 +127,33 @@
         (is (= 2 (i/ea-first-v store 1 :number)))
         (is (= [1 2 3] (vec (i/ea-first-v store 1 :blob))))
         (is (= 2 (i/entries writer c/eav)))))))
+
+(deftest bounded-immutable-tuples-support-both-staged-encoders
+  (doseq [freeze? [false true]]
+    (with-group
+      (fn [{:keys [store group writer]}]
+        (let [values {:ints (vec (range 8))
+                      :pair [42 (.repeat "\u754c" 48)]
+                      :strings ["one" "two"]}
+              datoms (mapv (fn [[a v]] (datom/datom 1 a v)) values)]
+          (is (number? (s/stage-group-datoms! store datoms)))
+          (let [rows (if freeze?
+                       ((:encode (s/freeze-group-storage-datoms! group writer)))
+                       (s/take-group-storage-rows! group writer))]
+            (is (= 3 (count rows)))
+            (is (empty? (pending group)))
+            (i/transact-kv writer rows))
+          (doseq [[a v] values]
+            (is (= v (i/ea-first-v store 1 a)))))))))
+
+(deftest unsafe-or-invalid-tuples-retain-eager-preparation
+  (with-group
+    (fn [{:keys [store group]}]
+      (doseq [[a v] [[:ints (vec (range 9))]
+                     [:pair [1 (.repeat "x" 49)]]
+                     [:strings (vec (repeat 4 (.repeat "x" 48)))]
+                     [:pair [1 2]]
+                     [:mutable [1 (java.util.Date.)]]
+                     [:untyped [1 2]]]]
+        (is (nil? (s/stage-group-datoms! store [(datom/datom 1 a v)])))
+        (is (empty? (pending group)))))))

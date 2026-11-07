@@ -99,6 +99,7 @@
    [java.lang AutoCloseable]
    [org.eclipse.collections.impl.list.mutable FastList]
    [org.eclipse.collections.impl.list.mutable.primitive LongArrayList]
+   [org.eclipse.collections.impl.set.mutable.primitive LongHashSet]
    [org.eclipse.collections.impl.map.mutable.primitive LongObjectHashMap]
    [datalevin.datom Datom]
    [datalevin.interface IStore]
@@ -1706,14 +1707,9 @@
         {})))
 
 (defn- collect-fulltext
-  [^Store store work attr props text ref job-op op]
+  [^Store store work domains text ref job-op op]
   (when-not (str/blank? text)
-    (doseq [domain (vec
-                     (distinct
-                       (cond-> (or (seq (props :db.fulltext/domains))
-                                   [c/default-domain])
-                         (props :db.fulltext/autoDomain)
-                         (conj (u/keyword->string attr)))))]
+    (doseq [domain domains]
       (if (si/async-indexing? (search-domain-config store domain))
         (add-index-work! work ft-jobs-slot {:type :fulltext
                                           :domain domain
@@ -2357,6 +2353,33 @@
       (and (string? value) (<= (count value) 100))
       (and (keyword? value) (<= (count (str value)) 100))))
 
+(defn- buffered-tuple-value?
+  [value props]
+  ;; Admit immutable components only. Bound both each variable component and
+  ;; the complete tuple, including headers, separators and the size trailer,
+  ;; without encoding it twice or deferring giant/native lookups.
+  (and (identical? :db.type/tuple (:db/valueType props))
+       (vector? value) (<= 1 (count value) 8)
+       (loop [idx 0 size 3]
+         (if (< idx (count value))
+           (let [v (nth value idx)
+                 bytes (cond
+                         (nil? v) 0
+                         (string? v) (when (<= (count v) 48) (* 4 (count v)))
+                         (keyword? v) (let [n (count (str v))]
+                                        (when (<= n 48) (* 4 n)))
+                         (buffered-datom-value? v) 16)]
+             (and bytes
+                  (<= (+ size 3 (long bytes)) c/+val-bytes-wo-hdr+)
+                  (recur (inc idx) (+ size 3 (long bytes)))))
+           true))
+       (let [types (idx/value-type props)]
+         (and (vector? types)
+              (every? #{:db.type/long :db.type/ref :db.type/double :db.type/float
+                        :db.type/boolean :db.type/uuid :db.type/string :db.type/keyword}
+                      types)
+              (b/valid-data? value types)))))
+
 (defn ^:no-doc stage-group-datoms!
   "Retain ordinary resolved datoms for one storage preparation per group.
    Reserve logical metadata now; encoding is drained before native-read scopes."
@@ -2381,7 +2404,8 @@
                       (if (and (:db/aid props) (not (:db/fulltext props))
                                (not (:db/embedding props))
                                (not (#{:db.type/vec :db.type/idoc} vt))
-                               (buffered-datom-value? (.-v datom)))
+                               (or (buffered-datom-value? (.-v datom))
+                                   (buffered-tuple-value? (.-v datom) props)))
                         (do (.add pending datom) true)
                         (reduced false))))
                   true datoms)
@@ -2416,21 +2440,33 @@
                 ;; distinguish signed zero and serialized numeric classes.
                 (Objects/equals (.-v datom) (.-v that)))))))
 
-(defn- ordered-scalar-storage-updates?
-  "Recognize one retract/add pair per increasing entity, with no canceling fact."
+(defn- scalar-storage-updates?
+  "Recognize one retract/add pair per distinct entity, with no canceling fact."
   [^FastList datoms]
   (let [n (.size datoms)]
     (when (even? n)
-      (loop [i (int 0) previous-e (long -1)]
+      (loop [i (int 0) previous-e (long -1) ^LongHashSet seen nil]
         (if (< i n)
           (let [^Datom before (.get datoms i)
                 ^Datom after (.get datoms (inc i))
                 e (.-e before)]
-            (when (and (> e previous-e) (== e (.-e after))
+            (when (and (== e (.-e after))
                        (= (.-a before) (.-a after))
                        (not (d/datom-added before)) (d/datom-added after)
                        (not (Objects/equals (.-v before) (.-v after))))
-              (recur (+ i 2) e)))
+              ;; Increasing IDs prove distinctness without a set. On the first
+              ;; disorder, retain the prefix IDs and check the remaining pairs.
+              (let [^LongHashSet seen
+                    (or seen
+                        (when (<= e previous-e)
+                          (let [ids (LongHashSet.)]
+                            (loop [j (int 0)]
+                              (when (< j i)
+                                (.add ids (.-e ^Datom (.get datoms j)))
+                                (recur (+ j 2))))
+                            ids)))]
+                (when (or (nil? seen) (.add seen e))
+                  (recur (+ i 2) e seen)))))
           true)))))
 
 (defn- compact-group-storage-datoms
@@ -2445,7 +2481,7 @@
                         true
                         (reduced false)))
                     true datoms))
-          (ordered-scalar-storage-updates? datoms))
+          (scalar-storage-updates? datoms))
     datoms
     (let [changes (LinkedHashMap.)
           compacted (FastList.)]
@@ -2517,7 +2553,10 @@
              bytes (reduce (fn [total ^Datom datom]
                              (let [v (.-v datom)]
                                (+ (long total) 32
-                                  (if (string? v) (* 4 (count v)) 0))))
+                                  (cond
+                                    (string? v) (* 4 (count v))
+                                    (vector? v) (* 2 c/+val-bytes-wo-hdr+)
+                                    :else 0))))
                            0 compacted)]
          ;; The old region belongs exclusively to the frozen plan. Any later
          ;; staging gets a fresh region, including an unexpected read boundary.
@@ -2587,25 +2626,41 @@
         (lmdb/with-transaction-kv [writer lmdb]
           (run writer))))))
 
+(defn- make-write-attr-info
+  [^Store store attr value insert?]
+  (let [schema (schema store)
+        props  (schema attr)
+        _      (when insert?
+                 (vld/validate-closed-schema
+                   schema (opts store) attr value))
+        props  (if insert?
+                 (or props (swap-attr store attr identity))
+                 props)
+        vt     (idx/storage-type (.-lmdb store) props)]
+    ;; Nonempty domain lists also serve as the enabled flags. They
+    ;; share this cache's schema epoch; indexing modes remain live.
+    (object-array
+      [props
+       vt
+       (:db/aid props)
+       (when (:db/embedding props)
+         (embedding-attr-domains attr props))
+       (when (:db/fulltext props)
+         (vec
+           (distinct
+             (cond-> (or (seq (:db.fulltext/domains props))
+                         [c/default-domain])
+               (:db.fulltext/autoDomain props)
+               (conj (u/keyword->string attr))))))
+       (:db/noindex props)
+       (when (identical? vt :db.type/vec)
+         (conjv (:db.vec/domains props) (v/attr-domain attr)))])))
+
 (defn- write-attr-info
   [^Store store ^HashMap attr-infos attr value insert?]
   (or (.get attr-infos attr)
-      (let [schema (schema store)
-            props  (schema attr)
-            _      (when insert?
-                     (vld/validate-closed-schema
-                       schema (opts store) attr value))
-            props  (if insert?
-                     (or props (swap-attr store attr identity))
-                     props)
-            info   (object-array
-                     [props
-                      (idx/storage-type (.-lmdb store) props)
-                      (:db/aid props)
-                      (:db/embedding props)
-                      (:db/fulltext props)
-                      (:db/noindex props)])]
-        (when props (.put attr-infos attr info))
+      (let [^objects info (make-write-attr-info store attr value insert?)]
+        (when (aget info 0) (.put attr-infos attr info))
         info)))
 
 (defn- giant-datom-key
@@ -2623,8 +2678,8 @@
         props      (aget ai 0)
         vt         (aget ai 1)
         aid        (aget ai 2)
-        embedding? (and embedding-work? (aget ai 3))
-        fulltext?  (and embedding-work? (aget ai 4))
+        embedding-domains (when embedding-work? (aget ai 3))
+        fulltext-domains (when embedding-work? (aget ai 4))
         noindex?   (aget ai 5)
         vb         (b/value-bytes v vt)
         i          ^Indexable (b/indexable nil aid v vt max-gt vb)
@@ -2652,10 +2707,9 @@
                                     :id vtype (when-not noindex?
                                                 [:append])))))
           (when (identical? vt :db.type/vec)
-            (let [ref     (if giant? [:g max-gt e aid] [e aid v])
-                  op      (if giant? [:g [e aid max-gt v]] [:a [e aid v]])
-                  domains (conjv (props :db.vec/domains) (v/attr-domain attr))]
-              (doseq [domain domains]
+            (let [ref (if giant? [:g max-gt e aid] [e aid v])
+                  op  (if giant? [:g [e aid max-gt v]] [:a [e aid v]])]
+              (doseq [domain (aget ai 6)]
                 (if (async-vector-domain? store domain)
                   (add-index-work! work vi-jobs-slot {:type :vector
                                                     :domain domain
@@ -2663,10 +2717,10 @@
                                                     :ref ref
                                                     :value v})
                   (add-index-work! work vi-ds-slot [[domain] op])))))
-          (when embedding?
+          (when embedding-domains
             (let [doc-ref     (if giant? [:g max-gt e aid] [e aid v])
                   domain-vecs (some-> ^IdentityHashMap embedding-plan (.get d))]
-              (doseq [domain (embedding-attr-domains attr props)]
+              (doseq [domain embedding-domains]
                 (if (async-embedding-domain? store domain)
                   (add-index-work! work em-jobs-slot {:type :embedding
                                                     :domain domain
@@ -2684,13 +2738,12 @@
                   patch  (some-> (meta d) :idoc/patch)
                   op     (if patch (with-meta op {:idoc/patch patch}) op)]
               (collect-idoc store work domain op)))
-          (when fulltext?
+          (when fulltext-domains
             (let [text (str v)
                   ref  (if giant? [:g max-gt e aid] [e aid text])]
               (collect-fulltext store
                                 work
-                                attr
-                                props
+                                fulltext-domains
                                 text
                                 ref
                                 :add
@@ -2706,10 +2759,11 @@
         props      (aget ai 0)
         vt         (aget ai 1)
         aid        (aget ai 2)
-        embedding? (and embedding-work? (aget ai 3))
-        fulltext?  (and embedding-work? (aget ai 4))
+        embedding-domains (when embedding-work? (aget ai 3))
+        fulltext-domains (when embedding-work? (aget ai 4))
         noindex?   (aget ai 5)
-        candidate-key (idx/take-giant-key! (.-lmdb store) d aid)
+        candidate-key (when (d/storage-reference d)
+                        (idx/take-giant-key! (.-lmdb store) d aid))
         plan-key   (when (and candidate-key (not (.isEmpty giants)))
                      (giant-datom-key e attr v))
         plan-gt    (when plan-key (.get giants plan-key))
@@ -2749,20 +2803,19 @@
                              [:closed i (Indexable. nil aid v (.-f i) (.-b i) c/gmax)]
                              :avg))
                          (raise "Cannot retract missing giant value" {:e e :a attr})))]
-    (when fulltext?
+    (when fulltext-domains
       (let [text (str v)
             ref  (if gt [:g gt e aid] [e aid text])]
         (collect-fulltext store
                           work
-                          attr
-                          props
+                          fulltext-domains
                           text
                           ref
                           :delete
                           (if gt [:r [e aid gt]] [:d ref]))))
-    (when embedding?
+    (when embedding-domains
       (let [doc-ref (if gt [:g gt e aid] [e aid v])]
-        (doseq [domain (embedding-attr-domains attr props)]
+        (doseq [domain embedding-domains]
           (if (async-embedding-domain? store domain)
             (add-index-work! work em-jobs-slot {:type :embedding
                                               :domain domain
@@ -2783,10 +2836,9 @@
         (when gt-cur (.remove giants d-eav))
         (.add txs (lmdb/kv-tx :del c/giants gt :id)))
       (when (identical? vt :db.type/vec)
-        (let [ref     (if gt [:g gt e aid] [e aid v])
-              op      (if gt [:r [e aid gt]] [:d [e aid v]])
-              domains (conjv (props :db.vec/domains) (v/attr-domain attr))]
-          (doseq [domain domains]
+        (let [ref (if gt [:g gt e aid] [e aid v])
+              op  (if gt [:r [e aid gt]] [:d [e aid v]])]
+          (doseq [domain (aget ai 6)]
             (if (async-vector-domain? store domain)
               (add-index-work! work vi-jobs-slot {:type :vector
                                                 :domain domain

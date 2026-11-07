@@ -559,26 +559,46 @@
    u/*reservoir-sampling-seed*])
 
 (defn- tx-touch-summary
-  [tx-data]
-  (loop [datoms (seq tx-data)
-         eids (transient #{})
-         attrs (transient #{})
-         values (transient #{})
-         values-by-attr (transient {})]
-    (if-let [^Datom datom (first datoms)]
-      (let [e (.-e datom)
-            a (.-a datom)
-            v (.-v datom)]
-        (recur (next datoms) (conj! eids e) (conj! attrs a) (conj! values v)
-               (assoc! values-by-attr a
-                       (conj! (or (get values-by-attr a) (transient #{})) v))))
-      {:eids (persistent! eids)
-       :attrs (persistent! attrs)
-       :values (persistent! values)
-       :values-by-attr
-       (persistent!
-         (reduce-kv (fn [m a vs] (assoc! m a (persistent! vs)))
-                    (transient {}) (persistent! values-by-attr)))})))
+  ([tx-data] (tx-touch-summary tx-data true true nil))
+  ([tx-data ^LRUCache cache]
+   ;; The caller holds the cache monitor through dependency inspection,
+   ;; summarization and removal, excluding newly published dependencies.
+   (tx-touch-summary tx-data (.hasDependency cache ::all-values)
+                     (or (.hasDependencyGroup cache ::attribute-value)
+                         (.hasDependencyGroup cache ::value-filter)) cache))
+  ([tx-data all-values? attribute-values? ^LRUCache cache]
+   (loop [datoms (seq tx-data)
+          eids (transient #{})
+          attrs (transient #{})
+          values (when all-values? (transient #{}))
+          values-by-attr nil]
+     (if-let [^Datom datom (first datoms)]
+       (let [e (.-e datom)
+             a (.-a datom)
+             v (.-v datom)
+             bucket (when attribute-values?
+                      (or (get values-by-attr a)
+                          ;; Consult the dependency index once per new touched
+                          ;; attribute. Needed buckets still deduplicate eagerly.
+                          (when (and (not (contains? attrs a))
+                                     (or (nil? cache)
+                                         (.hasDependencyGroup cache ::attribute-value a)
+                                         (.hasDependencyGroup cache ::value-filter a)))
+                            (transient #{}))))]
+         (recur (next datoms) (conj! eids e) (conj! attrs a)
+                (when values (conj! values v))
+                (if bucket
+                  (assoc! (or values-by-attr (transient {})) a (conj! bucket v))
+                  values-by-attr)))
+       {:eids (persistent! eids)
+        :attrs (persistent! attrs)
+        :values (if values (persistent! values) #{})
+        :values-by-attr
+        (if values-by-attr
+          (persistent!
+            (reduce-kv (fn [m a vs] (assoc! m a (persistent! vs)))
+                       (transient {}) (persistent! values-by-attr)))
+          {})}))))
 
 (defn- full-index-value-match?
   [db ^Datom low]
@@ -668,13 +688,24 @@
 (defn- pattern-cache-dependencies
   ([e a v] (pattern-cache-dependencies e a v true))
   ([e a v exact?]
-   (cond
-     (unresolved-pattern? e v) [::all]
-     (some? e) [[::entity e]]
-     (and exact? (some? a) (exact-cache-value? v))
-     [[::attribute-value a v]]
-     (some? a) [[::attribute a]]
-     :else [::all])))
+   (let [unresolved? (unresolved-pattern? e v)
+         value-bucket? (and (not unresolved?) (nil? e) exact? (some? a)
+                            (exact-cache-value? v))
+         deps (cond
+                unresolved? [::all]
+                (some? e) [[::entity e]]
+                value-bucket? [[::attribute-value a v]]
+                (some? a) [[::attribute a]]
+                :else [::all])]
+     ;; These tokens describe precise-filter requirements, not candidates.
+     ;; Entity and mutable-value buckets also need values for exact matching.
+     (if (and exact? (not unresolved?) (some? v))
+       (if (some? a)
+         (if value-bucket?
+           deps
+           (conj deps [::value-filter a nil]))
+         (conj deps ::all-values))
+       deps))))
 
 (defn- cache-key-dependencies
   "Candidate buckets, computed once when a key enters the LRU. Exact immutable
@@ -894,24 +925,13 @@
            (.beginInvalidation cache (long (or target 0)))
            (.clear cache))
          (if (seq tx-data)
-           ;; Pure ingestion normally has no cached reads. Avoid constructing
-           ;; four touch sets and a values-by-attribute map from every datom in
-           ;; that common case, while still advancing the cache generation.
-           (if (.isEmpty cache)
-             (locking cache
-               (.beginInvalidation cache (long (or target 0)))
-               ;; A cache entry may have appeared between the optimistic empty
-               ;; check and acquiring the monitor. Handle that race normally.
-               (when-not (.isEmpty cache)
-                 (let [touches (tx-touch-summary tx-data)]
-                   (remove-affected-cache-entries! store cache touches tx-data))))
-             (let [touches (tx-touch-summary tx-data)]
-               ;; Prevent a reader that started before this commit from publishing
-               ;; its old snapshot after the affected entries have been removed.
-               ;; LRUCache methods synchronize on the cache monitor, so this also
-               ;; keeps cache hits out of the invalidation window.
-               (locking cache
-                 (.beginInvalidation cache (long (or target 0)))
+           (locking cache
+             ;; Keep demand inspection and candidate removal in one generation:
+             ;; a newly published value-constrained key must not be overlooked.
+             (.beginInvalidation cache (long (or target 0)))
+             ;; Empty caches still advance their generation without summaries.
+             (when-not (.isEmpty cache)
+               (let [touches (tx-touch-summary tx-data cache)]
                  (remove-affected-cache-entries! store cache touches tx-data))))
            (.setTarget cache (long (or target 0)))))
        (mark-remote-cache-max-tx! store remote-max-tx))
@@ -2229,9 +2249,8 @@
   "Conservatively reject values that can spill into the giants DB. Giant
   values include an allocated giant ID in their AVE key, so LMDB key equality
   cannot enforce their logical uniqueness."
-  [value-type value]
-  (case value-type
-    (:db.type/string :db.type/keyword :db.type/symbol)
+  [textual? value]
+  (if textual?
     ;; UTF-8 needs at most four bytes per UTF-16 code unit. This leaves ample
     ;; room below LMDB's 511-byte key limit for the AVG type/attribute prefix.
     (<= (count (str value)) 100)
@@ -2267,23 +2286,24 @@
 
 (defn- append-blind-value!
   ^Boolean [^FastList attrs ^FastList unique-avs
-            seen-avs set-capacity
-            store-opts props attr entity value]
+            seen-avs set-capacity fuse-unique-inserts?
+            store-opts ^objects info attr entity value]
   (if (or (map? value)
           (datom? value)
           (and (coll? value) (not (bytes? value))))
     false
-    (let [value'  (do
+    (let [props   (aget info 0)
+          value'  (do
                     (vld/validate-val value entity)
                     (prepare/correct-value-with-props
                       store-opts props attr value))
           unique? (some? (:db/unique props))
+          inline? (blind-unique-inline-value? (aget info 3) value')
           av       (when unique?
                      ;; Compact deferred pairs; vectors hash faster in eager checks.
                      (if seen-avs [attr value'] (MapEntry/create attr value')))]
       (if (and unique?
-               (or (not (blind-unique-inline-value?
-                          (:db/valueType props) value'))
+               (or (not inline?)
                    (and seen-avs
                         (let [^java.util.HashSet seen
                               (or @seen-avs
@@ -2292,6 +2312,7 @@
                           (not (.add seen av))))))
         false
         (do
+          (when-not inline? (vreset! fuse-unique-inserts? false))
           (when av (.add unique-avs av))
           (.add attrs attr)
           (.add attrs value')
@@ -2316,17 +2337,14 @@
 
 (defn- prepare-blind-write-entity
   [store-opts unique-identity-attrs ^FastList unique-avs seen-avs set-capacity
-   has-many? fuse-unique-inserts? ^java.util.HashMap attr-infos check-attr entity]
+   has-many? fuse-unique-inserts? ^java.util.HashMap attr-infos entity]
   (let [old-eid   (:db/id entity)
         ;; An implicit entity does not need a transaction-scoped tempid: the
         ;; blind stamper assigns its final EID directly and never exposes an
         ;; implicit mapping in the report. Retain explicit tempids so repeated
         ;; user IDs still fall back to the resolver and merge correctly.
         entity-id old-eid]
-    (when (and (or (nil? old-eid) (tempid? old-eid))
-               ;; Attribute eligibility is independent of values. Check the
-               ;; whole map before validation, coercion or fusion bounds.
-               (reduce-kv check-attr true entity))
+    (when (or (nil? old-eid) (tempid? old-eid))
       (let [^FastList attrs (FastList. (int (* 2 (count entity))))
             supported?
             (reduce-kv
@@ -2336,9 +2354,7 @@
                   (let [^objects info (.get attr-infos attr)
                         props (aget info 0)
                         many? (identical? :db.cardinality/many (:db/cardinality props))
-                        _ (when (or (not (aget info 2))
-                                    (and (aget info 3)
-                                         (> (count (str raw-value)) 100)))
+                        _ (when-not (aget info 2)
                             (vreset! fuse-unique-inserts? false))
                         supported-values?
                         (if (blind-write-multiple-values?
@@ -2350,7 +2366,7 @@
                               (if-some [value (first values)]
                                 (if (and (append-blind-value!
                                            attrs unique-avs seen-avs set-capacity
-                                           store-opts props attr entity value)
+                                           fuse-unique-inserts? store-opts info attr entity value)
                                          ;; Repeated values need the resolver's
                                          ;; set semantics before EAV append.
                                          (.add seen-values
@@ -2362,7 +2378,7 @@
                             (when many? (vreset! has-many? true))
                             (append-blind-value!
                               attrs unique-avs seen-avs set-capacity
-                              store-opts props attr entity
+                              fuse-unique-inserts? store-opts info attr entity
                               raw-value)))]
                     (if-not supported-values?
                       (reduced false)
@@ -2480,24 +2496,9 @@
                                             blind-unique-write-threshold
                                             initial-es))
                                      blind-unique-write-threshold))
-           initial-count     (int
-                               (if (instance? java.util.Collection initial-es)
-                                 (.size ^java.util.Collection initial-es)
-                                 0))
-           ;; Entity preparation receives an Object; box once per batch.
-           set-capacity      (Integer/valueOf
-                               (int (max 1 (inc (quot (* 4 (long initial-count))
-                                                     3)))))
-           ^FastList unique-avs (FastList.)
-           seen-avs          (when check-unique-avs?
-                               (volatile! nil))
-           seen-tempids      (java.util.HashSet. (int set-capacity))
-           has-many?         (volatile! false)
-           fuse-unique-inserts? (volatile! true)
-           ;; These decisions depend only on the schema snapshot and this call's
-           ;; uniqueness policy. Value bounds and validation remain per value.
+           ;; Populate schema decisions for the entire request before any
+           ;; entity's values are validated or normalized.
            attr-infos        (java.util.HashMap.)
-           ;; Share the reducer across entities as well as their attribute info.
            check-attr        (fn [_ attr _]
                                (if (or (identical? attr :db/id)
                                        (aget ^objects
@@ -2506,59 +2507,78 @@
                                                allow-unique? attr)
                                              1))
                                  true
-                                 (reduced false)))
-           entities
-           (reduce
-             (fn [^FastList acc entity]
-               (if-let [^PreparedBlindEntity prepared
-                        (prepare-blind-write-entity
-                          store-opts unique-identity-attrs unique-avs
-                          seen-avs set-capacity has-many?
-                          fuse-unique-inserts? attr-infos check-attr entity)]
-                 (if (and (.-tempid prepared)
-                          (not (.add seen-tempids (.-tempid prepared))))
-                   (reduced nil)
-                   (if (or (not (.isEmpty ^FastList (.-attrs prepared)))
-                           auto-entity-time?)
-                     (doto acc (.add prepared))
-                     acc))
-                 (reduced nil)))
-             (FastList. initial-count)
-             initial-es)
-           has-unique?       (not (.isEmpty unique-avs))
-           fuse-unique-inserts? (and has-unique? @fuse-unique-inserts?)
-           identity-upsert-av
-           (when (and entities
-                      (not auto-entity-time?)
-                      (= 1 (.size ^FastList entities)))
-             (blind-identity-upsert-av
-               store-schema (.get ^FastList entities 0)))]
-       (when (and entities (not (.isEmpty ^FastList entities))
-                  ;; Fused writes enforce uniqueness natively. Other writes
-                  ;; deduplicate only the AVs collected during preparation.
-                  (or check-unique-avs? fuse-unique-inserts? (not has-unique?)
-                      (= (.size unique-avs)
-                         (.size (java.util.HashSet. ^java.util.Collection unique-avs)))))
-         (->PreparedBlindTx store-schema
-                            store-opts
-                            auto-entity-time?
-                            entities
-                            unique-avs
-                            has-unique?
-                            @has-many?
-                            fuse-unique-inserts?
-                            identity-upsert-av
-                            (when identity-upsert-av
-                              (let [^PreparedBlindEntity entity
-                                    (.get ^FastList entities 0)
-                                    ^FastList attrs (.-attrs entity)
-                                    identity-attr (first identity-upsert-av)]
-                                (prepare-scalar-entity-read
-                                  store-schema
-                                  (for [index (range 0 (.size attrs) 2)
-                                        :let [attr (.get attrs index)]
-                                        :when (not= attr identity-attr)]
-                                    attr))))))))))
+                                 (reduced false)))]
+       (when (reduce (fn [_ entity]
+                       (if (reduce-kv check-attr true entity)
+                         true
+                         (reduced false)))
+                     true initial-es)
+         (let [initial-count     (int
+                                   (if (instance? java.util.Collection initial-es)
+                                     (.size ^java.util.Collection initial-es)
+                                     0))
+               ;; Entity preparation receives an Object; box once per batch.
+               set-capacity      (Integer/valueOf
+                                   (int (max 1 (inc (quot (* 4 (long initial-count))
+                                                         3)))))
+               ^FastList unique-avs (FastList.)
+               seen-avs          (when check-unique-avs?
+                                   (volatile! nil))
+               seen-tempids      (java.util.HashSet. (int set-capacity))
+               has-many?         (volatile! false)
+               fuse-unique-inserts? (volatile! true)
+               entities
+               (reduce
+                 (fn [^FastList acc entity]
+                   (if-let [^PreparedBlindEntity prepared
+                            (prepare-blind-write-entity
+                              store-opts unique-identity-attrs unique-avs
+                              seen-avs set-capacity has-many?
+                              fuse-unique-inserts? attr-infos entity)]
+                     (if (and (.-tempid prepared)
+                              (not (.add seen-tempids (.-tempid prepared))))
+                       (reduced nil)
+                       (if (or (not (.isEmpty ^FastList (.-attrs prepared)))
+                               auto-entity-time?)
+                         (doto acc (.add prepared))
+                         acc))
+                     (reduced nil)))
+                 (FastList. initial-count)
+                 initial-es)
+               has-unique?       (not (.isEmpty unique-avs))
+               fuse-unique-inserts? (and has-unique? @fuse-unique-inserts?)
+               identity-upsert-av
+               (when (and entities
+                          (not auto-entity-time?)
+                          (= 1 (.size ^FastList entities)))
+                 (blind-identity-upsert-av
+                   store-schema (.get ^FastList entities 0)))]
+           (when (and entities (not (.isEmpty ^FastList entities))
+                      ;; Fused writes enforce uniqueness natively. Other writes
+                      ;; deduplicate only the AVs collected during preparation.
+                      (or check-unique-avs? fuse-unique-inserts? (not has-unique?)
+                          (= (.size unique-avs)
+                             (.size (java.util.HashSet. ^java.util.Collection unique-avs)))))
+             (->PreparedBlindTx store-schema
+                                store-opts
+                                auto-entity-time?
+                                entities
+                                unique-avs
+                                has-unique?
+                                @has-many?
+                                fuse-unique-inserts?
+                                identity-upsert-av
+                                (when identity-upsert-av
+                                  (let [^PreparedBlindEntity entity
+                                        (.get ^FastList entities 0)
+                                        ^FastList attrs (.-attrs entity)
+                                        identity-attr (first identity-upsert-av)]
+                                    (prepare-scalar-entity-read
+                                      store-schema
+                                      (for [index (range 0 (.size attrs) 2)
+                                            :let [attr (.get attrs index)]
+                                            :when (not= attr identity-attr)]
+                                        attr))))))))))))
 
 (defn ^:no-doc blind-local-tx-unique-values-absent?
   "Check a prepared batch's unique values against the current store snapshot.
@@ -2865,13 +2885,25 @@
 (defn- scalar-update-entity-reads
   [store-schema entries]
   (when (>= (count entries) scalar-entity-read-min-attrs)
-    (into {}
-          (keep (fn [[eid entries]]
-                  (when-let [layout
-                             (prepare-scalar-entity-read
-                               store-schema (map second entries))]
-                    [eid layout])))
-          (group-by first entries))))
+    (let [widths (java.util.HashMap.)]
+      (doseq [[eid] entries]
+        (.put widths eid (inc (long (or (.get widths eid) 0)))))
+      ;; Count first: narrow entities need neither grouped entries nor an
+      ;; attribute collection. Keep nil when all reads can use point seeks.
+      (when-let [attributes
+                 (reduce
+                   (fn [attributes ^java.util.Map$Entry entry]
+                     (let [width (long (.getValue entry))]
+                       (if (>= width scalar-entity-read-min-attrs)
+                         (assoc attributes (.getKey entry) (FastList. (int width)))
+                         attributes)))
+                   nil (.entrySet widths))]
+        (doseq [[eid attr] entries]
+          (when-let [^FastList names (get attributes eid)]
+            (.add names attr)))
+        (reduce-kv (fn [layouts eid names]
+                     (assoc layouts eid (prepare-scalar-entity-read store-schema names)))
+                   {} attributes)))))
 
 (defn- prepare-scalar-update-tx*
   [^DB db initial-es defer-entity-resolution?]

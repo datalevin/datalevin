@@ -9,6 +9,7 @@
    [datalevin.datom :as datom]
    [datalevin.db :as db]
    [datalevin.lmdb :as l]
+   [datalevin.storage :as s]
    [datalevin.test.core :refer [db-fixture]]
    [datalevin.tx-group.phase :as phase]))
 
@@ -21,6 +22,45 @@
 
 (def ^:private opts
   {:wal? true :background-sampling? false :snapshot-scheduler? false})
+
+(defn- pending-storage-count []
+  (let [^datalevin.storage.WriteGroup group s/*write-group*]
+    (count (or (aget ^objects (.-storage-context group) 1)
+               (.-storage-datoms group)))))
+
+(deftest preparation-resumes-after-each-native-read
+  (doseq [wal? [false true]]
+    (with-open [conn (d/create-conn nil
+                      (assoc schema :key {:db/valueType :db.type/tuple
+                                          :db/tupleAttrs [:value :name]})
+                      (assoc opts :wal? wal?))]
+      (d/transact! conn [{:db/id 1 :value 0 :name "one"}])
+      (d/with-transaction [tx conn]
+        (d/transact! tx [[:db/add 1 :value 1]])
+        (is (= 1 (:value (d/entity @tx 1))))
+        (when wal? (is (zero? (pending-storage-count))))
+        (doseq [value (range 2 6)]
+          (d/transact! tx [[:db/add 1 :tags (str value)]])
+          (let [report (d/transact! tx [[:db/add 1 :value value]])]
+            (when wal? (is (pos? (pending-storage-count))))
+            (is (= #{[[value "one"] true]
+                     [[(dec value) "one"] false]}
+                   (->> (:tx-data report)
+                        (filter #(= :key (:a %)))
+                        (mapv (juxt :v datom/datom-added))
+                        set)))
+            (is (= [value "one"] (:key (d/entity @tx 1))))
+            (when wal? (is (zero? (pending-storage-count))))))
+        ;; A rejected request after a drain must restore only the accepted tail.
+        (d/transact! tx [[:db/add 1 :value 6]])
+        (is (thrown? Exception
+                     (d/transact! tx [[:db/add 1 :value 99]
+                                      [:db/cas 1 :value 999 100]])))
+        (is (= [6 "one"] (:key (d/entity @tx 1))))
+        (d/transact! tx [[:db/add 1 :value 7]])
+        (d/transact! tx [[:db/add 1 :tags "last"]])
+        (when wal? (is (pos? (pending-storage-count)))))
+      (is (= [7 "one"] (:key (d/entity @conn 1)))))))
 
 (deftest inner-requests-share-current-values-and-native-read-boundaries
   (with-open [conn (d/create-conn nil schema opts)]
@@ -113,6 +153,7 @@
         (d/transact! conn [{:db/id 1 :value 0}])
         (let [notifications (atom [])
               bodies (atom 0)
+              callbacks (atom 0)
               run! (fn []
                      (d/with-transaction [tx conn]
                        (swap! bodies inc)
@@ -120,6 +161,13 @@
                        (d/transact! tx [[:db/add 1 :value 2]])
                        (is (empty? @notifications))
                        (is (= 2 (:value (d/entity @tx 1))))
+                       (d/transact! tx [[:db.fn/call
+                                        (fn [db]
+                                          (swap! callbacks inc)
+                                          (is (= 2 (:value (d/entity db 1))))
+                                          [])]])
+                       (d/transact! tx [[:db/add 1 :value 3]])
+                       (is (= 3 (:value (d/entity @tx 1))))
                        (case outcome
                          :abort (d/abort-transact tx)
                          :exception (throw (ex-info "reject explicit body" {}))
@@ -129,8 +177,9 @@
             (is (thrown-with-msg? Exception #"reject explicit body" (run!)))
             (run!))
           (is (= 1 @bodies))
-          (is (= (if (= :commit outcome) 2 0) (:value (d/entity @conn 1))))
-          (is (= (if (= :commit outcome) 2 0) (count @notifications)))
+          (is (= 1 @callbacks))
+          (is (= (if (= :commit outcome) 3 0) (:value (d/entity @conn 1))))
+          (is (= (if (= :commit outcome) 4 0) (count @notifications)))
           (d/transact! conn [[:db/add 1 :value 3]])
           (is (= 3 (:value (d/entity @conn 1)))))))))
 
@@ -188,11 +237,13 @@
           (d/transact! tx (mapv #(hash-map :value %) (range 15000)))
           (d/transact! tx (mapv #(hash-map :value %) (range 15000 30000)))
           (is (= 30000 (d/entries (d/datalog-kv tx) c/eav)))
+          (d/transact! tx (mapv #(hash-map :value %) (range 30000 60000)))
+          (is (= 60000 (d/entries (d/datalog-kv tx) c/eav)))
           (d/transact! tx [[:db/add 1 :value -1]]))
         (is (= 1 @bodies))
         (is (pos? @resizes))
         (is (= -1 (:value (d/entity @conn 1))))
-        (is (= 30000 (d/entries (d/datalog-kv conn) c/eav)))
+        (is (= 60000 (d/entries (d/datalog-kv conn) c/eav)))
         (finally (unobserve))))))
 
 (deftest inner-request-sequences-match-a-register-model
