@@ -73,9 +73,12 @@
         txs (if storage? (.-rows ^StorageRows txs) txs)
         owned-datoms? (or owned-datoms? storage?)
         log-rows (ArrayList.)
-        datom? (l/datom-kv-txs? txs)
-        datom-bytes (when datom? (long-array 1))
-        rows (if (or owned-datoms? datom?)
+        ;; Owned storage already takes the row loop, which discovers datoms
+        ;; and counts their bytes while freezing them. Do not detect them first.
+        direct? (or owned-datoms? (l/datom-kv-txs? txs))
+        datom-bytes (when direct? (long-array 1))
+        ^booleans conditional? (when direct? (boolean-array 1))
+        rows (if direct?
                (let [rows (FastList. (count txs)) other (FastList.)
                      flush-other! (fn []
                                     (when-not (.isEmpty other)
@@ -96,13 +99,24 @@
                        (flush-other!)
                        (.add rows frozen)
                        (aset datom-bytes 0 (+ (aget datom-bytes 0) 8 (alength avg)))
-                       (.add log-rows frozen))
+                       (.add log-rows frozen)
+                       (when (and (not (aget conditional? 0)) (.-no-overwrite? tx))
+                         (aset conditional? 0 true)))
                      (if-let [frozen (when (and storage? (instance? KVTxData tx))
                                        (public/freeze-owned-eav-row tx scratch))]
                        (do (flush-other!)
                            (.add rows tx)
                            (.add log-rows frozen))
-                       (.add other tx))))
+                       (let [^KVTxData row (if (instance? KVTxData tx) tx
+                                              (if name (l/->kv-tx-data tx kt vt)
+                                                  (l/->kv-tx-data tx)))]
+                         (.add other row)
+                         (when (and (not (aget conditional? 0))
+                                    (seq (.-flags row))
+                                    ;; Empty list operations emit no native rows.
+                                    (or (not (#{:put-list :del-list} (.-op row)))
+                                        (seq (.-v row))))
+                           (aset conditional? 0 true))))))
                  (flush-other!)
                  rows)
                (public/prepare-rows raw (fn [_]) name txs
@@ -111,9 +125,7 @@
     ;; handoff. Native rejection flags must resolve before WAL dispatch.
     (cond-> {:rows rows :wal-rows log-rows}
       (and datom-bytes (> (aget ^longs datom-bytes 0) 4096)
-              (not-any? #(if (instance? KVTxData %)
-                           (seq (.-flags ^KVTxData %))
-                           (.-no-overwrite? ^DatomKVTxData %)) rows))
+           (not (aget conditional? 0)))
       (assoc :native-tail-bytes (aget ^longs datom-bytes 0))))))
 
 (defn attach!

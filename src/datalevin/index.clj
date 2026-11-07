@@ -10,15 +10,17 @@
 (ns ^:no-doc datalevin.index
   "Shared index utility functions used by storage and prepare."
   (:require
-   [datalevin.interface :refer [get-value]]
+   [datalevin.interface :as i :refer [get-value]]
    [datalevin.bits :as b]
    [datalevin.custom-datalog :as cd]
    [datalevin.datom :as d]
+   [datalevin.lmdb :as l]
    [datalevin.constants :as c]
    [datalevin.util :refer [raise]])
   (:import
    [com.github.luben.zstd ZstdCompressCtx ZstdDecompressCtx]
    [java.nio ByteBuffer]
+   [java.lang.ref WeakReference]
    [java.util Arrays]
    [java.util.concurrent ArrayBlockingQueue]
    [datalevin.bits Indexable Retrieved CustomReference]
@@ -243,10 +245,67 @@
      :eav (datom->indexable lmdb schema datom high?)
      :ave (or (.-e datom) (if high? c/emax c/e0)))))
 
+(deftype ^:private ResolvedGiant [value ^long e a ^long id ^WeakReference writer])
+
+(defn- owned-writer
+  [lmdb]
+  (when (l/writing? lmdb)
+    (let [writer (l/write-txn lmdb)]
+      (when (Thread/holdsLock writer) @writer))))
+
+(defn logical-value
+  "Return the logical value of a preparation read. Inline values pass through."
+  [value]
+  (if (instance? ResolvedGiant value) (.-value ^ResolvedGiant value) value))
+
+(defn datom-prepared-value
+  "Keep a resolved giant's physical reference when preparing its replacement."
+  [^Datom datom]
+  (when datom (or (d/storage-reference datom) (.-v datom))))
+
+(defn retraction
+  "Retract a preparation value, retaining its writer-scoped physical reference."
+  [e a value tx]
+  (let [datom (d/datom e a (logical-value value) tx false)]
+    (if (instance? ResolvedGiant value)
+      (d/set-storage-reference! datom value)
+      datom)))
+
+(defn take-giant-reference!
+  "Consume a physical reference only in the native writer that resolved it.
+  The caller must still check EAV membership before using the ID. References
+  hold the writer weakly and never appear in datom metadata or serialization."
+  [lmdb ^Datom datom]
+  (let [reference (d/storage-reference datom)]
+    (when reference
+      (d/set-storage-reference! datom nil)
+      (when (instance? ResolvedGiant reference)
+        (let [^ResolvedGiant reference reference
+              writer (.get (.-writer reference))]
+          (when (and writer (identical? writer (owned-writer lmdb))
+                     (= (.-e reference) (.-e datom))
+                     (= (.-a reference) (.-a datom))
+                     (identical? (.-value reference) (.-v datom)))
+            (.-id reference)))))))
+
+(defprotocol PreparationRead
+  (preparation-first-v [store e a]
+    "Resolve a value and retain a giant reference under an owned writer."))
+
+(extend-protocol PreparationRead
+  Object
+  (preparation-first-v [store e a] (i/ea-first-v store e a)))
+
 (defn gt->datom
   [lmdb gt]
-  (when-let [bs (get-value lmdb c/giants gt :id :raw)]
-    (decode-giant-datom bs)))
+  (let [writer (owned-writer lmdb)]
+    (when-let [bs (get-value lmdb c/giants gt :id :raw)]
+      (let [^Datom datom (decode-giant-datom bs)]
+        (if writer
+          (d/set-storage-reference!
+            datom (ResolvedGiant. (.-v datom) (.-e datom) (.-a datom)
+                                  gt (WeakReference. writer)))
+          datom)))))
 
 (defn retrieved->v
   [lmdb ^Retrieved r]
@@ -263,3 +322,19 @@
       (let [v (b/avg->inline-value bf)]
         (if (instance? CustomReference v) (cd/read-value lmdb (b/avg->aid bf) v) v))
       (d/datom-v (gt->datom lmdb g)))))
+
+(defn avg-buffer->prepared-value
+  [lmdb ^ByteBuffer bf]
+  (let [g (b/avg->giant-id bf)]
+    (if (= g c/normal)
+      (let [v (b/avg->inline-value bf)]
+        (if (instance? CustomReference v) (cd/read-value lmdb (b/avg->aid bf) v) v))
+      (datom-prepared-value (gt->datom lmdb g)))))
+
+(defn avg-buffer->datom
+  [lmdb ^ByteBuffer bf e a]
+  (let [value (avg-buffer->prepared-value lmdb bf)
+        datom (d/datom e a (logical-value value))]
+    (if (instance? ResolvedGiant value)
+      (d/set-storage-reference! datom value)
+      datom)))

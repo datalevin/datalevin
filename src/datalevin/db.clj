@@ -61,7 +61,7 @@
    [datalevin.utl LRUCache QueryKey]
    [java.nio ByteBuffer]
    [java.util Arrays Comparator Date]
-   [clojure.lang LazilyPersistentVector]
+   [clojure.lang LazilyPersistentVector MapEntry]
    [java.util.concurrent ConcurrentHashMap]
    [java.util.concurrent.atomic AtomicBoolean]
    [java.util.function Function]
@@ -139,6 +139,7 @@
    entities
    unique-avs
    has-unique?
+   has-many?
    fuse-unique-inserts?
    identity-upsert-av
    identity-upsert-read])
@@ -1637,18 +1638,25 @@
 
 (defn transfer
   [^DB old store]
-  (carry-runtime-opts
-    ;; eavt/avet are mutable transaction-local overlays, not durable indexes.
-    ;; A transferred DB view must get fresh caches so local write transactions
-    ;; do not leak in-memory datoms across connection/transaction wrappers.
-    (DB. store
-         (.-max-eid old)
-         (.-max-tx old)
-         (TreeSortedSet. ^Comparator (tx-datom-comparator store :eav))
-         (TreeSortedSet. ^Comparator (tx-datom-comparator store :ave))
-         (.-pull-patterns old)
-         (.-pull-readers old))
-    old))
+  (let [same-store? (identical? store (.-store old))
+        ^Comparator eav-cmp (if same-store?
+                              (.comparator ^TreeSortedSet (.-eavt old))
+                              (tx-datom-comparator store :eav))
+        ^Comparator ave-cmp (if same-store?
+                              (.comparator ^TreeSortedSet (.-avet old))
+                              (tx-datom-comparator store :ave))]
+    (carry-runtime-opts
+      ;; eavt/avet are mutable transaction-local overlays, not durable indexes.
+      ;; A transferred DB view must get fresh caches so local write transactions
+      ;; do not leak in-memory datoms across connection/transaction wrappers.
+      (DB. store
+           (.-max-eid old)
+           (.-max-tx old)
+           (TreeSortedSet. eav-cmp)
+           (TreeSortedSet. ave-cmp)
+           (.-pull-patterns old)
+           (.-pull-readers old))
+      old)))
 
 (defn ^:no-doc transfer-report-db
   "Publish a report view using the committed store's index comparators.
@@ -2246,8 +2254,8 @@
        (not (contains? tuple-source-attrs attr))))
 
 (defn- blind-write-multiple-values?
-  [props unique-identity-attrs value]
-  (and (identical? (:db/cardinality props) :db.cardinality/many)
+  [many? unique-identity-attrs value]
+  (and many?
        (coll? value)
        (not (map? value))
        (not (and (= (count value) 2)
@@ -2255,7 +2263,7 @@
 
 (defn- append-blind-value!
   ^Boolean [^FastList attrs ^FastList unique-avs
-            ^java.util.HashSet seen-avs collect-unique-avs? has-unique?
+            seen-avs set-capacity
             store-opts props attr entity value]
   (if (or (map? value)
           (datom? value)
@@ -2266,13 +2274,18 @@
                     (prepare/correct-value-with-props
                       store-opts props attr value))
           unique? (some? (:db/unique props))
-          _        (when unique? (vreset! has-unique? true))
-          av       (when (and unique? collect-unique-avs?) [attr value'])]
+          av       (when unique?
+                     ;; Compact deferred pairs; vectors hash faster in eager checks.
+                     (if seen-avs [attr value'] (MapEntry/create attr value')))]
       (if (and unique?
                (or (not (blind-unique-inline-value?
                           (:db/valueType props) value'))
-                   (and collect-unique-avs?
-                        (not (.add seen-avs av)))))
+                   (and seen-avs
+                        (let [^java.util.HashSet seen
+                              (or @seen-avs
+                                  (vreset! seen-avs
+                                           (java.util.HashSet. (int set-capacity))))]
+                          (not (.add seen av))))))
         false
         (do
           (when av (.add unique-avs av))
@@ -2299,8 +2312,8 @@
 
 (defn- prepare-blind-write-entity
   [store-schema store-opts tuple-source-attrs unique-identity-attrs
-   allow-unique? ^FastList unique-avs ^java.util.HashSet seen-avs
-   collect-unique-avs? has-unique? fuse-unique-inserts? attr-infos entity]
+   allow-unique? ^FastList unique-avs seen-avs set-capacity
+   has-many? fuse-unique-inserts? attr-infos entity]
   (let [old-eid   (:db/id entity)
         ;; An implicit entity does not need a transaction-scoped tempid: the
         ;; blind stamper assigns its final EID directly and never exposes an
@@ -2317,7 +2330,8 @@
                   (let [^objects info (blind-write-attr-info
                                         attr-infos store-schema tuple-source-attrs
                                         allow-unique? attr)
-                        props (aget info 0)]
+                        props (aget info 0)
+                        many? (identical? :db.cardinality/many (:db/cardinality props))]
                     (if-not (aget info 1)
                       (reduced false)
                       (let [_ (when (or (not (aget info 2))
@@ -2326,13 +2340,14 @@
                                 (vreset! fuse-unique-inserts? false))
                             supported-values?
                             (if (blind-write-multiple-values?
-                                  props unique-identity-attrs raw-value)
-                              (let [seen-values (java.util.HashSet.)]
-                                (loop [values (seq raw-value)]
+                                  many? unique-identity-attrs raw-value)
+                              (let [seen-values (java.util.HashSet.)
+                                    values (seq raw-value)]
+                                (when values (vreset! has-many? true))
+                                (loop [values values]
                                   (if-some [value (first values)]
                                     (if (and (append-blind-value!
-                                               attrs unique-avs seen-avs
-                                               collect-unique-avs? has-unique?
+                                               attrs unique-avs seen-avs set-capacity
                                                store-opts props attr entity value)
                                              ;; Repeated values need the resolver's
                                              ;; set semantics before EAV append.
@@ -2341,10 +2356,12 @@
                                       (recur (next values))
                                       false)
                                     true)))
-                              (append-blind-value!
-                                attrs unique-avs seen-avs collect-unique-avs?
-                                has-unique? store-opts props attr entity
-                                raw-value))]
+                              (do
+                                (when many? (vreset! has-many? true))
+                                (append-blind-value!
+                                  attrs unique-avs seen-avs set-capacity
+                                  store-opts props attr entity
+                                  raw-value)))]
                         (if-not supported-values?
                           (reduced false)
                           true))))))
@@ -2352,31 +2369,6 @@
               entity)]
         (when supported?
           (PreparedBlindEntity. entity-id attrs))))))
-
-(defn- collect-prepared-blind-unique-avs
-  [store-schema ^FastList entities ^long initial-capacity]
-  (let [^FastList avs (FastList. (int initial-capacity))
-        seen          (java.util.HashSet.
-                        (int (max 1 (inc (quot (* 4 initial-capacity) 3)))))]
-    (loop [i 0]
-      (if (< i (.size entities))
-        (let [^PreparedBlindEntity entity (.get entities i)
-              ^FastList attrs (.-attrs entity)
-              distinct?
-              (loop [j 0]
-                (if (< j (.size attrs))
-                  (let [attr (.get attrs j)
-                        value (.get attrs (unchecked-inc j))]
-                    (if (:db/unique (store-schema attr))
-                      (let [av [attr value]]
-                        (if (.add seen av)
-                          (do (.add avs av) (recur (+ j 2)))
-                          false))
-                      (recur (+ j 2))))
-                  true))]
-          (when distinct?
-            (recur (unchecked-inc i))))
-        avs))))
 
 (declare blind-identity-upsert-av)
 
@@ -2394,7 +2386,8 @@
 
 (defn- read-scalar-entity
   [store eid ^ScalarEntityRead layout]
-  (first (s/select-entities store [eid] (.-names layout) (.-aids layout) false)))
+  (first (s/select-entities store [eid] (.-names layout) (.-aids layout)
+                            false idx/avg-buffer->prepared-value)))
 
 (defn- read-scalar-update-entity
   [db eid ^ScalarEntityRead layout]
@@ -2418,7 +2411,8 @@
                          (first (s/select-entities
                                   store [eid]
                                   (object-array (map #(aget names %) remaining))
-                                  (long-array (map #(aget aids %) remaining)) false)))
+                                  (long-array (map #(aget aids %) remaining))
+                                  false idx/avg-buffer->prepared-value)))
                        values)))))
         (read-scalar-entity store eid layout))
       (if txcommon/*batch-prepare*
@@ -2452,7 +2446,8 @@
                              (first (s/select-entities
                                       store [eid]
                                       (object-array (map #(aget names %) remaining))
-                                      (long-array (map #(aget aids %) remaining)) false)))
+                                      (long-array (map #(aget aids %) remaining))
+                                      false idx/avg-buffer->prepared-value)))
                            values)))))))
         (read-scalar-entity store eid layout)))))
 
@@ -2461,10 +2456,15 @@
    (prepare-blind-local-tx db initial-es false true))
   ([^DB db initial-es allow-small-unique?]
    (prepare-blind-local-tx db initial-es allow-small-unique? true))
-  ([^DB db initial-es allow-small-unique? collect-unique-avs?]
-   ;; Reject mixed requests before allocating preparation state or correcting
-   ;; map values that the general or mixed preparer would process again.
-   (when (reduce (fn [_ entity] (if (map? entity) true (reduced false)))
+  ([^DB db initial-es allow-small-unique? check-unique-avs?]
+   ;; Reject mixed requests and explicit IDs before allocating preparation
+   ;; state or correcting values that the general or mixed preparer repeats.
+   (when (reduce (fn [_ entity]
+                   (if (and (map? entity)
+                            (let [e (:db/id entity)]
+                              (or (nil? e) (tempid? e))))
+                     true
+                     (reduced false)))
                  true initial-es)
      (let [store             (.-store db)
            store-schema      (schema store)
@@ -2482,13 +2482,15 @@
                                (if (instance? java.util.Collection initial-es)
                                  (.size ^java.util.Collection initial-es)
                                  0))
-           set-capacity      (int (max 1 (inc (quot (* 4 (long initial-count))
-                                                    3))))
-           ^FastList unique-avs (FastList. initial-count)
-           seen-avs          (when collect-unique-avs?
-                                (java.util.HashSet. set-capacity))
-           seen-tempids      (java.util.HashSet. set-capacity)
-           has-unique?       (volatile! false)
+           ;; Entity preparation receives an Object; box once per batch.
+           set-capacity      (Integer/valueOf
+                               (int (max 1 (inc (quot (* 4 (long initial-count))
+                                                     3)))))
+           ^FastList unique-avs (FastList.)
+           seen-avs          (when check-unique-avs?
+                               (volatile! nil))
+           seen-tempids      (java.util.HashSet. (int set-capacity))
+           has-many?         (volatile! false)
            fuse-unique-inserts? (volatile! true)
            ;; These decisions depend only on the schema snapshot and this call's
            ;; uniqueness policy. Value bounds and validation remain per value.
@@ -2500,7 +2502,7 @@
                         (prepare-blind-write-entity
                           store-schema store-opts tuple-source-attrs
                           unique-identity-attrs allow-unique? unique-avs
-                          seen-avs collect-unique-avs? has-unique?
+                          seen-avs set-capacity has-many?
                           fuse-unique-inserts? attr-infos entity)]
                  (if (and (.-tempid prepared)
                           (not (.add seen-tempids (.-tempid prepared))))
@@ -2512,29 +2514,27 @@
                  (reduced nil)))
              (FastList. initial-count)
              initial-es)
-           fuse-unique-inserts?
-           (and @has-unique? @fuse-unique-inserts?)
-           unique-avs
-           (if (and entities
-                    @has-unique?
-                    (not collect-unique-avs?)
-                    (not fuse-unique-inserts?))
-             (collect-prepared-blind-unique-avs
-               store-schema entities initial-count)
-             unique-avs)
+           has-unique?       (not (.isEmpty unique-avs))
+           fuse-unique-inserts? (and has-unique? @fuse-unique-inserts?)
            identity-upsert-av
            (when (and entities
                       (not auto-entity-time?)
                       (= 1 (.size ^FastList entities)))
              (blind-identity-upsert-av
                store-schema (.get ^FastList entities 0)))]
-       (when (and entities unique-avs (not (.isEmpty ^FastList entities)))
+       (when (and entities (not (.isEmpty ^FastList entities))
+                  ;; Fused writes enforce uniqueness natively. Other writes
+                  ;; deduplicate only the AVs collected during preparation.
+                  (or check-unique-avs? fuse-unique-inserts? (not has-unique?)
+                      (= (.size unique-avs)
+                         (.size (java.util.HashSet. ^java.util.Collection unique-avs)))))
          (->PreparedBlindTx store-schema
                             store-opts
                             auto-entity-time?
                             entities
                             unique-avs
-                            @has-unique?
+                            has-unique?
+                            @has-many?
                             fuse-unique-inserts?
                             identity-upsert-av
                             (when identity-upsert-av
@@ -2613,21 +2613,20 @@
                 (recur (+ i 2) tx-data)
                 (let [old-value (if layout
                                   (get old-values attr)
-                                  (txcommon/ea-first-v db eid attr))]
+                                  (txcommon/preparation-first-v db eid attr))]
                   (cond
                     (nil? old-value)
                     (recur (+ i 2)
                            (conj! tx-data
                                   (d/datom eid attr value tx-id)))
 
-                    (d/value-equal? old-value value)
+                    (d/value-equal? (idx/logical-value old-value) value)
                     (recur (+ i 2) tx-data)
 
                     :else
                     (recur (+ i 2)
                            (-> tx-data
-                               (conj! (d/datom eid attr old-value
-                                               tx-id false))
+                               (conj! (idx/retraction eid attr old-value tx-id))
                                (conj! (d/datom eid attr value tx-id))))))))
             (persistent! tx-data)))
         tempid          (.-tempid entity)
@@ -2738,7 +2737,9 @@
 
 (defn- stamp-local-patch-idoc-doc
   [^DB db ^PreparedLocalPatchIdocTx prepared tx-meta old-doc]
-  (let [{:keys [entity e attr ops]} prepared
+  (let [before old-doc
+        old-doc (idx/logical-value before)
+        {:keys [entity e attr ops]} prepared
         store       (.-store db)
         props       ((schema store) attr)
         tx-id       (inc (long (:max-tx db)))
@@ -2763,7 +2764,7 @@
             tx-data (cond
                       (nil? old-doc) [add]
                       (= old-doc new-doc) []
-                      :else [(datom e attr old-doc tx-id false) add])]
+                      :else [(idx/retraction e attr before tx-id) add])]
         {:report (assoc base-report
                         :db-after db-after
                         :tx-data tx-data)
@@ -2779,7 +2780,7 @@
    (when (local-patch-idoc-tx-valid? db prepared)
      (let [e         (entid-strict db (:e prepared))
            old-datom (txcommon/ea-first-datom db e (:attr prepared))
-           old-doc   (when old-datom (.-v ^Datom old-datom))]
+           old-doc   (idx/datom-prepared-value old-datom)]
        (stamp-local-patch-idoc-doc db prepared tx-meta old-doc))))
   ([^DB db ^PreparedLocalPatchIdocTx prepared tx-meta old-doc]
    (when (local-patch-idoc-tx-valid? db prepared)
@@ -2891,11 +2892,13 @@
   ([db initial-es {:keys [defer-entity-resolution?]}]
    ;; Reject mixed and other operation shapes before correcting values or
    ;; resolving entities, including preparation on the collector's caller.
-   (when (every? (fn [entity]
-                   (and (sequential? entity)
-                        (= 4 (count entity))
-                        (identical? :db/add (nth entity 0))))
-                 initial-es)
+   (when (reduce (fn [_ entity]
+                   (if (and (sequential? entity)
+                            (= 4 (count entity))
+                            (identical? :db/add (nth entity 0)))
+                     true
+                     (reduced false)))
+                 true initial-es)
      (if defer-entity-resolution?
        ;; Collector preparation reads no persisted identities. The owner resolves
        ;; them and consults the pending transaction indexes when stamping.
@@ -2942,11 +2945,11 @@
             e (nth entry 0)
             attr (nth entry 1)
             value (nth entry 2)
-            old-value (txcommon/ea-first-v db e attr)]
+            old-value (txcommon/preparation-first-v db e attr)]
         (cond
           (nil? old-value) [(datom e attr value tx-id)]
-          (d/value-equal? old-value value) []
-          :else [(datom e attr old-value tx-id false)
+          (d/value-equal? (idx/logical-value old-value) value) []
+          :else [(idx/retraction e attr old-value tx-id)
                  (datom e attr value tx-id)]))
       (if-let [^objects buffer
                (when (and (<= n 16)
@@ -2960,14 +2963,15 @@
                     e (nth entry 0)
                     attr (nth entry 1)
                     value (nth entry 2)
-                    old-value (txcommon/ea-first-v db e attr)]
+                    old-value (txcommon/preparation-first-v db e attr)]
                 (cond
-                  (d/value-equal? old-value value) (recur (unchecked-inc i) out)
+                  (d/value-equal? (idx/logical-value old-value) value)
+                  (recur (unchecked-inc i) out)
                   (nil? old-value)
                   (do (aset buffer out (datom e attr value tx-id))
                       (recur (unchecked-inc i) (unchecked-inc out)))
                   :else
-                  (do (aset buffer out (datom e attr old-value tx-id false))
+                  (do (aset buffer out (idx/retraction e attr old-value tx-id))
                       (aset buffer (unchecked-inc out) (datom e attr value tx-id))
                       (recur (unchecked-inc i) (+ out 2)))))
               ;; The final tail is owned by this request. Never publish the
@@ -2984,13 +2988,13 @@
                   e (nth entry 0)
                   attr (nth entry 1)
                   value (nth entry 2)
-                  old-value (txcommon/ea-first-v db e attr)]
+                  old-value (txcommon/preparation-first-v db e attr)]
               (recur (unchecked-inc i)
                      (cond
-                       (d/value-equal? old-value value) out
+                       (d/value-equal? (idx/logical-value old-value) value) out
                        (nil? old-value) (conj! out (datom e attr value tx-id))
                        :else (-> out
-                                 (conj! (datom e attr old-value tx-id false))
+                                 (conj! (idx/retraction e attr old-value tx-id))
                                  (conj! (datom e attr value tx-id))))))
             (persistent! out)))))))
 
@@ -3021,19 +3025,19 @@
                   (let [[e attr value] (nth entries i)
                         old-value (if (contains? layouts e)
                                     (get (get old-values e) attr)
-                                    (txcommon/ea-first-v db e attr))]
+                                    (txcommon/preparation-first-v db e attr))]
                     (cond
                       (nil? old-value)
                       (recur (unchecked-inc i)
                              (conj! out (datom e attr value tx-id)))
 
-                      (d/value-equal? old-value value)
+                      (d/value-equal? (idx/logical-value old-value) value)
                       (recur (unchecked-inc i) out)
 
                       :else
                       (recur (unchecked-inc i)
                              (-> out
-                                 (conj! (datom e attr old-value tx-id false))
+                                 (conj! (idx/retraction e attr old-value tx-id))
                                  (conj! (datom e attr value tx-id))))))
                   (persistent! out)))))
           db-after (assoc db :max-tx tx-id)]

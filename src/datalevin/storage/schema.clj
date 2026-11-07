@@ -115,6 +115,8 @@
              (true? v))                   [:db/isComponent]
         (and (identical? :db/noindex k)
              (true? v))                   [:db/noindex]
+        (and (identical? :db/embedding k)
+             (true? v))                   [:db/embedding]
         (and (identical? :db.attr/preds k)
              (some? v))                   [:db.attr/preds]
         :else                             []))))
@@ -138,6 +140,7 @@
    :db.type/ref         => #{attr ...}
    :db/isComponent      => #{attr ...}
    :db/noindex          => #{attr ...}
+   :db/embedding        => #{attr ...}
    :db.attr/preds       => #{attr ...}
    :db.type/tuple       => #{attr ...}
    :db/tupleAttr        => #{attr ...}

@@ -347,6 +347,28 @@
 (defprotocol ^:no-doc IStoreIdocIndices
   (store-idoc-indices [store]))
 
+(defn- read-ea-first-value
+  [lmdb schema e a decode]
+  (let [native (kv/raw-lmdb lmdb)]
+    (if (:datalog-prepare? (lmdb/request-context native))
+      (when-let [aid (:db/aid (schema a))]
+        (cpp/read-resolution-value native lmdb e aid decode))
+      (cd/with-snapshot lmdb
+        (if (and (lmdb/writing? native)
+                 (Thread/holdsLock (lmdb/write-txn native))
+                 ;; Ordinary scalar decoding cannot reenter user codecs.
+                 (case (:db/valueType (schema a))
+                   (:db.type/long :db.type/float :db.type/double
+                    :db.type/boolean :db.type/string :db.type/keyword
+                    :db.type/symbol :db.type/instant :db.type/uuid
+                    :db.type/bytes :db.type/bigint :db.type/bigdec
+                    :db.type/ref) true
+                   false))
+          (cpp/read-resolution-value native lmdb e (:db/aid (schema a))
+                                     decode)
+          (when-let [bf (ea->avg-buffer schema lmdb e a)]
+            (decode lmdb bf)))))))
+
 (deftype Store [lmdb
                 search-engines
                 vector-indices
@@ -367,6 +389,11 @@
                 ^ReentrantReadWriteLock sampling-lock
                 ^:volatile-mutable local-closed?
                 shared-dir-key]
+
+  idx/PreparationRead
+
+  (preparation-first-v [_ e a]
+    (read-ea-first-value lmdb schema e a idx/avg-buffer->prepared-value))
 
   IStoreIdocIndices
 
@@ -943,28 +970,10 @@
   (ea-first-datom [_ e a]
     (cd/with-snapshot lmdb
       (when-let [bf (ea->avg-buffer schema lmdb e a)]
-        (d/datom e a (idx/avg-buffer->v lmdb bf)))))
+        (idx/avg-buffer->datom lmdb bf e a))))
 
   (ea-first-v [_ e a]
-    (let [native (kv/raw-lmdb lmdb)]
-      (if (:datalog-prepare? (lmdb/request-context native))
-        (when-let [aid (:db/aid (schema a))]
-          (cpp/read-resolution-value native lmdb e aid idx/avg-buffer->v))
-        (cd/with-snapshot lmdb
-          (if (and (lmdb/writing? native)
-                   (Thread/holdsLock (lmdb/write-txn native))
-                   ;; Ordinary scalar decoding cannot reenter user codecs.
-                   (case (:db/valueType (schema a))
-                     (:db.type/long :db.type/float :db.type/double
-                      :db.type/boolean :db.type/string :db.type/keyword
-                      :db.type/symbol :db.type/instant :db.type/uuid
-                      :db.type/bytes :db.type/bigint :db.type/bigdec
-                      :db.type/ref) true
-                     false))
-            (cpp/read-resolution-value native lmdb e (:db/aid (schema a))
-                                       idx/avg-buffer->v)
-            (when-let [bf (ea->avg-buffer schema lmdb e a)]
-              (idx/avg-buffer->v lmdb bf)))))))
+    (read-ea-first-value lmdb schema e a idx/avg-buffer->v))
 
   (v-datoms [_ v]
     (mapcat
@@ -1228,21 +1237,24 @@
 
 (defn ^:no-doc select-entities
   "Project scalar attributes for resolved IDs in input order with one EAV cursor."
-  [^Store store ids names aids id?]
-  (entity/select-entities (.-lmdb store) ids names aids id?))
+  ([^Store store ids names aids id?]
+   (entity/select-entities (.-lmdb store) ids names aids id?))
+  ([^Store store ids names aids id? decode]
+   (entity/select-entities (.-lmdb store) ids names aids id? decode)))
 
 (defn ^:no-doc ea-first-v-reader
   "Prepare repeated scalar reads inside the currently owned native writer.
   Return nil outside an owned writer. Callers must establish that attributes
   use built-in scalar types. The reader must not escape or cross a callback."
-  [^Store store]
-  (let [lmdb (.-lmdb store)
-        native (kv/raw-lmdb lmdb)
-        schema (schema store)]
-    (when (and (lmdb/writing? native)
-               (Thread/holdsLock (lmdb/write-txn native)))
-      (let [read (cpp/resolution-value-reader native lmdb idx/avg-buffer->v)]
-        (fn [e a] (read e (:db/aid (schema a))))))))
+  ([^Store store] (ea-first-v-reader store idx/avg-buffer->v))
+  ([^Store store decode]
+   (let [lmdb (.-lmdb store)
+         native (kv/raw-lmdb lmdb)
+         schema (schema store)]
+     (when (and (lmdb/writing? native)
+                (Thread/holdsLock (lmdb/write-txn native)))
+       (let [read (cpp/resolution-value-reader native lmdb decode)]
+         (fn [e a] (read e (:db/aid (schema a)))))))))
 
 (defn ^:no-doc ref-attr-adjacency
   "Scan a ref-valued AVE attribute directly into a primitive adjacency map.
@@ -2204,9 +2216,17 @@
 
 (defn prepare-embedding-plan
   [^Store store datoms]
-  ;; Most Datalog stores have no embedding domains. Avoid walking every datom
-  ;; in every commit when there cannot be an embedding operation to prepare.
-  (when (seq (.-embedding-indices store))
+  ;; Ordinary commits need only attribute membership checks, even when this
+  ;; store has embedding domains. Keep provider work before KV preparation.
+  (when (and (seq (.-embedding-indices store))
+             (when-let [embedding-attrs (:db/embedding (rschema store))]
+               (reduce (fn [_ ^Datom datom]
+                         (if (and (contains? embedding-attrs (.-a datom))
+                                  (d/datom-added datom)
+                                  (string? (.-v datom)))
+                           (reduced true)
+                           false))
+                       false datoms)))
     (let [schema  (schema store)
           batches (reduce
                     (fn [m ^Datom datom]
@@ -2281,25 +2301,39 @@
                  (not lmdb/*raw-kv?*)
                  (not *enforce-blind-unique-inserts?*)
                  (not c/*ordered-datom-writes?*)
-                 (not (cd/custom-schema? store-schema))
-                 (every? (fn [^Datom datom]
-                           (let [props (store-schema (.-a datom))
-                                 vt (:db/valueType props)]
-                             (and (:db/aid props) (not (:db/fulltext props))
-                                  (not (:db/embedding props))
-                                  (not (#{:db.type/vec :db.type/idoc} vt))
-                                  (buffered-datom-value? (.-v datom)))))
-                         datoms))
-        (let [^longs metadata (.-metadata group)
-              modified-ms (long (max (long (observed-state-sync-ms store))
-                                     (System/currentTimeMillis)))]
-          (aset metadata 0 (long (.advance-max-tx store)))
-          (aset metadata 1 modified-ms)
-          (aset context 0 store)
-          (doseq [datom datoms] (.add pending datom))
-          (when (seq datoms)
-            ((lmdb/storage-staged native)))
-          modified-ms)))))
+                 (not (cd/custom-schema? store-schema)))
+        (let [start (.size pending)
+              accepted?
+              (try
+                (reduce
+                  (fn [_ ^Datom datom]
+                    (let [props (store-schema (.-a datom))
+                          vt (:db/valueType props)]
+                      (if (and (:db/aid props) (not (:db/fulltext props))
+                               (not (:db/embedding props))
+                               (not (#{:db.type/vec :db.type/idoc} vt))
+                               (buffered-datom-value? (.-v datom)))
+                        (do (.add pending datom) true)
+                        (reduced false))))
+                  true datoms)
+                (catch Throwable error
+                  (.removeRange pending start (.size pending))
+                  (throw error)))]
+          (if accepted?
+            (let [^longs metadata (.-metadata group)
+                  modified-ms (long (max (long (observed-state-sync-ms store))
+                                         (System/currentTimeMillis)))]
+              (aset metadata 0 (long (.advance-max-tx store)))
+              (aset metadata 1 modified-ms)
+              (aset context 0 store)
+              (when (< start (.size pending))
+                ((lmdb/storage-staged native)))
+              modified-ms)
+            (do
+              ;; The owner holds the writer lock; an unaccepted prefix cannot
+              ;; become visible to another request or to native storage reads.
+              (.removeRange pending start (.size pending))
+              nil)))))))
 
 (defn ^:no-doc ^:redef encode-group-storage-datoms
   "Encode ordinary frozen datoms using immutable schema metadata only.
@@ -2439,7 +2473,8 @@
                       (idx/storage-type (.-lmdb store) props)
                       (:db/aid props)
                       (:db/embedding props)
-                      (:db/fulltext props)])]
+                      (:db/fulltext props)
+                      (:db/noindex props)])]
         (when props (.put attr-infos attr info))
         info)))
 
@@ -2448,9 +2483,10 @@
   (if (bytes? v) [e a ::bytes (ByteBuffer/wrap ^bytes v)] [e a v]))
 
 (defn- insert-datom
+  "Append a datom's writes and return the next giant ID."
   [^Store store ^Datom d ^FastList txs work
    ^HashMap giants ^objects ai embedding-plan
-   ^ByteBuffer avg-bf]
+   ^ByteBuffer avg-bf max-gt]
   (let [attr       (.-a d)
         e          (.-e d)
         v          (.-v d)
@@ -2459,72 +2495,75 @@
         aid        (aget ai 2)
         embedding? (aget ai 3)
         fulltext?  (aget ai 4)
-        max-gt     (max-gt store)
+        noindex?   (aget ai 5)
         i          (b/indexable nil aid v vt max-gt)
         giant?     (b/giant? i)]
     ;; Reports can retain repeated adds after a retraction. Reuse their
     ;; logical identity instead of allocating another physical giant key.
-    (when-not (and giant? (.containsKey giants (giant-datom-key e attr v)))
-      (.add txs (lmdb/datom-kv-tx
-                  e
-                  (b/indexable-bytes i avg-bf)
-                  true
-                  (boolean
-                    (and *enforce-blind-unique-inserts?*
-                         (:db/unique props)))
-                  (:db/noindex props)))
-      (when giant?
-        (.advance-max-gt store)
-        (let [gd [e attr v]
-              {:keys [value vtype]} (encode-giant-datom (apply d/datom gd))]
-          (.put giants (giant-datom-key e attr v) max-gt)
-          (.add txs (lmdb/kv-tx :put c/giants max-gt value
-                                :id vtype (when-not (:db/noindex props)
-                                            [:append])))))
-      (when (identical? vt :db.type/vec)
-        (let [ref     (if giant? [:g max-gt e aid] [e aid v])
-              op      (if giant? [:g [e aid max-gt v]] [:a [e aid v]])
-              domains (conjv (props :db.vec/domains) (v/attr-domain attr))]
-          (doseq [domain domains]
-            (if (async-vector-domain? store domain)
-              (add-index-work! work vi-jobs-slot {:type :vector
-                                                :domain domain
-                                                :op :add
-                                                :ref ref
-                                                :value v})
-              (add-index-work! work vi-ds-slot [[domain] op])))))
-      (when embedding?
-        (let [doc-ref     (if giant? [:g max-gt e aid] [e aid v])
-              domain-vecs (some-> ^IdentityHashMap embedding-plan (.get d))]
-          (doseq [domain (embedding-attr-domains attr props)]
-            (if (async-embedding-domain? store domain)
-              (add-index-work! work em-jobs-slot {:type :embedding
-                                                :domain domain
-                                                :op :add
-                                                :ref doc-ref
-                                                :value v})
-              (when-let [vec-data (some-> ^HashMap domain-vecs (.get domain))]
-                (add-index-work! work em-ds-slot
-                                 [domain [:a [doc-ref vec-data]]]))))))
-      (when (identical? vt :db.type/idoc)
-        (let [domain (or (props :db/domain) (u/keyword->string attr))
-              op     (if giant?
-                       [:g [e aid max-gt v]]
-                       [:a [e aid v]])
-              patch  (some-> (meta d) :idoc/patch)
-              op     (if patch (with-meta op {:idoc/patch patch}) op)]
-          (collect-idoc store work domain op)))
-      (when fulltext?
-        (let [text (str v)
-              ref  (if giant? [:g max-gt e aid] [e aid text])]
-          (collect-fulltext store
-                            work
-                            attr
-                            props
-                            text
-                            ref
-                            :add
-                            (if giant? [:g [e aid max-gt text]] [:a ref])))))))
+    (if (and giant? (.containsKey giants (giant-datom-key e attr v)))
+      max-gt
+      (do
+        (.add txs (lmdb/datom-kv-tx
+                    e
+                    (b/indexable-bytes i avg-bf)
+                    true
+                    (boolean
+                      (and *enforce-blind-unique-inserts?*
+                           (:db/unique props)))
+                    noindex?))
+        (let [next-gt (if giant? (.advance-max-gt store) max-gt)]
+          (when giant?
+            (let [gd [e attr v]
+                  {:keys [value vtype]} (encode-giant-datom (apply d/datom gd))]
+              (.put giants (giant-datom-key e attr v) max-gt)
+              (.add txs (lmdb/kv-tx :put c/giants max-gt value
+                                    :id vtype (when-not noindex?
+                                                [:append])))))
+          (when (identical? vt :db.type/vec)
+            (let [ref     (if giant? [:g max-gt e aid] [e aid v])
+                  op      (if giant? [:g [e aid max-gt v]] [:a [e aid v]])
+                  domains (conjv (props :db.vec/domains) (v/attr-domain attr))]
+              (doseq [domain domains]
+                (if (async-vector-domain? store domain)
+                  (add-index-work! work vi-jobs-slot {:type :vector
+                                                    :domain domain
+                                                    :op :add
+                                                    :ref ref
+                                                    :value v})
+                  (add-index-work! work vi-ds-slot [[domain] op])))))
+          (when embedding?
+            (let [doc-ref     (if giant? [:g max-gt e aid] [e aid v])
+                  domain-vecs (some-> ^IdentityHashMap embedding-plan (.get d))]
+              (doseq [domain (embedding-attr-domains attr props)]
+                (if (async-embedding-domain? store domain)
+                  (add-index-work! work em-jobs-slot {:type :embedding
+                                                    :domain domain
+                                                    :op :add
+                                                    :ref doc-ref
+                                                    :value v})
+                  (when-let [vec-data (some-> ^HashMap domain-vecs (.get domain))]
+                    (add-index-work! work em-ds-slot
+                                     [domain [:a [doc-ref vec-data]]]))))))
+          (when (identical? vt :db.type/idoc)
+            (let [domain (or (props :db/domain) (u/keyword->string attr))
+                  op     (if giant?
+                           [:g [e aid max-gt v]]
+                           [:a [e aid v]])
+                  patch  (some-> (meta d) :idoc/patch)
+                  op     (if patch (with-meta op {:idoc/patch patch}) op)]
+              (collect-idoc store work domain op)))
+          (when fulltext?
+            (let [text (str v)
+                  ref  (if giant? [:g max-gt e aid] [e aid text])]
+              (collect-fulltext store
+                                work
+                                attr
+                                props
+                                text
+                                ref
+                                :add
+                                (if giant? [:g [e aid max-gt text]] [:a ref]))))
+          next-gt)))))
 
 (defn- delete-datom
   [^Store store ^Datom d ^FastList txs work
@@ -2537,12 +2576,20 @@
         aid        (aget ai 2)
         embedding? (aget ai 3)
         fulltext?  (aget ai 4)
+        noindex?   (aget ai 5)
         i          ^Indexable (b/indexable nil aid v vt c/g0)
         giant?     (b/giant? i)
         d-eav      (when giant? (giant-datom-key e attr v))
         gt-cur     (when giant? (.get giants d-eav))
+        gt-read    (when giant? (idx/take-giant-reference! (.-lmdb store) d))
         gt         (when giant?
                      (or gt-cur
+                         (when (and gt-read
+                                    (i/in-list?
+                                      (.-lmdb store) c/eav e
+                                      (Indexable. nil aid v (.-f i) (.-b i) gt-read)
+                                      :id :avg))
+                           gt-read)
                          ;; A truncated prefix can name several different
                          ;; values on the same entity. Resolve the full value.
                          (some
@@ -2582,7 +2629,7 @@
                       (if gt [:r [e aid gt v]] [:d [e aid v]]))))
     (let [ii (if gt (Indexable. nil aid v (.-f i) (.-b i) gt) i)]
       (.add txs (lmdb/datom-kv-tx e (b/indexable-bytes ii avg-bf)
-                                 false false (:db/noindex props)))
+                                 false false noindex?))
       (when gt
         (when gt-cur (.remove giants d-eav))
         (.add txs (lmdb/kv-tx :del c/giants gt :id)))
@@ -2646,30 +2693,37 @@
          giants (HashMap.)
          avg-bf     (bf/get-array-buffer)]
      (try
-       (doseq [^Datom datom datoms]
-         ;; A custom payload can grow the map and replace the writer while
-         ;; this plan is being prepared. Resolve its callbacks again before
-         ;; encoding another datom against that new native transaction.
-         (when (and native-write (not (identical? @descriptor-txn @native-write)))
-           (.clear attr-infos)
-           (vreset! descriptor-txn @native-write))
-         (let [^objects ai (write-attr-info store attr-infos (.-a datom) (.-v datom)
-                                           (d/datom-added datom))
-               vt (aget ai 1)
-               noindex? (:db/noindex (aget ai 0))
-               datom-txs (if noindex? unindexed-txs txs)]
-           (if-let [type (when (map? vt) (:custom/type vt))]
-             (let [lmdb (.-lmdb store)
-                   ;; Serializer callbacks can grow the map. The collector
-                   ;; refreshes this scoped writer, so retain it for the reads
-                   ;; and writes that follow the callback.
-                   writer (if (lmdb/writing? lmdb) lmdb (lmdb/mark-write lmdb))]
-               ((if (d/datom-added datom) cd/put-datom! cd/delete-datom!)
-                writer (.-e datom) (aget ai 2) type (.-v datom) noindex?))
-             (if (d/datom-added datom)
-               (insert-datom store datom datom-txs work giants ai embedding-plan
-                             avg-bf)
-               (delete-datom store datom datom-txs work giants ai avg-bf)))))
+       ;; Carry the next ID through the plan; only new giant rows advance it.
+       (reduce
+         (fn [max-gt ^Datom datom]
+           ;; A custom payload can grow the map and replace the writer while
+           ;; this plan is being prepared. Resolve its callbacks again before
+           ;; encoding another datom against that new native transaction.
+           (when (and native-write (not (identical? @descriptor-txn @native-write)))
+             (.clear attr-infos)
+             (vreset! descriptor-txn @native-write))
+           (let [added? (d/datom-added datom)
+                 ^objects ai (write-attr-info store attr-infos (.-a datom) (.-v datom)
+                                             added?)
+                 vt (aget ai 1)
+                 noindex? (aget ai 5)
+                 datom-txs (if noindex? unindexed-txs txs)]
+             (if-let [type (when (map? vt) (:custom/type vt))]
+               (let [lmdb (.-lmdb store)
+                     ;; Serializer callbacks can grow the map. The collector
+                     ;; refreshes this scoped writer, so retain it for the reads
+                     ;; and writes that follow the callback.
+                     writer (if (lmdb/writing? lmdb) lmdb (lmdb/mark-write lmdb))]
+                 ((if added? cd/put-datom! cd/delete-datom!)
+                  writer (.-e datom) (aget ai 2) type (.-v datom) noindex?)
+                 max-gt)
+               (if added?
+                 (insert-datom store datom datom-txs work giants ai embedding-plan
+                               avg-bf max-gt)
+                 (do (delete-datom store datom datom-txs work giants ai avg-bf)
+                     max-gt)))))
+         (max-gt store)
+         datoms)
        (finally
          (bf/return-array-buffer avg-bf)))
      ;; Keep primitive datom operations first for native executor selection.

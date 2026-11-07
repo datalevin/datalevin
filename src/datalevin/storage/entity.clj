@@ -19,7 +19,7 @@
   (:import [java.lang AutoCloseable]))
 
 (defn- projected-entity
-  [lmdb iter eid ^objects names ^longs aids id?]
+  [lmdb iter eid ^objects names ^longs aids id? decode]
   (timeout/assert-time-left)
   (when-some [eid eid]
     (let [n (alength names)
@@ -36,7 +36,7 @@
                     match? (and (< index n) (= aid (aget aids index)))
                     entity (if match?
                              (assoc! entity (aget names index)
-                                     (idx/avg-buffer->v lmdb buffer))
+                                     (decode lmdb buffer))
                              entity)
                     index (if match? (inc index) index)]
                 (recur index (and (< index n) (l/has-next-val iter)) entity))
@@ -48,12 +48,14 @@
   "Project scalar attributes for resolved IDs with one reusable EAV cursor.
   Names and aids are parallel arrays ordered by aid. Preserve order, duplicates
   and nil lookup results, including pull's :db/id behavior for missing IDs."
-  [lmdb ids names aids id?]
-  (if (seq ids)
-    (cd/with-snapshot lmdb
-      (scan/scan lmdb c/eav
-        (with-open [^AutoCloseable iter
-                    (l/val-iterator (l/iterate-list-val-full dbi rtx cur))]
-          (mapv #(projected-entity lmdb iter % names aids id?) ids))
-        (throw e)))
-    []))
+  ([lmdb ids names aids id?]
+   (select-entities lmdb ids names aids id? idx/avg-buffer->v))
+  ([lmdb ids names aids id? decode]
+   (if (seq ids)
+     (cd/with-snapshot lmdb
+       (scan/scan lmdb c/eav
+         (with-open [^AutoCloseable iter
+                     (l/val-iterator (l/iterate-list-val-full dbi rtx cur))]
+           (mapv #(projected-entity lmdb iter % names aids id? decode) ids))
+         (throw e)))
+     [])))

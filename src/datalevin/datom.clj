@@ -25,12 +25,29 @@
   (datom-tx [this])
   (datom-added [this]))
 
+;; Giant preparation shares the metadata slot, preserving the ordinary datom
+;; layout. IMeta exposes only the caller's metadata.
+(deftype ^:private StorageMeta [metadata reference])
+
+(defprotocol ^:no-doc IStorageReference
+  (storage-reference [this])
+  (set-storage-reference! [this reference]))
+
 (deftype Datom [^long e a v ^long tx
                 ^:unsynchronized-mutable ^int _hash
-                ^:unsynchronized-mutable ^clojure.lang.IPersistentMap _meta]
+                ^:unsynchronized-mutable _meta]
   IDatom
   (datom-tx [d] (if (pos? tx) tx (- tx)))
   (datom-added [d] (pos? tx))
+
+  IStorageReference
+  (storage-reference [_]
+    (when (instance? StorageMeta _meta) (.-reference ^StorageMeta _meta)))
+  (set-storage-reference! [this reference]
+    (let [metadata (if (instance? StorageMeta _meta)
+                     (.-metadata ^StorageMeta _meta) _meta)]
+      (set! _meta (if reference (StorageMeta. metadata reference) metadata)))
+    this)
 
   Object
   (hashCode [d]
@@ -45,11 +62,14 @@
   (hasheq [d] (.hashCode d))
 
   clojure.lang.IMeta
-  (meta [_] _meta)
+  (meta [_]
+    (if (instance? StorageMeta _meta) (.-metadata ^StorageMeta _meta) _meta))
 
   clojure.lang.IObj
   (withMeta [this meta]
-    (Datom. e a v tx _hash meta))
+    (Datom. e a v tx _hash
+            (if (instance? StorageMeta _meta)
+              (StorageMeta. meta (.-reference ^StorageMeta _meta)) meta)))
 
   clojure.lang.Seqable
   (seq [d] (seq-datom d))

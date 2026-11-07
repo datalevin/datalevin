@@ -97,11 +97,23 @@
             value (proxy [Object] []
                     (toString [] (swap! corrections inc) "corrected"))
             insert {:db/id "line" :line/name value}
-            update [:db/add 1 :stock/value 6]]
+            update [:db/add 1 :stock/value 6]
+            update-map {:db/id 1 :stock/value 6}]
         (doseq [txs [[insert update] [update insert]
-                     (list insert update) (map identity [insert update])]]
+                     (list insert update) (map identity [insert update])
+                     [insert update-map] [update-map insert]
+                     (list insert update-map) (map identity [insert update-map])]]
           (is (nil? (db/prepare-blind-local-tx @conn txs true)))
           (is (zero? @corrections)))
+        (testing "explicit-ID batches decline before accessing the store"
+          (let [store (reify i/IStore
+                        (schema [_]
+                          (throw (ex-info "Unexpected blind preparation" {}))))
+                database (db/transfer @conn store)
+                updates (mapv #(hash-map :db/id % :stock/value 6) (range 1 257))]
+            (doseq [collect-unique-avs? [false true]]
+              (is (nil? (db/prepare-blind-local-tx
+                          database updates true collect-unique-avs?))))))
         (is (some? (db/prepare-blind-local-tx @conn [insert] true)))
         (is (pos? @corrections))))))
 

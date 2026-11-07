@@ -487,11 +487,18 @@
                   result
                   (l/with-transaction-kv [kv1 kv]
                     (let [store1 ^Store (s/transfer store kv1)
-                          db1    ^DB    (db/transfer db store1)
+                          db1    ^DB    (assoc (db/transfer db store1)
+                                              :max-eid
+                                              (max (long (:max-eid db))
+                                                   (long (i/init-max-eid store1)))
+                                              :max-tx
+                                              (max (long (:max-tx db))
+                                                   (long (i/max-tx store1))))
                           fused? (boolean (:fuse-unique-inserts? prepared))]
-                      (when (or fused?
-                                (db/blind-local-tx-unique-values-absent?
-                                  db1 prepared))
+                      (when (and (db/blind-local-tx-valid? db1 prepared)
+                                 (or fused?
+                                     (db/blind-local-tx-unique-values-absent?
+                                       db1 prepared)))
                         (vreset! prepared-store store1)
                         (let [report (db/stamp-blind-local-tx
                                        db1 prepared tx-meta)]
@@ -833,7 +840,7 @@
                      (db/stamp-blind-local-identity-tx db prepared tx-meta)]
             (commit-writing-report! db report (not upsert?)
                                    (if upsert? :identity-upsert :blind-insert)
-                                   false false))
+                                   (false? (:has-many? prepared)) false))
           (if (and fuse-unique? (:fuse-unique-inserts? prepared))
             (try
               (commit-writing-report! db (db/stamp-blind-local-tx db prepared tx-meta)
@@ -844,7 +851,8 @@
                   (throw e))))
             (when (db/blind-local-tx-unique-values-absent? db prepared)
               (commit-writing-report! db (db/stamp-blind-local-tx db prepared tx-meta)
-                                     true :blind-insert false false)))))
+                                     true :blind-insert
+                                     (false? (:has-many? prepared)) false)))))
       ;; Specialized preparers leave resolver indexes unchanged. Only the
       ;; interpreter needs fresh indexes outside collected batches.
       (let [db1 (if txcommon/*batch-prepare*

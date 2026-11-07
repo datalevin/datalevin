@@ -13,6 +13,7 @@
    [datalevin.constants :refer [e0 tx0 emax txmax v0 vmax]]
    [datalevin.datom :as d :refer [datom]]
    [datalevin.interface :as i :refer [rschema]]
+   [datalevin.index :as idx]
    [datalevin.validate :as vld])
   (:import
    [datalevin.datom Datom]
@@ -124,24 +125,30 @@
                                  (datom e a v0) (datom e a vmax)))))))
     (i/ea-first-datom (:store db) e a)))
 
-(defn ea-first-v
-  "Resolve the current entity/attribute value during write preparation."
+(defn preparation-first-v
+  "Resolve a value, retaining a giant reference under the current writer."
   [db e a]
   (if-let [^LongObjectHashMap pending (scalar-pending-index)]
     (if-let [^Datom datom (some-> ^HashMap (.get pending (long e)) (.get a))]
       (when (d/datom-added datom) (.-v datom))
-      (i/ea-first-v (:store db) e a))
+      (idx/preparation-first-v (:store db) e a))
     (if *batch-prepare*
       (let [^SortedSet cached (.subSet ^TreeSortedSet (:eavt db)
                                       (datom e a nil tx0) (datom e a nil txmax))]
         (if (.isEmpty cached)
-          (i/ea-first-v (:store db) e a)
+          (idx/preparation-first-v (:store db) e a)
           (if-let [^Datom pending (first-added-datom cached)]
             (.-v pending)
-            (:v (first (visible-stored
-                         db (i/slice (:store db) :eav
-                                     (datom e a v0) (datom e a vmax))))))))
-      (i/ea-first-v (:store db) e a))))
+            (idx/datom-prepared-value
+              (first (visible-stored
+                       db (i/slice (:store db) :eav
+                                   (datom e a v0) (datom e a vmax))))))))
+      (idx/preparation-first-v (:store db) e a))))
+
+(defn ea-first-v
+  "Resolve the logical entity/attribute value during write preparation."
+  [db e a]
+  (idx/logical-value (preparation-first-v db e a)))
 
 (defn av-first-e
   "Resolve the current owner of an indexed value during write preparation.

@@ -26,7 +26,7 @@
    [datalevin.datom Datom]
    [datalevin.db.tx.prepare IdentityResolution ResolvedIdentityAdd]
    [datalevin.storage Store]
-   [java.util ArrayList Collection List SortedSet]
+   [java.util ArrayList Collection HashMap List SortedSet]
    [org.eclipse.collections.impl.set.sorted.mutable TreeSortedSet]))
 
 (deftype ^:private TxStep [report entities])
@@ -70,9 +70,9 @@
   db)
 
 (defn- validate-datom
-  [db ^Datom datom resolution]
+  [db ^Datom datom resolution rschema]
   (when (and (datom-added datom)
-             (txcommon/is-attr? db (.-a datom) :db/unique))
+             (contains? (:db/unique rschema) (.-a datom)))
     (let [a (.-a datom)
           v (.-v datom)]
       (vld/validate-datom-unique
@@ -104,8 +104,11 @@
     (assoc :max-eid eid)))
 
 (defn- append-tx-datom!
-  [report datom]
+  [report ^Datom datom]
   (.add ^ArrayList (:tx-data report) datom)
+  (when-let [pending (::pending-attr-index report)]
+    (when-let [^HashMap index @pending]
+      (.put index [(.-e datom) (.-a datom)] datom)))
   report)
 
 (defn- allocate-eid
@@ -136,15 +139,16 @@
        (update :db-after advance-max-eid eid)))))
 
 (defn- with-datom
-  [db ^Datom datom resolution]
-  (validate-datom db datom resolution)
+  [db ^Datom datom resolution rschema]
+  (validate-datom db datom resolution rschema)
   (if txcommon/*batch-prepare*
     (do (txcommon/stage-batch-datom! db datom)
         (if (datom-added datom) (advance-max-eid db (.-e datom)) db))
     (if (datom-added datom)
       (do
         (.add ^TreeSortedSet (:eavt db) datom)
-        (when-not (txcommon/is-attr? db (.-a datom) :db/noindex)
+        (when-not (when-let [attrs (:db/noindex rschema)]
+                    (contains? attrs (.-a datom)))
           (.add ^TreeSortedSet (:avet db) datom))
         (advance-max-eid db (.-e datom)))
       (if (.isEmpty
@@ -154,20 +158,21 @@
         db
         (do
           (.remove ^TreeSortedSet (:eavt db) datom)
-          (when-not (txcommon/is-attr? db (.-a datom) :db/noindex)
+          (when-not (when-let [attrs (:db/noindex rschema)]
+                      (contains? attrs (.-a datom)))
             (.remove ^TreeSortedSet (:avet db) datom))
           db)))))
 
-(declare effective-attr-value)
+(declare effective-attr-value effective-attr-preparation)
 
 (defn- queue-tuple
   [queue tuple idx report db e _ v]
   (let [^ResolvedTuple queued (get queue tuple)
         before (if queued
                  (.-before queued)
-                 (effective-attr-value report db e tuple))
+                 (effective-attr-preparation report db e tuple))
         value (or (when queued (.-value queued))
-                  before
+                  (idx/logical-value before)
                   (vec (repeat (-> (schema (:store db))
                                    (get tuple)
                                    :db/tupleAttrs
@@ -193,17 +198,19 @@
   ([report datom] (transact-report report datom nil))
   ([report ^Datom datom resolution]
    (let [db      (:db-after report)
+         ;; Validation, AVET maintenance and tuple queuing share this read.
+         rschema (i/rschema (:store db))
          a       (.-a datom)
-         db'     (with-datom db datom resolution)
+         db'     (with-datom db datom resolution rschema)
          report' (-> report
                      (cond-> (not (identical? db db')) (assoc :db-after db'))
                      (append-tx-datom! datom)
                      (track-retraction datom))]
-     (if (txcommon/tuple-source? db a)
+     (if-let [tuples (when-let [sources (:db/attrTuples rschema)]
+                       (get sources a))]
        (let [e      (.-e datom)
              v      (if (datom-added datom) (.-v datom) nil)
              queue  (or (-> report' ::queued-tuples (get e)) {})
-             tuples (get (txcommon/attrs-by db :db/attrTuples) a)
              queue' (queue-tuples queue tuples report' db e a v)]
          (update report' ::queued-tuples assoc e queue'))
        report'))))
@@ -238,27 +245,40 @@
      (nil? old-value)
      (transact-report report new-datom resolution)
 
-     (d/value-equal? old-value (.-v new-datom))
+     (d/value-equal? (idx/logical-value old-value) (.-v new-datom))
      (transact-same-value report new-datom resolution)
 
      :else
      (-> report
-         (transact-report (datom (.-e new-datom) (.-a new-datom) old-value
-                                (d/datom-tx new-datom) false))
+         (transact-report (idx/retraction (.-e new-datom) (.-a new-datom) old-value
+                                         (d/datom-tx new-datom)))
          (transact-report new-datom resolution)))))
 
 (defn- pending-attr-state
   [report e a]
-  (let [^List datoms (:tx-data report)]
-    (loop [i (dec (.size datoms))]
-      (if (neg? i)
-        ::missing-attr-state
-        (let [^Datom d (.get datoms i)]
-          (if (and (= e (.-e d)) (= a (.-a d)))
-            (if (datom-added d) (.-v d) ::retracted-attr-state)
-            (recur (dec i))))))))
+  (if-let [pending (::pending-attr-index report)]
+    (let [^HashMap index
+          (or @pending
+              ;; Seed the complete prefix once. A miss then proves that this
+              ;; request has no pending E/A state; it must not rescan history.
+              (let [index (HashMap.)]
+                (doseq [^Datom datom (:tx-data report)]
+                  (.put index [(.-e datom) (.-a datom)] datom))
+                (vreset! pending index)
+                index))]
+      (if-let [^Datom datom (.get index [(long e) a])]
+        (if (datom-added datom) (.-v datom) ::retracted-attr-state)
+        ::missing-attr-state))
+    (let [^List datoms (:tx-data report)]
+      (loop [i (dec (.size datoms))]
+        (if (neg? i)
+          ::missing-attr-state
+          (let [^Datom d (.get datoms i)]
+            (if (and (= e (.-e d)) (= a (.-a d)))
+              (if (datom-added d) (.-v d) ::retracted-attr-state)
+              (recur (dec i)))))))))
 
-(defn- effective-attr-value
+(defn- effective-attr-preparation
   [report db e a]
   (if (> (long e) ^long (::max-eid-before report))
     ;; New entities have no stored values to mask. The existing EAV overlay
@@ -268,13 +288,17 @@
     (let [pending (pending-attr-state report e a)]
       (cond
         (identical? pending ::missing-attr-state)
-        (txcommon/ea-first-v db e a)
+        (txcommon/preparation-first-v db e a)
 
         (identical? pending ::retracted-attr-state)
         nil
 
         :else
         pending))))
+
+(defn- effective-attr-value
+  [report db e a]
+  (idx/logical-value (effective-attr-preparation report db e a)))
 
 (defn- validate-installed-callable-write
   [report db e a v ent]
@@ -327,7 +351,7 @@
                ;; made by other connections since db-before was obtained.
                (when (<= (long e) ^long (::max-eid-before report))
                  (txcommon/ea-first-datom db e a))))]
-     (apply-add report new-datom (when old-datom (.-v old-datom)) resolution))))
+     (apply-add report new-datom (idx/datom-prepared-value old-datom) resolution))))
 
 (defn- transact-add
   ([report [_ _ a _ _ :as ent]]
@@ -354,7 +378,9 @@
 
 (defn- transact-retract-datom [report ^Datom d]
   (let [tx (current-tx report)]
-    (transact-report report (datom (.-e d) (.-a d) (.-v d) tx false))))
+    (transact-report report
+                     (idx/retraction (.-e d) (.-a d)
+                                     (idx/datom-prepared-value d) tx))))
 
 (defn- transact-known-old-add
   "Validate and apply an addition whose previous cardinality-one value is
@@ -373,7 +399,7 @@
         meta*     (meta entity)
         new-datom (cond-> (datom e a nv' tx)
                     meta* (with-meta meta*))]
-    (apply-add report new-datom (when old-datom (.-v old-datom)))))
+    (apply-add report new-datom (idx/datom-prepared-value old-datom))))
 
 (defn- retract-components
   ([db datoms]
@@ -465,7 +491,7 @@
               (let [queued-value (.-value change)
                     value (when-not (every? nil? queued-value) queued-value)
                     current (.-before change)]
-                (if (= value current)
+                (if (= value (idx/logical-value current))
                   entities
                   (conj! entities
                     (if resolved?
@@ -473,7 +499,7 @@
                         (ResolvedTuple. eid tuple nil current)
                         change)
                       (if (nil? value)
-                        ^::internal [:db/retract eid tuple current]
+                        ^::internal [:db/retract eid tuple (idx/logical-value current)]
                         ^::internal [:db/add eid tuple value]))))))
             entities tuples+values))
         (transient []) queued))))
@@ -483,7 +509,7 @@
   (let [e (.-e change) a (.-a change) value (.-value change)
         tx (current-tx report)]
     (if (nil? value)
-      (transact-report report (datom e a (.-before change) tx false))
+      (transact-report report (idx/retraction e a (.-before change) tx))
       (let [value (coreprep/correct-value-with-props store-opts (schema a) a value)
             new-datom (with-meta (datom e a value tx) {::internal true})]
         (apply-add report new-datom (.-before change))))))
@@ -500,6 +526,7 @@
                       (dissoc-present ::reverse-tempids)
                       (dissoc-present ::max-eid-before)
                       (dissoc-present ::reference-free?)
+                      (dissoc-present ::pending-attr-index)
                       (dissoc-present ::tx-retracted)
                       (dissoc-present ::new-attributes))
         tx-id     (current-tx report)
@@ -982,8 +1009,10 @@
         max-eid-before  (max (long (:max-eid db))
                              (long (or (::max-eid-before initial-report)
                                        (init-max-eid store))))
+        tuples?         (seq (txcommon/attrs-by db :db.type/tuple))
         initial-report' (-> initial-report
                             (dissoc-present ::tx-retracted)
+                            (dissoc-present ::pending-attr-index)
                             ;; Each retry owns a fresh append buffer. Complex
                             ;; handlers and regular adds share it, and only the
                             ;; finalized report exposes an immutable vector.
@@ -991,11 +1020,12 @@
                                    (doto (ArrayList. 32)
                                      (.addAll ^Collection (:tx-data initial-report))))
                             (assoc ::max-eid-before max-eid-before)
+                            (cond-> tuples?
+                              (assoc ::pending-attr-index (volatile! nil)))
                             (cond-> reference-free? (assoc ::reference-free? true))
                             (update :db-after
                                     #(-> % clear-tx-cache
                                          (advance-max-eid max-eid-before))))
-        tuples?         (seq (txcommon/attrs-by db :db.type/tuple))
         schema          (schema store)
         store-opts      (opts store)]
     (loop [report    initial-report'

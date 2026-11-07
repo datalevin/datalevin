@@ -3,6 +3,13 @@
             [datalevin.storage.schema :as schema]
             [datalevin.validate :as vld]))
 
+(deftest embedding-attributes-in-reverse-schema
+  (let [attrs {:embedded {:db/valueType :db.type/string :db/embedding true}
+               :disabled {:db/valueType :db.type/string :db/embedding false}
+               :ordinary {:db/valueType :db.type/string}}]
+    (is (= #{:embedded} (:db/embedding (schema/schema->rschema attrs))))
+    (is (nil? (:db/embedding (schema/schema->rschema (dissoc attrs :embedded)))))))
+
 (deftest new-attribute-indexing-defaults
   (doseq [value-type [:db.type/idoc :db.type/vec]]
     (let [props {:db/valueType value-type}
