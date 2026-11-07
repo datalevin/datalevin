@@ -96,24 +96,55 @@
                                  (bytes? (nth vs 0))))
                 false)))))
 
+(defn- eav-row-run?
+  [^List rows ^long start]
+  (and (eav-row? (.get rows start)) (eav-row? (.get rows (inc start)))
+       (eav-row? (.get rows (+ start 2))) (eav-row? (.get rows (+ start 3)))))
+
+(defn- eav-op-run?
+  [^objects ops ^long start]
+  (and (eav-row? (aget ops (inc start)))
+       (eav-row? (aget ops (+ start 3)))
+       (eav-row? (aget ops (+ start 5)))
+       (eav-row? (aget ops (+ start 7)))
+       ;; Prepared operations retain their resolved DBI, not just its name.
+       (identical? (aget ops start) (aget ops (+ start 2)))
+       (identical? (aget ops start) (aget ops (+ start 4)))
+       (identical? (aget ops start) (aget ops (+ start 6)))))
+
 (defn- put-eav-rows!
   "Apply a contiguous run of validated EAV-only rows with one write cursor.
-  Preserve input order, including repeated adds and missing-value deletions."
-  [^List rows start ^DBI eav txn]
-  (with-open [^Cursor cur (.writeCursor ^IWriteCursor eav txn)]
-    (loop [i (long start)]
-      (if (and (< i (.size rows)) (eav-row? (.get rows i)))
-        (let [^KVTxData tx (.get rows i)
-              added? (= :put (.-op tx))]
-          (.putKeyId eav (long (.-k tx)))
-          (.put-val eav (if added? (.-v tx) (nth (.-v tx) 0)) :raw)
-          (if added?
-            (.put cur (int 0))
-            (do (.del eav txn false)
-                ;; A missing duplicate can overwrite the native key pointer.
-                (.reset ^BufVal (.-kp eav))))
-          (recur (unchecked-inc i)))
-        i))))
+  Preserve input order in row lists or interleaved prepared DBI/operation arrays."
+  ([^List rows start ^DBI eav txn]
+   (with-open [^Cursor cur (.writeCursor ^IWriteCursor eav txn)]
+     (loop [i (long start)]
+       (if (and (< i (.size rows)) (eav-row? (.get rows i)))
+         (let [^KVTxData tx (.get rows i)
+               added? (= :put (.-op tx))]
+           (.putKeyId eav (long (.-k tx)))
+           (.put-val eav (if added? (.-v tx) (nth (.-v tx) 0)) :raw)
+           (if added?
+             (.put cur (int 0))
+             (do (.del eav txn false)
+                 ;; A missing duplicate can overwrite the native key pointer.
+                 (.reset ^BufVal (.-kp eav))))
+           (recur (unchecked-inc i)))
+         i))))
+  ([^objects ops start ^DBI eav txn n]
+   (with-open [^Cursor cur (.writeCursor ^IWriteCursor eav txn)]
+     (loop [i (long start)]
+       (if (and (< i (long n)) (identical? eav (aget ops i))
+                (eav-row? (aget ops (inc i))))
+         (let [^KVTxData tx (aget ops (inc i))
+               added? (= :put (.-op tx))]
+           (.putKeyId eav (long (.-k tx)))
+           (.put-val eav (if added? (.-v tx) (nth (.-v tx) 0)) :raw)
+           (if added?
+             (.put cur (int 0))
+             (do (.del eav txn false)
+                 (.reset ^BufVal (.-kp eav))))
+           (recur (+ i 2)))
+         i)))))
 
 (defn- transact-kv-rows*
   "Apply the KV portion of a row list after any datom index passes. Only
@@ -137,7 +168,7 @@
                     ^DBI dbi (or (.get dbis name) (raise name " is not open" {}))]
                 (when validate?
                   (vld/validate-kv-tx-data tx (.-validate-data? dbi)))
-                ;; Opening a cursor is not worthwhile for a lone replacement.
+                ;; Keep short tails on the ordinary path before calling out.
                 (if (and (not validate?) (<= (+ i 4) n)
                          (eav-row? tx) (eav-row? (.get rows (inc i)))
                          (eav-row? (.get rows (+ i 2)))
@@ -610,17 +641,15 @@
                 (put-ave-added-datom! ave cur tx (int 0))
                 (put-ave-datom-tx ave txn tx)))))))))
 
-(defn- transact-datom-list*
-  ([txs dbis txn] (transact-datom-list* txs dbis txn true))
-  ([^java.util.List txs ^HashMap dbis txn validate?]
-  (if-let [[^objects datoms n all-datoms? all-added?]
-           (datom-txs txs (not c/*ordered-datom-writes?*))]
-    (do
-      (when (pos? (long n))
-        (transact-datom-index-passes* datoms n dbis txn all-added?))
-      ;; Metadata and other KV rows retain input order after the datom passes.
-      (when-not all-datoms?
-        (transact-kv-rows* txs dbis txn validate?)))
+(defn- transact-datom-rows-scalar*
+  "Apply every row in input order, walking grouped regions without indexed lookups."
+  [^List txs ^HashMap dbis txn validate?]
+  ;; A mixed batch needs an indexed row plus four EAV rows to batch at all.
+  (if (and (instance? RowRegions txs) (>= (.size txs) 5))
+    (.forEachRegion ^RowRegions txs
+                    (reify Consumer
+                      (accept [_ region]
+                        (transact-datom-rows-scalar* region dbis txn validate?))))
     (let [n (.size txs)]
       (loop [i   0
              ave nil
@@ -640,8 +669,23 @@
                                  (raise dbi-name " is not open" {}))]
                 (when validate?
                   (vld/validate-kv-tx-data tx (.-validate-data? dbi)))
-                (put-tx dbi txn tx)
-                (recur (unchecked-inc i) ave eav))))))))))
+                (if (and (not validate?) (<= (+ i 4) n) (eav-row-run? txs i))
+                  (recur (long (put-eav-rows! txs i dbi txn)) ave eav)
+                  (do (put-tx dbi txn tx)
+                      (recur (unchecked-inc i) ave eav)))))))))))
+
+(defn- transact-datom-list*
+  ([txs dbis txn] (transact-datom-list* txs dbis txn true))
+  ([^java.util.List txs ^HashMap dbis txn validate?]
+  (if-let [[^objects datoms n all-datoms? all-added?]
+           (datom-txs txs (not c/*ordered-datom-writes?*))]
+    (do
+      (when (pos? (long n))
+        (transact-datom-index-passes* datoms n dbis txn all-added?))
+      ;; Metadata and other KV rows retain input order after the datom passes.
+      (when-not all-datoms?
+        (transact-kv-rows* txs dbis txn validate?)))
+    (transact-datom-rows-scalar* txs dbis txn validate?))))
 
 (defn ^:redef transact*
   [txs ^HashMap dbis txn]
@@ -727,9 +771,11 @@
                                 (raise c/eav " is not open" {}))]
               (put-datom-tx ave* eav* txn tx)
               (recur (+ i 2) ave* eav*))
-            (do
-              (put-tx dbi txn ^KVTxData tx)
-              (recur (+ i 2) ave eav))))))))
+            (if (and (<= (+ i 8) n) (eav-op-run? ops i))
+              (recur (long (put-eav-rows! ops i dbi txn n)) ave eav)
+              (do
+                (put-tx dbi txn ^KVTxData tx)
+                (recur (+ i 2) ave eav)))))))))
 
 (defn- transact-prepared-datom-ops*
   [^objects ops ^HashMap dbis txn]

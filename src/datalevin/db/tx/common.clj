@@ -126,24 +126,30 @@
     (i/ea-first-datom (:store db) e a)))
 
 (defn preparation-first-v
-  "Resolve a value, retaining a giant reference under the current writer."
-  [db e a]
-  (if-let [^LongObjectHashMap pending (scalar-pending-index)]
-    (if-let [^Datom datom (some-> ^HashMap (.get pending (long e)) (.get a))]
-      (when (d/datom-added datom) (.-v datom))
-      (idx/preparation-first-v (:store db) e a))
-    (if *batch-prepare*
-      (let [^SortedSet cached (.subSet ^TreeSortedSet (:eavt db)
-                                      (datom e a nil tx0) (datom e a nil txmax))]
-        (if (.isEmpty cached)
-          (idx/preparation-first-v (:store db) e a)
-          (if-let [^Datom pending (first-added-datom cached)]
-            (.-v pending)
-            (idx/datom-prepared-value
-              (first (visible-stored
-                       db (i/slice (:store db) :eav
-                                   (datom e a v0) (datom e a vmax))))))))
-      (idx/preparation-first-v (:store db) e a))))
+  "Resolve a value, retaining a giant reference under the current writer.
+  An optional owned native reader is used only when the pending view has no
+  entry. Pending additions and retractions retain the ordinary resolver rules."
+  ([db e a] (preparation-first-v db e a nil))
+  ([db e a read-stored]
+   (if-let [^LongObjectHashMap pending (scalar-pending-index)]
+     (if-let [^Datom datom (some-> ^HashMap (.get pending (long e)) (.get a))]
+       (when (d/datom-added datom) (.-v datom))
+       (if read-stored (read-stored e a)
+           (idx/preparation-first-v (:store db) e a)))
+     (if *batch-prepare*
+       (let [^SortedSet cached (.subSet ^TreeSortedSet (:eavt db)
+                                       (datom e a nil tx0) (datom e a nil txmax))]
+         (if (.isEmpty cached)
+           (if read-stored (read-stored e a)
+               (idx/preparation-first-v (:store db) e a))
+           (if-let [^Datom pending (first-added-datom cached)]
+             (.-v pending)
+             (idx/datom-prepared-value
+               (first (visible-stored
+                        db (i/slice (:store db) :eav
+                                    (datom e a v0) (datom e a vmax))))))))
+       (if read-stored (read-stored e a)
+           (idx/preparation-first-v (:store db) e a))))))
 
 (defn ea-first-v
   "Resolve the logical entity/attribute value during write preparation."

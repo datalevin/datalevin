@@ -2315,60 +2315,58 @@
         info)))
 
 (defn- prepare-blind-write-entity
-  [store-schema store-opts tuple-source-attrs unique-identity-attrs
-   allow-unique? ^FastList unique-avs seen-avs set-capacity
-   has-many? fuse-unique-inserts? attr-infos entity]
+  [store-opts unique-identity-attrs ^FastList unique-avs seen-avs set-capacity
+   has-many? fuse-unique-inserts? ^java.util.HashMap attr-infos check-attr entity]
   (let [old-eid   (:db/id entity)
         ;; An implicit entity does not need a transaction-scoped tempid: the
         ;; blind stamper assigns its final EID directly and never exposes an
         ;; implicit mapping in the report. Retain explicit tempids so repeated
         ;; user IDs still fall back to the resolver and merge correctly.
         entity-id old-eid]
-    (when (or (nil? old-eid) (tempid? old-eid))
+    (when (and (or (nil? old-eid) (tempid? old-eid))
+               ;; Attribute eligibility is independent of values. Check the
+               ;; whole map before validation, coercion or fusion bounds.
+               (reduce-kv check-attr true entity))
       (let [^FastList attrs (FastList. (int (* 2 (count entity))))
             supported?
             (reduce-kv
               (fn [_ attr raw-value]
                 (if (identical? attr :db/id)
                   true
-                  (let [^objects info (blind-write-attr-info
-                                        attr-infos store-schema tuple-source-attrs
-                                        allow-unique? attr)
+                  (let [^objects info (.get attr-infos attr)
                         props (aget info 0)
-                        many? (identical? :db.cardinality/many (:db/cardinality props))]
-                    (if-not (aget info 1)
+                        many? (identical? :db.cardinality/many (:db/cardinality props))
+                        _ (when (or (not (aget info 2))
+                                    (and (aget info 3)
+                                         (> (count (str raw-value)) 100)))
+                            (vreset! fuse-unique-inserts? false))
+                        supported-values?
+                        (if (blind-write-multiple-values?
+                              many? unique-identity-attrs raw-value)
+                          (let [seen-values (java.util.HashSet.)
+                                values (seq raw-value)]
+                            (when values (vreset! has-many? true))
+                            (loop [values values]
+                              (if-some [value (first values)]
+                                (if (and (append-blind-value!
+                                           attrs unique-avs seen-avs set-capacity
+                                           store-opts props attr entity value)
+                                         ;; Repeated values need the resolver's
+                                         ;; set semantics before EAV append.
+                                         (.add seen-values
+                                               (.get attrs (dec (.size attrs)))))
+                                  (recur (next values))
+                                  false)
+                                true)))
+                          (do
+                            (when many? (vreset! has-many? true))
+                            (append-blind-value!
+                              attrs unique-avs seen-avs set-capacity
+                              store-opts props attr entity
+                              raw-value)))]
+                    (if-not supported-values?
                       (reduced false)
-                      (let [_ (when (or (not (aget info 2))
-                                        (and (aget info 3)
-                                             (> (count (str raw-value)) 100)))
-                                (vreset! fuse-unique-inserts? false))
-                            supported-values?
-                            (if (blind-write-multiple-values?
-                                  many? unique-identity-attrs raw-value)
-                              (let [seen-values (java.util.HashSet.)
-                                    values (seq raw-value)]
-                                (when values (vreset! has-many? true))
-                                (loop [values values]
-                                  (if-some [value (first values)]
-                                    (if (and (append-blind-value!
-                                               attrs unique-avs seen-avs set-capacity
-                                               store-opts props attr entity value)
-                                             ;; Repeated values need the resolver's
-                                             ;; set semantics before EAV append.
-                                             (.add seen-values
-                                                   (.get attrs (dec (.size attrs)))))
-                                      (recur (next values))
-                                      false)
-                                    true)))
-                              (do
-                                (when many? (vreset! has-many? true))
-                                (append-blind-value!
-                                  attrs unique-avs seen-avs set-capacity
-                                  store-opts props attr entity
-                                  raw-value)))]
-                        (if-not supported-values?
-                          (reduced false)
-                          true))))))
+                      true))))
               true
               entity)]
         (when supported?
@@ -2499,15 +2497,24 @@
            ;; These decisions depend only on the schema snapshot and this call's
            ;; uniqueness policy. Value bounds and validation remain per value.
            attr-infos        (java.util.HashMap.)
+           ;; Share the reducer across entities as well as their attribute info.
+           check-attr        (fn [_ attr _]
+                               (if (or (identical? attr :db/id)
+                                       (aget ^objects
+                                             (blind-write-attr-info
+                                               attr-infos store-schema tuple-source-attrs
+                                               allow-unique? attr)
+                                             1))
+                                 true
+                                 (reduced false)))
            entities
            (reduce
              (fn [^FastList acc entity]
                (if-let [^PreparedBlindEntity prepared
                         (prepare-blind-write-entity
-                          store-schema store-opts tuple-source-attrs
-                          unique-identity-attrs allow-unique? unique-avs
+                          store-opts unique-identity-attrs unique-avs
                           seen-avs set-capacity has-many?
-                          fuse-unique-inserts? attr-infos entity)]
+                          fuse-unique-inserts? attr-infos check-attr entity)]
                  (if (and (.-tempid prepared)
                           (not (.add seen-tempids (.-tempid prepared))))
                    (reduced nil)

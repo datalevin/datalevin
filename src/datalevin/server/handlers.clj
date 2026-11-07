@@ -1678,7 +1678,12 @@
      ;; Simulations need fresh overlays because db0 is published to readers.
      (let [transact (fn [db]
                       (or (when-not s?
-                            (transact-prepared db prepared (or tx-meta {})))
+                            (or (transact-prepared db prepared (or tx-meta {}))
+                                ;; Resolve mixed updates/inserts against this
+                                ;; owned writer, including preceding requests.
+                                (when-let [report (db/prepare-mixed-add-tx
+                                                    db txs (or tx-meta {}) (:max-eid db))]
+                                  (commit-stamped-report report false))))
                           (db/transact-tx-data
                             (db/->TxReport db (if s? (db/transfer db (:store db)) db)
                                            [] {} (or tx-meta {}))

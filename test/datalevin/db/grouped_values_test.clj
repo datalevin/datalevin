@@ -9,7 +9,8 @@
             [datalevin.kv :as kv]
             [datalevin.lmdb :as l]
             [datalevin.storage :as storage]
-            [datalevin.test.core :refer [db-fixture]]))
+            [datalevin.test.core :refer [db-fixture]])
+  (:import [org.eclipse.collections.impl.map.mutable.primitive LongObjectHashMap]))
 
 (use-fixtures :each db-fixture)
 
@@ -103,3 +104,53 @@
         (is (= 5 (read 1 :value)))
         (is (= 7 (common/ea-first-v @tx 2 :value)))
         (is (false? (read 1 :flag)))))))
+
+(deftest prepared-native-reader-is-used-only-for-unresolved-pending-attributes
+  (doseq [mode [:scalar :sorted]]
+    (with-open [conn (d/create-conn nil schema
+                      {:wal? false :background-sampling? false})]
+      (let [bytes (byte-array 2048 (byte 7))]
+        (d/transact! conn [{:db/id 1 :value 5 :flag true :text "stored"
+                           :bytes bytes :amount 1.00M}])
+        (d/with-transaction [tx conn]
+          (let [view (db/transfer @tx (:store @tx))
+                pending (LongObjectHashMap.)
+                context (if (= mode :scalar)
+                          (reify common/ScalarPendingIndex
+                            (pending-scalar-index [_] pending)
+                            (pending-unique-index [_] nil)
+                            (retain-pending-index? [_] false)
+                            (prepare-pending-index! [_ _])
+                            (materialize-scalar-pending! [_ _])
+                            (discard-scalar-pending! [_]))
+                          {:test true})
+                read (storage/ea-first-v-reader (:store view)
+                                               idx/avg-buffer->prepared-value)
+                calls (atom [])
+                read-stored (fn [e a] (swap! calls conj [e a]) (read e a))]
+            (is (some? read))
+            (binding [common/*batch-prepare* context]
+              (doseq [row [(datom/datom 1 :value 5 100 false)
+                            (datom/datom 1 :value 8 100)
+                            (datom/datom 1 :flag true 100 false)
+                            (datom/datom 1 :flag false 100)
+                            (datom/datom 1 :text "stored" 100 false)]]
+                (common/stage-batch-datom! view row))
+              (let [attrs [:value :flag :text :bytes :amount :absent]
+                    expected (mapv #(common/ea-first-v view 1 %) attrs)
+                    values (mapv #(idx/logical-value
+                                    (common/preparation-first-v view 1 % read-stored))
+                                 attrs)]
+                (is (= (comparable expected) (comparable values)))
+                (is (= [8 false nil (vec bytes) 1.00M nil] (comparable values)))
+                (is (= [[1 :bytes] [1 :amount] [1 :absent]] @calls))
+                ;; An ordinary internal read can reuse the writer buffers.
+                (is (= 1.00M (common/ea-first-v view 1 :amount)))
+                (is (= (vec bytes)
+                       (vec (idx/logical-value
+                              (common/preparation-first-v view 1 :bytes read-stored)))))
+                (let [before @calls]
+                  (is (= 8 (common/preparation-first-v view 1 :value read-stored)))
+                  (is (false? (common/preparation-first-v view 1 :flag read-stored)))
+                  (is (nil? (common/preparation-first-v view 1 :text read-stored)))
+                  (is (= before @calls)))))))))))

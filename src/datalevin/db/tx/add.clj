@@ -216,7 +216,7 @@
         updates))))
 
 (defn- plan-additions
-  [db entities schema options max-eid tx ^HashSet updates preflight?
+  [entities schema options max-eid tx ^HashSet updates preflight?
    ^HashMap infos sources]
   (let [additions (ArrayList.)]
     (loop [es (seq entities) eid (long max-eid) tempids {} read-safe? true]
@@ -257,9 +257,7 @@
 
             :else nil))
         (cond-> {:additions additions :max-eid eid :tempids tempids :infos infos}
-          ;; Pending lookups already avoid native setup. Keep their shared
-          ;; resolver rather than preparing an unused native reader.
-          (and (> (.size updates) 1) read-safe? (not (pending-values? db)))
+          (and (> (.size updates) 1) read-safe?)
           (assoc :prepare-reader? true))))))
 
 (defn- unique-additions-available?
@@ -307,21 +305,23 @@
                (let [before (max (long (:max-eid db))
                                  (long (or owned-max-eid (i/init-max-eid store))))
                      tx (inc (long (:max-tx db)))]
-                 (when-let [plan (plan-additions db entities schema options before tx
+                 (when-let [plan (plan-additions entities schema options before tx
                                                 updates preflight? infos sources)]
                    (let [^ArrayList additions (:additions plan)]
                      (when (unique-additions-available? db additions (:infos plan))
                        (let [read-old (when (:prepare-reader? plan)
                                         (storage/ea-first-v-reader
                                           store idx/avg-buffer->prepared-value))
+                             pending? (and read-old (pending-values? db))
                              datoms
                              (loop [index 0 out (transient [])]
                                (if (< index (.size additions))
                                  (let [^Datom addition (.get additions index)
                                        e (.-e addition) a (.-a addition) v (.-v addition)
                                        old (when (<= e before)
-                                             (if read-old (read-old e a)
-                                                 (common/preparation-first-v db e a)))]
+                                             (if (and read-old (not pending?))
+                                               (read-old e a)
+                                               (common/preparation-first-v db e a read-old)))]
                                    (recur (unchecked-inc index)
                                           (cond
                                             (d/value-equal? (idx/logical-value old) v) out

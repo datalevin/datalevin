@@ -4,12 +4,15 @@
             [clojure.test.check.generators :as gen]
             [clojure.test.check.properties :as prop]
             [datalevin.binding.cpp :as cpp]
+            [datalevin.binding.cpp.write :as write]
             [datalevin.constants :as c]
             [datalevin.interface :as i]
             [datalevin.kv :as kv]
             [datalevin.lmdb :as l]
             [datalevin.util :as u])
-  (:import [datalevin.lmdb DatomKVTxData]
+  (:import [datalevin.binding.cpp CppLMDB Rtx]
+           [datalevin.cpp Util$MapFullException]
+           [datalevin.lmdb DatomKVTxData]
            [datalevin.utl RowRegions]))
 
 (use-fixtures :each
@@ -32,6 +35,8 @@
     :clear (l/kv-tx :clear c/eav nil nil)
     :del (l/kv-tx :del c/eav e :id)
     :marker (l/kv-tx :put "marker" :last v)
+    :indexed-put (DatomKVTxData. (+ 98 e) (byte-array [v]) true false)
+    :indexed-del (DatomKVTxData. (+ 98 e) (byte-array [v]) false false)
     (l/kv-tx op c/eav e
              (if (= :put op) (byte-array [v]) [(byte-array [v])]) :id :raw)))
 
@@ -40,6 +45,8 @@
             (case op
               :put (update state e (fnil conj #{}) v)
               :del-list (update state e disj v)
+              :indexed-put (update state (+ 98 e) (fnil conj #{}) v)
+              :indexed-del (update state (+ 98 e) disj v)
               :del (dissoc state e)
               :clear {}
               :marker state)) {} ops))
@@ -48,6 +55,27 @@
   (let [out (RowRegions.)]
     (doseq [part (partition-all 5 rows)] (.append out (vec part)))
     out))
+
+(defn- apply-rows!
+  [^CppLMDB wdb rows mode]
+  (case mode
+    :prepared
+    (let [dbis (.-dbis wdb)
+          ^Rtx rtx @(l/write-txn wdb)
+          ;; :clear is an internal row, rejected by public KV preparation.
+          ops (if (some #(and (not (instance? DatomKVTxData %))
+                              (= :clear (.-op ^datalevin.lmdb.KVTxData %))) rows)
+                (object-array
+                  (mapcat (fn [tx]
+                            [(when-not (instance? DatomKVTxData tx)
+                               (.get ^java.util.HashMap dbis
+                                     (.-dbi-name ^datalevin.lmdb.KVTxData tx))) tx]) rows))
+                (write/prepare-kvtx-ops rows dbis nil :data :data))]
+      (write/transact-prepared-ops* ops dbis (.-txn rtx)))
+    :validated
+    (let [^Rtx rtx @(l/write-txn wdb)]
+      (write/transact* rows (.-dbis wdb) (.-txn rtx)))
+    ((cpp/prepared-row-applier wdb) (if (= :regions mode) (regions rows) rows))))
 
 (deftest eav-runs-preserve-order-across-regions-and-kv-barriers
   (with-native
@@ -81,7 +109,8 @@
     (fn [db raw]
       (let [avg (byte-array [50])
             indexed (DatomKVTxData. 99 avg true false)
-            rows (into [indexed] (map row [[:put 1 1] [:put 1 2]
+            rows (into [(DatomKVTxData. 99 avg false false) indexed]
+                       (map row [[:put 1 1] [:put 1 2]
                                           [:del-list 1 7] [:put 2 3]
                                           [:put 1 4] [:del-list 1 2]]))
             apply! (fn [wdb] ((cpp/prepared-row-applier wdb) (regions rows)))]
@@ -98,22 +127,114 @@
         ;; Unindexed values never acquire AVE entries.
         (is (= 1 (i/entries db c/ave)))))))
 
-(deftest eav-batch-closes-its-cursor-before-map-growth-retry
-  (with-native {:mapsize 1}
+(deftest scalar-eav-runs-preserve-order-around-indexed-and-kv-operations
+  (with-native
     (fn [db raw]
-      (let [value (byte-array 511 (byte 7))
-            rows (mapv #(l/kv-tx :put c/eav % value :id :raw) (range 1 5001))
-            calls (atom 0)
-            apply! (fn [wdb] ((cpp/prepared-row-applier wdb) rows))
-            failure (try
-                      (cpp/apply-native-once!
-                        raw (fn [wdb] (swap! calls inc) (apply! wdb)) nil)
-                      nil
-                      (catch clojure.lang.ExceptionInfo e e))]
-        (is (:resized (ex-data failure)))
-        (is (= 1 @calls))
-        (is (zero? (i/entries db c/eav)))
-        (cpp/apply-native-range! raw apply! nil)
-        (is (= 5000 (i/entries db c/eav)))
-        (is (= 511 (alength ^bytes (first (i/get-list db c/eav 5000 :id :raw)))))
-        (is (zero? (i/entries db c/ave)))))))
+      (binding [c/*ordered-datom-writes?* false]
+        (let [result
+              (tc/quick-check 100
+                (prop/for-all
+                  [tail (gen/vector
+                          (gen/tuple (gen/elements [:put :put :del-list :del :clear
+                                                    :marker :indexed-put :indexed-del])
+                                     (gen/choose 1 4) (gen/choose 1 8)) 0 80)
+                   mode (gen/elements [:rows :regions :prepared :validated])]
+                  (let [prefix [[:indexed-del 1 8]
+                                [:put 1 1] [:put 1 2] [:del-list 1 8] [:put 2 3]
+                                [:indexed-put 1 7]
+                                [:del-list 1 1] [:put 1 1] [:del-list 1 1] [:put 1 4]
+                                [:marker 0 77] [:indexed-del 1 7]]
+                        ops (into prefix (if (= mode :validated)
+                                           (remove #(= :clear (first %)) tail) tail))
+                        expected (model ops)
+                        ave (model (map (fn [[op e v]]
+                                          (case op
+                                            :indexed-put [:put v (+ 98 e)]
+                                            :indexed-del [:del-list v (+ 98 e)]
+                                            [:marker 0 0])) ops))
+                        rows (mapv row ops)]
+                    (cpp/apply-native-once!
+                      raw
+                      (fn [wdb]
+                        (apply-rows! wdb [(l/kv-tx :clear c/eav nil nil)
+                                         (l/kv-tx :clear c/ave nil nil)] :rows)
+                        (apply-rows! wdb rows mode)) nil)
+                    (and
+                      (every? (fn [e]
+                                (= (or (get expected e) #{})
+                                   (set (map #(aget ^bytes % 0)
+                                             (i/get-list db c/eav e :id :raw)))))
+                              (concat (range 1 5) (range 99 103)))
+                      (every? (fn [v]
+                                (= (or (get ave v) #{})
+                                   (set (i/get-list db c/ave (byte-array [v]) :raw :id))))
+                              (range 1 9))
+                      (= (nth (last (filter #(= :marker (first %)) ops)) 2)
+                         (i/get-value db "marker" :last)))))
+                :seed 43)]
+          (is (:pass? result) (pr-str result)))))))
+
+(deftest scalar-eav-runs-use-the-shared-writer-at-the-existing-threshold
+  (doseq [n [3 4 8] regions? [false true]]
+    (with-native
+      (fn [db raw]
+        (let [batched-reads (atom 0)
+              rows (into [(DatomKVTxData. 99 (byte-array [50]) false false)]
+                         (map #(row [:put % %]) (range 1 (inc n))))
+              observed (proxy [java.util.AbstractList java.util.RandomAccess] []
+                         (size [] (count rows))
+                         (get [index]
+                           (when (some #(.startsWith (.getClassName ^StackTraceElement %)
+                                                    "datalevin.binding.cpp.write$put_eav_rows")
+                                       (.getStackTrace (Thread/currentThread)))
+                             (swap! batched-reads inc))
+                           (nth rows index)))]
+          (binding [c/*ordered-datom-writes?* false]
+            (cpp/apply-native-once! raw
+              (fn [wdb]
+                (apply-rows! wdb (if regions?
+                                  (doto (RowRegions.) (.append observed)) observed)
+                             :rows)) nil))
+          (is (= (>= n 4) (pos? @batched-reads)))
+          (is (= n (i/entries db c/eav)))
+          (is (zero? (i/entries db c/ave))))))))
+
+(deftest scalar-eav-runs-respect-flagged-row-barriers
+  (doseq [mode [:rows :prepared]]
+    (with-native
+      (fn [db raw]
+        (let [rows (conj (into [(DatomKVTxData. 99 (byte-array [50]) false false)]
+                               (map #(row [:put % %]) (range 1 5)))
+                         (l/kv-tx :put c/eav 1 (byte-array [1]) :id :raw [:nodupdata]))]
+          (binding [c/*ordered-datom-writes?* false]
+            (is (thrown? Exception
+                         (cpp/apply-native-once! raw
+                           (fn [wdb] (apply-rows! wdb rows mode)) nil))))
+          (is (zero? (i/entries db c/eav)))
+          (is (zero? (i/entries db c/ave))))))))
+
+(deftest eav-batch-closes-its-cursor-before-map-growth-retry
+  (doseq [mode [:rows :prepared]]
+    (with-native {:mapsize 1}
+      (fn [db raw]
+        (let [value (byte-array 511 (byte 7))
+              rows (into [(DatomKVTxData. 99999 (byte-array [50]) false false)]
+                         (map #(l/kv-tx :put c/eav % value :id :raw) (range 1 5001)))
+              calls (atom 0)
+              apply! (fn [wdb] (apply-rows! wdb rows mode))
+              failure (try
+                        (cpp/apply-native-once!
+                          raw (fn [wdb] (swap! calls inc) (apply! wdb)) nil)
+                        nil
+                        (catch Exception e e))]
+          (is (if (= mode :prepared)
+                (instance? Util$MapFullException failure)
+                (:resized (ex-data failure))))
+          (is (= 1 @calls))
+          (is (zero? (i/entries db c/eav)))
+          (if (= mode :prepared)
+            (i/transact-kv raw rows)
+            (cpp/apply-native-range! raw apply! nil))
+          (is (= 5000 (i/entries db c/eav)))
+          (is (= 511 (alength ^bytes (first (i/get-list db c/eav 5000 :id :raw)))))
+          (is (zero? (i/entries db c/ave))))))))
