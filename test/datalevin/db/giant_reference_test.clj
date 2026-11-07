@@ -1,5 +1,6 @@
 (ns datalevin.db.giant-reference-test
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
+            [datalevin.bits :as b]
             [datalevin.constants :as c]
             [datalevin.core :as d]
             [datalevin.datom :as datom]
@@ -13,9 +14,11 @@
 
 (defrecord CountedPayload [text])
 (def ^:private decodes (atom 0))
+(def ^:private encodes (atom {}))
 
 (nippy/extend-freeze CountedPayload :datalevin.test/giant-reference
   [value ^DataOutput out]
+  (swap! encodes update (:text value) (fnil inc 0))
   (nippy/freeze-to-out! out (:text value)))
 
 (nippy/extend-thaw :datalevin.test/giant-reference
@@ -58,6 +61,26 @@
                 (is (= (if (= path :wide) 8 1) @decodes))
                 (is (every? #(nil? (meta %)) retractions))
                 (is (every? #(nil? (datom/storage-reference %)) retractions))
+                (is (= after (:payload0 (d/entity @conn 1))))))))))))
+
+(deftest replacements-serialize-only-the-new-payload
+  (doseq [wal? [false true] compressed? [false true] noindex? [false true]]
+    (binding [c/*giants-zstd-threshold* (if compressed? 0 Long/MAX_VALUE)]
+      (with-open [conn (d/create-conn nil
+                        (merge schema (zipmap attrs (repeat {:db/noindex noindex?})))
+                        (assoc options :wal? wal?))]
+        (doseq [path [:scalar :mixed :identity :general :wide]]
+          (testing (str [wal? compressed? noindex? path])
+            (let [before (->CountedPayload (str (.repeat "x" 65536) "before"))
+                  after (->CountedPayload (str (.repeat "x" 65536) "after"))
+                  n (if (= path :wide) 8 1)]
+              (d/transact! conn [(merge {:db/id 1 :key "one"}
+                                       (zipmap attrs (repeat before)))])
+              (reset! encodes {})
+              (let [report (d/transact! conn (request path after))]
+                (is (= 0 (get @encodes (:text before) 0)))
+                (is (= n (get @encodes (:text after) 0)))
+                (is (= n (count (remove datom/datom-added (:tx-data report)))))
                 (is (= after (:payload0 (d/entity @conn 1))))))))))))
 
 (deftest references-preserve-pending-visibility-and-rollback
@@ -152,3 +175,42 @@
           (d/transact! conn [[:db/add 1 :text before]])
           (is (= before (:text (d/entity @conn 1))))
           (is (= 1 (d/entries (d/datalog-kv conn) c/giants))))))))
+
+(deftest retained-avg-keys-own-their-bytes-and-check-the-attribute
+  (with-open [conn (d/create-conn nil schema (assoc options :wal? false))]
+    (let [value (text "before")]
+      (d/transact! conn [{:db/id 1 :text value} {:db/id 2 :number 42}])
+      (d/with-transaction [tx conn]
+        (let [store (:store @tx)
+              old (idx/preparation-first-v store 1 :text)
+              retract (idx/retraction 1 :text old 1)
+              aid (:db/aid (:text (i/schema store)))]
+          (is (nil? (idx/take-giant-key! (d/datalog-kv tx) retract (inc aid))))
+          (is (some? (datom/storage-reference retract)))
+          ;; Both reads reuse writer-owned buffers after the key was retained.
+          (is (= 42 (i/ea-first-v store 2 :number)))
+          (is (= value (i/ea-first-v store 1 :text)))
+          (let [key (idx/take-giant-key! (d/datalog-kv tx) retract aid)]
+            (is (bytes? key))
+            (is (nil? (datom/storage-reference retract)))
+            (is (i/in-list? (d/datalog-kv tx) c/eav 1 key :id :raw))
+            (is (= aid (b/avg->aid (java.nio.ByteBuffer/wrap key))))))
+        (d/abort-transact tx)))))
+
+(deftest same-plan-giants-take-precedence-over-retained-keys
+  (with-open [conn (d/create-conn nil schema (assoc options :wal? false))]
+    (let [before (->CountedPayload (text "before"))
+          after (->CountedPayload (text "after"))]
+      (d/transact! conn [{:db/id 1 :payload0 before}])
+      (d/with-transaction [tx conn]
+        (let [store (:store @tx)
+              old (idx/preparation-first-v store 1 :payload0)
+              first-retract (idx/retraction 1 :payload0 old 1)
+              second-retract (idx/retraction 1 :payload0 old 1)]
+          (i/load-datoms store [first-retract (datom/datom 1 :payload0 before)
+                                second-retract (datom/datom 1 :payload0 after)])
+          (is (= after (:payload0 (d/entity @tx 1))))
+          (is (= 1 (d/entries (d/datalog-kv tx) c/giants)))
+          (is (nil? (datom/storage-reference first-retract)))
+          (is (nil? (datom/storage-reference second-retract))))
+        (d/abort-transact tx)))))

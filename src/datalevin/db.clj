@@ -2823,6 +2823,45 @@
     (when (and eid (pos? (long eid)) (<= (long eid) (long (:max-eid db))))
       (long eid))))
 
+(defn- resolve-scalar-update-reference!
+  "Reuse an entity resolution within one read-only preparation request."
+  [db ^java.util.HashMap entities reference]
+  (or (.get entities reference)
+      (when-let [eid (scalar-update-entity-id db reference)]
+        (.put entities reference eid)
+        eid)))
+
+(defn- resolve-scalar-update-references
+  "Resolve distinct references in order, discarding results after this request."
+  [db references]
+  (let [entities (java.util.HashMap.)]
+    (when (reduce (fn [_ reference]
+                    (if (resolve-scalar-update-reference! db entities reference)
+                      true
+                      (reduced false)))
+                  true references)
+      entities)))
+
+(defn- resolve-scalar-update-candidates!
+  "Resolve eager candidates before correction, retaining the alias/E-A check."
+  [db ^FastList candidates]
+  (if (= 4 (.size candidates))
+    ;; Singleton requests already satisfy distinctness.
+    (when-let [eid (scalar-update-entity-id db (.get candidates 0))]
+      (.set candidates 0 eid)
+      true)
+    (when-let [entities (resolve-scalar-update-references
+                         db (map #(.get candidates %) (range 0 (.size candidates) 4)))]
+      (let [seen (java.util.HashSet.)]
+        (loop [i 0]
+          (if (< i (.size candidates))
+            (let [eid (get entities (.get candidates i))
+                  attr (.get candidates (inc i))]
+              (when (.add seen [eid attr])
+                (.set candidates i eid)
+                (recur (+ i 4))))
+            true))))))
+
 (defn- scalar-update-entity-reads
   [store-schema entries]
   (when (>= (count entries) scalar-entity-read-min-attrs)
@@ -2845,10 +2884,11 @@
       (let [^FastList candidates
             (FastList. (int (* 4 (if (instance? java.util.Collection initial-es)
                                   (.size ^java.util.Collection initial-es) 0))))]
-        ;; Retain resolved IDs and types, but do not coerce any values until
-        ;; every form is eligible and all entity/attribute pairs are distinct.
+        ;; Retain entity inputs and types. Resolve eager aliases before any
+        ;; correction, after proving eligibility and distinct E/A pairs.
         (loop [es      (seq initial-es)
-               seen    nil]
+               seen    nil
+               resolve-entities? false]
           (if es
             (let [entity (first es)]
               (if (and (sequential? entity)
@@ -2871,9 +2911,9 @@
                              (nil? (:db.attr/preds props))
                              (or (nil? vt) (contains? scalar-update-value-types vt))
                              (some? value))
-                    (let [eid (if (and defer-entity-resolution?
-                                       (or (keyword? e)
-                                           (and (sequential? e) (= 2 (count e)))))
+                    (let [reference? (or (keyword? e)
+                                         (and (sequential? e) (= 2 (count e))))
+                          eid (if reference?
                                 e
                                 (scalar-update-entity-id db e))]
                       (when (and eid (or (nil? seen) (.add ^java.util.HashSet seen [eid attr])))
@@ -2885,9 +2925,12 @@
                           (recur remaining
                                  (or seen
                                      (when remaining
-                                       (doto (java.util.HashSet.) (.add [eid attr]))))))))))
+                                       (doto (java.util.HashSet.) (.add [eid attr]))))
+                                 (or resolve-entities? reference?)))))))
                 nil))
-            (when-not (.isEmpty candidates)
+            (when (and (not (.isEmpty candidates))
+                       (or defer-entity-resolution? (not resolve-entities?)
+                           (resolve-scalar-update-candidates! db candidates)))
               (let [entries
                     (loop [i 0 entries (transient [])]
                       (if (< i (.size candidates))
@@ -2981,21 +3024,27 @@
   [db prepared]
   (if (:deferred-entity-resolution? prepared)
     (txcommon/with-lookup-ref-cache db
-      (let [seen (java.util.HashSet.)
-            entries
-            (reduce (fn [entries [e attr value]]
-                      (if-let [eid (scalar-update-entity-id db e)]
-                        ;; Distinct lookup references can alias the same entity.
-                        ;; Repeated updates to one attribute need general ordering.
-                        (if (.add seen [eid attr])
-                          (conj entries [eid attr value])
-                          (reduced nil))
-                        (reduced nil)))
-                    [] (:entries prepared))]
-        (when entries
-          (assoc prepared :entries entries
-                 :entity-reads (scalar-update-entity-reads
-                                 (:schema-epoch prepared) entries)))))
+      (let [entries (:entries prepared)]
+        (if (= 1 (count entries))
+          (let [[e attr value] (first entries)]
+            (when-let [eid (scalar-update-entity-id db e)]
+              (assoc prepared :entries [[eid attr value]] :entity-reads nil)))
+          (let [entities (java.util.HashMap.)
+                seen (java.util.HashSet.)
+                resolved
+                (reduce (fn [resolved [e attr value]]
+                          (if-let [eid (resolve-scalar-update-reference! db entities e)]
+                            ;; Distinct references can alias the same entity.
+                            ;; Repeated E/A updates need general ordering.
+                            (if (.add seen [eid attr])
+                              (conj resolved [eid attr value])
+                              (reduced nil))
+                            (reduced nil)))
+                        [] entries)]
+            (when resolved
+              (assoc prepared :entries resolved
+                     :entity-reads (scalar-update-entity-reads
+                                     (:schema-epoch prepared) resolved)))))))
     prepared))
 
 (def ^:dynamic *specialize-scalar-stamping?*

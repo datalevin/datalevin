@@ -91,7 +91,7 @@
    [datalevin.validate :as vld]
    [datalevin.vector :as v])
   (:import
-   [java.util List Collection HashMap HashSet IdentityHashMap UUID Objects]
+   [java.util List Collection HashMap LinkedHashMap HashSet IdentityHashMap UUID Objects]
    [datalevin.utl QueryKey QueryKey$KeyMap]
    [java.util.concurrent TimeUnit ScheduledExecutorService ConcurrentHashMap ScheduledFuture]
    [java.util.concurrent.locks ReentrantReadWriteLock]
@@ -2404,6 +2404,62 @@
               (.removeRange pending start (.size pending))
               nil)))))))
 
+(deftype ^:private StorageDatomKey [^Datom datom]
+  Object
+  (hashCode [_] (.hashCode datom))
+  (equals [_ other]
+    (and (instance? StorageDatomKey other)
+         (let [^Datom that (.-datom ^StorageDatomKey other)]
+           (and (== (.-e datom) (.-e that))
+                (= (.-a datom) (.-a that))
+                ;; Datom equality uses numeric equivalence. Storage must also
+                ;; distinguish signed zero and serialized numeric classes.
+                (Objects/equals (.-v datom) (.-v that)))))))
+
+(defn- ordered-scalar-storage-updates?
+  "Recognize one retract/add pair per increasing entity, with no canceling fact."
+  [^FastList datoms]
+  (let [n (.size datoms)]
+    (when (even? n)
+      (loop [i (int 0) previous-e (long -1)]
+        (if (< i n)
+          (let [^Datom before (.get datoms i)
+                ^Datom after (.get datoms (inc i))
+                e (.-e before)]
+            (when (and (> e previous-e) (== e (.-e after))
+                       (= (.-a before) (.-a after))
+                       (not (d/datom-added before)) (d/datom-added after)
+                       (not (Objects/equals (.-v before) (.-v after))))
+              (recur (+ i 2) e)))
+          true)))))
+
+(defn- compact-group-storage-datoms
+  "Compact resolved, unconditional transitions within one native-read segment."
+  [^FastList datoms]
+  (if (or (< (.size datoms) 2)
+          ;; Inserts and deletes alone cannot cancel. Keep their ordinary path
+          ;; free of per-fact keys and a compaction map.
+          (let [added? (d/datom-added (.get datoms 0))]
+            (reduce (fn [_ ^Datom datom]
+                      (if (= added? (d/datom-added datom))
+                        true
+                        (reduced false)))
+                    true datoms))
+          (ordered-scalar-storage-updates? datoms))
+    datoms
+    (let [changes (LinkedHashMap.)
+          compacted (FastList.)]
+      (doseq [^Datom datom datoms]
+        ;; LinkedHashMap retains the first key and the last value. Resolved
+        ;; changes establish the initial presence from their first operation.
+        (.put changes (StorageDatomKey. datom) datom))
+      (doseq [^java.util.Map$Entry entry (.entrySet changes)]
+        (let [^StorageDatomKey key (.getKey entry)
+              ^Datom last-datom (.getValue entry)]
+          (when (= (d/datom-added (.-datom key)) (d/datom-added last-datom))
+            (.add compacted last-datom))))
+      compacted)))
+
 (defn ^:no-doc ^:redef encode-group-storage-datoms
   "Encode ordinary frozen datoms using immutable schema metadata only.
    The caller has checked grouping eligibility; no native transaction is used."
@@ -2440,7 +2496,8 @@
          ^FastList datoms (or (aget context 1) (.-storage-datoms group))]
      (when-not (.isEmpty datoms)
        (let [store (group-storage-store context lmdb)
-             rows (encode-group-storage-datoms (schema store) datoms)]
+             rows (encode-group-storage-datoms
+                    (schema store) (compact-group-storage-datoms datoms))]
          (.clear datoms)
          (aset context 0 nil)
          rows)))))
@@ -2455,18 +2512,19 @@
      (when-not (.isEmpty datoms)
        (let [store (group-storage-store context lmdb)
              store-schema (schema store)
+             compacted (compact-group-storage-datoms datoms)
              ;; This is a scheduling bound, not a charge or serialized length.
              bytes (reduce (fn [total ^Datom datom]
                              (let [v (.-v datom)]
                                (+ (long total) 32
                                   (if (string? v) (* 4 (count v)) 0))))
-                           0 datoms)]
+                           0 compacted)]
          ;; The old region belongs exclusively to the frozen plan. Any later
          ;; staging gets a fresh region, including an unexpected read boundary.
          (aset context 1 (FastList. 0))
          (aset context 0 nil)
-         {:row-count (.size datoms) :native-tail-bytes bytes
-          :encode (fn [] (encode-group-storage-datoms store-schema datoms))})))))
+         {:row-count (.size ^FastList compacted) :native-tail-bytes bytes
+          :encode (fn [] (encode-group-storage-datoms store-schema compacted))})))))
 
 (defn load-datoms-with-plan!
   ([^Store store datoms]
@@ -2651,13 +2709,28 @@
         embedding? (and embedding-work? (aget ai 3))
         fulltext?  (and embedding-work? (aget ai 4))
         noindex?   (aget ai 5)
-        i          ^Indexable (b/indexable nil aid v vt c/g0)
-        giant?     (b/giant? i)
-        d-eav      (when giant? (giant-datom-key e attr v))
-        gt-cur     (when giant? (.get giants d-eav))
-        gt-read    (when giant? (idx/take-giant-reference! (.-lmdb store) d))
+        candidate-key (idx/take-giant-key! (.-lmdb store) d aid)
+        plan-key   (when (and candidate-key (not (.isEmpty giants)))
+                     (giant-datom-key e attr v))
+        plan-gt    (when plan-key (.get giants plan-key))
+        ;; A same-plan addition owns a newer ID even while the old row is
+        ;; still visible natively. Otherwise verify the retained physical row.
+        retained-key (when (and candidate-key (not plan-gt)
+                                (i/in-list? (.-lmdb store) c/eav e
+                                            candidate-key :id :raw))
+                       candidate-key)
+        i          ^Indexable (when-not retained-key (b/indexable nil aid v vt c/g0))
+        giant?     (or retained-key (b/giant? i))
+        d-eav      (or plan-key
+                       (when (and giant? (not (.isEmpty giants)))
+                         (giant-datom-key e attr v)))
+        gt-cur     (if plan-key plan-gt (when d-eav (.get giants d-eav)))
+        gt-read    (when (and giant? (not retained-key))
+                     (idx/take-giant-reference! (.-lmdb store) d))
         gt         (when giant?
                      (or gt-cur
+                         (when retained-key
+                           (b/avg->giant-id (ByteBuffer/wrap retained-key)))
                          (when (and gt-read
                                     (i/in-list?
                                       (.-lmdb store) c/eav e
@@ -2701,8 +2774,10 @@
       (let [domain (or (props :db/domain) (u/keyword->string attr))]
         (collect-idoc store work domain
                       (if gt [:r [e aid gt v]] [:d [e aid v]]))))
-    (let [ii (if gt (Indexable. nil aid v (.-f i) (.-b i) gt) i)]
-      (.add txs (lmdb/datom-kv-tx e (b/indexable-bytes ii avg-bf)
+    (let [avg (or retained-key
+                  (b/indexable-bytes
+                    (if gt (Indexable. nil aid v (.-f i) (.-b i) gt) i) avg-bf))]
+      (.add txs (lmdb/datom-kv-tx e avg
                                  false false noindex?))
       (when gt
         (when gt-cur (.remove giants d-eav))
