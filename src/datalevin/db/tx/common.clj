@@ -23,6 +23,16 @@
 
 (def ^:dynamic *batch-prepare* nil)
 
+(def ^:dynamic *resolver-index* nil)
+
+(defn resolver-index-active?
+  "Whether this DB's indexes describe the active resolver attempt. Committed
+   caches must not override native state when preparing a later request."
+  [db]
+  (or (boolean *batch-prepare*)
+      (and (some? *resolver-index*)
+           (identical? *resolver-index* (:eavt db)))))
+
 (defprotocol BatchPreparation
   (flush-preparation! [context])
   (restore-preparation! [context db]))
@@ -87,7 +97,8 @@
        (when-not (:db/noindex props)
          (.add avet datom))))))
 
-(defn- first-added-datom
+(defn first-added-datom
+  "Return the first live datom in a resolver range, skipping tombstones."
   [^SortedSet datoms]
   (let [iterator (.iterator datoms)]
     (loop []
@@ -98,7 +109,7 @@
 (defn visible-stored
   "Let the resolver overlay's latest datom replace an older native value."
   [db datoms]
-  (if *batch-prepare*
+  (if (resolver-index-active? db)
     (remove (fn [^Datom d]
               (not (.isEmpty (.subSet ^TreeSortedSet (:eavt db)
                                      (datom (.-e d) (.-a d) (.-v d) tx0)
@@ -110,14 +121,12 @@
   [db a v]
   (let [^SortedSet cached (.subSet ^TreeSortedSet (:avet db)
                                   (datom e0 a v tx0) (datom emax a v txmax))]
-    (if *batch-prepare*
-      (:e (first-added-datom cached))
-      (when-not (.isEmpty cached) (:e (.first cached))))))
+    (:e (first-added-datom cached))))
 
 (defn ea-first-datom
   "Resolve the first current entity/attribute datom during write preparation."
   [db e a]
-  (if *batch-prepare*
+  (if (resolver-index-active? db)
     (let [^SortedSet cached (.subSet ^TreeSortedSet (:eavt db)
                                     (datom e a nil tx0) (datom e a nil txmax))]
       (if (.isEmpty cached)
@@ -139,7 +148,7 @@
        (when (d/datom-added datom) (.-v datom))
        (if read-stored (read-stored e a)
            (idx/preparation-first-v (:store db) e a)))
-     (if *batch-prepare*
+     (if (resolver-index-active? db)
        (let [^SortedSet cached (.subSet ^TreeSortedSet (:eavt db)
                                        (datom e a nil tx0) (datom e a nil txmax))]
          (if (.isEmpty cached)
@@ -159,8 +168,16 @@
   [db e a]
   (idx/logical-value (preparation-first-v db e a)))
 
+(defn- visible-av-owner
+  [db a v stored-eid]
+  (when (and stored-eid
+             (.isEmpty (.subSet ^TreeSortedSet (:eavt db)
+                                (datom stored-eid a v tx0)
+                                (datom stored-eid a v txmax))))
+    stored-eid))
+
 (defn av-first-e
-  "Resolve the current owner of an indexed value during write preparation.
+  "Resolve the current owner of a unique indexed value during write preparation.
   The four-argument form carries a planned native result, including absence;
   the changing pending indexes still determine its current visibility."
   ([db a v]
@@ -169,9 +186,9 @@
      (if-let [^Datom datom (.get pending [a v])]
        (when (d/datom-added datom) (.-e datom))
        (i/av-first-e (:store db) a v))
-     (if *batch-prepare*
+     (if (resolver-index-active? db)
        (or (cached-av-first-e db a v)
-           (:e (first (visible-stored db (i/av-datoms (:store db) a v)))))
+           (visible-av-owner db a v (i/av-first-e (:store db) a v)))
        (i/av-first-e (:store db) a v))))
   ([db a v stored-eid]
    (if-let [^HashMap pending (when (scalar-pending-index)
@@ -179,19 +196,16 @@
      (if-let [^Datom datom (.get pending [a v])]
        (when (d/datom-added datom) (.-e datom))
        stored-eid)
-     (or (cached-av-first-e db a v)
-         (when (and stored-eid
-                    (or (nil? *batch-prepare*)
-                        (.isEmpty (.subSet ^TreeSortedSet (:eavt db)
-                                           (datom stored-eid a v tx0)
-                                           (datom stored-eid a v txmax)))))
-           stored-eid)))))
+     (if (resolver-index-active? db)
+       (or (cached-av-first-e db a v)
+           (visible-av-owner db a v stored-eid))
+       stored-eid))))
 
 (defn ea-datoms
   "Resolve current attribute datoms for CAS and retraction preparation."
   [db e a]
   (let [stored (i/slice (:store db) :eav (datom e a v0) (datom e a vmax))]
-    (if *batch-prepare*
+    (if (resolver-index-active? db)
       (vec (concat (filter d/datom-added
                            (.subSet ^TreeSortedSet (:eavt db)
                                     (datom e a nil tx0) (datom e a nil txmax)))
@@ -202,7 +216,7 @@
   "Resolve current entity datoms for retraction preparation."
   [db e]
   (let [stored (i/e-datoms (:store db) e)]
-    (if *batch-prepare*
+    (if (resolver-index-active? db)
       (vec (concat (filter d/datom-added
                            (.subSet ^TreeSortedSet (:eavt db)
                                     (datom e nil nil tx0) (datom e nil nil txmax)))
@@ -213,7 +227,7 @@
   "Resolve current incoming references for entity retraction preparation."
   [db e]
   (let [stored (i/v-datoms (:store db) e)]
-    (if *batch-prepare*
+    (if (resolver-index-active? db)
       (vec (concat (filter d/datom-added
                            ;; Reference attributes are always indexed. Seek each
                            ;; A/V range instead of scanning unrelated writes.
@@ -302,11 +316,14 @@
       (let [^HashMap entries (.-entries cache)
             key [attr value]
             cached (.getOrDefault entries key ::uncached)]
-        (if-not (identical? cached ::uncached)
-          cached
-          (let [eid (av-first-e db attr value)]
-            (.put entries key eid)
-            eid)))
+        ;; Cache only the native result. Pending additions and retractions may
+        ;; change ownership after any lookup within this attempt.
+        (av-first-e db attr value
+                    (if-not (identical? cached ::uncached)
+                      cached
+                      (let [eid (i/av-first-e store attr value)]
+                        (.put entries key eid)
+                        eid))))
       (av-first-e db attr value))))
 
 (defn entid

@@ -725,7 +725,7 @@
   *datalog-wal-durability-profile* :strict)
 
 (def ^{:dynamic true :no-doc true
-       :doc     "When true, use the prepare/apply transaction path"}
+       :doc     "Legacy compatibility binding; preparation uses one shared interpreter."}
   *use-prepare-path* false)
 
 (def ^{:dynamic true

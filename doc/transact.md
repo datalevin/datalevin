@@ -35,6 +35,26 @@ LMDB suggests that:
 > by newer write transactions, thus the database can grow quickly. Write
 > transactions prevent other write transactions, since writes are serialized.
 
+## Empty and unchanged Datalog transactions
+
+A successful Datalog transaction consumes a transaction ID even when its report
+contains no changed datoms. This includes `[]` and additions of values that are
+already present. The consumed ID survives close/reopen according to the store's
+configured durability policy, in both WAL and non-WAL mode. The next successful
+transaction does not reuse it.
+
+An empty report can skip datom and secondary-index planning, but a standalone
+transaction still commits the transaction-counter and last-modified metadata.
+Inside an explicit or collected transaction, logical requests can share one
+physical commit. Their final metadata is persisted with the enclosing commit;
+an abort does not persist the group's reserved IDs. WAL sequence numbers identify
+physical WAL records and need not correspond one-to-one with logical transaction
+IDs.
+
+Commit-time `:db/ensure` checks and saved client-operation responses still run
+for requests with no changed datoms. A replay of a saved client operation returns
+the original response without consuming another transaction ID.
+
 ## Acknowledgement without a transaction report
 
 Use `transact-ack!` when the caller only needs to know that a Datalog transaction

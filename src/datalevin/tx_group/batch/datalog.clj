@@ -13,14 +13,38 @@
             [datalevin.tx-group.batch :as batch]
             [datalevin.tx-group.batch.embedded :as embedded])
   (:import [datalevin.db DB TxReport]
+           [datalevin.datom Datom]
            [datalevin.storage Store WriteGroup]
            [datalevin.utl WriterContext]
-           [clojure.lang Var]
+           [clojure.lang IPersistentVector Var]
            [java.util HashMap IdentityHashMap Set]
            [org.eclipse.collections.impl.map.mutable.primitive LongObjectHashMap]
            [org.eclipse.collections.impl.list.mutable FastList]))
 
 (def ^:dynamic *explicit-body* nil)
+
+(defn- replay-pending!
+  ([group tx-db start] (replay-pending! group tx-db start nil))
+  ([^WriteGroup group tx-db start unique-attrs]
+   (let [^FastList batches (.-datom-batches group)
+         n (.size batches)]
+     (loop [idx (long start)]
+       (when (< idx n)
+         (let [^IPersistentVector datoms (.get batches (int idx))
+               m (.count datoms)]
+           (loop [j 0]
+             (when (< j m)
+               (let [^Datom datom (.nth datoms (int j))]
+                 (if unique-attrs
+                   ;; Scalar replay needs only uniqueness classification. Reuse
+                   ;; the existing staging entry point with its resolved props.
+                   (txcommon/stage-batch-datom!
+                     tx-db datom (when (contains? unique-attrs (.-a datom))
+                                   {:db/unique true}))
+                   (txcommon/stage-batch-datom! tx-db datom)))
+               (recur (unchecked-inc j)))))
+         (recur (unchecked-inc idx))))
+     n)))
 
 (deftype ^:private PreparationContext
   [flush! group ^:unsynchronized-mutable ^objects scalar-rows
@@ -38,23 +62,17 @@
     (when scalar-pending?
       ;; The native batch can admit more requests during execution. Populate
       ;; its hash view only when another simple request needs preceding writes.
-      (let [^FastList datoms (.-datoms ^WriteGroup @group)
-            n (.size datoms)]
-        (loop [idx pending-indexed]
-          (when (< idx n)
-            (txcommon/stage-batch-datom! tx-db (.get datoms (int idx)))
-            (recur (unchecked-inc idx))))
-        (set! pending-indexed (long n)))))
+      ;; Resolve the current schema once per replay, including after read or
+      ;; schema-change boundaries. Full metadata is still needed by sorted replay.
+      (let [unique-attrs (or (:db/unique (i/rschema (:store tx-db))) #{})]
+        (set! pending-indexed
+              (long (replay-pending! @group tx-db pending-indexed unique-attrs))))))
   (materialize-scalar-pending! [_ tx-db]
     (when scalar-pending?
       ;; General resolution needs E/A/V tombstones and sorted indexes. Replay
       ;; the group's existing ordered datoms only at that boundary.
       (set! scalar-pending? (boolean false))
-      (let [^FastList datoms (.-datoms ^WriteGroup @group)]
-        (loop [idx pending-start]
-          (when (< idx (.size datoms))
-            (txcommon/stage-batch-datom! tx-db (.get datoms (int idx)))
-            (recur (unchecked-inc idx)))))
+      (replay-pending! @group tx-db pending-start)
       (.clear scalar-pending)
       (.clear unique-pending)))
   (discard-scalar-pending! [_]
@@ -63,8 +81,13 @@
     ;; Every discard follows a native drain. The next segment can start with
     ;; the simple pending view even if its predecessor needed sorted indexes.
     (set! scalar-pending? (boolean true))
-    (set! pending-start (long (.size ^FastList (.-datoms ^WriteGroup @group))))
-    (set! pending-indexed pending-start))
+    (let [^WriteGroup writing @group
+          ^FastList batches (.-datom-batches writing)]
+      ;; A native drain makes this segment unnecessary for the resolver. Keep
+      ;; older requests only when commit still needs their cache dependencies.
+      (when-not (.-retain-cache-datoms? writing) (.clear batches))
+      (set! pending-start (long (.size batches)))
+      (set! pending-indexed pending-start)))
   txcommon/ScalarDatomBuffer
   (acquire-scalar-datom-buffer! [_ capacity]
     (when-not scalar-rows-in-use?
@@ -84,11 +107,7 @@
     (.clear scalar-pending)
     (.clear unique-pending)
     (db/-clear-tx-cache tx-db)
-    (let [^FastList datoms (.-datoms ^WriteGroup @group)]
-      (loop [idx pending-start]
-        (when (< idx (.size datoms))
-          (txcommon/stage-batch-datom! tx-db (.get datoms (int idx)))
-          (recur (unchecked-inc idx)))))))
+    (replay-pending! @group tx-db pending-start)))
 
 (defn control
   "Return the collector for a standalone local Datalog connection."
@@ -308,7 +327,7 @@
       (vreset! (:cache context) [store (db/cache-disabled? store)])
       (db/disable-cache store))
     (when-not @(:group context)
-      (vreset! (:group context) (s/write-group lmdb)))
+      (vreset! (:group context) (db/make-write-group tx-store)))
     tx-db))
 
 (defn- record-connection!
@@ -332,10 +351,10 @@
                                                (.-scalar-pending ^WriteGroup @(:group context))
                                                (HashMap.) true
                                                (long (.size ^FastList
-                                                            (.-datoms ^WriteGroup
+                                                            (.-datom-batches ^WriteGroup
                                                                       @(:group context))))
                                                (long (.size ^FastList
-                                                            (.-datoms ^WriteGroup
+                                                            (.-datom-batches ^WriteGroup
                                                                       @(:group context)))))}]
             (vreset! (:resolver-bindings context) bindings)
             bindings))

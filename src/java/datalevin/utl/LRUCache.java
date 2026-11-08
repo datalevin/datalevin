@@ -19,7 +19,6 @@ public class LRUCache {
     private final Map<Object, List<Object>> keyDependencies;
     private final Map<Object, Set<Object>> dependencyKeys;
     private final Map<Object, Map<Object, Integer>> dependencyGroups;
-    private boolean indexReady;
 
     public LRUCache(int capacity) {
         this(capacity, 0, null);
@@ -29,7 +28,8 @@ public class LRUCache {
         this(capacity, target, null);
     }
 
-    /** Optionally index immutable key dependencies for selective invalidation. */
+    /** Index immutable key dependencies as entries are inserted, so the first
+     * selective invalidation does not need to classify the retained cache. */
     public LRUCache(int capacity, long target,
                     Function<Object, ? extends Iterable<?>> dependencies) {
         this.capacity = capacity;
@@ -58,7 +58,7 @@ public class LRUCache {
     }
 
     private void removeDependencies(Object key) {
-        if (!indexReady) return;
+        if (dependencies == null) return;
         List<Object> tokens = keyDependencies.remove(key);
         if (tokens == null) return;
         for (Object token : tokens) {
@@ -112,7 +112,7 @@ public class LRUCache {
     }
 
     private void putEntry(Object key, Object value) {
-        if (indexReady && !map.containsKey(key)) {
+        if (dependencies != null && capacity > 0 && !map.containsKey(key)) {
             addDependencies(key);
         }
         map.put(key, value);
@@ -174,36 +174,22 @@ public class LRUCache {
         return map.remove(key);
     }
 
-    private void ensureDependencyIndex() {
-        if (dependencies == null || indexReady) return;
-        // Read-only caches need no dependency bookkeeping. Build once, when
-        // the first invalidation needs candidates, under the cache monitor.
-        keyDependencies.clear();
-        dependencyKeys.clear();
-        dependencyGroups.clear();
-        for (Object key : map.keySet()) addDependencies(key);
-        indexReady = true;
-    }
-
     /** Inspect a dependency bucket without copying keys or changing LRU order.
      * Unindexed caches conservatively depend on every token while nonempty. */
     public synchronized boolean hasDependency(Object token) {
         if (dependencies == null) return !map.isEmpty();
-        ensureDependencyIndex();
         return dependencyKeys.containsKey(token);
     }
 
     /** Inspect the populated three-part (or longer) dependency prefixes. */
     public synchronized boolean hasDependencyGroup(Object group) {
         if (dependencies == null) return !map.isEmpty();
-        ensureDependencyIndex();
         return dependencyGroups.containsKey(group);
     }
 
     /** Inspect one member of a three-part (or longer) dependency prefix. */
     public synchronized boolean hasDependencyGroup(Object group, Object member) {
         if (dependencies == null) return !map.isEmpty();
-        ensureDependencyIndex();
         Map<Object, Integer> members = dependencyGroups.get(group);
         return members != null && members.containsKey(member);
     }
@@ -211,7 +197,6 @@ public class LRUCache {
     /** Snapshot keys in the requested dependency buckets; does not affect LRU order. */
     public synchronized Set<Object> candidateKeys(Iterable<?> tokens) {
         if (dependencies == null) return keys();
-        ensureDependencyIndex();
         Set<Object> candidates = new HashSet<>();
         for (Object token : tokens) {
             Set<Object> keys = dependencyKeys.get(token);
@@ -238,7 +223,6 @@ public class LRUCache {
             keyDependencies.clear();
             dependencyKeys.clear();
             dependencyGroups.clear();
-            indexReady = false;
         }
     }
 }

@@ -1098,11 +1098,10 @@
       (notify-listeners! conn report)
       report)
     (if-let [control (datalog/control conn)]
-      (let [opts (l/read-env-opts (.-lmdb ^Store (:store @conn)))
-            ;; Type correction and read-layout construction do not depend on
-            ;; the eventual native snapshot. Keep that work on the caller;
-            ;; resolve lookup refs and read old values on the native owner.
-            prepared (db/prepare-scalar-update-tx
+      ;; Type correction and read-layout construction do not depend on
+      ;; the eventual native snapshot. Keep that work on the caller;
+      ;; resolve lookup refs and read old values on the native owner.
+      (let [prepared (db/prepare-scalar-update-tx
                        @conn tx-data {:defer-entity-resolution? true})
             report (if (and prepared (nil? (l/explicit-transaction-timeout)))
                      (datalog/run-scalar! control conn prepared tx-data tx-meta
@@ -1110,8 +1109,10 @@
                      (datalog/with-transaction!
                        control conn
                        (fn [tx]
-                         (observe-embedded-path! (:wal-durability-profile opts)
-                                                 (datalog/batched? control))
+                         (when *txlog-sync-path-observer*
+                           (let [opts (l/read-env-opts (.-lmdb ^Store (:store @tx)))]
+                             (observe-embedded-path! (:wal-durability-profile opts)
+                                                     (datalog/batched? control))))
                          (or (when prepared
                                (when-let [report (db/stamp-scalar-update-tx
                                                    @tx prepared tx-meta)]

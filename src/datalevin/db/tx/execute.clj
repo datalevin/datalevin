@@ -71,10 +71,10 @@
 
 (defn- cached-ea-first-datom
   [db ^long e a]
-  (if txcommon/*batch-prepare*
-    (first (filter datom-added
-                   (.subSet ^TreeSortedSet (:eavt db)
-                            (datom e a nil tx0) (datom e a nil txmax))))
+  (if (txcommon/resolver-index-active? db)
+    (txcommon/first-added-datom
+      (.subSet ^TreeSortedSet (:eavt db)
+               (datom e a nil tx0) (datom e a nil txmax)))
     (let [^SortedSet tail (.tailSet ^TreeSortedSet (:eavt db)
                                     (datom e a nil tx0))]
       (when-not (.isEmpty tail)
@@ -83,10 +83,10 @@
 
 (defn- cached-eav-first-datom
   [db ^long e a v]
-  (if txcommon/*batch-prepare*
-    (first (filter datom-added
-                   (.subSet ^TreeSortedSet (:eavt db)
-                            (datom e a v tx0) (datom e a v txmax))))
+  (if (txcommon/resolver-index-active? db)
+    (txcommon/first-added-datom
+      (.subSet ^TreeSortedSet (:eavt db)
+               (datom e a v tx0) (datom e a v txmax)))
     (let [^SortedSet tail (.tailSet ^TreeSortedSet (:eavt db)
                                     (datom e a v tx0))]
       (when-not (.isEmpty tail)
@@ -174,25 +174,10 @@
 (defn- with-datom
   [db ^Datom datom resolution props]
   (validate-datom db datom resolution props)
-  (if txcommon/*batch-prepare*
-    (do (txcommon/stage-batch-datom! db datom props)
-        (if (datom-added datom) (advance-max-eid db (.-e datom)) db))
-    (if (datom-added datom)
-      (do
-        (.add ^TreeSortedSet (:eavt db) datom)
-        (when-not (:db/noindex props)
-          (.add ^TreeSortedSet (:avet db) datom))
-        (advance-max-eid db (.-e datom)))
-      (if (.isEmpty
-            (.subSet ^TreeSortedSet (:eavt db)
-                     (d/datom (.-e datom) (.-a datom) (.-v datom) tx0)
-                     (d/datom (.-e datom) (.-a datom) (.-v datom) txmax)))
-        db
-        (do
-          (.remove ^TreeSortedSet (:eavt db) datom)
-          (when-not (:db/noindex props)
-            (.remove ^TreeSortedSet (:avet db) datom))
-          db)))))
+  ;; Retain tombstones on every interpreter path. Native uniqueness and lookup
+  ;; reads must see earlier retractions even before a writer has been opened.
+  (txcommon/stage-batch-datom! db datom props)
+  (if (datom-added datom) (advance-max-eid db (.-e datom)) db))
 
 (declare effective-attr-value effective-attr-preparation)
 
@@ -586,7 +571,7 @@
                         nv)
         _             (vld/validate-val nv entity)
         multival?     (txcommon/multival? db a)
-        datoms        (if txcommon/*batch-prepare*
+        datoms        (if (txcommon/resolver-index-active? db)
                         (txcommon/ea-datoms db e a)
                         (concatv
                           (.subSet ^TreeSortedSet (:eavt db)
@@ -756,7 +741,7 @@
     (if-some [e (txcommon/entid db e)]
       (let [_       (vld/validate-attr a entity)
             stored  (txcommon/ea-datoms db e a)
-            cached  (when-not txcommon/*batch-prepare*
+            cached  (when-not (txcommon/resolver-index-active? db)
                       (vec (.subSet ^TreeSortedSet (:eavt db)
                                     (datom e a nil tx0) (datom e a nil txmax))))
             report' (reduce #(transact-retract-datom %1 %2 context) report stored)
@@ -773,7 +758,7 @@
   (let [[_ e _ _] entity]
     (if-some [e (txcommon/entid db e)]
       (let [stored-e-datoms (vec (txcommon/e-datoms db e))
-            cached-e-datoms (when-not txcommon/*batch-prepare*
+            cached-e-datoms (when-not (txcommon/resolver-index-active? db)
                               (vec (.subSet ^TreeSortedSet (:eavt db)
                                             (datom e nil nil tx0) (datom e nil nil txmax))))
             v-datoms        (vec (txcommon/v-datoms db e))
@@ -1223,8 +1208,41 @@
                  (recur (next es) (and repeated? (= entity next-entity)))))
              (if (and repeated? (next entities)) [entity] entities))))))))
 
+(defn- plain-resolution-map?
+  [entity]
+  (let [t (class entity)]
+    (or (identical? t clojure.lang.PersistentArrayMap)
+        (identical? t clojure.lang.PersistentHashMap))))
+
+(defn- repeated-flat-upserts?
+  "Recognize value maps that precede a tempid's single identity definition.
+  Identity-first requests already resolve in one pass and need no new plan."
+  [entities identity?]
+  (let [find-identity (fn [found a _] (or found (when (identity? a) a)))
+        identity-map? #(and (plain-resolution-map? %)
+                            (reduce-kv find-identity nil %))]
+    ;; Reject the common identity-first/value-map sequence without grouping.
+    (when (some identity-map? (drop-while identity-map? entities))
+      ;; Tempid grouping uses the same numeric equality as the report's maps.
+      (loop [es (seq entities) identities #{} values #{} late? false]
+        (if-let [entity (first es)]
+          (when (plain-resolution-map? entity)
+            (let [tempid (:db/id entity)]
+              (if-let [a (reduce-kv find-identity nil entity)]
+                (when (and (not (contains? identities tempid))
+                           ;; Identity normalization cannot call user code before
+                           ;; earlier values execute. Payloads retain live lookup.
+                           (contains? resolution-value-classes (class (get entity a))))
+                  (recur (next es) (conj identities tempid) values
+                         (or late? (contains? values tempid))))
+                (recur (next es) identities
+                       (if (and (not late?) (not (contains? identities tempid)))
+                         (conj values tempid) values)
+                       late?))))
+          late?)))))
+
 (defn- plan-flat-upserts
-  "Resolve independent flat identity maps before allocating forward refs.
+  "Resolve flat identities before allocating forward refs or earlier value maps.
   Carry normalized identities and native owners only when the entire request
   excludes host callbacks. Ordered mutations, nested entities and predicates
   use ordinary resolution and retries."
@@ -1259,42 +1277,52 @@
                                                      (nil? (:db.attr/preds props))))))
                                         entity)))
                          entities)
-                 (some #(some identity? (keys %)) entities)
-                 (= (count entities) (count (set (map :db/id entities)))))
-        (let [safe? (every? (fn [entity]
-                              (and (#{clojure.lang.PersistentArrayMap
-                                      clojure.lang.PersistentHashMap} (class entity))
-                                   (every? (fn [[a v]]
-                                             (if (= :db/id a)
-                                               (or (txprep/auto-tempid? v)
-                                                   (contains? resolution-value-classes (class v)))
-                                               (and (or (contains? scalar-types
-                                                                   (:db/valueType (schema a)))
-                                                        (= :db.type/ref (:db/valueType (schema a))))
-                                                    (or (nil? v)
-                                                        (contains? resolution-value-classes (class v))))))
-                                           entity)))
-                            entities)]
-          (when (or safe? (next entities))
+                 (some #(some identity? (keys %)) entities))
+        (let [repeated? (not= (count entities) (count (set (map :db/id entities))))
+              eligible? (or (not repeated?) (repeated-flat-upserts? entities identity?))
+              safe? (when eligible?
+                      (every? (fn [entity]
+                                (and (plain-resolution-map? entity)
+                                     (every? (fn [[a v]]
+                                               (if (= :db/id a)
+                                                 (or (txprep/auto-tempid? v)
+                                                     (contains? resolution-value-classes (class v)))
+                                                 (and (or (contains? scalar-types
+                                                                     (:db/valueType (schema a)))
+                                                          (= :db.type/ref (:db/valueType (schema a))))
+                                                      (or (nil? v)
+                                                          (contains? resolution-value-classes (class v))))))
+                                             entity)))
+                              entities))]
+          (when (and eligible? (or safe? (next entities)))
             (loop [es (seq entities) tempids {} planned (transient [])]
               (if-let [entity (first es)]
                 (if-let [a (first (filter identity? (keys entity)))]
-                  (let [v (coreprep/correct-value-with-props
-                            (if safe? (:opts ctx) (opts store)) (schema a) a (get entity a))
-                        stored (when safe? (i/av-first-e store a v))
-                        resolution (when safe? (IdentityResolution. a v stored))
-                        eid (if resolution
-                              ;; Ordinary attempts clear these indexes on entry;
-                              ;; only an active batch owns a pending prefix.
-                              (if txcommon/*batch-prepare*
-                                (txprep/identity-owner db resolution) stored)
-                              (txcommon/av-first-e db a v))]
-                    (recur (next es) (cond-> tempids eid (assoc (:db/id entity) eid))
-                           (conj! planned (if resolution
-                                            (ResolvedIdentityMap. entity resolution)
-                                            entity))))
+                  (let [v (try
+                            (coreprep/correct-value-with-props
+                              (if safe? (:opts ctx) (opts store)) (schema a) a (get entity a))
+                            (catch RuntimeException error
+                              ;; A new repeated-tempid plan must not move an
+                              ;; invalid identity ahead of earlier value errors.
+                              (if repeated? (reduced nil) (throw error))))]
+                    (when-not (and repeated? (reduced? v))
+                      (let [stored (when safe? (i/av-first-e store a v))
+                            resolution (when safe? (IdentityResolution. a v stored))
+                            eid (if resolution
+                                  ;; Ordinary attempts clear these indexes on entry;
+                                  ;; only an active batch owns a pending prefix.
+                                  (if txcommon/*batch-prepare*
+                                    (txprep/identity-owner db resolution) stored)
+                                  (txcommon/av-first-e db a v))]
+                        (recur (next es) (cond-> tempids eid (assoc (:db/id entity) eid))
+                               (conj! planned (if resolution
+                                                (ResolvedIdentityMap. entity resolution)
+                                                entity))))))
                   (recur (next es) tempids (conj! planned entity)))
-                {:tempids tempids :entities (persistent! planned) :stable-schema? safe?}))))))))
+                (cond-> {:tempids tempids :entities (persistent! planned) :stable-schema? safe?}
+                  ;; Host value conversions can change ownership before the
+                  ;; identity map executes. Its live lookup may rebind once.
+                  (and repeated? (not safe?)) (assoc :provisional-tempids? true))))))))))
 
 (defn execute-tx-loop
   ([initial-report initial-es tx-time]
@@ -1311,16 +1339,17 @@
          initial-es (or ordinary (:entities plan) initial-es)
          upserts (:tempids plan)
          initial-report (if (seq upserts)
-                          (-> initial-report
-                              (update :tempids merge upserts)
-                              (update ::upserted-tempids merge upserts))
+                          (cond-> (update initial-report :tempids merge upserts)
+                            (not (:provisional-tempids? plan))
+                            (update ::upserted-tempids merge upserts))
                           initial-report)]
      ;; All operations share one attempt-local holder. Only user callbacks can
      ;; replace its schema snapshot; it never becomes part of the report.
      (loop [initial-report initial-report ctx ctx]
-       (let [result (txcommon/with-lookup-ref-cache (:db-before initial-report)
-                      (execute-tx-loop* initial-report initial-es tx-time
-                                        (boolean ordinary) (volatile! ctx)))]
+       (let [result (binding [txcommon/*resolver-index* (:eavt (:db-after initial-report))]
+                      (txcommon/with-lookup-ref-cache (:db-before initial-report)
+                        (execute-tx-loop* initial-report initial-es tx-time
+                                          (boolean ordinary) (volatile! ctx))))]
          (if (instance? TxRetry result)
            (recur (.-report ^TxRetry result)
                   (coreprep/make-prepare-ctx (:db-before initial-report)))
@@ -1331,17 +1360,4 @@
    (local-transact-tx-data initial-report initial-es tx-time
                            (coreprep/make-prepare-ctx (:db-before initial-report))))
   ([initial-report initial-es tx-time ctx]
-   (if c/*use-prepare-path*
-     (let [ptx (coreprep/prepare-tx
-                 ctx initial-es tx-time
-                 (fn [ctx es t] (execute-tx-loop initial-report es t ctx)))]
-       (cond-> (assoc (dissoc-present initial-report ::max-eid-before)
-                      :db-after (:db-after ptx)
-                      :tx-data (:tx-data ptx)
-                      :tempids (:tempids ptx))
-         (seq (:new-attributes ptx))
-         (assoc :new-attributes (:new-attributes ptx))
-
-         (seq (:ensures ptx))
-         (assoc ::ensures (:ensures ptx))))
-     (execute-tx-loop initial-report initial-es tx-time ctx))))
+   (execute-tx-loop initial-report initial-es tx-time ctx)))

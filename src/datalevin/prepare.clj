@@ -21,75 +21,15 @@
    [datalevin.datom Datom]
    [java.util Date]))
 
-;; ---- Records ----
+;; ---- Interpreter schema snapshot ----
 
-(defrecord PrepareCtx
-  [schema        ; map: attr keyword -> props map
-   rschema       ; reverse schema (property -> attrs)
-   opts          ; store options map (:closed-schema?, :auto-entity-time?, etc.)
-   store         ; the Store (for point lookups during resolve phase)
-   db            ; DB snapshot (db-before, for index lookups)
-   lmdb          ; the LMDB instance (for index lookups)
-   attrs         ; aid -> attr mapping
-   attr-cache])  ; precomputed per-attr flags cache (ref?, multival?, tuple?, etc.)
-
-(defrecord PreparedTx
-    [tx-data        ; vector of resolved Datom objects (canonical order)
-     db-after       ; DB snapshot after applying all datoms (with updated indexes)
-     tempids        ; map: tempid -> resolved eid
-     new-attributes ; vector of attrs added in this tx
-     ensures        ; vector of :db/ensure forms collected during tx processing
-     tx-redundant   ; vector of redundant (no-op) datoms
-     side-index-ops ; map: {:ft [...] :vec [...] :idoc [...] :gt [...]}
-     touch-summary  ; set of touched attr keywords (for cache invalidation)
-     stats])        ; optional: per-stage timing/counters map
-
-(def ^:private ->PreparedTx* ->PreparedTx)
-
-#_{:clj-kondo/ignore [:redefined-var]}
-(defn ->PreparedTx
-  "Positional constructor for PreparedTx.
-
-  Accepts the current 9-field shape and the previous 8-field shape, where
-  stats was absent."
-  ([tx-data db-after tempids new-attributes ensures tx-redundant side-index-ops
-    touch-summary]
-   (->PreparedTx* tx-data db-after tempids new-attributes ensures tx-redundant
-                  side-index-ops touch-summary nil))
-  ([tx-data db-after tempids new-attributes ensures tx-redundant side-index-ops
-    touch-summary stats]
-   (->PreparedTx* tx-data db-after tempids new-attributes ensures tx-redundant
-                  side-index-ops touch-summary stats)))
-
-;; ---- Constructor ----
+(defrecord PrepareCtx [schema rschema opts])
 
 (defn make-prepare-ctx
-  "Build a PrepareCtx from a DB snapshot. The interpreter needs only schema
-  and options; the two-argument form also supplies native storage metadata."
-  ([db]
-   (let [store (:store db)]
-     (->PrepareCtx (schema store) (i/rschema store) (opts store)
-                   store db nil nil nil)))
-  ([db lmdb]
-   (assoc (make-prepare-ctx db) :lmdb lmdb :attrs (i/attrs (:store db)))))
-
-;; ---- Top-level entry point ----
-
-(defn prepare-tx
-  "Execute the transaction loop and wrap its report in a PreparedTx.
-   execute-fn: (fn [ctx entities tx-time] -> report) runs the transaction loop."
-  [ctx entities tx-time execute-fn]
-  (let [report (execute-fn ctx entities tx-time)]
-    (->PreparedTx
-      (:tx-data report)
-      (:db-after report)
-      (:tempids report)
-      (:new-attributes report)
-      (:datalevin.db.tx.execute/ensures report)
-      nil   ; tx-redundant not needed externally
-      nil   ; side-index-ops (future)
-      nil   ; touch-summary (future)
-      nil)))
+  "Capture the schema and options shared by one interpreter attempt."
+  [db]
+  (let [store (:store db)]
+    (->PrepareCtx (schema store) (i/rschema store) (opts store))))
 
 ;; ---- Type coercion and value correction ----
 
@@ -116,12 +56,12 @@
   "Coerce a value to the appropriate type based on value type."
   [vt v]
   (case vt
-    :db.type/string              (str v)
+    :db.type/string              (if (string? v) v (str v))
     :db.type/bigint              (biginteger v)
     :db.type/bigdec              (bigdec v)
-    (:db.type/long :db.type/ref) (long v)
-    :db.type/float               (float v)
-    :db.type/double              (double v)
+    (:db.type/long :db.type/ref) (if (instance? Long v) v (long v))
+    :db.type/float               (if (instance? Float v) v (float v))
+    :db.type/double              (if (instance? Double v) v (double v))
     (:db.type/bytes :bytes)      (if (bytes? v) v (byte-array v))
     (:db.type/keyword :keyword)  (keyword v)
     (:db.type/symbol :symbol)    (symbol v)
@@ -130,6 +70,22 @@
     (:db.type/uuid :uuid)        (coerce-uuid v)
     :db.type/tuple               (vec v)
     v))
+
+(defn- valid-prepared-value?
+  "Check canonical scalar classes directly; other values retain full validation."
+  [v vt]
+  (case vt
+    :db.type/string (string? v)
+    (:db.type/long :db.type/ref)
+    (or (instance? Long v) (b/valid-data? v vt))
+    ;; These classes also contain NaN and infinities, which validation rejects.
+    :db.type/float (if (instance? Float v)
+                     (Float/isFinite (float v))
+                     (b/valid-data? v vt))
+    :db.type/double (if (instance? Double v)
+                      (Double/isFinite (double v))
+                      (b/valid-data? v vt))
+    (b/valid-data? v vt)))
 
 (defn correct-datom*
   "Reconstruct datom with corrected value."
@@ -164,7 +120,7 @@
       (do
         (or (not (store-opts :validate-data?))
             (cd/custom-type? vt)
-            (b/valid-data? v vt)
+            (valid-prepared-value? v vt)
             (raise "Invalid data, expecting" vt " got " v {:input v}))
         (type-coercion vt v)))))
 
@@ -175,7 +131,7 @@
   [validate? vt v]
   (let [vt (or vt :data)]
     (or (not validate?)
-        (b/valid-data? v vt)
+        (valid-prepared-value? v vt)
         (raise "Invalid data, expecting" vt " got " v {:input v}))
     (type-coercion vt v)))
 

@@ -51,6 +51,10 @@
 (deftype ^:private MixedAttrInfo
   [props ^boolean ordinary? ^boolean insert? ^boolean update? tuples ^boolean typed?])
 
+(def ^:private unique-attr-marker
+  ;; Attribute keys are keywords. Reserve a distinct key for this plan's flag.
+  (Object.))
+
 (defn- attr-info
   "Classify an attribute once per preparation call. Value correction and
   reference resolution still depend on each entity's values and tempids."
@@ -78,6 +82,7 @@
                                  (nil? (:db/unique props))
                                  (not (:db/tupleAttrs props)) (not source-tuples)))
                    source-tuples (some? (:db/valueType props)))]
+        (when (:db/unique props) (.put infos unique-attr-marker true))
         (.put infos a info)
         info)))
 
@@ -264,19 +269,20 @@
   "Validate unique additions before preparing any old-value reads. Neither
   request duplicates nor native/pending owners can enter the mixed report."
   [db ^ArrayList additions ^HashMap infos]
-  (loop [index 0 seen nil]
-    (if (< index (.size additions))
-      (let [^Datom addition (.get additions index)
-            a (.-a addition)
-            ^MixedAttrInfo info (.get infos a)]
-        (if (:db/unique (.-props info))
-          (let [v (.-v addition)
-                ^HashSet seen (or seen (HashSet.))]
-            (when (and (.add seen [a v])
-                       (nil? (common/av-first-e db a v)))
+  (or (not (.containsKey infos unique-attr-marker))
+      (loop [index 0 seen nil]
+        (if (< index (.size additions))
+          (let [^Datom addition (.get additions index)
+                a (.-a addition)
+                ^MixedAttrInfo info (.get infos a)]
+            (if (:db/unique (.-props info))
+              (let [v (.-v addition)
+                    ^HashSet seen (or seen (HashSet.))]
+                (when (and (.add seen [a v])
+                           (nil? (common/av-first-e db a v)))
+                  (recur (unchecked-inc index) seen)))
               (recur (unchecked-inc index) seen)))
-          (recur (unchecked-inc index) seen)))
-      true)))
+          true))))
 
 (defn prepare-mixed-report
   "Prepare mixed existing-entity updates and new maps on the owned writer.

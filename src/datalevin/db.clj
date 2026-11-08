@@ -58,9 +58,9 @@
    [datalevin.datom Datom]
    [datalevin.interface IRemoteDB IRemotePrepared IStore]
    [datalevin.storage Store WriteGroup]
-   [datalevin.utl LRUCache QueryKey]
+   [datalevin.utl LRUCache QueryKey QueryKey$KeySet]
    [java.nio ByteBuffer]
-   [java.util Arrays Comparator Date]
+   [java.util Arrays Collection Comparator Date]
    [clojure.lang LazilyPersistentVector MapEntry]
    [java.util.concurrent ConcurrentHashMap]
    [java.util.concurrent.atomic AtomicBoolean]
@@ -914,25 +914,30 @@
   ([store tx-data target]
    (invalidate-cache store tx-data target nil))
   ([store tx-data target remote-max-tx]
+   (invalidate-cache store tx-data target remote-max-tx nil))
+  ([store tx-data target remote-max-tx datom-count]
    (if-some [^LRUCache cache (.get ^ConcurrentHashMap caches (dir store))]
      (do
        (if (remote-store? store)
-         ;; A remote report describes only this transaction, not intervening
-         ;; commits from other clients. Before adopting its revision, discard
-         ;; every retained result, even for empty or idempotent transactions.
-         ;; Advance the generation too so older in-flight reads cannot publish.
+         ;; Reports omit other clients' commits and in-flight remote reads.
          (locking cache
            (.beginInvalidation cache (long (or target 0)))
            (.clear cache))
-         (if (seq tx-data)
+         (if (if (some? datom-count) (pos? (long datom-count)) (seq tx-data))
            (locking cache
-             ;; Keep demand inspection and candidate removal in one generation:
-             ;; a newly published value-constrained key must not be overlooked.
              (.beginInvalidation cache (long (or target 0)))
-             ;; Empty caches still advance their generation without summaries.
              (when-not (.isEmpty cache)
-               (let [touches (tx-touch-summary tx-data cache)]
-                 (remove-affected-cache-entries! store cache touches tx-data))))
+               ;; Bound invalidation work for bulk writes. Counted requests and
+               ;; grouped metadata decide this without scanning their datoms.
+               (let [limit (max 4096 (* 8 (long (.capacity cache))))
+                     n (or datom-count
+                           (when (instance? Collection tx-data)
+                             (.size ^Collection tx-data))
+                           (bounded-count limit tx-data))]
+                 (if (or (nil? tx-data) (>= (long n) limit))
+                   (.clear cache)
+                   (let [touches (tx-touch-summary tx-data cache)]
+                     (remove-affected-cache-entries! store cache touches tx-data))))))
            (.setTarget cache (long (or target 0)))))
        (mark-remote-cache-max-tx! store remote-max-tx))
      (refresh-cache store target remote-max-tx))))
@@ -949,28 +954,39 @@
         (.clear cache)))
     (.remove ^ConcurrentHashMap remote-cache-check-ms cache-dir)))
 
+(defn ^:no-doc make-write-group
+  "Create a group after disabling its read cache. Empty disabled caches cannot
+  admit entries, so only pending resolver work needs request datom vectors."
+  [^Store store]
+  (let [^LRUCache cache (.get ^ConcurrentHashMap caches (dir store))
+        retain? (if cache
+                  (locking cache
+                    (not (and (.isDisabled cache) (.isEmpty cache))))
+                  true)]
+    (s/write-group (.-lmdb store) retain?)))
+
 (defn ^:no-doc invalidate-write-group!
   "Invalidate committed Datalog writes using their consolidated metadata."
   [store ^WriteGroup group]
   (let [^longs metadata (.-metadata group)]
     (when-not (neg? (aget metadata 0))
-      (invalidate-cache store (.-datoms group) (aget metadata 1)))))
+      (invalidate-cache store
+                        (when (.-retain-cache-datoms? group)
+                          (eduction cat (.-datom-batches group)))
+                        (aget metadata 1) nil (aget metadata 2)))))
 
 (defn ^:no-doc execute-write-group
   "Execute logical writes on a private writing connection with caching disabled.
   Flush final metadata and invalidate combined dependencies before native commit."
   [conn execute]
   (let [^Store store (:store @conn)
-        ^WriteGroup group (s/write-group (.-lmdb store))]
-    (assert (cache-disabled? store))
+        _ (assert (cache-disabled? store))
+        ^WriteGroup group (make-write-group store)]
     (binding [s/*write-group* group]
-      (let [result (execute conn)
-            ^FastList datoms (.-datoms group)
-            ^longs metadata (.-metadata group)]
+      (let [result (execute conn)]
         (s/flush-write-group! group)
-        (when-not (neg? (aget metadata 0))
-          (invalidate-cache (:store @conn) datoms (aget metadata 1)))
-        {:result result :changed? (not (.isEmpty datoms))}))))
+        (invalidate-write-group! (:store @conn) group)
+        {:result result :changed? (pos? (aget ^longs (.-metadata group) 2))}))))
 
 (defn- tx-cache-empty?
   [db]
@@ -2153,9 +2169,14 @@
              db)))
        (if (instance? Store store)
          (let [tx-meta (:tx-meta report)
-               staged-ms (when (and txcommon/*batch-prepare* (not ensures)
-                                    (not (:client-op/id tx-meta)))
-                           (s/stage-group-datoms! store tx-data independent?))
+               staged-ms (if (and (empty? tx-data) (not ensures)
+                                  (not (:client-op/id tx-meta)))
+                           ;; Empty reports have no secondary-index work. Keep
+                           ;; durable ID consumption, deferring grouped metadata.
+                           (s/commit-empty-tx! store)
+                           (when (and txcommon/*batch-prepare* (not ensures)
+                                      (not (:client-op/id tx-meta)))
+                             (s/stage-group-datoms! store tx-data independent?)))
                modified-ms
                (long
                  (or staged-ms
@@ -2193,7 +2214,15 @@
            (s/mark-state-current! ^Store store modified-ms)
            (if-let [^WriteGroup group
                     (s/current-write-group (.-lmdb ^Store store))]
-             (doseq [datom tx-data] (.add ^FastList (.-datoms group) datom))
+             (let [n (count tx-data)]
+               (when (pos? n)
+                 (let [^longs metadata (.-metadata group)]
+                   (aset metadata 2 (+ (aget metadata 2) (long n))))
+                 (when (or (.-retain-cache-datoms? group) txcommon/*batch-prepare*)
+                   ;; Reports own persistent vectors. Snapshot external mutable
+                   ;; collections before retaining their pending history.
+                   (.add ^FastList (.-datom-batches group)
+                         (if (vector? tx-data) tx-data (vec tx-data))))))
              (invalidate-cache store tx-data modified-ms))
            db)
          (do
@@ -2311,7 +2340,8 @@
                     (prepare/correct-value-with-props
                       store-opts props attr value))
           unique? (some? (:db/unique props))
-          inline? (blind-unique-inline-value? (aget info 3) value')
+          inline? (or (not unique?)
+                      (blind-unique-inline-value? (aget info 3) value'))
           av       (when unique?
                      ;; Compact deferred pairs; vectors hash faster in eager checks.
                      (if seen-avs [attr value'] (MapEntry/create attr value')))]
@@ -2377,7 +2407,9 @@
         ;; implicit mapping in the report. Retain explicit tempids so repeated
         ;; user IDs still fall back to the resolver and merge correctly.
         entity-id old-eid]
-    (when (or (nil? old-eid) (tempid? old-eid))
+    (when (if (nil? old-eid)
+            (not (contains? entity :db/id))
+            (tempid? old-eid))
       (let [^FastList attrs (FastList. (int (* 2 (count entity))))
             supported?
             (reduce-kv
@@ -2396,7 +2428,13 @@
                           supported-values?
                           (if (blind-write-multiple-values?
                                 many? unique-identity-attrs raw-value)
-                            (let [seen-values (java.util.HashSet.)
+                            (let [vt (aget info 4)
+                                  ^java.util.Set seen-values
+                                  (if (or (nil? vt) (map? vt)
+                                          (identical? vt :data)
+                                          (identical? vt :db.type/bytes))
+                                    (QueryKey$KeySet.)
+                                    (java.util.HashSet.))
                                   values (seq raw-value)]
                               (when values (vreset! has-many? true))
                               (loop [values values]
@@ -2411,7 +2449,8 @@
                                       (if (:db/unique props)
                                         false
                                         (do
-                                          ;; Keep the first normalized occurrence.
+                                          ;; Compare bytes by content and keep
+                                          ;; the first normalized occurrence.
                                           ;; Unique AV collection remains untouched.
                                           (.remove attrs (int (dec (.size attrs))))
                                           (.remove attrs (int (dec (.size attrs))))
@@ -2526,12 +2565,15 @@
   ([^DB db initial-es allow-small-unique?]
    (prepare-blind-local-tx db initial-es allow-small-unique? true))
   ([^DB db initial-es allow-small-unique? check-unique-avs?]
-   ;; Reject mixed requests and explicit IDs before allocating preparation
+   ;; Reject mixed requests and ineligible IDs before allocating preparation
    ;; state or correcting values that the general or mixed preparer repeats.
+   ;; Only an absent :db/id is implicit; an explicit nil needs general validation.
    (when (reduce (fn [_ entity]
                    (if (and (map? entity)
                             (let [e (:db/id entity)]
-                              (or (nil? e) (tempid? e))))
+                              (if (nil? e)
+                                (not (contains? entity :db/id))
+                                (tempid? e))))
                      true
                      (reduced false)))
                  true initial-es)
@@ -3151,7 +3193,7 @@
   [initial-es]
   (reduce
     (fn [_ entity]
-      (if (or (and (sequential? entity) (= 4 (count entity))
+      (if (or (and (sequential? entity) (nil? (meta entity)) (= 4 (count entity))
                    (identical? :db/add (nth entity 0)))
               (and (map? entity) (nil? (meta entity)) (> (count entity) 1)
                    (let [e (:db/id entity)] (and (integer? e) (pos? e)))))

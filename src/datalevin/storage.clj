@@ -294,8 +294,9 @@
     this))
 
 (deftype ^:no-doc WriteGroup
-  [lmdb owner ^longs metadata ^FastList datoms ^objects attr-cache
-   ^FastList storage-datoms ^objects storage-context ^LongObjectHashMap scalar-pending])
+  [lmdb owner ^longs metadata ^FastList datom-batches ^objects attr-cache
+   ^FastList storage-datoms ^objects storage-context ^LongObjectHashMap scalar-pending
+   ^boolean retain-cache-datoms?])
 
 (def ^:dynamic *write-group* nil)
 
@@ -314,12 +315,15 @@
       group)))
 
 (defn ^:no-doc write-group
-  "Create bookkeeping scoped to one native writing transaction."
-  [lmdb]
-  {:pre [(lmdb/writing? lmdb)]}
-  (WriteGroup. lmdb (Thread/currentThread) (long-array [-1 0]) (FastList.)
-               ;; Store, detached region, independence proof, operation kinds.
-               (object-array 2) (FastList.) (object-array 4) (LongObjectHashMap. 8)))
+  "Create bookkeeping scoped to one native writing transaction. Retain immutable
+  request vectors for pending resolution and, when needed, cache invalidation."
+  ([lmdb] (write-group lmdb true))
+  ([lmdb retain-cache-datoms?]
+   {:pre [(lmdb/writing? lmdb)]}
+   (WriteGroup. lmdb (Thread/currentThread) (long-array [-1 0 0]) (FastList.)
+                ;; Store, detached region, independence proof, operation kinds.
+                (object-array 2) (FastList.) (object-array 4) (LongObjectHashMap. 8)
+                (boolean retain-cache-datoms?))))
 
 (defn ^:no-doc write-group-metadata
   "Return the final metadata pair for a native writing group."
@@ -2213,52 +2217,84 @@
     (enqueue-secondary-index-work! store))
   store)
 
+(defn- first-embedding-addition!
+  ^Datom [embedding-attrs ^java.util.Iterator datoms]
+  (loop []
+    (when (.hasNext datoms)
+      (let [^Datom datom (.next datoms)]
+        (if (and (d/datom-added datom)
+                 (string? (.-v datom))
+                 (contains? embedding-attrs (.-a datom)))
+          datom
+          (recur))))))
+
+(defn- collect-embedding-candidate
+  ^objects [state ^Datom datom added?]
+  (let [attr (.-a datom)
+        value (.-v datom)
+        ^objects state (or state (object-array [(FastList.) nil nil]))
+        ^FastList additions (aget state 0)
+        ^HashMap pending (aget state 1)]
+    (if added?
+      (do
+        (.add additions datom)
+        (when pending
+          (let [key [(.-e datom) attr value]]
+            (.put pending key (cons datom (.get pending key))))))
+      ;; Most commits have no retractions after an addition.
+      ;; Build cancellation state only at that first boundary.
+      (let [key [(.-e datom) attr value]
+            ^HashMap pending
+            (or pending
+                (let [pending (HashMap.)]
+                  (doseq [^Datom addition additions]
+                    (let [key [(.-e addition) (.-a addition) (.-v addition)]]
+                      (.put pending key
+                            (cons addition (.get pending key)))))
+                  (aset state 1 pending)
+                  pending))]
+        (when-let [cancelled (.remove pending key)]
+          (let [^IdentityHashMap skipped
+                (or (aget state 2)
+                    (let [skipped (IdentityHashMap.)]
+                      (aset state 2 skipped)
+                      skipped))]
+            (doseq [addition cancelled] (.put skipped addition true))
+            (.put skipped datom true)))))
+    state))
+
+(defn- embedding-candidate-state
+  ^objects [embedding-attrs state ^Datom datom]
+  (let [added? (d/datom-added datom)]
+    (if (or state added?)
+      (let [attr (.-a datom)
+            value (.-v datom)]
+        (if (and (string? value) (contains? embedding-attrs attr))
+          (collect-embedding-candidate state datom added?)
+          state))
+      state)))
+
 (defn- embedding-candidates
   "Find text additions and cancellations within one storage commit segment."
   [^Store store datoms]
   (when-let [embedding-attrs (when (seq (.-embedding-indices store))
                               (:db/embedding (rschema store)))]
     (let [state
-          (reduce
-            (fn [state ^Datom datom]
-              (let [added? (d/datom-added datom)]
-                (if (or state added?)
-                  (let [attr (.-a datom)
-                        value (.-v datom)]
-                    (if (and (string? value) (contains? embedding-attrs attr))
-                      (let [^objects state (or state (object-array [(FastList.) nil nil]))
-                            ^FastList additions (aget state 0)
-                            ^HashMap pending (aget state 1)]
-                        (if added?
-                          (do
-                            (.add additions datom)
-                            (when pending
-                              (let [key [(.-e datom) attr value]]
-                                (.put pending key (cons datom (.get pending key))))))
-                          ;; Most commits have no retractions after an addition.
-                          ;; Build cancellation state only at that first boundary.
-                          (let [key [(.-e datom) attr value]
-                                ^HashMap pending
-                                (or pending
-                                    (let [pending (HashMap.)]
-                                      (doseq [^Datom addition additions]
-                                        (let [key [(.-e addition) (.-a addition) (.-v addition)]]
-                                          (.put pending key
-                                                (cons addition (.get pending key)))))
-                                      (aset state 1 pending)
-                                      pending))]
-                            (when-let [cancelled (.remove pending key)]
-                              (let [^IdentityHashMap skipped
-                                    (or (aget state 2)
-                                        (let [skipped (IdentityHashMap.)]
-                                          (aset state 2 skipped)
-                                          skipped))]
-                                (doseq [addition cancelled] (.put skipped addition true))
-                                (.put skipped datom true)))))
-                        state)
-                      state))
-                  state)))
-            nil datoms)]
+          (if (instance? java.util.Collection datoms)
+            (when-not (.isEmpty ^java.util.Collection datoms)
+              (let [^java.util.Iterator rows (.iterator ^java.util.Collection datoms)]
+                ;; Guard and collection share the cursor: a late first addition
+                ;; must not cause a second traversal of the retraction prefix.
+                (when-let [first-added (first-embedding-addition! embedding-attrs rows)]
+                  (loop [state (collect-embedding-candidate nil first-added true)]
+                    (if (.hasNext rows)
+                      (recur (embedding-candidate-state embedding-attrs state (.next rows)))
+                      state)))))
+            ;; Streaming inputs retain their reduction protocol. An empty
+            ;; state gives the same addition guard in that single traversal.
+            (reduce (fn [state datom]
+                      (embedding-candidate-state embedding-attrs state datom))
+                    nil datoms))]
       (when state
         (let [^objects state state
               ^IdentityHashMap skipped (aget state 2)
@@ -2589,6 +2625,23 @@
          (aset context 3 nil)
          {:row-count (.size ^FastList compacted) :native-tail-bytes bytes
           :encode (fn [] (encode-group-storage-datoms store-schema compacted))})))))
+
+(defn ^:no-doc commit-empty-tx!
+  "Consume a Datalog transaction ID without preparing any datom/index work.
+  Standalone writes persist the metadata pair; groups defer it to their commit."
+  [^Store store]
+  (locking (.-write-txn store)
+    (let [tx-id (long (.advance-max-tx store))
+          modified-ms (max (long (observed-state-sync-ms store))
+                           (System/currentTimeMillis))]
+      (if-let [^WriteGroup group (current-write-group (.-lmdb store))]
+        (let [^longs metadata (.-metadata group)]
+          (aset metadata 0 tx-id)
+          (aset metadata 1 modified-ms))
+        (transact-kv (.-lmdb store)
+                     [(lmdb/kv-tx :put c/meta :max-tx tx-id :attr :long)
+                      (lmdb/kv-tx :put c/meta :last-modified modified-ms :attr :long)]))
+      modified-ms)))
 
 (defn load-datoms-with-plan!
   ([^Store store datoms]
@@ -3008,11 +3061,12 @@
                              :else (.advance-max-tx store)))
            ;; Auto-created attributes can advance this store's schema version
            ;; while the datom plan is built. Never overwrite that newer version
-           ;; with a timestamp chosen before preparation.
+           ;; with a timestamp chosen before preparation. Reuse the caller's
+           ;; commit time when supplied instead of reading the clock again.
            modified-ms (long (if reserved-metadata (aget reserved-metadata 1)
-                                (max (long (or last-modified-ms 0))
-                                     (long (observed-state-sync-ms store))
-                                     (System/currentTimeMillis))))]
+                                (max (long (or last-modified-ms
+                                               (System/currentTimeMillis)))
+                                     (long (observed-state-sync-ms store)))))]
        (aset work ft-jobs-slot ft-jobs)
        (when (or ft-jobs vi-jobs em-jobs id-jobs)
          (doseq [[ordinal job] (map-indexed vector

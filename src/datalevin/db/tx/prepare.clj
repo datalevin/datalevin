@@ -24,7 +24,7 @@
    [java.util ArrayList SortedSet]
    [org.eclipse.collections.impl.set.sorted.mutable TreeSortedSet]))
 
-(defn- sf [^SortedSet s] (when-not (.isEmpty s) (.first s)))
+(defn- sf [^SortedSet s] (some #(when (d/datom-added %) %) s))
 
 (def *last-auto-tempid
   (volatile! 0))

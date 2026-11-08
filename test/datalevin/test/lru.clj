@@ -129,7 +129,7 @@
     (.put l [:a 1] :one)
     (.put l [:b 2] :two)
     (.put l [:a 1] :replacement)
-    (is (empty? @classified))
+    (is (= [[:a 1] [:b 2]] @classified))
     (is (= #{[:a 1]} (candidates [:a])))
     (is (= #{[:a 1] [:b 2]} (set @classified)))
     (is (= 2 (count @classified)))
@@ -163,13 +163,64 @@
     (is (= #{[:a 1]} (candidates [:a])))))
 
 (deftest dependency-index-with-no-retained-entries
-  (let [l (LRUCache. 0 0 (reify Function (apply [_ k] [k k])))]
+  (let [classified (atom 0)
+        l (LRUCache. 0 0 (reify Function (apply [_ k] (swap! classified inc) [k k])))]
     (.put l :a 1)
+    (is (.putIfGeneration l :b 2 (.generation l)))
     (is (.isEmpty l))
-    (is (empty? (.candidateKeys l [:a]))))
+    (is (empty? (.candidateKeys l [:a])))
+    (is (zero? @classified)))
   (let [l (LRUCache. 2)]
     (.put l :unindexed 1)
     (is (= #{:unindexed} (set (.candidateKeys l [:anything]))))))
+
+(deftest first-invalidation-does-not-classify-warm-entries
+  (let [phase (atom :populate)
+        classified (atom 0)
+        l (LRUCache. 512 0
+                     (reify Function
+                       (apply [_ key]
+                         (when-not (= :populate @phase)
+                           (throw (IllegalStateException. "classification during invalidation")))
+                         (swap! classified inc)
+                         [[:kind :attribute key]])))]
+    (dotimes [key 512] (.put l key key))
+    (is (= 512 @classified))
+    (reset! phase :invalidate)
+    (locking l
+      (.beginInvalidation l 1)
+      (is (.hasDependencyGroup l :kind :attribute))
+      (is (.hasDependency l [:kind :attribute 42]))
+      (is (not (.hasDependency l [:kind :attribute -1])))
+      (is (= #{42} (set (.candidateKeys l [[:kind :attribute 42]]))))
+      (is (= 42 (.remove l 42))))
+    (is (= 512 @classified))
+    (is (= 1 (.get l 1)))))
+
+(deftest failed-classification-does-not-publish-or-evict
+  (let [classified (atom [])
+        l (LRUCache. 1 0
+                     (reify Function
+                       (apply [_ key]
+                         (swap! classified conj key)
+                         (when (= key :bad)
+                           (throw (IllegalArgumentException. "bad dependencies")))
+                         [key])))]
+    (.put l :keep :value)
+    (is (thrown-with-msg? IllegalArgumentException #"bad dependencies"
+                          (.put l :bad :invalid)))
+    (is (= [:keep] (vec (.orderedKeys l))))
+    (is (= :value (.get l :keep)))
+    (is (nil? (.get l :bad)))
+    (is (= #{:keep} (set (.candidateKeys l [:keep]))))
+    (is (empty? (.candidateKeys l [:bad])))
+    (let [generation (.generation l)]
+      (.beginInvalidation l 1)
+      (is (false? (.putIfGeneration l :bad :stale generation))))
+    (.disable l)
+    (.put l :bad :disabled)
+    (is (false? (.putIfGeneration l :bad :disabled (.generation l))))
+    (is (= [:keep :bad] @classified))))
 
 (deftest dependency-index-stays-bounded-after-eviction
   (doseq [capacity [0 8]]
