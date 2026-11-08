@@ -2125,10 +2125,13 @@
                                 response))))))
 
 (defn ^:no-doc commit-prepared-tx-data!
-  "Persist already prepared tx-data to the given DB store."
+  "Persist already prepared tx-data to the given DB store. independent? may
+   only be supplied for resolved scalar transitions with distinct E/A keys."
   ([^DB db tx-data]
    (commit-prepared-tx-data! db tx-data nil))
   ([^DB db tx-data report]
+   (commit-prepared-tx-data! db tx-data report false))
+  ([^DB db tx-data report independent?]
    (let [store   (.-store db)
          ensures (report-ensures report)]
      (if (and ensures
@@ -2141,7 +2144,7 @@
            (let [store1 ^Store (s/transfer ^Store store kv1)
                  db1    ^DB    (transfer db store1)
                  db2    ^DB    (commit-prepared-tx-data!
-                                 db1 tx-data report)]
+                                 db1 tx-data report independent?)]
              (vreset! prepared-store (.-store db2))
              (vreset! prepared-db db2)))
          (let [new-store ^Store (s/transfer ^Store @prepared-store kv)]
@@ -2152,7 +2155,7 @@
          (let [tx-meta (:tx-meta report)
                staged-ms (when (and txcommon/*batch-prepare* (not ensures)
                                     (not (:client-op/id tx-meta)))
-                           (s/stage-group-datoms! store tx-data))
+                           (s/stage-group-datoms! store tx-data independent?))
                modified-ms
                (long
                  (or staged-ms
@@ -2168,6 +2171,10 @@
                                            (:client-op/response-kind tx-meta))
                            commit-opts
                            (cond-> {:last-modified-ms commit-ms
+                                    ;; Raw bulk loads can add an existing fact
+                                    ;; before deleting it. Only resolved reports
+                                    ;; prove the initial index membership here.
+                                    :coalesce-fulltext? (some? report)
                                     :return-modified-ms? true}
                              embedding-skips
                              (assoc :embedding-skips embedding-skips)
@@ -2224,8 +2231,8 @@
   (txprep/expand-transactable-entity entity))
 
 (defn- prepare-entities
-  [^DB db entities tx-time]
-  (txprep/prepare-entities db entities tx-time))
+  [^DB db entities tx-time ctx]
+  (txprep/prepare-entities db entities tx-time ctx))
 
 ;; Identity probes in the blind path share the LMDB write transaction. Large
 ;; batches enable them from two entities onward so ingestion avoids the old
@@ -2264,7 +2271,6 @@
        (not (contains? #{:db/id :db/created-at :db/updated-at} attr))
        (not= "db" (namespace attr))
        (not (reverse-ref? attr))
-       (not (identical? (:db/valueType props) :db.type/ref))
        (or (nil? (:db/unique props))
            (and (or (identical? (:db/unique props) :db.unique/value)
                     (and allow-unique?
@@ -2275,6 +2281,13 @@
        (not (contains? props :db/tupleType))
        (not (contains? props :db/tupleTypes))
        (not (contains? tuple-source-attrs attr))))
+
+(defn- resolved-positive-ref?
+  "Recognize reference IDs that need no resolver, including a checked long range."
+  [value]
+  (and (integer? value)
+       (try (pos? (long value))
+            (catch IllegalArgumentException _ false))))
 
 (defn- blind-write-multiple-values?
   [many? unique-identity-attrs value]
@@ -2331,13 +2344,33 @@
                               (:db/noindex props) (map? vt)
                               (#{:db.type/vec :db.type/idoc :data} vt)))
                      (boolean (#{:db.type/string :db.type/keyword
-                                 :db.type/symbol} vt))])]
+                                 :db.type/symbol} vt))
+                     vt])]
         (.put infos attr info)
         info)))
 
+(defn- blind-value-ready?
+  "Values whose validation/coercion cannot fail or invoke user code. Other
+   values require the complete attribute preflight before normalization."
+  [^objects info value]
+  (case (aget info 4)
+    (nil :data) (and (some? value) (not (coll? value)))
+    :db.type/long (instance? Long value)
+    :db.type/ref (and (instance? Long value) (pos? (long value)))
+    :db.type/string (string? value)
+    :db.type/boolean (boolean? value)
+    :db.type/keyword (keyword? value)
+    :db.type/symbol (identical? clojure.lang.Symbol (class value))
+    :db.type/uuid (uuid? value)
+    :db.type/instant (identical? java.util.Date (class value))
+    :db.type/bytes (bytes? value)
+    :db.type/double (and (instance? Double value) (Double/isFinite (double value)))
+    :db.type/float (and (instance? Float value) (Float/isFinite (float value)))
+    false))
+
 (defn- prepare-blind-write-entity
   [store-opts unique-identity-attrs ^FastList unique-avs seen-avs set-capacity
-   has-many? fuse-unique-inserts? ^java.util.HashMap attr-infos entity]
+   has-many? fuse-unique-inserts? attr-infos entity]
   (let [old-eid   (:db/id entity)
         ;; An implicit entity does not need a transaction-scoped tempid: the
         ;; blind stamper assigns its final EID directly and never exposes an
@@ -2351,42 +2384,60 @@
               (fn [_ attr raw-value]
                 (if (identical? attr :db/id)
                   true
-                  (let [^objects info (.get attr-infos attr)
-                        props (aget info 0)
-                        many? (identical? :db.cardinality/many (:db/cardinality props))
-                        _ (when-not (aget info 2)
-                            (vreset! fuse-unique-inserts? false))
-                        supported-values?
-                        (if (blind-write-multiple-values?
-                              many? unique-identity-attrs raw-value)
-                          (let [seen-values (java.util.HashSet.)
-                                values (seq raw-value)]
-                            (when values (vreset! has-many? true))
-                            (loop [values values]
-                              (if-some [value (first values)]
-                                (if (and (append-blind-value!
-                                           attrs unique-avs seen-avs set-capacity
-                                           fuse-unique-inserts? store-opts info attr entity value)
-                                         ;; Repeated values need the resolver's
-                                         ;; set semantics before EAV append.
-                                         (.add seen-values
-                                               (.get attrs (dec (.size attrs)))))
-                                  (recur (next values))
-                                  false)
-                                true)))
-                          (do
-                            (when many? (vreset! has-many? true))
-                            (append-blind-value!
-                              attrs unique-avs seen-avs set-capacity
-                              fuse-unique-inserts? store-opts info attr entity
-                              raw-value)))]
-                    (if-not supported-values?
-                      (reduced false)
-                      true))))
+                  ;; Upfront preflight supplies a map; bulk preparation uses
+                  ;; a value-aware lookup without adding per-entity state.
+                  (if-some [^objects info (if (instance? java.util.HashMap attr-infos)
+                                           (.get ^java.util.HashMap attr-infos attr)
+                                           (attr-infos attr raw-value))]
+                    (let [props (aget info 0)
+                          many? (identical? :db.cardinality/many (:db/cardinality props))
+                          _ (when-not (aget info 2)
+                              (vreset! fuse-unique-inserts? false))
+                          supported-values?
+                          (if (blind-write-multiple-values?
+                                many? unique-identity-attrs raw-value)
+                            (let [seen-values (java.util.HashSet.)
+                                  values (seq raw-value)]
+                              (when values (vreset! has-many? true))
+                              (loop [values values]
+                                ;; A nil member must reach value validation.
+                                (if values
+                                  (if (append-blind-value!
+                                        attrs unique-avs seen-avs set-capacity
+                                        fuse-unique-inserts? store-opts info attr entity
+                                        (first values))
+                                    (if (.add seen-values (.get attrs (dec (.size attrs))))
+                                      (recur (next values))
+                                      (if (:db/unique props)
+                                        false
+                                        (do
+                                          ;; Keep the first normalized occurrence.
+                                          ;; Unique AV collection remains untouched.
+                                          (.remove attrs (int (dec (.size attrs))))
+                                          (.remove attrs (int (dec (.size attrs))))
+                                          (recur (next values)))))
+                                    false)
+                                  true)))
+                            (do
+                              (when many? (vreset! has-many? true))
+                              (append-blind-value!
+                                attrs unique-avs seen-avs set-capacity
+                                fuse-unique-inserts? store-opts info attr entity
+                                raw-value)))]
+                      (if-not supported-values?
+                        (reduced false)
+                        true))
+                    (reduced false))))
               true
               entity)]
         (when supported?
           (PreparedBlindEntity. entity-id attrs))))))
+
+(defn- blind-attributes-supported?
+  [entities check-attr]
+  (reduce (fn [_ entity]
+            (if (reduce-kv check-attr true entity) true (reduced false)))
+          true entities))
 
 (declare blind-identity-upsert-av)
 
@@ -2496,28 +2547,37 @@
                                             blind-unique-write-threshold
                                             initial-es))
                                      blind-unique-write-threshold))
-           ;; Populate schema decisions for the entire request before any
-           ;; entity's values are validated or normalized.
+           initial-count     (int
+                               (if (instance? java.util.Collection initial-es)
+                                 (.size ^java.util.Collection initial-es)
+                                 0))
+           ;; Amortize the lazy preflight in bulk requests. Small requests
+           ;; retain their upfront attribute check and direct metadata lookup.
+           incremental?      (if (instance? java.util.Collection initial-es)
+                               (>= initial-count 32)
+                               (>= (long (bounded-count 32 initial-es)) 32))
            attr-infos        (java.util.HashMap.)
-           check-attr        (fn [_ attr _]
-                               (if (or (identical? attr :db/id)
-                                       (aget ^objects
-                                             (blind-write-attr-info
-                                               attr-infos store-schema tuple-source-attrs
-                                               allow-unique? attr)
-                                             1))
+           check-attr        (fn [_ attr value]
+                               (if (identical? attr :db/id)
                                  true
-                                 (reduced false)))]
-       (when (reduce (fn [_ entity]
-                       (if (reduce-kv check-attr true entity)
-                         true
-                         (reduced false)))
-                     true initial-es)
-         (let [initial-count     (int
-                                   (if (instance? java.util.Collection initial-es)
-                                     (.size ^java.util.Collection initial-es)
-                                     0))
-               ;; Entity preparation receives an Object; box once per batch.
+                                 (let [^objects info
+                                       (blind-write-attr-info
+                                         attr-infos store-schema tuple-source-attrs
+                                         allow-unique? attr)]
+                                   (if (and (aget info 1)
+                                            (or (not (identical? (aget info 4) :db.type/ref))
+                                                (if (blind-write-multiple-values?
+                                                      (identical?
+                                                        :db.cardinality/many
+                                                        (:db/cardinality (aget info 0)))
+                                                      unique-identity-attrs value)
+                                                  (every? resolved-positive-ref? value)
+                                                  (resolved-positive-ref? value))))
+                                     true
+                                     (reduced false)))))]
+       (when (or incremental?
+                 (blind-attributes-supported? initial-es check-attr))
+         (let [;; Entity preparation receives an Object; box once per batch.
                set-capacity      (Integer/valueOf
                                    (int (max 1 (inc (quot (* 4 (long initial-count))
                                                          3)))))
@@ -2527,6 +2587,27 @@
                seen-tempids      (java.util.HashSet. (int set-capacity))
                has-many?         (volatile! false)
                fuse-unique-inserts? (volatile! true)
+               ;; Canonical scalar values are inert. Check and prepare those
+               ;; together; complete the attribute check before any coercion
+               ;; or collection handling that could invoke user code or fail.
+               preflight         (when incremental?
+                                   (delay (blind-attributes-supported?
+                                            initial-es check-attr)))
+               attr-lookup       (when incremental?
+                                   (fn [attr value]
+                                     ;; A failed preflight stops preparation.
+                                     ;; Once it succeeds, use the populated map.
+                                     (if (realized? preflight)
+                                       (.get attr-infos attr)
+                                       (let [^objects info
+                                             (blind-write-attr-info
+                                               attr-infos store-schema
+                                               tuple-source-attrs allow-unique? attr)]
+                                         (when (and (aget info 1)
+                                                    (or (blind-value-ready? info value)
+                                                        @preflight))
+                                           info)))))
+               entity-attr-infos (or attr-lookup attr-infos)
                entities
                (reduce
                  (fn [^FastList acc entity]
@@ -2534,7 +2615,7 @@
                             (prepare-blind-write-entity
                               store-opts unique-identity-attrs unique-avs
                               seen-avs set-capacity has-many?
-                              fuse-unique-inserts? attr-infos entity)]
+                              fuse-unique-inserts? entity-attr-infos entity)]
                      (if (and (.-tempid prepared)
                               (not (.add seen-tempids (.-tempid prepared))))
                        (reduced nil)
@@ -2626,40 +2707,44 @@
             (recur (+ i 2) identity-av)))
         identity-av))))
 
+(defn- append-blind-identity-upsert!
+  [^DB db ^PreparedBlindEntity entity identity-attr eid tx-id layout tx-data]
+  (let [^FastList attrs (.-attrs entity)
+        old-values (when layout (read-scalar-entity (.-store db) eid layout))]
+    (loop [i 0 tx-data tx-data]
+      (if (< i (.size attrs))
+        (let [attr  (.get attrs i)
+              value (.get attrs (unchecked-inc i))]
+          (if (= attr identity-attr)
+            (recur (+ i 2) tx-data)
+            (let [old-value (if layout
+                              (get old-values attr)
+                              (txcommon/preparation-first-v db eid attr))]
+              (cond
+                (nil? old-value)
+                (recur (+ i 2)
+                       (conj! tx-data
+                              (d/datom eid attr value tx-id)))
+
+                (d/value-equal? (idx/logical-value old-value) value)
+                (recur (+ i 2) tx-data)
+
+                :else
+                (recur (+ i 2)
+                       (-> tx-data
+                           (conj! (idx/retraction eid attr old-value tx-id))
+                           (conj! (d/datom eid attr value tx-id))))))))
+        tx-data))))
+
 (defn- stamp-existing-blind-local-identity-upsert
   [^DB db ^PreparedBlindTx prepared tx-meta identity-attr eid]
   (let [^FastList entities (:entities prepared)
         ^PreparedBlindEntity entity (.get entities 0)
         tx-id           (inc (long (:max-tx db)))
-        ^FastList attrs (.-attrs entity)
         layout          (when-not txcommon/*batch-prepare* (:identity-upsert-read prepared))
-        old-values      (when layout (read-scalar-entity (.-store db) eid layout))
-        tx-data
-        (loop [i       0
-               tx-data (transient [])]
-          (if (< i (.size attrs))
-            (let [attr  (.get attrs i)
-                  value (.get attrs (unchecked-inc i))]
-              (if (= attr identity-attr)
-                (recur (+ i 2) tx-data)
-                (let [old-value (if layout
-                                  (get old-values attr)
-                                  (txcommon/preparation-first-v db eid attr))]
-                  (cond
-                    (nil? old-value)
-                    (recur (+ i 2)
-                           (conj! tx-data
-                                  (d/datom eid attr value tx-id)))
-
-                    (d/value-equal? (idx/logical-value old-value) value)
-                    (recur (+ i 2) tx-data)
-
-                    :else
-                    (recur (+ i 2)
-                           (-> tx-data
-                               (conj! (idx/retraction eid attr old-value tx-id))
-                               (conj! (d/datom eid attr value tx-id))))))))
-            (persistent! tx-data)))
+        tx-data         (persistent! (append-blind-identity-upsert!
+                                       db entity identity-attr eid tx-id layout
+                                       (transient [])))
         tempid          (.-tempid entity)
         tempids         (cond-> {:db/current-tx tx-id}
                           (and tempid (not (auto-tempid? tempid)))
@@ -2668,6 +2753,59 @@
                           (> (long eid) (long (:max-eid db)))
                           (assoc :max-eid eid))]
     (->TxReport db db-after tx-data tempids tx-meta)))
+
+(defn ^:no-doc stamp-blind-local-upsert-tx
+  "Reuse a collided blind batch's normalized scalar values. Independent maps
+   with one identity each can resolve insert versus upsert under the same
+   writer. Repeated owners and ambiguous identities retain general resolution."
+  [^DB db ^PreparedBlindTx prepared tx-meta]
+  (let [^FastList entities (:entities prepared)]
+    (when (and (not (:auto-entity-time? prepared))
+               (not (:has-many? prepared))
+               (= (.size entities) (.size ^FastList (:unique-avs prepared)))
+               (blind-local-tx-valid? db prepared))
+      (let [seen-avs (java.util.HashSet.)
+            seen-eids (java.util.HashSet.)
+            ^FastList resolutions (FastList. (.size entities))
+            max-eid
+            (loop [i 0 max-eid (long (:max-eid db))]
+              (if (< i (.size entities))
+                (when-let [[a v :as av]
+                           (blind-identity-upsert-av (:schema-epoch prepared)
+                             (.get entities i))]
+                  (when (.add seen-avs av)
+                    (let [stored-eid (txcommon/av-first-e db a v)
+                          eid (if stored-eid (long stored-eid) (inc max-eid))]
+                      (when (.add seen-eids eid)
+                        (.add resolutions [a eid (some? stored-eid)])
+                        (recur (inc i) (if stored-eid max-eid eid))))))
+                max-eid))]
+        (when max-eid
+          (let [tx-id (inc (long (:max-tx db)))
+                [tx-data tempids]
+                (loop [i 0 tx-data (transient []) tempids (transient {})]
+                  (if (< i (.size entities))
+                    (let [^PreparedBlindEntity entity (.get entities i)
+                          [identity-attr eid stored?] (.get resolutions i)
+                          ^FastList attrs (.-attrs entity)
+                          tx-data (if stored?
+                                    (append-blind-identity-upsert!
+                                      db entity identity-attr eid tx-id nil tx-data)
+                                    (loop [j 0 tx-data tx-data]
+                                      (if (< j (.size attrs))
+                                        (recur (+ j 2)
+                                               (conj! tx-data
+                                                      (d/datom eid (.get attrs j)
+                                                               (.get attrs (inc j)) tx-id)))
+                                        tx-data)))
+                          tempid (.-tempid entity)]
+                      (recur (inc i) tx-data
+                             (if (and tempid (not (auto-tempid? tempid)))
+                               (assoc! tempids tempid eid) tempids)))
+                    [(persistent! tx-data)
+                     (assoc! tempids :db/current-tx tx-id)]))]
+            (->TxReport db (assoc db :max-eid max-eid :max-tx tx-id)
+                        tx-data (persistent! tempids) tx-meta)))))))
 
 (defn ^:no-doc stamp-blind-local-tx
   [^DB db ^PreparedBlindTx prepared tx-meta]
@@ -2905,6 +3043,38 @@
                      (assoc layouts eid (prepare-scalar-entity-read store-schema names)))
                    {} attributes)))))
 
+(defn- append-scalar-update-candidate!
+  "Append an eligible raw E/A value from either a map entry or an operation.
+   Value correction waits until the entire request has passed these checks."
+  [db store-schema tuple-source-attrs ^FastList candidates
+   ^java.util.HashSet seen e attr value]
+  (let [props (store-schema attr)
+        vt (:db/valueType props)]
+    (when (and (keyword? attr)
+               props
+               (not= "db" (namespace attr))
+               (some? (:db/aid props))
+               (not (identical? (:db/cardinality props) :db.cardinality/many))
+               (nil? (:db/unique props))
+               (nil? (:db/tupleAttrs props))
+               (not (contains? props :db/tupleType))
+               (nil? (:db/tupleTypes props))
+               (not (contains? tuple-source-attrs attr))
+               (nil? (:db.attr/preds props))
+               (or (nil? vt) (contains? scalar-update-value-types vt)
+                   (and (identical? vt :db.type/ref)
+                        (resolved-positive-ref? value)))
+               (some? value))
+      (let [eid (if (or (keyword? e) (and (sequential? e) (= 2 (count e))))
+                  e
+                  (scalar-update-entity-id db e))]
+        (when (and eid (or (nil? seen) (.add seen [eid attr])))
+          (.add candidates eid)
+          (.add candidates attr)
+          (.add candidates value)
+          (.add candidates vt)
+          eid)))))
+
 (defn- prepare-scalar-update-tx*
   [^DB db initial-es defer-entity-resolution?]
   (let [store        (.-store db)
@@ -2922,44 +3092,37 @@
                seen    nil
                resolve-entities? false]
           (if es
-            (let [entity (first es)]
-              (if (and (sequential? entity)
-                       (= 4 (count entity))
-                       (identical? :db/add (nth entity 0)))
-                (let [[_ e attr value] entity
-                      props            (store-schema attr)
-                      vt               (:db/valueType props)]
-                  (when (and (keyword? attr)
-                             props
-                             (not= "db" (namespace attr))
-                             (some? (:db/aid props))
-                             (not (identical? (:db/cardinality props)
-                                              :db.cardinality/many))
-                             (nil? (:db/unique props))
-                             (nil? (:db/tupleAttrs props))
-                             (not (contains? props :db/tupleType))
-                             (nil? (:db/tupleTypes props))
-                             (not (contains? tuple-source-attrs attr))
-                             (nil? (:db.attr/preds props))
-                             (or (nil? vt) (contains? scalar-update-value-types vt))
-                             (some? value))
-                    (let [reference? (or (keyword? e)
-                                         (and (sequential? e) (= 2 (count e))))
-                          eid (if reference?
-                                e
-                                (scalar-update-entity-id db e))]
-                      (when (and eid (or (nil? seen) (.add ^java.util.HashSet seen [eid attr])))
-                        (let [remaining (next es)]
-                          (.add candidates eid)
-                          (.add candidates attr)
-                          (.add candidates value)
-                          (.add candidates vt)
-                          (recur remaining
-                                 (or seen
-                                     (when remaining
-                                       (doto (java.util.HashSet.) (.add [eid attr]))))
-                                 (or resolve-entities? reference?)))))))
-                nil))
+            (let [entity (first es)
+                  remaining (next es)]
+              (if (map? entity)
+                (let [e (:db/id entity)
+                      seen (or seen
+                               (when (or remaining (> (count entity) 2))
+                                 (java.util.HashSet.)))]
+                  ;; Compare before narrowing, so oversized integer map IDs
+                  ;; still decline without throwing during the long cast.
+                  (when (and (<= e (:max-eid db))
+                             (reduce-kv
+                               (fn [_ attr value]
+                                 (if (identical? attr :db/id)
+                                   true
+                                   (if (and (keyword? attr) (pos? (count (name attr)))
+                                            (not (txcommon/reverse-ref? attr))
+                                            (append-scalar-update-candidate!
+                                              db store-schema tuple-source-attrs candidates
+                                              seen e attr value))
+                                     true
+                                     (reduced false))))
+                               true entity))
+                    (recur remaining seen resolve-entities?)))
+                (let [[_ e attr value] entity]
+                  (when-let [eid (append-scalar-update-candidate!
+                                   db store-schema tuple-source-attrs candidates seen e attr value)]
+                    (recur remaining
+                           (or seen
+                               (when remaining
+                                 (doto (java.util.HashSet.) (.add [eid attr]))))
+                           (or resolve-entities? (not (integer? eid))))))))
             (when (and (not (.isEmpty candidates))
                        (or defer-entity-resolution? (not resolve-entities?)
                            (resolve-scalar-update-candidates! db candidates)))
@@ -2983,68 +3146,38 @@
                             (scalar-update-entity-reads store-schema entries)))
                   deferred? (assoc :deferred-entity-resolution? true))))))))))
 
-(defn- scalar-update-forms
-  "Feed explicit-ID maps to scalar preparation in their attribute iteration order.
-   Ordinary operation batches retain their original input without normalization."
-  [db initial-es]
-  (let [shape
-        (reduce
-          (fn [maps? entity]
-            (cond
-              (and (sequential? entity) (= 4 (count entity))
-                   (identical? :db/add (nth entity 0))) maps?
-
+(defn- scalar-update-request?
+  "Reject incompatible forms before candidate construction or identity reads."
+  [initial-es]
+  (reduce
+    (fn [_ entity]
+      (if (or (and (sequential? entity) (= 4 (count entity))
+                   (identical? :db/add (nth entity 0)))
               (and (map? entity) (nil? (meta entity)) (> (count entity) 1)
-                   (let [e (:db/id entity)]
-                     (and (integer? e) (pos? e)))) true
-
-              :else (reduced ::ineligible)))
-          false initial-es)]
-    (case shape
-      false initial-es
-      true
-      (when-not (:auto-entity-time? (opts (:store db)))
-        (let [additions (FastList.)]
-          (when (reduce
-                  (fn [_ entity]
-                    (if (map? entity)
-                      (if (let [e (:db/id entity)]
-                            (when (<= e (:max-eid db))
-                              (reduce-kv
-                                (fn [_ attr value]
-                                  (cond
-                                    (identical? attr :db/id) true
-                                    (and (keyword? attr) (pos? (count (name attr)))
-                                         (not (txcommon/reverse-ref? attr)))
-                                    (do (.add additions [:db/add e attr value]) true)
-                                    :else (reduced false)))
-                                true entity)))
-                        true
-                        (reduced false))
-                      (do (.add additions entity) true)))
-                  true initial-es)
-            additions)))
-      nil)))
+                   (let [e (:db/id entity)] (and (integer? e) (pos? e)))))
+        true
+        (reduced false)))
+    true initial-es))
 
 (defn ^:no-doc prepare-scalar-update-tx
   "Recognize ordinary scalar add operations and explicit numeric-ID maps
-  updating existing entities with simple cardinality-one, non-unique,
-  non-reference attributes. The caller must stamp it against the current LMDB
-  write snapshot before committing. Returns nil for shapes that retain the
-  general transaction path. With :defer-entity-resolution?, lookup references
+  updating existing entities with simple cardinality-one, non-unique attributes.
+  Reference values must already be positive integer IDs. The caller must stamp
+  it against the current LMDB write snapshot before committing. Unsupported
+  shapes return nil. With :defer-entity-resolution?, lookup references
   and idents are resolved when stamping, for callers preparing before the writer."
   ([db initial-es]
    (prepare-scalar-update-tx db initial-es nil))
   ([db initial-es {:keys [defer-entity-resolution?]}]
    ;; Reject unsupported request shapes before correcting values or
    ;; resolving entities, including preparation on the collector's caller.
-   (when-let [entities (scalar-update-forms db initial-es)]
+   (when (scalar-update-request? initial-es)
      (if defer-entity-resolution?
        ;; Collector preparation reads no persisted identities. The owner resolves
        ;; them and consults the pending transaction indexes when stamping.
-       (prepare-scalar-update-tx* db entities true)
+       (prepare-scalar-update-tx* db initial-es true)
        (txcommon/with-lookup-ref-cache db
-         (prepare-scalar-update-tx* db entities false))))))
+         (prepare-scalar-update-tx* db initial-es false))))))
 
 (defn ^:no-doc scalar-update-tx-valid?
   [^DB db ^PreparedScalarUpdate prepared]
@@ -3204,8 +3337,10 @@
   ([initial-report initial-es]
    (prepare-local-tx-data initial-report initial-es (System/currentTimeMillis)))
   ([initial-report initial-es tx-time]
-   (let [entities (prepare-entities (:db-before initial-report) initial-es tx-time)]
-     (txexec/local-transact-tx-data initial-report entities tx-time))))
+   (let [db (:db-before initial-report)
+         ctx (prepare/make-prepare-ctx db)
+         entities (prepare-entities db initial-es tx-time ctx)]
+     (txexec/local-transact-tx-data initial-report entities tx-time ctx))))
 
 (defn transact-tx-data
   "Resolve transaction data. owned-max-eid may be supplied only for a current

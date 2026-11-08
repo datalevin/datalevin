@@ -12,7 +12,7 @@
   (:require
    [datalevin.constants :refer [e0 tx0 emax txmax]]
    [datalevin.db.tx.common :as txcommon]
-   [datalevin.interface :refer [ea-first-v opts schema]]
+   [datalevin.interface :refer [ea-first-v]]
    [datalevin.prepare :as coreprep]
    [datalevin.datom :as d :refer [datom?]]
    [datalevin.udf :as udf]
@@ -53,47 +53,52 @@
 (declare assoc-auto-tempid)
 
 (defn assoc-auto-tempids
-  [db entities]
-  (mapv #(assoc-auto-tempid db %) entities))
+  ([db entities]
+   (assoc-auto-tempids db entities (coreprep/make-prepare-ctx db)))
+  ([db entities ctx]
+   (mapv #(assoc-auto-tempid db % ctx) entities)))
 
 (defn assoc-auto-tempid
-  [db entity]
-  (cond+
-    (map? entity)
-    (let [entity (if (contains? entity :db/id)
-                   entity
-                   (assoc entity :db/id (auto-tempid)))
-          refs   (txcommon/attrs-by db :db.type/ref)]
-      ;; Scalar fields already have their final shape. Only rebuild entries
-      ;; whose reference values can contain entities needing an implicit ID.
-      (reduce-kv
-        (fn [entity a v]
-          (cond
-            (contains? refs a)
-            (assoc entity a (if (txcommon/multi-value? db a v)
-                              (assoc-auto-tempids db v)
-                              (assoc-auto-tempid db v)))
+  ([db entity]
+   (assoc-auto-tempid db entity (coreprep/make-prepare-ctx db)))
+  ([db entity ctx]
+   (let [refs (:db.type/ref (:rschema ctx))
+         many (:db.cardinality/many (:rschema ctx))]
+     (cond+
+       (map? entity)
+       (let [entity (if (contains? entity :db/id)
+                      entity
+                      (assoc entity :db/id (auto-tempid)))]
+         ;; Scalar fields already have their final shape. Only rebuild entries
+         ;; whose reference values can contain entities needing an implicit ID.
+         (reduce-kv
+           (fn [entity a v]
+             (cond
+               (contains? refs a)
+               (assoc entity a (if (txcommon/multi-value? (contains? many a) v)
+                                 (assoc-auto-tempids db v ctx)
+                                 (assoc-auto-tempid db v ctx)))
 
-            (txcommon/reverse-ref? a)
-            (assoc entity a (if (sequential? v)
-                              (assoc-auto-tempids db v)
-                              (assoc-auto-tempid db v)))
+               (txcommon/reverse-ref? a)
+               (assoc entity a (if (sequential? v)
+                                 (assoc-auto-tempids db v ctx)
+                                 (assoc-auto-tempid db v ctx)))
 
-            :else entity))
-        entity entity))
+               :else entity))
+           entity entity))
 
-    (not (sequential? entity))
-    entity
+       (not (sequential? entity))
+       entity
 
-    :let [[op e a v] entity]
+       :let [[op e a v] entity]
 
-    (and (= :db/add op) (txcommon/ref? db a))
-    (if (txcommon/multi-value? db a v)
-      [op e a (assoc-auto-tempids db v)]
-      [op e a (assoc-auto-tempid db v)])
+       (and (= :db/add op) (contains? refs a))
+       (if (txcommon/multi-value? (contains? many a) v)
+         [op e a (assoc-auto-tempids db v ctx)]
+         [op e a (assoc-auto-tempid db v ctx)])
 
-    :else
-    entity))
+       :else
+       entity))))
 
 (deftype IdentityResolution [attr value stored-eid])
 (deftype ResolvedIdentityAdd [e resolution])
@@ -108,64 +113,65 @@
   "Returns [entity' upserts]. Upsert attributes that resolve to existing entities
    are removed from entity, rest are kept in entity for insertion. Performs the
    validations needed for removed unique identity values."
-  [db entity]
-  (if-some [idents (not-empty (txcommon/attrs-by db :db.unique/identity))]
-    (let [store   (:store db)
-          schema  (schema store)
-          options (opts store)
-          upsert-value
-          (fn [a v]
-            (if (txcommon/ref? db a)
-              (when-not (or (tempid? v) (map? v))
-                (txcommon/entid db v))
-              (coreprep/correct-value-with-props options (schema a) a v)))
-          validate-upsert-preds
-          (fn [a v]
-            (when (:db.attr/preds (schema a)) (txcommon/flush-batch-prepare!))
-            (vld/validate-attr-preds
-              (:db/id entity) a v (schema a)
-              #(resolve-attr-pred-udf db %)))
-          ;; Multi-value inputs reach resolution one scalar at a time.
-          resolve (fn [a v at]
-                    (vld/validate-val v at)
-                    (when-some [v' (upsert-value a v)]
-                      (when-some [e (or (txcommon/cached-av-first-e db a v')
-                                       (txcommon/av-first-e db a v'))]
-                        [e v'])))
-          split   (fn [a vs]
-                    (reduce
-                      (fn [acc v]
-                        (if-some [[e v'] (resolve a v entity)]
-                          (do
-                            (validate-upsert-preds a v')
-                            (update acc 1 assoc v e))
-                          (update acc 0 conj v)))
-                      [[] {}] vs))]
-      (reduce-kv
-        (fn [[entity' upserts] a v]
-          (vld/validate-attr a entity)
-          (cond
-            (not (contains? idents a))
-            (do
-              (vld/validate-val v entity)
-              [(assoc entity' a v) upserts])
+  ([db entity]
+   (resolve-upserts db entity (coreprep/make-prepare-ctx db)))
+  ([db entity ctx]
+   (if-some [idents (not-empty (:db.unique/identity (:rschema ctx)))]
+     (let [schema  (:schema ctx)
+           options (:opts ctx)
+           upsert-value
+           (fn [a v]
+             (if (contains? (:db.type/ref (:rschema ctx)) a)
+               (when-not (or (tempid? v) (map? v))
+                 (txcommon/entid db v))
+               (coreprep/correct-value-with-props options (schema a) a v)))
+           validate-upsert-preds
+           (fn [a v]
+             (when (:db.attr/preds (schema a)) (txcommon/flush-batch-prepare!))
+             (vld/validate-attr-preds
+               (:db/id entity) a v (schema a)
+               #(resolve-attr-pred-udf db %)))
+           ;; Multi-value inputs reach resolution one scalar at a time.
+           resolve (fn [a v at]
+                     (vld/validate-val v at)
+                     (when-some [v' (upsert-value a v)]
+                       (when-some [e (or (txcommon/cached-av-first-e db a v')
+                                        (txcommon/av-first-e db a v'))]
+                         [e v'])))
+           split   (fn [a vs]
+                     (reduce
+                       (fn [acc v]
+                         (if-some [[e v'] (resolve a v entity)]
+                           (do
+                             (validate-upsert-preds a v')
+                             (update acc 1 assoc v e))
+                           (update acc 0 conj v)))
+                       [[] {}] vs))]
+       (reduce-kv
+         (fn [[entity' upserts] a v]
+           (vld/validate-attr a entity)
+           (cond
+             (not (contains? idents a))
+             (do
+               (vld/validate-val v entity)
+               [(assoc entity' a v) upserts])
 
-            (txcommon/multi-value? db a v)
-            (let [[insert upsert] (split a v)]
-              [(cond-> entity'
-                 (seq insert) (assoc a insert))
-               (cond-> upserts
-                 (seq upsert) (assoc a upsert))])
+             (txcommon/multi-value? (contains? (:db.cardinality/many (:rschema ctx)) a) v)
+             (let [[insert upsert] (split a v)]
+               [(cond-> entity'
+                  (seq insert) (assoc a insert))
+                (cond-> upserts
+                  (seq upsert) (assoc a upsert))])
 
-            :else
-            (if-some [[e v'] (resolve a v entity)]
-              (do
-                (validate-upsert-preds a v')
-                [entity' (assoc upserts a {v e})])
-              [(assoc entity' a v) upserts])))
-        [{} {}]
-        entity))
-    [entity nil]))
+             :else
+             (if-some [[e v'] (resolve a v entity)]
+               (do
+                 (validate-upsert-preds a v')
+                 [entity' (assoc upserts a {v e})])
+               [(assoc entity' a v) upserts])))
+         [{} {}]
+         entity))
+     [entity nil])))
 
 (defn resolve-identity-map
   "Resolve a flat map whose plan has validated its single scalar identity.
@@ -322,23 +328,25 @@
    (concat (handle-custom-tx-fn db store entity) entities)))
 
 (defn- expand-multival?
-  [db a vs]
+  [ctx a vs]
   (and (or (txcommon/reverse-ref? a)
-           (txcommon/multival? db a))
+           (contains? (:db.cardinality/many (:rschema ctx)) a))
        (coll? vs)
        (not (map? vs))
        (not (and (= (count vs) 2)
-                 (txcommon/is-attr? db (first vs) :db.unique/identity)))))
+                 (contains? (:db.unique/identity (:rschema ctx)) (first vs))))))
 
 (defn maybe-wrap-multival
   [db a vs]
-  (if (expand-multival? db a vs) vs [vs]))
+  (if (expand-multival? (coreprep/make-prepare-ctx db) a vs) vs [vs]))
 
 (defn contains-nested-map?
   "Whether explode will emit a nested entity map, without building operations.
    Opaque map values and maps inside lookup references remain ordinary values."
   ([db entity] (contains-nested-map? db entity nil))
-  ([db entity ^IdentityResolution resolution]
+  ([db entity resolution]
+   (contains-nested-map? db entity resolution (coreprep/make-prepare-ctx db)))
+  ([_db entity ^IdentityResolution resolution ctx]
    (reduce-kv
      (fn [_ a vs]
        (if (and (not (identical? a :db/id))
@@ -352,16 +360,16 @@
                                  false vs)))
                 (let [straight-a (if (txcommon/reverse-ref? a)
                                    (txcommon/reverse-ref a) a)]
-                  (and (txcommon/ref? db straight-a)
-                       (or (map? vs) (expand-multival? db a vs)))))
+                  (and (contains? (:db.type/ref (:rschema ctx)) straight-a)
+                       (or (map? vs) (expand-multival? ctx a vs)))))
          (reduced true)
          false))
      false entity)))
 
 (defn- add-exploded-value!
-  [^ArrayList txs db eid a reverse? straight-a v]
+  [^ArrayList txs ref? eid a reverse? straight-a v]
   (.add txs
-        (if (and (txcommon/ref? db straight-a) (map? v))
+        (if (and ref? (map? v))
           (assoc v (txcommon/reverse-ref a) eid)
           (if reverse?
             [:db/add v straight-a eid]
@@ -369,7 +377,9 @@
 
 (defn explode
   ([db entity] (explode db entity nil))
-  ([db entity ^IdentityResolution resolution]
+  ([db entity resolution]
+   (explode db entity resolution (coreprep/make-prepare-ctx db)))
+  ([_db entity ^IdentityResolution resolution ctx]
    (let [eid        (:db/id entity)
          txs        (ArrayList. (count entity))
          tuple-txs  (ArrayList.)]
@@ -380,22 +390,23 @@
                  straight-a (if reverse?
                               (txcommon/reverse-ref a)
                               a)
-                 ^ArrayList target (if (txcommon/tuple-attr? db a)
+                 ref? (contains? (:db.type/ref (:rschema ctx)) straight-a)
+                 ^ArrayList target (if (contains? (:db/tupleAttrs (:rschema ctx)) a)
                                      tuple-txs
                                      txs)]
              (when reverse?
                (vld/validate-reverse-ref-type
-                 (txcommon/ref? db straight-a) a eid vs))
+                 ref? a eid vs))
              (cond
                (and resolution (= a (.-attr resolution)))
                (.add target (ResolvedIdentityAdd. eid resolution))
 
-               (expand-multival? db a vs)
+               (expand-multival? ctx a vs)
                (doseq [v vs]
-                 (add-exploded-value! target db eid a reverse? straight-a v))
+                 (add-exploded-value! target ref? eid a reverse? straight-a v))
 
                :else
-               (add-exploded-value! target db eid a reverse? straight-a vs))))
+               (add-exploded-value! target ref? eid a reverse? straight-a vs))))
          nil)
        nil
        entity)
@@ -438,20 +449,24 @@
     (vld/validate-tx-entity-type entity)))
 
 (defn prepare-entities
-  [db entities tx-time]
-  (let [aat #(assoc-auto-tempid db %)
-        uet #(update-entity-time % tx-time)]
-    (sequence
-      (if (:auto-entity-time? (opts (:store db)))
-        (comp (mapcat expand-transactable-entity)
-              (map aat)
-              (mapcat uet))
-        (comp (mapcat expand-transactable-entity)
-              (map aat)))
-      entities)))
+  ([db entities tx-time]
+   (prepare-entities db entities tx-time (coreprep/make-prepare-ctx db)))
+  ([db entities tx-time ctx]
+   (let [aat #(assoc-auto-tempid db % ctx)
+         uet #(update-entity-time % tx-time)]
+     (sequence
+       (if (:auto-entity-time? (:opts ctx))
+         (comp (mapcat expand-transactable-entity)
+               (map aat)
+               (mapcat uet))
+         (comp (mapcat expand-transactable-entity)
+               (map aat)))
+       entities))))
 
 (defn prepare-tx-fn-result
-  [db entities tx-time]
-  (if (:auto-entity-time? (opts (:store db)))
-    (prepare-entities db entities tx-time)
-    entities))
+  ([db entities tx-time]
+   (prepare-tx-fn-result db entities tx-time (coreprep/make-prepare-ctx db)))
+  ([db entities tx-time ctx]
+   (if (:auto-entity-time? (:opts ctx))
+     (prepare-entities db entities tx-time ctx)
+     entities)))

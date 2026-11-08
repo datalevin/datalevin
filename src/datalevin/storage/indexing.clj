@@ -56,6 +56,56 @@
 
 (def ^:private ^:const max-fulltext-batch-size 1024)
 
+(defn coalesce-fulltext-operations
+  "Retain net effects of resolved transitions, in their original order.
+   References must include the domain unless the input belongs to one engine.
+   Unchecked bulk operations must retain their original execution."
+  [^FastList operations kind-fn ref-fn]
+  (let [n (.size operations)]
+    (cond
+      (<= n 1) operations
+
+      (= n 2)
+      (let [first-op (.get operations 0)
+            last-op (.get operations 1)]
+        (if (and (not= (kind-fn first-op) (kind-fn last-op))
+                 (= (ref-fn first-op) (ref-fn last-op)))
+          (FastList. 0)
+          operations))
+
+      (not-any? #(identical? :delete (kind-fn %)) operations) operations
+
+      :else
+      (let [states (HashMap.)]
+        (doseq [op operations]
+          (let [ref (ref-fn op)]
+            (if-let [^objects state (.get states ref)]
+              (do
+                ;; Repeated same-kind operations are not resolved transitions.
+                ;; Preserve them rather than infer their initial membership.
+                (when (= (kind-fn op) (kind-fn (aget state 1)))
+                  (aset state 2 false))
+                (aset state 1 op))
+              (.put states ref (object-array [op op true])))))
+        (loop [idx 0 result nil]
+          (if (< idx n)
+            (let [op (.get operations idx)
+                  ^objects state (.get states (ref-fn op))
+                  first-op (aget state 0)
+                  last-op (aget state 1)
+                  first-kind (kind-fn first-op)
+                  keep? (or (not (aget state 2))
+                            (and (= first-kind (kind-fn last-op))
+                                 (identical? op (if (identical? first-kind :add)
+                                                  last-op first-op))))
+                  ^FastList result
+                  (if keep?
+                    (when result (doto ^FastList result (.add op)))
+                    (or result (FastList/newList ^java.util.Collection
+                                                (.subList operations 0 idx))))]
+              (recur (unchecked-inc-int idx) result))
+            (or result operations)))))))
+
 (defn- add-fulltext-batches!
   [engine ^FastList entries]
   (let [n (long (.size entries))]
@@ -75,60 +125,66 @@
           (recur end))))))
 
 (defn fulltext-index
-  [search-engines ft-ds]
-  (let [^FastList ft-ds ft-ds
-        n               (.size ft-ds)]
-    (if (= n 1)
-      (apply-fulltext-op! search-engines (.get ft-ds 0))
-      (let [add-only? (loop [idx 0]
-                        (if (< idx n)
-                          (let [op   (peek (.get ft-ds idx))
-                                kind (nth op 0)]
-                            (if (or (identical? kind :a)
-                                    (identical? kind :g))
-                              (recur (unchecked-inc-int idx))
-                              false))
-                          true))]
-        (if add-only?
-          (let [batches (IdentityHashMap.)]
-            (doseq [res    ft-ds
-                    :let   [op   (peek res)
-                            d    (nth op 1)]
-                    domain (nth res 0)
-                    :let   [engine (search-engines domain)
-                            ^FastList entries
-                            (or (.get batches engine)
-                                (let [entries (FastList.)]
-                                  (.put batches engine entries)
-                                  entries))]]
-              (.add entries
-                    (fulltext-entry
-                      (op-ref op)
-                      (peek d))))
-            (doseq [[engine entries] batches]
-              (add-fulltext-batches! engine entries)))
-          (let [batches (IdentityHashMap.)]
-            (doseq [res    ft-ds
-                    :let   [op   (peek res)
-                            d    (nth op 1)
-                            kind (nth op 0)]
-                    domain (nth res 0)
-                    :let   [engine (search-engines domain)
-                            ^FastList entries
-                            (or (.get batches engine)
-                                (let [entries (FastList.)]
-                                  (.put batches engine entries)
-                                  entries))]]
-              (.add entries
-                    (case kind
-                      :a (fulltext-op-entry :add d (peek d))
-                      :d (fulltext-op-entry :delete d nil)
-                      :g (fulltext-op-entry :add (op-ref op)
-                                            (peek d))
-                      :r (fulltext-op-entry :delete (op-ref op)
-                                            nil))))
-            (doseq [[engine entries] batches]
-              (transact-fulltext-batches! engine entries))))))))
+  ([search-engines ft-ds]
+   (fulltext-index search-engines ft-ds false))
+  ([search-engines ft-ds coalesce?]
+   (let [^FastList ft-ds ft-ds
+         n               (.size ft-ds)]
+     (if (= n 1)
+       (apply-fulltext-op! search-engines (.get ft-ds 0))
+       (let [add-only? (loop [idx 0]
+                         (if (< idx n)
+                           (let [op   (peek (.get ft-ds idx))
+                                 kind (nth op 0)]
+                             (if (or (identical? kind :a)
+                                     (identical? kind :g))
+                               (recur (unchecked-inc-int idx))
+                               false))
+                           true))]
+         (if add-only?
+           (let [batches (IdentityHashMap.)]
+             (doseq [res    ft-ds
+                     :let   [op   (peek res)
+                             d    (nth op 1)]
+                     domain (nth res 0)
+                     :let   [engine (search-engines domain)
+                             ^FastList entries
+                             (or (.get batches engine)
+                                 (let [entries (FastList.)]
+                                   (.put batches engine entries)
+                                   entries))]]
+               (.add entries
+                     (fulltext-entry
+                       (op-ref op)
+                       (peek d))))
+             (doseq [[engine entries] batches]
+               (add-fulltext-batches! engine entries)))
+           (let [batches (IdentityHashMap.)]
+             (doseq [res    ft-ds
+                     :let   [op   (peek res)
+                             d    (nth op 1)
+                             kind (nth op 0)]
+                     domain (nth res 0)
+                     :let   [engine (search-engines domain)
+                             ^FastList entries
+                             (or (.get batches engine)
+                                 (let [entries (FastList.)]
+                                   (.put batches engine entries)
+                                   entries))]]
+               (.add entries
+                     (case kind
+                       :a (fulltext-op-entry :add d (peek d))
+                       :d (fulltext-op-entry :delete d nil)
+                       :g (fulltext-op-entry :add (op-ref op)
+                                             (peek d))
+                       :r (fulltext-op-entry :delete (op-ref op)
+                                             nil))))
+             (doseq [[engine entries] batches]
+               (transact-fulltext-batches!
+                 engine (if coalesce?
+                          (coalesce-fulltext-operations
+                            entries #(aget ^objects % 0) #(aget ^objects % 1))
+                          entries))))))))))
 
 (defn- apply-vector-op!
   [vector-indices res]

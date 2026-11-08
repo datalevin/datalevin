@@ -97,7 +97,7 @@
       (doseq [defer? [false true]
               tail [{:db/id 1 :text "duplicate"}
                     {:db/id 1 :missing value} {:db/id 1 :text nil}
-                    {:db/id 1 :many [1 2]} {:db/id 1 :reference 2}
+                    {:db/id 1 :many [1 2]} {:db/id 1 :reference [:key "two"]}
                     {:db/id 1 :key "identity"} {:db/id 1 :token "unique"}
                     {:db/id 1 :part 1} {:db/id 1 :pair [1 2]}
                     {:db/id 1 :_reference 2} {:db/id 1 "text" value}
@@ -145,3 +145,47 @@
   (with-open [connection (d/create-conn nil schema (assoc options :auto-entity-time? true))]
     (seed! connection)
     (is (nil? (db/prepare-scalar-update-tx @connection [{:db/id 1 :value 2}])))))
+
+(deftest map-batches-and-wide-maps-preserve-general-report-order
+  (let [fields (mapv #(keyword "field" (str %)) (range 8))
+        wide-schema (merge schema (zipmap fields (repeat {:db/valueType :db.type/long})))
+        wide-map (into (array-map :db/id 1) (map #(vector % 1) fields))]
+    (with-open [connection (d/create-conn nil wide-schema options)]
+      (seed! connection)
+      (d/transact! connection (mapv #(hash-map :db/id % :value 0) (range 3 129)))
+      (doseq [forms [(mapv #(hash-map :db/id % :value 1) (range 1 129))
+                     [wide-map]
+                     [(array-map :text "new" :db/id (int 1) :value 3)
+                      [:db/add [:key "two"] :text "second"]]]]
+        (let [before @connection
+              expected (db/prepare-local-tx-data
+                         (db/->TxReport before (db/transfer before (:store before)) [] {} nil)
+                         forms)]
+          (doseq [defer? [false true]
+                  input [forms (apply list forms) (map identity forms)]]
+            (let [prepared (db/prepare-scalar-update-tx before input
+                             {:defer-entity-resolution? defer?})
+                  report (db/stamp-scalar-update-tx before prepared nil)]
+              (is (some? prepared))
+              (is (= (report-data expected) (report-data report)))
+              (is (identical? (:eavt before) (:eavt (:db-after report)))))))))))
+
+(deftest map-and-operation-aliases-preserve-correction-and-rejection-order
+  (with-open [connection (d/create-conn nil schema options)]
+    (seed! connection)
+    (let [conversions (atom 0)
+          value (proxy [Object] [] (toString [] (swap! conversions inc) "corrected"))]
+      (doseq [defer? [false true]
+              forms [[{:db/id (int 1) :text value} [:db/add 1 :text value]]
+                     [[:db/add 1 :text value] {:db/id 1N :text value}]
+                     [{:db/id 2 :text value} [:db/add [:key "two"] :text value]]
+                     [[:db/add [:key "two"] :text value] {:db/id 2 :text value}]]]
+        (reset! conversions 0)
+        (let [prepared (db/prepare-scalar-update-tx @connection forms
+                         {:defer-entity-resolution? defer?})]
+          (if prepared
+            (do (is defer?)
+                (is (= 2 @conversions))
+                (is (nil? (db/stamp-scalar-update-tx @connection prepared nil))))
+            (is (zero? @conversions)))))
+      (is (= "old" (:text (d/entity @connection 1)))))))

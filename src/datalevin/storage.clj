@@ -318,7 +318,8 @@
   [lmdb]
   {:pre [(lmdb/writing? lmdb)]}
   (WriteGroup. lmdb (Thread/currentThread) (long-array [-1 0]) (FastList.)
-               (object-array 2) (FastList.) (object-array 2) (LongObjectHashMap. 8)))
+               ;; Store, detached region, independence proof, operation kinds.
+               (object-array 2) (FastList.) (object-array 4) (LongObjectHashMap. 8)))
 
 (defn ^:no-doc write-group-metadata
   "Return the final metadata pair for a native writing group."
@@ -2382,51 +2383,62 @@
 
 (defn ^:no-doc stage-group-datoms!
   "Retain ordinary resolved datoms for one storage preparation per group.
-   Reserve logical metadata now; encoding is drained before native-read scopes."
-  [^Store store datoms]
-  (when-let [^WriteGroup group (current-write-group (.-lmdb store))]
-    (let [native (kv/raw-lmdb (.-lmdb store))
-          store-schema (schema store)
-          ^objects context (.-storage-context group)
-          ^FastList pending (or (aget context 1) (.-storage-datoms group))]
-      (when (and (:datalog-prepare? (lmdb/request-context native))
-                 (not lmdb/*raw-kv?*)
-                 (not *enforce-blind-unique-inserts?*)
-                 (not c/*ordered-datom-writes?*)
-                 (not (cd/custom-schema? store-schema)))
-        (let [start (.size pending)
-              accepted?
-              (try
-                (reduce
-                  (fn [_ ^Datom datom]
-                    (let [props (store-schema (.-a datom))
-                          vt (:db/valueType props)]
-                      (if (and (:db/aid props) (not (:db/fulltext props))
-                               (not (:db/embedding props))
-                               (not (#{:db.type/vec :db.type/idoc} vt))
-                               (or (buffered-datom-value? (.-v datom))
-                                   (buffered-tuple-value? (.-v datom) props)))
-                        (do (.add pending datom) true)
-                        (reduced false))))
-                  true datoms)
-                (catch Throwable error
-                  (.removeRange pending start (.size pending))
-                  (throw error)))]
-          (if accepted?
-            (let [^longs metadata (.-metadata group)
-                  modified-ms (long (max (long (observed-state-sync-ms store))
-                                         (System/currentTimeMillis)))]
-              (aset metadata 0 (long (.advance-max-tx store)))
-              (aset metadata 1 modified-ms)
-              (aset context 0 store)
-              (when (< start (.size pending))
-                ((lmdb/storage-staged native)))
-              modified-ms)
-            (do
-              ;; The owner holds the writer lock; an unaccepted prefix cannot
-              ;; become visible to another request or to native storage reads.
-              (.removeRange pending start (.size pending))
-              nil)))))))
+   Reserve logical metadata now; encoding is drained before native-read scopes.
+   independent? carries a preparer's proof of distinct scalar E/A transitions;
+   combining nonempty requests invalidates that proof for the segment."
+  ([^Store store datoms] (stage-group-datoms! store datoms false))
+  ([^Store store datoms independent?]
+   (when-let [^WriteGroup group (current-write-group (.-lmdb store))]
+     (let [native (kv/raw-lmdb (.-lmdb store))
+           store-schema (schema store)
+           ^objects context (.-storage-context group)
+           ^FastList pending (or (aget context 1) (.-storage-datoms group))]
+       (when (and (:datalog-prepare? (lmdb/request-context native))
+                  (not lmdb/*raw-kv?*)
+                  (not *enforce-blind-unique-inserts?*)
+                  (not c/*ordered-datom-writes?*)
+                  (not (cd/custom-schema? store-schema)))
+         (let [start (.size pending)
+               accepted-kinds
+               (try
+                 (reduce
+                   (fn [kinds ^Datom datom]
+                     (let [props (store-schema (.-a datom))
+                           vt (:db/valueType props)]
+                       (if (and (:db/aid props) (not (:db/fulltext props))
+                                (not (:db/embedding props))
+                                (not (#{:db.type/vec :db.type/idoc} vt))
+                                (or (buffered-datom-value? (.-v datom))
+                                    (buffered-tuple-value? (.-v datom) props)))
+                         (do
+                           (.add pending datom)
+                           ;; Once both kinds occur, further flags are irrelevant.
+                           (if (== (long kinds) 3) kinds
+                               (bit-or (long kinds) (if (d/datom-added datom) 1 2))))
+                         (reduced nil))))
+                   (long (or (aget context 3) 0)) datoms)
+                 (catch Throwable error
+                   (.removeRange pending start (.size pending))
+                   (throw error)))]
+           (if accepted-kinds
+             (let [^longs metadata (.-metadata group)
+                   modified-ms (long (max (long (observed-state-sync-ms store))
+                                          (System/currentTimeMillis)))]
+               (aset metadata 0 (long (.advance-max-tx store)))
+               (aset metadata 1 modified-ms)
+               (aset context 0 store)
+               (aset context 3 accepted-kinds)
+               (when (< start (.size pending))
+                 ;; The guarantee belongs to one request, not to the group.
+                 ;; Empty or rejected requests cannot invalidate the prefix.
+                 (aset context 2 (when (and independent? (zero? start)) true))
+                 ((lmdb/storage-staged native)))
+               modified-ms)
+             (do
+               ;; The owner holds the writer lock; an unaccepted prefix cannot
+               ;; become visible to another request or to native storage reads.
+               (.removeRange pending start (.size pending))
+               nil))))))))
 
 (deftype ^:private StorageDatomKey [^Datom datom]
   Object
@@ -2471,16 +2483,11 @@
 
 (defn- compact-group-storage-datoms
   "Compact resolved, unconditional transitions within one native-read segment."
-  [^FastList datoms]
+  [^FastList datoms ^long kinds]
   (if (or (< (.size datoms) 2)
           ;; Inserts and deletes alone cannot cancel. Keep their ordinary path
           ;; free of per-fact keys and a compaction map.
-          (let [added? (d/datom-added (.get datoms 0))]
-            (reduce (fn [_ ^Datom datom]
-                      (if (= added? (d/datom-added datom))
-                        true
-                        (reduced false)))
-                    true datoms))
+          (not (== kinds 3))
           (scalar-storage-updates? datoms))
     datoms
     (let [changes (LinkedHashMap.)
@@ -2495,6 +2502,23 @@
           (when (= (d/datom-added (.-datom key)) (d/datom-added last-datom))
             (.add compacted last-datom))))
       compacted)))
+
+(defn- group-storage-byte-estimate
+  "Decide the >4096 scheduling threshold with at most 128 datoms inspected."
+  ^long [^FastList datoms]
+  (if (> (.size datoms) 128)
+    ;; Every row contributes at least 32 bytes to the scheduling estimate.
+    4097
+    (long
+      (reduce (fn [total ^Datom datom]
+                (let [v (.-v datom)
+                      total (+ (long total) 32
+                               (long (cond
+                                       (string? v) (* 4 (count v))
+                                       (vector? v) (* 2 c/+val-bytes-wo-hdr+)
+                                       :else 0)))]
+                  (if (> total 4096) (reduced 4097) total)))
+              0 datoms))))
 
 (defn ^:no-doc ^:redef encode-group-storage-datoms
   "Encode ordinary frozen datoms using immutable schema metadata only.
@@ -2533,9 +2557,13 @@
      (when-not (.isEmpty datoms)
        (let [store (group-storage-store context lmdb)
              rows (encode-group-storage-datoms
-                    (schema store) (compact-group-storage-datoms datoms))]
+                    (schema store) (if (aget context 2) datoms
+                                       (compact-group-storage-datoms
+                                         datoms (long (aget context 3)))))]
          (.clear datoms)
          (aset context 0 nil)
+         (aset context 2 nil)
+         (aset context 3 nil)
          rows)))))
 
 (defn ^:no-doc freeze-group-storage-datoms!
@@ -2548,20 +2576,17 @@
      (when-not (.isEmpty datoms)
        (let [store (group-storage-store context lmdb)
              store-schema (schema store)
-             compacted (compact-group-storage-datoms datoms)
+             compacted (if (aget context 2) datoms
+                           (compact-group-storage-datoms
+                             datoms (long (aget context 3))))
              ;; This is a scheduling bound, not a charge or serialized length.
-             bytes (reduce (fn [total ^Datom datom]
-                             (let [v (.-v datom)]
-                               (+ (long total) 32
-                                  (cond
-                                    (string? v) (* 4 (count v))
-                                    (vector? v) (* 2 c/+val-bytes-wo-hdr+)
-                                    :else 0))))
-                           0 compacted)]
+             bytes (group-storage-byte-estimate compacted)]
          ;; The old region belongs exclusively to the frozen plan. Any later
          ;; staging gets a fresh region, including an unexpected read boundary.
          (aset context 1 (FastList. 0))
          (aset context 0 nil)
+         (aset context 2 nil)
+         (aset context 3 nil)
          {:row-count (.size ^FastList compacted) :native-tail-bytes bytes
           :encode (fn [] (encode-group-storage-datoms store-schema compacted))})))))
 
@@ -2573,25 +2598,23 @@
   ([^Store store datoms embedding-plan]
    (load-datoms-with-plan! store datoms embedding-plan nil))
   ([^Store store datoms embedding-plan
-    {:keys [extra-kv-txs extra-kv-txs-fn last-modified-ms embedding-skips
+    {:keys [extra-kv-txs extra-kv-txs-fn last-modified-ms embedding-skips coalesce-fulltext?
             return-modified-ms?]}]
    (let [[res secondary-index-job-count modified-ms]
          (locking (.-write-txn store)
            ;; Eager/custom/giant plans can read native state during encoding.
            (when-let [flush! (lmdb/prepare-flush (kv/raw-lmdb (.-lmdb store)))]
              (flush!))
-           ;; Transaction stores refresh when the write lock is acquired.
-           ;; Direct writes acquire it here, before allocating any giant IDs.
-           (when-not (lmdb/writing? (.-lmdb store))
-             (sync-giant-id! store))
-           (let [run (fn [tx-lmdb]
+           (let [custom-schema? (cd/custom-schema? (schema store))
+                 run (fn [tx-lmdb]
                        (let [plan (prepare-datoms-kv-plan
                                     store datoms embedding-plan extra-kv-txs
-                                    extra-kv-txs-fn last-modified-ms nil embedding-skips)
+                                    extra-kv-txs-fn last-modified-ms nil embedding-skips
+                                    coalesce-fulltext?)
                              res (commit-datoms-kv-plan!
                                   tx-lmdb (.-search-engines store)
                                   (.-vector-indices store) (.-embedding-indices store)
-                                  (store-idoc-indices store) plan)]
+                                  (store-idoc-indices store) plan coalesce-fulltext?)]
                          (when *enforce-blind-unique-inserts?*
                            (.advance-max-tx store)
                            (when-let [^WriteGroup group (current-write-group tx-lmdb)]
@@ -2600,7 +2623,11 @@
                                (aset metadata 1 (long (:modified-ms plan))))))
                          [res (:secondary-index-job-count plan)
                           (:modified-ms plan)]))]
-             (if (cd/custom-schema? (schema store))
+             ;; Custom callbacks retain their entry-time allocator state.
+             ;; Ordinary direct plans refresh only when they allocate a giant.
+             (when (and custom-schema? (not (lmdb/writing? (.-lmdb store))))
+               (sync-giant-id! store))
+             (if custom-schema?
                (lmdb/with-transaction-kv [tx-lmdb (.-lmdb store)] (run tx-lmdb))
                (run (.-lmdb store)))))]
      (when (pos? (long (or secondary-index-job-count 0)))
@@ -2682,8 +2709,20 @@
         fulltext-domains (when embedding-work? (aget ai 4))
         noindex?   (aget ai 5)
         vb         (b/value-bytes v vt)
-        i          ^Indexable (b/indexable nil aid v vt max-gt vb)
-        giant?     (b/giant? i)]
+        i          ^Indexable (b/indexable nil aid v vt (or max-gt c/g0) vb)
+        giant?     (b/giant? i)
+        ;; A nil cursor means this ordinary direct plan has not allocated a
+        ;; giant yet. The caller still owns the shared writer lock: refresh
+        ;; before consuming an ID, without treating inline writes as a refresh.
+        refresh?   (and giant? (nil? max-gt))
+        max-gt     (if refresh?
+                     (do (sync-giant-id! store) (i/max-gt store))
+                     max-gt)
+        ;; Reuse the encoded prefix when the refreshed ID differs from the
+        ;; probe. In particular, do not serialize a user value a second time.
+        i          ^Indexable (if (and refresh? (not= (.-g i) (long max-gt)))
+                                (Indexable. nil aid v (.-f i) (.-b i) max-gt)
+                                i)]
     ;; Reports can retain repeated adds after a retraction. Reuse their
     ;; logical identity instead of allocating another physical giant key.
     (if (and giant? (.containsKey giants (giant-datom-key e attr v)))
@@ -2773,7 +2812,7 @@
                                 (i/in-list? (.-lmdb store) c/eav e
                                             candidate-key :id :raw))
                        candidate-key)
-        i          ^Indexable (when-not retained-key (b/indexable nil aid v vt c/g0))
+        ^Indexable i (when-not retained-key (b/indexable nil aid v vt c/g0))
         giant?     (or retained-key (b/giant? i))
         d-eav      (or plan-key
                        (when (and giant? (not (.isEmpty giants)))
@@ -2864,6 +2903,10 @@
                           last-modified-ms reserved-metadata nil))
   ([^Store store datoms embedding-plan extra-kv-txs extra-kv-txs-fn
     last-modified-ms ^longs reserved-metadata ^IdentityHashMap embedding-skips]
+   (prepare-datoms-kv-plan store datoms embedding-plan extra-kv-txs extra-kv-txs-fn
+                          last-modified-ms reserved-metadata embedding-skips false))
+  ([^Store store datoms embedding-plan extra-kv-txs extra-kv-txs-fn
+    last-modified-ms ^longs reserved-metadata ^IdentityHashMap embedding-skips coalesce-fulltext?]
    ;; Another connection may have enabled AVE since this wrapper was created.
    ;; The caller holds the write lock, so index participation cannot change
    ;; between this refresh and the commit.
@@ -2931,14 +2974,22 @@
                  (do (delete-datom store datom datom-txs work giants ai
                                    embedding-work? avg-bf)
                      max-gt)))))
-         (max-gt store)
+         ;; Explicit writers have already refreshed on entry. Custom plans
+         ;; retain their eager refresh before invoking serializer callbacks.
+         ;; Ordinary direct plans initialize this cursor at their first giant.
+         (when (or native-write (lmdb/writing? (.-lmdb store)))
+           (max-gt store))
          datoms)
        (finally
          (bf/return-array-buffer avg-bf)))
      ;; Keep primitive datom operations first for native executor selection.
      ;; Attribute IDs are disjoint, so the EAV-only writes can follow them.
      (when unindexed-txs (.addAll txs ^FastList unindexed-txs))
-     (let [ft-jobs (aget work ft-jobs-slot)
+     (let [ft-jobs (when-let [jobs (aget work ft-jobs-slot)]
+                     (if coalesce-fulltext?
+                       (indexing/coalesce-fulltext-operations
+                         jobs :op (juxt :domain :ref))
+                       jobs))
            vi-jobs (aget work vi-jobs-slot)
            em-jobs (aget work em-jobs-slot)
            id-jobs (when-let [ops (aget work id-jobs-slot)]
@@ -2962,6 +3013,7 @@
                                 (max (long (or last-modified-ms 0))
                                      (long (observed-state-sync-ms store))
                                      (System/currentTimeMillis))))]
+       (aset work ft-jobs-slot ft-jobs)
        (when (or ft-jobs vi-jobs em-jobs id-jobs)
          (doseq [[ordinal job] (map-indexed vector
                                             (concat ft-jobs vi-jobs em-jobs id-jobs))]
@@ -3001,28 +3053,31 @@
 
 (defn- commit-datoms-kv-plan!
   "Commit a prepared datom KV plan."
-  [lmdb search-engines vector-indices embedding-indices idoc-indices
-   {:keys [txs ft-ds vi-ds em-ds id-ds]}]
-  ;; Transaction bodies can change indexing modes after admission and Store
-  ;; transfer. Validate the prepared work before any engine state is mutated.
-  (when (and *validate-secondary-indexing!* (or ft-ds vi-ds em-ds id-ds)
-             (current-write-group lmdb))
-    (*validate-secondary-indexing!* lmdb))
-  (when ft-ds
-    (fulltext-index search-engines ft-ds))
-  (when vi-ds
-    (vector-index vector-indices vi-ds))
-  (when em-ds
-    (embedding-index embedding-indices em-ds))
-  (let [idoc-state-actions (when id-ds
-                            (idoc-index idoc-indices id-ds txs))]
-    ;; The collector already owns this writer. Its capture validates and
-    ;; freezes the storage rows without repeating public KV routing.
-    (if-let [capture (when *write-group*
-                      (lmdb/row-capture (kv/raw-lmdb lmdb)))]
-      (capture nil (encoding/storage-rows txs) :data :data)
-      (transact-kv lmdb txs))
-    (idoc/apply-state-actions! idoc-state-actions)))
+  ([lmdb search-engines vector-indices embedding-indices idoc-indices plan]
+   (commit-datoms-kv-plan! lmdb search-engines vector-indices embedding-indices
+                          idoc-indices plan false))
+  ([lmdb search-engines vector-indices embedding-indices idoc-indices
+    {:keys [txs ft-ds vi-ds em-ds id-ds]} coalesce-fulltext?]
+   ;; Transaction bodies can change indexing modes after admission and Store
+   ;; transfer. Validate the prepared work before any engine state is mutated.
+   (when (and *validate-secondary-indexing!* (or ft-ds vi-ds em-ds id-ds)
+              (current-write-group lmdb))
+     (*validate-secondary-indexing!* lmdb))
+   (when ft-ds
+     (fulltext-index search-engines ft-ds coalesce-fulltext?))
+   (when vi-ds
+     (vector-index vector-indices vi-ds))
+   (when em-ds
+     (embedding-index embedding-indices em-ds))
+   (let [idoc-state-actions (when id-ds
+                             (idoc-index idoc-indices id-ds txs))]
+     ;; The collector already owns this writer. Its capture validates and
+     ;; freezes the storage rows without repeating public KV routing.
+     (if-let [capture (when *write-group*
+                       (lmdb/row-capture (kv/raw-lmdb lmdb)))]
+       (capture nil (encoding/storage-rows txs) :data :data)
+       (transact-kv lmdb txs))
+     (idoc/apply-state-actions! idoc-state-actions))))
 
 (defn ea-tuples
   [^Store store e a]

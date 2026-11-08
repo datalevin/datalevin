@@ -64,25 +64,22 @@
 ;; ---- Constructor ----
 
 (defn make-prepare-ctx
-  "Build a PrepareCtx from a DB snapshot."
-  [db lmdb]
-  (let [store (:store db)]
-    (->PrepareCtx (schema store)
-                  (i/rschema store)
-                  (opts store)
-                  store
-                  db
-                  lmdb
-                  (i/attrs store)
-                  nil)))
+  "Build a PrepareCtx from a DB snapshot. The interpreter needs only schema
+  and options; the two-argument form also supplies native storage metadata."
+  ([db]
+   (let [store (:store db)]
+     (->PrepareCtx (schema store) (i/rschema store) (opts store)
+                   store db nil nil nil)))
+  ([db lmdb]
+   (assoc (make-prepare-ctx db) :lmdb lmdb :attrs (i/attrs (:store db)))))
 
 ;; ---- Top-level entry point ----
 
 (defn prepare-tx
   "Execute the transaction loop and wrap its report in a PreparedTx.
-   execute-fn: (fn [entities tx-time] -> report) runs the transaction loop."
-  [_ctx entities tx-time execute-fn]
-  (let [report (execute-fn entities tx-time)]
+   execute-fn: (fn [ctx entities tx-time] -> report) runs the transaction loop."
+  [ctx entities tx-time execute-fn]
+  (let [report (execute-fn ctx entities tx-time)]
     (->PreparedTx
       (:tx-data report)
       (:db-after report)
@@ -173,7 +170,7 @@
 
 (defn ^:no-doc correct-scalar-value
   "Validate and coerce a non-nil value after the scalar update gate has excluded
-  tuples, references, idoc and custom types. `vt` is the resolved built-in type
+  tuples, unresolved references, idoc and custom types. `vt` is the built-in type
   or nil for untyped attributes; value-dependent validation is never cached."
   [validate? vt v]
   (let [vt (or vt :data)]

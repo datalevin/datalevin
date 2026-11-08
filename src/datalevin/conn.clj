@@ -363,7 +363,11 @@
                                           (not owned?#)
                                           (assoc :max-eid
                                                  (max (long (:max-eid db1#))
-                                                      (long (i/init-max-eid store1#)))))
+                                                      (long (i/init-max-eid store1#))))
+                                          (and (not owned?#)
+                                               (> (long (i/max-tx store1#))
+                                                  (long (:max-tx db1#))))
+                                          (assoc :max-tx (i/max-tx store1#)))
                                    conn1# (atom db1#
                                                 :meta (meta orig-conn#))
                                    res#   (let [~conn conn1#]
@@ -542,10 +546,20 @@
                   result
                   (l/with-transaction-kv [kv1 kv]
                     (let [store1 ^Store (s/transfer store kv1)
-                          db1    ^DB    (db/transfer db store1)]
+                          stored-max-tx (long (i/max-tx store1))
+                          db1    ^DB    (cond-> (db/transfer db store1)
+                                          (not (== stored-max-tx (long (:max-tx db))))
+                                          (assoc :max-eid
+                                                 (max (long (:max-eid db))
+                                                      (long (i/init-max-eid store1)))
+                                                 :max-tx
+                                                 (max (long (:max-tx db)) stored-max-tx)))]
                       (when-let [[report upsert? :as result]
-                                 (db/stamp-blind-local-identity-tx
-                                   db1 prepared tx-meta)]
+                                 (or (db/stamp-blind-local-identity-tx
+                                       db1 prepared tx-meta)
+                                     (when-let [report (db/stamp-blind-local-upsert-tx
+                                                        db1 prepared tx-meta)]
+                                       [report true]))]
                         (vreset! prepared-store store1)
                         (binding [s/*enforce-blind-unique-inserts?* false
                                   c/*ordered-datom-writes?* (not upsert?)]
@@ -604,16 +618,6 @@
               (when-not old
                 (db/enable-cache (.-store ^DB @conn))))))))))
 
-(defn- maybe-direct-local-blind-transact!
-  ([conn tx-data tx-meta]
-   (maybe-direct-local-blind-transact! conn tx-data tx-meta false))
-  ([conn tx-data tx-meta require-unique?]
-   (when-let [prepared (db/prepare-blind-local-tx
-                         ^DB @conn tx-data require-unique? false)]
-     (when (or (not require-unique?)
-               (:has-unique? prepared))
-       (direct-local-blind-transact! conn prepared tx-meta)))))
-
 (def ^:dynamic *local-wal-tx-path-observer* nil)
 (def ^:dynamic *local-wal-identity-upsert?* true)
 (def ^:dynamic *local-wal-patch-idoc?* true)
@@ -622,6 +626,26 @@
   [path]
   (when (fn? *local-wal-tx-path-observer*)
     (*local-wal-tx-path-observer* path)))
+
+(defn- try-direct-local-blind-transact!
+  [conn prepared tx-meta]
+  (or (when-let [report (direct-local-blind-transact! conn prepared tx-meta)]
+        (observe-local-wal-tx-path! :blind-insert)
+        report)
+      (when *local-wal-identity-upsert?*
+        (when-let [[report upsert?]
+                   (direct-local-identity-transact! conn prepared tx-meta)]
+          (observe-local-wal-tx-path! (if upsert? :identity-upsert :blind-insert))
+          report))))
+
+(defn- maybe-direct-local-blind-transact!
+  ([conn tx-data tx-meta]
+   (maybe-direct-local-blind-transact! conn tx-data tx-meta false))
+  ([conn tx-data tx-meta require-unique?]
+   (when-let [prepared (db/prepare-blind-local-tx
+                         ^DB @conn tx-data require-unique? false)]
+     (when (or (not require-unique?) (:has-unique? prepared))
+       (try-direct-local-blind-transact! conn prepared tx-meta)))))
 
 (defn- direct-local-scalar-update!
   "Commit a prepared simple scalar-update batch directly against one LMDB write
@@ -639,7 +663,18 @@
                   result
                   (l/with-transaction-kv [kv1 kv]
                     (let [store1 ^Store (s/transfer store kv1)
-                          db1    ^DB    (db/transfer db store1)]
+                          stored-max-tx (long (i/max-tx store1))
+                          ;; Keep both allocation floors current: later blind
+                          ;; inserts use the transaction counter to recognize
+                          ;; a fresh DB.
+                          db1    ^DB    (cond-> (db/transfer db store1)
+                                          (not (== stored-max-tx (long (:max-tx db))))
+                                          (assoc :max-eid
+                                                 (max (long (:max-eid db))
+                                                      (long (i/init-max-eid store1)))
+                                                 :max-tx
+                                                 (max (long (:max-tx db))
+                                                      stored-max-tx)))]
                       (when-let [report (db/stamp-scalar-update-tx
                                           db1 prepared tx-meta)]
                         (vreset! prepared-store store1)
@@ -686,10 +721,7 @@
           (observe-local-wal-tx-path!
             (if upsert? :identity-upsert :blind-insert))
           report)
-        (when-let [report (direct-local-blind-transact!
-                            conn prepared tx-meta)]
-          (observe-local-wal-tx-path! :blind-insert)
-          report)))))
+        (try-direct-local-blind-transact! conn prepared tx-meta)))))
 
 (defn- single-identity-entity?
   "Cheap gate for the single-entity identity-upsert specialization: exactly one
@@ -774,14 +806,14 @@
       (assoc report :db-after after))))
 
 (defn- commit-writing-report!
-  [db report ordered? path known-scalar? fused?]
+  [db report ordered? path independent-scalar? fused?]
   (let [preparation txcommon/*batch-prepare*
         ;; Add-only native batches already select ordered index passes. Avoid
         ;; forcing eager encoding when the collector can freeze ordinary datoms.
         ordered? (and ordered? (nil? preparation))]
     (when (and preparation (not fused?))
       ;; Scalar preparers already established this for every emitted datom.
-      (when-not known-scalar?
+      (when-not independent-scalar?
         (let [schema (i/schema (:store db))]
           (when (some #(identical? :db.cardinality/many
                                   (:db/cardinality (schema (:a %))))
@@ -796,10 +828,12 @@
              (not fused?)
              (not s/*enforce-blind-unique-inserts?*)
              (= c/*ordered-datom-writes?* ordered?))
-      (db/commit-prepared-tx-data! (:db-after report) (:tx-data report) report)
+      (db/commit-prepared-tx-data!
+        (:db-after report) (:tx-data report) report independent-scalar?)
       (binding [s/*enforce-blind-unique-inserts?* fused?
                 c/*ordered-datom-writes?* ordered?]
-        (db/commit-prepared-tx-data! (:db-after report) (:tx-data report) report)))
+        (db/commit-prepared-tx-data!
+          (:db-after report) (:tx-data report) report independent-scalar?)))
     ;; Publish resolver state only after conditional native inserts succeed.
     (when (and preparation fused?)
       (if (txcommon/retain-pending-index? preparation)
@@ -847,18 +881,21 @@
               (commit-writing-report! db report (not upsert?)
                                      (if upsert? :identity-upsert :blind-insert)
                                      (false? (:has-many? prepared)) false))
-            (if (and fuse-unique? (:fuse-unique-inserts? prepared))
-              (try
-                (commit-writing-report! db (db/stamp-blind-local-tx db prepared tx-meta)
-                                       true :blind-insert false true)
-                (catch Exception e
-                  (when-not (and (l/blind-unique-collision? e)
-                                 (:unique-inserts-rolled-back? (ex-data e)))
-                    (throw e))))
-              (when (db/blind-local-tx-unique-values-absent? db prepared)
-                (commit-writing-report! db (db/stamp-blind-local-tx db prepared tx-meta)
-                                       true :blind-insert
-                                       (false? (:has-many? prepared)) false)))))
+            (or (if (and fuse-unique? (:fuse-unique-inserts? prepared))
+                  (try
+                    (commit-writing-report! db (db/stamp-blind-local-tx db prepared tx-meta)
+                                           true :blind-insert false true)
+                    (catch Exception e
+                      (when-not (and (l/blind-unique-collision? e)
+                                     (:unique-inserts-rolled-back? (ex-data e)))
+                        (throw e))))
+                  (when (db/blind-local-tx-unique-values-absent? db prepared)
+                    (commit-writing-report! db (db/stamp-blind-local-tx db prepared tx-meta)
+                                           true :blind-insert
+                                           (false? (:has-many? prepared)) false)))
+                (when *local-wal-identity-upsert?*
+                  (when-let [report (db/stamp-blind-local-upsert-tx db prepared tx-meta)]
+                    (commit-writing-report! db report false :identity-upsert true false))))))
         ;; Specialized preparers leave resolver indexes unchanged. Only the
         ;; interpreter needs fresh indexes outside collected batches.
         (let [db1 (if txcommon/*batch-prepare*

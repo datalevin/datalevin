@@ -16,16 +16,14 @@
    [datalevin.db.tx.prepare :as txprep]
    [datalevin.idoc :as idoc]
    [datalevin.index :as idx]
-   [datalevin.interface :as i :refer [fetch init-max-eid opts schema]]
+   [datalevin.interface :as i :refer [fetch init-max-eid opts]]
    [datalevin.prepare :as coreprep]
-   [datalevin.storage :as s]
    [datalevin.udf :as udf]
    [datalevin.util :as u :refer [ conjv conjs concatv cond+ raise]]
    [datalevin.validate :as vld])
   (:import
    [datalevin.datom Datom]
    [datalevin.db.tx.prepare IdentityResolution ResolvedIdentityAdd]
-   [datalevin.storage Store]
    [java.util ArrayList Collection HashMap List SortedSet]
    [org.eclipse.collections.impl.set.sorted.mutable TreeSortedSet]))
 
@@ -34,6 +32,42 @@
 
 (deftype ^:private ResolvedTuple [^long e a value before])
 (deftype ^:private ResolvedIdentityMap [entity resolution])
+
+(def ^:private resolution-value-classes
+  ;; No host conversion, predicates or nested calls may change the native
+  ;; transaction while a flat plan carries its stored identity results.
+  #{String Long Integer Short Byte Double Float Boolean
+    clojure.lang.Keyword clojure.lang.Symbol clojure.lang.BigInt
+    clojure.lang.Ratio java.math.BigInteger java.math.BigDecimal
+    java.util.UUID java.util.Date java.sql.Date java.sql.Timestamp
+    java.time.Instant (class (byte-array 0))})
+
+(def ^:private resolution-scalar-types
+  #{nil :db.type/string :db.type/long :db.type/keyword :db.type/symbol
+    :db.type/uuid :db.type/instant :db.type/boolean :db.type/float
+    :db.type/double :db.type/bigint :db.type/bigdec :db.type/bytes})
+
+
+(defn- refresh-context
+  [report context]
+  (when-let [ctx @context]
+    (let [store (:store (:db-after report))]
+      (when-not (and (identical? (:schema ctx) (i/schema store))
+                     (identical? (:opts ctx) (opts store)))
+        (vreset! context (coreprep/make-prepare-ctx (:db-after report))))))
+  report)
+
+(defn- after-value-callbacks
+  "Ordinary plans exclude callbacks. Other additions refresh schema decisions
+  after predicates or host coercion before publishing their datoms."
+  [report props value context]
+  (if (or (::reference-free? report)
+          (and (not (:db.attr/preds props))
+               (or (contains? resolution-scalar-types (:db/valueType props))
+                   (identical? :db.type/ref (:db/valueType props)))
+               (contains? resolution-value-classes (class value))))
+    report
+    (refresh-context report context)))
 
 (defn- cached-ea-first-datom
   [db ^long e a]
@@ -70,9 +104,8 @@
   db)
 
 (defn- validate-datom
-  [db ^Datom datom resolution rschema]
-  (when (and (datom-added datom)
-             (contains? (:db/unique rschema) (.-a datom)))
+  [db ^Datom datom resolution props]
+  (when (and (datom-added datom) (:db/unique props))
     (let [a (.-a datom)
           v (.-v datom)]
       (vld/validate-datom-unique
@@ -112,12 +145,12 @@
   report)
 
 (defn- allocate-eid
-  ([_ report eid]
+  ([_ report eid _context]
    (update report :db-after advance-max-eid eid))
-  ([tx-time report e eid]
+  ([tx-time report e eid context]
    (let [db   (:db-after report)
          new? (new-eid? db eid)
-         db-opts (opts (:store db))]
+         db-opts (:opts @context)]
      (cond-> report
        (tx-id? e)
        (->
@@ -139,16 +172,15 @@
        (update :db-after advance-max-eid eid)))))
 
 (defn- with-datom
-  [db ^Datom datom resolution rschema]
-  (validate-datom db datom resolution rschema)
+  [db ^Datom datom resolution props]
+  (validate-datom db datom resolution props)
   (if txcommon/*batch-prepare*
-    (do (txcommon/stage-batch-datom! db datom)
+    (do (txcommon/stage-batch-datom! db datom props)
         (if (datom-added datom) (advance-max-eid db (.-e datom)) db))
     (if (datom-added datom)
       (do
         (.add ^TreeSortedSet (:eavt db) datom)
-        (when-not (when-let [attrs (:db/noindex rschema)]
-                    (contains? attrs (.-a datom)))
+        (when-not (:db/noindex props)
           (.add ^TreeSortedSet (:avet db) datom))
         (advance-max-eid db (.-e datom)))
       (if (.isEmpty
@@ -158,22 +190,21 @@
         db
         (do
           (.remove ^TreeSortedSet (:eavt db) datom)
-          (when-not (when-let [attrs (:db/noindex rschema)]
-                      (contains? attrs (.-a datom)))
+          (when-not (:db/noindex props)
             (.remove ^TreeSortedSet (:avet db) datom))
           db)))))
 
 (declare effective-attr-value effective-attr-preparation)
 
 (defn- queue-tuple
-  [queue tuple idx report db e _ v]
+  [queue tuple idx report db e _ v context]
   (let [^ResolvedTuple queued (get queue tuple)
         before (if queued
                  (.-before queued)
                  (effective-attr-preparation report db e tuple))
         value (or (when queued (.-value queued))
                   (idx/logical-value before)
-                  (vec (repeat (-> (schema (:store db))
+                  (vec (repeat (-> @context :schema
                                    (get tuple)
                                    :db/tupleAttrs
                                    count)
@@ -181,10 +212,10 @@
     (assoc queue tuple (ResolvedTuple. e tuple (assoc value idx v) before))))
 
 (defn- queue-tuples
-  [queue tuples report db e a v]
+  [queue tuples report db e a v context]
   (reduce-kv
     (fn [queue tuple idx]
-      (queue-tuple queue tuple idx report db e a v))
+      (queue-tuple queue tuple idx report db e a v context))
     queue
     tuples))
 
@@ -195,13 +226,15 @@
   report)
 
 (defn- transact-report
-  ([report datom] (transact-report report datom nil))
-  ([report ^Datom datom resolution]
+  ([report datom context] (transact-report report datom nil context))
+  ([report ^Datom datom resolution context]
+   (transact-report report datom resolution
+                    (get (:schema @context) (.-a datom)) context))
+  ([report ^Datom datom resolution props context]
    (let [db      (:db-after report)
-         ;; Validation, AVET maintenance and tuple queuing share this read.
-         rschema (i/rschema (:store db))
+         rschema (:rschema @context)
          a       (.-a datom)
-         db'     (with-datom db datom resolution rschema)
+         db'     (with-datom db datom resolution props)
          report' (-> report
                      (cond-> (not (identical? db db')) (assoc :db-after db'))
                      (append-tx-datom! datom)
@@ -211,48 +244,55 @@
        (let [e      (.-e datom)
              v      (if (datom-added datom) (.-v datom) nil)
              queue  (or (-> report' ::queued-tuples (get e)) {})
-             queue' (queue-tuples queue tuples report' db e a v)]
+             queue' (queue-tuples queue tuples report' db e a v context)]
          (update report' ::queued-tuples assoc e queue'))
        report'))))
 
 (defn- transact-same-value
-  [report datom resolution]
-  ;; Build membership on the first redundant operation, then maintain it as
-  ;; retractions are emitted. Transactions without redundant values avoid it.
-  ;; Keep even re-added values; Datom equivalence ignores tx, added? and metadata.
-  (let [report (if (::tx-retracted report)
-                 report
-                 (assoc report ::tx-retracted
-                        (reduce (fn [retracted d]
-                                  (if (datom-added d)
-                                    retracted
-                                    (conj! retracted d)))
-                                (transient #{}) (:tx-data report))))]
-    (if (contains? (::tx-retracted report) datom)
-      (transact-report report datom resolution)
-      ;; Only reference tempid validation consumes redundant additions. The
-      ;; ordinary-addition plan proves that no later input can introduce one.
-      (if (::reference-free? report)
-        report
-        (update report ::tx-redundant conjv datom)))))
+  ([report datom resolution]
+   (transact-same-value report datom resolution (volatile! nil)))
+  ([report ^Datom datom resolution context]
+   (transact-same-value report datom resolution
+                        (get (:schema @context) (.-a datom)) context))
+  ([report datom resolution props context]
+   ;; Build membership on the first redundant operation, then maintain it as
+   ;; retractions are emitted. Transactions without redundant values avoid it.
+   ;; Keep even re-added values; Datom equivalence ignores tx, added? and metadata.
+   (let [report (if (::tx-retracted report)
+                  report
+                  (assoc report ::tx-retracted
+                         (reduce (fn [retracted d]
+                                   (if (datom-added d)
+                                     retracted
+                                     (conj! retracted d)))
+                                 (transient #{}) (:tx-data report))))]
+     (if (contains? (::tx-retracted report) datom)
+       (transact-report report datom resolution props context)
+       ;; Only reference tempid validation consumes redundant additions. The
+       ;; ordinary-addition plan proves that no later input can introduce one.
+       (if (::reference-free? report)
+         report
+         (update report ::tx-redundant conjv datom))))))
 
 (defn- apply-add
   "Apply a normalized value against its known previous value. Ordinary input,
   CAS and derived tuples share datom publication and constraint maintenance."
-  ([report new-datom old-value] (apply-add report new-datom old-value nil))
-  ([report ^Datom new-datom old-value resolution]
+  ([report ^Datom new-datom old-value context]
+   (apply-add report new-datom old-value nil
+              (get (:schema @context) (.-a new-datom)) context))
+  ([report ^Datom new-datom old-value resolution props context]
    (cond
      (nil? old-value)
-     (transact-report report new-datom resolution)
+     (transact-report report new-datom resolution props context)
 
      (d/value-equal? (idx/logical-value old-value) (.-v new-datom))
-     (transact-same-value report new-datom resolution)
+     (transact-same-value report new-datom resolution props context)
 
      :else
      (-> report
          (transact-report (idx/retraction (.-e new-datom) (.-a new-datom) old-value
-                                         (d/datom-tx new-datom)))
-         (transact-report new-datom resolution)))))
+                                         (d/datom-tx new-datom)) nil props context)
+         (transact-report new-datom resolution props context)))))
 
 (defn- pending-attr-state
   [report e a]
@@ -331,8 +371,8 @@
 (defn- transact-resolved-add
   "Publish a normalized datom. IDs, value, transaction and metadata are already
   carried by the datom; old-value reads do not repeat input resolution."
-  ([report new-datom props] (transact-resolved-add report new-datom props nil))
-  ([report ^Datom new-datom props resolution]
+  ([report new-datom props context] (transact-resolved-add report new-datom props nil context))
+  ([report ^Datom new-datom props resolution context]
    (let [e (.-e new-datom)
          a (.-a new-datom)
          value (.-v new-datom)
@@ -351,14 +391,13 @@
                ;; made by other connections since db-before was obtained.
                (when (<= (long e) ^long (::max-eid-before report))
                  (txcommon/ea-first-datom db e a))))]
-     (apply-add report new-datom (idx/datom-prepared-value old-datom) resolution))))
+     (apply-add report new-datom (idx/datom-prepared-value old-datom) resolution props context))))
 
 (defn- transact-add
-  ([report [_ _ a _ _ :as ent]]
-   (let [store (:store (:db-after report))
-         props ((schema store) a)]
-     (transact-add report ent props (opts store))))
-  ([report [_ e a v tx :as ent] props store-opts]
+  ([report [_ _ a _ _ :as ent] context]
+   (let [ctx @context]
+     (transact-add report ent (get (:schema ctx) a) (:opts ctx) context)))
+  ([report [_ e a v tx :as ent] props store-opts context]
    (vld/validate-attr a ent)
    (vld/validate-val v ent)
    (let [db (:db-after report)
@@ -371,35 +410,40 @@
        (txcommon/flush-batch-prepare!)
        (vld/validate-attr-preds
          e a value props #(txprep/resolve-attr-pred-udf db %)))
-     (let [meta* (meta ent)
+     (let [before @context
+           report (after-value-callbacks report props v context)
+           props (if (identical? before @context)
+                   props (get (:schema @context) a))
+           meta* (meta ent)
            new-datom (cond-> (datom e a value (or tx (current-tx report)))
                        meta* (with-meta meta*))]
-       (transact-resolved-add report new-datom props)))))
+       (transact-resolved-add report new-datom props context)))))
 
-(defn- transact-retract-datom [report ^Datom d]
+(defn- transact-retract-datom [report ^Datom d context]
   (let [tx (current-tx report)]
     (transact-report report
                      (idx/retraction (.-e d) (.-a d)
-                                     (idx/datom-prepared-value d) tx))))
+                                     (idx/datom-prepared-value d) tx) context)))
 
 (defn- transact-known-old-add
   "Validate and apply an addition whose previous cardinality-one value is
   already known. CAS and document patches retain metadata and predicates."
-  [report db store entity e a nv ^Datom old-datom]
+  [report db _store entity e a nv ^Datom old-datom context]
   (vld/validate-val nv entity)
   (let [tx        (current-tx report)
         _         (validate-installed-callable-write report db e a nv entity)
-        props     ((schema store) a)
+        props     (get (:schema @context) a)
         nv'       (coreprep/correct-value-with-props
-                    (opts store) props a nv)
+                    (:opts @context) props a nv)
         _         (when (:db.attr/preds props)
                     (txcommon/flush-batch-prepare!)
                     (vld/validate-attr-preds
                       e a nv' props #(txprep/resolve-attr-pred-udf db %)))
+        report    (after-value-callbacks report props nv context)
         meta*     (meta entity)
         new-datom (cond-> (datom e a nv' tx)
                     meta* (with-meta meta*))]
-    (apply-add report new-datom (idx/datom-prepared-value old-datom))))
+    (apply-add report new-datom (idx/datom-prepared-value old-datom) context)))
 
 (defn- retract-components
   ([db datoms]
@@ -497,14 +541,14 @@
         (transient []) queued))))
 
 (defn- transact-resolved-tuple
-  [report schema store-opts ^ResolvedTuple change]
+  [report schema store-opts ^ResolvedTuple change context]
   (let [e (.-e change) a (.-a change) value (.-value change)
         tx (current-tx report)]
     (if (nil? value)
-      (transact-report report (idx/retraction e a (.-before change) tx))
+      (transact-report report (idx/retraction e a (.-before change) tx) context)
       (let [value (coreprep/correct-value-with-props store-opts (schema a) a value)
             new-datom (with-meta (datom e a value tx) {::internal true})]
-        (apply-add report new-datom (.-before change))))))
+        (apply-add report new-datom (.-before change) context)))))
 
 (defn- finalize-report
   [report]
@@ -530,7 +574,7 @@
       (seq new-attrs) (assoc :new-attributes new-attrs))))
 
 (defn- handle-cas
-  [report db store entity entities]
+  [report db store entity entities context]
   (let [[_ e a ov nv] entity
         e             (txcommon/entid-strict db e)
         _             (vld/validate-attr a entity)
@@ -550,13 +594,13 @@
                           (txcommon/ea-datoms db e a)))]
     (vld/validate-cas-value multival? e a ov nv datoms)
     [(if multival?
-       (transact-add report [:db/add e a nv])
+       (transact-add report [:db/add e a nv] context)
        (transact-known-old-add
-         report db store entity e a nv (first datoms)))
+         report db store entity e a nv (first datoms) context))
      entities]))
 
 (defn- handle-patch-idoc
-  [report db store schema entity entities]
+  [report db store schema entity entities context]
   (let [argc (count entity)]
     (vld/validate-patch-idoc-arity argc entity (first entity))
     (let [[_ e a x y] entity
@@ -585,7 +629,7 @@
                 [report entities]
                 (let [ent (with-meta [:db/add e a doc]
                             {:idoc/patch {:paths paths}})]
-                  [(transact-add report ent)
+                  [(transact-add report ent context)
                    (cons [:db/retract e a old-doc] entities)]))))
           (let [old-datom           (or (cached-ea-first-datom db e a)
                                         (txcommon/ea-first-datom db e a))
@@ -593,7 +637,7 @@
                 {:keys [doc paths]} (idoc/apply-patch (or old-doc {}) ops)
                 ent                 (with-meta [:db/add e a doc]
                                       {:idoc/patch {:paths paths}})]
-            [(transact-known-old-add report db store ent e a doc old-datom)
+            [(transact-known-old-add report db store ent e a doc old-datom context)
              entities]))))))
 
 (defn- handle-ensure
@@ -604,19 +648,19 @@
     [(update report ::ensures conjv [pred args entity]) entities]))
 
 (defn- handle-ref-tempid-value
-  [report db tempids entity entities es tx-time]
+  [report db tempids entity entities es tx-time context]
   (let [[op e a v] entity]
     (if-some [resolved (get tempids v)]
       [(update report ::value-tempids assoc resolved v)
        (cons [op e a resolved] entities)]
       (let [resolved (next-eid db)]
-        [(-> (allocate-eid tx-time report v resolved)
+        [(-> (allocate-eid tx-time report v resolved context)
              (update ::value-tempids assoc resolved v))
          es]))))
 
 (defn- handle-tempid-entity
   [initial-report report db _store tempids unique-identity? entity entities
-   initial-es tx-time]
+   initial-es tx-time context]
   (let [[op e a v] entity
         upserted-eid  (when unique-identity?
                         (or (txcommon/cached-av-first-e db a v)
@@ -628,7 +672,7 @@
       (let [eid (or upserted-eid allocated-eid (next-eid db))]
         [(if allocated-eid
            report
-           (allocate-eid tx-time report e eid))
+           (allocate-eid tx-time report e eid context))
          (cons [op eid a v] entities)]))))
 
 (defn- handle-reverse-tempid-upsert
@@ -660,7 +704,7 @@
     [report entities]))
 
 (defn- handle-tuple-ref-tempids
-  [report db tempids entity entities vs tx-time]
+  [report _db _tempids entity entities vs tx-time context]
   (let [[op e a _] entity
         [report' v']
         (loop [report' report
@@ -669,10 +713,11 @@
           (if-let [[[tuple-type v] & vs] vs]
             (if (and (identical? tuple-type :db.type/ref)
                      (txprep/tempid? v))
-              (if-some [resolved (get tempids v)]
+              ;; Each component must see allocations from earlier components.
+              (if-some [resolved (get (:tempids report') v)]
                 (recur report' vs (conj v' resolved))
-                (let [resolved (next-eid db)
-                      report'  (-> (allocate-eid tx-time report' v resolved)
+                (let [resolved (next-eid (:db-after report'))
+                      report'  (-> (allocate-eid tx-time report' v resolved context)
                                    (update ::value-tempids assoc resolved v))]
                   (recur report' vs (conj v' resolved))))
               (recur report' vs (conj v' v)))
@@ -691,7 +736,7 @@
     [op e a v']))
 
 (defn- handle-retract-value
-  [report db store entity entities]
+  [report db store entity entities context]
   (let [[_ e a v] entity]
     (if-some [e (txcommon/entid db e)]
       (let [v (if (txcommon/ref? db a)
@@ -701,12 +746,12 @@
         (vld/validate-val v entity)
         (if-some [old-datom (or (cached-eav-first-datom db e a v)
                                 (first (txcommon/visible-stored db (fetch store (datom e a v)))))]
-          [(transact-retract-datom report old-datom) entities]
+          [(transact-retract-datom report old-datom context) entities]
           [report entities]))
       [report entities])))
 
 (defn- handle-retract-attribute
-  [report db _store entity entities]
+  [report db _store entity entities context]
   (let [[_ e a _] entity]
     (if-some [e (txcommon/entid db e)]
       (let [_       (vld/validate-attr a entity)
@@ -714,8 +759,8 @@
             cached  (when-not txcommon/*batch-prepare*
                       (vec (.subSet ^TreeSortedSet (:eavt db)
                                     (datom e a nil tx0) (datom e a nil txmax))))
-            report' (reduce transact-retract-datom report stored)
-            report' (reduce transact-retract-datom report' cached)
+            report' (reduce #(transact-retract-datom %1 %2 context) report stored)
+            report' (reduce #(transact-retract-datom %1 %2 context) report' cached)
             components (retract-components db stored)
             components (retract-components db components cached)]
         [report' (if (seq components)
@@ -724,7 +769,7 @@
       [report entities])))
 
 (defn- handle-retract-entity
-  [report db _store entity entities]
+  [report db _store entity entities context]
   (let [[_ e _ _] entity]
     (if-some [e (txcommon/entid db e)]
       (let [stored-e-datoms (vec (txcommon/e-datoms db e))
@@ -732,11 +777,9 @@
                               (vec (.subSet ^TreeSortedSet (:eavt db)
                                             (datom e nil nil tx0) (datom e nil nil txmax))))
             v-datoms        (vec (txcommon/v-datoms db e))
-            report'         (reduce transact-retract-datom
-                                    report stored-e-datoms)
-            report'         (reduce transact-retract-datom
-                                    report' cached-e-datoms)
-            report'         (reduce transact-retract-datom report' v-datoms)
+            report'         (reduce #(transact-retract-datom %1 %2 context) report stored-e-datoms)
+            report'         (reduce #(transact-retract-datom %1 %2 context) report' cached-e-datoms)
+            report'         (reduce #(transact-retract-datom %1 %2 context) report' v-datoms)
             components      (retract-components db stored-e-datoms)
             components      (retract-components db components cached-e-datoms)]
         [report' (if (seq components)
@@ -745,61 +788,67 @@
       [report entities])))
 
 (defn- handle-map-entity
-  [initial-report report db entity entities initial-es tx-time resolution]
-  (let [old-eid (:db/id entity)]
-    (vld/validate-installed-callable-entity entity)
-    (cond+
-      (tx-id? old-eid)
-      (let [id (current-tx report)]
-        [(allocate-eid tx-time report old-eid id)
-         (cons (assoc entity :db/id id) entities)])
+  ([initial-report report db entity entities initial-es tx-time resolution]
+   (handle-map-entity initial-report report db entity entities initial-es tx-time
+                      resolution (volatile! (coreprep/make-prepare-ctx db))))
+  ([initial-report report db entity entities initial-es tx-time resolution context]
+   (let [old-eid (:db/id entity)
+         ctx (or @context (coreprep/make-prepare-ctx db))]
+     (vld/validate-installed-callable-entity entity)
+     (cond+
+       (tx-id? old-eid)
+       (let [id (current-tx report)]
+         [(allocate-eid tx-time report old-eid id context)
+          (cons (assoc entity :db/id id) entities)])
 
-      (sequential? old-eid)
-      (let [id (txcommon/entid-strict db old-eid)]
-        [report (cons (assoc entity :db/id id) entities)])
+       (sequential? old-eid)
+       (let [id (txcommon/entid-strict db old-eid)]
+         [report (cons (assoc entity :db/id id) entities)])
 
-      :let [[entity' resolution-result]
-            (if resolution
-              (txprep/resolve-identity-map db entity resolution)
-              (txprep/resolve-upserts db entity))
-            upserted-eid (if resolution resolution-result
-                            (txprep/validate-upserts entity' resolution-result))]
+       :let [[entity' resolution-result]
+             (if resolution
+               (txprep/resolve-identity-map db entity resolution)
+               (txprep/resolve-upserts db entity ctx))
+             upserted-eid (if resolution resolution-result
+                             (txprep/validate-upserts entity' resolution-result))
+             report (if resolution report (refresh-context report context))
+             ctx (or @context ctx)]
 
-      (some? upserted-eid)
-      (let [tempids (:tempids report)]
-        (if (and (txprep/tempid? old-eid)
-                 (contains? tempids old-eid)
-                 (not= upserted-eid (get tempids old-eid)))
-          (retry-with-tempid initial-report report initial-es old-eid
-                             upserted-eid tx-time)
-          [(-> (allocate-eid tx-time report old-eid upserted-eid)
-               (update ::tx-redundant conjv
-                       (datom upserted-eid nil nil tx0)))
-           (concat (txprep/explode db
-                                   (assoc entity' :db/id upserted-eid) resolution)
-                   entities)]))
+       (some? upserted-eid)
+       (let [tempids (:tempids report)]
+         (if (and (txprep/tempid? old-eid)
+                  (contains? tempids old-eid)
+                  (not= upserted-eid (get tempids old-eid)))
+           (retry-with-tempid initial-report report initial-es old-eid
+                              upserted-eid tx-time)
+           [(-> (allocate-eid tx-time report old-eid upserted-eid context)
+                (update ::tx-redundant conjv
+                        (datom upserted-eid nil nil tx0)))
+            (concat (txprep/explode db
+                                    (assoc entity' :db/id upserted-eid) resolution ctx)
+                    entities)]))
 
-      (txprep/tempid? old-eid)
-      (if (txprep/contains-nested-map? db entity resolution)
-        [report (concat (txprep/explode db entity) entities)]
-        (let [allocated-eid (get (:tempids report) old-eid)
-              eid           (or allocated-eid (next-eid db))
-              txs           (txprep/explode db (assoc entity :db/id eid) resolution)]
-          (if (.isEmpty ^List txs)
-            [report entities]
-            [(if allocated-eid
-               report
-               (allocate-eid tx-time report old-eid eid))
-             (concat txs entities)])))
+       (txprep/tempid? old-eid)
+       (if (txprep/contains-nested-map? db entity resolution ctx)
+         [report (concat (txprep/explode db entity nil ctx) entities)]
+         (let [allocated-eid (get (:tempids report) old-eid)
+               eid           (or allocated-eid (next-eid db))
+               txs           (txprep/explode db (assoc entity :db/id eid) resolution ctx)]
+           (if (.isEmpty ^List txs)
+             [report entities]
+             [(if allocated-eid
+                report
+                (allocate-eid tx-time report old-eid eid context))
+              (concat txs entities)])))
 
-      (or (number? old-eid)
-          (nil? old-eid)
-          (string? old-eid)
-          (txprep/auto-tempid? old-eid))
-      [report (concat (txprep/explode db entity) entities)]
+       (or (number? old-eid)
+           (nil? old-eid)
+           (string? old-eid)
+           (txprep/auto-tempid? old-eid))
+       [report (concat (txprep/explode db entity nil ctx) entities)]
 
-      :else
-      (vld/validate-map-entity-id-syntax old-eid))))
+       :else
+       (vld/validate-map-entity-id-syntax old-eid)))))
 
 (defn- regular-attr?
   "An attribute that needs no identity, reference or tuple input resolution.
@@ -846,7 +895,7 @@
   "Feed a flat map directly to the shared add operation. Input forms requiring
   expansion or upsert retries remain in handle-map-entity; both paths use the
   same validation, pending indexes, retractions, and composite maintenance."
-  [report schema store-opts entity tx-time]
+  [report entity tx-time context]
   (if (= 1 (count entity))
     report
     (let [old-eid (:db/id entity)
@@ -854,26 +903,29 @@
           allocated (when temporary? (get (:tempids report) old-eid))
           eid (if temporary? (or allocated (next-eid (:db-after report))) old-eid)
           report (if (and temporary? (nil? allocated))
-                   (allocate-eid tx-time report old-eid eid)
+                   (allocate-eid tx-time report old-eid eid context)
                    report)]
       (reduce-kv
         (fn [report a v]
           (if (identical? a :db/id)
             report
-            (let [props (schema a)]
+            (let [ctx @context
+                  props (get (:schema ctx) a)]
               ;; The map gate checked attribute syntax and resolved references.
               ;; Materialize an operation only for a value error's context.
               (when (nil? v) (vld/validate-val v [:db/add eid a v]))
-              (transact-resolved-add
-                report
-                (datom eid a (coreprep/correct-value-with-props store-opts props a v)
-                       (current-tx report))
-                props))))
+              (let [value (coreprep/correct-value-with-props (:opts ctx) props a v)
+                    before @context
+                    report (after-value-callbacks report props v context)]
+                (transact-resolved-add
+                  report (datom eid a value (current-tx report))
+                  (if (identical? before @context)
+                    props (get (:schema @context) a)) context)))))
         report entity))))
 
 (defn- handle-sequential-entity
   [initial-report report db store schema store-opts tempids entity entities
-   initial-es tx-time]
+   initial-es tx-time context]
   (let [[op e a v]     entity
         props          (schema a)
         ref?           (identical? (:db/valueType props) :db.type/ref)
@@ -884,40 +936,40 @@
         tuple-types?   (contains? props :db/tupleTypes)]
     (cond+
       (identical? op :db.fn/call)
-      [report (concat
-                (txprep/prepare-tx-fn-result
-                  db (txprep/handle-fn-call db entity) tx-time)
-                entities)]
+      (let [result (txprep/handle-fn-call db entity)
+            report (refresh-context report context)]
+        [report (concat (txprep/prepare-tx-fn-result
+                          db result tx-time @context) entities)])
 
       (identical? op :db/ensure)
       (handle-ensure report entity entities)
 
       (and (keyword? op) (not (txprep/builtin-fn? op)))
-      [report (concat
-                (txprep/prepare-tx-fn-result
-                  db (txprep/handle-custom-tx-fn db store entity) tx-time)
-                entities)]
+      (let [result (txprep/handle-custom-tx-fn db store entity)
+            report (refresh-context report context)]
+        [report (concat (txprep/prepare-tx-fn-result
+                          db result tx-time @context) entities)])
 
       (and (txprep/tempid? e) (not (identical? op :db/add)))
       (vld/validate-tempid-op true op entity)
 
       (or (identical? op :db.fn/cas) (identical? op :db/cas))
-      (handle-cas report db store entity entities)
+      (handle-cas report db store entity entities context)
 
       (identical? op :db.fn/patchIdoc)
-      (handle-patch-idoc report db store schema entity entities)
+      (handle-patch-idoc report db store schema entity entities context)
 
       (tx-id? e)
-      [(allocate-eid tx-time report e (current-tx report))
+      [(allocate-eid tx-time report e (current-tx report) context)
        (cons [op (current-tx report) a v] entities)]
 
       (and ref? (tx-id? v))
-      [(allocate-eid tx-time report v (current-tx report))
+      [(allocate-eid tx-time report v (current-tx report) context)
        (cons [op e a (current-tx report)] entities)]
 
       (and ref? (txprep/tempid? v))
       (handle-ref-tempid-value report db tempids entity entities
-                               (cons entity entities) tx-time)
+                               (cons entity entities) tx-time context)
 
       (and ref? (sequential? v))
       (let [resolved (txcommon/entid-strict db v)]
@@ -926,7 +978,7 @@
       (txprep/tempid? e)
       (handle-tempid-entity initial-report report db store tempids
                             unique-identity? entity entities initial-es
-                            tx-time)
+                            tx-time context)
 
       :let [upserted-eid (when (and unique-identity?
                                     (contains? (::reverse-tempids report) e)
@@ -950,31 +1002,31 @@
 
       (some #(and (identical? (first %) :db.type/ref)
                   (txprep/tempid? (second %))) vs)
-      (handle-tuple-ref-tempids report db tempids entity entities vs tx-time)
+      (handle-tuple-ref-tempids report db tempids entity entities vs tx-time context)
 
       (some #(and (identical? (first %) :db.type/ref)
                   (keyword? (second %))) vs)
       [report (cons (handle-tuple-ref-idents db entity vs) entities)]
 
       (identical? op :db/add)
-      (TxStep. (transact-add report entity props store-opts) entities)
+      (TxStep. (transact-add report entity props store-opts context) entities)
 
       (and (identical? op :db/retract) (some? v))
-      (handle-retract-value report db store entity entities)
+      (handle-retract-value report db store entity entities context)
 
       (or (identical? op :db.fn/retractAttribute)
           (identical? op :db/retract))
-      (handle-retract-attribute report db store entity entities)
+      (handle-retract-attribute report db store entity entities context)
 
       (or (identical? op :db.fn/retractEntity)
           (identical? op :db/retractEntity))
-      (handle-retract-entity report db store entity entities)
+      (handle-retract-entity report db store entity entities context)
 
       :else
       (vld/validate-tx-op op entity))))
 
 (defn- transact-resolved-identity
-  [initial-report report ^ResolvedIdentityAdd entity entities initial-es tx-time]
+  [initial-report report ^ResolvedIdentityAdd entity entities initial-es tx-time context]
   (let [e (.-e entity)
         ^IdentityResolution resolution (.-resolution entity)
         a (.-attr resolution)
@@ -986,18 +1038,19 @@
       (handle-reverse-tempid-upsert initial-report report [:db/add e a v]
                                     entities initial-es tx-time owner)
       (transact-resolved-add report (datom e a v (current-tx report))
-                             ((schema (:store db)) a) resolution))))
+                             (get (:schema @context) a) resolution context))))
 
 (defn- execute-tx-loop*
-  [initial-report initial-es tx-time reference-free?]
-  (let [db              (:db-before initial-report)
+  [initial-report initial-es tx-time ordinary? context]
+  (let [ctx             @context
+        db              (:db-before initial-report)
         store           (:store db)
         ;; The owning writer supplies its current maximum. Preserve the
         ;; attempt boundary on the initial report so upsert retries reuse it.
         max-eid-before  (max (long (:max-eid db))
                              (long (or (::max-eid-before initial-report)
                                        (init-max-eid store))))
-        tuples?         (seq (txcommon/attrs-by db :db.type/tuple))
+        tuples?         (seq (:db.type/tuple (:rschema ctx)))
         initial-report' (-> initial-report
                             (dissoc-present ::tx-retracted)
                             (dissoc-present ::pending-attr-index)
@@ -1010,117 +1063,105 @@
                             (assoc ::max-eid-before max-eid-before)
                             (cond-> tuples?
                               (assoc ::pending-attr-index (volatile! nil)))
-                            (cond-> reference-free? (assoc ::reference-free? true))
+                            (cond-> ordinary? (assoc ::reference-free? true))
                             (update :db-after
                                     #(-> % clear-tx-cache
-                                         (advance-max-eid max-eid-before))))
-        schema          (schema store)
-        store-opts      (opts store)]
+                                         (advance-max-eid max-eid-before))))]
     (loop [report    initial-report'
            es        (when-not tuples? initial-es)
            remaining (when tuples? (seq initial-es))]
-      (cond+
-        (empty? es)
-        ;; Finish all expansions of one input before deriving its tuples.
-        ;; Empty queues need neither synthetic operations nor a handler result.
-        (cond
-          (::queued-tuples report)
-          (recur (dissoc report ::queued-tuples)
-                 (seq (flush-tuples report schema)) remaining)
+      (let [ctx @context
+            schema (:schema ctx)
+            store-opts (:opts ctx)]
+        (cond+
+          (empty? es)
+          ;; Finish all expansions of one input before deriving its tuples.
+          ;; Empty queues need neither synthetic operations nor a handler result.
+          (cond
+            (::queued-tuples report)
+            (recur (dissoc report ::queued-tuples)
+                   (seq (flush-tuples report schema)) remaining)
 
-          (seq remaining)
-          (recur report (list (first remaining)) (next remaining))
+            (seq remaining)
+            (recur report (list (first remaining)) (next remaining))
 
-          :else
-          (finalize-report report))
+            :else
+            (finalize-report report))
 
-        :let [[entity & entities] es]
+          :let [[entity & entities] es]
 
-        :let [db      (:db-after report)
-              tempids (:tempids report)]
+          :let [db      (:db-after report)
+                tempids (:tempids report)]
 
-        (instance? ResolvedTuple entity)
-        (recur (transact-resolved-tuple report schema store-opts entity)
-               entities remaining)
-
-        (map? entity)
-        (if (regular-map? schema entity)
-          (recur (transact-regular-map report schema store-opts entity tx-time)
+          (instance? ResolvedTuple entity)
+          (recur (transact-resolved-tuple report schema store-opts entity context)
                  entities remaining)
-          (let [result (handle-map-entity initial-report report db entity
-                                          entities initial-es tx-time nil)]
+
+          (map? entity)
+          (if (or ordinary? (regular-map? schema entity))
+            (recur (transact-regular-map report entity tx-time context)
+                   entities remaining)
+            (let [result (handle-map-entity initial-report report db entity
+                                            entities initial-es tx-time nil context)]
+              (if (or (instance? TxRetry result) (map? result))
+                result
+                (let [[r' es'] result]
+                  (recur r' es' remaining)))))
+
+          (sequential? entity)
+          (let [[op e a] entity
+                props (schema a)]
+            (if (or ordinary?
+                    (and (identical? op :db/add)
+                         (integer? e) (not (neg? ^long e))
+                         (regular-attr? props)))
+              (recur (transact-add report entity props store-opts context) entities remaining)
+              (let [result (handle-sequential-entity
+                             initial-report report db store schema store-opts
+                             tempids entity entities initial-es tx-time context)]
+                (cond
+                  (instance? TxRetry result)
+                  result
+
+                  (instance? TxStep result)
+                  (recur (.-report ^TxStep result) (.-entities ^TxStep result)
+                         remaining)
+
+                  (map? result)
+                  result
+
+                  :else
+                  (let [[r' es'] result]
+                    (recur r' es' remaining))))))
+
+          (datom? entity)
+          (let [[e a v tx added] entity]
+            (if added
+              (recur (transact-add report [:db/add e a v tx] context) entities remaining)
+              (recur report (cons [:db/retract e a v] entities) remaining)))
+
+          (nil? entity)
+          (recur report entities remaining)
+
+          (instance? ResolvedIdentityMap entity)
+          (let [result (handle-map-entity
+                         initial-report report db (.-entity ^ResolvedIdentityMap entity)
+                         entities initial-es tx-time
+                         (.-resolution ^ResolvedIdentityMap entity) context)]
             (if (or (instance? TxRetry result) (map? result))
               result
               (let [[r' es'] result]
-                (recur r' es' remaining)))))
+                (recur r' es' remaining))))
 
-        (sequential? entity)
-        (let [[op e a] entity
-              props (schema a)]
-          (if (and (identical? op :db/add)
-                   (integer? e) (not (neg? ^long e))
-                   (regular-attr? props))
-            (recur (transact-add report entity props store-opts) entities remaining)
-            (let [result (handle-sequential-entity
-                           initial-report report db store schema store-opts
-                           tempids entity entities initial-es tx-time)]
-              (cond
-                (instance? TxRetry result)
-                result
+          (instance? ResolvedIdentityAdd entity)
+          (let [result (transact-resolved-identity initial-report report entity
+                                                  entities initial-es tx-time context)]
+            (if (instance? TxRetry result)
+              result
+              (recur result entities remaining)))
 
-                (instance? TxStep result)
-                (recur (.-report ^TxStep result) (.-entities ^TxStep result)
-                       remaining)
-
-                (map? result)
-                result
-
-                :else
-                (let [[r' es'] result]
-                  (recur r' es' remaining))))))
-
-        (datom? entity)
-        (let [[e a v tx added] entity]
-          (if added
-            (recur (transact-add report [:db/add e a v tx]) entities remaining)
-            (recur report (cons [:db/retract e a v] entities) remaining)))
-
-        (nil? entity)
-        (recur report entities remaining)
-
-        (instance? ResolvedIdentityMap entity)
-        (let [result (handle-map-entity
-                       initial-report report db (.-entity ^ResolvedIdentityMap entity)
-                       entities initial-es tx-time
-                       (.-resolution ^ResolvedIdentityMap entity))]
-          (if (or (instance? TxRetry result) (map? result))
-            result
-            (let [[r' es'] result]
-              (recur r' es' remaining))))
-
-        (instance? ResolvedIdentityAdd entity)
-        (let [result (transact-resolved-identity initial-report report entity
-                                                entities initial-es tx-time)]
-          (if (instance? TxRetry result)
-            result
-            (recur result entities remaining)))
-
-        :else
-        (vld/validate-tx-entity-type entity)))))
-
-(def ^:private resolution-value-classes
-  ;; No host conversion, predicates or nested calls may change the native
-  ;; transaction while a flat plan carries its stored identity results.
-  #{String Long Integer Short Byte Double Float Boolean
-    clojure.lang.Keyword clojure.lang.Symbol clojure.lang.BigInt
-    clojure.lang.Ratio java.math.BigInteger java.math.BigDecimal
-    java.util.UUID java.util.Date java.sql.Date java.sql.Timestamp
-    java.time.Instant (class (byte-array 0))})
-
-(def ^:private resolution-scalar-types
-  #{nil :db.type/string :db.type/long :db.type/keyword :db.type/symbol
-    :db.type/uuid :db.type/instant :db.type/boolean :db.type/float
-    :db.type/double :db.type/bigint :db.type/bigdec :db.type/bytes})
+          :else
+          (vld/validate-tx-entity-type entity))))))
 
 (defn- ordinary-value?
   [schema a value]
@@ -1165,38 +1206,40 @@
   "Prove that flat scalar additions cannot introduce reference tempids.
   An entirely repeated input also needs only its first ordinary addition:
   there are no intervening replacements, retractions or user callbacks."
-  [db entities collapse?]
-  (when (and (seq entities)
-             (not (:auto-entity-time? (opts (:store db))))
-             (empty? (txcommon/attrs-by db :db.type/tuple)))
-    (let [schema (schema (:store db))
-          entity (first entities)]
-      (when (ordinary-addition? schema entity)
-        (loop [es (next entities) repeated? collapse?]
-          (if (seq es)
-            (let [next-entity (first es)]
-              (when (or (identical? entity next-entity)
-                        (ordinary-addition? schema next-entity))
-                (recur (next es) (and repeated? (= entity next-entity)))))
-            (if (and repeated? (next entities)) [entity] entities)))))))
+  ([db entities collapse?]
+   (plan-ordinary-additions db entities collapse? (coreprep/make-prepare-ctx db)))
+  ([_db entities collapse? ctx]
+   (when (and (seq entities)
+              (not (:auto-entity-time? (:opts ctx)))
+              (empty? (:db.type/tuple (:rschema ctx))))
+     (let [schema (:schema ctx)
+           entity (first entities)]
+       (when (ordinary-addition? schema entity)
+         (loop [es (next entities) repeated? collapse?]
+           (if (seq es)
+             (let [next-entity (first es)]
+               (when (or (identical? entity next-entity)
+                         (ordinary-addition? schema next-entity))
+                 (recur (next es) (and repeated? (= entity next-entity)))))
+             (if (and repeated? (next entities)) [entity] entities))))))))
 
 (defn- plan-flat-upserts
   "Resolve independent flat identity maps before allocating forward refs.
   Carry normalized identities and native owners only when the entire request
   excludes host callbacks. Ordered mutations, nested entities and predicates
   use ordinary resolution and retries."
-  [db entities]
+  [db entities ctx]
   ;; :db/ident is implicit, but db-namespaced keys cannot enter this flat
   ;; path. Only identities that an eligible map can name justify the walk.
   (when (some #(not= "db" (namespace %))
-              (txcommon/attrs-by db :db.unique/identity))
+              (:db.unique/identity (:rschema ctx)))
     (let [store (:store db)
-          schema (schema store)
+          schema (:schema ctx)
           identity? #(identical? :db.unique/identity (:db/unique (schema %)))
           scalar-types resolution-scalar-types]
       (when (and (seq entities)
-                 (not (:auto-entity-time? (opts store)))
-                 (empty? (txcommon/attrs-by db :db.type/tuple))
+                 (not (:auto-entity-time? (:opts ctx)))
+                 (empty? (:db.type/tuple (:rschema ctx)))
                  (every? (fn [entity]
                            (and (map? entity)
                                 (txprep/tempid? (:db/id entity))
@@ -1237,7 +1280,7 @@
               (if-let [entity (first es)]
                 (if-let [a (first (filter identity? (keys entity)))]
                   (let [v (coreprep/correct-value-with-props
-                            (opts store) (schema a) a (get entity a))
+                            (if safe? (:opts ctx) (opts store)) (schema a) a (get entity a))
                         stored (when safe? (i/av-first-e store a v))
                         resolution (when safe? (IdentityResolution. a v stored))
                         eid (if resolution
@@ -1251,49 +1294,54 @@
                                             (ResolvedIdentityMap. entity resolution)
                                             entity))))
                   (recur (next es) tempids (conj! planned entity)))
-                {:tempids tempids :entities (persistent! planned)}))))))))
+                {:tempids tempids :entities (persistent! planned) :stable-schema? safe?}))))))))
 
 (defn execute-tx-loop
-  [initial-report initial-es tx-time]
-  (let [db (:db-before initial-report)
-        ordinary (when-not (::value-tempids initial-report)
-                   (plan-ordinary-additions db initial-es
-                                            (empty? (:tx-data initial-report))))
-        plan (when-not ordinary (plan-flat-upserts db initial-es))
-        initial-es (or ordinary (:entities plan) initial-es)
-        upserts (:tempids plan)
-        initial-report (if (seq upserts)
-                         (-> initial-report
-                             (update :tempids merge upserts)
-                             (update ::upserted-tempids merge upserts))
-                         initial-report)]
-    (loop [initial-report initial-report]
-      (let [result (txcommon/with-lookup-ref-cache (:db-before initial-report)
-                     (execute-tx-loop* initial-report initial-es tx-time
-                                       (boolean ordinary)))]
-        (if (instance? TxRetry result)
-          (recur (.-report ^TxRetry result))
-          result)))))
+  ([initial-report initial-es tx-time]
+   (execute-tx-loop initial-report initial-es tx-time
+                    (coreprep/make-prepare-ctx (:db-before initial-report))))
+  ([initial-report initial-es tx-time ctx]
+   (let [db (:db-before initial-report)
+         ordinary (when-not (::value-tempids initial-report)
+                    (plan-ordinary-additions db initial-es
+                                             (empty? (:tx-data initial-report)) ctx))
+         plan (when-not ordinary (plan-flat-upserts db initial-es ctx))
+         ctx (if (and plan (not (:stable-schema? plan)))
+               (coreprep/make-prepare-ctx db) ctx)
+         initial-es (or ordinary (:entities plan) initial-es)
+         upserts (:tempids plan)
+         initial-report (if (seq upserts)
+                          (-> initial-report
+                              (update :tempids merge upserts)
+                              (update ::upserted-tempids merge upserts))
+                          initial-report)]
+     ;; All operations share one attempt-local holder. Only user callbacks can
+     ;; replace its schema snapshot; it never becomes part of the report.
+     (loop [initial-report initial-report ctx ctx]
+       (let [result (txcommon/with-lookup-ref-cache (:db-before initial-report)
+                      (execute-tx-loop* initial-report initial-es tx-time
+                                        (boolean ordinary) (volatile! ctx)))]
+         (if (instance? TxRetry result)
+           (recur (.-report ^TxRetry result)
+                  (coreprep/make-prepare-ctx (:db-before initial-report)))
+           result))))))
 
 (defn local-transact-tx-data
-  [initial-report initial-es tx-time]
-  (if c/*use-prepare-path*
-    (let [db    (:db-before initial-report)
-          store (:store db)
-          lmdb  (when (instance? Store store)
-                  (.-lmdb ^Store store))
-          ctx   (coreprep/make-prepare-ctx db lmdb)
-          ptx   (coreprep/prepare-tx
-                   ctx initial-es tx-time
-                   (fn [es t]
-                     (execute-tx-loop initial-report es t)))]
-      (cond-> (assoc (dissoc-present initial-report ::max-eid-before)
-                     :db-after (:db-after ptx)
-                     :tx-data (:tx-data ptx)
-                     :tempids (:tempids ptx))
-        (seq (:new-attributes ptx))
-        (assoc :new-attributes (:new-attributes ptx))
+  ([initial-report initial-es tx-time]
+   (local-transact-tx-data initial-report initial-es tx-time
+                           (coreprep/make-prepare-ctx (:db-before initial-report))))
+  ([initial-report initial-es tx-time ctx]
+   (if c/*use-prepare-path*
+     (let [ptx (coreprep/prepare-tx
+                 ctx initial-es tx-time
+                 (fn [ctx es t] (execute-tx-loop initial-report es t ctx)))]
+       (cond-> (assoc (dissoc-present initial-report ::max-eid-before)
+                      :db-after (:db-after ptx)
+                      :tx-data (:tx-data ptx)
+                      :tempids (:tempids ptx))
+         (seq (:new-attributes ptx))
+         (assoc :new-attributes (:new-attributes ptx))
 
-        (seq (:ensures ptx))
-        (assoc ::ensures (:ensures ptx))))
-    (execute-tx-loop initial-report initial-es tx-time)))
+         (seq (:ensures ptx))
+         (assoc ::ensures (:ensures ptx))))
+     (execute-tx-loop initial-report initial-es tx-time ctx))))

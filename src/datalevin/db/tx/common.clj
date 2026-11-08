@@ -58,31 +58,34 @@
 
 (defn stage-batch-datom!
   "Update the resolver's existing indexes with the latest pending E/A/V state."
-  [db ^Datom datom]
-  (if-let [^LongObjectHashMap pending (scalar-pending-index)]
-    ;; Scalar preparation has cardinality-one E/A keys. The latest datom,
-    ;; including a retraction, replaces its entire pending attribute state.
-    (let [e (.-e datom)
-          ^HashMap attrs (or (.get pending e)
-                             (let [attrs (HashMap. 4)]
-                               (.put pending e attrs)
-                               attrs))]
-      (.put attrs (.-a datom) datom)
-      (when (:db/unique ((i/schema (:store db)) (.-a datom)))
-        (.put ^HashMap (pending-unique-index *batch-prepare*)
-              [(.-a datom) (.-v datom)] datom)))
-    (let [^TreeSortedSet eavt (:eavt db)
-          ^TreeSortedSet avet (:avet db)
-          ^SortedSet cached (.subSet eavt
-                                    (d/datom (.-e datom) (.-a datom) (.-v datom) tx0)
-                                    (d/datom (.-e datom) (.-a datom) (.-v datom) txmax))]
-      (while (not (.isEmpty cached))
-        (let [old (.first cached)] (.remove eavt old) (.remove avet old)))
-      ;; Keep the retraction bit: it masks an older native value until the
-      ;; frozen writes have been applied. One latest datom per E/A/V is enough.
-      (.add eavt datom)
-      (when-not (contains? (:db/noindex (rschema (:store db))) (.-a datom))
-        (.add avet datom)))))
+  ([db ^Datom datom]
+   (let [store (:store db)]
+     (stage-batch-datom! db datom ((i/schema store) (.-a datom)))))
+  ([db ^Datom datom props]
+   (if-let [^LongObjectHashMap pending (scalar-pending-index)]
+     ;; Scalar preparation has cardinality-one E/A keys. The latest datom,
+     ;; including a retraction, replaces its entire pending attribute state.
+     (let [e (.-e datom)
+           ^HashMap attrs (or (.get pending e)
+                              (let [attrs (HashMap. 4)]
+                                (.put pending e attrs)
+                                attrs))]
+       (.put attrs (.-a datom) datom)
+       (when (:db/unique props)
+         (.put ^HashMap (pending-unique-index *batch-prepare*)
+               [(.-a datom) (.-v datom)] datom)))
+     (let [^TreeSortedSet eavt (:eavt db)
+           ^TreeSortedSet avet (:avet db)
+           ^SortedSet cached (.subSet eavt
+                                     (d/datom (.-e datom) (.-a datom) (.-v datom) tx0)
+                                     (d/datom (.-e datom) (.-a datom) (.-v datom) txmax))]
+       (while (not (.isEmpty cached))
+         (let [old (.first cached)] (.remove eavt old) (.remove avet old)))
+       ;; Keep the retraction bit: it masks an older native value until the
+       ;; frozen writes have been applied. One latest datom per E/A/V is enough.
+       (.add eavt datom)
+       (when-not (:db/noindex props)
+         (.add avet datom))))))
 
 (defn- first-added-datom
   [^SortedSet datoms]
@@ -235,12 +238,13 @@
   (is-attr? db attr :db.cardinality/many))
 
 (defn multi-value?
-  ^Boolean [db attr value]
-  (and
-    (is-attr? db attr :db.cardinality/many)
-    (or
-      (and (some? value) (.isArray (class value)))
-      (and (coll? value) (not (map? value))))))
+  ([db attr value]
+   (multi-value? (is-attr? db attr :db.cardinality/many) value))
+  ([many? value]
+   (and many?
+        (or
+          (and (some? value) (.isArray (class value)))
+          (and (coll? value) (not (map? value)))))))
 
 (defn ref?
   ^Boolean [db attr]
