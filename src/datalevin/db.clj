@@ -26,6 +26,8 @@
    [datalevin.remote-cache :as remote-cache]
    [datalevin.db.tx.add :as txadd]
    [datalevin.db.tx.common :as txcommon]
+   [datalevin.db.tx.compile :as txcompile]
+   [datalevin.db.tx.plan :as txplan]
    [datalevin.db.tx.engine :as txengine]
    [datalevin.db.tx.execute :as txexec]
    [datalevin.db.tx.prepare :as txprep]
@@ -62,14 +64,13 @@
    [datalevin.storage Store WriteGroup]
    [datalevin.utl LRUCache QueryKey QueryKey$EquivSet QueryKey$KeySet]
    [java.nio ByteBuffer]
-   [java.util Arrays Collection Comparator Date]
-   [clojure.lang LazilyPersistentVector MapEntry]
+   [java.util Collection Comparator Date]
+   [clojure.lang MapEntry]
    [java.util.concurrent ConcurrentHashMap]
    [java.util.concurrent.atomic AtomicBoolean]
    [java.util.function Function]
    [org.eclipse.collections.api.block HashingStrategy]
    [org.eclipse.collections.impl.list.mutable FastList]
-   [org.eclipse.collections.impl.map.mutable.primitive LongObjectHashMap]
    [org.eclipse.collections.impl.set.strategy.mutable UnifiedSetWithHashingStrategy]
    [org.eclipse.collections.impl.set.sorted.mutable TreeSortedSet]))
 
@@ -163,8 +164,6 @@
    opts-epoch
    entries
    entity-reads])
-
-(deftype ^:private ScalarEntityRead [^objects names ^longs aids])
 
 ;; (defmethod print-method TxReport [^TxReport rp, ^java.io.Writer w]
 ;;   (binding [*out* w]
@@ -2337,13 +2336,6 @@
        (not (contains? props :db/tupleTypes))
        (not (contains? tuple-source-attrs attr))))
 
-(defn- resolved-positive-ref?
-  "Recognize reference IDs that need no resolver, including a checked long range."
-  [value]
-  (and (integer? value)
-       (try (pos? (long value))
-            (catch IllegalArgumentException _ false))))
-
 (defn- blind-write-multiple-values?
   [many? unique-identity-attrs value]
   (and many?
@@ -2538,85 +2530,6 @@
 
 (declare blind-identity-upsert-av)
 
-(def ^:private ^:const scalar-entity-read-min-attrs 8)
-
-(defn- prepare-scalar-entity-read
-  [store-schema attributes]
-  ;; Four-attribute projections cost more CPU on Linux. Use point seeks for
-  ;; narrow updates; retain a layout for wider updates so stamping can read
-  ;; their attributes with one shared cursor inside the write transaction.
-  (when (>= (count attributes) scalar-entity-read-min-attrs)
-    (let [names (sort-by #(:db/aid (store-schema %)) attributes)]
-      (ScalarEntityRead. (object-array names)
-                         (long-array (map #(:db/aid (store-schema %)) names))))))
-
-(defn- read-scalar-entity
-  [store eid ^ScalarEntityRead layout]
-  (first (s/select-entities store [eid] (.-names layout) (.-aids layout)
-                            false idx/avg-buffer->prepared-value)))
-
-(defn- read-scalar-update-entity
-  [db eid ^ScalarEntityRead layout]
-  (let [store (:store db)]
-    (if-let [^LongObjectHashMap pending (txcommon/scalar-pending-index)]
-      (if-let [^java.util.HashMap pending (.get pending (long eid))]
-        (let [^objects names (.-names layout)
-              ^longs aids (.-aids layout)
-              n (alength names)]
-          (loop [idx 0 values {} remaining []]
-            (if (< idx n)
-              (let [attr (aget names idx)]
-                (if-let [^Datom datom (.get pending attr)]
-                  (recur (unchecked-inc idx)
-                         (assoc values attr (when (d/datom-added datom) (.-v datom)))
-                         remaining)
-                  (recur (unchecked-inc idx) values (conj remaining idx))))
-              (if (empty? values)
-                (read-scalar-entity store eid layout)
-                (merge (when (seq remaining)
-                         (first (s/select-entities
-                                  store [eid]
-                                  (object-array (map #(aget names %) remaining))
-                                  (long-array (map #(aget aids %) remaining))
-                                  false idx/avg-buffer->prepared-value)))
-                       values)))))
-        (read-scalar-entity store eid layout))
-      (if txcommon/*batch-prepare*
-        (let [^TreeSortedSet eavt (:eavt db)
-              ^java.util.SortedSet pending
-              (.subSet eavt
-                       (datom eid nil nil c/tx0) (datom eid nil nil c/txmax))]
-          (if (.isEmpty pending)
-            (read-scalar-entity store eid layout)
-            (let [^objects names (.-names layout)
-                  ^longs aids (.-aids layout)
-                  n (alength names)]
-              (loop [idx 0 values {} remaining []]
-                (if (< idx n)
-                  (let [attr (aget names idx)
-                        ^java.util.SortedSet pending
-                        (.subSet eavt (datom eid attr nil c/tx0)
-                                 (datom eid attr nil c/txmax))]
-                    (if (.isEmpty pending)
-                      (recur (unchecked-inc idx) values (conj remaining idx))
-                      ;; Scalar attributes have at most one current addition.
-                      ;; Retractions alone mean absent, and never override an
-                      ;; addition regardless of index sort order. Seek only the
-                      ;; requested attributes, avoiding unrelated pending datoms.
-                      (recur (unchecked-inc idx)
-                             (assoc values attr (:v (first (filter d/datom-added pending))))
-                             remaining)))
-                  (if (empty? values)
-                    (read-scalar-entity store eid layout)
-                    (merge (when (seq remaining)
-                             (first (s/select-entities
-                                      store [eid]
-                                      (object-array (map #(aget names %) remaining))
-                                      (long-array (map #(aget aids %) remaining))
-                                      false idx/avg-buffer->prepared-value)))
-                           values)))))))
-        (read-scalar-entity store eid layout)))))
-
 (defn- local-tx-form-kinds
   "Shape-only candidates: scalar 1, blind 2, mixed 4, patch 8; tempids use 16."
   ^long [entity]
@@ -2631,7 +2544,7 @@
         (bit-or 6 (if tempid? 16 0))
 
         (and (nil? (meta entity)) (> (count entity) 1)
-             (resolved-positive-ref? eid)) 1
+             (txplan/resolved-positive-ref? eid)) 1
 
         :else 0))
 
@@ -2743,8 +2656,8 @@
                                                         :db.cardinality/many
                                                         (:db/cardinality (aget info 0)))
                                                       unique-identity-attrs value)
-                                                  (every? resolved-positive-ref? value)
-                                                  (resolved-positive-ref? value))))
+                                                  (every? txplan/resolved-positive-ref? value)
+                                                  (txplan/resolved-positive-ref? value))))
                                      (bit-or (long kinds) (long (aget info 1)))
                                      (reduced nil)))))
            attribute-kinds   (when-not incremental?
@@ -2834,7 +2747,7 @@
                                         (.get ^FastList entities 0)
                                         ^FastList attrs (.-attrs entity)
                                         identity-attr (first identity-upsert-av)]
-                                    (prepare-scalar-entity-read
+                                    (txcompile/prepare-scalar-entity-read
                                       store-schema
                                       (for [index (range 0 (.size attrs) 2)
                                             :let [attr (.get attrs index)]
@@ -2891,7 +2804,7 @@
 (defn- append-blind-identity-upsert!
   [^DB db ^PreparedBlindEntity entity identity-attr eid tx-id layout tx-data]
   (let [^FastList attrs (.-attrs entity)
-        old-values (when layout (read-scalar-entity (.-store db) eid layout))]
+        old-values (when layout (txexec/read-scalar-entity (.-store db) eid layout))]
     (loop [i 0 tx-data tx-data]
       (if (< i (.size attrs))
         (let [attr  (.get attrs i)
@@ -3140,11 +3053,6 @@
      (entid-strict db (:e prepared))
      (stamp-local-patch-idoc-doc db prepared tx-meta old-doc))))
 
-(def ^:private scalar-update-value-types
-  #{:db.type/long :db.type/string :db.type/keyword :db.type/symbol
-    :db.type/float :db.type/double :db.type/boolean :db.type/instant
-    :db.type/uuid :db.type/bytes :db.type/bigint :db.type/bigdec})
-
 (defn- scalar-update-entity-id
   "Resolve an existing entity id for a scalar update, or nil to fall back.
   Numeric ids use the in-memory maximum; lookup references and idents read db."
@@ -3202,60 +3110,15 @@
                 (recur (+ i 4))))
             true))))))
 
-(defn- scalar-update-entity-reads
-  [store-schema entries]
-  (when (>= (count entries) scalar-entity-read-min-attrs)
-    (let [widths (java.util.HashMap.)]
-      (doseq [[eid] entries]
-        (.put widths eid (inc (long (or (.get widths eid) 0)))))
-      ;; Count first: narrow entities need neither grouped entries nor an
-      ;; attribute collection. Keep nil when all reads can use point seeks.
-      (when-let [attributes
-                 (reduce
-                   (fn [attributes ^java.util.Map$Entry entry]
-                     (let [width (long (.getValue entry))]
-                       (if (>= width scalar-entity-read-min-attrs)
-                         (assoc attributes (.getKey entry) (FastList. (int width)))
-                         attributes)))
-                   nil (.entrySet widths))]
-        (doseq [[eid attr] entries]
-          (when-let [^FastList names (get attributes eid)]
-            (.add names attr)))
-        (reduce-kv (fn [layouts eid names]
-                     (assoc layouts eid (prepare-scalar-entity-read store-schema names)))
-                   {} attributes)))))
-
 (defn- append-scalar-update-candidate!
-  "Append an eligible raw E/A value from either a map entry or an operation.
-   Value correction waits until the entire request has passed these checks."
-  [db store-schema tuple-source-attrs ^FastList candidates
-   ^java.util.HashSet seen e attr value]
-  (let [props (store-schema attr)
-        vt (:db/valueType props)]
-    (when (and (keyword? attr)
-               props
-               (not= "db" (namespace attr))
-               (some? (:db/aid props))
-               (not (identical? (:db/cardinality props) :db.cardinality/many))
-               (nil? (:db/unique props))
-               (nil? (:db/tupleAttrs props))
-               (not (contains? props :db/tupleType))
-               (nil? (:db/tupleTypes props))
-               (not (contains? tuple-source-attrs attr))
-               (nil? (:db.attr/preds props))
-               (or (nil? vt) (contains? scalar-update-value-types vt)
-                   (and (identical? vt :db.type/ref)
-                        (resolved-positive-ref? value)))
-               (some? value))
-      (let [eid (if (or (keyword? e) (and (sequential? e) (= 2 (count e))))
-                  e
-                  (scalar-update-entity-id db e))]
-        (when (and eid (or (nil? seen) (.add seen [eid attr])))
-          (.add candidates eid)
-          (.add candidates attr)
-          (.add candidates value)
-          (.add candidates vt)
-          eid)))))
+  "Retain runtime entity checks around the shared pure candidate workers."
+  [db store-schema tuple-source-attrs candidates seen e attr value]
+  (when-let [props (txcompile/scalar-attribute-props
+                    store-schema tuple-source-attrs attr value)]
+    (when-let [eid (if (or (keyword? e) (and (sequential? e) (= 2 (count e))))
+                    e (scalar-update-entity-id db e))]
+      (txcompile/append-scalar-candidate!
+        candidates seen eid attr value (:db/valueType props)))))
 
 (defn- prepare-scalar-update-tx*
   [^DB db initial-es defer-entity-resolution?]
@@ -3308,37 +3171,14 @@
                        (or defer-entity-resolution? (not resolve-entities?)
                            (resolve-scalar-update-candidates! db candidates)))
               (let [entries
-                    (loop [i 0 entries (transient [])]
-                      (if (< i (.size candidates))
-                        (let [eid (.get candidates i)
-                              attr (.get candidates (+ i 1))
-                              value (.get candidates (+ i 2))
-                              vt (.get candidates (+ i 3))]
-                          (recur (+ i 4)
-                                 (conj! entries
-                                        [eid attr (prepare/correct-scalar-value
-                                                    validate? vt value)])))
-                        (persistent! entries)))
+                    (txcompile/correct-scalar-candidates validate? candidates)
                     deferred? (and defer-entity-resolution?
                                    (some #(not (integer? (first %))) entries))]
                 (cond-> (->PreparedScalarUpdate
                           store-schema store-opts entries
                           (when-not deferred?
-                            (scalar-update-entity-reads store-schema entries)))
+                            (txcompile/scalar-update-entity-reads store-schema entries)))
                   deferred? (assoc :deferred-entity-resolution? true))))))))))
-
-(defn- scalar-update-request?
-  "Reject incompatible forms before candidate construction or identity reads."
-  [initial-es]
-  (reduce
-    (fn [_ entity]
-      (if (or (and (sequential? entity) (nil? (meta entity)) (= 4 (count entity))
-                   (identical? :db/add (nth entity 0)))
-              (and (map? entity) (nil? (meta entity)) (> (count entity) 1)
-                   (resolved-positive-ref? (:db/id entity))))
-        true
-        (reduced false)))
-    true initial-es))
 
 (defn ^:no-doc prepare-scalar-update-tx
   "Recognize ordinary scalar add operations and explicit numeric-ID maps
@@ -3353,7 +3193,7 @@
   ([db initial-es {:keys [defer-entity-resolution? shape-checked?]}]
    ;; Reject unsupported request shapes before correcting values or
    ;; resolving entities, including preparation on the collector's caller.
-   (when (or shape-checked? (scalar-update-request? initial-es))
+   (when (or shape-checked? (txcompile/scalar-update-request? initial-es))
      (if defer-entity-resolution?
        ;; Collector preparation reads no persisted identities. The owner resolves
        ;; them and consults the pending transaction indexes when stamping.
@@ -3390,74 +3230,13 @@
                         [] entries)]
             (when resolved
               (assoc prepared :entries resolved
-                     :entity-reads (scalar-update-entity-reads
+                     :entity-reads (txcompile/scalar-update-entity-reads
                                      (:schema-epoch prepared) resolved)))))))
     prepared))
 
 (def ^:dynamic *specialize-scalar-stamping?*
   "Internal comparison switch for resolved scalar stamping."
   true)
-
-(defn- scalar-update-datoms
-  [db entries tx-id]
-  (let [n (count entries)]
-    (if (= n 1)
-      (let [entry (nth entries 0)
-            e (nth entry 0)
-            attr (nth entry 1)
-            value (nth entry 2)
-            old-value (txcommon/preparation-first-v db e attr)]
-        (cond
-          (nil? old-value) [(datom e attr value tx-id)]
-          (d/value-equal? (idx/logical-value old-value) value) []
-          :else [(idx/retraction e attr old-value tx-id)
-                 (datom e attr value tx-id)]))
-      (if-let [^objects buffer
-               (when (and (<= n 16)
-                          (instance? datalevin.db.tx.common.ScalarDatomBuffer
-                                     txcommon/*batch-prepare*))
-                 (txcommon/acquire-scalar-datom-buffer! txcommon/*batch-prepare* (* 2 n)))]
-        (try
-          (loop [i 0 out 0]
-            (if (< i n)
-              (let [entry (nth entries i)
-                    e (nth entry 0)
-                    attr (nth entry 1)
-                    value (nth entry 2)
-                    old-value (txcommon/preparation-first-v db e attr)]
-                (cond
-                  (d/value-equal? (idx/logical-value old-value) value)
-                  (recur (unchecked-inc i) out)
-                  (nil? old-value)
-                  (do (aset buffer out (datom e attr value tx-id))
-                      (recur (unchecked-inc i) (unchecked-inc out)))
-                  :else
-                  (do (aset buffer out (idx/retraction e attr old-value tx-id))
-                      (aset buffer (unchecked-inc out) (datom e attr value tx-id))
-                      (recur (unchecked-inc i) (+ out 2)))))
-              ;; The final tail is owned by this request. Never publish the
-              ;; scratch array: later stamps reuse it, including after abort.
-              (if (zero? out) []
-                  (LazilyPersistentVector/createOwning
-                    (Arrays/copyOf buffer (int out))))))
-          (finally
-            (Arrays/fill buffer (int 0) (int (* 2 n)) nil)
-            (txcommon/release-scalar-datom-buffer! txcommon/*batch-prepare* buffer)))
-        (loop [i 0 out (transient [])]
-          (if (< i n)
-            (let [entry (nth entries i)
-                  e (nth entry 0)
-                  attr (nth entry 1)
-                  value (nth entry 2)
-                  old-value (txcommon/preparation-first-v db e attr)]
-              (recur (unchecked-inc i)
-                     (cond
-                       (d/value-equal? (idx/logical-value old-value) value) out
-                       (nil? old-value) (conj! out (datom e attr value tx-id))
-                       :else (-> out
-                                 (conj! (idx/retraction e attr old-value tx-id))
-                                 (conj! (datom e attr value tx-id))))))
-            (persistent! out)))))))
 
 (defn ^:no-doc stamp-scalar-update-tx
   "Stamp a prepared scalar-update batch against the current store snapshot.
@@ -3471,36 +3250,9 @@
                           (resolve-scalar-update-entities db prepared)))]
     (let [tx-id   (inc (long (:max-tx db)))
           entries (:entries prepared)
-          n       (count entries)
-          layouts (:entity-reads prepared)
-          tx-data
-          (if (and *specialize-scalar-stamping?* (nil? layouts))
-            (scalar-update-datoms db entries tx-id)
-            (let [old-values
-                  (reduce-kv
-                    (fn [values eid layout]
-                      (assoc values eid (read-scalar-update-entity db eid layout)))
-                    {} layouts)]
-              (loop [i 0, out (transient [])]
-                (if (< i n)
-                  (let [[e attr value] (nth entries i)
-                        old-value (if (contains? layouts e)
-                                    (get (get old-values e) attr)
-                                    (txcommon/preparation-first-v db e attr))]
-                    (cond
-                      (nil? old-value)
-                      (recur (unchecked-inc i)
-                             (conj! out (datom e attr value tx-id)))
-
-                      (d/value-equal? (idx/logical-value old-value) value)
-                      (recur (unchecked-inc i) out)
-
-                      :else
-                      (recur (unchecked-inc i)
-                             (-> out
-                                 (conj! (idx/retraction e attr old-value tx-id))
-                                 (conj! (datom e attr value tx-id))))))
-                  (persistent! out)))))
+          tx-data (txexec/execute-scalar-region
+                    db entries (:entity-reads prepared) tx-id
+                    *specialize-scalar-stamping?*)
           db-after (assoc db :max-tx tx-id)]
       (->TxReport db db-after tx-data {:db/current-tx tx-id} tx-meta))))
 
@@ -3515,16 +3267,92 @@
    (txadd/prepare-mixed-report (->TxReport db db [] {} tx-meta) tx-data
                              owned-max-eid shape-checked?)))
 
+(def ^:dynamic *tx-compiler-observer*
+  "Optional diagnostic observer, outside compilation and uninstrumented timings."
+  nil)
+
+(defn ^:no-doc prepare-local-request
+  "Pure preparation portion of the DB request hook. Only standalone local
+  callers opt into Stage 1. A rejection retains original input and admission
+  isolation; unsupported shapes keep their existing route."
+  [db tx-data origin]
+  (when (and (identical? clojure.lang.PersistentVector (class tx-data))
+             (pos? (count tx-data))
+             (txengine/compiler?) (identical? origin :standalone-local)
+             (nil? (l/explicit-transaction-timeout))
+             (instance? Store (:store db))
+             (let [lmdb (.-lmdb ^Store (:store db))]
+               (and (not (l/writing? lmdb))
+                    (not (Thread/holdsLock (l/write-txn lmdb))))))
+    (when-let [shape (txcompile/literal-scalar-shape tx-data)]
+      (when-let [outcome (txcompile/compile-tx
+                          (prepare/make-prepare-ctx db) tx-data
+                          (if (identical? shape :scalar-operations)
+                            {:literal-shape :scalar-operations} {:literal-shape :scalar}))]
+      ;; A caller's old scalar preparer declines IDs above its published floor
+      ;; before correction. Those failures belong to ordinary writer execution,
+      ;; so a new pure correction rejection must not narrow their batch abort.
+      ;; This admission check grants no execution proof; the writer rechecks IDs.
+        (when (or (instance? datalevin.db.tx.plan.TxPlan outcome)
+                  (every? (fn [form]
+                            (<= (long (if (map? form) (:db/id form) (nth form 1)))
+                                (long (:max-eid db))))
+                          tx-data))
+          (let [outcome (if (instance? datalevin.db.tx.plan.TxPlan outcome)
+                          outcome
+                          (assoc outcome :origin origin :isolated? true))]
+            (when *tx-compiler-observer*
+              (*tx-compiler-observer* :prepared outcome))
+            outcome))))))
+
 (defn ^:no-doc prepare-local-tx-data
-  "Resolve local transaction data without committing or constructing the final
-  simulated view. The report retains datoms, tempids and commit-time ensures;
-  its db-after is internal preparation state, not a public queryable snapshot."
+  "Resolve one local request without committing. Ordinary callers retain their
+  initial attempt state; a prepared scalar request constructs its report only
+  after resolution. All epoch checks and execution selection live here."
   ([initial-report initial-es]
    (prepare-local-tx-data initial-report initial-es (System/currentTimeMillis)))
   ([initial-report initial-es tx-time]
-   (let [db (:db-before initial-report)
-         ctx (prepare/make-prepare-ctx db)]
-     (txexec/prepare-and-transact-tx-data initial-report initial-es tx-time ctx))))
+   (prepare-local-tx-data (:db-before initial-report) initial-es
+                          (:tx-meta initial-report) tx-time nil initial-report))
+  ([db initial-es tx-meta tx-time outcome]
+   (prepare-local-tx-data db initial-es tx-meta tx-time outcome nil))
+  ([db initial-es tx-meta tx-time outcome initial-report]
+   (let [captured (:ctx outcome)
+         valid? (and outcome
+                     (identical? (:schema captured) (schema (:store db)))
+                     (identical? (:opts captured) (opts (:store db))))
+         ctx (if valid? captured (prepare/make-prepare-ctx db))
+         selected (when outcome
+                    (if valid? outcome
+                        (do
+                          (when *tx-compiler-observer*
+                            (*tx-compiler-observer* :recompile initial-es))
+                          (txcompile/compile-tx ctx initial-es))))
+         entry-offset (when (instance? datalevin.db.tx.plan.TxPlan selected)
+                        (case (:strategy selected) :scalar 0 :scalar-operations 1))]
+     (if (and (some? entry-offset)
+              (txexec/scalar-entities-within-bound? (:entries selected) (:max-eid db) entry-offset))
+       (let [tx-id (inc (long (:max-tx db)))
+             tx-data (txexec/execute-scalar-region
+                      db (:entries selected) (:entity-reads selected)
+                      tx-id *specialize-scalar-stamping?* entry-offset)]
+         (when *tx-compiler-observer*
+           (*tx-compiler-observer* :execute-scalar selected))
+         (cond-> (->TxReport db (assoc db :max-tx tx-id) tx-data
+                             {:db/current-tx tx-id} tx-meta)
+           ;; Reuse the existing resolved-scalar staging proof. Tiny traces
+           ;; already take storage's cheap guards and need no report field.
+           (and txcommon/*batch-prepare* (> (count tx-data) 2))
+           (assoc ::independent-scalar? true)))
+       (let [initial-report (or initial-report (->TxReport db db [] {} tx-meta))]
+         ;; Reuse the original input at its semantic positions. A runtime
+         ;; decline never resubmits the request or releases its writer.
+         (when (and outcome txcommon/*batch-prepare*)
+           (txcommon/materialize-scalar-pending! txcommon/*batch-prepare*
+                                                 (:db-after initial-report)))
+         (when (and outcome *tx-compiler-observer*)
+           (*tx-compiler-observer* :ordered initial-es))
+         (txexec/prepare-and-transact-tx-data initial-report initial-es tx-time ctx))))))
 
 (defn transact-tx-data
   "Resolve transaction data. owned-max-eid may be supplied only for a current

@@ -934,7 +934,11 @@
                           :validate-data? validate-data?}
                                 (select-keys existing-opts [:key-type :value-type])
                                 (select-keys supplied [:key-type :value-type]))
-                flags    (set flags)
+                raw-existing? (:raw-existing? @info)
+                _ (when (and raw-existing? (not= dbi-name c/kv-info)
+                             (not (contains? info-dbis dbi-name)))
+                    (raise "Raw copy finalization cannot create a DBI" {:dbi dbi-name}))
+                flags    (cond-> (set flags) raw-existing? (disj :create))
                 dupsort? (if (:dupsort flags) true false)
                 dupfixed? (if (:dupfixed flags) true false)
                 counted? (if (:counted flags) true false)
@@ -947,7 +951,7 @@
                 vp       (buffer/new-bufval val-size)
                 kc       (bf/allocate-buffer key-size)
                 vc       (bf/allocate-buffer val-size)
-                dbi      (if (and (not raw?) (not= existing-opts opts))
+                dbi      (if (and (not raw-existing?) (not raw?) (not= existing-opts opts))
                            ;; Create the native DBI and persist its metadata in
                            ;; one write transaction, so the HA commit guard
                            ;; fences the catalog change and a rejection rolls
@@ -985,7 +989,7 @@
                                (and validate-data?
                                     (not (or (:key-type opts) (:value-type opts))))
                                nil nil)]
-            (when (and (not raw?) (not= existing-opts opts))
+            (when (and (not raw-existing?) (not raw?) (not= existing-opts opts))
               ;; Publish cached metadata only after the guarded commit.
               (vswap! info assoc-in [:dbis dbi-name] opts))
             (when (or (:key-type opts) (:value-type opts))
@@ -1662,6 +1666,68 @@
               (when-not (failure/expected-native-rejection? e)
                 (scan/record-native-read-failure! wdb error))
               (throw error))))))))
+
+(defrecord PreparedCopy [^Env env handle lease]
+  java.lang.AutoCloseable
+  (close [_]
+    (try (.closePrepared env handle)
+         (finally (when lease (.close ^java.lang.AutoCloseable lease))))))
+
+(defn prepare-copy
+  "Fix this environment's copy snapshot. Close the result on the preparing
+  thread after copying or cancellation; it retains lifetime/remap protection."
+  [^CppLMDB lmdb dest compact?]
+  (let [lease (when-let [guard (:native-lifetime @(.-info lmdb))]
+                (lifetime/enter! guard))]
+    (try
+      (i/check-ready lmdb)
+      (->PreparedCopy (.-env lmdb) (.prepareCopy (.-env lmdb) dest (boolean compact?)) lease)
+      (catch Throwable e
+        (when lease (.close ^java.lang.AutoCloseable lease))
+        (throw e)))))
+
+(defn copy-prepared!
+  "Write payload bytes from exactly the prepared snapshot. Does not close it."
+  [^PreparedCopy prepared]
+  (.copyPrepared ^Env (:env prepared) (:handle prepared)))
+
+(defn open-existing-raw
+  "Open staged, uncompressed LMDB bytes for metadata finalization only. Never
+  creates an environment or DBI, starts WAL/background work, or upgrades data."
+  [dir]
+  (let [file (io/file dir c/data-file-name)]
+    (when-not (.isFile file)
+      (raise "Copy payload does not exist" {:error :copy/missing-payload}))
+    (let [dir-key (lifecycle/reserve-local-kv-handle! (u/file dir) c/default-env-flags)
+          opened (volatile! nil)]
+      (try
+        (let [env (Env/create dir (* (long (c/pick-mapsize file)) 1024 1024)
+                              c/*max-readers* c/*max-dbs*
+                              (buffer/kv-flags c/default-env-flags))
+              lmdb (->CppLMDB env
+                              (volatile! {:dir dir :max-dbs c/*max-dbs*
+                                          :max-readers c/*max-readers*
+                                          :flags c/default-env-flags :wal? false
+                                          :spill? true :raw-existing? true})
+                              (ThreadLocal.) (ConcurrentHashMap.) (HashMap.)
+                              (volatile! nil)
+                              (buffer/new-bufval c/+max-key-size+)
+                              (buffer/new-bufval 0)
+                              (buffer/new-bufval c/+max-key-size+)
+                              (buffer/new-bufval c/+max-key-size+)
+                              (buffer/new-bufval c/+max-key-size+)
+                              (buffer/new-bufval c/+max-key-size+)
+                              (bf/allocate-buffer c/+max-key-size+)
+                              (volatile! nil) false nil nil nil nil)]
+          (vreset! opened lmdb)
+          (i/open-dbi lmdb c/kv-info)
+          (let [runtime @(i/kv-info lmdb)]
+            (vswap! (i/kv-info lmdb) merge (open/load-info-from-kv lmdb) runtime))
+          lmdb)
+        (catch Throwable e
+          (if-let [lmdb @opened] (i/close-kv lmdb)
+                  (lifecycle/release-local-kv-handle! dir-key))
+          (throw e))))))
 
 (defn- open-kv*
   [dir dir-file db-file {:keys [mapsize max-readers flags max-dbs temp?

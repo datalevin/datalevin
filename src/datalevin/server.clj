@@ -1307,28 +1307,8 @@
   [tf]
   (scopy/cleanup-copy-tmp-dir! tf))
 
-(def ^:private ^:redef server-copy-store!
-  scopy/server-copy-store!)
-
-(def ^:private ^:redef open-server-copied-store!
-  scopy/open-server-copied-store!)
-
-(def ^:private ^:redef close-server-copied-store!
-  scopy/close-server-copied-store!)
-
 (def ^:private ^:redef copy-server-file-out!
   copy-file-out)
-
-(def ^:private ^:redef unpin-server-copy-backup-floor!
-  scopy/unpin-server-copy-backup-floor!)
-
-(defn- copy-response-meta
-  [db-name store base-meta]
-  (scopy/copy-response-meta db-name store base-meta))
-
-(defn- sync-copy-response-store!
-  [store]
-  (scopy/sync-copy-response-store! store))
 
 (defn- open-port
   [host port]
@@ -2283,10 +2263,9 @@
      :authenticate #'authenticate
      :cleanup-copy-tmp-dir! #'cleanup-copy-tmp-dir!
      :client-display #'client-display
-     :close-server-copied-store! #'close-server-copied-store!
      :copy-in #'copy-in
      :copy-out #'copy-out
-     :copy-response-meta #'copy-response-meta
+     :copy-options (fn [^Server server] (:copy-options (.-execution server)))
      :copy-server-file-out! #'copy-server-file-out!
      :current-runtime-opts #'current-runtime-opts
      :db-dir #'db-dir
@@ -2307,7 +2286,6 @@
      :in-use-dbs #'in-use-dbs
      :lmdb #'lmdb
      :new-runtime-db #'new-runtime-db
-     :open-server-copied-store! #'open-server-copied-store!
      :open-server-store #'open-server-store
      :open-write-txn-with-retry #'open-write-txn-with-retry
      :remove-client #'remove-client
@@ -2315,13 +2293,10 @@
      :root #'server-root
      :acquire-transaction-slot! #'acquire-transaction-slot!
      :search-engine #'search-engine
-     :server-copy-store! #'server-copy-store!
      :store #'store
      :store->db-name #'store->db-name
-     :sync-copy-response-store! #'sync-copy-response-store!
      :store-closed? #'store-closed?
      :sys-conn #'server-sys-conn
-     :unpin-server-copy-backup-floor! #'unpin-server-copy-backup-floor!
      :update-cached-permission #'update-cached-permission
      :update-cached-role #'update-cached-role
      :update-client #'update-client
@@ -2756,6 +2731,7 @@
                     server-socket selector (ConcurrentLinkedQueue.)
                     dispatcher background sys-conn clients dbs
                     {:background background
+                     :copy-options (select-keys opts [:copy-phase-observer :copy-timeout-ms])
                      :connection-limits connection-limits
                      :connection-maintenance connection-maintenance
                      :session-maintenance maintenance

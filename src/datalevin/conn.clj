@@ -37,6 +37,8 @@
 (declare close closed? remove-conn shutdown-transact-async-executor!
          shutdown-transact-async-executor-if-idle!)
 
+(def ^:dynamic ^:private *request-origin* :standalone-local)
+
 (defonce ^:private shared-local-stores (atom {}))
 
 (defn conn?
@@ -651,49 +653,54 @@
 (defn- direct-local-scalar-update!
   "Commit a prepared simple scalar-update batch directly against one LMDB write
   transaction, without mutable index overlays or per-form report updates."
-  [conn prepared tx-meta]
-  (locking conn
-    (let [db    ^DB (deref conn)
-          store ^Store (.-store db)]
-      (when (db/scalar-update-tx-valid? db prepared)
-        (let [old (db/cache-disabled? store)]
-          (db/disable-cache store)
-          (try
-            (let [kv             (.-lmdb store)
-                  prepared-store (volatile! nil)
-                  result
-                  (l/with-transaction-kv [kv1 kv]
-                    (let [store1 ^Store (s/transfer store kv1)
-                          stored-max-tx (long (i/max-tx store1))
+  ([conn prepared tx-meta]
+   (direct-local-scalar-update! conn prepared tx-meta nil))
+  ([conn prepared tx-meta tx-data]
+   (locking conn
+     (let [db    ^DB (deref conn)
+           store ^Store (.-store db)]
+       (when (or tx-data (db/scalar-update-tx-valid? db prepared))
+         (let [old (db/cache-disabled? store)]
+           (db/disable-cache store)
+           (try
+             (let [kv             (.-lmdb store)
+                   prepared-store (volatile! nil)
+                   result
+                   (l/with-transaction-kv [kv1 kv]
+                     (let [store1 ^Store (s/transfer store kv1)
+                           stored-max-tx (long (i/max-tx store1))
                           ;; Keep both allocation floors current: later blind
                           ;; inserts use the transaction counter to recognize
                           ;; a fresh DB.
-                          db1    ^DB    (cond-> (db/transfer db store1)
-                                          (not (== stored-max-tx (long (:max-tx db))))
-                                          (assoc :max-eid
-                                                 (max (long (:max-eid db))
-                                                      (long (i/init-max-eid store1)))
-                                                 :max-tx
-                                                 (max (long (:max-tx db))
-                                                      stored-max-tx)))]
-                      (when-let [report (db/stamp-scalar-update-tx
-                                          db1 prepared tx-meta)]
-                        (vreset! prepared-store store1)
-                        (db/commit-prepared-tx-data!
+                           db1    ^DB    (cond-> (db/transfer db store1)
+                                           (not (== stored-max-tx (long (:max-tx db))))
+                                           (assoc :max-eid
+                                                  (max (long (:max-eid db))
+                                                       (long (i/init-max-eid store1)))
+                                                  :max-tx
+                                                  (max (long (:max-tx db))
+                                                       stored-max-tx)))]
+                       (when-let [report (if tx-data
+                                           (db/prepare-local-tx-data
+                                            db1 tx-data tx-meta
+                                            (System/currentTimeMillis) prepared)
+                                           (db/stamp-scalar-update-tx db1 prepared tx-meta))]
+                         (vreset! prepared-store store1)
+                         (db/commit-prepared-tx-data!
                           db1 (:tx-data report) report)
-                        report)))]
-              (when result
-                (let [report    result
-                      new-store ^Store (s/transfer ^Store @prepared-store kv)
-                      new-db    (-> (:db-after report)
-                                    (db/transfer new-store)
-                                    (db/carry-runtime-opts db)
-                                    (db/adopt-current-db!))]
-                  (reset! conn new-db)
-                  (assoc report :db-after @conn))))
-            (finally
-              (when-not old
-                (db/enable-cache (.-store ^DB @conn))))))))))
+                         report)))]
+               (when result
+                 (let [report    result
+                       new-store ^Store (s/transfer ^Store @prepared-store kv)
+                       new-db    (-> (:db-after report)
+                                     (db/transfer new-store)
+                                     (db/carry-runtime-opts db)
+                                     (db/adopt-current-db!))]
+                   (reset! conn new-db)
+                   (assoc report :db-after @conn))))
+             (finally
+               (when-not old
+                 (db/enable-cache (.-store ^DB @conn)))))))))))
 
 (defn- maybe-direct-local-scalar-update!
   [conn tx-data tx-meta]
@@ -1075,6 +1082,36 @@
   (when-let [report (db/stamp-scalar-update-tx before prepared tx-meta)]
     (commit-writing-report! before report false :scalar-update true false)))
 
+(defn- stamp-compiled-local!
+  [control before outcome tx-data tx-meta]
+  (when *txlog-sync-path-observer*
+    (let [opts (l/read-env-opts (.-lmdb ^Store (:store before)))]
+      (observe-embedded-path! (:wal-durability-profile opts) (datalog/batched? control))))
+  (let [report (db/prepare-local-tx-data
+                 before tx-data tx-meta (System/currentTimeMillis) outcome)
+        independent? (::db/independent-scalar? report)
+        report (if independent? (dissoc report ::db/independent-scalar?) report)]
+    ;; Epoch changes can select ordered execution, whose report carries no proof.
+    (commit-writing-report! before report false :compiled-scalar (boolean independent?) false)))
+
+(defn- transact-compiled-local!
+  [conn tx-data tx-meta outcome]
+  (let [report
+        (if-let [control (datalog/control conn)]
+          (datalog/run-scalar!
+            control conn outcome tx-data tx-meta
+            (fn [control before prepared meta]
+              (stamp-compiled-local! control before prepared tx-data meta))
+            ;; The authoritative hook always resolves or throws in its owned
+            ;; scope. It never resubmits a deferred rejection.
+            (fn [& _] (throw (IllegalStateException. "Compiler request escaped its writer")))
+            {:isolated? (:isolated? outcome)})
+          (direct-local-scalar-update! conn outcome tx-meta tx-data))
+        report (if (::db/independent-scalar? report)
+                 (dissoc report ::db/independent-scalar?) report)]
+    (notify-listeners! conn report)
+    report))
+
 (defn- transact-request!
   [conn tx-data tx-meta]
   ;; Remote preparation must run under the server's writer, including when
@@ -1085,54 +1122,56 @@
       (observe-txlog-sync-path! :direct-remote)
       (notify-listeners! conn report)
       report)
-    (let [kind (db/classify-local-tx tx-data)]
-      (if-let [control (datalog/control conn)]
+    (if-let [outcome (db/prepare-local-request @conn tx-data *request-origin*)]
+      (transact-compiled-local! conn tx-data tx-meta outcome)
+      (let [kind (db/classify-local-tx tx-data)]
+        (if-let [control (datalog/control conn)]
         ;; Type correction and read-layout construction do not depend on
         ;; the eventual native snapshot. Keep that work on the caller;
         ;; resolve lookup refs and read old values on the native owner.
-        (let [prepared (when (= kind :scalar)
-                         (db/prepare-scalar-update-tx
-                           @conn tx-data {:defer-entity-resolution? true :shape-checked? true}))
-              kind (if (= kind :scalar) :general kind)
-              report (if (and prepared (nil? (l/explicit-transaction-timeout)))
-                       (datalog/run-scalar! control conn prepared tx-data tx-meta
-                                            stamp-collected-scalar!
-                                            (fn [tx forms meta]
-                                              (-transact! tx forms meta
-                                                          (if (db/scalar-update-tx-valid? @tx prepared)
-                                                            :general :scalar))))
-                       (datalog/with-transaction!
-                         control conn
-                         (fn [tx]
-                           (when *txlog-sync-path-observer*
-                             (let [opts (l/read-env-opts (.-lmdb ^Store (:store @tx)))]
-                               (observe-embedded-path! (:wal-durability-profile opts)
-                                                       (datalog/batched? control))))
-                           (or (when prepared
-                                 (when-let [report (db/stamp-scalar-update-tx
-                                                     @tx prepared tx-meta)]
-                                   (let [report (commit-writing-report!
-                                                  @tx report false :scalar-update true false)]
-                                     (reset! tx (:db-after report))
-                                     report)))
-                               (-transact! tx tx-data tx-meta
-                                           (if (and prepared
-                                                    (not (db/scalar-update-tx-valid? @tx prepared)))
-                                             :scalar kind))))
-                         {:context {:datalog-prepare? true :datalog-fast? true}}))]
-          (notify-listeners! conn report)
-          report)
-      (if-let [g (embedded-write-group conn)]
-        (transact-embedded-group! g conn tx-data tx-meta kind)
-        (do
-          (let [store (.-store ^DB @conn)
-                opts (when (and (instance? Store store)
-                                (not (l/writing? (.-lmdb ^Store store)))
-                                (not (current-thread-holds-store-write-lock? store)))
-                       (l/read-env-opts (.-lmdb ^Store store)))]
-            (observe-embedded-path!
-             (when (:wal? opts) (:wal-durability-profile opts)) false))
-          (run-transact-now! conn tx-data tx-meta kind)))))))
+          (let [prepared (when (= kind :scalar)
+                           (db/prepare-scalar-update-tx
+                            @conn tx-data {:defer-entity-resolution? true :shape-checked? true}))
+                kind (if (= kind :scalar) :general kind)
+                report (if (and prepared (nil? (l/explicit-transaction-timeout)))
+                         (datalog/run-scalar! control conn prepared tx-data tx-meta
+                                              stamp-collected-scalar!
+                                              (fn [tx forms meta]
+                                                (-transact! tx forms meta
+                                                            (if (db/scalar-update-tx-valid? @tx prepared)
+                                                              :general :scalar))))
+                         (datalog/with-transaction!
+                           control conn
+                           (fn [tx]
+                             (when *txlog-sync-path-observer*
+                               (let [opts (l/read-env-opts (.-lmdb ^Store (:store @tx)))]
+                                 (observe-embedded-path! (:wal-durability-profile opts)
+                                                         (datalog/batched? control))))
+                             (or (when prepared
+                                   (when-let [report (db/stamp-scalar-update-tx
+                                                      @tx prepared tx-meta)]
+                                     (let [report (commit-writing-report!
+                                                   @tx report false :scalar-update true false)]
+                                       (reset! tx (:db-after report))
+                                       report)))
+                                 (-transact! tx tx-data tx-meta
+                                             (if (and prepared
+                                                      (not (db/scalar-update-tx-valid? @tx prepared)))
+                                               :scalar kind))))
+                           {:context {:datalog-prepare? true :datalog-fast? true}}))]
+            (notify-listeners! conn report)
+            report)
+          (if-let [g (embedded-write-group conn)]
+            (transact-embedded-group! g conn tx-data tx-meta kind)
+            (do
+              (let [store (.-store ^DB @conn)
+                    opts (when (and (instance? Store store)
+                                    (not (l/writing? (.-lmdb ^Store store)))
+                                    (not (current-thread-holds-store-write-lock? store)))
+                           (l/read-env-opts (.-lmdb ^Store store)))]
+                (observe-embedded-path!
+                 (when (:wal? opts) (:wal-durability-profile opts)) false))
+              (run-transact-now! conn tx-data tx-meta kind))))))))
 
 (defn transact!
   ([conn tx-data] (transact! conn tx-data nil))
@@ -1158,7 +1197,8 @@
        (observe-txlog-sync-path! :direct-remote)
        (when report (notify-listeners! conn report)))
      ;; Retain local queueing and explicit transaction/watchdog semantics.
-     (transact! conn tx-data tx-meta))
+     (binding [*request-origin* :ack]
+       (transact! conn tx-data tx-meta)))
    :transacted))
 
 (defn reset-conn!
@@ -1439,7 +1479,9 @@
   IAsyncWork
   (work-key [_] (->> (.-store ^DB @conn) i/db-name dl-work-key))
   ;; Async transact stays at the API layer and delegates execution to transact!.
-  (do-work [_] (transact! conn tx-data tx-meta))
+  (do-work [_]
+    (binding [*request-origin* :async]
+      (transact! conn tx-data tx-meta)))
   (combine [_] dl-tx-combine)
   (callback [_] cb)
   IBoundedAsyncWork

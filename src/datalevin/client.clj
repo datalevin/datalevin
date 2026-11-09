@@ -2921,7 +2921,18 @@
                response)
              (catch Throwable failure
                (cleanup-after-failure! failure #(file-copy/close! receiver))
-               (throw failure)))))))))
+               (if standalone?
+                 (throw (ex-info (ex-message failure)
+                                 (assoc (ex-data failure) :admin/maintenance-sent? (cr/exchanged?))
+                                 failure))
+                 (throw failure))))))))))
+
+(defn admin-backup!
+  "Receive a guarded standalone copy of the discovered database into an
+  incomplete file. Preserve catalog identity through reconnects and opens."
+  [client {:keys [db-name db-id db-type]} file]
+  (copy-to-file client db-name file
+                {:standalone? true :expected-db-id db-id :expected-db-type db-type}))
 
 (defn assign-role
   "Assign a role to a user. "

@@ -12,6 +12,7 @@
   (:require
    [datalevin.constants :refer [e0 tx0 emax txmax v0 vmax]]
    [datalevin.datom :as d :refer [datom]]
+   [datalevin.db.tx.plan :as plan]
    [datalevin.interface :as i :refer [rschema]]
    [datalevin.index :as idx]
    [datalevin.validate :as vld])
@@ -369,7 +370,7 @@
 (defn reverse-ref?
   ^Boolean [attr]
   (if (keyword? attr)
-    (= \_ (nth (name attr) 0))
+    (plan/reverse-ref-attr? attr)
     (do (vld/validate-reverse-ref-attr attr)
         false)))
 

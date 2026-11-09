@@ -427,7 +427,7 @@ The query-map `:query-source` value accepts these options:
 | `:consistency` | Default requested read minimum; defaults to `:snapshot`. |
 | `:sources` | Source-symbol map of `{:consistency ...}` overrides for declared external aliases. |
 | `:limits` | Overrides for the shared resource limits shown below. |
-| `:planning` | `:max-alternatives` (default `32`) and `:estimate-max-age-ms` (default `300000`). Estimate age remains advisory. |
+| `:planning` | `:max-alternatives` (default `32`) and `:estimate-max-age-ms` (default `300000`). Estimate age limits cardinality ranking; it never changes query answers. |
 
 For example, put limits inside `:limits`, rather than directly under
 `:query-source`:
@@ -827,16 +827,31 @@ nonnegative integers or `nil`. Condition estimates on the actual scope,
 coverage, constants, predicates, types, and binding/request caps. Do not issue
 planning I/O to obtain them or count on speculative concurrency.
 
-Current selection is structural and ignores estimate values:
+Current selection ranks fresh provider cardinalities before structural tie
+breaks. These remain advisory estimates, separate from native optimizer costs:
 
 - Regions with only single-pattern candidates report `:eav-structural-v1`.
 - Regions containing fused candidates report `:eav-fusion-v1`.
 
-Choices are ordered by source, region, and lowest covered pattern ID. For the
+Use `:rows` for an independent access and `:rows-per-binding` for a dependent
+access. Counts qualify when confidence is `:low`, `:medium`, or `:high`, provenance
+kind is `:exact`, `:statistics`, or `:heuristic`, and `:observed-at-ms` is present
+and not in the future. The observation must be no older than
+`:estimate-max-age-ms` and strictly younger than any non-nil `:valid-for-ms`.
+Providers should capture statistics during acquisition; planning remains pure.
+
+Smaller qualifying counts come first. Missing, unknown, or expired counts follow
+qualifying ones and use structural ordering among themselves. Explanations report
+`:selection :cardinality` when qualifying counts rank candidates, otherwise
+`:selection :structural`. Time and transfer fields remain diagnostic;
+`:estimated-access-ns` remains `nil`. A statistical zero is still executed and
+cannot prove an access empty, supply a dependency, or change coverage checks.
+
+Structural ties are ordered by source, region, and lowest covered pattern ID. For the
 same first work item, entity lookup precedes value lookup, then attribute
 enumeration. Within the same kind, wider pattern coverage precedes narrower
 coverage; canonical structural identifiers break ties. Provider response order,
-opaque handles, labels, and costs do not determine the choice. The dependency
+opaque handles, labels, and time/transfer costs do not determine the choice. The dependency
 search backtracks to find complete nonoverlapping coverage within its 4096-state
 bound. Failure to find a feasible complete plan is `:query-source/unsupported`.
 This does not promise minimum latency or a globally minimum number of opens.

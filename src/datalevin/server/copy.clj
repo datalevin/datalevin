@@ -11,12 +11,13 @@
   "Copy helpers for large client/server data transfer."
   (:require
    [datalevin.constants :as c]
+   [datalevin.binding.cpp :as cpp]
    [datalevin.interface :as i]
    [datalevin.kv :as kv]
    [datalevin.native-value :as nv]
    [datalevin.protocol :as p]
    [datalevin.server.connection :as connection]
-   [datalevin.storage :as st]
+   [datalevin.storage]
    [datalevin.util :as u :refer [raise]]
    [taoensso.timbre :as log])
   (:import
@@ -41,18 +42,6 @@
 (defn cleanup-copy-tmp-dir!
   [tf]
   (@cleanup-copy-tmp-dir-fn* tf))
-
-(def ^:redef server-copy-store!
-  i/copy)
-
-(def ^:redef open-server-copied-store!
-  st/open)
-
-(def ^:redef close-server-copied-store!
-  i/close)
-
-(def ^:redef unpin-server-copy-backup-floor!
-  kv/txlog-unpin-backup-floor!)
 
 (defn copy-in
   "Continuously read batched data from the client"
@@ -241,3 +230,48 @@
   (when-let [kv-store (copy-source-kv-store store)]
     (i/sync kv-store 1))
   store)
+
+(def ^:private source-local-keys
+  #{c/wal-marker-a c/wal-marker-b c/wal-backup-pins c/wal-replica-floors
+    c/wal-snapshot-current-lsn c/wal-snapshot-previous-lsn
+    :wal-backup-pins :wal-replica-floors :wal-backup-pin-floor-lsn
+    :wal-replica-floor-lsn :wal-snapshot-current-lsn :wal-snapshot-previous-lsn
+    :wal-snapshot-floor-lsn :wal-dir :snapshot-dir})
+
+(defn- without-source-directories
+  [opts]
+  (cond-> (dissoc opts :wal-dir :snapshot-dir)
+    (map? (:kv-opts opts)) (update :kv-opts dissoc :wal-dir :snapshot-dir)))
+
+(defn finalize-copy!
+  "Reconcile captured bytes before any normal store open. Uses existing DBIs
+  without recovery, background work, index initialization, or source paths."
+  [dir db-name base-meta]
+  (let [raw (cpp/open-existing-raw dir)]
+    (try
+     (let [meta (copy-response-meta db-name raw base-meta)
+          payload (:payload-last-applied-lsn meta)
+          types [:keyword :data]
+          deletes (for [key source-local-keys kt types]
+                    [:del c/kv-info key kt])
+          option-dbis (cond-> [c/kv-info]
+                        (contains? (set (i/list-dbis raw)) c/opts) (conj c/opts))
+          option-txs
+          (mapcat
+            (fn [dbi]
+              (mapcat
+                (fn [kt]
+                  (concat
+                    (for [key [:wal-dir :snapshot-dir]] [:del dbi key kt])
+                    (for [key [:kv-opts :opts]
+                          :let [value (i/get-value raw dbi key kt :data)]
+                          :when (map? value)]
+                      [:put dbi key (without-source-directories value) kt :data])))
+                (distinct (if (= dbi c/opts) [:attr :keyword :data] types))))
+            option-dbis)
+          txs (cond-> (vec (concat deletes option-txs))
+                (some? payload) (conj [:put c/kv-info c/wal-local-payload-lsn payload :keyword :data]))]
+      (i/transact-kv raw txs)
+      (i/sync raw 1)
+      meta)
+     (finally (i/close-kv raw)))))

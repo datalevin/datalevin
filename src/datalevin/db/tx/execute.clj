@@ -15,6 +15,7 @@
    [datalevin.db.tx.common :as txcommon]
    [datalevin.db.tx.engine :as txengine]
    [datalevin.db.tx.prepare :as txprep]
+   [datalevin.storage :as s]
    [datalevin.idoc :as idoc]
    [datalevin.index :as idx]
    [datalevin.interface :as i :refer [fetch init-max-eid opts]]
@@ -24,9 +25,191 @@
    [datalevin.validate :as vld])
   (:import
    [datalevin.datom Datom]
+   [datalevin.db.tx.plan ScalarEntityRead]
+   [clojure.lang LazilyPersistentVector]
+   [org.eclipse.collections.impl.map.mutable.primitive LongObjectHashMap]
    [datalevin.db.tx.prepare IdentityResolution ResolvedIdentityAdd]
-   [java.util ArrayList Collection HashMap HashSet List SortedSet]
+   [java.util ArrayList Arrays Collection HashMap HashSet List SortedSet]
    [org.eclipse.collections.impl.set.sorted.mutable TreeSortedSet]))
+
+(defn read-scalar-entity
+  [store eid ^ScalarEntityRead layout]
+  (first (s/select-entities store [eid] (.-names layout) (.-aids layout)
+                            false idx/avg-buffer->prepared-value)))
+
+(defn- read-scalar-update-entity
+  [db eid ^ScalarEntityRead layout]
+  (let [store (:store db)]
+    (if-let [^LongObjectHashMap pending (txcommon/scalar-pending-index)]
+      (if-let [^java.util.HashMap pending (.get pending (long eid))]
+        (let [^objects names (.-names layout)
+              ^longs aids (.-aids layout)
+              n (alength names)]
+          (loop [idx 0 values {} remaining []]
+            (if (< idx n)
+              (let [attr (aget names idx)]
+                (if-let [^Datom datom (.get pending attr)]
+                  (recur (unchecked-inc idx)
+                         (assoc values attr (when (d/datom-added datom) (.-v datom)))
+                         remaining)
+                  (recur (unchecked-inc idx) values (conj remaining idx))))
+              (if (empty? values)
+                (read-scalar-entity store eid layout)
+                (merge (when (seq remaining)
+                         (first (s/select-entities
+                                  store [eid]
+                                  (object-array (map #(aget names %) remaining))
+                                  (long-array (map #(aget aids %) remaining))
+                                  false idx/avg-buffer->prepared-value)))
+                       values)))))
+        (read-scalar-entity store eid layout))
+      (if txcommon/*batch-prepare*
+        (let [^TreeSortedSet eavt (:eavt db)
+              ^java.util.SortedSet pending
+              (.subSet eavt
+                       (datom eid nil nil c/tx0) (datom eid nil nil c/txmax))]
+          (if (.isEmpty pending)
+            (read-scalar-entity store eid layout)
+            (let [^objects names (.-names layout)
+                  ^longs aids (.-aids layout)
+                  n (alength names)]
+              (loop [idx 0 values {} remaining []]
+                (if (< idx n)
+                  (let [attr (aget names idx)
+                        ^java.util.SortedSet pending
+                        (.subSet eavt (datom eid attr nil c/tx0)
+                                 (datom eid attr nil c/txmax))]
+                    (if (.isEmpty pending)
+                      (recur (unchecked-inc idx) values (conj remaining idx))
+                      ;; Scalar attributes have at most one current addition.
+                      ;; Retractions alone mean absent, and never override an
+                      ;; addition regardless of index sort order. Seek only the
+                      ;; requested attributes, avoiding unrelated pending datoms.
+                      (recur (unchecked-inc idx)
+                             (assoc values attr (:v (first (filter d/datom-added pending))))
+                             remaining)))
+                  (if (empty? values)
+                    (read-scalar-entity store eid layout)
+                    (merge (when (seq remaining)
+                             (first (s/select-entities
+                                      store [eid]
+                                      (object-array (map #(aget names %) remaining))
+                                      (long-array (map #(aget aids %) remaining))
+                                      false idx/avg-buffer->prepared-value)))
+                           values)))))))
+        (read-scalar-entity store eid layout)))))
+
+(defn- scalar-update-datoms
+  [db entries tx-id entry-offset]
+  (let [n (count entries)
+        attr-offset (inc entry-offset)
+        value-offset (+ 2 entry-offset)]
+    (if (= n 1)
+      (let [entry (nth entries 0)
+            e (nth entry entry-offset)
+            attr (nth entry attr-offset)
+            value (nth entry value-offset)
+            old-value (txcommon/preparation-first-v db e attr)]
+        (cond
+          (nil? old-value) [(datom e attr value tx-id)]
+          (d/value-equal? (idx/logical-value old-value) value) []
+          :else [(idx/retraction e attr old-value tx-id)
+                 (datom e attr value tx-id)]))
+      (if-let [^objects buffer
+               (when (and (<= n 16)
+                          (instance? datalevin.db.tx.common.ScalarDatomBuffer
+                                     txcommon/*batch-prepare*))
+                 (txcommon/acquire-scalar-datom-buffer! txcommon/*batch-prepare* (* 2 n)))]
+        (try
+          (loop [i 0 out 0]
+            (if (< i n)
+              (let [entry (nth entries i)
+                    e (nth entry entry-offset)
+                    attr (nth entry attr-offset)
+                    value (nth entry value-offset)
+                    old-value (txcommon/preparation-first-v db e attr)]
+                (cond
+                  (d/value-equal? (idx/logical-value old-value) value)
+                  (recur (unchecked-inc i) out)
+                  (nil? old-value)
+                  (do (aset buffer out (datom e attr value tx-id))
+                      (recur (unchecked-inc i) (unchecked-inc out)))
+                  :else
+                  (do (aset buffer out (idx/retraction e attr old-value tx-id))
+                      (aset buffer (unchecked-inc out) (datom e attr value tx-id))
+                      (recur (unchecked-inc i) (+ out 2)))))
+              ;; The final tail is owned by this request. Never publish the
+              ;; scratch array: later stamps reuse it, including after abort.
+              (if (zero? out) []
+                  (LazilyPersistentVector/createOwning
+                   (Arrays/copyOf buffer (int out))))))
+          (finally
+            (Arrays/fill buffer (int 0) (int (* 2 n)) nil)
+            (txcommon/release-scalar-datom-buffer! txcommon/*batch-prepare* buffer)))
+        (loop [i 0 out (transient [])]
+          (if (< i n)
+            (let [entry (nth entries i)
+                  e (nth entry entry-offset)
+                  attr (nth entry attr-offset)
+                  value (nth entry value-offset)
+                  old-value (txcommon/preparation-first-v db e attr)]
+              (recur (unchecked-inc i)
+                     (cond
+                       (d/value-equal? (idx/logical-value old-value) value) out
+                       (nil? old-value) (conj! out (datom e attr value tx-id))
+                       :else (-> out
+                                 (conj! (idx/retraction e attr old-value tx-id))
+                                 (conj! (datom e attr value tx-id))))))
+            (persistent! out)))))))
+
+(defn scalar-entities-within-bound?
+  "Check the current writer's allocation floor before scalar execution."
+  ([entries max-eid] (scalar-entities-within-bound? entries max-eid 0))
+  ([entries ^long max-eid entry-offset]
+   (loop [i 0]
+     (or (= i (count entries))
+         (and (<= (long (nth (nth entries i) entry-offset)) max-eid)
+              (recur (unchecked-inc i)))))))
+
+(defn execute-scalar-region
+  "Read current values and emit one owned logical datom vector. Caller supplies
+  validated distinct E/A operands and owns the writer or simulation scope."
+  ([db entries layouts tx-id specialize?]
+   (execute-scalar-region db entries layouts tx-id specialize? 0))
+  ([db entries layouts tx-id specialize? entry-offset]
+   (let [n (count entries)
+         attr-offset (inc entry-offset)
+         value-offset (+ 2 entry-offset)]
+     (if (and specialize? (nil? layouts))
+       (scalar-update-datoms db entries tx-id entry-offset)
+       (let [old-values
+             (reduce-kv
+              (fn [values eid layout]
+                (assoc values eid (read-scalar-update-entity db eid layout)))
+              {} layouts)]
+         (loop [i 0, out (transient [])]
+           (if (< i n)
+             (let [entry (nth entries i)
+                   e (nth entry entry-offset)
+                   attr (nth entry attr-offset)
+                   value (nth entry value-offset)
+                   old-value (if (contains? layouts e)
+                               (get (get old-values e) attr)
+                               (txcommon/preparation-first-v db e attr))]
+               (cond
+                 (nil? old-value)
+                 (recur (unchecked-inc i)
+                        (conj! out (datom e attr value tx-id)))
+
+                 (d/value-equal? (idx/logical-value old-value) value)
+                 (recur (unchecked-inc i) out)
+
+                 :else
+                 (recur (unchecked-inc i)
+                        (-> out
+                            (conj! (idx/retraction e attr old-value tx-id))
+                            (conj! (datom e attr value tx-id))))))
+             (persistent! out))))))))
 
 (deftype ^:private TxStep [report entities])
 (deftype ^:private TxRetry [report])

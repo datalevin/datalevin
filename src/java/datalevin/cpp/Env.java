@@ -2,15 +2,18 @@ package datalevin.cpp;
 
 import org.bytedeco.javacpp.*;
 import datalevin.dtlvnative.DTLV;
-import java.util.List;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
  * Wrap a MDB_env
  */
 public class Env {
 
-    private boolean closed;
+    private volatile boolean closed;
     private DTLV.MDB_env env;
+    // A prepared reader holds pointers into the current mapping. Writers may
+    // commit while it is alive, but close and map growth must wait for it.
+    private final ReentrantReadWriteLock copyLifetime = new ReentrantReadWriteLock(true);
 
     public Env(DTLV.MDB_env env) {
         this.closed = false;
@@ -51,11 +54,19 @@ public class Env {
      * Close and free memory
      */
     public void close() {
-        if (closed) {
-            return;
+        if (copyLifetime.getReadHoldCount() != 0) {
+            throw new IllegalStateException("Close prepared copies before closing the environment");
         }
-        closed = true;
-        DTLV.mdb_env_close(env);
+        copyLifetime.writeLock().lock();
+        try {
+            if (closed) {
+                return;
+            }
+            closed = true;
+            DTLV.mdb_env_close(env);
+        } finally {
+            copyLifetime.writeLock().unlock();
+        }
     }
 
     /**
@@ -105,12 +116,89 @@ public class Env {
     }
 
     public void setMapSize(long size) {
-        Util.checkRc(DTLV.mdb_env_set_mapsize(env, size));
+        if (copyLifetime.getReadHoldCount() != 0) {
+            throw new IllegalStateException("Close prepared copies before remapping the environment");
+        }
+        copyLifetime.writeLock().lock();
+        try {
+            Util.checkRc(DTLV.mdb_env_set_mapsize(env, size));
+        } finally {
+            copyLifetime.writeLock().unlock();
+        }
+    }
+
+    /** A fixed, single-use snapshot owned by the preparing Java thread. */
+    public final class PreparedCopy implements AutoCloseable {
+        private final Thread thread = Thread.currentThread();
+        private DTLV.MDB_copy handle;
+        private boolean executed;
+
+        private PreparedCopy(DTLV.MDB_copy handle) {
+            this.handle = handle;
+        }
+
+        private void checkThread() {
+            if (thread != Thread.currentThread()) {
+                throw new IllegalStateException("Use prepared copy on its preparing thread");
+            }
+        }
+
+        private void execute() {
+            checkThread();
+            if (handle == null || executed) {
+                throw new IllegalStateException("Prepared copy is closed or already executed");
+            }
+            executed = true;
+            Util.checkRc(DTLV.mdb_env_copy_execute(handle));
+        }
+
+        @Override
+        public void close() {
+            checkThread();
+            if (handle != null) {
+                DTLV.MDB_copy copy = handle;
+                handle = null;
+                try {
+                    Util.checkRc(DTLV.mdb_env_copy_close(copy));
+                } finally {
+                    copyLifetime.readLock().unlock();
+                }
+            }
+        }
+    }
+
+    /** Fix the reader and metadata without copying payload bytes. The caller
+     * must close the result on this thread, including after cancellation. */
+    public PreparedCopy prepareCopy(String dest, boolean compact) {
+        copyLifetime.readLock().lock();
+        try {
+            if (closed) {
+                throw new IllegalStateException("LMDB env is closed");
+            }
+            DTLV.MDB_copy copy = new DTLV.MDB_copy();
+            Util.checkRc(DTLV.mdb_env_copy_prepare(env, dest,
+                         compact ? DTLV.MDB_CP_COMPACT : 0, copy));
+            return new PreparedCopy(copy);
+        } catch (RuntimeException | Error e) {
+            copyLifetime.readLock().unlock();
+            throw e;
+        }
+    }
+
+    /** Copy exactly the prepared state; foreground commits remain allowed. */
+    public void copyPrepared(PreparedCopy copy) {
+        copy.execute();
+    }
+
+    /** Release the fixed reader, destination descriptor, and mapping lease. */
+    public void closePrepared(PreparedCopy copy) {
+        copy.close();
     }
 
     public void copy(String dest, boolean compact) {
-        int flag = compact ? DTLV.MDB_CP_COMPACT : 0;
-        Util.checkRc(DTLV.mdb_env_copy2(env, dest, flag));
+        try (PreparedCopy copy = prepareCopy(dest, compact)) {
+            copyPrepared(copy);
+        }
     }
 
 }

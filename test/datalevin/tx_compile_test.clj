@@ -1,0 +1,96 @@
+(ns datalevin.tx-compile-test
+  (:require [clojure.test :refer [deftest is]]
+            [datalevin.db.tx.compile :as compile]
+            [datalevin.prepare :as prepare])
+  (:import [datalevin.db.tx.plan TxPlan]))
+
+(def ctx
+  (prepare/->PrepareCtx
+    {:value {:db/aid 3 :db/valueType :db.type/long}
+     :text {:db/aid 4 :db/valueType :db.type/string}
+     :identity {:db/aid 5 :db/valueType :db.type/string :db/unique :db.unique/identity}
+     :reference {:db/aid 6 :db/valueType :db.type/ref}}
+    {} {:validate-data? true}))
+
+(deftest literal-scalar-plan-owns-one-context-and-operand-stream
+  (let [p (compile/compile-tx ctx [[:db/add 1 :value 42] {:db/id 1 :text "a"}])]
+    (is (instance? TxPlan p))
+    (is (identical? ctx (:ctx p)))
+    (is (= :scalar (:strategy p)))
+    (is (= [[1 :value 42] [1 :text "a"]] (:entries p)))
+    (is (nil? (:entity-reads p)))))
+
+(deftest unsupported-forms-decline-before-effects
+  (let [effects (atom [])
+        value (proxy [Object] [] (toString [] (swap! effects conj :conversion) "value"))
+        tail (lazy-seq (swap! effects conj :tail) (list [:db/add 1 :value 1]))]
+    (doseq [forms [tail
+                   [[:db/add 1 :text value]]
+                   [[:db/add 1 :value 1] [:db/add 1 :value 2]]
+                   [[:db/add [:identity "x"] :value 1]]
+                   [[:db/add 1 :reference 2]]
+                   [{:value 1}]
+                   [(with-meta [:db/add 1 :value 1] {:source true})]
+                   [[:db/add 1 :identity "x"]]
+                   [[:db.fn/call (fn [_] (swap! effects conj :callback))]]]]
+      (is (nil? (compile/compile-tx ctx forms))))
+    (is (empty? @effects))))
+
+(deftest correction-failure-retains-original-input
+  (let [forms [[:db/add 1 :text 42]]
+        outcome (compile/compile-tx ctx forms)]
+    (is (= :needs-writer (:outcome outcome)))
+    (is (identical? forms (:input outcome)))
+    (is (identical? ctx (:ctx outcome)))
+    ;; Coercion stays on the legacy route until its writer-time obligations
+    ;; migrate; the original input is still available to authoritative execution.
+    (is (nil? (compile/compile-tx
+                (assoc ctx :opts {:validate-data? false}) forms)))))
+
+(deftest canonical-operation-operands-reuse-the-inert-source-buffer
+  (let [forms [[:db/add 1 :value 42] [:db/add 2 :text "text"]]
+        p (compile/compile-tx ctx forms)]
+    (is (= :scalar-operations (:strategy p)))
+    (is (identical? forms (:entries p)))
+    (is (identical? ctx (:ctx p)))))
+
+(deftest canonical-numeric-classes-still-obey-validation-bounds
+  (let [big-ctx (assoc ctx :schema
+                       (assoc (:schema ctx) :big {:db/aid 8 :db/valueType :db.type/bigint}))
+        too-large (.shiftLeft java.math.BigInteger/ONE 4096)]
+    (is (= :needs-writer
+           (:outcome (compile/compile-tx big-ctx [[:db/add 1 :big too-large]]))))))
+
+(deftest wrapped-host-numbers-cannot-run-user-code-during-planning
+  (let [effects (atom [])
+        number (proxy [java.math.BigInteger] ["1"]
+                 (bitLength [] 128)
+                 (longValue [] (swap! effects conj :long) 1)
+                 (toString [] (swap! effects conj :string) "1"))
+        wrapped (clojure.lang.BigInt/fromBigInteger number)
+        permissive (assoc ctx :opts {:validate-data? false})]
+    (is (nil? (compile/compile-tx permissive [[:db/add wrapped :value 1]])))
+    (is (nil? (compile/compile-tx permissive [[:db/add 1 :text wrapped]])))
+    (is (empty? @effects))))
+
+(deftest canonical-value-proofs-match-the-existing-correction-contract
+  (doseq [[vt value] [[:db.type/long 42]
+                      [:db.type/string "text"]
+                      [:db.type/keyword :value]
+                      [:db.type/symbol (with-meta 'value {:source true})]
+                      [:db.type/boolean false]
+                      [:db.type/uuid (java.util.UUID. 0 1)]
+                      [:db.type/instant (java.util.Date. 1234)]
+                      [:db.type/bytes (byte-array [1 2])]
+                      [:db.type/bigint (biginteger 42)]
+                      [:db.type/bigdec 42.00M]
+                      [:db.type/float (float 0.25)]
+                      [:db.type/double 0.25]
+                      [nil 1/2]]]
+    (let [context (assoc ctx :schema {:value {:db/aid 3 :db/valueType vt}})
+          plan (compile/compile-tx context [[:db/add 1 :value value]])]
+      (is (identical? value (prepare/correct-scalar-value true vt value)))
+      (is (= :scalar-operations (:strategy plan)))))
+  ;; Calendar formatting can consult host callbacks; keep it ordered.
+  (is (nil? (compile/compile-tx (assoc ctx :opts {:validate-data? false})
+                                [[:db/add 1 :text (java.util.Date. 1234)]]))))

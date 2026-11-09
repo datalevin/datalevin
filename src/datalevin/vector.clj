@@ -33,6 +33,13 @@
    [java.util.concurrent.locks ReentrantReadWriteLock]
    [org.bytedeco.javacpp BytePointer]))
 
+(def ^:dynamic *mutation-observer*
+  "Optional phase observer for deterministic vector mutation contention tests."
+  nil)
+
+(defn- observe-mutation! [phase index]
+  (when *mutation-observer* (*mutation-observer* phase index)))
+
 (defn- metric-key->type
   [k]
   (int (case k
@@ -408,7 +415,7 @@
       meta2)))
 
 (defn- checkpoint-to-lmdb
-  [lmdb ^DTLV$usearch_index_t index ^String domain]
+  [lmdb ^DTLV$usearch_index_t index ^String domain & [index-opts]]
   (let [target-lsn   (txn-log-applied-lsn lmdb)
         total-bytes  (VecIdx/serializedLength index)
         chunk-size   (long (vec-checkpoint-chunk-bytes lmdb))
@@ -458,8 +465,8 @@
           (finally
             (.delete tmp-file)))))
     (.add txs (l/kv-tx :put c/vec-meta-dbi domain
-                       (checkpoint-meta old-meta chunk-count total-bytes
-                                        target-lsn)
+                       (cond-> (checkpoint-meta old-meta chunk-count total-bytes target-lsn)
+                         index-opts (assoc :index-opts index-opts))
                        :string :data))
     (i/transact-kv lmdb txs)
     {:chunk-count chunk-count
@@ -684,8 +691,10 @@
           wlock   (.writeLock vec-lock)
           tx-lock (l/write-txn lmdb)
           vec-id  (volatile! nil)]
+      (observe-mutation! :before-vector-lock this)
       (.lock wlock)
       (try
+        (observe-mutation! :vector-locked this)
         (when @closed?
           (raise "Vector index is closed." {:domain domain}))
         (let [id (.incrementAndGet max-vec)]
@@ -743,8 +752,10 @@
     (let [wlock    (.writeLock vec-lock)
           tx-lock  (l/write-txn lmdb)
           removed? (volatile! false)]
+      (observe-mutation! :before-vector-lock this)
       (.lock wlock)
       (try
+        (observe-mutation! :vector-locked this)
         (when @closed?
           (raise "Vector index is closed." {:domain domain}))
         (let [[stored-ref ids] (stored-vec-entry lmdb vecs-dbi vec-ref)]
@@ -797,7 +808,12 @@
     (when-not @closed?
       (let [started-ms (System/currentTimeMillis)]
         (try
-          (let [{:keys [total-bytes]} (checkpoint-to-lmdb lmdb index domain)
+          (let [{:keys [total-bytes]} (checkpoint-to-lmdb
+                                      lmdb index domain
+                                      {:domain domain :dimensions dimensions
+                                       :metric-type metric-type :quantization quantization
+                                       :connectivity connectivity :expansion-add expansion-add
+                                       :expansion-search expansion-search})
                 completed-ms (System/currentTimeMillis)
                 duration-ms (nonneg-long
                              (- completed-ms started-ms))]
@@ -1125,6 +1141,6 @@
                  (.-max-vec old)
                  (.-search-opts old)
                  (.-checkpoint-stats old)
-                 (ReentrantReadWriteLock.)))
+                 (.-vec-lock old)))
 
 (defn attr-domain [attr] (s/replace (u/keyword->string attr) "/" "_"))

@@ -973,7 +973,7 @@
              {:dimensions         (embedding-dimensions provider)
               :embedding-metadata (embedding-metadata provider)})))))))
 
-(defn- lazy-provider
+(defn ^:no-doc lazy-provider
   [provider-spec init-fn]
   (let [provider* (atom nil)
         closed?   (atom false)

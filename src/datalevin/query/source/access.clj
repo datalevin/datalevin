@@ -205,6 +205,22 @@
   (let [{:keys [source-symbol region-id covers]} (options plan)]
     [source-symbol region-id (reduce min covers)]))
 
+(defn- cardinality-key
+  "Fresh provider counts rank alternatives, without becoming native costs or
+  proofs of emptiness. Unknown/expired counts retain canonical structural order."
+  [plan now max-age]
+  (let [estimate (:advisory-estimate plan)
+        dependent? (seq (:requires (options plan)))
+        rows (get estimate (if dependent? :rows-per-binding :rows))
+        {:keys [kind observed-at-ms valid-for-ms]} (:provenance estimate)]
+    (if (and (#{:low :medium :high} (:confidence estimate))
+             (#{:exact :statistics :heuristic} kind)
+             (number? rows) (not (neg? rows))
+             (integer? observed-at-ms) (<= 0 observed-at-ms now)
+             (<= (- now observed-at-ms) max-age)
+             (or (nil? valid-for-ms) (< (- now observed-at-ms) valid-for-ms)))
+      [0 rows] [1 0])))
+
 (defrecord ^:private CoreOperator [owner region-id id requires columns after step])
 
 (defn core-operator!
@@ -302,15 +318,20 @@
   Inputs are actual seeds from the enclosing engine operator. Optional captured
   core operators contribute typed outputs only after their dependencies run.
   Never infer an export from another region or inspect outer rows. Regions with
-  fused candidates use :eav-fusion-v1: lookup priority, then wider coverage for
-  the same first work item, then canonical identity. Single-pattern regions
-  retain :eav-structural-v1. Feasibility
+  fused candidates use :eav-fusion-v1. Fresh provider cardinalities rank accesses
+  before structural tie breaks: first work item, lookup priority, wider coverage,
+  then canonical identity. Counts never prove completeness or emptiness.
+  Single-pattern regions retain :eav-structural-v1. Feasibility
   search shares the invocation ledger and the existing 4096-state bound.
   Caller-owned candidate/request reservations must live through execution."
   ([runtime region-id input-columns requests plans]
    (schedule! runtime region-id input-columns requests plans []))
   ([runtime region-id input-columns requests plans operators]
+   (schedule! runtime region-id input-columns requests plans operators {}))
+  ([runtime region-id input-columns requests plans operators planning]
    (let [started (System/nanoTime)
+         now (System/currentTimeMillis)
+         count-key #(cardinality-key % now (get planning :estimate-max-age-ms 300000))
          ctl (:control runtime) check! #(control/check-active! ctl)
          charges (volatile! []) output-token (volatile! nil)
          own-work! (fn [bytes]
@@ -352,7 +373,10 @@
                                                   (:consumption o) (get-in o [:capture :alternative]))))))
                              (sort (fn [a b]
                                      (check!)
-                                     (let [work (compare-keys (first-work-key a) (first-work-key b) check!)]
+                                     (let [cardinality (compare (count-key a) (count-key b))
+                                           work (if (zero? cardinality)
+                                                  (compare-keys (first-work-key a) (first-work-key b) check!)
+                                                  cardinality)]
                                        (if (zero? work)
                                          (let [kind (compare (kind-rank (get-in a [:path :options :access :kind]))
                                                              (kind-rank (get-in b [:path :options :access :kind])))
@@ -423,7 +447,8 @@
            (let [result {:region-id region-id
                          :policy (if (some #(> (count (work-keys %)) 1) candidates)
                                    :eav-fusion-v1 :eav-structural-v1)
-                         :selection :structural
+                         :selection (if (some #(zero? (first (count-key %))) candidates)
+                                      :cardinality :structural)
                          :estimated-access-ns nil :fallback-reasons []
                          :plans (into [] (comp (filter #(= :access (:kind %))) (map :value)) selected)
                          :operators (mapv #(select-keys % [:kind :value]) selected)

@@ -31,6 +31,8 @@
    [datalevin.server.client-op-cache :as op-cache]
    [datalevin.server.api :as sapi]
    [datalevin.server.connection :as connection]
+   [datalevin.server.capture :as capture]
+   [datalevin.server.copy :as scopy]
    [datalevin.server.prepared :as prepared]
    [datalevin.server.auth :as auth
     :refer [view-act alter-act create-act control-act database-obj user-obj
@@ -47,7 +49,8 @@
    [taoensso.timbre :as log])
   (:import
    [java.nio.channels SelectionKey]
-   [java.nio.file Paths]
+   [java.nio.file Files Paths]
+   [java.nio.file.attribute FileAttribute PosixFilePermissions]
    [java.util Collections Map UUID WeakHashMap]
    [java.util.concurrent ConcurrentHashMap Semaphore TimeUnit]
    [datalevin.storage Store]))
@@ -62,15 +65,15 @@
   {:callbacks
    #{:add-store :apply-assoc-opt! :apply-assoc-opts! :authenticate
      :cleanup-copy-tmp-dir! :client-display :clients
-     :close-server-copied-store! :copy-in :copy-out :copy-response-meta
+     :copy-in :copy-out :copy-options
      :copy-server-file-out! :current-runtime-opts :db-dir :db-exists?
      :db-in-use? :db-state :db-store :dbs :detach-client-store!
      :disconnect-client* :disconnect-user :get-client :get-db :get-kv-store
      :get-lock :get-store :halt-run :in-use-dbs :lmdb :new-runtime-db
-     :open-server-copied-store! :open-server-store :open-write-txn-with-retry
+     :open-server-store :open-write-txn-with-retry
      :remove-client :remove-store :root :acquire-transaction-slot! :search-engine
-     :server-copy-store! :store :store->db-name :store-closed?
-     :sync-copy-response-store! :sys-conn :unpin-server-copy-backup-floor!
+     :store :store->db-name :store-closed?
+     :sys-conn
      :update-cached-permission :update-cached-role :update-client :update-db
      :vector-index :with-db-lifecycle-access :with-db-lifecycle-write-access
      :with-db-runtime-store-read-access :with-maintenance-source :write-message
@@ -1979,7 +1982,7 @@
            "Don't have permission to view database status"
            (fn []
              (let [identity {:db-name db-name :db-type (:database/type catalog)
-                             :db-id did :admin-capabilities #{:guarded-maintenance :wal-gc-dry-run}}
+                             :db-id did :admin-capabilities #{:guarded-maintenance :wal-gc-dry-run :standalone-copy}}
                    result
                    (if-not runtime?
                      identity
@@ -2032,108 +2035,76 @@
        (update-in m [:stores db-name :dbis] disj dbi-name)))
     (write-complete! deps skey)))
 
-(defn- best-effort-unpin-server-copy-backup-floor!
-  [deps db-name source-store copy-backup-pin]
-  (when-let [pin-id (:pin-id copy-backup-pin)]
-    (try
-      ((:unpin-server-copy-backup-floor! deps) source-store pin-id)
-      (catch Throwable e
-        (log/debug e
-                   "Best-effort server copy backup pin cleanup failed"
-                   {:db-name db-name
-                    :pin-id pin-id})))))
+(defn- copy-temp-directory
+  []
+  (str (try
+         (Files/createTempDirectory
+           "copy-" (into-array FileAttribute
+                              [(PosixFilePermissions/asFileAttribute
+                                 (PosixFilePermissions/fromString "rwx------"))]))
+         (catch UnsupportedOperationException _
+           (Files/createTempDirectory "copy-" (make-array FileAttribute 0))))))
 
 (defn copy
-  [deps server skey {:keys [args writing?] :as message}]
-  (when (or (:admin-required-capabilities message) (:expected-db-id message)
-            (:expected-db-type message))
-    (raise "Guarded standalone copy is not implemented"
-           {:error :admin/unsupported-server :required #{:standalone-copy}}))
+  [deps server skey {:keys [args standalone? writing?] :as message}]
+  (when writing?
+    (raise "Cannot capture an open write transaction" {:error :copy/write-transaction-open}))
   (let [[db-name compact?] args
-        started-ms         (System/currentTimeMillis)
-        copy-backup-pin    (atom nil)
-        source-store-v     (volatile! nil)
-        tf                 (u/tmp-dir (str "copy-" (UUID/randomUUID)))
-        path               (Paths/get (str tf u/+separator+ c/data-file-name)
-                                      (into-array String []))]
-    (letfn [(cleanup-copy-dir! []
-              (try
-                ((:cleanup-copy-tmp-dir! deps) tf)
-                (catch Throwable _ nil))
-              (u/create-dirs tf))
-            (copy-store! [source-store backup-pin-enabled?]
-              (reset! copy-backup-pin nil)
-              (binding [kvtx/*wal-copy-backup-pin-observer*
-                        (when backup-pin-enabled?
-                          (fn [{:keys [pin-id pin-floor-lsn pin-expires-ms]}]
-                            (reset! copy-backup-pin
-                                    {:pin-id pin-id
-                                     :floor-lsn pin-floor-lsn
-                                     :expires-ms pin-expires-ms})))
-                        kvtx/*wal-copy-backup-pin-enabled?*
-                        backup-pin-enabled?]
-                ((:server-copy-store! deps) source-store tf compact?)))]
+        options (when-let [options (:copy-options deps)] (options server))
+        timeout-ms (long (or (:copy-timeout-ms options) 60000))
+        deadline (+ (System/nanoTime) (* timeout-ms 1000000))
+        started-ms (System/currentTimeMillis)
+        catalog-id (volatile! nil)
+        tf (copy-temp-directory)]
     (try
-      (with-direct-db-transaction-slot
-        deps
-        server
-        db-name
-        writing?
-        (fn []
-          ;; Snapshot copy must not race an open write transaction or a
-          ;; runtime store swap/reopen.
-          (with-runtime-store-read-access
-            deps
-            server
-            db-name
-            (fn []
-              (with-transient-runtime-store-retry
-                (fn []
-                  (let [source-store (kv-store deps server skey db-name
-                                               writing?)]
-                    (vreset! source-store-v source-store)
-                    (try
-                      (copy-store! source-store true)
-                      (catch Throwable e
-                        (when (transient-runtime-store-error? e)
-                          (cleanup-copy-dir!)
-                          (log/debug
-                            e
-                            "Retrying server copy without WAL backup pin after transient source-store race"
-                            {:db-name db-name})
-                          (copy-store! source-store false))
-                        (throw e))))))))))
-      (let [completed-ms (System/currentTimeMillis)
-            copied-store ((:open-server-copied-store! deps) tf nil nil)
-            copy-meta
-            (try
-              (let [copy-meta ((:copy-response-meta deps)
-                               db-name
-                               copied-store
-                               (cond-> {:started-ms started-ms
-                                        :completed-ms completed-ms
-                                        :duration-ms (- completed-ms
-                                                        started-ms)
-                                        :compact? (boolean compact?)}
-                                 (map? @copy-backup-pin)
-                                 (assoc :backup-pin @copy-backup-pin)))]
-                ((:sync-copy-response-store! deps) copied-store)
-                copy-meta)
-              (finally
-                ;; Stream only after the copied LMDB has been finalized on
-                ;; disk; snapshot metadata must describe the bytes sent.
-                (when-not (i/closed? copied-store)
-                  ((:close-server-copied-store! deps) copied-store))))]
+      (let [capture-meta
+            (loop []
+              (when (>= (System/nanoTime) deadline)
+                (raise "Copy capture timed out waiting for indexes"
+                       {:error :copy/capture-timeout :timeout-ms timeout-ms}))
+              (let [result
+                    ((:with-maintenance-source deps)
+                     server db-name message
+                     (fn [catalog]
+                       (vreset! catalog-id (:db/id catalog))
+                       (with-permission! deps server skey view-act database-obj (:db/id catalog)
+                         "Don't have permission to copy the database" (constantly true)))
+                     (fn [source]
+                       (capture/attempt!
+                         source tf compact?
+                         {:standalone? standalone?
+                          :observer (or (:copy-phase-observer options) (fn [_ _]))
+                          :with-writer #(with-direct-db-transaction-slot deps server db-name false %)
+                          :authorize-write!
+                          (fn []
+                            (let [{:keys [client-id]} @(skey-state skey)
+                                  permissions (:permissions ((:get-client deps) server client-id))]
+                              (when-not (auth/has-permission? alter-act database-obj @catalog-id permissions)
+                                (raise "Index capture requires database alter permission"
+                                       {:error :copy/alter-required :db-name db-name}))))
+                          :admit-write
+                          (fn [f]
+                            (try ((:with-index-write-admission deps) server message f)
+                                 (catch Exception e
+                                   (if (= :replica/read-only (:error (ex-data e)))
+                                     (throw (ex-info "Capture requires writes on a read-only source"
+                                                     {:error :copy/read-only-source} e))
+                                     (throw e)))))})))]
+                (if (= :retry result)
+                  (do (Thread/sleep 10) (recur))
+                  result)))
+            completed-ms (System/currentTimeMillis)
+            copy-meta (scopy/finalize-copy!
+                        tf db-name
+                        (merge capture-meta
+                               {:started-ms started-ms :completed-ms completed-ms
+                                :duration-ms (- completed-ms started-ms)}))
+            path (Paths/get tf (into-array String [c/data-file-name]))]
         ((:copy-server-file-out! deps) skey path copy-meta))
       (finally
-        (best-effort-unpin-server-copy-backup-floor!
-         deps db-name @source-store-v @copy-backup-pin)
-        (try
-          ((:cleanup-copy-tmp-dir! deps) tf)
-          (catch Throwable e
-            (log/warn e
-                      "Unable to delete temporary copy directory"
-                      {:path (str tf)}))))))))
+        (try ((:cleanup-copy-tmp-dir! deps) tf)
+             (catch Throwable e
+               (log/warn e "Unable to delete temporary copy directory" {:path tf})))))))
 
 (def ^:private kv-ops
   "KV interface ops shared by direct wire dispatch and batch-kv calls."

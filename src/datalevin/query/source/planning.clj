@@ -204,7 +204,8 @@
                                               (mapv #(access/candidate! runtime request % (:consumption group) method)
                                                     (envelope/alternatives runtime response))))) responses)]
                       (vswap! all-candidates into candidates)
-                      (access/schedule! runtime (:region-id region) inputs requests candidates operators))) responses)]
+                      (access/schedule! runtime (:region-id region) inputs requests candidates operators
+                                        (:planning prepared)))) responses)]
         (access/validate-query! runtime schedules)
         (let [identity-key #(select-keys (get-in % [:path :options]) [:source-symbol :region-id :alternative-id])
               selected (into #{} (map identity-key) (mapcat :plans schedules))]

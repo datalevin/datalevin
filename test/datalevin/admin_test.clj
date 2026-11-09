@@ -39,7 +39,7 @@
                 ["admin" "status" "--database" "one" "--dry-run"]
                 ["--dry-run" "--dir" "/tmp/example" "drop" "values"]
                 ["--dry-run" "--dir" "/tmp/example" "copy" "/tmp/destination"]
-                ["admin" "backup" "--database" "one" "dest"]
+                ["admin" "backup" "--database" "one"]
                 ["admin" "status" "--all"]]]
     (testing (pr-str args)
       (is (= 2 (:exit-code (main/validate-args args))))))

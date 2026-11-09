@@ -919,13 +919,13 @@
               (vswap! info-v assoc :snapshot-last-backup-unpin-error
                       (.getMessage e)))))))))
 
-(defn txlog-copy-with-backup-pin!
+(defn prepare-copy-backup-pin!
+  "Acquire an ordinary copy pin under the caller's writer admission. Standalone
+  capture disables pins; its fixed LMDB reader never needs source WAL."
   [lmdb raw-lmdb dest compact?]
-  (if (and *wal-copy-backup-pin-enabled?*
-           (txlog-write-path-enabled? raw-lmdb))
-    (let [compact? (boolean compact?)
-          context
-          (with-write-txn-lock-before-runtime-txlog-state
+  (when (and *wal-copy-backup-pin-enabled?*
+             (txlog-write-path-enabled? raw-lmdb))
+    (with-write-txn-lock-before-runtime-txlog-state
             raw-lmdb
             (fn []
               (when (write-txn-open? raw-lmdb)
@@ -962,10 +962,21 @@
                  :pin-floor-lsn pin-floor-lsn
                  :pin-expires-ms pin-expires-ms
                  :applied-lsn applied-lsn
-                 :started-ms started-ms})))]
+                 :started-ms started-ms})))))
+
+(defn notify-copy-backup-pin!
+  "Run ordinary copy pin observers after ownership has been recorded by caller."
+  [context]
+  (when context
+    (maybe-notify-txn-log-copy-backup-pin-observer! context)
+    (maybe-run-txn-log-copy-backup-pin-failpoint! context)))
+
+(defn txlog-copy-with-backup-pin!
+  [lmdb raw-lmdb dest compact?]
+  (if-let [context (prepare-copy-backup-pin! lmdb raw-lmdb dest (boolean compact?))]
+    (let [compact? (boolean compact?)]
       (try
-        (maybe-notify-txn-log-copy-backup-pin-observer! context)
-        (maybe-run-txn-log-copy-backup-pin-failpoint! context)
+        (notify-copy-backup-pin! context)
         (i/copy raw-lmdb dest compact?)
         (let [completed-ms (System/currentTimeMillis)]
           {:started-ms (:started-ms context)

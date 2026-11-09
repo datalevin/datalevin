@@ -512,22 +512,25 @@
 (defn run-scalar!
   "Stamp a prepared scalar request against the current native batch DB.
   Avoid transaction-local connection/publication/listener wrappers on success."
-  [control conn prepared tx-data tx-meta stamp! fallback!]
-  (let [submitter (Thread/currentThread)
+  ([control conn prepared tx-data tx-meta stamp! fallback!]
+   (run-scalar! control conn prepared tx-data tx-meta stamp! fallback! nil))
+  ([control conn prepared tx-data tx-meta stamp! fallback! opts]
+   (let [submitter (Thread/currentThread)
         ;; Submission blocks until execution completes, so the caller's frame
         ;; remains live. Push/pop creates new frames; retain this one without
         ;; cloning and restore the owner after cross-thread execution.
-        frame (Var/getThreadBindingFrame)]
-    ((:internal-body! control)
-     (fn [native]
-       (if (identical? submitter (Thread/currentThread))
-         (execute-scalar! control conn prepared tx-data tx-meta stamp! fallback! native)
-         (let [owner-frame (Var/getThreadBindingFrame)]
-           (Var/resetThreadBindingFrame frame)
-           (try (execute-scalar! control conn prepared tx-data tx-meta stamp! fallback! native)
-                (finally (Var/resetThreadBindingFrame owner-frame))))))
-     {:datalog-conn conn :datalog-prepare? true
-      :isolated? (s/synchronous-secondary-indexing? (:store @conn))})))
+         frame (Var/getThreadBindingFrame)]
+     ((:internal-body! control)
+      (fn [native]
+        (if (identical? submitter (Thread/currentThread))
+          (execute-scalar! control conn prepared tx-data tx-meta stamp! fallback! native)
+          (let [owner-frame (Var/getThreadBindingFrame)]
+            (Var/resetThreadBindingFrame frame)
+            (try (execute-scalar! control conn prepared tx-data tx-meta stamp! fallback! native)
+                 (finally (Var/resetThreadBindingFrame owner-frame))))))
+      {:datalog-conn conn :datalog-prepare? true
+       :isolated? (or (:isolated? opts)
+                      (s/synchronous-secondary-indexing? (:store @conn)))}))))
 
 (defn with-transaction!
   "Run one Datalog body on the elected native owner and publish after commit."
@@ -542,8 +545,9 @@
                             body publication notifications)))
          (assoc opts :context (assoc (:context opts) :datalog-conn conn
                                :datalog-publication publication
-                               :isolated? (s/synchronous-secondary-indexing?
-                                            (:store @conn)))))]
+                               :isolated? (or (get-in opts [:context :isolated?])
+                                              (s/synchronous-secondary-indexing?
+                                                (:store @conn))))))]
     ;; Explicit abort returns the body's result but publishes neither its
     ;; staged connection nor its listeners. Callbacks run after owner handoff.
     (when-let [after @publication]

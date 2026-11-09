@@ -7,7 +7,8 @@
             [datalevin.client :as client]
             [datalevin.util :as u])
   (:import [java.io File IOException]
-           [java.nio.file Path]))
+           [java.nio.file Files Path Paths LinkOption CopyOption]
+           [java.nio.file.attribute FileAttribute PosixFilePermissions]))
 
 (def cli-options
   [[nil "--uri-env VAR" "Environment variable containing the server URI"
@@ -28,6 +29,7 @@
 
 Usage: dtlv admin [options] status (--all-databases | --database NAME ...)
        dtlv admin [options] wal-gc (--all-databases | --database NAME ...) [--dry-run]
+       dtlv admin [options] backup (--all-databases | --database NAME ...) DEST
 
 Options:
   --uri-env VAR       Server URI environment variable (default DATALEVIN_URI)
@@ -46,7 +48,11 @@ Partial failures retain native results and exit 1. Directory sync may fail or be
 unsupported (including Windows) after deletion; such a result also exits 1.
 Results are one EDN map per target. Diagnostics go to stderr.
 Exit codes: 0 success; 1 target failure; 2 invalid invocation or discovery failure.
-WAL-disabled and rollback GC skips exit 0. Standalone backup is not yet available.
+WAL-disabled and rollback GC skips exit 0. Backup creates a new local DEST with
+one independently usable database directory per target. The parent must exist.
+Do not place DEST under a live server's data root. Failed transfers remain in
+DEST/.incomplete. Backup needs view permission, plus alter when flushing indexes.
+Budget a server temp copy plus a destination copy; writers resume after capture.
 
 Example:
   dtlv admin --uri-env DATALEVIN_URI status --database orders --database users")
@@ -55,8 +61,10 @@ Example:
   [options arguments]
   (let [names (vec (distinct (:database options)))
         error (cond
-                (not (and (= 1 (count arguments)) (#{"status" "wal-gc"} (first arguments))))
-                "Expected the admin status or wal-gc subcommand"
+                (not (or (and (= 1 (count arguments)) (#{"status" "wal-gc"} (first arguments)))
+                         (and (= 2 (count arguments)) (= "backup" (first arguments))
+                              (not (str/blank? (second arguments))))))
+                "Expected admin status, wal-gc, or backup DEST"
                 (and (:dry-run options) (not= "wal-gc" (first arguments)))
                 "--dry-run is only supported by wal-gc"
                 (:all options) "--all selects sub-databases; use --all-databases for admin"
@@ -220,15 +228,88 @@ Example:
                  attempted?)))
       (if failed? 1 0))))
 
+(def ^:private no-follow (into-array LinkOption [LinkOption/NOFOLLOW_LINKS]))
+
+(defn- private-directory!
+  [^Path path]
+  (try
+    (Files/createDirectory path
+      (into-array FileAttribute [(PosixFilePermissions/asFileAttribute
+                                  (PosixFilePermissions/fromString "rwx------"))]))
+    (catch UnsupportedOperationException _
+      (Files/createDirectory path (make-array FileAttribute 0)))))
+
+(defn- backup-destination!
+  [destination targets]
+  (let [names (mapv :db-name targets)]
+    (when (or (some #(or (str/blank? %) (#{"." ".." ".incomplete"} %)
+                        (re-find #"[\\/\u0000<>:\"|?*]" %)
+                        (re-find #"[. ]$" %)) names)
+              (not= (count names) (count (distinct (map str/lower-case names)))))
+      (throw (ex-info "Unsafe or colliding backup database names"
+                      {:error :admin/invalid-destination}))))
+  (let [path (.normalize (.toAbsolutePath (Paths/get destination (make-array String 0))))
+        parent (.getParent path)]
+    (when-not (and parent (Files/isDirectory parent (make-array LinkOption 0))
+                   (Files/isWritable parent))
+      (throw (ex-info "Backup parent directory must exist and be writable"
+                      {:error :admin/invalid-destination})))
+    (let [path (.resolve (.toRealPath parent (make-array LinkOption 0)) (.getFileName path))]
+      (private-directory! path)
+      (private-directory! (.resolve path ".incomplete"))
+      path)))
+
+(defn- backup-sweep
+  [request backup connection targets ^Path destination emit]
+  (loop [targets (seq targets) failed? false attempted? false]
+    (if-let [target (first targets)]
+      (let [sent? (volatile! false)
+            outcome
+            (try
+              (let [discovery (read-status request connection target false)
+                    required #{:guarded-maintenance :standalone-copy}]
+                (when-not (every? (:admin-capabilities discovery) required)
+                  (throw (ex-info "Server does not support standalone backup"
+                                  {:error :admin/unsupported-server :required required})))
+                (let [name (:db-name discovery)
+                      stage (.resolve (.resolve destination ".incomplete") ^String name)
+                      final (.resolve destination ^String name)]
+                  (private-directory! stage)
+                  (let [result (backup connection
+                                       (select-keys discovery [:db-name :db-id :db-type])
+                                       (.resolve stage "data.mdb"))]
+                    (vreset! sent? true)
+                    (when-not (and (:verified? result) (= :binary-chunks (:copy-format result)))
+                      (throw (ex-info "Backup requires a verified binary transfer"
+                                      {:error :copy/missing-integrity})))
+                    (when (or (Files/exists final no-follow) (Files/isSymbolicLink stage))
+                      (throw (ex-info "Backup destination changed during transfer"
+                                      {:error :admin/invalid-destination})))
+                    (Files/move stage final (make-array CopyOption 0))
+                    {:result (dissoc result :type :result)})))
+              (catch Exception e
+                (when (:admin/maintenance-sent? (ex-data e)) (vreset! sent? true))
+                {:error {:message (ex-message e) :data (ex-data e)}
+                 :stop? (terminal-error? e)
+                 :unsupported? (= :admin/unsupported-server (:error (ex-data e)))}))
+            attempted? (or attempted? @sent?)]
+        (emit (merge {:db-name (:db-name target) :operation :backup}
+                     (select-keys outcome [:result :error])))
+        (if (:stop? outcome)
+          (if (and (:unsupported? outcome) (not attempted?)) 2 1)
+          (recur (next targets) (or failed? (contains? outcome :error)) attempted?)))
+      (if failed? 1 0))))
+
 (defn run!
   "Execute an admin sweep, returning an exit code. Dependencies are injectable
   for transport, output and environment tests; normal calls use the real client."
   ([options arguments] (run! options arguments {}))
   ([options arguments dependencies]
-   (let [{:keys [getenv connect disconnect request maintenance emit diagnostic]}
+   (let [{:keys [getenv connect disconnect request maintenance backup emit diagnostic]}
          (merge {:getenv u/env :connect client/new-client
                  :disconnect client/close-client :request client/endpoint-request
                  :maintenance client/admin-gc!
+                 :backup client/admin-backup!
                  :emit print-result :diagnostic #(binding [*out* *err*] (println %))}
                 dependencies)
          validation (validate-options options arguments)]
@@ -247,13 +328,16 @@ Example:
                  (try
                    (let [targets (if (:all-databases options)
                                    (all-targets request connection)
-                                   (mapv #(hash-map :db-name %) (:database options)))]
+                                   (mapv #(hash-map :db-name %) (:database options)))
+                         destination (when (= "backup" (first arguments))
+                                       (backup-destination! (second arguments) targets))]
                      (vreset! started? true)
-                     (if (= "wal-gc" (first arguments))
-                       (gc-sweep request maintenance connection targets options #(emit (sanitize uri %)))
+                     (case (first arguments)
+                       "wal-gc" (gc-sweep request maintenance connection targets options #(emit (sanitize uri %)))
+                       "backup" (backup-sweep request backup connection targets destination #(emit (sanitize uri %)))
                        (sweep request connection targets #(emit (sanitize uri %)))))
                    (catch Exception e
-                     (diagnostic (str "Admin status failed: "
+                     (diagnostic (str "Admin command failed: "
                                       (safe-string uri (or (ex-message e) "Error"))))
                      (if @started? 1 2))
                    (finally

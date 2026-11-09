@@ -138,7 +138,8 @@
         (if (seq domains)
           (listed-vector-domains dms domains vector-opts vector-domains)
           (let [domain (v/attr-domain attr)]
-            (assoc dms domain (assoc (get vector-domains domain vector-opts)
+            (assoc dms domain (assoc (merge (get dms domain)
+                                             (get vector-domains domain vector-opts))
                                      :domain domain))))
         dms))
     (or vector-domains0 {}) schema))
@@ -220,12 +221,19 @@
       (raise "Embedding provider is not configured"
                {:domain domain :provider provider-id}))))
 
+(defn complete-embedding-space?
+  "Whether stored dimensions and metadata identify an existing embedding space."
+  [{:keys [dimensions embedding-metadata]}]
+  (and (integer? dimensions) (pos? (long dimensions)) (seq embedding-metadata)))
+
 (defn- resolve-embedding-domain
-  [dir runtime-providers [domain domain-opts]]
+  [dir runtime-providers explicit? [domain domain-opts]]
   (let [domain-opts                 (merge default-embedding-opts domain-opts)
         {:keys [dimensions
-                embedding-metadata]} (runtime-provider-space dir runtime-providers
-                                                             domain domain-opts)
+                embedding-metadata]} (when (or explicit?
+                                              (not (complete-embedding-space? domain-opts)))
+                                       (runtime-provider-space dir runtime-providers
+                                                               domain domain-opts))
         provider-dimensions         dimensions
         provider-metadata           embedding-metadata
         stored-dimensions           (:dimensions domain-opts)
@@ -239,7 +247,7 @@
                 :provider            (:provider domain-opts)
                 :stored-dimensions   stored-dimensions
                 :provider-dimensions provider-dimensions}))
-    (when stored-metadata
+    (when (and stored-metadata provider-metadata)
       (emb/ensure-compatible-metadata stored-metadata provider-metadata))
     (when-not dimensions
       (raise "Embedding domain dimensions could not be resolved"
@@ -255,7 +263,13 @@
   (let [domains (init-embedding-domain-refs embedding-domains0 schema
                                             embedding-opts embedding-domains)]
     (into {}
-          (map #(resolve-embedding-domain dir runtime-providers %))
+          (map (fn [[domain domain-opts :as entry]]
+                 (resolve-embedding-domain
+                   dir runtime-providers
+                   (or (contains? runtime-providers (:provider domain-opts :default))
+                       (seq embedding-opts)
+                       (contains? embedding-domains domain))
+                   entry)))
           domains)))
 
 (defn init-embedding-providers
@@ -263,8 +277,37 @@
   (reduce-kv
     (fn [m domain domain-opts]
       (assoc m domain
-             (emb/init-embedding-provider
-               (provider-spec-for-domain dir runtime-providers domain domain-opts))))
+             (emb/lazy-provider
+               domain-opts
+               (fn [_]
+                 (let [provider (try
+                                  (emb/init-embedding-provider
+                                    (provider-spec-for-domain
+                                      dir runtime-providers domain
+                                      (apply dissoc domain-opts persisted-embedding-space-keys)))
+                                  (catch Exception e
+                                    (throw (ex-info "Embedding provider is unavailable"
+                                                    {:error :embedding/provider-unavailable
+                                                     :domain domain
+                                                     :provider (:provider domain-opts)} e))))]
+                   (try
+                     (let [space (try
+                                   {:dimensions (emb/embedding-dimensions provider)
+                                    :metadata (emb/embedding-metadata provider)}
+                                   (catch Exception e
+                                     (throw (ex-info "Embedding provider is unavailable"
+                                                     {:error :embedding/provider-unavailable
+                                                      :domain domain
+                                                      :provider (:provider domain-opts)} e))))]
+                     (when-not (= (:dimensions domain-opts) (:dimensions space))
+                       (raise "Embedding domain dimensions do not match the runtime provider"
+                              {:error :embedding/dimensions-mismatch :domain domain}))
+                     (emb/ensure-compatible-metadata (:embedding-metadata domain-opts)
+                                                     (:metadata space))
+                     provider)
+                     (catch Throwable e
+                       (emb/close-provider provider)
+                       (throw e))))))))
     {}
     domains))
 
@@ -372,7 +415,9 @@
   [dir schema opts3 search-opts search-domains
    vector-opts vector-domains embedding-opts embedding-domains
    embedding-providers]
-  (let [s-domains (init-search-domains (:search-domains opts3)
+  (let [search-opts (merge (:search-opts opts3) search-opts)
+        vector-opts (merge (:vector-opts opts3) vector-opts)
+        s-domains (init-search-domains (:search-domains opts3)
                                        schema search-opts search-domains)
         v-domains (init-vector-domains (:vector-domains opts3)
                                        schema vector-opts vector-domains)
