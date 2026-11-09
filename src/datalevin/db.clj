@@ -3171,7 +3171,19 @@
                        (or defer-entity-resolution? (not resolve-entities?)
                            (resolve-scalar-update-candidates! db candidates)))
               (let [entries
-                    (txcompile/correct-scalar-candidates validate? candidates)
+                    ;; Coercion remains legacy orchestration. Keep its errors
+                    ;; at the original call site; compilation proves identity
+                    ;; and uses the shared prepare value semantics separately.
+                    (loop [i 0 entries (transient [])]
+                      (if (< i (.size candidates))
+                        (recur (+ i 4)
+                               (conj! entries
+                                      [(.get candidates i)
+                                       (.get candidates (+ i 1))
+                                       (prepare/correct-scalar-value
+                                         validate? (.get candidates (+ i 3))
+                                         (.get candidates (+ i 2)))]))
+                        (persistent! entries)))
                     deferred? (and defer-entity-resolution?
                                    (some #(not (integer? (first %))) entries))]
                 (cond-> (->PreparedScalarUpdate
@@ -3281,14 +3293,21 @@
              (txengine/compiler?) (identical? origin :standalone-local)
              (nil? (l/explicit-transaction-timeout))
              (instance? Store (:store db))
+             ;; Validation-enabled requests retain caller-side legacy rejection
+             ;; until the deferred-validation route meets its own rollout gates.
+             (not (:validate-data? (opts (:store db))))
              (let [lmdb (.-lmdb ^Store (:store db))]
                (and (not (l/writing? lmdb))
                     (not (Thread/holdsLock (l/write-txn lmdb))))))
     (when-let [shape (txcompile/literal-scalar-shape tx-data)]
-      (when-let [outcome (txcompile/compile-tx
-                          (prepare/make-prepare-ctx db) tx-data
+      (let [ctx (prepare/make-prepare-ctx db)]
+        ;; Options may change between the cheap admission check and capture.
+        ;; Apply the rollout scope to the exact snapshot compilation will use.
+        (when-let [outcome (when-not (:validate-data? (:opts ctx))
+                            (txcompile/compile-tx
+                          ctx tx-data
                           (if (identical? shape :scalar-operations)
-                            {:literal-shape :scalar-operations} {:literal-shape :scalar}))]
+                            {:literal-shape :scalar-operations} {:literal-shape :scalar})))]
       ;; A caller's old scalar preparer declines IDs above its published floor
       ;; before correction. Those failures belong to ordinary writer execution,
       ;; so a new pure correction rejection must not narrow their batch abort.
@@ -3303,7 +3322,7 @@
                           (assoc outcome :origin origin :isolated? true))]
             (when *tx-compiler-observer*
               (*tx-compiler-observer* :prepared outcome))
-            outcome))))))
+            outcome)))))))
 
 (defn ^:no-doc prepare-local-tx-data
   "Resolve one local request without committing. Ordinary callers retain their
@@ -3312,8 +3331,11 @@
   ([initial-report initial-es]
    (prepare-local-tx-data initial-report initial-es (System/currentTimeMillis)))
   ([initial-report initial-es tx-time]
-   (prepare-local-tx-data (:db-before initial-report) initial-es
-                          (:tx-meta initial-report) tx-time nil initial-report))
+   ;; Unmigrated requests already own their initial report. Keep their original
+   ;; path through this hook without inspecting an absent compilation outcome.
+   (txexec/prepare-and-transact-tx-data
+     initial-report initial-es tx-time
+     (prepare/make-prepare-ctx (:db-before initial-report))))
   ([db initial-es tx-meta tx-time outcome]
    (prepare-local-tx-data db initial-es tx-meta tx-time outcome nil))
   ([db initial-es tx-meta tx-time outcome initial-report]

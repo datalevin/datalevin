@@ -11,12 +11,18 @@ or closed databases without opening them. The server URI comes from
 permission; global `--all-databases` also requires database create and server
 view permission. See [the CLI guide](dtlv.md#remote-administration) for output,
 timeouts, and exit codes. The read-only `:admin-status` endpoint also supports
-`{:runtime? false}` discovery and advertises `:guarded-maintenance` and
-`:wal-gc-dry-run`. `dtlv admin wal-gc --database NAME [--dry-run]` requires that
+`{:runtime? false}` discovery and advertises `:guarded-maintenance`,
+`:wal-gc-dry-run`, and `:standalone-copy`. `dtlv admin wal-gc --database NAME [--dry-run]` requires that
 database's alter permission, checks its discovered identity, and uses an
 existing-only open if needed. Targets opened for maintenance stay open.
 Capabilities are checked per live client session/endpoint and rechecked after
-renewal or connection replacement. Standalone copy is not advertised yet.
+renewal or connection replacement. `dtlv admin backup --database NAME DEST`
+creates a new local destination containing independently usable database
+directories. Named backup requires view permission and additionally alter when
+flushing index work or checkpointing vector/embedding domains. Global selection
+also needs the catalog permissions described above. See the
+[backup instructions in the CLI guide](dtlv.md#remote-administration) for
+destination layout, recovery requirements, and scheduling examples.
 
 Remote KV `copy` receives chunks directly into a temporary file, validates its
 SHA-256 and byte count, then replaces `data.mdb` and writes `VERSION`. A failed
@@ -27,6 +33,21 @@ explicit incomplete file path. Its parent directory must exist. It returns
 transfer metadata without retaining payload chunks, and writes `VERSION` only
 after validation and sink close. Transfer failures after the response header
 are never replayed.
+
+Server copy flushes pending secondary-index jobs and persists vector/embedding
+checkpoints before establishing its LMDB snapshot. Write exclusion ends at that
+boundary, while the fixed snapshot and source lifetime remain protected through
+local copying. Standalone copies create no source WAL pin. Staged bytes are
+finalized through an existing-only raw LMDB handle, without recovery or index
+workers. Source retention metadata and custom WAL/snapshot directory overrides
+are removed; restored directories retain the captured payload position, indexes,
+WAL enablement, and durability settings.
+
+Existing complete embedding domains open without resolving their provider.
+Reading data and searching captured vectors needs no provider registration,
+model file, or endpoint. Provider resolution happens when generating new
+embeddings, and validates dimensions and metadata before use. Explicit provider
+overrides retain open-time compatibility validation.
 
 Dropped catalog database entities retain a small retired marker after their
 name/type and permissions are removed. Their IDs therefore cannot be reused

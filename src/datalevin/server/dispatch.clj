@@ -201,12 +201,16 @@
     (f)))
 
 (defn with-index-write-admission
-  "Admit the persistent initialization branch of an index-open request.
+  "Admit persistent index writes, including writes inside read-only transports.
   Existing-only opens never enter this path. Rejections throw before `f` runs."
   [deps server message f]
-  (when-let [err (replica-read-only-error deps server message)]
-    (raise "Replica is read-only" err))
-  (let [{:keys [ok? error result]}
+  ;; Copy stays read-only for transport/replay. Its flushes and checkpoints are
+  ;; ordinary KV writes, so request and commit admission must see a write here.
+  (let [message (if (cmd/ha-write? (:type message)) message
+                   (assoc message :type :transact-kv))
+        _ (when-let [err (replica-read-only-error deps server message)]
+            (raise "Replica is read-only" err))
+        {:keys [ok? error result]}
         ((:with-ha-write-admission-fn deps)
          server message #(call-with-write-guards deps server message f))]
     (if ok?

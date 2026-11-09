@@ -27,6 +27,7 @@
   (:import
    [java.nio ByteBuffer]
    [java.nio.channels SocketChannel Selector SelectionKey]
+   [java.nio.file Files OpenOption StandardOpenOption LinkOption]
    [java.util Set UUID WeakHashMap Collections LinkedHashMap]
    [datalevin.prepared Request]
    [java.util.concurrent ConcurrentHashMap TimeUnit]
@@ -2917,7 +2918,12 @@
                  (throw (ex-info "Client did not complete file reception" {:error :copy/incomplete})))
                (when version-file
                  (cr/check! :copy-version)
-                 (spit (.toFile (file-copy/path version-file)) c/version))
+                 (if standalone?
+                   (Files/writeString (file-copy/path version-file) c/version
+                     (into-array OpenOption [StandardOpenOption/CREATE StandardOpenOption/WRITE
+                                             StandardOpenOption/TRUNCATE_EXISTING
+                                             LinkOption/NOFOLLOW_LINKS]))
+                   (spit (.toFile (file-copy/path version-file)) c/version)))
                response)
              (catch Throwable failure
                (cleanup-after-failure! failure #(file-copy/close! receiver))

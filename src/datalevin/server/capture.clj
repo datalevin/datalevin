@@ -79,11 +79,25 @@
 
 (defn- check-embedding-state! [source]
   (when (instance? Store source)
-    (doseq [[domain config] (:embedding-domains (i/opts source))]
-      (when-not (and (domains/complete-embedding-space? config)
-                     (contains? (.-embedding-indices ^Store source) domain))
-        (raise "Embedding space is incomplete at capture"
-               {:error :copy/embedding-state-incomplete :domain domain})))))
+    (let [kv (source-kv source)
+          configs (:embedding-domains (i/opts source))
+          stored (i/get-value kv c/opts :embedding-domains :attr :data)]
+      (when-not (= (set (keys configs)) (set (keys stored)))
+        (raise "Persisted embedding domains disagree with the source"
+               {:error :copy/embedding-state-incomplete}))
+      (doseq [[domain config] configs]
+        (let [^VectorIndex index (get (.-embedding-indices ^Store source) domain)
+              checkpoint (when index
+                           (i/get-value kv c/vec-meta-dbi (.-domain index) :string :data))
+              space [:dimensions :embedding-metadata]]
+          (when-not (and (domains/complete-embedding-space? config)
+                         (= (select-keys config space) (select-keys (get stored domain) space))
+                         index (not (i/vec-closed? index))
+                         (= (:dimensions config) (.-dimensions index)
+                            (get-in checkpoint [:index-opts :dimensions]))
+                         (number? (:total-bytes checkpoint)))
+            (raise "Embedding space or checkpoint is incomplete at capture"
+                   {:error :copy/embedding-state-incomplete :domain domain})))))))
 
 (defn attempt!
   "Called with runtime lifetime protection, before acquiring a writer slot.
@@ -103,7 +117,8 @@
                       (raise "Capture requires writes on a read-only source"
                              {:error :copy/read-only-source}))
                     (when writes? (authorize-write!)))
-        pin (volatile! nil)]
+        pin (volatile! nil)
+        prepared-copy (volatile! nil)]
     (check-failed-jobs! source)
     (when writes?
       (writable!)
@@ -145,13 +160,18 @@
                                       (raise "Secondary indexes did not catch up"
                                              {:error :copy/index-flush-failed})))
                                   (doseq [[domain index] indices]
+                                    (when (i/vec-closed? index)
+                                      (raise "A captured vector domain is closed"
+                                             {:error :copy/vector-domain-unavailable :domain domain}))
                                     (observer :before-checkpoint {:domain domain})
                                     (i/persist-vecs index)))
                                 (check-embedding-state! source)
                                 (when-not standalone?
                                   (vreset! pin (kvtx/prepare-copy-backup-pin! kv raw dest compact?))
                                   (kvtx/notify-copy-backup-pin! @pin))
-                                (cpp/prepare-copy raw dest compact?))]
+                                ;; Own cleanup before with-writer can fail its
+                                ;; post-commit confirmation after this callback.
+                                (vreset! prepared-copy (cpp/prepare-copy raw dest compact?)))]
                           (if (or writes? (and (not standalone?) (:wal? (i/env-opts kv))))
                             (do (when-not standalone? (writable!)) (admit-write prepare!))
                             (prepare!))))
@@ -159,7 +179,7 @@
                         (doseq [^Lock lock (rseq @locks)] (.unlock lock))))))))]
         (if (= :retry prepared)
           :retry
-          (with-open [prepared prepared]
+          (do
             (observer :prepared {:source source :prepared prepared})
             (cpp/copy-prepared! prepared)
             (observer :copied {:source source})
@@ -168,5 +188,12 @@
                                       :floor-lsn (:pin-floor-lsn @pin)
                                       :expires-ms (:pin-expires-ms @pin)})))))
       (finally
-        (when-let [pin-id (:pin-id @pin)]
-          (with-writer #(admit-write (fn [] (kv/txlog-unpin-backup-floor! kv pin-id)))))))))
+        (try
+          (when-let [^java.lang.AutoCloseable prepared @prepared-copy]
+            (.close prepared))
+          (finally
+            (when-let [pin-id (:pin-id @pin)]
+              (try
+                (with-writer #(admit-write (fn [] (kv/txlog-unpin-backup-floor! kv pin-id))))
+                (catch Exception e
+                  (vswap! (i/kv-info raw) assoc :copy-last-backup-unpin-error (ex-message e)))))))))))

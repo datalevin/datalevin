@@ -171,15 +171,25 @@ public class Env {
      * must close the result on this thread, including after cancellation. */
     public PreparedCopy prepareCopy(String dest, boolean compact) {
         copyLifetime.readLock().lock();
+        DTLV.MDB_copy copy = null;
+        boolean prepared = false;
         try {
             if (closed) {
                 throw new IllegalStateException("LMDB env is closed");
             }
-            DTLV.MDB_copy copy = new DTLV.MDB_copy();
+            copy = new DTLV.MDB_copy();
             Util.checkRc(DTLV.mdb_env_copy_prepare(env, dest,
                          compact ? DTLV.MDB_CP_COMPACT : 0, copy));
+            prepared = true;
             return new PreparedCopy(copy);
         } catch (RuntimeException | Error e) {
+            if (prepared) {
+                try {
+                    Util.checkRc(DTLV.mdb_env_copy_close(copy));
+                } catch (RuntimeException | Error cleanup) {
+                    e.addSuppressed(cleanup);
+                }
+            }
             copyLifetime.readLock().unlock();
             throw e;
         }

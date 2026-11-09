@@ -44,6 +44,8 @@
     (testing (pr-str args)
       (is (= 2 (:exit-code (main/validate-args args))))))
   (is (:ok? (main/validate-args ["admin" "--help"])))
+  (is (= ["backup" "dest"]
+         (:arguments (main/validate-args ["admin" "backup" "--database" "one" "dest"]))))
   (is (command/read-only? :admin-status))
   (is (not (command/ha-write? :admin-status))))
 

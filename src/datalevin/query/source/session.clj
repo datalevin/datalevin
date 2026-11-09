@@ -53,9 +53,11 @@
     (doseq [[_ override] overrides]
       (fields! override #{:consistency} #{} :context)
       (ensure! (contains? rank (:consistency override)) :context))
-    (fields! planning #{} #{:max-alternatives :estimate-max-age-ms} :context)
+    (fields! planning #{} #{:max-alternatives :estimate-max-age-ms :estimate-budget-ms :estimate-max-requests} :context)
     (ensure! (and (positive? (get planning :max-alternatives 32))
-                  (nonnegative? (get planning :estimate-max-age-ms 300000))) :context)
+                  (nonnegative? (get planning :estimate-max-age-ms 300000))
+                  (nonnegative? (get planning :estimate-budget-ms 100))
+                  (nonnegative? (get planning :estimate-max-requests 8))) :context)
     (when (some? (:limits options))
       (let [limits (:limits options)]
         (ensure! (value/plain-map? limits) :context)
@@ -69,7 +71,9 @@
     {:requirements (into {} (map (fn [alias] [alias (get-in overrides [alias :consistency] default)])) aliases)
      :authorization (get options :authorization {:principal-id :application})
      :planning {:max-alternatives (get planning :max-alternatives 32)
-                :estimate-max-age-ms (get planning :estimate-max-age-ms 300000)}}))
+                :estimate-max-age-ms (get planning :estimate-max-age-ms 300000)
+                :estimate-budget-ms (get planning :estimate-budget-ms 100)
+                :estimate-max-requests (get planning :estimate-max-requests 8)}}))
 
 (defn validate-options!
   "Check already admitted invocation options against declared source aliases

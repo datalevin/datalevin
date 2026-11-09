@@ -54,6 +54,42 @@
     (is (identical? forms (:entries p)))
     (is (identical? ctx (:ctx p)))))
 
+(deftest singleton-layouts-retain-order-and-normalize-literal-ids
+  (doseq [form [{:db/id 1 :value 42} {:value 42 :db/id 1}
+                (assoc clojure.lang.PersistentHashMap/EMPTY :db/id (int 1) :value 42)]]
+    (let [p (compile/compile-tx ctx [form])]
+      (is (= :scalar (:strategy p)))
+      (is (= [[1 :value 42]] (:entries p)))
+      (is (instance? Long (ffirst (:entries p))))))
+  (doseq [form [{:db/id 1 :text 42} {:text 42 :db/id 1}]]
+    (is (= :needs-writer (:outcome (compile/compile-tx ctx [form]))))))
+
+(deftest compact-schema-proof-does-not-hide-exclusion-properties
+  (doseq [props [{:db/aid 3 :db/unique :db.unique/identity}
+                 {:db/aid 3 :db/cardinality :db.cardinality/many}
+                 {:db/aid 3 :db/tupleType :db.type/long}
+                 {:db/aid 3 :db/valueType :db.type/ref}
+                 {:db/aid 3 :db/valueType :db.type/long :db/fulltext true}
+                 {:db/aid 3 :db/valueType :db.type/long :db/vector true}
+                 {:db/aid 3 :db/valueType :db.type/long :db/embedding true}]]
+    (is (nil? (compile/compile-tx (assoc ctx :schema {:value props})
+                                  [[:db/add 1 :value 42]]))))
+  (is (nil? (compile/compile-tx (assoc ctx :rschema {:db/attrTuples {:value {:pair 0}}})
+                                [[:db/add 1 :value 42]]))))
+
+(deftest legacy-exclusions-precede-reference-value-conversion
+  (let [effects (atom [])
+        number (proxy [java.math.BigInteger] ["1"]
+                 (longValue [] (swap! effects conj :conversion) 1))]
+    (doseq [exclusion [{:db/cardinality :db.cardinality/many}
+                       {:db/unique :db.unique/identity}
+                       {:db/tupleType :db.type/long}
+                       {:db.attr/preds [(constantly true)]}]]
+      (is (nil? (compile/scalar-attribute-props
+                  {:reference (merge {:db/aid 6 :db/valueType :db.type/ref} exclusion)}
+                  {} :reference number))))
+    (is (empty? @effects))))
+
 (deftest canonical-numeric-classes-still-obey-validation-bounds
   (let [big-ctx (assoc ctx :schema
                        (assoc (:schema ctx) :big {:db/aid 8 :db/valueType :db.type/bigint}))

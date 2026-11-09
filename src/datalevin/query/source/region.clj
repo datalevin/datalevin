@@ -359,7 +359,8 @@
     (into []
       (keep-indexed
         (fn [i {:keys [node]}]
-          (let [operator ({'= := 'not= :not= '< :< '<= :<= '> :> '>= :>=} (get-in node [:fn :symbol]))
+          (let [operator ({'= := 'not= :not= '< :< '<= :<= '> :> '>= :>=
+                           'like :like 'not-like :not-like} (get-in node [:fn :symbol]))
                 args (:args node)]
             (when (and (instance? Predicate node) operator (= 2 (count args))
                        (every? #(or (instance? Variable %) (instance? Constant %)) args))

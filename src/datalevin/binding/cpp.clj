@@ -1677,12 +1677,17 @@
   "Fix this environment's copy snapshot. Close the result on the preparing
   thread after copying or cancellation; it retains lifetime/remap protection."
   [^CppLMDB lmdb dest compact?]
-  (let [lease (when-let [guard (:native-lifetime @(.-info lmdb))]
+  (let [handle (volatile! nil)
+        lease (when-let [guard (:native-lifetime @(.-info lmdb))]
                 (lifetime/enter! guard))]
     (try
       (i/check-ready lmdb)
-      (->PreparedCopy (.-env lmdb) (.prepareCopy (.-env lmdb) dest (boolean compact?)) lease)
+      (vreset! handle (.prepareCopy (.-env lmdb) dest (boolean compact?)))
+      (->PreparedCopy (.-env lmdb) @handle lease)
       (catch Throwable e
+        (when @handle
+          (try (.closePrepared (.-env lmdb) @handle)
+               (catch Throwable cleanup (.addSuppressed e cleanup))))
         (when lease (.close ^java.lang.AutoCloseable lease))
         (throw e)))))
 
@@ -1699,11 +1704,13 @@
     (when-not (.isFile file)
       (raise "Copy payload does not exist" {:error :copy/missing-payload}))
     (let [dir-key (lifecycle/reserve-local-kv-handle! (u/file dir) c/default-env-flags)
+          native-env (volatile! nil)
           opened (volatile! nil)]
       (try
         (let [env (Env/create dir (* (long (c/pick-mapsize file)) 1024 1024)
                               c/*max-readers* c/*max-dbs*
                               (buffer/kv-flags c/default-env-flags))
+              _ (vreset! native-env env)
               lmdb (->CppLMDB env
                               (volatile! {:dir dir :max-dbs c/*max-dbs*
                                           :max-readers c/*max-readers*
@@ -1725,8 +1732,11 @@
             (vswap! (i/kv-info lmdb) merge (open/load-info-from-kv lmdb) runtime))
           lmdb)
         (catch Throwable e
-          (if-let [lmdb @opened] (i/close-kv lmdb)
-                  (lifecycle/release-local-kv-handle! dir-key))
+          (try
+            (if-let [lmdb @opened] (i/close-kv lmdb)
+                    (try (when-let [^Env env @native-env] (.close env))
+                         (finally (lifecycle/release-local-kv-handle! dir-key))))
+            (catch Throwable cleanup (.addSuppressed e cleanup)))
           (throw e))))))
 
 (defn- open-kv*

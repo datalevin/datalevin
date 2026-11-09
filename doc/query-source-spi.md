@@ -7,10 +7,11 @@ residual predicates, supported rules, aggregation, and query results.
 
 This reference targets **Datalevin 1.2.10** and **SPI revision 2**. The SPI was
 introduced in Datalevin 1.2.8; version 1.2.9 adds same-entity fusion and fixes
-boxed-integer interoperability. Revision 2 is the only accepted revision. Cost
-estimates are advisory; they do not select access paths. Version 1.2.10 adds
+boxed-integer interoperability. Revision 2 is the only accepted revision. Fresh cardinality estimates rank eligible fact accesses; time and transfer
+estimates remain advisory. Version 1.2.10 adds
 eligible scalar-predicate export and the optional relational protocols described
-below. Existing EAV adapters need not implement those protocols.
+below, plus optional cost-budgeted estimate preparation. Existing EAV adapters
+need not implement these protocols.
 
 The public namespace is [`datalevin.query.source`](../src/datalevin/query/source.clj).
 For mapping compilation, provider packaging, and implementation examples, see
@@ -173,7 +174,8 @@ internally if the backend requires it.
 
 ```text
 capture descriptors -> validate -> acquire and authorize sessions
-  -> plan each source/region -> validate complete plan
+  -> price and optionally prepare estimates -> plan each source/region
+  -> validate complete plan
   -> open selected cursors -> consume batches -> close cursors -> close sessions
 ```
 
@@ -427,7 +429,7 @@ The query-map `:query-source` value accepts these options:
 | `:consistency` | Default requested read minimum; defaults to `:snapshot`. |
 | `:sources` | Source-symbol map of `{:consistency ...}` overrides for declared external aliases. |
 | `:limits` | Overrides for the shared resource limits shown below. |
-| `:planning` | `:max-alternatives` (default `32`) and `:estimate-max-age-ms` (default `300000`). Estimate age limits cardinality ranking; it never changes query answers. |
+| `:planning` | `:max-alternatives` (default `32`), `:estimate-max-age-ms` (default `300000`), `:estimate-budget-ms` (default `100`), and `:estimate-max-requests` (default `8`). Estimate age limits ranking; either preparation cap set to zero disables optional probes. |
 
 For example, put limits inside `:limits`, rather than directly under
 `:query-source`:
@@ -662,10 +664,18 @@ has three terms. Eligible predicate envelopes have this shape:
  :args [[:var ?name] [:const ""]]}
 ```
 
-Eligible operators are `:=`, `:not=`, `:<`, `:<=`, `:>`, and `:>=`, with two
+Eligible operators are `:=`, `:not=`, `:<`, `:<=`, `:>`, `:>=`, `:like`, and `:not-like`, with two
 arguments and semantics version `1`. Exact support depends on operand types.
 A similarly named SQL operator is not automatically equivalent. Unsupported
 predicates remain core work; never discard rows needed by a residual.
+
+The binary `:like`/`:not-like` operators use the native case-sensitive matcher:
+`%` matches any sequence of Unicode code points, `_` matches one, and `!` is
+the default escape. Only `%`, `_`, and `!` may follow the escape; an unescaped
+trailing `!` is ignored. Argument order is significant. Calls with explicit
+options/escape arguments or scalar output bindings stay in core and are not
+represented by this binary predicate envelope. Providers may offer a safe SQL
+prefilter while retaining the original predicate as residual work.
 
 ### Access alternatives
 
@@ -840,6 +850,46 @@ and not in the future. The observation must be no older than
 `:estimate-max-age-ms` and strictly younger than any non-nil `:valid-for-ms`.
 Providers should capture statistics during acquisition; planning remains pure.
 
+Providers can implement `IQuerySourceEstimation` to prepare more specific
+cardinalities after all sessions are acquired and authorized, before pure
+`-plan-source` calls. The core first calls the pure
+`-estimation-info [source session request]`. Return `nil` or exactly:
+
+```edn
+{:rows 100000.0 :batch-rows 128 :request-ns 1000000
+ :probe-requests 2 :estimated-ns 4000000}
+```
+
+`:rows` describes the cheapest independent access in this request using already
+captured statistics; `:batch-rows` is a positive execution request batch size.
+`:request-ns` prices one execution request and `:estimated-ns` prices all proposed
+metadata requests. Unknown row/time quantities use `nil`; request count is a
+nonnegative integer bounded by `:max-alternatives`. Quotes perform no I/O.
+
+The core allows at most one eighth of the cheapest known independent access's
+estimated fetch-request work, additionally bounded by the shared
+`:estimate-budget-ms` and `:estimate-max-requests`. Only more expensive sources
+that could replace that driver are probed, cheapest probe first. A single driver,
+incoming inputs, unknown cost information, or an unaffordable probe retains the
+baseline plan. These are admission heuristics, not expected savings or a complete
+execution cost model.
+
+An admitted provider receives `-prepare-estimates [source session request budget]`
+with `{:max-requests n :max-elapsed-ns n}`. Read-only estimate I/O must use the
+same session, limiter, control, cancellation, and accounting as other requests.
+Check time between requests; an individual slow request still uses the normal
+invocation deadline. Retain only charged, session-owned advisory metadata;
+return `nil`. No answer rows, execution cursors, new coverage, or cross-query
+reuse are permitted. Optional scratch admission may decline preparation.
+`-plan-source` must remain pure and work with baseline estimates when preparation
+is skipped. Preparation errors follow normal acquisition failure and cleanup.
+Plan-only explanations can prepare estimates but open no execution cursors.
+
+Each region's `:estimation` reports the decision/reason, actual `:requests` and
+`:elapsed-ns` (including quotes and preparation), `:estimated-provider-ns` for
+performed requests, and the heuristic `:budget-ns`. These observations remain
+separate from access cardinalities and executed cursor work.
+
 Smaller qualifying counts come first. Missing, unknown, or expired counts follow
 qualifying ones and use structural ordering among themselves. Explanations report
 `:selection :cardinality` when qualifying counts rank candidates, otherwise
@@ -1011,12 +1061,17 @@ map supplied to provider callbacks.
 
 ```edn
 {:batch-rows 4096 :batch-bytes 1048576
- :binding-rows 256 :binding-bytes 262144
+ :binding-rows 256 :binding-bytes 2097152
  :in-flight-batches 2
- :retained-bytes 67108864 :spill-bytes 1073741824
+ :retained-bytes 1073741824 :spill-bytes 1073741824
  :result-rows 1000000 :result-bytes 67108864
  :external-requests 1024 :concurrent-requests 4}
 ```
+
+The 1 GiB retained-memory default targets federation server workloads. It is
+a conservative per-invocation accounting allowance, not preallocated heap.
+Size the JVM for concurrent queries and override it for smaller deployments.
+The final-result byte cap is independent of the retained-memory allowance.
 
 All are finite nonnegative signed-64-bit integers. Batch/binding row and byte
 caps, in-flight batches, and concurrent requests must be positive. Zero spill

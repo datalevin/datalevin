@@ -1310,6 +1310,10 @@
 (def ^:private ^:redef copy-server-file-out!
   copy-file-out)
 
+(defn- copy-options
+  [^Server server]
+  (:copy-options (.-execution server)))
+
 (defn- open-port
   [host port]
   (try
@@ -2265,7 +2269,7 @@
      :client-display #'client-display
      :copy-in #'copy-in
      :copy-out #'copy-out
-     :copy-options (fn [^Server server] (:copy-options (.-execution server)))
+     :copy-options #'copy-options
      :copy-server-file-out! #'copy-server-file-out!
      :current-runtime-opts #'current-runtime-opts
      :db-dir #'db-dir

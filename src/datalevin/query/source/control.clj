@@ -6,9 +6,9 @@
             ThreadFactory TimeUnit ScheduledFuture]))
 
 (def default-limits
-  {:batch-rows 4096 :batch-bytes 1048576 :binding-rows 256 :binding-bytes 262144
+  {:batch-rows 4096 :batch-bytes 1048576 :binding-rows 256 :binding-bytes 2097152
    :in-flight-batches 2
-   :retained-bytes 67108864 :spill-bytes 1073741824 :result-rows 1000000
+   :retained-bytes 1073741824 :spill-bytes 1073741824 :result-rows 1000000
    :result-bytes 67108864 :external-requests 1024 :concurrent-requests 4})
 (def ledger-keys
   (disj (set (keys default-limits)) :batch-rows :batch-bytes :binding-rows :binding-bytes))

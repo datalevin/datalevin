@@ -62,6 +62,23 @@
   (-cancel-session! [session reason] "Signal cancellation promptly; return nil.")
   (-close-session! [session] "Release this session and its cursors; return nil."))
 
+(defprotocol IQuerySourceEstimation
+  (-estimation-info [source session request]
+    "Pure advisory quote, or nil: {:rows n-or-nil :batch-rows positive-integer
+    :request-ns n-or-nil :probe-requests nonnegative-integer :estimated-ns n-or-nil}.
+    Rows describe the cheapest independent catalog access; request-ns estimates
+    one execution request, and estimated-ns prices all proposed metadata probes.
+    Unknown costs decline automatic probing. No I/O is allowed here.")
+  (-prepare-estimates [source session request budget]
+    "Optional bounded estimate preparation after authorization/acquisition and
+    before -plan-source. Receives the validated source/region planning request.
+    Read-only provider I/O is allowed under the invocation's control and quotas.
+    Budget is {:max-requests n :max-elapsed-ns n}; check elapsed time between
+    probes. A single slow request remains subject to the invocation deadline.
+    Retain only session-owned advisory metadata and return nil. No execution
+    cursor, row answers, native callbacks, or new coverage may be introduced.
+    -plan-source remains pure and must work when estimates are unavailable."))
+
 (defprotocol IQuerySourceCursor
   (-next-batch! [cursor request] "Return one owned, bounded batch.")
   (-cursor-metrics [cursor] "Return cumulative metrics, including after close.")

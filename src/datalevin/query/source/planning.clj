@@ -10,6 +10,7 @@
             [datalevin.query.source.cursor :as cursor]
             [datalevin.query.source.descriptor :as descriptor]
             [datalevin.query.source.envelope :as envelope]
+            [datalevin.query.source.estimation :as estimation]
             [datalevin.query.source.region :as region]
             [datalevin.query.source.runtime :as rt]
             [datalevin.query.source.scope :as scope]
@@ -179,6 +180,7 @@
                   {:region r :inputs inputs :operators operators :requests requests})) live)
             groups (session/acquire! runtime prepared)
             by-alias (into {} (mapcat (fn [group] (map #(vector % group) (:aliases group)))) groups)
+            estimate-work (estimation/prepare! runtime regions by-alias (:planning prepared))
             ids (delay (binding/id-space! runtime))
             ;; Capture every returned candidate before running any selection.
             responses
@@ -204,8 +206,9 @@
                                               (mapv #(access/candidate! runtime request % (:consumption group) method)
                                                     (envelope/alternatives runtime response))))) responses)]
                       (vswap! all-candidates into candidates)
-                      (access/schedule! runtime (:region-id region) inputs requests candidates operators
-                                        (:planning prepared)))) responses)]
+                      (assoc (access/schedule! runtime (:region-id region) inputs requests candidates operators
+                                               (:planning prepared))
+                             :estimation (get estimate-work (:region-id region))))) responses)]
         (access/validate-query! runtime schedules)
         (let [identity-key #(select-keys (get-in % [:path :options]) [:source-symbol :region-id :alternative-id])
               selected (into #{} (map identity-key) (mapcat :plans schedules))]

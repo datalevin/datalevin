@@ -926,43 +926,44 @@
   (when (and *wal-copy-backup-pin-enabled?*
              (txlog-write-path-enabled? raw-lmdb))
     (with-write-txn-lock-before-runtime-txlog-state
-            raw-lmdb
-            (fn []
-              (when (write-txn-open? raw-lmdb)
-                (raise "Cannot copy LMDB while write transaction is open"
-                       {:type :txlog/copy-write-transaction-open
-                        :dest dest
-                        :compact? compact?}))
-              (let [state (txlog/enabled-state raw-lmdb)
-                    _ (txlog-force-sync! state)
-                    _ (force-lmdb-sync-now! raw-lmdb)
-                    watermarks (txlog-watermarks-map raw-lmdb state)
-                    applied-lsn (long (or (:last-applied-lsn watermarks) 0))
-                    snapshot-pin-floor-state
-                    (txlog-snapshot-floor-state raw-lmdb
-                                                (or (i/env-opts raw-lmdb) {})
-                                                applied-lsn)
-                    pin-floor-lsn (long (:floor-lsn
-                                         snapshot-pin-floor-state))
-                    started-ms (System/currentTimeMillis)
-                    pin-id (str "backup-copy/" started-ms "-"
-                                (java.util.UUID/randomUUID))
-                    pin-ttl-ms (long (max 60000
-                                          (long (snapshot-max-age-ms
-                                                 raw-lmdb))))
-                    pin-expires-ms (long (+ (long started-ms) pin-ttl-ms))]
-                (txlog-pin-backup-floor-state! raw-lmdb
-                                               pin-id
-                                               pin-floor-lsn
-                                               pin-expires-ms)
-                {:lmdb lmdb
-                 :dest dest
-                 :compact? compact?
-                 :pin-id pin-id
-                 :pin-floor-lsn pin-floor-lsn
-                 :pin-expires-ms pin-expires-ms
-                 :applied-lsn applied-lsn
-                 :started-ms started-ms})))))
+      raw-lmdb
+      (fn []
+        (when (write-txn-open? raw-lmdb)
+          (raise "Cannot copy LMDB while write transaction is open"
+                 {:type :txlog/copy-write-transaction-open
+                  :dest dest
+                  :compact? compact?}))
+        (let [state (txlog/enabled-state raw-lmdb)
+              _ (txlog-force-sync! state)
+              _ (force-lmdb-sync-now! raw-lmdb)
+              watermarks (txlog-watermarks-map raw-lmdb state)
+              applied-lsn (long (or (:last-applied-lsn watermarks) 0))
+              snapshot-pin-floor-state
+              (txlog-snapshot-floor-state raw-lmdb
+                                          (or (i/env-opts raw-lmdb) {})
+                                          applied-lsn)
+              pin-floor-lsn (long (:floor-lsn
+                                   snapshot-pin-floor-state))
+              started-ms (System/currentTimeMillis)
+              pin-id (str "backup-copy/" started-ms "-"
+                          (java.util.UUID/randomUUID))
+              pin-ttl-ms (long (max 60000
+                                    (long (snapshot-max-age-ms
+                                           raw-lmdb))))
+              pin-expires-ms (long (+ (long started-ms) pin-ttl-ms))]
+          (txlog-pin-backup-floor-state! raw-lmdb
+                                         pin-id
+                                         pin-floor-lsn
+                                         pin-expires-ms)
+          {:lmdb lmdb
+           :dest dest
+           :compact? compact?
+           :pin-id pin-id
+           :pin-floor-lsn pin-floor-lsn
+           :pin-expires-ms pin-expires-ms
+           :applied-lsn applied-lsn
+           :started-ms started-ms})))))
+
 
 (defn notify-copy-backup-pin!
   "Run ordinary copy pin observers after ownership has been recorded by caller."

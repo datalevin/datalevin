@@ -188,11 +188,14 @@
 
 (defn track-exchange! [message]
   (when-let [^Budget b (current)]
-    (when (and (not (cmd/read-only? (:type message))) (original? b message))
+    (when (and (or (not (cmd/read-only? (:type message)))
+                   (:admin-required-capabilities message))
+               (original? b message))
       (.set ^AtomicBoolean (.-tracked? b) true))))
 
 (defn exchanged?
-  "Whether the enclosing mutation reached a transport exchange."
+  "Whether the enclosing mutation or guarded maintenance reached an exchange.
+  Tracking a read-only copy does not change its transport replay rules."
   []
   (boolean (when-let [^Budget b (current)] (.get ^AtomicBoolean (.-tracked? b)))))
 

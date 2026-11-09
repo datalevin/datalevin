@@ -224,7 +224,8 @@
 (defn complete-embedding-space?
   "Whether stored dimensions and metadata identify an existing embedding space."
   [{:keys [dimensions embedding-metadata]}]
-  (and (integer? dimensions) (pos? (long dimensions)) (seq embedding-metadata)))
+  (and (integer? dimensions) (pos? (long dimensions))
+       (map? embedding-metadata) (seq embedding-metadata)))
 
 (defn- resolve-embedding-domain
   [dir runtime-providers explicit? [domain domain-opts]]
@@ -272,44 +273,43 @@
                    entry)))
           domains)))
 
+(defn- unavailable-provider
+  [domain opts cause]
+  (ex-info "Embedding provider is unavailable"
+           {:error :embedding/provider-unavailable
+            :domain domain :provider (:provider opts)} cause))
+
+(defn- checked-domain-provider
+  [dir runtime-providers domain opts]
+  (let [provider (try
+                   (emb/init-embedding-provider
+                     (provider-spec-for-domain
+                       dir runtime-providers domain
+                       (apply dissoc opts persisted-embedding-space-keys)))
+                   (catch Exception e (throw (unavailable-provider domain opts e))))]
+    (try
+      (let [space (try
+                    {:dimensions (emb/embedding-dimensions provider)
+                     :metadata (emb/embedding-metadata provider)}
+                    (catch Exception e (throw (unavailable-provider domain opts e))))]
+        (when-not (= (:dimensions opts) (:dimensions space))
+          (raise "Embedding domain dimensions do not match the runtime provider"
+                 {:error :embedding/dimensions-mismatch :domain domain}))
+        (emb/ensure-compatible-metadata (:embedding-metadata opts) (:metadata space))
+        provider)
+      (catch Throwable e
+        (try (emb/close-provider provider)
+             (catch Throwable cleanup (.addSuppressed e cleanup)))
+        (throw e)))))
+
 (defn init-embedding-providers
   [dir domains runtime-providers]
   (reduce-kv
-    (fn [m domain domain-opts]
+    (fn [m domain opts]
       (assoc m domain
-             (emb/lazy-provider
-               domain-opts
-               (fn [_]
-                 (let [provider (try
-                                  (emb/init-embedding-provider
-                                    (provider-spec-for-domain
-                                      dir runtime-providers domain
-                                      (apply dissoc domain-opts persisted-embedding-space-keys)))
-                                  (catch Exception e
-                                    (throw (ex-info "Embedding provider is unavailable"
-                                                    {:error :embedding/provider-unavailable
-                                                     :domain domain
-                                                     :provider (:provider domain-opts)} e))))]
-                   (try
-                     (let [space (try
-                                   {:dimensions (emb/embedding-dimensions provider)
-                                    :metadata (emb/embedding-metadata provider)}
-                                   (catch Exception e
-                                     (throw (ex-info "Embedding provider is unavailable"
-                                                     {:error :embedding/provider-unavailable
-                                                      :domain domain
-                                                      :provider (:provider domain-opts)} e))))]
-                     (when-not (= (:dimensions domain-opts) (:dimensions space))
-                       (raise "Embedding domain dimensions do not match the runtime provider"
-                              {:error :embedding/dimensions-mismatch :domain domain}))
-                     (emb/ensure-compatible-metadata (:embedding-metadata domain-opts)
-                                                     (:metadata space))
-                     provider)
-                     (catch Throwable e
-                       (emb/close-provider provider)
-                       (throw e))))))))
-    {}
-    domains))
+             (emb/lazy-provider opts
+               (fn [_] (checked-domain-provider dir runtime-providers domain opts)))))
+    {} domains))
 
 (defn init-indices
   [lmdb domains]

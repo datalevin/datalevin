@@ -6,8 +6,13 @@
             [datalevin.interface :as i]
             [datalevin.kv :as kv]
             [datalevin.lmdb :as l]
+            [datalevin.server.capture :as capture]
             [datalevin.server.copy :as copy]
-            [datalevin.util :as u]))
+            [datalevin.tx-group.compat :as group]
+            [datalevin.util :as u])
+  (:import [datalevin.binding.cpp CppLMDB PreparedCopy]
+           [datalevin.cpp Env]
+           [java.util.concurrent CountDownLatch TimeUnit]))
 
 (deftest prepared-reader-keeps-the-captured-state-while-writers-commit
   (doseq [compact? [false true] wal? [false true]]
@@ -66,4 +71,67 @@
                  (i/get-value raw c/opts :kv-opts :attr :data)))
           (is (= "captured" (i/get-value raw "data" :value)))
           (finally (i/close-kv raw))))
+      (finally (d/close-kv source) (u/delete-files root)))))
+
+(deftest failed-post-commit-confirmation-releases-the-prepared-snapshot
+  (doseq [compact? [false true] standalone? [false true]]
+    (testing (str {:compact? compact? :standalone? standalone?})
+      (let [root (u/tmp-dir (str "capture-confirmation-failure-" (random-uuid)))
+            source (d/open-kv (str root "/source") {:wal? true})
+            raw (kv/raw-lmdb source)
+            ^Env env (.-env ^CppLMDB raw)
+            dest (str root "/copy")
+            prepared (volatile! nil)
+            phases (atom [])
+            failure (ex-info "HA write commit confirmation failed"
+                             {:error :ha/write-indeterminate})]
+        (try
+          (i/open-dbi source "data")
+          (i/transact-kv source [[:put "data" :value "captured"]])
+          (u/create-dirs dest)
+          (let [error
+                (try
+                  (capture/attempt! source dest compact?
+                    {:standalone? standalone?
+                     :authorize-write! (fn [])
+                     :admit-write (fn [f] (f))
+                     :observer (fn [phase _] (swap! phases conj phase))
+                     :with-writer
+                     (fn [f]
+                       (group/with-confirmation
+                         (fn []
+                           (let [result (binding [kv/*server-write-slot-held?* true] (f))]
+                             (when (instance? PreparedCopy result)
+                               (vreset! prepared result)
+                               (group/confirm-after-commit! #(throw failure)))
+                             result))))})
+                  nil
+                  (catch Exception e e))]
+            (is (identical? failure error))
+            (is (some? @prepared))
+            (is (not-any? #{:prepared :copied} @phases))
+            (is (empty? (i/get-value raw c/kv-info c/wal-backup-pins :keyword :data)))
+            (is (thrown? IllegalStateException (cpp/copy-prepared! @prepared)))
+            (is (= :resized (do (.setMapSize env (* 1024 1024 1024)) :resized))))
+          (finally
+            ;; Keep a failing regression run from leaking its native resources.
+            (when-let [^PreparedCopy snapshot @prepared] (.close snapshot))
+            (d/close-kv source)
+            (u/delete-files root)))))))
+
+(deftest prepared-handles-protect-the-mapping-and-reject-owner-thread-teardown
+  (let [root (u/tmp-dir (str "prepared-copy-lifetime-" (random-uuid)))
+        source (d/open-kv (str root "/source")) dest (str root "/copy")
+        ^Env env (.-env ^CppLMDB (kv/raw-lmdb source))
+        entered (CountDownLatch. 1)]
+    (try
+      (u/create-dirs dest)
+      (with-open [prepared (cpp/prepare-copy (kv/raw-lmdb source) dest false)]
+        (is (thrown? IllegalStateException (.close env)))
+        (is (thrown? IllegalStateException (.setMapSize env (* 1024 1024 1024))))
+        (let [remap (future (.countDown entered) (.setMapSize env (* 1024 1024 1024)) :remapped)]
+          (is (.await entered 5 TimeUnit/SECONDS))
+          (is (= ::blocked (deref remap 100 ::blocked)))
+          (.close prepared)
+          (is (= :remapped (deref remap 5000 ::timeout)))))
       (finally (d/close-kv source) (u/delete-files root)))))

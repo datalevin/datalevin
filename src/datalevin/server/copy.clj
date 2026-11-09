@@ -249,29 +249,29 @@
   [dir db-name base-meta]
   (let [raw (cpp/open-existing-raw dir)]
     (try
-     (let [meta (copy-response-meta db-name raw base-meta)
-          payload (:payload-last-applied-lsn meta)
-          types [:keyword :data]
-          deletes (for [key source-local-keys kt types]
-                    [:del c/kv-info key kt])
-          option-dbis (cond-> [c/kv-info]
-                        (contains? (set (i/list-dbis raw)) c/opts) (conj c/opts))
-          option-txs
-          (mapcat
-            (fn [dbi]
-              (mapcat
-                (fn [kt]
-                  (concat
-                    (for [key [:wal-dir :snapshot-dir]] [:del dbi key kt])
-                    (for [key [:kv-opts :opts]
-                          :let [value (i/get-value raw dbi key kt :data)]
-                          :when (map? value)]
-                      [:put dbi key (without-source-directories value) kt :data])))
-                (distinct (if (= dbi c/opts) [:attr :keyword :data] types))))
-            option-dbis)
-          txs (cond-> (vec (concat deletes option-txs))
-                (some? payload) (conj [:put c/kv-info c/wal-local-payload-lsn payload :keyword :data]))]
-      (i/transact-kv raw txs)
-      (i/sync raw 1)
-      meta)
-     (finally (i/close-kv raw)))))
+      (let [meta (copy-response-meta db-name raw base-meta)
+            payload (:payload-last-applied-lsn meta)
+            types [:keyword :data]
+            deletes (for [key source-local-keys kt types]
+                      [:del c/kv-info key kt])
+            option-dbis (cond-> [c/kv-info]
+                          (contains? (set (i/list-dbis raw)) c/opts) (conj c/opts))
+            option-txs
+            (mapcat
+              (fn [dbi]
+                (mapcat
+                  (fn [kt]
+                    (concat
+                      (for [key [:wal-dir :snapshot-dir]] [:del dbi key kt])
+                      (for [key [:kv-opts :opts]
+                            :let [value (i/get-value raw dbi key kt :data)]
+                            :when (map? value)]
+                        [:put dbi key (without-source-directories value) kt :data])))
+                  (distinct (if (= dbi c/opts) [:attr :keyword :data] types))))
+              option-dbis)
+            txs (cond-> (vec (concat deletes option-txs))
+                  (some? payload) (conj [:put c/kv-info c/wal-local-payload-lsn payload :keyword :data]))]
+        (i/transact-kv raw txs)
+        (i/sync raw 1)
+        meta)
+      (finally (i/close-kv raw)))))

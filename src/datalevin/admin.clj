@@ -282,7 +282,10 @@ Example:
                     (when-not (and (:verified? result) (= :binary-chunks (:copy-format result)))
                       (throw (ex-info "Backup requires a verified binary transfer"
                                       {:error :copy/missing-integrity})))
-                    (when (or (Files/exists final no-follow) (Files/isSymbolicLink stage))
+                    (when (or (Files/exists final no-follow)
+                              (not (Files/isDirectory stage no-follow))
+                              (not (Files/isRegularFile (.resolve stage "data.mdb") no-follow))
+                              (not (Files/isRegularFile (.resolve stage "VERSION") no-follow)))
                       (throw (ex-info "Backup destination changed during transfer"
                                       {:error :admin/invalid-destination})))
                     (Files/move stage final (make-array CopyOption 0))

@@ -59,6 +59,8 @@ dtlv admin --uri-env DATALEVIN_URI status --database orders --database users
 dtlv admin --timeout-ms 5000 status --all-databases
 dtlv admin wal-gc --database orders --dry-run
 dtlv admin wal-gc --all-databases
+dtlv admin --timeout-ms 300000 backup --database orders /backups/orders-2026-11-09
+dtlv admin backup --all-databases /backups/nightly-2026-11-09
 ```
 
 The URI variable defaults to `DATALEVIN_URI`. Database names are normalized and
@@ -66,8 +68,8 @@ deduplicated in the supplied order. `-a/--all` retains its existing sub-database
 meaning and is not an admin selector. `--timeout-ms` defaults to 60000 and bounds
 authentication and each request individually; the entire sweep can take longer.
 
-Each stdout line is an EDN map containing `:db-name`, `:operation` (`:status` or
-`:wal-gc`), and
+Each stdout line is an EDN map containing `:db-name`, `:operation` (`:status`,
+`:wal-gc`, or `:backup`), and
 either a native `:result` or an `:error` map. Closed databases have `:open? false`
 and nil `:stat`, `:replica`, and `:watermarks`. Server filesystem paths are
 removed and credentials in nested URIs are redacted. Diagnostics go to stderr.
@@ -95,10 +97,58 @@ that still exits `1`. Only the `:wal-disabled` and `:rollback` skip reasons map
 an `:ok? false` result to exit `0`. Other determinate failures continue to later
 targets; a timeout or indeterminate transport failure stops further mutations.
 
-An operator can schedule status collection with cron using a protected URI
-environment and ordinary output redirection. Scheduling and log retention remain
-with that script. Status and guarded WAL GC are implemented. Standalone backups
-follow their shared copy hardening prerequisites.
+Backup creates a new directory on the CLI host. Its parent must already exist
+and be writable; an existing destination is refused. Each selected database is
+an ordinary database directory beneath it, for example
+`/backups/nightly-2026-11-09/orders/{data.mdb,VERSION}`. The invocation directory
+and its children are owner-only on POSIX systems. Names must be safe path
+components; collisions and symlinks are refused. Never put the destination
+under a live server's data root. The CLI cannot determine that root remotely.
+
+Transfers write into `DEST/.incomplete/NAME`, verify SHA-256 and byte counts,
+then publish `DEST/NAME`. Failed transfers remain incomplete for inspection or
+cleanup. A timeout does not prove the server stopped; the CLI stops starting
+further mutations. Increase `--timeout-ms` for large databases. Reception uses
+bounded memory, including when the database exceeds the CLI heap.
+
+Each backup captures a consistent database state. Pending secondary-index work
+finishes and vector/embedding checkpoints persist before capture. Foreground
+writes resume once the snapshot is established, while copying and transfer
+continue. Later commits may be absent. Databases in a sweep have independent
+capture boundaries; this provides neither cross-database consistency nor
+point-in-time recovery. The result's `:copy-meta` reports
+`:payload-last-applied-lsn` when available.
+
+Named backup needs database view permission. Flushing pending index work or
+checkpointing vector/embedding domains additionally requires alter permission.
+Plain read-only sources can be copied without creating a WAL pin; read-only
+sources requiring index writes fail. Failed jobs, unavailable embedding providers
+needed by pending work, and failed checkpoints fail the target. Remote copies
+of compressed databases are refused until dictionary transfer is supported.
+
+Restored copies use WAL and snapshot directories beneath their own database
+directory, preserving WAL enablement and durability settings. They need no
+source WAL or unfinished index catch-up. Existing embedding indexes reopen
+without their provider registration, model file, or endpoint; reads and vector
+searches work immediately. Text queries and new writes that generate embeddings
+still need a compatible provider.
+
+The server first creates a full temporary copy, then streams it. Budget about
+twice the database size across the server and CLI hosts, or on one host if they
+are the same. Temporary server copies are owner-only; an operator may clean
+stale `copy-*` directories under the server's temporary directory after a crash.
+
+An operator can schedule sweeps with cron using a protected URI environment.
+The script owns overlap prevention, destination naming, retention, and cleanup:
+
+```cron
+0 2 * * * /usr/local/bin/nightly-datalevin-backup
+```
+
+For example, that script can load `DATALEVIN_URI` from a protected environment
+file, acquire its usual scheduler lock, and run
+`dtlv admin --timeout-ms 300000 backup --all-databases "$DEST"` with a new
+destination for each invocation. There is no server-side backup job service.
 
 ## Interactive Console
 

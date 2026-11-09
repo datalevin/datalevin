@@ -99,7 +99,7 @@
                 (ensure! (not (value/disjoint-constant? (:type column) (second term) check!))))))
         :predicate
         (do (fields! clause #{:id :kind :operator :semantics-version :args} #{})
-            (when-not (and (#{:= :not= :< :<= :> :>=} (:operator clause))
+            (when-not (and (#{:= :not= :< :<= :> :>= :like :not-like} (:operator clause))
                            (= 1 (:semantics-version clause)))
               (fail! :query-source/unsupported :planning))
             (ensure! (and (vector? (:args clause)) (= 2 (count (:args clause)))))
