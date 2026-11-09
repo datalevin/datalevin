@@ -23,6 +23,7 @@
    datalevin.native-value-test
    datalevin.serialization-context-test
    datalevin.storage-buffer-test
+   datalevin.tx-engine-test
    datalevin.util-test
    datalevin.wire-buffer-test)
   (:gen-class))
@@ -49,6 +50,7 @@
           'datalevin.native-value-test
           'datalevin.serialization-context-test
           'datalevin.storage-buffer-test
+          'datalevin.tx-engine-test
           'datalevin.util-test
           'datalevin.wire-buffer-test)]
     (System/exit (if (zero? ^long (+ ^long fail ^long error)) 0 1))))

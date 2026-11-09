@@ -18,6 +18,7 @@
    [datalevin.constants :as c]
    [datalevin.core :as d]
    [datalevin.db :as db]
+   [datalevin.db.tx.engine :as txengine]
    [datalevin.ha :as dha]
    [datalevin.ha.authority :as ha-auth]
    [datalevin.ha.control :as ctrl]
@@ -1642,15 +1643,16 @@
 
 (defn- ^:redef prepare-server-tx
   [db txs]
-  (try
-    (or (when-let [prepared (db/prepare-scalar-update-tx
-                             db txs {:defer-entity-resolution? true})]
-          [:scalar-update prepared])
-        (when-let [prepared (db/prepare-blind-local-tx db txs true)]
-          [:blind prepared]))
-    ;; Preparation uses the published schema/options. Let the general engine
-    ;; validate against the writer's current state if that snapshot rejects it.
-    (catch Exception _ nil)))
+  (when-not (txengine/interpreter?)
+    (try
+      (or (when-let [prepared (db/prepare-scalar-update-tx
+                               db txs {:defer-entity-resolution? true})]
+            [:scalar-update prepared])
+          (when-let [prepared (db/prepare-blind-local-tx db txs true)]
+            [:blind prepared]))
+      ;; Preparation uses the published schema/options. Let the general engine
+      ;; validate against the writer's current state if that snapshot rejects it.
+      (catch Exception _ nil))))
 
 (defn- ^:redef transact-prepared
   [db [kind prepared] tx-meta]
@@ -1677,7 +1679,7 @@
      ;; pending indexes so general resolution sees preceding batch writes.
      ;; Simulations need fresh overlays because db0 is published to readers.
      (let [transact (fn [db]
-                      (or (when-not s?
+                      (or (when-not (or s? (txengine/interpreter?))
                             (or (transact-prepared db prepared (or tx-meta {}))
                                 ;; Resolve mixed updates/inserts against this
                                 ;; owned writer, including preceding requests.

@@ -13,6 +13,7 @@
    [datalevin.constants :as c :refer [tx0 txmax]]
    [datalevin.datom :as d :refer [datom datom-added datom?]]
    [datalevin.db.tx.common :as txcommon]
+   [datalevin.db.tx.engine :as txengine]
    [datalevin.db.tx.prepare :as txprep]
    [datalevin.idoc :as idoc]
    [datalevin.index :as idx]
@@ -1460,12 +1461,14 @@
            (update initial-report :tempids mark-auto-tempids)
            initial-report)
          db (:db-before initial-report)
+         interpreting? (txengine/interpreter?)
          ordinary (if (some? ordinary-plan)
                     (when ordinary-plan ordinary-plan)
-                    (when-not (::value-tempids initial-report)
+                    (when-not (or interpreting? (::value-tempids initial-report))
                       (plan-ordinary-additions db initial-es
                                               (empty? (:tx-data initial-report)) ctx)))
-         plan (when-not ordinary (plan-flat-upserts db initial-es ctx))
+         plan (when-not (or ordinary interpreting?)
+                (plan-flat-upserts db initial-es ctx))
          ctx (if (and plan (not (:stable-schema? plan)))
                (coreprep/make-prepare-ctx db) ctx)
          initial-es (or (:entities ordinary) (:entities plan) initial-es)
@@ -1500,6 +1503,7 @@
   remain. Lazy input retains its original expansion and realization order."
   [initial-report initial-es tx-time ctx]
   (let [preflight? (and (identical? clojure.lang.PersistentVector (class initial-es))
+                         (not (txengine/interpreter?))
                          (not (::value-tempids initial-report)))
         ordinary (when preflight?
                    (plan-ordinary-additions (:db-before initial-report) initial-es

@@ -26,6 +26,7 @@
    [datalevin.remote-cache :as remote-cache]
    [datalevin.db.tx.add :as txadd]
    [datalevin.db.tx.common :as txcommon]
+   [datalevin.db.tx.engine :as txengine]
    [datalevin.db.tx.execute :as txexec]
    [datalevin.db.tx.prepare :as txprep]
    [datalevin.idoc :as idoc]
@@ -2649,7 +2650,7 @@
    resolution. Mixed preparation checks the suffix once a mixture is proven;
    a general decision needs no further specialization gates."
   [tx-data]
-  (if (seqable? tx-data)
+  (if (and (not (txengine/interpreter?)) (seqable? tx-data))
     (let [kinds (long
                   (if (and (sequential? tx-data) (counted? tx-data) (= 1 (count tx-data)))
                     (local-tx-form-kinds (nth tx-data 0))
