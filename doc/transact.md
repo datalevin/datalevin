@@ -10,8 +10,9 @@ The foundation of all these transaction modes is a LMDB transaction.
 ## LMDB Transaction
 
 Datalevin relies on the transaction mechanism of the underlying key-value store,
-LMDB (Lightening Memory-Mapped Database), to achieve ACID. Datalevin transaction
-and LMDB transaction have an one-to-one correspondence.
+LMDB (Lightening Memory-Mapped Database), to achieve ACID. A standalone logical
+write usually owns one LMDB write transaction. Explicit transaction bodies and
+collected writes can combine several logical requests into one LMDB commit.
 
 LMDB implements multiversion concurrency control (MVCC), so read and write are
 independent and do not block each other. Read requires a read transaction. Write

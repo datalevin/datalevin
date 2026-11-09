@@ -460,22 +460,21 @@
                 (not (l/writing? lmdb)))))))
 
 (defn- direct-local-transact!
+  "Resolve and commit a general request under the shared native writer."
   [conn tx-data tx-meta]
   (locking conn
-    (let [db    ^DB (deref conn)
-          store (.-store db)
-          old   (db/cache-disabled? store)]
-      (db/disable-cache store)
-      (try
-        (let [report (u/repeat-try-catch
-                       c/+in-tx-overflow-times+
-                       l/resized?
-                       (with-isolated-tx-cache db tx-data tx-meta false))]
-          (reset! conn (db/carry-runtime-opts (:db-after report) db))
-          (assoc report :db-after @conn))
-          (finally
-            (when-not old
-              (db/enable-cache (.-store ^DB @conn))))))))
+    (let [report (with-transaction [tx conn]
+                   ;; General resolution reads entity state (including CAS).
+                   ;; Acquiring the writer only during commit lets another
+                   ;; connection invalidate those reads before they are written.
+                   (let [db ^DB @tx
+                         report (with-isolated-tx-cache db tx-data tx-meta false)]
+                     (reset! tx (db/carry-runtime-opts (:db-after report) db))
+                     report))
+          after @conn]
+      (assoc report
+             :db-before (db/transfer-report-db (:db-before report) after)
+             :db-after after))))
 
 (defn- direct-local-blind-transact!
   [conn prepared tx-meta]
@@ -638,14 +637,16 @@
           (observe-local-wal-tx-path! (if upsert? :identity-upsert :blind-insert))
           report))))
 
+(defn- prepare-classified-blind-tx
+  [db tx-data allow-small-unique? check-unique-avs? kind]
+  (db/prepare-blind-local-tx db tx-data allow-small-unique? check-unique-avs?
+                             (if (= kind :blind-tempids) 1 0)))
+
 (defn- maybe-direct-local-blind-transact!
-  ([conn tx-data tx-meta]
-   (maybe-direct-local-blind-transact! conn tx-data tx-meta false))
-  ([conn tx-data tx-meta require-unique?]
-   (when-let [prepared (db/prepare-blind-local-tx
-                         ^DB @conn tx-data require-unique? false)]
-     (when (or (not require-unique?) (:has-unique? prepared))
-       (try-direct-local-blind-transact! conn prepared tx-meta)))))
+  [conn tx-data tx-meta kind]
+  (when-let [prepared (prepare-classified-blind-tx
+                       @conn tx-data false false kind)]
+    (try-direct-local-blind-transact! conn prepared tx-meta)))
 
 (defn- direct-local-scalar-update!
   "Commit a prepared simple scalar-update batch directly against one LMDB write
@@ -696,32 +697,30 @@
 
 (defn- maybe-direct-local-scalar-update!
   [conn tx-data tx-meta]
-  (when-let [prepared (db/prepare-scalar-update-tx ^DB @conn tx-data)]
+  (when-let [prepared (db/prepare-scalar-update-tx ^DB @conn tx-data {:shape-checked? true})]
     (when-let [report (direct-local-scalar-update! conn prepared tx-meta)]
       (observe-local-wal-tx-path! :scalar-update)
       report)))
 
 (defn- maybe-direct-local-wal-transact!
-  [conn tx-data tx-meta]
-  (or
-    (maybe-direct-local-scalar-update! conn tx-data tx-meta)
+  [conn tx-data tx-meta kind]
+  (case kind
+    :scalar (maybe-direct-local-scalar-update! conn tx-data tx-meta)
+    :patch-idoc
     (when *local-wal-patch-idoc?*
       (when-let [prepared (db/prepare-local-patch-idoc-tx ^DB @conn tx-data)]
         (when-let [report (direct-local-patch-idoc-transact!
                             conn prepared tx-meta)]
           (observe-local-wal-tx-path! :patch-idoc)
           report)))
-    (when-let [prepared (db/prepare-blind-local-tx
-                          ^DB @conn tx-data true false)]
-      (if (and *local-wal-identity-upsert?*
-               (:identity-upsert-av prepared))
-        (when-let [[report upsert?]
-                   (direct-local-identity-transact!
-                     conn prepared tx-meta)]
-          (observe-local-wal-tx-path!
-            (if upsert? :identity-upsert :blind-insert))
+    (:blind :blind-tempids)
+    (when-let [prepared (prepare-classified-blind-tx @conn tx-data true false kind)]
+      (if (and *local-wal-identity-upsert?* (:identity-upsert-av prepared))
+        (when-let [[report upsert?] (direct-local-identity-transact! conn prepared tx-meta)]
+          (observe-local-wal-tx-path! (if upsert? :identity-upsert :blind-insert))
           report)
-        (try-direct-local-blind-transact! conn prepared tx-meta)))))
+        (try-direct-local-blind-transact! conn prepared tx-meta)))
+    nil))
 
 (defn- single-identity-entity?
   "Cheap gate for the single-entity identity-upsert specialization: exactly one
@@ -739,12 +738,11 @@
 (defn- maybe-direct-local-identity-transact!
   "Try the simple single-entity identity-upsert fast path for a store that is
    not on the WAL direct path. Returns the transaction report, or nil so the
-   caller can continue with blind or general resolution."
-  [conn tx-data tx-meta]
+   caller can continue with general resolution."
+  [conn tx-data tx-meta kind]
   (when (and *local-wal-identity-upsert?*
              (single-identity-entity? @conn tx-data))
-    (when-let [prepared (db/prepare-blind-local-tx
-                          ^DB @conn tx-data true false)]
+    (when-let [prepared (prepare-classified-blind-tx @conn tx-data true false kind)]
       (when (:identity-upsert-av prepared)
         (when-let [[report upsert?]
                    (direct-local-identity-transact! conn prepared tx-meta)]
@@ -766,29 +764,9 @@
 
 (defn- prepared-local-wal-transact!
   [conn tx-data tx-meta]
-  (locking conn
-    (let [db    ^DB @conn
-          store (.-store db)
-          old   (db/cache-disabled? store)]
-      (db/disable-cache store)
-      (try
-        (let [report (u/repeat-try-catch
-                       c/+in-tx-overflow-times+
-                       l/resized?
-                       ;; Only datoms and report metadata cross into the writer.
-                       ;; Keep preparation isolated without building a simulated
-                       ;; read view that the commit path immediately discards.
-                       (db/prepare-local-tx-data
-                         (db/->TxReport db (db/transfer db store) [] {} tx-meta)
-                         tx-data))]
-          (with-transaction [c conn]
-            (assert (active-conn-structural? c))
-            (db/commit-prepared-tx-data! @c (:tx-data report) report))
-          (observe-local-wal-tx-path! :general)
-          (assoc report :db-after @conn))
-        (finally
-          (when-not old
-            (db/enable-cache (.-store ^DB @conn))))))))
+  (let [report (direct-local-transact! conn tx-data tx-meta)]
+    (observe-local-wal-tx-path! :general)
+    report))
 
 (defn- standalone-remote-transaction?
   [conn]
@@ -847,55 +825,63 @@
     report
     (assoc report :db-before db)))
 
+(defn- local-tx-kind
+  [tx-data kind]
+  (if (keyword? kind)
+    kind
+    ;; Retain the former scalar-rejection argument for internal callers.
+    (let [classified (db/classify-local-tx tx-data)]
+      (if (and kind (= classified :scalar)) :general classified))))
+
 (defn- ^:redef transact-local-in-write-txn!
-  "Apply one request to an already owned local writer. Prepare and resolve
-  against preceding writes, retaining the general interpreter for other shapes."
+  "Apply one classified request to the owned writer. A rejected specialization
+  goes directly to general resolution against this writer's current state."
   ([db tx-data tx-meta]
-   (transact-local-in-write-txn! db tx-data tx-meta false))
-  ([^DB db tx-data tx-meta scalar-rejected?]
-    ;; Both collectors own one native writer. Conditional inserts can roll back
-    ;; their reservations before falling back to upsert resolution.
-    (let [fuse-unique? (and (not (:client-op/id tx-meta))
+   (transact-local-in-write-txn! db tx-data tx-meta (db/classify-local-tx tx-data)))
+  ([^DB db tx-data tx-meta kind]
+    (let [kind (local-tx-kind tx-data kind)
+          fuse-unique? (and (not (:client-op/id tx-meta))
                             (or txcommon/*batch-prepare*
-                                (s/current-write-group
-                                  (.-lmdb ^Store (.-store db)))))]
+                                (s/current-write-group (.-lmdb ^Store (.-store db)))))]
       (or
-        (when-let [report (db/prepare-mixed-add-tx db tx-data tx-meta
-                                                 (:max-eid db))]
-          (commit-writing-report! db report false :mixed-add true false))
-        (when-not scalar-rejected?
-          (when-let [prepared (db/prepare-scalar-update-tx db tx-data)]
+        (case kind
+          :mixed
+          (when-let [report (db/prepare-mixed-add-tx db tx-data tx-meta (:max-eid db) true)]
+            (commit-writing-report! db report false :mixed-add true false))
+          :scalar
+          (when-let [prepared (db/prepare-scalar-update-tx db tx-data {:shape-checked? true})]
             (when-let [report (db/stamp-scalar-update-tx db prepared tx-meta)]
-              (commit-writing-report! db report false :scalar-update true false))))
-        (when *local-wal-patch-idoc?*
-          (when-let [prepared (db/prepare-local-patch-idoc-tx db tx-data)]
-            (when-let [{:keys [report]}
-                       (db/stamp-local-patch-idoc-tx db prepared tx-meta)]
-              (commit-writing-report! db report false :patch-idoc true false))))
-        (when-let [prepared (db/prepare-blind-local-tx
-                             db tx-data true
-                             (not fuse-unique?))]
-          (if (and *local-wal-identity-upsert?* (:identity-upsert-av prepared))
-            (when-let [[report upsert?]
-                       (db/stamp-blind-local-identity-tx db prepared tx-meta)]
-              (commit-writing-report! db report (not upsert?)
-                                     (if upsert? :identity-upsert :blind-insert)
-                                     (false? (:has-many? prepared)) false))
-            (or (if (and fuse-unique? (:fuse-unique-inserts? prepared))
-                  (try
-                    (commit-writing-report! db (db/stamp-blind-local-tx db prepared tx-meta)
-                                           true :blind-insert false true)
-                    (catch Exception e
-                      (when-not (and (l/blind-unique-collision? e)
-                                     (:unique-inserts-rolled-back? (ex-data e)))
-                        (throw e))))
-                  (when (db/blind-local-tx-unique-values-absent? db prepared)
-                    (commit-writing-report! db (db/stamp-blind-local-tx db prepared tx-meta)
-                                           true :blind-insert
-                                           (false? (:has-many? prepared)) false)))
-                (when *local-wal-identity-upsert?*
-                  (when-let [report (db/stamp-blind-local-upsert-tx db prepared tx-meta)]
-                    (commit-writing-report! db report false :identity-upsert true false))))))
+              (commit-writing-report! db report false :scalar-update true false)))
+          :patch-idoc
+          (when *local-wal-patch-idoc?*
+            (when-let [prepared (db/prepare-local-patch-idoc-tx db tx-data)]
+              (when-let [{:keys [report]} (db/stamp-local-patch-idoc-tx db prepared tx-meta)]
+                (commit-writing-report! db report false :patch-idoc true false))))
+          (:blind :blind-tempids)
+          (when-let [prepared (prepare-classified-blind-tx
+                               db tx-data true (not fuse-unique?) kind)]
+            (if (and *local-wal-identity-upsert?* (:identity-upsert-av prepared))
+              (when-let [[report upsert?]
+                         (db/stamp-blind-local-identity-tx db prepared tx-meta)]
+                (commit-writing-report! db report (not upsert?)
+                                       (if upsert? :identity-upsert :blind-insert)
+                                       (false? (:has-many? prepared)) false))
+              (or (if (and fuse-unique? (:fuse-unique-inserts? prepared))
+                    (try
+                      (commit-writing-report! db (db/stamp-blind-local-tx db prepared tx-meta)
+                                             true :blind-insert false true)
+                      (catch Exception e
+                        (when-not (and (l/blind-unique-collision? e)
+                                       (:unique-inserts-rolled-back? (ex-data e)))
+                          (throw e))))
+                    (when (db/blind-local-tx-unique-values-absent? db prepared)
+                      (commit-writing-report! db (db/stamp-blind-local-tx db prepared tx-meta)
+                                             true :blind-insert
+                                             (false? (:has-many? prepared)) false)))
+                  (when *local-wal-identity-upsert?*
+                    (when-let [report (db/stamp-blind-local-upsert-tx db prepared tx-meta)]
+                      (commit-writing-report! db report false :identity-upsert true false))))))
+          nil)
         ;; Specialized preparers leave resolver indexes unchanged. Only the
         ;; interpreter needs fresh indexes outside collected batches.
         (let [db1 (if txcommon/*batch-prepare*
@@ -909,76 +895,78 @@
 
 (defn- maybe-transact-local-mixed!
   [conn tx-data tx-meta]
-  (when (and (some map? tx-data) (some vector? tx-data))
-    ;; Resolve old values and allocate new IDs after acquiring the writer, just
-    ;; as for nested requests. Unsupported shapes use the same interpreter
-    ;; inside that transaction, preserving ordered resolution and rollback.
-    (locking conn
-      (let [before ^DB @conn
-            store ^Store (.-store before)
-            old (db/cache-disabled? store)]
-        (db/disable-cache store)
-        (try
-          (let [kv (.-lmdb store)
-                report (l/with-transaction-kv [kv1 kv]
-                         (let [store1 (s/transfer store kv1)
-                               database (assoc (db/transfer before store1)
-                                               :max-eid
-                                               (max (long (:max-eid before))
-                                                    (long (i/init-max-eid store1)))
-                                               :max-tx
-                                               (max (long (:max-tx before))
-                                                    (long (i/max-tx store1))))]
-                           (transact-local-in-write-txn! database tx-data tx-meta)))
-                after (-> (:db-after report)
-                          (db/transfer (s/transfer (:store (:db-after report)) kv))
-                          (db/carry-runtime-opts before)
-                          (db/adopt-current-db!))]
-            (reset! conn after)
-            (assoc report :db-before before :db-after after))
-          (finally
-            (when-not old
-              (db/enable-cache (.-store ^DB @conn)))))))))
+  ;; Resolve old values and allocate new IDs after acquiring the writer, just
+  ;; as for nested requests. Unsupported shapes use the same interpreter
+  ;; inside that transaction, preserving ordered resolution and rollback.
+  (locking conn
+    (let [before ^DB @conn
+          store ^Store (.-store before)
+          old (db/cache-disabled? store)]
+      (db/disable-cache store)
+      (try
+        (let [kv (.-lmdb store)
+              report (l/with-transaction-kv [kv1 kv]
+                       (let [store1 (s/transfer store kv1)
+                             database (assoc (db/transfer before store1)
+                                             :max-eid
+                                             (max (long (:max-eid before))
+                                                  (long (i/init-max-eid store1)))
+                                             :max-tx
+                                             (max (long (:max-tx before))
+                                                  (long (i/max-tx store1))))]
+                         (transact-local-in-write-txn! database tx-data tx-meta :mixed)))
+              after (-> (:db-after report)
+                        (db/transfer (s/transfer (:store (:db-after report)) kv))
+                        (db/carry-runtime-opts before)
+                        (db/adopt-current-db!))]
+          (reset! conn after)
+          (assoc report :db-before before :db-after after))
+        (finally
+          (when-not old
+            (db/enable-cache (.-store ^DB @conn))))))))
 
 (defn- -transact!
-  ([conn tx-data tx-meta] (-transact! conn tx-data tx-meta false))
-  ([conn tx-data tx-meta scalar-rejected?]
-   ;; A caller rejection only skips scalar specialization. Other preparation
-   ;; and general resolution still validate the current writer's state.
-    (if (local-direct-transact-eligible? conn)
-      (or (maybe-direct-local-identity-transact! conn tx-data tx-meta)
-          (maybe-direct-local-scalar-update! conn tx-data tx-meta)
-          (maybe-direct-local-blind-transact! conn tx-data tx-meta)
-          (maybe-transact-local-mixed! conn tx-data tx-meta)
-          (direct-local-transact! conn tx-data tx-meta))
-      (if (local-wal-transact-eligible? conn)
-        (or (maybe-direct-local-wal-transact! conn tx-data tx-meta)
-            (maybe-transact-local-mixed! conn tx-data tx-meta)
-            (prepared-local-wal-transact! conn tx-data tx-meta))
-        (let [store (.-store ^DB @conn)]
-          (if (and (instance? Store store)
-                   (l/writing? (.-lmdb ^Store store))
-                   (Thread/holdsLock (l/write-txn (.-lmdb ^Store store)))
-                   (db/cache-disabled? store)
-                   ;; Keep the nested watchdog when a global timeout is enabled.
-                   ;; An explicit outer timeout is still enforced by its owner.
-                   (nil? (l/explicit-transaction-timeout)))
-            (locking conn
-              ;; The enclosing transaction already owns this Store and writer.
-              ;; The general interpreter isolates its mutable indexes. Retain the
-              ;; resulting DB view for subsequent transaction-local reads and
-              ;; writes. The owner commits and publishes the base view.
-              (let [db     ^DB @conn
-                    report (transact-local-in-write-txn! db tx-data tx-meta scalar-rejected?)
-                    after  (db/carry-runtime-opts (:db-after report) db)]
-                (reset! conn after)
-                (assoc report :db-after after)))
-            (let [report (with-transaction [c conn]
-                           (assert (active-conn-structural? c))
-                           (if (instance? Store (.-store ^DB @c))
-                             (transact-local-in-write-txn! @c tx-data tx-meta scalar-rejected?)
-                             (with @c tx-data tx-meta)))]
-              (assoc report :db-after @conn))))))))
+  ([conn tx-data tx-meta] (-transact! conn tx-data tx-meta (db/classify-local-tx tx-data)))
+  ([conn tx-data tx-meta kind]
+   (let [kind (local-tx-kind tx-data kind)]
+     (if (local-direct-transact-eligible? conn)
+       (or (case kind
+             (:blind :blind-tempids)
+             (if (and *local-wal-identity-upsert?* (single-identity-entity? @conn tx-data))
+               (maybe-direct-local-identity-transact! conn tx-data tx-meta kind)
+               (maybe-direct-local-blind-transact! conn tx-data tx-meta kind))
+             :scalar (maybe-direct-local-scalar-update! conn tx-data tx-meta)
+             :mixed (maybe-transact-local-mixed! conn tx-data tx-meta)
+             nil)
+           (direct-local-transact! conn tx-data tx-meta))
+       (if (local-wal-transact-eligible? conn)
+         (or (maybe-direct-local-wal-transact! conn tx-data tx-meta kind)
+             (when (= kind :mixed) (maybe-transact-local-mixed! conn tx-data tx-meta))
+             (prepared-local-wal-transact! conn tx-data tx-meta))
+         (let [store (.-store ^DB @conn)]
+           (if (and (instance? Store store)
+                    (l/writing? (.-lmdb ^Store store))
+                    (Thread/holdsLock (l/write-txn (.-lmdb ^Store store)))
+                    (db/cache-disabled? store)
+                    ;; Keep the nested watchdog when a global timeout is enabled.
+                    ;; An explicit outer timeout is still enforced by its owner.
+                    (nil? (l/explicit-transaction-timeout)))
+             (locking conn
+               ;; The enclosing transaction already owns this Store and writer.
+               ;; The general interpreter isolates its mutable indexes. Retain the
+               ;; resulting DB view for subsequent transaction-local reads and
+               ;; writes. The owner commits and publishes the base view.
+               (let [db     ^DB @conn
+                     report (transact-local-in-write-txn! db tx-data tx-meta kind)
+                     after  (db/carry-runtime-opts (:db-after report) db)]
+                 (reset! conn after)
+                 (assoc report :db-after after)))
+             (let [report (with-transaction [c conn]
+                            (assert (active-conn-structural? c))
+                            (if (instance? Store (.-store ^DB @c))
+                              (transact-local-in-write-txn! @c tx-data tx-meta kind)
+                              (with @c tx-data tx-meta)))]
+               (assoc report :db-after @conn)))))))))
 
 (defn- notify-listeners!
   [conn report]
@@ -987,8 +975,8 @@
       (callback report))))
 
 (defn- run-transact-now!
-  [conn tx-data tx-meta]
-  (let [report (-transact! conn tx-data tx-meta)]
+  [conn tx-data tx-meta kind]
+  (let [report (-transact! conn tx-data tx-meta kind)]
     (notify-listeners! conn report)
     report))
 
@@ -1038,11 +1026,11 @@
                     {:datalevin.tx-group/body-failure true}))))
 
 (defn- transact-embedded-group!
-  [g conn tx-data tx-meta]
+  [g conn tx-data tx-meta kind]
   (let [lmdb (.-lmdb ^Store (.-store ^DB @conn))
         op (fn [[tx batched?]]
              (observe-embedded-path! nil batched?)
-             (-transact! tx tx-data tx-meta))
+             (-transact! tx tx-data tx-meta kind))
         report
         (group/submit!
          g
@@ -1097,44 +1085,54 @@
       (observe-txlog-sync-path! :direct-remote)
       (notify-listeners! conn report)
       report)
-    (if-let [control (datalog/control conn)]
-      ;; Type correction and read-layout construction do not depend on
-      ;; the eventual native snapshot. Keep that work on the caller;
-      ;; resolve lookup refs and read old values on the native owner.
-      (let [prepared (db/prepare-scalar-update-tx
-                       @conn tx-data {:defer-entity-resolution? true})
-            report (if (and prepared (nil? (l/explicit-transaction-timeout)))
-                     (datalog/run-scalar! control conn prepared tx-data tx-meta
-                                          stamp-collected-scalar! -transact!)
-                     (datalog/with-transaction!
-                       control conn
-                       (fn [tx]
-                         (when *txlog-sync-path-observer*
-                           (let [opts (l/read-env-opts (.-lmdb ^Store (:store @tx)))]
-                             (observe-embedded-path! (:wal-durability-profile opts)
-                                                     (datalog/batched? control))))
-                         (or (when prepared
-                               (when-let [report (db/stamp-scalar-update-tx
-                                                   @tx prepared tx-meta)]
-                                 (let [report (commit-writing-report!
-                                                @tx report false :scalar-update true false)]
-                                   (reset! tx (:db-after report))
-                                   report)))
-                             (-transact! tx tx-data tx-meta (nil? prepared))))
-                       {:context {:datalog-prepare? true :datalog-fast? true}}))]
-        (notify-listeners! conn report)
-        report)
-    (if-let [g (embedded-write-group conn)]
-      (transact-embedded-group! g conn tx-data tx-meta)
-      (do
-        (let [store (.-store ^DB @conn)
-              opts (when (and (instance? Store store)
-                              (not (l/writing? (.-lmdb ^Store store)))
-                              (not (current-thread-holds-store-write-lock? store)))
-                     (l/read-env-opts (.-lmdb ^Store store)))]
-          (observe-embedded-path!
-           (when (:wal? opts) (:wal-durability-profile opts)) false))
-        (run-transact-now! conn tx-data tx-meta))))))
+    (let [kind (db/classify-local-tx tx-data)]
+      (if-let [control (datalog/control conn)]
+        ;; Type correction and read-layout construction do not depend on
+        ;; the eventual native snapshot. Keep that work on the caller;
+        ;; resolve lookup refs and read old values on the native owner.
+        (let [prepared (when (= kind :scalar)
+                         (db/prepare-scalar-update-tx
+                           @conn tx-data {:defer-entity-resolution? true :shape-checked? true}))
+              kind (if (= kind :scalar) :general kind)
+              report (if (and prepared (nil? (l/explicit-transaction-timeout)))
+                       (datalog/run-scalar! control conn prepared tx-data tx-meta
+                                            stamp-collected-scalar!
+                                            (fn [tx forms meta]
+                                              (-transact! tx forms meta
+                                                          (if (db/scalar-update-tx-valid? @tx prepared)
+                                                            :general :scalar))))
+                       (datalog/with-transaction!
+                         control conn
+                         (fn [tx]
+                           (when *txlog-sync-path-observer*
+                             (let [opts (l/read-env-opts (.-lmdb ^Store (:store @tx)))]
+                               (observe-embedded-path! (:wal-durability-profile opts)
+                                                       (datalog/batched? control))))
+                           (or (when prepared
+                                 (when-let [report (db/stamp-scalar-update-tx
+                                                     @tx prepared tx-meta)]
+                                   (let [report (commit-writing-report!
+                                                  @tx report false :scalar-update true false)]
+                                     (reset! tx (:db-after report))
+                                     report)))
+                               (-transact! tx tx-data tx-meta
+                                           (if (and prepared
+                                                    (not (db/scalar-update-tx-valid? @tx prepared)))
+                                             :scalar kind))))
+                         {:context {:datalog-prepare? true :datalog-fast? true}}))]
+          (notify-listeners! conn report)
+          report)
+      (if-let [g (embedded-write-group conn)]
+        (transact-embedded-group! g conn tx-data tx-meta kind)
+        (do
+          (let [store (.-store ^DB @conn)
+                opts (when (and (instance? Store store)
+                                (not (l/writing? (.-lmdb ^Store store)))
+                                (not (current-thread-holds-store-write-lock? store)))
+                       (l/read-env-opts (.-lmdb ^Store store)))]
+            (observe-embedded-path!
+             (when (:wal? opts) (:wal-durability-profile opts)) false))
+          (run-transact-now! conn tx-data tx-meta kind)))))))
 
 (defn transact!
   ([conn tx-data] (transact! conn tx-data nil))

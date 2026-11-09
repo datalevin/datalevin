@@ -17,18 +17,19 @@
    [datalevin.sparselist :as sl]
    [clojure.string :as s]
    [taoensso.nippy :as nippy]
+   [taoensso.nippy.io :as nippy-io]
    [taoensso.nippy.impl :as nippy-impl])
   (:import
    [java.util Arrays UUID Date Base64 Base64$Decoder Base64$Encoder]
    [java.util.regex Pattern]
    [java.math BigInteger BigDecimal]
    [java.io EOFException Writer]
-   [java.nio BufferOverflowException ByteBuffer]
+   [java.nio BufferOverflowException ByteBuffer ByteOrder]
    [java.nio.charset StandardCharsets]
    [java.lang String]
    [org.roaringbitmap RoaringBitmap RoaringBitmapWriter  FastAggregation]
    [org.roaringbitmap.longlong Roaring64Bitmap]
-   [datalevin.utl BitOps]))
+   [datalevin.utl BitOps BufOps BufOps$Utf8Encoder]))
 
 ;; base64
 
@@ -1075,6 +1076,82 @@
   (^bytes [^Indexable x ^ByteBuffer bf]
    (put-avg (.clear bf) x)
    (Arrays/copyOfRange (.array bf) 0 (.position bf))))
+
+(deftype EncodedGiant [^bytes bytes])
+
+(defn- data-avg
+  [aid value]
+  (when (instance? java.lang.Class value)
+    (raise "Unfreezable type: java.lang.Class" {}))
+  (let [allowlist (serialization-allowlist)
+        write (fn [bb dout_]
+                (nippy-io/write-typed+meta value bb dout_)
+                true)
+        finish (fn [^ByteBuffer bb]
+                 (let [n (.position bb)]
+                   (if (<= n c/+val-bytes-wo-hdr+)
+                     (BufOps/avgBytes (int aid) bb c/separator c/false-value)
+                     (EncodedGiant.
+                       (Arrays/copyOfRange (.array bb) (.arrayOffset bb)
+                                           (+ (.arrayOffset bb) n))))))]
+    ;; Use fast-freeze's writer, cache scope and growing buffer. Its finalizer
+    ;; runs only after encoding settles, so custom writers are never replayed
+    ;; merely to switch from inline framing to giant construction.
+    (nippy/with-cache
+      (if (identical? allowlist nippy/*freeze-serializable-allowlist*)
+        (nippy-io/with-bb 512 write finish)
+        (binding [nippy/*freeze-serializable-allowlist* allowlist]
+          (nippy-io/with-bb 512 write finish))))))
+
+(defn ^:no-doc encode-avg
+  "Return owned inline AVG bytes, an EncodedGiant holding complete variable
+  payload bytes, or nil for ordinary Indexable encoding. Pooled buffers never
+  escape. A rejected typed encoding may modify the supplied heap buffer."
+  ([aid value vt buffer] (encode-avg aid value vt buffer nil))
+  ([aid value vt ^ByteBuffer buffer ^objects utf8-context]
+   (let [kind (case vt
+                :db.type/string (when (and utf8-context (string? value)) :string)
+                :db.type/keyword (when (and utf8-context (keyword? value)) :name)
+                :db.type/symbol (when (and utf8-context (symbol? value)) :name)
+                (when (and (or (nil? vt) (identical? vt :data))
+                           (identical? ByteOrder/BIG_ENDIAN (.order buffer)))
+                  :data))]
+     (when (and kind
+                (not (and (keyword? value)
+                          (case value
+                            (:db.value/sysMin :db.value/sysMax) true
+                            false))))
+       (if (identical? kind :data)
+         (data-avg aid value)
+         (when (<= (long (if (identical? kind :string)
+                            (count value)
+                            (+ (count (namespace value)) (count (name value)) 1)))
+                    c/+val-bytes-wo-hdr+)
+           (.clear buffer)
+           (put-int buffer aid)
+           (put-byte buffer (val-header value vt))
+           (let [^BufOps$Utf8Encoder encoder
+                 (or (aget utf8-context 0)
+                     (let [encoder (BufOps$Utf8Encoder.)]
+                       (aset utf8-context 0 encoder)
+                       encoder))
+                 start (.position buffer)
+                 encoded?
+                 (case kind
+                   :string (.put encoder buffer value c/+val-bytes-wo-hdr+)
+                   :name (let [n (namespace value) nm (name value)]
+                           (and (<= (+ (count n) (count nm) 1) c/+val-bytes-wo-hdr+)
+                                (or (nil? n)
+                                    (.put encoder buffer n (dec c/+val-bytes-wo-hdr+)))
+                                (do
+                                  (put-byte buffer c/separator)
+                                  (.put encoder buffer nm
+                                    (int (- c/+val-bytes-wo-hdr+
+                                            (- (.position buffer) start))))))))]
+             (when encoded?
+               (put-byte buffer c/separator)
+               (put-byte buffer c/false-value)
+               (Arrays/copyOfRange (.array buffer) 0 (.position buffer))))))))))
 
 (deftype Retrieved [e a v g])
 

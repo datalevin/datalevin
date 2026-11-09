@@ -33,6 +33,7 @@
    [datalevin.util :as u
     :refer [ case-tree defrecord-updatable raise]]
    [datalevin.lmdb :as l]
+   [datalevin.kv.txlog :as kvtx]
    [datalevin.storage :as s]
    [datalevin.storage.metadata :as metadata]
    [datalevin.storage.scan :as scans]
@@ -58,15 +59,17 @@
    [datalevin.datom Datom]
    [datalevin.interface IRemoteDB IRemotePrepared IStore]
    [datalevin.storage Store WriteGroup]
-   [datalevin.utl LRUCache QueryKey QueryKey$KeySet]
+   [datalevin.utl LRUCache QueryKey QueryKey$EquivSet QueryKey$KeySet]
    [java.nio ByteBuffer]
    [java.util Arrays Collection Comparator Date]
    [clojure.lang LazilyPersistentVector MapEntry]
    [java.util.concurrent ConcurrentHashMap]
    [java.util.concurrent.atomic AtomicBoolean]
    [java.util.function Function]
+   [org.eclipse.collections.api.block HashingStrategy]
    [org.eclipse.collections.impl.list.mutable FastList]
    [org.eclipse.collections.impl.map.mutable.primitive LongObjectHashMap]
+   [org.eclipse.collections.impl.set.strategy.mutable UnifiedSetWithHashingStrategy]
    [org.eclipse.collections.impl.set.sorted.mutable TreeSortedSet]))
 
 ;;;;;;;;;; Protocols
@@ -486,6 +489,47 @@
         (mutable-index-input? (.-v ^Datom value)))
     (or (bytes? value) (= Date (class value)))))
 
+(defn- storage-cache-dependencies
+  "Keep lookup identity intact while matching invalidation at storage precision.
+  Numeric tuple reports can retain uncoerced components, so use their attribute
+  bucket rather than comparing those components with decoded native values."
+  [store key]
+  (if (instance? Store store)
+    (let [pattern (cache-key-pattern key)
+          position (case (first pattern)
+                     (:search :search-tuples :first :count) 3
+                     :av-datoms 2
+                     (:datoms :populated?) (case (get pattern 1) :ave 3 :eav 4 nil)
+                     nil)
+          value (when position (get pattern position))]
+      (if (or (number? value) (sequential? value))
+        (let [attr (get pattern (dec (long position)))
+              vt (when attr (idx/value-type ((schema store) attr)))
+              normalized (case vt
+                           (:db.type/long :db.type/ref)
+                           (if (and (number? value) (not (instance? Long value)))
+                             (long value) value)
+
+                           :db.type/double
+                           (if (and (number? value) (not (instance? Double value)))
+                             (double value) value)
+
+                           :db.type/float
+                           (if (and (number? value) (not (instance? Float value)))
+                             (float value) value)
+
+                           (if (and (vector? vt)
+                                    (some #{:db.type/long :db.type/ref
+                                            :db.type/double :db.type/float} vt)
+                                    (not (qu/lookup-ref? value)))
+                             nil value))]
+          (if (identical? value normalized)
+            key
+            (with-meta key (assoc (meta key) ::index-pattern
+                                 (assoc pattern position normalized)))))
+        key))
+    key))
+
 (defn ^:no-doc index-cache-key
   "Distinguish storage representations and custom-codec generations. Keep an
   owned snapshot of mutable lookup inputs for dependency and range checks.
@@ -510,13 +554,15 @@
                    ;; Metadata is excluded from key equality and hashing.
                    (if mutable? (with-meta key {::index-pattern owned}) key)))
                pattern)]
-    (if-let [registry (when (instance? Store store)
-                       (get-in @(kv-info (.-lmdb ^Store store))
-                               [:runtime-opts :udf-registry]))]
-      (if (cd/custom-schema? (schema store))
-        (conj pattern ::codec [registry (udf/generation registry)])
-        pattern)
-      pattern)))
+    (storage-cache-dependencies
+      store
+      (if-let [registry (when (instance? Store store)
+                         (get-in @(kv-info (.-lmdb ^Store store))
+                                 [:runtime-opts :udf-registry]))]
+        (if (cd/custom-schema? (schema store))
+          (conj pattern ::codec [registry (udf/generation registry)])
+          pattern)
+        pattern))))
 
 (defmacro wrap-cache
   [store pattern body]
@@ -570,7 +616,7 @@
    (loop [datoms (seq tx-data)
           eids (transient #{})
           attrs (transient #{})
-          values (when all-values? (transient #{}))
+          values (when all-values? (LRUCache/dependencySet))
           values-by-attr nil]
      (if-let [^Datom datom (first datoms)]
        (let [e (.-e datom)
@@ -584,20 +630,21 @@
                                      (or (nil? cache)
                                          (.hasDependencyGroup cache ::attribute-value a)
                                          (.hasDependencyGroup cache ::value-filter a)))
-                            (transient #{}))))]
+                            (LRUCache/dependencySet))))]
+         (when values (.add ^java.util.Set values v))
          (recur (next datoms) (conj! eids e) (conj! attrs a)
-                (when values (conj! values v))
+                values
                 (if bucket
-                  (assoc! (or values-by-attr (transient {})) a (conj! bucket v))
+                  (do
+                    (.add ^java.util.Set bucket v)
+                    (assoc! (or values-by-attr (transient {})) a bucket))
                   values-by-attr)))
        {:eids (persistent! eids)
         :attrs (persistent! attrs)
-        :values (if values (persistent! values) #{})
+        :values (or values #{})
         :values-by-attr
         (if values-by-attr
-          (persistent!
-            (reduce-kv (fn [m a vs] (assoc! m a (persistent! vs)))
-                       (transient {}) (persistent! values-by-attr)))
+          (persistent! values-by-attr)
           {})}))))
 
 (defn- full-index-value-match?
@@ -640,7 +687,10 @@
 
 (defn carry-runtime-opts
   [x source]
-  (with-runtime-opts x (runtime-opts source)))
+  (let [opts (:runtime-opts (meta source))]
+    (if (or (some? opts) (contains? (meta x) :runtime-opts))
+      (with-runtime-opts x opts)
+      x)))
 
 (defn udf-registry
   [x]
@@ -1603,33 +1653,39 @@
                    (Long/compare (d/datom-tx x) (d/datom-tx y))))))))))
 
 
+(deftype ^:private TxDatomComparator
+  [store index schema-fn resolver-kv ordinary ^:volatile-mutable state]
+  Comparator
+  (compare [_ x y]
+    ;; Store schemas can change independently across transaction wrappers.
+    ;; Keep the target binding, but allocate custom ordering only on first use.
+    (let [current (if schema-fn (schema-fn) (schema store))
+          cached state
+          comparator (if (identical? current (nth cached 0 nil))
+                       (nth cached 1)
+                       (let [custom? (cd/custom-schema? current)
+                             ;; Preserve equal-prefix ordinals across schema
+                             ;; changes without reordering the live overlay.
+                             custom (or (nth cached 2 nil)
+                                        (when custom?
+                                          (custom-tx-datom-comparator
+                                            store index
+                                            (or schema-fn #(schema store))
+                                            resolver-kv)))
+                             comparator (if custom? custom ordinary)]
+                         ;; Publish the schema, comparator and custom state as
+                         ;; one snapshot, including for shared same-store views.
+                         (set! state [current comparator custom])
+                         comparator))]
+      (.compare ^Comparator comparator x y))))
+
 (defn- tx-datom-comparator
-  ;; Store schemas can change inside a transaction. Retain the ordinary datom
-  ;; comparator until a new schema requires custom value ordering.
-  ([store index] (tx-datom-comparator store index #(schema store)))
+  ([store index] (tx-datom-comparator store index nil nil))
   ([store index schema-fn] (tx-datom-comparator store index schema-fn nil))
   ([store index schema-fn resolver-kv]
-   (let [ordinary (if (= index :eav) d/cmp-datoms-eavt d/cmp-datoms-avet)
-         state (volatile! nil)]
-     (reify Comparator
-       (compare [_ x y]
-         (let [current (schema-fn)
-               cached @state
-               comparator (if (identical? current (nth cached 0 nil))
-                            (nth cached 1)
-                            (let [custom? (cd/custom-schema? current)
-                                  ;; Preserve equal-prefix value ordinals when
-                                  ;; attributes are added to a live overlay.
-                                  ;; Replacing this comparator would reorder
-                                  ;; existing entries without rebuilding them.
-                                  custom (or (nth cached 2 nil)
-                                             (when custom?
-                                               (custom-tx-datom-comparator
-                                                 store index schema-fn resolver-kv)))
-                                  comparator (if custom? custom ordinary)]
-                              (vreset! state [current comparator custom])
-                              comparator))]
-           (.compare ^Comparator comparator x y)))))))
+   (TxDatomComparator. store index schema-fn resolver-kv
+                       (if (= index :eav) d/cmp-datoms-eavt d/cmp-datoms-avet)
+                       nil)))
 
 (defn ^:no-doc batch-tx-indexes
   "Create batch-owned resolver indexes. Custom comparisons use the owner's
@@ -1800,57 +1856,29 @@
     (local-store db :wait-for-secondary-index)
     opts)))
 
-(defn- with-bulk-load-direct-write-path
-  [lmdb f]
-  (if-let [info-v (kv-info lmdb)]
-    (let [info @info-v]
-      (if (true? (:wal? info))
-        (let [had-rollout?  (contains? info :wal-rollout-mode)
-              had-rollback? (contains? info :wal-rollback?)
-              prev-rollout  (:wal-rollout-mode info)
-              prev-rollback (:wal-rollback? info)]
-          ;; Bulk loads prefer throughput over WAL append/replay guarantees.
-          ;; Keep the override runtime-only and restore after loading.
-          (vswap! info-v assoc :wal-rollout-mode :rollback :wal-rollback? true)
-          (try
-            (f)
-            (finally
-              (vswap! info-v
-                      (fn [m]
-                        (cond-> m
-                          had-rollout?
-                          (assoc :wal-rollout-mode prev-rollout)
-
-                          (not had-rollout?)
-                          (dissoc :wal-rollout-mode)
-
-                          had-rollback?
-                          (assoc :wal-rollback? prev-rollback)
-
-                          (not had-rollback?)
-                          (dissoc :wal-rollback?)))))))
-        (f)))
-    (f)))
-
 (defn- quick-fill-local
   [^Store store datoms]
-  (let [lmdb    (.-lmdb store)
-        flags   (get-env-flags lmdb)
-        nosync? (:nosync flags)
-        loaded  (volatile! nil)]
-    (set-env-flags lmdb #{:nosync} true)
-    (try
-      (with-bulk-load-direct-write-path
-        lmdb
-        #(binding [c/*ordered-datom-writes?* true]
-           (l/with-transaction-kv [writer lmdb]
-             (let [tx-store (s/transfer store writer)]
-               (pour tx-store datoms)
-               (vreset! loaded tx-store)))))
-      (finally
-        (when-not nosync? (set-env-flags lmdb #{:nosync} false))))
-    (sync lmdb)
-    (s/transfer @loaded lmdb)))
+  (let [lmdb (.-lmdb store)]
+    ;; Own the shared writer before taking either settings snapshot. Another
+    ;; load must not save temporary WAL/:nosync values as its restore target.
+    ;; The existing guard also keeps runtime administration in lock order.
+    (kvtx/with-runtime-txlog-rollback
+      lmdb
+      (fn []
+        (let [flags   (get-env-flags lmdb)
+              nosync? (:nosync flags)
+              loaded  (volatile! nil)]
+          (set-env-flags lmdb #{:nosync} true)
+          (try
+            (binding [c/*ordered-datom-writes?* true]
+              (l/with-transaction-kv [writer lmdb]
+                (let [tx-store (s/transfer store writer)]
+                  (pour tx-store datoms)
+                  (vreset! loaded tx-store))))
+            (finally
+              (when-not nosync? (set-env-flags lmdb #{:nosync} false))))
+          (sync lmdb)
+          (s/transfer @loaded lmdb))))))
 
 (defn- quick-fill
   [store datoms]
@@ -2169,17 +2197,18 @@
              db)))
        (if (instance? Store store)
          (let [tx-meta (:tx-meta report)
-               staged-ms (if (and (empty? tx-data) (not ensures)
-                                  (not (:client-op/id tx-meta)))
-                           ;; Empty reports have no secondary-index work. Keep
-                           ;; durable ID consumption, deferring grouped metadata.
-                           (s/commit-empty-tx! store)
-                           (when (and txcommon/*batch-prepare* (not ensures)
-                                      (not (:client-op/id tx-meta)))
-                             (s/stage-group-datoms! store tx-data independent?)))
+               staged-ms (when (and txcommon/*batch-prepare* (not ensures)
+                                    (not (:client-op/id tx-meta)))
+                           (s/stage-group-datoms! store tx-data independent?))
                modified-ms
                (long
                  (or staged-ms
+                     ;; Staging already reserves grouped metadata. Only check
+                     ;; for an empty report before the full storage planner.
+                     (when (and (empty? tx-data) (not ensures)
+                                (not s/*enforce-blind-unique-inserts?*)
+                                (not (:client-op/id tx-meta)))
+                       (s/commit-empty-tx! store))
                      (let [{:keys [embedding-plan embedding-skips]}
                            (s/prepare-secondary-index-plan store tx-data)
                            ;; Preparation may create attributes and advance the
@@ -2259,10 +2288,6 @@
   [entity]
   (txprep/expand-transactable-entity entity))
 
-(defn- prepare-entities
-  [^DB db entities tx-time ctx]
-  (txprep/prepare-entities db entities tx-time ctx))
-
 ;; Identity probes in the blind path share the LMDB write transaction. Large
 ;; batches enable them from two entities onward so ingestion avoids the old
 ;; discontinuity. A single entity is routed to the identity-upsert
@@ -2326,6 +2351,25 @@
        (not (and (= (count value) 2)
                  (contains? unique-identity-attrs (first value))))))
 
+(defn- blind-value-ready?
+  "Values whose validation/coercion cannot fail or invoke user code. Other
+   values require the complete attribute preflight before normalization."
+  [^objects info value]
+  (case (aget info 4)
+    (nil :data) (and (some? value) (not (coll? value)))
+    :db.type/long (instance? Long value)
+    :db.type/ref (and (instance? Long value) (pos? (long value)))
+    :db.type/string (string? value)
+    :db.type/boolean (boolean? value)
+    :db.type/keyword (keyword? value)
+    :db.type/symbol (identical? clojure.lang.Symbol (class value))
+    :db.type/uuid (uuid? value)
+    :db.type/instant (identical? java.util.Date (class value))
+    :db.type/bytes (bytes? value)
+    :db.type/double (and (instance? Double value) (Double/isFinite (double value)))
+    :db.type/float (and (instance? Float value) (Float/isFinite (float value)))
+    false))
+
 (defn- append-blind-value!
   ^Boolean [^FastList attrs ^FastList unique-avs
             seen-avs set-capacity fuse-unique-inserts?
@@ -2335,10 +2379,15 @@
           (and (coll? value) (not (bytes? value))))
     false
     (let [props   (aget info 0)
-          value'  (do
-                    (vld/validate-val value entity)
-                    (prepare/correct-value-with-props
-                      store-opts props attr value))
+          value'  (if (blind-value-ready? info value)
+                    value
+                    (do
+                      (vld/validate-val value entity)
+                      (if (aget info 5)
+                        (prepare/correct-scalar-value
+                          (:validate-data? store-opts) (aget info 4) value)
+                        (prepare/correct-value-with-props
+                          store-opts props attr value))))
           unique? (some? (:db/unique props))
           inline? (or (not unique?)
                       (blind-unique-inline-value? (aget info 3) value'))
@@ -2366,37 +2415,35 @@
   (or (.get infos attr)
       (let [props (store-schema attr)
             vt    (:db/valueType props)
-            info  (object-array
-                    [props
-                     (blind-write-attr-supported?
-                       attr props tuple-source-attrs allow-unique?)
-                     (not (or (:db/fulltext props) (:db/embedding props)
-                              (:db/noindex props) (map? vt)
-                              (#{:db.type/vec :db.type/idoc :data} vt)))
-                     (boolean (#{:db.type/string :db.type/keyword
-                                 :db.type/symbol} vt))
-                     vt])]
+            ^objects info (object-array 6)]
+        (aset info 0 props)
+        ;; nil rejects an attribute; supported attributes carry cached
+        ;; uniqueness/cardinality flags (zero is a valid proof).
+        (aset info 1 (when (blind-write-attr-supported?
+                            attr props tuple-source-attrs allow-unique?)
+                       (bit-or (if (:db/unique props) 1 0)
+                               (if (identical? :db.cardinality/many
+                                               (:db/cardinality props)) 2 0))))
+        (aset info 2 (not (or (:db/fulltext props) (:db/embedding props)
+                             (:db/noindex props) (map? vt)
+                             (#{:db.type/vec :db.type/idoc :data} vt))))
+        (aset info 3 (Boolean/valueOf
+                      (boolean (#{:db.type/string :db.type/keyword
+                                  :db.type/symbol} vt))))
+        (aset info 4 vt)
+        ;; Only these types can bypass schema-aware correction.
+        (aset info 5 (not (or (cd/custom-type? vt) (map? vt)
+                             (identical? vt :db.type/idoc)
+                             (identical? vt :db.type/tuple))))
         (.put infos attr info)
         info)))
 
-(defn- blind-value-ready?
-  "Values whose validation/coercion cannot fail or invoke user code. Other
-   values require the complete attribute preflight before normalization."
-  [^objects info value]
-  (case (aget info 4)
-    (nil :data) (and (some? value) (not (coll? value)))
-    :db.type/long (instance? Long value)
-    :db.type/ref (and (instance? Long value) (pos? (long value)))
-    :db.type/string (string? value)
-    :db.type/boolean (boolean? value)
-    :db.type/keyword (keyword? value)
-    :db.type/symbol (identical? clojure.lang.Symbol (class value))
-    :db.type/uuid (uuid? value)
-    :db.type/instant (identical? java.util.Date (class value))
-    :db.type/bytes (bytes? value)
-    :db.type/double (and (instance? Double value) (Double/isFinite (double value)))
-    :db.type/float (and (instance? Float value) (Float/isFinite (float value)))
-    false))
+(def ^:private instant-hashing-strategy
+  ;; Storage keys retain milliseconds, unlike asymmetric Date/Timestamp
+  ;; equality and Timestamp's additional nanosecond precision.
+  (reify HashingStrategy
+    (computeHashCode [_ value] (Long/hashCode (long (inst-ms value))))
+    (equals [_ left right] (== (long (inst-ms left)) (long (inst-ms right))))))
 
 (defn- prepare-blind-write-entity
   [store-opts unique-identity-attrs ^FastList unique-avs seen-avs set-capacity
@@ -2423,18 +2470,26 @@
                                            (attr-infos attr raw-value))]
                     (let [props (aget info 0)
                           many? (identical? :db.cardinality/many (:db/cardinality props))
-                          _ (when-not (aget info 2)
+                          _ (when (and (not (aget info 2)) fuse-unique-inserts?)
                               (vreset! fuse-unique-inserts? false))
                           supported-values?
                           (if (blind-write-multiple-values?
                                 many? unique-identity-attrs raw-value)
                             (let [vt (aget info 4)
                                   ^java.util.Set seen-values
-                                  (if (or (nil? vt) (map? vt)
-                                          (identical? vt :data)
-                                          (identical? vt :db.type/bytes))
-                                    (QueryKey$KeySet.)
-                                    (java.util.HashSet.))
+                                  (case vt
+                                    :db.type/instant
+                                    (UnifiedSetWithHashingStrategy. instant-hashing-strategy)
+                                    ;; The interpreter equates signed zeros and
+                                    ;; decimals with different scales. Compare
+                                    ;; normalized values with that equivalence.
+                                    (:db.type/double :db.type/float :db.type/bigdec)
+                                    (QueryKey$EquivSet.)
+                                    (if (or (nil? vt) (map? vt)
+                                            (identical? vt :data)
+                                            (identical? vt :db.type/bytes))
+                                      (QueryKey$KeySet.)
+                                      (java.util.HashSet.)))
                                   values (seq raw-value)]
                               (when values (vreset! has-many? true))
                               (loop [values values]
@@ -2449,8 +2504,7 @@
                                       (if (:db/unique props)
                                         false
                                         (do
-                                          ;; Compare bytes by content and keep
-                                          ;; the first normalized occurrence.
+                                          ;; Keep the first normalized occurrence.
                                           ;; Unique AV collection remains untouched.
                                           (.remove attrs (int (dec (.size attrs))))
                                           (.remove attrs (int (dec (.size attrs))))
@@ -2473,10 +2527,13 @@
           (PreparedBlindEntity. entity-id attrs))))))
 
 (defn- blind-attributes-supported?
+  "Preflight attributes and retain unique/many flags without correcting values."
   [entities check-attr]
-  (reduce (fn [_ entity]
-            (if (reduce-kv check-attr true entity) true (reduced false)))
-          true entities))
+  (reduce (fn [kinds entity]
+            (if-some [kinds (reduce-kv check-attr kinds entity)]
+              kinds
+              (reduced nil)))
+          0 entities))
 
 (declare blind-identity-upsert-av)
 
@@ -2559,24 +2616,96 @@
                            values)))))))
         (read-scalar-entity store eid layout)))))
 
+(defn- local-tx-form-kinds
+  "Shape-only candidates: scalar 1, blind 2, mixed 4, patch 8; tempids use 16."
+  ^long [entity]
+  (cond
+    (map? entity)
+    (let [absent-id? (not (contains? entity :db/id))
+          eid (:db/id entity)
+          tempid? (and (not absent-id?) (tempid? eid))]
+      (cond
+        (or absent-id? tempid?)
+        ;; Mixed preparation validates map contents and IDs on the writer.
+        (bit-or 6 (if tempid? 16 0))
+
+        (and (nil? (meta entity)) (> (count entity) 1)
+             (resolved-positive-ref? eid)) 1
+
+        :else 0))
+
+    (and (sequential? entity) (= 4 (count entity)))
+    (let [op (nth entity 0)]
+      (cond
+        (identical? op :db.fn/patchIdoc) 8
+        (and (identical? op :db/add) (nil? (meta entity)))
+        (if (vector? entity) 5 1)
+        :else 0))
+
+    :else 0))
+
+(defn ^:no-doc classify-local-tx
+  "Choose a local specialization without schema reads, correction or entity
+   resolution. Mixed preparation checks the suffix once a mixture is proven;
+   a general decision needs no further specialization gates."
+  [tx-data]
+  (if (seqable? tx-data)
+    (let [kinds (long
+                  (if (and (sequential? tx-data) (counted? tx-data) (= 1 (count tx-data)))
+                    (local-tx-form-kinds (nth tx-data 0))
+                    (reduce (fn [previous entity]
+                            (let [previous (long previous)
+                                  current (local-tx-form-kinds entity)]
+                              (cond
+                                (= current 8) (if (= previous 15) 8 (reduced 0))
+                                ;; A homogeneous prefix leaves the proof intact.
+                                (= previous current) previous
+                                :else
+                                (let [candidates (bit-and previous current 15)]
+                                  (cond
+                                    (zero? candidates) (reduced 0)
+                                    ;; The mixed planner validates the suffix
+                                    ;; before publishing any resolver state.
+                                    (= candidates 4) (reduced 4)
+                                    :else
+                                    (bit-or candidates
+                                            (bit-and (bit-or previous current) 16)))))))
+                            15 tx-data)))]
+      (case (bit-and kinds 15)
+        (1 5) :scalar
+        (2 6) (if (zero? (bit-and kinds 16)) :blind :blind-tempids)
+        4 :mixed
+        8 :patch-idoc
+        :general))
+    :general))
+
 (defn ^:no-doc prepare-blind-local-tx
   ([^DB db initial-es]
    (prepare-blind-local-tx db initial-es false true))
   ([^DB db initial-es allow-small-unique?]
    (prepare-blind-local-tx db initial-es allow-small-unique? true))
   ([^DB db initial-es allow-small-unique? check-unique-avs?]
+   (prepare-blind-local-tx db initial-es allow-small-unique? check-unique-avs? nil))
+  ([^DB db initial-es allow-small-unique? check-unique-avs? entity-kinds]
+   ;; Classified callers retain the implicit-ID/tempid proof from their one
+   ;; shape pass. Other callers still establish that proof here.
    ;; Reject mixed requests and ineligible IDs before allocating preparation
    ;; state or correcting values that the general or mixed preparer repeats.
    ;; Only an absent :db/id is implicit; an explicit nil needs general validation.
-   (when (reduce (fn [_ entity]
-                   (if (and (map? entity)
-                            (let [e (:db/id entity)]
-                              (if (nil? e)
-                                (not (contains? entity :db/id))
-                                (tempid? e))))
-                     true
-                     (reduced false)))
-                 true initial-es)
+   ;; Zero is a valid proof of implicit IDs; one marks an explicit tempid.
+   (when-let [entity-kinds
+               (if (some? entity-kinds)
+                 entity-kinds
+                 (reduce (fn [kinds entity]
+                         (if (map? entity)
+                           (let [e (:db/id entity)]
+                             (cond
+                               (nil? e) (if (contains? entity :db/id)
+                                          (reduced false) kinds)
+                               (tempid? e) 1
+                               :else (reduced false)))
+                           (reduced false)))
+                       0 initial-es))]
      (let [store             (.-store db)
            store-schema      (schema store)
            store-opts        (opts store)
@@ -2599,9 +2728,9 @@
                                (>= initial-count 32)
                                (>= (long (bounded-count 32 initial-es)) 32))
            attr-infos        (java.util.HashMap.)
-           check-attr        (fn [_ attr value]
+           check-attr        (fn [kinds attr value]
                                (if (identical? attr :db/id)
-                                 true
+                                 kinds
                                  (let [^objects info
                                        (blind-write-attr-info
                                          attr-infos store-schema tuple-source-attrs
@@ -2615,20 +2744,28 @@
                                                       unique-identity-attrs value)
                                                   (every? resolved-positive-ref? value)
                                                   (resolved-positive-ref? value))))
-                                     true
-                                     (reduced false)))))]
-       (when (or incremental?
-                 (blind-attributes-supported? initial-es check-attr))
+                                     (bit-or (long kinds) (long (aget info 1)))
+                                     (reduced nil)))))
+           attribute-kinds   (when-not incremental?
+                               (blind-attributes-supported? initial-es check-attr))]
+       (when (or incremental? (some? attribute-kinds))
          (let [;; Entity preparation receives an Object; box once per batch.
                set-capacity      (Integer/valueOf
                                    (int (max 1 (inc (quot (* 4 (long initial-count))
                                                          3)))))
-               ^FastList unique-avs (FastList.)
-               seen-avs          (when check-unique-avs?
+               ;; Small requests already proved which workspace is needed.
+               ;; Incremental bulk preflight retains its existing shared state.
+               ^FastList unique-avs (when (or incremental?
+                                             (not (zero? (bit-and (long attribute-kinds) 1))))
+                                      (FastList.))
+               seen-avs          (when (and unique-avs check-unique-avs?)
                                    (volatile! nil))
-               seen-tempids      (java.util.HashSet. (int set-capacity))
-               has-many?         (volatile! false)
-               fuse-unique-inserts? (volatile! true)
+               seen-tempids      (when (and (pos? (long entity-kinds)) (not (== initial-count 1)))
+                                   (java.util.HashSet. (int set-capacity)))
+               has-many?         (when (or incremental?
+                                          (not (zero? (bit-and (long attribute-kinds) 2))))
+                                   (volatile! false))
+               fuse-unique-inserts? (when unique-avs (volatile! true))
                ;; Canonical scalar values are inert. Check and prepare those
                ;; together; complete the attribute check before any coercion
                ;; or collection handling that could invoke user code or fail.
@@ -2658,7 +2795,7 @@
                               store-opts unique-identity-attrs unique-avs
                               seen-avs set-capacity has-many?
                               fuse-unique-inserts? entity-attr-infos entity)]
-                     (if (and (.-tempid prepared)
+                     (if (and (.-tempid prepared) seen-tempids
                               (not (.add seen-tempids (.-tempid prepared))))
                        (reduced nil)
                        (if (or (not (.isEmpty ^FastList (.-attrs prepared)))
@@ -2668,10 +2805,10 @@
                      (reduced nil)))
                  (FastList. initial-count)
                  initial-es)
-               has-unique?       (not (.isEmpty unique-avs))
+               has-unique?       (boolean (and unique-avs (not (.isEmpty unique-avs))))
                fuse-unique-inserts? (and has-unique? @fuse-unique-inserts?)
                identity-upsert-av
-               (when (and entities
+               (when (and has-unique? entities
                           (not auto-entity-time?)
                           (= 1 (.size ^FastList entities)))
                  (blind-identity-upsert-av
@@ -2688,7 +2825,7 @@
                                 entities
                                 unique-avs
                                 has-unique?
-                                @has-many?
+                                (boolean (and has-many? @has-many?))
                                 fuse-unique-inserts?
                                 identity-upsert-av
                                 (when identity-upsert-av
@@ -2709,11 +2846,12 @@
    probes share that transaction and no concurrent insert can race the check."
   [^DB db ^PreparedBlindTx prepared]
   (let [^FastList avs (:unique-avs prepared)]
-    (loop [i 0]
-      (or (>= i (.size avs))
-          (let [[a v] (.get avs i)]
-            (and (nil? (txcommon/av-first-e db a v))
-                 (recur (unchecked-inc i))))))))
+    (or (nil? avs)
+        (loop [i 0]
+          (or (>= i (.size avs))
+              (let [[a v] (.get avs i)]
+                (and (nil? (txcommon/av-first-e db a v))
+                     (recur (unchecked-inc i)))))))))
 
 (defn ^:no-doc blind-local-tx-valid?
   [^DB db ^PreparedBlindTx prepared]
@@ -2804,6 +2942,7 @@
   (let [^FastList entities (:entities prepared)]
     (when (and (not (:auto-entity-time? prepared))
                (not (:has-many? prepared))
+               (:has-unique? prepared)
                (= (.size entities) (.size ^FastList (:unique-avs prepared)))
                (blind-local-tx-valid? db prepared))
       (let [seen-avs (java.util.HashSet.)
@@ -2852,8 +2991,8 @@
 (defn ^:no-doc stamp-blind-local-tx
   [^DB db ^PreparedBlindTx prepared tx-meta]
   (let [tx-id              (inc (long (:max-tx db)))
-        tx-time            (System/currentTimeMillis)
         auto-entity-time?  (:auto-entity-time? prepared)
+        tx-time            (when auto-entity-time? (System/currentTimeMillis))
         ^FastList entities  (:entities prepared)
         entity-count       (.size entities)
         [tx-data tempids max-eid]
@@ -3127,7 +3266,7 @@
     (when-not (:auto-entity-time? store-opts)
       (let [^FastList candidates
             (FastList. (int (* 4 (if (instance? java.util.Collection initial-es)
-                                  (.size ^java.util.Collection initial-es) 0))))]
+                                  (long (.size ^java.util.Collection initial-es)) 0))))]
         ;; Retain entity inputs and types. Resolve eager aliases before any
         ;; correction, after proving eligibility and distinct E/A pairs.
         (loop [es      (seq initial-es)
@@ -3141,9 +3280,8 @@
                       seen (or seen
                                (when (or remaining (> (count entity) 2))
                                  (java.util.HashSet.)))]
-                  ;; Compare before narrowing, so oversized integer map IDs
-                  ;; still decline without throwing during the long cast.
-                  (when (and (<= e (:max-eid db))
+                  ;; Request preflight already proved that this ID fits a long.
+                  (when (and (<= (long e) (.-max-eid db))
                              (reduce-kv
                                (fn [_ attr value]
                                  (if (identical? attr :db/id)
@@ -3196,7 +3334,7 @@
       (if (or (and (sequential? entity) (nil? (meta entity)) (= 4 (count entity))
                    (identical? :db/add (nth entity 0)))
               (and (map? entity) (nil? (meta entity)) (> (count entity) 1)
-                   (let [e (:db/id entity)] (and (integer? e) (pos? e)))))
+                   (resolved-positive-ref? (:db/id entity))))
         true
         (reduced false)))
     true initial-es))
@@ -3207,13 +3345,14 @@
   Reference values must already be positive integer IDs. The caller must stamp
   it against the current LMDB write snapshot before committing. Unsupported
   shapes return nil. With :defer-entity-resolution?, lookup references
-  and idents are resolved when stamping, for callers preparing before the writer."
+  and idents are resolved when stamping, for callers preparing before the writer.
+  Internal :shape-checked? callers retain the proof from classify-local-tx."
   ([db initial-es]
    (prepare-scalar-update-tx db initial-es nil))
-  ([db initial-es {:keys [defer-entity-resolution?]}]
+  ([db initial-es {:keys [defer-entity-resolution? shape-checked?]}]
    ;; Reject unsupported request shapes before correcting values or
    ;; resolving entities, including preparation on the collector's caller.
-   (when (scalar-update-request? initial-es)
+   (when (or shape-checked? (scalar-update-request? initial-es))
      (if defer-entity-resolution?
        ;; Collector preparation reads no persisted identities. The owner resolves
        ;; them and consults the pending transaction indexes when stamping.
@@ -3370,7 +3509,10 @@
   ([db tx-data tx-meta]
    (prepare-mixed-add-tx db tx-data tx-meta nil))
   ([db tx-data tx-meta owned-max-eid]
-   (txadd/prepare-mixed-report (->TxReport db db [] {} tx-meta) tx-data owned-max-eid)))
+   (prepare-mixed-add-tx db tx-data tx-meta owned-max-eid false))
+  ([db tx-data tx-meta owned-max-eid shape-checked?]
+   (txadd/prepare-mixed-report (->TxReport db db [] {} tx-meta) tx-data
+                             owned-max-eid shape-checked?)))
 
 (defn ^:no-doc prepare-local-tx-data
   "Resolve local transaction data without committing or constructing the final
@@ -3380,9 +3522,8 @@
    (prepare-local-tx-data initial-report initial-es (System/currentTimeMillis)))
   ([initial-report initial-es tx-time]
    (let [db (:db-before initial-report)
-         ctx (prepare/make-prepare-ctx db)
-         entities (prepare-entities db initial-es tx-time ctx)]
-     (txexec/local-transact-tx-data initial-report entities tx-time ctx))))
+         ctx (prepare/make-prepare-ctx db)]
+     (txexec/prepare-and-transact-tx-data initial-report initial-es tx-time ctx))))
 
 (defn transact-tx-data
   "Resolve transaction data. owned-max-eid may be supplied only for a current

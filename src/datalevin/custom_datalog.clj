@@ -237,9 +237,12 @@
   The comparator belongs to a transaction overlay or a single range operation.
   Immutable type definitions and stable values need resolving/encoding only once;
   new UDF bindings or a replaced native writer invalidate the cached keys.
-  resolver-kv can supply a member-scoped handle without discarding order keys."
+  resolver-kv can supply a member-scoped handle without discarding order keys.
+  compare-built-in supplies ordering for non-custom attributes."
   ([kv schema-fn] (order-comparator kv schema-fn (constantly kv)))
   ([kv schema-fn resolver-kv]
+   (order-comparator kv schema-fn resolver-kv d/compare-with-type))
+  ([kv schema-fn resolver-kv compare-built-in]
    (let [types (HashMap.)]
      (fn [a x y]
        (if (or (nil? x) (nil? y))
@@ -281,15 +284,16 @@
                                   (.put keys v key)
                                   key)))]
                (Arrays/compareUnsigned ^bytes (prefix x) ^bytes (prefix y))))
-           (d/compare-with-type x y)))))))
+           (compare-built-in x y)))))))
 
 (defn value-comparator
   "Order complete values by their native order prefix, then by a stable
   transaction-local ordinal. Equal values share an ordinal; hash collisions
-  and non-Comparable application objects never collapse distinct entries."
+  and non-Comparable application objects never collapse distinct entries.
+  Built-in values use pending-index ordering."
   ([kv schema-fn] (value-comparator kv schema-fn (constantly kv)))
   ([kv schema-fn resolver-kv]
-   (let [order (order-comparator kv schema-fn resolver-kv)
+   (let [order (order-comparator kv schema-fn resolver-kv d/compare-index-values)
          ordinals (HashMap.)
          ordinal (fn [a v]
                    (let [k [a v]]

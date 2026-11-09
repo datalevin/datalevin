@@ -3,6 +3,7 @@ package datalevin.utl;
 import clojure.lang.IRecord;
 import clojure.lang.Murmur3;
 import clojure.lang.PersistentVector;
+import clojure.lang.Sequential;
 import clojure.lang.Util;
 import org.eclipse.collections.api.block.HashingStrategy;
 import org.eclipse.collections.api.iterator.LongIterator;
@@ -79,7 +80,8 @@ public final class QueryKey {
     private static boolean collection(Object value) {
         // User collection classes can define nominal equality, just like
         // records. Only the standard portable Clojure containers are structural.
-        if (value instanceof List<?> || value instanceof Map<?, ?> || value instanceof Set<?>) {
+        if (value instanceof List<?> || value instanceof Map<?, ?> || value instanceof Set<?>
+                || value instanceof Sequential) {
             Class<?> type = value.getClass();
             return type == PersistentVector.class || STRUCTURAL_COLLECTION.get(type);
         }
@@ -94,7 +96,7 @@ public final class QueryKey {
             for (Map.Entry<?, ?> entry : map.entrySet()) {
                 if (containsBytes(entry.getKey()) || containsBytes(entry.getValue())) return true;
             }
-        } else if (value instanceof List<?> || value instanceof Set<?>) {
+        } else if (value instanceof List<?> || value instanceof Set<?> || value instanceof Sequential) {
             for (Object child : (Iterable<?>) value) {
                 if (containsBytes(child)) return true;
             }
@@ -128,9 +130,9 @@ public final class QueryKey {
             for (int i = 0; i < size; i++) hash = 31 * hash + hash(vector.nth(i));
             return hash;
         }
-        if (value instanceof List<?> list) {
+        if (value instanceof List<?> || value instanceof Sequential) {
             int hash = 1;
-            for (Object child : list) hash = 31 * hash + hash(child);
+            for (Object child : (Iterable<?>) value) hash = 31 * hash + hash(child);
             return hash;
         }
         if (value instanceof Map<?, ?> map) {
@@ -201,6 +203,16 @@ public final class QueryKey {
             }
             return true;
         }
+        // PersistentQueue is sequential but is not a java.util.List. Its
+        // equality and hash must agree with equivalent vectors and lists.
+        if (left instanceof Sequential && right instanceof Sequential) {
+            Iterator<?> ai = ((Iterable<?>) left).iterator();
+            Iterator<?> bi = ((Iterable<?>) right).iterator();
+            while (ai.hasNext() && bi.hasNext()) {
+                if (!equal(ai.next(), bi.next(), equiv)) return false;
+            }
+            return !ai.hasNext() && !bi.hasNext();
+        }
         // Preserve the existing semantics of opaque values and collections
         // without bytes, including records with user-defined equality.
         if (left instanceof IRecord || right instanceof IRecord
@@ -217,15 +229,20 @@ public final class QueryKey {
         return false;
     }
 
-    private static int equivHash(Object value) {
+    /** Hash Clojure-equivalent values, including nested byte-array contents. */
+    public static int equivHash(Object value) {
         if (!(value instanceof byte[]) && !collection(value)) return Util.hasheq(value);
         check();
         if (value instanceof byte[] bytes) return Arrays.hashCode(bytes);
         if (value instanceof IRecord) return Util.hasheq(value);
-        if (value instanceof List<?> list) {
+        if (value instanceof List<?> || value instanceof Sequential) {
             int hash = 1;
-            for (Object child : list) hash = 31 * hash + equivHash(child);
-            return Murmur3.mixCollHash(hash, list.size());
+            int size = 0;
+            for (Object child : (Iterable<?>) value) {
+                hash = 31 * hash + equivHash(child);
+                size++;
+            }
+            return Murmur3.mixCollHash(hash, size);
         }
         if (value instanceof Map<?, ?> map) {
             int hash = 0;

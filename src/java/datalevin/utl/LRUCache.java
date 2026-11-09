@@ -1,9 +1,101 @@
 package datalevin.utl;
 
+import clojure.lang.IRecord;
+import clojure.lang.PersistentVector;
+import clojure.lang.Sequential;
+import clojure.lang.Util;
+import org.eclipse.collections.api.block.HashingStrategy;
+import org.eclipse.collections.impl.map.strategy.mutable.UnifiedMapWithHashingStrategy;
+import org.eclipse.collections.impl.set.strategy.mutable.UnifiedSetWithHashingStrategy;
+
 import java.util.*;
 import java.util.function.Function;
 
 public class LRUCache {
+    // Dependency tokens use the same numeric equivalence as invalidation.
+    // Actual result keys retain Java equality and their storage identity.
+    private static final HashingStrategy<Object> DEPENDENCY_STRATEGY = new HashingStrategy<>() {
+        private static final long serialVersionUID = 1L;
+        @Override public int computeHashCode(Object token) { return dependencyHash(token); }
+        @Override public boolean equals(Object left, Object right) { return Util.equiv(left, right); }
+    };
+
+    private static int dependencyHash(Object value) {
+        if (value instanceof Float || value instanceof Double) {
+            double number = ((Number) value).doubleValue();
+            return Double.hashCode(number == 0.0 ? 0.0 : number);
+        }
+        // Tokens and exact tuple values are lists. Hash their numeric leaves
+        // recursively: Clojure's Float and Double hashes can differ despite =.
+        if (value instanceof List<?> parts) {
+            int hash = 1;
+            for (Object part : parts) hash = 31 * hash + dependencyHash(part);
+            return hash;
+        }
+        return Util.hasheq(value);
+    }
+
+    private static int touchedValueHash(Object value) {
+        if (value instanceof Float || value instanceof Double) return dependencyHash(value);
+        // Most tuple values are vectors. Avoid sequence allocation while
+        // hashing their numeric leaves with consistent Float/Double hashes.
+        if (value instanceof PersistentVector parts && value.getClass() == PersistentVector.class) {
+            int hash = 1;
+            for (int i = 0; i < parts.count(); i++) hash = 31 * hash + touchedValueHash(parts.nth(i));
+            return hash;
+        }
+        if (!structuralCollection(value)) return Util.hasheq(value);
+        if (value instanceof Iterable<?> parts
+                && (value instanceof List<?> || value instanceof Sequential)) {
+            int hash = 1;
+            for (Object part : parts) hash = 31 * hash + touchedValueHash(part);
+            return hash;
+        }
+        if (value instanceof Map<?, ?> parts && !(value instanceof IRecord)) {
+            int hash = 0;
+            for (Map.Entry<?, ?> part : parts.entrySet()) {
+                hash += touchedValueHash(part.getKey()) ^ touchedValueHash(part.getValue());
+            }
+            return hash;
+        }
+        if (value instanceof Set<?> parts) {
+            int hash = 0;
+            for (Object part : parts) hash += touchedValueHash(part);
+            return hash;
+        }
+        return Util.hasheq(value);
+    }
+
+    private static boolean structuralCollection(Object value) {
+        if (!(value instanceof List<?> || value instanceof Map<?, ?> || value instanceof Set<?>
+                || value instanceof Sequential && value instanceof Iterable<?>)
+                || value instanceof IRecord) return false;
+        // Opaque user collections own their equality and hash implementations.
+        String name = value.getClass().getName();
+        return name.startsWith("clojure.lang.") || name.startsWith("java.util.");
+    }
+
+    private static <V> Map<Object, V> dependencyMap() {
+        return new UnifiedMapWithHashingStrategy<>(DEPENDENCY_STRATEGY);
+    }
+
+    private static final class TouchedValueStrategy implements HashingStrategy<Object> {
+        private static final long serialVersionUID = 1L;
+        @Override public int computeHashCode(Object value) { return touchedValueHash(value); }
+        @Override public boolean equals(Object stored, Object lookup) {
+            // Clojure membership compares the lookup first. Date/Timestamp
+            // equality makes that ordering observable despite equal hashes.
+            return Util.equiv(lookup, stored);
+        }
+    }
+
+    private static final HashingStrategy<Object> TOUCHED_VALUE_STRATEGY = new TouchedValueStrategy();
+
+    /** Transaction-local membership with the same equality as dependency buckets. */
+    public static Set<Object> dependencySet() {
+        return new UnifiedSetWithHashingStrategy<>(TOUCHED_VALUE_STRATEGY);
+    }
+
     final int capacity;
     Map<Object, Object> map;
 
@@ -36,8 +128,8 @@ public class LRUCache {
         this.target = target;
         this.dependencies = dependencies;
         keyDependencies = dependencies == null ? null : new HashMap<>();
-        dependencyKeys = dependencies == null ? null : new HashMap<>();
-        dependencyGroups = dependencies == null ? null : new HashMap<>();
+        dependencyKeys = dependencies == null ? null : dependencyMap();
+        dependencyGroups = dependencies == null ? null : dependencyMap();
         disabled = false;
         map = Collections.synchronizedMap(new LinkedHashMap<Object, Object>(capacity,
                                                                             0.75f,
@@ -80,7 +172,7 @@ public class LRUCache {
         if (!(token instanceof List<?>)) return;
         List<?> parts = (List<?>) token;
         if (parts.size() < 3) return;
-        dependencyGroups.computeIfAbsent(parts.get(0), ignored -> new HashMap<>())
+        dependencyGroups.computeIfAbsent(parts.get(0), ignored -> dependencyMap())
             .merge(parts.get(1), 1, Integer::sum);
     }
 

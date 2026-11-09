@@ -282,9 +282,10 @@
                                                                        ;; caller effects. Give them their own native
                                                                        ;; outcome without replaying the body or
                                                                        ;; cancelling unrelated queued requests.
-                                                                       ;; Internal prepared Datalog requests retain
-                                                                       ;; their existing collection policy.
-                                                                       :isolated? (or (not (get-in opts [:context :datalog-fast?]))
+                                                                       ;; Both local and server Datalog preparation
+                                                                       ;; mark internal requests, independently of
+                                                                       ;; how pending scalar datoms are drained.
+                                                                       :isolated? (or (not (get-in opts [:context :datalog-prepare?]))
                                                                                       (get-in opts [:context :isolated?]))
                                                                        ::rmw/explicit-abort? aborted?)))
                                (catch Throwable t

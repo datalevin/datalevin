@@ -104,7 +104,7 @@
    [datalevin.datom Datom]
    [datalevin.interface IStore]
    [datalevin.async IAsyncWork]
-   [datalevin.bits Retrieved Indexable]))
+   [datalevin.bits Retrieved Indexable EncodedGiant]))
 
 (declare with-open-opts close-store-resources! release-shared-local-store!
          enqueue-secondary-index-work! enqueue-secondary-index-work-if-needed!
@@ -131,7 +131,7 @@
   ;; Their identity cannot determine whether a stored datom matches a retract.
   (if (u/array? expected)
     (Objects/deepEquals expected actual)
-    (= expected actual)))
+    (d/value-equal? expected actual)))
 
 ;; Retain interned helpers used by sibling tests.
 (def ^:private existing-store? options/existing-store?)
@@ -321,8 +321,9 @@
   ([lmdb retain-cache-datoms?]
    {:pre [(lmdb/writing? lmdb)]}
    (WriteGroup. lmdb (Thread/currentThread) (long-array [-1 0 0]) (FastList.)
-                ;; Store, detached region, independence proof, operation kinds.
-                (object-array 2) (FastList.) (object-array 4) (LongObjectHashMap. 8)
+                ;; Store, detached region, independence proof, operation kinds,
+                ;; staged attribute metadata, and its immutable schema snapshot.
+                (object-array 2) (FastList.) (object-array 6) (LongObjectHashMap. 8)
                 (boolean retain-cache-datoms?))))
 
 (defn ^:no-doc write-group-metadata
@@ -2391,31 +2392,63 @@
       (and (keyword? value) (<= (count (str value)) 100))))
 
 (defn- buffered-tuple-value?
-  [value props]
-  ;; Admit immutable components only. Bound both each variable component and
-  ;; the complete tuple, including headers, separators and the size trailer,
-  ;; without encoding it twice or deferring giant/native lookups.
-  (and (identical? :db.type/tuple (:db/valueType props))
-       (vector? value) (<= 1 (count value) 8)
-       (loop [idx 0 size 3]
-         (if (< idx (count value))
-           (let [v (nth value idx)
-                 bytes (cond
-                         (nil? v) 0
-                         (string? v) (when (<= (count v) 48) (* 4 (count v)))
-                         (keyword? v) (let [n (count (str v))]
-                                        (when (<= n 48) (* 4 n)))
-                         (buffered-datom-value? v) 16)]
-             (and bytes
-                  (<= (+ size 3 (long bytes)) c/+val-bytes-wo-hdr+)
-                  (recur (inc idx) (+ size 3 (long bytes)))))
-           true))
-       (let [types (idx/value-type props)]
-         (and (vector? types)
-              (every? #{:db.type/long :db.type/ref :db.type/double :db.type/float
-                        :db.type/boolean :db.type/uuid :db.type/string :db.type/keyword}
-                      types)
-              (b/valid-data? value types)))))
+  ([value props] (buffered-tuple-value? value props (idx/value-type props)))
+  ([value props types]
+   ;; Admit immutable components only. Bound both each variable component and
+   ;; the complete tuple, including headers, separators and the size trailer,
+   ;; without encoding it twice or deferring giant/native lookups.
+   (and (identical? :db.type/tuple (:db/valueType props))
+        (vector? value) (<= 1 (count value) 8)
+        (loop [idx 0 size 3]
+          (if (< idx (count value))
+            (let [v (nth value idx)
+                  bytes (cond
+                          (nil? v) 0
+                          (string? v) (when (<= (count v) 48) (* 4 (count v)))
+                          (keyword? v) (let [n (count (str v))]
+                                         (when (<= n 48) (* 4 n)))
+                          (buffered-datom-value? v) 16)]
+              (and bytes
+                   (<= (+ size 3 (long bytes)) c/+val-bytes-wo-hdr+)
+                   (recur (inc idx) (+ size 3 (long bytes)))))
+            true))
+        (and (vector? types)
+             (every? #{:db.type/long :db.type/ref :db.type/double :db.type/float
+                       :db.type/boolean :db.type/uuid :db.type/string :db.type/keyword}
+                     types)
+             (b/valid-data? value types)))))
+
+(defn- group-storage-attr-info
+  [store-schema attr]
+  (let [props (store-schema attr)
+        info (object-array 4)]
+    ;; Keep props for eligibility checks; encoding needs only the first slots.
+    (aset info 0 (:db/aid props))
+    (aset info 1 (idx/value-type props))
+    (aset info 2 (:db/noindex props))
+    (aset info 3 props)
+    info))
+
+(defn- group-storage-attr-info!
+  [^HashMap attrs store-schema attr]
+  (or (.get attrs attr)
+      (let [info (group-storage-attr-info store-schema attr)]
+        (.put attrs attr info)
+        info)))
+
+(defn- group-storage-attrs!
+  "Resolve one table per group/schema epoch. Frozen regions detach their table."
+  ^HashMap [^objects context store-schema]
+  (let [^HashMap attrs (aget context 4)]
+    (if (and attrs (identical? store-schema (aget context 5)))
+      attrs
+      (let [updated (HashMap.)]
+        (when attrs
+          (doseq [attr (.keySet attrs)]
+            (.put updated attr (group-storage-attr-info store-schema attr))))
+        (aset context 4 updated)
+        (aset context 5 store-schema)
+        updated))))
 
 (defn ^:no-doc stage-group-datoms!
   "Retain ordinary resolved datoms for one storage preparation per group.
@@ -2434,18 +2467,20 @@
                   (not *enforce-blind-unique-inserts?*)
                   (not c/*ordered-datom-writes?*)
                   (not (cd/custom-schema? store-schema)))
-         (let [start (.size pending)
+         (let [^HashMap attrs (group-storage-attrs! context store-schema)
+               start (.size pending)
                accepted-kinds
                (try
                  (reduce
                    (fn [kinds ^Datom datom]
-                     (let [props (store-schema (.-a datom))
-                           vt (:db/valueType props)]
-                       (if (and (:db/aid props) (not (:db/fulltext props))
+                     (let [^objects info (group-storage-attr-info! attrs store-schema (.-a datom))
+                           props (aget info 3)
+                           vt (aget info 1)]
+                       (if (and (aget info 0) (not (:db/fulltext props))
                                 (not (:db/embedding props))
                                 (not (#{:db.type/vec :db.type/idoc} vt))
                                 (or (buffered-datom-value? (.-v datom))
-                                    (buffered-tuple-value? (.-v datom) props)))
+                                    (buffered-tuple-value? (.-v datom) props (aget info 1))))
                          (do
                            (.add pending datom)
                            ;; Once both kinds occur, further flags are irrelevant.
@@ -2517,6 +2552,26 @@
                   (recur (+ i 2) e seen)))))
           true)))))
 
+(defn- distinct-storage-eas?
+  "Prove that no E/A repeats. Fingerprint collisions conservatively decline."
+  [^FastList datoms]
+  (let [^Datom first-datom (.get datoms 0)
+        ^Datom second-datom (.get datoms 1)]
+    ;; Cycles and chains usually repeat their E/A immediately. Decline without
+    ;; allocating the gate's set, before inspecting any values.
+    (when-not (and (== (.-e first-datom) (.-e second-datom))
+                   (= (.-a first-datom) (.-a second-datom)))
+      (let [seen (LongHashSet.)
+            n (.size datoms)]
+        (loop [i (int 0)]
+          (if (< i n)
+            (let [^Datom datom (.get datoms i)
+                  fingerprint (bit-xor (.-e datom)
+                                       (bit-shift-left (long (hash (.-a datom))) 32))]
+              (when (.add seen fingerprint)
+                (recur (unchecked-inc-int i))))
+            true))))))
+
 (defn- compact-group-storage-datoms
   "Compact resolved, unconditional transitions within one native-read segment."
   [^FastList datoms ^long kinds]
@@ -2524,7 +2579,8 @@
           ;; Inserts and deletes alone cannot cancel. Keep their ordinary path
           ;; free of per-fact keys and a compaction map.
           (not (== kinds 3))
-          (scalar-storage-updates? datoms))
+          (scalar-storage-updates? datoms)
+          (distinct-storage-eas? datoms))
     datoms
     (let [changes (LinkedHashMap.)
           compacted (FastList.)]
@@ -2559,21 +2615,34 @@
 (defn ^:no-doc ^:redef encode-group-storage-datoms
   "Encode ordinary frozen datoms using immutable schema metadata only.
    The caller has checked grouping eligibility; no native transaction is used."
-  [store-schema datoms]
-  (let [txs (FastList. (count datoms))
-        unindexed (FastList.)
-        ^ByteBuffer buffer (bf/get-array-buffer)]
-    (try
-      (doseq [^Datom datom datoms]
-        (let [props (store-schema (.-a datom))
-              indexable (b/indexable nil (:db/aid props) (.-v datom)
-                                     (idx/value-type props) c/g0)
-              row (lmdb/datom-kv-tx (.-e datom) (b/indexable-bytes indexable buffer)
-                                    (d/datom-added datom) false (:db/noindex props))]
-          (.add ^FastList (if (:db/noindex props) unindexed txs) row)))
-      (.addAll txs ^FastList unindexed)
-      txs
-      (finally (bf/return-array-buffer buffer)))))
+  ([store-schema datoms] (encode-group-storage-datoms store-schema datoms nil))
+  ([store-schema datoms ^HashMap attrs]
+   (let [n (count datoms)
+         txs (FastList. n)
+         unindexed (FastList.)
+         utf8-context (when (>= n 32) (object-array 1))
+         ^ByteBuffer buffer (bf/get-array-buffer)]
+     (try
+       (doseq [^Datom datom datoms]
+         (let [^objects info (when attrs (.get attrs (.-a datom)))
+               props (when-not info (store-schema (.-a datom)))
+               aid (if info (aget info 0) (:db/aid props))
+               vt (if info (aget info 1) (idx/value-type props))
+               noindex? (if info (aget info 2) (:db/noindex props))
+               encoded (b/encode-avg aid (.-v datom) vt buffer utf8-context)
+               avg (if (bytes? encoded)
+                     encoded
+                     (b/indexable-bytes
+                       (if (instance? EncodedGiant encoded)
+                         (b/indexable nil aid (.-v datom) vt c/g0
+                                      (.-bytes ^EncodedGiant encoded))
+                         (b/indexable nil aid (.-v datom) vt c/g0)) buffer))
+               row (lmdb/datom-kv-tx (.-e datom) avg
+                                     (d/datom-added datom) false noindex?)]
+           (.add ^FastList (if noindex? unindexed txs) row)))
+       (.addAll txs ^FastList unindexed)
+       txs
+       (finally (bf/return-array-buffer buffer))))))
 
 (defn- group-storage-store
   [^objects context lmdb]
@@ -2592,10 +2661,12 @@
          ^FastList datoms (or (aget context 1) (.-storage-datoms group))]
      (when-not (.isEmpty datoms)
        (let [store (group-storage-store context lmdb)
+             store-schema (schema store)
+             attrs (group-storage-attrs! context store-schema)
              rows (encode-group-storage-datoms
-                    (schema store) (if (aget context 2) datoms
+                    store-schema (if (aget context 2) datoms
                                        (compact-group-storage-datoms
-                                         datoms (long (aget context 3)))))]
+                                         datoms (long (aget context 3)))) attrs)]
          (.clear datoms)
          (aset context 0 nil)
          (aset context 2 nil)
@@ -2612,6 +2683,7 @@
      (when-not (.isEmpty datoms)
        (let [store (group-storage-store context lmdb)
              store-schema (schema store)
+             attrs (group-storage-attrs! context store-schema)
              compacted (if (aget context 2) datoms
                            (compact-group-storage-datoms
                              datoms (long (aget context 3))))
@@ -2623,25 +2695,32 @@
          (aset context 0 nil)
          (aset context 2 nil)
          (aset context 3 nil)
+         (aset context 4 nil)
+         (aset context 5 nil)
          {:row-count (.size ^FastList compacted) :native-tail-bytes bytes
-          :encode (fn [] (encode-group-storage-datoms store-schema compacted))})))))
+          :encode (fn [] (encode-group-storage-datoms store-schema compacted attrs))})))))
 
 (defn ^:no-doc commit-empty-tx!
   "Consume a Datalog transaction ID without preparing any datom/index work.
   Standalone writes persist the metadata pair; groups defer it to their commit."
   [^Store store]
   (locking (.-write-txn store)
-    (let [tx-id (long (.advance-max-tx store))
-          modified-ms (max (long (observed-state-sync-ms store))
-                           (System/currentTimeMillis))]
-      (if-let [^WriteGroup group (current-write-group (.-lmdb store))]
-        (let [^longs metadata (.-metadata group)]
-          (aset metadata 0 tx-id)
-          (aset metadata 1 modified-ms))
-        (transact-kv (.-lmdb store)
-                     [(lmdb/kv-tx :put c/meta :max-tx tx-id :attr :long)
-                      (lmdb/kv-tx :put c/meta :last-modified modified-ms :attr :long)]))
-      modified-ms)))
+    (let [^WriteGroup group (current-write-group (.-lmdb store))]
+      ;; Retain the ordinary planner's schema-version refresh without draining
+      ;; an owned group's pending storage on an empty request.
+      (when (and (not group) (seq (:db/noindex (rschema store))))
+        (ensure-current! store))
+      (let [tx-id (long (.advance-max-tx store))
+            modified-ms (max (long (observed-state-sync-ms store))
+                             (System/currentTimeMillis))]
+        (if group
+          (let [^longs metadata (.-metadata group)]
+            (aset metadata 0 tx-id)
+            (aset metadata 1 modified-ms))
+          (transact-kv (.-lmdb store)
+                       [(lmdb/kv-tx :put c/meta :max-tx tx-id :attr :long)
+                        (lmdb/kv-tx :put c/meta :last-modified modified-ms :attr :long)]))
+        modified-ms))))
 
 (defn load-datoms-with-plan!
   ([^Store store datoms]
@@ -2751,7 +2830,7 @@
   "Append a datom's writes and return the next giant ID."
   [^Store store ^Datom d ^FastList txs work
    ^HashMap giants ^objects ai embedding-plan embedding-work?
-   ^ByteBuffer avg-bf max-gt]
+   ^ByteBuffer avg-bf max-gt utf8-context]
   (let [attr       (.-a d)
         e          (.-e d)
         v          (.-v d)
@@ -2761,9 +2840,14 @@
         embedding-domains (when embedding-work? (aget ai 3))
         fulltext-domains (when embedding-work? (aget ai 4))
         noindex?   (aget ai 5)
-        vb         (b/value-bytes v vt)
-        i          ^Indexable (b/indexable nil aid v vt (or max-gt c/g0) vb)
-        giant?     (b/giant? i)
+        encoded    (b/encode-avg aid v vt avg-bf utf8-context)
+        avg        (when (bytes? encoded) encoded)
+        vb         (if (instance? EncodedGiant encoded)
+                     (.-bytes ^EncodedGiant encoded)
+                     (when-not avg (b/value-bytes v vt)))
+        ^Indexable i          (when-not avg
+                               (b/indexable nil aid v vt (or max-gt c/g0) vb))
+        giant?     (and i (b/giant? i))
         ;; A nil cursor means this ordinary direct plan has not allocated a
         ;; giant yet. The caller still owns the shared writer lock: refresh
         ;; before consuming an ID, without treating inline writes as a refresh.
@@ -2773,7 +2857,7 @@
                      max-gt)
         ;; Reuse the encoded prefix when the refreshed ID differs from the
         ;; probe. In particular, do not serialize a user value a second time.
-        i          ^Indexable (if (and refresh? (not= (.-g i) (long max-gt)))
+        ^Indexable i          (if (and refresh? (not= (.-g i) (long max-gt)))
                                 (Indexable. nil aid v (.-f i) (.-b i) max-gt)
                                 i)]
     ;; Reports can retain repeated adds after a retraction. Reuse their
@@ -2783,7 +2867,7 @@
       (do
         (.add txs (lmdb/datom-kv-tx
                     e
-                    (b/indexable-bytes i avg-bf)
+                    (or avg (b/indexable-bytes i avg-bf))
                     true
                     (boolean
                       (and *enforce-blind-unique-inserts?*
@@ -2844,7 +2928,7 @@
 
 (defn- delete-datom
   [^Store store ^Datom d ^FastList txs work
-   ^HashMap giants ^objects ai embedding-work? ^ByteBuffer avg-bf]
+   ^HashMap giants ^objects ai embedding-work? ^ByteBuffer avg-bf utf8-context]
   (let [e          (.-e d)
         attr       (.-a d)
         v          (.-v d)
@@ -2865,8 +2949,13 @@
                                 (i/in-list? (.-lmdb store) c/eav e
                                             candidate-key :id :raw))
                        candidate-key)
-        ^Indexable i (when-not retained-key (b/indexable nil aid v vt c/g0))
-        giant?     (or retained-key (b/giant? i))
+        encoded (when-not retained-key (b/encode-avg aid v vt avg-bf utf8-context))
+        inline-avg (when (bytes? encoded) encoded)
+        ^Indexable i (when-not (or retained-key inline-avg)
+                       (if (instance? EncodedGiant encoded)
+                         (b/indexable nil aid v vt c/g0 (.-bytes ^EncodedGiant encoded))
+                         (b/indexable nil aid v vt c/g0)))
+        giant?     (or retained-key (and i (b/giant? i)))
         d-eav      (or plan-key
                        (when (and giant? (not (.isEmpty giants)))
                          (giant-datom-key e attr v)))
@@ -2919,7 +3008,7 @@
       (let [domain (or (props :db/domain) (u/keyword->string attr))]
         (collect-idoc store work domain
                       (if gt [:r [e aid gt v]] [:d [e aid v]]))))
-    (let [avg (or retained-key
+    (let [avg (or retained-key inline-avg
                   (b/indexable-bytes
                     (if gt (Indexable. nil aid v (.-f i) (.-b i) gt) i) avg-bf))]
       (.add txs (lmdb/datom-kv-tx e avg
@@ -2987,11 +3076,15 @@
          native-write (when (cd/custom-schema? store-schema)
                         (lmdb/write-txn (.-lmdb store)))
          descriptor-txn (when native-write (volatile! @native-write))
-         txs    (FastList. (+ 2 (count datoms) (count extra-kv-txs)))
+         n (count datoms)
+         txs    (FastList. (+ 2 n (count extra-kv-txs)))
          unindexed-txs (when (seq (:db/noindex (rschema store))) (FastList.))
          ;; Nil slots mean no work; each list is allocated on its first item.
          work   (object-array 8)
          giants (HashMap.)
+         ;; Bulk rows amortize a JDK encoder and its bounded character scratch.
+         ;; The encoder itself is allocated only for a short typed text value.
+         utf8-context (when (>= n 32) (object-array 1))
          avg-bf     (bf/get-array-buffer)]
      (try
        ;; Carry the next ID through the plan; only new giant rows advance it.
@@ -3023,9 +3116,9 @@
                (if added?
                  (insert-datom store datom datom-txs work giants ai embedding-plan
                                embedding-work?
-                               avg-bf max-gt)
+                               avg-bf max-gt utf8-context)
                  (do (delete-datom store datom datom-txs work giants ai
-                                   embedding-work? avg-bf)
+                                   embedding-work? avg-bf utf8-context)
                      max-gt)))))
          ;; Explicit writers have already refreshed on entry. Custom plans
          ;; retain their eager refresh before invoking serializer callbacks.

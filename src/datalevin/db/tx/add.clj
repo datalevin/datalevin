@@ -168,6 +168,11 @@
           (recur (next es) (or maps? (map? entity))
                  (or vectors? (vector? entity))))))))
 
+(defn- identity-map?
+  [identity-attrs entity]
+  (and (map? entity)
+       (some #(contains? entity %) identity-attrs)))
+
 (defn- preflight-checker
   [schema sources ^HashMap infos ^HashSet updates]
   (let [insert? (fn [_ a _value]
@@ -294,18 +299,26 @@
   ([report entities]
    (prepare-mixed-report report entities nil))
   ([report entities owned-max-eid]
+   (prepare-mixed-report report entities owned-max-eid false))
+  ([report entities owned-max-eid shape-checked?]
    ;; Short requests keep their inexpensive mixed-shape check. Large requests
    ;; recognize the mixture while preflighting every form and attribute.
    (let [preflight? (>= (long (bounded-count mixed-preflight-min-count entities))
                         mixed-preflight-min-count)]
-     (when (or preflight? (mixed-request? entities))
+     (when (or preflight? shape-checked? (mixed-request? entities))
        (let [db (:db-after report) store (:store db)
              schema (i/schema store) options (i/opts store)]
          (when-not (:auto-entity-time? options)
-           (let [sources (:db/attrTuples (i/rschema store))
+           (let [rschema (i/rschema store)
+                 sources (:db/attrTuples rschema)
                  infos (HashMap.)
                  updates (if preflight?
-                           (preflight-additions entities schema sources infos)
+                           (let [head (seq entities)]
+                             ;; A leading identity map already rules out this plan.
+                             ;; Reuse its sequence without walking the batch again.
+                             (when-not (identity-map? (:db.unique/identity rschema)
+                                                       (first head))
+                               (preflight-additions head schema sources infos)))
                            (HashSet.))]
              (when updates
                (let [before (max (long (:max-eid db))

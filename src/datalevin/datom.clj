@@ -14,7 +14,7 @@
    [datalevin.constants :refer [tx0]]
    [datalevin.util :refer [array? combine-hashes combine-cmp defcomp]])
   (:import
-   [datalevin.utl BitOps]
+   [datalevin.utl BitOps QueryKey]
    [java.util Arrays]
    [java.io DataInput DataOutput]))
 
@@ -107,17 +107,16 @@
 (defn datom? [x] (instance? Datom x))
 
 (defn value-equal?
-  "Compare byte arrays by content and other datom values with Clojure equality."
+  "Compare byte arrays by content, including in ordinary collections.
+   Other datom values retain Clojure equality."
   [expected actual]
-  (if (bytes? expected)
-    (and (bytes? actual) (Arrays/equals ^bytes expected ^bytes actual))
-    (= expected actual)))
+  (QueryKey/equiv expected actual))
 
 (defn- hash-datom [^Datom d]
   (let [v (.-v d)]
     (-> (hash (.-e d))
         (combine-hashes (hash (.-a d)))
-        (combine-hashes (if (bytes? v) (Arrays/hashCode ^bytes v) (hash v))))))
+        (combine-hashes (QueryKey/equivHash v)))))
 
 (defn- equiv-datom [^Datom d ^Datom o]
   (and (== (.-e d) (.-e o))
@@ -201,33 +200,143 @@
         (if (nil? o2) 0
             (cmp-fn o1 o2)))))
 
-(defn compare-with-type [a b]
-  (try
-    (if (and (array? a) (identical? (class a) (class b)))
-      ;; Pending transaction indexes must distinguish vector contents even
-      ;; when every value has the same array class and serialized prefix.
-      (case (.getName (class a))
-        "[B" (BitOps/compareBytes a b)
-        "[S" (Arrays/compare ^shorts a ^shorts b)
-        "[I" (Arrays/compare ^ints a ^ints b)
-        "[J" (Arrays/compare ^longs a ^longs b)
-        "[F" (Arrays/compare ^floats a ^floats b)
-        "[D" (Arrays/compare ^doubles a ^doubles b)
-        "[C" (Arrays/compare ^chars a ^chars b)
-        "[Z" (Arrays/compare ^booleans a ^booleans b)
-        (compare (vec a) (vec b)))
-      (compare a b))
-    (catch ClassCastException e
-      (cond
-        ;; using `compare` on colls throws when items at the same index of
-        ;; the coll are not of the same type, so we use `=`. since `a` and
-        ;; `b` are of identical type, use hash for ordering when not equal
-        (coll? a)  (if (= a b) 0 (Long/compare (hash a) (hash b)))
-        ;; for different types, order by type name for consistency
-        :else      (compare (str (type a)) (str (type b)))))))
+(declare compare-collision-values)
+
+(defn- compare-collision-seqs
+  [xs ys]
+  (let [n (Long/compare (count xs) (count ys))]
+    (if (zero? n)
+      (if (and (indexed? xs) (indexed? ys))
+        (let [size (count xs)]
+          (loop [i 0]
+            (if (< i size)
+              (let [n (long (compare-collision-values (nth xs i) (nth ys i)))]
+                (if (zero? n) (recur (inc i)) n))
+              0)))
+        (loop [xs (seq xs) ys (seq ys)]
+          (if xs
+            (let [n (long (compare-collision-values (first xs) (first ys)))]
+              (if (zero? n) (recur (next xs) (next ys)) n))
+            0)))
+      n)))
+
+(defn- collision-kind
+  [x]
+  (cond
+    (record? x) (class x)
+    (map? x) :map
+    (set? x) :set
+    (sequential? x) :sequential
+    (number? x) :number
+    (inst? x) :instant
+    :else (class x)))
+
+(defn- numeric-kind
+  [x]
+  (cond (integer? x) :integer
+        (ratio? x) :ratio
+        (decimal? x) :decimal
+        (float? x) :floating
+        :else (class x)))
+
+(defn- compare-collision-values
+  "Order collection values structurally, independent of iteration order.
+   Equivalent collection implementations and numeric classes share a kind."
+  [a b]
+  (cond
+    (identical? a b)
+    0
+
+    (and (bytes? a) (bytes? b))
+    (BitOps/compareBytes a b)
+
+    (and (sequential? a) (sequential? b))
+    (compare-collision-seqs a b)
+
+    (= a b)
+    0
+
+    :else
+    (let [ak (collision-kind a)
+          bk (collision-kind b)
+          kind-order (long (if (identical? ak bk) 0 (compare (str ak) (str bk))))
+          n (long
+              (if-not (zero? kind-order)
+                kind-order
+                (cond
+                  (map? a)
+                  ;; Content-equal array keys can occur more than once in a
+                  ;; map. Order complete entries to break those key ties.
+                  (compare-collision-seqs (sort compare-collision-values a)
+                                          (sort compare-collision-values b))
+
+                  (set? a)
+                  (compare-collision-seqs (sort compare-collision-values a)
+                                          (sort compare-collision-values b))
+
+                  :else
+                  (let [n (long (try (compare a b) (catch ClassCastException _ 0)))
+                        n (long (if (and (zero? n) (number? a))
+                                  (compare (str (numeric-kind a))
+                                           (str (numeric-kind b))) n))]
+                    (if (zero? n) (Long/compare (hash a) (hash b)) n)))))]
+      ;; Structural equality can now hold for collections whose array leaves
+      ;; differ by identity. Only ambiguous opaque leaves must be rejected.
+      (if (or (not (zero? n)) (map? a) (set? a))
+        n
+        ;; An opaque value needs its own ordering contract. Reject an
+        ;; ambiguous comparison rather than silently dropping a fact.
+        (throw (ex-info "Cannot order unequal values with colliding hashes"
+                        {:error :datom/ambiguous-order :left a :right b}))))))
+
+(defn compare-with-type
+  ([a b] (compare-with-type a b false))
+  ([a b order-opaque?]
+   (try
+     (cond
+       ;; Comparable vectors and non-Comparable sequences must use the same
+       ;; ordering, including when they occur inside another collection.
+       (and (coll? a) (coll? b))
+       (compare-collision-values a b)
+
+       (and (array? a) (identical? (class a) (class b)))
+       ;; Pending transaction indexes must distinguish vector contents even
+       ;; when every value has the same array class and serialized prefix.
+       (case (.getName (class a))
+         "[B" (BitOps/compareBytes a b)
+         "[S" (Arrays/compare ^shorts a ^shorts b)
+         "[I" (Arrays/compare ^ints a ^ints b)
+         "[J" (Arrays/compare ^longs a ^longs b)
+         "[F" (Arrays/compare ^floats a ^floats b)
+         "[D" (Arrays/compare ^doubles a ^doubles b)
+         "[C" (Arrays/compare ^chars a ^chars b)
+         "[Z" (Arrays/compare ^booleans a ^booleans b)
+         (compare (vec a) (vec b)))
+       :else (compare a b))
+     (catch ClassCastException _
+       (if order-opaque?
+         ;; Pending indexes need distinct entries, including for regex values.
+         ;; Reuse nested-value ordering and reject ambiguous hash ties.
+         (compare-collision-values a b)
+         ;; Query grouping also handles custom values with their own equality
+         ;; and ordering contract; retain its coarse type fallback.
+         (compare (str (collision-kind a)) (str (collision-kind b))))))))
+
+(defn compare-index-values
+  "Keep numeric equality families and unequal opaque values distinct in pending
+   indexes. Query predicates still use compare-with-type's coarse fallback."
+  [a b]
+  (if (and (not (identical? (class a) (class b)))
+           (number? a) (number? b))
+    (let [ak (numeric-kind a)
+          bk (numeric-kind b)]
+      (if (identical? ak bk)
+        (compare a b)
+        (compare (str ak) (str bk))))
+    (compare-with-type a b true)))
 
 (def nil-cmp (nil-check-cmp-fn compare))
-(def nil-cmp-type (nil-check-cmp-fn compare-with-type))
+(def nil-cmp-type (nil-check-cmp-fn compare-index-values))
 
 (defmacro long-compare [x y] `(Long/compare ^long ~x ^long ~y))
 

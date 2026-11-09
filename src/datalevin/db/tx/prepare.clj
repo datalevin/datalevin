@@ -175,14 +175,17 @@
 
 (defn resolve-identity-map
   "Resolve a flat map whose plan has validated its single scalar identity.
-  Preserve map syntax checks and overlay the pending owner at execution time."
-  [db entity ^IdentityResolution resolution]
-  (reduce-kv (fn [_ a v]
-               (vld/validate-attr a entity)
-               (vld/validate-val v entity))
-             nil entity)
-  (let [owner (identity-owner db resolution)]
-    [(if owner (dissoc entity (.-attr resolution)) entity) owner]))
+  Reuse proven map syntax; otherwise retain the original validation pass.
+  Overlay the pending owner at execution time."
+  ([db entity resolution] (resolve-identity-map db entity resolution false))
+  ([db entity ^IdentityResolution resolution syntax-checked?]
+   (when-not syntax-checked?
+     (reduce-kv (fn [_ a v]
+                  (vld/validate-attr a entity)
+                  (vld/validate-val v entity))
+                nil entity))
+   (let [owner (identity-owner db resolution)]
+     [(if owner (dissoc entity (.-attr resolution)) entity) owner])))
 
 (defn validate-upserts
   [entity upserts]

@@ -88,10 +88,12 @@
     (b/valid-data? v vt)))
 
 (defn correct-datom*
-  "Reconstruct datom with corrected value."
+  "Reuse a datom whose corrected value is identical; otherwise reconstruct it."
   [^Datom datom v]
-  (d/datom (.-e datom) (.-a datom) v
-           (d/datom-tx datom) (d/datom-added datom)))
+  (if (identical? (.-v datom) v)
+    datom
+    (d/datom (.-e datom) (.-a datom) v
+             (d/datom-tx datom) (d/datom-added datom))))
 
 (declare correct-value)
 
@@ -125,7 +127,7 @@
         (type-coercion vt v)))))
 
 (defn ^:no-doc correct-scalar-value
-  "Validate and coerce a non-nil value after the scalar update gate has excluded
+  "Validate and coerce a non-nil value after preparation has excluded
   tuples, unresolved references, idoc and custom types. `vt` is the built-in type
   or nil for untyped attributes; value-dependent validation is never cached."
   [validate? vt v]

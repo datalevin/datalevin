@@ -24,8 +24,10 @@ to LMDB storage, but has since deviated from that origin signficantly.
   recursive rules efficiently.
 
 * Datalevin is not an immutable database, and there is no
-  "database as a value" feature.  Since history is not kept, transaction ids are
-  not stored.
+  "database as a value" feature. Since history is not kept, individual datom
+  transaction IDs are not stored. The current transaction counter is persisted
+  as database metadata, including for successful transactions with no changed
+  datoms.
 
 * Datoms in a transaction are committed together as a batch, rather than being
   saved by `with-datom` one at a time.

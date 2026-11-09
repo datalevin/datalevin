@@ -33,6 +33,8 @@
 (def ^:private ^:const ave-multiple-min-items 2)
 (def ^:private ^:const ave-multiple-max-items 65536)
 
+(def ^:private ^:const datom-run-min-items 256)
+
 (defonce ^:private write-observer-reader* (atom nil))
 (defonce ^:private write-flags-observer-reader* (atom nil))
 
@@ -588,6 +590,19 @@
         (aset keys i (.-avg ^DatomKVTxData (aget datoms i))))
       (ByteKeySort/sort datoms keys (int n)))))
 
+(defn- ave-added-run-end
+  ^long [^objects datoms ^long start ^long n]
+  (let [^bytes avg (.-avg ^DatomKVTxData (aget datoms start))]
+    (loop [end (inc start)]
+      (if (< end n)
+        (let [^DatomKVTxData tx (aget datoms end)]
+          (if (and (.-added? tx) (not (.-no-overwrite? tx))
+                   (< (.-e ^DatomKVTxData (aget datoms (dec end))) (.-e tx))
+                   (zero? (BitOps/compareBytes avg (.-avg tx))))
+            (recur (unchecked-inc end))
+            end))
+        end))))
+
 (defn- transact-datom-index-passes*
   [^objects datoms n ^HashMap dbis txn ^Boolean add-only?]
   (let [^DBI ave (or (.get dbis c/ave) (raise c/ave " is not open" {}))
@@ -599,6 +614,8 @@
                         (when (< i n)
                           (or (.-no-overwrite? ^DatomKVTxData (aget datoms i))
                               (recur (unchecked-inc i))))))
+          ;; Retain EAV order while unique AVE reservations run in key order.
+          ;; A collision must leave EAV untouched so the writer remains usable.
           ^objects eav-datoms (if fused? (Arrays/copyOf datoms n) datoms)
           _ (when fused?
               (sort-fused-ave-datoms! datoms n)
@@ -629,20 +646,99 @@
                       (put-eav-datom-tx eav txn tx)))))
               append?))]
       (when-not fused? (Arrays/parallelSort datoms 0 n datom-ave-comparator))
-      (with-open [^Cursor cur (if add-only?
-                               (.multipleWriteCursor ^IMultipleBuffer ave txn)
-                               (.writeCursor ^IWriteCursor ave txn))]
+      (with-open [^Cursor cur (.multipleWriteCursor ^IMultipleBuffer ave txn)]
         (if add-only?
           (put-ave-add-only-runs!
             ave cur datoms n all-new-entities?)
-          (dotimes [i n]
-            (let [^DatomKVTxData tx (aget datoms i)]
-              (if (.-added? tx)
-                (put-ave-added-datom! ave cur tx (int 0))
-                (put-ave-datom-tx ave txn tx)))))))))
+          (loop [i 0]
+            (when (< i n)
+              (let [^DatomKVTxData tx (aget datoms i)]
+                (if (and (.-dupfixed? ave) (.-added? tx) (not (.-no-overwrite? tx)))
+                  (let [end (ave-added-run-end datoms i n)]
+                    (if (= end (inc i))
+                      (put-ave-added-datom! ave cur tx (int 0))
+                      (let [append-start (ave-appenddup-start ave cur datoms i end false)]
+                        ;; Existing duplicates are idempotent scalar puts. The
+                        ;; strictly increasing tail contains only fresh IDs.
+                        (loop [j i]
+                          (when (< j (long append-start))
+                            (put-ave-added-datom! ave cur (aget datoms j) (int 0))
+                            (recur (unchecked-inc j))))
+                        (put-ave-added-segment!
+                          ave cur datoms append-start end DTLV/MDB_APPENDDUP)))
+                    (recur end))
+                  (do
+                    (if (.-added? tx)
+                      (put-ave-added-datom! ave cur tx (int 0))
+                      (put-ave-datom-tx ave txn tx))
+                    (recur (unchecked-inc i))))))))))))
+
+(defn- unconditional-datom?
+  [tx]
+  (and (instance? DatomKVTxData tx)
+       (not (.-no-overwrite? ^DatomKVTxData tx))))
+
+(defn- wide-datom-run?
+  "Narrow replacements cost less in scalar order. Require two attribute
+  transitions on the leading entity before paying for both index sorts."
+  [^DatomKVTxData first-tx second-tx third-tx]
+  (and (unconditional-datom? second-tx) (unconditional-datom? third-tx)
+       (let [^DatomKVTxData second-tx second-tx
+             ^DatomKVTxData third-tx third-tx
+             ^bytes first-avg (.-avg first-tx)
+             ^bytes third-avg (.-avg third-tx)]
+         (and (== (.-e first-tx) (.-e second-tx) (.-e third-tx))
+              (or (.-added? first-tx) (.-added? second-tx) (.-added? third-tx))
+              ;; Physical AVG keys begin with the four-byte attribute ID.
+              (<= 4 (alength first-avg)) (<= 4 (alength third-avg))
+              (not (zero? (Arrays/compareUnsigned first-avg 0 4 third-avg 0 4)))))))
+
+(defn- transact-datom-run*
+  "Batch one contiguous unconditional run. Stable EAV and AVE sorts retain
+  input order for equal physical facts, including repeated add/delete cycles.
+  KV rows and conditional unique inserts remain barriers."
+  ([^List rows start ^HashMap dbis txn]
+   (let [start (long start)
+         end (long (loop [end (inc start)]
+                     (if (and (< end (.size rows))
+                              (unconditional-datom? (.get rows end)))
+                       (recur (unchecked-inc end))
+                       end)))
+         n (- end start)]
+     (if (and (>= n datom-run-min-items)
+              (.-dupfixed? ^DBI (.get dbis c/ave))
+              (wide-datom-run? (.get rows start) (.get rows (inc start))
+                               (.get rows (+ start 2))))
+       (let [datoms (object-array n)]
+         (dotimes [j n] (aset datoms j (.get rows (+ start j))))
+         (transact-datom-index-passes* datoms n dbis txn false))
+       (let [^DBI ave (or (.get dbis c/ave) (raise c/ave " is not open" {}))
+             ^DBI eav (or (.get dbis c/eav) (raise c/eav " is not open" {}))]
+         (dotimes [j n] (put-datom-tx ave eav txn (.get rows (+ start j))))))
+     end))
+  ([^objects ops start ^HashMap dbis txn n]
+   (let [start (long start)
+         end (long (loop [end (+ start 2)]
+                     (if (and (< end (long n))
+                              (unconditional-datom? (aget ops (inc end))))
+                       (recur (+ end 2))
+                       end)))
+         count (quot (- end start) 2)]
+     (if (and (>= count datom-run-min-items)
+              (.-dupfixed? ^DBI (.get dbis c/ave))
+              (wide-datom-run? (aget ops (inc start)) (aget ops (+ start 3))
+                               (aget ops (+ start 5))))
+       (let [datoms (object-array count)]
+         (dotimes [j count] (aset datoms j (aget ops (+ start (* 2 j) 1))))
+         (transact-datom-index-passes* datoms count dbis txn false))
+       (let [^DBI ave (or (.get dbis c/ave) (raise c/ave " is not open" {}))
+             ^DBI eav (or (.get dbis c/eav) (raise c/eav " is not open" {}))]
+         (dotimes [j count]
+           (put-datom-tx ave eav txn (aget ops (+ start (* 2 j) 1))))))
+     end)))
 
 (defn- transact-datom-rows-scalar*
-  "Apply every row in input order, walking grouped regions without indexed lookups."
+  "Apply barrier-separated runs, retaining input order for each physical fact."
   [^List txs ^HashMap dbis txn validate?]
   ;; A mixed batch needs an indexed row plus four EAV rows to batch at all.
   (if (and (instance? RowRegions txs) (>= (.size txs) 5))
@@ -657,12 +753,15 @@
         (when (< i n)
           (let [t (.get txs i)]
             (if (instance? DatomKVTxData t)
-              (let [^DBI ave* (or ave (.get dbis c/ave)
-                                  (raise c/ave " is not open" {}))
-                    ^DBI eav* (or eav (.get dbis c/eav)
-                                  (raise c/eav " is not open" {}))]
-                (put-datom-tx ave* eav* txn t)
-                (recur (unchecked-inc i) ave* eav*))
+              (if (and (<= (+ i datom-run-min-items) n)
+                       (unconditional-datom? t))
+                (recur (long (transact-datom-run* txs i dbis txn)) ave eav)
+                (let [^DBI ave* (or ave (.get dbis c/ave)
+                                    (raise c/ave " is not open" {}))
+                      ^DBI eav* (or eav (.get dbis c/eav)
+                                    (raise c/eav " is not open" {}))]
+                  (put-datom-tx ave* eav* txn t)
+                  (recur (unchecked-inc i) ave* eav*)))
               (let [^KVTxData tx (if validate? (l/->kv-tx-data t) t)
                     dbi-name (.-dbi-name tx)
                     ^DBI dbi (or (.get dbis dbi-name)
@@ -765,12 +864,15 @@
         (let [^DBI dbi (aget ops i)
               tx       (aget ops (unchecked-inc i))]
           (if (instance? DatomKVTxData tx)
-            (let [^DBI ave* (or ave (.get dbis c/ave)
-                                (raise c/ave " is not open" {}))
-                  ^DBI eav* (or eav (.get dbis c/eav)
-                                (raise c/eav " is not open" {}))]
-              (put-datom-tx ave* eav* txn tx)
-              (recur (+ i 2) ave* eav*))
+            (if (and (<= (+ i (* 2 datom-run-min-items)) n)
+                     (unconditional-datom? tx))
+              (recur (long (transact-datom-run* ops i dbis txn n)) ave eav)
+              (let [^DBI ave* (or ave (.get dbis c/ave)
+                                  (raise c/ave " is not open" {}))
+                    ^DBI eav* (or eav (.get dbis c/eav)
+                                  (raise c/eav " is not open" {}))]
+                (put-datom-tx ave* eav* txn tx)
+                (recur (+ i 2) ave* eav*)))
             (if (and (<= (+ i 8) n) (eav-op-run? ops i))
               (recur (long (put-eav-rows! ops i dbi txn n)) ave eav)
               (do
