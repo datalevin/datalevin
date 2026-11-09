@@ -8,12 +8,13 @@
             [datalevin.query.access.dependency :as dependency]
             [datalevin.query.plan :as plan]
             [datalevin.query.source.contract :as contract]
+            [datalevin.query.source.join-cost :as join-cost]
             [datalevin.query.source.control :as control]
             [datalevin.query.source.permissions :as permissions]
             [datalevin.query.source.runtime :as rt]
             [datalevin.query.source.value :as value :refer [fail!]]))
 
-(def ^:private kind-rank {:entity-lookup 0 :value-lookup 1 :attribute-enumeration 2})
+(def ^:private kind-rank {:entity-lookup 0 :join 0 :value-lookup 1 :attribute-enumeration 2})
 (def ^:private search-bound 4096)
 
 (defn- ensure! [ok]
@@ -87,7 +88,8 @@
 
 (defn- request-metadata [request]
   (select-keys request [:source-symbol :region-id :scope-id :clauses :bindings
-                        :available-inputs :required-vars :demand :max-alternatives]))
+                        :available-inputs :required-vars :demand :max-alternatives
+                        :datalevin.query.source/region-sources]))
 
 (defn- request! [request check!]
   (let [{:keys [source-symbol region-id scope-id clauses bindings available-inputs
@@ -165,7 +167,10 @@
                        :access (select-keys access [:kind :anchor-clause]) :covers covered-patterns
                        :requires (mapv #(select-keys % [:variable :type :nullable?]) requires)
                        :columns (mapv #(select-keys % [:variable :type :nullable?]) columns)
-                       :scope-id scope-id}
+                       :scope-id scope-id
+                       :work-keys (into #{} (map (fn [id]
+                                                   [(or (:source-symbol (by-id id)) source-symbol) region-id id]))
+                                        covered-patterns)}
               token (rt/charge-metadata! runtime options :planning
                                          (+ 2048 (* 64 (+ (count requires) (count covered-patterns)))))]
           (try
@@ -177,7 +182,7 @@
                   required-vars (mapv :variable (:requires options))
                   output-vars (mapv :variable (:columns options))
                   expr (access/->AccessExpr :query-source
-                         (into #{} (map #(vector (:source-symbol options) region-id %)) covered-patterns)
+                         (:work-keys options)
                          (set required-vars) (set/difference (set output-vars) (set required-vars))
                          (set/intersection (set output-vars) (set required-vars)) output-vars (:source-symbol options))
                   path (access/->AccessPath :query-source implementation (:kind access) [] #{:complete}
@@ -202,8 +207,9 @@
   (:covers (:expr plan)))
 
 (defn- first-work-key [plan]
-  (let [{:keys [source-symbol region-id covers]} (options plan)]
-    [source-symbol region-id (reduce min covers)]))
+  (reduce (fn [best key]
+            (if (neg? (compare-keys key best (constantly nil))) key best))
+          (:work-keys (options plan))))
 
 (defn- cardinality-key
   "Fresh provider counts rank alternatives, without becoming native costs or
@@ -353,14 +359,25 @@
              required (into #{} (mapcat (fn [request]
                                          (for [clause (:clauses request) :when (= :pattern (:kind clause))]
                                            [(:source-symbol request) region-id (:id clause)]))) requests)
-             live-vars (into #{} (mapcat :required-vars) requests)
+             live-vars (get planning :required-vars (into #{} (mapcat :required-vars) requests))
              _ (doseq [plan plans]
                  (check!)
                  (let [o (options plan) request (get request-map (:source-symbol o))]
                    (ensure! (and request (= region-id (:region-id o))
-                                 (identical? request (get-in o [:capture :request]))
-                                 (set/subset? (into #{} (map #(vector (:source-symbol o) region-id %)) (:covers o))
-                                              required)))))
+                                 (set/subset? (work-keys plan) required)))
+                   (let [captured (get-in o [:capture :request])]
+                     (if (:datalevin.query.source/region-sources captured)
+                       (do
+                         (ensure! (and (= :join (get-in o [:access :kind]))
+                                       (identical? (:source-descriptor request) (:source-descriptor captured))
+                                       (= (select-keys request [:control :query-id :region-id :scope-id])
+                                          (select-keys captured [:control :query-id :region-id :scope-id]))))
+                         (doseq [{:keys [symbol descriptor]} (:datalevin.query.source/region-sources captured)]
+                           (ensure! (identical? descriptor (:source-descriptor (request-map symbol)))))
+                         (doseq [clause (:clauses captured) :when (= :pattern (:kind clause))]
+                           (ensure! (some #(= % (dissoc clause :source-symbol))
+                                          (:clauses (request-map (:source-symbol clause)))))))
+                       (ensure! (identical? request captured))))))
              _ (doseq [[source-symbol candidates] (group-by #(get-in % [:expr :source]) plans)]
                  (ensure! (<= (count candidates) (long (:max-alternatives (request-map source-symbol)))))
                  (ensure! (= (count candidates)
@@ -434,9 +451,10 @@
                                      :resources (if (= :once (:opens p)) #{(:resource p)} #{})
                                      :unavailable? (and (= :once (:opens p)) (:spent? p))})) candidates)
                                    (map core-choice (sort-by #(get ranks (:id %)) (filter deferred? ordered-core)))))
-             result (dependency/schedule {:inputs input-columns :required-work required
+             result (join-cost/select {:inputs input-columns :required-work required
                                           :required-vars live-vars :choices choices
-                                          :check! check! :reserve! own-work! :max-states search-bound})]
+                                          :check! check! :reserve! own-work! :max-states search-bound}
+                                      (fn [plan] (let [[unknown rows] (count-key plan)] (when (zero? unknown) rows))))]
          (when-not (= :complete (:status result)) (fail! :query-source/unsupported :planning))
          ;; Native/core steps remain private and keep their shared implementation.
          ;; Only selected external AccessPlans enter the provider explanation.
@@ -447,8 +465,10 @@
            (let [result {:region-id region-id
                          :policy (if (some #(> (count (work-keys %)) 1) candidates)
                                    :eav-fusion-v1 :eav-structural-v1)
-                         :selection (if (some #(zero? (first (count-key %))) candidates)
-                                      :cardinality :structural)
+                         :selection (cond (:cost-changed? result) :join-cost
+                                          (some #(zero? (first (count-key %))) candidates) :cardinality
+                                          :else :structural)
+                         :join-cost (:join-cost result) :cost-search (:cost-search result)
                          :estimated-access-ns nil :fallback-reasons []
                          :plans (into [] (comp (filter #(= :access (:kind %))) (map :value)) selected)
                          :operators (mapv #(select-keys % [:kind :value]) selected)
@@ -533,6 +553,8 @@
                            :estimate (assoc (select-keys estimate (conj numeric :confidence))
                                             :provenance (select-keys (:provenance estimate)
                                                                      [:kind :id :observed-at-ms :valid-for-ms]))}
+                            (= :join (get-in o [:access :kind]))
+                            (assoc :covered-sources (vec (sort (set (map first (:work-keys o))))))
                             (contains? (:properties alternative) :consumption-group)
                             (assoc :consumption-group (get-in alternative [:properties :consumption-group]))
                             (seq (:requires o))
@@ -542,7 +564,7 @@
                                     :bytes (min (long (:binding-bytes (control/limits ctl)))
                                                 (long (get-in alternative [:constraints :max-binding-bytes])))}))))) plans)
             result (assoc (select-keys schedule [:region-id :policy :selection
-                                                 :estimated-access-ns :fallback-reasons :planning-time-ms :estimation]) :steps steps)]
+                                                 :estimated-access-ns :fallback-reasons :planning-time-ms :estimation :join-cost :cost-search]) :steps steps)]
         (rt/own! runtime #(control/release! token))
         result)
       (catch Throwable e (control/release! token) (throw e)))))

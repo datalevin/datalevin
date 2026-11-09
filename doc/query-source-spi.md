@@ -7,11 +7,12 @@ residual predicates, supported rules, aggregation, and query results.
 
 This reference targets **Datalevin 1.2.10** and **SPI revision 2**. The SPI was
 introduced in Datalevin 1.2.8; version 1.2.9 adds same-entity fusion and fixes
-boxed-integer interoperability. Revision 2 is the only accepted revision. Fresh cardinality estimates rank eligible fact accesses; time and transfer
-estimates remain advisory. Version 1.2.10 adds
+boxed-integer interoperability. Revision 2 is the only accepted revision. Fresh cardinalities and bounded
+complete-path lookahead guide fact accesses. Time and transfer estimates remain
+advisory. Version 1.2.10 adds
 eligible scalar-predicate export and the optional relational protocols described
-below, plus optional cost-budgeted estimate preparation. Existing EAV adapters
-need not implement these protocols.
+below, plus cost-budgeted estimate preparation and optional dependent regional
+join planning. Existing EAV adapters need not implement these protocols.
 
 The public namespace is [`datalevin.query.source`](../src/datalevin/query/source.clj).
 For mapping compilation, provider packaging, and implementation examples, see
@@ -174,8 +175,8 @@ internally if the backend requires it.
 
 ```text
 capture descriptors -> validate -> acquire and authorize sessions
-  -> price and optionally prepare estimates -> plan each source/region
-  -> validate complete plan
+  -> price and optionally prepare estimates -> plan sources and regional joins
+  -> compare complete typed paths -> validate complete plan
   -> open selected cursors -> consume batches -> close cursors -> close sessions
 ```
 
@@ -664,7 +665,8 @@ has three terms. Eligible predicate envelopes have this shape:
  :args [[:var ?name] [:const ""]]}
 ```
 
-Eligible operators are `:=`, `:not=`, `:<`, `:<=`, `:>`, `:>=`, `:like`, and `:not-like`, with two
+Eligible operators are `:=`, `:not=`, `:<`, `:<=`, `:>`, `:>=`, `:like`, `:not-like`,
+`:in`, and `:not-in`, with two
 arguments and semantics version `1`. Exact support depends on operand types.
 A similarly named SQL operator is not automatically equivalent. Unsupported
 predicates remain core work; never discard rows needed by a residual.
@@ -728,6 +730,7 @@ integers and are required for both input-free and dependent alternatives.
 | `:entity-lookup` | Entity is a constant, a known planning binding, or a declared required input. |
 | `:value-lookup` | Value is a constant, a known planning binding, or a declared required input. |
 | `:attribute-enumeration` | Neither entity nor value must be bound; explicit scope inputs may still be required. |
+| `:join` | Optional regional protocol only: patterns from at least two captured aliases and explicit, nonempty typed inputs. |
 
 `:anchor-clause` identifies an exactly covered pattern. Access kinds do not
 imply backend indexes or grant hidden correlation. An entity lookup with a
@@ -756,11 +759,11 @@ scope, definition, and session; opening cannot substitute another plan.
 
 ### Same-entity fusion
 
-An alternative may cover several patterns when they share the anchor's entity
-variable or the same entity constant under the same declared entity type. They
-must remain within one source, region, and accepted scope. Distinct entity
-variables and separate `_` entity positions do not imply shared identity.
-Cross-entity join pushdown is outside this contract.
+An ordinary alternative may cover several patterns when they share the
+anchor's entity variable or the same entity constant under the same declared
+entity type. They remain within one source, region, and accepted scope.
+Distinct entity variables and separate `_` entity positions do not imply shared
+identity. Cross-entity joins use the separate optional regional join contract.
 
 For example, a request containing these two patterns on `?item` can use one
 wide row shape. The request fragment replaces `:clauses` and `:required-vars`
@@ -837,8 +840,8 @@ nonnegative integers or `nil`. Condition estimates on the actual scope,
 coverage, constants, predicates, types, and binding/request caps. Do not issue
 planning I/O to obtain them or count on speculative concurrency.
 
-Current selection ranks fresh provider cardinalities before structural tie
-breaks. These remain advisory estimates, separate from native optimizer costs:
+Selection starts with fresh provider cardinalities and structural tie breaks,
+then can compare complete typed paths with different starting accesses. These remain advisory estimates, separate from native optimizer costs:
 
 - Regions with only single-pattern candidates report `:eav-structural-v1`.
 - Regions containing fused candidates report `:eav-fusion-v1`.
@@ -897,14 +900,58 @@ qualifying ones and use structural ordering among themselves. Explanations repor
 `:estimated-access-ns` remains `nil`. A statistical zero is still executed and
 cannot prove an access empty, supply a dependency, or change coverage checks.
 
+Bounded lookahead compares at most 16 possible starting accesses using the
+remaining 4096-state feasibility budget and a 20 ms allowance checked between
+attempts. It propagates row counts through dependent joins, sums input/output
+row work, and tracks peak estimated tuple count. Counts floor at one for this
+calculation; zero never suppresses required work. Missing or expired counts,
+unmodeled local producers, and unknown selectivity for a second independent
+scan retain the original feasible plan. This is a row-work heuristic, without
+skew, correlation, CPU, transfer-byte, or latency modeling; it does not guarantee
+a global minimum. Opaque handles and sessions are never compared or hashed.
+
+Explanations expose `:join-cost {:work-rows ... :peak-rows ...}` and
+`:cost-search {:evaluated ... :states ... :elapsed-ns ...}`. Selection is
+`:join-cost` when lookahead changes the baseline; otherwise existing
+`:cardinality`/`:structural` selection remains. `:planning-time-ms` includes pure
+provider plan construction, response capture, and scheduling. Estimate
+preparation remains separately reported under `:estimation`.
+
 Structural ties are ordered by source, region, and lowest covered pattern ID. For the
-same first work item, entity lookup precedes value lookup, then attribute
+same first work item, entity lookup and dependent joins precede value lookup, then attribute
 enumeration. Within the same kind, wider pattern coverage precedes narrower
 coverage; canonical structural identifiers break ties. Provider response order,
 opaque handles, labels, and time/transfer costs do not determine the choice. The dependency
 search backtracks to find complete nonoverlapping coverage within its 4096-state
 bound. Failure to find a feasible complete plan is `:query-source/unsupported`.
 This does not promise minimum latency or a globally minimum number of opens.
+
+### Optional regional join alternatives
+
+`IQuerySourceJoinPlanning` adds pure
+`-plan-joins [source session request]` after all sessions are acquired and normal
+fact alternatives captured. It is currently called for root conjunctions with
+2–32 aliases in one session. The request retains the coordinator's descriptor
+and scope and adds `:datalevin.query.source/region-sources`, a vector of captured
+`{:symbol $alias :descriptor ...}` entries. Every pattern has `:source-symbol`;
+predicate IDs remain region-local and original predicates remain in core.
+
+Return `{:alternatives [...]}` or `{:alternatives []}` to decline. These use
+ordinary session-owned handles and cursor/binding lifecycles, with
+`:access {:kind :join :anchor-clause ...}`. A join covers patterns from at least
+two aliases and declares nonempty `:requires`; the typed scheduler must prove
+their availability. Validate every contributing descriptor against the acquired
+views. No new scopes, hidden inputs, row answers, source reads, or native
+callbacks are allowed. The coordinator's remaining candidate quota bounds the
+response; ordinary alternatives remain available. Explanations identify
+`:covered-sources` separately from the coordinator `:source`.
+
+Root output requirements include live projection/with variables, actual input
+keys, core operator variables, and cross-source join variables. Internal fused
+identities need not be exported. Residual clauses and all explicit dependencies
+still require their variables. Child regions retain conservative contracts
+through rule/branch boundaries. A provider can continue returning extra columns.
+Physical conversion and error checks must not be lost through output pruning.
 
 <a id="105-dependent-access-and-binding-batches"></a>
 

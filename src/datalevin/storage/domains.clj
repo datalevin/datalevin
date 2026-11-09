@@ -306,9 +306,14 @@
   [dir domains runtime-providers]
   (reduce-kv
     (fn [m domain opts]
-      (assoc m domain
-             (emb/lazy-provider opts
-               (fn [_] (checked-domain-provider dir runtime-providers domain opts)))))
+      (let [provider (get runtime-providers (or (:provider opts) :default))]
+        (assoc m domain
+               ;; Supplied instances were already validated during domain
+               ;; resolution. Own them even when no embeddings are requested.
+               (if (satisfies? emb/IEmbeddingProvider provider)
+                 provider
+                 (emb/lazy-provider opts
+                   (fn [_] (checked-domain-provider dir runtime-providers domain opts)))))))
     {} domains))
 
 (defn init-indices

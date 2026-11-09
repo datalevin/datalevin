@@ -62,6 +62,14 @@
   (-cancel-session! [session reason] "Signal cancellation promptly; return nil.")
   (-close-session! [session] "Release this session and its cursors; return nil."))
 
+(defprotocol IQuerySourceJoinPlanning
+  (-plan-joins [source session request]
+    "Optional pure planning of dependent joins across acquired aliases in one
+    session/region. :datalevin.query.source/region-sources lists their captured
+    descriptors; patterns carry :source-symbol. Return ordinary alternatives
+    with :access :kind :join, explicit inputs, and coverage across those aliases.
+    No I/O, new scopes, execution rows, or hidden dependencies are permitted."))
+
 (defprotocol IQuerySourceEstimation
   (-estimation-info [source session request]
     "Pure advisory quote, or nil: {:rows n-or-nil :batch-rows positive-integer

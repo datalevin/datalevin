@@ -1806,17 +1806,23 @@
 
 (defn secondary-index-jobs
   [^Store store]
-  ;; Closing LMDB takes this same monitor. A worker's earlier closed? check
-  ;; cannot protect mapped buffers while a job snapshot is being decoded.
-  (locking (.-write-txn store)
-    (if (closed? store)
-      []
-      (mapv second
-            (get-range (.-lmdb store)
-                       c/secondary-index-jobs
-                       [:all]
-                       :data
-                       :data)))))
+  ;; Share sampling's lifetime guard: close takes its write lock, while
+  ;; ordinary writes can progress throughout this read-only snapshot.
+  (let [rlock (.readLock ^ReentrantReadWriteLock (.-sampling-lock store))
+        read-jobs (fn []
+                    (if (closed? store)
+                      []
+                      (mapv second
+                            (get-range (.-lmdb store)
+                                       c/secondary-index-jobs
+                                       [:all]
+                                       :data
+                                       :data))))]
+    (if (.tryLock rlock)
+      (try (read-jobs) (finally (.unlock rlock)))
+      ;; A caller may already hold the writer monitor. Never wait for close's
+      ;; sampling lock while close is waiting for that same monitor.
+      (locking (.-write-txn store) (read-jobs)))))
 
 (defn- secondary-index-job
   [^Store store job-id]
@@ -3664,8 +3670,11 @@
         (doseq [index (vals (.-embedding-indices this))]
           (when-not (vec-closed? index)
             (close-vecs index)))
-        (doseq [provider (vals (.-embedding-providers this))]
-          (emb/close-provider provider))
+        ;; Several domains can share one supplied provider instance.
+        (let [closed-providers (IdentityHashMap.)]
+          (doseq [provider (vals (.-embedding-providers this))
+                  :when (nil? (.put closed-providers provider true))]
+            (emb/close-provider provider)))
         (close-kv (.-lmdb this)))
       (finally
         (try

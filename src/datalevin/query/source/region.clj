@@ -360,7 +360,7 @@
       (keep-indexed
         (fn [i {:keys [node]}]
           (let [operator ({'= := 'not= :not= '< :< '<= :<= '> :> '>= :>=
-                           'like :like 'not-like :not-like} (get-in node [:fn :symbol]))
+                           'like :like 'not-like :not-like 'in :in 'not-in :not-in} (get-in node [:fn :symbol]))
                 args (:args node)]
             (when (and (instance? Predicate node) operator (= 2 (count args))
                        (every? #(or (instance? Variable %) (instance? Constant %)) args))
@@ -403,15 +403,21 @@
         (let [patterns (mapv :clause patterns)
               variables (into #{} (mapcat contract/variables) patterns)
               clauses (into patterns (predicate-clauses region variables))
+              needed (if (seq (:path region)) variables
+                       (set/intersection variables
+                       (set/union (:required-vars region) (:input-vars region)
+                                  (vars (mapv :node (:core-clauses region)) check! (constantly nil))
+                                  (into #{} (mapcat (comp contract/variables :clause))
+                                        (remove #(= (:source-symbol %) (:symbol entry)) (:patterns region))))))
               inputs (set (map :variable available-inputs))
               bindings (select-keys (:bindings region) (set/union variables inputs))
               output {:source-symbol (:symbol entry) :source-descriptor descriptor
                       :region-id (:region-id region) :scope-id (get-in descriptor [:scope :id])
                       :clauses clauses :bindings bindings :available-inputs available-inputs
-                      ;; Keep normalized E/V variables through joins/residuals.
-                      ;; Shared unused-variable rewrites may remove them before
-                      ;; this pass; estimates cannot justify removing them.
-                      :required-vars variables :max-alternatives max-alternatives
+                      ;; Preserve actual live outputs, cross-source joins, and
+                      ;; every private operator input. Internal fused identities
+                      ;; need not cross the provider boundary.
+                      :required-vars needed :max-alternatives max-alternatives
                       :demand {:quality :exact :ordering [] :offset 0 :limit nil}}
               token (rt/charge-copy! runtime (dissoc output :source-descriptor))]
           (try

@@ -8,7 +8,6 @@
             [datalevin.kv :as kv]
             [datalevin.kv.txlog :as kvtx]
             [datalevin.lmdb :as l]
-            [datalevin.secondary-index :as si]
             [datalevin.storage :as st]
             [datalevin.storage.domains :as domains]
             [datalevin.vector :as v]
@@ -47,14 +46,10 @@
                   (assoc indices domain index))))
             runtime metadata)))
 
-(defn- status [source]
-  (when (instance? Store source) (st/secondary-index-status source)))
-
-(defn- index-writes? [source indices]
-  (let [stats (status source)]
-    (or (seq indices)
-        (some #(pos? (long (get stats % 0)))
-              [:pending-count :running-count :failed-count]))))
+(defn- index-writes? [stats indices]
+  (or (seq indices)
+      (some #(pos? (long (get stats % 0)))
+            [:pending-count :running-count :failed-count])))
 
 (defn- check-source! [source under-write-lock?]
   (let [raw (kv/raw-lmdb (source-kv source))]
@@ -65,17 +60,22 @@
       (raise "Cannot capture an open write transaction"
              {:error :copy/write-transaction-open}))))
 
-(defn- foreign-worker? [source]
-  (when (instance? Store source)
-    (let [now (System/currentTimeMillis)]
-      (some #(and (si/running-job? %)
-                  (> (long (or (:job/lease-until-ms %) Long/MAX_VALUE)) now))
-            (st/secondary-index-jobs source)))))
+(defn- unfinished-jobs? [stats]
+  (some #(pos? (long (get stats % 0))) [:pending-count :running-count]))
 
-(defn- check-failed-jobs! [source]
-  (when (pos? (long (get (status source) :failed-count 0)))
+(defn- check-failed-jobs! [stats]
+  (when (pos? (long (get stats :failed-count 0)))
     (raise "Secondary index work failed before capture"
-           {:error :copy/index-flush-failed :status (status source)})))
+           {:error :copy/index-flush-failed :status stats})))
+
+(defn- job-state! [source raw]
+  (when (instance? Store source)
+    ;; Read the version before scanning: a commit during the scan must also
+    ;; invalidate this observation when capture acquires write exclusion.
+    (let [txn-id (cpp/committed-txn-id raw)
+          stats (st/secondary-index-status source)]
+      (check-failed-jobs! stats)
+      {:txn-id txn-id :status stats})))
 
 (defn- check-embedding-state! [source]
   (when (instance? Store source)
@@ -101,9 +101,9 @@
 
 (defn attempt!
   "Called with runtime lifetime protection, before acquiring a writer slot.
-  Return :retry after contention; the caller must release runtime access before
-  waiting/reacquiring. Copying retains the prepared snapshot, never the writer
-  slot, LMDB monitor, or vector locks. Callbacks provide server authorization,
+  Return :retry after contention or concurrent writes; release runtime access
+  before waiting/reacquiring. Copying retains the prepared snapshot, never the
+  writer slot, LMDB monitor, or vector locks. Callbacks provide server authorization,
   write admission, and an injectable phase observer."
   [source dest compact? {:keys [standalone? with-writer authorize-write! admit-write observer]
                         :or {observer (fn [_ _])}}]
@@ -111,23 +111,24 @@
   (let [kv (source-kv source)
         raw (kv/raw-lmdb kv)
         indices (vector-indices source)
-        writes? (index-writes? source indices)
+        initial (job-state! source raw)
+        writes? (index-writes? (:status initial) indices)
         writable! (fn []
                     (when (some #{:rdonly :rdonly-env} (i/get-env-flags raw))
                       (raise "Capture requires writes on a read-only source"
                              {:error :copy/read-only-source}))
                     (when writes? (authorize-write!)))
+        _ (when writes? (writable!))
+        checked (if (unfinished-jobs? (:status initial))
+                  (do
+                    ;; External providers and live workers run without capture
+                    ;; locks. Retained history is inspected only in this phase.
+                    (admit-write #(st/wait-for-secondary-index source
+                                    {:timeout-ms 1 :process? true}))
+                    (job-state! source raw))
+                  initial)
         pin (volatile! nil)
         prepared-copy (volatile! nil)]
-    (check-failed-jobs! source)
-    (when writes?
-      (writable!)
-      ;; External provider calls and live workers must be able to finish before
-      ;; capture acquires the gate. Never steal a live claim to drain the queue.
-      (admit-write #(when (instance? Store source)
-                      (st/wait-for-secondary-index source
-                        {:timeout-ms 1 :process? true}))))
-    (check-failed-jobs! source)
     (try
       (let [prepared
             (with-writer
@@ -136,10 +137,14 @@
                   (observer :lmdb-locked {:source source})
                   (check-source! source true)
                   (let [indices (vector-indices source)
-                        writes? (index-writes? source indices)
+                        writes? (index-writes? (:status checked) indices)
                         locks (volatile! [])]
                     (try
-                      (if (or (foreign-worker? source)
+                      ;; Verify freshness in constant time. Never rescan job
+                      ;; history while excluding writers, even after a change.
+                      (if (or (unfinished-jobs? (:status checked))
+                              (and checked
+                                   (not= (:txn-id checked) (cpp/committed-txn-id raw)))
                               (some (fn [[domain ^VectorIndex index]]
                                       (let [lock (.writeLock ^ReentrantReadWriteLock (.-vec-lock index))]
                                         (if (.tryLock lock)
@@ -153,12 +158,6 @@
                                 (when writes?
                                   (writable!)
                                   (authorize-write!)
-                                  (when (instance? Store source)
-                                    (st/process-secondary-index-jobs! source)
-                                    (check-failed-jobs! source)
-                                    (when-not (:caught-up? (st/wait-for-secondary-index source))
-                                      (raise "Secondary indexes did not catch up"
-                                             {:error :copy/index-flush-failed})))
                                   (doseq [[domain index] indices]
                                     (when (i/vec-closed? index)
                                       (raise "A captured vector domain is closed"

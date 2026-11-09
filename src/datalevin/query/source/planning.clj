@@ -11,6 +11,7 @@
             [datalevin.query.source.descriptor :as descriptor]
             [datalevin.query.source.envelope :as envelope]
             [datalevin.query.source.estimation :as estimation]
+            [datalevin.query.source.joins :as joins]
             [datalevin.query.source.region :as region]
             [datalevin.query.source.runtime :as rt]
             [datalevin.query.source.scope :as scope]
@@ -186,29 +187,33 @@
             responses
             (mapv
               (fn [{:keys [requests] :as r}]
-                (assoc r :responses
-                       (mapv (fn [request]
-                               (let [alias (:source-symbol request) group (by-alias alias)
-                                     entry (some #(when (= alias (:symbol %)) %) (:entries group))]
-                                 (rt/with-context runtime {:source-symbol alias :region-id (:region-id request)}
-                                   (fn [runtime]
-                                     {:request request :group group
-                                      :response (envelope/capture-response! runtime request
-                                                  (rt/invoke runtime :planning
-                                                    #(source/-plan-source (:source entry) (:session group) request))
-                                                  (:consumption group))})))) requests))) regions)
+                (let [started (System/nanoTime)
+                      regular
+                      (mapv (fn [request]
+                              (let [alias (:source-symbol request) group (by-alias alias)
+                                    entry (some #(when (= alias (:symbol %)) %) (:entries group))]
+                                (rt/with-context runtime {:source-symbol alias :region-id (:region-id request)}
+                                  (fn [runtime]
+                                    {:request request :group group
+                                     :response (envelope/capture-response! runtime request
+                                                 (rt/invoke runtime :planning
+                                                   #(source/-plan-source (:source entry) (:session group) request))
+                                                 (:consumption group))})))) requests)
+                      responses (into regular (joins/plan! runtime r by-alias regular))]
+                  (assoc r :responses responses :provider-planning-ns (- (System/nanoTime) started)))) regions)
             all-candidates (volatile! [])
             schedules
-            (mapv (fn [{:keys [region inputs operators requests responses]}]
+            (mapv (fn [{:keys [region inputs operators requests responses provider-planning-ns]}]
                     (let [candidates
                           (into [] (mapcat (fn [{:keys [request group response]}]
                                             (let [method (cursor/method runtime group ids)]
                                               (mapv #(access/candidate! runtime request % (:consumption group) method)
                                                     (envelope/alternatives runtime response))))) responses)]
                       (vswap! all-candidates into candidates)
-                      (assoc (access/schedule! runtime (:region-id region) inputs requests candidates operators
-                                               (:planning prepared))
-                             :estimation (get estimate-work (:region-id region))))) responses)]
+                      (-> (access/schedule! runtime (:region-id region) inputs requests candidates operators
+                                             (assoc (:planning prepared) :required-vars (:required-vars region)))
+                          (assoc :estimation (get estimate-work (:region-id region)))
+                          (update :planning-time-ms + (/ (double provider-planning-ns) 1000000.0))))) responses)]
         (access/validate-query! runtime schedules)
         (let [identity-key #(select-keys (get-in % [:path :options]) [:source-symbol :region-id :alternative-id])
               selected (into #{} (map identity-key) (mapcat :plans schedules))]
@@ -217,7 +222,7 @@
         (doseq [[{:keys [responses]} schedule] (map vector responses schedules)
                 {:keys [request response]} responses]
           (envelope/select! runtime response
-            (into [] (comp (filter #(= (:source-symbol request) (get-in % [:expr :source])))
+            (into [] (comp (filter #(identical? request (get-in % [:path :options :capture :request])))
                            (map #(get-in % [:path :options :alternative-id]))) (:plans schedule))))
         (reset! state :planned)
         (->Planned compilation groups schedules))

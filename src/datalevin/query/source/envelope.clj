@@ -44,7 +44,7 @@
     :const (value/value-charge (second term) (fn [_] (check!)))
     (fail! :query-source/invalid :planning)))
 
-(defn- pattern-types [info clauses check!]
+(defn- pattern-types [request clauses check!]
   (reduce (fn [types clause]
             (if (= :pattern (:kind clause))
               (reduce (fn [types [term column]]
@@ -57,7 +57,7 @@
                                           :nullable? (and (:nullable? column)
                                                           (get-in types [variable :nullable?] true)))))
                           types)) types
-                      (map vector (:terms clause) (contract/pattern-columns info clause check!)))
+                      (map vector (:terms clause) (contract/pattern-columns (contract/pattern-source-info request clause) clause check!)))
               types)) {} clauses))
 
 (defn request!
@@ -82,6 +82,17 @@
     (descriptor/source-info! source-descriptor check!)
     (ensure! (and (set/subset? (:features request) (:features source-descriptor))
                   (set/subset? (:required-features source-descriptor) (:features request))))
+    (when-let [sources (:datalevin.query.source/region-sources request)]
+      (ensure! (and (vector? sources) (<= 2 (count sources) 32)
+                    (= (count sources) (count (set (map :symbol sources))))))
+      (doseq [{:keys [symbol descriptor] :as entry} sources]
+        (fields! entry #{:symbol :descriptor} #{})
+        (ensure! (and (symbol? symbol) (.startsWith (name symbol) "$")))
+        (descriptor/source-info! descriptor check!)
+        (ensure! (= (select-keys source-descriptor [:source-instance-id :compute-context-id])
+                    (select-keys descriptor [:source-instance-id :compute-context-id]))))
+      (ensure! (identical? source-descriptor
+                          (some #(when (= source-symbol (:symbol %)) (:descriptor %)) sources))))
     (columns! available-inputs check!)
     (ensure! (and (every? #(nonnegative? (:id %)) clauses)
                   (= (count clauses) (count (set (map :id clauses))))))
@@ -89,9 +100,9 @@
       (check!)
       (case (:kind clause)
         :pattern
-        (do (fields! clause #{:id :kind :terms} #{})
+        (do (fields! clause #{:id :kind :terms} (if (:datalevin.query.source/region-sources request) #{:source-symbol} #{}))
             (doseq [[term column] (map vector (:terms clause)
-                                      (contract/pattern-columns source-descriptor clause check!))]
+                                      (contract/pattern-columns (contract/pattern-source-info request clause) clause check!))]
               (when (= :const (first term))
                 ;; A constant is a predicate operand, not a provider output.
                 ;; Numeric/sequence representations can compare equal without
@@ -99,7 +110,7 @@
                 (ensure! (not (value/disjoint-constant? (:type column) (second term) check!))))))
         :predicate
         (do (fields! clause #{:id :kind :operator :semantics-version :args} #{})
-            (when-not (and (#{:= :not= :< :<= :> :>= :like :not-like} (:operator clause))
+            (when-not (and (#{:= :not= :< :<= :> :>= :like :not-like :in :not-in} (:operator clause))
                            (= 1 (:semantics-version clause)))
               (fail! :query-source/unsupported :planning))
             (ensure! (and (vector? (:args clause)) (= 2 (count (:args clause)))))
@@ -164,22 +175,25 @@
           anchor (clauses (:anchor-clause access))
           available (by-variable (:available-inputs request))
           required (by-variable requires) output (by-variable columns)
-          types (pattern-types (:source-descriptor request) patterns check!)
+          types (pattern-types request patterns check!)
           supplied (into (into (set (keys (:bindings request))) (keys required)) (keys output))
           covered-vars (into #{} (mapcat contract/variables) (map clauses covers))
           residual-vars (into #{} (mapcat contract/variables)
                               (remove #(contains? covers (:id %)) (:clauses request)))]
       (ensure! (and (seq patterns) (contains? pattern-ids (:anchor-clause access))
-                    (#{:entity-lookup :value-lookup :attribute-enumeration} (:kind access))))
-      (when (> (count patterns) 1)
+                    (#{:entity-lookup :value-lookup :attribute-enumeration :join} (:kind access))))
+      (when (= :join (:kind access))
+        (ensure! (and (:datalevin.query.source/region-sources request) (seq requires)
+                      (> (count (set (map :source-symbol patterns))) 1))))
+      (when (and (not= :join (:kind access)) (> (count patterns) 1))
         (let [[tag x] (first (:terms anchor))
-              entity-type (:type (first (contract/pattern-columns (:source-descriptor request) anchor check!)))]
+              entity-type (:type (first (contract/pattern-columns (contract/pattern-source-info request anchor) anchor check!)))]
           (ensure! (and (#{:var :const} tag)
                         (every? (fn [pattern]
                                   (let [[other-tag y] (first (:terms pattern))]
                                     (and (= tag other-tag)
                                          (= entity-type (:type (first (contract/pattern-columns
-                                                                        (:source-descriptor request) pattern check!))))
+                                                                        (contract/pattern-source-info request pattern) pattern check!))))
                                          (if (= :const tag) (QueryKey/equiv x y) (= x y))))) patterns)))))
       (doseq [[variable column] required]
         (check!)

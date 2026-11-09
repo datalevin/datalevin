@@ -3,7 +3,8 @@
             [datalevin.client.copy :as copy]
             [datalevin.client.request :as request]
             [datalevin.util :as u])
-  (:import [java.nio ByteBuffer]
+  (:import [java.io EOFException IOException]
+           [java.nio ByteBuffer]
            [java.nio.channels SeekableByteChannel]
            [java.nio.file Files]
            [java.nio.file.attribute FileAttribute]
@@ -15,13 +16,17 @@
   {:type :copy-done :checksum (u/hexify (.digest (MessageDigest/getInstance "SHA-256") data))
    :checksum-algo :sha-256 :bytes (alength data) :chunks chunks})
 
-(defn- tracked-sink [file events {:keys [max-write write-error close-error stall?]}]
+(defn- tracked-sink [file events {:keys [max-write reset-error write-error close-error stall?]}]
   (let [^SeekableByteChannel sink (copy/file-sink file)]
     (reify SeekableByteChannel
       (isOpen [_] (.isOpen sink))
       (read [_ buffer] (.read sink buffer))
       (size [_] (.size sink))
-      (truncate [this n] (swap! events conj [:truncate n]) (.truncate sink n) this)
+      (truncate [this n]
+        (swap! events conj [:truncate n])
+        (when reset-error (throw reset-error))
+        (.truncate sink n)
+        this)
       (position [_] (.position sink))
       (position [this n] (.position sink n) this)
       (write [_ buffer]
@@ -127,4 +132,50 @@
         (is (= :socket/timeout (:error (ex-data error))))
         (is (false? @read?))
         (is (not (.isOpen ^SeekableByteChannel (:sink receiver)))))
+      (finally (copy/close! receiver) (Files/delete file)))))
+
+(deftest sink-io-errors-retain-local-origin-and-original-cause
+  (doseq [phase [:open :reset]]
+    (testing (name phase)
+      (let [file (Files/createTempFile "copy-local-io-" ".incomplete" (make-array FileAttribute 0))
+            failure (IOException. "Local sink failed")
+            receiver (volatile! nil)]
+        (try
+          (let [error (try
+                        (vreset! receiver
+                          (copy/receiver file
+                            {:sink-factory (if (= :open phase)
+                                             (fn [_] (throw failure))
+                                             #(tracked-sink % (atom []) {:reset-error failure}))}))
+                        (copy/reset-before-request! @receiver)
+                        nil
+                        (catch Exception e e))]
+            (is (= :copy/local-io (:error (ex-data error))))
+            (is (identical? failure (ex-cause error))))
+          (finally (when @receiver (copy/close! @receiver)) (Files/delete file))))))
+  (doseq [phase [:write :close]]
+    (testing (name phase)
+      (let [failure (IOException. "Local sink failed")
+            data (byte-array [1])]
+        (run-copy header [[data] (done data 1)]
+                  {(if (= phase :write) :write-error :close-error) failure}
+                  (fn [error _ receiver events]
+                    (is (= :copy/local-io (:error (ex-data error))))
+                    (is (identical? failure (ex-cause error)))
+                    (is (not (copy/completed? receiver)))
+                    (is (= :close (last events)))))))))
+
+(deftest local-cleanup-errors-do-not-reclassify-a-network-failure
+  (let [file (Files/createTempFile "copy-network-io-" ".incomplete" (make-array FileAttribute 0))
+        network (EOFException. "Connection closed")
+        cleanup (IOException. "Sink close failed")
+        receiver (copy/receiver file {:sink-factory #(tracked-sink % (atom []) {:close-error cleanup})})]
+    (try
+      (copy/reset-before-request! receiver)
+      (let [error (try (copy/receive! receiver #(throw network) header)
+                       nil (catch Exception e e))
+            suppressed (first (.getSuppressed ^Throwable error))]
+        (is (identical? network error))
+        (is (= :copy/local-io (:error (ex-data suppressed))))
+        (is (identical? cleanup (ex-cause suppressed))))
       (finally (copy/close! receiver) (Files/delete file)))))

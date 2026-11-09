@@ -5,9 +5,11 @@
   (:refer-clojure :exclude [run!])
   (:require [clojure.string :as str]
             [datalevin.client :as client]
+            [datalevin.client.copy :as file-copy]
             [datalevin.util :as u])
-  (:import [java.io File IOException]
-           [java.nio.file Files Path Paths LinkOption CopyOption]
+  (:import [java.io File IOException InterruptedIOException]
+           [java.nio.channels ClosedByInterruptException]
+           [java.nio.file Files Path Paths LinkOption CopyOption FileSystemException]
            [java.nio.file.attribute FileAttribute PosixFilePermissions]))
 
 (def cli-options
@@ -131,16 +133,27 @@ Example:
 
 (defn- terminal-error?
   [error]
-  (let [causes (take-while some? (iterate ex-cause error))]
+  (let [causes (take-while some? (iterate ex-cause error))
+        local-io? (some (fn [cause]
+                          (let [data (ex-data cause)]
+                            (or (instance? FileSystemException cause)
+                                (:copy/local-io? data)
+                                (get-in data [:err-data :copy/local-io?])
+                                (= :copy/local-io
+                                   (or (:error data) (get-in data [:err-data :error]))))))
+                        causes)]
     (boolean
       (some (fn [cause]
               (let [data (ex-data cause)
                     code (or (:error data) (get-in data [:err-data :error]))]
-                (or (instance? IOException cause)
+                (or (and (instance? IOException cause) (not local-io?))
                     (instance? InterruptedException cause)
+                    (instance? InterruptedIOException cause)
+                    (instance? ClosedByInterruptException cause)
                     (#{:admin/unsupported-server :socket/timeout :client/closed} code)
                     (:termination-reason data)
-                    (re-find #"(?i)authentication fail" (or (ex-message cause) "")))))
+                    (and (not local-io?)
+                         (re-find #"(?i)authentication fail" (or (ex-message cause) ""))))))
             causes))))
 
 (defn- read-status
@@ -232,12 +245,13 @@ Example:
 
 (defn- private-directory!
   [^Path path]
-  (try
-    (Files/createDirectory path
-      (into-array FileAttribute [(PosixFilePermissions/asFileAttribute
-                                  (PosixFilePermissions/fromString "rwx------"))]))
-    (catch UnsupportedOperationException _
-      (Files/createDirectory path (make-array FileAttribute 0)))))
+  (file-copy/with-local-io
+    (try
+      (Files/createDirectory path
+        (into-array FileAttribute [(PosixFilePermissions/asFileAttribute
+                                    (PosixFilePermissions/fromString "rwx------"))]))
+      (catch UnsupportedOperationException _
+        (Files/createDirectory path (make-array FileAttribute 0))))))
 
 (defn- backup-destination!
   [destination targets]
@@ -288,7 +302,7 @@ Example:
                               (not (Files/isRegularFile (.resolve stage "VERSION") no-follow)))
                       (throw (ex-info "Backup destination changed during transfer"
                                       {:error :admin/invalid-destination})))
-                    (Files/move stage final (make-array CopyOption 0))
+                    (file-copy/with-local-io (Files/move stage final (make-array CopyOption 0)))
                     {:result (dissoc result :type :result)})))
               (catch Exception e
                 (when (:admin/maintenance-sent? (ex-data e)) (vreset! sent? true))

@@ -2918,12 +2918,13 @@
                  (throw (ex-info "Client did not complete file reception" {:error :copy/incomplete})))
                (when version-file
                  (cr/check! :copy-version)
-                 (if standalone?
-                   (Files/writeString (file-copy/path version-file) c/version
-                     (into-array OpenOption [StandardOpenOption/CREATE StandardOpenOption/WRITE
-                                             StandardOpenOption/TRUNCATE_EXISTING
-                                             LinkOption/NOFOLLOW_LINKS]))
-                   (spit (.toFile (file-copy/path version-file)) c/version)))
+                 (file-copy/with-local-io
+                   (if standalone?
+                     (Files/writeString (file-copy/path version-file) c/version
+                       (into-array OpenOption [StandardOpenOption/CREATE StandardOpenOption/WRITE
+                                               StandardOpenOption/TRUNCATE_EXISTING
+                                               LinkOption/NOFOLLOW_LINKS]))
+                     (spit (.toFile (file-copy/path version-file)) c/version))))
                response)
              (catch Throwable failure
                (cleanup-after-failure! failure #(file-copy/close! receiver))

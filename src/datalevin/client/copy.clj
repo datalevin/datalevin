@@ -5,7 +5,7 @@
   (:require [clojure.string :as str]
             [datalevin.client.request :as cr]
             [datalevin.util :as u])
-  (:import [java.io File]
+  (:import [java.io File IOException]
            [java.nio ByteBuffer]
            [java.nio.channels FileChannel SeekableByteChannel]
            [java.nio.file Files LinkOption OpenOption Path Paths StandardOpenOption]
@@ -16,6 +16,21 @@
 (def ^:dynamic *receiver*
   "Caller-owned file sink, local to one synchronous copy request. Never sent on wire."
   nil)
+
+(defmacro with-local-io
+  "Identify failures from local file operations; keep network reads outside this
+  scope. Preserve original causes and any existing error code."
+  [& body]
+  `(try
+     ~@body
+     (catch Exception failure#
+       (if (some #(instance? IOException %)
+                 (take-while some? (iterate ex-cause failure#)))
+         (throw (ex-info (ex-message failure#)
+                         (merge {:error :copy/local-io} (ex-data failure#)
+                                {:copy/local-io? true})
+                         failure#))
+         (throw failure#)))))
 
 (defn path ^Path [file]
   (cond
@@ -36,7 +51,7 @@
 (defn receiver
   [file {:keys [sink-factory require-binary?] :or {sink-factory file-sink}}]
   (let [digest (MessageDigest/getInstance "SHA-256")
-        sink (sink-factory (path file))]
+        sink (with-local-io (sink-factory (path file)))]
     (when-not (instance? SeekableByteChannel sink)
       (when (instance? java.io.Closeable sink) (.close ^java.io.Closeable sink))
       (throw (ex-info "Copy sink must be a SeekableByteChannel" {:error :copy/invalid-sink})))
@@ -48,7 +63,7 @@
   [^Receiver receiver]
   (when (.compareAndSet ^AtomicBoolean (:closed receiver) false true)
     (let [^SeekableByteChannel sink (:sink receiver)]
-      (try (.close sink)
+      (try (with-local-io (.close sink))
            (catch Throwable t
              ;; A failing close that leaves the resource open can be retried by
              ;; the enclosing owner without replacing the original failure.
@@ -64,8 +79,9 @@
                     {:error :copy/retry-after-header})))
   (cr/check! :copy-sink-reset)
   (let [^SeekableByteChannel sink (:sink receiver)]
-    (.truncate sink 0)
-    (.position sink 0)
+    (with-local-io
+      (.truncate sink 0)
+      (.position sink 0))
     (.reset ^MessageDigest (:digest receiver))
     (vreset! (:state receiver) {:phase :waiting-header :bytes 0 :chunks 0 :tail "" :padded? false})))
 
@@ -83,7 +99,7 @@
       (when (.hasRemaining buffer)
         (cr/check! :copy-sink-write)
         (let [offset (.position buffer)
-              written (.write sink buffer)]
+              written (with-local-io (.write sink buffer))]
           (when-not (and (pos? written) (= written (- (.position buffer) offset)))
             (fail! :copy/sink-stalled "Copy sink made no progress" {:written written}))
           (.update digest bytes offset written)
@@ -151,7 +167,8 @@
       (fail! :copy/format-mismatch "Copy format changed during reception" {}))
     ;; Validate before forcing/closing the destination. A sink failure remains
     ;; inside the borrowed connection's transfer scope and cannot trigger replay.
-    (when (instance? FileChannel (:sink receiver)) (.force ^FileChannel (:sink receiver) true))
+    (when (instance? FileChannel (:sink receiver))
+      (with-local-io (.force ^FileChannel (:sink receiver) true)))
     (close! receiver)
     (cr/check! :copy-close)
     (vswap! (:state receiver) assoc :phase :complete)

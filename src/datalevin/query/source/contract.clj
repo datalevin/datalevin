@@ -112,3 +112,11 @@
 (defn variables [clause]
   (into #{} (keep #(when (= :var (first %)) (second %)))
         (or (:terms clause) (:args clause))))
+
+(defn pattern-source-info
+  "The captured descriptor for a normal or regional pattern."
+  [request pattern]
+  (if-let [sources (:datalevin.query.source/region-sources request)]
+    (or (some #(when (= (:symbol %) (:source-symbol pattern)) (:descriptor %)) sources)
+        (fail! :query-source/invalid :planning))
+    (:source-descriptor request)))
