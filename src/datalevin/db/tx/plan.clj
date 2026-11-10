@@ -7,6 +7,9 @@
 
 (deftype ScalarEntityRead [^objects names ^longs aids])
 
+(deftype MixedAttrInfo
+  [props ^boolean ordinary? ^boolean insert? ^boolean update? tuples ^boolean typed?])
+
 (defn resolved-positive-ref?
   "Recognize positive literal IDs within the signed long range."
   [value]

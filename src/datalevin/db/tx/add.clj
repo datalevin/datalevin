@@ -11,80 +11,16 @@
   "Prepare independent ordinary additions without interpreter or index mutations."
   (:require [datalevin.datom :as d :refer [datom]]
             [datalevin.db.tx.common :as common]
+            [datalevin.db.tx.compile :as compile]
             [datalevin.db.tx.prepare :as txprep]
             [datalevin.interface :as i]
             [datalevin.index :as idx]
             [datalevin.prepare :as prepare]
             [datalevin.storage :as storage])
   (:import [datalevin.datom Datom]
+           [datalevin.db.tx.plan MixedAttrInfo]
            [java.util ArrayList HashMap HashSet SortedSet]
            [org.eclipse.collections.impl.map.mutable.primitive LongObjectHashMap]))
-
-(def ^:private scalar-types
-  #{nil :db.type/long :db.type/string :db.type/keyword :db.type/symbol
-    :db.type/float :db.type/double :db.type/boolean :db.type/instant
-    :db.type/uuid :db.type/bytes :db.type/bigint :db.type/bigdec})
-
-(def ^:private unique-types
-  #{:db.type/boolean :db.type/instant :db.type/keyword :db.type/long
-    :db.type/string :db.type/symbol :db.type/uuid :db.type/ref})
-
-(defn- ordinary-unique? [schema props]
-  (or (nil? (:db/unique props))
-      (contains? unique-types (:db/valueType props))
-      (and (= :db.type/tuple (:db/valueType props))
-           (every? unique-types
-                   (or (some->> (:db/tupleAttrs props)
-                                (map #(:db/valueType (schema %))))
-                       (:db/tupleTypes props)
-                       [(:db/tupleType props)])))))
-
-(defn- ordinary-attr? [a props]
-  (and props (keyword? a) (not= "db" (namespace a))
-       (not (common/reverse-ref? a))
-       (not= :db.cardinality/many (:db/cardinality props))
-       (not= :db.unique/identity (:db/unique props))
-       (not (:db.attr/preds props))
-       (or (contains? scalar-types (:db/valueType props))
-           (#{:db.type/ref :db.type/tuple} (:db/valueType props)))))
-
-(deftype ^:private MixedAttrInfo
-  [props ^boolean ordinary? ^boolean insert? ^boolean update? tuples ^boolean typed?])
-
-(def ^:private unique-attr-marker
-  ;; Attribute keys are keywords. Reserve a distinct key for this plan's flag.
-  (Object.))
-
-(defn- attr-info
-  "Classify an attribute once per preparation call. Value correction and
-  reference resolution still depend on each entity's values and tempids."
-  [^HashMap infos schema sources a]
-  (or (.get infos a)
-      (let [props (schema a)
-            ordinary? (and (ordinary-attr? a props)
-                           (ordinary-unique? schema props))
-            source-tuples (get sources a)
-            ;; Composite tuples cannot themselves be tuple sources, so this
-            ;; resolves each derived tuple's metadata without a dependency cycle.
-            ordinary-tuples?
-            (and ordinary?
-                 (reduce-kv
-                   (fn [_ tuple _]
-                     (let [^MixedAttrInfo info (attr-info infos schema sources tuple)]
-                       (if (.-ordinary? info) true (reduced false))))
-                   true source-tuples))
-            info (MixedAttrInfo.
-                   props (boolean ordinary?)
-                   (boolean (and ordinary? (not (:db/tupleAttrs props))
-                                 ordinary-tuples?))
-                   (boolean (and ordinary?
-                                 (contains? scalar-types (:db/valueType props))
-                                 (nil? (:db/unique props))
-                                 (not (:db/tupleAttrs props)) (not source-tuples)))
-                   source-tuples (some? (:db/valueType props)))]
-        (when (:db/unique props) (.put infos unique-attr-marker true))
-        (.put infos a info)
-        info)))
 
 (defn- resolved-ref [tempids value]
   (if (and (integer? value) (not (neg? (long value))))
@@ -111,7 +47,7 @@
           (fn [values a v]
             (if (= :db/id a)
               values
-              (let [^MixedAttrInfo info (attr-info infos schema sources a)
+              (let [^MixedAttrInfo info (compile/ordinary-attr-info! infos schema sources a)
                     props (.-props info)]
                 (if (and (.-insert? info) (resolved-value? props tempids v))
                   (let [v (prepare/correct-value-with-props
@@ -178,7 +114,7 @@
   (let [insert? (fn [_ a _value]
                   (if (= :db/id a)
                     true
-                    (let [^MixedAttrInfo info (attr-info infos schema sources a)]
+                    (let [^MixedAttrInfo info (compile/ordinary-attr-info! infos schema sources a)]
                       (if (.-insert? info) true (reduced false)))))]
     (fn [entity kind]
       (when-not (meta entity)
@@ -193,7 +129,7 @@
             (let [[_ e a v] entity]
               ;; Keep canonical Long E/A keys shared with construction.
               (and (instance? Long e) (pos? (long e)) (keyword? a) (some? v)
-                   (.-update? ^MixedAttrInfo (attr-info infos schema sources a))
+                   (.-update? ^MixedAttrInfo (compile/ordinary-attr-info! infos schema sources a))
                    (.add updates [e a])))))))))
 
 (defn- preflight-additions
@@ -251,7 +187,7 @@
             (and (vector? entity) (= 4 (count entity))
                  (= :db/add (nth entity 0)))
             (let [[_ e a v] entity
-                  ^MixedAttrInfo info (attr-info infos schema sources a)
+                  ^MixedAttrInfo info (compile/ordinary-attr-info! infos schema sources a)
                   props (.-props info)]
               ;; Java set keys must use the datom's canonical Long entity ID.
               ;; Other integer representations need ordered resolution.
@@ -274,7 +210,7 @@
   "Validate unique additions before preparing any old-value reads. Neither
   request duplicates nor native/pending owners can enter the mixed report."
   [db ^ArrayList additions ^HashMap infos]
-  (or (not (.containsKey infos unique-attr-marker))
+  (or (not (compile/ordinary-unique-attrs-present? infos))
       (loop [index 0 seen nil]
         (if (< index (.size additions))
           (let [^Datom addition (.get additions index)

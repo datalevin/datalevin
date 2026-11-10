@@ -5,7 +5,8 @@
             [datalevin.admin :as admin]
             [datalevin.client :as client]
             [datalevin.command :as command]
-            [datalevin.main :as main]))
+            [datalevin.main :as main]
+            [datalevin.util :as u]))
 
 (defn- status [name id]
   {:db-name name :db-id id :db-type :key-value :open? false
@@ -61,6 +62,27 @@
                                       (throw (ex-info "dtlv://user:secret@localhost" {})))})]
     (is (= 2 (:exit result)))
     (is (not (str/includes? (pr-str result) "secret")))))
+
+(deftest admin-validation-normalizes-names-before-deduplication
+  (doseq [arguments [["status"] ["wal-gc"] ["backup" "destination"]]]
+    (let [options {:database ["Orders_DB" "users" "orders-db" "ORDERS-DB" "Users"]}
+          validated (admin/validate-options options arguments)]
+      (is (= ["orders-db" "users"] (get-in validated [:options :database])))
+      (is (= validated (admin/validate-options (:options validated) arguments)))))
+  (doseq [names [[""] [" "] [nil]]]
+    (is (= 2 (:exit-code (admin/validate-options {:database names} ["status"]))))))
+
+(deftest programmatic-status-normalizes-deduplicates-and-preserves-target-order
+  (let [result (run-admin {:database ["Orders_DB" "users" "orders-db" "ORDERS-DB" "Users"]}
+                          (fn [_ [name]] (status (u/lisp-case name) 1)))
+        requests (filter #(= :admin-status (first %)) (:calls result))]
+    (is (= 0 (:exit result)))
+    (is (= [["orders-db" {:runtime? true}] ["users" {:runtime? true}]]
+           (mapv second requests)))
+    (is (= ["orders-db" "users"] (mapv :db-name (:results result))))
+    (is (every? :result (:results result)))
+    (is (empty? (:diagnostics result)))
+    (is (= 1 (:closed result)))))
 
 (deftest named-status-does-not-enumerate-and-continues-target-failures
   (let [result (run-admin {:database ["missing" "good"] :timeout-ms 25}

@@ -2297,15 +2297,6 @@
 ;; the blind path at any batch size.
 (def ^:private ^:const ^long blind-unique-write-threshold 2)
 
-(def ^:private blind-unique-value-types
-  #{:db.type/boolean
-    :db.type/instant
-    :db.type/keyword
-    :db.type/long
-    :db.type/string
-    :db.type/symbol
-    :db.type/uuid})
-
 (defn- blind-unique-inline-value?
   "Conservatively reject values that can spill into the giants DB. Giant
   values include an allocated giant ID in their AVE key, so LMDB key equality
@@ -2318,24 +2309,6 @@
 
     true))
 
-(defn- blind-write-attr-supported?
-  [attr props tuple-source-attrs allow-unique?]
-  (and props
-       (keyword? attr)
-       (not (contains? #{:db/id :db/created-at :db/updated-at} attr))
-       (not= "db" (namespace attr))
-       (not (reverse-ref? attr))
-       (or (nil? (:db/unique props))
-           (and (or (identical? (:db/unique props) :db.unique/value)
-                    (and allow-unique?
-                         (identical? (:db/unique props) :db.unique/identity)))
-                (contains? blind-unique-value-types (:db/valueType props))))
-       (not (:db.attr/preds props))
-       (not (contains? props :db/tupleAttrs))
-       (not (contains? props :db/tupleType))
-       (not (contains? props :db/tupleTypes))
-       (not (contains? tuple-source-attrs attr))))
-
 (defn- blind-write-multiple-values?
   [many? unique-identity-attrs value]
   (and many?
@@ -2343,25 +2316,6 @@
        (not (map? value))
        (not (and (= (count value) 2)
                  (contains? unique-identity-attrs (first value))))))
-
-(defn- blind-value-ready?
-  "Values whose validation/coercion cannot fail or invoke user code. Other
-   values require the complete attribute preflight before normalization."
-  [^objects info value]
-  (case (aget info 4)
-    (nil :data) (and (some? value) (not (coll? value)))
-    :db.type/long (instance? Long value)
-    :db.type/ref (and (instance? Long value) (pos? (long value)))
-    :db.type/string (string? value)
-    :db.type/boolean (boolean? value)
-    :db.type/keyword (keyword? value)
-    :db.type/symbol (identical? clojure.lang.Symbol (class value))
-    :db.type/uuid (uuid? value)
-    :db.type/instant (identical? java.util.Date (class value))
-    :db.type/bytes (bytes? value)
-    :db.type/double (and (instance? Double value) (Double/isFinite (double value)))
-    :db.type/float (and (instance? Float value) (Float/isFinite (float value)))
-    false))
 
 (defn- append-blind-value!
   ^Boolean [^FastList attrs ^FastList unique-avs
@@ -2372,7 +2326,7 @@
           (and (coll? value) (not (bytes? value))))
     false
     (let [props   (aget info 0)
-          value'  (if (blind-value-ready? info value)
+          value'  (if (txcompile/blind-value-ready? info value)
                     value
                     (do
                       (vld/validate-val value entity)
@@ -2402,34 +2356,6 @@
           (.add attrs attr)
           (.add attrs value')
           true)))))
-
-(defn- blind-write-attr-info
-  [^java.util.HashMap infos store-schema tuple-source-attrs allow-unique? attr]
-  (or (.get infos attr)
-      (let [props (store-schema attr)
-            vt    (:db/valueType props)
-            ^objects info (object-array 6)]
-        (aset info 0 props)
-        ;; nil rejects an attribute; supported attributes carry cached
-        ;; uniqueness/cardinality flags (zero is a valid proof).
-        (aset info 1 (when (blind-write-attr-supported?
-                            attr props tuple-source-attrs allow-unique?)
-                       (bit-or (if (:db/unique props) 1 0)
-                               (if (identical? :db.cardinality/many
-                                               (:db/cardinality props)) 2 0))))
-        (aset info 2 (not (or (:db/fulltext props) (:db/embedding props)
-                             (:db/noindex props) (map? vt)
-                             (#{:db.type/vec :db.type/idoc :data} vt))))
-        (aset info 3 (Boolean/valueOf
-                      (boolean (#{:db.type/string :db.type/keyword
-                                  :db.type/symbol} vt))))
-        (aset info 4 vt)
-        ;; Only these types can bypass schema-aware correction.
-        (aset info 5 (not (or (cd/custom-type? vt) (map? vt)
-                             (identical? vt :db.type/idoc)
-                             (identical? vt :db.type/tuple))))
-        (.put infos attr info)
-        info)))
 
 (def ^:private instant-hashing-strategy
   ;; Storage keys retain milliseconds, unlike asymmetric Date/Timestamp
@@ -2646,7 +2572,7 @@
                                (if (identical? attr :db/id)
                                  kinds
                                  (let [^objects info
-                                       (blind-write-attr-info
+                                       (txcompile/blind-attr-info!
                                          attr-infos store-schema tuple-source-attrs
                                          allow-unique? attr)]
                                    (if (and (aget info 1)
@@ -2693,11 +2619,11 @@
                                      (if (realized? preflight)
                                        (.get attr-infos attr)
                                        (let [^objects info
-                                             (blind-write-attr-info
+                                             (txcompile/blind-attr-info!
                                                attr-infos store-schema
                                                tuple-source-attrs allow-unique? attr)]
                                          (when (and (aget info 1)
-                                                    (or (blind-value-ready? info value)
+                                                    (or (txcompile/blind-value-ready? info value)
                                                         @preflight))
                                            info)))))
                entity-attr-infos (or attr-lookup attr-infos)

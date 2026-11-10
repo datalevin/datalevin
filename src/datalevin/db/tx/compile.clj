@@ -3,11 +3,148 @@
 (ns ^:no-doc datalevin.db.tx.compile
   "Pure transaction analysis. No database, writer, entity allocation or pending view."
   (:require [datalevin.bits :as b]
+            [datalevin.custom-datalog :as cd]
             [datalevin.db.tx.plan :as plan]
             [datalevin.prepare])
-  (:import [datalevin.db.tx.plan ScalarEntityRead]
+  (:import [datalevin.db.tx.plan MixedAttrInfo ScalarEntityRead]
            [datalevin.prepare PrepareCtx]
+           [java.util HashMap]
            [org.eclipse.collections.impl.list.mutable FastList]))
+
+(def ^:private ordinary-scalar-types
+  #{nil :db.type/long :db.type/string :db.type/keyword :db.type/symbol
+    :db.type/float :db.type/double :db.type/boolean :db.type/instant
+    :db.type/uuid :db.type/bytes :db.type/bigint :db.type/bigdec})
+
+(def ^:private ordinary-unique-types
+  #{:db.type/boolean :db.type/instant :db.type/keyword :db.type/long
+    :db.type/string :db.type/symbol :db.type/uuid :db.type/ref})
+
+(defn- ordinary-unique? [schema props]
+  (or (nil? (:db/unique props))
+      (contains? ordinary-unique-types (:db/valueType props))
+      (and (= :db.type/tuple (:db/valueType props))
+           (every? ordinary-unique-types
+                   (or (some->> (:db/tupleAttrs props)
+                                (map #(:db/valueType (schema %))))
+                       (:db/tupleTypes props)
+                       [(:db/tupleType props)])))))
+
+(defn- ordinary-attr? [a props]
+  (and props (keyword? a) (not= "db" (namespace a))
+       (not (plan/reverse-ref-attr? a))
+       (not= :db.cardinality/many (:db/cardinality props))
+       (not= :db.unique/identity (:db/unique props))
+       (not (:db.attr/preds props))
+       (or (contains? ordinary-scalar-types (:db/valueType props))
+           (#{:db.type/ref :db.type/tuple} (:db/valueType props)))))
+
+(def ^:private ordinary-unique-attr-marker
+  ;; Attribute keys are keywords. Reserve a distinct key for this request flag.
+  (Object.))
+
+(defn ordinary-attr-info!
+  "Bind ordinary addition metadata in request-owned scratch. Schema and tuple
+  sources are immutable PrepareCtx inputs; no value correction or writer reads."
+  [^HashMap infos schema sources a]
+  (or (.get infos a)
+      (let [props (schema a)
+            ordinary? (and (ordinary-attr? a props)
+                           (ordinary-unique? schema props))
+            source-tuples (get sources a)
+            ;; Composite tuples cannot themselves be tuple sources.
+            ordinary-tuples?
+            (and ordinary?
+                 (reduce-kv
+                   (fn [_ tuple _]
+                     (let [^MixedAttrInfo info (ordinary-attr-info! infos schema sources tuple)]
+                       (if (.-ordinary? info) true (reduced false))))
+                   true source-tuples))
+            info (MixedAttrInfo.
+                   props (boolean ordinary?)
+                   (boolean (and ordinary? (not (:db/tupleAttrs props))
+                                 ordinary-tuples?))
+                   (boolean (and ordinary?
+                                 (contains? ordinary-scalar-types (:db/valueType props))
+                                 (nil? (:db/unique props))
+                                 (not (:db/tupleAttrs props)) (not source-tuples)))
+                   source-tuples (some? (:db/valueType props)))]
+        (when (:db/unique props) (.put infos ordinary-unique-attr-marker true))
+        (.put infos a info)
+        info)))
+
+(defn ordinary-unique-attrs-present?
+  "Whether these request-owned bindings contain a unique attribute."
+  [^HashMap infos]
+  (.containsKey infos ordinary-unique-attr-marker))
+
+(def ^:private blind-unique-types
+  #{:db.type/boolean :db.type/instant :db.type/keyword :db.type/long
+    :db.type/string :db.type/symbol :db.type/uuid})
+
+(defn- blind-attr-supported?
+  [attr props tuple-source-attrs allow-unique?]
+  (and props
+       (keyword? attr)
+       (not (contains? #{:db/id :db/created-at :db/updated-at} attr))
+       (not= "db" (namespace attr))
+       (not (plan/reverse-ref-attr? attr))
+       (or (nil? (:db/unique props))
+           (and (or (identical? (:db/unique props) :db.unique/value)
+                    (and allow-unique?
+                         (identical? (:db/unique props) :db.unique/identity)))
+                (contains? blind-unique-types (:db/valueType props))))
+       (not (:db.attr/preds props))
+       (not (contains? props :db/tupleAttrs))
+       (not (contains? props :db/tupleType))
+       (not (contains? props :db/tupleTypes))
+       (not (contains? tuple-source-attrs attr))))
+
+(defn blind-attr-info!
+  "Bind blind-insert flags from immutable schema inputs in request-owned scratch.
+  Value normalization, uniqueness probes and entity binding remain runtime work."
+  [^HashMap infos schema tuple-source-attrs allow-unique? attr]
+  (or (.get infos attr)
+      (let [props (schema attr)
+            vt (:db/valueType props)
+            ^objects info (object-array 6)]
+        (aset info 0 props)
+        ;; Nil rejects an attribute; zero is a supported cardinality-one proof.
+        (aset info 1 (when (blind-attr-supported?
+                            attr props tuple-source-attrs allow-unique?)
+                       (bit-or (if (:db/unique props) 1 0)
+                               (if (identical? :db.cardinality/many
+                                               (:db/cardinality props)) 2 0))))
+        (aset info 2 (not (or (:db/fulltext props) (:db/embedding props)
+                             (:db/noindex props) (map? vt)
+                             (#{:db.type/vec :db.type/idoc :data} vt))))
+        (aset info 3 (Boolean/valueOf
+                      (boolean (#{:db.type/string :db.type/keyword
+                                  :db.type/symbol} vt))))
+        (aset info 4 vt)
+        (aset info 5 (not (or (cd/custom-type? vt) (map? vt)
+                             (identical? vt :db.type/idoc)
+                             (identical? vt :db.type/tuple))))
+        (.put infos attr info)
+        info)))
+
+(defn blind-value-ready?
+  "Recognize existing no-correction cases without calling a value conversion."
+  [^objects info value]
+  (case (aget info 4)
+    (nil :data) (and (some? value) (not (coll? value)))
+    :db.type/long (instance? Long value)
+    :db.type/ref (and (instance? Long value) (pos? (long value)))
+    :db.type/string (string? value)
+    :db.type/boolean (boolean? value)
+    :db.type/keyword (keyword? value)
+    :db.type/symbol (identical? clojure.lang.Symbol (class value))
+    :db.type/uuid (uuid? value)
+    :db.type/instant (identical? java.util.Date (class value))
+    :db.type/bytes (bytes? value)
+    :db.type/double (and (instance? Double value) (Double/isFinite (double value)))
+    :db.type/float (and (instance? Float value) (Float/isFinite (float value)))
+    false))
 
 (def scalar-update-value-types
   #{:db.type/long :db.type/string :db.type/keyword :db.type/symbol

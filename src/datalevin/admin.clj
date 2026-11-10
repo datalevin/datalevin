@@ -21,7 +21,7 @@
     :validate [#(<= 1 (long %) Integer/MAX_VALUE) "Must be a positive 32-bit integer"]]
    [nil "--database NAME" "Named database; repeat to select more databases"
     :assoc-fn (fn [options key value]
-                (update options key (fnil conj []) (u/lisp-case value)))
+                (update options key (fnil conj []) value))
     :validate [#(not (str/blank? %)) "Must name a database"]]
    [nil "--all-databases" "Select the contacted node's complete database catalog"]
    [nil "--dry-run" "Plan WAL GC without deleting segments (wal-gc only)"]])
@@ -61,7 +61,10 @@ Example:
 
 (defn validate-options
   [options arguments]
-  (let [names (vec (distinct (:database options)))
+  (let [names (->> (:database options)
+                   (map #(some-> % u/lisp-case))
+                   distinct
+                   vec)
         error (cond
                 (not (or (and (= 1 (count arguments)) (#{"status" "wal-gc"} (first arguments)))
                          (and (= 2 (count arguments)) (= "backup" (first arguments))

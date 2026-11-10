@@ -2,7 +2,8 @@
   (:require [clojure.test :refer [deftest is]]
             [datalevin.db.tx.compile :as compile]
             [datalevin.prepare :as prepare])
-  (:import [datalevin.db.tx.plan TxPlan]))
+  (:import [datalevin.db.tx.plan MixedAttrInfo TxPlan]
+           [java.util HashMap]))
 
 (def ctx
   (prepare/->PrepareCtx
@@ -11,6 +12,45 @@
      :identity {:db/aid 5 :db/valueType :db.type/string :db/unique :db.unique/identity}
      :reference {:db/aid 6 :db/valueType :db.type/ref}}
     {} {:validate-data? true}))
+
+(deftest ordinary-attribute-proofs-keep-writer-obligations-distinct
+  (let [effects (atom [])
+        schema {:value {:db/valueType :db.type/long}
+                :left {:db/valueType :db.type/long}
+                :right {:db/valueType :db.type/long}
+                :pair {:db/valueType :db.type/tuple :db/tupleAttrs [:left :right]
+                       :db/unique :db.unique/value}
+                :token {:db/valueType :db.type/string :db/unique :db.unique/value}
+                :identity {:db/valueType :db.type/string :db/unique :db.unique/identity}
+                :reference {:db/valueType :db.type/ref}
+                :many {:db/valueType :db.type/long :db/cardinality :db.cardinality/many}
+                :custom {:db/valueType :app/custom}
+                :predicate {:db/valueType :db.type/long
+                            :db.attr/preds [(fn [_] (swap! effects conj :predicate))]}}
+        sources {:left {:pair 0} :right {:pair 1}}
+        infos (HashMap.)]
+    ;; Built-in attributes remain eligible in a schema with unrelated custom
+    ;; attributes. Unique/reference/tuple obligations still belong to the writer.
+    (doseq [[attr expected]
+            [[:value [true true true]]
+             [:left [true true false]]
+             [:pair [true false false]]
+             [:token [true true false]]
+             [:identity [false false false]]
+             [:reference [true true false]]
+             [:many [false false false]]
+             [:custom [false false false]]
+             [:predicate [false false false]]]]
+      (let [^MixedAttrInfo info (compile/ordinary-attr-info! infos schema sources attr)]
+        (is (= expected [(.-ordinary? info) (.-insert? info) (.-update? info)])
+            (str attr))))
+    (is (compile/ordinary-unique-attrs-present? infos))
+    (is (empty? @effects))
+    ;; An unsupported derived tuple blocks its source insertion proof as well.
+    (let [schema (assoc-in schema [:pair :db/unique] :db.unique/identity)
+          ^MixedAttrInfo info (compile/ordinary-attr-info! (HashMap.) schema sources :left)]
+      (is (true? (.-ordinary? info)))
+      (is (false? (.-insert? info))))))
 
 (deftest literal-scalar-plan-owns-one-context-and-operand-stream
   (let [p (compile/compile-tx ctx [[:db/add 1 :value 42] {:db/id 1 :text "a"}])]
