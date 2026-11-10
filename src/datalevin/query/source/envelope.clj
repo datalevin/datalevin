@@ -110,10 +110,12 @@
                 (ensure! (not (value/disjoint-constant? (:type column) (second term) check!))))))
         :predicate
         (do (fields! clause #{:id :kind :operator :semantics-version :args} #{})
-            (when-not (and (#{:= :not= :< :<= :> :>= :like :not-like :in :not-in} (:operator clause))
+            (when-not (and (#{:= :not= :< :<= :> :>= :like :not-like :like-any :in :not-in} (:operator clause))
                            (= 1 (:semantics-version clause)))
               (fail! :query-source/unsupported :planning))
             (ensure! (and (vector? (:args clause)) (= 2 (count (:args clause)))))
+            (when (= :like-any (:operator clause))
+              (ensure! (contains? (:datalevin.query.source/predicate-prefilters source-descriptor) :like-any)))
             (doseq [term (:args clause)] (predicate-term! term check!)))
         (fail! :query-source/invalid :planning)))
     (doseq [x (vals bindings)] (value/value-charge x (fn [_] (check!))))

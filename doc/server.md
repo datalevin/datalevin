@@ -34,6 +34,12 @@ transfer metadata without retaining payload chunks, and writes `VERSION` only
 after validation and sink close. Transfer failures after the response header
 are never replayed.
 
+Copy metadata reports `:storage-version`, the producing server's Datalevin
+version. Both APIs write that version to `VERSION`, including when the client
+and server versions differ. Copies that write `VERSION` require valid version
+metadata; servers that omit it cannot produce a labeled backup. Raw
+`copy-to-file` transfers with `:version-file nil` do not require this metadata.
+
 Server copy flushes pending secondary-index jobs and persists vector/embedding
 checkpoints before establishing its LMDB snapshot. Write exclusion ends at that
 boundary, while the fixed snapshot and source lifetime remain protected through

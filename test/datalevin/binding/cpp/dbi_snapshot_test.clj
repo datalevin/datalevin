@@ -9,6 +9,37 @@
 
 (use-fixtures :once db-fixture)
 
+(deftest table-snapshots-support-thread-local-reader-slots
+  (let [root (u/tmp-dir (str "dbi-snapshot-tls-" (random-uuid)))
+        db (d/open-kv root {:wal? false :flags #{:nordahead} :max-readers 3})
+        raw (kv/raw-lmdb db)]
+    (try
+      (i/open-dbi db "observed")
+      (i/open-dbi db "unrelated")
+      (i/transact-kv db [[:put "observed" :value 0]])
+      ;; More captures than reader slots also exercise owner-thread cleanup.
+      (dotimes [n 16]
+        (with-open [snapshot ^java.lang.AutoCloseable (cpp/dbi-snapshot raw "observed")]
+          (is (= n (i/get-value db "observed" :value)))
+          (is (cpp/dbi-snapshot-current? raw snapshot))
+          (i/transact-kv db [[:put "unrelated" :value n]])
+          (is (cpp/dbi-snapshot-current? raw snapshot))
+          (i/transact-kv db [[:put "observed" :value (inc n)]])
+          (is (not (cpp/dbi-snapshot-current? raw snapshot)))))
+      (is (= 16 (i/get-value db "observed" :value)))
+      ;; Constructor failure must release the owner before the environment closes.
+      (is (thrown? NullPointerException (cpp/dbi-snapshot raw nil)))
+      (with-open [snapshot ^java.lang.AutoCloseable (cpp/dbi-snapshot raw "observed")]
+        (try
+          (.interrupt (Thread/currentThread))
+          (.close snapshot)
+          (is (.isInterrupted (Thread/currentThread)))
+          (finally (Thread/interrupted))))
+      (is (= 16 (i/get-value db "observed" :value)))
+      (finally
+        (d/close-kv db)
+        (u/delete-files root)))))
+
 (deftest table-snapshots-ignore-other-trees-and-aborted-writes
   (let [root (u/tmp-dir (str "dbi-snapshot-" (random-uuid)))
         db (d/open-kv root {:wal? false})

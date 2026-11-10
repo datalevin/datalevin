@@ -9,7 +9,8 @@
             [datalevin.util :as u])
   (:import [java.io File IOException InterruptedIOException]
            [java.nio.channels ClosedByInterruptException]
-           [java.nio.file Files Path Paths LinkOption CopyOption FileSystemException]
+           [java.nio.file Files Path Paths LinkOption CopyOption FileSystemException
+            DirectoryNotEmptyException NoSuchFileException]
            [java.nio.file.attribute FileAttribute PosixFilePermissions]))
 
 (def cli-options
@@ -85,12 +86,18 @@ Example:
   #{"dir" "root" "path" "file" "filename" "wal-dir" "snapshot-dir"
     "segment-path" "segment-file" "temp-dir" "tmp-dir" "copy-dir"})
 
+(def ^:private server-path-pattern
+  (let [prefix "(?:(?<![\\w:/])(?:/[\\w.]|//)|(?<![\\w/])[A-Za-z]:[\\\\/]|\\\\\\\\)"]
+    ;; Spaces and punctuation can belong to filenames. Redact through the last
+    ;; matching quote, or through the end of the line for unquoted diagnostics.
+    (re-pattern (str "(?:([\"'])" prefix "[^\\r\\n]*\\1|" prefix "[^\\r\\n]*)"))))
+
 (defn- safe-string
   [uri value]
   (-> (if (str/blank? uri) value (str/replace value uri "[redacted-uri]"))
       (str/replace #"(?i)([a-z][a-z0-9+.-]*://)[^\s/@]+@" "$1[redacted]@")
-      (str/replace #"(?<![\w:/])(?:/[\w.][^\s\"',;)}\]]*|[A-Za-z]:[\\/][^\s\"',;)}\]]*)"
-                   "[redacted-path]")))
+      (str/replace server-path-pattern
+                   (fn [[_ quote]] (str quote "[redacted-path]" quote)))))
 
 (defn sanitize
   "Keep EDN results while removing server-local paths and URI credentials."
@@ -246,6 +253,11 @@ Example:
 
 (def ^:private no-follow (into-array LinkOption [LinkOption/NOFOLLOW_LINKS]))
 
+;; Windows also reserves aliases with extensions and superscript ¹/²/³ digits.
+;; https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file
+(def ^:private windows-device-name
+  #"(?i)(?:con|prn|aux|nul|conin\$|conout\$|(?:com|lpt)[1-9¹²³])(?:\..*)?")
+
 (defn- private-directory!
   [^Path path]
   (file-copy/with-local-io
@@ -256,10 +268,24 @@ Example:
       (catch UnsupportedOperationException _
         (Files/createDirectory path (make-array FileAttribute 0))))))
 
+(defn- remove-empty-directory! [^Path path]
+  (file-copy/with-local-io
+    (try
+      (when (Files/isDirectory path no-follow)
+        (Files/delete path))
+      (catch DirectoryNotEmptyException _)
+      (catch NoSuchFileException _))))
+
+(defn- cleanup-backup-destination! [^Path destination]
+  (remove-empty-directory! (.resolve destination ".incomplete"))
+  (remove-empty-directory! destination))
+
 (defn- backup-destination!
-  [destination targets]
+  [create-directory! destination targets]
   (let [names (mapv :db-name targets)]
-    (when (or (some #(or (str/blank? %) (#{"." ".." ".incomplete"} %)
+    (when (or (some #(or (str/blank? %) (#{"." ".."} %)
+                        (.equalsIgnoreCase ".incomplete" %)
+                        (re-matches windows-device-name %)
                         (re-find #"[\\/\u0000<>:\"|?*]" %)
                         (re-find #"[. ]$" %)) names)
               (not= (count names) (count (distinct (map str/lower-case names)))))
@@ -272,12 +298,18 @@ Example:
       (throw (ex-info "Backup parent directory must exist and be writable"
                       {:error :admin/invalid-destination})))
     (let [path (.resolve (.toRealPath parent (make-array LinkOption 0)) (.getFileName path))]
-      (private-directory! path)
-      (private-directory! (.resolve path ".incomplete"))
-      path)))
+      (create-directory! path)
+      (try
+        (create-directory! (.resolve path ".incomplete"))
+        path
+        (catch Throwable failure
+          (try (cleanup-backup-destination! path)
+               (catch Throwable cleanup
+                 (when-not (identical? failure cleanup) (.addSuppressed failure cleanup))))
+          (throw failure))))))
 
 (defn- backup-sweep
-  [request backup connection targets ^Path destination emit]
+  [request backup create-directory! connection targets ^Path destination emit]
   (loop [targets (seq targets) failed? false attempted? false]
     (if-let [target (first targets)]
       (let [sent? (volatile! false)
@@ -291,7 +323,7 @@ Example:
                 (let [name (:db-name discovery)
                       stage (.resolve (.resolve destination ".incomplete") ^String name)
                       final (.resolve destination ^String name)]
-                  (private-directory! stage)
+                  (create-directory! stage)
                   (let [result (backup connection
                                        (select-keys discovery [:db-name :db-id :db-type])
                                        (.resolve stage "data.mdb"))]
@@ -322,14 +354,15 @@ Example:
 
 (defn run!
   "Execute an admin sweep, returning an exit code. Dependencies are injectable
-  for transport, output and environment tests; normal calls use the real client."
+  for transport, filesystem, output and environment tests; normal calls use the real client."
   ([options arguments] (run! options arguments {}))
   ([options arguments dependencies]
-   (let [{:keys [getenv connect disconnect request maintenance backup emit diagnostic]}
+   (let [{:keys [getenv connect disconnect request maintenance backup create-directory! emit diagnostic]}
          (merge {:getenv u/env :connect client/new-client
                  :disconnect client/close-client :request client/endpoint-request
                  :maintenance client/admin-gc!
                  :backup client/admin-backup!
+                 :create-directory! private-directory!
                  :emit print-result :diagnostic #(binding [*out* *err*] (println %))}
                 dependencies)
          validation (validate-options options arguments)]
@@ -349,12 +382,17 @@ Example:
                    (let [targets (if (:all-databases options)
                                    (all-targets request connection)
                                    (mapv #(hash-map :db-name %) (:database options)))
-                         destination (when (= "backup" (first arguments))
-                                       (backup-destination! (second arguments) targets))]
+                         destination (when (and (= "backup" (first arguments)) (seq targets))
+                                       (backup-destination! create-directory! (second arguments) targets))]
                      (vreset! started? true)
                      (case (first arguments)
                        "wal-gc" (gc-sweep request maintenance connection targets options #(emit (sanitize uri %)))
-                       "backup" (backup-sweep request backup connection targets destination #(emit (sanitize uri %)))
+                       "backup" (if destination
+                                  (try
+                                    (backup-sweep request backup create-directory! connection targets destination
+                                                  #(emit (sanitize uri %)))
+                                    (finally (cleanup-backup-destination! destination)))
+                                  0)
                        (sweep request connection targets #(emit (sanitize uri %)))))
                    (catch Exception e
                      (diagnostic (str "Admin command failed: "

@@ -907,8 +907,7 @@
                   (let [input (input-program/prepare! child parsed arguments #(joined! child check! %1 %2))
                         compilation (planning/capture! child (:entries input) (:parsed input) (:rules input)
                                       (:bindings input) (set (map :variable (:columns input))) options)]
-                    (if-let [delegation (when-not (seq (get-in compilation [:prepared :native-extrema]))
-                                         (relational/plan! child compilation input))]
+                    (if-let [delegation (relational/plan! child compilation input)]
                       (let [result (when execute? (relational/run! child delegation))]
                         (if (nil? explain-options) result
                             (diagnostics/finish! child execute? (:result-rows (control/usage (:control child)))

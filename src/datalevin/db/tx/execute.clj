@@ -339,6 +339,15 @@
     (.clear ^TreeSortedSet (:avet db)))
   db)
 
+(defn stage-compiled-report!
+  "Populate the existing request-local EAV/AVE view from finalized logical datoms.
+  Queryable preparation uses this outside batch preparation; commit-only writer
+  callers retain the existing commit path's pending-state staging."
+  [report]
+  (let [db (clear-tx-cache (:db-after report))]
+    (doseq [datom (:tx-data report)] (txcommon/stage-batch-datom! db datom))
+    report))
+
 (defn- validate-datom
   [db ^Datom datom resolution props]
   (when (and (datom-added datom) (:db/unique props))

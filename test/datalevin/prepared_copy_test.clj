@@ -57,9 +57,10 @@
       (u/create-dirs dest)
       (with-open [prepared (cpp/prepare-copy (kv/raw-lmdb source) dest false)]
         (cpp/copy-prepared! prepared))
-      (let [meta (copy/finalize-copy! dest "source" {})
+      (let [meta (copy/finalize-copy! dest "source" {:storage-version "0.0.0"})
             raw (cpp/open-existing-raw dest)]
         (try
+          (is (= c/version (:storage-version meta)))
           (is (pos? (:payload-last-applied-lsn meta)))
           (is (not (contains? (set (i/list-dbis raw)) c/schema)))
           (is (not (u/file-exists (str dest "/txlog"))))

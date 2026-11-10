@@ -15,7 +15,8 @@
             [datalevin.util :as u]
             [datalevin.vector :as v]
             [taoensso.nippy :as nippy])
-  (:import [datalevin.vector VectorIndex]
+  (:import [datalevin.db DB]
+           [datalevin.vector VectorIndex]
            [java.util.concurrent CountDownLatch Semaphore TimeUnit]
            [java.util.concurrent.locks ReentrantReadWriteLock]))
 
@@ -38,6 +39,51 @@
      :with-index-write-admission (fn [_ _ f] (f))}
     nil nil :client {:args ["source" opts]})
   (:index @state))
+
+(deftest datalog-capture-supports-thread-local-reader-slots
+  (doseq [compact? [false true] wal? [false true]]
+    (testing (str {:compact? compact? :wal? wal?})
+      (let [root (u/tmp-dir (str "capture-tls-" (random-uuid)))
+            conn (d/get-conn (str root "/source")
+                            {:name {:db/valueType :db.type/string}}
+                            {:wal? wal? :kv-opts {:flags #{:nordahead}}})
+            source (.-store ^DB @conn)
+            kv (capture/source-kv source)
+            options {:standalone? true :authorize-write! (fn [])
+                     :admit-write (fn [f] (f))
+                     :with-writer
+                     (fn [f]
+                       (i/transact-kv kv [[:put "unrelated" :committed true]])
+                       (binding [kv/*server-write-slot-held?* true] (f)))}]
+        (try
+          (is (not (contains? (set (i/get-env-flags kv)) :notls)))
+          (i/open-dbi kv "unrelated")
+          (i/transact-kv kv
+            [(si/job-tx
+               (si/completed-job
+                 (si/make-job {:type :fulltext :op :add :domain c/default-domain
+                               :ref 1 :value "completed" :tx 1})))])
+          (dotimes [n 2]
+            (let [dest (str root "/copy-" n)
+                  expected (set (map str (range (inc n))))]
+              (d/transact! conn [{:name (str n)}])
+              (is (= expected (set (d/q '[:find [?name ...] :where [_ :name ?name]] @conn))))
+              (u/create-dirs dest)
+              (let [result (capture/attempt! source dest compact? options)]
+                (is (map? result))
+                (copy/finalize-copy! dest "source" result)
+                (spit (str dest "/VERSION") c/version)
+                (let [restored (d/get-conn dest)]
+                  (try
+                    (is (= expected
+                           (set (d/q '[:find [?name ...] :where [_ :name ?name]] @restored))))
+                    (is (= true (i/get-value (capture/source-kv (.-store ^DB @restored))
+                                            "unrelated" :committed)))
+                    (finally (d/close restored)))))
+              (is (= expected (set (d/q '[:find [?name ...] :where [_ :name ?name]] @conn))))))
+          (finally
+            (d/close conn)
+            (u/delete-files root)))))))
 
 (deftest cold-vector-capture-shares-client-initialization
   (doseq [compact? [false true] wal? [false true]]
@@ -181,8 +227,8 @@
     (close-provider [_])))
 
 (deftest late-embedding-jobs-drain-outside-capture-locks
-  (doseq [compact? [false true] wal? [false true] expired-lease? [false true]]
-    (testing (str {:compact? compact? :wal? wal? :expired-lease? expired-lease?})
+  (doseq [compact? [false true] wal? [false true] expired-lease? [false true] tls? [false true]]
+    (testing (str {:compact? compact? :wal? wal? :expired-lease? expired-lease? :tls? tls?})
       (let [root (u/tmp-dir (str "capture-late-embedding-" (random-uuid)))
             dest (str root "/copy")
             source-ref (volatile! nil)
@@ -191,9 +237,10 @@
             gate (Semaphore. 1)
             source (st/open (str root "/source")
                      {:text {:db/valueType :db.type/string :db/embedding true}}
-                     {:wal? wal?
-                      :embedding-opts {:provider :custom :indexing-mode :async}
-                      :embedding-providers {:custom (blocking-provider source-ref entered release)}})
+                     (cond-> {:wal? wal?
+                              :embedding-opts {:provider :custom :indexing-mode :async}
+                              :embedding-providers {:custom (blocking-provider source-ref entered release)}}
+                       tls? (assoc :kv-opts {:flags #{:nordahead}})))
             kv (capture/source-kv source)
             ref [1 (get-in (i/schema source) [:text :db/aid]) "late"]
             job (cond-> (si/make-job {:type :embedding :op :add :domain c/default-domain
@@ -348,11 +395,13 @@
         (u/delete-files root)))))
 
 (deftest unrelated-commits-do-not-invalidate-capture-job-history
-  (doseq [compact? [false true] wal? [false true]]
-    (testing (str {:compact? compact? :wal? wal?})
+  (doseq [compact? [false true] wal? [false true] tls? [false true]]
+    (testing (str {:compact? compact? :wal? wal? :tls? tls?})
       (let [root (u/tmp-dir (str "capture-unrelated-writes-" (random-uuid)))
             dest (str root "/copy")
-            source (st/open (str root "/source") nil {:wal? wal?})
+            source (st/open (str root "/source") nil
+                            (cond-> {:wal? wal?}
+                              tls? (assoc :kv-opts {:flags #{:nordahead}})))
             kv (capture/source-kv source)
             commits (atom 0)
             protected-reads (atom 0)

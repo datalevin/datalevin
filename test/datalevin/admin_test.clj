@@ -138,6 +138,57 @@
     (is (not (str/includes? text "secret")))
     (is (not (str/includes? text "p%40ss")))))
 
+(def ^:private diagnostic-paths
+  ["\\\\server\\share"
+   "\\\\server\\share\\dir\\file"
+   "\\\\server\\shared reports\\private folder\\data.mdb"
+   "//server/shared reports/private folder/data.mdb"
+   "C:\\server\\data.mdb"
+   "c:/Program Files/Datalevin/data.mdb"
+   "C:\\Program Files (x86)\\Datalevin\\data.mdb"
+   "C:\\Users\\O'Brien\\Private Files\\data.mdb"
+   "\\\\?\\UNC\\server\\share\\private folder\\data.mdb"
+   "\\\\?\\C:\\Program Files\\Datalevin\\data.mdb"
+   "/private/server data/old (backup)/data.mdb"])
+
+(deftest sanitization-removes-complete-paths-from-messages-and-unknown-keys
+  (doseq [path diagnostic-paths]
+    (testing path
+      (is (= "[redacted-path]" (admin/sanitize nil path)))
+      (is (= "Cannot read [redacted-path]"
+             (admin/sanitize nil (str "Cannot read " path))))
+      (doseq [quote ["\"" "'"]]
+        (is (= (str "Cannot read " quote "[redacted-path]" quote ": access denied")
+               (admin/sanitize nil (str "Cannot read " quote path quote ": access denied")))))
+      (when (or (str/starts-with? path "\\\\") (re-find #"^[A-Za-z]:" path))
+        (is (= "source:[redacted-path]" (admin/sanitize nil (str "source:" path)))))
+      (let [value {:details {path [path true 42]}
+                   :error (ex-info (str "Cannot read " path) {:opaque path})
+                   :paths #{path}}
+            clean (admin/sanitize nil value)]
+        (is (= {:details {"[redacted-path]" ["[redacted-path]" true 42]}
+                :error {:message "Cannot read [redacted-path]"
+                        :data {:opaque "[redacted-path]"}}
+                :paths #{"[redacted-path]"}}
+               clean))
+        (is (= clean (edn/read-string (pr-str clean)))))))
+  (doseq [text ["ordinary status text" "view/alter" "dtlv://host/orders"
+                "https://example.com/docs/server" "last-applied-lsn: 42"]]
+    (is (= text (admin/sanitize nil text)))))
+
+(deftest admin-errors-sanitize-paths-in-results-and-discovery-diagnostics
+  (doseq [path diagnostic-paths]
+    (testing path
+      (let [fail (fn [& _] (throw (ex-info (str "Cannot read " path) {:opaque path})))
+            named (run-admin {:database ["one"]} fail)
+            global (run-admin {:all-databases true} fail)]
+        (is (= 1 (:exit named)))
+        (is (= {:message "Cannot read [redacted-path]" :data {:opaque "[redacted-path]"}}
+               (get-in named [:results 0 :error])))
+        (is (= 2 (:exit global)))
+        (is (= ["Admin command failed: Cannot read [redacted-path]"] (:diagnostics global)))
+        (is (= 1 (:closed named) (:closed global)))))))
+
 (deftest admin-client-read-does-not-follow-ha-routing
   (let [requests (atom [])
         transport (reify client/IClient

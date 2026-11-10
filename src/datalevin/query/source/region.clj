@@ -48,6 +48,33 @@
 (defn- head-vars [branch]
   (mapv :symbol (concat (get-in branch [:vars :required]) (get-in branch [:vars :free]))))
 
+(defn- like-union-prefilters
+  "Derive advisory LIKE disjunctions without replacing their scoped operators.
+  Every branch must be one flat LIKE on the same variable with a literal pattern."
+  [region regions sites check!]
+  (let [base (+' 1 (reduce max -1 (map (comp :id :clause) (:patterns region)))
+                (count (:core-clauses region)))]
+    (into []
+      (keep-indexed
+        (fn [i site]
+          (check!)
+          (when (and (= :union (:kind site)) (= (:region-id region) (:parent-region site))
+                     (<= 1 (count (:branches site)) 32))
+            (let [children (mapv #(nth regions %) (:branches site))
+                  nodes (mapv #(get-in % [:core-clauses 0 :node]) children)
+                  args (mapv :args nodes)]
+              (when (and (every? #(and (empty? (:patterns %)) (= 1 (count (:core-clauses %)))) children)
+                         (every? #(and (instance? Predicate %) (= 'like (get-in % [:fn :symbol]))) nodes)
+                         (every? #(and (= 2 (count %)) (instance? Variable (first %))
+                                        (instance? Constant (second %)) (string? (:value (second %)))) args)
+                         (apply = (map #(get-in % [0 :symbol]) args))
+                         (contains? (:exports site) (get-in args [0 0 :symbol])))
+                (let [id (+' base i)]
+                  (when (> id Long/MAX_VALUE) (fail! :query-source/limit :planning))
+                  {:id id :kind :predicate :operator :like-any :semantics-version 1
+                   :args [[:var (get-in args [0 0 :symbol])]
+                          [:const (mapv #(get-in % [1 :value]) args)]]}))))) sites))))
+
 (defn annotate!
   "Attach stable regions/occurrence IDs and explicit rule/union/attribute
   edges to an engine-owned parsed query. entries contain already validated v2
@@ -335,6 +362,7 @@
                                                                        (or (nil? parent)
                                                                            (:live? (nth result parent))))))))
                                    [] @regions)
+                  sites-by-parent (group-by :parent-region @sites)
                   held @tokens closes @children closed? (atom false)
                   owner {:control ctl :query-id (:query-id runtime) :closed? closed?
                          :descriptors (into {} (map (juxt :symbol :descriptor)) entries)}
@@ -342,7 +370,13 @@
                                              (doseq [f (reverse closes)] (f))
                                              (doseq [token held] (control/release! token))))]
               (vreset! success? true)
-              {:parsed parsed :root-region root :regions (mapv #(assoc % :owner owner) resolved)
+              {:parsed parsed :root-region root
+               :regions (mapv (fn [region]
+                                (let [filters (like-union-prefilters region resolved
+                                               (get sites-by-parent (:region-id region)) check!)]
+                                  (when (seq filters) (reserve-node! (+ 256 (* 512 (count filters)))))
+                                  (cond-> (assoc region :owner owner)
+                                    (seq filters) (assoc :source-prefilters filters)))) resolved)
                :sites @sites :rules rules :rule-relations (:rule-relations compiler-context) :close close})))
         (finally
           (when-not @success?
@@ -402,7 +436,9 @@
             (finally (control/release! token))))
         (let [patterns (mapv :clause patterns)
               variables (into #{} (mapcat contract/variables) patterns)
-              clauses (into patterns (predicate-clauses region variables))
+              clauses (into (into patterns (predicate-clauses region variables))
+                          (when (contains? (:datalevin.query.source/predicate-prefilters descriptor) :like-any)
+                            (filter #(set/subset? (contract/variables %) variables) (:source-prefilters region))))
               needed (if (seq (:path region)) variables
                        (set/intersection variables
                        (set/union (:required-vars region) (:input-vars region)

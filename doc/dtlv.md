@@ -106,7 +106,10 @@ components; collisions and symlinks are refused. Never put the destination
 under a live server's data root. The CLI cannot determine that root remotely.
 
 Transfers write into `DEST/.incomplete/NAME`, verify SHA-256 and byte counts,
-then publish `DEST/NAME`. Failed transfers remain incomplete for inspection or
+then publish `DEST/NAME`. An empty `DEST/.incomplete` directory is removed when
+the sweep finishes. Empty discovery creates no destination. Setup failures remove empty
+directories created by that invocation, allowing a retry at the same path.
+Failed transfers remain incomplete for inspection or
 cleanup. A timeout does not prove the server stopped; the CLI stops starting
 further mutations. Increase `--timeout-ms` for large databases. Reception uses
 bounded memory, including when the database exceeds the CLI heap.

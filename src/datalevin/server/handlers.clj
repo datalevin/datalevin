@@ -1648,7 +1648,9 @@
   [db txs]
   (when-not (txengine/interpreter?)
     (try
-      (or (when-let [prepared (db/prepare-scalar-update-tx
+      (or (when-let [outcome (db/prepare-compiled-request db txs)]
+            [:compiled outcome txs])
+          (when-let [prepared (db/prepare-scalar-update-tx
                                db txs {:defer-entity-resolution? true})]
             [:scalar-update prepared])
           (when-let [prepared (db/prepare-blind-local-tx db txs true)]
@@ -1658,8 +1660,15 @@
       (catch Exception _ nil))))
 
 (defn- ^:redef transact-prepared
-  [db [kind prepared] tx-meta]
+  [db [kind prepared forms] tx-meta]
   (case kind
+    :compiled
+    (let [report (db/prepare-local-tx-data
+                   db forms tx-meta (System/currentTimeMillis) prepared nil
+                   {:stage? false :route? true :owned-max-eid (:max-eid db)})
+          ordered? (= :blind-insert (db/compiled-request-route report))]
+      (commit-stamped-report (db/clear-compiled-request-route report) ordered?))
+
     :scalar-update
     (commit-stamped-report (db/stamp-scalar-update-tx db prepared tx-meta) false)
 
@@ -1964,45 +1973,52 @@
   "Inspect catalog identity and an existing runtime without opening a store."
   [deps server skey {:keys [args]}]
   (let [[db-name {:keys [runtime?] :or {runtime? true}}] args
-        db-name (u/lisp-case db-name)]
-    ;; Do not allocate permanent per-name locks for nonexistent targets.
-    (when-not (auth/db-eid (sys-conn deps server) db-name)
-      (raise "Database does not exist"
-             {:error :admin/database-not-found :db-name db-name}))
-    ((:with-db-lifecycle-access deps)
-     server db-name
-     (fn []
-       (let [catalog (auth/pull-db (sys-conn deps server) db-name)
-             did (:db/id catalog)]
-         (when-not did
-           (raise "Database does not exist"
-                  {:error :admin/database-not-found :db-name db-name}))
-         (with-permission!
-           deps server skey view-act database-obj did
-           "Don't have permission to view database status"
-           (fn []
-             (let [identity {:db-name db-name :db-type (:database/type catalog)
-                             :db-id did :admin-capabilities #{:guarded-maintenance :wal-gc-dry-run :standalone-copy}}
-                   result
-                   (if-not runtime?
-                     identity
-                     (try
-                       (let [store ((:get-store deps) server db-name)
-                             raw (when store
-                                   (if (instance? Store store) (.-lmdb ^Store store) store))]
-                         (assoc identity :open? (boolean store)
-                                :stat (when raw (visible-stat raw nil))
-                                :replica (when store
-                                           (replica-status-value db-name
-                                                                 (db-state deps server db-name)))
-                                :watermarks (when raw (kv/txlog-watermarks raw))))
-                       (catch Exception e
-                         ;; A diagnostic must never trigger the client's implicit open.
-                         (throw (ex-info "Unable to read database status"
-                                         {:error :admin/runtime-read-failed
-                                          :db-name db-name
-                                          :cause-data (dissoc (ex-data e) :type)} e)))))]
-               (write-result! deps skey result)))))))))
+        db-name (u/lisp-case db-name)
+        did (auth/db-eid (sys-conn deps server) db-name)
+        denied-message "Don't have permission to view database status"
+        require-db! (fn [did]
+                      (when-not did
+                        (raise "Database does not exist"
+                               {:error :admin/database-not-found :db-name db-name})))]
+    ;; A nil target requires global view permission. Authorize before revealing
+    ;; absence, while avoiding permanent lifecycle locks for nonexistent names.
+    (with-permission!
+      deps server skey view-act database-obj did denied-message
+      (fn []
+        (require-db! did)
+        ((:with-db-lifecycle-access deps)
+         server db-name
+         (fn []
+           (let [catalog (auth/pull-db (sys-conn deps server) db-name)
+                 did (:db/id catalog)]
+             ;; The catalog or permissions may have changed while acquiring
+             ;; lifecycle access, including a drop or replacement of this name.
+             (with-permission!
+               deps server skey view-act database-obj did denied-message
+               (fn []
+                 (require-db! did)
+                 (let [identity {:db-name db-name :db-type (:database/type catalog)
+                                 :db-id did :admin-capabilities #{:guarded-maintenance :wal-gc-dry-run :standalone-copy}}
+                       result
+                       (if-not runtime?
+                         identity
+                         (try
+                           (let [store ((:get-store deps) server db-name)
+                                 raw (when store
+                                       (if (instance? Store store) (.-lmdb ^Store store) store))]
+                             (assoc identity :open? (boolean store)
+                                    :stat (when raw (visible-stat raw nil))
+                                    :replica (when store
+                                               (replica-status-value db-name
+                                                                     (db-state deps server db-name)))
+                                    :watermarks (when raw (kv/txlog-watermarks raw))))
+                           (catch Exception e
+                             ;; A diagnostic must never trigger the client's implicit open.
+                             (throw (ex-info "Unable to read database status"
+                                             {:error :admin/runtime-read-failed
+                                              :db-name db-name
+                                              :cause-data (dissoc (ex-data e) :type)} e)))))]
+                   (write-result! deps skey result)))))))))))
 
 (defonce ^:private ^Map read-cache-store-ids
   (Collections/synchronizedMap (WeakHashMap.)))

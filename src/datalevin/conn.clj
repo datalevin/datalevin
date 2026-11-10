@@ -840,65 +840,87 @@
     (let [classified (db/classify-local-tx tx-data)]
       (if (and kind (= classified :scalar)) :general classified))))
 
+(defn- commit-blind-insert!
+  [db prepared tx-meta fuse-unique?]
+  (if (and fuse-unique? (:fuse-unique-inserts? prepared))
+    (try
+      (commit-writing-report! db (db/stamp-blind-local-tx db prepared tx-meta)
+                             true :blind-insert false true)
+      (catch Exception e
+        (when-not (and (l/blind-unique-collision? e)
+                       (:unique-inserts-rolled-back? (ex-data e)))
+          (throw e))))
+    (when (db/blind-local-tx-unique-values-absent? db prepared)
+      (commit-writing-report! db (db/stamp-blind-local-tx db prepared tx-meta)
+                             true :blind-insert (false? (:has-many? prepared)) false))))
+
 (defn- ^:redef transact-local-in-write-txn!
   "Apply one classified request to the owned writer. A rejected specialization
   goes directly to general resolution against this writer's current state."
   ([db tx-data tx-meta]
-   (transact-local-in-write-txn! db tx-data tx-meta (db/classify-local-tx tx-data)))
-  ([^DB db tx-data tx-meta kind]
-    (let [kind (local-tx-kind tx-data kind)
-          fuse-unique? (and (not (:client-op/id tx-meta))
-                            (or txcommon/*batch-prepare*
-                                (s/current-write-group (.-lmdb ^Store (.-store db)))))]
-      (or
-        (case kind
-          :mixed
-          (when-let [report (db/prepare-mixed-add-tx db tx-data tx-meta (:max-eid db) true)]
-            (commit-writing-report! db report false :mixed-add true false))
-          :scalar
-          (when-let [prepared (db/prepare-scalar-update-tx db tx-data {:shape-checked? true})]
-            (when-let [report (db/stamp-scalar-update-tx db prepared tx-meta)]
-              (commit-writing-report! db report false :scalar-update true false)))
-          :patch-idoc
-          (when *local-wal-patch-idoc?*
-            (when-let [prepared (db/prepare-local-patch-idoc-tx db tx-data)]
-              (when-let [{:keys [report]} (db/stamp-local-patch-idoc-tx db prepared tx-meta)]
-                (commit-writing-report! db report false :patch-idoc true false))))
-          (:blind :blind-tempids)
-          (when-let [prepared (prepare-classified-blind-tx
-                               db tx-data true (not fuse-unique?) kind)]
-            (if (and *local-wal-identity-upsert?* (:identity-upsert-av prepared))
-              (when-let [[report upsert?]
-                         (db/stamp-blind-local-identity-tx db prepared tx-meta)]
-                (commit-writing-report! db report (not upsert?)
-                                       (if upsert? :identity-upsert :blind-insert)
-                                       (false? (:has-many? prepared)) false))
-              (or (if (and fuse-unique? (:fuse-unique-inserts? prepared))
-                    (try
-                      (commit-writing-report! db (db/stamp-blind-local-tx db prepared tx-meta)
-                                             true :blind-insert false true)
-                      (catch Exception e
-                        (when-not (and (l/blind-unique-collision? e)
-                                       (:unique-inserts-rolled-back? (ex-data e)))
-                          (throw e))))
-                    (when (db/blind-local-tx-unique-values-absent? db prepared)
-                      (commit-writing-report! db (db/stamp-blind-local-tx db prepared tx-meta)
-                                             true :blind-insert
-                                             (false? (:has-many? prepared)) false)))
-                  (when *local-wal-identity-upsert?*
-                    (when-let [report (db/stamp-blind-local-upsert-tx db prepared tx-meta)]
-                      (commit-writing-report! db report false :identity-upsert true false))))))
-          nil)
-        ;; Specialized preparers leave resolver indexes unchanged. Only the
-        ;; interpreter needs fresh indexes outside collected batches.
-        (let [db1 (if txcommon/*batch-prepare*
-                    db (db/transfer db (.-store db)))]
-          (when-let [preparation txcommon/*batch-prepare*]
-            (txcommon/materialize-scalar-pending! preparation db1))
-          (let [report (db/transact-tx-data (db/->TxReport db db1 [] {} tx-meta)
-                                            tx-data false (:max-eid db1))]
-            (observe-local-wal-tx-path! :general)
-            report))))))
+   (transact-local-in-write-txn! db tx-data tx-meta nil nil))
+  ([db tx-data tx-meta kind]
+   (transact-local-in-write-txn! db tx-data tx-meta kind nil))
+  ([^DB db tx-data tx-meta kind outcome]
+   (let [outcome (or outcome (db/prepare-compiled-request db tx-data))
+         fuse-unique? (and (not (:client-op/id tx-meta))
+                           (or txcommon/*batch-prepare*
+                               (s/current-write-group (.-lmdb ^Store (.-store db)))))]
+     (or (when (and outcome (identical? :blind (:strategy outcome))
+                    fuse-unique? (:fuse-unique-inserts? outcome)
+                    (not (and *local-wal-identity-upsert?* (:identity-upsert-av outcome)))
+                    (db/blind-local-tx-valid? db outcome))
+           (commit-blind-insert! db outcome tx-meta true))
+         (if outcome
+           (let [report (db/prepare-local-tx-data
+                          db tx-data tx-meta (System/currentTimeMillis) outcome nil
+                          {:stage? false :route? true :owned-max-eid (:max-eid db)
+                           :identity-upsert? *local-wal-identity-upsert?*})
+                 route (db/compiled-request-route report)
+                 independent? (::db/independent-scalar? report)
+                 report (db/clear-compiled-request-route report)]
+             (commit-writing-report! db report (= route :blind-insert)
+                                    (if (= route :compiled-scalar) :scalar-update route)
+                                    (boolean independent?) false))
+           (let [kind (local-tx-kind tx-data kind)]
+             (or
+               (case kind
+                 :mixed
+                 (when-let [report (db/prepare-mixed-add-tx db tx-data tx-meta (:max-eid db) true)]
+                   (commit-writing-report! db report false :mixed-add true false))
+                 :scalar
+                 (when-let [prepared (db/prepare-scalar-update-tx db tx-data {:shape-checked? true})]
+                   (when-let [report (db/stamp-scalar-update-tx db prepared tx-meta)]
+                     (commit-writing-report! db report false :scalar-update true false)))
+                 :patch-idoc
+                 (when *local-wal-patch-idoc?*
+                   (when-let [prepared (db/prepare-local-patch-idoc-tx db tx-data)]
+                     (when-let [{:keys [report]} (db/stamp-local-patch-idoc-tx db prepared tx-meta)]
+                       (commit-writing-report! db report false :patch-idoc true false))))
+                 (:blind :blind-tempids)
+                 (when-let [prepared (prepare-classified-blind-tx
+                                      db tx-data true (not fuse-unique?) kind)]
+                   (if (and *local-wal-identity-upsert?* (:identity-upsert-av prepared))
+                     (when-let [[report upsert?]
+                                (db/stamp-blind-local-identity-tx db prepared tx-meta)]
+                       (commit-writing-report! db report (not upsert?)
+                                              (if upsert? :identity-upsert :blind-insert)
+                                              (false? (:has-many? prepared)) false))
+                     (or (commit-blind-insert! db prepared tx-meta fuse-unique?)
+                         (when *local-wal-identity-upsert?*
+                           (when-let [report (db/stamp-blind-local-upsert-tx db prepared tx-meta)]
+                             (commit-writing-report! db report false :identity-upsert true false))))))
+                 nil)
+               ;; Specialized preparers leave resolver indexes unchanged. Only the
+               ;; interpreter needs fresh indexes outside collected batches.
+               (let [db1 (if txcommon/*batch-prepare*
+                           db (db/transfer db (.-store db)))]
+                 (when-let [preparation txcommon/*batch-prepare*]
+                   (txcommon/materialize-scalar-pending! preparation db1))
+                 (let [report (db/transact-tx-data (db/->TxReport db db1 [] {} tx-meta)
+                                                   tx-data false (:max-eid db1))]
+                   (observe-local-wal-tx-path! :general)
+                   report)))))))))
 
 (defn- maybe-transact-local-mixed!
   [conn tx-data tx-meta]

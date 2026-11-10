@@ -50,6 +50,86 @@
       (is (nil? (compile/compile-blind-region ctx forms))))
     (is (empty? @calls))))
 
+(def ^:private many-ctx
+  (assoc ctx
+         :schema (merge (:schema ctx)
+                        {:numbers {:db/aid 7 :db/valueType :db.type/long
+                                   :db/cardinality :db.cardinality/many}
+                         :doubles {:db/aid 8 :db/valueType :db.type/double
+                                   :db/cardinality :db.cardinality/many}
+                         :decimals {:db/aid 9 :db/valueType :db.type/bigdec
+                                    :db/cardinality :db.cardinality/many}
+                         :times {:db/aid 10 :db/valueType :db.type/instant
+                                 :db/cardinality :db.cardinality/many}
+                         :byte-values {:db/aid 11 :db/valueType :db.type/bytes
+                                       :db/cardinality :db.cardinality/many}
+                         :token {:db/aid 12 :db/valueType :db.type/string
+                                 :db/unique :db.unique/value}
+                         :unique-many {:db/aid 13 :db/valueType :db.type/long
+                                       :db/unique :db.unique/value
+                                       :db/cardinality :db.cardinality/many}
+                         :unindexed {:db/aid 14 :db/valueType :db.type/long :db/noindex true}})
+         :rschema {:db.unique/identity #{:identity}}))
+
+(deftest canonical-many-operands-retain-the-first-storage-equivalent-value
+  (let [timestamp (java.sql.Timestamp. 1000) bytes (byte-array [1 2])
+        plan (compile/compile-blind-region many-ctx
+               [(array-map :doubles [-0.0 0.0] :decimals [1.00M 1.0M]
+                           :times [timestamp (java.util.Date. 1000)]
+                           :byte-values [bytes (byte-array [1 2])]
+                           :numbers #{1 2})])
+        ^BlindEntity entity (first (:entries plan))
+        pairs (mapv vec (partition 2 (.-attrs entity)))
+        values (into {} pairs)]
+    (is (instance? TxPlan plan))
+    (is (true? (:has-many? plan)))
+    (is (= 6 (count pairs)))
+    (is (= (Double/doubleToRawLongBits -0.0)
+           (Double/doubleToRawLongBits (:doubles values))))
+    (is (= 2 (.scale ^java.math.BigDecimal (:decimals values))))
+    (is (identical? timestamp (:times values)))
+    (is (identical? bytes (:byte-values values))))
+  (let [plan (compile/compile-blind-region many-ctx [{:value 1 :numbers []}])]
+    (is (false? (:has-many? plan)))))
+
+(deftest unique-proofs-preserve-eager-deferred-and-fusion-decisions
+  (doseq [check? [false true]]
+    (let [plan (compile/compile-blind-region many-ctx [{:token "one" :numbers [1 1 2]}]
+                 {:check-unique-avs? check?})]
+      (is (= [[:token "one"]] (mapv vec (:unique-avs plan))))
+      (is (true? (:has-unique? plan)))
+      (is (true? (:has-many? plan)))
+      (is (true? (:fuse-unique-inserts? plan)))))
+  (is (nil? (compile/compile-blind-region many-ctx [{:token "one"} {:token "one"}])))
+  (is (instance? TxPlan
+                 (compile/compile-blind-region many-ctx [{:token "one"} {:token "one"}]
+                   {:check-unique-avs? false})))
+  (is (nil? (compile/compile-blind-region many-ctx
+              [{:token "one" :unindexed 1} {:token "one"}] {:check-unique-avs? false})))
+  (doseq [check? [false true]]
+    (is (nil? (compile/compile-blind-region many-ctx [{:unique-many [1 1]}]
+                {:check-unique-avs? check?}))))
+  (let [plan (compile/compile-blind-region many-ctx [{:db/id "one" :identity "one" :value 1}]
+               {:allow-small-unique? true})]
+    (is (= [:identity "one"] (:identity-upsert-av plan)))
+    (is (true? (:independent-identity-upserts? plan)))
+    (is (nil? (:identity-upsert-read plan))))
+  (is (nil? (compile/compile-blind-region many-ctx [{:identity "one"}]))))
+
+(deftest many-and-unique-lookahead-does-not-invoke-host-code
+  (let [calls (atom [])
+        host (proxy [Object] []
+               (hashCode [] (swap! calls conj :hash) 0)
+               (toString [] (swap! calls conj :string) "host"))
+        date (proxy [java.util.Date] [1000]
+               (getTime [] (swap! calls conj :clock) 1000))
+        lazy-values (lazy-seq (swap! calls conj :realize) (list 1))]
+    (doseq [forms [[{:numbers [1 host]}] [{:token host}]
+                   [{:times [date]}] [{:numbers lazy-values}]
+                   [{:numbers [:identity host]}] [{:unique-many [1 nil]}]]]
+      (is (nil? (compile/compile-blind-region many-ctx forms {:allow-small-unique? true}))))
+    (is (empty? @calls))))
+
 (deftest mixed-operands-retain-order-and-symbolic-identities
   (let [forms [[:db/add 7 :value 2]
                (array-map :text "parent" :db/id "parent" :reference "parent")
@@ -152,12 +232,21 @@
                    [[:db/add 1 :value 1] [:db/add 1 :value 2]]
                    [[:db/add [:identity "x"] :value 1]]
                    [[:db/add 1 :reference 2]]
-                   [{:value 1}]
                    [(with-meta [:db/add 1 :value 1] {:source true})]
                    [[:db/add 1 :identity "x"]]
                    [[:db.fn/call (fn [_] (swap! effects conj :callback))]]]]
       (is (nil? (compile/compile-tx ctx forms))))
     (is (empty? @effects))))
+
+(deftest unified-selection-chooses-one-materialized-family
+  (doseq [[forms shape strategy]
+          [[[[:db/add 1 :value 1]] :scalar-operations :scalar-operations]
+           [[{:db/id 1 :value 1}] :scalar :scalar]
+           [[{:value 1}] :blind :blind]
+           [[{:db/id "new" :value 1} [:db/add 1 :text "one"]] :mixed :mixed]]]
+    (is (= shape (compile/literal-request-shape forms)))
+    (is (= strategy (:strategy (compile/compile-tx ctx forms)))))
+  (is (nil? (compile/literal-request-shape [{:db/id 1 :value 1} {:value 2}]))))
 
 (deftest correction-failure-retains-original-input
   (let [forms [[:db/add 1 :text 42]]

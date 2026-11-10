@@ -17,6 +17,7 @@
    [datalevin.custom-datalog :as cd]
    [datalevin.interface :as i]
    [datalevin.client :as cl]
+   [datalevin.client.copy :as file-copy]
    [datalevin.prepared :as prepared]
    [datalevin.storage.schema :as schema]
    [datalevin.txlog.transfer :as transfer]
@@ -1296,10 +1297,11 @@
       (try
         (let [response (cl/copy-to-file client db-name stage
                                         {:compact? compact? :writing? writing?
-                                         :version-file nil})]
+                                         :version-file nil})
+              version (file-copy/storage-version response)]
           (Files/move stage file (into-array CopyOption
                                             [StandardCopyOption/REPLACE_EXISTING]))
-          (spit (str dest u/+separator+ c/version-file-name) c/version)
+          (spit (str dest u/+separator+ c/version-file-name) version)
           (:copy-meta response))
         (catch Exception e
           (throw (ex-info (ex-message e)

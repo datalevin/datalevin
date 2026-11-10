@@ -42,7 +42,7 @@
    [datalevin.binding.cpp.buffer DBI]
    [datalevin.lmdb RangeContext]
    [datalevin.utl BitOps WriterContext]
-   [java.util.concurrent ConcurrentHashMap]
+   [java.util.concurrent ConcurrentHashMap CountDownLatch]
    [java.util.concurrent.atomic AtomicBoolean]
    [java.lang AutoCloseable]
    [java.io File]
@@ -1560,23 +1560,74 @@
         (Util/checkRc rc)
         (b/get-bytes (.outBuf value))))))
 
-(defrecord DBISnapshot [^Txn txn dbi-name state]
+(defrecord DBISnapshot [dbi-name state close-reader! ^AtomicBoolean closed?]
   AutoCloseable
-  (close [_] (.close txn)))
+  (close [_]
+    (when (.compareAndSet closed? false true)
+      (close-reader!))))
+
+(defn- direct-dbi-snapshot [^Env env dbi-name]
+  (let [txn (Txn/createReadOnly env)]
+    (try
+      (->DBISnapshot dbi-name (dbi-state txn dbi-name) #(.close txn) (AtomicBoolean.))
+      (catch Throwable e
+        (.close txn)
+        (throw e)))))
+
+(defn- join-reader-owner! [^Thread owner]
+  ;; Cancellation must not let environment teardown race a live reader or its
+  ;; native TLS destructor. Restore interruption after the owner has exited.
+  (loop [interrupted? false]
+    (let [joined? (try (.join owner) true (catch InterruptedException _ false))]
+      (if joined?
+        (when interrupted? (.interrupt (Thread/currentThread)))
+        (recur true)))))
+
+(defn- thread-dbi-snapshot [^Env env dbi-name]
+  (let [ready (promise)
+        release (CountDownLatch. 1)
+        failure (volatile! nil)
+        owner (Thread.
+                (fn []
+                  (try
+                    (let [txn (Txn/createReadOnly env)]
+                      (try
+                        (deliver ready {:state (dbi-state txn dbi-name)})
+                        (.await release)
+                        (finally (.close txn))))
+                    (catch Throwable e
+                      (vreset! failure e)
+                      (deliver ready {:error e}))))
+                "datalevin-dbi-snapshot")
+        close! (fn []
+                 (.countDown release)
+                 (join-reader-owner! owner)
+                 (when-let [e @failure] (throw e)))]
+    (.setDaemon owner true)
+    (.start owner)
+    (try
+      (let [{:keys [state error]} @ready]
+        (when error (throw error))
+        (->DBISnapshot dbi-name state close! (AtomicBoolean.)))
+      (catch Throwable e
+        (try (close!)
+             (catch Throwable cleanup
+               (when-not (identical? e cleanup) (.addSuppressed e cleanup))))
+        (throw e)))))
 
 (defn dbi-snapshot
   "Retain a read snapshot and a named tree's catalog state. The reader prevents
   root-page reuse while validating the observed tree. The caller protects the
-  environment's lifetime and closes the result before writing or retrying."
+  environment's lifetime and closes the result before writing or retrying.
+  TLS environments use a separate platform thread to own and release the reader,
+  leaving the caller's reader slot available for scans and fresh validation."
   [^CppLMDB lmdb dbi-name]
   (native-call (.-info lmdb)
     (i/check-ready lmdb)
-    (let [txn (Txn/createReadOnly (.-env lmdb))]
-      (try
-        (->DBISnapshot txn dbi-name (dbi-state txn dbi-name))
-        (catch Throwable e
-          (.close txn)
-          (throw e))))))
+    (let [env (.-env lmdb)]
+      (if (zero? (bit-and (.getFlags env) DTLV/MDB_NOTLS))
+        (thread-dbi-snapshot env dbi-name)
+        (direct-dbi-snapshot env dbi-name)))))
 
 (defn dbi-snapshot-current?
   "Verify the retained tree against a fresh reader, independently of other DBIs.
@@ -1584,7 +1635,8 @@
   [^CppLMDB lmdb ^DBISnapshot snapshot]
   (native-call (.-info lmdb)
     (i/check-ready lmdb)
-    (.id ^Txn (:txn snapshot))
+    (when (.get ^AtomicBoolean (:closed? snapshot))
+      (throw (IllegalStateException. "DBI snapshot is closed")))
     (let [txn (Txn/createReadOnly (.-env lmdb))]
       (try
         (Arrays/equals ^bytes (:state snapshot)

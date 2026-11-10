@@ -9,6 +9,7 @@
             [datalevin.query.source.contract :as contract]
             [datalevin.query.source.control :as control]
             [datalevin.query.source.diagnostics :as diagnostics]
+            [datalevin.query.source.extrema :as extrema]
             [datalevin.query.source.permissions :as permissions]
             [datalevin.query.source.region :as region]
             [datalevin.query.source.result-window :as window]
@@ -32,11 +33,44 @@
     {:kind :aggregate :operator (keyword (name (get-in element [:fn :symbol])))
      :variable (:symbol (first (:args element)))}))
 
+(defn- whole-predicates
+  "Flatten a completely represented scalar conjunction for SQL. Chained long
+  comparisons normalize only here; the ordinary scoped compiler is unchanged."
+  [root variables types]
+  (let [base (inc (reduce max -1 (map (comp :id :clause) (:patterns root))))
+        binary (into {} (map (juxt :id identity)) (region/predicate-clauses root variables))
+        clauses (map-indexed
+                  (fn [i {:keys [node]}]
+                    (if-let [predicate (get binary (+ base i))] [predicate]
+                      (let [args (:args node)
+                            operator ({'< :< '<= :<= '> :> '>= :>=} (get-in node [:fn :symbol]))
+                            operand (fn [arg]
+                                      (cond (instance? Variable arg)
+                                            (when (and (variables (:symbol arg)) (= :long (types (:symbol arg))))
+                                              (if (contains? (:bindings root) (:symbol arg))
+                                                [:const (get-in root [:bindings (:symbol arg)])] [:var (:symbol arg)]))
+                                            (and (instance? datalevin.parser.Constant arg) (int? (:value arg)))
+                                            [:const (:value arg)]))
+                            terms (when (and (instance? Predicate node) operator (<= 3 (count args) 32))
+                                    (mapv operand args))]
+                        (when (and (seq terms) (every? some? terms))
+                          (mapv (fn [pair] {:kind :predicate :operator operator :semantics-version 1 :args (vec pair)})
+                                (partition 2 1 terms)))))) (:core-clauses root))]
+    (when (every? some? clauses) (vec (mapcat identity clauses)))))
+
 (defn- request [compilation input]
   (let [{:keys [entries compiled prepared]} compilation
         parsed (:parsed compiled) [root] (:regions compiled)
         elements (mapv projection (parser/find-elements (:qfind parsed)))
         sources (into {} (map (juxt :symbol :descriptor)) entries)
+        native-extrema (:native-extrema prepared)
+        sites (:sites compiled)
+        pure-unions? (and (seq sites)
+                          (every? #(and (= :union (:kind %)) (= (:region-id root) (:parent-region %))
+                                         (= 1 (count (:exports %)))) sites)
+                          (= (count sites) (count (:source-prefilters root)))
+                          (every? #(contains? (:datalevin.query.source/predicate-prefilters (:descriptor %)) :like-any) entries))
+        flat? (or (and (= 1 (count (:regions compiled))) (empty? sites)) pure-unions?)
         patterns (mapv #(assoc (:clause %) :source-symbol (:source-symbol %)) (:patterns root))
         variables (into #{} (mapcat contract/variables) patterns)
         groups (set (map #(vector (:source-symbol %) (first (:terms %))) patterns))
@@ -48,11 +82,15 @@
                                 out (map vector terms (contract/pattern-columns (sources source-symbol) clause))))
                       {} patterns)]
     (when (and (= 1 (count (:groups prepared))) (every? :descriptor entries)
-               (= 1 (count (:regions compiled))) (empty? (:sites compiled))
+               flat?
+               (or (empty? native-extrema)
+                   (and (empty? (:qorder parsed)) (nil? (:qlimit parsed)) (nil? (:qoffset parsed))
+                        (every? #(true? (:datalevin.query.source/native-extrema-relational? (:descriptor %))) entries)))
                (empty? (:rules compiled)) (empty? (:qhaving parsed))
                (not (and (:qreturn-map parsed) (seq (:qorder parsed))))
                (nil? *math-context*)
-               (every? #(or (instance? Pattern %) (instance? Predicate %)) (:qwhere parsed))
+               (every? #(or (instance? Pattern %) (instance? Predicate %)
+                            (and pure-unions? (instance? datalevin.parser.Or %))) (:qwhere parsed))
                (= 1 (.size ^List (get-in input [:relation :tuples])))
                (set/subset? (set (map :variable (:columns input))) (set (keys (:bindings input))))
                (seq patterns) (every? some? elements)
@@ -62,12 +100,16 @@
                    (window/specification parsed)))
       ;; Every scalar operator must be represented. A function, ternary
       ;; predicate, scoped body, or unknown operator keeps the core path.
-      (let [predicates (region/predicate-clauses root variables)]
-        (when (= (count predicates) (count (:core-clauses root)))
+      (when-let [predicates (whole-predicates root variables types)]
+        (let [predicates (mapv (fn [i predicate] (assoc predicate :id i))
+                              (range (inc (reduce max -1 (map :id patterns))) Long/MAX_VALUE)
+                              (into predicates (when pure-unions? (:source-prefilters root))))]
           (merge (:request (first (:groups prepared)))
+                 (when (seq native-extrema) {:datalevin.query.source/native-extrema native-extrema})
                  {:mode :relational :semantics-version 1
                   :sources (mapv #(select-keys % [:symbol :descriptor]) entries)
-                  :clauses (into patterns predicates) :bindings (:bindings input)
+                  :clauses (into patterns predicates)
+                  :bindings (:bindings input)
                   :find elements :with (mapv :symbol (:qwith parsed))
                   :columns (mapv (fn [i {:keys [kind operator variable]}]
                                    {:variable (symbol (str "?relational_result_" i))
@@ -104,7 +146,9 @@
                            (value/owned-copy response #(control/check-active! (:control runtime)))
                            (finally (control/release! borrowed)))
                 groups (session/acquire! runtime (:prepared compilation))
-                group (first groups)]
+                group (first groups)
+                _ (when (seq (get-in compilation [:prepared :native-extrema]))
+                    (extrema/prepare! runtime compilation groups))]
             (ensure! (satisfies? source/IRelationalQuerySession (:session group)))
             (when (:diagnostics runtime)
               (diagnostics/sources! runtime

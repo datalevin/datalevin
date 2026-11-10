@@ -2889,8 +2889,9 @@
 
   Options: :compact?, :require-binary?, :sink-factory (Path -> owned
   SeekableByteChannel), and :version-file (defaults to VERSION beside the data
-  file; nil skips it). VERSION is written only after integrity validation and
-  successful sink close. Legacy base64 is retained for ordinary callers.
+  file; nil skips it). VERSION uses the server's :copy-meta :storage-version,
+  which must be present and valid. It is written only after integrity validation
+  and successful sink close. Legacy base64 is retained for ordinary callers.
   :standalone? requires guarded standalone-copy support before any copy request."
   ([client db-name file] (copy-to-file client db-name file {}))
   ([client db-name file {:keys [compact? writing? standalone?] :as opts}]
@@ -2918,13 +2919,14 @@
                  (throw (ex-info "Client did not complete file reception" {:error :copy/incomplete})))
                (when version-file
                  (cr/check! :copy-version)
-                 (file-copy/with-local-io
-                   (if standalone?
-                     (Files/writeString (file-copy/path version-file) c/version
-                       (into-array OpenOption [StandardOpenOption/CREATE StandardOpenOption/WRITE
-                                               StandardOpenOption/TRUNCATE_EXISTING
-                                               LinkOption/NOFOLLOW_LINKS]))
-                     (spit (.toFile (file-copy/path version-file)) c/version))))
+                 (let [version (file-copy/storage-version response)]
+                   (file-copy/with-local-io
+                     (if standalone?
+                       (Files/writeString (file-copy/path version-file) version
+                         (into-array OpenOption [StandardOpenOption/CREATE StandardOpenOption/WRITE
+                                                 StandardOpenOption/TRUNCATE_EXISTING
+                                                 LinkOption/NOFOLLOW_LINKS]))
+                       (spit (.toFile (file-copy/path version-file)) version)))))
                response)
              (catch Throwable failure
                (cleanup-after-failure! failure #(file-copy/close! receiver))

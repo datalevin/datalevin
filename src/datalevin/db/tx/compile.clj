@@ -9,7 +9,11 @@
   (:import [datalevin.db.tx.plan BlindEntity MixedAttrInfo MixedInsert MixedOperands MixedUpdate
             ScalarEntityRead]
            [datalevin.prepare PrepareCtx]
-           [java.util ArrayList HashMap HashSet]
+           [datalevin.utl QueryKey$EquivSet QueryKey$KeySet]
+           [clojure.lang MapEntry]
+           [java.util ArrayList HashMap HashSet Set]
+           [org.eclipse.collections.api.block HashingStrategy]
+           [org.eclipse.collections.impl.set.strategy.mutable UnifiedSetWithHashingStrategy]
            [org.eclipse.collections.impl.list.mutable FastList]))
 
 (def ^:private ordinary-scalar-types
@@ -146,6 +150,93 @@
     :db.type/double (and (instance? Double value) (Double/isFinite (double value)))
     :db.type/float (and (instance? Float value) (Float/isFinite (float value)))
     false))
+
+(defn blind-unique-inline-value?
+  "Conservatively reject values that can spill into the giants DB. Giant
+  values include an allocated giant ID in their AVE key, so LMDB key equality
+  cannot enforce their logical uniqueness."
+  [textual? value]
+  (if textual?
+    ;; UTF-8 needs at most four bytes per UTF-16 code unit. This leaves ample
+    ;; room below LMDB's 511-byte key limit for the AVG type/attribute prefix.
+    (<= (count (str value)) 100)
+
+    true))
+
+(defn append-blind-canonical-value!
+  "Collect a normalized value and its unique AV using request-owned scratch.
+  Compilation proves inert canonical values before calling this worker; legacy
+  preparation performs its correction first. No writer/ownership reads occur."
+  [^FastList attrs ^FastList unique-avs seen-avs set-capacity
+   fuse-unique-inserts? ^objects info attr value']
+  (let [props (aget info 0)
+        unique? (some? (:db/unique props))
+        inline? (or (not unique?)
+                    (blind-unique-inline-value? (aget info 3) value'))
+        av (when unique?
+             ;; Compact deferred pairs; vectors hash faster in eager checks.
+             (if seen-avs [attr value'] (MapEntry/create attr value')))]
+    (if (and unique?
+             (or (not inline?)
+                 (and seen-avs
+                      (let [^HashSet seen
+                            (or @seen-avs
+                                (vreset! seen-avs (HashSet. (int set-capacity))))]
+                        (not (.add seen av))))))
+      false
+      (do
+        (when-not inline? (vreset! fuse-unique-inserts? false))
+        (when av (.add unique-avs av))
+        (.add attrs attr)
+        (.add attrs value')
+        true))))
+
+(def ^:private instant-hashing-strategy
+  ;; Storage keys retain milliseconds, unlike asymmetric Date/Timestamp
+  ;; equality and Timestamp's additional nanosecond precision.
+  (reify HashingStrategy
+    (computeHashCode [_ value] (Long/hashCode (long (inst-ms value))))
+    (equals [_ left right] (== (long (inst-ms left)) (long (inst-ms right))))))
+
+(defn blind-value-set
+  "Reuse normalized many-value equivalence in request-owned deduplication scratch."
+  [vt]
+  (case vt
+    :db.type/instant
+    (UnifiedSetWithHashingStrategy. instant-hashing-strategy)
+    (:db.type/double :db.type/float :db.type/bigdec) (QueryKey$EquivSet.)
+    (if (or (nil? vt) (map? vt) (identical? vt :data) (identical? vt :db.type/bytes))
+      (QueryKey$KeySet.)
+      (HashSet.))))
+
+(defn blind-identity-upsert-av
+  "Prove one scalar identity AV from normalized entity operands and schema."
+  [store-schema ^BlindEntity entity]
+  (let [^FastList attrs (.-attrs entity)]
+    (loop [i           0
+           identity-av nil]
+      (if (< i (.size attrs))
+        (let [attr  (.get attrs i)
+              value (.get attrs (unchecked-inc i))
+              props (store-schema attr)]
+          ;; Cardinality-many map values are additive and need exact EAV
+          ;; membership checks. Leave those, and entities with ambiguous
+          ;; identities or additional uniqueness constraints, to the general
+          ;; transaction engine.
+          (cond
+            (identical? (:db/cardinality props) :db.cardinality/many)
+            nil
+
+            (identical? (:db/unique props) :db.unique/value)
+            nil
+
+            (identical? (:db/unique props) :db.unique/identity)
+            (when-not identity-av
+              (recur (+ i 2) [attr value]))
+
+            :else
+            (recur (+ i 2) identity-av)))
+        identity-av))))
 
 (def scalar-update-value-types
   #{:db.type/long :db.type/string :db.type/keyword :db.type/symbol
@@ -498,19 +589,57 @@
        :scalar (compile-canonical-scalar-region ctx forms true)
        nil))))
 
-(defn compile-tx
-  "Select a pure materialized region. Unsupported input is left untouched."
-  ([ctx forms] (compile-scalar-region ctx forms))
-  ([ctx forms {:keys [literal-shape]}]
-   (if literal-shape
-     (compile-scalar-region ctx forms literal-shape)
-     (compile-scalar-region ctx forms))))
-
 (defn- literal-tempid? [value]
   (or (string? value) (and (instance? Long value) (neg? (long value)))))
 
+(defn- canonical-blind-value? [ctx ^objects info value]
+  (and (inert-scalar-value? value)
+       (let [vt (aget info 4)]
+         (if (identical? vt :db.type/ref)
+           (and (instance? Long value) (pos? (long value)))
+           (canonical-scalar-value? (:validate-data? (:opts ctx)) vt value)))))
+
+(defn- literal-many-values? [value]
+  (or (identical? clojure.lang.PersistentVector (class value))
+      (identical? clojure.lang.PersistentHashSet (class value))))
+
+(defn- compile-blind-attribute!
+  [ctx ^FastList attrs ^objects info attr raw-value
+   {:keys [unique-avs seen-avs set-capacity has-many? fuse-unique-inserts?]}]
+  (let [props (aget info 0)
+        many? (identical? :db.cardinality/many (:db/cardinality props))
+        unique? (some? (:db/unique props))
+        ^FastList avs (when unique?
+                        (or @unique-avs (vreset! unique-avs (FastList.))))
+        append! (fn [value]
+                  (and (canonical-blind-value? ctx info value)
+                       (append-blind-canonical-value!
+                         attrs avs seen-avs set-capacity fuse-unique-inserts? info attr value)))]
+    (when-not (aget info 2) (vreset! fuse-unique-inserts? false))
+    (if (and many? (literal-many-values? raw-value))
+      ;; A two-element lookup reference remains a scalar resolver operand.
+      ;; Test the keyword before membership, so host values cannot be hashed.
+      (when-not (and (= 2 (count raw-value)) (keyword? (first raw-value))
+                     (contains? (:db.unique/identity (:rschema ctx)) (first raw-value)))
+        (let [^Set seen (blind-value-set (aget info 4))
+              values (seq raw-value)]
+          (when values (vreset! has-many? true))
+          (loop [values values]
+            (if values
+              (when (append! (first values))
+                (if (.add seen (.get attrs (dec (.size attrs))))
+                  (recur (next values))
+                  (when-not unique?
+                    (.remove attrs (int (dec (.size attrs))))
+                    (.remove attrs (int (dec (.size attrs))))
+                    (recur (next values)))))
+              true))))
+      (when (append! raw-value)
+        (when many? (vreset! has-many? true))
+        true))))
+
 (defn- compile-blind-entity
-  [ctx ^HashMap infos ^HashSet tempids entity]
+  [ctx ^HashMap infos ^HashSet tempids state entity]
   (let [explicit? (contains? entity :db/id)
         tempid (:db/id entity)]
     (when (or (not explicit?)
@@ -521,51 +650,82 @@
               (fn [_ attr value]
                 (if (identical? :db/id attr)
                   true
-                  (if (and (keyword? attr) (pos? (count (name attr)))
-                           (inert-scalar-value? value))
+                  (if (and (keyword? attr) (pos? (count (name attr))))
                     (let [^objects info (blind-attr-info!
                                            infos (:schema ctx)
-                                           (:db/attrTuples (:rschema ctx)) false attr)
-                          vt (aget info 4)]
+                                           (:db/attrTuples (:rschema ctx))
+                                           (:allow-unique? state) attr)]
                       (if (and (some? (aget info 1))
-                               ;; This first rule retains unique/many requests on
-                               ;; their existing specialization, without coercion.
-                               (zero? (long (aget info 1)))
-                               (nil? (:db/unique (aget info 0)))
-                               (if (identical? vt :db.type/ref)
-                                 (and (instance? Long value) (pos? (long value)))
-                                 (canonical-scalar-value?
-                                   (:validate-data? (:opts ctx)) vt value)))
-                        (do (.add attrs attr) (.add attrs value) true)
+                               (compile-blind-attribute! ctx attrs info attr value state))
+                        true
                         (reduced false)))
                     (reduced false))))
               true entity)]
         (when supported? (BlindEntity. tempid attrs))))))
 
 (defn compile-blind-region
-  "Compile canonical cardinality-one new maps without allocating persistent IDs.
-  Writer binding retains timestamp synthesis. Unique/many values, coercions and
-  symbolic references retain the existing specialization."
-  [ctx forms]
-  (when (and (identical? clojure.lang.PersistentVector (class forms))
-             (nil? (meta forms)) (pos? (count forms)))
-    (let [entities (FastList. (count forms))
-          infos (HashMap.) tempids (HashSet.)
-          auto-time? (boolean (:auto-entity-time? (:opts ctx)))]
-      (loop [index 0]
-        (if (< index (count forms))
-          (let [form (nth forms index)]
-            (when (and (plain-map? form) (nil? (meta form)))
-              (when-let [^BlindEntity entity (compile-blind-entity ctx infos tempids form)]
-                ;; Keep the existing allocation rule for empty maps. Their
-                ;; explicit tempids still participate in duplicate detection.
-                (when (or auto-time? (not (.isEmpty ^FastList (.-attrs entity))))
-                  (.add entities entity))
-                (recur (unchecked-inc index)))))
-          (when-not (.isEmpty entities)
-            (assoc (plan/->TxPlan ctx :blind entities nil)
-                   :auto-entity-time? auto-time?
-                   :has-unique? false :has-many? false :fuse-unique-inserts? false)))))))
+  "Compile canonical new maps, materialized many values and uniqueness proofs.
+  Persistent IDs, ownership checks, identity resolution and timestamps remain
+  writer work. Coercing/host/lazy values retain their existing specialization."
+  ([ctx forms] (compile-blind-region ctx forms {}))
+  ([ctx forms {:keys [allow-small-unique? check-unique-avs?]
+               :or {check-unique-avs? true}}]
+   (when (and (identical? clojure.lang.PersistentVector (class forms))
+              (nil? (meta forms)) (pos? (count forms)))
+     (let [entities (FastList. (count forms))
+           infos (HashMap.) tempids (HashSet.)
+           auto-time? (boolean (:auto-entity-time? (:opts ctx)))
+           state {:allow-unique? (or allow-small-unique? (>= (count forms) 2))
+                  :unique-avs (volatile! nil)
+                  :seen-avs (when check-unique-avs? (volatile! nil))
+                  :set-capacity (Integer/valueOf (int (max 1 (inc (quot (* 4 (count forms)) 3)))))
+                  :has-many? (volatile! false)
+                  :fuse-unique-inserts? (volatile! true)}]
+       (loop [index 0]
+         (if (< index (count forms))
+           (let [form (nth forms index)]
+             (when (and (plain-map? form) (nil? (meta form)))
+               (when-let [^BlindEntity entity (compile-blind-entity ctx infos tempids state form)]
+                 ;; Empty maps still participate in explicit-tempid detection.
+                 (when (or auto-time? (not (.isEmpty ^FastList (.-attrs entity))))
+                   (.add entities entity))
+                 (recur (unchecked-inc index)))))
+           (let [^FastList avs @(:unique-avs state)
+                 has-unique? (boolean (and avs (not (.isEmpty avs))))
+                 has-many? @(:has-many? state)
+                 fuse? (and has-unique? @(:fuse-unique-inserts? state))
+                 independent-identities?
+                 (boolean
+                   (and has-unique? (not auto-time?) (not has-many?)
+                        (= (.size entities) (.size avs))
+                        (loop [offset 0]
+                          (if (< offset (.size entities))
+                            (when (blind-identity-upsert-av (:schema ctx) (.get entities offset))
+                              (recur (unchecked-inc offset)))
+                            true))))
+                 ;; Each proven entity contributes exactly one AV in entity
+                 ;; order. Reuse that buffer as its writer binding operand.
+                 identity-av (when (and independent-identities? (= 1 (.size entities)))
+                               (.get avs 0))]
+             (when (and (not (.isEmpty entities))
+                        (or check-unique-avs? fuse? (not has-unique?)
+                            (= (.size avs) (.size (HashSet. ^java.util.Collection avs)))))
+               (assoc (plan/->TxPlan ctx :blind entities nil)
+                      :auto-entity-time? auto-time?
+                      :has-unique? has-unique? :has-many? has-many?
+                      :fuse-unique-inserts? fuse? :unique-avs avs
+                      :independent-identity-upserts? independent-identities?
+                      :identity-upsert-av identity-av
+                      :identity-upsert-read
+                      (when identity-av
+                        (let [^BlindEntity entity (.get entities 0)
+                              ^FastList attrs (.-attrs entity)
+                              identity-attr (first identity-av)]
+                          (prepare-scalar-entity-read
+                            (:schema ctx)
+                            (for [offset (range 0 (.size attrs) 2)
+                                  :let [attr (.get attrs offset)]
+                                  :when (not= attr identity-attr)] attr)))))))))))))
 
 (defn- mixed-value-ready? [validate? props ^HashSet tempids value]
   (if (identical? :db.type/ref (:db/valueType props))
@@ -644,3 +804,46 @@
                            (MixedOperands. entries infos required-eid
                                            (and typed? (> (.size updates) 1)))
                            nil)))))))
+
+(defn literal-request-shape
+  "Select one materialized request family without schema reads or host methods."
+  [forms]
+  (when (and (identical? clojure.lang.PersistentVector (class forms))
+             (nil? (meta forms)) (pos? (count forms)))
+    (loop [index 0 kinds 0]
+      (if (< index (count forms))
+        (let [form (nth forms index)
+              kind (cond
+                     (and (plain-map? form) (nil? (meta form)))
+                     (let [explicit? (contains? form :db/id) eid (:db/id form)]
+                       (cond
+                         (or (not explicit?) (literal-tempid? eid)) 2
+                         (and (> (count form) 1) (positive-literal-id? eid)) 1
+                         :else nil))
+                     (and (identical? clojure.lang.PersistentVector (class form))
+                          (nil? (meta form)) (= 4 (count form))
+                          (identical? :db/add (nth form 0))
+                          (positive-literal-id? (nth form 1))) 4)]
+          (when kind
+            (let [kinds (bit-or kinds (long kind))]
+              ;; Positive-ID maps plus new maps retain ordered resolution.
+              (when-not (= 3 (bit-and kinds 3))
+                (recur (unchecked-inc index) kinds)))))
+        (cond
+          (pos? (bit-and kinds 2)) (if (pos? (bit-and kinds 4)) :mixed :blind)
+          (pos? (bit-and kinds 1)) :scalar
+          ;; Preserve the small repeated-E/A decline before context allocation.
+          (= 2 (count forms)) (literal-scalar-shape forms)
+          :else :scalar-operations)))))
+
+(defn compile-tx
+  "Select one scalar, blind or mixed rule from a pure structural decision.
+  Known-family adapters may carry their shape proof; unsupported input is untouched."
+  ([ctx forms] (compile-tx ctx forms {}))
+  ([ctx forms {:keys [literal-shape request-shape] :as options}]
+   (let [shape (or literal-shape request-shape (literal-request-shape forms))]
+     (case shape
+       (:scalar :scalar-operations) (compile-scalar-region ctx forms shape)
+       :blind (compile-blind-region ctx forms options)
+       :mixed (compile-mixed-region ctx forms)
+       nil))))

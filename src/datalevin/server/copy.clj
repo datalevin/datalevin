@@ -212,7 +212,7 @@
         db-identity (or (:db-identity store-opts)
                         (:db-identity kv-opts)
                         stored-db-identity)]
-    (cond-> (assoc base-meta :db-name db-name)
+    (cond-> (assoc base-meta :db-name db-name :storage-version c/version)
       (some? db-identity)
       (assoc :db-identity db-identity)
 

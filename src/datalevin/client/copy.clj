@@ -3,6 +3,7 @@
 (ns ^:no-doc datalevin.client.copy
   "Bounded file reception over the existing copy-out framing."
   (:require [clojure.string :as str]
+            [datalevin.constants :as c]
             [datalevin.client.request :as cr]
             [datalevin.util :as u])
   (:import [java.io File IOException]
@@ -89,6 +90,21 @@
 
 (defn- fail! [code message data]
   (throw (ex-info message (assoc data :error code))))
+
+(defn storage-version
+  "Return the producing server's storage version from a copy response.
+  VERSION-producing callers require valid metadata before publishing files."
+  [response]
+  (let [version (get-in response [:copy-meta :storage-version])]
+    (when (nil? version)
+      (fail! :copy/missing-storage-version
+             "Copy server did not report a storage version" {}))
+    (when-not (and (string? version)
+                  (re-matches c/version-regex version)
+                  (every? some? (map parse-long (str/split version #"\."))))
+      (fail! :copy/invalid-storage-version
+             "Copy server reported an invalid storage version" {:storage-version version}))
+    version))
 
 (defn- write-bytes!
   [^Receiver receiver ^bytes bytes]
