@@ -114,17 +114,24 @@
         (release-slot!)
         (finally (.release lock))))))
 
-(defn- with-permission!
-  [deps server ^SelectionKey skey req-act req-obj req-tgt denied-message f]
+(defn- with-client-permissions!
+  [deps server ^SelectionKey skey f]
   (let [{:keys [client-id write-bf wire-opts]} @(skey-state skey)
         {:keys [permissions]}                ((:get-client deps) server client-id)]
     (if permissions
-      (if (auth/has-permission? req-act req-obj req-tgt permissions)
-        (f)
-        (raise denied-message {}))
+      (f permissions)
       (do
         ((:remove-client deps) server client-id)
         (connection/write-message skey write-bf {:type :reconnect} wire-opts)))))
+
+(defn- with-permission!
+  [deps server skey req-act req-obj req-tgt denied-message f]
+  (with-client-permissions!
+    deps server skey
+    (fn [permissions]
+      (if (auth/has-permission? req-act req-obj req-tgt permissions)
+        (f)
+        (raise denied-message {})))))
 
 (defn- privileged-server-option-key?
   [k]
@@ -1025,14 +1032,18 @@
                    (write-complete! deps skey)))))
            (raise "Database does not exist." {})))))))
 
+(declare admin-catalog)
+
 (defn list-databases
-  [deps server skey _]
-  (with-permission!
-    deps server skey create-act database-obj nil
-    "Don't have permission to list databases"
-    (fn []
-      (write-result!
-        deps skey (auth/query-databases (sys-conn deps server))))))
+  [deps server skey {:keys [args]}]
+  (if (:admin? (first args))
+    (admin-catalog deps server skey (first args))
+    (with-permission!
+      deps server skey create-act database-obj nil
+      "Don't have permission to list databases"
+      (fn []
+        (write-result!
+          deps skey (auth/query-databases (sys-conn deps server)))))))
 
 (defn list-databases-in-use
   [deps server skey _]
@@ -1969,6 +1980,81 @@
          (boolean (some-> ^java.util.concurrent.atomic.AtomicBoolean
                           (:replica-loop-running? state) .get))))
 
+(defn- admin-status-value
+  [deps server db-name catalog runtime?]
+  (let [identity {:db-name db-name :db-type (:database/type catalog)
+                  :db-id (:db/id catalog)
+                  :admin-capabilities #{:guarded-maintenance :wal-gc-dry-run :standalone-copy}}]
+    (if-not runtime?
+      identity
+      (try
+        (let [store ((:get-store deps) server db-name)
+              raw (when store
+                    (if (instance? Store store) (.-lmdb ^Store store) store))]
+          (assoc identity :open? (boolean store)
+                 :stat (when raw (visible-stat raw nil))
+                 :replica (when store
+                            (replica-status-value db-name (db-state deps server db-name)))
+                 :watermarks (when raw (kv/txlog-watermarks raw))))
+        (catch Exception e
+          ;; A diagnostic must never trigger the client's implicit open.
+          (throw (ex-info "Unable to read database status"
+                          {:error :admin/runtime-read-failed
+                           :db-name db-name
+                           :cause-data (dissoc (ex-data e) :type)} e)))))))
+
+(defn admin-catalog
+  "Return identities and optional per-database status in one catalog pass.
+  Enumeration requires global database create and server view permissions."
+  [deps server ^SelectionKey skey {:keys [runtime?] :or {runtime? true}}]
+  (with-client-permissions!
+    deps server skey
+    (fn [permissions]
+      (when-not (auth/has-permission? create-act database-obj nil permissions)
+        (raise "Don't have permission to list databases" {}))
+      (when-not (auth/has-permission? view-act server-obj nil permissions)
+        (raise "Don't have permission to query system." {}))
+      (let [{:keys [client-id]} @(skey-state skey)
+            ;; These global grants imply view access to every database. Check
+            ;; that this request's authorization is still current before each
+            ;; runtime read and publication, without rescanning grants N times.
+            check-permissions! (fn []
+                                 (when-not (identical? permissions
+                                             (:permissions ((:get-client deps) server client-id)))
+                                   (raise "Permissions changed during catalog inspection"
+                                          {:error :admin/permissions-changed})))
+            catalog (d/q '[:find ?name ?type ?id
+                           :where [?id :database/name ?name]
+                                  [?id :database/type ?type]]
+                         @(sys-conn deps server))
+            rows
+            (mapv
+              (fn [[db-name db-type db-id]]
+                (check-permissions!)
+                (let [target {:db-name db-name :db-type db-type :db-id db-id}]
+                  (if-not runtime?
+                    target
+                    (merge target
+                      (try
+                        {:result
+                         ((:with-db-lifecycle-access deps)
+                          server db-name
+                          (fn []
+                            (check-permissions!)
+                            (let [current (auth/pull-db (sys-conn deps server) db-name)]
+                              (when-not (= [db-id db-type]
+                                           [(:db/id current) (:database/type current)])
+                                (raise "Database identity changed during discovery"
+                                       {:error (if current :admin/identity-mismatch
+                                                   :admin/database-not-found)
+                                        :db-name db-name}))
+                              (admin-status-value deps server db-name current true))))}
+                        (catch Exception e
+                          {:error {:message (ex-message e) :data (ex-data e)}}))))))
+              (sort-by first catalog))]
+        (check-permissions!)
+        (write-result! deps skey {:admin-statuses rows})))))
+
 (defn admin-status
   "Inspect catalog identity and an existing runtime without opening a store."
   [deps server skey {:keys [args]}]
@@ -1997,28 +2083,8 @@
                deps server skey view-act database-obj did denied-message
                (fn []
                  (require-db! did)
-                 (let [identity {:db-name db-name :db-type (:database/type catalog)
-                                 :db-id did :admin-capabilities #{:guarded-maintenance :wal-gc-dry-run :standalone-copy}}
-                       result
-                       (if-not runtime?
-                         identity
-                         (try
-                           (let [store ((:get-store deps) server db-name)
-                                 raw (when store
-                                       (if (instance? Store store) (.-lmdb ^Store store) store))]
-                             (assoc identity :open? (boolean store)
-                                    :stat (when raw (visible-stat raw nil))
-                                    :replica (when store
-                                               (replica-status-value db-name
-                                                                     (db-state deps server db-name)))
-                                    :watermarks (when raw (kv/txlog-watermarks raw))))
-                           (catch Exception e
-                             ;; A diagnostic must never trigger the client's implicit open.
-                             (throw (ex-info "Unable to read database status"
-                                             {:error :admin/runtime-read-failed
-                                              :db-name db-name
-                                              :cause-data (dissoc (ex-data e) :type)} e)))))]
-                   (write-result! deps skey result)))))))))))
+                 (write-result! deps skey
+                                (admin-status-value deps server db-name catalog runtime?)))))))))))
 
 (defonce ^:private ^Map read-cache-store-ids
   (Collections/synchronizedMap (WeakHashMap.)))

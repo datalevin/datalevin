@@ -68,9 +68,30 @@
               (recur (seq (drop chunk-size pending)) result)))))
       (finally (when-let [token @held] (control/release! token))))))
 
-(defn wrap [runtime prepared element fallback]
-  (let [operator (get-in element [:fn :symbol])
-        spec (get prepared (get-in element [:args 0 :symbol]))]
-    (if (and spec (#{'min 'max} operator))
-      (fn [values] (extremum! runtime spec (keyword (name operator)) values))
-      fallback)))
+(defn validate-ignore-nil!
+  "NULL-ignoring reduction is explicit and only applies to scalar extrema."
+  [runtime compiled variables]
+  (let [allowed (into #{}
+                  (keep (fn [element]
+                          (control/check-active! (:control runtime))
+                          (when (and (parser/aggregate? element)
+                                     (#{'min 'max} (get-in element [:fn :symbol]))
+                                     (= 1 (count (:args element))))
+                            (get-in element [:args 0 :symbol]))))
+                  (parser/find-elements (get-in compiled [:parsed :qfind])))]
+    (doseq [v variables]
+      (control/check-active! (:control runtime))
+      (when-not (contains? allowed v) (fail! :query-source/unsupported :projection)))
+    variables))
+
+(defn wrap
+  ([runtime prepared element fallback] (wrap runtime prepared #{} element fallback))
+  ([runtime prepared ignore-nil element fallback]
+   (let [operator (get-in element [:fn :symbol])
+         variable (get-in element [:args 0 :symbol])
+         spec (get prepared variable)
+         reduce! (if (and spec (#{'min 'max} operator))
+                   (fn [values] (extremum! runtime spec (keyword (name operator)) values))
+                   fallback)]
+     (if (and (#{'min 'max} operator) (contains? ignore-nil variable))
+       (fn [values] (reduce! (remove nil? values))) reduce!))))

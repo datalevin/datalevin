@@ -47,13 +47,13 @@
                                     (update out (second term) #(if (or (nil? %) (= % (:type c))) (:type c) ::mixed)) out))
                                 out (map vector terms (contract/pattern-columns (descriptors source-symbol) clause)))) {} patterns)
         exported (into {} (map (juxt :id identity)) (region/predicate-clauses root remote-vars))
-        base (inc (reduce max -1 (map :id patterns)))
+        base (inc (long (reduce max -1 (map :id patterns))))
         clauses (reduce (fn [out [i {:keys [node]}]]
                           (cond
                             (nil? out) nil
                             (instance? Pattern node) (update out :native conj node)
-                            (and (instance? Predicate node) (get exported (+ base i)))
-                            (update out :remote conj (get exported (+ base i)))
+                            (and (instance? Predicate node) (get exported (+ base (long i))))
+                            (update out :remote conj (get exported (+ base (long i))))
                             (and (instance? Predicate node) (set/subset? (vars node) native-vars)
                                  (#{'= 'not= '< '<= '> '>= 'nil? 'some?} (get-in node [:fn :symbol]))
                                  (every? #(or (instance? Variable %) (instance? Constant %)) (:args node)))
@@ -161,10 +161,13 @@
 
 (defn- batches [shape groups]
   (let [request (:request shape) columns (:inputs request)
-        cap (min 256 (get-in request [:limits :binding-rows]) (get-in shape [:response :constraints :max-binding-rows]))
-        byte-cap (min (get-in request [:limits :binding-bytes]) (get-in shape [:response :constraints :max-binding-bytes]))
+        cap (min 256 (long (get-in request [:limits :binding-rows]))
+                 (long (get-in shape [:response :constraints :max-binding-rows])))
+        byte-cap (min (long (get-in request [:limits :binding-bytes]))
+                      (long (get-in shape [:response :constraints :max-binding-bytes])))
         pack #(mapv (fn [i values] {:binding-id (long i) :values values}) (range) %)
-        fits? #(and (<= (count %) cap) (<= (source/binding-charge-bytes columns (pack %)) byte-cap))]
+        fits? #(and (<= (count %) cap)
+                    (value/at-most? (source/binding-charge-bytes columns (pack %)) byte-cap))]
     (loop [groups groups pending [] out []]
       (control/check-active! (:control request))
       (if-let [group (first groups)]
@@ -265,7 +268,8 @@
                                      (map :symbol) (get-in compilation [:compiled :parsed :qwith]))
                       emit! (fn [row]
                               (let [id (first row)]
-                                (ensure! (and (integer? id) (<= 0 id) (< id (count groups))))
+                                (ensure! (and (integer? id) (not (neg? (compare id 0)))
+                                              (value/at-most? id (dec (count groups)))))
                                 (let [host (:host (nth groups (int id)))
                                       output (if (:aggregate? shape)
                                                (mapv (fn [e] (if (and (= :variable (:kind e)) ((:native-vars shape) (:variable e)))

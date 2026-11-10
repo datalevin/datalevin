@@ -12,6 +12,7 @@
   (:require
    [datalevin.constants :as c :refer [tx0 txmax]]
    [datalevin.datom :as d :refer [datom datom-added datom?]]
+   [datalevin.db.tx.compile :as compile]
    [datalevin.db.tx.common :as txcommon]
    [datalevin.db.tx.engine :as txengine]
    [datalevin.db.tx.prepare :as txprep]
@@ -1444,54 +1445,18 @@
           :else
           (vld/validate-tx-entity-type entity))))))
 
-(defn- ordinary-value-flags
-  "Nil for unsupported values; bit zero records a unique attribute."
-  [schema a value]
-  (when (keyword? a)
-    (let [props (schema a)]
-      (when (and (not= "db" (namespace a))
-               (not (txcommon/reverse-ref? a))
-               (not (identical? (:db/unique props) :db.unique/identity))
-               (or (contains? resolution-scalar-types (:db/valueType props))
-                   ;; Concrete reference IDs cannot introduce reference tempids.
-                   (and (identical? (:db/valueType props) :db.type/ref)
-                        (integer? value) (not (neg? ^long value))))
-               (not (:db.attr/preds props))
-               (contains? resolution-value-classes (class value)))
-        (if (:db/unique props) 1 0)))))
-
-(defn- ordinary-addition-flags
-  "Bit zero records uniqueness; bit one records an implicit map ID."
-  [schema entity implicit-ids?]
-  (when (nil? (meta entity))
-    (cond
-      (#{clojure.lang.PersistentArrayMap clojure.lang.PersistentHashMap} (class entity))
-      (let [e (:db/id entity)
-            implicit? (and implicit-ids? (not (contains? entity :db/id)))]
-        (when (or implicit?
-                  (and (or (txprep/auto-tempid? e)
-                           (contains? resolution-value-classes (class e)))
-                       (or (txprep/tempid? e) (and (integer? e) (not (neg? ^long e))))))
-          (reduce-kv
-            (fn [flags a v]
-              (if (= a :db/id)
-                flags
-                (if-some [attr-flags (ordinary-value-flags schema a v)]
-                  (if (not= :db.cardinality/many (:db/cardinality (schema a)))
-                    (bit-or (long flags) (long attr-flags))
-                    (reduced nil))
-                  (reduced nil))))
-            (if implicit? 2 0) entity)))
-
-      (identical? clojure.lang.PersistentVector (class entity))
-      (let [[op e a v tx] entity]
-        (when (and (= :db/add op)
-                   (<= 4 (count entity) 5)
-                   (integer? e) (not (neg? ^long e))
-                   (or (nil? tx) (integer? tx)))
-          (ordinary-value-flags schema a v)))
-
-      :else nil)))
+(defn- ordinary-form-flags
+  [ctx entity implicit-ids?]
+  (let [t (class entity)
+        plain-map? (or (identical? t clojure.lang.PersistentArrayMap)
+                       (identical? t clojure.lang.PersistentHashMap))]
+    (if (or plain-map? (identical? t clojure.lang.PersistentVector))
+      (compile/ordinary-addition-flags
+        ctx entity implicit-ids?
+        (and plain-map? (txprep/auto-tempid? (:db/id entity))))
+      ;; Retain the legacy driver's metadata access on an unsupported demanded
+      ;; form. Pure analysis never invokes a host IMeta implementation.
+      (let [_ (meta entity)] nil))))
 
 (defn- distinct-ordinary-eas?
   "Prove that no addition can read another addition's pending E/A value.
@@ -1520,44 +1485,33 @@
                             (.add seen [(long e) (nth entity 2)])))))
                  entities))))))
 
-(defn- plan-ordinary-additions
-  "Prove that flat additions cannot introduce reference tempids. Track unique
-  attributes and whether request-local resolver staging can be omitted.
-  An entirely repeated input needs only its first ordinary addition."
-  ([db entities collapse?]
-   (plan-ordinary-additions db entities collapse? (coreprep/make-prepare-ctx db)))
-  ([db entities collapse? ctx]
-   (plan-ordinary-additions db entities collapse? ctx false))
-  ([_db entities collapse? ctx implicit-ids?]
-   (when (and (seq entities)
-              (not (:auto-entity-time? (:opts ctx)))
-              (empty? (:db.type/tuple (:rschema ctx))))
-     (let [schema (:schema ctx)
-           entity (first entities)]
-       (when-some [initial-flags (ordinary-addition-flags schema entity implicit-ids?)]
-         (loop [es (next entities)
-                flags (long initial-flags)
-                ;; Each implicit-ID map denotes a distinct new entity.
-                repeated? (and collapse?
-                               (or (not (map? entity)) (contains? entity :db/id)))]
-           (if (seq es)
-             (let [next-entity (first es)]
-               (when-some [next-flags (if (identical? entity next-entity)
-                                       initial-flags
-                                       (ordinary-addition-flags schema next-entity implicit-ids?))]
-                 (recur (next es) (bit-or flags (long next-flags))
-                        (and repeated? (= entity next-entity)))))
-             (let [entities (if (and repeated? (next entities)) [entity] entities)
-                   has-unique? (bit-test flags 0)]
-               (cond-> {:entities entities
-                :has-unique? has-unique?
-                ;; Batch indexes describe accepted preceding requests too.
-                ;; Keep their staging even when this request is independent.
-                :stage-resolver? (not (and collapse? (nil? txcommon/*batch-prepare*)
-                                          (not has-unique?)
-                                          (distinct-ordinary-eas? entities)))}
-                 (bit-test flags 1) (assoc :implicit-ids? true))))))))))
-
+(defn- prepare-ordinary-additions
+  "Drive the established input demand and batch-staging integration around
+  pure compiler eligibility. Only the runtime traverses prepared/lazy input."
+  [entities collapse? ctx implicit-ids?]
+  (when (and (seq entities) (compile/ordinary-analysis-enabled? ctx))
+    (let [entity (first entities)]
+      (when-some [initial-flags (ordinary-form-flags ctx entity implicit-ids?)]
+        (loop [es (next entities)
+               flags (long initial-flags)
+               ;; Each implicit-ID map denotes a distinct new entity.
+               repeated? (and collapse?
+                              (or (not (map? entity)) (contains? entity :db/id)))]
+          (if (seq es)
+            (let [next-entity (first es)]
+              (when-some [next-flags (if (identical? entity next-entity)
+                                      initial-flags
+                                      (ordinary-form-flags ctx next-entity implicit-ids?))]
+                (recur (next es) (bit-or flags (long next-flags))
+                       (and repeated? (= entity next-entity)))))
+            (let [entities (if (and repeated? (next entities)) [entity] entities)
+                  has-unique? (bit-test flags 0)]
+              (compile/ordinary-addition-proof
+                entities flags
+                ;; Batch indexes describe preceding requests too. Current
+                ;; allocation/aliasing and batch state remain runtime facts.
+                (not (and collapse? (nil? txcommon/*batch-prepare*)
+                          (not has-unique?) (distinct-ordinary-eas? entities)))))))))))
 
 (defn- plain-resolution-map?
   [entity]
@@ -1709,8 +1663,8 @@
          ordinary (if (some? ordinary-plan)
                     (when ordinary-plan ordinary-plan)
                     (when-not (or interpreting? (::value-tempids initial-report))
-                      (plan-ordinary-additions db initial-es
-                                              (empty? (:tx-data initial-report)) ctx)))
+                      (prepare-ordinary-additions
+                        initial-es (empty? (:tx-data initial-report)) ctx false)))
          plan (when-not (or ordinary interpreting?)
                 (plan-flat-upserts db initial-es ctx))
          ctx (if (and plan (not (:stable-schema? plan)))
@@ -1750,8 +1704,8 @@
                          (not (txengine/interpreter?))
                          (not (::value-tempids initial-report)))
         ordinary (when preflight?
-                   (plan-ordinary-additions (:db-before initial-report) initial-es
-                                            (empty? (:tx-data initial-report)) ctx true))]
+                   (prepare-ordinary-additions
+                     initial-es (empty? (:tx-data initial-report)) ctx true))]
     (if ordinary
       ;; This plan excludes reference resolution and identity retries. Implicit
       ;; maps can allocate during execution without creating private tempids.

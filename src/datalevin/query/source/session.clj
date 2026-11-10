@@ -44,7 +44,7 @@
   (reduce #(if (at-least? %1 %2) %1 %2) :best-effort requirements))
 
 (defn- options! [ctl options aliases]
-  (fields! options #{} #{:limits :authorization :consistency :sources :planning :native-extrema} :context)
+  (fields! options #{} #{:limits :authorization :consistency :sources :planning :native-extrema :ignore-nil-extrema} :context)
   (let [default (get options :consistency :snapshot)
         overrides (get options :sources {})
         planning (get options :planning {})]
@@ -64,6 +64,9 @@
         (fields! spec #{:source :attribute} #{} :context)
         (ensure! (and (symbol? variable) (.startsWith (name variable) "?")
                       (contains? aliases (:source spec)) (keyword? (:attribute spec))) :context)))
+    (let [variables (get options :ignore-nil-extrema #{})]
+      (ensure! (and (set? variables)
+                    (every? #(and (symbol? %) (.startsWith (name %) "?")) variables)) :context))
     (when (some? (:limits options))
       (let [limits (:limits options)]
         (ensure! (value/plain-map? limits) :context)
@@ -75,6 +78,7 @@
                         ;; cap is fine; silently ignoring a requested cap is not.
                         (<= (long (get (control/limits ctl) k)) (long v))) :context))))
     {:native-extrema (get options :native-extrema {})
+     :ignore-nil-extrema (get options :ignore-nil-extrema #{})
      :requirements (into {} (map (fn [alias] [alias (get-in overrides [alias :consistency] default)])) aliases)
      :authorization (get options :authorization {:principal-id :application})
      :planning {:max-alternatives (get planning :max-alternatives 32)
@@ -155,7 +159,7 @@
                          (options! ctl options (into #{} (map #(with-meta % nil)) raw-aliases))
                          (finally (control/release! transient)))
             _ (own-token! (rt/charge-copy! runtime normalized))
-            {:keys [requirements authorization planning native-extrema]}
+            {:keys [requirements authorization planning native-extrema ignore-nil-extrema]}
             (value/owned-copy normalized #(control/check-active! ctl))
             descriptors (IdentityHashMap.)
             entries
@@ -198,7 +202,7 @@
             prepared (->Prepared ctl (:query-id runtime) groups requirements
                                  (select-keys requirements (map :symbol (filter :native entries))) planning
                                  (atom :prepared))
-            prepared (assoc prepared :native-extrema native-extrema)
+            prepared (assoc prepared :native-extrema native-extrema :ignore-nil-extrema ignore-nil-extrema)
             held @tokens]
         (rt/own! runtime #(do (reset! (:state prepared) :closed)
                              (doseq [token held] (control/release! token))))

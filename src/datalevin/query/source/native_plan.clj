@@ -58,7 +58,7 @@
                    [])
        :value-type type
        :constant-constraints (mapv (fn [[variable i]]
-                                     {:variable variable :type (case i 0 :long 1 :keyword 2 type) :nullable? false})
+                                     {:variable variable :type (case (int i) 0 :long 1 :keyword 2 type) :nullable? false})
                                    literal-terms)
        :columns (cond-> []
                   (instance? Variable entity) (conj {:variable (:symbol entity) :type :long :nullable? false})

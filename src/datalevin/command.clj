@@ -81,7 +81,7 @@
    :create-database unguarded-write
    :close-database runtime-write
    :drop-database (assoc local-write :runtime-read-access-exempt? true)
-   :list-databases unguarded
+   :list-databases runtime-managed
    :list-databases-in-use unguarded
    :admin-status runtime-managed
    :assign-role unguarded-write

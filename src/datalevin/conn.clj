@@ -1147,53 +1147,56 @@
     (if-let [outcome (db/prepare-local-request @conn tx-data *request-origin*)]
       (transact-compiled-local! conn tx-data tx-meta outcome)
       (let [kind (db/classify-local-tx tx-data)]
-        (if-let [control (datalog/control conn)]
-        ;; Type correction and read-layout construction do not depend on
-        ;; the eventual native snapshot. Keep that work on the caller;
-        ;; resolve lookup refs and read old values on the native owner.
-          (let [prepared (when (= kind :scalar)
-                           (db/prepare-scalar-update-tx
-                            @conn tx-data {:defer-entity-resolution? true :shape-checked? true}))
-                kind (if (= kind :scalar) :general kind)
-                report (if (and prepared (nil? (l/explicit-transaction-timeout)))
-                         (datalog/run-scalar! control conn prepared tx-data tx-meta
-                                              stamp-collected-scalar!
-                                              (fn [tx forms meta]
-                                                (-transact! tx forms meta
-                                                            (if (db/scalar-update-tx-valid? @tx prepared)
-                                                              :general :scalar))))
-                         (datalog/with-transaction!
-                           control conn
-                           (fn [tx]
-                             (when *txlog-sync-path-observer*
-                               (let [opts (l/read-env-opts (.-lmdb ^Store (:store @tx)))]
-                                 (observe-embedded-path! (:wal-durability-profile opts)
-                                                         (datalog/batched? control))))
-                             (or (when prepared
-                                   (when-let [report (db/stamp-scalar-update-tx
-                                                      @tx prepared tx-meta)]
-                                     (let [report (commit-writing-report!
-                                                   @tx report false :scalar-update true false)]
-                                       (reset! tx (:db-after report))
-                                       report)))
-                                 (-transact! tx tx-data tx-meta
-                                             (if (and prepared
-                                                      (not (db/scalar-update-tx-valid? @tx prepared)))
-                                               :scalar kind))))
-                           {:context {:datalog-prepare? true :datalog-fast? true}}))]
-            (notify-listeners! conn report)
-            report)
-          (if-let [g (embedded-write-group conn)]
-            (transact-embedded-group! g conn tx-data tx-meta kind)
-            (do
-              (let [store (.-store ^DB @conn)
-                    opts (when (and (instance? Store store)
-                                    (not (l/writing? (.-lmdb ^Store store)))
-                                    (not (current-thread-holds-store-write-lock? store)))
-                           (l/read-env-opts (.-lmdb ^Store store)))]
-                (observe-embedded-path!
-                 (when (:wal? opts) (:wal-durability-profile opts)) false))
-              (run-transact-now! conn tx-data tx-meta kind))))))))
+        (if-let [outcome (when (= kind :scalar)
+                           (db/prepare-local-scalar-request @conn tx-data))]
+          (transact-compiled-local! conn tx-data tx-meta outcome)
+          (if-let [control (datalog/control conn)]
+          ;; Type correction and read-layout construction do not depend on
+          ;; the eventual native snapshot. Keep that work on the caller;
+          ;; resolve lookup refs and read old values on the native owner.
+            (let [prepared (when (= kind :scalar)
+                             (db/prepare-scalar-update-tx
+                              @conn tx-data {:defer-entity-resolution? true :shape-checked? true}))
+                  kind (if (= kind :scalar) :general kind)
+                  report (if (and prepared (nil? (l/explicit-transaction-timeout)))
+                           (datalog/run-scalar! control conn prepared tx-data tx-meta
+                                                stamp-collected-scalar!
+                                                (fn [tx forms meta]
+                                                  (-transact! tx forms meta
+                                                              (if (db/scalar-update-tx-valid? @tx prepared)
+                                                                :general :scalar))))
+                           (datalog/with-transaction!
+                             control conn
+                             (fn [tx]
+                               (when *txlog-sync-path-observer*
+                                 (let [opts (l/read-env-opts (.-lmdb ^Store (:store @tx)))]
+                                   (observe-embedded-path! (:wal-durability-profile opts)
+                                                           (datalog/batched? control))))
+                               (or (when prepared
+                                     (when-let [report (db/stamp-scalar-update-tx
+                                                        @tx prepared tx-meta)]
+                                       (let [report (commit-writing-report!
+                                                     @tx report false :scalar-update true false)]
+                                         (reset! tx (:db-after report))
+                                         report)))
+                                   (-transact! tx tx-data tx-meta
+                                               (if (and prepared
+                                                        (not (db/scalar-update-tx-valid? @tx prepared)))
+                                                 :scalar kind))))
+                             {:context {:datalog-prepare? true :datalog-fast? true}}))]
+              (notify-listeners! conn report)
+              report)
+            (if-let [g (embedded-write-group conn)]
+              (transact-embedded-group! g conn tx-data tx-meta kind)
+              (do
+                (let [store (.-store ^DB @conn)
+                      opts (when (and (instance? Store store)
+                                      (not (l/writing? (.-lmdb ^Store store)))
+                                      (not (current-thread-holds-store-write-lock? store)))
+                             (l/read-env-opts (.-lmdb ^Store store)))]
+                  (observe-embedded-path!
+                   (when (:wal? opts) (:wal-durability-profile opts)) false))
+                (run-transact-now! conn tx-data tx-meta kind)))))))))
 
 (defn transact!
   ([conn tx-data] (transact! conn tx-data nil))

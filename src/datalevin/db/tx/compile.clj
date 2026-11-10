@@ -5,7 +5,7 @@
   (:require [datalevin.bits :as b]
             [datalevin.custom-datalog :as cd]
             [datalevin.db.tx.plan :as plan]
-            [datalevin.prepare])
+            [datalevin.prepare :as prepare])
   (:import [datalevin.db.tx.plan BlindEntity MixedAttrInfo MixedInsert MixedOperands MixedUpdate
             ScalarEntityRead]
            [datalevin.prepare PrepareCtx]
@@ -107,7 +107,7 @@
 
 (defn blind-attr-info!
   "Bind blind-insert flags from immutable schema inputs in request-owned scratch.
-  Value normalization, uniqueness probes and entity binding remain runtime work."
+  Callers normalize values separately; ownership and entity binding stay runtime work."
   [^HashMap infos schema tuple-source-attrs allow-unique? attr]
   (or (.get infos attr)
       (let [props (schema attr)
@@ -271,7 +271,8 @@
                 ;; exclusion checks before any conversion can invoke user code.
                 (or (identical? vt :db.type/long) (nil? vt)
                     (contains? scalar-update-value-types vt)
-                    (and (not literal?) (identical? vt :db.type/ref)
+                    (and (or (not literal?) (identical? literal? :references))
+                         (identical? vt :db.type/ref)
                          (plan/resolved-positive-ref? value))))
        props))))
 
@@ -390,6 +391,76 @@
          (inert-scalar-value? e)
          (plan/resolved-positive-ref? e))))
 
+(defn ordinary-analysis-enabled?
+  "Whether the captured context permits the interpreter's ordinary-add proof."
+  [ctx]
+  (and (not (:auto-entity-time? (:opts ctx)))
+       (empty? (:db.type/tuple (:rschema ctx)))))
+
+(defn- ordinary-nonnegative-id?
+  [value]
+  (and (inert-scalar-value? value) (integer? value)
+       (try (not (neg? (long value)))
+            (catch IllegalArgumentException _ false))))
+
+(defn- ordinary-value-flags
+  [schema attr value]
+  (when (and (keyword? attr) (pos? (count (name attr)))
+             (inert-scalar-value? value))
+    (let [props (schema attr)]
+      (when (and (not= "db" (namespace attr))
+                 (not (plan/reverse-ref-attr? attr))
+                 (not (identical? (:db/unique props) :db.unique/identity))
+                 (or (contains? ordinary-scalar-types (:db/valueType props))
+                     (and (identical? (:db/valueType props) :db.type/ref)
+                          (ordinary-nonnegative-id? value)))
+                 (not (:db.attr/preds props)))
+        (if (:db/unique props) 1 0)))))
+
+(defn ordinary-addition-flags
+  "Analyze one already-demanded plain form without correction or store reads.
+  Bit zero marks uniqueness, bit one an implicit ID. The runtime may supply a
+  private-ID proof for an AutoTempid it has already allocated; no allocator or
+  callback enters this worker. Root sequence demand remains runtime-owned."
+  ([ctx entity] (ordinary-addition-flags ctx entity false false))
+  ([ctx entity implicit-ids? private-tempid?]
+   (when (and (or (plain-map? entity)
+                  (identical? clojure.lang.PersistentVector (class entity)))
+              (nil? (meta entity)))
+     (let [schema (:schema ctx)]
+       (if (map? entity)
+         (let [e (:db/id entity)
+               implicit? (and implicit-ids? (not (contains? entity :db/id)))]
+           (when (or implicit? private-tempid?
+                     (and (inert-scalar-value? e)
+                          (or (string? e) (ordinary-nonnegative-id? e)
+                              (and (number? e)
+                                   (try (neg? (long e))
+                                        (catch IllegalArgumentException _ false))))))
+             (reduce-kv
+               (fn [flags attr value]
+                 (if (identical? :db/id attr)
+                   flags
+                   (if-some [attr-flags (ordinary-value-flags schema attr value)]
+                     (if (not= :db.cardinality/many (:db/cardinality (schema attr)))
+                       (bit-or (long flags) (long attr-flags))
+                       (reduced nil))
+                     (reduced nil))))
+               (if implicit? 2 0) entity)))
+         (let [[op e attr value tx] entity]
+           (when (and (identical? :db/add op) (<= 4 (count entity) 5)
+                      (ordinary-nonnegative-id? e)
+                      (or (nil? tx) (and (inert-scalar-value? tx) (integer? tx))))
+             (ordinary-value-flags schema attr value))))))))
+
+(defn ordinary-addition-proof
+  "Attach pure eligibility flags to the runtime's demanded input and staging
+  decision. This is a temporary interpreter proof, not a new execution region."
+  [entities flags stage-resolver?]
+  (cond-> {:entities entities :has-unique? (bit-test flags 0)
+           :stage-resolver? stage-resolver?}
+    (bit-test flags 1) (assoc :implicit-ids? true)))
+
 (defn literal-scalar-shape
   "Recognize inert materialized literal forms without schema reads or scratch.
   The caller may carry this structural proof into compile-tx."
@@ -418,14 +489,15 @@
           :scalar)))))
 
 (defn- literal-scalar-props
-  [store-schema tuple-source-attrs attr value]
+  [store-schema tuple-source-attrs attr value allow-references?]
   ;; Structural analysis proved the ID; inspect only inert values before any
   ;; hashing or correction. Attribute and value eligibility stays compiler-owned.
   (when (and (keyword? attr) (pos? (count (name attr)))
              (not (plan/reverse-ref-attr? attr))
              (inert-scalar-value? value))
     (when-let [props (scalar-attribute-props
-                      store-schema tuple-source-attrs attr value true)]
+                      store-schema tuple-source-attrs attr value
+                      (if allow-references? :references true))]
       ;; Date formatting can invoke a user-supplied default TimeZone.
       ;; Identity preparation for dates remains safe.
       (when-not
@@ -435,8 +507,8 @@
         props))))
 
 (defn- append-literal-candidate!
-  [store-schema tuple-source-attrs candidates seen e attr value]
-  (when-let [props (literal-scalar-props store-schema tuple-source-attrs attr value)]
+  [store-schema tuple-source-attrs candidates seen e attr value allow-references?]
+  (when-let [props (literal-scalar-props store-schema tuple-source-attrs attr value allow-references?)]
     (append-scalar-candidate! candidates seen (long e) attr value (:db/valueType props))))
 
 (defn- canonical-scalar-value?
@@ -447,6 +519,7 @@
     (case vt
       nil true
       :db.type/string (string? value)
+      :db.type/ref (and (instance? Long value) (pos? (long value)))
       :db.type/keyword (keyword? value)
       :db.type/symbol (identical? clojure.lang.Symbol (class value))
       :db.type/boolean (boolean? value)
@@ -473,9 +546,9 @@
             (catch ArithmeticException _ true))))
 
 (defn- compile-one-scalar
-  [^PrepareCtx ctx forms e attr value operation?]
+  [^PrepareCtx ctx forms e attr value operation? allow-references?]
   (when-let [props (literal-scalar-props
-                    (.-schema ctx) (:db/attrTuples (.-rschema ctx)) attr value)]
+                    (.-schema ctx) (:db/attrTuples (.-rschema ctx)) attr value allow-references?)]
     (let [vt (:db/valueType props)
           validate? (:validate-data? (.-opts ctx))]
       (if (canonical-scalar-value? validate? vt value)
@@ -486,10 +559,10 @@
           {:outcome :needs-writer :ctx ctx :input forms})))))
 
 (defn- compile-scalar-operations
-  [ctx forms]
+  [ctx forms allow-references?]
   (if (= 1 (count forms))
     (let [form (nth forms 0)]
-      (compile-one-scalar ctx forms (nth form 1) (nth form 2) (nth form 3) true))
+      (compile-one-scalar ctx forms (nth form 1) (nth form 2) (nth form 3) true allow-references?))
     (let [store-schema (:schema ctx)
           tuple-source-attrs (:db/attrTuples (:rschema ctx))
           validate? (:validate-data? (:opts ctx))
@@ -500,7 +573,7 @@
       (loop [i 0 canonical? true long-ids? true rejected? false]
         (if (< i n)
           (let [[_ e attr value] (nth forms i)]
-            (when-let [props (literal-scalar-props store-schema tuple-source-attrs attr value)]
+            (when-let [props (literal-scalar-props store-schema tuple-source-attrs attr value allow-references?)]
               (when (or (nil? seen) (.add seen [(long e) attr]))
                 (let [vt (:db/valueType props)
                       ready? (canonical-scalar-value? validate? vt value)]
@@ -540,57 +613,73 @@
           :else nil)))))
 
 (defn- compile-canonical-scalar-region
-  "Compile the Stage 1 literal scalar family. Nil means a pure shape decline;
+  "Compile the literal scalar family. Nil means a pure shape decline;
   needs-writer retains the original forms after a pure correction failure."
-  ([ctx forms] (compile-canonical-scalar-region ctx forms false))
-  ([ctx forms literal-shape-checked?]
-   (when (and (or literal-shape-checked? (literal-scalar-shape forms))
-              (not (:auto-entity-time? (:opts ctx))))
-     (if (and (= 1 (count forms)) (= 2 (count (nth forms 0))))
-       ;; A single-attribute map needs neither distinctness scratch nor an
-       ;; intermediate candidate buffer. Its final operands use the shared layout.
-       (let [form (nth forms 0)
-             ^java.util.Iterator keys (.keyIterator ^clojure.lang.IMapIterable form)
-             first-key (.next keys)
-             attr (if (identical? :db/id first-key) (.next keys) first-key)]
-         (when (keyword? attr)
-           (compile-one-scalar ctx forms (:db/id form) attr (get form attr) false)))
-       (let [n (count forms)
-             store-schema (:schema ctx)
-             tuple-source-attrs (:db/attrTuples (:rschema ctx))
-             candidates (FastList. (int (* 4 n)))
-             seen (when (> n 1) (java.util.HashSet.))]
-         (loop [i 0]
-           (if (< i n)
-             (let [form (nth forms i)]
-               (when
-                (if (map? form)
-                  (let [e (:db/id form)]
-                     ;; One literal map already has distinct attribute keys.
-                    (reduce-kv
-                     (fn [_ attr value]
-                       (if (or (identical? :db/id attr)
-                               (append-literal-candidate!
-                                store-schema tuple-source-attrs candidates seen e attr value))
-                         true (reduced false)))
-                     true form))
-                  (append-literal-candidate! store-schema tuple-source-attrs candidates seen
-                                             (nth form 1) (nth form 2) (nth form 3)))
-                 (recur (unchecked-inc i))))
-             (candidate-value-outcome ctx forms candidates))))))))
+  [ctx forms allow-references?]
+  (when-not (:auto-entity-time? (:opts ctx))
+    (if (and (= 1 (count forms)) (= 2 (count (nth forms 0))))
+      ;; A single-attribute map needs neither distinctness scratch nor an
+      ;; intermediate candidate buffer. Its final operands use the shared layout.
+      (let [form (nth forms 0)
+            ^java.util.Iterator keys (.keyIterator ^clojure.lang.IMapIterable form)
+            first-key (.next keys)
+            attr (if (identical? :db/id first-key) (.next keys) first-key)]
+        (when (keyword? attr)
+          (compile-one-scalar ctx forms (:db/id form) attr (get form attr) false allow-references?)))
+      (let [n (count forms)
+            store-schema (:schema ctx)
+            tuple-source-attrs (:db/attrTuples (:rschema ctx))
+            candidates (FastList. (int (* 4 n)))
+            seen (when (> n 1) (java.util.HashSet.))]
+        (loop [i 0]
+          (if (< i n)
+            (let [form (nth forms i)]
+              (when
+               (if (map? form)
+                 (let [e (:db/id form)]
+                    ;; One literal map already has distinct attribute keys.
+                   (reduce-kv
+                    (fn [_ attr value]
+                      (if (or (identical? :db/id attr)
+                              (append-literal-candidate!
+                               store-schema tuple-source-attrs candidates seen e attr value allow-references?))
+                        true (reduced false)))
+                    true form))
+                 (append-literal-candidate! store-schema tuple-source-attrs candidates seen
+                                            (nth form 1) (nth form 2) (nth form 3) allow-references?))
+                (recur (unchecked-inc i))))
+            (candidate-value-outcome ctx forms candidates)))))))
 
 (defn compile-scalar-region
   "Select one scalar operand layout without constructing parallel plans."
   ([ctx forms] (compile-scalar-region ctx forms (literal-scalar-shape forms)))
   ([ctx forms shape]
+   (compile-scalar-region ctx forms shape false))
+  ([ctx forms shape allow-references?]
    (when-not (:auto-entity-time? (:opts ctx))
      (case shape
-       :scalar-operations (compile-scalar-operations ctx forms)
-       :scalar (compile-canonical-scalar-region ctx forms true)
+       :scalar-operations (compile-scalar-operations ctx forms allow-references?)
+       :scalar (compile-canonical-scalar-region ctx forms allow-references?)
        nil))))
 
 (defn- literal-tempid? [value]
   (or (string? value) (and (instance? Long value) (neg? (long value)))))
+
+(defn- pure-scalar-coercion?
+  "Recognize conversions with no host callbacks, interning or default-zone work.
+  The caller has already proved the exact input value class is inert."
+  [vt value]
+  (case vt
+    (:db.type/long :db.type/ref :db.type/float :db.type/double
+     :db.type/bigint :db.type/bigdec) (number? value)
+    :db.type/string (or (number? value) (boolean? value) (keyword? value)
+                        (symbol? value) (uuid? value)
+                        (identical? java.time.Instant (class value)))
+    :db.type/boolean true
+    :db.type/instant (or (integer? value)
+                         (identical? java.time.Instant (class value)))
+    :db.type/uuid (string? value)
+    false))
 
 (defn- canonical-blind-value? [ctx ^objects info value]
   (and (inert-scalar-value? value)
@@ -603,18 +692,69 @@
   (or (identical? clojure.lang.PersistentVector (class value))
       (identical? clojure.lang.PersistentHashSet (class value))))
 
+(defn- coercible-blind-infos
+  "Prove the complete inert materialized request before any correction. Reuse
+  these request-owned metadata bindings during normalized operand construction."
+  [ctx forms allow-small-unique?]
+  (when (and (identical? clojure.lang.PersistentVector (class forms))
+             (nil? (meta forms)) (pos? (count forms)))
+    (let [infos (HashMap.) tempids (HashSet.)
+          allow-unique? (or allow-small-unique? (>= (count forms) 2))
+          value? (fn [^objects info value]
+                   (let [vt (aget info 4)]
+                     (and (inert-scalar-value? value)
+                          (or (not (instance? java.util.Date value))
+                              (identical? vt :db.type/instant))
+                          (or (not (identical? vt :db.type/ref))
+                              (plan/resolved-positive-ref? value))
+                          (or (canonical-blind-value? ctx info value)
+                              (pure-scalar-coercion? vt value)))))
+          attribute? (fn [attr raw]
+                       (when (and (keyword? attr) (pos? (count (name attr))))
+                         (let [^objects info (blind-attr-info!
+                                               infos (:schema ctx)
+                                               (:db/attrTuples (:rschema ctx)) allow-unique? attr)]
+                           (and (some? (aget info 1))
+                                (if (and (identical? :db.cardinality/many
+                                                    (:db/cardinality (aget info 0)))
+                                         (literal-many-values? raw))
+                                  (and (not (and (= 2 (count raw)) (keyword? (first raw))
+                                                 (contains? (:db.unique/identity (:rschema ctx))
+                                                            (first raw))))
+                                       (every? #(value? info %) raw))
+                                  (value? info raw))))))]
+      (when (reduce
+              (fn [_ entity]
+                (if (and (plain-map? entity) (nil? (meta entity))
+                         (or (not (contains? entity :db/id))
+                             (let [e (:db/id entity)]
+                               (and (literal-tempid? e) (.add tempids e))))
+                         (reduce-kv (fn [_ attr raw]
+                                      (if (or (identical? :db/id attr) (attribute? attr raw))
+                                        true (reduced false)))
+                                    true entity))
+                  true (reduced false)))
+              true forms)
+        infos))))
+
 (defn- compile-blind-attribute!
   [ctx ^FastList attrs ^objects info attr raw-value
-   {:keys [unique-avs seen-avs set-capacity has-many? fuse-unique-inserts?]}]
+   {:keys [unique-avs seen-avs set-capacity has-many? fuse-unique-inserts? coerce?]}]
   (let [props (aget info 0)
         many? (identical? :db.cardinality/many (:db/cardinality props))
         unique? (some? (:db/unique props))
         ^FastList avs (when unique?
                         (or @unique-avs (vreset! unique-avs (FastList.))))
-        append! (fn [value]
-                  (and (canonical-blind-value? ctx info value)
-                       (append-blind-canonical-value!
-                         attrs avs seen-avs set-capacity fuse-unique-inserts? info attr value)))]
+        append! (fn [raw]
+                  (let [value (if (canonical-blind-value? ctx info raw)
+                                raw
+                                (when coerce?
+                                  (try (prepare/correct-scalar-value
+                                         (:validate-data? (:opts ctx)) (aget info 4) raw)
+                                       (catch Exception _ nil))))]
+                    (and (some? value)
+                         (append-blind-canonical-value!
+                           attrs avs seen-avs set-capacity fuse-unique-inserts? info attr value))))]
     (when-not (aget info 2) (vreset! fuse-unique-inserts? false))
     (if (and many? (literal-many-values? raw-value))
       ;; A two-element lookup reference remains a scalar resolver operand.
@@ -663,19 +803,16 @@
               true entity)]
         (when supported? (BlindEntity. tempid attrs))))))
 
-(defn compile-blind-region
-  "Compile canonical new maps, materialized many values and uniqueness proofs.
-  Persistent IDs, ownership checks, identity resolution and timestamps remain
-  writer work. Coercing/host/lazy values retain their existing specialization."
-  ([ctx forms] (compile-blind-region ctx forms {}))
-  ([ctx forms {:keys [allow-small-unique? check-unique-avs?]
-               :or {check-unique-avs? true}}]
+(defn- compile-blind-region*
+  [ctx forms {:keys [allow-small-unique? check-unique-avs?]
+              :or {check-unique-avs? true}} infos coerce?]
    (when (and (identical? clojure.lang.PersistentVector (class forms))
               (nil? (meta forms)) (pos? (count forms)))
      (let [entities (FastList. (count forms))
-           infos (HashMap.) tempids (HashSet.)
+           infos (or infos (HashMap.)) tempids (HashSet.)
            auto-time? (boolean (:auto-entity-time? (:opts ctx)))
            state {:allow-unique? (or allow-small-unique? (>= (count forms) 2))
+                  :coerce? coerce?
                   :unique-avs (volatile! nil)
                   :seen-avs (when check-unique-avs? (volatile! nil))
                   :set-capacity (Integer/valueOf (int (max 1 (inc (quot (* 4 (count forms)) 3)))))
@@ -725,7 +862,17 @@
                             (:schema ctx)
                             (for [offset (range 0 (.size attrs) 2)
                                   :let [attr (.get attrs offset)]
-                                  :when (not= attr identity-attr)] attr)))))))))))))
+                                  :when (not= attr identity-attr)] attr))))))))))))
+
+(defn compile-blind-region
+  "Compile canonical or safely coercible new maps, materialized many values
+  and normalized uniqueness proofs. IDs, ownership and timestamps remain writer
+  work. Failed corrections and effectful inputs retain their existing route."
+  ([ctx forms] (compile-blind-region ctx forms {}))
+  ([ctx forms options]
+   (or (compile-blind-region* ctx forms options nil false)
+       (when-let [infos (coercible-blind-infos ctx forms (:allow-small-unique? options))]
+         (compile-blind-region* ctx forms options infos true)))))
 
 (defn- mixed-value-ready? [validate? props ^HashSet tempids value]
   (if (identical? :db.type/ref (:db/valueType props))
@@ -805,6 +952,13 @@
                                            (and typed? (> (.size updates) 1)))
                            nil)))))))
 
+(defn- literal-scalar-alias?
+  [value]
+  (or (keyword? value)
+      (and (identical? clojure.lang.PersistentVector (class value))
+           (nil? (meta value)) (= 2 (count value))
+           (keyword? (nth value 0)) (inert-scalar-value? (nth value 1)))))
+
 (defn literal-request-shape
   "Select one materialized request family without schema reads or host methods."
   [forms]
@@ -822,19 +976,117 @@
                          :else nil))
                      (and (identical? clojure.lang.PersistentVector (class form))
                           (nil? (meta form)) (= 4 (count form))
-                          (identical? :db/add (nth form 0))
-                          (positive-literal-id? (nth form 1))) 4)]
+                          (identical? :db/add (nth form 0)))
+                     (let [e (nth form 1)]
+                       (cond (positive-literal-id? e) 4
+                             (literal-scalar-alias? e) 8)))]
           (when kind
             (let [kinds (bit-or kinds (long kind))]
               ;; Positive-ID maps plus new maps retain ordered resolution.
-              (when-not (= 3 (bit-and kinds 3))
+              (when-not (or (= 3 (bit-and kinds 3))
+                            (and (pos? (bit-and kinds 2))
+                                 (pos? (bit-and kinds 8))))
                 (recur (unchecked-inc index) kinds)))))
         (cond
+          (pos? (bit-and kinds 8)) :scalar-aliases
           (pos? (bit-and kinds 2)) (if (pos? (bit-and kinds 4)) :mixed :blind)
           (pos? (bit-and kinds 1)) :scalar
           ;; Preserve the small repeated-E/A decline before context allocation.
           (= 2 (count forms)) (literal-scalar-shape forms)
           :else :scalar-operations)))))
+
+(defn- canonical-scalar-alias?
+  [ctx e]
+  (or (keyword? e)
+      (let [props (get (:schema ctx) (nth e 0))]
+        (and (#{:db.unique/identity :db.unique/value} (:db/unique props))
+             (contains? ordinary-unique-types (:db/valueType props))
+             (canonical-scalar-value? (:validate-data? (:opts ctx))
+                                      (:db/valueType props) (nth e 1))))))
+
+(defn- compile-scalar-aliases
+  "Retain canonical symbolic entity operands for writer-time binding. Raw
+  distinctness is provisional: the writer must reject aliases of one E/A."
+  [ctx forms]
+  (when-not (:auto-entity-time? (:opts ctx))
+    (let [store-schema (:schema ctx)
+          tuple-source-attrs (:db/attrTuples (:rschema ctx))
+          candidates (FastList.)
+          seen (HashSet.)
+          append! (fn [e attr value]
+                    (when-let [props (literal-scalar-props
+                                      store-schema tuple-source-attrs attr value true)]
+                      ;; Noncanonical values retain the existing caller's
+                      ;; correction/rejection order, including missing aliases.
+                      (when (canonical-scalar-value? (:validate-data? (:opts ctx))
+                                                     (:db/valueType props) value)
+                        (append-scalar-candidate! candidates seen e attr value
+                                                  (:db/valueType props)))))]
+      (when (reduce
+              (fn [_ form]
+                (let [raw-e (if (map? form) (:db/id form) (nth form 1))
+                      e (if (positive-literal-id? raw-e) (long raw-e) raw-e)]
+                  (if (and (or (integer? e) (canonical-scalar-alias? ctx e))
+                           (if (map? form)
+                             (reduce-kv (fn [_ attr value]
+                                          (if (or (identical? :db/id attr)
+                                                  (append! e attr value))
+                                            true (reduced false)))
+                                        true form)
+                             (append! e (nth form 2) (nth form 3))))
+                    true (reduced false))))
+              true forms)
+        (plan/->TxPlan ctx :scalar-aliases
+                       (canonical-scalar-candidates candidates) nil)))))
+
+(defn- compile-coerced-scalar-region
+  "Normalize only after complete inert eligibility and raw E/A distinctness.
+  Correction failures decline without surfacing an error or replacing input."
+  [ctx forms aliases?]
+  (when-not (:auto-entity-time? (:opts ctx))
+    (let [store-schema (:schema ctx)
+          tuple-source-attrs (:db/attrTuples (:rschema ctx))
+          validate? (:validate-data? (:opts ctx))
+          candidates (FastList.)
+          seen (HashSet.)
+          append! (fn [e attr value]
+                    (when-let [props (literal-scalar-props
+                                      store-schema tuple-source-attrs attr value true)]
+                      (let [vt (:db/valueType props)]
+                        (when (or (canonical-scalar-value? validate? vt value)
+                                  (pure-scalar-coercion? vt value))
+                          (append-scalar-candidate! candidates seen e attr value vt)))))]
+      (when (reduce
+              (fn [_ form]
+                (let [raw-e (if (map? form) (:db/id form) (nth form 1))
+                      e (if (positive-literal-id? raw-e) (long raw-e) raw-e)]
+                  (if (and (or (integer? e) (canonical-scalar-alias? ctx e))
+                           (if (map? form)
+                             (reduce-kv (fn [_ attr value]
+                                          (if (or (identical? :db/id attr)
+                                                  (append! e attr value))
+                                            true (reduced false)))
+                                        true form)
+                             (append! e (nth form 2) (nth form 3))))
+                    true (reduced false))))
+              true forms)
+        (when-let [entries
+                   (loop [i 0 entries (transient [])]
+                     (if (< i (.size candidates))
+                       (let [raw (.get candidates (+ i 2))
+                             vt (.get candidates (+ i 3))
+                             value (if (canonical-scalar-value? validate? vt raw)
+                                     raw
+                                     (try (prepare/correct-scalar-value validate? vt raw)
+                                          (catch Exception _ nil)))]
+                         (when (some? value)
+                           (recur (+ i 4)
+                                  (conj! entries [(.get candidates i)
+                                                  (.get candidates (inc i)) value]))))
+                       (persistent! entries)))]
+          (plan/->TxPlan ctx (if aliases? :scalar-aliases :scalar) entries
+                         (when-not aliases?
+                           (scalar-update-entity-reads store-schema entries))))))))
 
 (defn compile-tx
   "Select one scalar, blind or mixed rule from a pure structural decision.
@@ -843,7 +1095,14 @@
   ([ctx forms {:keys [literal-shape request-shape] :as options}]
    (let [shape (or literal-shape request-shape (literal-request-shape forms))]
      (case shape
-       (:scalar :scalar-operations) (compile-scalar-region ctx forms shape)
+       ;; The protected Stage 1 adapter carries :literal-shape. Successful
+       ;; Stage 2 preparation additionally accepts canonical concrete references.
+       (:scalar :scalar-operations)
+       (or (compile-scalar-region ctx forms shape (nil? literal-shape))
+           (when (nil? literal-shape) (compile-coerced-scalar-region ctx forms false)))
+       :scalar-aliases
+       (or (compile-scalar-aliases ctx forms)
+           (compile-coerced-scalar-region ctx forms true))
        :blind (compile-blind-region ctx forms options)
        :mixed (compile-mixed-region ctx forms)
        nil))))

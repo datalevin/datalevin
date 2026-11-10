@@ -1135,43 +1135,40 @@
 (defn- txlog-vector-checkpoint-summary
   [lmdb]
   (let [db-dir (i/env-dir lmdb)
-        prefix (str db-dir u/+separator+)
         init {:vec-checkpoint-count 0
               :vec-checkpoint-duration-ms 0
               :vec-checkpoint-bytes 0
               :vec-checkpoint-failure-count 0
               :vec-replay-lag-lsn 0
               :vec-checkpoint-domains {}}]
-    (reduce-kv
-     (fn [acc fname vec-index]
-       (if (and (string? fname) (str/starts-with? fname prefix))
-         (let [index-info (try
-                            (i/vecs-info vec-index)
-                            (catch Throwable _ nil))
-               cp-state (if (map? (:checkpoint index-info))
-                          (:checkpoint index-info)
-                          {})
-               count (nonneg-long (:vec-checkpoint-count cp-state))
-               duration (nonneg-long (:vec-checkpoint-duration-ms cp-state))
-               bytes (nonneg-long (:vec-checkpoint-bytes cp-state))
-               failures (nonneg-long (:vec-checkpoint-failure-count cp-state))
-               replay-lag (nonneg-long (:vec-replay-lag-lsn cp-state))
-               domain (txlog-vector-domain db-dir fname index-info)]
-           (-> acc
-               (update :vec-checkpoint-count + count)
-               (update :vec-checkpoint-duration-ms + duration)
-               (update :vec-checkpoint-bytes + bytes)
-               (update :vec-checkpoint-failure-count + failures)
-               (update :vec-replay-lag-lsn max replay-lag)
-               (assoc-in [:vec-checkpoint-domains domain]
-                         {:vec-checkpoint-count count
-                          :vec-checkpoint-duration-ms duration
-                          :vec-checkpoint-bytes bytes
-                          :vec-checkpoint-failure-count failures
-                          :vec-replay-lag-lsn replay-lag})))
-         acc))
+    (reduce
+     (fn [acc [fname vec-index]]
+       (let [index-info (try
+                          (i/vecs-info vec-index)
+                          (catch Throwable _ nil))
+             cp-state (if (map? (:checkpoint index-info))
+                        (:checkpoint index-info)
+                        {})
+             count (nonneg-long (:vec-checkpoint-count cp-state))
+             duration (nonneg-long (:vec-checkpoint-duration-ms cp-state))
+             bytes (nonneg-long (:vec-checkpoint-bytes cp-state))
+             failures (nonneg-long (:vec-checkpoint-failure-count cp-state))
+             replay-lag (nonneg-long (:vec-replay-lag-lsn cp-state))
+             domain (txlog-vector-domain db-dir fname index-info)]
+         (-> acc
+             (update :vec-checkpoint-count + count)
+             (update :vec-checkpoint-duration-ms + duration)
+             (update :vec-checkpoint-bytes + bytes)
+             (update :vec-checkpoint-failure-count + failures)
+             (update :vec-replay-lag-lsn max replay-lag)
+             (assoc-in [:vec-checkpoint-domains domain]
+                       {:vec-checkpoint-count count
+                        :vec-checkpoint-duration-ms duration
+                        :vec-checkpoint-bytes bytes
+                        :vec-checkpoint-failure-count failures
+                        :vec-replay-lag-lsn replay-lag}))))
      init
-     @l/vector-indices)))
+     (l/vector-indices-in-dir db-dir))))
 
 (defn txlog-rollout-watermarks
   [lmdb rollout-mode]

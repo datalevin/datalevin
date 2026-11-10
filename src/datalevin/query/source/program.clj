@@ -198,15 +198,26 @@
       (instance? Function node)
       (let [arg (first args)
             copy? (and (#{'identity 'ground} f) (= 1 (count args)))
-            variable (get-in node [:binding :variable :symbol])]
-        (when-not variable (unsupported!))
-        {:requires (if (and copy? (instance? Variable arg))
-                     [(assoc (or (schema (:symbol arg)) (column (:symbol arg) :data true)) :nullable? true)] inputs)
-         :columns [(cond
-                     (not copy?) (column variable :data false)
-                     (instance? Constant arg) (column variable (value/inferred-type (:value arg)) false)
-                     :else (assoc (or (schema (:symbol arg)) (column variable :data true))
-                                  :variable variable :nullable? false))]})
+            variable (get-in node [:binding :variable :symbol])
+            tuple (:bindings (:binding node))
+            variables (mapv #(get-in % [:variable :symbol]) tuple)]
+        (cond
+          (and copy? (instance? Constant arg) (vector? (:value arg))
+               (instance? datalevin.parser.BindTuple (:binding node))
+               (= (count tuple) (count (:value arg)) (count (set variables)))
+               (every? #(instance? datalevin.parser.BindScalar %) tuple))
+          {:requires []
+           :columns (mapv (fn [v x] (column v (value/inferred-type x) (nil? x)))
+                          variables (:value arg))}
+          (nil? variable) (unsupported!)
+          :else
+          {:requires (if (and copy? (instance? Variable arg))
+                       [(assoc (or (schema (:symbol arg)) (column (:symbol arg) :data true)) :nullable? true)] inputs)
+           :columns [(cond
+                       (not copy?) (column variable :data false)
+                       (instance? Constant arg) (column variable (value/inferred-type (:value arg)) false)
+                       :else (assoc (or (schema (:symbol arg)) (column variable :data true))
+                                    :variable variable :nullable? false))]}))
       :else (unsupported!))))
 
 (defn- pure-factory [runtime check! node spec literal-output]
@@ -338,7 +349,7 @@
                                 (column v (if (and (seq cs) (apply = (map :type cs))) (:type (first cs)) :data)
                                         (boolean (some :nullable? cs))))) (canonical (:exports site) check!))]
                   (add-columns schema outputs))) initial
-              (filter #(= id (:parent-region %)) (:sites compiled)))
+              (filter #(and (= id (:parent-region %)) (not= :negation (:kind %))) (:sites compiled)))
             [final _ constraints]
             (reduce (fn [[schema produced constraints] {:keys [node path]}]
                       (check!)
@@ -424,7 +435,8 @@
                                   {:requires (set (map :variable (:requires spec)))
                                    :columns (set (map :variable (:columns spec)))})) (:core-clauses r))
                     (concat (map #(hash-map :requires #{} :columns (set (map :variable (:columns %)))) (:patterns r))
-                            (map #(hash-map :requires (scope-required-vars % inputs) :columns (:exports %)) sites)))]
+                            (map #(hash-map :requires (scope-required-vars % inputs)
+                                           :columns (if (= :negation (:kind %)) #{} (:exports %))) sites)))]
               (loop [required #{}]
                 (check!)
                 (let [[known pending]
@@ -577,8 +589,8 @@
   "Compile captured regions and real typed input tuples into executable shared
   steps. This is the revised internal compiler, not a caller-supplied interface
   fixture. Scalar predicates/functions and positive rule/union/attribute sites
-  use existing engine operators. Native negation compiles child bodies and
-  uses shared bounded subtraction. Unsupported core operators reject before
+  use existing engine operators. Negation uses shared bounded subtraction;
+  external fact bodies remain regions in the same acquired source sessions. Unsupported core operators reject before
   acquisition. Local collections use controlled shared pattern emission.
   Native initializations use the existing planner and the explicit controlled
   storage boundary within the caller's pinned views."
@@ -593,6 +605,7 @@
         run-region (fn [id input] (check!) (ensure! @runner) (@runner id input))
         _ (rt/own! runtime #(do (reset! state :closed) (reset! runner nil)))
         _ (terminal-query! compiled)
+        _ (extrema/validate-ignore-nil! runtime compiled (get-in compilation [:prepared :ignore-nil-extrema]))
         entries (into {} (map (juxt :symbol identity)) (:entries compilation))
         compile-body!
         (fn [parsed context body-rules bindings columns]
@@ -703,8 +716,19 @@
                                           boundary (scope/interfaces! runtime compiled index parent branch-outputs)]
                                       (doseq [branch (:branches boundary) :when (not (:empty? branch))]
                                         (region! (:region-id branch) (:inputs branch)))
-                                      (add! (:path site) (:inputs boundary) (:columns boundary)
-                                            (scope-factory runtime check! boundary run-region))))
+                                      (if (= :negation (:kind site))
+                                        (let [branch (first (:branches boundary))
+                                              variables (mapv :variable (:inputs boundary))
+                                              program {:runtime runtime
+                                                       :run! (fn [input]
+                                                               (if (:empty? branch)
+                                                                 (relation/relation! (zipmap variables (range)) (FastList.))
+                                                                 (run-region (:region-id branch) input)))}]
+                                          (add! (:path site) (:inputs boundary) []
+                                                (negation-factory runtime check!
+                                                  {:requires (:inputs boundary) :program program})))
+                                        (add! (:path site) (:inputs boundary) (:columns boundary)
+                                              (scope-factory runtime check! boundary run-region)))))
                                   (swap! interfaces assoc id {:inputs inputs :operators @operators :core @core})))]
                         (when (:live? (nth (:regions compiled) root)) (region! root root-columns))
                         (vreset! tables @interfaces)
@@ -762,6 +786,7 @@
       (assoc (->Program runtime compilation planned root (:relation input) executable state runner)
              :program-id program-id
              :native-extrema (extrema/prepare! runtime compilation (:groups planned))
+             :ignore-nil-extrema (get-in compilation [:prepared :ignore-nil-extrema])
              :core-specs (into {} (map (fn [[path spec]]
                                         [path (if-let [selected (:selected-inputs spec)]
                                                 (-> spec (dissoc :selected-inputs)
@@ -833,7 +858,7 @@
             (first (result/tuples->return-map return-map [(first tuples)] {:spill-threshold Long/MAX_VALUE}))
             :else (execute/-post-process find return-map tuples)))
         process (execute/result-processor parsed
-                  {:check! check! :wrap-aggregate #(extrema/wrap runtime (:native-extrema program) %1
+                  {:check! check! :wrap-aggregate #(extrema/wrap runtime (:native-extrema program) (:ignore-nil-extrema program) %1
                                      (arithmetic/wrap-aggregate runtime %1 %2))
                    :prepare-call (partial expression/prepare-call runtime)
                    :post-process post-process})

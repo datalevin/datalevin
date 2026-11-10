@@ -2628,8 +2628,8 @@
                                         attr))))))))))))
 
 (defn ^:no-doc prepare-blind-local-tx
-  "Select compiled canonical new maps when opted in; other shapes retain the
-  existing blind specialization. Neither route binds persistent IDs here."
+  "Select compiled canonical or safely coercible new maps when opted in; other
+  shapes retain the blind specialization. Neither route binds persistent IDs here."
   ([db entities] (prepare-blind-local-tx db entities false true))
   ([db entities allow-small-unique?]
    (prepare-blind-local-tx db entities allow-small-unique? true))
@@ -3061,31 +3061,35 @@
     (and (identical? (:schema-epoch prepared) (schema store))
          (identical? (:opts-epoch prepared) (opts store)))))
 
+(defn- bind-scalar-entities
+  "Resolve all entity operands before old-value reads or datom emission.
+  Shared by legacy deferred preparation and compiled symbolic operands."
+  [db {:keys [entries] :as prepared} store-schema]
+  (txcommon/with-lookup-ref-cache db
+    (if (= 1 (count entries))
+      (let [[e attr value] (first entries)]
+        (when-let [eid (scalar-update-entity-id db e)]
+          (assoc prepared :entries [[eid attr value]] :entity-reads nil)))
+      (let [entities (java.util.HashMap.)
+            seen (java.util.HashSet.)
+            resolved
+            (reduce (fn [resolved [e attr value]]
+                      (if-let [eid (resolve-scalar-update-reference! db entities e)]
+                        ;; Distinct references can alias the same entity.
+                        ;; Repeated E/A updates need general ordering.
+                        (if (.add seen [eid attr])
+                          (conj resolved [eid attr value])
+                          (reduced nil))
+                        (reduced nil)))
+                    [] entries)]
+        (when resolved
+          (assoc prepared :entries resolved
+                 :entity-reads (txcompile/scalar-update-entity-reads store-schema resolved)))))))
+
 (defn- resolve-scalar-update-entities
   [db prepared]
   (if (:deferred-entity-resolution? prepared)
-    (txcommon/with-lookup-ref-cache db
-      (let [entries (:entries prepared)]
-        (if (= 1 (count entries))
-          (let [[e attr value] (first entries)]
-            (when-let [eid (scalar-update-entity-id db e)]
-              (assoc prepared :entries [[eid attr value]] :entity-reads nil)))
-          (let [entities (java.util.HashMap.)
-                seen (java.util.HashSet.)
-                resolved
-                (reduce (fn [resolved [e attr value]]
-                          (if-let [eid (resolve-scalar-update-reference! db entities e)]
-                            ;; Distinct references can alias the same entity.
-                            ;; Repeated E/A updates need general ordering.
-                            (if (.add seen [eid attr])
-                              (conj resolved [eid attr value])
-                              (reduced nil))
-                            (reduced nil)))
-                        [] entries)]
-            (when resolved
-              (assoc prepared :entries resolved
-                     :entity-reads (txcompile/scalar-update-entity-reads
-                                     (:schema-epoch prepared) resolved)))))))
+    (bind-scalar-entities db prepared (:schema-epoch prepared))
     prepared))
 
 (def ^:dynamic *specialize-scalar-stamping?*
@@ -3185,6 +3189,17 @@
           (when *tx-compiler-observer* (*tx-compiler-observer* :prepared outcome))
           outcome)))))
 
+(defn ^:no-doc prepare-local-scalar-request
+  "Capture a successful Stage 2 plan after the caller's scalar classification.
+  Provisional rejections retain legacy caller correction and admission."
+  [db forms]
+  (when (and (txengine/compiler?) (nil? (l/explicit-transaction-timeout))
+             (instance? Store (:store db))
+             (let [lmdb (.-lmdb ^Store (:store db))]
+               (and (not (l/writing? lmdb))
+                    (not (Thread/holdsLock (l/write-txn lmdb))))))
+    (prepare-compiled-request db forms)))
+
 (def ^:private fresh-request-keys
   #{:db-before :db-after :tx-data :tempids :tx-meta ::txexec/max-eid-before})
 
@@ -3228,6 +3243,17 @@
               (assoc initial :db-after (assoc db :max-tx tx-id) :tx-data datoms
                      :tempids {:db/current-tx tx-id})
               :compiled-scalar (and txcommon/*batch-prepare* (> (count datoms) 2))))))
+
+      :scalar-aliases
+      (when-let [{:keys [entries entity-reads]}
+                 (bind-scalar-entities db plan (:schema (:ctx plan)))]
+        (let [datoms (txexec/execute-scalar-region
+                       db entries entity-reads tx-id *specialize-scalar-stamping?*)]
+          (when *tx-compiler-observer* (*tx-compiler-observer* :execute-scalar plan))
+          (compiled-report initial
+            (assoc initial :db-after (assoc db :max-tx tx-id) :tx-data datoms
+                   :tempids {:db/current-tx tx-id})
+            :compiled-scalar (and txcommon/*batch-prepare* (> (count datoms) 2)))))
 
       :blind
       (when-let [[report upsert?]

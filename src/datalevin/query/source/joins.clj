@@ -45,11 +45,11 @@
                 entry (some #(when (= (:symbol %) (:source-symbol leader)) %) (:entries group))
                 provider (:source entry)
                 existing (some #(when (identical? leader (:request %)) (:response %)) regular)
-                maximum (- (:max-alternatives leader)
-                           (if existing (count (envelope/alternatives runtime existing)) 0))]
+                maximum (- (long (:max-alternatives leader))
+                           (if existing (long (count (envelope/alternatives runtime existing))) 0))]
             (if (and (empty? (:path region)) (<= 2 (count members) 32) (pos? maximum)
                      (satisfies? source/IQuerySourceJoinPlanning provider))
-              (let [scratch (control/reserve! ctl {:retained-bytes (+ 131072 (* 2048 (reduce + (map #(count (:clauses %)) members))))})]
+              (let [scratch (control/reserve! ctl {:retained-bytes (+ 131072 (* 2048 (long (reduce + (map #(count (:clauses %)) members)))))})]
                 (try
                   (let [request (assoc (merged-request members group maximum)
                                        :required-vars

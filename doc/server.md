@@ -10,7 +10,13 @@ or closed databases without opening them. The server URI comes from
 `DATALEVIN_URI` or `--uri-env VAR`. Named status requires the database's view
 permission; global `--all-databases` also requires database create and server
 view permission. See [the CLI guide](dtlv.md#remote-administration) for output,
-timeouts, and exit codes. The read-only `:admin-status` endpoint also supports
+timeouts, and exit codes. Global status uses one `:list-databases` request with
+`{:admin? true :runtime? true}`, returning `{:admin-statuses [...]}` with each
+database's identity and either `:result` or `:error`. Setting `:runtime? false`
+returns identities alone for maintenance discovery. Ordinary `:list-databases`
+calls still return names. Clients fall back to individual status requests when
+an older server returns names to the extended request. The read-only
+`:admin-status` endpoint also supports
 `{:runtime? false}` discovery and advertises `:guarded-maintenance`,
 `:wal-gc-dry-run`, and `:standalone-copy`. `dtlv admin wal-gc --database NAME [--dry-run]` requires that
 database's alter permission, checks its discovered identity, and uses an

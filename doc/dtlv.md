@@ -56,6 +56,7 @@ never echoed. Select named databases with repeatable `--database`, or use
 
 ```sh
 dtlv admin --uri-env DATALEVIN_URI status --database orders --database users
+dtlv admin status --status-concurrency 4 --database orders --database users
 dtlv admin --timeout-ms 5000 status --all-databases
 dtlv admin wal-gc --database orders --dry-run
 dtlv admin wal-gc --all-databases
@@ -67,6 +68,14 @@ The URI variable defaults to `DATALEVIN_URI`. Database names are normalized and
 deduplicated in the supplied order. `-a/--all` retains its existing sub-database
 meaning and is not an admin selector. `--timeout-ms` defaults to 60000 and bounds
 authentication and each request individually; the entire sweep can take longer.
+On current servers, global status reads the catalog and collects each target's
+status in one request. Older servers use individual status requests. Global
+GC and backup discovery collects identities without reading runtime status.
+For named status or older servers, `--status-concurrency N` overlaps up to N
+reads and uses a matching connection-pool bound. It defaults to 1 and accepts
+1–16. Results remain in selection order, including target errors. New requests
+stop after a terminal error; pending reads are interrupted during cleanup.
+The option applies only to status. GC and backup stay sequential.
 
 Each stdout line is an EDN map containing `:db-name`, `:operation` (`:status`,
 `:wal-gc`, or `:backup`), and

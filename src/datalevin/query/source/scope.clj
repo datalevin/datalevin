@@ -170,7 +170,7 @@
             parent-region (nth (:regions compiled) (:parent-region site))
             owner (:owner parent-region)]
         (ensure! (and (identical? ctl (:control owner)) (= (:query-id runtime) (:query-id owner))
-                      (not @(:closed? owner)) (#{:rule :union :attribute} (:kind site))))
+                      (not @(:closed? owner)) (#{:rule :union :attribute :negation} (:kind site))))
         (vreset! captured-owner owner)
         (columns! parent-columns check!)
         (ensure! (set/subset? (set (map :variable parent-columns)) (:available-vars parent-region)))
@@ -273,8 +273,8 @@
 (defn refine-regions!
   "Propagate captured boundary no-match proofs through the region tree before
   provider requests are built. A conjunction is empty when any of its sites
-  has no live branch; an empty ancestor suppresses all descendant access work.
-  Authorization and descriptor validation remain query-wide."
+  has no live positive branch; an empty negative body keeps its parent live.
+  An empty ancestor suppresses all descendant access work. Authorization and descriptor validation remain query-wide."
   [runtime compiled boundaries]
   (let [active! #(control/check-active! (:control runtime))
         regions (:regions compiled) sites (:sites compiled)]
@@ -306,8 +306,9 @@
                         (let [id (:region-id r)]
                           (if (or (:empty? r) (contains? ids id)
                                   (some (fn [site]
-                                          (every? #(contains? ids (if (map? %) (:region-id %) %))
-                                                  (:branches site))) (get children id)))
+                                          (and (not= :negation (:kind site))
+                                               (every? #(contains? ids (if (map? %) (:region-id %) %))
+                                                       (:branches site)))) (get children id)))
                             (conj ids id) ids))) proved (reverse regions))
               refined
               (reduce (fn [result r]

@@ -333,15 +333,24 @@
                                     (when (every? #(:empty? (nth @regions (:region-id %))) branches)
                                       (swap! regions assoc-in [id :empty?] true))))))
                             (instance? Not node)
-                            (do
-                              (when (external? node inherited (volatile! #{}) 0)
-                                (fail! :query-source/unsupported :clauses))
-                              (let [form (dp/source node)
-                                    form (if (instance? DefaultSrc (:source node)) form (rest form))
-                                    explicit? (= "not-join" (some-> (first form) name))
-                                    positive (reduce-kv (fn [s j vs] (if (= i j) s (set/union s vs))) input-vars producers)
-                                    inputs (if explicit? (node-vars node) (set/intersection positive (node-vars node)))]
-                                (when (empty? inputs) (fail! :query-source/unsupported :planning))
+                            (let [form (dp/source node)
+                                  form (if (instance? DefaultSrc (:source node)) form (rest form))
+                                  explicit? (= "not-join" (some-> (first form) name))
+                                  positive (reduce-kv (fn [s j vs] (if (= i j) s (set/union s vs))) input-vars producers)
+                                  inputs (if explicit? (node-vars node) (set/intersection positive (node-vars node)))]
+                              (when (empty? inputs) (fail! :query-source/unsupported :planning))
+                              (if (external? node inherited (volatile! #{}) 0)
+                                (do
+                                  ;; Complete positive fact bodies share the parent's
+                                  ;; acquired sessions. Negative recursion and arbitrary
+                                  ;; external operators require separate admission.
+                                  (when-not (every? #(instance? Pattern %) (:clauses node))
+                                    (fail! :query-source/unsupported :clauses))
+                                  (let [child (body! (:clauses node) (conj location :negative)
+                                                    source inputs inputs (select-keys bindings inputs)
+                                                    (set/intersection literals inputs) stack (inc (long depth)))]
+                                    (site! {:kind :negation :path location :node node :parent-region id
+                                            :exports inputs :required-inputs inputs :branches [child]})))
                                 (add-core! id (vary-meta node assoc ::negation-inputs inputs
                                                            ::negation-literals (set/intersection literals inputs)) location)))
                             :else (add-core! id node location))))

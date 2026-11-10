@@ -175,7 +175,11 @@
                                      (keep (fn [entry]
                                              (when (and (:descriptor entry) (contains? sources (:symbol entry)))
                                                (let [context (:request (prepared-groups (:symbol entry)))
-                                                     request (region/request! runtime r entry context available
+                                                     ;; Scoped operators may consume a fact identity
+                                                     ;; that is absent from the final projection.
+                                                     needed (into (:required-vars r)
+                                                              (mapcat #(map :variable (:requires %))) operators)
+                                                     request (region/request! runtime (assoc r :required-vars needed) entry context available
                                                                 (get-in prepared [:planning :max-alternatives]))]
                                                  (envelope/request! runtime request))))) entries)]
                   {:region r :inputs inputs :operators operators :requests requests})) live)
@@ -214,6 +218,10 @@
                                              (assoc (:planning prepared) :required-vars (:required-vars region)))
                           (assoc :estimation (get estimate-work (:region-id region)))
                           (update :planning-time-ms + (/ (double provider-planning-ns) 1000000.0))))) responses)]
+        ;; A scoped workspace can be the first user of dependent access.
+        ;; Its temporary cleanup must not close the invocation's shared IDs.
+        (when (some #(seq (get-in % [:path :options :requires])) (mapcat :plans schedules))
+          @ids)
         (access/validate-query! runtime schedules)
         (let [identity-key #(select-keys (get-in % [:path :options]) [:source-symbol :region-id :alternative-id])
               selected (into #{} (map identity-key) (mapcat :plans schedules))]

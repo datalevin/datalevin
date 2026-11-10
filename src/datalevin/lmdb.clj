@@ -812,8 +812,18 @@
   (u/shutdown-scheduler)
   nil)
 
-;; for freeing in-memory vector index objects when an LMDB exits
-(defonce vector-indices (atom {}))  ; fname -> VectorIndex
+;; Ordered filenames allow database-local enumeration without scanning indices
+;; belonging to other environments. Also used to free indices when LMDB exits.
+(defonce vector-indices (atom (sorted-map))) ; fname -> VectorIndex
+
+(defn vector-indices-in-dir
+  "Snapshot the registered vector indices under a database directory.
+  Seek to its filename prefix, then visit only matching entries."
+  ([dir] (vector-indices-in-dir @vector-indices dir))
+  ([indices dir]
+   (let [prefix (str dir u/+separator+)]
+     (take-while #(s/starts-with? (key %) prefix)
+                 (subseq indices >= prefix)))))
 
 ;; check if db is backed by DLMDB (rather than stock LMDB)
 (defonce dlmdb? (memoize (fn [] (s/starts-with? (Util/version) "D"))))

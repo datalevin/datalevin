@@ -146,7 +146,7 @@
   (let [{:keys [alternative request]} (captured! runtime group plan true)]
     (rt/with-context runtime (select-keys request [:source-symbol :region-id :alternative-id])
       (fn [runtime]
-        (with-open [keys (binding/collect! runtime @ids (:requires alternative))]
+        (with-open [^Closeable keys (binding/collect! runtime @ids (:requires alternative))]
           (doseq [outer outer-bindings]
             (control/check-active! (:control runtime))
             (ensure! (and (value/plain-map? outer)

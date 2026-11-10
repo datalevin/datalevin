@@ -11,7 +11,9 @@
            [java.nio.channels ClosedByInterruptException]
            [java.nio.file Files Path Paths LinkOption CopyOption FileSystemException
             DirectoryNotEmptyException NoSuchFileException]
-           [java.nio.file.attribute FileAttribute PosixFilePermissions]))
+           [java.nio.file.attribute FileAttribute PosixFilePermissions]
+           [java.util.concurrent Callable Executors ExecutorService Future ThreadFactory TimeUnit]
+           [java.util.concurrent.atomic AtomicBoolean]))
 
 (def cli-options
   [[nil "--uri-env VAR" "Environment variable containing the server URI"
@@ -25,6 +27,9 @@
                 (update options key (fnil conj []) value))
     :validate [#(not (str/blank? %)) "Must name a database"]]
    [nil "--all-databases" "Select the contacted node's complete database catalog"]
+   [nil "--status-concurrency N" "Concurrent status reads (default 1; maximum 16)"
+    :parse-fn #(Long/parseLong %)
+    :validate [#(<= 1 (long %) 16) "Must be between 1 and 16"]]
    [nil "--dry-run" "Plan WAL GC without deleting segments (wal-gc only)"]])
 
 (def help
@@ -39,6 +44,7 @@ Options:
   --timeout-ms MS     Per-request timeout in milliseconds (default 60000)
   --database NAME     Select a database; repeatable, normalized and deduplicated
   --all-databases     Select the contacted node's catalog, including closed DBs
+  --status-concurrency N  Concurrent status reads, 1–16 (default 1; status only)
   --dry-run          Plan WAL GC without unlinking files (wal-gc only)
   -h, --help          Show this help
 
@@ -66,6 +72,7 @@ Example:
                    (map #(some-> % u/lisp-case))
                    distinct
                    vec)
+        concurrency (get options :status-concurrency 1)
         error (cond
                 (not (or (and (= 1 (count arguments)) (#{"status" "wal-gc"} (first arguments)))
                          (and (= 2 (count arguments)) (= "backup" (first arguments))
@@ -73,6 +80,10 @@ Example:
                 "Expected admin status, wal-gc, or backup DEST"
                 (and (:dry-run options) (not= "wal-gc" (first arguments)))
                 "--dry-run is only supported by wal-gc"
+                (not (and (integer? concurrency) (<= 1 concurrency 16)))
+                "--status-concurrency must be between 1 and 16"
+                (and (some? (:status-concurrency options)) (not= "status" (first arguments)))
+                "--status-concurrency is only supported by status"
                 (:all options) "--all selects sub-databases; use --all-databases for admin"
                 (= (boolean (:all-databases options)) (boolean (seq names)))
                 "Select exactly one of --all-databases or --database NAME"
@@ -130,16 +141,35 @@ Example:
     :where [?id :database/name ?name] [?id :database/type ?type]])
 
 (defn- all-targets
-  [request connection]
-  (let [names (request connection :list-databases [])
-        open-names (set (request connection :list-databases-in-use []))
-        catalog (into {} (map (fn [[name type id]]
-                               [name {:db-name name :db-type type :db-id id}]))
-                      (request connection :query-system [catalog-query []]))]
-    (mapv (fn [name]
-            (assoc (get catalog name {:db-name name :db-id nil})
-                   :open? (contains? open-names name)))
-          (sort names))))
+  [request connection runtime?]
+  (let [response (request connection :list-databases [{:admin? true :runtime? runtime?}])]
+    (if (and (map? response) (vector? (:admin-statuses response)))
+      (let [rows (:admin-statuses response)]
+        (when-not (and (every? #(and (string? (:db-name %))
+                                     (integer? (:db-id %))
+                                     (#{:datalog :key-value} (:db-type %))
+                                     (or (not runtime?)
+                                         (and (contains? % :result) (not (contains? % :error)))
+                                         (and (map? (:error %)) (not (contains? % :result)))))
+                               rows)
+                       (= (count rows) (count (distinct (map :db-name rows)))))
+          (throw (ex-info "Invalid admin catalog" {:error :admin/invalid-result})))
+        (mapv (fn [row]
+                (cond-> (select-keys row [:db-name :db-id :db-type])
+                  runtime? (assoc ::status-outcome (select-keys row [:result :error]))))
+              (sort-by :db-name rows)))
+      ;; Older servers ignore list-databases options and return names. Keep
+      ;; identity checks on that path, without fetching unused open state.
+      (do
+        (when-not (and (sequential? response) (every? string? response))
+          (throw (ex-info "Invalid database catalog" {:error :admin/invalid-result})))
+        (let [catalog (into {} (map (fn [[name type id]]
+                                      [name {:db-name name :db-type type :db-id id}]))
+                            (request connection :query-system [catalog-query []]))]
+          (mapv #(get catalog % {:db-name % :db-id nil}) (sort response)))))))
+
+(defn- error-code [data]
+  (or (:error data) (get-in data [:err-data :error])))
 
 (defn- terminal-error?
   [error]
@@ -149,13 +179,12 @@ Example:
                             (or (instance? FileSystemException cause)
                                 (:copy/local-io? data)
                                 (get-in data [:err-data :copy/local-io?])
-                                (= :copy/local-io
-                                   (or (:error data) (get-in data [:err-data :error]))))))
+                                (= :copy/local-io (error-code data)))))
                         causes)]
     (boolean
       (some (fn [cause]
               (let [data (ex-data cause)
-                    code (or (:error data) (get-in data [:err-data :error]))]
+                    code (error-code data)]
                 (or (and (instance? IOException cause) (not local-io?))
                     (instance? InterruptedException cause)
                     (instance? InterruptedIOException cause)
@@ -166,48 +195,126 @@ Example:
                          (re-find #"(?i)authentication fail" (or (ex-message cause) ""))))))
             causes))))
 
+(defn- validate-status
+  [{:keys [db-name db-id db-type] :as target} result]
+  (when-not (and (map? result) (set? (:admin-capabilities result)))
+    (throw (ex-info "Server does not support admin status"
+                    {:error :admin/unsupported-server})))
+  (when-not (and (= db-name (:db-name result))
+                 (integer? (:db-id result))
+                 (#{:datalog :key-value} (:db-type result))
+                 (or (nil? db-id) (= db-id (:db-id result)))
+                 (or (nil? db-type) (= db-type (:db-type result))))
+    (throw (ex-info "Database identity changed during discovery"
+                    {:error :admin/identity-mismatch :expected target
+                     :actual (select-keys result [:db-name :db-type :db-id])})))
+  result)
+
 (defn- read-status
   ([request connection target] (read-status request connection target true))
-  ([request connection {:keys [db-name db-id db-type] :as target} runtime?]
-  (when (and (contains? target :db-id) (nil? db-id))
-    (throw (ex-info "Database disappeared during discovery"
-                    {:error :admin/database-not-found :db-name db-name})))
-  (let [result (try
-                 (request connection :admin-status [db-name {:runtime? runtime?}])
-                 (catch Exception e
-                   (if (str/includes? (or (:server-message (ex-data e)) (ex-message e) "")
-                                      "Unknown message type :admin-status")
-                     (throw (ex-info "Server does not support admin status"
-                                     {:error :admin/unsupported-server} e))
-                     (throw e))))]
-    (when-not (and (map? result) (set? (:admin-capabilities result)))
-      (throw (ex-info "Server does not support admin status"
-                      {:error :admin/unsupported-server})))
-    (when-not (and (= db-name (:db-name result))
-                   (integer? (:db-id result))
-                   (#{:datalog :key-value} (:db-type result))
-                   (or (nil? db-id) (= db-id (:db-id result)))
-                   (or (nil? db-type) (= db-type (:db-type result))))
-      (throw (ex-info "Database identity changed during discovery"
-                      {:error :admin/identity-mismatch :expected target
-                       :actual (select-keys result [:db-name :db-type :db-id])})))
-    result)))
+  ([request connection {:keys [db-name] :as target} runtime?]
+   (when (and (contains? target :db-id) (nil? (:db-id target)))
+     (throw (ex-info "Database disappeared during discovery"
+                     {:error :admin/database-not-found :db-name db-name})))
+   (validate-status
+     target
+     (try
+       (request connection :admin-status [db-name {:runtime? runtime?}])
+       (catch Exception e
+         (if (str/includes? (or (:server-message (ex-data e)) (ex-message e) "")
+                            "Unknown message type :admin-status")
+           (throw (ex-info "Server does not support admin status"
+                           {:error :admin/unsupported-server} e))
+           (throw e)))))))
+
+(defn- status-outcome
+  [request connection target]
+  (try
+    (if-let [batch-outcome (::status-outcome target)]
+      (if (:error batch-outcome)
+        batch-outcome
+        {:result (validate-status target (:result batch-outcome))})
+      {:result (read-status request connection target)})
+    (catch Exception e
+      {:error {:message (ex-message e) :data (ex-data e)}
+       :stop? (terminal-error? e)})))
+
+(defn- emit-status
+  [emit target outcome]
+  (emit (merge {:db-name (:db-name target) :operation :status}
+               (dissoc outcome :stop?))))
 
 (defn- sweep
   [request connection targets emit]
   (loop [targets (seq targets) failed? false]
     (if-let [target (first targets)]
-      (let [outcome (try
-                      {:result (read-status request connection target)}
-                      (catch Exception e
-                        {:error {:message (ex-message e) :data (ex-data e)}
-                         :stop? (terminal-error? e)}))]
-        (emit (merge {:db-name (:db-name target) :operation :status}
-                     (dissoc outcome :stop?)))
+      (let [outcome (status-outcome request connection target)]
+        (emit-status emit target outcome)
         (if (:stop? outcome)
           1
           (recur (next targets) (or failed? (contains? outcome :error)))))
       (if failed? 1 0))))
+
+(defn- stop-status-workers!
+  [^ExecutorService executor]
+  (.shutdownNow executor)
+  (let [interrupted? (volatile! (Thread/interrupted))
+        deadline (+ (System/nanoTime) 1000000000)]
+    (try
+      (loop []
+        (when (= ::interrupted
+                 (try
+                   (.awaitTermination executor (max 0 (- deadline (System/nanoTime)))
+                                      TimeUnit/NANOSECONDS)
+                   (catch InterruptedException _
+                     (vreset! interrupted? true)
+                     ::interrupted)))
+          (recur)))
+      (finally (when @interrupted? (.interrupt (Thread/currentThread)))))))
+
+(defn- parallel-status-sweep
+  [request connection targets concurrency emit]
+  (let [executor (Executors/newFixedThreadPool
+                   concurrency
+                   (reify ThreadFactory
+                     (newThread [_ runnable]
+                       (doto (Thread. ^Runnable runnable "datalevin-admin-status")
+                         (.setDaemon true)))))
+        stopped? (AtomicBoolean. false)
+        submit (fn [target]
+                 (.submit executor
+                   ^Callable
+                   (bound-fn []
+                     (when-not (.get stopped?)
+                       (let [outcome (status-outcome request connection target)]
+                         (when (:stop? outcome) (.set stopped? true))
+                         outcome)))))]
+    (try
+      ;; Keep at most N futures, including completed results waiting for an
+      ;; earlier target. This bounds both request pressure and buffered output.
+      (loop [remaining (drop concurrency targets)
+             pending (into clojure.lang.PersistentQueue/EMPTY
+                           (map (fn [target] [target (submit target)]))
+                           (take concurrency targets))
+             failed? false]
+        (if-let [[target ^Future task] (peek pending)]
+          (let [outcome (.get task)]
+            (when outcome (emit-status emit target outcome))
+            (if (:stop? outcome)
+              1
+              (let [pending (pop pending)]
+                (if (and (seq remaining) (not (.get stopped?)))
+                  (recur (next remaining)
+                         (conj pending [(first remaining) (submit (first remaining))])
+                         (or failed? (contains? outcome :error)))
+                  (recur nil pending (or failed? (contains? outcome :error)))))))
+          (if (or failed? (.get stopped?)) 1 0)))
+      (catch InterruptedException e
+        (.interrupt (Thread/currentThread))
+        (throw e))
+      (finally
+        (.set stopped? true)
+        (stop-status-workers! executor)))))
 
 (defn- require-gc-support!
   [discovery dry-run?]
@@ -240,7 +347,7 @@ Example:
                 (when (:admin/maintenance-sent? (ex-data e)) (vreset! sent? true))
                 {:error {:message (ex-message e) :data (ex-data e)}
                  :stop? (terminal-error? e)
-                 :unsupported? (= :admin/unsupported-server (:error (ex-data e)))}))
+                 :unsupported? (= :admin/unsupported-server (error-code (ex-data e)))}))
             attempted? (or attempted? @sent?)]
         (emit (merge {:db-name (:db-name target) :operation :wal-gc}
                      (select-keys outcome [:result :error])))
@@ -343,7 +450,7 @@ Example:
                 (when (:admin/maintenance-sent? (ex-data e)) (vreset! sent? true))
                 {:error {:message (ex-message e) :data (ex-data e)}
                  :stop? (terminal-error? e)
-                 :unsupported? (= :admin/unsupported-server (:error (ex-data e)))}))
+                 :unsupported? (= :admin/unsupported-server (error-code (ex-data e)))}))
             attempted? (or attempted? @sent?)]
         (emit (merge {:db-name (:db-name target) :operation :backup}
                      (select-keys outcome [:result :error])))
@@ -373,14 +480,21 @@ Example:
          (if (str/blank? uri)
            (do (diagnostic "The server URI environment variable is missing or blank") 2)
            (let [connection (try
-                              (connect uri {:pool-size 1 :time-out (or (:timeout-ms options) 60000)})
+                              (connect uri
+                                {:pool-size (if (= "status" (first arguments))
+                                              (min (or (:status-concurrency options) 1)
+                                                   (if (:all-databases options)
+                                                     16
+                                                     (count (:database options))))
+                                              1)
+                                 :time-out (or (:timeout-ms options) 60000)})
                               (catch Exception _ nil))]
              (if-not connection
                (do (diagnostic "Unable to connect or authenticate to the server") 2)
                (let [started? (volatile! false)]
                  (try
                    (let [targets (if (:all-databases options)
-                                   (all-targets request connection)
+                                   (all-targets request connection (= "status" (first arguments)))
                                    (mapv #(hash-map :db-name %) (:database options)))
                          destination (when (and (= "backup" (first arguments)) (seq targets))
                                        (backup-destination! create-directory! (second arguments) targets))]
@@ -393,7 +507,11 @@ Example:
                                                   #(emit (sanitize uri %)))
                                     (finally (cleanup-backup-destination! destination)))
                                   0)
-                       (sweep request connection targets #(emit (sanitize uri %)))))
+                       (let [concurrency (min (or (:status-concurrency options) 1) (count targets))
+                             emit #(emit (sanitize uri %))]
+                         (if (and (> concurrency 1) (not-every? ::status-outcome targets))
+                           (parallel-status-sweep request connection targets concurrency emit)
+                           (sweep request connection targets emit)))))
                    (catch Exception e
                      (diagnostic (str "Admin command failed: "
                                       (safe-string uri (or (ex-message e) "Error"))))
