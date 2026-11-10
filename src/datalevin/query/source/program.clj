@@ -20,6 +20,7 @@
             [datalevin.query.source.context :as context]
             [datalevin.query.source.diagnostics :as diagnostics]
             [datalevin.query.source.expression :as expression]
+            [datalevin.query.source.extrema :as extrema]
             [datalevin.query.source.input-program :as input-program]
             [datalevin.query.source.fragment :as fragment]
             [datalevin.query.source.inputs :as inputs]
@@ -760,6 +761,7 @@
       (reset! state :ready)
       (assoc (->Program runtime compilation planned root (:relation input) executable state runner)
              :program-id program-id
+             :native-extrema (extrema/prepare! runtime compilation (:groups planned))
              :core-specs (into {} (map (fn [[path spec]]
                                         [path (if-let [selected (:selected-inputs spec)]
                                                 (-> spec (dissoc :selected-inputs)
@@ -831,7 +833,8 @@
             (first (result/tuples->return-map return-map [(first tuples)] {:spill-threshold Long/MAX_VALUE}))
             :else (execute/-post-process find return-map tuples)))
         process (execute/result-processor parsed
-                  {:check! check! :wrap-aggregate #(arithmetic/wrap-aggregate runtime %1 %2)
+                  {:check! check! :wrap-aggregate #(extrema/wrap runtime (:native-extrema program) %1
+                                     (arithmetic/wrap-aggregate runtime %1 %2))
                    :prepare-call (partial expression/prepare-call runtime)
                    :post-process post-process})
         raw (process parsed context)
@@ -904,7 +907,8 @@
                   (let [input (input-program/prepare! child parsed arguments #(joined! child check! %1 %2))
                         compilation (planning/capture! child (:entries input) (:parsed input) (:rules input)
                                       (:bindings input) (set (map :variable (:columns input))) options)]
-                    (if-let [delegation (relational/plan! child compilation input)]
+                    (if-let [delegation (when-not (seq (get-in compilation [:prepared :native-extrema]))
+                                         (relational/plan! child compilation input))]
                       (let [result (when execute? (relational/run! child delegation))]
                         (if (nil? explain-options) result
                             (diagnostics/finish! child execute? (:result-rows (control/usage (:control child)))
@@ -915,12 +919,13 @@
                     (native/with-views (filter db/db? (keep :native (:entries compilation)))
                       (fn [snapshots]
                         (if-let [delegated
+                                 (when-not (seq (get-in compilation [:prepared :native-extrema]))
                                  (fragment/try! child compilation input execute?
                                    (fn [prefix-runtime shape execute?]
                                      (let [prefix (planning/capture! prefix-runtime (:native-entries shape) (:prefix-query shape) []
                                                     (:bindings input) (set (map :variable (:columns input))) nil)
                                            program (compile-program! prefix-runtime prefix nil nil snapshots (select-keys input [:columns :relation]))]
-                                       (when execute? (execute! prefix-runtime program)))))]
+                                       (when execute? (execute! prefix-runtime program))))))]
                           (if (nil? explain-options) (:result delegated)
                               (diagnostics/finish! child execute? (:result-rows (control/usage (:control child)))
                                 {:storage :memory :spill-policy :reject :relational-fragment? true

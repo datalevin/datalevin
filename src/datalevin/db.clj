@@ -3194,6 +3194,10 @@
           db-after (assoc db :max-tx tx-id)]
       (->TxReport db db-after tx-data {:db/current-tx tx-id} tx-meta))))
 
+(def ^:dynamic *tx-compiler-observer*
+  "Optional diagnostic observer, outside compilation and uninstrumented timings."
+  nil)
+
 (defn ^:no-doc prepare-mixed-add-tx
   "Prepare ordinary mixed updates/inserts. An owned writer may supply its
   current maximum entity ID to avoid rescanning the native index."
@@ -3202,12 +3206,16 @@
   ([db tx-data tx-meta owned-max-eid]
    (prepare-mixed-add-tx db tx-data tx-meta owned-max-eid false))
   ([db tx-data tx-meta owned-max-eid shape-checked?]
-   (txadd/prepare-mixed-report (->TxReport db db [] {} tx-meta) tx-data
-                             owned-max-eid shape-checked?)))
-
-(def ^:dynamic *tx-compiler-observer*
-  "Optional diagnostic observer, outside compilation and uninstrumented timings."
-  nil)
+   (let [report (->TxReport db db [] {} tx-meta)
+         plan (when (and (txengine/compiler?) (instance? Store (:store db)))
+                (txcompile/compile-mixed-region (prepare/make-prepare-ctx db) tx-data))]
+     (if plan
+       (do
+         (when *tx-compiler-observer* (*tx-compiler-observer* :prepared plan))
+         (when-let [result (txadd/execute-mixed-region report plan owned-max-eid)]
+           (when *tx-compiler-observer* (*tx-compiler-observer* :execute-mixed plan))
+           result))
+       (txadd/prepare-mixed-report report tx-data owned-max-eid shape-checked?)))))
 
 (defn ^:no-doc prepare-local-request
   "Pure preparation portion of the DB request hook. Only standalone local

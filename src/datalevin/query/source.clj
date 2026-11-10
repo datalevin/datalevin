@@ -62,6 +62,15 @@
   (-cancel-session! [session reason] "Signal cancellation promptly; return nil.")
   (-close-session! [session] "Release this session and its cursors; return nil."))
 
+(defprotocol IQuerySourceTextExtrema
+  (-text-extremum [session request]
+    "Optional explicitly requested native text ordering. Reduce 1..256 owned
+    strings in :values using :operator :min/:max and :attribute's collation.
+    Request has captured source descriptor, common authorized session context,
+    source symbol/fingerprint/scope. Return an exact member of :values under a
+    deterministic source ordering. Reads use normal control/limits; no session
+    acquisition or answer caching. Ordinary Datalog extrema do not call this."))
+
 (defprotocol IQuerySourceJoinPlanning
   (-plan-joins [source session request]
     "Optional pure planning of dependent joins across acquired aliases in one
@@ -74,6 +83,8 @@
   (-estimation-info [source session request]
     "Pure advisory quote, or nil: {:rows n-or-nil :batch-rows positive-integer
     :request-ns n-or-nil :probe-requests nonnegative-integer :estimated-ns n-or-nil}.
+    Optional :relation-rows supplies the unfiltered catalog size, allowing tiny
+    dimensions to be distinguished from selective accesses to large relations.
     Rows describe the cheapest independent catalog access; request-ns estimates
     one execution request, and estimated-ns prices all proposed metadata probes.
     Unknown costs decline automatic probing. No I/O is allowed here.")

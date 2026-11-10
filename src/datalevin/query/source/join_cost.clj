@@ -5,7 +5,7 @@
 
 (defn price
   "Estimate returned-row work along a complete path. Counts are advisory and
-  floor at one for costing; a zero never proves emptiness. A second independent
+  floor the propagated tuple count at one; a zero never proves emptiness. A second independent
   scan sharing keys has unknown join selectivity and declines this model."
   [selected inputs row-count]
   (reduce
@@ -17,9 +17,9 @@
             (let [output (set (map :variable columns))
                   dependent? (seq requires)
                   shared? (seq (set/intersection known output))
-                  n (max 1.0 (double n))]
+                  n (if (zero? n) 1.0 (double n))]
               (when (or dependent? (not shared?))
-                (let [returned (min Double/MAX_VALUE (* tuples n))]
+                (let [returned (max 1.0 (min Double/MAX_VALUE (* tuples n)))]
                   {:known (set/union known output) :tuples returned
                    :work-rows (min Double/MAX_VALUE (+ work-rows tuples returned))
                    :peak-rows (max peak-rows returned)})))))))
@@ -41,19 +41,31 @@
             roots (->> choices
                        (filter #(and (= :access (:kind %))
                                      (every? (fn [c] (dependency/supplies? (seed (:variable c)) c)) (:requires %))))
-                       (take 16))
+                       (sort-by #(if (:filtered? %) 0 1))
+                       ;; Probe distinct starting work, not repeated scan/lookup
+                       ;; variants for the same patterns. Keys contain only core IDs.
+                       (reduce (fn [{:keys [seen roots] :as state} choice]
+                                 (let [source-work (into #{} (map #(if (vector? %) (first %) %)) (:covers choice))]
+                                   (if (seen source-work) state
+                                     {:seen (conj seen source-work) :roots (conj roots choice)})))
+                               {:seen #{} :roots []})
+                       :roots (take 16))
             early (vec (take-while #(= :core (:kind %)) choices))
             row-key (juxt :work-rows :peak-rows)
             _ (when-not (pos? maximum) (throw (IllegalArgumentException. "invalid search bound")))]
-        (loop [pending (seq roots) best baseline best-price initial evaluated 1]
+        (loop [pending (seq roots) best baseline best-price initial evaluated 1 starts []]
           (if (or (nil? pending) (>= @checks maximum) (>= (- (System/nanoTime) started) 20000000))
             (assoc best :cost-changed? (not (and (= (count (:choices best)) (count (:choices baseline)))
                                                        (every? true? (map identical? (:choices best) (:choices baseline)))))
                         :join-cost (select-keys best-price [:work-rows :peak-rows])
-                        :cost-search {:evaluated evaluated :states @checks
+                        :cost-search {:evaluated evaluated :states @checks :starts starts
                                       :elapsed-ns (- (System/nanoTime) started)})
             (let [root (first pending)
-                  ordered (into early (cons root (remove #(identical? root %) (drop (count early) choices))))
+                  remaining (remove #(identical? root %) (drop (count early) choices))
+                  ;; Keep optional lookahead connected: bind-dependent accesses
+                  ;; precede additional independent scans once their inputs exist.
+                  ordered (into early (cons root (concat (filter #(seq (:requires %)) remaining)
+                                                          (remove #(seq (:requires %)) remaining))))
                   attempt (try
                             (dependency/schedule
                               (assoc arguments :choices ordered :max-states (max 1 (- maximum @checks))
@@ -65,4 +77,6 @@
                             (catch clojure.lang.ExceptionInfo e (when-not (::budget (ex-data e)) (throw e))))
                   priced (when (= :complete (:status attempt)) (price (:choices attempt) (:inputs arguments) row-count))
                   better? (and priced (neg? (compare (row-key priced) (row-key best-price))))]
-              (recur (next pending) (if better? attempt best) (if better? priced best-price) (inc evaluated)))))))))
+              (recur (next pending) (if better? attempt best) (if better? priced best-price) (inc evaluated)
+                     (conj starts (merge {:covers (:covers root) :status (:status attempt)}
+                                         (select-keys priced [:work-rows :peak-rows])))))))))))

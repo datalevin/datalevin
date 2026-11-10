@@ -1,16 +1,19 @@
 (ns datalevin.server.capture-test
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [datalevin.constants :as c]
+            [datalevin.core :as d]
             [datalevin.embedding :as emb]
             [datalevin.interface :as i]
             [datalevin.kv :as kv]
             [datalevin.lmdb :as l]
             [datalevin.secondary-index :as si]
+            [datalevin.server.api :as api]
             [datalevin.server.capture :as capture]
             [datalevin.server.copy :as copy]
             [datalevin.storage :as st]
             [datalevin.test.core :refer [db-fixture]]
             [datalevin.util :as u]
+            [datalevin.vector :as v]
             [taoensso.nippy :as nippy])
   (:import [datalevin.vector VectorIndex]
            [java.util.concurrent CountDownLatch Semaphore TimeUnit]
@@ -24,6 +27,140 @@
 (nippy/extend-thaw ::history-value [_]
   (*history-read!*)
   (HistoryValue.))
+
+(defn- open-client-index! [source state opts]
+  (api/new-vector-index
+    {:get-store (fn [_ _] source)
+     :db-state (fn [_ _] @state)
+     :update-db (fn [_ _ f] (swap! state f))
+     :update-client (fn [_ _ _])
+     :write-message (fn [_ message] message)
+     :with-index-write-admission (fn [_ _ f] (f))}
+    nil nil :client {:args ["source" opts]})
+  (:index @state))
+
+(deftest cold-vector-capture-shares-client-initialization
+  (doseq [compact? [false true] wal? [false true]]
+    (testing (str {:compact? compact? :wal? wal?})
+      (let [root (u/tmp-dir (str "capture-cold-vector-" (random-uuid)))
+            dest (str root "/copy")
+            source (d/open-kv (str root "/source") {:wal? wal?})
+            opts {:dimensions 2}
+            state (atom {})
+            reads (atom 0)
+            opening (promise)
+            client-started (promise)
+            mutated (promise)
+            release (CountDownLatch. 1)
+            tasks (atom [])
+            options {:standalone? true :authorize-write! (fn [])
+                     :admit-write (fn [f] (f))
+                     :with-writer
+                     (fn [f]
+                       (when-not (= true (deref mutated 5000 ::timeout))
+                         (throw (ex-info "Client mutation did not finish" {})))
+                       (binding [kv/*server-write-slot-held?* true] (f)))}]
+        (try
+          (binding [v/*submit-async-vec-save* (constantly nil)]
+            (let [index (v/new-vector-index source opts)]
+              (i/add-vec index :before (float-array [1 0]))
+              (i/close-vecs index)))
+          ;; Pause actual checkpoint loading, after capture has read the domain
+          ;; catalog but before the cold native index is published.
+          (i/transact-kv source
+            [[:put c/vec-meta-dbi c/default-domain
+              (assoc (i/get-value source c/vec-meta-dbi c/default-domain :string :data)
+                     ::loading (HistoryValue.)) :string :data]])
+          (u/create-dirs dest)
+          (let [capture-job
+                (future
+                  (binding [*history-read!*
+                            #(when (= 2 (swap! reads inc))
+                               (deliver opening (Thread/holdsLock source))
+                               (when-not (.await release 5 TimeUnit/SECONDS)
+                                 (throw (ex-info "Cold loader was not released" {}))))]
+                    (capture/attempt! source dest compact? options)))]
+            (swap! tasks conj capture-job)
+            (is (= true (deref opening 5000 ::timeout)))
+            (let [client-job
+                  (future
+                    (deliver client-started true)
+                    (binding [v/*submit-async-vec-save* (constantly nil)]
+                      (i/add-vec (open-client-index! source state opts)
+                                 :later (float-array [0 1])))
+                    (deliver mutated true)
+                    :mutated)]
+              (swap! tasks conj client-job)
+              (is (= true (deref client-started 5000 ::timeout)))
+              (is (= ::blocked (deref client-job 100 ::blocked)))
+              (.countDown release)
+              (is (= :mutated (deref client-job 5000 ::timeout))))
+            (let [result (deref capture-job 5000 ::timeout)]
+              (is (map? result))
+              (copy/finalize-copy! dest "source" result)
+              (spit (str dest "/VERSION") c/version)
+              (let [restored (d/open-kv dest)]
+                (try
+                  (let [index (v/open-vector-index restored opts)]
+                    (is (seq (i/get-list restored (str c/default-domain "/" c/vec-refs)
+                                         :later :data :id)))
+                    (is (= [[0.0 1.0]] (mapv vec (i/get-vec index :later))))
+                    (is (= [:later] (i/search-vec index (float-array [0 1]) {:top 1})))
+                    (is (= 2 (:size (i/vecs-info index)))))
+                  (finally (d/close-kv restored))))))
+          (finally
+            (.countDown release)
+            (doseq [task @tasks] (deref task 5000 ::timeout))
+            (d/close-kv source)
+            (u/delete-files root)))))))
+
+(deftest client-reuses-vector-index-opened-for-capture
+  (let [root (u/tmp-dir (str "capture-vector-reuse-" (random-uuid)))
+        source (d/open-kv root)
+        opts {:dimensions 2}]
+    (try
+      (i/close-vecs (v/new-vector-index source opts))
+      (let [index (v/open-vector-index source opts)]
+        (binding [v/*submit-async-vec-save* (constantly nil)]
+          (i/add-vec index :pending (float-array [0 1])))
+        (let [client-index (open-client-index! source (atom {}) opts)]
+          (is (identical? index client-index))
+          (is (= [:pending] (i/search-vec client-index (float-array [0 1]))))))
+      (finally
+        (d/close-kv source)
+        (u/delete-files root)))))
+
+(deftest late-cold-vector-domain-retries-before-initialization
+  (let [root (u/tmp-dir (str "capture-late-domain-" (random-uuid)))
+        dest (str root "/copy")
+        source (d/open-kv (str root "/source"))
+        injected? (atom false)
+        opts {:dimensions 2 :domain "late"}
+        options {:standalone? true :authorize-write! (fn [])
+                 :admit-write (fn [f] (f))
+                 :with-writer
+                 (fn [f]
+                   (when (compare-and-set! injected? false true)
+                     (binding [v/*submit-async-vec-save* (constantly nil)]
+                       (let [index (v/new-vector-index source opts)]
+                         (i/add-vec index :late (float-array [0 1]))
+                         (i/close-vecs index))))
+                   (binding [kv/*server-write-slot-held?* true] (f)))}]
+    (try
+      (u/create-dirs dest)
+      (is (= :retry (capture/attempt! source dest false options)))
+      (let [result (capture/attempt! source dest false options)]
+        (is (map? result))
+        (copy/finalize-copy! dest "source" result)
+        (spit (str dest "/VERSION") c/version)
+        (let [restored (d/open-kv dest)]
+          (try
+            (is (= [:late] (i/search-vec (v/open-vector-index restored opts)
+                                        (float-array [0 1]))))
+            (finally (d/close-kv restored)))))
+      (finally
+        (d/close-kv source)
+        (u/delete-files root)))))
 
 (defn- blocking-provider [source entered ^CountDownLatch release]
   (reify emb/IEmbeddingProvider

@@ -18,7 +18,7 @@
             [datalevin.prepare :as prepare]
             [datalevin.storage :as storage])
   (:import [datalevin.datom Datom]
-           [datalevin.db.tx.plan MixedAttrInfo]
+           [datalevin.db.tx.plan MixedAttrInfo MixedInsert MixedOperands MixedUpdate]
            [java.util ArrayList HashMap HashSet SortedSet]
            [org.eclipse.collections.impl.map.mutable.primitive LongObjectHashMap]))
 
@@ -40,47 +40,66 @@
                                       (repeat (:db/tupleType props))) v)))
          true)))
 
+(defn- append-new-attribute!
+  [^ArrayList additions options tempids eid tx values a v ^MixedAttrInfo info canonical?]
+  (let [props (.-props info)]
+    (when (and (.-insert? info) (resolved-value? props tempids v))
+      (let [resolved (if (= :db.type/ref (:db/valueType props))
+                      (resolved-ref tempids v) v)
+            value (if canonical? resolved
+                      (prepare/correct-value-with-props options props a resolved))]
+        (.add additions (datom eid a value tx))
+        (if (.-tuples info) (assoc values a value) values)))))
+
+(defn- append-derived-tuples!
+  [^ArrayList additions ^HashMap infos options eid tx values]
+  (when values
+    ;; Build each new tuple once from normalized sources. Identity tuples
+    ;; and predicates retain the interpreter's ordered resolution path.
+    (when (seq values)
+      (let [tuples (reduce-kv
+                     (fn [tuples a _]
+                       (let [^MixedAttrInfo info (.get infos a)]
+                         (reduce-kv (fn [tuples tuple _] (assoc tuples tuple true))
+                                    tuples (.-tuples info))))
+                     {} values)]
+        (reduce-kv
+          (fn [_ a _]
+            (let [^MixedAttrInfo info (.get infos a)
+                  props (.-props info)]
+              (.add additions
+                    (with-meta
+                      (datom eid a
+                             (prepare/correct-value-with-props
+                               options props a
+                               (mapv values (:db/tupleAttrs props))) tx)
+                      {:datalevin.db.tx.execute/internal true}))))
+          nil tuples)))
+    true))
+
 (defn- append-new-entity!
   [^ArrayList additions ^HashMap infos schema options sources tempids eid tx entity]
-  (let [values
-        (reduce-kv
-          (fn [values a v]
-            (if (= :db/id a)
-              values
-              (let [^MixedAttrInfo info (compile/ordinary-attr-info! infos schema sources a)
-                    props (.-props info)]
-                (if (and (.-insert? info) (resolved-value? props tempids v))
-                  (let [v (prepare/correct-value-with-props
-                            options props a
-                            (if (= :db.type/ref (:db/valueType props))
-                              (resolved-ref tempids v) v))]
-                    (.add additions (datom eid a v tx))
-                    (if (.-tuples info) (assoc values a v) values))
-                  (reduced nil)))))
-          {} entity)]
-    (when values
-      ;; Build each new tuple once from normalized sources. Identity tuples
-      ;; and predicates retain the interpreter's ordered resolution path.
-      (when (seq values)
-        (let [tuples (reduce-kv
-                       (fn [tuples a _]
-                         (let [^MixedAttrInfo info (.get infos a)]
-                           (reduce-kv (fn [tuples tuple _] (assoc tuples tuple true))
-                                      tuples (.-tuples info))))
-                       {} values)]
-          (reduce-kv
-            (fn [_ a _]
-              (let [^MixedAttrInfo info (.get infos a)
-                    props (.-props info)]
-                (.add additions
-                      (with-meta
-                        (datom eid a
-                               (prepare/correct-value-with-props
-                                 options props a
-                                 (mapv values (:db/tupleAttrs props))) tx)
-                        {:datalevin.db.tx.execute/internal true}))))
-            nil tuples)))
-      true)))
+  (let [values (reduce-kv
+                 (fn [values a v]
+                   (if (= :db/id a)
+                     values
+                     (or (append-new-attribute!
+                           additions options tempids eid tx values a v
+                           (compile/ordinary-attr-info! infos schema sources a) false)
+                         (reduced nil))))
+                 {} entity)]
+    (append-derived-tuples! additions infos options eid tx values)))
+
+(defn- append-compiled-entity!
+  [^ArrayList additions ^HashMap infos options tempids eid tx ^objects attrs]
+  (loop [offset 0 values {}]
+    (if (< offset (alength attrs))
+      (when-let [values (append-new-attribute!
+                         additions options tempids eid tx values
+                         (aget attrs offset) (aget attrs (inc offset))
+                         (aget attrs (+ offset 2)) true)]
+        (recur (+ offset 3) values))
+      (append-derived-tuples! additions infos options eid tx values))))
 
 (defn- pending-values?
   [db]
@@ -225,6 +244,75 @@
               (recur (unchecked-inc index) seen)))
           true))))
 
+(defn- finish-mixed-report
+  [report db store before tx plan]
+  (let [before (long before) tx (long tx)
+        ^ArrayList additions (:additions plan)]
+    (when (unique-additions-available? db additions (:infos plan))
+      (let [read-old (when (:prepare-reader? plan)
+                     (storage/ea-first-v-reader
+                       store idx/avg-buffer->prepared-value))
+            pending? (and read-old (pending-values? db))
+            datoms
+            (loop [index 0 out (transient [])]
+              (if (< index (.size additions))
+                (let [^Datom addition (.get additions index)
+                      e (.-e addition) a (.-a addition) v (.-v addition)
+                      old (when (<= e before)
+                            (if (and read-old (not pending?))
+                              (read-old e a)
+                              (common/preparation-first-v db e a read-old)))]
+                  (recur (unchecked-inc index)
+                         (cond
+                           (d/value-equal? (idx/logical-value old) v) out
+                           (nil? old) (conj! out addition)
+                           :else (-> out
+                                     (conj! (idx/retraction e a old tx))
+                                     (conj! addition)))))
+                (persistent! out)))]
+        (assoc report
+               :db-after (assoc db :max-eid (:max-eid plan) :max-tx tx)
+               :tx-data datoms
+               :tempids (assoc (:tempids plan) :db/current-tx tx))))))
+
+(defn execute-mixed-region
+  "Bind compiled mixed operands on the current writer without revisiting forms.
+  Declines stale epochs, nonempty attempt state and out-of-bound existing IDs
+  before reads. Unique additions are checked before old-value reader setup."
+  [report plan owned-max-eid]
+  (let [db (:db-after report) store (:store db) ctx (:ctx plan)]
+    (when (and (identical? :mixed (:strategy plan))
+               (empty? (:tx-data report)) (empty? (:tempids report))
+               (identical? (:schema ctx) (i/schema store))
+               (identical? (:opts ctx) (i/opts store)))
+      (let [^MixedOperands operands (:entries plan)
+            ^ArrayList entries (.-entries operands)
+            infos (.-infos operands)
+            before (max (long (:max-eid db))
+                        (long (or owned-max-eid (i/init-max-eid store))))
+            tx (inc (long (:max-tx db)))
+            additions (ArrayList.)]
+        (when (<= (.-required-eid operands) before)
+          (loop [index 0 eid before tempids {}]
+            (if (< index (.size entries))
+              (let [entry (.get entries index)]
+                (if (instance? MixedInsert entry)
+                  (let [^MixedInsert entry entry
+                        next-eid (inc eid)
+                        tempid (.-tempid entry)
+                        tempids (cond-> tempids tempid (assoc tempid next-eid))]
+                    (when (append-compiled-entity!
+                            additions infos (:opts ctx) tempids next-eid tx
+                            (.-attrs entry))
+                      (recur (unchecked-inc index) next-eid tempids)))
+                  (let [^MixedUpdate entry entry]
+                    (.add additions (datom (.-e entry) (.-attr entry) (.-value entry) tx))
+                    (recur (unchecked-inc index) eid tempids))))
+              (finish-mixed-report
+                report db store before tx
+                {:additions additions :max-eid eid :tempids tempids :infos infos
+                 :prepare-reader? (.-prepare-reader? operands)}))))))))
+
 (defn prepare-mixed-report
   "Prepare mixed existing-entity updates and new maps on the owned writer.
   Each existing E/A is written once; new maps own distinct IDs. This makes
@@ -262,30 +350,4 @@
                      tx (inc (long (:max-tx db)))]
                  (when-let [plan (plan-additions entities schema options before tx
                                                 updates preflight? infos sources)]
-                   (let [^ArrayList additions (:additions plan)]
-                     (when (unique-additions-available? db additions (:infos plan))
-                       (let [read-old (when (:prepare-reader? plan)
-                                        (storage/ea-first-v-reader
-                                          store idx/avg-buffer->prepared-value))
-                             pending? (and read-old (pending-values? db))
-                             datoms
-                             (loop [index 0 out (transient [])]
-                               (if (< index (.size additions))
-                                 (let [^Datom addition (.get additions index)
-                                       e (.-e addition) a (.-a addition) v (.-v addition)
-                                       old (when (<= e before)
-                                             (if (and read-old (not pending?))
-                                               (read-old e a)
-                                               (common/preparation-first-v db e a read-old)))]
-                                   (recur (unchecked-inc index)
-                                          (cond
-                                            (d/value-equal? (idx/logical-value old) v) out
-                                            (nil? old) (conj! out addition)
-                                            :else (-> out
-                                                      (conj! (idx/retraction e a old tx))
-                                                      (conj! addition)))))
-                                 (persistent! out)))]
-                         (assoc report
-                                :db-after (assoc db :max-eid (:max-eid plan) :max-tx tx)
-                                :tx-data datoms
-                                :tempids (assoc (:tempids plan) :db/current-tx tx)))))))))))))))
+                   (finish-mixed-report report db store before tx plan)))))))))))

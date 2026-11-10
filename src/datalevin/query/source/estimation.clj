@@ -10,10 +10,16 @@
 
 (defn work-budget
   "Spend at most one eighth of the cheapest independent access's estimated
-  fetch work. This is a conservative opportunity bound, not expected savings."
+  fetch work among substantial relations when base sizes are supplied. Tiny
+  dimensions cannot price the whole join. This is opportunity, not savings."
   [infos]
   (when (and (seq infos) (every? some? infos))
-    (let [known (filter #(some? (:rows %)) infos)]
+    (let [known (filter #(some? (:rows %)) infos)
+          substantial (remove #(and (some? (:relation-rows %))
+                                    (<= (:relation-rows %) (:batch-rows %))) known)
+          ;; A tiny dimension cannot price an entire join's opportunity.
+          ;; A selective lookup into a large relation still constrains it.
+          known (if (seq substantial) substantial known)]
       (when (seq known)
         (let [best (first (sort-by :rows known))]
           (when (and (pos? (:rows best)) (some? (:request-ns best)))
@@ -33,7 +39,9 @@
   (when (satisfies? source/IQuerySourceEstimation provider)
     (when-let [info (rt/invoke runtime :planning #(source/-estimation-info provider session request))]
       (when-not (and (value/plain-map? info)
-                     (= #{:rows :batch-rows :request-ns :probe-requests :estimated-ns} (set (keys info)))
+                     (every? #(contains? info %) [:rows :batch-rows :request-ns :probe-requests :estimated-ns])
+                     (every? #{:rows :relation-rows :batch-rows :request-ns :probe-requests :estimated-ns} (keys info))
+                     (or (nil? (:relation-rows info)) (finite-nonnegative? (:relation-rows info)))
                      (or (nil? (:rows info)) (finite-nonnegative? (:rows info)))
                      (integer? (:batch-rows info)) (<= 1 (:batch-rows info) Long/MAX_VALUE)
                      (integer? (:probe-requests info)) (<= 0 (:probe-requests info) (:max-alternatives request))

@@ -10,6 +10,13 @@
 (deftype MixedAttrInfo
   [props ^boolean ordinary? ^boolean insert? ^boolean update? tuples ^boolean typed?])
 
+(deftype MixedInsert [tempid ^objects attrs])
+
+(deftype MixedUpdate [^long e attr value])
+
+(deftype MixedOperands
+  [entries infos ^long required-eid ^boolean prepare-reader?])
+
 (defn resolved-positive-ref?
   "Recognize positive literal IDs within the signed long range."
   [value]

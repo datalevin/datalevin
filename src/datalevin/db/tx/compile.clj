@@ -6,9 +6,10 @@
             [datalevin.custom-datalog :as cd]
             [datalevin.db.tx.plan :as plan]
             [datalevin.prepare])
-  (:import [datalevin.db.tx.plan MixedAttrInfo ScalarEntityRead]
+  (:import [datalevin.db.tx.plan MixedAttrInfo MixedInsert MixedOperands MixedUpdate
+            ScalarEntityRead]
            [datalevin.prepare PrepareCtx]
-           [java.util HashMap]
+           [java.util ArrayList HashMap HashSet]
            [org.eclipse.collections.impl.list.mutable FastList]))
 
 (def ^:private ordinary-scalar-types
@@ -504,3 +505,84 @@
    (if literal-shape
      (compile-scalar-region ctx forms literal-shape)
      (compile-scalar-region ctx forms))))
+
+(defn- mixed-tempid? [value]
+  (or (string? value) (and (instance? Long value) (neg? (long value)))))
+
+(defn- mixed-value-ready? [validate? props ^HashSet tempids value]
+  (if (identical? :db.type/ref (:db/valueType props))
+    (or (and (instance? Long value) (not (neg? (long value))))
+        (and (mixed-tempid? value) (.contains tempids value)))
+    (and (inert-scalar-value? value)
+         (canonical-scalar-value? validate? (:db/valueType props) value))))
+
+(defn- compile-mixed-insert
+  [schema sources validate? ^HashMap infos ^HashSet tempids entity]
+  (let [explicit? (contains? entity :db/id)
+        tempid (:db/id entity)
+        size (- (count entity) (if explicit? 1 0))]
+    (when (and (pos? size)
+               (or (not explicit?)
+                   (and (mixed-tempid? tempid) (.add tempids tempid))))
+      (let [attrs (object-array (* 3 size))
+            end (reduce-kv
+                  (fn [offset a v]
+                    (if (identical? :db/id a)
+                      offset
+                      ;; Never hash a host key or inspect a host value's methods.
+                      (if (and (keyword? a) (pos? (count (name a))))
+                        (let [^MixedAttrInfo info (ordinary-attr-info!
+                                                   infos schema sources a)]
+                          (if (and (.-insert? info)
+                                   (mixed-value-ready? validate? (.-props info) tempids v))
+                            (do (aset attrs offset a)
+                                (aset attrs (inc (long offset)) v)
+                                (aset attrs (+ (long offset) 2) info)
+                                (+ (long offset) 3))
+                            (reduced nil)))
+                        (reduced nil))))
+                  0 entity)]
+        (when end (MixedInsert. tempid attrs))))))
+
+(defn compile-mixed-region
+  "Compile inert materialized new maps and distinct existing scalar updates.
+  IDs remain symbolic; writer bounds, uniqueness and old values are runtime work.
+  Coercions, forward references and explicit tuple values retain ordered routing."
+  [ctx forms]
+  (when (and (identical? clojure.lang.PersistentVector (class forms))
+             (nil? (meta forms)) (> (count forms) 1)
+             (not (:auto-entity-time? (:opts ctx))))
+    (let [schema (:schema ctx) sources (:db/attrTuples (:rschema ctx))
+          validate? (:validate-data? (:opts ctx))
+          infos (HashMap.) tempids (HashSet.) updates (HashSet.)
+          entries (ArrayList.)]
+      (loop [index 0 inserts? false required-eid 0 typed? true]
+        (if (< index (count forms))
+          (let [form (nth forms index)]
+            (cond
+              (and (plain-map? form) (nil? (meta form)))
+              (when-let [entry (compile-mixed-insert
+                                 schema sources validate? infos tempids form)]
+                (.add entries entry)
+                (recur (unchecked-inc index) true required-eid typed?))
+
+              (and (identical? clojure.lang.PersistentVector (class form))
+                   (nil? (meta form)) (= 4 (count form)) (identical? :db/add (nth form 0)))
+              (let [[_ e a v] form]
+                (when (and (instance? Long e) (pos? (long e))
+                           (keyword? a) (pos? (count (name a)))
+                           (inert-scalar-value? v))
+                  (let [^MixedAttrInfo info (ordinary-attr-info! infos schema sources a)]
+                    (when (and (.-update? info)
+                               (canonical-scalar-value?
+                                 validate? (:db/valueType (.-props info)) v)
+                               (.add updates [e a]))
+                      (.add entries (MixedUpdate. e a v))
+                      (recur (unchecked-inc index) inserts? (max required-eid (long e))
+                             (and typed? (.-typed? info)))))))
+              :else nil))
+          (when (and inserts? (pos? (.size updates)))
+            (plan/->TxPlan ctx :mixed
+                           (MixedOperands. entries infos required-eid
+                                           (and typed? (> (.size updates) 1)))
+                           nil)))))))

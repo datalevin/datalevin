@@ -44,7 +44,7 @@
   (reduce #(if (at-least? %1 %2) %1 %2) :best-effort requirements))
 
 (defn- options! [ctl options aliases]
-  (fields! options #{} #{:limits :authorization :consistency :sources :planning} :context)
+  (fields! options #{} #{:limits :authorization :consistency :sources :planning :native-extrema} :context)
   (let [default (get options :consistency :snapshot)
         overrides (get options :sources {})
         planning (get options :planning {})]
@@ -58,6 +58,12 @@
                   (nonnegative? (get planning :estimate-max-age-ms 300000))
                   (nonnegative? (get planning :estimate-budget-ms 100))
                   (nonnegative? (get planning :estimate-max-requests 8))) :context)
+    (let [specs (get options :native-extrema {})]
+      (ensure! (value/plain-map? specs) :context)
+      (doseq [[variable spec] specs]
+        (fields! spec #{:source :attribute} #{} :context)
+        (ensure! (and (symbol? variable) (.startsWith (name variable) "?")
+                      (contains? aliases (:source spec)) (keyword? (:attribute spec))) :context)))
     (when (some? (:limits options))
       (let [limits (:limits options)]
         (ensure! (value/plain-map? limits) :context)
@@ -68,7 +74,8 @@
                         ;; The caller creates the runtime first. A stronger parent
                         ;; cap is fine; silently ignoring a requested cap is not.
                         (<= (long (get (control/limits ctl) k)) (long v))) :context))))
-    {:requirements (into {} (map (fn [alias] [alias (get-in overrides [alias :consistency] default)])) aliases)
+    {:native-extrema (get options :native-extrema {})
+     :requirements (into {} (map (fn [alias] [alias (get-in overrides [alias :consistency] default)])) aliases)
      :authorization (get options :authorization {:principal-id :application})
      :planning {:max-alternatives (get planning :max-alternatives 32)
                 :estimate-max-age-ms (get planning :estimate-max-age-ms 300000)
@@ -148,7 +155,7 @@
                          (options! ctl options (into #{} (map #(with-meta % nil)) raw-aliases))
                          (finally (control/release! transient)))
             _ (own-token! (rt/charge-copy! runtime normalized))
-            {:keys [requirements authorization planning]}
+            {:keys [requirements authorization planning native-extrema]}
             (value/owned-copy normalized #(control/check-active! ctl))
             descriptors (IdentityHashMap.)
             entries
@@ -191,6 +198,7 @@
             prepared (->Prepared ctl (:query-id runtime) groups requirements
                                  (select-keys requirements (map :symbol (filter :native entries))) planning
                                  (atom :prepared))
+            prepared (assoc prepared :native-extrema native-extrema)
             held @tokens]
         (rt/own! runtime #(do (reset! (:state prepared) :closed)
                              (doseq [token held] (control/release! token))))

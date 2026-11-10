@@ -12,7 +12,8 @@ complete-path lookahead guide fact accesses. Time and transfer estimates remain
 advisory. Version 1.2.10 adds
 eligible scalar-predicate export and the optional relational protocols described
 below, plus cost-budgeted estimate preparation and optional dependent regional
-join planning. Existing EAV adapters need not implement these protocols.
+join planning and explicitly requested native text extrema. Existing EAV adapters
+need not implement these protocols.
 
 The public namespace is [`datalevin.query.source`](../src/datalevin/query/source.clj).
 For mapping compilation, provider packaging, and implementation examples, see
@@ -430,6 +431,7 @@ The query-map `:query-source` value accepts these options:
 | `:consistency` | Default requested read minimum; defaults to `:snapshot`. |
 | `:sources` | Source-symbol map of `{:consistency ...}` overrides for declared external aliases. |
 | `:limits` | Overrides for the shared resource limits shown below. |
+| `:native-extrema` | Optional map from an aggregate input variable to `{:source $alias :attribute :mapped/text}`. Explicitly requests that source column's native text ordering for `min`/`max`; ordinary Datalog extrema retain their usual semantics. Requires the optional session protocol below. |
 | `:planning` | `:max-alternatives` (default `32`), `:estimate-max-age-ms` (default `300000`), `:estimate-budget-ms` (default `100`), and `:estimate-max-requests` (default `8`). Estimate age limits ranking; either preparation cap set to zero disables optional probes. |
 
 For example, put limits inside `:limits`, rather than directly under
@@ -866,11 +868,15 @@ cardinalities after all sessions are acquired and authorized, before pure
 `:rows` describes the cheapest independent access in this request using already
 captured statistics; `:batch-rows` is a positive execution request batch size.
 `:request-ns` prices one execution request and `:estimated-ns` prices all proposed
-metadata requests. Unknown row/time quantities use `nil`; request count is a
+metadata requests. Optional `:relation-rows` supplies the unfiltered base
+cardinality to distinguish tiny dimensions from selective large-table accesses.
+Unknown row/time quantities use `nil`; request count is a
 nonnegative integer bounded by `:max-alternatives`. Quotes perform no I/O.
 
 The core allows at most one eighth of the cheapest known independent access's
-estimated fetch-request work, additionally bounded by the shared
+estimated fetch-request work among substantial relations when base sizes are
+provided; tiny dimensions do not price the entire join. A selective access to
+a large relation still constrains the budget. Preparation is additionally bounded by the shared
 `:estimate-budget-ms` and `:estimate-max-requests`. Only more expensive sources
 that could replace that driver are probed, cheapest probe first. A single driver,
 incoming inputs, unknown cost information, or an unaffordable probe retains the
@@ -900,18 +906,21 @@ qualifying ones and use structural ordering among themselves. Explanations repor
 `:estimated-access-ns` remains `nil`. A statistical zero is still executed and
 cannot prove an access empty, supply a dependency, or change coverage checks.
 
-Bounded lookahead compares at most 16 possible starting accesses using the
+Bounded lookahead compares at most 16 distinct starting sources, prioritizing
+filtered accesses and connected dependent paths using the
 remaining 4096-state feasibility budget and a 20 ms allowance checked between
 attempts. It propagates row counts through dependent joins, sums input/output
-row work, and tracks peak estimated tuple count. Counts floor at one for this
-calculation; zero never suppresses required work. Missing or expired counts,
+row work, and tracks peak estimated tuple count. Fractional dependent fan-out
+can reduce the propagated tuple count, which floors at one; zero never suppresses required work. Missing or expired counts,
 unmodeled local producers, and unknown selectivity for a second independent
 scan retain the original feasible plan. This is a row-work heuristic, without
 skew, correlation, CPU, transfer-byte, or latency modeling; it does not guarantee
 a global minimum. Opaque handles and sessions are never compared or hashed.
 
 Explanations expose `:join-cost {:work-rows ... :peak-rows ...}` and
-`:cost-search {:evaluated ... :states ... :elapsed-ns ...}`. Selection is
+`:cost-search {:evaluated ... :states ... :elapsed-ns ... :starts [...]}`.
+Each bounded start diagnostic contains only covered core work IDs, status and
+estimated row work/peak counts; it retains no provider handles or sessions. Selection is
 `:join-cost` when lookahead changes the baseline; otherwise existing
 `:cardinality`/`:structural` selection remains. `:planning-time-ms` includes pure
 provider plan construction, response capture, and scheduling. Estimate
@@ -925,6 +934,29 @@ opaque handles, labels, and time/transfer costs do not determine the choice. The
 search backtracks to find complete nonoverlapping coverage within its 4096-state
 bound. Failure to find a feasible complete plan is `:query-source/unsupported`.
 This does not promise minimum latency or a globally minimum number of opens.
+
+### Optional source-native text extrema
+
+`IQuerySourceTextExtrema` adds `-text-extremum [session request]` for explicitly
+requested source text ordering. `:native-extrema` maps a `min`/`max` input
+variable to a captured alias and string-valued mapped attribute. The core
+validates this configuration and session capability during compilation,
+including plan-only explains. Explicit unsupported requests fail. Whole-query
+and mixed-source delegation currently decline these requests so the terminal
+core reducer owns the specified semantics.
+
+After normal query execution and find/with distinctness, the shared aggregate
+processor reduces each complete group. Requests contain unchanged authorized
+session context, captured descriptor, source symbol/fingerprint/scope,
+`:attribute`, `:operator :min/:max`, and `:values` (1–256 owned strings, further
+bounded by binding rows/bytes). The source returns an exact member under the
+attribute's deterministic total ordering. The core validates membership and
+retains the winner before releasing each bounded request. It combines chunk
+winners using the same operation; grouping, windows and return shape continue
+through the shared processor. Provider calls use invocation cancellation,
+request and memory accounting, and the already acquired read view. No answer
+cache, new source acquisition or I/O during planning is permitted. An empty
+aggregate group does not require a source read.
 
 ### Optional regional join alternatives
 

@@ -20,31 +20,34 @@
   (if (instance? Store source) (.-lmdb ^Store source) source))
 
 (defn- vector-indices
-  [source]
-  (let [kv (source-kv source)
-        dir (i/env-dir kv)
-        runtime (into (sorted-map)
-                      (keep (fn [[_ ^VectorIndex index]]
-                              (when (= dir (i/env-dir (.-lmdb index)))
-                                [(.-domain index) index])))
-                      @l/vector-indices)
-        runtime (if (instance? Store source)
-                  (into runtime (map (fn [^VectorIndex index] [(.-domain index) index]))
-                        (concat (vals (.-vector-indices ^Store source))
-                                (vals (.-embedding-indices ^Store source))))
-                  runtime)
-        metadata (when (contains? (set (i/list-dbis kv)) c/vec-meta-dbi)
-                   (i/get-range kv c/vec-meta-dbi [:all] :string :data))]
-    (reduce (fn [indices [domain meta]]
-              (if (contains? indices domain)
-                indices
-                (let [opts (:index-opts meta)
-                      index (when (:dimensions opts) (v/open-vector-index kv opts))]
-                  (when-not index
-                    (raise "Cannot open a captured vector domain"
-                           {:error :copy/vector-domain-unavailable :domain domain}))
-                  (assoc indices domain index))))
-            runtime metadata)))
+  ([source] (vector-indices source true))
+  ([source open?]
+   (let [kv (source-kv source)
+         dir (i/env-dir kv)
+         runtime (into (sorted-map)
+                       (keep (fn [[_ ^VectorIndex index]]
+                               (when (= dir (i/env-dir (.-lmdb index)))
+                                 [(.-domain index) index])))
+                       @l/vector-indices)
+         runtime (if (instance? Store source)
+                   (into runtime (map (fn [^VectorIndex index] [(.-domain index) index]))
+                         (concat (vals (.-vector-indices ^Store source))
+                                 (vals (.-embedding-indices ^Store source))))
+                   runtime)
+         metadata (when (contains? (set (i/list-dbis kv)) c/vec-meta-dbi)
+                    (i/get-range kv c/vec-meta-dbi [:all] :string :data))]
+     (reduce (fn [indices [domain meta]]
+               (if (contains? indices domain)
+                 indices
+                 (if open?
+                   (let [opts (:index-opts meta)
+                         index (when (:dimensions opts) (v/open-vector-index kv opts))]
+                     (when-not index
+                       (raise "Cannot open a captured vector domain"
+                              {:error :copy/vector-domain-unavailable :domain domain}))
+                     (assoc indices domain index))
+                   (reduced nil))))
+             runtime metadata))))
 
 (defn- index-writes? [stats indices]
   (or (seq indices)
@@ -136,13 +139,17 @@
                 (locking (l/write-txn raw)
                   (observer :lmdb-locked {:source source})
                   (check-source! source true)
-                  (let [indices (vector-indices source)
+                  ;; A cold domain needs the store initialization monitor, which
+                  ;; clients acquire before the LMDB monitor. Open it on retry
+                  ;; outside write exclusion to preserve that lock order.
+                  (let [indices (vector-indices source false)
                         writes? (index-writes? (:status checked) indices)
                         locks (volatile! [])]
                     (try
                       ;; Verify freshness in constant time. Never rescan job
                       ;; history while excluding writers, even after a change.
-                      (if (or (unfinished-jobs? (:status checked))
+                      (if (or (nil? indices)
+                              (unfinished-jobs? (:status checked))
                               (and checked
                                    (not= (:txn-id checked) (cpp/committed-txn-id raw)))
                               (some (fn [[domain ^VectorIndex index]]

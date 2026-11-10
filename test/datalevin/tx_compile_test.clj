@@ -2,7 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
             [datalevin.db.tx.compile :as compile]
             [datalevin.prepare :as prepare])
-  (:import [datalevin.db.tx.plan MixedAttrInfo TxPlan]
+  (:import [datalevin.db.tx.plan MixedAttrInfo MixedInsert MixedOperands MixedUpdate TxPlan]
            [java.util HashMap]))
 
 (def ctx
@@ -12,6 +12,52 @@
      :identity {:db/aid 5 :db/valueType :db.type/string :db/unique :db.unique/identity}
      :reference {:db/aid 6 :db/valueType :db.type/ref}}
     {} {:validate-data? true}))
+
+(deftest mixed-operands-retain-order-and-symbolic-identities
+  (let [forms [[:db/add 7 :value 2]
+               (array-map :text "parent" :db/id "parent" :reference "parent")
+               {:db/id -1 :reference "parent" :value 3}
+               [:db/add 2 :text "updated"]]
+        plan (compile/compile-mixed-region ctx forms)
+        ^MixedOperands operands (:entries plan)
+        entries (.-entries operands)
+        ^MixedInsert insert (nth entries 1)]
+    (is (instance? TxPlan plan))
+    (is (identical? ctx (:ctx plan)))
+    (is (= :mixed (:strategy plan)))
+    (is (= [MixedUpdate MixedInsert MixedInsert MixedUpdate] (mapv class entries)))
+    (is (= 7 (.-required-eid operands)))
+    (is (true? (.-prepare-reader? operands)))
+    (is (= "parent" (.-tempid insert)))
+    (is (= [:text "parent" :reference "parent"]
+           (into [] (comp (partition-all 3) (mapcat #(take 2 %)))
+                 (seq (.-attrs insert)))))))
+
+(deftest mixed-compilation-declines-without-callbacks-or-realization
+  (let [effects (atom [])
+        host (proxy [Object clojure.lang.IMeta] []
+               (meta [] (swap! effects conj :meta) nil)
+               (toString [] (swap! effects conj :string) "host")
+               (hashCode [] (swap! effects conj :hash) 0))
+        update [:db/add 1 :value 1]
+        insert {:db/id "new" :text "new"}
+        lazy-input (lazy-seq (swap! effects conj :realize) (list update insert))]
+    (doseq [forms [lazy-input [update host] [update {:text host}]
+                   [update {:db/id host :text "new"}]
+                   [update {:db/id nil :text "new"}]
+                   [update {:db/id "a" :reference "later"} {:db/id "later" :text "later"}]
+                   [update insert insert]
+                   [update insert update]
+                   [update {:db/id 3 :text "explicit"}]
+                   [update {:identity "identity"}]
+                   [update {:text 42}]
+                   [update {:reference [1]}]
+                   [update (with-meta insert {:ordered true})]
+                   (with-meta [update insert] {:ordered true})]]
+      (is (nil? (compile/compile-mixed-region ctx forms))))
+    (is (nil? (compile/compile-mixed-region
+                (assoc ctx :opts {:auto-entity-time? true}) [update insert])))
+    (is (empty? @effects))))
 
 (deftest ordinary-attribute-proofs-keep-writer-obligations-distinct
   (let [effects (atom [])

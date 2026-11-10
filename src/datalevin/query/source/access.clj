@@ -447,6 +447,7 @@
                            (concat (map (fn [plan]
                                   (let [o (options plan) p (:permission o)]
                                     {:kind :access :value plan :covers (work-keys plan)
+                                     :filtered? (boolean (seq (get-in o [:capture :alternative :prefilters])))
                                      :requires (:requires o) :columns (:columns o) :after #{}
                                      :resources (if (= :once (:opens p)) #{(:resource p)} #{})
                                      :unavailable? (and (= :once (:opens p)) (:spent? p))})) candidates)

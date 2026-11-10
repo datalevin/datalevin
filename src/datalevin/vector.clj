@@ -1112,10 +1112,16 @@
            vi))))))
 
 (defn ^:no-doc open-vector-index
-  "Open existing vector storage without creating DBIs or migrating a legacy
-  file. Return nil when initialization requires a write."
+  "Reuse a live index or open existing vector storage without creating DBIs or
+  migrating a legacy file. Serialize initialization and publication with server
+  clients on the store monitor. Return nil when initialization requires a write."
   [lmdb opts]
-  (new-vector-index* lmdb opts false))
+  (locking lmdb
+    (let [fname (index-fname lmdb (str (get opts :domain c/default-domain)))
+          index (get @l/vector-indices fname)]
+      (if (and index (not (i/vec-closed? index)))
+        index
+        (new-vector-index* lmdb opts false)))))
 
 (defn new-vector-index
   [lmdb opts]
