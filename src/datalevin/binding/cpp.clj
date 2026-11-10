@@ -49,7 +49,8 @@
    [java.util HashMap Arrays Collection List ArrayList ArrayDeque
     Map$Entry]
    [java.nio BufferOverflowException ByteBuffer]
-   [org.bytedeco.javacpp LongPointer]
+   [java.nio.charset StandardCharsets]
+   [org.bytedeco.javacpp IntPointer LongPointer]
    [clojure.lang IObj]))
 
 ;; Compatibility aliases for callers that use `datalevin.binding.cpp`; the
@@ -1545,6 +1546,50 @@
     (let [^Info info (Info/create (.-env lmdb))]
       (try (.me_last_txnid ^DTLV$MDB_envinfo (.get info))
            (finally (.close info))))))
+
+(defn- dbi-state
+  "Copy the named tree's opaque catalog record, including its root page."
+  [^Txn txn ^String dbi-name]
+  (with-open [main (IntPointer. 1)
+              key (BufVal. c/+max-key-size+)
+              value (BufVal. 0)]
+    (Util/checkRc (DTLV/mdb_dbi_open (.get txn) (cast String nil) (int 0) main))
+    (buffer/put-bufval key (.getBytes dbi-name StandardCharsets/UTF_8) :raw nil nil)
+    (let [rc (DTLV/mdb_get (.get txn) (.get main) (.ptr key) (.ptr value))]
+      (when-not (= rc DTLV/MDB_NOTFOUND)
+        (Util/checkRc rc)
+        (b/get-bytes (.outBuf value))))))
+
+(defrecord DBISnapshot [^Txn txn dbi-name state]
+  AutoCloseable
+  (close [_] (.close txn)))
+
+(defn dbi-snapshot
+  "Retain a read snapshot and a named tree's catalog state. The reader prevents
+  root-page reuse while validating the observed tree. The caller protects the
+  environment's lifetime and closes the result before writing or retrying."
+  [^CppLMDB lmdb dbi-name]
+  (native-call (.-info lmdb)
+    (i/check-ready lmdb)
+    (let [txn (Txn/createReadOnly (.-env lmdb))]
+      (try
+        (->DBISnapshot txn dbi-name (dbi-state txn dbi-name))
+        (catch Throwable e
+          (.close txn)
+          (throw e))))))
+
+(defn dbi-snapshot-current?
+  "Verify the retained tree against a fresh reader, independently of other DBIs.
+  Call with write exclusion when using the result to prepare a copy."
+  [^CppLMDB lmdb ^DBISnapshot snapshot]
+  (native-call (.-info lmdb)
+    (i/check-ready lmdb)
+    (.id ^Txn (:txn snapshot))
+    (let [txn (Txn/createReadOnly (.-env lmdb))]
+      (try
+        (Arrays/equals ^bytes (:state snapshot)
+                       ^bytes (dbi-state txn (:dbi-name snapshot)))
+        (finally (.close txn))))))
 
 (defn invalidate-thread-reader!
   [lmdb]

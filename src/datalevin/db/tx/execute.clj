@@ -25,8 +25,9 @@
    [datalevin.validate :as vld])
   (:import
    [datalevin.datom Datom]
-   [datalevin.db.tx.plan ScalarEntityRead]
+   [datalevin.db.tx.plan BlindEntity ScalarEntityRead]
    [clojure.lang LazilyPersistentVector]
+   [org.eclipse.collections.impl.list.mutable FastList]
    [org.eclipse.collections.impl.map.mutable.primitive LongObjectHashMap]
    [datalevin.db.tx.prepare IdentityResolution ResolvedIdentityAdd]
    [java.util ArrayList Arrays Collection HashMap HashSet List SortedSet]
@@ -210,6 +211,57 @@
                             (conj! (idx/retraction e attr old-value tx-id))
                             (conj! (datom e attr value tx-id))))))
              (persistent! out))))))))
+
+(defn execute-blind-inserts
+  "Bind normalized new-entity operands and emit datoms without reading raw forms.
+  The caller owns the writer, current allocation maxima and epoch validation."
+  [report ^FastList entities auto-entity-time?]
+  (when (and (empty? (:tx-data report)) (empty? (:tempids report)))
+    (let [db                 (:db-after report)
+          tx-id              (inc (long (:max-tx db)))
+          tx-time            (when auto-entity-time? (System/currentTimeMillis))
+          entity-count       (.size entities)
+          [tx-data tempids max-eid]
+          (loop [i        0
+                 tx-data  (transient [])
+                 tempids  (transient {})
+                 next-eid (long (:max-eid db))]
+            (if (< i entity-count)
+              (let [^BlindEntity entity (.get entities i)
+                    eid      (unchecked-inc next-eid)
+                    tempid   (.-tempid entity)
+                    ^FastList attrs (.-attrs entity)
+                    attr-count (.size attrs)
+                    tx-data (cond-> tx-data
+                              auto-entity-time?
+                              (conj! (Datom. eid :db/created-at tx-time
+                                             tx-id 0 nil))
+
+                              auto-entity-time?
+                              (conj! (Datom. eid :db/updated-at tx-time
+                                             tx-id 0 nil)))
+                    tx-data
+                    (loop [j 0
+                           tx-data tx-data]
+                      (if (< j attr-count)
+                        (recur (+ j 2)
+                               (conj! tx-data
+                                      (Datom. eid
+                                              (.get attrs j)
+                                              (.get attrs (unchecked-inc j))
+                                              tx-id 0 nil)))
+                        tx-data))
+                    tempids (if (and tempid (not (txprep/auto-tempid? tempid)))
+                              (assoc! tempids tempid eid)
+                              tempids)]
+                (recur (unchecked-inc i) tx-data tempids eid))
+              [(persistent! tx-data) (persistent! tempids) next-eid]))
+          tempids            (assoc tempids :db/current-tx tx-id)
+          db-after           (-> db
+                                 (assoc :max-eid max-eid)
+                                 (assoc :max-tx tx-id))
+          result             (assoc report :db-after db-after :tx-data tx-data :tempids tempids)]
+      result)))
 
 (deftype ^:private TxStep [report entities])
 (deftype ^:private TxRetry [report])

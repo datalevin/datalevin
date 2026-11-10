@@ -60,6 +60,7 @@
             kv-info]])
   (:import
    [datalevin.datom Datom]
+   [datalevin.db.tx.plan BlindEntity TxPlan]
    [datalevin.interface IRemoteDB IRemotePrepared IStore]
    [datalevin.storage Store WriteGroup]
    [datalevin.utl LRUCache QueryKey QueryKey$EquivSet QueryKey$KeySet]
@@ -137,6 +138,10 @@
 
 (defrecord TxReport [db-before db-after tx-data tempids tx-meta])
 
+(def ^:dynamic *tx-compiler-observer*
+  "Optional diagnostic observer, outside compilation and uninstrumented timings."
+  nil)
+
 (defrecord PreparedBlindTx
   [schema-epoch
    opts-epoch
@@ -148,8 +153,6 @@
    fuse-unique-inserts?
    identity-upsert-av
    identity-upsert-read])
-
-(deftype ^:private PreparedBlindEntity [tempid ^FastList attrs])
 
 (defrecord PreparedLocalPatchIdocTx
   [schema-epoch
@@ -2443,7 +2446,7 @@
               true
               entity)]
         (when supported?
-          (PreparedBlindEntity. entity-id attrs))))))
+          (BlindEntity. entity-id attrs))))))
 
 (defn- blind-attributes-supported?
   "Preflight attributes and retain unique/many flags without correcting values."
@@ -2519,13 +2522,13 @@
         :general))
     :general))
 
-(defn ^:no-doc prepare-blind-local-tx
+(defn- prepare-blind-local-tx*
   ([^DB db initial-es]
-   (prepare-blind-local-tx db initial-es false true))
+   (prepare-blind-local-tx* db initial-es false true))
   ([^DB db initial-es allow-small-unique?]
-   (prepare-blind-local-tx db initial-es allow-small-unique? true))
+   (prepare-blind-local-tx* db initial-es allow-small-unique? true))
   ([^DB db initial-es allow-small-unique? check-unique-avs?]
-   (prepare-blind-local-tx db initial-es allow-small-unique? check-unique-avs? nil))
+   (prepare-blind-local-tx* db initial-es allow-small-unique? check-unique-avs? nil))
   ([^DB db initial-es allow-small-unique? check-unique-avs? entity-kinds]
    ;; Classified callers retain the implicit-ID/tempid proof from their one
    ;; shape pass. Other callers still establish that proof here.
@@ -2630,7 +2633,7 @@
                entities
                (reduce
                  (fn [^FastList acc entity]
-                   (if-let [^PreparedBlindEntity prepared
+                   (if-let [^BlindEntity prepared
                             (prepare-blind-write-entity
                               store-opts unique-identity-attrs unique-avs
                               seen-avs set-capacity has-many?
@@ -2669,7 +2672,7 @@
                                 fuse-unique-inserts?
                                 identity-upsert-av
                                 (when identity-upsert-av
-                                  (let [^PreparedBlindEntity entity
+                                  (let [^BlindEntity entity
                                         (.get ^FastList entities 0)
                                         ^FastList attrs (.-attrs entity)
                                         identity-attr (first identity-upsert-av)]
@@ -2680,11 +2683,29 @@
                                             :when (not= attr identity-attr)]
                                         attr))))))))))))
 
+(defn ^:no-doc prepare-blind-local-tx
+  "Select compiled canonical new maps when opted in; other shapes retain the
+  existing blind specialization. Neither route binds persistent IDs here."
+  ([db entities] (prepare-blind-local-tx db entities false true))
+  ([db entities allow-small-unique?]
+   (prepare-blind-local-tx db entities allow-small-unique? true))
+  ([db entities allow-small-unique? check-unique-avs?]
+   (prepare-blind-local-tx db entities allow-small-unique? check-unique-avs? nil))
+  ([db entities allow-small-unique? check-unique-avs? entity-kinds]
+   (or (when (and (txengine/compiler?) (instance? Store (:store db)))
+         (when-let [plan (txcompile/compile-blind-region (prepare/make-prepare-ctx db) entities)]
+           (when *tx-compiler-observer* (*tx-compiler-observer* :prepared plan))
+           plan))
+       (prepare-blind-local-tx* db entities allow-small-unique? check-unique-avs? entity-kinds))))
+
+(defn- blind-tx-entities [prepared]
+  (if (instance? TxPlan prepared) (:entries prepared) (:entities prepared)))
+
 (defn ^:no-doc blind-local-tx-unique-values-absent?
   "Check a prepared batch's unique values against the current store snapshot.
    The caller invokes this after opening its LMDB write transaction, so all
    probes share that transaction and no concurrent insert can race the check."
-  [^DB db ^PreparedBlindTx prepared]
+  [^DB db prepared]
   (let [^FastList avs (:unique-avs prepared)]
     (or (nil? avs)
         (loop [i 0]
@@ -2694,13 +2715,17 @@
                      (recur (unchecked-inc i)))))))))
 
 (defn ^:no-doc blind-local-tx-valid?
-  [^DB db ^PreparedBlindTx prepared]
+  [^DB db prepared]
   (let [store (.-store db)]
-    (and (identical? (:schema-epoch prepared) (schema store))
-         (identical? (:opts-epoch prepared) (opts store)))))
+    (if (instance? TxPlan prepared)
+      (and (identical? :blind (:strategy prepared))
+           (identical? (:schema (:ctx prepared)) (schema store))
+           (identical? (:opts (:ctx prepared)) (opts store)))
+      (and (identical? (:schema-epoch prepared) (schema store))
+           (identical? (:opts-epoch prepared) (opts store))))))
 
 (defn- blind-identity-upsert-av
-  [store-schema ^PreparedBlindEntity entity]
+  [store-schema ^BlindEntity entity]
   (let [^FastList attrs (.-attrs entity)]
     (loop [i           0
            identity-av nil]
@@ -2728,7 +2753,7 @@
         identity-av))))
 
 (defn- append-blind-identity-upsert!
-  [^DB db ^PreparedBlindEntity entity identity-attr eid tx-id layout tx-data]
+  [^DB db ^BlindEntity entity identity-attr eid tx-id layout tx-data]
   (let [^FastList attrs (.-attrs entity)
         old-values (when layout (txexec/read-scalar-entity (.-store db) eid layout))]
     (loop [i 0 tx-data tx-data]
@@ -2757,9 +2782,9 @@
         tx-data))))
 
 (defn- stamp-existing-blind-local-identity-upsert
-  [^DB db ^PreparedBlindTx prepared tx-meta identity-attr eid]
-  (let [^FastList entities (:entities prepared)
-        ^PreparedBlindEntity entity (.get entities 0)
+  [^DB db prepared tx-meta identity-attr eid]
+  (let [^FastList entities (blind-tx-entities prepared)
+        ^BlindEntity entity (.get entities 0)
         tx-id           (inc (long (:max-tx db)))
         layout          (when-not txcommon/*batch-prepare* (:identity-upsert-read prepared))
         tx-data         (persistent! (append-blind-identity-upsert!
@@ -2778,8 +2803,8 @@
   "Reuse a collided blind batch's normalized scalar values. Independent maps
    with one identity each can resolve insert versus upsert under the same
    writer. Repeated owners and ambiguous identities retain general resolution."
-  [^DB db ^PreparedBlindTx prepared tx-meta]
-  (let [^FastList entities (:entities prepared)]
+  [^DB db prepared tx-meta]
+  (let [^FastList entities (blind-tx-entities prepared)]
     (when (and (not (:auto-entity-time? prepared))
                (not (:has-many? prepared))
                (:has-unique? prepared)
@@ -2806,7 +2831,7 @@
                 [tx-data tempids]
                 (loop [i 0 tx-data (transient []) tempids (transient {})]
                   (if (< i (.size entities))
-                    (let [^PreparedBlindEntity entity (.get entities i)
+                    (let [^BlindEntity entity (.get entities i)
                           [identity-attr eid stored?] (.get resolutions i)
                           ^FastList attrs (.-attrs entity)
                           tx-data (if stored?
@@ -2829,59 +2854,21 @@
                         tx-data (persistent! tempids) tx-meta)))))))
 
 (defn ^:no-doc stamp-blind-local-tx
-  [^DB db ^PreparedBlindTx prepared tx-meta]
-  (let [tx-id              (inc (long (:max-tx db)))
-        auto-entity-time?  (:auto-entity-time? prepared)
-        tx-time            (when auto-entity-time? (System/currentTimeMillis))
-        ^FastList entities  (:entities prepared)
-        entity-count       (.size entities)
-        [tx-data tempids max-eid]
-        (loop [i        0
-               tx-data  (transient [])
-               tempids  (transient {})
-               next-eid (long (:max-eid db))]
-          (if (< i entity-count)
-            (let [^PreparedBlindEntity entity (.get entities i)
-                  eid      (unchecked-inc next-eid)
-                  tempid   (.-tempid entity)
-                  ^FastList attrs (.-attrs entity)
-                  attr-count (.size attrs)
-                  tx-data (cond-> tx-data
-                            auto-entity-time?
-                            (conj! (Datom. eid :db/created-at tx-time
-                                           tx-id 0 nil))
-
-                            auto-entity-time?
-                            (conj! (Datom. eid :db/updated-at tx-time
-                                           tx-id 0 nil)))
-                  tx-data
-                  (loop [j 0
-                         tx-data tx-data]
-                    (if (< j attr-count)
-                      (recur (+ j 2)
-                             (conj! tx-data
-                                    (Datom. eid
-                                            (.get attrs j)
-                                            (.get attrs (unchecked-inc j))
-                                            tx-id 0 nil)))
-                      tx-data))
-                  tempids (if (and tempid (not (auto-tempid? tempid)))
-                            (assoc! tempids tempid eid)
-                            tempids)]
-              (recur (unchecked-inc i) tx-data tempids eid))
-            [(persistent! tx-data) (persistent! tempids) next-eid]))
-        tempids            (assoc tempids :db/current-tx tx-id)
-        db-after           (-> db
-                               (assoc :max-eid max-eid)
-                               (assoc :max-tx tx-id))
-        report             (->TxReport db db-after tx-data tempids tx-meta)]
-    report))
+  "Bind legacy or compiled blind operands through the shared emission loop."
+  [db prepared tx-meta]
+  (when (or (not (instance? TxPlan prepared)) (blind-local-tx-valid? db prepared))
+    (let [report (txexec/execute-blind-inserts
+                   (->TxReport db db [] {} tx-meta) (blind-tx-entities prepared)
+                   (:auto-entity-time? prepared))]
+      (when (and (instance? TxPlan prepared) *tx-compiler-observer*)
+        (*tx-compiler-observer* :execute-blind prepared))
+      report)))
 
 (defn ^:no-doc stamp-blind-local-identity-tx
   "Stamp one eligible simple identity transaction, resolving insert versus
    upsert inside the caller's LMDB write transaction. Returns
    [report upsert?], or nil when the prepared shape is not eligible."
-  [^DB db ^PreparedBlindTx prepared tx-meta]
+  [^DB db prepared tx-meta]
   (when-let [[identity-attr identity-value]
              (:identity-upsert-av prepared)]
     (if-some [eid (txcommon/av-first-e db identity-attr identity-value)]
@@ -3193,10 +3180,6 @@
                     *specialize-scalar-stamping?*)
           db-after (assoc db :max-tx tx-id)]
       (->TxReport db db-after tx-data {:db/current-tx tx-id} tx-meta))))
-
-(def ^:dynamic *tx-compiler-observer*
-  "Optional diagnostic observer, outside compilation and uninstrumented timings."
-  nil)
 
 (defn ^:no-doc prepare-mixed-add-tx
   "Prepare ordinary mixed updates/inserts. An owned writer may supply its

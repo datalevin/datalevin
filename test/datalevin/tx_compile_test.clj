@@ -2,7 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
             [datalevin.db.tx.compile :as compile]
             [datalevin.prepare :as prepare])
-  (:import [datalevin.db.tx.plan MixedAttrInfo MixedInsert MixedOperands MixedUpdate TxPlan]
+  (:import [datalevin.db.tx.plan BlindEntity MixedAttrInfo MixedInsert MixedOperands MixedUpdate TxPlan]
            [java.util HashMap]))
 
 (def ctx
@@ -12,6 +12,43 @@
      :identity {:db/aid 5 :db/valueType :db.type/string :db/unique :db.unique/identity}
      :reference {:db/aid 6 :db/valueType :db.type/ref}}
     {} {:validate-data? true}))
+
+(deftest blind-operands-own-one-stream-with-symbolic-ids
+  (let [plan (compile/compile-blind-region ctx
+               [(array-map :text "one" :db/id "one" :value 1)
+                {:db/id -1 :reference 7} {}])
+        ^BlindEntity entity (first (:entries plan))]
+    (is (= :blind (:strategy plan)))
+    (is (identical? ctx (:ctx plan)))
+    (is (= 2 (count (:entries plan))))
+    (is (= "one" (.-tempid entity)))
+    (is (= [:text "one" :value 1] (vec (.-attrs entity))))
+    (is (not (contains? plan :entities)))
+    (is (not (contains? plan :schema-epoch)))
+    (is (false? (:has-many? plan)))
+    (is (false? (:has-unique? plan)))
+    (is (false? (:fuse-unique-inserts? plan))))
+  (let [timed (compile/compile-blind-region
+                (assoc ctx :opts {:auto-entity-time? true}) [{} {:db/id "empty"}])]
+    (is (:auto-entity-time? timed))
+    (is (= 2 (count (:entries timed))))))
+
+(deftest blind-compilation-defers-effects-and-unsupported-specializations
+  (let [calls (atom [])
+        host (proxy [Object clojure.lang.IMeta] []
+               (meta [] (swap! calls conj :meta) nil)
+               (hashCode [] (swap! calls conj :hash) 0)
+               (toString [] (swap! calls conj :string) "converted"))
+        tail (lazy-seq (swap! calls conj :realize) (list {:text "late"}))]
+    (doseq [forms [tail [host] [{:text host}] [(array-map host "value")]
+                   [{:db/id host :text "value"}] [{:db/id nil :text "value"}]
+                   [{:db/id 1 :text "existing"}] [{:db/id "one" :text "one"} {:db/id "one"}]
+                   [{:reference "one"}] [{:reference 0}] [{:value "coercion"}]
+                   [{:identity "one"}] [{:value 1} [:db/add 1 :value 2]]
+                   [(with-meta {:value 1} {:source true})]
+                   (with-meta [{:value 1}] {:source true})]]
+      (is (nil? (compile/compile-blind-region ctx forms))))
+    (is (empty? @calls))))
 
 (deftest mixed-operands-retain-order-and-symbolic-identities
   (let [forms [[:db/add 7 :value 2]

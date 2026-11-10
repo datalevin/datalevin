@@ -347,6 +347,57 @@
         (i/close source)
         (u/delete-files root)))))
 
+(deftest unrelated-commits-do-not-invalidate-capture-job-history
+  (doseq [compact? [false true] wal? [false true]]
+    (testing (str {:compact? compact? :wal? wal?})
+      (let [root (u/tmp-dir (str "capture-unrelated-writes-" (random-uuid)))
+            dest (str root "/copy")
+            source (st/open (str root "/source") nil {:wal? wal?})
+            kv (capture/source-kv source)
+            commits (atom 0)
+            protected-reads (atom 0)
+            options {:standalone? true :authorize-write! (fn [])
+                     :admit-write (fn [f] (f))
+                     :with-writer
+                     (fn [f]
+                       ;; Also commit after the scan, before acquiring the gate.
+                       (i/transact-kv kv [[:put "unrelated" :after-scan true]])
+                       (binding [kv/*server-write-slot-held?* true] (f)))}]
+        (try
+          (i/open-dbi kv "unrelated")
+          (i/transact-kv kv
+            (mapv #(si/job-tx
+                     (si/completed-job
+                       (si/make-job {:type :fulltext :op :add :domain c/default-domain
+                                     :ref % :value (HistoryValue.) :tx %})))
+                  (range 128)))
+          (u/create-dirs dest)
+          (let [result
+                (binding [*history-read!*
+                          (fn []
+                            (when (or kv/*server-write-slot-held?*
+                                      (Thread/holdsLock (l/write-txn kv)))
+                              (swap! protected-reads inc))
+                            ;; A commit at every decoded row makes the race
+                            ;; deterministic without timers or a quiet window.
+                            (i/transact-kv kv [[:put "unrelated" :during-scan
+                                               (swap! commits inc)]]))]
+                  (capture/attempt! source dest compact? options))]
+            (is (map? result))
+            (is (= 128 @commits))
+            (is (zero? @protected-reads))
+            (when (map? result)
+              (copy/finalize-copy! dest "source" result)
+              (spit (str dest "/VERSION") c/version)
+              (let [restored (d/open-kv dest)]
+                (try
+                  (is (= 128 (i/get-value restored "unrelated" :during-scan)))
+                  (is (= true (i/get-value restored "unrelated" :after-scan)))
+                  (finally (d/close-kv restored))))))
+          (finally
+            (i/close source)
+            (u/delete-files root)))))))
+
 (deftest job-history-reader-protects-decoding-against-close
   (let [root (u/tmp-dir (str "capture-history-close-" (random-uuid)))
         source (st/open root nil {:wal? false})

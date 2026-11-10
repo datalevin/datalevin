@@ -1,11 +1,14 @@
 ;; Copyright (c) Huahai Yang. All rights reserved.
 ;; Distributed under the Eclipse Public License 2.0.
 (ns ^:no-doc datalevin.db.tx.plan
-  "Owned transaction operands and schema-independent literal helpers.")
+  "Owned transaction operands and schema-independent literal helpers."
+  (:import [org.eclipse.collections.impl.list.mutable FastList]))
 
 (defrecord TxPlan [ctx strategy entries entity-reads])
 
 (deftype ScalarEntityRead [^objects names ^longs aids])
+
+(deftype BlindEntity [tempid ^FastList attrs])
 
 (deftype MixedAttrInfo
   [props ^boolean ordinary? ^boolean insert? ^boolean update? tuples ^boolean typed?])

@@ -6,7 +6,7 @@
             [datalevin.custom-datalog :as cd]
             [datalevin.db.tx.plan :as plan]
             [datalevin.prepare])
-  (:import [datalevin.db.tx.plan MixedAttrInfo MixedInsert MixedOperands MixedUpdate
+  (:import [datalevin.db.tx.plan BlindEntity MixedAttrInfo MixedInsert MixedOperands MixedUpdate
             ScalarEntityRead]
            [datalevin.prepare PrepareCtx]
            [java.util ArrayList HashMap HashSet]
@@ -506,13 +506,71 @@
      (compile-scalar-region ctx forms literal-shape)
      (compile-scalar-region ctx forms))))
 
-(defn- mixed-tempid? [value]
+(defn- literal-tempid? [value]
   (or (string? value) (and (instance? Long value) (neg? (long value)))))
+
+(defn- compile-blind-entity
+  [ctx ^HashMap infos ^HashSet tempids entity]
+  (let [explicit? (contains? entity :db/id)
+        tempid (:db/id entity)]
+    (when (or (not explicit?)
+              (and (literal-tempid? tempid) (.add tempids tempid)))
+      (let [attrs (FastList. (int (* 2 (count entity))))
+            supported?
+            (reduce-kv
+              (fn [_ attr value]
+                (if (identical? :db/id attr)
+                  true
+                  (if (and (keyword? attr) (pos? (count (name attr)))
+                           (inert-scalar-value? value))
+                    (let [^objects info (blind-attr-info!
+                                           infos (:schema ctx)
+                                           (:db/attrTuples (:rschema ctx)) false attr)
+                          vt (aget info 4)]
+                      (if (and (some? (aget info 1))
+                               ;; This first rule retains unique/many requests on
+                               ;; their existing specialization, without coercion.
+                               (zero? (long (aget info 1)))
+                               (nil? (:db/unique (aget info 0)))
+                               (if (identical? vt :db.type/ref)
+                                 (and (instance? Long value) (pos? (long value)))
+                                 (canonical-scalar-value?
+                                   (:validate-data? (:opts ctx)) vt value)))
+                        (do (.add attrs attr) (.add attrs value) true)
+                        (reduced false)))
+                    (reduced false))))
+              true entity)]
+        (when supported? (BlindEntity. tempid attrs))))))
+
+(defn compile-blind-region
+  "Compile canonical cardinality-one new maps without allocating persistent IDs.
+  Writer binding retains timestamp synthesis. Unique/many values, coercions and
+  symbolic references retain the existing specialization."
+  [ctx forms]
+  (when (and (identical? clojure.lang.PersistentVector (class forms))
+             (nil? (meta forms)) (pos? (count forms)))
+    (let [entities (FastList. (count forms))
+          infos (HashMap.) tempids (HashSet.)
+          auto-time? (boolean (:auto-entity-time? (:opts ctx)))]
+      (loop [index 0]
+        (if (< index (count forms))
+          (let [form (nth forms index)]
+            (when (and (plain-map? form) (nil? (meta form)))
+              (when-let [^BlindEntity entity (compile-blind-entity ctx infos tempids form)]
+                ;; Keep the existing allocation rule for empty maps. Their
+                ;; explicit tempids still participate in duplicate detection.
+                (when (or auto-time? (not (.isEmpty ^FastList (.-attrs entity))))
+                  (.add entities entity))
+                (recur (unchecked-inc index)))))
+          (when-not (.isEmpty entities)
+            (assoc (plan/->TxPlan ctx :blind entities nil)
+                   :auto-entity-time? auto-time?
+                   :has-unique? false :has-many? false :fuse-unique-inserts? false)))))))
 
 (defn- mixed-value-ready? [validate? props ^HashSet tempids value]
   (if (identical? :db.type/ref (:db/valueType props))
     (or (and (instance? Long value) (not (neg? (long value))))
-        (and (mixed-tempid? value) (.contains tempids value)))
+        (and (literal-tempid? value) (.contains tempids value)))
     (and (inert-scalar-value? value)
          (canonical-scalar-value? validate? (:db/valueType props) value))))
 
@@ -523,7 +581,7 @@
         size (- (count entity) (if explicit? 1 0))]
     (when (and (pos? size)
                (or (not explicit?)
-                   (and (mixed-tempid? tempid) (.add tempids tempid))))
+                   (and (literal-tempid? tempid) (.add tempids tempid))))
       (let [attrs (object-array (* 3 size))
             end (reduce-kv
                   (fn [offset a v]

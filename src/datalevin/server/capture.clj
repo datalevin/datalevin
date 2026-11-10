@@ -71,14 +71,19 @@
     (raise "Secondary index work failed before capture"
            {:error :copy/index-flush-failed :status stats})))
 
-(defn- job-state! [source raw]
+(defn- close-job-snapshot! [snapshot]
+  (when-let [^java.lang.AutoCloseable reader @snapshot]
+    (vreset! snapshot nil)
+    (.close reader)))
+
+(defn- job-state! [source raw snapshot]
   (when (instance? Store source)
-    ;; Read the version before scanning: a commit during the scan must also
-    ;; invalidate this observation when capture acquires write exclusion.
-    (let [txn-id (cpp/committed-txn-id raw)
-          stats (st/secondary-index-status source)]
+    ;; Own the reader before scanning, including failure and authorization
+    ;; paths. Only changes to this tree invalidate the history observation.
+    (vreset! snapshot (cpp/dbi-snapshot raw c/secondary-index-jobs))
+    (let [stats (st/secondary-index-status source)]
       (check-failed-jobs! stats)
-      {:txn-id txn-id :status stats})))
+      {:status stats})))
 
 (defn- check-embedding-state! [source]
   (when (instance? Store source)
@@ -113,27 +118,29 @@
   (check-source! source false)
   (let [kv (source-kv source)
         raw (kv/raw-lmdb kv)
-        indices (vector-indices source)
-        initial (job-state! source raw)
-        writes? (index-writes? (:status initial) indices)
-        writable! (fn []
-                    (when (some #{:rdonly :rdonly-env} (i/get-env-flags raw))
-                      (raise "Capture requires writes on a read-only source"
-                             {:error :copy/read-only-source}))
-                    (when writes? (authorize-write!)))
-        _ (when writes? (writable!))
-        checked (if (unfinished-jobs? (:status initial))
-                  (do
-                    ;; External providers and live workers run without capture
-                    ;; locks. Retained history is inspected only in this phase.
-                    (admit-write #(st/wait-for-secondary-index source
-                                    {:timeout-ms 1 :process? true}))
-                    (job-state! source raw))
-                  initial)
+        job-snapshot (volatile! nil)
         pin (volatile! nil)
         prepared-copy (volatile! nil)]
     (try
-      (let [prepared
+      (let [indices (vector-indices source)
+            initial (job-state! source raw job-snapshot)
+            writes? (index-writes? (:status initial) indices)
+            writable! (fn []
+                        (when (some #{:rdonly :rdonly-env} (i/get-env-flags raw))
+                          (raise "Capture requires writes on a read-only source"
+                                 {:error :copy/read-only-source}))
+                        (when writes? (authorize-write!)))
+            _ (when writes? (writable!))
+            checked (if (unfinished-jobs? (:status initial))
+                      (do
+                        ;; Release the observation before providers or workers
+                        ;; write, then observe their committed result afresh.
+                        (close-job-snapshot! job-snapshot)
+                        (admit-write #(st/wait-for-secondary-index source
+                                        {:timeout-ms 1 :process? true}))
+                        (job-state! source raw job-snapshot))
+                      initial)
+            prepared
             (with-writer
               (fn []
                 (locking (l/write-txn raw)
@@ -146,12 +153,12 @@
                         writes? (index-writes? (:status checked) indices)
                         locks (volatile! [])]
                     (try
-                      ;; Verify freshness in constant time. Never rescan job
-                      ;; history while excluding writers, even after a change.
+                      ;; Verify only the jobs tree, without rescanning history
+                      ;; or invalidating it for unrelated database commits.
                       (if (or (nil? indices)
                               (unfinished-jobs? (:status checked))
                               (and checked
-                                   (not= (:txn-id checked) (cpp/committed-txn-id raw)))
+                                   (not (cpp/dbi-snapshot-current? raw @job-snapshot)))
                               (some (fn [[domain ^VectorIndex index]]
                                       (let [lock (.writeLock ^ReentrantReadWriteLock (.-vec-lock index))]
                                         (if (.tryLock lock)
@@ -162,6 +169,7 @@
                         :retry
                         (let [prepare!
                               (fn []
+                                (close-job-snapshot! job-snapshot)
                                 (when writes?
                                   (writable!)
                                   (authorize-write!)
@@ -198,8 +206,11 @@
           (when-let [^java.lang.AutoCloseable prepared @prepared-copy]
             (.close prepared))
           (finally
-            (when-let [pin-id (:pin-id @pin)]
-              (try
-                (with-writer #(admit-write (fn [] (kv/txlog-unpin-backup-floor! kv pin-id))))
-                (catch Exception e
-                  (vswap! (i/kv-info raw) assoc :copy-last-backup-unpin-error (ex-message e)))))))))))
+            (try
+              (close-job-snapshot! job-snapshot)
+              (finally
+                (when-let [pin-id (:pin-id @pin)]
+                  (try
+                    (with-writer #(admit-write (fn [] (kv/txlog-unpin-backup-floor! kv pin-id))))
+                    (catch Exception e
+                      (vswap! (i/kv-info raw) assoc :copy-last-backup-unpin-error (ex-message e)))))))))))))
