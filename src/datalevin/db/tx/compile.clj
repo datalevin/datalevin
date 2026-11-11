@@ -1032,15 +1032,27 @@
                 (recur (+ offset 3)))
               entry)))))))
 
+(defn mixed-update-operand
+  "Assemble one raw scalar replacement over captured metadata. The Long ID
+  stays unbound and values remain opaque; this proves neither writer bounds,
+  E/A distinctness nor value readiness. Scratch remains request-owned."
+  [ctx ^HashMap infos e attr value]
+  (when (and (instance? Long e) (pos? (long e))
+             (keyword? attr) (pos? (count (name attr))) (some? value)
+             (not (:auto-entity-time? (:opts ctx))))
+    (let [^MixedAttrInfo info (ordinary-attr-info!
+                              infos (:schema ctx) (:db/attrTuples (:rschema ctx)) attr)]
+      (when (.-update? info)
+        (MixedUpdate. e attr value)))))
+
 (defn- append-mixed-update!
-  [schema sources validate? ^HashMap infos ^HashSet updates
-   ^ArrayList entries e attr value coerce?]
-  (when (and (keyword? attr) (pos? (count (name attr))))
-    (let [^MixedAttrInfo info (ordinary-attr-info! infos schema sources attr)]
-      (when (and (.-update? info)
-                 (mixed-scalar-ready? validate? (:db/valueType (.-props info)) value coerce?)
+  [ctx ^HashMap infos ^HashSet updates ^ArrayList entries e attr value coerce?]
+  (when-let [entry (mixed-update-operand ctx infos e attr value)]
+    (let [^MixedAttrInfo info (.get infos attr)]
+      (when (and (mixed-scalar-ready? (:validate-data? (:opts ctx))
+                   (:db/valueType (.-props info)) value coerce?)
                  (distinct-mixed-update? updates e attr))
-        (.add entries (MixedUpdate. e attr value))
+        (.add entries entry)
         info))))
 
 (defn- compile-mixed-region*
@@ -1048,8 +1060,7 @@
   (when (and (identical? clojure.lang.PersistentVector (class forms))
              (nil? (meta forms)) (> (count forms) 1)
              (not (:auto-entity-time? (:opts ctx))))
-    (let [schema (:schema ctx) sources (:db/attrTuples (:rschema ctx))
-          validate? (:validate-data? (:opts ctx))
+    (let [validate? (:validate-data? (:opts ctx))
           infos (HashMap.) tempids (HashSet.) updates (HashSet.)
           entries (ArrayList.)]
       (loop [index 0 inserts? false required-eid 0 typed? true]
@@ -1066,7 +1077,7 @@
                                     typed
                                     (if-let [^MixedAttrInfo info
                                              (append-mixed-update!
-                                               schema sources validate? infos updates entries
+                                               ctx infos updates entries
                                                e attr value coerce?)]
                                       (and typed (.-typed? info))
                                       (reduced nil))))
@@ -1083,7 +1094,7 @@
                 (when (positive-literal-id? e)
                   (when-let [^MixedAttrInfo info
                              (append-mixed-update!
-                               schema sources validate? infos updates entries (long e) a v coerce?)]
+                               ctx infos updates entries (long e) a v coerce?)]
                     (recur (unchecked-inc index) inserts? (max required-eid (long e))
                            (and typed? (.-typed? info))))))
               :else nil))

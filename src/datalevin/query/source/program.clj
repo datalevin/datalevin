@@ -88,6 +88,15 @@
     (size [] (check!) (.size tuples))
     (get [i] (check!) (.get tuples i))))
 
+(defn- boundary-variables
+  "Retain future join/equality variables as well as explicit requirements.
+  This projects bags only; it never deduplicates witnesses or enters a scope."
+  [operators terminal]
+  (let [used (mapv (fn [{:keys [kind value]}]
+                     (let [interface (if (= :access kind) (get-in value [:path :options]) value)]
+                       (into #{} (map :variable) (into (:requires interface) (:columns interface))))) operators)]
+    (vec (rest (reverse (reductions into terminal (reverse used)))))))
+
 (defn- joined! [runtime check! left right]
   (join/hash-join-bounded left right
     {:check! check! :reserve! #(reserve! runtime %1 %2)
@@ -748,6 +757,13 @@
           (into {}
                 (map (fn [schedule]
                        (let [id (:region-id schedule) inputs (get-in @tables [id :inputs])
+                             operators (:operators schedule)
+                             _ (retain! runtime (reserve! runtime 0
+                                                  (+ 2048 (* 512 (reduce + (count operators)
+                                                                    (map (fn [{:keys [kind value]}]
+                                                                           (let [o (if (= :access kind) (get-in value [:path :options]) value)]
+                                                                             (+ (count (:requires o)) (count (:columns o))))) operators))))))
+                             live (boundary-variables operators (get-in compiled [:regions id :required-vars]))
                              paths (when (:diagnostics runtime) (into {} (map (fn [[path id]] [id path])) (get-in @tables [id :core])))
                              [cols steps descriptions]
                              (reduce (fn [[cols steps descriptions] [index {:keys [kind value] :as operator}]]
@@ -757,11 +773,14 @@
                                                       (:bounds value) (:work value) cols)
                                                     (let [step (:step value)]
                                                       (if (satisfies? plan/IStepFactory step)
-                                                        (plan/-instantiate-step step cols) step)))]
+                                                        (plan/-instantiate-step step cols) step)))
+                                             step (if (and (= :access kind) (seq (get-in value [:path :options :requires])))
+                                                    (let [cols (filterv (nth live index) (:cols step))]
+                                                      (assoc step :cols cols :out (set cols))) step)]
                                          [(:cols step) (conj steps step)
                                           (cond-> descriptions (:diagnostics runtime)
                                             (conj (operator-description compiled native-specs id paths index operator cols (:cols step))))]))
-                                     [(mapv :variable inputs) [] []] (map-indexed vector (:operators schedule)))
+                                     [(mapv :variable inputs) [] []] (map-indexed vector operators))
                              _ (when (:diagnostics runtime)
                                  (diagnostics/region! runtime (assoc (access/explain! runtime schedule)
                                                                :program-id program-id :operators descriptions)))]

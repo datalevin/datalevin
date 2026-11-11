@@ -227,6 +227,13 @@
              (or (nil? valid-for-ms) (< (- now (long observed-at-ms)) (long valid-for-ms))))
       [0 rows] [1 0])))
 
+(defn- elapsed-cost [plan tuples limits now max-age]
+  (let [e (:advisory-estimate plan) o (options plan) dependent? (seq (:requires o))
+        batch (min (:binding-rows limits)
+                   (get-in o [:constraints :max-binding-rows] (:binding-rows limits)))]
+    (when (zero? (long (first (cardinality-key plan now max-age))))
+      (join-cost/access-time e tuples batch dependent?))))
+
 (defrecord ^:private CoreOperator [owner region-id id requires columns after step])
 
 (defn core-operator!
@@ -460,7 +467,12 @@
              result (join-cost/select {:inputs input-columns :required-work required
                                           :required-vars live-vars :choices choices
                                           :check! check! :reserve! own-work! :max-states search-bound}
-                                      (fn [plan] (let [[unknown rows] (count-key plan)] (when (zero? (long unknown)) rows))))]
+                                      (fn [plan] (let [[unknown rows] (count-key plan)] (when (zero? (long unknown)) rows)))
+                                      (when (not= :cardinality (:cost-model planning))
+                                      {:access-cost #(elapsed-cost %1 %2 (control/limits ctl) now
+                                                                  (get planning :estimate-max-age-ms 300000))
+                                       :local-row-ns (get planning :local-row-ns 1000)
+                                       :local-column-ns (get planning :local-column-ns 250)}))]
          (when-not (= :complete (:status result)) (fail! :query-source/unsupported :planning))
          ;; Native/core steps remain private and keep their shared implementation.
          ;; Only selected external AccessPlans enter the provider explanation.
@@ -475,7 +487,7 @@
                                           (some #(zero? (long (first (count-key %)))) candidates) :cardinality
                                           :else :structural)
                          :join-cost (:join-cost result) :cost-search (:cost-search result)
-                         :estimated-access-ns nil :fallback-reasons []
+                         :estimated-access-ns (get-in result [:join-cost :access-ns]) :fallback-reasons []
                          :plans (into [] (comp (filter #(= :access (:kind %))) (map :value)) selected)
                          :operators (mapv #(select-keys % [:kind :value]) selected)
                          :planning-time-ms (/ (double (- (System/nanoTime) started)) 1000000.0)}]

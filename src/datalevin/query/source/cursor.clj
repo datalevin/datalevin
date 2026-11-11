@@ -15,6 +15,7 @@
             [datalevin.relation :as relation])
   (:import [datalevin.utl QueryKey]
            [java.io Closeable]
+           [java.util Iterator List]
            [org.eclipse.collections.impl.list.mutable FastList]))
 
 (def ^:private common-keys
@@ -138,20 +139,13 @@
           (fn [batch]
             (doseq [row (:rows batch)] (emit-all! runtime emit! row))))))))
 
-(defn lookup!
-  "Collect all outer bindings before any lookup, then exhaust each legal
-  distinct-key batch once. ids is the invocation's shared lazy ID space.
-  emit! borrows [outer row]; retaining operators must copy/account separately."
-  [runtime group plan ids outer-bindings emit!]
+(defn- lookup-keys!
+  [runtime group plan ids collect! emit!]
   (let [{:keys [alternative request]} (captured! runtime group plan true)]
     (rt/with-context runtime (select-keys request [:source-symbol :region-id :alternative-id])
       (fn [runtime]
         (with-open [^Closeable keys (binding/collect! runtime @ids (:requires alternative))]
-          (doseq [outer outer-bindings]
-            (control/check-active! (:control runtime))
-            (ensure! (and (value/plain-map? outer)
-                          (every? #(contains? outer (:variable %)) (:requires alternative))) :open)
-            (binding/add! keys (mapv #(get outer (:variable %)) (:requires alternative)) outer))
+          (collect! runtime keys (:requires alternative))
           (let [opens (:opens (permissions/planning-permission (:consumption group) alternative))
                 n (binding/seal! keys (:constraints alternative) opens)]
             (dotimes [i n]
@@ -160,6 +154,42 @@
                   (binding/consume! keys i (:columns alternative) (:rows batch) (:binding-ids batch)
                                     (:exhausted? batch) #(emit-all! runtime emit! %1 %2)))))
             (when-not (binding/complete? keys) (fail! :query-source/incomplete :execution))))))))
+
+(defn lookup!
+  "Collect all outer bindings before any lookup, then exhaust each legal
+  distinct-key batch once. ids is the invocation's shared lazy ID space.
+  emit! borrows [outer row]; retaining operators must copy/account separately."
+  [runtime group plan ids outer-bindings emit!]
+  (lookup-keys! runtime group plan ids
+    (fn [runtime keys requires]
+      (let [^Iterator iterator (clojure.lang.RT/iter outer-bindings)]
+        (while (.hasNext iterator)
+          (let [outer (.next iterator)]
+            (control/check-active! (:control runtime))
+            (ensure! (and (value/plain-map? outer)
+                          (every? #(contains? outer (:variable %)) requires)) :open)
+            (binding/add! keys (mapv #(get outer (:variable %)) requires) outer))))) emit!))
+
+(defn- collect-tuples!
+  "The collector owns each witness before an upstream iterator can reuse it.
+  Build no row maps or separately retained intermediate witness collection."
+  [input-cols tuples runtime keys requires]
+  (let [positions (zipmap input-cols (range))
+        required (mapv #(get positions (:variable %)) requires)
+        width (count input-cols) ctl (:control runtime)]
+    (ensure! (every? some? required) :execution)
+    (let [^Iterator iterator (clojure.lang.RT/iter tuples)]
+      (while (.hasNext iterator)
+        (let [tuple (.next iterator)]
+          (control/check-active! ctl)
+          (let [array? (instance? object-array-class tuple)
+                n (if array? (alength ^objects tuple) (when (vector? tuple) (count tuple)))]
+            (ensure! (= width n) :execution)
+            (let [scratch (control/reserve! ctl {:retained-bytes (+ 512 (* 64 (+ width (count required))))})]
+              (try
+                (let [outer (mapv #(if array? (aget ^objects tuple (long %)) (nth tuple %)) (range width))]
+                  (binding/add! keys (mapv #(nth outer %) required) outer))
+                (finally (control/release! scratch))))))))))
 
 (defn- tuple-bindings! [runtime columns tuple]
   (let [array? (instance? object-array-class tuple)
@@ -202,11 +232,31 @@
             ;; input tuple. Collector deduplication never reads a mutable outer
             ;; tuple again. Input-free cross products also keep owned witnesses.
             outer-input? (or (seq input-cols) (some? tuples))
+            unit-input? (and (empty? input-cols) (instance? List tuples) (= 1 (.size ^List tuples)))
+            _ (when unit-input?
+                (let [tuple (.get ^List tuples 0)]
+                  (ensure! (or (and (instance? object-array-class tuple) (zero? (alength ^objects tuple)))
+                               (and (vector? tuple) (empty? tuple))) :execution)))
             outers (when outer-input?
                      (eduction (map (fn [tuple]
                                       (let [{:keys [bindings token]} (tuple-bindings! runtime input-cols tuple)]
                                         (vswap! input-tokens conj token)
                                         bindings))) tuples))
+            input-positions (zipmap input-cols (range))
+            returned-positions (zipmap (map :variable columns) (range))
+            shared (into [] (keep (fn [[v i]] (when-some [j (get input-positions v)] [j i]))) returned-positions)
+            projection (mapv (fn [v] (if-some [i (get returned-positions v)] [true i]
+                                        [false (get input-positions v)])) output-cols)
+            _ (ensure! (every? (comp some? second) projection) :execution)
+            save-tuple! (fn [outer row]
+                          (check!)
+                          (when (every? (fn [[a b]] (QueryKey/equals (nth outer a) (nth row b))) shared)
+                            (let [scratch (control/reserve! ctl {:retained-bytes (+ 256 (* 64 (count projection)))})]
+                              (try
+                                (let [values (mapv (fn [[returned? i]] (nth (if returned? row outer) i)) projection)]
+                                  (own! (rt/charge-copy! runtime values))
+                                  (.add output (object-array (value/owned-copy values check!))))
+                                (finally (control/release! scratch))))))
             save! (fn [outer row]
                     (check!)
                     (let [scratch (control/reserve! ctl
@@ -227,7 +277,9 @@
         (try
           (let [result
                 (cond
-                  dependent? (do (lookup! runtime group plan ids outers save!) output)
+                  dependent? (do (lookup-keys! runtime group plan ids
+                                   (partial collect-tuples! input-cols tuples) save-tuple!) output)
+                  unit-input? (do (scan! runtime group plan #(save-tuple! [] %)) output)
                   outer-input?
                   (let [owned (into [] outers)]
                     (if (empty? owned) output

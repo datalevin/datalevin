@@ -13,6 +13,44 @@
      :reference {:db/aid 6 :db/valueType :db.type/ref}}
     {} {:validate-data? true}))
 
+(deftest mixed-update-analysis-retains-opaque-values-and-unbound-ids
+  (let [calls (atom [])
+        host (proxy [Object] []
+               (hashCode [] (swap! calls conj :hash) 0)
+               (toString [] (swap! calls conj :string) "normalized"))
+        ^MixedUpdate entry (compile/mixed-update-operand ctx (HashMap.) Long/MAX_VALUE :text host)]
+    (is (= Long/MAX_VALUE (.-e entry)))
+    (is (= :text (.-attr entry)))
+    (is (identical? host (.-value entry)))
+    (is (nil? (compile/compile-mixed-region ctx
+                [[:db/add Long/MAX_VALUE :text host] {:text "new"}])))
+    (is (empty? @calls))))
+
+(deftest mixed-update-analysis-declines-unsafe-roles-before-scratch-or-callbacks
+  (let [calls (atom []) infos (HashMap.)
+        host (proxy [Number] []
+               (hashCode [] (swap! calls conj :hash) 0)
+               (longValue [] (swap! calls conj :long) 1)
+               (intValue [] 1) (floatValue [] 1.0) (doubleValue [] 1.0))]
+    (doseq [[e a v] [[host :text "value"] [(int 1) :text "value"] [1N :text "value"]
+                     [0 :text "value"] [-1 :text "value"] [1 host "value"]
+                     [1 :text nil] [1 (keyword "") "value"]]]
+      (is (nil? (compile/mixed-update-operand ctx infos e a v))))
+    (is (.isEmpty infos))
+    (is (empty? @calls))))
+
+(deftest mixed-update-analysis-is-a-shape-proof-without-distinctness
+  (let [infos (HashMap.)]
+    (doseq [a [:identity :reference :unknown]]
+      (is (nil? (compile/mixed-update-operand ctx infos 1 a "value"))))
+    (is (nil? (compile/mixed-update-operand
+                (assoc-in ctx [:opts :auto-entity-time?] true) infos 1 :text "value")))
+    ;; Duplicate E/A and safe coercion are independent, later compiler proofs.
+    (is (some? (compile/mixed-update-operand ctx infos 1 :text 42)))
+    (is (some? (compile/mixed-update-operand ctx infos 1 :text 43)))
+    (is (nil? (compile/compile-mixed-region ctx
+                [[:db/add 1 :text "first"] {:text "new"} [:db/add 1 :text "second"]])))))
+
 (deftest mixed-insert-analysis-retains-opaque-symbolic-values
   (let [calls (atom [])
         host (proxy [Object] []

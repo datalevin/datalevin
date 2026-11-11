@@ -1131,7 +1131,9 @@
     (doseq [category [:batch-bytes :retained-bytes :result-rows :result-bytes :external-requests]
             close-fault? [false true]]
       (let [limits (case category
-                     :retained-bytes {:retained-bytes 262144}
+                     ;; Leave headroom for admitted planning metadata; the fetch hook
+                     ;; below exhausts the remaining allowance deterministically.
+                     :retained-bytes {:retained-bytes 1048576}
                      :external-requests {:external-requests 1}
                      {category 1})
             observed

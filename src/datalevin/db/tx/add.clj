@@ -102,6 +102,16 @@
         (recur (+ offset 3) values))
       (append-derived-tuples! additions infos options eid tx values))))
 
+(defn- append-mixed-update!
+  "Correct a raw replacement at its writer position, or emit a canonical one."
+  [^ArrayList additions options ^MixedAttrInfo info tx ^MixedUpdate entry canonical?]
+  (let [a (.-attr entry)
+        value (.-value entry)]
+    (.add additions
+          (datom (.-e entry) a
+                 (if canonical? value
+                     (prepare/correct-value-with-props options (.-props info) a value)) tx))))
+
 (defn- pending-values?
   [db]
   (and common/*batch-prepare*
@@ -221,7 +231,10 @@
             (and (vector? entity) (= 4 (count entity))
                  (= :db/add (nth entity 0)))
             (let [[_ e a v] entity
-                  ^MixedAttrInfo info (compile/ordinary-attr-info! infos schema sources a)
+                  ^MixedUpdate operand (compile/mixed-update-operand ctx infos e a v)
+                  ^MixedAttrInfo info (if operand
+                                        (.get infos a)
+                                        (compile/ordinary-attr-info! infos schema sources a))
                   props (.-props info)]
               ;; Java set keys must use the datom's canonical Long entity ID.
               ;; Other integer representations need ordered resolution.
@@ -231,8 +244,12 @@
                          (or preflight?
                              (and (.-update? info) (some? v)
                                   (compile/distinct-mixed-update? updates e a))))
-                (.add additions (datom e a (prepare/correct-value-with-props
-                                            options props a v) tx))
+                (if operand
+                  (append-mixed-update! additions options info tx operand false)
+                  ;; Preserve legacy numeric/key behavior outside symbolic
+                  ;; analysis, including correction before datom ID coercion.
+                  (.add additions (datom e a (prepare/correct-value-with-props
+                                              options props a v) tx)))
                 (recur (next es) eid tempids
                        (and read-safe? (.-typed? info)))))
 
@@ -322,7 +339,7 @@
                             (.-attrs entry) true)
                       (recur (unchecked-inc index) next-eid tempids)))
                   (let [^MixedUpdate entry entry]
-                    (.add additions (datom (.-e entry) (.-attr entry) (.-value entry) tx))
+                    (append-mixed-update! additions nil nil tx entry true)
                     (recur (unchecked-inc index) eid tempids))))
               (finish-mixed-report
                 report db store before tx

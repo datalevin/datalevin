@@ -432,7 +432,7 @@ The query-map `:query-source` value accepts these options:
 | `:sources` | Source-symbol map of `{:consistency ...}` overrides for declared external aliases. |
 | `:limits` | Overrides for the shared resource limits shown below. |
 | `:native-extrema` | Optional map from an aggregate input variable to `{:source $alias :attribute :mapped/text}`. Explicitly requests that source column's native text ordering for `min`/`max`; ordinary Datalog extrema retain their usual semantics. Requires the optional session protocol below. |
-| `:planning` | `:max-alternatives` (default `32`), `:estimate-max-age-ms` (default `300000`), `:estimate-budget-ms` (default `100`), and `:estimate-max-requests` (default `8`). Estimate age limits ranking; either preparation cap set to zero disables optional probes. |
+| `:planning` | `:max-alternatives` (default `32`), `:estimate-max-age-ms` (default `300000`), `:estimate-budget-ms` (default `100`), `:estimate-max-requests` (default `8`), `:cost-model` (default `:elapsed`, also `:cardinality`), `:local-row-ns` (default `1000`), and `:local-column-ns` (default `250`). Local cost coefficients are nonnegative integers. Estimate age limits ranking; either preparation cap set to zero disables optional probes. |
 
 For example, put limits inside `:limits`, rather than directly under
 `:query-source`:
@@ -902,8 +902,9 @@ separate from access cardinalities and executed cursor work.
 Smaller qualifying counts come first. Missing, unknown, or expired counts follow
 qualifying ones and use structural ordering among themselves. Explanations report
 `:selection :cardinality` when qualifying counts rank candidates, otherwise
-`:selection :structural`. Time and transfer fields remain diagnostic;
-`:estimated-access-ns` remains `nil`. A statistical zero is still executed and
+`:selection :structural`. Fresh time hints additionally guide complete-path
+lookahead as described below. Transfer-byte fields remain diagnostic. A
+statistical zero is still executed and
 cannot prove an access empty, supply a dependency, or change coverage checks.
 
 Bounded lookahead compares at most 16 distinct starting sources, prioritizing
@@ -913,12 +914,37 @@ attempts. It propagates row counts through dependent joins, sums input/output
 row work, and tracks peak estimated tuple count. Fractional dependent fan-out
 can reduce the propagated tuple count, which floors at one; zero never suppresses required work. Missing or expired counts,
 unmodeled local producers, and unknown selectivity for a second independent
-scan retain the original feasible plan. This is a row-work heuristic, without
-skew, correlation, CPU, transfer-byte, or latency modeling; it does not guarantee
-a global minimum. Opaque handles and sessions are never compared or hashed.
+scan retain the original feasible plan. Regions with at most eight work items
+and 32 choices use a 1 ms optional allowance and at most 128 additional checks.
 
-Explanations expose `:join-cost {:work-rows ... :peak-rows ...}` and
-`:cost-search {:evaluated ... :states ... :elapsed-ns ... :starts [...]}`.
+With `:planning :cost-model :elapsed` (the default), a baseline path whose
+accesses all have fresh cardinalities and complete time hints enables time
+ranking. An independent access costs `startup-ns + run-ns`; a dependent access
+costs `ceil(input-tuples / effective-binding-rows) * startup-ns + input-tuples *
+per-binding-ns`. Effective binding rows are the smaller of the query and
+provider logical binding caps. Backend request splitting is already included
+in the provider's per-binding hint, so its per-request binding cap does not
+multiply cursor opens. Request counts propagate using the same batching rules
+when supplied. Missing or stale time hints on the baseline select cardinality
+ranking for the whole comparison; attempts with incomplete timing cannot
+replace a fully timed baseline.
+
+The time score adds `:local-row-ns` per estimated input and returned row and
+`:local-column-ns` per required input and returned column, including core
+residual inputs. Defaults are 1000 and 250 ns respectively; both accept
+nonnegative integer overrides under `:query-source :planning`. These are
+heuristic CPU weights, not measured operator runtimes. Set `:cost-model
+:cardinality` to retain row-work ranking. Timed ties use row work and peak
+estimated tuples. Costs saturate at finite double bounds. Skew, correlated
+selectivity, transfer-byte costs, and complete backend execution prediction
+remain unmodeled; the search does not guarantee a global minimum. Opaque
+handles and sessions are never compared or hashed.
+
+Explanations expose `:join-cost` with `:work-rows`, `:peak-rows`, `:access-ns`,
+`:local-ns`, `:estimated-ns`, `:estimated-opens`, and `:estimated-requests`.
+`:estimated-access-ns` is the selected access-time component when known.
+`:cost-search` includes `:model :elapsed|:cardinality`, `:evaluated`, `:states`,
+`:elapsed-ns`, and `:starts`.
 Each bounded start diagnostic contains only covered core work IDs, status and
 estimated row work/peak counts; it retains no provider handles or sessions. Selection is
 `:join-cost` when lookahead changes the baseline; otherwise existing
@@ -930,7 +956,7 @@ Structural ties are ordered by source, region, and lowest covered pattern ID. Fo
 same first work item, entity lookup and dependent joins precede value lookup, then attribute
 enumeration. Within the same kind, wider pattern coverage precedes narrower
 coverage; canonical structural identifiers break ties. Provider response order,
-opaque handles, labels, and time/transfer costs do not determine the choice. The dependency
+opaque handles and labels do not determine structural ordering. The dependency
 search backtracks to find complete nonoverlapping coverage within its 4096-state
 bound. Failure to find a feasible complete plan is `:query-source/unsupported`.
 This does not promise minimum latency or a globally minimum number of opens.
