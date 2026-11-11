@@ -3,7 +3,7 @@
             [datalevin.db.tx.compile :as compile]
             [datalevin.prepare :as prepare])
   (:import [datalevin.db.tx.plan BlindEntity MixedAttrInfo MixedInsert MixedOperands MixedUpdate TxPlan]
-           [java.util HashMap]))
+           [java.util HashMap HashSet]))
 
 (def ctx
   (prepare/->PrepareCtx
@@ -12,6 +12,53 @@
      :identity {:db/aid 5 :db/valueType :db.type/string :db/unique :db.unique/identity}
      :reference {:db/aid 6 :db/valueType :db.type/ref}}
     {} {:validate-data? true}))
+
+(deftest mixed-insert-analysis-retains-opaque-symbolic-values
+  (let [calls (atom [])
+        host (proxy [Object] []
+               (hashCode [] (swap! calls conj :hash) 0)
+               (toString [] (swap! calls conj :string) "normalized"))
+        form (array-map :text host :db/id "self" :reference "self" :value 42)
+        ^MixedInsert entry (compile/mixed-insert-operands ctx (HashMap.) form)
+        attrs (vec (.-attrs entry))]
+    (is (= "self" (.-tempid entry)))
+    (is (= [:text :reference :value] (mapv first (partition 3 attrs))))
+    (is (identical? host (second attrs)))
+    (is (= "self" (nth attrs 4)))
+    (is (nil? (compile/compile-mixed-region ctx [[:db/add 1 :value 1] form])))
+    (is (empty? @calls))))
+
+(deftest mixed-insert-analysis-declines-unsafe-shapes-without-effects
+  (let [calls (atom [])
+        host (proxy [Number] []
+               (hashCode [] (swap! calls conj :hash) (hash :db/id))
+               (equals [_] (swap! calls conj :equals) false)
+               (longValue [] (swap! calls conj :long) -1)
+               (intValue [] -1) (floatValue [] -1.0) (doubleValue [] -1.0))
+        bad-key (assoc clojure.lang.PersistentHashMap/EMPTY host "opaque" :text "text")
+        forms [{} {:db/id "empty"} {:db/id 1 :text "existing"}
+               {:db/id (int -1) :text "numeric"} {:db/id host :text "numeric"}
+               {:identity "identity"} (array-map host "opaque" :text "text") bad-key
+               (sorted-map :text "custom") (with-meta {:text "text"} {:source true})]]
+    (reset! calls [])
+    (doseq [form forms]
+      (is (nil? (compile/mixed-insert-operands ctx (HashMap.) form))))
+    (is (nil? (compile/mixed-insert-operands
+                (assoc-in ctx [:opts :auto-entity-time?] true) (HashMap.) {:text "text"})))
+    (is (empty? @calls))))
+
+(deftest mixed-insert-operands-own-their-normalization-buffer
+  (let [context (assoc ctx :opts {:validate-data? false})
+        form {:db/id "new" :text 42}
+        infos (HashMap.)
+        ^MixedInsert first-entry (compile/mixed-insert-operands context infos form)
+        ^MixedInsert second-entry (compile/mixed-insert-operands context infos form)
+        compiled (compile/compile-mixed-region context [[:db/add 1 :value 1] form])
+        ^MixedInsert compiled-entry (second (.-entries ^MixedOperands (:entries compiled)))]
+    (is (not (identical? (.-attrs first-entry) (.-attrs second-entry))))
+    (is (= 42 (aget (.-attrs first-entry) 1)))
+    (is (= "42" (aget (.-attrs compiled-entry) 1)))
+    (is (= 42 (:text form)))))
 
 (deftest blind-operands-own-one-stream-with-symbolic-ids
   (let [plan (compile/compile-blind-region ctx
@@ -706,3 +753,78 @@
   ;; Calendar formatting can consult host callbacks; keep it ordered.
   (is (nil? (compile/compile-tx (assoc ctx :opts {:validate-data? false})
                                 [[:db/add 1 :text (java.util.Date. 1234)]]))))
+
+(defn- mixed-preflight [context infos updates entity kind]
+  ((compile/mixed-preflight-checker context infos updates) entity kind))
+
+(deftest mixed-preflight-separates-shape-from-value-correction
+  (let [effects (atom [])
+        value (proxy [Object] []
+                (toString [] (swap! effects conj :string) "opaque")
+                (hashCode [] (swap! effects conj :hash) 1))
+        infos (HashMap.) updates (HashSet.)]
+    (is (true? (mixed-preflight
+                 ctx infos updates {:db/id "new" :text value} :insert)))
+    (is (true? (mixed-preflight
+                 ctx infos updates [:db/add 1 :value value] :update)))
+    (is (= #{[1 :value]} (set updates)))
+    (is (false? (mixed-preflight
+                  ctx infos updates [:db/add 1 :value 2] :update)))
+    ;; A preflight shape/attribute proof grants no compiled value eligibility.
+    (is (nil? (compile/compile-tx ctx [[:db/add 1 :value 1] {:text value}])))
+    (is (empty? @effects))))
+
+(deftest mixed-preflight-unsupported-input-adds-no-scratch-or-host-effects
+  (let [effects (atom [])
+        number (proxy [Number] []
+                 (longValue [] (swap! effects conj :long) -1)
+                 (intValue [] -1) (floatValue [] -1.0) (doubleValue [] -1.0))
+        key (proxy [Object] []
+              (hashCode [] (swap! effects conj :hash) 7))
+        input (proxy [Object clojure.lang.Seqable clojure.lang.IMeta] []
+                (seq [] (swap! effects conj :seq) nil)
+                (meta [] (swap! effects conj :meta) nil))]
+    (doseq [[form kind] [[{:db/id number :text "new"} :insert]
+                        [(array-map :text "new" key 1) :insert]
+                        [(sorted-map :text "new") :insert]
+                        [input :insert]
+                        [[key 1 :value 1] :update]
+                        [[:db/add 1 (keyword "") 1] :update]]]
+      (let [infos (HashMap.) updates (HashSet.)]
+        (is (= ::compile/unsupported-mixed-preflight
+               (mixed-preflight ctx infos updates form kind)))
+        (is (.isEmpty infos))
+        (is (.isEmpty updates))))
+    (is (empty? @effects))))
+
+(deftest mixed-preflight-retains-context-and-attribute-exclusions
+  (doseq [[form kind] [[{:db/id nil :text "new"} :insert]
+                      [{:db/id 1 :text "existing"} :insert]
+                      [{:db/id "empty"} :insert]
+                      [{:identity "new"} :insert]
+                      [{:missing 1} :insert]
+                      [(with-meta {:text "new"} {:source true}) :insert]
+                      [[:db/add 1 :reference 2] :update]
+                      [[:db/add 1 :identity "new"] :update]
+                      [[:db/add 1 :value nil] :update]
+                      [[:db/retract 1 :value 1] :update]]]
+    (is (false? (mixed-preflight ctx (HashMap.) (HashSet.) form kind))))
+  (is (false? (mixed-preflight
+                (assoc ctx :opts {:auto-entity-time? true})
+                (HashMap.) (HashSet.) {:text "timed"} :insert))))
+
+(deftest mixed-distinctness-never-converts-or-hashes-unsafe-keys
+  (let [effects (atom [])
+        number (proxy [Number] []
+                 (longValue [] (swap! effects conj :long) 1)
+                 (intValue [] 1) (floatValue [] 1.0) (doubleValue [] 1.0))
+        attr (proxy [Object] [] (hashCode [] (swap! effects conj :hash) 1))
+        updates (HashSet.)]
+    (is (false? (compile/distinct-mixed-update? updates number :value)))
+    (is (false? (compile/distinct-mixed-update? updates 1 attr)))
+    (is (false? (compile/distinct-mixed-update? updates 1N :value)))
+    (is (.isEmpty updates))
+    (is (empty? @effects))
+    (is (true? (compile/distinct-mixed-update? updates 1 :value)))
+    (is (false? (compile/distinct-mixed-update? updates 1 :value)))
+    (is (true? (compile/distinct-mixed-update? updates 1 :text)))))

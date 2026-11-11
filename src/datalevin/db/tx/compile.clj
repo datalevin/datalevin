@@ -384,6 +384,61 @@
   (or (identical? clojure.lang.PersistentArrayMap (class value))
       (identical? clojure.lang.PersistentHashMap (class value))))
 
+(defn distinct-mixed-update?
+  "Prove canonical distinct E/A keys in request-owned scratch. Values are not
+  hashed; both compiled operands and legacy mixed preflight use this proof."
+  [^HashSet updates e attr]
+  (and (instance? Long e) (pos? (long e)) (keyword? attr)
+       (.add updates [e attr])))
+
+(defn mixed-preflight-checker
+  "Build a shape/attribute checker over captured metadata and owned scratch.
+  Each call checks one already-demanded plain form, without correcting values
+  or proving writer eligibility. Opaque values are never inspected or hashed.
+  Unsupported containers, keys and numeric tempids return
+  ::unsupported-mixed-preflight before scratch mutation so runtime can retain
+  their existing validation and callback order. No input sequence is consumed."
+  [ctx ^HashMap infos ^HashSet updates]
+  (let [schema (:schema ctx) sources (:db/attrTuples (:rschema ctx))
+        enabled? (not (:auto-entity-time? (:opts ctx)))
+        safe-key? (fn [_ attr _]
+                    (if (and (keyword? attr) (pos? (count (name attr))))
+                      true (reduced false)))
+        insert? (fn [_ attr _]
+                  (if (identical? attr :db/id)
+                    true
+                    (if (.-insert? ^MixedAttrInfo (ordinary-attr-info! infos schema sources attr))
+                      true (reduced false))))]
+    (fn [entity kind]
+      (if (identical? kind :insert)
+        (if (and (plain-map? entity) (reduce-kv safe-key? true entity))
+          (let [explicit? (contains? entity :db/id)
+                tempid (:db/id entity)]
+            (if (and (number? tempid) (not (instance? Long tempid)))
+              ::unsupported-mixed-preflight
+              (boolean
+                (and (nil? (meta entity)) enabled?
+                     (or (not explicit?) (string? tempid)
+                         (and (instance? Long tempid) (neg? (long tempid))))
+                     (> (count entity) (if explicit? 1 0))
+                     (reduce-kv insert? true entity)))))
+          ::unsupported-mixed-preflight)
+        (if (identical? clojure.lang.PersistentVector (class entity))
+          (let [op (nth entity 0 nil) attr (nth entity 2 nil)]
+            (if (and (= 4 (count entity))
+                     (or (not (keyword? op))
+                         (and (keyword? attr) (zero? (count (name attr))))))
+              ::unsupported-mixed-preflight
+              (boolean
+                (and (nil? (meta entity)) enabled?
+                     (= 4 (count entity)) (identical? :db/add op)
+                     (let [[_ e attr value] entity]
+                       (and (instance? Long e) (pos? (long e)) (keyword? attr)
+                            (some? value)
+                            (.-update? ^MixedAttrInfo (ordinary-attr-info! infos schema sources attr))
+                            (distinct-mixed-update? updates e attr)))))))
+          ::unsupported-mixed-preflight)))))
+
 (defn- positive-literal-id? [e]
   (if (instance? Long e)
     (pos? (long e))
@@ -929,33 +984,53 @@
           (recur (unchecked-inc index))))
       true)))
 
+(defn mixed-insert-operands
+  "Assemble symbolic insert attributes from one plain map and captured metadata.
+  Values stay untouched: this grants no value/ownership proof, performs no
+  correction and binds no persistent IDs. Runtime adapters may normalize these
+  operands in order; compilation must additionally prove value eligibility."
+  [ctx ^HashMap infos entity]
+  (when (and (plain-map? entity) (nil? (meta entity))
+             (not (:auto-entity-time? (:opts ctx))))
+    (let [explicit? (contains? entity :db/id)
+          tempid (:db/id entity)
+          size (- (count entity) (if explicit? 1 0))]
+      (when (and (pos? size) (or (not explicit?) (literal-tempid? tempid)))
+        (let [attrs (object-array (* 3 size))
+              end (reduce-kv
+                    (fn [offset a value]
+                      (if (identical? :db/id a)
+                        offset
+                        (if (and (keyword? a) (pos? (count (name a))))
+                          (let [^MixedAttrInfo info
+                                (ordinary-attr-info! infos (:schema ctx)
+                                  (:db/attrTuples (:rschema ctx)) a)]
+                            (if (.-insert? info)
+                              (do (aset attrs offset a)
+                                  (aset attrs (inc (long offset)) value)
+                                  (aset attrs (+ (long offset) 2) info)
+                                  (+ (long offset) 3))
+                              (reduced nil)))
+                          (reduced nil))))
+                    0 entity)]
+          (when end (MixedInsert. tempid attrs)))))))
+
 (defn- compile-mixed-insert
-  [schema sources validate? ^HashMap infos ^HashSet tempids entity coerce?]
+  [ctx ^HashMap infos ^HashSet tempids entity coerce?]
   (let [explicit? (contains? entity :db/id)
-        tempid (:db/id entity)
-        size (- (count entity) (if explicit? 1 0))]
-    (when (and (pos? size)
-               (or (not explicit?)
-                   (and (literal-tempid? tempid) (.add tempids tempid))))
-      (let [attrs (object-array (* 3 size))
-            end (reduce-kv
-                  (fn [offset a v]
-                    (if (identical? :db/id a)
-                      offset
-                      ;; Never hash a host key or inspect a host value's methods.
-                      (if (and (keyword? a) (pos? (count (name a))))
-                        (let [^MixedAttrInfo info (ordinary-attr-info!
-                                                   infos schema sources a)]
-                          (if (and (.-insert? info)
-                                   (mixed-value-ready? validate? (.-props info) tempids v coerce?))
-                            (do (aset attrs offset a)
-                                (aset attrs (inc (long offset)) v)
-                                (aset attrs (+ (long offset) 2) info)
-                                (+ (long offset) 3))
-                            (reduced nil)))
-                        (reduced nil))))
-                  0 entity)]
-        (when end (MixedInsert. tempid attrs))))))
+        tempid (:db/id entity)]
+    (when (or (not explicit?)
+              (and (literal-tempid? tempid) (.add tempids tempid)))
+      (when-let [^MixedInsert entry (mixed-insert-operands ctx infos entity)]
+        (let [^objects attrs (.-attrs entry)]
+          (loop [offset 0]
+            (if (< offset (alength attrs))
+              (when (mixed-value-ready?
+                      (:validate-data? (:opts ctx))
+                      (.-props ^MixedAttrInfo (aget attrs (+ offset 2)))
+                      tempids (aget attrs (inc offset)) coerce?)
+                (recur (+ offset 3)))
+              entry)))))))
 
 (defn- append-mixed-update!
   [schema sources validate? ^HashMap infos ^HashSet updates
@@ -964,7 +1039,7 @@
     (let [^MixedAttrInfo info (ordinary-attr-info! infos schema sources attr)]
       (when (and (.-update? info)
                  (mixed-scalar-ready? validate? (:db/valueType (.-props info)) value coerce?)
-                 (.add updates [e attr]))
+                 (distinct-mixed-update? updates e attr))
         (.add entries (MixedUpdate. e attr value))
         info))))
 
@@ -998,8 +1073,7 @@
                                 typed? form))]
                   (when (some? typed)
                     (recur (unchecked-inc index) inserts? (max required-eid e) typed)))
-                (when-let [entry (compile-mixed-insert
-                                   schema sources validate? infos tempids form coerce?)]
+                (when-let [entry (compile-mixed-insert ctx infos tempids form coerce?)]
                   (.add entries entry)
                   (recur (unchecked-inc index) true required-eid typed?)))
 

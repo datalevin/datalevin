@@ -90,14 +90,15 @@
                  {} entity)]
     (append-derived-tuples! additions infos options eid tx values)))
 
-(defn- append-compiled-entity!
-  [^ArrayList additions ^HashMap infos options tempids eid tx ^objects attrs]
+(defn- append-mixed-entity!
+  "Bind/correct a symbolic attribute stream and emit its logical additions."
+  [^ArrayList additions ^HashMap infos options tempids eid tx ^objects attrs canonical?]
   (loop [offset 0 values {}]
     (if (< offset (alength attrs))
       (when-let [values (append-new-attribute!
                          additions options tempids eid tx values
                          (aget attrs offset) (aget attrs (inc offset))
-                         (aget attrs (+ offset 2)) true)]
+                         (aget attrs (+ offset 2)) canonical?)]
         (recur (+ offset 3) values))
       (append-derived-tuples! additions infos options eid tx values))))
 
@@ -128,7 +129,7 @@
   (and (map? entity)
        (some #(contains? entity %) identity-attrs)))
 
-(defn- preflight-checker
+(defn- legacy-preflight-checker
   [schema sources ^HashMap infos ^HashSet updates]
   (let [insert? (fn [_ a _value]
                   (if (= :db/id a)
@@ -149,12 +150,12 @@
               ;; Keep canonical Long E/A keys shared with construction.
               (and (instance? Long e) (pos? (long e)) (keyword? a) (some? v)
                    (.-update? ^MixedAttrInfo (compile/ordinary-attr-info! infos schema sources a))
-                   (.add updates [e a])))))))))
+                   (compile/distinct-mixed-update? updates e a)))))))))
 
 (defn- preflight-additions
   "Recognize the mixture and validate shapes and attributes before correction.
   Defer metadata work until both shapes occur, keeping pure requests cheap."
-  [entities schema sources ^HashMap infos]
+  [entities ctx ^HashMap infos]
   (let [head (seq entities)]
     (loop [es head index 0 first-kind nil updates nil check nil]
       (if es
@@ -165,7 +166,14 @@
                   initialize? (and mixed? (nil? updates))
                   updates (if initialize? (HashSet.) updates)
                   check (if initialize?
-                          (preflight-checker schema sources infos updates) check)]
+                          (let [compiled-check (compile/mixed-preflight-checker ctx infos updates)]
+                            (fn [entity kind]
+                              (let [decision (compiled-check entity kind)]
+                                (if (identical? decision ::compile/unsupported-mixed-preflight)
+                                  ((legacy-preflight-checker
+                                     (:schema ctx) (:db/attrTuples (:rschema ctx))
+                                     infos updates) entity kind)
+                                  decision)))) check)]
               (when (and
                       ;; The leading homogeneous prefix has only been classified
                       ;; by shape. Validate its metadata once mixing is proven.
@@ -181,9 +189,10 @@
         updates))))
 
 (defn- plan-additions
-  [entities schema options max-eid tx ^HashSet updates preflight?
-   ^HashMap infos sources]
-  (let [additions (ArrayList.)]
+  [entities ctx max-eid tx ^HashSet updates preflight? ^HashMap infos]
+  (let [schema (:schema ctx) options (:opts ctx)
+        sources (:db/attrTuples (:rschema ctx))
+        additions (ArrayList.)]
     (loop [es (seq entities) eid (long max-eid) tempids {} read-safe? true]
       (if es
         (let [entity (first es)]
@@ -197,10 +206,16 @@
                                   (not (txprep/auto-tempid? tempid))))
                          (not (contains? tempids tempid))
                          (> (count entity) (if (contains? entity :db/id) 1 0)))
-                (let [next-eid (inc eid)
+                (let [^MixedInsert operand (compile/mixed-insert-operands ctx infos entity)
+                      next-eid (inc eid)
                       tempids' (cond-> tempids tempid (assoc tempid next-eid))]
-                  (when (append-new-entity! additions infos schema options sources
-                                           tempids' next-eid tx entity)
+                  (when (if operand
+                          (append-mixed-entity! additions infos options tempids'
+                            next-eid tx (.-attrs operand) false)
+                          ;; Preserve correction/decline order for containers,
+                          ;; tempids and attributes outside symbolic analysis.
+                          (append-new-entity! additions infos schema options sources
+                            tempids' next-eid tx entity))
                     (recur (next es) next-eid tempids' read-safe?)))))
 
             (and (vector? entity) (= 4 (count entity))
@@ -214,7 +229,8 @@
                              (and (instance? Long e) (pos? (long e))))
                          (<= (long e) (long max-eid))
                          (or preflight?
-                             (and (.-update? info) (some? v) (.add updates [e a]))))
+                             (and (.-update? info) (some? v)
+                                  (compile/distinct-mixed-update? updates e a))))
                 (.add additions (datom e a (prepare/correct-value-with-props
                                             options props a v) tx))
                 (recur (next es) eid tempids
@@ -301,9 +317,9 @@
                         next-eid (inc eid)
                         tempid (.-tempid entry)
                         tempids (cond-> tempids tempid (assoc tempid next-eid))]
-                    (when (append-compiled-entity!
+                    (when (append-mixed-entity!
                             additions infos (:opts ctx) tempids next-eid tx
-                            (.-attrs entry))
+                            (.-attrs entry) true)
                       (recur (unchecked-inc index) next-eid tempids)))
                   (let [^MixedUpdate entry entry]
                     (.add additions (datom (.-e entry) (.-attr entry) (.-value entry) tx))
@@ -334,7 +350,7 @@
              schema (i/schema store) options (i/opts store)]
          (when-not (:auto-entity-time? options)
            (let [rschema (i/rschema store)
-                 sources (:db/attrTuples rschema)
+                 ctx (prepare/->PrepareCtx schema rschema options)
                  infos (HashMap.)
                  updates (if preflight?
                            (let [head (seq entities)]
@@ -342,12 +358,11 @@
                              ;; Reuse its sequence without walking the batch again.
                              (when-not (identity-map? (:db.unique/identity rschema)
                                                        (first head))
-                               (preflight-additions head schema sources infos)))
+                               (preflight-additions head ctx infos)))
                            (HashSet.))]
              (when updates
                (let [before (max (long (:max-eid db))
                                  (long (or owned-max-eid (i/init-max-eid store))))
                      tx (inc (long (:max-tx db)))]
-                 (when-let [plan (plan-additions entities schema options before tx
-                                                updates preflight? infos sources)]
+                 (when-let [plan (plan-additions entities ctx before tx updates preflight? infos)]
                    (finish-mixed-report report db store before tx plan)))))))))))

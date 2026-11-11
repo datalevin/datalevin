@@ -1294,9 +1294,10 @@ adapters retain the ordinary EAV path. A source opts in by implementing
 `IRelationalQuerySource/-plan-relational`; its acquired session also implements
 `IRelationalQuerySession/-open-relational-cursor`.
 
-Core considers this path only for a flat conjunction whose sources all belong
-to one physical session group, with no rules, scoped branches, host functions,
-or `:having`. Inputs must consist entirely of captured scalar values in a
+By default, core considers this path for a flat conjunction whose sources all
+belong to one physical session group, with no rules, scoped branches, host
+functions, or `:having`. The opt-in scalar Boolean extension described below
+also admits completely represented filter branches. Inputs must consist entirely of captured scalar values in a
 single input tuple. A source may decline any shape by returning `nil`, before
 acquisition or reads. Ordering combined with return maps currently uses the
 ordinary path. Other ordering and public result windows remain core operations.
@@ -1326,6 +1327,23 @@ binary predicate envelope and remain within the conjunction. Core exports
 only variables visible in the fact patterns and substitutes captured scalar
 bounds; another operator's possible output never becomes a constant. Original
 parser nodes, scoped bodies, native sources, and host callbacks are not exported.
+
+The matching development compiler also accepts bounded scalar AND/OR filters
+when every source descriptor opts in with
+`:datalevin.query.source/boolean-filters-relational? true`. It exports logical
+clauses as `{:kind :boolean :operator :and|:or :clauses [...]}`; leaves use the
+ordinary scalar predicate envelope. Top-level logical clauses receive ordinary
+clause IDs. Nested leaves remain within their Boolean parent. There is no
+provider I/O or new execution operator: a provider either implements the complete
+filter as part of the relational plan or declines it.
+
+Every referenced variable must already come from outer fact patterns, and all
+union exports must belong to those variables. Branch facts, host functions,
+negation, rules, unsupported predicates, and comparisons over optional nullable
+projections retain core execution. The compiler bounds the complete logical
+forest to 128 nodes, logical depth 16, and 32 branches per OR. Providers must
+validate the logical tree as well as every leaf. Overlapping OR branches filter
+one outer witness once; they do not introduce SQL UNION bag multiplicity.
 
 The initial projection grammar accepts variable projections and unary
 `count`, `count-distinct`, `sum`, `min`, and `max` aggregates over variables.

@@ -34,7 +34,7 @@
      :variable (:symbol (first (:args element)))}))
 
 (defn- whole-predicates
-  "Flatten a completely represented scalar conjunction for SQL. Chained long
+  "Flatten a completely represented scalar conjunction for SQL. Chained scalar
   comparisons normalize only here; the ordinary scoped compiler is unchanged."
   [root variables types]
   (let [base (inc (long (reduce max -1 (map (comp :id :clause) (:patterns root)))))
@@ -46,10 +46,10 @@
                             operator ({'< :< '<= :<= '> :> '>= :>=} (get-in node [:fn :symbol]))
                             operand (fn [arg]
                                       (cond (instance? Variable arg)
-                                            (when (and (variables (:symbol arg)) (= :long (types (:symbol arg))))
+                                            (when (and (variables (:symbol arg)) (contains? types (:symbol arg)))
                                               (if (contains? (:bindings root) (:symbol arg))
                                                 [:const (get-in root [:bindings (:symbol arg)])] [:var (:symbol arg)]))
-                                            (and (instance? datalevin.parser.Constant arg) (int? (:value arg)))
+                                            (instance? datalevin.parser.Constant arg)
                                             [:const (:value arg)]))
                             terms (when (and (instance? Predicate node) operator (<= 3 (count args) 32))
                                     (mapv operand args))]
@@ -57,6 +57,40 @@
                           (mapv (fn [pair] {:kind :predicate :operator operator :semantics-version 1 :args (vec pair)})
                                 (partition 2 1 terms)))))) (:core-clauses root))]
     (when (every? some? clauses) (vec (mapcat identity clauses)))))
+
+(defn- scalar-unions
+  "Represent only bounded Boolean filters over already bound fact values.
+  Branches cannot introduce facts, functions, negation, or private variables."
+  [compiled sites variables types]
+  (let [regions (:regions compiled) by-parent (group-by :parent-region sites)
+        root (:root-region compiled) visited (volatile! #{}) remaining (volatile! 128)]
+    (letfn [(union [site depth visible]
+              (when (and (<= depth 14) (not (neg? (vswap! remaining - (inc (count (:branches site))))))
+                         (= :union (:kind site)) (<= 1 (count (:branches site)) 32)
+                         (set/subset? (:exports site) visible))
+                (let [branches
+                      (mapv (fn [id]
+                              (let [region (nth regions id)
+                                    visible (set/intersection visible (:input-vars region))
+                                    predicates (when (empty? (:patterns region))
+                                                 (whole-predicates region visible types))
+                                    children (when predicates
+                                               (mapv #(union % (+ 2 depth) visible) (by-parent id)))]
+                                (when (and predicates (every? some? children)
+                                           (not (neg? (vswap! remaining - (count predicates)))))
+                                  {:kind :boolean :operator :and :clauses (into predicates children)})))
+                            (:branches site))]
+                  (when (every? some? branches)
+                    (vswap! visited conj (:path site))
+                    {:kind :boolean :operator :or :clauses branches}))))]
+      (let [clauses (mapv #(union % 0 variables) (filter #(= :union (:kind %)) (by-parent root)))]
+        (when (and (seq clauses) (every? some? clauses))
+          {:clauses clauses :sites @visited})))))
+
+(defn- filter-variables [clause]
+  (if (= :boolean (:kind clause))
+    (into #{} (mapcat filter-variables) (:clauses clause))
+    (contract/variables clause)))
 
 (defn- absence-clause [compiled sources patterns site]
   (when (= :negation (:kind site))
@@ -142,11 +176,6 @@
                           (every? #(= 1 (count (:exports %))) unions)
                           (= (count unions) (count (:source-prefilters root)))
                           (every? #(contains? (:datalevin.query.source/predicate-prefilters (:descriptor %)) :like-any) entries))
-        flat? (or (and (= 1 (count (:regions compiled))) (empty? sites))
-                  (and (every? #(= (:region-id root) (:parent-region %)) sites)
-                       (= (count sites) (+ (count unions) (count negatives)))
-                       (or (empty? unions) pure-unions?)
-                       (every? some? absences)))
         variables (into #{} (mapcat contract/variables) (into patterns optionals))
         groups (set (map #(vector (:source-symbol %) (first (:terms %))) patterns))
         types (reduce (fn [out {:keys [source-symbol terms] :as clause}]
@@ -155,7 +184,18 @@
                                     (update out (second term) #(if (or (nil? %) (= % (:type column)))
                                                                (:type column) ::mixed)) out))
                                 out (map vector terms (contract/pattern-columns (sources source-symbol) clause))))
-                      {} (into patterns optionals))]
+                      {} (into patterns optionals))
+        booleans (when (and (seq unions) (not pure-unions?)
+                            (every? #(true? (:datalevin.query.source/boolean-filters-relational? (:descriptor %))) entries))
+                   (scalar-unions compiled sites variables types))
+        flat? (or (and (= 1 (count (:regions compiled))) (empty? sites))
+                  (and (every? #(= (:region-id root) (:parent-region %)) negatives)
+                       (every? some? absences)
+                       (if booleans
+                         (every? #(or (= :negation (:kind %)) ((:sites booleans) (:path %))) sites)
+                         (and (every? #(= (:region-id root) (:parent-region %)) sites)
+                              (= (count sites) (+ (count unions) (count negatives)))
+                              (or (empty? unions) pure-unions?)))))]
     (when (and (= 1 (count (:groups prepared))) (every? :descriptor entries)
                flat?
                (or (empty? native-extrema)
@@ -168,7 +208,7 @@
                (not (and (:qreturn-map parsed) (seq (:qorder parsed))))
                (nil? *math-context*)
                (every? #(or (instance? Pattern %) (instance? Predicate %)
-                            (and (or pure-unions? (seq optional)) (instance? datalevin.parser.Or %))
+                            (and (or pure-unions? booleans (seq optional)) (instance? datalevin.parser.Or %))
                             (and (seq absences) (instance? datalevin.parser.Not %))) (:qwhere parsed))
                (= 1 (.size ^List (get-in input [:relation :tuples])))
                (set/subset? (set (map :variable (:columns input))) (set (keys (:bindings input))))
@@ -181,11 +221,12 @@
       ;; predicate, scoped body, or unknown operator keeps the core path.
       (when-let [predicates (whole-predicates root variables types)]
         ;; SQL NULL comparisons need separate semantics from local predicates.
-        (when-not (some #(seq (set/intersection nullable (contract/variables %)))
-                        (into predicates (when pure-unions? (:source-prefilters root))))
+        (when-not (some #(seq (set/intersection nullable (filter-variables %)))
+                        (into (into predicates (:clauses booleans)) (when pure-unions? (:source-prefilters root))))
           (let [predicates (mapv (fn [i predicate] (assoc predicate :id i))
                                 (range (inc (long (reduce max -1 (map :id patterns)))) Long/MAX_VALUE)
-                                (into (into (into predicates absences) optionals) (when pure-unions? (:source-prefilters root))))]
+                                (into (into (into (into predicates absences) optionals) (:clauses booleans))
+                                      (when pure-unions? (:source-prefilters root))))]
             (merge (:request (first (:groups prepared)))
                    (when (seq native-extrema) {:datalevin.query.source/native-extrema native-extrema})
                    (when (seq ignore-nil) {:datalevin.query.source/ignore-nil-extrema ignore-nil})

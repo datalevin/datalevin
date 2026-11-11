@@ -139,18 +139,6 @@
   "Optional diagnostic observer, outside compilation and uninstrumented timings."
   nil)
 
-(defrecord PreparedBlindTx
-  [schema-epoch
-   opts-epoch
-   auto-entity-time?
-   entities
-   unique-avs
-   has-unique?
-   has-many?
-   fuse-unique-inserts?
-   identity-upsert-av
-   identity-upsert-read])
-
 (defrecord PreparedLocalPatchIdocTx
   [schema-epoch
    opts-epoch
@@ -158,12 +146,6 @@
    e
    attr
    ops])
-
-(defrecord PreparedScalarUpdate
-  [schema-epoch
-   opts-epoch
-   entries
-   entity-reads])
 
 ;; (defmethod print-method TxReport [^TxReport rp, ^java.io.Writer w]
 ;;   (binding [*out* w]
@@ -2613,26 +2595,27 @@
                       (or check-unique-avs? fuse-unique-inserts? (not has-unique?)
                           (= (.size unique-avs)
                              (.size (java.util.HashSet. ^java.util.Collection unique-avs)))))
-             (->PreparedBlindTx store-schema
-                                store-opts
-                                auto-entity-time?
-                                entities
-                                unique-avs
-                                has-unique?
-                                (boolean (and has-many? @has-many?))
-                                fuse-unique-inserts?
-                                identity-upsert-av
-                                (when identity-upsert-av
-                                  (let [^BlindEntity entity
-                                        (.get ^FastList entities 0)
-                                        ^FastList attrs (.-attrs entity)
-                                        identity-attr (first identity-upsert-av)]
-                                    (txcompile/prepare-scalar-entity-read
-                                      store-schema
-                                      (for [index (range 0 (.size attrs) 2)
-                                            :let [attr (.get attrs index)]
-                                            :when (not= attr identity-attr)]
-                                        attr))))))))))))
+             (assoc (txplan/->TxPlan
+                      (prepare/->PrepareCtx store-schema store-rschema store-opts)
+                      :blind entities nil)
+                    ::legacy-prepared? true
+                    :auto-entity-time? auto-entity-time?
+                    :unique-avs unique-avs
+                    :has-unique? has-unique?
+                    :has-many? (boolean (and has-many? @has-many?))
+                    :fuse-unique-inserts? fuse-unique-inserts?
+                    :identity-upsert-av identity-upsert-av
+                    :identity-upsert-read
+                    (when identity-upsert-av
+                      (let [^BlindEntity entity (.get ^FastList entities 0)
+                            ^FastList attrs (.-attrs entity)
+                            identity-attr (first identity-upsert-av)]
+                        (txcompile/prepare-scalar-entity-read
+                          store-schema
+                          (for [index (range 0 (.size attrs) 2)
+                                :let [attr (.get attrs index)]
+                                :when (not= attr identity-attr)]
+                            attr))))))))))))
 
 (defn ^:no-doc prepare-blind-local-tx
   "Select compiled canonical or safely coercible new maps when opted in; other
@@ -2652,8 +2635,10 @@
            plan))
        (prepare-blind-local-tx* db entities allow-small-unique? check-unique-avs? entity-kinds))))
 
-(defn- blind-tx-entities [prepared]
-  (if (instance? TxPlan prepared) (:entries prepared) (:entities prepared)))
+(defn- compiler-prepared?
+  "Legacy adapters share TxPlan operands without acquiring compiler proofs."
+  [prepared]
+  (and (instance? TxPlan prepared) (not (::legacy-prepared? prepared))))
 
 (defn ^:no-doc blind-local-tx-unique-values-absent?
   "Check a prepared batch's unique values against the current store snapshot.
@@ -2665,20 +2650,17 @@
 (defn ^:no-doc blind-local-tx-valid?
   [^DB db prepared]
   (let [store (.-store db)]
-    (if (instance? TxPlan prepared)
-      (and (identical? :blind (:strategy prepared))
-           (identical? (:schema (:ctx prepared)) (schema store))
-           (identical? (:opts (:ctx prepared)) (opts store)))
-      (and (identical? (:schema-epoch prepared) (schema store))
-           (identical? (:opts-epoch prepared) (opts store))))))
+    (and (identical? :blind (:strategy prepared))
+         (identical? (:schema (:ctx prepared)) (schema store))
+         (identical? (:opts (:ctx prepared)) (opts store)))))
 
 (defn ^:no-doc stamp-blind-local-upsert-tx
   "Reuse a collided blind batch's normalized scalar values. Independent maps
    with one identity each can resolve insert versus upsert under the same
    writer. Repeated owners and ambiguous identities retain general resolution."
   [^DB db prepared tx-meta]
-  (let [^FastList entities (blind-tx-entities prepared)
-        compiled? (instance? TxPlan prepared)
+  (let [^FastList entities (:entries prepared)
+        compiled? (compiler-prepared? prepared)
         ^FastList identity-avs (when (and compiled? (:independent-identity-upserts? prepared))
                                 (:unique-avs prepared))]
     (when (and (not (:auto-entity-time? prepared))
@@ -2689,7 +2671,7 @@
                (blind-local-tx-valid? db prepared))
       (when-let [report (txexec/execute-blind-upserts
                           (->TxReport db db [] {} tx-meta) entities identity-avs
-                          (if compiled? (:schema (:ctx prepared)) (:schema-epoch prepared)))]
+                          (:schema (:ctx prepared)))]
         (when (and compiled? *tx-compiler-observer*)
           (*tx-compiler-observer* :execute-blind-upsert prepared))
         report))))
@@ -2697,11 +2679,11 @@
 (defn ^:no-doc stamp-blind-local-tx
   "Bind legacy or compiled blind operands through the shared emission loop."
   [db prepared tx-meta]
-  (when (or (not (instance? TxPlan prepared)) (blind-local-tx-valid? db prepared))
+  (when (or (not (compiler-prepared? prepared)) (blind-local-tx-valid? db prepared))
     (let [report (txexec/execute-blind-inserts
-                   (->TxReport db db [] {} tx-meta) (blind-tx-entities prepared)
+                   (->TxReport db db [] {} tx-meta) (:entries prepared)
                    (:auto-entity-time? prepared))]
-      (when (and (instance? TxPlan prepared) *tx-compiler-observer*)
+      (when (and (compiler-prepared? prepared) *tx-compiler-observer*)
         (*tx-compiler-observer* :execute-blind prepared))
       report)))
 
@@ -2710,14 +2692,14 @@
    upsert inside the caller's LMDB write transaction. Returns
    [report upsert?], or nil when the prepared shape is not eligible."
   [^DB db prepared tx-meta]
-  (when (or (not (instance? TxPlan prepared)) (blind-local-tx-valid? db prepared))
+  (when (or (not (compiler-prepared? prepared)) (blind-local-tx-valid? db prepared))
     (when-let [[identity-attr identity-value] (:identity-upsert-av prepared)]
       (if-some [eid (txcommon/av-first-e db identity-attr identity-value)]
         (let [report (txexec/execute-blind-identity-upsert
                        (->TxReport db db [] {} tx-meta)
-                       (.get ^FastList (blind-tx-entities prepared) 0)
+                       (.get ^FastList (:entries prepared) 0)
                        identity-attr eid (:identity-upsert-read prepared))]
-          (when (and (instance? TxPlan prepared) *tx-compiler-observer*)
+          (when (and (compiler-prepared? prepared) *tx-compiler-observer*)
             (*tx-compiler-observer* :execute-blind-upsert prepared))
           [report true])
         [(stamp-blind-local-tx db prepared tx-meta) false]))))
@@ -2826,8 +2808,9 @@
   (let [store        (.-store db)
         store-schema (schema store)
         store-opts   (opts store)
+        store-rschema (rschema store)
         validate?    (:validate-data? store-opts)
-        tuple-source-attrs (:db/attrTuples (rschema store))]
+        tuple-source-attrs (:db/attrTuples store-rschema)]
     (when-not (:auto-entity-time? store-opts)
       (let [^FastList candidates
             (FastList. (int (* 4 (if (instance? java.util.Collection initial-es)
@@ -2887,10 +2870,12 @@
                         (persistent! entries)))
                     deferred? (and defer-entity-resolution?
                                    (some #(not (integer? (first %))) entries))]
-                (cond-> (->PreparedScalarUpdate
-                          store-schema store-opts entries
-                          (when-not deferred?
-                            (txcompile/scalar-update-entity-reads store-schema entries)))
+                (cond-> (assoc (txplan/->TxPlan
+                                 (prepare/->PrepareCtx store-schema store-rschema store-opts)
+                                 :scalar entries
+                                 (when-not deferred?
+                                   (txcompile/scalar-update-entity-reads store-schema entries)))
+                               ::legacy-prepared? true)
                   deferred? (assoc :deferred-entity-resolution? true))))))))))
 
 (defn ^:no-doc prepare-scalar-update-tx
@@ -2915,10 +2900,12 @@
          (prepare-scalar-update-tx* db initial-es false))))))
 
 (defn ^:no-doc scalar-update-tx-valid?
-  [^DB db ^PreparedScalarUpdate prepared]
+  [^DB db ^TxPlan prepared]
   (let [store (.-store db)]
-    (and (identical? (:schema-epoch prepared) (schema store))
-         (identical? (:opts-epoch prepared) (opts store)))))
+    (and (::legacy-prepared? prepared)
+         (identical? :scalar (:strategy prepared))
+         (identical? (:schema (:ctx prepared)) (schema store))
+         (identical? (:opts (:ctx prepared)) (opts store)))))
 
 (defn- bind-scalar-entities
   "Attach writer-bound operands/layouts to the adapter-owned representation."
@@ -2936,10 +2923,10 @@
   "Stamp a prepared scalar-update batch against the current store snapshot.
   Returns a TxReport without mutable index overlays, or nil when schema/options
   epochs are stale or entity references require general transaction resolution."
-  [^DB db ^PreparedScalarUpdate prepared tx-meta]
+  [^DB db ^TxPlan prepared tx-meta]
   (when-let [prepared (when (scalar-update-tx-valid? db prepared)
                         (if (:deferred-entity-resolution? prepared)
-                          (bind-scalar-entities db prepared (:schema-epoch prepared))
+                          (bind-scalar-entities db prepared (:schema (:ctx prepared)))
                           prepared))]
     (let [tx-id   (inc (long (:max-tx db)))
           entries (:entries prepared)
@@ -3111,7 +3098,8 @@
 (defn- prepare-local-report
   [initial forms tx-time outcome {:keys [stage? route?] :as options}]
   (let [db (:db-after initial) captured (:ctx outcome)
-        valid? (and outcome (identical? (:schema captured) (schema (:store db)))
+        valid? (and outcome (not (::legacy-prepared? outcome))
+                    (identical? (:schema captured) (schema (:store db)))
                     (identical? (:opts captured) (opts (:store db))))
         eligible? (and (instance? Store (:store db)) (fresh-request-report? initial)
                        ;; Queryable simulation inside a live batch still uses
