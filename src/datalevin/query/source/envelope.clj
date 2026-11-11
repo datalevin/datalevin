@@ -60,10 +60,8 @@
                       (map vector (:terms clause) (contract/pattern-columns (contract/pattern-source-info request clause) clause check!)))
               types)) {} clauses))
 
-(defn request!
-  "Check an already admitted, owned v2 region request against its runtime.
-  Availability is a potential typed supply, never proof of a legal schedule."
-  [runtime request]
+(defn- request*!
+  [runtime request descriptor!]
   (let [ctl (:control runtime) check! #(control/check-active! ctl)
         {:keys [source-symbol source-descriptor region-id scope-id clauses bindings available-inputs
                 required-vars demand max-alternatives]} request]
@@ -79,7 +77,7 @@
                   (every? variable? (keys bindings)) (set? required-vars) (every? variable? required-vars)
                   (positive? max-alternatives)
                   (= {:quality :exact :ordering [] :offset 0 :limit nil} demand)))
-    (descriptor/source-info! source-descriptor check!)
+    (descriptor! source-descriptor check!)
     (ensure! (and (set/subset? (:features request) (:features source-descriptor))
                   (set/subset? (:required-features source-descriptor) (:features request))))
     (when-let [sources (:datalevin.query.source/region-sources request)]
@@ -88,7 +86,7 @@
       (doseq [{:keys [symbol descriptor] :as entry} sources]
         (fields! entry #{:symbol :descriptor} #{})
         (ensure! (and (symbol? symbol) (.startsWith (name symbol) "$")))
-        (descriptor/source-info! descriptor check!)
+        (descriptor! descriptor check!)
         (ensure! (= (select-keys source-descriptor [:source-instance-id :compute-context-id])
                     (select-keys descriptor [:source-instance-id :compute-context-id]))))
       (ensure! (identical? source-descriptor
@@ -126,6 +124,21 @@
                     (set/subset? required-vars visible)))
       (doseq [clause clauses] (ensure! (set/subset? (contract/variables clause) visible))))
     request))
+
+(defn request!
+  "Validate an admitted request and its descriptors at the public boundary."
+  [runtime request]
+  (request*! runtime request descriptor/source-info!))
+
+(defn captured-request!
+  "Validate a core-built request using descriptors already owned and validated
+  by capture!. The supplied entries must be the compilation/session entries;
+  require object identity, so a replacement descriptor cannot bypass checks."
+  [runtime request entries]
+  (request*! runtime request
+    (fn [info check!]
+      (check!)
+      (ensure! (some #(identical? info (:descriptor %)) entries)))))
 
 (defn estimate!
   "Validate the two revised estimate shapes without replacing unknowns or

@@ -61,7 +61,7 @@
                                                         (remove #(some #{(:source-symbol %)} (:aliases group)) requests))))
                         token (rt/charge-copy! runtime (dissoc request :control))]
                     (rt/own! runtime #(control/release! token))
-                    (envelope/request! runtime request)
+                    (envelope/captured-request! runtime request (:entries group))
                     [{:request request :group group
                       :response (rt/with-context runtime {:source-symbol (:source-symbol leader) :region-id (:region-id leader)}
                                   (fn [runtime]

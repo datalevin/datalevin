@@ -34,6 +34,86 @@
    [java.util ArrayList Arrays Collection HashMap HashSet List SortedSet]
    [org.eclipse.collections.impl.set.sorted.mutable TreeSortedSet]))
 
+(defn scalar-update-entity-id
+  "Resolve an existing entity id for a scalar update, or nil to fall back.
+  Numeric ids use the in-memory maximum; lookup references and idents read db."
+  ^Long [db e]
+  (let [eid (cond
+              (integer? e)
+              (when (pos? (long e)) (long e))
+
+              (and (sequential? e) (= 2 (count e)))
+              (try (txcommon/entid db e) (catch Throwable _ nil))
+
+              (keyword? e)
+              (try (txcommon/entid db e) (catch Throwable _ nil))
+
+              :else nil)]
+    (when (and eid (pos? (long eid)) (<= (long eid) (long (:max-eid db))))
+      (long eid))))
+
+(defn- resolve-scalar-update-reference!
+  "Reuse an entity resolution within one read-only preparation request."
+  [db ^HashMap entities reference]
+  (or (.get entities reference)
+      (when-let [eid (scalar-update-entity-id db reference)]
+        (.put entities reference eid)
+        eid)))
+
+(defn- resolve-scalar-update-references
+  "Resolve distinct references in order, discarding results after this request."
+  [db references]
+  (let [entities (HashMap.)]
+    (when (reduce (fn [_ reference]
+                    (if (resolve-scalar-update-reference! db entities reference)
+                      true
+                      (reduced false)))
+                  true references)
+      entities)))
+
+(defn resolve-scalar-update-candidates!
+  "Resolve eager candidates before correction, retaining the alias/E-A check."
+  [db ^FastList candidates]
+  (if (= 4 (.size candidates))
+    ;; Singleton requests already satisfy distinctness.
+    (when-let [eid (scalar-update-entity-id db (.get candidates 0))]
+      (.set candidates 0 eid)
+      true)
+    (when-let [entities (resolve-scalar-update-references
+                         db (map #(.get candidates %) (range 0 (.size candidates) 4)))]
+      (let [seen (HashSet.)]
+        (loop [i 0]
+          (if (< i (.size candidates))
+            (let [eid (get entities (.get candidates i))
+                  attr (.get candidates (inc i))]
+              (when (.add seen [eid attr])
+                (.set candidates i eid)
+                (recur (+ i 4))))
+            true))))))
+
+(defn resolve-scalar-update-entries
+  "Bind all scalar entity operands before old-value reads or datom emission.
+  Return resolved entries or nil for missing/out-of-bound owners or E/A aliases.
+  Request-owned resolution scratch is shared by legacy and compiled adapters;
+  prepared representations and read-layout construction remain adapter work."
+  [db entries]
+  (txcommon/with-lookup-ref-cache db
+    (if (= 1 (count entries))
+      (let [[e attr value] (first entries)]
+        (when-let [eid (scalar-update-entity-id db e)]
+          [[eid attr value]]))
+      (let [entities (HashMap.)
+            seen (HashSet.)]
+        (reduce (fn [resolved [e attr value]]
+                  (if-let [eid (resolve-scalar-update-reference! db entities e)]
+                    ;; Distinct references can alias the same entity.
+                    ;; Repeated E/A updates need general ordering.
+                    (if (.add seen [eid attr])
+                      (conj resolved [eid attr value])
+                      (reduced nil))
+                    (reduced nil)))
+                [] entries)))))
+
 (defn read-scalar-entity
   [store eid ^ScalarEntityRead layout]
   (first (s/select-entities store [eid] (.-names layout) (.-aids layout)
@@ -103,7 +183,8 @@
 
 (defn- scalar-update-datoms
   [db entries tx-id entry-offset]
-  (let [n (count entries)
+  (let [entry-offset (long entry-offset)
+        n (count entries)
         attr-offset (inc entry-offset)
         value-offset (+ 2 entry-offset)]
     (if (= n 1)
@@ -179,7 +260,8 @@
   ([db entries layouts tx-id specialize?]
    (execute-scalar-region db entries layouts tx-id specialize? 0))
   ([db entries layouts tx-id specialize? entry-offset]
-   (let [n (count entries)
+   (let [entry-offset (long entry-offset)
+         n (count entries)
          attr-offset (inc entry-offset)
          value-offset (+ 2 entry-offset)]
      (if (and specialize? (nil? layouts))
@@ -263,6 +345,114 @@
                                  (assoc :max-tx tx-id))
           result             (assoc report :db-after db-after :tx-data tx-data :tempids tempids)]
       result)))
+
+(defn blind-unique-values-absent?
+  "Check normalized unique AV operands against the caller's current view."
+  [db ^FastList avs]
+  (or (nil? avs)
+      (loop [i 0]
+        (or (>= i (.size avs))
+            (let [[a v] (.get avs i)]
+              (and (nil? (txcommon/av-first-e db a v))
+                   (recur (unchecked-inc i))))))))
+
+(defn- append-blind-identity-upsert!
+  [db ^BlindEntity entity identity-attr eid tx-id layout tx-data]
+  (let [^FastList attrs (.-attrs entity)
+        old-values (when layout (read-scalar-entity (:store db) eid layout))]
+    (loop [i 0 tx-data tx-data]
+      (if (< i (.size attrs))
+        (let [attr  (.get attrs i)
+              value (.get attrs (unchecked-inc i))]
+          (if (= attr identity-attr)
+            (recur (+ i 2) tx-data)
+            (let [old-value (if layout
+                              (get old-values attr)
+                              (txcommon/preparation-first-v db eid attr))]
+              (cond
+                (nil? old-value)
+                (recur (+ i 2)
+                       (conj! tx-data
+                              (d/datom eid attr value tx-id)))
+
+                (d/value-equal? (idx/logical-value old-value) value)
+                (recur (+ i 2) tx-data)
+
+                :else
+                (recur (+ i 2)
+                       (-> tx-data
+                           (conj! (idx/retraction eid attr old-value tx-id))
+                           (conj! (d/datom eid attr value tx-id))))))))
+        tx-data))))
+
+(defn execute-blind-identity-upsert
+  "Emit one bound identity upsert into a fresh adapter-owned report. Pending
+  batches retain point reads; other callers may supply the existing read layout."
+  [report ^BlindEntity entity identity-attr eid layout]
+  (when (and (empty? (:tx-data report)) (empty? (:tempids report)))
+    (let [db (:db-after report)
+          tx-id (inc (long (:max-tx db)))
+          layout (when-not txcommon/*batch-prepare* layout)
+          tx-data (persistent! (append-blind-identity-upsert!
+                                 db entity identity-attr eid tx-id layout (transient [])))
+          tempid (.-tempid entity)
+          tempids (cond-> {:db/current-tx tx-id}
+                    (and tempid (not (txprep/auto-tempid? tempid))) (assoc tempid eid))
+          db-after (cond-> (assoc db :max-tx tx-id)
+                     (> (long eid) (long (:max-eid db))) (assoc :max-eid eid))]
+      (assoc report :db-after db-after :tx-data tx-data :tempids tempids))))
+
+(defn execute-blind-upserts
+  "Bind every independent identity owner before old-value reads or emission.
+  Consume shared normalized operands and optional preproven identity AVs. Return
+  an updated fresh report, or nil for ambiguous AVs/owners without changing state."
+  [report ^FastList entities ^FastList identity-avs store-schema]
+  (when (and (empty? (:tx-data report)) (empty? (:tempids report)))
+    (let [db (:db-after report)
+          seen-avs (HashSet.)
+          seen-eids (HashSet.)
+          ^FastList resolutions (FastList. (.size entities))
+          max-eid
+          (loop [i 0 max-eid (long (:max-eid db))]
+            (if (< i (.size entities))
+              (when-let [[a v :as av]
+                         (if identity-avs
+                           (.get identity-avs i)
+                           (compile/blind-identity-upsert-av store-schema
+                             (.get entities i)))]
+                (when (.add seen-avs av)
+                  (let [stored-eid (txcommon/av-first-e db a v)
+                        eid (if stored-eid (long stored-eid) (inc max-eid))]
+                    (when (.add seen-eids eid)
+                      (.add resolutions [a eid (some? stored-eid)])
+                      (recur (inc i) (if stored-eid max-eid eid))))))
+              max-eid))]
+      (when max-eid
+        (let [tx-id (inc (long (:max-tx db)))
+              [tx-data tempids]
+              (loop [i 0 tx-data (transient []) tempids (transient {})]
+                (if (< i (.size entities))
+                  (let [^BlindEntity entity (.get entities i)
+                        [identity-attr eid stored?] (.get resolutions i)
+                        ^FastList attrs (.-attrs entity)
+                        tx-data (if stored?
+                                  (append-blind-identity-upsert!
+                                    db entity identity-attr eid tx-id nil tx-data)
+                                  (loop [j 0 tx-data tx-data]
+                                    (if (< j (.size attrs))
+                                      (recur (+ j 2)
+                                             (conj! tx-data
+                                                    (d/datom eid (.get attrs j)
+                                                             (.get attrs (inc j)) tx-id)))
+                                      tx-data)))
+                        tempid (.-tempid entity)]
+                    (recur (inc i) tx-data
+                           (if (and tempid (not (txprep/auto-tempid? tempid)))
+                             (assoc! tempids tempid eid) tempids)))
+                  [(persistent! tx-data)
+                   (assoc! tempids :db/current-tx tx-id)]))]
+          (assoc report :db-after (assoc db :max-eid max-eid :max-tx tx-id)
+                 :tx-data tx-data :tempids (persistent! tempids)))))))
 
 (deftype ^:private TxStep [report entities])
 (deftype ^:private TxRetry [report])

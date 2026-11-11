@@ -17,6 +17,14 @@
   (-logical-type [value] "Return this value's complete custom type descriptor.")
   (-retained-bytes [value] "Return a conservative positive integer heap charge."))
 
+(defn custom-value?
+  "Recognize direct protocol implementations without walking Java supertypes
+  for every ordinary scalar/container. Preserve externally extended types when
+  the protocol has extension entries; no value or class cache is retained."
+  [x]
+  (or (instance? datalevin.query.source.value.IQuerySourceValue x)
+      (boolean (and (seq (:impls IQuerySourceValue)) (satisfies? IQuerySourceValue x)))))
+
 (declare matches-type?)
 
 (defn inferred-type
@@ -24,7 +32,7 @@
   and nil use :data; a custom value retains its complete declared identity."
   [x]
   (cond (nil? x) :data
-        (satisfies? IQuerySourceValue x) (-logical-type x)
+        (custom-value? x) (-logical-type x)
         :else (or (some #(when (matches-type? % x) %) (disj scalar-types :data)) :data)))
 
 (defn fail!
@@ -47,25 +55,42 @@
 (defn- owned-copy* [x check! depth]
   (when check! (check!))
   (check-depth! depth :values)
-  (if (satisfies? IQuerySourceValue x)
+  (if (custom-value? x)
     x
     (let [_ (when (custom-comparator? x) (fail! :query-source/unsupported :values))
           copy-child #(owned-copy* % check! (inc (long depth)))
           copy (cond
                  (bytes? x) (aclone ^bytes x)
                  (= Date (class x)) (Date. (.getTime ^Date x))
-                 (vector? x) (mapv copy-child x)
-                 (plain-map? x) (into (if (sorted? x) (empty x) {})
-                                      (map (fn [[k v]] [(copy-child k) (copy-child v)])) x)
-                 (set? x) (into (if (sorted? x) (empty x) #{}) (map copy-child) x)
-                 (list? x) (apply list (map copy-child x))
+                 (vector? x)
+                 ;; Map entries and other vector implementations need a plain
+                 ;; vector, just as vector views must detach their backing.
+                 (let [base (if (instance? clojure.lang.PersistentVector x) x (into [] x))]
+                   (reduce-kv (fn [out i v]
+                                (let [copied (copy-child v)]
+                                  (if (identical? v copied) out (assoc out i copied)))) base base))
+                 (plain-map? x)
+                 (reduce-kv (fn [out k v]
+                              (let [key (copy-child k) val (copy-child v)]
+                                (cond (not (identical? k key)) (assoc (dissoc out k) key val)
+                                      (not (identical? v val)) (assoc out k val)
+                                      :else out))) x x)
+                 (set? x)
+                 (reduce (fn [out v]
+                           (let [copied (copy-child v)]
+                             (if (identical? v copied) out (conj (disj out v) copied)))) x x)
+                 (list? x)
+                 (let [copied (mapv copy-child x)]
+                   (if (every? true? (map identical? x copied)) x (apply list copied)))
                  :else x)]
       (when check! (check!))
       (if-let [metadata (when (instance? clojure.lang.IObj copy) (meta x))]
-        (with-meta copy (copy-child metadata)) copy))))
+        (let [copied (copy-child metadata)]
+          (if (identical? (meta copy) copied) copy (with-meta copy copied))) copy))))
 
 (defn owned-copy
-  "Detach mutable leaves in supported values, including metadata. Custom values
+  "Detach mutable leaves and vector views, including in metadata. Share unchanged
+  persistent containers after checking every child. Custom values
   follow their immutable opt-in contract and are retained as supplied. The
   caller must reserve the value's charge before copying retained query state.
   An internal check callback can stop copying on cancellation."
@@ -173,7 +198,7 @@
   (when (and metadata-phase (not (metadata-node? x)))
     (fail! :query-source/invalid metadata-phase))
   (cond
-    (satisfies? IQuerySourceValue x)
+    (and (nil? metadata-phase) (custom-value? x))
     (let [n (-retained-bytes x)]
       (when-not (and (integer? n) (<= 64 n Long/MAX_VALUE))
         (fail! :query-source/invalid :values))
@@ -258,7 +283,7 @@
       (case (:kind t)
         :tuple (and (vector? x) (= (count x) (count (:elements t)))
                     (every? true? (map #(matches-type*? %1 %2 charged? check! (inc (long depth))) (:elements t) x)))
-        :custom (and (satisfies? IQuerySourceValue x) (= t (-logical-type x)))
+        :custom (and (custom-value? x) (= t (-logical-type x)))
         false)
       (case t
         :boolean (boolean? x)
@@ -301,7 +326,7 @@
   (check!)
   (or (nil? x)
       (and (not (matches-type? type x check!))
-           (not (or (satisfies? IQuerySourceValue x)
+           (not (or (custom-value? x)
                     (= :custom (:kind type))
                     (and (number? x) (#{:long :bigint :float :double :bigdec} type))
                     (and (= :tuple (:kind type)) (sequential? x)))))))

@@ -51,6 +51,10 @@
                           (.add (biginteger (System/nanoTime))
                                 (.multiply (biginteger timeout-ms)
                                            (biginteger 1000000))))
+         ;; Normal deadlines fit in a long. Preserve exact arithmetic for huge
+         ;; timeouts, without allocating BigInteger comparisons at every value.
+         local-deadline (if (and local-deadline (<= (.bitLength ^BigInteger local-deadline) 63))
+                          (.longValue ^BigInteger local-deadline) local-deadline)
          deadlines (keep identity [local-deadline (when parent (.-deadline ^Control parent))])
          control (Control. (if parent (merge-with min (.-limits ^Control parent) limits)
                                (merge default-limits limits))

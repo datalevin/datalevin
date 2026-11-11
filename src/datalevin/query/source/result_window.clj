@@ -29,7 +29,7 @@
   (when-let [{:keys [limit offset order]} (specification parsed)]
     (let [ctl (:control runtime) check! #(control/check-active! ctl)
           width (count (parser/find-elements (:qfind parsed)))
-          capacity (+' limit offset)
+          capacity (+' (long limit) (long offset))
           cmp (result/order-comps get [] (mapcat (juxt :column :direction) order) check!)
           worst-first (reify Comparator (compare [_ a b] (.compare ^Comparator cmp (:key b) (:key a))))
           heap (PriorityQueue. 1 worst-first) members (QueryKey$KeyMap.)
@@ -43,7 +43,7 @@
                (check!)
                (let [key (subvec row 0 width)]
                  (when (and (not (.containsKey members key))
-                            (or (< (.size heap) capacity)
+                            (or (not (value/at-most? capacity (.size heap)))
                                 (and (seq order) (neg? (.compare ^Comparator cmp key (:key (.peek heap)))))))
                    (when (= (.size heap) capacity)
                      (let [old (.poll heap)] (.remove members (:key old)) (release! old)))
@@ -55,5 +55,5 @@
                          (.add heap entry) (.put members (:key entry) entry))
                        (catch Throwable e (control/release! token) (control/release! overhead) (throw e)))))))
        :rows (fn [] (check!)
-               (if (<= (.size heap) offset) []
+               (if (<= (.size heap) (long offset)) []
                    (mapv :row (iterator-seq (.iterator heap)))))})))

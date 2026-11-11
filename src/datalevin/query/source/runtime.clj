@@ -157,6 +157,11 @@
   (let [control (:control runtime)
         limits (control/limits control)
         categories (if result? [:retained-bytes :result-bytes] [:retained-bytes])
+        ;; Preflight walks retain no values. Read the ledger once, then compare
+        ;; incremental sizes with this headroom. The final atomic reservation
+        ;; still checks concurrent reservations before any owned copy is made.
+        usage (control/usage control)
+        headroom (reduce min (map #(- (long (get limits %)) (long (get usage %))) categories))
         bytes (volatile! overhead)
         check-limit! (fn [usage category charge]
                        (let [maximum (long (get limits category))
@@ -167,15 +172,17 @@
                                          :attempted attempted}))))
         check! (fn []
                  (source/check-active! control)
-                 (let [usage (control/usage control)]
-                   (when result? (check-limit! usage :result-rows 1))
+                 (when-not (value/at-most? @bytes headroom)
                    (doseq [category categories] (check-limit! usage category @bytes))))
         observe! (fn [increment]
-                   (vreset! bytes (value/add-charge (long @bytes)
-                                    (value/multiply-charge multiplier increment)))
+                   (when-not (zero? increment)
+                     (vreset! bytes (value/add-charge (long @bytes)
+                                      (if (= 1 multiplier) increment
+                                        (value/multiply-charge multiplier increment)))))
                    (check!))]
     ;; Fixed overhead and row limits can reject without visiting any values.
     (check!)
+    (when result? (check-limit! usage :result-rows 1))
     (size! x observe!)
     ;; Preflight does not mutate the shared ledger. A provider or nested query
     ;; can reserve concurrently; the final atomic reservation checks it again.

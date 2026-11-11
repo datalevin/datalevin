@@ -53,6 +53,7 @@
    [java.nio.file.attribute FileAttribute PosixFilePermissions]
    [java.util Collections Map UUID WeakHashMap]
    [java.util.concurrent ConcurrentHashMap Semaphore TimeUnit]
+   [datalevin.db.tx.plan TxPlan]
    [datalevin.storage Store]))
 
 (def ^:private transient-runtime-store-max-attempts 8)
@@ -1692,6 +1693,14 @@
 
     nil))
 
+(defn- scalar-prepared-request?
+  "Reuse scalar collector bookkeeping for accepted legacy or compiled scalar
+  operands. Stale plans retain the shared hook's owned-writer fallback."
+  [[kind outcome]]
+  (or (identical? kind :scalar-update)
+      (and (identical? kind :compiled) (instance? TxPlan outcome)
+           (contains? #{:scalar :scalar-operations :scalar-aliases} (:strategy outcome)))))
+
 (defn- transact*
   ([deps db0 txs tx-meta s? server db-name writing?]
    (transact* deps db0 txs tx-meta s? server db-name writing?
@@ -1732,7 +1741,7 @@
                       (let [report (transact @tx)]
                         (reset! tx (:db-after report))
                         (stamp-report report)))
-               report (if (= :scalar-update (first prepared))
+               report (if (scalar-prepared-request? prepared)
                         ;; Retain pending scalar datoms across requests and
                         ;; freeze the native suffix after resolution, as the
                         ;; embedded collector does. The general body wrapper

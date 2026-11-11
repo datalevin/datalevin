@@ -5,9 +5,9 @@
   (:require [clojure.set :as set]
             [datalevin.query.source :as source]
             [datalevin.query.source.control :as control]
-            [datalevin.query.source.descriptor :as descriptor]
             [datalevin.query.source.permissions :as permissions]
             [datalevin.query.source.runtime :as rt]
+            [datalevin.query.source.schema :as schema]
             [datalevin.query.source.value :as value :refer [fail!]])
   (:import [java.io Closeable]
            [java.util IdentityHashMap]))
@@ -171,7 +171,7 @@
                           (ensure! (and (nil? native) (satisfies? source/IQuerySource source)) :inputs)
                           (when-not (.containsKey descriptors descriptor)
                             (own-token! (rt/charge-metadata! runtime descriptor :descriptor))
-                            (descriptor/source-info! descriptor #(control/check-active! ctl))
+                            (schema/admitted-source-info! descriptor #(control/check-active! ctl))
                             (.put descriptors descriptor true))
                           {:symbol symbol :source source :descriptor descriptor})
                         (do (ensure! (some? native) :inputs) {:symbol symbol :native native})))) entries)

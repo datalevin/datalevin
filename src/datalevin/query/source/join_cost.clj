@@ -17,24 +17,25 @@
             (let [output (set (map :variable columns))
                   dependent? (seq requires)
                   shared? (seq (set/intersection known output))
-                  n (if (zero? n) 1.0 (double n))]
+                  n (if (zero? (compare n 0)) 1.0 (double n))]
               (when (or dependent? (not shared?))
-                (let [returned (max 1.0 (min Double/MAX_VALUE (* tuples n)))]
+                (let [returned (max 1.0 (min Double/MAX_VALUE (* (double tuples) n)))]
                   {:known (set/union known output) :tuples returned
-                   :work-rows (min Double/MAX_VALUE (+ work-rows tuples returned))
-                   :peak-rows (max peak-rows returned)})))))))
+                   :work-rows (min Double/MAX_VALUE (+ (double work-rows) (double tuples) returned))
+                   :peak-rows (max (double peak-rows) returned)})))))))
     {:known (set (map :variable inputs)) :tuples 1.0 :work-rows 0.0 :peak-rows 1.0} selected))
 
 (defn select
   "Keep the original feasible plan, then compare complete alternatives with a
   different first access. All attempts share the remaining 4096-state allowance
-  and a 20 ms optional CPU budget. Unknown estimates retain the original plan."
+  and a 20 ms optional CPU budget. Small plans use at most 128 additional
+  states and 1 ms. Unknown estimates retain the original plan."
   [arguments row-count]
   (let [checks (volatile! 0) check! (:check! arguments)
-        counted! #(do (vswap! checks inc) (check!))
+        counted! #(do (vreset! checks (inc (long @checks))) (check!))
         baseline (dependency/schedule (assoc arguments :check! counted!))
         initial (when (= :complete (:status baseline)) (price (:choices baseline) (:inputs arguments) row-count))
-        started (System/nanoTime) maximum (:max-states arguments)]
+        started (System/nanoTime) maximum (long (:max-states arguments))]
     (if-not initial baseline
       (let [choices (:choices arguments)
             seed (into {} (map (juxt :variable identity)) (:inputs arguments))
@@ -50,15 +51,24 @@
                                      {:seen (conj seen source-work) :roots (conj roots choice)})))
                                {:seen #{} :roots []})
                        :roots (take 16))
+            ;; The baseline already evaluated this starting work. Repeating
+            ;; its scan/lookup variants cannot discover a different driver.
+            first-access (first (filter #(= :access (:kind %)) (:choices baseline)))
+            work-key #(into #{} (map (fn [id] (if (vector? id) (first id) id))) (:covers %))
+            roots (remove #(= (work-key first-access) (work-key %)) roots)
+            small? (and (<= (count (:required-work arguments)) 8) (<= (count choices) 32))
+            budget-ns (if small? 1000000 20000000)
+            maximum (if small? (min maximum (+ (long @checks) 128)) maximum)
             early (vec (take-while #(= :core (:kind %)) choices))
             row-key (juxt :work-rows :peak-rows)
             _ (when-not (pos? maximum) (throw (IllegalArgumentException. "invalid search bound")))]
         (loop [pending (seq roots) best baseline best-price initial evaluated 1 starts []]
-          (if (or (nil? pending) (>= @checks maximum) (>= (- (System/nanoTime) started) 20000000))
+          (if (or (nil? pending) (>= (long @checks) maximum) (>= (- (System/nanoTime) started) budget-ns))
             (assoc best :cost-changed? (not (and (= (count (:choices best)) (count (:choices baseline)))
                                                        (every? true? (map identical? (:choices best) (:choices baseline)))))
                         :join-cost (select-keys best-price [:work-rows :peak-rows])
                         :cost-search {:evaluated evaluated :states @checks :starts starts
+                                      :budget-ns budget-ns :max-states maximum
                                       :elapsed-ns (- (System/nanoTime) started)})
             (let [root (first pending)
                   remaining (remove #(identical? root %) (drop (count early) choices))
@@ -68,11 +78,13 @@
                                                           (remove #(seq (:requires %)) remaining))))
                   attempt (try
                             (dependency/schedule
-                              (assoc arguments :choices ordered :max-states (max 1 (- maximum @checks))
+                              (assoc arguments :choices ordered :max-states (max 1 (- maximum (long @checks)))
                                      :check! #(do (check!)
-                                                  (when (>= (vswap! checks inc) maximum)
-                                                    (throw (ex-info "Cost search budget" {::budget true})))
-                                                  (when (>= (- (System/nanoTime) started) 20000000)
+                                                  (let [n (inc (long @checks))]
+                                                    (vreset! checks n)
+                                                    (when (>= n maximum)
+                                                      (throw (ex-info "Cost search budget" {::budget true}))))
+                                                  (when (>= (- (System/nanoTime) started) budget-ns)
                                                     (throw (ex-info "Cost search budget" {::budget true}))))))
                             (catch clojure.lang.ExceptionInfo e (when-not (::budget (ex-data e)) (throw e))))
                   priced (when (= :complete (:status attempt)) (price (:choices attempt) (:inputs arguments) row-count))

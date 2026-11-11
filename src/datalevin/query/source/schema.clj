@@ -41,12 +41,10 @@
                                (= value-type (get-in domains [reference-domain :entity-type])))))))))
   schema)
 
-(defn source-info!
-  "Validate one fully admitted revised EAV descriptor without provider I/O.
-  All generic type fields retain their complete identity. Qualified envelope
-  annotations are inert; attribute/domain dictionaries have exact membership."
-  ([info] (source-info! info (fn [])))
-  ([info check!]
+(defn admitted-source-info!
+  "Check descriptor structure after metadata-charge has admitted every value,
+  annotation, and retained vector parent. No second portable-value walk."
+  [info check!]
    (check!)
    (ensure! (and (value/plain-map? info) (contains? info :spi-versions)
                  (set? (:spi-versions info)) (seq (:spi-versions info))
@@ -55,8 +53,7 @@
    (fields! info #{:spi-versions :source-instance-id :compute-context-id :definition-id
                    :definition-fingerprint :features :required-features :pattern-contract
                    :logical-schema :read-capabilities :scope :completion})
-   (ensure! (and (value/portable? info check!)
-                 (every? #(identifier? (get info %) check!)
+   (ensure! (and (every? #(identifier? (get info %) check!)
                          [:source-instance-id :compute-context-id :definition-id])
                  (string? (:definition-fingerprint info)) (seq (:definition-fingerprint info))
                  (set? (:features info)) (every? keyword? (:features info))
@@ -75,5 +72,13 @@
                    (or (= :restricted (:kind scope)) (empty? (:parameters scope)))))
      (fields! completion #{:domain :extent})
      (ensure! (and (= :finite (:domain completion)) (#{:all-matches :declared-view} (:extent completion)))))
-   info))
+   info)
+
+(defn source-info!
+  "Validate a revised EAV descriptor, including all portable annotations.
+  Call admitted-source-info! only after bounded metadata admission."
+  ([info] (source-info! info (fn [])))
+  ([info check!]
+   (ensure! (value/portable? info check!))
+   (admitted-source-info! info check!)))
 

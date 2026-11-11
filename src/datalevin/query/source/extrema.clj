@@ -33,7 +33,7 @@
 
 (defn- extremum! [runtime {:keys [session request]} operator values]
   (let [ctl (:control runtime) limits (control/limits ctl)
-        maximum (min 256 (:binding-rows limits))
+        maximum (min 256 (long (:binding-rows limits)))
         ;; Leave one slot for the previous chunk's winner. Extrema compose
         ;; exactly under the source's declared, deterministic total ordering.
         chunk-size (max 1 (dec maximum))
@@ -51,7 +51,7 @@
               (when (> (count input) maximum)
                 (fail! :query-source/limit :reserve
                        {:category :binding-rows :maximum maximum :attempted (count input)}))
-              (when (> bytes (:binding-bytes limits))
+              (when-not (value/at-most? bytes (long (:binding-bytes limits)))
                 (fail! :query-source/limit :reserve
                        {:category :binding-bytes :maximum (:binding-bytes limits) :attempted bytes})))
             (let [token (rt/charge-copy! runtime input)

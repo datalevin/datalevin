@@ -289,6 +289,85 @@
                 (assoc ctx :opts {:auto-entity-time? true}) [update insert])))
     (is (empty? @effects))))
 
+(deftest mixed-coercions-match-scalar-correction-without-changing-input
+  (doseq [[vt raw]
+          [[:db.type/long (int 123)] [:db.type/long 1.25]
+           [:db.type/ref (int 2)] [:db.type/ref 2N] [:db.type/ref (int 0)]
+           [:db.type/double (float -0.0)] [:db.type/float 1.25]
+           [:db.type/bigint 123N] [:db.type/bigdec 123]
+           [:db.type/string 42] [:db.type/string false]
+           [:db.type/boolean 0] [:db.type/boolean false]
+           [:db.type/instant 123] [:db.type/instant (java.time.Instant/ofEpochMilli 123)]
+           [:db.type/uuid "550e8400-e29b-41d4-a716-446655440000"]]
+          validate? [false true]
+          side (if (= vt :db.type/ref) [:insert] [:insert :update])]
+    (let [context (-> ctx (assoc-in [:schema :converted] {:db/aid 7 :db/valueType vt})
+                      (assoc :opts {:validate-data? validate?}))
+          forms (if (= side :insert)
+                  [[:db/add 1 :value 1] {:db/id "new" :converted raw}]
+                  [[:db/add 1 :converted raw] {:db/id "new" :text "new"}])
+          expected (try {:value (prepare/correct-scalar-value validate? vt raw)}
+                        (catch Exception _ {:rejected true}))
+          p (compile/compile-tx context forms)]
+      (if (:rejected expected)
+        (is (nil? p))
+        (let [^MixedOperands operands (:entries p)
+              entries (.-entries operands)
+              actual (if (= side :insert)
+                       (aget ^objects (.-attrs ^MixedInsert (nth entries 1)) 1)
+                       (.-value ^MixedUpdate (nth entries 0)))
+              wanted (:value expected)]
+          (is (= :mixed (:strategy p)))
+          (is (identical? context (:ctx p)))
+          (is (= (class wanted) (class actual)))
+          (cond
+            (instance? Double wanted)
+            (is (= (Double/doubleToRawLongBits wanted) (Double/doubleToRawLongBits actual)))
+            (instance? Float wanted)
+            (is (= (Float/floatToRawIntBits wanted) (Float/floatToRawIntBits actual)))
+            :else (is (= wanted actual)))))
+      (is (identical? raw (if (= side :insert)
+                           (:converted (nth forms 1)) (nth (first forms) 3)))))))
+
+(deftest mixed-coercion-retains-symbolic-refs-and-declines-before-effects
+  (let [effects (atom []) word (str "mixed-compiler-purity-" (random-uuid))
+        context (-> ctx (assoc :opts {:validate-data? false})
+                    (assoc-in [:schema :word] {:db/aid 7 :db/valueType :db.type/keyword})
+                    (assoc-in [:schema :uuid] {:db/aid 8 :db/valueType :db.type/uuid}))
+        host (proxy [Object clojure.lang.IMeta] []
+               (meta [] (swap! effects conj :meta) nil)
+               (toString [] (swap! effects conj :string) "host")
+               (hashCode [] (swap! effects conj :hash) 0))
+        number (proxy [java.math.BigInteger] ["1"]
+                 (bitLength [] 128)
+                 (longValue [] (swap! effects conj :long) 1))
+        wrapped (clojure.lang.BigInt/fromBigInteger number)
+        tail (lazy-seq (swap! effects conj :tail) (list {:text "late"}))
+        update [:db/add 1 :value 1.25]
+        forms [update (array-map :db/id "self" :reference "self" :text 42)
+               {:db/id -1 :reference "self" :value 2N} {:reference -1}]
+        p (compile/compile-tx context forms)
+        ^MixedOperands operands (:entries p)
+        inserts (rest (.-entries operands))]
+    (is (= :mixed (:strategy p)))
+    (is (= ["self" -1 nil] (mapv #(.-tempid ^MixedInsert %) inserts)))
+    (is (= ["self" "self" -1]
+           (mapv (fn [^MixedInsert entry]
+                   (get (into {} (map #(vector (first %) (second %))
+                                     (partition 3 (seq (.-attrs entry))))) :reference)) inserts)))
+    (is (nil? (clojure.lang.Keyword/find word)))
+    (doseq [forms [[update host] [update {:text host}] [update {:value wrapped}]
+                   [update {:reference wrapped}] [update {:word word}]
+                   [update {:text (java.util.Date. 1)}] [update {:text (byte-array [1])}]
+                   [update {:text tail}] [update {:uuid "invalid"}]
+                   [update {:db/id "self" :reference "later"} {:db/id "later" :text 42}]
+                   [update {:reference 1.5}] [update {:reference -2}]
+                   [update {:text 42} update] [update {:text 42} {:identity "unsupported"}]
+                   [update {:text 42} (with-meta {:text "late"} {:source true})]]]
+      (is (nil? (compile/compile-tx context forms))))
+    (is (nil? (clojure.lang.Keyword/find word)))
+    (is (empty? @effects))))
+
 (deftest ordinary-attribute-proofs-keep-writer-obligations-distinct
   (let [effects (atom [])
         schema {:value {:db/valueType :db.type/long}
@@ -358,7 +437,66 @@
            [[{:db/id "new" :value 1} [:db/add 1 :text "one"]] :mixed :mixed]]]
     (is (= shape (compile/literal-request-shape forms)))
     (is (= strategy (:strategy (compile/compile-tx ctx forms)))))
-  (is (nil? (compile/literal-request-shape [{:db/id 1 :value 1} {:value 2}]))))
+  (is (= :mixed (compile/literal-request-shape [{:db/id 1 :value 1} {:value 2}]))))
+
+(deftest mixed-map-replacements-share-ordered-operands-and-normalized-ids
+  (let [context (assoc ctx :opts {:validate-data? false})
+        forms [(array-map :text 42 :db/id (int 7) :value 1.9)
+               {:db/id "self" :reference "self" :text false}
+               [:db/add 2N :text :changed/value]
+               {:db/id 7N :reference 2}]
+        ;; Reference replacements keep their previous mixed exclusion.
+        _ (is (nil? (compile/compile-tx context forms)))
+        forms (assoc forms 3 {:db/id 7N :untyped 3})
+        context (assoc-in context [:schema :untyped] {:db/aid 7})
+        plan (compile/compile-tx context forms)
+        ^MixedOperands operands (:entries plan)
+        entries (.-entries operands)
+        updates (filter #(instance? MixedUpdate %) entries)]
+    (is (= :mixed (:strategy plan)))
+    (is (identical? context (:ctx plan)))
+    (is (= [MixedUpdate MixedUpdate MixedInsert MixedUpdate MixedUpdate] (mapv class entries)))
+    (is (= [[7 :text "42"] [7 :value 1] [2 :text ":changed/value"] [7 :untyped 3]]
+           (mapv (fn [^MixedUpdate entry] [(.-e entry) (.-attr entry) (.-value entry)]) updates)))
+    (is (every? #(instance? Long (.-e ^MixedUpdate %)) updates))
+    (is (= 7 (.-required-eid operands)))
+    (is (false? (.-prepare-reader? operands)))
+    (is (instance? Integer (:db/id (first forms))))
+    (is (= 1.9 (:value (first forms))))))
+
+(deftest mixed-map-id-aliases-and-unsupported-fields-decline-without-effects
+  (let [effects (atom [])
+        host (proxy [Object clojure.lang.IMeta] []
+               (meta [] (swap! effects conj :meta) nil)
+               (hashCode [] (swap! effects conj :hash) 0)
+               (toString [] (swap! effects conj :string) "host"))
+        wrapped (clojure.lang.BigInt/fromBigInteger
+                  (proxy [java.math.BigInteger] ["1"]
+                    (bitLength [] 128)
+                    (longValue [] (swap! effects conj :long) 1)))
+        context (assoc many-ctx :opts {:validate-data? false})
+        insert {:text 42}]
+    (doseq [forms [[{:db/id 1 :value 1} insert {:db/id (int 1) :value 2}]
+                   [{:db/id 1N :value 1} insert [:db/add (biginteger 1) :value 2]]
+                   [[:db/add 1N :value 1] insert [:db/add (int 1) :value 2]]
+                   [{:db/id 1 :numbers [1 2]} insert]
+                   [{:db/id 1 :identity "one"} insert]
+                   [{:db/id 1 :value host} insert]
+                   [{:db/id wrapped :value 1} insert]
+                   [{:db/id 1} insert]
+                   [{:db/id 0 :value 1} insert]
+                   [(with-meta {:db/id 1 :value 1} {:source true}) insert]
+                   [{:db/id 1 :value 1} insert host]]]
+      (is (nil? (compile/compile-tx context forms))))
+    (is (empty? @effects)))
+  (doseq [eid [1 (int 1) 1N (biginteger 1)]]
+    (let [plan (compile/compile-tx ctx [{:db/id eid :value 1} {:text "new"}])
+          ^MixedOperands operands (:entries plan)]
+      (is (= :mixed (:strategy plan)))
+      (is (true? (.-prepare-reader? ^MixedOperands
+                   (:entries (compile/compile-tx ctx
+                               [{:db/id eid :value 1 :text "updated"} {:text "new"}])))))
+      (is (= 1 (.-required-eid operands))))))
 
 (deftest canonical-scalar-aliases-retain-symbolic-entity-operands
   (let [lookup [:identity "one"]

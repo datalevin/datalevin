@@ -300,7 +300,7 @@
   (when-let [reference (d/storage-reference datom)]
     (when (instance? ResolvedGiant reference)
       (let [^ResolvedGiant reference reference
-            writer (.get (.-writer reference))]
+            writer (.get ^WeakReference (.-writer reference))]
         (when (and writer (identical? writer (owned-writer lmdb))
                    (= (.-e reference) (.-e datom))
                    (= (.-a reference) (.-a datom))

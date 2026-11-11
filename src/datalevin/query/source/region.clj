@@ -52,8 +52,8 @@
   "Derive advisory LIKE disjunctions without replacing their scoped operators.
   Every branch must be one flat LIKE on the same variable with a literal pattern."
   [region regions sites check!]
-  (let [base (+' 1 (reduce max -1 (map (comp :id :clause) (:patterns region)))
-                (count (:core-clauses region)))]
+  (let [base (value/add-charge (inc (long (count (:core-clauses region))))
+                               (reduce max -1 (map (comp :id :clause) (:patterns region))))]
     (into []
       (keep-indexed
         (fn [i site]
@@ -69,8 +69,8 @@
                                         (instance? Constant (second %)) (string? (:value (second %)))) args)
                          (apply = (map #(get-in % [0 :symbol]) args))
                          (contains? (:exports site) (get-in args [0 0 :symbol])))
-                (let [id (+' base i)]
-                  (when (> id Long/MAX_VALUE) (fail! :query-source/limit :planning))
+                (let [id (value/add-charge (long i) base)]
+                  (when-not (value/at-most? id Long/MAX_VALUE) (fail! :query-source/limit :planning))
                   {:id id :kind :predicate :operator :like-any :semantics-version 1
                    :args [[:var (get-in args [0 0 :symbol])]
                           [:const (mapv #(get-in % [1 :value]) args)]]}))))) sites))))
@@ -398,7 +398,7 @@
   producers and values from another scope never become predicate constants."
   [region variables]
   (let [bindings (:bindings region)
-        base (inc (reduce max -1 (map (comp :id :clause) (:patterns region))))]
+        base (value/add-charge 1 (reduce max -1 (map (comp :id :clause) (:patterns region))))]
     (into []
       (keep-indexed
         (fn [i {:keys [node]}]
@@ -411,8 +411,8 @@
                                  [:const (get bindings (:symbol %))] (term %)) args)
                     used (into #{} (keep #(when (= :var (first %)) (second %))) args)]
                 (when (and (seq used) (set/subset? used variables))
-                  (let [id (+' base i)]
-                    (when (> id Long/MAX_VALUE) (fail! :query-source/limit :planning))
+                  (let [id (value/add-charge (long i) base)]
+                    (when-not (value/at-most? id Long/MAX_VALUE) (fail! :query-source/limit :planning))
                     {:id id :kind :predicate :operator operator :semantics-version 1 :args args})))))))
       (:core-clauses region))))
 

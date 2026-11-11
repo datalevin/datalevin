@@ -328,7 +328,7 @@
                    nil (.entrySet widths))]
          (doseq [entry entries]
            (let [eid (nth entry entry-offset)
-                 attr (nth entry (inc entry-offset))]
+                 attr (nth entry (inc (long entry-offset)))]
              (when-let [^FastList names (get attributes eid)]
                (.add names attr))))
          (reduce-kv (fn [layouts eid names]
@@ -874,15 +874,63 @@
        (when-let [infos (coercible-blind-infos ctx forms (:allow-small-unique? options))]
          (compile-blind-region* ctx forms options infos true)))))
 
-(defn- mixed-value-ready? [validate? props ^HashSet tempids value]
+(defn- mixed-scalar-ready? [validate? vt value coerce?]
+  (and (inert-scalar-value? value)
+       (or (canonical-scalar-value? validate? vt value)
+           (and coerce?
+                (or (not (instance? java.util.Date value))
+                    (identical? vt :db.type/instant))
+                (pure-scalar-coercion? vt value)))))
+
+(defn- mixed-value-ready? [validate? props ^HashSet tempids value coerce?]
   (if (identical? :db.type/ref (:db/valueType props))
     (or (and (instance? Long value) (not (neg? (long value))))
-        (and (literal-tempid? value) (.contains tempids value)))
-    (and (inert-scalar-value? value)
-         (canonical-scalar-value? validate? (:db/valueType props) value))))
+        (and (literal-tempid? value) (.contains tempids value))
+        (and coerce? (ordinary-nonnegative-id? value)))
+    (mixed-scalar-ready? validate? (:db/valueType props) value coerce?)))
+
+(defn- correct-mixed-value
+  [validate? vt value]
+  (if (or (and (identical? vt :db.type/ref)
+               ;; Self/back tempids stay symbolic until writer binding. Long
+               ;; concrete references, including zero, already need no coercion.
+               (or (instance? Long value) (literal-tempid? value)))
+          (canonical-scalar-value? validate? vt value))
+    value
+    (try (prepare/correct-scalar-value validate? vt value)
+         (catch Exception _ nil))))
+
+(defn- correct-mixed-entries!
+  "Normalize only the fully proven request-owned operand stream. Nothing has
+  escaped to a writer; correction failure discards it and retains original input."
+  [validate? ^HashMap infos ^ArrayList entries]
+  (loop [index 0]
+    (if (< index (.size entries))
+      (let [entry (.get entries index)]
+        (when
+          (if (instance? MixedInsert entry)
+            (let [^objects attrs (.-attrs ^MixedInsert entry)]
+              (loop [offset 0]
+                (if (< offset (alength attrs))
+                  (let [^MixedAttrInfo info (aget attrs (+ offset 2))]
+                    (when-some [value (correct-mixed-value
+                                       validate? (:db/valueType (.-props info))
+                                       (aget attrs (inc offset)))]
+                      (aset attrs (inc offset) value)
+                      (recur (+ offset 3))))
+                  true)))
+            (let [^MixedUpdate entry entry
+                  ^MixedAttrInfo info (.get infos (.-attr entry))]
+              (when-some [value (correct-mixed-value
+                                 validate? (:db/valueType (.-props info)) (.-value entry))]
+                (when-not (identical? value (.-value entry))
+                  (.set entries index (MixedUpdate. (.-e entry) (.-attr entry) value)))
+                true)))
+          (recur (unchecked-inc index))))
+      true)))
 
 (defn- compile-mixed-insert
-  [schema sources validate? ^HashMap infos ^HashSet tempids entity]
+  [schema sources validate? ^HashMap infos ^HashSet tempids entity coerce?]
   (let [explicit? (contains? entity :db/id)
         tempid (:db/id entity)
         size (- (count entity) (if explicit? 1 0))]
@@ -899,7 +947,7 @@
                         (let [^MixedAttrInfo info (ordinary-attr-info!
                                                    infos schema sources a)]
                           (if (and (.-insert? info)
-                                   (mixed-value-ready? validate? (.-props info) tempids v))
+                                   (mixed-value-ready? validate? (.-props info) tempids v coerce?))
                             (do (aset attrs offset a)
                                 (aset attrs (inc (long offset)) v)
                                 (aset attrs (+ (long offset) 2) info)
@@ -909,11 +957,19 @@
                   0 entity)]
         (when end (MixedInsert. tempid attrs))))))
 
-(defn compile-mixed-region
-  "Compile inert materialized new maps and distinct existing scalar updates.
-  IDs remain symbolic; writer bounds, uniqueness and old values are runtime work.
-  Coercions, forward references and explicit tuple values retain ordered routing."
-  [ctx forms]
+(defn- append-mixed-update!
+  [schema sources validate? ^HashMap infos ^HashSet updates
+   ^ArrayList entries e attr value coerce?]
+  (when (and (keyword? attr) (pos? (count (name attr))))
+    (let [^MixedAttrInfo info (ordinary-attr-info! infos schema sources attr)]
+      (when (and (.-update? info)
+                 (mixed-scalar-ready? validate? (:db/valueType (.-props info)) value coerce?)
+                 (.add updates [e attr]))
+        (.add entries (MixedUpdate. e attr value))
+        info))))
+
+(defn- compile-mixed-region*
+  [ctx forms coerce?]
   (when (and (identical? clojure.lang.PersistentVector (class forms))
              (nil? (meta forms)) (> (count forms) 1)
              (not (:auto-entity-time? (:opts ctx))))
@@ -926,31 +982,53 @@
           (let [form (nth forms index)]
             (cond
               (and (plain-map? form) (nil? (meta form)))
-              (when-let [entry (compile-mixed-insert
-                                 schema sources validate? infos tempids form)]
-                (.add entries entry)
-                (recur (unchecked-inc index) true required-eid typed?))
+              (if (positive-literal-id? (:db/id form))
+                (let [e (long (:db/id form))
+                      typed (when (> (count form) 1)
+                              (reduce-kv
+                                (fn [typed attr value]
+                                  (if (identical? :db/id attr)
+                                    typed
+                                    (if-let [^MixedAttrInfo info
+                                             (append-mixed-update!
+                                               schema sources validate? infos updates entries
+                                               e attr value coerce?)]
+                                      (and typed (.-typed? info))
+                                      (reduced nil))))
+                                typed? form))]
+                  (when (some? typed)
+                    (recur (unchecked-inc index) inserts? (max required-eid e) typed)))
+                (when-let [entry (compile-mixed-insert
+                                   schema sources validate? infos tempids form coerce?)]
+                  (.add entries entry)
+                  (recur (unchecked-inc index) true required-eid typed?)))
 
               (and (identical? clojure.lang.PersistentVector (class form))
                    (nil? (meta form)) (= 4 (count form)) (identical? :db/add (nth form 0)))
               (let [[_ e a v] form]
-                (when (and (instance? Long e) (pos? (long e))
-                           (keyword? a) (pos? (count (name a)))
-                           (inert-scalar-value? v))
-                  (let [^MixedAttrInfo info (ordinary-attr-info! infos schema sources a)]
-                    (when (and (.-update? info)
-                               (canonical-scalar-value?
-                                 validate? (:db/valueType (.-props info)) v)
-                               (.add updates [e a]))
-                      (.add entries (MixedUpdate. e a v))
-                      (recur (unchecked-inc index) inserts? (max required-eid (long e))
-                             (and typed? (.-typed? info)))))))
+                (when (positive-literal-id? e)
+                  (when-let [^MixedAttrInfo info
+                             (append-mixed-update!
+                               schema sources validate? infos updates entries (long e) a v coerce?)]
+                    (recur (unchecked-inc index) inserts? (max required-eid (long e))
+                           (and typed? (.-typed? info))))))
               :else nil))
-          (when (and inserts? (pos? (.size updates)))
+          (when (and inserts? (pos? (.size updates))
+                     ;; Complete all shape, metadata, tempid and E/A proofs
+                     ;; before invoking even a store-free conversion.
+                     (or (not coerce?) (correct-mixed-entries! validate? infos entries)))
             (plan/->TxPlan ctx :mixed
                            (MixedOperands. entries infos required-eid
                                            (and typed? (> (.size updates) 1)))
                            nil)))))))
+
+(defn compile-mixed-region
+  "Compile new maps and distinct scalar replacements from maps or add vectors.
+  Values may use safe built-in coercions; existing literal IDs normalize to Long.
+  Writer bounds, uniqueness and old values remain runtime work."
+  [ctx forms]
+  (or (compile-mixed-region* ctx forms false)
+      (compile-mixed-region* ctx forms true)))
 
 (defn- literal-scalar-alias?
   [value]
@@ -982,14 +1060,13 @@
                              (literal-scalar-alias? e) 8)))]
           (when kind
             (let [kinds (bit-or kinds (long kind))]
-              ;; Positive-ID maps plus new maps retain ordered resolution.
-              (when-not (or (= 3 (bit-and kinds 3))
-                            (and (pos? (bit-and kinds 2))
-                                 (pos? (bit-and kinds 8))))
+              ;; Symbolic existing IDs still need ordered mixed resolution.
+              (when-not (and (pos? (bit-and kinds 2))
+                             (pos? (bit-and kinds 8)))
                 (recur (unchecked-inc index) kinds)))))
         (cond
           (pos? (bit-and kinds 8)) :scalar-aliases
-          (pos? (bit-and kinds 2)) (if (pos? (bit-and kinds 4)) :mixed :blind)
+          (pos? (bit-and kinds 2)) (if (pos? (bit-and kinds 5)) :mixed :blind)
           (pos? (bit-and kinds 1)) :scalar
           ;; Preserve the small repeated-E/A decline before context allocation.
           (= 2 (count forms)) (literal-scalar-shape forms)

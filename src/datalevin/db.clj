@@ -2042,8 +2042,6 @@
 
 (declare commit-prepared-tx-data!)
 
-(defn- auto-tempid? ^Boolean [x] (txprep/auto-tempid? x))
-
 (defn- tempid?
   ^Boolean [x]
   (txprep/tempid? x))
@@ -2287,6 +2285,15 @@
 (defn- expand-transactable-entity
   [entity]
   (txprep/expand-transactable-entity entity))
+
+(defn- remote-tx-input
+  "Retain recognized materialized input for server compilation. Such forms
+  cannot be Entity objects requiring client-side expansion. Other inputs keep
+  the existing sequence demand and expansion; compilation remains server-owned."
+  [forms]
+  (if (and (txengine/compiler?) (txcompile/literal-request-shape forms))
+    forms
+    (sequence (mapcat expand-transactable-entity) forms)))
 
 ;; Identity probes in the blind path share the LMDB write transaction. Large
 ;; batches enable them from two entities onward so ingestion avoids the old
@@ -2652,14 +2659,8 @@
   "Check a prepared batch's unique values against the current store snapshot.
    The caller invokes this after opening its LMDB write transaction, so all
    probes share that transaction and no concurrent insert can race the check."
-  [^DB db prepared]
-  (let [^FastList avs (:unique-avs prepared)]
-    (or (nil? avs)
-        (loop [i 0]
-          (or (>= i (.size avs))
-              (let [[a v] (.get avs i)]
-                (and (nil? (txcommon/av-first-e db a v))
-                     (recur (unchecked-inc i)))))))))
+  [db prepared]
+  (txexec/blind-unique-values-absent? db (:unique-avs prepared)))
 
 (defn ^:no-doc blind-local-tx-valid?
   [^DB db prepared]
@@ -2670,53 +2671,6 @@
            (identical? (:opts (:ctx prepared)) (opts store)))
       (and (identical? (:schema-epoch prepared) (schema store))
            (identical? (:opts-epoch prepared) (opts store))))))
-
-(defn- append-blind-identity-upsert!
-  [^DB db ^BlindEntity entity identity-attr eid tx-id layout tx-data]
-  (let [^FastList attrs (.-attrs entity)
-        old-values (when layout (txexec/read-scalar-entity (.-store db) eid layout))]
-    (loop [i 0 tx-data tx-data]
-      (if (< i (.size attrs))
-        (let [attr  (.get attrs i)
-              value (.get attrs (unchecked-inc i))]
-          (if (= attr identity-attr)
-            (recur (+ i 2) tx-data)
-            (let [old-value (if layout
-                              (get old-values attr)
-                              (txcommon/preparation-first-v db eid attr))]
-              (cond
-                (nil? old-value)
-                (recur (+ i 2)
-                       (conj! tx-data
-                              (d/datom eid attr value tx-id)))
-
-                (d/value-equal? (idx/logical-value old-value) value)
-                (recur (+ i 2) tx-data)
-
-                :else
-                (recur (+ i 2)
-                       (-> tx-data
-                           (conj! (idx/retraction eid attr old-value tx-id))
-                           (conj! (d/datom eid attr value tx-id))))))))
-        tx-data))))
-
-(defn- stamp-existing-blind-local-identity-upsert
-  [^DB db prepared tx-meta identity-attr eid]
-  (let [^FastList entities (blind-tx-entities prepared)
-        ^BlindEntity entity (.get entities 0)
-        tx-id           (inc (long (:max-tx db)))
-        layout          (when-not txcommon/*batch-prepare* (:identity-upsert-read prepared))
-        tx-data         (persistent! (append-blind-identity-upsert!
-                                       db entity identity-attr eid tx-id layout
-                                       (transient [])))
-        tempid          (.-tempid entity)
-        tempids         (cond-> {:db/current-tx tx-id}
-                          (and tempid (not (auto-tempid? tempid)))
-                          (assoc tempid eid))
-        db-after        (cond-> (assoc db :max-tx tx-id)
-                          (> (long eid) (long (:max-eid db)))
-                          (assoc :max-eid eid))]
-    (->TxReport db db-after tx-data tempids tx-meta)))
 
 (defn ^:no-doc stamp-blind-local-upsert-tx
   "Reuse a collided blind batch's normalized scalar values. Independent maps
@@ -2733,52 +2687,12 @@
                (= (.size entities) (.size ^FastList (:unique-avs prepared)))
                (or (not compiled?) identity-avs)
                (blind-local-tx-valid? db prepared))
-      (let [seen-avs (java.util.HashSet.)
-            seen-eids (java.util.HashSet.)
-            ^FastList resolutions (FastList. (.size entities))
-            max-eid
-            (loop [i 0 max-eid (long (:max-eid db))]
-              (if (< i (.size entities))
-                (when-let [[a v :as av]
-                           (if identity-avs
-                             (.get identity-avs i)
-                             (txcompile/blind-identity-upsert-av (:schema-epoch prepared)
-                               (.get entities i)))]
-                  (when (.add seen-avs av)
-                    (let [stored-eid (txcommon/av-first-e db a v)
-                          eid (if stored-eid (long stored-eid) (inc max-eid))]
-                      (when (.add seen-eids eid)
-                        (.add resolutions [a eid (some? stored-eid)])
-                        (recur (inc i) (if stored-eid max-eid eid))))))
-                max-eid))]
-        (when max-eid
-          (let [tx-id (inc (long (:max-tx db)))
-                [tx-data tempids]
-                (loop [i 0 tx-data (transient []) tempids (transient {})]
-                  (if (< i (.size entities))
-                    (let [^BlindEntity entity (.get entities i)
-                          [identity-attr eid stored?] (.get resolutions i)
-                          ^FastList attrs (.-attrs entity)
-                          tx-data (if stored?
-                                    (append-blind-identity-upsert!
-                                      db entity identity-attr eid tx-id nil tx-data)
-                                    (loop [j 0 tx-data tx-data]
-                                      (if (< j (.size attrs))
-                                        (recur (+ j 2)
-                                               (conj! tx-data
-                                                      (d/datom eid (.get attrs j)
-                                                               (.get attrs (inc j)) tx-id)))
-                                        tx-data)))
-                          tempid (.-tempid entity)]
-                      (recur (inc i) tx-data
-                             (if (and tempid (not (auto-tempid? tempid)))
-                               (assoc! tempids tempid eid) tempids)))
-                    [(persistent! tx-data)
-                     (assoc! tempids :db/current-tx tx-id)]))]
-            (when (and (instance? TxPlan prepared) *tx-compiler-observer*)
-              (*tx-compiler-observer* :execute-blind-upsert prepared))
-            (->TxReport db (assoc db :max-eid max-eid :max-tx tx-id)
-                        tx-data (persistent! tempids) tx-meta)))))))
+      (when-let [report (txexec/execute-blind-upserts
+                          (->TxReport db db [] {} tx-meta) entities identity-avs
+                          (if compiled? (:schema (:ctx prepared)) (:schema-epoch prepared)))]
+        (when (and compiled? *tx-compiler-observer*)
+          (*tx-compiler-observer* :execute-blind-upsert prepared))
+        report))))
 
 (defn ^:no-doc stamp-blind-local-tx
   "Bind legacy or compiled blind operands through the shared emission loop."
@@ -2799,8 +2713,10 @@
   (when (or (not (instance? TxPlan prepared)) (blind-local-tx-valid? db prepared))
     (when-let [[identity-attr identity-value] (:identity-upsert-av prepared)]
       (if-some [eid (txcommon/av-first-e db identity-attr identity-value)]
-        (let [report (stamp-existing-blind-local-identity-upsert
-                       db prepared tx-meta identity-attr eid)]
+        (let [report (txexec/execute-blind-identity-upsert
+                       (->TxReport db db [] {} tx-meta)
+                       (.get ^FastList (blind-tx-entities prepared) 0)
+                       identity-attr eid (:identity-upsert-read prepared))]
           (when (and (instance? TxPlan prepared) *tx-compiler-observer*)
             (*tx-compiler-observer* :execute-blind-upsert prepared))
           [report true])
@@ -2895,70 +2811,13 @@
      (entid-strict db (:e prepared))
      (stamp-local-patch-idoc-doc db prepared tx-meta old-doc))))
 
-(defn- scalar-update-entity-id
-  "Resolve an existing entity id for a scalar update, or nil to fall back.
-  Numeric ids use the in-memory maximum; lookup references and idents read db."
-  ^Long [^DB db e]
-  (let [eid (cond
-              (integer? e)
-              (when (pos? (long e)) (long e))
-
-              (and (sequential? e) (= 2 (count e)))
-              (try (txcommon/entid db e) (catch Throwable _ nil))
-
-              (keyword? e)
-              (try (txcommon/entid db e) (catch Throwable _ nil))
-
-              :else nil)]
-    (when (and eid (pos? (long eid)) (<= (long eid) (long (:max-eid db))))
-      (long eid))))
-
-(defn- resolve-scalar-update-reference!
-  "Reuse an entity resolution within one read-only preparation request."
-  [db ^java.util.HashMap entities reference]
-  (or (.get entities reference)
-      (when-let [eid (scalar-update-entity-id db reference)]
-        (.put entities reference eid)
-        eid)))
-
-(defn- resolve-scalar-update-references
-  "Resolve distinct references in order, discarding results after this request."
-  [db references]
-  (let [entities (java.util.HashMap.)]
-    (when (reduce (fn [_ reference]
-                    (if (resolve-scalar-update-reference! db entities reference)
-                      true
-                      (reduced false)))
-                  true references)
-      entities)))
-
-(defn- resolve-scalar-update-candidates!
-  "Resolve eager candidates before correction, retaining the alias/E-A check."
-  [db ^FastList candidates]
-  (if (= 4 (.size candidates))
-    ;; Singleton requests already satisfy distinctness.
-    (when-let [eid (scalar-update-entity-id db (.get candidates 0))]
-      (.set candidates 0 eid)
-      true)
-    (when-let [entities (resolve-scalar-update-references
-                         db (map #(.get candidates %) (range 0 (.size candidates) 4)))]
-      (let [seen (java.util.HashSet.)]
-        (loop [i 0]
-          (if (< i (.size candidates))
-            (let [eid (get entities (.get candidates i))
-                  attr (.get candidates (inc i))]
-              (when (.add seen [eid attr])
-                (.set candidates i eid)
-                (recur (+ i 4))))
-            true))))))
-
 (defn- append-scalar-update-candidate!
   "Retain runtime entity checks around the shared pure candidate workers."
   [db store-schema tuple-source-attrs candidates seen e attr value]
   (when-let [props (txcompile/scalar-attribute-props
                     store-schema tuple-source-attrs attr value)]
     (when-let [eid (if (or (keyword? e) (and (sequential? e) (= 2 (count e))))
-                    e (scalar-update-entity-id db e))]
+                    e (txexec/scalar-update-entity-id db e))]
       (txcompile/append-scalar-candidate!
         candidates seen eid attr value (:db/valueType props)))))
 
@@ -3011,7 +2870,7 @@
                            (or resolve-entities? (not (integer? eid))))))))
             (when (and (not (.isEmpty candidates))
                        (or defer-entity-resolution? (not resolve-entities?)
-                           (resolve-scalar-update-candidates! db candidates)))
+                           (txexec/resolve-scalar-update-candidates! db candidates)))
               (let [entries
                     ;; Coercion remains legacy orchestration. Keep its errors
                     ;; at the original call site; compilation proves identity
@@ -3062,35 +2921,12 @@
          (identical? (:opts-epoch prepared) (opts store)))))
 
 (defn- bind-scalar-entities
-  "Resolve all entity operands before old-value reads or datom emission.
-  Shared by legacy deferred preparation and compiled symbolic operands."
+  "Attach writer-bound operands/layouts to the adapter-owned representation."
   [db {:keys [entries] :as prepared} store-schema]
-  (txcommon/with-lookup-ref-cache db
-    (if (= 1 (count entries))
-      (let [[e attr value] (first entries)]
-        (when-let [eid (scalar-update-entity-id db e)]
-          (assoc prepared :entries [[eid attr value]] :entity-reads nil)))
-      (let [entities (java.util.HashMap.)
-            seen (java.util.HashSet.)
-            resolved
-            (reduce (fn [resolved [e attr value]]
-                      (if-let [eid (resolve-scalar-update-reference! db entities e)]
-                        ;; Distinct references can alias the same entity.
-                        ;; Repeated E/A updates need general ordering.
-                        (if (.add seen [eid attr])
-                          (conj resolved [eid attr value])
-                          (reduced nil))
-                        (reduced nil)))
-                    [] entries)]
-        (when resolved
-          (assoc prepared :entries resolved
-                 :entity-reads (txcompile/scalar-update-entity-reads store-schema resolved)))))))
-
-(defn- resolve-scalar-update-entities
-  [db prepared]
-  (if (:deferred-entity-resolution? prepared)
-    (bind-scalar-entities db prepared (:schema-epoch prepared))
-    prepared))
+  (when-let [entries (txexec/resolve-scalar-update-entries db entries)]
+    (assoc prepared :entries entries
+           :entity-reads (when (> (count entries) 1)
+                           (txcompile/scalar-update-entity-reads store-schema entries)))))
 
 (def ^:dynamic *specialize-scalar-stamping?*
   "Internal comparison switch for resolved scalar stamping."
@@ -3102,10 +2938,9 @@
   epochs are stale or entity references require general transaction resolution."
   [^DB db ^PreparedScalarUpdate prepared tx-meta]
   (when-let [prepared (when (scalar-update-tx-valid? db prepared)
-                        (if (and *specialize-scalar-stamping?*
-                                 (not (:deferred-entity-resolution? prepared)))
-                          prepared
-                          (resolve-scalar-update-entities db prepared)))]
+                        (if (:deferred-entity-resolution? prepared)
+                          (bind-scalar-entities db prepared (:schema-epoch prepared))
+                          prepared))]
     (let [tx-id   (inc (long (:max-tx db)))
           entries (:entries prepared)
           tx-data (txexec/execute-scalar-region
@@ -3339,10 +3174,7 @@
          tx-time (System/currentTimeMillis)]
      (if (remote-store? store)
        (try
-         (let [txs                                    (sequence
-                                                       (mapcat
-                                                         expand-transactable-entity)
-                                                       initial-es)
+         (let [txs                                    (remote-tx-input initial-es)
                res                                    (i/tx-data store txs simulated?)
                db-info                                (when (map? res) (:db-info res))
                res                                    (if db-info (dissoc res :db-info) res)
@@ -3384,7 +3216,7 @@
   [^DB db tx-data]
   (vld/validate-tx-data-shape tx-data)
   (let [store (.-store db)
-        txs (sequence (mapcat expand-transactable-entity) tx-data)]
+        txs (remote-tx-input tx-data)]
     (try
       (let [response (i/tx-data-ack store txs)
             info (:db-info response)]

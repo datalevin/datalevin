@@ -171,17 +171,18 @@
                       _ (ensure! (every? (set (map :id operators)) (vals core)))
                       available (access/available-inputs! runtime r inputs operators)
                       sources (set (map :source-symbol (:patterns r)))
+                      ;; Every alias needs the same region boundary exports.
+                      needed (into (:required-vars r)
+                                   (mapcat #(map :variable (:requires %))) operators)
                       requests (into []
                                      (keep (fn [entry]
                                              (when (and (:descriptor entry) (contains? sources (:symbol entry)))
                                                (let [context (:request (prepared-groups (:symbol entry)))
                                                      ;; Scoped operators may consume a fact identity
                                                      ;; that is absent from the final projection.
-                                                     needed (into (:required-vars r)
-                                                              (mapcat #(map :variable (:requires %))) operators)
                                                      request (region/request! runtime (assoc r :required-vars needed) entry context available
                                                                 (get-in prepared [:planning :max-alternatives]))]
-                                                 (envelope/request! runtime request))))) entries)]
+                                                 (envelope/captured-request! runtime request entries))))) entries)]
                   {:region r :inputs inputs :operators operators :requests requests})) live)
             groups (session/acquire! runtime prepared)
             by-alias (into {} (mapcat (fn [group] (map #(vector % group) (:aliases group)))) groups)

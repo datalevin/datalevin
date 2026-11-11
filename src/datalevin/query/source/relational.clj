@@ -229,7 +229,14 @@
                            (retain! runtime (rt/charge-copy! runtime response))
                            (value/owned-copy response #(control/check-active! (:control runtime)))
                            (finally (control/release! borrowed)))
-                groups (session/acquire! runtime (:prepared compilation))
+                ;; A complete delegated plan has no remaining cardinality
+                ;; choices. Keep snapshot/schema validation, but tell providers
+                ;; not to collect optional statistics for unused alternatives.
+                prepared (update (:prepared compilation) :groups
+                                 (fn [groups]
+                                   (mapv #(update % :request assoc
+                                                  :datalevin.query.source/estimates? false) groups)))
+                groups (session/acquire! runtime prepared)
                 group (first groups)
                 _ (when (seq (get-in compilation [:prepared :native-extrema]))
                     (extrema/prepare! runtime compilation groups))]

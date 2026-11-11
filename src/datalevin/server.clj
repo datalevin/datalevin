@@ -1656,28 +1656,28 @@
                                         (contains? message :expected-db-id)
                                         (contains? message :expected-db-type))
           sys-conn                  (.-sys-conn server)]
-      (when existing-only?
-        (check-maintenance-identity! db-name (auth/pull-db sys-conn db-name) message))
       (log/debug "open" db-name "that exist?" existing-db?)
       (wrap-permission
-          (if existing-db? ::view ::create)
+          (if (or existing-db? existing-only?) ::view ::create)
           ::database
           (when existing-db? (db-eid sys-conn db-name))
           "Don't have permission to open database"
+        (when existing-only?
+          (check-maintenance-identity! db-name (auth/pull-db sys-conn db-name) message))
         (require-control-for-privileged-server-options! permissions opts)
         (locking (db-open-lock server db-name)
           (with-db-runtime-store-swap
             server
             db-name
             (fn []
-              (let [_ (when guarded?
-                        (check-maintenance-identity! db-name (auth/pull-db sys-conn db-name) message))
-                    _ (when existing-only?
+              (let [_ (when existing-only?
                         (when-not (auth/has-permission? ::view ::database
                                                        (db-eid sys-conn db-name)
                                                        (:permissions (get-client server client-id)))
                           (raise "Don't have permission to open the maintenance database"
                                  {:error :admin/permission-denied :db-name db-name})))
+                    _ (when guarded?
+                        (check-maintenance-identity! db-name (auth/pull-db sys-conn db-name) message))
                     dir              (db-dir (.-root server) db-name)
                     open-opts        opts
                     opts             (replica/local-open-opts open-opts)
@@ -2078,36 +2078,43 @@
     (with-db-runtime-store-swap server db-name f)))
 
 (defn- with-maintenance-source
-  "Validate the catalog and source under lifecycle/read access. Release lifecycle
-  access before invoking work that can wait for the database writer slot."
+  "Authorize before retaining lifecycle locks, then revalidate under read access.
+  Release lifecycle access before work that can wait for the database writer slot."
   [^Server server db-name message authorize work]
-  (let [^ReentrantReadWriteLock lock (get-runtime-access-lock server db-name)
-        read-lock (.readLock lock)
-        acquired? (volatile! false)
-        source (locking (db-open-lock server db-name)
-                 (.lock read-lock)
-                 (vreset! acquired? true)
-                 (try
-                   (let [catalog (auth/pull-db (.-sys-conn server) db-name)]
-                     (when-not (:db/id catalog)
-                       (if (or (:expected-db-id message) (:expected-db-type message)
-                               (:admin-required-capabilities message))
-                         (raise "Maintenance database does not exist"
-                                {:error :admin/database-not-found :db-name db-name})
-                         (raise "Database is closed"
-                                {:type :reopen :db-name db-name :db-type "kv"})))
-                     (when (authorize catalog)
-                       (check-maintenance-identity! db-name catalog message)
-                       (or (get-store server db-name)
-                           (raise "Maintenance database is closed"
-                                  {:type :reopen :db-name db-name
-                                   :db-type (if (= :datalog (:database/type catalog)) "datalog" "kv")}))))
-                   (catch Throwable t
-                     (.unlock read-lock)
-                     (vreset! acquired? false)
-                     (throw t))))]
-    (try (when source (work source))
-         (finally (when @acquired? (.unlock read-lock))))))
+  (let [authorized-catalog
+        (fn []
+          (let [catalog (auth/pull-db (.-sys-conn server) db-name)]
+            ;; A missing target requires global permission. Check before
+            ;; revealing absence or retaining locks for an arbitrary name.
+            (when (authorize catalog)
+              (when-not (:db/id catalog)
+                (if (or (:expected-db-id message) (:expected-db-type message)
+                        (:admin-required-capabilities message))
+                  (raise "Maintenance database does not exist"
+                         {:error :admin/database-not-found :db-name db-name})
+                  (raise "Database is closed"
+                         {:type :reopen :db-name db-name :db-type "kv"})))
+              catalog)))]
+    (when (authorized-catalog)
+      (let [^ReentrantReadWriteLock lock (get-runtime-access-lock server db-name)
+            read-lock (.readLock lock)
+            acquired? (volatile! false)
+            source (locking (db-open-lock server db-name)
+                     (.lock read-lock)
+                     (vreset! acquired? true)
+                     (try
+                       (when-let [catalog (authorized-catalog)]
+                         (check-maintenance-identity! db-name catalog message)
+                         (or (get-store server db-name)
+                             (raise "Maintenance database is closed"
+                                    {:type :reopen :db-name db-name
+                                     :db-type (if (= :datalog (:database/type catalog)) "datalog" "kv")})))
+                       (catch Throwable t
+                         (.unlock read-lock)
+                         (vreset! acquired? false)
+                         (throw t))))]
+        (try (when source (work source))
+             (finally (when @acquired? (.unlock read-lock))))))))
 
 (defn- get-kv-store
   [server db-name]

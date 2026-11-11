@@ -189,7 +189,10 @@ Example:
                     (instance? InterruptedException cause)
                     (instance? InterruptedIOException cause)
                     (instance? ClosedByInterruptException cause)
-                    (#{:admin/unsupported-server :socket/timeout :client/closed} code)
+                    (#{:admin/unsupported-server :socket/timeout
+                       :client/closed :ha/write-indeterminate} code)
+                    (:indeterminate? data)
+                    (get-in data [:err-data :indeterminate?])
                     (:termination-reason data)
                     (and (not local-io?)
                          (re-find #"(?i)authentication fail" (or (ex-message cause) ""))))))
@@ -282,13 +285,13 @@ Example:
                          (.setDaemon true)))))
         stopped? (AtomicBoolean. false)
         submit (fn [target]
-                 (.submit executor
-                   ^Callable
-                   (bound-fn []
-                     (when-not (.get stopped?)
-                       (let [outcome (status-outcome request connection target)]
-                         (when (:stop? outcome) (.set stopped? true))
-                         outcome)))))]
+                 (let [^Callable task
+                       (bound-fn []
+                         (when-not (.get stopped?)
+                           (let [outcome (status-outcome request connection target)]
+                             (when (:stop? outcome) (.set stopped? true))
+                             outcome)))]
+                   (.submit executor task)))]
     (try
       ;; Keep at most N futures, including completed results waiting for an
       ;; earlier target. This bounds both request pressure and buffered output.
@@ -476,16 +479,17 @@ Example:
      (if-let [message (:exit-message validation)]
        (do (diagnostic message) 2)
        (let [options (:options validation)
+             status-concurrency (long (get options :status-concurrency 1))
              uri (getenv (or (:uri-env options) "DATALEVIN_URI"))]
          (if (str/blank? uri)
            (do (diagnostic "The server URI environment variable is missing or blank") 2)
            (let [connection (try
                               (connect uri
                                 {:pool-size (if (= "status" (first arguments))
-                                              (min (or (:status-concurrency options) 1)
-                                                   (if (:all-databases options)
-                                                     16
-                                                     (count (:database options))))
+                                              (min status-concurrency
+                                                   (long (if (:all-databases options)
+                                                           16
+                                                           (count (:database options)))))
                                               1)
                                  :time-out (or (:timeout-ms options) 60000)})
                               (catch Exception _ nil))]
@@ -507,7 +511,7 @@ Example:
                                                   #(emit (sanitize uri %)))
                                     (finally (cleanup-backup-destination! destination)))
                                   0)
-                       (let [concurrency (min (or (:status-concurrency options) 1) (count targets))
+                       (let [concurrency (min status-concurrency (count targets))
                              emit #(emit (sanitize uri %))]
                          (if (and (> concurrency 1) (not-every? ::status-outcome targets))
                            (parallel-status-sweep request connection targets concurrency emit)

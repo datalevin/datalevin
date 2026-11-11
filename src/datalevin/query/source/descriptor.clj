@@ -22,7 +22,7 @@
         (fail! :query-source/unsupported :inputs))
       (let [info (rt/invoke runtime :descriptor #(source/-source-info provider))]
         (vswap! tokens conj (rt/charge-metadata! runtime info :descriptor 1024))
-        (source-info! info check!)
+        (schema/admitted-source-info! info check!)
         (vswap! tokens conj (rt/charge-copy! runtime info))
         (let [captured (value/owned-copy info check!) held @tokens]
           (rt/own! runtime #(doseq [token held] (control/release! token)))

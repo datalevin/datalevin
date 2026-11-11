@@ -56,7 +56,7 @@
                 (recur (+ i (Character/charCount x)) (+ j (Character/charCount y)) (inc n))
                 (compare x y))))))
 
-(defn- key-tag [x]
+(defn- key-tag ^long [x]
   (cond (nil? x) 0 (integer? x) 1 (symbol? x) 2 (keyword? x) 3
         (string? x) 4 (vector? x) 5
         :else (fail! :query-source/invalid :planning)))
@@ -214,17 +214,17 @@
 (defn- cardinality-key
   "Fresh provider counts rank alternatives, without becoming native costs or
   proofs of emptiness. Unknown/expired counts retain canonical structural order."
-  [plan now max-age]
+  [plan ^long now ^long max-age]
   (let [estimate (:advisory-estimate plan)
         dependent? (seq (:requires (options plan)))
         rows (get estimate (if dependent? :rows-per-binding :rows))
         {:keys [kind observed-at-ms valid-for-ms]} (:provenance estimate)]
     (if (and (#{:low :medium :high} (:confidence estimate))
              (#{:exact :statistics :heuristic} kind)
-             (number? rows) (not (neg? rows))
+             (number? rows) (not (neg? (compare rows 0)))
              (integer? observed-at-ms) (<= 0 observed-at-ms now)
-             (<= (- now observed-at-ms) max-age)
-             (or (nil? valid-for-ms) (< (- now observed-at-ms) valid-for-ms)))
+             (<= (- now (long observed-at-ms)) max-age)
+             (or (nil? valid-for-ms) (< (- now (long observed-at-ms)) (long valid-for-ms))))
       [0 rows] [1 0])))
 
 (defrecord ^:private CoreOperator [owner region-id id requires columns after step])
@@ -388,22 +388,27 @@
                                       (assoc-in plan [:path :options :permission]
                                                 (permissions/planning-permission
                                                   (:consumption o) (get-in o [:capture :alternative]))))))
+                             (map (fn [plan]
+                                    {:plan plan :count-key (count-key plan)
+                                     :first-work-key (first-work-key plan)
+                                     :kind (kind-rank (get-in plan [:path :options :access :kind]))
+                                     :width (count (work-keys plan))
+                                     :canonical-key (:canonical-key (options plan))}))
                              (sort (fn [a b]
                                      (check!)
-                                     (let [cardinality (compare (count-key a) (count-key b))
+                                     (let [cardinality (long (compare (:count-key a) (:count-key b)))
                                            work (if (zero? cardinality)
-                                                  (compare-keys (first-work-key a) (first-work-key b) check!)
+                                                  (compare-keys (:first-work-key a) (:first-work-key b) check!)
                                                   cardinality)]
                                        (if (zero? work)
-                                         (let [kind (compare (kind-rank (get-in a [:path :options :access :kind]))
-                                                             (kind-rank (get-in b [:path :options :access :kind])))
-                                               width (compare (count (work-keys b)) (count (work-keys a)))]
+                                         (let [kind (compare (:kind a) (:kind b))
+                                               width (compare (:width b) (:width a))]
                                            (cond
                                              (not (zero? kind)) kind
                                              (not (zero? width)) width
-                                             :else (compare-keys (:canonical-key (options a))
-                                                                 (:canonical-key (options b)) check!))) work))))
-                             vec)
+                                             :else (compare-keys (:canonical-key a)
+                                                                 (:canonical-key b) check!))) work))))
+                             (mapv :plan))
              local-work (into #{} (map #(vector :core region-id (:id %))) operators)
              required (set/union required local-work)
              _ (doseq [operator operators]
@@ -455,7 +460,7 @@
              result (join-cost/select {:inputs input-columns :required-work required
                                           :required-vars live-vars :choices choices
                                           :check! check! :reserve! own-work! :max-states search-bound}
-                                      (fn [plan] (let [[unknown rows] (count-key plan)] (when (zero? unknown) rows))))]
+                                      (fn [plan] (let [[unknown rows] (count-key plan)] (when (zero? (long unknown)) rows))))]
          (when-not (= :complete (:status result)) (fail! :query-source/unsupported :planning))
          ;; Native/core steps remain private and keep their shared implementation.
          ;; Only selected external AccessPlans enter the provider explanation.
@@ -467,7 +472,7 @@
                          :policy (if (some #(> (count (work-keys %)) 1) candidates)
                                    :eav-fusion-v1 :eav-structural-v1)
                          :selection (cond (:cost-changed? result) :join-cost
-                                          (some #(zero? (first (count-key %))) candidates) :cardinality
+                                          (some #(zero? (long (first (count-key %)))) candidates) :cardinality
                                           :else :structural)
                          :join-cost (:join-cost result) :cost-search (:cost-search result)
                          :estimated-access-ns nil :fallback-reasons []

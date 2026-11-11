@@ -1553,7 +1553,8 @@
   (with-open [main (IntPointer. 1)
               key (BufVal. c/+max-key-size+)
               value (BufVal. 0)]
-    (Util/checkRc (DTLV/mdb_dbi_open (.get txn) (cast String nil) (int 0) main))
+    (Util/checkRc (DTLV/mdb_dbi_open (.get txn) ^String (cast String nil)
+                                  (int 0) main))
     (buffer/put-bufval key (.getBytes dbi-name StandardCharsets/UTF_8) :raw nil nil)
     (let [rc (DTLV/mdb_get (.get txn) (.get main) (.ptr key) (.ptr value))]
       (when-not (= rc DTLV/MDB_NOTFOUND)
@@ -1624,7 +1625,7 @@
   [^CppLMDB lmdb dbi-name]
   (native-call (.-info lmdb)
     (i/check-ready lmdb)
-    (let [env (.-env lmdb)]
+    (let [^Env env (.-env lmdb)]
       (if (zero? (bit-and (.getFlags env) DTLV/MDB_NOTLS))
         (thread-dbi-snapshot env dbi-name)
         (direct-dbi-snapshot env dbi-name)))))
@@ -1779,11 +1780,11 @@
                 (lifetime/enter! guard))]
     (try
       (i/check-ready lmdb)
-      (vreset! handle (.prepareCopy (.-env lmdb) dest (boolean compact?)))
+      (vreset! handle (.prepareCopy ^Env (.-env lmdb) dest (boolean compact?)))
       (->PreparedCopy (.-env lmdb) @handle lease)
       (catch Throwable e
         (when @handle
-          (try (.closePrepared (.-env lmdb) @handle)
+          (try (.closePrepared ^Env (.-env lmdb) @handle)
                (catch Throwable cleanup (.addSuppressed e cleanup))))
         (when lease (.close ^java.lang.AutoCloseable lease))
         (throw e)))))

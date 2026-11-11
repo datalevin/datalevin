@@ -115,7 +115,7 @@
       (when (.hasRemaining buffer)
         (cr/check! :copy-sink-write)
         (let [offset (.position buffer)
-              written (with-local-io (.write sink buffer))]
+              written (int (with-local-io (.write sink buffer)))]
           (when-not (and (pos? written) (= written (- (.position buffer) offset)))
             (fail! :copy/sink-stalled "Copy sink made no progress" {:written written}))
           (.update digest bytes offset written)
