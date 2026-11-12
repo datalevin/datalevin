@@ -1,6 +1,6 @@
 # Query-source Extensions Appendix
 
-Status: proposed optional contracts and companion extensions  
+Status: implemented development extensions and separately gated proposals  
 Release placement: [roadmap source milestones](../roadmap.md#source-milestones)
 
 This appendix collects work beyond the [baseline query-source SPI](query-source-spi.md)
@@ -8,20 +8,30 @@ and [companion plan](../../federation/federation.md). Extension negotiation foll
 [the SPI rules](query-source-spi.md#version-negotiation-and-source-information).
 
 Required input bindings are part of the current
-[query-source contract](query-source-spi.md#dependent-access). Probes
-and the other protocol extensions below still require separate envelope design
-and conformance gates.
+[query-source contract](query-source-spi.md#dependent-access). The matching
+development builds also implement budgeted estimate preparation and eligible
+relational delegation, including PostgreSQL joins, aggregates, result ordering
+and limits, and mixed-source fragments. The [SPI](query-source-spi.md) defines their current
+envelopes; this appendix does not replace them. Broader probes, repeated estimate
+rounds, and unimplemented capabilities still need separate contracts and gates.
 DataFusion/Parquet is a companion backend choice, not an SPI feature keyword.
 These adapters expose mapped entities and attributes through the revised EAV
 interface. Columnar or tuple batches are execution representations; arbitrary
 tuple inputs continue to use the existing Datalog facilities. Every extension
 uses the same Datalevin query/rule planner and executor. Every optimization
-phase, including future probes, repeated estimate rounds, and broader plan
+phase, including richer probes, repeated estimate rounds, and broader plan
 search, extends that existing planner. Providers contribute access
 implementations and delegated capabilities.
 The [architectural layers and governing invariant](query-source-spi.md#architectural-layers)
 apply to every extension: access capabilities determine how an admitted EAV
 operation executes while preserving its meaning.
+
+Prioritize extensions by the [F4–F7 roadmap](../roadmap.md#federation-optimization-follow-up):
+mixed-source evidence, joint native/external costing, supported binding/rule
+propagation and bounded adaptation, then derived-fact integration under the
+existing maintenance contracts. Additional connectors and delegated engines
+need a workload case and measured benefit. PostgreSQL JOB remains a regression
+baseline; connector count and maximum pushdown are not the optimization goal.
 
 <a id="1-bulk-bindings"></a>
 
@@ -48,9 +58,11 @@ Explicit consumption groups are needed only for independent resources requiring
 separate open budgets or concurrency permissions; ordinary alternatives and
 opens omit group IDs. The current contract supports bounded execution,
 deterministic structural EAV selection, and safe same-entity fusion; estimates
-may be entirely unknown. Cost-based ranking remains an
-[optimization proposal](../roadmap.md#federation-optimization-follow-up). This appendix
-adds no alternative envelope. The explicit anchor above remains for existing links.
+may be entirely unknown. Current cardinality ranking and bounded elapsed-cost
+lookahead follow the [SPI selection contract](query-source-spi.md#estimates-and-selection).
+Joint native/external costing remains [F5 work](../roadmap.md#f5-joint-entity-graph-costing).
+This appendix adds no alternative envelope. The explicit anchor above remains
+for existing links.
 
 ### Additional conformance
 
@@ -67,7 +79,9 @@ only providers advertising a real bulk operation are held to batched request sca
 ## 2. DataFusion and Parquet
 
 Choose an optional JVM/JNI, Rust library/Arrow C interface, or companion-process
-boundary after the first workflows pass. Evaluate streaming, cancellation,
+boundary when mixed-source workload evidence justifies the backend. DuckDB is
+also an execution-backend candidate, subject to the same semantic and ownership
+gates. Evaluate streaming, cancellation,
 buffer lifetime/copying, failure containment, packaging, and dependency
 isolation. Reuse DataFusion Federation/Table Providers inside the selected
 backend where they pass conformance. Such a backend executes only the selected
@@ -78,7 +92,11 @@ the [F1 execution suite](../roadmap.md#f1-core).
 
 ## 3. Conditioned planning evidence
 
-Design a negotiated probe extension separately. Compile selected counts/samples
+Current `IQuerySourceEstimation` quotes and budgets optional metadata preparation
+before pure planning; PostgreSQL uses it for filtered estimates. Its admission
+heuristic already accounts for estimation cost, but does not model complete
+expected plan savings. F5 improves that decision without making probes mandatory.
+Broader counts/samples or repeated rounds need a negotiated extension. Compile them
 from the same execution IR and retained existence predicates. Core allocates
 one cancellable native/external work budget and can always choose no probes.
 Evidence identifies its planning region, population, clause/condition/metadata fingerprints,
@@ -95,12 +113,14 @@ Correlated probes use bounded key batches, not N+1 requests. Samples remain
 query-scoped source data and are excluded from logs/schema/shared caches.
 Evidence from another snapshot is advisory. Execution reuse requires an
 explicit same-view continuation contract; otherwise execution restarts normally.
-Implement PostgreSQL probes independently of the optional DataFusion backend.
+Keep provider estimate work independent of the optional DataFusion backend.
 
 ## 4. Other negotiated capabilities
 
-Shared executable-plan caches, borrowed/columnar batches, source limits/order,
-and aggregate delegation each need a separate contract and conformance gate.
+Borrowed/columnar batches and any broader delegation need their own contracts
+and conformance gates. Eligible relational aggregation and result windows are
+already negotiated extensions in the development SPI, with PostgreSQL support.
+Specialized caches are not part of F4–F6; improve decisions over shared operators.
 Aggregate delegation follows the [shared aggregate contract](../analytics.md#6-shared-aggregate-semantics).
 These capabilities apply to any access shape that can implement their semantics.
 OLAP is a workload/cost profile, not an SPI source kind; a SQL or resource API
@@ -120,15 +140,15 @@ fixed-attribute accesses. Variable/wildcard attributes are logical EAV terms;
 this handling is required in F1 and needs no optional provider feature.
 [Region coverage and predicate scope](query-source-spi.md#logical-planning-regions)
 apply to every extension; no extension may silently flatten rule/branch or
-projection boundaries. Safe same-entity fusion is part of the current contract;
-comparable-cost ranking remains a proposed improvement. General cross-entity delegation,
-separate enumeration and estimate phases, repeated conditioned estimate rounds,
-and broader plan search are later extensions within the existing planner,
-beyond F0–F3 requirements. Specify and negotiate any added envelopes and planning
-budgets separately; they cannot silently replace the baseline request or make
+projection boundaries. Safe same-entity fusion, budgeted estimate preparation,
+bounded cost ranking, and eligible cross-entity delegation are implemented in
+the matching development builds. Broader scoped delegation, repeated conditioned
+estimate rounds, and joint native/external search remain further work within
+the existing planner, beyond F0–F3 requirements. Specify and negotiate added
+envelopes and planning budgets separately; they cannot silently replace the baseline request or make
 its unknown-cost path unusable.
 
-For future delegation, extend comparable units and account for transferred
+For F5 placement decisions, extend comparable units and account for transferred
 rows/bytes, provider work, startup, and differing local retained state. Retain
 the EAV identity/cardinality/existence rules through every translation. For
 analytical workloads, measure reductions from exact aggregation and legal ordering/limit pushdown;

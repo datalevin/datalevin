@@ -20,6 +20,17 @@
 (deftype MixedOperands
   [entries infos ^long required-eid ^boolean prepare-reader?])
 
+(defn scalar-candidate-entries
+  "Project owned E/A/value/type scratch into scalar operands. No correction,
+  hashing, entity binding or input traversal; values retain their identity."
+  [^FastList candidates]
+  (loop [i 0 entries (transient [])]
+    (if (< i (.size candidates))
+      (recur (+ i 4)
+             (conj! entries [(.get candidates i) (.get candidates (+ i 1))
+                            (.get candidates (+ i 2))]))
+      (persistent! entries))))
+
 (defn resolved-positive-ref?
   "Recognize positive literal IDs within the signed long range."
   [value]

@@ -88,6 +88,30 @@
   (renew [this] "renew a read only transaction")
   (read-only? [this] "is this a read only transaction"))
 
+(defprotocol ITransactionState
+  (restore-transaction-state! [state db]
+    "Restore derived mutable state from authoritative native rows."))
+
+(defprotocol ITransactionRollback
+  (transaction-states [rtx]
+    "Borrow this writer's recovery participants for frozen-row retry.")
+  (enlist-transaction-state! [rtx identity state]
+    "Retain one recovery participant per shared state identity in this writer.")
+  (commit-transaction-state! [rtx]
+    "Discard recovery participants after the native transaction commits."))
+
+(defn enlist-transaction-states!
+  "Retain the original recovery identities when retrying frozen rows."
+  [rtx states]
+  (doseq [^java.util.Map$Entry entry (when states (.entrySet ^java.util.IdentityHashMap states))]
+    (enlist-transaction-state! rtx (.getKey entry) (.getValue entry))))
+
+(defn restore-transaction-states!
+  "Refresh all participants after replay, before publishing its native result."
+  [states db]
+  (doseq [state (when states (.values ^java.util.IdentityHashMap states))]
+    (restore-transaction-state! state db)))
+
 (defprotocol ICompress
   (key-bf [this] "return the working buffer for key compression")
   (val-bf [this] [this size] "Return value scratch, growing on demand to size."))

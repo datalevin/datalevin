@@ -18,6 +18,7 @@
    [datalevin.constants :as c]
    [datalevin.core :as d]
    [datalevin.db :as db]
+   [datalevin.db.tx.add :as txadd]
    [datalevin.db.tx.engine :as txengine]
    [datalevin.ha :as dha]
    [datalevin.ha.authority :as ha-auth]
@@ -1647,7 +1648,9 @@
 
 (defn- transact-blind-insert
   ([db txs tx-meta]
-   (transact-blind-insert db txs tx-meta (db/prepare-blind-local-tx db txs true)))
+   (transact-blind-insert db txs tx-meta
+     (or (db/prepare-compiled-request db txs)
+         (db/prepare-blind-local-tx db txs true))))
   ([db _txs tx-meta prepared]
    (when (and prepared (db/blind-local-tx-valid? db prepared))
      ;; The caller already holds the native writer. Probe before mutating the
@@ -1713,10 +1716,15 @@
      (let [transact (fn [db]
                       (or (when-not (or s? (txengine/interpreter?))
                             (or (transact-prepared db prepared (or tx-meta {}))
+                                ;; A declined caller snapshot may become eligible
+                                ;; under this writer's current schema/options.
+                                (when-let [outcome (db/prepare-compiled-request db txs)]
+                                  (transact-prepared db [:compiled outcome txs] (or tx-meta {})))
                                 ;; Resolve mixed updates/inserts against this
                                 ;; owned writer, including preceding requests.
-                                (when-let [report (db/prepare-mixed-add-tx
-                                                    db txs (or tx-meta {}) (:max-eid db))]
+                                (when-let [report (txadd/prepare-mixed-report
+                                                    (db/->TxReport db db [] {} (or tx-meta {}))
+                                                    txs (:max-eid db))]
                                   (commit-stamped-report report false))))
                           (db/transact-tx-data
                             (db/->TxReport db (if s? (db/transfer db (:store db)) db)

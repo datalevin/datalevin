@@ -49,9 +49,12 @@
   (let [{:keys [batch history opts applier dispatched?]} application]
     (when history (.add ^ArrayList history rows))
     (loop [replay? false]
-      (let [failure (try
+      (let [states (l/transaction-states @(l/write-txn (:raw application)))
+            failure (try
                       (if replay?
-                        (doseq [region history] (@applier region))
+                        (do
+                          (doseq [region history] (@applier region))
+                          (l/restore-transaction-states! states (:view application)))
                         (@applier rows))
                       nil
                       (catch Throwable t t))]
@@ -64,6 +67,7 @@
           (if (and history (:resized (ex-data failure)))
             (do (phase/phase! :native-resized batch)
                 (refresh! application)
+                (l/enlist-transaction-states! @(l/write-txn (:raw application)) states)
                 (recur true))
             (if-let [on-error! (:application-error! opts)]
               (on-error! failure)
@@ -77,7 +81,8 @@
 (defn apply-with-frozen-commit-retry!
   "Retry commit-stage growth using frozen writes and the existing WAL receipt."
   [raw batch history prepare! before-commit!]
-  (let [prepared? (volatile! false)]
+  (let [prepared? (volatile! false)
+        states (volatile! nil)]
     (u/repeat-try-catch c/+in-tx-overflow-times+
       #(and history @prepared? (l/resized? %))
       (cpp/apply-native-once!
@@ -85,9 +90,12 @@
         (fn [wdb]
           (if @prepared?
             (let [apply! (cpp/prepared-row-applier wdb)]
+              (l/enlist-transaction-states! @(l/write-txn raw) @states)
               (phase/phase! :native-resized batch)
-              (doseq [rows history] (apply! rows)))
+              (doseq [rows history] (apply! rows))
+              (l/restore-transaction-states! @states wdb))
             (let [result (prepare! wdb)]
+              (vreset! states (l/transaction-states @(l/write-txn raw)))
               (vreset! prepared? true)
               result)))
         before-commit!))))

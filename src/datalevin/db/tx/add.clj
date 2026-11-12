@@ -198,64 +198,85 @@
                        updates check)))))
         updates))))
 
-(defn- plan-additions
-  [entities ctx max-eid tx ^HashSet updates preflight? ^HashMap infos]
+(defn- append-legacy-mixed-update!
+  "Retain ordered legacy validation/correction. Return typedness, or nil on
+  decline; false is a successful untyped replacement, not a rejection."
+  [^ArrayList additions ctx max-eid tx ^HashSet updates preflight? ^HashMap infos entity]
   (let [schema (:schema ctx) options (:opts ctx)
         sources (:db/attrTuples (:rschema ctx))
+        [_ e a v] entity
+        ^MixedUpdate operand (compile/mixed-update-operand ctx infos e a v)
+        ^MixedAttrInfo info (if operand
+                              (.get infos a)
+                              (compile/ordinary-attr-info! infos schema sources a))
+        props (.-props info)]
+    ;; Java set keys must use the datom's canonical Long entity ID.
+    ;; Other integer representations need ordered resolution.
+    (when (and (or preflight?
+                   (and (instance? Long e) (pos? (long e))))
+               (<= (long e) (long max-eid))
+               (or preflight?
+                   (and (.-update? info) (some? v)
+                        (compile/distinct-mixed-update? updates e a))))
+      (if operand
+        (append-mixed-update! additions options info tx operand false)
+        ;; Preserve legacy numeric/key behavior outside symbolic analysis,
+        ;; including correction before datom ID coercion.
+        (.add additions (datom e a (prepare/correct-value-with-props options props a v) tx)))
+      (.-typed? info))))
+
+(defn- bind-mixed-additions
+  "Bind either compiled MixedOperands or ordered legacy forms in one writer
+  loop. Compiled entries use indexed access; raw sequence demand stays between
+  successful forms. Caller admission owns epochs and compiled ID bounds."
+  [entities ctx max-eid tx ^HashSet updates preflight? ^HashMap infos]
+  (let [compiled? (instance? MixedOperands entities)
+        ^ArrayList entries (when compiled? (.-entries ^MixedOperands entities))
+        schema (:schema ctx) options (:opts ctx)
+        sources (:db/attrTuples (:rschema ctx))
         additions (ArrayList.)]
-    (loop [es (seq entities) eid (long max-eid) tempids {} read-safe? true]
-      (if es
-        (let [entity (first es)]
-          (cond
-            (meta entity) nil
+    (loop [index 0 es (when-not compiled? (seq entities))
+           eid (long max-eid) tempids {} read-safe? true]
+      (if (if compiled? (< index (.size entries)) (some? es))
+        (let [entity (if compiled? (.get entries index) (first es))]
+          (when (or compiled? (not (meta entity)))
+            (cond
+              (if compiled? (instance? MixedInsert entity) (map? entity))
+              (let [tempid (if compiled? (.-tempid ^MixedInsert entity) (:db/id entity))]
+                (when (or compiled?
+                          (and (or (not (contains? entity :db/id))
+                                   (and (txprep/tempid? tempid)
+                                        (not (txprep/auto-tempid? tempid))))
+                               (not (contains? tempids tempid))
+                               (> (count entity) (if (contains? entity :db/id) 1 0))))
+                  (let [^MixedInsert operand (if compiled? entity
+                                               (compile/mixed-insert-operands ctx infos entity))
+                        next-eid (inc eid)
+                        tempids' (cond-> tempids tempid (assoc tempid next-eid))]
+                    (when (if operand
+                            (append-mixed-entity! additions infos options tempids'
+                              next-eid tx (.-attrs operand) compiled?)
+                            ;; Preserve correction/decline order for containers,
+                            ;; tempids and attributes outside symbolic analysis.
+                            (append-new-entity! additions infos schema options sources
+                              tempids' next-eid tx entity))
+                      (recur (unchecked-inc index) (when-not compiled? (next es))
+                             next-eid tempids' read-safe?)))))
 
-            (map? entity)
-            (let [tempid (:db/id entity)]
-              (when (and (or (not (contains? entity :db/id))
-                             (and (txprep/tempid? tempid)
-                                  (not (txprep/auto-tempid? tempid))))
-                         (not (contains? tempids tempid))
-                         (> (count entity) (if (contains? entity :db/id) 1 0)))
-                (let [^MixedInsert operand (compile/mixed-insert-operands ctx infos entity)
-                      next-eid (inc eid)
-                      tempids' (cond-> tempids tempid (assoc tempid next-eid))]
-                  (when (if operand
-                          (append-mixed-entity! additions infos options tempids'
-                            next-eid tx (.-attrs operand) false)
-                          ;; Preserve correction/decline order for containers,
-                          ;; tempids and attributes outside symbolic analysis.
-                          (append-new-entity! additions infos schema options sources
-                            tempids' next-eid tx entity))
-                    (recur (next es) next-eid tempids' read-safe?)))))
+              (or compiled? (and (vector? entity) (= 4 (count entity))
+                                 (= :db/add (nth entity 0))))
+              (when-some [typed? (if compiled?
+                                  (do (append-mixed-update! additions nil nil tx entity true)
+                                      true)
+                                  (append-legacy-mixed-update!
+                                    additions ctx max-eid tx updates preflight? infos entity))]
+                (recur (unchecked-inc index) (when-not compiled? (next es))
+                       eid tempids (and read-safe? typed?)))
 
-            (and (vector? entity) (= 4 (count entity))
-                 (= :db/add (nth entity 0)))
-            (let [[_ e a v] entity
-                  ^MixedUpdate operand (compile/mixed-update-operand ctx infos e a v)
-                  ^MixedAttrInfo info (if operand
-                                        (.get infos a)
-                                        (compile/ordinary-attr-info! infos schema sources a))
-                  props (.-props info)]
-              ;; Java set keys must use the datom's canonical Long entity ID.
-              ;; Other integer representations need ordered resolution.
-              (when (and (or preflight?
-                             (and (instance? Long e) (pos? (long e))))
-                         (<= (long e) (long max-eid))
-                         (or preflight?
-                             (and (.-update? info) (some? v)
-                                  (compile/distinct-mixed-update? updates e a))))
-                (if operand
-                  (append-mixed-update! additions options info tx operand false)
-                  ;; Preserve legacy numeric/key behavior outside symbolic
-                  ;; analysis, including correction before datom ID coercion.
-                  (.add additions (datom e a (prepare/correct-value-with-props
-                                              options props a v) tx)))
-                (recur (next es) eid tempids
-                       (and read-safe? (.-typed? info)))))
-
-            :else nil))
+              :else nil)))
         (cond-> {:additions additions :max-eid eid :tempids tempids :infos infos}
-          (and (> (.size updates) 1) read-safe?)
+          (if compiled? (.-prepare-reader? ^MixedOperands entities)
+              (and (> (.size updates) 1) read-safe?))
           (assoc :prepare-reader? true))))))
 
 (defn- unique-additions-available?
@@ -319,32 +340,13 @@
                (identical? (:schema ctx) (i/schema store))
                (identical? (:opts ctx) (i/opts store)))
       (let [^MixedOperands operands (:entries plan)
-            ^ArrayList entries (.-entries operands)
             infos (.-infos operands)
             before (max (long (:max-eid db))
                         (long (or owned-max-eid (i/init-max-eid store))))
-            tx (inc (long (:max-tx db)))
-            additions (ArrayList.)]
+            tx (inc (long (:max-tx db)))]
         (when (<= (.-required-eid operands) before)
-          (loop [index 0 eid before tempids {}]
-            (if (< index (.size entries))
-              (let [entry (.get entries index)]
-                (if (instance? MixedInsert entry)
-                  (let [^MixedInsert entry entry
-                        next-eid (inc eid)
-                        tempid (.-tempid entry)
-                        tempids (cond-> tempids tempid (assoc tempid next-eid))]
-                    (when (append-mixed-entity!
-                            additions infos (:opts ctx) tempids next-eid tx
-                            (.-attrs entry) true)
-                      (recur (unchecked-inc index) next-eid tempids)))
-                  (let [^MixedUpdate entry entry]
-                    (append-mixed-update! additions nil nil tx entry true)
-                    (recur (unchecked-inc index) eid tempids))))
-              (finish-mixed-report
-                report db store before tx
-                {:additions additions :max-eid eid :tempids tempids :infos infos
-                 :prepare-reader? (.-prepare-reader? operands)}))))))))
+          (when-let [bound (bind-mixed-additions operands ctx before tx nil false infos)]
+            (finish-mixed-report report db store before tx bound)))))))
 
 (defn prepare-mixed-report
   "Prepare mixed existing-entity updates and new maps on the owned writer.
@@ -381,5 +383,5 @@
                (let [before (max (long (:max-eid db))
                                  (long (or owned-max-eid (i/init-max-eid store))))
                      tx (inc (long (:max-tx db)))]
-                 (when-let [plan (plan-additions entities ctx before tx updates preflight? infos)]
+                 (when-let [plan (bind-mixed-additions entities ctx before tx updates preflight? infos)]
                    (finish-mixed-report report db store before tx plan)))))))))))

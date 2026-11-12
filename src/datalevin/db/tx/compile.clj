@@ -265,7 +265,13 @@
                          (nil? (:db/tupleTypes props))
                          (nil? (:db.attr/preds props))
                          (or (not literal?)
-                             (not (or (:db/fulltext props) (:db/vector props)
+                             (not (or (and (:db/fulltext props)
+                                           ;; Stage 2 retains ordinary fulltext
+                                           ;; strings on the shared scalar loop.
+                                           ;; Stage 1 keeps its original scope.
+                                           (not (and (identical? literal? :references)
+                                                     (identical? vt :db.type/string))))
+                                      (:db/vector props)
                                       (:db/embedding props))))))
                 ;; Legacy reference operands may be host numbers. Preserve
                 ;; exclusion checks before any conversion can invoke user code.
@@ -286,16 +292,6 @@
     (.add candidates vt)
     e))
 
-(defn- canonical-scalar-candidates
-  "Copy identity-proven operands without entering the legacy correction path."
-  [^FastList candidates]
-  (loop [i 0 entries (transient [])]
-    (if (< i (.size candidates))
-      (recur (+ i 4)
-             (conj! entries [(.get candidates i) (.get candidates (+ i 1))
-                            (.get candidates (+ i 2))]))
-      (persistent! entries))))
-
 (def ^:const scalar-entity-read-min-attrs 8)
 
 (defn prepare-scalar-entity-read
@@ -307,6 +303,20 @@
     (let [names (sort-by #(:db/aid (store-schema %)) attributes)]
       (ScalarEntityRead. (object-array names)
                          (long-array (map #(:db/aid (store-schema %)) names))))))
+
+(defn blind-identity-entity-read
+  "Select the existing single-identity projection from normalized operands and
+  captured schema. Header/provenance and current ownership remain caller work."
+  [store-schema ^FastList entities identity-av]
+  (when identity-av
+    (let [^BlindEntity entity (.get entities 0)
+          ^FastList attrs (.-attrs entity)
+          identity-attr (first identity-av)]
+      (prepare-scalar-entity-read
+        store-schema
+        (for [offset (range 0 (.size attrs) 2)
+              :let [attr (.get attrs offset)]
+              :when (not= attr identity-attr)] attr)))))
 
 (defn scalar-update-entity-reads
   ([store-schema entries] (scalar-update-entity-reads store-schema entries 0))
@@ -662,7 +672,7 @@
         (cond
           rejected? {:outcome :needs-writer :ctx ctx :input forms}
           canonical?
-          (let [entries (canonical-scalar-candidates candidates)]
+          (let [entries (plan/scalar-candidate-entries candidates)]
             (plan/->TxPlan ctx :scalar entries
                            (scalar-update-entity-reads (:schema ctx) entries)))
           :else nil)))))
@@ -909,15 +919,7 @@
                       :independent-identity-upserts? independent-identities?
                       :identity-upsert-av identity-av
                       :identity-upsert-read
-                      (when identity-av
-                        (let [^BlindEntity entity (.get entities 0)
-                              ^FastList attrs (.-attrs entity)
-                              identity-attr (first identity-av)]
-                          (prepare-scalar-entity-read
-                            (:schema ctx)
-                            (for [offset (range 0 (.size attrs) 2)
-                                  :let [attr (.get attrs offset)]
-                                  :when (not= attr identity-attr)] attr))))))))))))
+                      (blind-identity-entity-read (:schema ctx) entities identity-av)))))))))
 
 (defn compile-blind-region
   "Compile canonical or safely coercible new maps, materialized many values
@@ -1199,7 +1201,7 @@
                     true (reduced false))))
               true forms)
         (plan/->TxPlan ctx :scalar-aliases
-                       (canonical-scalar-candidates candidates) nil)))))
+                       (plan/scalar-candidate-entries candidates) nil)))))
 
 (defn- compile-coerced-scalar-region
   "Normalize only after complete inert eligibility and raw E/A distinctness.
@@ -1232,23 +1234,23 @@
                              (append! e (nth form 2) (nth form 3))))
                     true (reduced false))))
               true forms)
-        (when-let [entries
-                   (loop [i 0 entries (transient [])]
-                     (if (< i (.size candidates))
-                       (let [raw (.get candidates (+ i 2))
-                             vt (.get candidates (+ i 3))
-                             value (if (canonical-scalar-value? validate? vt raw)
-                                     raw
-                                     (try (prepare/correct-scalar-value validate? vt raw)
-                                          (catch Exception _ nil)))]
-                         (when (some? value)
-                           (recur (+ i 4)
-                                  (conj! entries [(.get candidates i)
-                                                  (.get candidates (inc i)) value]))))
-                       (persistent! entries)))]
-          (plan/->TxPlan ctx (if aliases? :scalar-aliases :scalar) entries
-                         (when-not aliases?
-                           (scalar-update-entity-reads store-schema entries))))))))
+        (when (loop [i 0]
+                (if (< i (.size candidates))
+                  (let [raw (.get candidates (+ i 2))
+                        vt (.get candidates (+ i 3))
+                        value (if (canonical-scalar-value? validate? vt raw)
+                                raw
+                                (try (prepare/correct-scalar-value validate? vt raw)
+                                     (catch Exception _ nil)))]
+                    (when (some? value)
+                      ;; The complete inert proof precedes this private mutation.
+                      (.set candidates (+ i 2) value)
+                      (recur (+ i 4))))
+                  true))
+          (let [entries (plan/scalar-candidate-entries candidates)]
+            (plan/->TxPlan ctx (if aliases? :scalar-aliases :scalar) entries
+                           (when-not aliases?
+                             (scalar-update-entity-reads store-schema entries)))))))))
 
 (defn compile-tx
   "Select one scalar, blind or mixed rule from a pure structural decision.

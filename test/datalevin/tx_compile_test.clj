@@ -1,9 +1,28 @@
 (ns datalevin.tx-compile-test
   (:require [clojure.test :refer [deftest is]]
             [datalevin.db.tx.compile :as compile]
+            [datalevin.db.tx.plan :as plan]
             [datalevin.prepare :as prepare])
   (:import [datalevin.db.tx.plan BlindEntity MixedAttrInfo MixedInsert MixedOperands MixedUpdate TxPlan]
-           [java.util HashMap HashSet]))
+           [java.util HashMap HashSet]
+           [org.eclipse.collections.impl.list.mutable FastList]))
+
+(deftest scalar-candidate-projection-keeps-values-opaque-and-scratch-owned
+  (let [calls (atom [])
+        host (proxy [Object] []
+               (hashCode [] (swap! calls conj :hash) 0)
+               (toString [] (swap! calls conj :string) "host"))
+        candidates (doto (FastList.)
+                     (.add 1) (.add :text) (.add host) (.add :db.type/string)
+                     (.add [:key "one"]) (.add :text) (.add nil) (.add :db.type/string))
+        entries (plan/scalar-candidate-entries candidates)]
+    (is (identical? host (nth (first entries) 2)))
+    (is (nil? (nth (second entries) 2)))
+    (is (= [:key "one"] (first (second entries))))
+    (is (= 8 (.size candidates)))
+    (is (identical? host (.get candidates 2)))
+    (is (not (identical? entries (plan/scalar-candidate-entries candidates))))
+    (is (empty? @calls))))
 
 (def ctx
   (prepare/->PrepareCtx
@@ -12,6 +31,19 @@
      :identity {:db/aid 5 :db/valueType :db.type/string :db/unique :db.unique/identity}
      :reference {:db/aid 6 :db/valueType :db.type/ref}}
     {} {:validate-data? true}))
+
+(deftest blind-identity-read-selection-is-shared-and-excludes-the-key
+  (let [fields (mapv #(keyword (str "field-" %)) (range 8))
+        schema (into {:key {:db/aid 1 :db/valueType :db.type/string}}
+                     (map-indexed (fn [index attr] [attr {:db/aid (+ index 2)
+                                                        :db/valueType :db.type/long}]) fields))
+        attrs (doto (FastList.) (.add :key) (.add "one"))
+        _ (doseq [attr (reverse fields)] (.add attrs attr) (.add attrs 1))
+        entities (doto (FastList.) (.add (BlindEntity. "new" attrs)))
+        read (compile/blind-identity-entity-read schema entities [:key "one"])]
+    (is (= fields (vec (.-names ^datalevin.db.tx.plan.ScalarEntityRead read))))
+    (is (= (vec (range 2 10)) (vec (.-aids ^datalevin.db.tx.plan.ScalarEntityRead read))))
+    (is (nil? (compile/blind-identity-entity-read schema nil nil)))))
 
 (deftest mixed-update-analysis-retains-opaque-values-and-unbound-ids
   (let [calls (atom [])
@@ -737,6 +769,22 @@
                                   [[:db/add 1 :value 42]]))))
   (is (nil? (compile/compile-tx (assoc ctx :rschema {:db/attrTuples {:value {:pair 0}}})
                                 [[:db/add 1 :value 42]]))))
+
+(deftest stage2-fulltext-strings-retain-the-stage1-and-secondary-scope
+  (let [props {:db/aid 3 :db/valueType :db.type/string :db/fulltext true}
+        context (assoc ctx :schema {:text props})
+        forms [[:db/add 1 :text "searchable"]]]
+    (is (= :scalar-operations (:strategy (compile/compile-tx context forms))))
+    (is (nil? (compile/compile-tx context forms {:literal-shape :scalar-operations})))
+    (doseq [exclusion [{:db/vector true} {:db/embedding true}
+                       {:db/cardinality :db.cardinality/many}
+                       {:db/unique :db.unique/identity}
+                       {:db.attr/preds [(constantly true)]}
+                       {:db/valueType :db.type/long}]]
+      (is (nil? (compile/compile-tx
+                  (assoc context :schema {:text (merge props exclusion)}) forms))))
+    (is (nil? (compile/compile-tx
+                (assoc context :opts (assoc (:opts context) :auto-entity-time? true)) forms)))))
 
 (deftest legacy-exclusions-precede-reference-value-conversion
   (let [effects (atom [])

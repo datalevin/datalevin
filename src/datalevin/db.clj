@@ -60,7 +60,7 @@
             kv-info]])
   (:import
    [datalevin.datom Datom]
-   [datalevin.db.tx.plan BlindEntity TxPlan]
+   [datalevin.db.tx.plan TxPlan]
    [datalevin.interface IRemoteDB IRemotePrepared IStore]
    [datalevin.storage Store WriteGroup]
    [datalevin.utl LRUCache QueryKey]
@@ -2277,121 +2277,6 @@
     forms
     (sequence (mapcat expand-transactable-entity) forms)))
 
-;; Identity probes in the blind path share the LMDB write transaction. Large
-;; batches enable them from two entities onward so ingestion avoids the old
-;; discontinuity. A single entity is routed to the identity-upsert
-;; specialization when it names a unique-identity attribute, on both the WAL
-;; and non-WAL direct paths, so simple upserts avoid the ordinary resolver.
-;; Value-unique inserts reject duplicates instead of upserting, so they can use
-;; the blind path at any batch size.
-(def ^:private ^:const ^long blind-unique-write-threshold 2)
-
-(defn- blind-write-multiple-values?
-  [many? unique-identity-attrs value]
-  (and many?
-       (coll? value)
-       (not (map? value))
-       (not (and (= (count value) 2)
-                 (contains? unique-identity-attrs (first value))))))
-
-(defn- append-blind-value!
-  ^Boolean [^FastList attrs ^FastList unique-avs
-            seen-avs set-capacity fuse-unique-inserts?
-            store-opts ^objects info attr entity value]
-  (if (or (map? value)
-          (datom? value)
-          (and (coll? value) (not (bytes? value))))
-    false
-    (let [props   (aget info 0)
-          value'  (if (txcompile/blind-value-ready? info value)
-                    value
-                    (do
-                      (vld/validate-val value entity)
-                      (if (aget info 5)
-                        (prepare/correct-scalar-value
-                          (:validate-data? store-opts) (aget info 4) value)
-                        (prepare/correct-value-with-props
-                          store-opts props attr value))))]
-      (txcompile/append-blind-canonical-value!
-        attrs unique-avs seen-avs set-capacity fuse-unique-inserts? info attr value'))))
-
-(defn- prepare-blind-write-entity
-  [store-opts unique-identity-attrs ^FastList unique-avs seen-avs set-capacity
-   has-many? fuse-unique-inserts? attr-infos entity]
-  (let [old-eid   (:db/id entity)
-        ;; An implicit entity does not need a transaction-scoped tempid: the
-        ;; blind stamper assigns its final EID directly and never exposes an
-        ;; implicit mapping in the report. Retain explicit tempids so repeated
-        ;; user IDs still fall back to the resolver and merge correctly.
-        entity-id old-eid]
-    (when (if (nil? old-eid)
-            (not (contains? entity :db/id))
-            (tempid? old-eid))
-      (let [^FastList attrs (FastList. (int (* 2 (count entity))))
-            supported?
-            (reduce-kv
-              (fn [_ attr raw-value]
-                (if (identical? attr :db/id)
-                  true
-                  ;; Upfront preflight supplies a map; bulk preparation uses
-                  ;; a value-aware lookup without adding per-entity state.
-                  (if-some [^objects info (if (instance? java.util.HashMap attr-infos)
-                                           (.get ^java.util.HashMap attr-infos attr)
-                                           (attr-infos attr raw-value))]
-                    (let [props (aget info 0)
-                          many? (identical? :db.cardinality/many (:db/cardinality props))
-                          _ (when (and (not (aget info 2)) fuse-unique-inserts?)
-                              (vreset! fuse-unique-inserts? false))
-                          supported-values?
-                          (if (blind-write-multiple-values?
-                                many? unique-identity-attrs raw-value)
-                            (let [vt (aget info 4)
-                                  ^java.util.Set seen-values (txcompile/blind-value-set vt)
-                                  values (seq raw-value)]
-                              (when values (vreset! has-many? true))
-                              (loop [values values]
-                                ;; A nil member must reach value validation.
-                                (if values
-                                  (if (append-blind-value!
-                                        attrs unique-avs seen-avs set-capacity
-                                        fuse-unique-inserts? store-opts info attr entity
-                                        (first values))
-                                    (if (.add seen-values (.get attrs (dec (.size attrs))))
-                                      (recur (next values))
-                                      (if (:db/unique props)
-                                        false
-                                        (do
-                                          ;; Keep the first normalized occurrence.
-                                          ;; Unique AV collection remains untouched.
-                                          (.remove attrs (int (dec (.size attrs))))
-                                          (.remove attrs (int (dec (.size attrs))))
-                                          (recur (next values)))))
-                                    false)
-                                  true)))
-                            (do
-                              (when many? (vreset! has-many? true))
-                              (append-blind-value!
-                                attrs unique-avs seen-avs set-capacity
-                                fuse-unique-inserts? store-opts info attr entity
-                                raw-value)))]
-                      (if-not supported-values?
-                        (reduced false)
-                        true))
-                    (reduced false))))
-              true
-              entity)]
-        (when supported?
-          (BlindEntity. entity-id attrs))))))
-
-(defn- blind-attributes-supported?
-  "Preflight attributes and retain unique/many flags without correcting values."
-  [entities check-attr]
-  (reduce (fn [kinds entity]
-            (if-some [kinds (reduce-kv check-attr kinds entity)]
-              kinds
-              (reduced nil)))
-          0 entities))
-
 (defn- local-tx-form-kinds
   "Shape-only candidates: scalar 1, blind 2, mixed 4, patch 8; tempids use 16."
   ^long [entity]
@@ -2455,185 +2340,39 @@
         :general))
     :general))
 
-(defn- prepare-blind-local-tx*
-  ([^DB db initial-es]
-   (prepare-blind-local-tx* db initial-es false true))
-  ([^DB db initial-es allow-small-unique?]
-   (prepare-blind-local-tx* db initial-es allow-small-unique? true))
-  ([^DB db initial-es allow-small-unique? check-unique-avs?]
-   (prepare-blind-local-tx* db initial-es allow-small-unique? check-unique-avs? nil))
-  ([^DB db initial-es allow-small-unique? check-unique-avs? entity-kinds]
-   ;; Classified callers retain the implicit-ID/tempid proof from their one
-   ;; shape pass. Other callers still establish that proof here.
-   ;; Reject mixed requests and ineligible IDs before allocating preparation
-   ;; state or correcting values that the general or mixed preparer repeats.
-   ;; Only an absent :db/id is implicit; an explicit nil needs general validation.
-   ;; Zero is a valid proof of implicit IDs; one marks an explicit tempid.
-   (when-let [entity-kinds
-               (if (some? entity-kinds)
-                 entity-kinds
-                 (reduce (fn [kinds entity]
-                         (if (map? entity)
-                           (let [e (:db/id entity)]
-                             (cond
-                               (nil? e) (if (contains? entity :db/id)
-                                          (reduced false) kinds)
-                               (tempid? e) 1
-                               :else (reduced false)))
-                           (reduced false)))
-                       0 initial-es))]
-     (let [store             (.-store db)
-           store-schema      (schema store)
-           store-opts        (opts store)
-           store-rschema     (rschema store)
-           tuple-source-attrs (:db/attrTuples store-rschema)
-           unique-identity-attrs (:db.unique/identity store-rschema)
-           auto-entity-time? (boolean (:auto-entity-time? store-opts))
-           allow-unique?     (or allow-small-unique?
-                                 (>= (long (bounded-count
-                                            blind-unique-write-threshold
-                                            initial-es))
-                                     blind-unique-write-threshold))
-           initial-count     (int
-                               (if (instance? java.util.Collection initial-es)
-                                 (.size ^java.util.Collection initial-es)
-                                 0))
-           ;; Amortize the lazy preflight in bulk requests. Small requests
-           ;; retain their upfront attribute check and direct metadata lookup.
-           incremental?      (if (instance? java.util.Collection initial-es)
-                               (>= initial-count 32)
-                               (>= (long (bounded-count 32 initial-es)) 32))
-           attr-infos        (java.util.HashMap.)
-           check-attr        (fn [kinds attr value]
-                               (if (identical? attr :db/id)
-                                 kinds
-                                 (let [^objects info
-                                       (txcompile/blind-attr-info!
-                                         attr-infos store-schema tuple-source-attrs
-                                         allow-unique? attr)]
-                                   (if (and (aget info 1)
-                                            (or (not (identical? (aget info 4) :db.type/ref))
-                                                (if (blind-write-multiple-values?
-                                                      (identical?
-                                                        :db.cardinality/many
-                                                        (:db/cardinality (aget info 0)))
-                                                      unique-identity-attrs value)
-                                                  (every? txplan/resolved-positive-ref? value)
-                                                  (txplan/resolved-positive-ref? value))))
-                                     (bit-or (long kinds) (long (aget info 1)))
-                                     (reduced nil)))))
-           attribute-kinds   (when-not incremental?
-                               (blind-attributes-supported? initial-es check-attr))]
-       (when (or incremental? (some? attribute-kinds))
-         (let [;; Entity preparation receives an Object; box once per batch.
-               set-capacity      (Integer/valueOf
-                                   (int (max 1 (inc (quot (* 4 (long initial-count))
-                                                         3)))))
-               ;; Small requests already proved which workspace is needed.
-               ;; Incremental bulk preflight retains its existing shared state.
-               ^FastList unique-avs (when (or incremental?
-                                             (not (zero? (bit-and (long attribute-kinds) 1))))
-                                      (FastList.))
-               seen-avs          (when (and unique-avs check-unique-avs?)
-                                   (volatile! nil))
-               seen-tempids      (when (and (pos? (long entity-kinds)) (not (== initial-count 1)))
-                                   (java.util.HashSet. (int set-capacity)))
-               has-many?         (when (or incremental?
-                                          (not (zero? (bit-and (long attribute-kinds) 2))))
-                                   (volatile! false))
-               fuse-unique-inserts? (when unique-avs (volatile! true))
-               ;; Canonical scalar values are inert. Check and prepare those
-               ;; together; complete the attribute check before any coercion
-               ;; or collection handling that could invoke user code or fail.
-               preflight         (when incremental?
-                                   (delay (blind-attributes-supported?
-                                            initial-es check-attr)))
-               attr-lookup       (when incremental?
-                                   (fn [attr value]
-                                     ;; A failed preflight stops preparation.
-                                     ;; Once it succeeds, use the populated map.
-                                     (if (realized? preflight)
-                                       (.get attr-infos attr)
-                                       (let [^objects info
-                                             (txcompile/blind-attr-info!
-                                               attr-infos store-schema
-                                               tuple-source-attrs allow-unique? attr)]
-                                         (when (and (aget info 1)
-                                                    (or (txcompile/blind-value-ready? info value)
-                                                        @preflight))
-                                           info)))))
-               entity-attr-infos (or attr-lookup attr-infos)
-               entities
-               (reduce
-                 (fn [^FastList acc entity]
-                   (if-let [^BlindEntity prepared
-                            (prepare-blind-write-entity
-                              store-opts unique-identity-attrs unique-avs
-                              seen-avs set-capacity has-many?
-                              fuse-unique-inserts? entity-attr-infos entity)]
-                     (if (and (.-tempid prepared) seen-tempids
-                              (not (.add seen-tempids (.-tempid prepared))))
-                       (reduced nil)
-                       (if (or (not (.isEmpty ^FastList (.-attrs prepared)))
-                               auto-entity-time?)
-                         (doto acc (.add prepared))
-                         acc))
-                     (reduced nil)))
-                 (FastList. initial-count)
-                 initial-es)
-               has-unique?       (boolean (and unique-avs (not (.isEmpty unique-avs))))
-               fuse-unique-inserts? (and has-unique? @fuse-unique-inserts?)
-               identity-upsert-av
-               (when (and has-unique? entities
-                          (not auto-entity-time?)
-                          (= 1 (.size ^FastList entities)))
-                 (txcompile/blind-identity-upsert-av
-                   store-schema (.get ^FastList entities 0)))]
-           (when (and entities (not (.isEmpty ^FastList entities))
-                      ;; Fused writes enforce uniqueness natively. Other writes
-                      ;; deduplicate only the AVs collected during preparation.
-                      (or check-unique-avs? fuse-unique-inserts? (not has-unique?)
-                          (= (.size unique-avs)
-                             (.size (java.util.HashSet. ^java.util.Collection unique-avs)))))
-             (assoc (txplan/->TxPlan
-                      (prepare/->PrepareCtx store-schema store-rschema store-opts)
-                      :blind entities nil)
-                    ::legacy-prepared? true
-                    :auto-entity-time? auto-entity-time?
-                    :unique-avs unique-avs
-                    :has-unique? has-unique?
-                    :has-many? (boolean (and has-many? @has-many?))
-                    :fuse-unique-inserts? fuse-unique-inserts?
-                    :identity-upsert-av identity-upsert-av
-                    :identity-upsert-read
-                    (when identity-upsert-av
-                      (let [^BlindEntity entity (.get ^FastList entities 0)
-                            ^FastList attrs (.-attrs entity)
-                            identity-attr (first identity-upsert-av)]
-                        (txcompile/prepare-scalar-entity-read
-                          store-schema
-                          (for [index (range 0 (.size attrs) 2)
-                                :let [attr (.get attrs index)]
-                                :when (not= attr identity-attr)]
-                            attr))))))))))))
+(defn- prepare-legacy-blind-plan
+  "Keep ID preflight before snapshots and attach the legacy blind header."
+  [^DB db entities allow-small-unique? check-unique-avs? entity-kinds]
+  (when-let [entity-kinds (txexec/blind-entity-kinds entities entity-kinds)]
+    (let [store (.-store db)
+          store-schema (schema store)
+          store-opts (opts store)
+          store-rschema (rschema store)
+          ctx (prepare/->PrepareCtx store-schema store-rschema store-opts)]
+      (when-let [{:keys [entries auto-entity-time? unique-avs has-unique? has-many?
+                        fuse-unique-inserts? identity-upsert-av]}
+                 (txexec/prepare-blind-operands
+                   ctx entities allow-small-unique? check-unique-avs? entity-kinds)]
+        (assoc (txplan/->TxPlan ctx :blind entries nil)
+               ::legacy-prepared? true
+               :auto-entity-time? auto-entity-time?
+               :unique-avs unique-avs :has-unique? has-unique? :has-many? has-many?
+               :fuse-unique-inserts? fuse-unique-inserts?
+               :identity-upsert-av identity-upsert-av
+               :identity-upsert-read
+               (txcompile/blind-identity-entity-read store-schema entries identity-upsert-av))))))
 
 (defn ^:no-doc prepare-blind-local-tx
-  "Select compiled canonical or safely coercible new maps when opted in; other
-  shapes retain the blind specialization. Neither route binds persistent IDs here."
+  "Normalize legacy blind input at the caller's existing preparation checkpoint.
+  Compiler selection belongs to prepare-compiled-request. Persistent IDs remain
+  unbound until writer execution."
   ([db entities] (prepare-blind-local-tx db entities false true))
   ([db entities allow-small-unique?]
    (prepare-blind-local-tx db entities allow-small-unique? true))
   ([db entities allow-small-unique? check-unique-avs?]
    (prepare-blind-local-tx db entities allow-small-unique? check-unique-avs? nil))
   ([db entities allow-small-unique? check-unique-avs? entity-kinds]
-   (or (when (and (txengine/compiler?) (instance? Store (:store db)))
-         (when-let [plan (txcompile/compile-tx
-                           (prepare/make-prepare-ctx db) entities
-                           {:request-shape :blind :allow-small-unique? allow-small-unique?
-                            :check-unique-avs? check-unique-avs?})]
-           (when *tx-compiler-observer* (*tx-compiler-observer* :prepared plan))
-           plan))
-       (prepare-blind-local-tx* db entities allow-small-unique? check-unique-avs? entity-kinds))))
+   (prepare-legacy-blind-plan db entities allow-small-unique? check-unique-avs? entity-kinds)))
 
 (defn- compiler-prepared?
   "Legacy adapters share TxPlan operands without acquiring compiler proofs."
@@ -2793,90 +2532,23 @@
      (entid-strict db (:e prepared))
      (stamp-local-patch-idoc-doc db prepared tx-meta old-doc))))
 
-(defn- append-scalar-update-candidate!
-  "Retain runtime entity checks around the shared pure candidate workers."
-  [db store-schema tuple-source-attrs candidates seen e attr value]
-  (when-let [props (txcompile/scalar-attribute-props
-                    store-schema tuple-source-attrs attr value)]
-    (when-let [eid (if (or (keyword? e) (and (sequential? e) (= 2 (count e))))
-                    e (txexec/scalar-update-entity-id db e))]
-      (txcompile/append-scalar-candidate!
-        candidates seen eid attr value (:db/valueType props)))))
-
-(defn- prepare-scalar-update-tx*
+(defn- prepare-legacy-scalar-plan
+  "Capture legacy epochs and attach headers/read layouts to runtime operands."
   [^DB db initial-es defer-entity-resolution?]
-  (let [store        (.-store db)
+  (let [store (.-store db)
         store-schema (schema store)
-        store-opts   (opts store)
+        store-opts (opts store)
         store-rschema (rschema store)
-        validate?    (:validate-data? store-opts)
-        tuple-source-attrs (:db/attrTuples store-rschema)]
-    (when-not (:auto-entity-time? store-opts)
-      (let [^FastList candidates
-            (FastList. (int (* 4 (if (instance? java.util.Collection initial-es)
-                                  (long (.size ^java.util.Collection initial-es)) 0))))]
-        ;; Retain entity inputs and types. Resolve eager aliases before any
-        ;; correction, after proving eligibility and distinct E/A pairs.
-        (loop [es      (seq initial-es)
-               seen    nil
-               resolve-entities? false]
-          (if es
-            (let [entity (first es)
-                  remaining (next es)]
-              (if (map? entity)
-                (let [e (:db/id entity)
-                      seen (or seen
-                               (when (or remaining (> (count entity) 2))
-                                 (java.util.HashSet.)))]
-                  ;; Request preflight already proved that this ID fits a long.
-                  (when (and (<= (long e) (.-max-eid db))
-                             (reduce-kv
-                               (fn [_ attr value]
-                                 (if (identical? attr :db/id)
-                                   true
-                                   (if (and (keyword? attr) (pos? (count (name attr)))
-                                            (not (txcommon/reverse-ref? attr))
-                                            (append-scalar-update-candidate!
-                                              db store-schema tuple-source-attrs candidates
-                                              seen e attr value))
-                                     true
-                                     (reduced false))))
-                               true entity))
-                    (recur remaining seen resolve-entities?)))
-                (let [[_ e attr value] entity]
-                  (when-let [eid (append-scalar-update-candidate!
-                                   db store-schema tuple-source-attrs candidates seen e attr value)]
-                    (recur remaining
-                           (or seen
-                               (when remaining
-                                 (doto (java.util.HashSet.) (.add [eid attr]))))
-                           (or resolve-entities? (not (integer? eid))))))))
-            (when (and (not (.isEmpty candidates))
-                       (or defer-entity-resolution? (not resolve-entities?)
-                           (txexec/resolve-scalar-update-candidates! db candidates)))
-              (let [entries
-                    ;; Coercion remains legacy orchestration. Keep its errors
-                    ;; at the original call site; compilation proves identity
-                    ;; and uses the shared prepare value semantics separately.
-                    (loop [i 0 entries (transient [])]
-                      (if (< i (.size candidates))
-                        (recur (+ i 4)
-                               (conj! entries
-                                      [(.get candidates i)
-                                       (.get candidates (+ i 1))
-                                       (prepare/correct-scalar-value
-                                         validate? (.get candidates (+ i 3))
-                                         (.get candidates (+ i 2)))]))
-                        (persistent! entries)))
-                    deferred? (and defer-entity-resolution?
-                                   (some #(not (integer? (first %))) entries))]
-                (cond-> (assoc (txplan/->TxPlan
-                                 (prepare/->PrepareCtx store-schema store-rschema store-opts)
-                                 :scalar entries
-                                 (when-not deferred?
-                                   (txcompile/scalar-update-entity-reads store-schema entries)))
-                               ::legacy-prepared? true)
-                  deferred? (assoc :deferred-entity-resolution? true))))))))))
+        ctx (prepare/->PrepareCtx store-schema store-rschema store-opts)]
+    (when-let [entries (txexec/prepare-scalar-operands db ctx initial-es defer-entity-resolution?)]
+      (let [deferred? (and defer-entity-resolution?
+                           (some #(not (integer? (first %))) entries))]
+        (cond-> (assoc (txplan/->TxPlan
+                         ctx :scalar entries
+                         (when-not deferred?
+                           (txcompile/scalar-update-entity-reads store-schema entries)))
+                       ::legacy-prepared? true)
+          deferred? (assoc :deferred-entity-resolution? true))))))
 
 (defn ^:no-doc prepare-scalar-update-tx
   "Recognize ordinary scalar add operations and explicit numeric-ID maps
@@ -2895,9 +2567,9 @@
      (if defer-entity-resolution?
        ;; Collector preparation reads no persisted identities. The owner resolves
        ;; them and consults the pending transaction indexes when stamping.
-       (prepare-scalar-update-tx* db initial-es true)
+       (prepare-legacy-scalar-plan db initial-es true)
        (txcommon/with-lookup-ref-cache db
-         (prepare-scalar-update-tx* db initial-es false))))))
+         (prepare-legacy-scalar-plan db initial-es false))))))
 
 (defn ^:no-doc scalar-update-tx-valid?
   [^DB db ^TxPlan prepared]
@@ -2928,33 +2600,9 @@
                         (if (:deferred-entity-resolution? prepared)
                           (bind-scalar-entities db prepared (:schema (:ctx prepared)))
                           prepared))]
-    (let [tx-id   (inc (long (:max-tx db)))
-          entries (:entries prepared)
-          tx-data (txexec/execute-scalar-region
-                    db entries (:entity-reads prepared) tx-id
-                    *specialize-scalar-stamping?*)
-          db-after (assoc db :max-tx tx-id)]
-      (->TxReport db db-after tx-data {:db/current-tx tx-id} tx-meta))))
-
-(defn ^:no-doc prepare-mixed-add-tx
-  "Prepare ordinary mixed updates/inserts. An owned writer may supply its
-  current maximum entity ID to avoid rescanning the native index."
-  ([db tx-data tx-meta]
-   (prepare-mixed-add-tx db tx-data tx-meta nil))
-  ([db tx-data tx-meta owned-max-eid]
-   (prepare-mixed-add-tx db tx-data tx-meta owned-max-eid false))
-  ([db tx-data tx-meta owned-max-eid shape-checked?]
-   (let [report (->TxReport db db [] {} tx-meta)
-         plan (when (and (txengine/compiler?) (instance? Store (:store db)))
-                (txcompile/compile-tx (prepare/make-prepare-ctx db) tx-data
-                                      {:request-shape :mixed}))]
-     (if plan
-       (do
-         (when *tx-compiler-observer* (*tx-compiler-observer* :prepared plan))
-         (when-let [result (txadd/execute-mixed-region report plan owned-max-eid)]
-           (when *tx-compiler-observer* (*tx-compiler-observer* :execute-mixed plan))
-           result))
-       (txadd/prepare-mixed-report report tx-data owned-max-eid shape-checked?)))))
+    (txexec/execute-scalar-report
+      (->TxReport db db [] {} tx-meta) (:entries prepared) (:entity-reads prepared)
+      (inc (long (:max-tx db))) *specialize-scalar-stamping?*)))
 
 (defn ^:no-doc prepare-local-request
   "Pure preparation portion of the DB request hook. Only standalone local
@@ -2997,30 +2645,43 @@
               (*tx-compiler-observer* :prepared outcome))
             outcome)))))))
 
+(defn- successful-compiled-request
+  [db forms shape {:keys [allow-small-unique? check-unique-avs?]
+                   :or {allow-small-unique? true check-unique-avs? true}}]
+  (let [outcome (txcompile/compile-tx (prepare/make-prepare-ctx db) forms
+                  {:request-shape shape :allow-small-unique? allow-small-unique?
+                   :check-unique-avs? check-unique-avs?})]
+    ;; Generic adapters admit successful plans only. Stage 1's explicitly
+    ;; isolated scalar adapter retains ownership of deferred rejections.
+    (when (instance? TxPlan outcome)
+      (when *tx-compiler-observer* (*tx-compiler-observer* :prepared outcome))
+      outcome)))
+
 (defn ^:no-doc prepare-compiled-request
   "Capture one pure decision for materialized local/server input. Writer
-  admission and error isolation remain the caller's existing responsibility."
-  [db forms]
-  (when (and (txengine/compiler?) (instance? Store (:store db)))
-    (when-let [shape (txcompile/literal-request-shape forms)]
-      (let [outcome (txcompile/compile-tx (prepare/make-prepare-ctx db) forms
-                      {:request-shape shape :allow-small-unique? true})]
-        ;; Generic adapters admit successful plans only. Stage 1's explicitly
-        ;; isolated scalar adapter retains ownership of deferred rejections.
-        (when (instance? TxPlan outcome)
-          (when *tx-compiler-observer* (*tx-compiler-observer* :prepared outcome))
-          outcome)))))
+  admission and error isolation remain the caller's existing responsibility.
+  Blind callers may retain their small-unique and unique-value collection policy;
+  request shape always comes from the forms."
+  ([db forms] (prepare-compiled-request db forms nil))
+  ([db forms options]
+   (when (and (txengine/compiler?) (instance? Store (:store db)))
+     (when-let [shape (txcompile/literal-request-shape forms)]
+       (successful-compiled-request db forms shape options)))))
 
-(defn ^:no-doc prepare-local-scalar-request
-  "Capture a successful Stage 2 plan after the caller's scalar classification.
-  Provisional rejections retain legacy caller correction and admission."
+(defn ^:no-doc prepare-local-compiled-request
+  "Capture a successful Stage 2 plan before legacy caller classification.
+  Timed scalar callers retain their pre-writer preparation phase. Provisional
+  rejections retain legacy caller correction and admission."
   [db forms]
-  (when (and (txengine/compiler?) (nil? (l/explicit-transaction-timeout))
+  (when (and (txengine/compiler?)
              (instance? Store (:store db))
              (let [lmdb (.-lmdb ^Store (:store db))]
                (and (not (l/writing? lmdb))
                     (not (Thread/holdsLock (l/write-txn lmdb))))))
-    (prepare-compiled-request db forms)))
+    (when-let [shape (txcompile/literal-request-shape forms)]
+      (when (or (nil? (l/explicit-transaction-timeout))
+                (#{:scalar :scalar-operations :scalar-aliases} shape))
+        (successful-compiled-request db forms shape nil)))))
 
 (def ^:private fresh-request-keys
   #{:db-before :db-after :tx-data :tempids :tx-meta ::txexec/max-eid-before})
@@ -3054,28 +2715,19 @@
         initial (assoc initial :db-after db)
         tx-id (inc (long (:max-tx db)))]
     (case (:strategy plan)
-      (:scalar :scalar-operations)
-      (let [offset (if (identical? :scalar (:strategy plan)) 0 1)]
-        (when (txexec/scalar-entities-within-bound? (:entries plan) before offset)
-          (let [datoms (txexec/execute-scalar-region
-                         db (:entries plan) (:entity-reads plan) tx-id
-                         *specialize-scalar-stamping?* offset)]
+      (:scalar :scalar-operations :scalar-aliases)
+      (let [offset (if (identical? :scalar-operations (:strategy plan)) 1 0)
+            bound (if (identical? :scalar-aliases (:strategy plan))
+                    (bind-scalar-entities db plan (:schema (:ctx plan)))
+                    (when (txexec/scalar-entities-within-bound? (:entries plan) before offset)
+                      plan))]
+        (when bound
+          (when-let [report (txexec/execute-scalar-report
+                             initial (:entries bound) (:entity-reads bound) tx-id
+                             *specialize-scalar-stamping?* offset)]
             (when *tx-compiler-observer* (*tx-compiler-observer* :execute-scalar plan))
-            (compiled-report initial
-              (assoc initial :db-after (assoc db :max-tx tx-id) :tx-data datoms
-                     :tempids {:db/current-tx tx-id})
-              :compiled-scalar (and txcommon/*batch-prepare* (> (count datoms) 2))))))
-
-      :scalar-aliases
-      (when-let [{:keys [entries entity-reads]}
-                 (bind-scalar-entities db plan (:schema (:ctx plan)))]
-        (let [datoms (txexec/execute-scalar-region
-                       db entries entity-reads tx-id *specialize-scalar-stamping?*)]
-          (when *tx-compiler-observer* (*tx-compiler-observer* :execute-scalar plan))
-          (compiled-report initial
-            (assoc initial :db-after (assoc db :max-tx tx-id) :tx-data datoms
-                   :tempids {:db/current-tx tx-id})
-            :compiled-scalar (and txcommon/*batch-prepare* (> (count datoms) 2)))))
+            (compiled-report initial report :compiled-scalar
+                             (and txcommon/*batch-prepare* (> (count (:tx-data report)) 2))))))
 
       :blind
       (when-let [[report upsert?]

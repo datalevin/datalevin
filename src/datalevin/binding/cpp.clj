@@ -46,7 +46,7 @@
    [java.util.concurrent.atomic AtomicBoolean]
    [java.lang AutoCloseable]
    [java.io File]
-   [java.util HashMap Arrays Collection List ArrayList ArrayDeque
+   [java.util HashMap IdentityHashMap Arrays Collection List ArrayList ArrayDeque
     Map$Entry]
    [java.nio BufferOverflowException ByteBuffer]
    [java.nio.charset StandardCharsets]
@@ -147,6 +147,8 @@
   (close-resolution-cursor! [rtx]
     "Release the EAV cursor before its native transaction is committed or aborted."))
 
+(declare restore-rollback-states!)
+
 (deftype Rtx [^:unsynchronized-mutable lmdb
               ^Txn txn
               depth
@@ -162,7 +164,17 @@
               ^AtomicBoolean closed?
               ^boolean owns-buffers?
               ^ArrayList native-leases
-              ^:unsynchronized-mutable ^Cursor resolution-cursor]
+              ^:unsynchronized-mutable ^Cursor resolution-cursor
+              ^:unsynchronized-mutable ^IdentityHashMap rollback-states]
+
+  l/ITransactionRollback
+  (transaction-states [_] rollback-states)
+  (enlist-transaction-state! [_ identity state]
+    (when-not rollback-states (set! rollback-states (IdentityHashMap.)))
+    (.putIfAbsent rollback-states identity state)
+    nil)
+  (commit-transaction-state! [_]
+    (set! rollback-states nil))
 
   IResolutionCursor
   (resolution-cursor! [this dbi]
@@ -390,7 +402,9 @@
   (close [_]
     (when (.compareAndSet closed? false true)
       (close-resolution-cursor! _)
-      (let [txn*       txn
+      (let [lmdb*      lmdb
+            states*    rollback-states
+            txn*       txn
             kp*        kp
             vp*        vp
             start-kp*  start-kp
@@ -400,20 +414,27 @@
             k-comp-bf* k-comp-bf
             v-comp-bf* v-comp-bf]
         (set! lmdb nil)
+        (set! rollback-states nil)
         (set! k-comp-bf nil)
         (set! v-comp-bf nil)
         (buffer/close-txn-quiet! txn*)
-        (when owns-buffers?
-          (buffer/close-bufval-quiet! kp*)
-          (buffer/close-bufval-quiet! vp*)
-          (buffer/close-bufval-quiet! start-kp*)
-          (buffer/close-bufval-quiet! stop-kp*)
-          (buffer/close-bufval-quiet! start-vp*)
-          (buffer/close-bufval-quiet! stop-vp*)
-          (buffer/clean-buffer-quiet! k-comp-bf*))
-        (buffer/clean-buffer-quiet! v-comp-bf*)
-        (doseq [^AutoCloseable lease native-leases] (.close lease))
-        (.clear native-leases)))
+        (try
+          (when states*
+            ;; The writer has been detached and closed. Read committed rows
+            ;; while its native lifetime lease and writer monitor still hold.
+            (restore-rollback-states! lmdb* states*))
+          (finally
+            (when owns-buffers?
+              (buffer/close-bufval-quiet! kp*)
+              (buffer/close-bufval-quiet! vp*)
+              (buffer/close-bufval-quiet! start-kp*)
+              (buffer/close-bufval-quiet! stop-kp*)
+              (buffer/close-bufval-quiet! start-vp*)
+              (buffer/close-bufval-quiet! stop-vp*)
+              (buffer/clean-buffer-quiet! k-comp-bf*))
+            (buffer/clean-buffer-quiet! v-comp-bf*)
+            (doseq [^AutoCloseable lease native-leases] (.close lease))
+            (.clear native-leases)))))
     nil))
 
 
@@ -521,7 +542,7 @@
                   nil
                   (volatile! false)
                   (AtomicBoolean.)
-                  true (ArrayList. 1) nil)]
+                  true (ArrayList. 1) nil nil)]
     (.set tl-reader rtx)
     (when-not (.isVirtual thread)
       (when-let [^Rtx old (.put reader-registry thread rtx)]
@@ -548,46 +569,54 @@
     (raise "Native writer belongs to another caller"
            {:error :lmdb/write-transaction-open :retryable? true})))
 
+(defn- finish-native-write!
+  [write-txn ^Rtx wtxn]
+  (locking write-txn
+    (let [replacement @write-txn]
+      (vreset! write-txn nil)
+      (try
+        (when-not (identical? replacement wtxn)
+          (when replacement (.close ^AutoCloseable replacement)))
+        (finally (.close ^AutoCloseable wtxn))))))
+
 (defn- close-native-write!
   [^Env env write-txn wdb before-commit]
   (if-let [^Rtx wtxn @write-txn]
     (do
       (assert-native-write-owner! wtxn)
-      (try
-        (when-let [^Txn txn (.-txn wtxn)]
-          (close-resolution-cursor! wtxn)
-          (let [aborted? @(.-aborted? wtxn)]
-            (if aborted?
-              (.close txn)
-              (try
-                (when before-commit
-                  (before-commit wdb {:operation :close-transact-kv}))
+      (let [result
+            (try
+              (when-let [^Txn txn (.-txn wtxn)]
                 (close-resolution-cursor! wtxn)
-                (.commit txn)
-                (catch Util$MapFullException _
-                  (close-resolution-cursor! wtxn)
+                (let [aborted? @(.-aborted? wtxn)]
+                  (if aborted?
+                    (.close txn)
+                    (try
+                      (when before-commit
+                        (before-commit wdb {:operation :close-transact-kv}))
+                      (close-resolution-cursor! wtxn)
+                      (.commit txn)
+                      (l/commit-transaction-state! wtxn)
+                      (catch Util$MapFullException _
+                        (close-resolution-cursor! wtxn)
+                        (.close txn)
+                        (up-db-size env)
+                        (raise "DB resized" {:resized true}))
+                      (catch Exception e
+                        (close-resolution-cursor! wtxn)
+                        (.close txn)
+                        (if (or (l/resized? e)
+                                (= :ha/write-rejected (:error (ex-data e))))
+                          (throw e)
+                          (raise "Fail to commit read/write transaction in LMDB: " e {})))))
                   (.close txn)
-                  (up-db-size env)
-                  (raise "DB resized" {:resized true}))
-                (catch Exception e
-                  (close-resolution-cursor! wtxn)
-                  (.close txn)
-                  (if (or (l/resized? e)
-                          (= :ha/write-rejected (:error (ex-data e))))
-                    (throw e)
-                    (raise "Fail to commit read/write transaction in LMDB: "
-                           e {})))))
-            (.close txn)
-            (if aborted? :aborted :committed)))
-        (finally
-          ;; Every exit must detach the writer before closing its buffers, even
-          ;; when a commit hook throws an Error or map growth itself fails. A
-          ;; metadata write may also have replaced the original transaction.
-          (let [replacement @write-txn]
-            (vreset! write-txn nil)
-            (when-not (identical? replacement wtxn)
-              (close-rtx-quiet! replacement))
-            (close-rtx-quiet! wtxn)))))
+                  (if aborted? :aborted :committed)))
+              (catch Throwable t
+                (try (finish-native-write! write-txn wtxn)
+                     (catch Throwable cleanup (.addSuppressed t cleanup)))
+                (throw t)))]
+        (finish-native-write! write-txn wtxn)
+        result))
     (raise "Calling `close-transact-kv` without opening" {})))
 
 
@@ -753,38 +782,44 @@
 
   (reset-write
     [this]
-    (when-let [old @write-txn]
-      (assert-native-write-owner! old)
-      (vreset! write-txn nil)
-      (close-rtx-quiet! old))
-    (let [lease (when-let [guard (:native-lifetime @info)] (lifetime/enter! guard))]
-      (try
-        (.clear kp-w)
-        (.clear vp-w)
-        (.clear start-kp-w)
-        (.clear stop-kp-w)
-        (.clear start-vp-w)
-        (.clear stop-vp-w)
-        (.clear k-comp-bf-w)
-        (vreset! write-txn (Rtx. this
-                                (Txn/create env)
-                                (volatile! 1)
-                                kp-w
-                                vp-w
-                                start-kp-w
-                                stop-kp-w
-                                start-vp-w
-                                stop-vp-w
-                                k-comp-bf-w
-                                nil
-                                (volatile! false)
-                                (AtomicBoolean.)
-                                false (let [leases (ArrayList. 1)]
-                                        (when lease (.add leases lease))
-                                        leases) nil))
-        (catch Throwable e
-          (when lease (.close ^AutoCloseable lease))
-          (throw e)))))
+    (locking write-txn
+      (when-let [old @write-txn]
+        (assert-native-write-owner! old)
+        (vreset! write-txn nil)
+        (.close ^AutoCloseable old))
+      (let [lease (when-let [guard (:native-lifetime @info)] (lifetime/enter! guard))]
+        (try
+          (.clear kp-w)
+          (.clear vp-w)
+          (.clear start-kp-w)
+          (.clear stop-kp-w)
+          (.clear start-vp-w)
+          (.clear stop-vp-w)
+          (.clear k-comp-bf-w)
+          (vreset! write-txn (Rtx. (if writing?
+                                    ;; Recovery must not borrow a retired writer.
+                                    (->CppLMDB env info tl-reader reader-registry dbis scheduled-sync
+                                               kp-w vp-w start-kp-w stop-kp-w start-vp-w stop-vp-w
+                                               k-comp-bf-w write-txn false k-comp v-comp nil meta)
+                                    this)
+                                  (Txn/create env)
+                                  (volatile! 1)
+                                  kp-w
+                                  vp-w
+                                  start-kp-w
+                                  stop-kp-w
+                                  start-vp-w
+                                  stop-vp-w
+                                  k-comp-bf-w
+                                  nil
+                                  (volatile! false)
+                                  (AtomicBoolean.)
+                                  false (let [leases (ArrayList. 1)]
+                                          (when lease (.add leases lease))
+                                          leases) nil nil))
+          (catch Throwable e
+            (when lease (.close ^AutoCloseable lease))
+            (throw e))))))
 
   IObj
   (withMeta [_ m]
@@ -1014,21 +1049,29 @@
 
   (clear-dbi [this dbi-name]
     (.check-ready this)
-    (try
-      (let [^Dbi dbi (.-db ^DBI (.get-dbi this dbi-name))
-            ^Txn txn (Txn/create env)]
+    (locking (l/write-txn this)
+      (let [^Rtx rtx @write-txn]
+        (when rtx (assert-native-write-owner! rtx))
         (try
-          (Util/checkRc (DTLV/mdb_drop (.get txn) (.get dbi) 0))
-          (.commit txn)
-          (finally (.close txn))))
-      (catch Util$MapFullException _
-        (let [^Info info (Info/create env)]
-          (.setMapSize env (* ^long c/+buffer-grow-factor+
-                              (.me_mapsize ^DTLV$MDB_envinfo (.get info))))
-          (.close info))
-        (.clear-dbi this dbi-name))
-      (catch Exception e
-        (raise "Fail to clear DBI: " dbi-name " " e {}))))
+          (let [^Dbi dbi (.-db ^DBI (.get-dbi this dbi-name))
+                ^Txn txn (if rtx (.-txn rtx) (Txn/create env))]
+            (try
+              (when rtx (close-resolution-cursor! rtx))
+              (Util/checkRc (DTLV/mdb_drop (.get txn) (.get dbi) 0))
+              (when-not rtx (.commit txn))
+              (finally (when-not rtx (.close txn)))))
+          (catch Util$MapFullException _
+            (if rtx
+              (do
+                (.close ^Txn (.-txn rtx))
+                (up-db-size env)
+                (.reset-write this)
+                (raise "DB resized" {:resized true}))
+              (do (up-db-size env) (.clear-dbi this dbi-name))))
+          (catch Exception e
+            (if (l/resized? e)
+              (throw e)
+              (raise "Fail to clear DBI: " dbi-name " " e {})))))))
 
   (drop-dbi [this dbi-name]
     (.check-ready this)
@@ -1538,6 +1581,31 @@
 
   IAdmin
   (re-index [this opts] (l/re-index* this opts)))
+
+(defn- restore-rollback-states!
+  [^CppLMDB db ^IdentityHashMap states]
+  ;; Recovery needs a fresh committed snapshot, even when the caller has a
+  ;; public reader pinned. Keep that reader and its buffers untouched.
+  (let [readers (ConcurrentHashMap.)
+        local (ThreadLocal.)
+        view (->CppLMDB (.-env db) (.-info db) local readers
+                        (.-dbis db) (.-scheduled-sync db)
+                        (.-kp-w db) (.-vp-w db) (.-start-kp-w db) (.-stop-kp-w db)
+                        (.-start-vp-w db) (.-stop-vp-w db) (.-k-comp-bf-w db)
+                        (.-write-txn db) false (key-compressor db) (val-compressor db)
+                        nil (meta db))
+        failure (volatile! nil)]
+    (try
+      (doseq [state (.values states)]
+        (try (l/restore-transaction-state! state view)
+             (catch Throwable t
+               (if-let [primary @failure]
+                 (.addSuppressed ^Throwable primary t)
+                 (vreset! failure t)))))
+      (when-let [t @failure] (throw t))
+      (finally
+        (close-reader-rtxs! readers)
+        (.remove local)))))
 
 (defn committed-txn-id
   "Return the environment's latest committed LMDB transaction ID."

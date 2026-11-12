@@ -291,7 +291,7 @@
     (nth (.top pq) 0)))
 
 (declare doc-ref->id stored-doc-entry remove-doc* add-doc* hydrate-query display-xf
-         cached-search-results score-docs get-rawtext new-search-engine*
+         cached-search-results score-docs get-rawtext new-search-engine* restore-search-state!
          parse-query* parse-query get-pos-info hydrate-matching-query)
 
 (defprotocol IPositions
@@ -818,18 +818,29 @@
   nil)
 
 (defmacro ^:private with-document-write-lock
-  [lmdb documents & body]
+  [lmdb documents state & body]
   `(let [lmdb# ~lmdb
          documents# ~documents
+         state# ~state
          observer# *document-write-observer*]
      (when observer# (observer# :before-lmdb-lock lmdb# documents#))
      ;; Secondary-job completion and snapshot capture already own this monitor.
      ;; Direct mutations must acquire it before the shared document state too.
-     (locking (l/write-txn lmdb#)
-       (when observer# (observer# :lmdb-locked lmdb# documents#))
-       (locking documents#
-         (when observer# (observer# :documents-locked lmdb# documents#))
-         ~@body))))
+     (let [write-txn# (l/write-txn lmdb#)]
+       (locking write-txn#
+         (when observer# (observer# :lmdb-locked lmdb# documents#))
+         (locking documents#
+           (when observer# (observer# :documents-locked lmdb# documents#))
+           (let [rtx# @write-txn#]
+             (when rtx# (l/enlist-transaction-state! rtx# documents# state#))
+             (try ~@body
+                  (catch Throwable t#
+                    ;; A standalone mutation can fail before/after its one-shot
+                    ;; write; an enclosing writer restores on native cleanup.
+                    (when-not rtx#
+                      (try (l/restore-transaction-state! state# lmdb#)
+                           (catch Throwable cleanup# (.addSuppressed t# cleanup#))))
+                    (throw t#)))))))))
 
 (deftype SearchEngine [lmdb
                        analyzer
@@ -848,9 +859,13 @@
                        index-position?
                        include-text?
                        search-opts]
+  l/ITransactionState
+  (restore-transaction-state! [this committed-db]
+    (restore-search-state! this committed-db))
+
   ISearchEngine
   (add-doc [this doc-ref doc-text check-exist?]
-    (with-document-write-lock lmdb docs
+    (with-document-write-lock lmdb docs this
       (when-not (s/blank? doc-text)
         (when check-exist?
           (when-let [[doc-id stored-ref] (stored-doc-entry this doc-ref)]
@@ -860,13 +875,13 @@
     (.add-doc this doc-ref doc-text true))
 
   (remove-doc [this doc-ref]
-    (with-document-write-lock lmdb docs
+    (with-document-write-lock lmdb docs this
       (if-let [[doc-id stored-ref] (stored-doc-entry this doc-ref)]
         (remove-doc* this doc-id stored-ref)
         (raise "Document does not exist." {:doc-ref doc-ref}))))
 
-  (clear-docs [_]
-    (with-document-write-lock lmdb docs
+  (clear-docs [this]
+    (with-document-write-lock lmdb docs this
       (.empty docs)
       (.empty terms)
       (.clear dictionary)
@@ -932,7 +947,7 @@
 
   IAdmin
   (re-index [this opts]
-    (with-document-write-lock lmdb docs
+    (with-document-write-lock lmdb docs this
       (if include-text?
         (try
           (let [dfname (str (env-dir lmdb) u/+separator+ "search.dump")
@@ -943,7 +958,8 @@
             (.flush dos)
             (.close dos)
             (.clear-docs this)
-            (let [new (new-search-engine* lmdb opts)
+            (let [new (or (new-search-engine* lmdb opts (nil? @(l/write-txn lmdb)))
+                          (raise "Re-index cannot create search DBIs inside an open transaction" {}))
                   dis (DataInputStream. (FileInputStream. ^String dfname))]
               (doseq [[doc-ref rawtext] (nippy/thaw-from-in! dis)]
                 (if/add-doc new doc-ref rawtext))
@@ -1321,7 +1337,7 @@
   "Add a batch of unchecked `[doc-ref doc-text]` object arrays in one LMDB
   transaction. Intended for synchronous secondary indexing."
   [^SearchEngine engine ^List docs]
-  (with-document-write-lock (.-lmdb engine) (.-docs engine)
+  (with-document-write-lock (.-lmdb engine) (.-docs engine) engine
     (let [terms-dbi       (.-terms-dbi engine)
           positions-dbi   (.-positions-dbi engine)
           terms           ^SpillableMap (.-terms engine)
@@ -1396,7 +1412,7 @@
   "Apply ordered `[:add|:delete doc-ref doc-text]` object arrays in one LMDB
   transaction. Intended for synchronous secondary indexing."
   [^SearchEngine engine ^List ops]
-  (with-document-write-lock (.-lmdb engine) (.-docs engine)
+  (with-document-write-lock (.-lmdb engine) (.-docs engine) engine
     (let [terms-dbi       (.-terms-dbi engine)
           positions-dbi   (.-positions-dbi engine)
           rawtext-dbi     (.-rawtext-dbi engine)
@@ -1689,47 +1705,63 @@
   [lmdb terms-dbi docs-dbi positions-dbi rawtext-dbi]
   (assert (not (closed-kv? lmdb)) "LMDB env is closed.")
 
-  ;; term -> term-id,max-weight,doc-freq
-  (open-dbi lmdb terms-dbi {:key-size c/+max-key-size+})
-
-  ;; doc-ref -> doc-id,norm,term-set
-  (open-dbi lmdb docs-dbi {:key-size c/+max-key-size+})
-
-  ;; doc-id,term-id -> positions,offsets
-  (open-dbi lmdb positions-dbi {:key-size (* 2 Integer/BYTES)})
-
-  ;; doc-id -> raw-text
-  (open-dbi lmdb rawtext-dbi {:key-size Integer/BYTES}))
+  ;; Reopening an existing DBI creates another native writer. Reuse the
+  ;; environment's handles, including inside an explicit indexing transaction.
+  (let [existing (set (if/list-dbis lmdb))]
+    (doseq [[dbi key-size] [[terms-dbi c/+max-key-size+]
+                           [docs-dbi c/+max-key-size+]
+                           [positions-dbi (* 2 Integer/BYTES)]
+                           [rawtext-dbi Integer/BYTES]]]
+      (if (contains? existing dbi)
+        (if/get-dbi lmdb dbi false)
+        (open-dbi lmdb dbi {:key-size key-size})))))
 
 (defn- init-terms
-  [lmdb terms-dbi]
-  (let [terms      (sp/new-spillable-map)
-        dictionary (TermDictionary.)
-        max-id     (volatile! 0)
-        load       (fn [kv]
-                 (let [term (b/read-buffer (l/k kv) :string)
-                       id   (b/read-buffer (l/v kv) :int)]
-                   (when (< ^int @max-id ^int id) (vreset! max-id id))
-                   (.put ^SpillableMap terms id term)
-                   (.put dictionary term id)))]
-    (visit lmdb terms-dbi load [:all-back])
-    [@max-id terms dictionary]))
+  ([lmdb terms-dbi]
+   (init-terms lmdb terms-dbi (sp/new-spillable-map) (TermDictionary.)))
+  ([lmdb terms-dbi ^SpillableMap terms ^TermDictionary dictionary]
+   (let [max-id (volatile! 0)
+         load (fn [kv]
+                (let [term (b/read-buffer (l/k kv) :string)
+                      id (b/read-buffer (l/v kv) :int)]
+                  (when (< ^int @max-id ^int id) (vreset! max-id id))
+                  (.put terms id term)
+                  (.put dictionary term id)))]
+     (visit lmdb terms-dbi load [:all-back])
+     [@max-id terms dictionary])))
 
 (defn- init-docs
-  [lmdb docs-dbi]
-  (let [norms  (IntShortHashMap.)
-        docs   (sp/new-spillable-map)
-        max-id (volatile! 0)
-        load   (fn [kv]
-                 (let [ref  (b/read-buffer (l/k kv) :data)
-                       vb   (l/v kv)
-                       id   (b/read-buffer vb :int)
-                       norm (b/read-buffer vb :short)]
-                   (when (< ^int @max-id ^int id) (vreset! max-id id))
-                   (.put ^SpillableMap docs id ref)
-                   (.put norms id norm)))]
-    (visit lmdb docs-dbi load [:all-back])
-    [@max-id norms docs]))
+  ([lmdb docs-dbi]
+   (init-docs lmdb docs-dbi (IntShortHashMap.) (sp/new-spillable-map)))
+  ([lmdb docs-dbi ^IntShortHashMap norms ^SpillableMap docs]
+   (let [max-id (volatile! 0)
+         load (fn [kv]
+                (let [ref (b/read-buffer (l/k kv) :data)
+                      vb (l/v kv)
+                      id (b/read-buffer vb :int)
+                      norm (b/read-buffer vb :short)]
+                  (when (< ^int @max-id ^int id) (vreset! max-id id))
+                  (.put docs id ref)
+                  (.put norms id norm)))]
+     (visit lmdb docs-dbi load [:all-back])
+     [@max-id norms docs])))
+
+(defn- restore-search-state!
+  "Reload shared search metadata after rollback, without analyzing text or
+  rewriting index rows. Successful transactions never scan the index."
+  [^SearchEngine engine committed-db]
+  (locking (.-docs engine)
+    (.empty ^SpillableMap (.-docs engine))
+    (.empty ^SpillableMap (.-terms engine))
+    (.clear ^TermDictionary (.-dictionary engine))
+    (.clear ^IntShortHashMap (.-norms engine))
+    (.clear ^LRUCache (.-cache engine))
+    (let [[max-doc] (init-docs committed-db (.-docs-dbi engine)
+                              (.-norms engine) (.-docs engine))
+          [max-term] (init-terms committed-db (.-terms-dbi engine)
+                                (.-terms engine) (.-dictionary engine))]
+      (.set ^AtomicInteger (.-max-doc engine) (int max-doc))
+      (.set ^AtomicInteger (.-max-term engine) (int max-term)))))
 
 ;; Bulk writers operate directly on DBIs. Keep weak registrations so a commit
 ;; can also publish into live engines without extending their lifetime.
@@ -1751,7 +1783,7 @@
                        (= terms-dbi (.-terms-dbi engine)))]
       ;; Registered views can outlive their native transaction. Publish through
       ;; the committing handle's monitor, which belongs to this same environment.
-      (with-document-write-lock lmdb (.-docs engine)
+      (with-document-write-lock lmdb (.-docs engine) engine
         (let [^SpillableMap terms (.-terms engine)
               ^TermDictionary dictionary (.-dictionary engine)
               ^SpillableMap docs (.-docs engine)
