@@ -100,17 +100,17 @@
   [db entries]
   (txcommon/with-lookup-ref-cache db
     (if (= 1 (count entries))
-      (let [[e attr value] (first entries)]
+      (let [[e] (first entries)]
         (when-let [eid (scalar-update-entity-id db e)]
-          [[eid attr value]]))
+          [(assoc (first entries) 0 eid)]))
       (let [entities (HashMap.)
             seen (HashSet.)]
-        (reduce (fn [resolved [e attr value]]
+        (reduce (fn [resolved [e attr :as entry]]
                   (if-let [eid (resolve-scalar-update-reference! db entities e)]
                     ;; Distinct references can alias the same entity.
                     ;; Repeated E/A updates need general ordering.
                     (if (.add seen [eid attr])
-                      (conj resolved [eid attr value])
+                      (conj resolved (assoc entry 0 eid))
                       (reduced nil))
                     (reduced nil)))
                 [] entries)))))
@@ -605,13 +605,18 @@
                    e (nth entry entry-offset)
                    attr (nth entry attr-offset)
                    value (nth entry value-offset)
+                   ;; Explicit additions select this loop and retain their
+                   ;; supplied transaction ID in the next operand slot.
+                   tx-id (long (or (nth entry (inc value-offset) nil) tx-id))
+                   annotations (nth entry (+ value-offset 2) nil)
                    old-value (if (contains? layouts e)
                                (get (get old-values e) attr)
                                (txcommon/preparation-first-v db e attr))]
                (cond
                  (nil? old-value)
                  (recur (unchecked-inc i)
-                        (conj! out (datom e attr value tx-id)))
+                        (conj! out (cond-> (datom e attr value tx-id)
+                                     annotations (with-meta annotations))))
 
                  (d/value-equal? (idx/logical-value old-value) value)
                  (recur (unchecked-inc i) out)
@@ -620,7 +625,8 @@
                  (recur (unchecked-inc i)
                         (-> out
                             (conj! (idx/retraction e attr old-value tx-id))
-                            (conj! (datom e attr value tx-id))))))
+                            (conj! (cond-> (datom e attr value tx-id)
+                                     annotations (with-meta annotations)))))))
              (persistent! out))))))))
 
 (defn execute-scalar-report

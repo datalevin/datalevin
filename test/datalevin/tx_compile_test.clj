@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
             [datalevin.db.tx.compile :as compile]
             [datalevin.db.tx.plan :as plan]
+            [datalevin.datom :as datom]
             [datalevin.prepare :as prepare])
   (:import [datalevin.db.tx.plan BlindEntity MixedAttrInfo MixedInsert MixedOperands MixedUpdate TxPlan]
            [java.util HashMap HashSet]
@@ -31,6 +32,318 @@
      :identity {:db/aid 5 :db/valueType :db.type/string :db/unique :db.unique/identity}
      :reference {:db/aid 6 :db/valueType :db.type/ref}}
     {} {:validate-data? true}))
+
+(deftest application-add-metadata-is-an-opaque-owned-operand
+  (let [annotations {:source :test :user/note ["nested"]}
+        empty-annotations {}
+        input [(with-meta [:db/add 1 :value (int 7)] annotations)
+               (with-meta [:db/add [:identity "one"] :text "text" 123] empty-annotations)
+               {:db/id 2 :value (int 8)}]
+        p (compile/compile-tx ctx input)]
+    (is (= :explicit-additions (compile/literal-request-shape input)))
+    (is (true? (:explicit-tx? p)))
+    (is (= [[1 :value 7 nil annotations] [[:identity "one"] :text "text" 123 {}]
+            [2 :value 8 nil]] (:entries p)))
+    (is (identical? annotations (peek (first (:entries p)))))
+    (is (identical? empty-annotations (peek (second (:entries p)))))
+    (is (identical? annotations (meta (first input))))
+    (is (nil? (compile/literal-scalar-shape [(first input)]))))
+  (let [input [(with-meta (datom/datom 1 :value 7 123) {:datalevin.db.tx.execute/internal true})]
+        p (compile/compile-tx ctx input)]
+    (is (= [[1 :value 7 123]] (:entries p))))
+  (let [context (assoc ctx :rschema {:db.type/ref #{:reference}})
+        p (compile/compile-tx context
+            [(with-meta [:db/add 1 :reference 2 123] {:source :discarded})
+             (datom/datom 2 :reference 1 456)])]
+    (is (= [[1 :reference 2 nil] [2 :reference 1 456]] (:entries p)))))
+
+(deftest metadata-proof-does-not-observe-values-or-custom-map-behavior
+  (let [effects (atom [])
+        host (proxy [Object clojure.lang.IMeta] []
+               (meta [] (swap! effects conj :meta) nil)
+               (hashCode [] (swap! effects conj :hash) 0)
+               (toString [] (swap! effects conj :string) "host"))
+        tail (lazy-seq (swap! effects conj :tail) (list "lazy"))
+        annotations {:source host :user/lazy tail}
+        input [(with-meta [:db/add 1 :value 7] annotations)]
+        custom (sorted-map-by (fn [a b] (swap! effects conj :compare) (compare a b)) :source :custom)
+        p (do (reset! effects []) (compile/compile-tx ctx input))]
+    (is (instance? TxPlan p))
+    (is (identical? annotations (peek (first (:entries p)))))
+    (doseq [metadata [custom (array-map host :key) {:db/internal true} {:db.fn/call true}
+                      {:idoc/patch host} {:datalevin/internal true}
+                      {:datalevin.db.tx.execute/internal true}]]
+      (is (nil? (compile/compile-tx ctx [(with-meta [:db/add 1 :value 7] metadata)]))))
+    (is (nil? (compile/compile-tx ctx (with-meta input {:source :request}))))
+    (is (nil? (compile/compile-tx ctx [(with-meta {:db/id 1 :value 7} annotations)])))
+    (is (empty? @effects))))
+
+(deftest explicit-additions-retain-supplied-transaction-ids-in-owned-operands
+  (let [input [(with-meta (datom/datom 1 :value (int 3) 123 true) {:source :ignored})
+               [:db/add [:identity "one"] :text "text" (int 456)]
+               {:db/id 2 :value (int 4)} [:db/add 2 :text "default" nil]]
+        p (compile/compile-tx ctx input)]
+    (is (= :explicit-additions (compile/literal-request-shape input)))
+    (is (= :scalar-aliases (:strategy p)))
+    (is (true? (:explicit-tx? p)))
+    (is (= [[1 :value 3 123] [[:identity "one"] :text "text" 456]
+            [2 :value 4 nil] [2 :text "default" nil]] (:entries p)))
+    (is (every? #(or (nil? (peek %)) (instance? Long (peek %))) (:entries p)))
+    (is (= {:source :ignored} (meta (first input))))
+    (is (nil? (compile/literal-scalar-shape [(first input)])))
+    (is (nil? (compile/literal-scalar-shape [(second input)]))))
+  (let [context (assoc-in ctx [:schema :tuple]
+                  {:db/aid 7 :db/valueType :db.type/tuple :db/tupleType :db.type/long})
+        value [(int 1) 2] p (compile/compile-tx context [(datom/datom 1 :tuple value)])]
+    (is (= :scalar-aliases (:strategy p)))
+    (is (identical? value (nth (first (:entries p)) 2)))))
+
+(deftest explicit-addition-declines-preserve-original-input-without-host-callbacks
+  (let [effects (atom [])
+        number (proxy [Number] []
+                 (longValue [] (swap! effects conj :long) 123)
+                 (intValue [] 123) (floatValue [] 123.0) (doubleValue [] 123.0)
+                 (hashCode [] (swap! effects conj :hash) 123)
+                 (toString [] (swap! effects conj :string) "host"))
+        tail (lazy-seq (swap! effects conj :tail) (list (datom/datom 1 :value 1)))]
+    (doseq [input [[(datom/datom 1 :value 2 123 false)]
+                   [(datom/datom 0 :value 2)] [(datom/datom -1 :value 2)]
+                   [(datom/datom 1 :value number)]
+                   [(datom/datom 1 :value "bad")]
+                   [[:db/add 1 :value 2 number]]
+                   [[:db/add 1 :value 2 0]] [[:db/add 1 :value 2 -1]]
+                   [[:db/add 1 :value 2 1.5]] [[:db/add 1 :value 2 9223372036854775808N]]
+                   [(with-meta [:db/add 1 :value 2 123] {:datalevin.db.tx.execute/internal true})]
+                   [(datom/datom 1 :value 2) {:text "new"}]
+                   [(datom/datom 1 :value 2) [:db/add 1 :value 3 123]]
+                   [(datom/datom 1 :value 2) tail] tail]]
+      (is (nil? (compile/compile-tx ctx input))))
+    (is (nil? (compile/compile-tx (assoc-in ctx [:opts :auto-entity-time?] true)
+                [(datom/datom 1 :value 2)])))
+    (is (empty? @effects))))
+
+(deftest alias-maps-and-tuple-values-share-the-scalar-alias-layout
+  (let [context (assoc-in ctx [:schema :tuple]
+                  {:db/aid 7 :db/valueType :db.type/tuple :db/tupleType :db.type/long})
+        lookup [:identity "one"] value [(int 1) 2]]
+    (doseq [input [[{:db/id lookup :tuple value}]
+                   [[:db/add :entity/one :tuple value]]
+                   [[:db/add lookup :tuple value]]
+                   [{:db/id lookup :tuple value} [:db/add 2 :value 3]]
+                   [{:db/id lookup :tuple value} [:db/add :entity/one :text "text"]]]]
+      (let [p (compile/compile-tx context input)]
+        (is (= :scalar-aliases (compile/literal-request-shape input)))
+        (is (= :scalar-aliases (:strategy p)))
+        (is (identical? value (nth (first (:entries p)) 2)))
+        (is (nil? (:entity-reads p)))))
+    (is (= :scalar-aliases (:strategy (compile/compile-tx ctx [{:db/id lookup :value 3}]))))
+    (let [p (compile/compile-tx (assoc-in context [:opts :validate-data?] false)
+              [(array-map :db/id lookup :tuple value :text 42)])]
+      (is (= [[lookup :tuple value] [lookup :text "42"]] (:entries p)))
+      (is (identical? value (nth (first (:entries p)) 2))))
+    (is (nil? (compile/compile-tx context [{:db/id lookup :tuple value}]
+                {:literal-shape :scalar})))))
+
+(deftest tuple-alias-proofs-decline-unsupported-shapes-without-host-observation
+  (let [effects (atom [])
+        host (proxy [Object clojure.lang.IMeta] []
+               (meta [] (swap! effects conj :meta) nil)
+               (hashCode [] (swap! effects conj :hash) 0)
+               (toString [] (swap! effects conj :string) "host"))
+        tail (lazy-seq (swap! effects conj :tail) (list :identity "one"))
+        context (assoc-in ctx [:schema :tuple]
+                  {:db/aid 7 :db/valueType :db.type/tuple :db/tupleType :db.type/long})]
+    (doseq [input [[{:db/id :entity/one :tuple [1]}]
+                   [{:db/id host :tuple [1]}] [{:db/id tail :tuple [1]}]
+                   [{:db/id [:identity host] :tuple [1]}]
+                   [{:db/id (with-meta [:identity "one"] {:source true}) :tuple [1]}]
+                   [(with-meta {:db/id [:identity "one"] :tuple [1]} {:source true})]
+                   [{:db/id [:identity "one"] :tuple [host]}]
+                   [{:db/id [:identity "one"] :tuple [tail]}]
+                   [{:db/id [:identity "one"] :tuple tail}]
+                   [{:db/id [:identity "one"] :tuple []}]
+                   [{:db/id [:identity "one"] :tuple ["bad"]}]
+                   [{:db/id [:identity "one"] :tuple [1]} {:text "new"}]
+                   [{:db/id [:identity "one"] :tuple [1]} [:db/add [:identity "one"] :tuple [2]]]
+                   [{:db/id [:identity "one"] :tuple [1]} [:db/add [:identity "one"] :tuple [2]]]
+                   [{:db/id [:identity "one"]}]]]
+      (is (nil? (compile/compile-tx context input))))
+    (doseq [props [{:db/unique :db.unique/value} {:db/cardinality :db.cardinality/many}
+                  {:db.attr/preds [(fn [_] true)]} {:db/tupleAttrs [:value]}]]
+      (is (nil? (compile/compile-tx (update-in context [:schema :tuple] merge props)
+                  [{:db/id [:identity "one"] :tuple [1]}]))))
+    (is (nil? (compile/compile-tx (assoc-in context [:opts :auto-entity-time?] true)
+                [{:db/id [:identity "one"] :tuple [1]}])))
+    (is (empty? @effects))))
+
+(deftest independent-tuple-replacements-share-the-mixed-writer-layout
+  (let [context (assoc-in ctx [:schema :tuple]
+                  {:db/aid 7 :db/valueType :db.type/tuple :db/tupleType :db.type/long})
+        value [(int 3) 4]]
+    (doseq [input [[[:db/add 1 :tuple value]]
+                   [{:db/id (int 1) :tuple value}]
+                   [[:db/add 1 :tuple value] [:db/add 2 :text "second"]]
+                   [{:db/id 1 :tuple value :value (int 2)}]
+                   [{:text "new"} [:db/add 1 :tuple value]]]]
+      (let [p (compile/compile-tx context input)
+            ^MixedOperands operands (:entries p)
+            ^MixedUpdate entry (first (filter #(and (instance? MixedUpdate %)
+                                                    (= :tuple (.-attr ^MixedUpdate %)))
+                                              (.-entries operands)))]
+        (is (= :mixed (:strategy p)))
+        (is (identical? value (.-value entry)))
+        (is (pos? (.-required-eid operands)))
+        (is (= (> (count (filter #(instance? MixedUpdate %) (.-entries operands))) 1)
+               (.-prepare-reader? operands)))))
+    (is (nil? (compile/compile-mixed-region ctx [[:db/add 1 :value 2]])))
+    (is (nil? (compile/compile-tx context [[:db/add 1 :tuple value]]
+                {:literal-shape :scalar-operations})))))
+
+(deftest tuple-replacement-analysis-preserves-legacy-roles-and-decline-purity
+  (let [effects (atom []) host (proxy [Object] []
+                                (hashCode [] (swap! effects conj :hash) 0)
+                                (toString [] (swap! effects conj :string) "host"))
+        tail (lazy-seq (swap! effects conj :tail) (list 1))
+        context (assoc-in ctx [:schema :tuple]
+                  {:db/aid 7 :db/valueType :db.type/tuple :db/tupleType :db.type/long})
+        infos (HashMap.)
+        ^MixedUpdate raw (compile/mixed-update-operand context infos 1 :tuple host true)]
+    (is (identical? host (.-value raw)))
+    (is (nil? (compile/mixed-update-operand context infos 1 :tuple host)))
+    (is (false? (.-update? ^MixedAttrInfo (.get infos :tuple))))
+    (doseq [value [nil [] [nil] ["bad"] [host] tail [tail]
+                   (with-meta [1] {:source true})]
+            input [[[:db/add 1 :tuple value]]
+                   [{:text "new"} {:db/id 1 :tuple value}]]]
+      (is (nil? (compile/compile-tx context input))))
+    (doseq [props [{:db/unique :db.unique/value} {:db/unique :db.unique/identity}
+                  {:db/cardinality :db.cardinality/many} {:db/tupleAttrs [:value]}
+                  {:db.attr/preds [(fn [_] true)]}]]
+      (is (nil? (compile/compile-tx (update-in context [:schema :tuple] merge props)
+                  [[:db/add 1 :tuple [1]]]))))
+    (doseq [input [[[:db/add 1 :tuple [1]] [:db/add (int 1) :tuple [2]]]
+                   [{:db/id 1 :tuple [1]} [:db/add 1N :tuple [2]]]
+                   [[:db/add 1 :tuple [1]] [:db/add 1 :value 2] [:db/add 1 :tuple [3]]]]]
+      (is (nil? (compile/compile-tx context input))))
+    (is (nil? (compile/compile-tx (assoc context :rschema {:db/attrTuples {:tuple {:pair 0}}})
+                [[:db/add 1 :tuple [1]]])))
+    (is (nil? (compile/compile-tx (assoc-in context [:opts :auto-entity-time?] true)
+                [[:db/add 1 :tuple [1]]])))
+    (is (empty? @effects))))
+
+(deftest explicit-tuple-inserts-retain-component-values-and-shared-operands
+  (let [context (update ctx :schema assoc
+                  :words {:db/aid 7 :db/valueType :db.type/tuple :db/tupleType :db.type/string}
+                  :record {:db/aid 8 :db/valueType :db.type/tuple
+                           :db/tupleTypes [:db.type/long :db.type/string]}
+                  :refs {:db/aid 9 :db/valueType :db.type/tuple :db/tupleType :db.type/ref})]
+    (doseq [validate? [false true]
+            [attr value] [[:words ["one" "two"]] [:record [(int 1) "one"]]
+                          [:record [nil nil]] [:refs [0 (int 1) (short 2) (byte 3)]]]
+            input [[{attr value}]
+                   [[:db/add 1 :text "updated"] {attr value}]
+                   [{attr value} {:db/id 1 :value (int 2)}]]]
+      (let [p (compile/compile-tx (assoc-in context [:opts :validate-data?] validate?) input)
+            ^MixedOperands operands (:entries p)
+            ^MixedInsert insert (first (filter #(instance? MixedInsert %) (.-entries operands)))]
+        (is (= :mixed (:strategy p)))
+        (is (identical? value (aget ^objects (.-attrs insert) 1)))))
+    (doseq [props [{:db/unique :db.unique/identity} {:db/cardinality :db.cardinality/many}
+                  {:db.attr/preds [(fn [_] true)]}]]
+      (is (nil? (compile/compile-tx (update-in context [:schema :words] merge props)
+                  [{:words ["one"]}]))))))
+
+(deftest tuple-eligibility-declines-unsafe-components-without-observation
+  (let [effects (atom [])
+        host (proxy [Number] []
+               (longValue [] (swap! effects conj :long) 1)
+               (intValue [] 1) (floatValue [] 1.0) (doubleValue [] 1.0)
+               (hashCode [] (swap! effects conj :hash) 1)
+               (toString [] (swap! effects conj :string) "host"))
+        tail (lazy-seq (swap! effects conj :tail) (list 1))
+        context (update ctx :schema assoc
+                  :tuple {:db/aid 7 :db/valueType :db.type/tuple :db/tupleType :db.type/long}
+                  :refs {:db/aid 8 :db/valueType :db.type/tuple :db/tupleType :db.type/ref})]
+    (doseq [validate? [false true]
+            [attr value] [[:tuple []] [:tuple [nil]] [:tuple ["1"]] [:tuple [host]]
+                          [:tuple [tail]] [:tuple tail] [:tuple (list 1)]
+                          [:tuple (with-meta [1] {:source true})]
+                          [:refs [nil]] [:refs [-1]] [:refs ["self"]] [:refs [1N]]
+                          [:refs [:entity/one]] [:refs [[:identity "one"]]]]]
+      (let [input [{:db/id "self" attr value}]]
+        (is (nil? (compile/compile-tx (assoc-in context [:opts :validate-data?] validate?) input)))
+        (is (nil? (compile/compile-tx context (into [[:db/add 1 :value 2]] input))))))
+    (is (empty? @effects))))
+
+(deftest unique-tuple-proofs-preserve-the-shared-av-equality-boundary
+  (let [context (update ctx :schema assoc
+                  :token {:db/aid 7 :db/valueType :db.type/tuple
+                          :db/tupleTypes [:db.type/string :db.type/long]
+                          :db/unique :db.unique/value}
+                  :times {:db/aid 8 :db/valueType :db.type/tuple :db/tupleType :db.type/instant
+                          :db/unique :db.unique/value})]
+    (doseq [input [[{:token ["unique" 1]}] [{:token [nil nil]}]
+                   [{:times [(java.util.Date. 123)]}]]]
+      (is (= :mixed (:strategy (compile/compile-tx context input)))))
+    (doseq [input [[{:token ["unique" (int 1)]}]
+                   [{:token ["duplicate" 1]} {:token ["duplicate" (int 1)]}]
+                   [{:times [(java.sql.Timestamp. 123)]}]]]
+      (is (nil? (compile/compile-tx context input))))
+    (is (nil? (compile/compile-tx (assoc-in context [:opts :auto-entity-time?] true)
+                [{:token ["timestamped" 1]}])))))
+
+(deftest ordinary-insert-plans-reuse-mixed-operands-without-existing-updates
+  (let [tuple-ctx (assoc ctx
+                   :schema (assoc (:schema ctx) :pair
+                             {:db/aid 7 :db/valueType :db.type/tuple
+                              :db/tupleAttrs [:reference :value]})
+                   :rschema {:db/attrTuples {:reference {:pair 0} :value {:pair 1}}})]
+    (doseq [[context forms]
+            [[ctx [{:db/id "self" :reference "self" :text "self"}]]
+             [ctx [{:db/id (int -1) :reference -1N}
+                   {:db/id "child" :reference (short -1)}]]
+             [tuple-ctx [{:value 3}]]
+             [tuple-ctx [{:db/id -1N :reference (int -1) :value 3}]]]]
+      (let [plan (compile/compile-tx context forms)
+            ^MixedOperands operands (:entries plan)]
+        (is (instance? TxPlan plan))
+        (is (= :mixed (:strategy plan)))
+        (is (every? #(instance? MixedInsert %) (.-entries operands)))
+        (is (zero? (.-required-eid operands)))
+        (is (false? (.-prepare-reader? operands)))))
+    (doseq [forms [[{:text "simple"}] [{:reference 2}]
+                   [{:db/id "one" :value 1} {:db/id -1 :value 2}]]]
+      (is (= :blind (:strategy (compile/compile-tx ctx forms)))))
+    (let [unique-ctx (assoc-in ctx [:schema :token]
+                      {:db/aid 8 :db/valueType :db.type/string :db/unique :db.unique/value})]
+      (is (nil? (compile/compile-tx unique-ctx [{:token "same"} {:token "same"}]))))
+    (is (nil? (compile/compile-tx ctx [{:identity "small"}]
+                {:allow-small-unique? false})))
+    (is (= :blind (:strategy (compile/compile-tx ctx [{:identity "small"}]
+                               {:allow-small-unique? true}))))))
+
+(deftest ordinary-insert-selection-declines-unsupported-dependencies-without-effects
+  (let [effects (atom [])
+        host (proxy [Number] []
+               (longValue [] (swap! effects conj :long) -1)
+               (intValue [] -1) (floatValue [] -1.0) (doubleValue [] -1.0)
+               (hashCode [] (swap! effects conj :hash) -1))
+        text (proxy [Object] [] (toString [] (swap! effects conj :string) "host"))
+        tail (lazy-seq (swap! effects conj :realize) (list {:text "tail"}))]
+    (doseq [forms [[{:db/id "first" :reference "later"} {:db/id "later" :text "later"}]
+                   [{:db/id (int -1) :reference -1N} {:db/id -1N :text "duplicate"}]
+                   [{:db/id "self" :reference "self" :identity "upsert"}]
+                   [{:db/id "self" :reference "self" :text text}]
+                   [{:db/id host :reference host}]
+                   [{:db/id "self" :reference tail}]
+                   [{:db/id "self" :reference {:text "nested"}}]
+                   (with-meta [{:db/id "self" :reference "self"}] {:source true})
+                   [(with-meta {:db/id "self" :reference "self"} {:source true})]
+                   tail]]
+      (is (nil? (compile/compile-tx ctx forms))))
+    (is (nil? (compile/compile-tx (assoc-in ctx [:opts :auto-entity-time?] true)
+                [{:db/id "self" :reference "self"}])))
+    (is (empty? @effects))))
 
 (deftest blind-identity-read-selection-is-shared-and-excludes-the-key
   (let [fields (mapv #(keyword (str "field-" %)) (range 8))
@@ -83,6 +396,37 @@
     (is (nil? (compile/compile-mixed-region ctx
                 [[:db/add 1 :text "first"] {:text "new"} [:db/add 1 :text "second"]])))))
 
+(deftest compiled-mixed-reference-operands-preserve-legacy-role-boundaries
+  (doseq [value [(byte 2) (short 2) (int 2) 2 2N (biginteger 2) Long/MAX_VALUE]]
+    (let [infos (HashMap.)
+          ^MixedUpdate operand (compile/mixed-update-operand ctx infos 1 :reference value true)
+          plan (compile/compile-tx (assoc-in ctx [:opts :validate-data?] false)
+                 [[:db/add 1 :reference value] {:text "new"}])]
+      (is (nil? (compile/mixed-update-operand ctx infos 1 :reference value)))
+      (is (identical? value (.-value operand)))
+      (is (instance? TxPlan plan))
+      (is (= (long value) (.-value ^MixedUpdate
+                           (first (.-entries ^MixedOperands (:entries plan))))))))
+  (let [calls (atom [])
+        host (proxy [Number] []
+               (longValue [] (swap! calls conj :long) 2)
+               (intValue [] 2) (floatValue [] 2.0) (doubleValue [] 2.0)
+               (hashCode [] (swap! calls conj :hash) 2))]
+    (doseq [value [nil 0 -1 "new" [:identity "new"] 2.0 2M 3/2
+                   9223372036854775808N host]]
+      (is (nil? (compile/mixed-update-operand ctx (HashMap.) 1 :reference value true))))
+    (doseq [props [{:db/cardinality :db.cardinality/many}
+                   {:db/unique :db.unique/value} {:db/unique :db.unique/identity}
+                   {:db/fulltext true} {:db/embedding true} {:db/vector true}]]
+      (is (nil? (compile/compile-tx (update-in ctx [:schema :reference] merge props)
+                  [[:db/add 1 :reference 2] {:text "new"}]))))
+    (doseq [value [2N (biginteger 2)]]
+      ;; A pure correction rejection retains the existing validation route.
+      (is (nil? (compile/compile-tx ctx [[:db/add 1 :reference value] {:text "new"}]))))
+    (is (nil? (compile/compile-tx (assoc ctx :rschema {:db/attrTuples {:reference {:pair 0}}})
+                [[:db/add 1 :reference 2] {:text "new"}])))
+    (is (empty? @calls))))
+
 (deftest mixed-insert-analysis-retains-opaque-symbolic-values
   (let [calls (atom [])
         host (proxy [Object] []
@@ -107,7 +451,7 @@
                (intValue [] -1) (floatValue [] -1.0) (doubleValue [] -1.0))
         bad-key (assoc clojure.lang.PersistentHashMap/EMPTY host "opaque" :text "text")
         forms [{} {:db/id "empty"} {:db/id 1 :text "existing"}
-               {:db/id (int -1) :text "numeric"} {:db/id host :text "numeric"}
+               {:db/id -1.0 :text "fractional"} {:db/id host :text "numeric"}
                {:identity "identity"} (array-map host "opaque" :text "text") bad-key
                (sorted-map :text "custom") (with-meta {:text "text"} {:source true})]]
     (reset! calls [])
@@ -116,6 +460,18 @@
     (is (nil? (compile/mixed-insert-operands
                 (assoc-in ctx [:opts :auto-entity-time?] true) (HashMap.) {:text "text"})))
     (is (empty? @calls))))
+
+(deftest mixed-insert-analysis-retains-integer-tempids-and-cross-representation-refs
+  (doseq [id [(byte -1) (short -1) (int -1) -1 -1N (biginteger -1)]]
+    (let [form {:db/id id :text "integer" :reference -1N}
+          ^MixedInsert operand (compile/mixed-insert-operands ctx (HashMap.) form)
+          plan (compile/compile-mixed-region ctx [[:db/add 1 :value 7] form])]
+      (is (identical? id (.-tempid operand)))
+      (is (instance? TxPlan plan))
+      (is (identical? id (.-tempid ^MixedInsert
+                          (second (.-entries ^MixedOperands (:entries plan))))))
+      (is (nil? (compile/compile-mixed-region ctx
+                  [[:db/add 1 :value 7] form {:db/id (int -1) :value 8}]))))))
 
 (deftest mixed-insert-operands-own-their-normalization-buffer
   (let [context (assoc ctx :opts {:validate-data? false})
@@ -540,7 +896,7 @@
                    [[:db/add 1 :text value]]
                    [[:db/add 1 :value 1] [:db/add 1 :value 2]]
                    [[:db/add 1 :reference :entity/two]]
-                   [(with-meta [:db/add 1 :value 1] {:source true})]
+                   [(with-meta [:db/add 1 :value 1] {:datalevin.db.tx.execute/internal true})]
                    [[:db/add 1 :identity "x"]]
                    [[:db.fn/call (fn [_] (swap! effects conj :callback))]]]]
       (is (nil? (compile/compile-tx ctx forms))))
@@ -562,8 +918,8 @@
                {:db/id "self" :reference "self" :text false}
                [:db/add 2N :text :changed/value]
                {:db/id 7N :reference 2}]
-        ;; Reference replacements keep their previous mixed exclusion.
-        _ (is (nil? (compile/compile-tx context forms)))
+        ;; Concrete reference replacements now share the compiled mixed layout.
+        _ (is (instance? TxPlan (compile/compile-tx context forms)))
         forms (assoc forms 3 {:db/id 7N :untyped 3})
         context (assoc-in context [:schema :untyped] {:db/aid 7})
         plan (compile/compile-tx context forms)

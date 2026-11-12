@@ -649,11 +649,15 @@
       (db/prepare-blind-local-tx db tx-data allow-small-unique? check-unique-avs?
                                (if (= kind :blind-tempids) 1 0))))
 
+(declare transact-local-in-native-txn!)
+
 (defn- maybe-direct-local-blind-transact!
   [conn tx-data tx-meta kind]
   (when-let [prepared (prepare-classified-blind-tx
                        @conn tx-data false false kind)]
-    (try-direct-local-blind-transact! conn prepared tx-meta)))
+    (if (identical? :mixed (:strategy prepared))
+      (transact-local-in-native-txn! conn tx-data tx-meta kind prepared)
+      (try-direct-local-blind-transact! conn prepared tx-meta))))
 
 (defn- direct-local-scalar-update!
   "Commit a prepared simple scalar-update batch directly against one LMDB write
@@ -727,10 +731,16 @@
           report)))
     (:blind :blind-tempids)
     (when-let [prepared (prepare-classified-blind-tx @conn tx-data true false kind)]
-      (if (and *local-wal-identity-upsert?* (:identity-upsert-av prepared))
+      (cond
+        (identical? :mixed (:strategy prepared))
+        (transact-local-in-native-txn! conn tx-data tx-meta kind prepared)
+
+        (and *local-wal-identity-upsert?* (:identity-upsert-av prepared))
         (when-let [[report upsert?] (direct-local-identity-transact! conn prepared tx-meta)]
           (observe-local-wal-tx-path! (if upsert? :identity-upsert :blind-insert))
           report)
+
+        :else
         (try-direct-local-blind-transact! conn prepared tx-meta)))
     nil))
 

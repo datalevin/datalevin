@@ -2653,7 +2653,15 @@
                    :check-unique-avs? check-unique-avs?})]
     ;; Generic adapters admit successful plans only. Stage 1's explicitly
     ;; isolated scalar adapter retains ownership of deferred rejections.
-    (when (instance? TxPlan outcome)
+    (when (and (instance? TxPlan outcome)
+               ;; Datom/general callers retain their allocation/report boundary
+               ;; when a literal ID is above the published floor. This grants
+               ;; no ownership proof; accepted plans still bind on the writer.
+               (or (not (:explicit-tx? outcome))
+                   (every? (fn [[e]]
+                             (or (not (instance? Long e))
+                                 (<= (long e) (long (:max-eid db)))))
+                           (:entries outcome))))
       (when *tx-compiler-observer* (*tx-compiler-observer* :prepared outcome))
       outcome)))
 
@@ -2680,7 +2688,7 @@
                     (not (Thread/holdsLock (l/write-txn lmdb))))))
     (when-let [shape (txcompile/literal-request-shape forms)]
       (when (or (nil? (l/explicit-transaction-timeout))
-                (#{:scalar :scalar-operations :scalar-aliases} shape))
+                (#{:scalar :scalar-operations :scalar-aliases :explicit-additions} shape))
         (successful-compiled-request db forms shape nil)))))
 
 (def ^:private fresh-request-keys
@@ -2724,7 +2732,7 @@
         (when bound
           (when-let [report (txexec/execute-scalar-report
                              initial (:entries bound) (:entity-reads bound) tx-id
-                             *specialize-scalar-stamping?* offset)]
+                             (and *specialize-scalar-stamping?* (not (:explicit-tx? plan))) offset)]
             (when *tx-compiler-observer* (*tx-compiler-observer* :execute-scalar plan))
             (compiled-report initial report :compiled-scalar
                              (and txcommon/*batch-prepare* (> (count (:tx-data report)) 2))))))

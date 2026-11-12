@@ -4,9 +4,11 @@
   "Pure transaction analysis. No database, writer, entity allocation or pending view."
   (:require [datalevin.bits :as b]
             [datalevin.custom-datalog :as cd]
+            [datalevin.datom :as d]
             [datalevin.db.tx.plan :as plan]
             [datalevin.prepare :as prepare])
-  (:import [datalevin.db.tx.plan BlindEntity MixedAttrInfo MixedInsert MixedOperands MixedUpdate
+  (:import [datalevin.datom Datom]
+           [datalevin.db.tx.plan BlindEntity MixedAttrInfo MixedInsert MixedOperands MixedUpdate
             ScalarEntityRead]
            [datalevin.prepare PrepareCtx]
            [datalevin.utl QueryKey$EquivSet QueryKey$KeySet]
@@ -24,6 +26,9 @@
 (def ^:private ordinary-unique-types
   #{:db.type/boolean :db.type/instant :db.type/keyword :db.type/long
     :db.type/string :db.type/symbol :db.type/uuid :db.type/ref})
+
+(def ^:private ordinary-tuple-types
+  (conj (disj ordinary-scalar-types nil :db.type/bytes) :db.type/ref))
 
 (defn- ordinary-unique? [schema props]
   (or (nil? (:db/unique props))
@@ -727,8 +732,17 @@
        :scalar (compile-canonical-scalar-region ctx forms allow-references?)
        nil))))
 
-(defn- literal-tempid? [value]
-  (or (string? value) (and (instance? Long value) (neg? (long value)))))
+(defn- literal-tempid-key
+  "Prove an inert negative integer within the long range. Canonicalize only
+  compiler scratch; operands retain the caller's tempid object."
+  [value]
+  (cond
+    (string? value) value
+    (instance? Long value) (when (neg? (long value)) value)
+    (and (contains? inert-id-classes (class value)) (inert-scalar-value? value))
+    (try
+      (let [id (long value)] (when (neg? id) id))
+      (catch IllegalArgumentException _ nil))))
 
 (defn- pure-scalar-coercion?
   "Recognize conversions with no host callbacks, interning or default-zone work.
@@ -793,7 +807,8 @@
                 (if (and (plain-map? entity) (nil? (meta entity))
                          (or (not (contains? entity :db/id))
                              (let [e (:db/id entity)]
-                               (and (literal-tempid? e) (.add tempids e))))
+                               (when-let [key (literal-tempid-key e)]
+                                 (.add tempids key))))
                          (reduce-kv (fn [_ attr raw]
                                       (if (or (identical? :db/id attr) (attribute? attr raw))
                                         true (reduced false)))
@@ -848,7 +863,8 @@
   (let [explicit? (contains? entity :db/id)
         tempid (:db/id entity)]
     (when (or (not explicit?)
-              (and (literal-tempid? tempid) (.add tempids tempid)))
+              (when-let [key (literal-tempid-key tempid)]
+                (.add tempids key)))
       (let [attrs (FastList. (int (* 2 (count entity))))
             supported?
             (reduce-kv
@@ -939,23 +955,54 @@
                     (identical? vt :db.type/instant))
                 (pure-scalar-coercion? vt value)))))
 
+(defn- mixed-tuple-ready?
+  "Prove a materialized tuple without component coercion. Tuple preparation
+  retains its values; reference components must already be concrete IDs."
+  [props value]
+  (let [types (or (:db/tupleTypes props)
+                  (when-let [t (:db/tupleType props)] [t]))]
+    (and (identical? clojure.lang.PersistentVector (class value))
+         (nil? (meta value)) (vector? types) (seq types)
+         (every? ordinary-tuple-types types)
+         (every? #(or (nil? %) (inert-scalar-value? %)) value)
+         (try
+           (and (b/valid-data? value types)
+                (every? (fn [[t component]]
+                          (and (or (not (identical? t :db.type/ref))
+                                   (and (int? component) (not (neg? (long component)))))
+                               ;; The shared unique-AV scratch uses Java equality.
+                               ;; Preserve tuple components rather than coercing
+                               ;; them, and decline representations it cannot prove.
+                               (or (not (:db/unique props)) (nil? component)
+                                   (case t
+                                     (:db.type/long :db.type/ref) (instance? Long component)
+                                     :db.type/instant (identical? java.util.Date (class component))
+                                     true))))
+                        (map vector (if (= 1 (count types)) (repeat (first types)) types)
+                             value)))
+           (catch Exception _ false)))))
+
 (defn- mixed-value-ready? [validate? props ^HashSet tempids value coerce?]
-  (if (identical? :db.type/ref (:db/valueType props))
+  (case (:db/valueType props)
+    :db.type/tuple (mixed-tuple-ready? props value)
+    :db.type/ref
     (or (and (instance? Long value) (not (neg? (long value))))
-        (and (literal-tempid? value) (.contains tempids value))
+        (when-let [key (literal-tempid-key value)] (.contains tempids key))
         (and coerce? (ordinary-nonnegative-id? value)))
     (mixed-scalar-ready? validate? (:db/valueType props) value coerce?)))
 
 (defn- correct-mixed-value
-  [validate? vt value]
-  (if (or (and (identical? vt :db.type/ref)
-               ;; Self/back tempids stay symbolic until writer binding. Long
-               ;; concrete references, including zero, already need no coercion.
-               (or (instance? Long value) (literal-tempid? value)))
-          (canonical-scalar-value? validate? vt value))
-    value
-    (try (prepare/correct-scalar-value validate? vt value)
-         (catch Exception _ nil))))
+  [validate? props value]
+  (let [vt (:db/valueType props)]
+    (if (or (identical? vt :db.type/tuple)
+            (and (identical? vt :db.type/ref)
+                 ;; Self/back tempids stay symbolic until writer binding. Long
+                 ;; concrete references, including zero, already need no coercion.
+                 (or (instance? Long value) (literal-tempid-key value)))
+            (canonical-scalar-value? validate? vt value))
+      value
+      (try (prepare/correct-scalar-value validate? vt value)
+           (catch Exception _ nil)))))
 
 (defn- correct-mixed-entries!
   "Normalize only the fully proven request-owned operand stream. Nothing has
@@ -971,7 +1018,7 @@
                 (if (< offset (alength attrs))
                   (let [^MixedAttrInfo info (aget attrs (+ offset 2))]
                     (when-some [value (correct-mixed-value
-                                       validate? (:db/valueType (.-props info))
+                                       validate? (.-props info)
                                        (aget attrs (inc offset)))]
                       (aset attrs (inc offset) value)
                       (recur (+ offset 3))))
@@ -979,7 +1026,7 @@
             (let [^MixedUpdate entry entry
                   ^MixedAttrInfo info (.get infos (.-attr entry))]
               (when-some [value (correct-mixed-value
-                                 validate? (:db/valueType (.-props info)) (.-value entry))]
+                                 validate? (.-props info) (.-value entry))]
                 (when-not (identical? value (.-value entry))
                   (.set entries index (MixedUpdate. (.-e entry) (.-attr entry) value)))
                 true)))
@@ -997,7 +1044,7 @@
     (let [explicit? (contains? entity :db/id)
           tempid (:db/id entity)
           size (- (count entity) (if explicit? 1 0))]
-      (when (and (pos? size) (or (not explicit?) (literal-tempid? tempid)))
+      (when (and (pos? size) (or (not explicit?) (literal-tempid-key tempid)))
         (let [attrs (object-array (* 3 size))
               end (reduce-kv
                     (fn [offset a value]
@@ -1022,7 +1069,7 @@
   (let [explicit? (contains? entity :db/id)
         tempid (:db/id entity)]
     (when (or (not explicit?)
-              (and (literal-tempid? tempid) (.add tempids tempid)))
+              (when-let [key (literal-tempid-key tempid)] (.add tempids key)))
       (when-let [^MixedInsert entry (mixed-insert-operands ctx infos entity)]
         (let [^objects attrs (.-attrs entry)]
           (loop [offset 0]
@@ -1034,25 +1081,45 @@
                 (recur (+ offset 3)))
               entry)))))))
 
+(defn- independent-tuple-info? [^MixedAttrInfo info]
+  (and (.-ordinary? info) (.-insert? info)
+       (identical? :db.type/tuple (:db/valueType (.-props info)))
+       (nil? (.-tuples info)) (nil? (:db/unique (.-props info)))))
+
 (defn mixed-update-operand
-  "Assemble one raw scalar replacement over captured metadata. The Long ID
+  "Assemble one raw replacement over captured metadata. The Long ID
   stays unbound and values remain opaque; this proves neither writer bounds,
-  E/A distinctness nor value readiness. Scratch remains request-owned."
-  [ctx ^HashMap infos e attr value]
-  (when (and (instance? Long e) (pos? (long e))
-             (keyword? attr) (pos? (count (name attr))) (some? value)
-             (not (:auto-entity-time? (:opts ctx))))
-    (let [^MixedAttrInfo info (ordinary-attr-info!
-                              infos (:schema ctx) (:db/attrTuples (:rschema ctx)) attr)]
-      (when (.-update? info)
-        (MixedUpdate. e attr value)))))
+  E/A distinctness nor value readiness. Compilation can additionally admit
+  inert positive references and independent explicit tuple attributes. Raw
+  legacy callers retain their earlier roles. Scratch remains request-owned."
+  ([ctx infos e attr value]
+   (mixed-update-operand ctx infos e attr value false))
+  ([ctx ^HashMap infos e attr value allow-extended?]
+   (when (and (instance? Long e) (pos? (long e))
+              (keyword? attr) (pos? (count (name attr))) (some? value)
+              (not (:auto-entity-time? (:opts ctx))))
+     (let [schema (:schema ctx) sources (:db/attrTuples (:rschema ctx))
+           ^MixedAttrInfo info (ordinary-attr-info! infos schema sources attr)]
+       (when (or (.-update? info)
+                 (and allow-extended?
+                      (.-ordinary? info)
+                      (case (:db/valueType (.-props info))
+                        :db.type/ref
+                        (and (positive-literal-id? value)
+                             (scalar-attribute-props schema sources attr value :references))
+                        :db.type/tuple
+                        (independent-tuple-info? info)
+                        false)))
+         (MixedUpdate. e attr value))))))
 
 (defn- append-mixed-update!
   [ctx ^HashMap infos ^HashSet updates ^ArrayList entries e attr value coerce?]
-  (when-let [entry (mixed-update-operand ctx infos e attr value)]
+  (when-let [entry (mixed-update-operand ctx infos e attr value true)]
     (let [^MixedAttrInfo info (.get infos attr)]
-      (when (and (mixed-scalar-ready? (:validate-data? (:opts ctx))
-                   (:db/valueType (.-props info)) value coerce?)
+      (when (and (if (identical? :db.type/tuple (:db/valueType (.-props info)))
+                   (mixed-tuple-ready? (.-props info) value)
+                   (mixed-scalar-ready? (:validate-data? (:opts ctx))
+                     (:db/valueType (.-props info)) value coerce?))
                  (distinct-mixed-update? updates e attr))
         (.add entries entry)
         info))))
@@ -1060,7 +1127,7 @@
 (defn- compile-mixed-region*
   [ctx forms coerce?]
   (when (and (identical? clojure.lang.PersistentVector (class forms))
-             (nil? (meta forms)) (> (count forms) 1)
+             (nil? (meta forms)) (pos? (count forms))
              (not (:auto-entity-time? (:opts ctx))))
     (let [validate? (:validate-data? (:opts ctx))
           infos (HashMap.) tempids (HashSet.) updates (HashSet.)
@@ -1100,7 +1167,14 @@
                     (recur (unchecked-inc index) inserts? (max required-eid (long e))
                            (and typed? (.-typed? info))))))
               :else nil))
-          (when (and inserts? (pos? (.size updates))
+          (when (and (or inserts?
+                         ;; Scalar-only requests retain their own rules. An
+                         ;; independent tuple replacement needs this shared loop
+                         ;; even when no new entity participates in the request.
+                         (some (fn [^MixedUpdate entry]
+                                 (let [^MixedAttrInfo info (.get infos (.-attr entry))]
+                                   (identical? :db.type/tuple (:db/valueType (.-props info)))))
+                               entries))
                      ;; Complete all shape, metadata, tempid and E/A proofs
                      ;; before invoking even a store-free conversion.
                      (or (not coerce?) (correct-mixed-entries! validate? infos entries)))
@@ -1110,12 +1184,35 @@
                            nil)))))))
 
 (defn compile-mixed-region
-  "Compile new maps and distinct scalar replacements from maps or add vectors.
+  "Compile ordinary new maps and distinct independent replacements, including
+  explicit non-unique tuple replacements without new maps.
   Values may use safe built-in coercions; existing literal IDs normalize to Long.
   Writer bounds, uniqueness and old values remain runtime work."
   [ctx forms]
   (or (compile-mixed-region* ctx forms false)
       (compile-mixed-region* ctx forms true)))
+
+(defn- needs-ordinary-insert-plan?
+  "Select the shared ordinary loop only for reference/tuple work that
+  the blind rule cannot handle. Full eligibility remains in the region compiler;
+  ordinary blind-policy declines do not acquire a different proof."
+  [ctx forms]
+  (when (and (identical? clojure.lang.PersistentVector (class forms))
+             (nil? (meta forms)))
+    (let [schema (:schema ctx) sources (:db/attrTuples (:rschema ctx))]
+      (boolean
+        (some (fn [form]
+                (when (and (plain-map? form) (nil? (meta form)))
+                  (reduce-kv
+                    (fn [_ attr value]
+                      (if (and (keyword? attr)
+                               (or (contains? sources attr)
+                                   (identical? :db.type/tuple (:db/valueType (schema attr)))
+                                   (and (identical? :db.type/ref (:db/valueType (schema attr)))
+                                        (literal-tempid-key value))))
+                        (reduced true)
+                        false))
+                    false form))) forms)))))
 
 (defn- literal-scalar-alias?
   [value]
@@ -1123,6 +1220,20 @@
       (and (identical? clojure.lang.PersistentVector (class value))
            (nil? (meta value)) (= 2 (count value))
            (keyword? (nth value 0)) (inert-scalar-value? (nth value 1)))))
+
+(defn- application-add-metadata?
+  "Prove keyword-keyed application annotations without inspecting values.
+  Custom maps and reserved engine/control namespaces retain their old route."
+  [metadata]
+  (and (plain-map? metadata)
+       (reduce-kv
+         (fn [_ key _value]
+           (if (and (keyword? key)
+                    (let [n (namespace key)]
+                      (not (and n (or (= n "db") (= n "db.fn") (= n "idoc")
+                                      (= n "datalevin") (.startsWith ^String n "datalevin."))))))
+             true (reduced false)))
+         true metadata)))
 
 (defn literal-request-shape
   "Select one materialized request family without schema reads or host methods."
@@ -1133,25 +1244,39 @@
       (if (< index (count forms))
         (let [form (nth forms index)
               kind (cond
+                     (identical? Datom (class form))
+                     (when (and (pos? (.-e ^Datom form)) (d/datom-added form)) 20)
+
                      (and (plain-map? form) (nil? (meta form)))
                      (let [explicit? (contains? form :db/id) eid (:db/id form)]
                        (cond
-                         (or (not explicit?) (literal-tempid? eid)) 2
+                         (or (not explicit?) (literal-tempid-key eid)) 2
                          (and (> (count form) 1) (positive-literal-id? eid)) 1
+                         ;; Map IDs accept lookup refs, but unlike operation
+                         ;; vectors their syntax excludes bare ident keywords.
+                         (and (> (count form) 1) (vector? eid) (literal-scalar-alias? eid)) 8
                          :else nil))
                      (and (identical? clojure.lang.PersistentVector (class form))
-                          (nil? (meta form)) (= 4 (count form))
+                          (or (nil? (meta form)) (application-add-metadata? (meta form)))
+                          (<= 4 (count form) 5)
                           (identical? :db/add (nth form 0)))
-                     (let [e (nth form 1)]
-                       (cond (positive-literal-id? e) 4
-                             (literal-scalar-alias? e) 8)))]
+                     (let [e (nth form 1)
+                           kind (cond (positive-literal-id? e) 4
+                                      (literal-scalar-alias? e) 8)]
+                       (when kind
+                         (if (and (= 4 (count form)) (nil? (meta form))) kind
+                             (when (or (= 4 (count form))
+                                       (nil? (nth form 4)) (positive-literal-id? (nth form 4)))
+                               (bit-or kind 16))))))]
           (when kind
             (let [kinds (bit-or kinds (long kind))]
-              ;; Symbolic existing IDs still need ordered mixed resolution.
+              ;; New entities mixed with aliases or supplied transaction IDs
+              ;; still require ordered resolution and allocation.
               (when-not (and (pos? (bit-and kinds 2))
-                             (pos? (bit-and kinds 8)))
+                             (pos? (bit-and kinds 24)))
                 (recur (unchecked-inc index) kinds)))))
         (cond
+          (pos? (bit-and kinds 16)) :explicit-additions
           (pos? (bit-and kinds 8)) :scalar-aliases
           (pos? (bit-and kinds 2)) (if (pos? (bit-and kinds 5)) :mixed :blind)
           (pos? (bit-and kinds 1)) :scalar
@@ -1168,6 +1293,24 @@
              (canonical-scalar-value? (:validate-data? (:opts ctx))
                                       (:db/valueType props) (nth e 1))))))
 
+(defn- alias-value-props
+  "Share scalar eligibility and the independent tuple proof. Entity binding
+  stays symbolic, and unsupported values cannot invoke callbacks here."
+  [store-schema tuple-source-attrs ^HashMap infos attr value]
+  (or (literal-scalar-props store-schema tuple-source-attrs attr value true)
+      (when (and (keyword? attr) (pos? (count (name attr))))
+        (let [^MixedAttrInfo info (ordinary-attr-info! infos store-schema tuple-source-attrs attr)]
+          (when (and (independent-tuple-info? info)
+                     (mixed-tuple-ready? (.-props info) value))
+            (.-props info))))))
+
+(defn- alias-value-unchanged?
+  "Tuple readiness was already proven by alias-value-props; its components
+  retain their representation instead of entering scalar correction."
+  [validate? vt value]
+  (or (identical? vt :db.type/tuple)
+      (canonical-scalar-value? validate? vt value)))
+
 (defn- compile-scalar-aliases
   "Retain canonical symbolic entity operands for writer-time binding. Raw
   distinctness is provisional: the writer must reject aliases of one E/A."
@@ -1175,15 +1318,16 @@
   (when-not (:auto-entity-time? (:opts ctx))
     (let [store-schema (:schema ctx)
           tuple-source-attrs (:db/attrTuples (:rschema ctx))
+          infos (HashMap.)
           candidates (FastList.)
           seen (HashSet.)
           append! (fn [e attr value]
-                    (when-let [props (literal-scalar-props
-                                      store-schema tuple-source-attrs attr value true)]
+                    (when-let [props (alias-value-props
+                                      store-schema tuple-source-attrs infos attr value)]
                       ;; Noncanonical values retain the existing caller's
                       ;; correction/rejection order, including missing aliases.
-                      (when (canonical-scalar-value? (:validate-data? (:opts ctx))
-                                                     (:db/valueType props) value)
+                      (when (alias-value-unchanged? (:validate-data? (:opts ctx))
+                                                   (:db/valueType props) value)
                         (append-scalar-candidate! candidates seen e attr value
                                                   (:db/valueType props)))))]
       (when (reduce
@@ -1211,13 +1355,15 @@
     (let [store-schema (:schema ctx)
           tuple-source-attrs (:db/attrTuples (:rschema ctx))
           validate? (:validate-data? (:opts ctx))
+          infos (when aliases? (HashMap.))
           candidates (FastList.)
           seen (HashSet.)
           append! (fn [e attr value]
-                    (when-let [props (literal-scalar-props
-                                      store-schema tuple-source-attrs attr value true)]
+                    (when-let [props (if aliases?
+                                      (alias-value-props store-schema tuple-source-attrs infos attr value)
+                                      (literal-scalar-props store-schema tuple-source-attrs attr value true))]
                       (let [vt (:db/valueType props)]
-                        (when (or (canonical-scalar-value? validate? vt value)
+                        (when (or (alias-value-unchanged? validate? vt value)
                                   (pure-scalar-coercion? vt value))
                           (append-scalar-candidate! candidates seen e attr value vt)))))]
       (when (reduce
@@ -1238,7 +1384,7 @@
                 (if (< i (.size candidates))
                   (let [raw (.get candidates (+ i 2))
                         vt (.get candidates (+ i 3))
-                        value (if (canonical-scalar-value? validate? vt raw)
+                        value (if (alias-value-unchanged? validate? vt raw)
                                 raw
                                 (try (prepare/correct-scalar-value validate? vt raw)
                                      (catch Exception _ nil)))]
@@ -1252,6 +1398,47 @@
                            (when-not aliases?
                              (scalar-update-entity-reads store-schema entries)))))))))
 
+(declare compile-tx)
+
+(defn- compile-explicit-additions
+  "Normalize already-materialized additions into independent alias operands.
+  Supplied positive transaction IDs survive binding; nil uses the request ID.
+  Declines retain the caller's original forms, including metadata and errors."
+  [ctx forms]
+  (let [prepass? (not (and (ordinary-analysis-enabled? ctx)
+                           (every? #(some? (ordinary-addition-flags ctx % true false)) forms)))
+        [operations txs metadata]
+        (reduce
+          (fn [[operations txs metadata] form]
+            (cond
+              (identical? Datom (class form))
+              [(conj operations [:db/add (.-e ^Datom form) (.-a ^Datom form) (.-v ^Datom form)])
+               (conj txs (d/datom-tx form)) (conj metadata nil)]
+              (plain-map? form)
+              (reduce-kv (fn [[operations txs metadata] attr value]
+                           (if (identical? :db/id attr) [operations txs metadata]
+                               [(conj operations [:db/add (:db/id form) attr value])
+                                (conj txs nil) (conj metadata nil)]))
+                         [operations txs metadata] form)
+              :else
+              (let [rebuild-reference? (and prepass?
+                                            (contains? (:db.type/ref (:rschema ctx)) (nth form 2)))]
+                ;; When the ordinary proof declines, the implicit-ID prepass rebuilds reference add
+                ;; vectors with four fields, dropping their stamp/metadata.
+                ;; Datoms bypass that prepass and keep their supplied stamp.
+                [(conj operations (with-meta (if (= 5 (count form)) (pop form) form) nil))
+                 (conj txs (when-not rebuild-reference?
+                             (when-some [tx (nth form 4 nil)] (long tx))))
+                 (conj metadata (when-not rebuild-reference? (meta form)))])))
+          [[] [] []] forms)
+        prepared (compile-tx ctx operations {:request-shape :scalar-aliases})]
+    (when (instance? datalevin.db.tx.plan.TxPlan prepared)
+      (assoc prepared :entries
+             (mapv (fn [entry tx annotations]
+                     (cond-> (conj entry tx) annotations (conj annotations)))
+                   (:entries prepared) txs metadata)
+             :explicit-tx? true))))
+
 (defn compile-tx
   "Select one scalar, blind or mixed rule from a pure structural decision.
   Known-family adapters may carry their shape proof; unsupported input is untouched."
@@ -1259,14 +1446,19 @@
   ([ctx forms {:keys [literal-shape request-shape] :as options}]
    (let [shape (or literal-shape request-shape (literal-request-shape forms))]
      (case shape
+       :explicit-additions (compile-explicit-additions ctx forms)
        ;; The protected Stage 1 adapter carries :literal-shape. Successful
        ;; Stage 2 preparation additionally accepts canonical concrete references.
        (:scalar :scalar-operations)
        (or (compile-scalar-region ctx forms shape (nil? literal-shape))
-           (when (nil? literal-shape) (compile-coerced-scalar-region ctx forms false)))
+           (when (nil? literal-shape)
+             (or (compile-coerced-scalar-region ctx forms false)
+                 (compile-mixed-region ctx forms))))
        :scalar-aliases
        (or (compile-scalar-aliases ctx forms)
            (compile-coerced-scalar-region ctx forms true))
-       :blind (compile-blind-region ctx forms options)
+       :blind (or (compile-blind-region ctx forms options)
+                  (when (needs-ordinary-insert-plan? ctx forms)
+                    (compile-mixed-region ctx forms)))
        :mixed (compile-mixed-region ctx forms)
        nil))))
