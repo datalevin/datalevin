@@ -18,8 +18,6 @@
    [datalevin.constants :as c]
    [datalevin.core :as d]
    [datalevin.db :as db]
-   [datalevin.db.tx.add :as txadd]
-   [datalevin.db.tx.engine :as txengine]
    [datalevin.ha :as dha]
    [datalevin.ha.authority :as ha-auth]
    [datalevin.ha.control :as ctrl]
@@ -1638,71 +1636,52 @@
     (with-direct-db-transaction-slot deps server db-name writing? f))))
 
 (defn- commit-stamped-report
-  [report ordered?]
-  (when report
-    (binding [c/*ordered-datom-writes?* ordered?
-              st/*enforce-blind-unique-inserts?* false]
-      (assoc report :db-after
-             (db/commit-prepared-tx-data!
-               (:db-after report) (:tx-data report) report)))))
-
-(defn- transact-blind-insert
-  ([db txs tx-meta]
-   (transact-blind-insert db txs tx-meta
-     (or (db/prepare-compiled-request db txs)
-         (db/prepare-blind-local-tx db txs true))))
-  ([db _txs tx-meta prepared]
-   (when (and prepared (db/blind-local-tx-valid? db prepared))
-     ;; The caller already holds the native writer. Probe before mutating the
-     ;; store: a late unique collision cannot be retried inside a shared group
-     ;; or an explicit transaction without rolling back preceding requests.
-     (when (db/blind-local-tx-unique-values-absent? db prepared)
-       (commit-stamped-report (db/stamp-blind-local-tx db prepared tx-meta) true)))))
+  ([report ordered?] (commit-stamped-report report ordered? false))
+  ([report ordered? independent?]
+   (when report
+     (binding [c/*ordered-datom-writes?* ordered?
+               st/*enforce-blind-unique-inserts?* false]
+       (assoc report :db-after
+              (db/commit-prepared-tx-data!
+                (:db-after report) (:tx-data report) report independent?))))))
 
 (defn- ^:redef prepare-server-tx
   [db txs]
-  (when-not (txengine/interpreter?)
-    (try
-      (or (when-let [outcome (db/prepare-compiled-request db txs)]
-            [:compiled outcome txs])
-          (when-let [prepared (db/prepare-scalar-update-tx
-                               db txs {:defer-entity-resolution? true})]
-            [:scalar-update prepared])
-          (when-let [prepared (db/prepare-blind-local-tx db txs true)]
-            [:blind prepared]))
-      ;; Preparation uses the published schema/options. Let the general engine
-      ;; validate against the writer's current state if that snapshot rejects it.
-      (catch Exception _ nil))))
+  (try
+    (when-let [plan (or (db/prepare-compiled-request db txs)
+                       (db/prepare-admitted-request
+                         db txs {:strategy :scalar :defer-entity-resolution? true})
+                       (db/prepare-admitted-request
+                         db txs {:strategy :blind :allow-small-unique? true}))]
+      [:compiled plan txs])
+    ;; The owned compiler hook validates against current schema/options.
+    (catch Exception _ nil)))
+
+(defn- execute-compiled-request!
+  [db prepared forms tx-meta]
+  (let [report (db/prepare-local-tx-data
+                 db forms tx-meta (System/currentTimeMillis) prepared nil
+                 {:stage? false :route? true :owned-max-eid (:max-eid db)})
+        ordered? (= :blind-insert (db/compiled-request-route report))
+        independent? (db/request-storage-independent? report)]
+    (commit-stamped-report (db/clear-compiled-request-route report) ordered? independent?)))
 
 (defn- ^:redef transact-prepared
   [db [kind prepared forms] tx-meta]
   (case kind
     :compiled
-    (let [report (db/prepare-local-tx-data
-                   db forms tx-meta (System/currentTimeMillis) prepared nil
-                   {:stage? false :route? true :owned-max-eid (:max-eid db)})
-          ordered? (= :blind-insert (db/compiled-request-route report))]
-      (commit-stamped-report (db/clear-compiled-request-route report) ordered?))
-
-    :scalar-update
-    (commit-stamped-report (db/stamp-scalar-update-tx db prepared tx-meta) false)
-
-    :blind
-    (when (db/blind-local-tx-valid? db prepared)
-      (if (:identity-upsert-av prepared)
-        (when-let [[report upsert?] (db/stamp-blind-local-identity-tx db prepared tx-meta)]
-          (commit-stamped-report report (not upsert?)))
-        (transact-blind-insert db nil tx-meta prepared)))
+    (if-let [attributes (db/request-storage-attributes db prepared)]
+      (binding [st/*compiled-storage-attributes* attributes]
+        (execute-compiled-request! db prepared forms tx-meta))
+      (execute-compiled-request! db prepared forms tx-meta))
 
     nil))
 
 (defn- scalar-prepared-request?
-  "Reuse scalar collector bookkeeping for accepted legacy or compiled scalar
-  operands. Stale plans retain the shared hook's owned-writer fallback."
+  "Use scalar collector bookkeeping for compiled scalar operands."
   [[kind outcome]]
-  (or (identical? kind :scalar-update)
-      (and (identical? kind :compiled) (instance? TxPlan outcome)
-           (contains? #{:scalar :scalar-operations :scalar-aliases} (:strategy outcome)))))
+  (and (identical? kind :compiled) (instance? TxPlan outcome)
+       (contains? #{:scalar :scalar-operations :scalar-aliases} (:strategy outcome))))
 
 (defn- transact*
   ([deps db0 txs tx-meta s? server db-name writing?]
@@ -1714,18 +1693,12 @@
      ;; pending indexes so general resolution sees preceding batch writes.
      ;; Simulations need fresh overlays because db0 is published to readers.
      (let [transact (fn [db]
-                      (or (when-not (or s? (txengine/interpreter?))
+                      (or (when-not s?
                             (or (transact-prepared db prepared (or tx-meta {}))
                                 ;; A declined caller snapshot may become eligible
                                 ;; under this writer's current schema/options.
                                 (when-let [outcome (db/prepare-compiled-request db txs)]
-                                  (transact-prepared db [:compiled outcome txs] (or tx-meta {})))
-                                ;; Resolve mixed updates/inserts against this
-                                ;; owned writer, including preceding requests.
-                                (when-let [report (txadd/prepare-mixed-report
-                                                    (db/->TxReport db db [] {} (or tx-meta {}))
-                                                    txs (:max-eid db))]
-                                  (commit-stamped-report report false))))
+                                  (transact-prepared db [:compiled outcome txs] (or tx-meta {})))))
                           (db/transact-tx-data
                             (db/->TxReport db (if s? (db/transfer db (:store db)) db)
                                            [] {} (or tx-meta {}))

@@ -8,6 +8,12 @@
            [java.util HashMap HashSet]
            [org.eclipse.collections.impl.list.mutable FastList]))
 
+(defn- compile-stage2
+  "Keep the accepted Stage 2 proof controls scoped to their original rules."
+  ([ctx forms] (compile-stage2 ctx forms nil))
+  ([ctx forms options]
+   (compile/compile-tx ctx forms (assoc options :ordered? false))))
+
 (deftest scalar-candidate-projection-keeps-values-opaque-and-scratch-owned
   (let [calls (atom [])
         host (proxy [Object] []
@@ -33,13 +39,56 @@
      :reference {:db/aid 6 :db/valueType :db.type/ref}}
     {} {:validate-data? true}))
 
+(deftest existing-map-annotations-normalize-without-becoming-datom-metadata
+  (let [annotations {:source :map :user/nested ["opaque"]}
+        input [(with-meta (array-map :db/id (int 1) :value (int 7) :text "map") annotations)
+               (with-meta {:db/id [:identity "one"] :value 8} {})
+               (with-meta [:db/add 2 :text "vector" 123] {:source :vector})]
+        p (compile-stage2 ctx input)]
+    (is (= :explicit-additions (compile/literal-request-shape input)))
+    (is (= :scalar-aliases (:strategy p)))
+    (is (= [[1 :value 7 nil] [1 :text "map" nil] [[:identity "one"] :value 8 nil]
+            [2 :text "vector" 123 {:source :vector}]] (:entries p)))
+    (is (identical? annotations (meta (first input))))
+    (is (nil? (compile/literal-scalar-shape [(first input)]))))
+  (let [context (assoc ctx :rschema {:db.type/ref #{:reference}})
+        p (compile-stage2 context
+            [(with-meta {:db/id 1 :value 7} {:source :ignored})
+             [:db/add 2 :reference 1 123]])]
+    (is (= [[1 :value 7 nil] [2 :reference 1 nil]] (:entries p)))))
+
+(deftest existing-map-annotation-declines-do-not-observe-host-values
+  (let [effects (atom [])
+        host (proxy [Object clojure.lang.IMeta] []
+               (meta [] (swap! effects conj :meta) nil)
+               (hashCode [] (swap! effects conj :hash) 0)
+               (toString [] (swap! effects conj :string) "host"))
+        tail (lazy-seq (swap! effects conj :tail) (list "lazy"))
+        annotations {:source host :user/lazy tail}
+        custom (sorted-map-by (fn [a b] (swap! effects conj :compare) (compare a b)) :source :custom)]
+    (reset! effects [])
+    (is (instance? TxPlan (compile-stage2 ctx [(with-meta {:db/id 1 :value 7} annotations)])))
+    (doseq [input [[(with-meta {:value 7} annotations)]
+                   [(with-meta {:db/id "new" :value 7} annotations)]
+                   [(with-meta {:db/id -1 :value 7} annotations)]
+                   [(with-meta {:db/id 1 :value 7} annotations) {:text "new"}]
+                   [(with-meta {:db/id :entity/one :value 7} annotations)]
+                   [(with-meta {:db/id 1} annotations)]
+                   [(with-meta {:db/id 1 :value host} annotations)]
+                   [(with-meta {:db/id 1 :value 7} custom)]
+                   [(with-meta {:db/id 1 :value 7} (array-map host :key))]
+                   [(with-meta {:db/id 1 :value 7} {:db/internal true})]
+                   [(with-meta {:db/id 1 :value 7} annotations) [:db/add 1 :value 8]]]]
+      (is (nil? (compile-stage2 ctx input))))
+    (is (empty? @effects))))
+
 (deftest application-add-metadata-is-an-opaque-owned-operand
   (let [annotations {:source :test :user/note ["nested"]}
         empty-annotations {}
         input [(with-meta [:db/add 1 :value (int 7)] annotations)
                (with-meta [:db/add [:identity "one"] :text "text" 123] empty-annotations)
                {:db/id 2 :value (int 8)}]
-        p (compile/compile-tx ctx input)]
+        p (compile-stage2 ctx input)]
     (is (= :explicit-additions (compile/literal-request-shape input)))
     (is (true? (:explicit-tx? p)))
     (is (= [[1 :value 7 nil annotations] [[:identity "one"] :text "text" 123 {}]
@@ -49,10 +98,10 @@
     (is (identical? annotations (meta (first input))))
     (is (nil? (compile/literal-scalar-shape [(first input)]))))
   (let [input [(with-meta (datom/datom 1 :value 7 123) {:datalevin.db.tx.execute/internal true})]
-        p (compile/compile-tx ctx input)]
+        p (compile-stage2 ctx input)]
     (is (= [[1 :value 7 123]] (:entries p))))
   (let [context (assoc ctx :rschema {:db.type/ref #{:reference}})
-        p (compile/compile-tx context
+        p (compile-stage2 context
             [(with-meta [:db/add 1 :reference 2 123] {:source :discarded})
              (datom/datom 2 :reference 1 456)])]
     (is (= [[1 :reference 2 nil] [2 :reference 1 456]] (:entries p)))))
@@ -67,22 +116,23 @@
         annotations {:source host :user/lazy tail}
         input [(with-meta [:db/add 1 :value 7] annotations)]
         custom (sorted-map-by (fn [a b] (swap! effects conj :compare) (compare a b)) :source :custom)
-        p (do (reset! effects []) (compile/compile-tx ctx input))]
+        p (do (reset! effects []) (compile-stage2 ctx input))]
     (is (instance? TxPlan p))
     (is (identical? annotations (peek (first (:entries p)))))
     (doseq [metadata [custom (array-map host :key) {:db/internal true} {:db.fn/call true}
                       {:idoc/patch host} {:datalevin/internal true}
                       {:datalevin.db.tx.execute/internal true}]]
-      (is (nil? (compile/compile-tx ctx [(with-meta [:db/add 1 :value 7] metadata)]))))
-    (is (nil? (compile/compile-tx ctx (with-meta input {:source :request}))))
-    (is (nil? (compile/compile-tx ctx [(with-meta {:db/id 1 :value 7} annotations)])))
+      (is (nil? (compile-stage2 ctx [(with-meta [:db/add 1 :value 7] metadata)]))))
+    (is (nil? (compile-stage2 ctx (with-meta input {:source :request}))))
+    (is (= [[1 :value 7 nil]]
+           (:entries (compile-stage2 ctx [(with-meta {:db/id 1 :value 7} annotations)]))))
     (is (empty? @effects))))
 
 (deftest explicit-additions-retain-supplied-transaction-ids-in-owned-operands
   (let [input [(with-meta (datom/datom 1 :value (int 3) 123 true) {:source :ignored})
                [:db/add [:identity "one"] :text "text" (int 456)]
                {:db/id 2 :value (int 4)} [:db/add 2 :text "default" nil]]
-        p (compile/compile-tx ctx input)]
+        p (compile-stage2 ctx input)]
     (is (= :explicit-additions (compile/literal-request-shape input)))
     (is (= :scalar-aliases (:strategy p)))
     (is (true? (:explicit-tx? p)))
@@ -94,9 +144,26 @@
     (is (nil? (compile/literal-scalar-shape [(second input)]))))
   (let [context (assoc-in ctx [:schema :tuple]
                   {:db/aid 7 :db/valueType :db.type/tuple :db/tupleType :db.type/long})
-        value [(int 1) 2] p (compile/compile-tx context [(datom/datom 1 :tuple value)])]
+        value [(int 1) 2] p (compile-stage2 context [(datom/datom 1 :tuple value)])]
     (is (= :scalar-aliases (:strategy p)))
     (is (identical? value (nth (first (:entries p)) 2)))))
+
+(deftest scalar-rules-decline-supplied-transaction-slots
+  (doseq [tx [nil 123 (int 456)]
+          eid [1 (int 1)]
+          value [7 (int 7)]
+          input [[[:db/add eid :value value tx]]
+                 [[:db/add eid :value value tx] [:db/add 2 :text "other"]]
+                 [[:db/add 2 :text "other"] [:db/add eid :value value tx]]]]
+    (let [p (compile-stage2 ctx input)]
+      (is (= :explicit-additions (compile/literal-request-shape input)))
+      (is (true? (:explicit-tx? p)))
+      (is (= (some-> tx long)
+             (nth (first (filter #(= :value (second %)) (:entries p))) 3))))
+    (doseq [shape [:scalar :scalar-operations]]
+      (is (nil? (compile/compile-scalar-region ctx input shape)))
+      (doseq [hint [:literal-shape :request-shape]]
+        (is (nil? (compile-stage2 ctx input {hint shape})))))))
 
 (deftest explicit-addition-declines-preserve-original-input-without-host-callbacks
   (let [effects (atom [])
@@ -117,8 +184,8 @@
                    [(datom/datom 1 :value 2) {:text "new"}]
                    [(datom/datom 1 :value 2) [:db/add 1 :value 3 123]]
                    [(datom/datom 1 :value 2) tail] tail]]
-      (is (nil? (compile/compile-tx ctx input))))
-    (is (nil? (compile/compile-tx (assoc-in ctx [:opts :auto-entity-time?] true)
+      (is (nil? (compile-stage2 ctx input))))
+    (is (nil? (compile-stage2 (assoc-in ctx [:opts :auto-entity-time?] true)
                 [(datom/datom 1 :value 2)])))
     (is (empty? @effects))))
 
@@ -131,17 +198,17 @@
                    [[:db/add lookup :tuple value]]
                    [{:db/id lookup :tuple value} [:db/add 2 :value 3]]
                    [{:db/id lookup :tuple value} [:db/add :entity/one :text "text"]]]]
-      (let [p (compile/compile-tx context input)]
+      (let [p (compile-stage2 context input)]
         (is (= :scalar-aliases (compile/literal-request-shape input)))
         (is (= :scalar-aliases (:strategy p)))
         (is (identical? value (nth (first (:entries p)) 2)))
         (is (nil? (:entity-reads p)))))
-    (is (= :scalar-aliases (:strategy (compile/compile-tx ctx [{:db/id lookup :value 3}]))))
-    (let [p (compile/compile-tx (assoc-in context [:opts :validate-data?] false)
+    (is (= :scalar-aliases (:strategy (compile-stage2 ctx [{:db/id lookup :value 3}]))))
+    (let [p (compile-stage2 (assoc-in context [:opts :validate-data?] false)
               [(array-map :db/id lookup :tuple value :text 42)])]
       (is (= [[lookup :tuple value] [lookup :text "42"]] (:entries p)))
       (is (identical? value (nth (first (:entries p)) 2))))
-    (is (nil? (compile/compile-tx context [{:db/id lookup :tuple value}]
+    (is (nil? (compile-stage2 context [{:db/id lookup :tuple value}]
                 {:literal-shape :scalar})))))
 
 (deftest tuple-alias-proofs-decline-unsupported-shapes-without-host-observation
@@ -157,7 +224,7 @@
                    [{:db/id host :tuple [1]}] [{:db/id tail :tuple [1]}]
                    [{:db/id [:identity host] :tuple [1]}]
                    [{:db/id (with-meta [:identity "one"] {:source true}) :tuple [1]}]
-                   [(with-meta {:db/id [:identity "one"] :tuple [1]} {:source true})]
+                   [(with-meta {:db/id [:identity "one"] :tuple [1]} {:db/internal true})]
                    [{:db/id [:identity "one"] :tuple [host]}]
                    [{:db/id [:identity "one"] :tuple [tail]}]
                    [{:db/id [:identity "one"] :tuple tail}]
@@ -167,12 +234,12 @@
                    [{:db/id [:identity "one"] :tuple [1]} [:db/add [:identity "one"] :tuple [2]]]
                    [{:db/id [:identity "one"] :tuple [1]} [:db/add [:identity "one"] :tuple [2]]]
                    [{:db/id [:identity "one"]}]]]
-      (is (nil? (compile/compile-tx context input))))
+      (is (nil? (compile-stage2 context input))))
     (doseq [props [{:db/unique :db.unique/value} {:db/cardinality :db.cardinality/many}
                   {:db.attr/preds [(fn [_] true)]} {:db/tupleAttrs [:value]}]]
-      (is (nil? (compile/compile-tx (update-in context [:schema :tuple] merge props)
+      (is (nil? (compile-stage2 (update-in context [:schema :tuple] merge props)
                   [{:db/id [:identity "one"] :tuple [1]}]))))
-    (is (nil? (compile/compile-tx (assoc-in context [:opts :auto-entity-time?] true)
+    (is (nil? (compile-stage2 (assoc-in context [:opts :auto-entity-time?] true)
                 [{:db/id [:identity "one"] :tuple [1]}])))
     (is (empty? @effects))))
 
@@ -185,7 +252,7 @@
                    [[:db/add 1 :tuple value] [:db/add 2 :text "second"]]
                    [{:db/id 1 :tuple value :value (int 2)}]
                    [{:text "new"} [:db/add 1 :tuple value]]]]
-      (let [p (compile/compile-tx context input)
+      (let [p (compile-stage2 context input)
             ^MixedOperands operands (:entries p)
             ^MixedUpdate entry (first (filter #(and (instance? MixedUpdate %)
                                                     (= :tuple (.-attr ^MixedUpdate %)))
@@ -196,7 +263,7 @@
         (is (= (> (count (filter #(instance? MixedUpdate %) (.-entries operands))) 1)
                (.-prepare-reader? operands)))))
     (is (nil? (compile/compile-mixed-region ctx [[:db/add 1 :value 2]])))
-    (is (nil? (compile/compile-tx context [[:db/add 1 :tuple value]]
+    (is (nil? (compile-stage2 context [[:db/add 1 :tuple value]]
                 {:literal-shape :scalar-operations})))))
 
 (deftest tuple-replacement-analysis-preserves-legacy-roles-and-decline-purity
@@ -215,19 +282,19 @@
                    (with-meta [1] {:source true})]
             input [[[:db/add 1 :tuple value]]
                    [{:text "new"} {:db/id 1 :tuple value}]]]
-      (is (nil? (compile/compile-tx context input))))
+      (is (nil? (compile-stage2 context input))))
     (doseq [props [{:db/unique :db.unique/value} {:db/unique :db.unique/identity}
                   {:db/cardinality :db.cardinality/many} {:db/tupleAttrs [:value]}
                   {:db.attr/preds [(fn [_] true)]}]]
-      (is (nil? (compile/compile-tx (update-in context [:schema :tuple] merge props)
+      (is (nil? (compile-stage2 (update-in context [:schema :tuple] merge props)
                   [[:db/add 1 :tuple [1]]]))))
     (doseq [input [[[:db/add 1 :tuple [1]] [:db/add (int 1) :tuple [2]]]
                    [{:db/id 1 :tuple [1]} [:db/add 1N :tuple [2]]]
                    [[:db/add 1 :tuple [1]] [:db/add 1 :value 2] [:db/add 1 :tuple [3]]]]]
-      (is (nil? (compile/compile-tx context input))))
-    (is (nil? (compile/compile-tx (assoc context :rschema {:db/attrTuples {:tuple {:pair 0}}})
+      (is (nil? (compile-stage2 context input))))
+    (is (nil? (compile-stage2 (assoc context :rschema {:db/attrTuples {:tuple {:pair 0}}})
                 [[:db/add 1 :tuple [1]]])))
-    (is (nil? (compile/compile-tx (assoc-in context [:opts :auto-entity-time?] true)
+    (is (nil? (compile-stage2 (assoc-in context [:opts :auto-entity-time?] true)
                 [[:db/add 1 :tuple [1]]])))
     (is (empty? @effects))))
 
@@ -243,14 +310,14 @@
             input [[{attr value}]
                    [[:db/add 1 :text "updated"] {attr value}]
                    [{attr value} {:db/id 1 :value (int 2)}]]]
-      (let [p (compile/compile-tx (assoc-in context [:opts :validate-data?] validate?) input)
+      (let [p (compile-stage2 (assoc-in context [:opts :validate-data?] validate?) input)
             ^MixedOperands operands (:entries p)
             ^MixedInsert insert (first (filter #(instance? MixedInsert %) (.-entries operands)))]
         (is (= :mixed (:strategy p)))
         (is (identical? value (aget ^objects (.-attrs insert) 1)))))
     (doseq [props [{:db/unique :db.unique/identity} {:db/cardinality :db.cardinality/many}
                   {:db.attr/preds [(fn [_] true)]}]]
-      (is (nil? (compile/compile-tx (update-in context [:schema :words] merge props)
+      (is (nil? (compile-stage2 (update-in context [:schema :words] merge props)
                   [{:words ["one"]}]))))))
 
 (deftest tuple-eligibility-declines-unsafe-components-without-observation
@@ -271,8 +338,8 @@
                           [:refs [nil]] [:refs [-1]] [:refs ["self"]] [:refs [1N]]
                           [:refs [:entity/one]] [:refs [[:identity "one"]]]]]
       (let [input [{:db/id "self" attr value}]]
-        (is (nil? (compile/compile-tx (assoc-in context [:opts :validate-data?] validate?) input)))
-        (is (nil? (compile/compile-tx context (into [[:db/add 1 :value 2]] input))))))
+        (is (nil? (compile-stage2 (assoc-in context [:opts :validate-data?] validate?) input)))
+        (is (nil? (compile-stage2 context (into [[:db/add 1 :value 2]] input))))))
     (is (empty? @effects))))
 
 (deftest unique-tuple-proofs-preserve-the-shared-av-equality-boundary
@@ -284,12 +351,12 @@
                           :db/unique :db.unique/value})]
     (doseq [input [[{:token ["unique" 1]}] [{:token [nil nil]}]
                    [{:times [(java.util.Date. 123)]}]]]
-      (is (= :mixed (:strategy (compile/compile-tx context input)))))
+      (is (= :mixed (:strategy (compile-stage2 context input)))))
     (doseq [input [[{:token ["unique" (int 1)]}]
                    [{:token ["duplicate" 1]} {:token ["duplicate" (int 1)]}]
                    [{:times [(java.sql.Timestamp. 123)]}]]]
-      (is (nil? (compile/compile-tx context input))))
-    (is (nil? (compile/compile-tx (assoc-in context [:opts :auto-entity-time?] true)
+      (is (nil? (compile-stage2 context input))))
+    (is (nil? (compile-stage2 (assoc-in context [:opts :auto-entity-time?] true)
                 [{:token ["timestamped" 1]}])))))
 
 (deftest ordinary-insert-plans-reuse-mixed-operands-without-existing-updates
@@ -304,7 +371,7 @@
                    {:db/id "child" :reference (short -1)}]]
              [tuple-ctx [{:value 3}]]
              [tuple-ctx [{:db/id -1N :reference (int -1) :value 3}]]]]
-      (let [plan (compile/compile-tx context forms)
+      (let [plan (compile-stage2 context forms)
             ^MixedOperands operands (:entries plan)]
         (is (instance? TxPlan plan))
         (is (= :mixed (:strategy plan)))
@@ -313,13 +380,13 @@
         (is (false? (.-prepare-reader? operands)))))
     (doseq [forms [[{:text "simple"}] [{:reference 2}]
                    [{:db/id "one" :value 1} {:db/id -1 :value 2}]]]
-      (is (= :blind (:strategy (compile/compile-tx ctx forms)))))
+      (is (= :blind (:strategy (compile-stage2 ctx forms)))))
     (let [unique-ctx (assoc-in ctx [:schema :token]
                       {:db/aid 8 :db/valueType :db.type/string :db/unique :db.unique/value})]
-      (is (nil? (compile/compile-tx unique-ctx [{:token "same"} {:token "same"}]))))
-    (is (nil? (compile/compile-tx ctx [{:identity "small"}]
+      (is (nil? (compile-stage2 unique-ctx [{:token "same"} {:token "same"}]))))
+    (is (nil? (compile-stage2 ctx [{:identity "small"}]
                 {:allow-small-unique? false})))
-    (is (= :blind (:strategy (compile/compile-tx ctx [{:identity "small"}]
+    (is (= :blind (:strategy (compile-stage2 ctx [{:identity "small"}]
                                {:allow-small-unique? true}))))))
 
 (deftest ordinary-insert-selection-declines-unsupported-dependencies-without-effects
@@ -340,8 +407,8 @@
                    (with-meta [{:db/id "self" :reference "self"}] {:source true})
                    [(with-meta {:db/id "self" :reference "self"} {:source true})]
                    tail]]
-      (is (nil? (compile/compile-tx ctx forms))))
-    (is (nil? (compile/compile-tx (assoc-in ctx [:opts :auto-entity-time?] true)
+      (is (nil? (compile-stage2 ctx forms))))
+    (is (nil? (compile-stage2 (assoc-in ctx [:opts :auto-entity-time?] true)
                 [{:db/id "self" :reference "self"}])))
     (is (empty? @effects))))
 
@@ -400,7 +467,7 @@
   (doseq [value [(byte 2) (short 2) (int 2) 2 2N (biginteger 2) Long/MAX_VALUE]]
     (let [infos (HashMap.)
           ^MixedUpdate operand (compile/mixed-update-operand ctx infos 1 :reference value true)
-          plan (compile/compile-tx (assoc-in ctx [:opts :validate-data?] false)
+          plan (compile-stage2 (assoc-in ctx [:opts :validate-data?] false)
                  [[:db/add 1 :reference value] {:text "new"}])]
       (is (nil? (compile/mixed-update-operand ctx infos 1 :reference value)))
       (is (identical? value (.-value operand)))
@@ -418,12 +485,12 @@
     (doseq [props [{:db/cardinality :db.cardinality/many}
                    {:db/unique :db.unique/value} {:db/unique :db.unique/identity}
                    {:db/fulltext true} {:db/embedding true} {:db/vector true}]]
-      (is (nil? (compile/compile-tx (update-in ctx [:schema :reference] merge props)
+      (is (nil? (compile-stage2 (update-in ctx [:schema :reference] merge props)
                   [[:db/add 1 :reference 2] {:text "new"}]))))
     (doseq [value [2N (biginteger 2)]]
       ;; A pure correction rejection retains the existing validation route.
-      (is (nil? (compile/compile-tx ctx [[:db/add 1 :reference value] {:text "new"}]))))
-    (is (nil? (compile/compile-tx (assoc ctx :rschema {:db/attrTuples {:reference {:pair 0}}})
+      (is (nil? (compile-stage2 ctx [[:db/add 1 :reference value] {:text "new"}]))))
+    (is (nil? (compile-stage2 (assoc ctx :rschema {:db/attrTuples {:reference {:pair 0}}})
                 [[:db/add 1 :reference 2] {:text "new"}])))
     (is (empty? @calls))))
 
@@ -781,7 +848,7 @@
                   [[:db/add 1 :converted raw] {:db/id "new" :text "new"}])
           expected (try {:value (prepare/correct-scalar-value validate? vt raw)}
                         (catch Exception _ {:rejected true}))
-          p (compile/compile-tx context forms)]
+          p (compile-stage2 context forms)]
       (if (:rejected expected)
         (is (nil? p))
         (let [^MixedOperands operands (:entries p)
@@ -819,7 +886,7 @@
         update [:db/add 1 :value 1.25]
         forms [update (array-map :db/id "self" :reference "self" :text 42)
                {:db/id -1 :reference "self" :value 2N} {:reference -1}]
-        p (compile/compile-tx context forms)
+        p (compile-stage2 context forms)
         ^MixedOperands operands (:entries p)
         inserts (rest (.-entries operands))]
     (is (= :mixed (:strategy p)))
@@ -837,7 +904,7 @@
                    [update {:reference 1.5}] [update {:reference -2}]
                    [update {:text 42} update] [update {:text 42} {:identity "unsupported"}]
                    [update {:text 42} (with-meta {:text "late"} {:source true})]]]
-      (is (nil? (compile/compile-tx context forms))))
+      (is (nil? (compile-stage2 context forms))))
     (is (nil? (clojure.lang.Keyword/find word)))
     (is (empty? @effects))))
 
@@ -881,7 +948,7 @@
       (is (false? (.-insert? info))))))
 
 (deftest literal-scalar-plan-owns-one-context-and-operand-stream
-  (let [p (compile/compile-tx ctx [[:db/add 1 :value 42] {:db/id 1 :text "a"}])]
+  (let [p (compile-stage2 ctx [[:db/add 1 :value 42] {:db/id 1 :text "a"}])]
     (is (instance? TxPlan p))
     (is (identical? ctx (:ctx p)))
     (is (= :scalar (:strategy p)))
@@ -899,7 +966,7 @@
                    [(with-meta [:db/add 1 :value 1] {:datalevin.db.tx.execute/internal true})]
                    [[:db/add 1 :identity "x"]]
                    [[:db.fn/call (fn [_] (swap! effects conj :callback))]]]]
-      (is (nil? (compile/compile-tx ctx forms))))
+      (is (nil? (compile-stage2 ctx forms))))
     (is (empty? @effects))))
 
 (deftest unified-selection-chooses-one-materialized-family
@@ -909,7 +976,7 @@
            [[{:value 1}] :blind :blind]
            [[{:db/id "new" :value 1} [:db/add 1 :text "one"]] :mixed :mixed]]]
     (is (= shape (compile/literal-request-shape forms)))
-    (is (= strategy (:strategy (compile/compile-tx ctx forms)))))
+    (is (= strategy (:strategy (compile-stage2 ctx forms)))))
   (is (= :mixed (compile/literal-request-shape [{:db/id 1 :value 1} {:value 2}]))))
 
 (deftest mixed-map-replacements-share-ordered-operands-and-normalized-ids
@@ -919,10 +986,10 @@
                [:db/add 2N :text :changed/value]
                {:db/id 7N :reference 2}]
         ;; Concrete reference replacements now share the compiled mixed layout.
-        _ (is (instance? TxPlan (compile/compile-tx context forms)))
+        _ (is (instance? TxPlan (compile-stage2 context forms)))
         forms (assoc forms 3 {:db/id 7N :untyped 3})
         context (assoc-in context [:schema :untyped] {:db/aid 7})
-        plan (compile/compile-tx context forms)
+        plan (compile-stage2 context forms)
         ^MixedOperands operands (:entries plan)
         entries (.-entries operands)
         updates (filter #(instance? MixedUpdate %) entries)]
@@ -960,14 +1027,14 @@
                    [{:db/id 0 :value 1} insert]
                    [(with-meta {:db/id 1 :value 1} {:source true}) insert]
                    [{:db/id 1 :value 1} insert host]]]
-      (is (nil? (compile/compile-tx context forms))))
+      (is (nil? (compile-stage2 context forms))))
     (is (empty? @effects)))
   (doseq [eid [1 (int 1) 1N (biginteger 1)]]
-    (let [plan (compile/compile-tx ctx [{:db/id eid :value 1} {:text "new"}])
+    (let [plan (compile-stage2 ctx [{:db/id eid :value 1} {:text "new"}])
           ^MixedOperands operands (:entries plan)]
       (is (= :mixed (:strategy plan)))
       (is (true? (.-prepare-reader? ^MixedOperands
-                   (:entries (compile/compile-tx ctx
+                   (:entries (compile-stage2 ctx
                                [{:db/id eid :value 1 :text "updated"} {:text "new"}])))))
       (is (= 1 (.-required-eid operands))))))
 
@@ -975,7 +1042,7 @@
   (let [lookup [:identity "one"]
         forms [[:db/add lookup :value 1] [:db/add :entity/one :text "text"]
                {:db/id 2N :value 2}]
-        plan (compile/compile-tx ctx forms)]
+        plan (compile-stage2 ctx forms)]
     (is (= :scalar-aliases (compile/literal-request-shape forms)))
     (is (= :scalar-aliases (:strategy plan)))
     (is (identical? ctx (:ctx plan)))
@@ -985,7 +1052,7 @@
     (is (nil? (:entity-reads plan)))
     ;; Alias resolution can make these the same E/A; compilation grants no
     ;; resolved distinctness proof. Runtime must decline before old-value reads.
-    (is (instance? TxPlan (compile/compile-tx ctx
+    (is (instance? TxPlan (compile-stage2 ctx
                            [[:db/add lookup :value 1] [:db/add 1 :value 2]])))))
 
 (deftest scalar-aliases-decline-without-correction-or-host-callbacks
@@ -1008,9 +1075,9 @@
                    [[:db/add :entity/one :value 1] {:value 2}]
                    [[:db/add :entity/one :value 1] [:db/add :entity/one :value 2]]
                    [[:db/add (with-meta [:identity "one"] {:source true}) :value 1]]]]
-      (is (nil? (compile/compile-tx ctx forms))))
+      (is (nil? (compile-stage2 ctx forms))))
     (is (empty? @effects)))
-  (is (nil? (compile/compile-tx (assoc ctx :opts {:auto-entity-time? true})
+  (is (nil? (compile-stage2 (assoc ctx :opts {:auto-entity-time? true})
                                [[:db/add :entity/one :value 1]]))))
 
 (deftest canonical-reference-values-share-scalar-operands-outside-stage1
@@ -1018,29 +1085,29 @@
           [[[[:db/add 1 :reference 2]] :scalar-operations]
            [[{:db/id 1 :reference Long/MAX_VALUE}] :scalar]
            [[[:db/add [:identity "one"] :reference 2]] :scalar-aliases]]]
-    (let [p (compile/compile-tx ctx forms)]
+    (let [p (compile-stage2 ctx forms)]
       (is (= strategy (:strategy p)))
       (is (identical? ctx (:ctx p)))))
   (doseq [forms [[[:db/add 1 :reference 2]] [{:db/id 1 :reference 2}]]]
-    (is (nil? (compile/compile-tx ctx forms
+    (is (nil? (compile-stage2 ctx forms
                 {:literal-shape (compile/literal-scalar-shape forms)}))))
   (doseq [value [0 -1 2N "new" :entity/two [:identity "two"]]]
-    (is (not (instance? TxPlan (compile/compile-tx ctx [[:db/add 1 :reference value]]))))
-    (is (nil? (compile/compile-tx ctx [[:db/add :entity/one :reference value]]))))
+    (is (not (instance? TxPlan (compile-stage2 ctx [[:db/add 1 :reference value]]))))
+    (is (nil? (compile-stage2 ctx [[:db/add :entity/one :reference value]]))))
   (let [reference-key (assoc-in ctx [:schema :reference-key]
                                {:db/aid 7 :db/valueType :db.type/ref :db/unique :db.unique/value})]
     (is (= :scalar-aliases
-           (:strategy (compile/compile-tx reference-key
+           (:strategy (compile-stage2 reference-key
                         [[:db/add [:reference-key 2] :reference 3]]))))))
 
 (deftest correction-failure-retains-original-input
   (let [forms [[:db/add 1 :text 42]]
-        outcome (compile/compile-tx ctx forms)]
+        outcome (compile-stage2 ctx forms)]
     (is (= :needs-writer (:outcome outcome)))
     (is (identical? forms (:input outcome)))
     (is (identical? ctx (:ctx outcome)))
     ;; The protected Stage 1 literal proof keeps its earlier admission scope.
-    (is (nil? (compile/compile-tx
+    (is (nil? (compile-stage2
                 (assoc ctx :opts {:validate-data? false}) forms
                 {:literal-shape :scalar-operations})))))
 
@@ -1060,7 +1127,7 @@
           forms [[:db/add e :converted value]]
           expected (try {:value (prepare/correct-scalar-value validate? vt value)}
                         (catch Exception _ {:rejected true}))
-          p (compile/compile-tx context forms)]
+          p (compile-stage2 context forms)]
       (if (:rejected expected)
         (is (not (instance? TxPlan p)))
         (let [actual (nth (first (:entries p)) 2) wanted (:value expected)]
@@ -1093,13 +1160,13 @@
                    [[:db/add 1 :text 42] [:db/add 1 :uuid "invalid"]]
                    [[:db/add 1 :text (java.util.Date. 123)]]
                    [[:db/add 1 :text (byte-array [1 2])]]]]
-      (is (nil? (compile/compile-tx context forms))))
+      (is (nil? (compile-stage2 context forms))))
     (is (nil? (clojure.lang.Keyword/find word)))
     (is (empty? @effects))))
 
 (deftest canonical-operation-operands-reuse-the-inert-source-buffer
   (let [forms [[:db/add 1 :value 42] [:db/add 2 :text "text"]]
-        p (compile/compile-tx ctx forms)]
+        p (compile-stage2 ctx forms)]
     (is (= :scalar-operations (:strategy p)))
     (is (identical? forms (:entries p)))
     (is (identical? ctx (:ctx p)))))
@@ -1107,12 +1174,12 @@
 (deftest singleton-layouts-retain-order-and-normalize-literal-ids
   (doseq [form [{:db/id 1 :value 42} {:value 42 :db/id 1}
                 (assoc clojure.lang.PersistentHashMap/EMPTY :db/id (int 1) :value 42)]]
-    (let [p (compile/compile-tx ctx [form])]
+    (let [p (compile-stage2 ctx [form])]
       (is (= :scalar (:strategy p)))
       (is (= [[1 :value 42]] (:entries p)))
       (is (instance? Long (ffirst (:entries p))))))
   (doseq [form [{:db/id 1 :text 42} {:text 42 :db/id 1}]]
-    (is (= :needs-writer (:outcome (compile/compile-tx ctx [form]))))))
+    (is (= :needs-writer (:outcome (compile-stage2 ctx [form]))))))
 
 (deftest compact-schema-proof-does-not-hide-exclusion-properties
   (doseq [props [{:db/aid 3 :db/unique :db.unique/identity}
@@ -1121,25 +1188,25 @@
                  {:db/aid 3 :db/valueType :db.type/long :db/fulltext true}
                  {:db/aid 3 :db/valueType :db.type/long :db/vector true}
                  {:db/aid 3 :db/valueType :db.type/long :db/embedding true}]]
-    (is (nil? (compile/compile-tx (assoc ctx :schema {:value props})
+    (is (nil? (compile-stage2 (assoc ctx :schema {:value props})
                                   [[:db/add 1 :value 42]]))))
-  (is (nil? (compile/compile-tx (assoc ctx :rschema {:db/attrTuples {:value {:pair 0}}})
+  (is (nil? (compile-stage2 (assoc ctx :rschema {:db/attrTuples {:value {:pair 0}}})
                                 [[:db/add 1 :value 42]]))))
 
 (deftest stage2-fulltext-strings-retain-the-stage1-and-secondary-scope
   (let [props {:db/aid 3 :db/valueType :db.type/string :db/fulltext true}
         context (assoc ctx :schema {:text props})
         forms [[:db/add 1 :text "searchable"]]]
-    (is (= :scalar-operations (:strategy (compile/compile-tx context forms))))
-    (is (nil? (compile/compile-tx context forms {:literal-shape :scalar-operations})))
+    (is (= :scalar-operations (:strategy (compile-stage2 context forms))))
+    (is (nil? (compile-stage2 context forms {:literal-shape :scalar-operations})))
     (doseq [exclusion [{:db/vector true} {:db/embedding true}
                        {:db/cardinality :db.cardinality/many}
                        {:db/unique :db.unique/identity}
                        {:db.attr/preds [(constantly true)]}
                        {:db/valueType :db.type/long}]]
-      (is (nil? (compile/compile-tx
+      (is (nil? (compile-stage2
                   (assoc context :schema {:text (merge props exclusion)}) forms))))
-    (is (nil? (compile/compile-tx
+    (is (nil? (compile-stage2
                 (assoc context :opts (assoc (:opts context) :auto-entity-time? true)) forms)))))
 
 (deftest legacy-exclusions-precede-reference-value-conversion
@@ -1160,7 +1227,7 @@
                        (assoc (:schema ctx) :big {:db/aid 8 :db/valueType :db.type/bigint}))
         too-large (.shiftLeft java.math.BigInteger/ONE 4096)]
     (is (= :needs-writer
-           (:outcome (compile/compile-tx big-ctx [[:db/add 1 :big too-large]]))))))
+           (:outcome (compile-stage2 big-ctx [[:db/add 1 :big too-large]]))))))
 
 (deftest wrapped-host-numbers-cannot-run-user-code-during-planning
   (let [effects (atom [])
@@ -1170,8 +1237,8 @@
                  (toString [] (swap! effects conj :string) "1"))
         wrapped (clojure.lang.BigInt/fromBigInteger number)
         permissive (assoc ctx :opts {:validate-data? false})]
-    (is (nil? (compile/compile-tx permissive [[:db/add wrapped :value 1]])))
-    (is (nil? (compile/compile-tx permissive [[:db/add 1 :text wrapped]])))
+    (is (nil? (compile-stage2 permissive [[:db/add wrapped :value 1]])))
+    (is (nil? (compile-stage2 permissive [[:db/add 1 :text wrapped]])))
     (is (empty? @effects))))
 
 (deftest canonical-value-proofs-match-the-existing-correction-contract
@@ -1189,11 +1256,11 @@
                       [:db.type/double 0.25]
                       [nil 1/2]]]
     (let [context (assoc ctx :schema {:value {:db/aid 3 :db/valueType vt}})
-          plan (compile/compile-tx context [[:db/add 1 :value value]])]
+          plan (compile-stage2 context [[:db/add 1 :value value]])]
       (is (identical? value (prepare/correct-scalar-value true vt value)))
       (is (= :scalar-operations (:strategy plan)))))
   ;; Calendar formatting can consult host callbacks; keep it ordered.
-  (is (nil? (compile/compile-tx (assoc ctx :opts {:validate-data? false})
+  (is (nil? (compile-stage2 (assoc ctx :opts {:validate-data? false})
                                 [[:db/add 1 :text (java.util.Date. 1234)]]))))
 
 (defn- mixed-preflight [context infos updates entity kind]
@@ -1213,7 +1280,7 @@
     (is (false? (mixed-preflight
                   ctx infos updates [:db/add 1 :value 2] :update)))
     ;; A preflight shape/attribute proof grants no compiled value eligibility.
-    (is (nil? (compile/compile-tx ctx [[:db/add 1 :value 1] {:text value}])))
+    (is (nil? (compile-stage2 ctx [[:db/add 1 :value 1] {:text value}])))
     (is (empty? @effects))))
 
 (deftest mixed-preflight-unsupported-input-adds-no-scratch-or-host-effects

@@ -23,7 +23,7 @@
    datalevin.native-value-test
    datalevin.serialization-context-test
    datalevin.storage-buffer-test
-   datalevin.tx-engine-test
+   datalevin.tx-compiler-route-test
    datalevin.tx-compile-test
    datalevin.util-test
    datalevin.wire-buffer-test)
@@ -51,7 +51,7 @@
           'datalevin.native-value-test
           'datalevin.serialization-context-test
           'datalevin.storage-buffer-test
-          'datalevin.tx-engine-test
+          'datalevin.tx-compiler-route-test
           'datalevin.tx-compile-test
           'datalevin.util-test
           'datalevin.wire-buffer-test)]

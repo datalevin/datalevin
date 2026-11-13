@@ -6,6 +6,7 @@
             [datalevin.custom-datalog :as cd]
             [datalevin.datom :as d]
             [datalevin.db.tx.plan :as plan]
+            [datalevin.index :as idx]
             [datalevin.prepare :as prepare])
   (:import [datalevin.datom Datom]
            [datalevin.db.tx.plan BlindEntity MixedAttrInfo MixedInsert MixedOperands MixedUpdate
@@ -78,7 +79,7 @@
                                  (contains? ordinary-scalar-types (:db/valueType props))
                                  (nil? (:db/unique props))
                                  (not (:db/tupleAttrs props)) (not source-tuples)))
-                   source-tuples (some? (:db/valueType props)))]
+                   source-tuples (some? (:db/valueType props)) (idx/value-type props))]
         (when (:db/unique props) (.put infos ordinary-unique-attr-marker true))
         (.put infos a info)
         info)))
@@ -720,13 +721,21 @@
                 (recur (unchecked-inc i))))
             (candidate-value-outcome ctx forms candidates)))))))
 
+(defn- scalar-form-arities?
+  "Scalar layouts carry E/A/V only. Supplied transaction slots need their own rule."
+  [forms]
+  (every? #(or (map? %) (and (sequential? %) (= 4 (count %)))) forms))
+
 (defn compile-scalar-region
   "Select one scalar operand layout without constructing parallel plans."
   ([ctx forms] (compile-scalar-region ctx forms (literal-scalar-shape forms)))
   ([ctx forms shape]
    (compile-scalar-region ctx forms shape false))
   ([ctx forms shape allow-references?]
-   (when-not (:auto-entity-time? (:opts ctx))
+   (when (and (not (:auto-entity-time? (:opts ctx)))
+              ;; Recheck arity even when the caller supplies a shape. Raw scalar
+              ;; execution has no supplied transaction-ID slot.
+              (scalar-form-arities? forms))
      (case shape
        :scalar-operations (compile-scalar-operations ctx forms allow-references?)
        :scalar (compile-canonical-scalar-region ctx forms allow-references?)
@@ -1180,7 +1189,8 @@
                      (or (not coerce?) (correct-mixed-entries! validate? infos entries)))
             (plan/->TxPlan ctx :mixed
                            (MixedOperands. entries infos required-eid
-                                           (and typed? (> (.size updates) 1)))
+                                           (and typed? (> (.size updates) 1))
+                                           (>= (.size infos) 8))
                            nil)))))))
 
 (defn compile-mixed-region
@@ -1235,7 +1245,7 @@
              true (reduced false)))
          true metadata)))
 
-(defn literal-request-shape
+(defn independent-request-shape
   "Select one materialized request family without schema reads or host methods."
   [forms]
   (when (and (identical? clojure.lang.PersistentVector (class forms))
@@ -1247,15 +1257,20 @@
                      (identical? Datom (class form))
                      (when (and (pos? (.-e ^Datom form)) (d/datom-added form)) 20)
 
-                     (and (plain-map? form) (nil? (meta form)))
-                     (let [explicit? (contains? form :db/id) eid (:db/id form)]
-                       (cond
-                         (or (not explicit?) (literal-tempid-key eid)) 2
-                         (and (> (count form) 1) (positive-literal-id? eid)) 1
-                         ;; Map IDs accept lookup refs, but unlike operation
-                         ;; vectors their syntax excludes bare ident keywords.
-                         (and (> (count form) 1) (vector? eid) (literal-scalar-alias? eid)) 8
-                         :else nil))
+                     (and (plain-map? form)
+                          (or (nil? (meta form)) (application-add-metadata? (meta form))))
+                     (let [explicit? (contains? form :db/id) eid (:db/id form)
+                           kind (cond
+                                  (or (not explicit?) (literal-tempid-key eid)) 2
+                                  (and (> (count form) 1) (positive-literal-id? eid)) 1
+                                  ;; Map IDs accept lookup refs, but unlike operation
+                                  ;; vectors their syntax excludes bare ident keywords.
+                                  (and (> (count form) 1) (vector? eid) (literal-scalar-alias? eid)) 8)]
+                       (when kind
+                         (if (nil? (meta form)) kind
+                             ;; Existing map annotations are ignored by map expansion.
+                             ;; Keep original forms for the reference prepass proof.
+                             (when (not= kind 2) (bit-or kind 16)))))
                      (and (identical? clojure.lang.PersistentVector (class form))
                           (or (nil? (meta form)) (application-add-metadata? (meta form)))
                           (<= 4 (count form) 5)
@@ -1283,6 +1298,101 @@
           ;; Preserve the small repeated-E/A decline before context allocation.
           (= 2 (count forms)) (literal-scalar-shape forms)
           :else :scalar-operations)))))
+
+(defn admission-form-proof
+  "Prove the existing caller-admission candidates for an inert demanded form.
+  Bit 5 preserves supplied transaction slots through caller admission.
+  Nil delegates opaque inspection to its original execution checkpoint."
+  [form]
+  (cond
+    (plain-map? form)
+    (let [absent? (not (contains? form :db/id)) e (:db/id form)]
+      (if absent?
+        6
+        (when (or (nil? e) (inert-scalar-value? e)
+                  (identical? clojure.lang.PersistentVector (class e)))
+          (try
+            (if (or (string? e) (and (number? e) (neg? (long e))))
+              22
+              (if (and (nil? (meta form)) (> (count form) 1)
+                       (positive-literal-id? e)) 1 0))
+            (catch IllegalArgumentException _ nil)))))
+    (identical? clojure.lang.PersistentVector (class form))
+    (let [n (count form)]
+      (if (<= 4 n 5)
+        (let [op (nth form 0)]
+          (cond (and (= n 4) (identical? op :db.fn/patchIdoc)) 8
+                (and (identical? op :db/add) (nil? (meta form))) (if (= n 5) 33 5)
+                :else 0))
+        0))
+    :else nil))
+
+(defn compile-patch-region
+  "Own admitted single-document patch operands. The caller performs any opaque
+  sequence/numeric binding at its existing preparation checkpoint."
+  [ctx source e attr operations]
+  (let [props (get (:schema ctx) attr)]
+    (when (and (not (:auto-entity-time? (:opts ctx)))
+               (instance? Long e) (pos? (long e)) (keyword? attr)
+               (identical? :db.type/idoc (:db/valueType props))
+               (not (identical? :db.cardinality/many (:db/cardinality props)))
+               (nil? (:db/unique props)) (not (:db.attr/preds props))
+               (or (nil? operations) (sequential? operations)))
+      (plan/->TxPlan ctx :patch
+        [(plan/->OrderedOp :db.fn/patchIdoc e attr operations nil source nil)] nil))))
+
+(defn- declarative-entity-syntax?
+  "Keep host IDs and overflowing numbers outside admission without resolving IDs."
+  [value]
+  (or (string? value) (keyword? value)
+      (and (contains? inert-id-classes (class value))
+           (inert-scalar-value? value)
+           (try (<= Long/MIN_VALUE (long value) Long/MAX_VALUE)
+                (catch IllegalArgumentException _ false)))
+      (and (identical? clojure.lang.PersistentVector (class value))
+           (nil? (meta value)) (= 2 (count value)) (keyword? (nth value 0))
+           (let [key (nth value 1)]
+             (or (inert-scalar-value? key)
+                 (and (identical? clojure.lang.PersistentVector (class key))
+                      (nil? (meta key)) (<= 1 (count key) 8)
+                      (every? #(or (nil? %) (inert-scalar-value? %)) key)))))))
+
+(defn- declarative-map-syntax?
+  [form]
+  (and (plain-map? form)
+       (or (not (contains? form :db/id))
+           (and (not (keyword? (:db/id form)))
+                (declarative-entity-syntax? (:db/id form))))
+       (or (nil? (meta form))
+           ;; New annotated maps retain the blind normalizer's allocation path.
+           (and (application-add-metadata? (meta form))
+                (let [id (:db/id form)]
+                  (or (positive-literal-id? id)
+                      (identical? clojure.lang.PersistentVector (class id))))))))
+
+(defn literal-request-shape
+  "Recognize a materialized independent family or declarative operation program.
+  Full value/schema eligibility remains in the compiler; no sequences are forced."
+  [forms]
+  (or (independent-request-shape forms)
+      (when (and (identical? clojure.lang.PersistentVector (class forms))
+                 (nil? (meta forms)) (seq forms)
+                 (every? (fn [form]
+                           (or (identical? Datom (class form))
+                               (declarative-map-syntax? form)
+                               (and (identical? clojure.lang.PersistentVector (class form))
+                                    (or (nil? (meta form)) (application-add-metadata? (meta form)))
+                                    (declarative-entity-syntax? (nth form 1 nil))
+                                    (let [n (count form)]
+                                      (case (nth form 0 nil)
+                                        :db/add (<= 4 n 5)
+                                        :db/retract (<= 3 n 4)
+                                        (:db.fn/cas :db/cas) (= n 5)
+                                        :db.fn/retractAttribute (= n 3)
+                                        (:db.fn/retractEntity :db/retractEntity) (= n 2)
+                                        false)))))
+                         forms))
+        :ordered)))
 
 (defn- canonical-scalar-alias?
   [ctx e]
@@ -1431,7 +1541,7 @@
                              (when-some [tx (nth form 4 nil)] (long tx))))
                  (conj metadata (when-not rebuild-reference? (meta form)))])))
           [[] [] []] forms)
-        prepared (compile-tx ctx operations {:request-shape :scalar-aliases})]
+        prepared (compile-tx ctx operations {:request-shape :scalar-aliases :ordered? false})]
     (when (instance? datalevin.db.tx.plan.TxPlan prepared)
       (assoc prepared :entries
              (mapv (fn [entry tx annotations]
@@ -1439,19 +1549,298 @@
                    (:entries prepared) txs metadata)
              :explicit-tx? true))))
 
+(defn flat-upsert-map-proof
+  "Prove one already-demanded plain map using value classes only.
+  Bit zero permits cached identity ownership; bit one proves non-nil map syntax.
+  Runtime analysis owns sequence demand and supplies the private-tempid flag."
+  [ctx entity private-tempid?]
+  (if (plain-map? entity)
+    (reduce-kv
+      (fn [proof attr value]
+        (if (and (keyword? attr)
+                 (if (identical? attr :db/id)
+                   (or private-tempid? (contains? inert-value-classes (class value)))
+                   (and (or (contains? ordinary-scalar-types
+                                        (:db/valueType (get (:schema ctx) attr)))
+                            (identical? :db.type/ref (:db/valueType (get (:schema ctx) attr))))
+                        (or (nil? value) (contains? inert-value-classes (class value))))))
+          (if (nil? value) (bit-and (long proof) 1) proof)
+          (reduced 0)))
+      3 entity)
+    0))
+
+(def ^:private ordered-operations
+  #{:db/add :db/retract :db.fn/cas :db/cas :db.fn/retractAttribute
+    :db.fn/retractEntity :db/retractEntity})
+
+(defn- datom-operation-form
+  [^Datom form]
+  (if (d/datom-added form)
+    [:db/add (.-e form) (.-a form) (.-v form) (d/datom-tx form)]
+    [:db/retract (.-e form) (.-a form) (.-v form)]))
+
+(defn ordered-operation
+  "Normalize a demanded declarative operation without conversion. A reusable
+  template retains its original preparation operand as well as its effective
+  source, so metadata and Datom reference-prepass decisions stay unchanged."
+  ([input] (ordered-operation input nil))
+  ([input original]
+   (let [datom? (identical? Datom (class input))
+         form (if datom? (datom-operation-form input) input)]
+     (when (and (identical? clojure.lang.PersistentVector (class form))
+                (contains? ordered-operations (nth form 0 nil)))
+       (plan/->OrderedOp (nth form 0) (nth form 1 nil) (nth form 2 nil)
+                        (nth form 3 nil) (nth form 4 nil) form
+                        (or original (when datom? input)))))))
+
+(defn demanded-form
+  "Choose a template for one form already demanded by the execution driver.
+  Opaque sequences retain their original handle: binding their operands is
+  execution work, never an eligibility probe. Values and annotations are opaque."
+  [form]
+  (cond
+    (map? form) (plan/->OrderedMap form)
+    (identical? Datom (class form)) (plan/->DatomOperation form)
+    (identical? clojure.lang.PersistentVector (class form))
+    (plan/->OrderedOp (nth form 0 nil) (nth form 1 nil) (nth form 2 nil)
+                     (nth form 3 nil) (nth form 4 nil) form nil)
+    (sequential? form) (plan/->DeferredOperation form)
+    :else form))
+
+(defn compile-program
+  "Retain an opaque request for bounded compilation by its realization driver.
+  No input methods, metadata, schema values or callbacks are consulted."
+  [ctx forms]
+  (plan/->TxPlan ctx :dynamic forms nil))
+
+(defn- ordered-tuple-props? [props]
+  (or (identical? :db.type/tuple (:db/valueType props))
+      (:db/tupleTypes props) (:db/tupleType props) (:db/tupleAttrs props)))
+
+(defn- ordered-tuple-types
+  [ctx props size]
+  (or (:db/tupleTypes props)
+      (when-let [sources (:db/tupleAttrs props)]
+        (mapv #(:db/valueType (get (:schema ctx) %)) sources))
+      (when-let [type (:db/tupleType props)] (repeat size type))))
+
+(defn- ordered-tuple-types? [types]
+  (and (seq types)
+       (every? #(and (keyword? %) (or (contains? ordinary-tuple-types %)
+                                      (identical? :db.type/bytes %))) types)))
+
+(declare ordered-tuple-value?)
+
+(defn- ordered-lookup?
+  [ctx value]
+  (when (and (identical? clojure.lang.PersistentVector (class value))
+             (nil? (meta value)) (= 2 (count value)) (keyword? (nth value 0)))
+    (let [props (get (:schema ctx) (nth value 0)) vt (:db/valueType props)]
+      (and (#{:db.unique/identity :db.unique/value} (:db/unique props))
+           (if (ordered-tuple-props? props)
+             (ordered-tuple-value? ctx props (nth value 1))
+             (and (contains? ordinary-unique-types vt)
+                  (canonical-scalar-value? (:validate-data? (:opts ctx)) vt (nth value 1))))))))
+
+(defn- ordered-entity?
+  [ctx e]
+  (or (and (inert-scalar-value? e) (integer? e)
+           (try (<= Long/MIN_VALUE (long e) Long/MAX_VALUE)
+                (catch IllegalArgumentException _ false)))
+      (string? e) (keyword? e)
+      (ordered-lookup? ctx e)))
+
+(defn- ordered-attribute-props
+  [ctx attr]
+  (when (and (keyword? attr) (pos? (count (name attr)))
+             (not= "db" (namespace attr)) (not (plan/reverse-ref-attr? attr)))
+    (let [props (get (:schema ctx) attr) vt (:db/valueType props)]
+      (when (and props (not (:db.attr/preds props))
+                 ;; Untyped data can decode arbitrary user values. Declarative
+                 ;; tuple flags still constrain their complete component types.
+                 (or (some? vt) (ordered-tuple-props? props))
+                 (or (not (ordered-tuple-props? props))
+                     (ordered-tuple-types? (ordered-tuple-types ctx props 8)))
+                 (or (contains? ordinary-scalar-types vt)
+                     (#{:db.type/ref :db.type/tuple} vt))
+                 (not (:db/embedding props)) (not (:db/vector props))
+                 (every? (fn [[tuple _]]
+                           (let [p (get (:schema ctx) tuple)]
+                             (and (not (:db.attr/preds p))
+                                  (not (:db/embedding p)) (not (:db/vector p))
+                                  (or (nil? (:db/valueType p))
+                                      (identical? :db.type/tuple (:db/valueType p)))
+                                  (ordered-tuple-props? p)
+                                  (ordered-tuple-types? (ordered-tuple-types ctx p 8)))))
+                         (get (:db/attrTuples (:rschema ctx)) attr)))
+        props))))
+
+(defn- ordered-tuple-value?
+  [ctx props value]
+  (when (and (identical? clojure.lang.PersistentVector (class value))
+             (nil? (meta value)) (<= 1 (count value) 8))
+    (let [types (ordered-tuple-types ctx props (count value))]
+      (and (ordered-tuple-types? types) (= (count types) (count value))
+           (every? (fn [[type component]]
+                     (or (nil? component)
+                         (if (identical? type :db.type/ref)
+                           (and (not (coll? component)) (ordered-entity? ctx component))
+                           (and (inert-scalar-value? component)
+                                (canonical-scalar-value? true type component)))))
+                   (map vector types value))))))
+
+(defn- ordered-value?
+  [ctx props value]
+  (let [vt (:db/valueType props)]
+    (cond
+      (ordered-tuple-props? props) (ordered-tuple-value? ctx props value)
+      (identical? vt :db.type/ref) (ordered-entity? ctx value)
+      :else
+      (and (inert-scalar-value? value) (some? value)
+           ;; Date formatting and effectful custom conversions stay ordered.
+           (or (canonical-scalar-value? (:validate-data? (:opts ctx)) vt value)
+               (pure-scalar-coercion? vt value))))))
+
+(declare ordered-map?)
+
+(defn- ordered-map-field?
+  [ctx props value depth]
+  (if (and (identical? :db.type/ref (:db/valueType props)) (plain-map? value))
+    (ordered-map? ctx value (inc depth))
+    (ordered-value? ctx props value)))
+
+(defn- ordered-map?
+  [ctx form depth]
+  (and (< depth 64) (plain-map? form)
+       (or (nil? (meta form))
+           (and (application-add-metadata? (meta form))
+                (or (positive-literal-id? (:db/id form))
+                    (ordered-lookup? ctx (:db/id form)))))
+       (or (not (contains? form :db/id))
+           (let [e (:db/id form)]
+             (and (not (keyword? e)) (ordered-entity? ctx e))))
+       (reduce-kv
+         (fn [_ attr value]
+           (if (identical? attr :db/id)
+             true
+             (if (and (keyword? attr) (pos? (count (name attr))))
+               (let [reverse? (plan/reverse-ref-attr? attr)
+                     straight (if reverse?
+                                (some (fn [a]
+                                        (when (and (= (namespace a) (namespace attr))
+                                                   (= (name a) (subs (name attr) 1))) a))
+                                      (keys (:schema ctx)))
+                                attr)
+                     props (ordered-attribute-props ctx straight)
+                     lookup? (ordered-lookup? ctx value)]
+                 (if (and props (or (not reverse?) (identical? :db.type/ref (:db/valueType props)))
+                          (if (and (or reverse? (identical? :db.cardinality/many (:db/cardinality props)))
+                                   (literal-many-values? value) (not lookup?))
+                            (every? #(ordered-map-field? ctx props % depth) value)
+                            (ordered-map-field? ctx props value depth)))
+                   true (reduced false)))
+               (reduced false))))
+         true form)))
+
+(defn- ordered-form?
+  [ctx form]
+  (let [form (if (identical? Datom (class form)) (datom-operation-form form) form)]
+  (when (and (identical? clojure.lang.PersistentVector (class form))
+             (or (nil? (meta form)) (application-add-metadata? (meta form))))
+    (let [[op e attr value extra] form n (count form)]
+      (and (ordered-entity? ctx e)
+           (case op
+             (:db.fn/retractEntity :db/retractEntity)
+             ;; Cascades may visit any attribute. Unknown/custom decoding and
+             ;; predicates remain outside this declarative proof.
+             (and (= n 2)
+                  (every? (fn [[attr _]]
+                            (or (= "db" (namespace attr))
+                                (ordered-attribute-props ctx attr)))
+                          (:schema ctx)))
+             (:db/add :db/retract :db.fn/cas :db/cas :db.fn/retractAttribute)
+             (when-let [props (ordered-attribute-props ctx attr)]
+               (and (or (not (:db/isComponent props))
+                        (every? (fn [[a _]]
+                                  (or (= "db" (namespace a))
+                                      (ordered-attribute-props ctx a))) (:schema ctx)))
+                    (case op
+                      :db/add (and (<= 4 n 5) (ordered-value? ctx props value)
+                                   (or (= n 4) (nil? extra) (positive-literal-id? extra)))
+                      :db/retract (and (<= 3 n 4)
+                                       (or (nil? value) (ordered-value? ctx props value)))
+                      :db.fn/retractAttribute (= n 3)
+                      (:db.fn/cas :db/cas)
+                      (and (= n 5) (or (nil? value) (ordered-value? ctx props value))
+                           (ordered-value? ctx props extra)))))
+             false))))))
+
+(defn- ordered-independent-prefix
+  "Select a bounded, existing-EID scalar prefix. These operands cannot be a
+  future value-tempid target, queue tuples or require redundant-add evidence."
+  [ctx forms]
+  (let [seen (HashSet.)
+        prefix (into []
+                 (take-while
+                   (fn [form]
+                     (and (identical? clojure.lang.PersistentVector (class form))
+                          (nil? (meta form)) (= 4 (count form))
+                          (identical? :db/add (nth form 0))
+                          (instance? Long (nth form 1)) (pos? (long (nth form 1)))
+                          (when-let [props (literal-scalar-props
+                                            (:schema ctx) (:db/attrTuples (:rschema ctx))
+                                            (nth form 2) (nth form 3) true)]
+                            (and (some? (:db/valueType props))
+                                 (not (identical? :db.type/ref (:db/valueType props)))
+                                 (canonical-scalar-value? true (:db/valueType props) (nth form 3))
+                                 (.add seen [(nth form 1) (nth form 2)]))))))
+                 (take 8 forms))]
+    (when (>= (count prefix) 2)
+      (when-let [prepared (compile-scalar-region ctx prefix :scalar true)]
+        (when (instance? datalevin.db.tx.plan.TxPlan prepared)
+          {:prefix-plan prepared :prefix-count (count prefix)})))))
+
+(defn- compile-ordered-region
+  "Own a complete inert declarative operation program before execution.
+  The general driver remains authoritative for allocation, pending state,
+  identity conflicts, tuple queues, errors and retries."
+  [ctx forms]
+  (when (and (identical? clojure.lang.PersistentVector (class forms))
+             (nil? (meta forms)) (seq forms)
+             (not (:auto-entity-time? (:opts ctx)))
+             (every? #(if (plain-map? %) (ordered-map? ctx % 0) (ordered-form? ctx %)) forms))
+    (let [prepass? (not (and (ordinary-analysis-enabled? ctx)
+                             (every? #(some? (ordinary-addition-flags ctx % true false)) forms)))
+          refs (:db.type/ref (:rschema ctx))]
+      (merge (plan/->TxPlan
+        ctx :ordered
+        (mapv (fn [form]
+                (if (plain-map? form)
+                  (plan/->OrderedMap form)
+                  (ordered-operation
+                  (if (and prepass? (identical? :db/add (nth form 0))
+                           (contains? refs (nth form 2)))
+                    ;; Match assoc-auto-tempid's reference vector rebuild.
+                    [(nth form 0) (nth form 1) (nth form 2) (nth form 3)]
+                    form) form)))
+              forms)
+        nil)
+        (ordered-independent-prefix ctx forms)))))
+
 (defn compile-tx
-  "Select one scalar, blind or mixed rule from a pure structural decision.
-  Known-family adapters may carry their shape proof; unsupported input is untouched."
+  "Select an independent or ordered rule from a pure structural decision.
+  With :dynamic? true, retain all remaining input for demanded-form compilation.
+  Known-family adapters may carry their proof; probing never demands opaque input."
   ([ctx forms] (compile-tx ctx forms {}))
   ([ctx forms {:keys [literal-shape request-shape] :as options}]
    (let [shape (or literal-shape request-shape (literal-request-shape forms))]
-     (case shape
+     (or (case shape
        :explicit-additions (compile-explicit-additions ctx forms)
        ;; The protected Stage 1 adapter carries :literal-shape. Successful
        ;; Stage 2 preparation additionally accepts canonical concrete references.
        (:scalar :scalar-operations)
        (or (compile-scalar-region ctx forms shape (nil? literal-shape))
-           (when (nil? literal-shape)
+           (when (and (nil? literal-shape) (scalar-form-arities? forms))
              (or (compile-coerced-scalar-region ctx forms false)
                  (compile-mixed-region ctx forms))))
        :scalar-aliases
@@ -1461,4 +1850,11 @@
                   (when (needs-ordinary-insert-plan? ctx forms)
                     (compile-mixed-region ctx forms)))
        :mixed (compile-mixed-region ctx forms)
-       nil))))
+       nil)
+         (when (and (nil? literal-shape) (not= false (:ordered? options)))
+           (when-not (and (identical? :blind shape)
+                          (not (:allow-small-unique? options)) (< (count forms) 2)
+                          (coercible-blind-infos ctx forms true))
+             (compile-ordered-region ctx forms)))
+         (when (and (nil? literal-shape) (:dynamic? options))
+           (compile-program ctx forms))))))

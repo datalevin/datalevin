@@ -6,19 +6,28 @@
 
 (defrecord TxPlan [ctx strategy entries entity-reads])
 
+(deftype OrderedOp [op e attr value extra source original])
+
+(deftype OrderedMap [source])
+
+(deftype DeferredOperation [source])
+
+(deftype DatomOperation [source])
+
 (deftype ScalarEntityRead [^objects names ^longs aids])
 
 (deftype BlindEntity [tempid ^FastList attrs])
 
 (deftype MixedAttrInfo
-  [props ^boolean ordinary? ^boolean insert? ^boolean update? tuples ^boolean typed?])
+  [props ^boolean ordinary? ^boolean insert? ^boolean update? tuples ^boolean typed?
+   storage-type])
 
 (deftype MixedInsert [tempid ^objects attrs])
 
 (deftype MixedUpdate [^long e attr value])
 
 (deftype MixedOperands
-  [entries infos ^long required-eid ^boolean prepare-reader?])
+  [entries infos ^long required-eid ^boolean prepare-reader? ^boolean storage?])
 
 (defn scalar-candidate-entries
   "Project owned E/A/value/type scratch into scalar operands. No correction,

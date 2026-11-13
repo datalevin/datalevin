@@ -422,7 +422,7 @@ issue](https://github.com/datalevin/datalevin/issues/383).
 The goal of Datalevin is to simplify data storage and access. We aim to support
 diverse workloads and use cases.
 
-* 1.3.0 Direct analytics and federation
+* 1.3.0 Data federation, encryption at rest and in transit.
 * 1.4.0 Derived-fact views, rule-head aggregation, and incremental maintenance
 * 2.0.0 Compression and KV TTL
 * 2.1.0 Entity-level security

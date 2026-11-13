@@ -28,11 +28,9 @@
    [datalevin.db.tx.common :as txcommon]
    [datalevin.db.tx.compile :as txcompile]
    [datalevin.db.tx.plan :as txplan]
-   [datalevin.db.tx.engine :as txengine]
    [datalevin.db.tx.execute :as txexec]
    [datalevin.db.tx.prepare :as txprep]
-   [datalevin.idoc :as idoc]
-   [datalevin.index :as idx]
+      [datalevin.index :as idx]
    [datalevin.util :as u
     :refer [ case-tree defrecord-updatable raise]]
    [datalevin.lmdb :as l]
@@ -60,7 +58,7 @@
             kv-info]])
   (:import
    [datalevin.datom Datom]
-   [datalevin.db.tx.plan TxPlan]
+   [datalevin.db.tx.plan TxPlan MixedOperands MixedAttrInfo]
    [datalevin.interface IRemoteDB IRemotePrepared IStore]
    [datalevin.storage Store WriteGroup]
    [datalevin.utl LRUCache QueryKey]
@@ -138,14 +136,6 @@
 (def ^:dynamic *tx-compiler-observer*
   "Optional diagnostic observer, outside compilation and uninstrumented timings."
   nil)
-
-(defrecord PreparedLocalPatchIdocTx
-  [schema-epoch
-   opts-epoch
-   entity
-   e
-   attr
-   ops])
 
 ;; (defmethod print-method TxReport [^TxReport rp, ^java.io.Writer w]
 ;;   (binding [*out* w]
@@ -2273,111 +2263,11 @@
   cannot be Entity objects requiring client-side expansion. Other inputs keep
   the existing sequence demand and expansion; compilation remains server-owned."
   [forms]
-  (if (and (txengine/compiler?) (txcompile/literal-request-shape forms))
+  (if (txcompile/literal-request-shape forms)
     forms
     (sequence (mapcat expand-transactable-entity) forms)))
 
-(defn- local-tx-form-kinds
-  "Shape-only candidates: scalar 1, blind 2, mixed 4, patch 8; tempids use 16."
-  ^long [entity]
-  (cond
-    (map? entity)
-    (let [absent-id? (not (contains? entity :db/id))
-          eid (:db/id entity)
-          tempid? (and (not absent-id?) (tempid? eid))]
-      (cond
-        (or absent-id? tempid?)
-        ;; Mixed preparation validates map contents and IDs on the writer.
-        (bit-or 6 (if tempid? 16 0))
-
-        (and (nil? (meta entity)) (> (count entity) 1)
-             (txplan/resolved-positive-ref? eid)) 1
-
-        :else 0))
-
-    (and (sequential? entity) (= 4 (count entity)))
-    (let [op (nth entity 0)]
-      (cond
-        (identical? op :db.fn/patchIdoc) 8
-        (and (identical? op :db/add) (nil? (meta entity)))
-        (if (vector? entity) 5 1)
-        :else 0))
-
-    :else 0))
-
-(defn ^:no-doc classify-local-tx
-  "Choose a local specialization without schema reads, correction or entity
-   resolution. Mixed preparation checks the suffix once a mixture is proven;
-   a general decision needs no further specialization gates."
-  [tx-data]
-  (if (and (not (txengine/interpreter?)) (seqable? tx-data))
-    (let [kinds (long
-                  (if (and (sequential? tx-data) (counted? tx-data) (= 1 (count tx-data)))
-                    (local-tx-form-kinds (nth tx-data 0))
-                    (reduce (fn [previous entity]
-                            (let [previous (long previous)
-                                  current (local-tx-form-kinds entity)]
-                              (cond
-                                (= current 8) (if (= previous 15) 8 (reduced 0))
-                                ;; A homogeneous prefix leaves the proof intact.
-                                (= previous current) previous
-                                :else
-                                (let [candidates (bit-and previous current 15)]
-                                  (cond
-                                    (zero? candidates) (reduced 0)
-                                    ;; The mixed planner validates the suffix
-                                    ;; before publishing any resolver state.
-                                    (= candidates 4) (reduced 4)
-                                    :else
-                                    (bit-or candidates
-                                            (bit-and (bit-or previous current) 16)))))))
-                            15 tx-data)))]
-      (case (bit-and kinds 15)
-        (1 5) :scalar
-        (2 6) (if (zero? (bit-and kinds 16)) :blind :blind-tempids)
-        4 :mixed
-        8 :patch-idoc
-        :general))
-    :general))
-
-(defn- prepare-legacy-blind-plan
-  "Keep ID preflight before snapshots and attach the legacy blind header."
-  [^DB db entities allow-small-unique? check-unique-avs? entity-kinds]
-  (when-let [entity-kinds (txexec/blind-entity-kinds entities entity-kinds)]
-    (let [store (.-store db)
-          store-schema (schema store)
-          store-opts (opts store)
-          store-rschema (rschema store)
-          ctx (prepare/->PrepareCtx store-schema store-rschema store-opts)]
-      (when-let [{:keys [entries auto-entity-time? unique-avs has-unique? has-many?
-                        fuse-unique-inserts? identity-upsert-av]}
-                 (txexec/prepare-blind-operands
-                   ctx entities allow-small-unique? check-unique-avs? entity-kinds)]
-        (assoc (txplan/->TxPlan ctx :blind entries nil)
-               ::legacy-prepared? true
-               :auto-entity-time? auto-entity-time?
-               :unique-avs unique-avs :has-unique? has-unique? :has-many? has-many?
-               :fuse-unique-inserts? fuse-unique-inserts?
-               :identity-upsert-av identity-upsert-av
-               :identity-upsert-read
-               (txcompile/blind-identity-entity-read store-schema entries identity-upsert-av))))))
-
-(defn ^:no-doc prepare-blind-local-tx
-  "Normalize legacy blind input at the caller's existing preparation checkpoint.
-  Compiler selection belongs to prepare-compiled-request. Persistent IDs remain
-  unbound until writer execution."
-  ([db entities] (prepare-blind-local-tx db entities false true))
-  ([db entities allow-small-unique?]
-   (prepare-blind-local-tx db entities allow-small-unique? true))
-  ([db entities allow-small-unique? check-unique-avs?]
-   (prepare-blind-local-tx db entities allow-small-unique? check-unique-avs? nil))
-  ([db entities allow-small-unique? check-unique-avs? entity-kinds]
-   (prepare-legacy-blind-plan db entities allow-small-unique? check-unique-avs? entity-kinds)))
-
-(defn- compiler-prepared?
-  "Legacy adapters share TxPlan operands without acquiring compiler proofs."
-  [prepared]
-  (and (instance? TxPlan prepared) (not (::legacy-prepared? prepared))))
+(declare stamp-prepared-request)
 
 (defn ^:no-doc blind-local-tx-unique-values-absent?
   "Check a prepared batch's unique values against the current store snapshot.
@@ -2399,182 +2289,43 @@
    writer. Repeated owners and ambiguous identities retain general resolution."
   [^DB db prepared tx-meta]
   (let [^FastList entities (:entries prepared)
-        compiled? (compiler-prepared? prepared)
-        ^FastList identity-avs (when (and compiled? (:independent-identity-upserts? prepared))
+        bound? (::bound-operands? prepared)
+        ^FastList identity-avs (when (:independent-identity-upserts? prepared)
                                 (:unique-avs prepared))]
     (when (and (not (:auto-entity-time? prepared))
                (not (:has-many? prepared))
                (:has-unique? prepared)
                (= (.size entities) (.size ^FastList (:unique-avs prepared)))
-               (or (not compiled?) identity-avs)
+               (or bound? identity-avs)
                (blind-local-tx-valid? db prepared))
       (when-let [report (txexec/execute-blind-upserts
                           (->TxReport db db [] {} tx-meta) entities identity-avs
                           (:schema (:ctx prepared)))]
-        (when (and compiled? *tx-compiler-observer*)
+        (when *tx-compiler-observer*
           (*tx-compiler-observer* :execute-blind-upsert prepared))
         report))))
-
-(defn ^:no-doc stamp-blind-local-tx
-  "Bind legacy or compiled blind operands through the shared emission loop."
-  [db prepared tx-meta]
-  (when (or (not (compiler-prepared? prepared)) (blind-local-tx-valid? db prepared))
-    (let [report (txexec/execute-blind-inserts
-                   (->TxReport db db [] {} tx-meta) (:entries prepared)
-                   (:auto-entity-time? prepared))]
-      (when (and (compiler-prepared? prepared) *tx-compiler-observer*)
-        (*tx-compiler-observer* :execute-blind prepared))
-      report)))
 
 (defn ^:no-doc stamp-blind-local-identity-tx
   "Stamp one eligible simple identity transaction, resolving insert versus
    upsert inside the caller's LMDB write transaction. Returns
    [report upsert?], or nil when the prepared shape is not eligible."
   [^DB db prepared tx-meta]
-  (when (or (not (compiler-prepared? prepared)) (blind-local-tx-valid? db prepared))
+  (when (blind-local-tx-valid? db prepared)
     (when-let [[identity-attr identity-value] (:identity-upsert-av prepared)]
       (if-some [eid (txcommon/av-first-e db identity-attr identity-value)]
         (let [report (txexec/execute-blind-identity-upsert
                        (->TxReport db db [] {} tx-meta)
                        (.get ^FastList (:entries prepared) 0)
                        identity-attr eid (:identity-upsert-read prepared))]
-          (when (and (compiler-prepared? prepared) *tx-compiler-observer*)
+          (when *tx-compiler-observer*
             (*tx-compiler-observer* :execute-blind-upsert prepared))
           [report true])
-        [(stamp-blind-local-tx db prepared tx-meta) false]))))
-
-(defn ^:no-doc prepare-local-patch-idoc-tx
-  "Recognize one simple non-unique cardinality-one patchIdoc request without
-   consulting mutable entity state. The caller must stamp it against the
-   current LMDB write snapshot before committing it. Returns nil for shapes
-   that retain the general transaction path."
-  [^DB db initial-es]
-  (let [store      (.-store db)
-        store-opts (opts store)
-        forms      (seq initial-es)
-        entity     (when (and forms (nil? (next forms))) (first forms))]
-    (when (and (sequential? entity)
-               (= 4 (count entity))
-               (not (:auto-entity-time? store-opts)))
-      (let [[op e attr patch-ops] entity
-            props                 ((schema store) attr)]
-        (when (and (identical? op :db.fn/patchIdoc)
-                   (integer? e)
-                   (<= 1 e Long/MAX_VALUE)
-                   (keyword? attr)
-                   props
-                   (identical? (:db/valueType props) :db.type/idoc)
-                   (not (identical? (:db/cardinality props)
-                                    :db.cardinality/many))
-                   (nil? (:db/unique props))
-                   (not (:db.attr/preds props))
-                   (or (nil? patch-ops) (sequential? patch-ops)))
-          (->PreparedLocalPatchIdocTx
-            (schema store) store-opts entity (long e) attr patch-ops))))))
-
-(defn ^:no-doc local-patch-idoc-tx-valid?
-  [^DB db ^PreparedLocalPatchIdocTx prepared]
-  (let [store (.-store db)]
-    (and (identical? (:schema-epoch prepared) (schema store))
-         (identical? (:opts-epoch prepared) (opts store)))))
-
-(defn- stamp-local-patch-idoc-doc
-  [^DB db ^PreparedLocalPatchIdocTx prepared tx-meta old-doc]
-  (let [before old-doc
-        old-doc (idx/logical-value before)
-        {:keys [entity e attr ops]} prepared
-        store       (.-store db)
-        props       ((schema store) attr)
-        tx-id       (inc (long (:max-tx db)))
-        base-report (->TxReport db
-                                (assoc db :max-tx tx-id)
-                                []
-                                {:db/current-tx tx-id}
-                                tx-meta)]
-    (if (empty? ops)
-      {:report base-report :doc old-doc}
-      (let [{raw-doc :doc paths :paths}
-            (idoc/apply-patch (or old-doc {}) ops)
-            _       (vld/validate-val raw-doc entity)
-            new-doc (prepare/correct-value-with-props
-                      (opts store) props attr raw-doc)
-            add     (with-meta (datom e attr new-doc tx-id)
-                      {:idoc/patch {:paths paths}})
-            db-after (cond-> (:db-after base-report)
-                       (nil? old-doc)
-                       (assoc :max-eid
-                              (max (long (:max-eid db)) (long e))))
-            tx-data (cond
-                      (nil? old-doc) [add]
-                      (= old-doc new-doc) []
-                      :else [(idx/retraction e attr before tx-id) add])]
-        {:report (assoc base-report
-                        :db-after db-after
-                        :tx-data tx-data)
-         :doc new-doc}))))
-
-(defn ^:no-doc stamp-local-patch-idoc-tx
-  "Stamp a prepared patchIdoc request against the current store snapshot.
-   Returns {:report TxReport :doc resulting-doc}, or nil when its immutable
-   schema/options epochs are stale. An empty patch in the three-argument form
-   leaves :doc nil without reading the stored document. The four-argument arity
-   accepts a virtual current document so queued patches to the same entity can
-   be prepared in order before any side index is mutated."
-  ([^DB db ^PreparedLocalPatchIdocTx prepared tx-meta]
-   (when (local-patch-idoc-tx-valid? db prepared)
-     (let [e         (entid-strict db (:e prepared))
-           old-datom (when (seq (:ops prepared))
-                       (txcommon/ea-first-datom db e (:attr prepared)))
-           old-doc   (idx/datom-prepared-value old-datom)]
-       (stamp-local-patch-idoc-doc db prepared tx-meta old-doc))))
-  ([^DB db ^PreparedLocalPatchIdocTx prepared tx-meta old-doc]
-   (when (local-patch-idoc-tx-valid? db prepared)
-     (entid-strict db (:e prepared))
-     (stamp-local-patch-idoc-doc db prepared tx-meta old-doc))))
-
-(defn- prepare-legacy-scalar-plan
-  "Capture legacy epochs and attach headers/read layouts to runtime operands."
-  [^DB db initial-es defer-entity-resolution?]
-  (let [store (.-store db)
-        store-schema (schema store)
-        store-opts (opts store)
-        store-rschema (rschema store)
-        ctx (prepare/->PrepareCtx store-schema store-rschema store-opts)]
-    (when-let [entries (txexec/prepare-scalar-operands db ctx initial-es defer-entity-resolution?)]
-      (let [deferred? (and defer-entity-resolution?
-                           (some #(not (integer? (first %))) entries))]
-        (cond-> (assoc (txplan/->TxPlan
-                         ctx :scalar entries
-                         (when-not deferred?
-                           (txcompile/scalar-update-entity-reads store-schema entries)))
-                       ::legacy-prepared? true)
-          deferred? (assoc :deferred-entity-resolution? true))))))
-
-(defn ^:no-doc prepare-scalar-update-tx
-  "Recognize ordinary scalar add operations and explicit numeric-ID maps
-  updating existing entities with simple cardinality-one, non-unique attributes.
-  Reference values must already be positive integer IDs. The caller must stamp
-  it against the current LMDB write snapshot before committing. Unsupported
-  shapes return nil. With :defer-entity-resolution?, lookup references
-  and idents are resolved when stamping, for callers preparing before the writer.
-  Internal :shape-checked? callers retain the proof from classify-local-tx."
-  ([db initial-es]
-   (prepare-scalar-update-tx db initial-es nil))
-  ([db initial-es {:keys [defer-entity-resolution? shape-checked?]}]
-   ;; Reject unsupported request shapes before correcting values or
-   ;; resolving entities, including preparation on the collector's caller.
-   (when (or shape-checked? (txcompile/scalar-update-request? initial-es))
-     (if defer-entity-resolution?
-       ;; Collector preparation reads no persisted identities. The owner resolves
-       ;; them and consults the pending transaction indexes when stamping.
-       (prepare-legacy-scalar-plan db initial-es true)
-       (txcommon/with-lookup-ref-cache db
-         (prepare-legacy-scalar-plan db initial-es false))))))
+        [(stamp-prepared-request db prepared tx-meta) false]))))
 
 (defn ^:no-doc scalar-update-tx-valid?
   [^DB db ^TxPlan prepared]
   (let [store (.-store db)]
-    (and (::legacy-prepared? prepared)
+    (and (::bound-operands? prepared)
          (identical? :scalar (:strategy prepared))
          (identical? (:schema (:ctx prepared)) (schema store))
          (identical? (:opts (:ctx prepared)) (opts store)))))
@@ -2591,31 +2342,95 @@
   "Internal comparison switch for resolved scalar stamping."
   true)
 
-(defn ^:no-doc stamp-scalar-update-tx
-  "Stamp a prepared scalar-update batch against the current store snapshot.
-  Returns a TxReport without mutable index overlays, or nil when schema/options
-  epochs are stale or entity references require general transaction resolution."
-  [^DB db ^TxPlan prepared tx-meta]
-  (when-let [prepared (when (scalar-update-tx-valid? db prepared)
-                        (if (:deferred-entity-resolution? prepared)
-                          (bind-scalar-entities db prepared (:schema (:ctx prepared)))
-                          prepared))]
-    (txexec/execute-scalar-report
-      (->TxReport db db [] {} tx-meta) (:entries prepared) (:entity-reads prepared)
-      (inc (long (:max-tx db))) *specialize-scalar-stamping?*)))
+(defn- binding-context
+  "Capture metadata after the caller's shape/ID preflight."
+  [db]
+  (let [store (:store db)
+        store-schema (schema store)
+        store-opts (opts store)
+        store-rschema (rschema store)]
+    (prepare/->PrepareCtx store-schema store-rschema store-opts)))
+
+(defn ^:no-doc prepare-admitted-request
+  "Bind admitted operands at their established caller checkpoint. Scalar/blind
+  correction retains explicit runtime provenance; patch operands use the pure
+  patch rule. Ownership and old-value reads remain current-writer work."
+  [db forms {:keys [strategy shape-checked? defer-entity-resolution?
+                    allow-small-unique? check-unique-avs? entity-kinds]
+             :or {check-unique-avs? true}}]
+  (case strategy
+    :scalar
+    (when (or shape-checked? (txcompile/scalar-update-request? forms))
+      (let [prepare-plan
+            (fn []
+              (let [ctx (binding-context db)]
+                (when-let [entries (txexec/prepare-scalar-operands
+                                    db ctx forms defer-entity-resolution?)]
+                  (let [deferred? (and defer-entity-resolution?
+                                       (some #(not (integer? (first %))) entries))]
+                    (cond-> (assoc (txplan/->TxPlan
+                                     ctx :scalar entries
+                                     (when-not deferred?
+                                       (txcompile/scalar-update-entity-reads (:schema ctx) entries)))
+                                   ::bound-operands? true)
+                      deferred? (assoc :deferred-entity-resolution? true))))))]
+        (if defer-entity-resolution?
+          (prepare-plan)
+          (txcommon/with-lookup-ref-cache db (prepare-plan)))))
+
+    :blind
+    (when-let [kinds (txexec/blind-entity-kinds forms entity-kinds)]
+      (let [ctx (binding-context db)]
+        (when-let [operands (txexec/prepare-blind-operands
+                             ctx forms allow-small-unique? check-unique-avs? kinds)]
+          (let [{:keys [entries identity-upsert-av]} operands]
+            (assoc (txplan/map->TxPlan (assoc operands :ctx ctx :strategy :blind))
+                   ::bound-operands? true
+                   :identity-upsert-read
+                   (txcompile/blind-identity-entity-read (:schema ctx) entries identity-upsert-av))))))
+    :patch (txexec/prepare-patch-operands (binding-context db) forms)
+    nil))
+
+(defn ^:no-doc stamp-prepared-request
+  "Execute shared scalar/blind/patch operands against the current writer snapshot.
+  Bound scalar operands retain epoch and entity-binding checks. Request adapters
+  use the authoritative compiler hook with their original forms."
+  [db prepared tx-meta]
+  (case (:strategy prepared)
+    :scalar
+    (when-let [prepared (when (scalar-update-tx-valid? db prepared)
+                         (if (:deferred-entity-resolution? prepared)
+                           (bind-scalar-entities db prepared (:schema (:ctx prepared)))
+                           prepared))]
+      (txexec/execute-scalar-report
+        (->TxReport db db [] {} tx-meta) (:entries prepared) (:entity-reads prepared)
+        (inc (long (:max-tx db))) *specialize-scalar-stamping?*))
+
+    :blind
+    (when (blind-local-tx-valid? db prepared)
+      (let [report (txexec/execute-blind-inserts
+                     (->TxReport db db [] {} tx-meta) (:entries prepared)
+                     (:auto-entity-time? prepared))]
+        (when *tx-compiler-observer*
+          (*tx-compiler-observer* :execute-blind prepared))
+        report))
+    :patch
+    (when (and (identical? (:schema (:ctx prepared)) (schema (:store db)))
+               (identical? (:opts (:ctx prepared)) (opts (:store db))))
+      (txexec/execute-patch-region (->TxReport db db [] {} tx-meta) prepared))
+    nil))
 
 (defn ^:no-doc prepare-local-request
-  "Pure preparation portion of the DB request hook. Only standalone local
-  callers opt into Stage 1. A rejection retains original input and admission
-  isolation; unsupported shapes keep their existing route."
+  "Capture isolated scalar outcomes at standalone admission. A rejection keeps
+  original input and failure isolation; other forms compile at their checkpoint."
   [db tx-data origin]
   (when (and (identical? clojure.lang.PersistentVector (class tx-data))
              (pos? (count tx-data))
-             (txengine/compiler?) (identical? origin :standalone-local)
+             (identical? origin :standalone-local)
              (nil? (l/explicit-transaction-timeout))
              (instance? Store (:store db))
-             ;; Validation-enabled requests retain caller-side legacy rejection
-             ;; until the deferred-validation route meets its own rollout gates.
+             ;; Validated inputs retain caller-side correction so a rejection
+             ;; does not widen the existing collector failure partition.
              (not (:validate-data? (opts (:store db))))
              (let [lmdb (.-lmdb ^Store (:store db))]
                (and (not (l/writing? lmdb))
@@ -2623,36 +2438,36 @@
     (when-let [shape (txcompile/literal-scalar-shape tx-data)]
       (let [ctx (prepare/make-prepare-ctx db)]
         ;; Options may change between the cheap admission check and capture.
-        ;; Apply the rollout scope to the exact snapshot compilation will use.
+        ;; Recheck validation against the snapshot compilation will use.
         (when-let [outcome (when-not (:validate-data? (:opts ctx))
                             (txcompile/compile-tx
-                          ctx tx-data
-                          (if (identical? shape :scalar-operations)
-                            {:literal-shape :scalar-operations} {:literal-shape :scalar})))]
-      ;; A caller's old scalar preparer declines IDs above its published floor
-      ;; before correction. Those failures belong to ordinary writer execution,
-      ;; so a new pure correction rejection must not narrow their batch abort.
-      ;; This admission check grants no execution proof; the writer rechecks IDs.
-        (when (or (instance? datalevin.db.tx.plan.TxPlan outcome)
-                  (every? (fn [form]
-                            (<= (long (if (map? form) (:db/id form) (nth form 1)))
-                                (long (:max-eid db))))
-                          tx-data))
-          (let [outcome (if (instance? datalevin.db.tx.plan.TxPlan outcome)
-                          outcome
-                          (assoc outcome :origin origin :isolated? true))]
-            (when *tx-compiler-observer*
-              (*tx-compiler-observer* :prepared outcome))
-            outcome)))))))
+                              ctx tx-data
+                              (if (identical? shape :scalar-operations)
+                                {:literal-shape :scalar-operations}
+                                {:literal-shape :scalar})))]
+          ;; IDs above the published floor belong to writer-bound resolution.
+          ;; A pure correction rejection must preserve their failure partition.
+          ;; Admission grants no execution proof; the writer rechecks IDs.
+          (when (or (instance? TxPlan outcome)
+                    (every? (fn [form]
+                              (<= (long (if (map? form) (:db/id form) (nth form 1)))
+                                  (long (:max-eid db))))
+                            tx-data))
+            (let [outcome (if (instance? TxPlan outcome)
+                            outcome
+                            (assoc outcome :origin origin :isolated? true))]
+              (when *tx-compiler-observer*
+                (*tx-compiler-observer* :prepared outcome))
+              outcome)))))))
 
 (defn- successful-compiled-request
-  [db forms shape {:keys [allow-small-unique? check-unique-avs?]
-                   :or {allow-small-unique? true check-unique-avs? true}}]
+  [db forms shape {:keys [allow-small-unique? check-unique-avs? ordered?]
+                   :or {allow-small-unique? true check-unique-avs? true ordered? true}}]
   (let [outcome (txcompile/compile-tx (prepare/make-prepare-ctx db) forms
                   {:request-shape shape :allow-small-unique? allow-small-unique?
-                   :check-unique-avs? check-unique-avs?})]
-    ;; Generic adapters admit successful plans only. Stage 1's explicitly
-    ;; isolated scalar adapter retains ownership of deferred rejections.
+                   :check-unique-avs? check-unique-avs? :ordered? ordered?})]
+    ;; Generic adapters admit successful plans only. The isolated scalar
+    ;; admission hook owns deferred rejections.
     (when (and (instance? TxPlan outcome)
                ;; Datom/general callers retain their allocation/report boundary
                ;; when a literal ID is above the published floor. This grants
@@ -2672,24 +2487,23 @@
   request shape always comes from the forms."
   ([db forms] (prepare-compiled-request db forms nil))
   ([db forms options]
-   (when (and (txengine/compiler?) (instance? Store (:store db)))
+   (when (instance? Store (:store db))
      (when-let [shape (txcompile/literal-request-shape forms)]
        (successful-compiled-request db forms shape options)))))
 
 (defn ^:no-doc prepare-local-compiled-request
-  "Capture a successful Stage 2 plan before legacy caller classification.
-  Timed scalar callers retain their pre-writer preparation phase. Provisional
-  rejections retain legacy caller correction and admission."
+  "Capture inert plans before caller binding. Timed scalar requests retain their
+  pre-writer preparation phase; provisional rejections retain caller correction."
   [db forms]
-  (when (and (txengine/compiler?)
-             (instance? Store (:store db))
+  (when (and (instance? Store (:store db))
              (let [lmdb (.-lmdb ^Store (:store db))]
                (and (not (l/writing? lmdb))
                     (not (Thread/holdsLock (l/write-txn lmdb))))))
     (when-let [shape (txcompile/literal-request-shape forms)]
-      (when (or (nil? (l/explicit-transaction-timeout))
-                (#{:scalar :scalar-operations :scalar-aliases :explicit-additions} shape))
-        (successful-compiled-request db forms shape nil)))))
+      (when (and (not (identical? :ordered shape))
+                 (or (nil? (l/explicit-transaction-timeout))
+                     (#{:scalar :scalar-operations :scalar-aliases :explicit-additions} shape)))
+        (successful-compiled-request db forms shape {:ordered? false})))))
 
 (def ^:private fresh-request-keys
   #{:db-before :db-after :tx-data :tempids :tx-meta ::txexec/max-eid-before})
@@ -2704,61 +2518,133 @@
 (defn ^:no-doc clear-compiled-request-route [report]
   (dissoc report ::compiled-route ::independent-scalar?))
 
+(defn ^:no-doc request-storage-independent?
+  "Validate resolved scalar-transition evidence against its exact logical trace
+  and current storage schema. An input plan alone supplies neither proof."
+  [report]
+  (let [proof (::independent-scalar? report)]
+    (and (vector? proof) (= 2 (count proof))
+         (identical? (nth proof 1) (:tx-data report))
+         (identical? (nth proof 0) (schema (:store (:db-after report)))))))
+
+(defn ^:no-doc compiled-storage-attributes
+  "Expose existing logical bindings only within the owned commit scope.
+  Storage receives fresh entries for its existing table, never compiler scratch."
+  [plan]
+  (when (and (instance? TxPlan plan) (identical? :mixed (:strategy plan)))
+    (let [^java.util.HashMap infos (.-infos ^MixedOperands (:entries plan))]
+      [(:schema (:ctx plan))
+       (fn [attr]
+         (when-let [^MixedAttrInfo info (.get infos attr)]
+           (when (.-ordinary? info)
+             (let [props (.-props info)
+                   binding (object-array 4)]
+               (aset binding 0 (:db/aid props))
+               (aset binding 1 (.-storage-type info))
+               (aset binding 2 (:db/noindex props))
+               (aset binding 3 props)
+               binding))))])))
+
+(defn ^:no-doc request-storage-attributes
+  "Use the compiler's metadata-reuse decision only for an owned group whose
+  table needs population. Warm tables and small requests avoid a binding scope."
+  [db plan]
+  (when (and txcommon/*batch-prepare* (instance? TxPlan plan)
+             (identical? :mixed (:strategy plan))
+             (.-storage? ^MixedOperands (:entries plan)))
+    (when-let [^WriteGroup group (s/current-write-group (.-lmdb ^Store (:store db)))]
+      (let [^objects context (.-storage-context group)]
+        (when (or (nil? (aget context 4))
+                  (not (identical? (:schema (:ctx plan)) (aget context 5))))
+          (compiled-storage-attributes plan))))))
+
 (defn- compiled-report
-  [initial report route independent?]
+  [initial report route independent? ctx]
   (when report
     (cond-> (-> initial
                 (dissoc ::txexec/max-eid-before)
                 (assoc :db-after (:db-after report) :tx-data (:tx-data report)
                        :tempids (:tempids report) ::compiled-route route))
-      independent? (assoc ::independent-scalar? true))))
+      independent? (assoc ::independent-scalar? [(:schema ctx) (:tx-data report)]))))
+
+(defn- request-execution-report
+  "Give ordered work its own resolver overlays. Collected preparation owns its
+  pending indexes and restore boundary; other DB values retain their old view."
+  [report]
+  (if txcommon/*batch-prepare*
+    report
+    (let [before (:db-after report)
+          after (reduce
+                  (fn [view key]
+                    (if-let [^java.util.SortedSet index (key before)]
+                      (assoc view key
+                             (doto (TreeSortedSet. (.comparator index))
+                               (.addAll index)))
+                      view))
+                  before [:eavt :avet])]
+      (assoc report :db-after after))))
 
 (defn- execute-compiled-request
-  [initial plan {:keys [owned-max-eid identity-upsert?] :or {identity-upsert? true}}]
-  (let [db (:db-after initial)
-        before (max (long (:max-eid db))
-                    (long (or owned-max-eid (::txexec/max-eid-before initial)
-                              (i/init-max-eid (:store db)))))
-        db (assoc db :max-eid before)
-        initial (assoc initial :db-after db)
-        tx-id (inc (long (:max-tx db)))]
-    (case (:strategy plan)
-      (:scalar :scalar-operations :scalar-aliases)
-      (let [offset (if (identical? :scalar-operations (:strategy plan)) 1 0)
-            bound (if (identical? :scalar-aliases (:strategy plan))
-                    (bind-scalar-entities db plan (:schema (:ctx plan)))
-                    (when (txexec/scalar-entities-within-bound? (:entries plan) before offset)
-                      plan))]
-        (when bound
-          (when-let [report (txexec/execute-scalar-report
-                             initial (:entries bound) (:entity-reads bound) tx-id
-                             (and *specialize-scalar-stamping?* (not (:explicit-tx? plan))) offset)]
-            (when *tx-compiler-observer* (*tx-compiler-observer* :execute-scalar plan))
-            (compiled-report initial report :compiled-scalar
-                             (and txcommon/*batch-prepare* (> (count (:tx-data report)) 2))))))
+  [initial plan {:keys [owned-max-eid identity-upsert? tx-time] :or {identity-upsert? true}}]
+  (if (identical? :dynamic (:strategy plan))
+    (let [report (txexec/execute-dynamic-region (request-execution-report initial) plan tx-time)]
+      (when *tx-compiler-observer* (*tx-compiler-observer* :execute-dynamic plan))
+      (assoc report ::compiled-route :compiled-dynamic))
+    (let [db (:db-after initial)
+          before (max (long (:max-eid db))
+                      (long (or owned-max-eid (::txexec/max-eid-before initial)
+                                (i/init-max-eid (:store db)))))
+          db (assoc db :max-eid before)
+          initial (assoc initial :db-after db)
+          tx-id (inc (long (:max-tx db)))]
+      (case (:strategy plan)
+        (:scalar :scalar-operations :scalar-aliases)
+        (let [offset (if (identical? :scalar-operations (:strategy plan)) 1 0)
+              bound (if (or (identical? :scalar-aliases (:strategy plan))
+                            (:deferred-entity-resolution? plan))
+                      (bind-scalar-entities db plan (:schema (:ctx plan)))
+                      (when (txexec/scalar-entities-within-bound? (:entries plan) before offset)
+                        plan))]
+          (when bound
+            (when-let [report (txexec/execute-scalar-report
+                               initial (:entries bound) (:entity-reads bound) tx-id
+                               (and *specialize-scalar-stamping?* (not (:explicit-tx? plan))) offset)]
+              (when *tx-compiler-observer* (*tx-compiler-observer* :execute-scalar plan))
+              (compiled-report initial report :compiled-scalar
+                               (and txcommon/*batch-prepare* (> (count (:tx-data report)) 2)) (:ctx plan)))))
 
-      :blind
-      (when-let [[report upsert?]
-                 (if (and identity-upsert? (:identity-upsert-av plan))
-                   (stamp-blind-local-identity-tx db plan (:tx-meta initial))
-                   (if (blind-local-tx-unique-values-absent? db plan)
-                     [(stamp-blind-local-tx db plan (:tx-meta initial)) false]
-                     (when identity-upsert?
-                       (when-let [report (stamp-blind-local-upsert-tx db plan (:tx-meta initial))]
-                         [report true]))))]
-        (compiled-report initial report (if upsert? :identity-upsert :blind-insert)
-                         (or upsert? (false? (:has-many? plan)))))
+        :blind
+        (when-let [[report upsert?]
+                   (if (and identity-upsert? (:identity-upsert-av plan))
+                     (stamp-blind-local-identity-tx db plan (:tx-meta initial))
+                     (if (blind-local-tx-unique-values-absent? db plan)
+                       [(stamp-prepared-request db plan (:tx-meta initial)) false]
+                       (when identity-upsert?
+                         (when-let [report (stamp-blind-local-upsert-tx db plan (:tx-meta initial))]
+                           [report true]))))]
+          (compiled-report initial report (if upsert? :identity-upsert :blind-insert)
+                           (or upsert? (false? (:has-many? plan))) (:ctx plan)))
 
-      :mixed
-      (when-let [report (txadd/execute-mixed-region initial plan before)]
-        (when *tx-compiler-observer* (*tx-compiler-observer* :execute-mixed plan))
-        (compiled-report initial report :mixed-add true))
-      nil)))
+        :ordered
+        (let [report (txexec/execute-ordered-region (request-execution-report initial) plan tx-time)]
+          (when *tx-compiler-observer* (*tx-compiler-observer* :execute-ordered plan))
+          (compiled-report initial report :compiled-ordered false (:ctx plan)))
+
+        :patch
+        (when-let [report (txexec/execute-patch-region initial plan)]
+          (when *tx-compiler-observer* (*tx-compiler-observer* :execute-patch plan))
+          (assoc report ::compiled-route :patch-idoc))
+
+        :mixed
+        (when-let [report (txadd/execute-additions initial plan before)]
+          (when *tx-compiler-observer* (*tx-compiler-observer* :execute-mixed plan))
+          (compiled-report initial report :mixed-add true (:ctx plan)))
+        nil))))
 
 (defn- prepare-local-report
   [initial forms tx-time outcome {:keys [stage? route?] :as options}]
   (let [db (:db-after initial) captured (:ctx outcome)
-        valid? (and outcome (not (::legacy-prepared? outcome))
+        valid? (and outcome
                     (identical? (:schema captured) (schema (:store db)))
                     (identical? (:opts captured) (opts (:store db))))
         eligible? (and (instance? Store (:store db)) (fresh-request-report? initial)
@@ -2767,26 +2653,28 @@
                        (not (and stage? txcommon/*batch-prepare*)))
         ctx (if (and eligible? valid?) captured
                 (prepare/make-prepare-ctx (if eligible? db (:db-before initial))))
-        selected (when (and eligible? (or outcome (txengine/compiler?)))
+        selected (when eligible?
                    (if valid? outcome
                        (do
                          (when (and outcome *tx-compiler-observer*)
                            (*tx-compiler-observer* :recompile forms))
-                         (let [selected (txcompile/compile-tx ctx forms {:allow-small-unique? true})]
+                         (let [selected (txcompile/compile-tx ctx forms {:allow-small-unique? true :dynamic? true})]
                            (when (and selected (nil? outcome) *tx-compiler-observer*)
                              (*tx-compiler-observer* :prepared selected))
                            selected))))
         prepared (when (instance? TxPlan selected)
-                   (execute-compiled-request initial selected options))
+                   (execute-compiled-request initial selected (assoc options :tx-time tx-time)))
         report (if prepared
-                 (if stage? (txexec/stage-compiled-report! prepared) prepared)
+                 (if (and stage? (not= :dynamic (:strategy selected)))
+                   (txexec/stage-compiled-report! prepared) prepared)
                  (do
-                   (when (and outcome txcommon/*batch-prepare*)
+                   (when (and outcome (satisfies? txcommon/ScalarPendingIndex txcommon/*batch-prepare*))
                      (txcommon/materialize-scalar-pending! txcommon/*batch-prepare* db))
-                   (when (and (or selected outcome) *tx-compiler-observer*)
-                     (*tx-compiler-observer* :ordered forms))
-                   (cond-> (txexec/prepare-and-transact-tx-data initial forms tx-time ctx)
-                     route? (assoc ::compiled-route :general))))]
+                   (let [program (txcompile/compile-program ctx forms)
+                         report (txexec/execute-dynamic-region
+                                  (request-execution-report initial) program tx-time)]
+                     (when *tx-compiler-observer* (*tx-compiler-observer* :execute-dynamic program))
+                     (cond-> report route? (assoc ::compiled-route :compiled-dynamic)))))]
     (cond-> report
       (not route?) (dissoc ::compiled-route)
       stage? (dissoc ::independent-scalar?))))
@@ -2798,10 +2686,7 @@
   ([initial forms]
    (prepare-local-tx-data initial forms (System/currentTimeMillis)))
   ([initial forms tx-time]
-   (if (txengine/compiler?)
-     (prepare-local-report initial forms tx-time nil {:stage? true})
-     (txexec/prepare-and-transact-tx-data
-       initial forms tx-time (prepare/make-prepare-ctx (:db-before initial)))))
+   (prepare-local-report initial forms tx-time nil {:stage? true}))
   ([db forms tx-meta tx-time outcome]
    (prepare-local-tx-data db forms tx-meta tx-time outcome nil))
   ([db forms tx-meta tx-time outcome initial]

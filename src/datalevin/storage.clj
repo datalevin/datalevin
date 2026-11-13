@@ -2424,16 +2424,25 @@
                      types)
              (b/valid-data? value types)))))
 
+(def ^:dynamic *compiled-storage-attributes*
+  "Request-scoped [schema lookup] for already resolved ordinary metadata.
+  Lookup creates an owned group-table entry; neither the lookup nor compiler
+  scratch survives in a frozen segment. Schema mismatch uses normal resolution."
+  nil)
+
 (defn- group-storage-attr-info
   [store-schema attr]
-  (let [props (store-schema attr)
-        info (object-array 4)]
-    ;; Keep props for eligibility checks; encoding needs only the first slots.
-    (aset info 0 (:db/aid props))
-    (aset info 1 (idx/value-type props))
-    (aset info 2 (:db/noindex props))
-    (aset info 3 props)
-    info))
+  (or (when (and *compiled-storage-attributes*
+                 (identical? store-schema (nth *compiled-storage-attributes* 0)))
+        ((nth *compiled-storage-attributes* 1) attr))
+      (let [props (store-schema attr)
+            info (object-array 4)]
+        ;; Keep props for eligibility checks; encoding needs only the first slots.
+        (aset info 0 (:db/aid props))
+        (aset info 1 (idx/value-type props))
+        (aset info 2 (:db/noindex props))
+        (aset info 3 props)
+        info)))
 
 (defn- group-storage-attr-info!
   [^HashMap attrs store-schema attr]
