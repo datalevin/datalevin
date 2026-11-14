@@ -4,7 +4,7 @@
             [datalevin.db.tx.plan :as plan]
             [datalevin.datom :as datom]
             [datalevin.prepare :as prepare])
-  (:import [datalevin.db.tx.plan BlindEntity MixedAttrInfo MixedInsert MixedOperands MixedUpdate TxPlan]
+  (:import [datalevin.db.tx.plan BlindEntity AttrInfo MixedInsert MixedOperands MixedUpdate TxPlan]
            [java.util HashMap HashSet]
            [org.eclipse.collections.impl.list.mutable FastList]))
 
@@ -38,6 +38,59 @@
      :identity {:db/aid 5 :db/valueType :db.type/string :db/unique :db.unique/identity}
      :reference {:db/aid 6 :db/valueType :db.type/ref}}
     {} {:validate-data? true}))
+
+(deftest attribute-bindings-share-one-representation-and-identity-across-roles
+  (let [infos (HashMap.) schema (:schema ctx)
+        ^AttrInfo info (compile/attribute-info! infos schema {} :value)]
+    (is (instance? AttrInfo info))
+    (is (identical? (:value schema) (.-props info)))
+    (is (= :db.type/long (.-value-type info)))
+    (is (= :db.type/long (.-storage-type info)))
+    (is (.-insert? info))
+    (is (.-update? info))
+    (is (identical? info (compile/blind-attr-info! infos schema {} true :value)))
+    (is (identical? info (compile/scalar-attribute-info schema {} :value 7 true infos)))
+    (let [^AttrInfo identity-info (compile/attribute-info! infos schema {} :identity)]
+      ;; Request policy cannot poison the immutable binding for another rule.
+      (is (nil? (compile/blind-attr-info! infos schema {} false :identity)))
+      (is (identical? identity-info (compile/blind-attr-info! infos schema {} true :identity)))
+      (is (nil? (compile/scalar-attribute-info schema {} :identity "one" true infos))))))
+
+(deftest operand-builders-read-each-source-attribute-once
+  (doseq [[family forms expected]
+          [[:scalar-operations [[:db/add 1 :value (int 3)] [:db/add 2 :text 42]]
+            [[1 :value 3] [2 :text "42"]]]
+           [:scalar-aliases [[:db/add :entity/one :value (int 3)] [:db/add :entity/two :text 42]]
+            [[:entity/one :value 3] [:entity/two :text "42"]]]
+           [:blind [(array-map :value (int 3) :text 42)] [:value 3 :text "42"]]
+           [:mixed [{:text 42} [:db/add 1 :value (int 3)]] ["42" 3]]]]
+    (let [reads (atom {}) schema (:schema ctx)
+          observed (reify clojure.lang.IFn
+                     (invoke [_ attr] (swap! reads update attr (fnil inc 0)) (get schema attr))
+                     clojure.lang.ILookup
+                     (valAt [_ attr] (swap! reads update attr (fnil inc 0)) (get schema attr))
+                     (valAt [_ attr missing] (swap! reads update attr (fnil inc 0)) (get schema attr missing)))
+          p (compile/compile-tx (assoc ctx :schema observed :opts {:validate-data? false}) forms
+              {:request-shape family :ordered? false})]
+      (is (instance? TxPlan p) (str family))
+      (is (= {:value 1 :text 1} @reads) (str family))
+      (is (= expected
+             (case family
+               :blind (vec (.-attrs ^BlindEntity (first (:entries p))))
+               :mixed (let [entries (.-entries ^MixedOperands (:entries p))]
+                        [(aget ^objects (.-attrs ^MixedInsert (first entries)) 1)
+                         (.-value ^MixedUpdate (second entries))])
+               (:entries p)))
+          (str family)))))
+
+(deftest small-unique-decline-reuses-the-complete-operand-proof
+  (let [reads (atom {}) schema (:schema ctx)
+        observed (fn [attr] (swap! reads update attr (fnil inc 0)) (get schema attr))
+        forms [(array-map :identity 'one :value (int 3))]
+        p (compile/compile-tx (assoc ctx :schema observed :opts {:validate-data? false}) forms
+            {:allow-small-unique? false})]
+    (is (nil? p))
+    (is (= {:identity 1 :value 1} @reads))))
 
 (deftest existing-map-annotations-normalize-without-becoming-datom-metadata
   (let [annotations {:source :map :user/nested ["opaque"]}
@@ -277,7 +330,7 @@
         ^MixedUpdate raw (compile/mixed-update-operand context infos 1 :tuple host true)]
     (is (identical? host (.-value raw)))
     (is (nil? (compile/mixed-update-operand context infos 1 :tuple host)))
-    (is (false? (.-update? ^MixedAttrInfo (.get infos :tuple))))
+    (is (false? (.-update? ^AttrInfo (.get infos :tuple))))
     (doseq [value [nil [] [nil] ["bad"] [host] tail [tail]
                    (with-meta [1] {:source true})]
             input [[[:db/add 1 :tuple value]]
@@ -936,14 +989,14 @@
              [:many [false false false]]
              [:custom [false false false]]
              [:predicate [false false false]]]]
-      (let [^MixedAttrInfo info (compile/ordinary-attr-info! infos schema sources attr)]
+      (let [^AttrInfo info (compile/attribute-info! infos schema sources attr)]
         (is (= expected [(.-ordinary? info) (.-insert? info) (.-update? info)])
             (str attr))))
     (is (compile/ordinary-unique-attrs-present? infos))
     (is (empty? @effects))
     ;; An unsupported derived tuple blocks its source insertion proof as well.
     (let [schema (assoc-in schema [:pair :db/unique] :db.unique/identity)
-          ^MixedAttrInfo info (compile/ordinary-attr-info! (HashMap.) schema sources :left)]
+          ^AttrInfo info (compile/attribute-info! (HashMap.) schema sources :left)]
       (is (true? (.-ordinary? info)))
       (is (false? (.-insert? info))))))
 
@@ -1217,7 +1270,7 @@
                        {:db/unique :db.unique/identity}
                        {:db/tupleType :db.type/long}
                        {:db.attr/preds [(constantly true)]}]]
-      (is (nil? (compile/scalar-attribute-props
+      (is (nil? (compile/scalar-attribute-info
                   {:reference (merge {:db/aid 6 :db/valueType :db.type/ref} exclusion)}
                   {} :reference number))))
     (is (empty? @effects))))

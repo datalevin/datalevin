@@ -14,7 +14,6 @@
    [datalevin.db :as db]
    [datalevin.db.tx.common :as txcommon]
    [datalevin.db.tx.compile :as txcompile]
-   [datalevin.db.tx.execute :as txexec]
    [datalevin.lmdb :as l]
    [datalevin.storage :as s]
    [datalevin.async :as a]
@@ -641,19 +640,19 @@
           report))))
 
 (defn- prepare-classified-blind-tx
-  [db tx-data allow-small-unique? check-unique-avs? kind]
+  [db tx-data allow-small-unique? check-unique-avs?]
   (or (db/prepare-compiled-request db tx-data
         {:allow-small-unique? allow-small-unique? :check-unique-avs? check-unique-avs?})
       (db/prepare-admitted-request db tx-data
         {:strategy :blind :allow-small-unique? allow-small-unique?
-         :check-unique-avs? check-unique-avs? :entity-kinds (if (= kind :blind-tempids) 1 0)})))
+         :check-unique-avs? check-unique-avs?})))
 
 (declare transact-local-in-native-txn!)
 
 (defn- maybe-direct-local-blind-transact!
   [conn tx-data tx-meta kind]
   (when-let [prepared (prepare-classified-blind-tx
-                       @conn tx-data false false kind)]
+                       @conn tx-data false false)]
     (if (#{:mixed :ordered} (:strategy prepared))
       (transact-local-in-native-txn! conn tx-data tx-meta kind prepared)
       (try-direct-local-blind-transact! conn prepared tx-meta))))
@@ -702,7 +701,7 @@
 
 (defn- maybe-direct-local-scalar-update!
   [conn tx-data tx-meta]
-  (when-let [prepared (db/prepare-admitted-request ^DB @conn tx-data {:strategy :scalar :shape-checked? true})]
+  (when-let [prepared (db/prepare-admitted-request ^DB @conn tx-data {:strategy :scalar})]
     (when-let [report (direct-local-scalar-update! conn prepared tx-meta tx-data)]
       (observe-local-wal-tx-path! :scalar-update)
       report)))
@@ -710,16 +709,16 @@
 (defn- maybe-direct-local-wal-transact!
   [conn tx-data tx-meta kind]
   (case kind
-    :scalar (maybe-direct-local-scalar-update! conn tx-data tx-meta)
-    :patch-idoc
+    (:scalar :scalar-operations :scalar-aliases) (maybe-direct-local-scalar-update! conn tx-data tx-meta)
+    :patch
     (when *local-wal-patch-idoc?*
       (when-let [prepared (db/prepare-admitted-request @conn tx-data {:strategy :patch})]
         (when-let [report (direct-local-patch-idoc-transact!
                             conn prepared tx-meta)]
           (observe-local-wal-tx-path! :patch-idoc)
           report)))
-    (:blind :blind-tempids)
-    (when-let [prepared (prepare-classified-blind-tx @conn tx-data true false kind)]
+    :blind
+    (when-let [prepared (prepare-classified-blind-tx @conn tx-data true false)]
       (cond
         (#{:mixed :ordered} (:strategy prepared))
         (transact-local-in-native-txn! conn tx-data tx-meta kind prepared)
@@ -750,10 +749,10 @@
   "Try the simple single-entity identity-upsert fast path for a store that is
    not on the WAL direct path. Returns the transaction report, or nil so the
    caller can continue with general resolution."
-  [conn tx-data tx-meta kind]
+  [conn tx-data tx-meta]
   (when (and *local-wal-identity-upsert?*
              (single-identity-entity? @conn tx-data))
-    (when-let [prepared (prepare-classified-blind-tx @conn tx-data true false kind)]
+    (when-let [prepared (prepare-classified-blind-tx @conn tx-data true false)]
       (when (:identity-upsert-av prepared)
         (when-let [[report upsert?]
                    (direct-local-identity-transact! conn prepared tx-meta)]
@@ -836,14 +835,6 @@
     report
     (assoc report :db-before db)))
 
-(defn- local-tx-kind
-  [tx-data kind]
-  (if (keyword? kind)
-    kind
-    ;; Retain the former scalar-rejection argument for internal callers.
-    (let [classified (txexec/prepare-request-admission tx-data)]
-      (if (and kind (= classified :scalar)) :general classified))))
-
 (defn- commit-blind-insert!
   [db prepared tx-meta fuse-unique?]
   (if (and fuse-unique? (:fuse-unique-inserts? prepared))
@@ -880,7 +871,7 @@
                                (boolean independent?) false))))
 
 (defn- ^:redef transact-local-in-write-txn!
-  "Bind one request to its owned writer and preserve the existing admission policy."
+  "Execute one request through its compiler-selected or caller-bound plan."
   ([db tx-data tx-meta]
    (transact-local-in-write-txn! db tx-data tx-meta nil nil))
   ([db tx-data tx-meta kind]
@@ -893,24 +884,22 @@
                      ;; Bind operands at their admitted checkpoint, then use
                      ;; the same compiler hook. Implicit-ID and correction
                      ;; timing belong to binding, not a second execution route.
-                     (case kind
-                       (:blind :blind-tempids)
-                       (prepare-classified-blind-tx db tx-data true (not fuse-unique?) kind)
-                       :scalar
-                       (db/prepare-admitted-request db tx-data {:strategy :scalar :shape-checked? true})
-                       :patch-idoc
+                     (case (or kind (txcompile/literal-request-shape tx-data))
+                       :blind
+                       (prepare-classified-blind-tx db tx-data true (not fuse-unique?))
+                       (:scalar :scalar-operations :scalar-aliases)
+                       (db/prepare-admitted-request db tx-data {:strategy :scalar})
+                       :patch
                        (when *local-wal-patch-idoc?*
                          (db/prepare-admitted-request db tx-data {:strategy :patch}))
                        nil))]
-     (if-let [attributes (db/request-storage-attributes db outcome)]
-       (binding [s/*compiled-storage-attributes* attributes]
-         (execute-local-request! db tx-data tx-meta outcome fuse-unique?))
-       (execute-local-request! db tx-data tx-meta outcome fuse-unique?)))))
+     (db/seed-request-storage-attributes! db outcome)
+     (execute-local-request! db tx-data tx-meta outcome fuse-unique?))))
 
 (defn- transact-local-in-native-txn!
   [conn tx-data tx-meta kind outcome]
   ;; Resolve old values and allocate new IDs after acquiring the writer, just
-  ;; as for nested requests. Unsupported shapes use the same interpreter
+  ;; as for nested requests. Other forms use the dynamic compiler driver
   ;; inside that transaction, preserving ordered resolution and rollback.
   (locking conn
     (let [before ^DB @conn
@@ -975,14 +964,14 @@
       (assoc report :db-after after))))
 
 (defn- -transact!
-  ([conn tx-data tx-meta] (-transact! conn tx-data tx-meta (txexec/prepare-request-admission tx-data)))
+  ([conn tx-data tx-meta] (-transact! conn tx-data tx-meta (txcompile/literal-request-shape tx-data)))
   ([conn tx-data tx-meta kind]
    (-transact! conn tx-data tx-meta kind nil))
   ([conn tx-data tx-meta kind outcome]
    ;; A nil kind leaves binding to the owned compiler hook. Standalone direct
    ;; paths retain their caller admission and native commit policies.
-   (let [kind (when (and (not outcome) (some? kind))
-                (local-tx-kind tx-data kind))
+   (let [kind (when-not outcome
+                (or kind (txcompile/literal-request-shape tx-data)))
          direct? (local-direct-transact-eligible? conn)
          wal? (and (not direct?) (local-wal-transact-eligible? conn))]
      (cond
@@ -1002,20 +991,20 @@
            (transact-local-in-native-txn! conn tx-data tx-meta kind outcome))
 
        direct?
-       (let [kind (or kind (txexec/prepare-request-admission tx-data))]
+       (let [kind (or kind (txcompile/literal-request-shape tx-data))]
          (or (case kind
-               (:blind :blind-tempids)
+               :blind
                (if (and *local-wal-identity-upsert?* (single-identity-entity? @conn tx-data))
-                 (maybe-direct-local-identity-transact! conn tx-data tx-meta kind)
+                 (maybe-direct-local-identity-transact! conn tx-data tx-meta)
                  (maybe-direct-local-blind-transact! conn tx-data tx-meta kind))
-               :scalar (maybe-direct-local-scalar-update! conn tx-data tx-meta)
+               (:scalar :scalar-operations :scalar-aliases) (maybe-direct-local-scalar-update! conn tx-data tx-meta)
                (:mixed :explicit-additions)
                (transact-local-in-native-txn! conn tx-data tx-meta kind nil)
                nil)
              (direct-local-transact! conn tx-data tx-meta)))
        :else
        (if wal?
-         (let [kind (or kind (txexec/prepare-request-admission tx-data))]
+         (let [kind (or kind (txcompile/literal-request-shape tx-data))]
            (or (maybe-direct-local-wal-transact! conn tx-data tx-meta kind)
                (when (#{:mixed :explicit-additions} kind)
                  (transact-local-in-native-txn! conn tx-data tx-meta kind nil))
@@ -1184,7 +1173,7 @@
             kind (when-not (or outcome
                                (and (not owned?)
                                     (guarded-local-request-shape conn tx-data)))
-                   (txexec/prepare-request-admission tx-data))]
+                   (txcompile/literal-request-shape tx-data))]
         ;; Owned scalar requests retain the enclosing writer's staging and
         ;; failure partition rather than entering the standalone scalar runner.
         (if (and outcome (not owned?)
@@ -1195,10 +1184,10 @@
           ;; Type correction and read-layout construction do not depend on
           ;; the eventual native snapshot. Keep that work on the caller;
           ;; resolve lookup refs and read old values on the native owner.
-            (let [prepared (when (= kind :scalar)
+            (let [prepared (when (#{:scalar :scalar-operations :scalar-aliases} kind)
                              (db/prepare-admitted-request
-                              @conn tx-data {:strategy :scalar :defer-entity-resolution? true :shape-checked? true}))
-                  kind (if (= kind :scalar) :general kind)
+                              @conn tx-data {:strategy :scalar :defer-entity-resolution? true}))
+                  kind (if (#{:scalar :scalar-operations :scalar-aliases} kind) :general kind)
                   report (if (and prepared (nil? (l/explicit-transaction-timeout)))
                            (datalog/run-scalar! control conn prepared tx-data tx-meta
                                                 (fn [control before plan meta]

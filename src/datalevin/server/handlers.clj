@@ -1654,8 +1654,11 @@
                        (db/prepare-admitted-request
                          db txs {:strategy :blind :allow-small-unique? true}))]
       [:compiled plan txs])
-    ;; The owned compiler hook validates against current schema/options.
-    (catch Exception _ nil)))
+    ;; Retain the writer retry for binding failures, but surface unexpected
+    ;; compiler failures instead of treating them as ordinary plan declines.
+    (catch Exception e
+      (log/warn e "Server transaction preparation failed; retrying under the writer")
+      nil)))
 
 (defn- execute-compiled-request!
   [db prepared forms tx-meta]
@@ -1670,9 +1673,8 @@
   [db [kind prepared forms] tx-meta]
   (case kind
     :compiled
-    (if-let [attributes (db/request-storage-attributes db prepared)]
-      (binding [st/*compiled-storage-attributes* attributes]
-        (execute-compiled-request! db prepared forms tx-meta))
+    (do
+      (db/seed-request-storage-attributes! db prepared)
       (execute-compiled-request! db prepared forms tx-meta))
 
     nil))

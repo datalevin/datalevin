@@ -19,6 +19,7 @@
    [datalevin.constants :as c]
    [datalevin.custom-datalog :as cd]
    [datalevin.datom :as d]
+   [datalevin.db.tx.plan]
    [datalevin.embedding :as emb]
    [datalevin.idoc :as idoc]
    [datalevin.index :as idx
@@ -102,6 +103,7 @@
    [org.eclipse.collections.impl.set.mutable.primitive LongHashSet]
    [org.eclipse.collections.impl.map.mutable.primitive LongObjectHashMap]
    [datalevin.datom Datom]
+   [datalevin.db.tx.plan AttrInfo]
    [datalevin.interface IStore]
    [datalevin.async IAsyncWork]
    [datalevin.bits Retrieved Indexable EncodedGiant]))
@@ -2424,25 +2426,23 @@
                      types)
              (b/valid-data? value types)))))
 
-(def ^:dynamic *compiled-storage-attributes*
-  "Request-scoped [schema lookup] for already resolved ordinary metadata.
-  Lookup creates an owned group-table entry; neither the lookup nor compiler
-  scratch survives in a frozen segment. Schema mismatch uses normal resolution."
-  nil)
-
 (defn- group-storage-attr-info
   [store-schema attr]
-  (or (when (and *compiled-storage-attributes*
-                 (identical? store-schema (nth *compiled-storage-attributes* 0)))
-        ((nth *compiled-storage-attributes* 1) attr))
-      (let [props (store-schema attr)
-            info (object-array 4)]
-        ;; Keep props for eligibility checks; encoding needs only the first slots.
-        (aset info 0 (:db/aid props))
-        (aset info 1 (idx/value-type props))
-        (aset info 2 (:db/noindex props))
-        (aset info 3 props)
-        info)))
+  (let [props (store-schema attr)]
+    ;; The physical table belongs to the group, not to any compiler request.
+    (object-array [(:db/aid props) (idx/value-type props) (:db/noindex props) props])))
+
+(defn- seed-storage-attributes!
+  [^HashMap attrs store-schema captured-schema ^HashMap bindings]
+  (when (identical? store-schema captured-schema)
+    (doseq [^java.util.Map$Entry entry (.entrySet bindings)]
+      (let [attr (.getKey entry) info (.getValue entry)]
+        (when (and (instance? AttrInfo info) (.-ordinary? ^AttrInfo info)
+                   (not (.containsKey attrs attr)))
+          (let [^AttrInfo info info props (.-props info)]
+            (.put attrs attr
+                  (object-array [(:db/aid props) (.-storage-type info)
+                                 (:db/noindex props) props]))))))))
 
 (defn- group-storage-attr-info!
   [^HashMap attrs store-schema attr]
@@ -2464,6 +2464,21 @@
         (aset context 4 updated)
         (aset context 5 store-schema)
         updated))))
+
+(defn ^:no-doc seed-group-storage-attributes!
+  "Copy proven logical bindings into the existing cold group/schema table.
+  No request lookup callback or compiler scratch is retained. Plan selection
+  decides whether seeding is worthwhile; ordinary misses always use schema."
+  [^Store store captured-schema bindings]
+  (let [store-schema (schema store)]
+    (when (and (identical? store-schema captured-schema)
+               (not (cd/custom-schema? store-schema)))
+      (when-let [^WriteGroup group (current-write-group (.-lmdb store))]
+        (let [^objects context (.-storage-context group)]
+          (when (or (nil? (aget context 4))
+                    (not (identical? store-schema (aget context 5))))
+            (seed-storage-attributes!
+              (group-storage-attrs! context store-schema) store-schema captured-schema bindings)))))))
 
 (defn ^:no-doc stage-group-datoms!
   "Retain ordinary resolved datoms for one storage preparation per group.

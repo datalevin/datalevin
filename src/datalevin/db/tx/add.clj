@@ -9,7 +9,7 @@
 ;;
 (ns ^:no-doc datalevin.db.tx.add
   "Prepare independent ordinary additions without interpreter or index mutations."
-  (:require [datalevin.datom :as d :refer [datom]]
+  (:require [datalevin.datom :refer [datom]]
             [datalevin.db.tx.common :as common]
             [datalevin.db.tx.compile :as compile]
             [datalevin.interface :as i]
@@ -17,7 +17,7 @@
             [datalevin.prepare :as prepare]
             [datalevin.storage :as storage])
   (:import [datalevin.datom Datom]
-           [datalevin.db.tx.plan MixedAttrInfo MixedInsert MixedOperands MixedUpdate TxPlan]
+           [datalevin.db.tx.plan AttrInfo MixedInsert MixedOperands MixedUpdate TxPlan]
            [java.util ArrayList HashMap HashSet SortedSet]
            [org.eclipse.collections.impl.map.mutable.primitive LongObjectHashMap]))
 
@@ -40,7 +40,7 @@
          true)))
 
 (defn- append-new-attribute!
-  [^ArrayList additions tempids eid tx values a v ^MixedAttrInfo info]
+  [^ArrayList additions tempids eid tx values a v ^AttrInfo info]
   (let [props (.-props info)]
     (when (and (.-insert? info) (resolved-value? props tempids v))
       (let [value (if (= :db.type/ref (:db/valueType props))
@@ -56,13 +56,13 @@
     (when (seq values)
       (let [tuples (reduce-kv
                      (fn [tuples a _]
-                       (let [^MixedAttrInfo info (.get infos a)]
+                       (let [^AttrInfo info (.get infos a)]
                          (reduce-kv (fn [tuples tuple _] (assoc tuples tuple true))
                                     tuples (.-tuples info))))
                      {} values)]
         (reduce-kv
           (fn [_ a _]
-            (let [^MixedAttrInfo info (.get infos a)
+            (let [^AttrInfo info (.get infos a)
                   props (.-props info)]
               (.add additions
                     (with-meta
@@ -133,7 +133,7 @@
         (if (< index (.size additions))
           (let [^Datom addition (.get additions index)
                 a (.-a addition)
-                ^MixedAttrInfo info (.get infos a)]
+                ^AttrInfo info (.get infos a)]
             (if (:db/unique (.-props info))
               (let [v (.-v addition)
                     ^HashSet seen (or seen (HashSet.))]
@@ -156,18 +156,13 @@
             (loop [index 0 out (transient [])]
               (if (< index (.size additions))
                 (let [^Datom addition (.get additions index)
-                      e (.-e addition) a (.-a addition) v (.-v addition)
+                      e (.-e addition) a (.-a addition)
                       old (when (<= e before)
                             (if (and read-old (not pending?))
                               (read-old e a)
                               (common/preparation-first-v db e a read-old)))]
                   (recur (unchecked-inc index)
-                         (cond
-                           (d/value-equal? (idx/logical-value old) v) out
-                           (nil? old) (conj! out addition)
-                           :else (-> out
-                                     (conj! (idx/retraction e a old tx))
-                                     (conj! addition)))))
+                         (common/emit-transition conj! out old addition)))
                 (persistent! out)))]
         (assoc report
                :db-after (assoc db :max-eid (:max-eid plan) :max-tx tx)

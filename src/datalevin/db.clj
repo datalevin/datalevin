@@ -29,6 +29,8 @@
    [datalevin.db.tx.compile :as txcompile]
    [datalevin.db.tx.plan :as txplan]
    [datalevin.db.tx.execute :as txexec]
+   [datalevin.db.tx.bind :as txbind]
+   [datalevin.db.tx.dynamic :as txdynamic]
    [datalevin.db.tx.prepare :as txprep]
       [datalevin.index :as idx]
    [datalevin.util :as u
@@ -58,7 +60,7 @@
             kv-info]])
   (:import
    [datalevin.datom Datom]
-   [datalevin.db.tx.plan TxPlan MixedOperands MixedAttrInfo]
+   [datalevin.db.tx.plan TxPlan MixedOperands]
    [datalevin.interface IRemoteDB IRemotePrepared IStore]
    [datalevin.storage Store WriteGroup]
    [datalevin.utl LRUCache QueryKey]
@@ -2333,7 +2335,7 @@
 (defn- bind-scalar-entities
   "Attach writer-bound operands/layouts to the adapter-owned representation."
   [db {:keys [entries] :as prepared} store-schema]
-  (when-let [entries (txexec/resolve-scalar-update-entries db entries)]
+  (when-let [entries (txbind/resolve-scalar-update-entries db entries)]
     (assoc prepared :entries entries
            :entity-reads (when (> (count entries) 1)
                            (txcompile/scalar-update-entity-reads store-schema entries)))))
@@ -2354,41 +2356,43 @@
 (defn ^:no-doc prepare-admitted-request
   "Bind admitted operands at their established caller checkpoint. Scalar/blind
   correction retains explicit runtime provenance; patch operands use the pure
-  patch rule. Ownership and old-value reads remain current-writer work."
-  [db forms {:keys [strategy shape-checked? defer-entity-resolution?
+  patch rule. Results carry ::bound-operands? to select the binding adapter.
+  Ownership and old-value reads remain current-writer work."
+  [db forms {:keys [strategy defer-entity-resolution?
                     allow-small-unique? check-unique-avs? entity-kinds]
              :or {check-unique-avs? true}}]
   (case strategy
     :scalar
-    (when (or shape-checked? (txcompile/scalar-update-request? forms))
-      (let [prepare-plan
-            (fn []
-              (let [ctx (binding-context db)]
-                (when-let [entries (txexec/prepare-scalar-operands
-                                    db ctx forms defer-entity-resolution?)]
-                  (let [deferred? (and defer-entity-resolution?
-                                       (some #(not (integer? (first %))) entries))]
-                    (cond-> (assoc (txplan/->TxPlan
-                                     ctx :scalar entries
-                                     (when-not deferred?
-                                       (txcompile/scalar-update-entity-reads (:schema ctx) entries)))
-                                   ::bound-operands? true)
-                      deferred? (assoc :deferred-entity-resolution? true))))))]
-        (if defer-entity-resolution?
-          (prepare-plan)
-          (txcommon/with-lookup-ref-cache db (prepare-plan)))))
+    (let [prepare-plan
+          (fn []
+            (let [ctx (binding-context db)]
+              (when-let [entries (txbind/prepare-scalar-operands
+                                  db ctx forms defer-entity-resolution?)]
+                (let [deferred? (and defer-entity-resolution?
+                                     (some #(not (integer? (first %))) entries))]
+                  (cond-> (assoc (txplan/->TxPlan
+                                   ctx :scalar entries
+                                   (when-not deferred?
+                                     (txcompile/scalar-update-entity-reads (:schema ctx) entries)))
+                                 ::bound-operands? true)
+                    deferred? (assoc :deferred-entity-resolution? true))))))]
+      (if defer-entity-resolution?
+        (prepare-plan)
+        (txcommon/with-lookup-ref-cache db (prepare-plan))))
 
     :blind
-    (when-let [kinds (txexec/blind-entity-kinds forms entity-kinds)]
+    (when-let [kinds (txbind/blind-entity-kinds forms entity-kinds)]
       (let [ctx (binding-context db)]
-        (when-let [operands (txexec/prepare-blind-operands
+        (when-let [operands (txbind/prepare-blind-operands
                              ctx forms allow-small-unique? check-unique-avs? kinds)]
           (let [{:keys [entries identity-upsert-av]} operands]
             (assoc (txplan/map->TxPlan (assoc operands :ctx ctx :strategy :blind))
                    ::bound-operands? true
                    :identity-upsert-read
                    (txcompile/blind-identity-entity-read (:schema ctx) entries identity-upsert-av))))))
-    :patch (txexec/prepare-patch-operands (binding-context db) forms)
+    :patch
+    (when-let [prepared (txbind/prepare-patch-operands (binding-context db) forms)]
+      (assoc prepared ::bound-operands? true))
     nil))
 
 (defn ^:no-doc stamp-prepared-request
@@ -2527,36 +2531,16 @@
          (identical? (nth proof 1) (:tx-data report))
          (identical? (nth proof 0) (schema (:store (:db-after report)))))))
 
-(defn ^:no-doc compiled-storage-attributes
-  "Expose existing logical bindings only within the owned commit scope.
-  Storage receives fresh entries for its existing table, never compiler scratch."
-  [plan]
-  (when (and (instance? TxPlan plan) (identical? :mixed (:strategy plan)))
-    (let [^java.util.HashMap infos (.-infos ^MixedOperands (:entries plan))]
-      [(:schema (:ctx plan))
-       (fn [attr]
-         (when-let [^MixedAttrInfo info (.get infos attr)]
-           (when (.-ordinary? info)
-             (let [props (.-props info)
-                   binding (object-array 4)]
-               (aset binding 0 (:db/aid props))
-               (aset binding 1 (.-storage-type info))
-               (aset binding 2 (:db/noindex props))
-               (aset binding 3 props)
-               binding))))])))
-
-(defn ^:no-doc request-storage-attributes
-  "Use the compiler's metadata-reuse decision only for an owned group whose
-  table needs population. Warm tables and small requests avoid a binding scope."
+(defn ^:no-doc seed-request-storage-attributes!
+  "Apply the compiler's metadata-reuse decision to the existing group table.
+  Seeding copies encoding fields under the current schema epoch; no request
+  cache, dynamic binding or lookup provider is introduced."
   [db plan]
   (when (and txcommon/*batch-prepare* (instance? TxPlan plan)
              (identical? :mixed (:strategy plan))
              (.-storage? ^MixedOperands (:entries plan)))
-    (when-let [^WriteGroup group (s/current-write-group (.-lmdb ^Store (:store db)))]
-      (let [^objects context (.-storage-context group)]
-        (when (or (nil? (aget context 4))
-                  (not (identical? (:schema (:ctx plan)) (aget context 5))))
-          (compiled-storage-attributes plan))))))
+    (s/seed-group-storage-attributes!
+      (:store db) (:schema (:ctx plan)) (.-infos ^MixedOperands (:entries plan)))))
 
 (defn- compiled-report
   [initial report route independent? ctx]
@@ -2573,6 +2557,11 @@
   [report]
   (if txcommon/*batch-prepare*
     report
+    ;; Invariant: :eavt/:avet are transaction/simulation overlays, never the
+    ;; stored indexes in Store. new-db/transfer create empty sets; staging and
+    ;; mark-simulated-tx-cache! populate them only from transaction datoms.
+    ;; Copy size follows retained transaction data, which can itself be large.
+    ;; Copies protect prior DB/report views from in-place clears and retries.
     (let [before (:db-after report)
           after (reduce
                   (fn [view key]
@@ -2584,10 +2573,11 @@
                   before [:eavt :avet])]
       (assoc report :db-after after))))
 
-(defn- execute-compiled-request
+(defn- execute-request-plan
+  "Share execution after the entry adapter has checked plan provenance."
   [initial plan {:keys [owned-max-eid identity-upsert? tx-time] :or {identity-upsert? true}}]
   (if (identical? :dynamic (:strategy plan))
-    (let [report (txexec/execute-dynamic-region (request-execution-report initial) plan tx-time)]
+    (let [report (txdynamic/execute-dynamic-region (request-execution-report initial) plan tx-time)]
       (when *tx-compiler-observer* (*tx-compiler-observer* :execute-dynamic plan))
       (assoc report ::compiled-route :compiled-dynamic))
     (let [db (:db-after initial)
@@ -2626,7 +2616,7 @@
                            (or upsert? (false? (:has-many? plan))) (:ctx plan)))
 
         :ordered
-        (let [report (txexec/execute-ordered-region (request-execution-report initial) plan tx-time)]
+        (let [report (txdynamic/execute-ordered-region (request-execution-report initial) plan tx-time)]
           (when *tx-compiler-observer* (*tx-compiler-observer* :execute-ordered plan))
           (compiled-report initial report :compiled-ordered false (:ctx plan)))
 
@@ -2640,6 +2630,20 @@
           (when *tx-compiler-observer* (*tx-compiler-observer* :execute-mixed plan))
           (compiled-report initial report :mixed-add true (:ctx plan)))
         nil))))
+
+(defn- execute-bound-request
+  "Execute only operand layouts supported by the caller-binding adapter."
+  [initial plan options]
+  (assert (true? (::bound-operands? plan)) "Expected caller-bound transaction operands")
+  (case (:strategy plan)
+    (:scalar :blind :patch) (execute-request-plan initial plan options)
+    (throw (IllegalArgumentException.
+             (str "Unsupported caller-bound transaction strategy: " (:strategy plan))))))
+
+(defn- execute-compiled-request
+  [initial plan options]
+  (assert (not (::bound-operands? plan)) "Caller-bound plan cannot enter the compiler route")
+  (execute-request-plan initial plan options))
 
 (defn- prepare-local-report
   [initial forms tx-time outcome {:keys [stage? route?] :as options}]
@@ -2663,7 +2667,10 @@
                              (*tx-compiler-observer* :prepared selected))
                            selected))))
         prepared (when (instance? TxPlan selected)
-                   (execute-compiled-request initial selected (assoc options :tx-time tx-time)))
+                   (let [options (assoc options :tx-time tx-time)]
+                     (if (::bound-operands? selected)
+                       (execute-bound-request initial selected options)
+                       (execute-compiled-request initial selected options))))
         report (if prepared
                  (if (and stage? (not= :dynamic (:strategy selected)))
                    (txexec/stage-compiled-report! prepared) prepared)
@@ -2671,7 +2678,7 @@
                    (when (and outcome (satisfies? txcommon/ScalarPendingIndex txcommon/*batch-prepare*))
                      (txcommon/materialize-scalar-pending! txcommon/*batch-prepare* db))
                    (let [program (txcompile/compile-program ctx forms)
-                         report (txexec/execute-dynamic-region
+                         report (txdynamic/execute-dynamic-region
                                   (request-execution-report initial) program tx-time)]
                      (when *tx-compiler-observer* (*tx-compiler-observer* :execute-dynamic program))
                      (cond-> report route? (assoc ::compiled-route :compiled-dynamic)))))]

@@ -22,6 +22,31 @@
    [org.eclipse.collections.impl.map.mutable.primitive LongObjectHashMap]
    [org.eclipse.collections.impl.set.sorted.mutable TreeSortedSet]))
 
+(defn emit-transition
+  "Append a normalized, non-nil cardinality-one value and return the output state.
+  append accepts state and one datom (conj, conj! or an array cursor adapter).
+  A supplied addition is retained, including its metadata and transaction ID;
+  otherwise construct it only for a changed value. Prepared old values retain
+  their physical reference on retraction, never on the addition."
+  ([append out old-value ^Datom addition]
+   (emit-transition append out (.-e addition) (.-a addition) old-value
+                    (.-v addition) (d/datom-tx addition) addition nil))
+  ([append out e attr old-value value tx-id]
+   (emit-transition append out e attr old-value value tx-id nil nil))
+  ([append out e attr old-value value tx-id annotations]
+   (emit-transition append out e attr old-value value tx-id nil annotations))
+  ([append out e attr old-value value tx-id addition annotations]
+   (if (and (some? old-value)
+            (d/value-equal? (idx/logical-value old-value) value))
+     out
+     (let [out (if (nil? old-value)
+                 out
+                 (append out (idx/retraction e attr old-value tx-id)))]
+       (append out
+               (or addition
+                   (cond-> (datom e attr value tx-id)
+                     annotations (with-meta annotations))))))))
+
 (def ^:dynamic *batch-prepare* nil)
 
 (def ^:dynamic *resolver-index* nil)

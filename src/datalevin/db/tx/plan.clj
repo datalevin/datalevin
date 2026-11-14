@@ -6,21 +6,16 @@
 
 (defrecord TxPlan [ctx strategy entries entity-reads])
 
-(deftype OrderedOp [op e attr value extra source original])
-
-(deftype OrderedMap [source])
-
-(deftype DeferredOperation [source])
-
-(deftype DatomOperation [source])
-
 (deftype ScalarEntityRead [^objects names ^longs aids])
 
 (deftype BlindEntity [tempid ^FastList attrs])
 
-(deftype MixedAttrInfo
-  [props ^boolean ordinary? ^boolean insert? ^boolean update? tuples ^boolean typed?
-   storage-type])
+(deftype AttrInfo
+  ;; One immutable logical binding; schema props remain the authoritative payload.
+  ;; Eligibility is compiler-owned. Physical storage tables copy encoding fields.
+  [props value-type storage-type tuples
+   ^boolean ordinary? ^boolean insert? ^boolean update? ^boolean typed?
+   blind-kinds ^boolean fuse-blind? ^boolean textual? ^boolean scalar-correction?])
 
 (deftype MixedInsert [tempid ^objects attrs])
 
@@ -28,6 +23,11 @@
 
 (deftype MixedOperands
   [entries infos ^long required-eid ^boolean prepare-reader? ^boolean storage?])
+
+(defn patch-plan
+  "Own one normalized patch entry; source is diagnostic context only."
+  [ctx source e attr operations]
+  (->TxPlan ctx :patch [[e attr operations source]] nil))
 
 (defn scalar-candidate-entries
   "Project owned E/A/value/type scratch into scalar operands. No correction,
