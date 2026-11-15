@@ -16,6 +16,7 @@
             [datalevin.query.source.runtime :as rt]
             [datalevin.query.source.scope :as scope]
             [datalevin.query.source.session :as session]
+            [datalevin.query.source.union-selection :as unions]
             [datalevin.query.source.value :as value :refer [fail!]])
   (:import [java.util IdentityHashMap]))
 
@@ -207,7 +208,7 @@
                       responses (into regular (joins/plan! runtime r by-alias regular))]
                   (assoc r :responses responses :provider-planning-ns (- (System/nanoTime) started)))) regions)
             all-candidates (volatile! [])
-            schedules
+            work
             (mapv (fn [{:keys [region inputs operators requests responses provider-planning-ns]}]
                     (let [candidates
                           (into [] (mapcat (fn [{:keys [request group response]}]
@@ -215,10 +216,14 @@
                                               (mapv #(access/candidate! runtime request % (:consumption group) method)
                                                     (envelope/alternatives runtime response))))) responses)]
                       (vswap! all-candidates into candidates)
-                      (-> (access/schedule! runtime (:region-id region) inputs requests candidates operators
-                                             (assoc (:planning prepared) :required-vars (:required-vars region)))
-                          (assoc :estimation (get estimate-work (:region-id region)))
-                          (update :planning-time-ms + (/ (double provider-planning-ns) 1000000.0))))) responses)]
+                      {:region region :inputs inputs :requests requests :candidates candidates
+                       :operators operators :provider-planning-ns provider-planning-ns})) responses)
+            schedules
+            (mapv (fn [schedule w]
+                    (-> schedule
+                        (assoc :estimation (get estimate-work (:region-id schedule)))
+                        (update :planning-time-ms + (/ (double (:provider-planning-ns w)) 1000000.0))))
+                  (unions/select! runtime work (:planning prepared)) work)]
         ;; A scoped workspace can be the first user of dependent access.
         ;; Its temporary cleanup must not close the invocation's shared IDs.
         (when (some #(seq (get-in % [:path :options :requires])) (mapcat :plans schedules))

@@ -5,6 +5,7 @@
             [datalevin.datom :as datom]
             [datalevin.db :as db]
             [datalevin.db.tx.compile :as compile]
+            [datalevin.db.tx.execute :as execute]
             [datalevin.test.core :refer [db-fixture]]))
 
 (use-fixtures :each db-fixture)
@@ -87,9 +88,11 @@
               dynamic-events (atom [])
               metadata {:source :bound-patch}
               options {:stage? false :route? true :owned-max-eid (:max-eid @tx)}
+              initial (assoc (db/->TxReport @tx @tx [] {} metadata)
+                             ::execute/max-eid-before (:max-eid @tx))
               _ (is (zero? @demands))
               report (binding [db/*tx-compiler-observer* #(swap! events conj [%1 %2])]
-                       (db/prepare-local-tx-data @tx forms metadata 0 plan nil options))
+                       (db/prepare-local-tx-data @tx forms metadata 0 plan initial options))
               dynamic-report
               (binding [db/*tx-compiler-observer* (fn [event _] (swap! dynamic-events conj event))]
                 (db/prepare-local-tx-data @tx forms metadata 0
@@ -101,6 +104,8 @@
           (is (= [:execute-patch] (mapv first @events)))
           (is (identical? plan (second (first @events))))
           (is (= :patch-idoc (db/compiled-request-route report)))
+          (is (not (contains? report ::execute/max-eid-before)))
+          (is (= (:max-eid @tx) (::execute/max-eid-before initial)))
           (is (= [:execute-dynamic] @dynamic-events))
           (is (= :compiled-dynamic (db/compiled-request-route dynamic-report)))
           (is (= (datoms dynamic-report) (datoms report)))

@@ -198,7 +198,7 @@
   (let [context (assoc-in ctx [:schema :tuple]
                   {:db/aid 7 :db/valueType :db.type/tuple :db/tupleType :db.type/long})
         value [(int 1) 2] p (compile-stage2 context [(datom/datom 1 :tuple value)])]
-    (is (= :scalar-aliases (:strategy p)))
+    (is (= :scalar (:strategy p)))
     (is (identical? value (nth (first (:entries p)) 2)))))
 
 (deftest scalar-rules-decline-supplied-transaction-slots
@@ -641,6 +641,9 @@
                    [(with-meta {:value 1} {:source true})]
                    (with-meta [{:value 1}] {:source true})]]
       (is (nil? (compile/compile-blind-region ctx forms))))
+    ;; Caller options cannot opt a pure probe into runtime operand handling.
+    (is (nil? (compile/compile-blind-region ctx [{:text host}]
+                                          {:caller-bound? true :allow-small-unique? true})))
     (is (empty? @calls))))
 
 (def ^:private many-ctx
@@ -734,7 +737,7 @@
   (let [plan (compile/compile-blind-region many-ctx [{:value 1 :numbers []}])]
     (is (false? (:has-many? plan)))))
 
-(deftest unique-proofs-preserve-eager-deferred-and-fusion-decisions
+(deftest unique-proofs-are-required-for-eager-deferred-and-fused-inserts
   (doseq [check? [false true]]
     (let [plan (compile/compile-blind-region many-ctx [{:token "one" :numbers [1 1 2]}]
                  {:check-unique-avs? check?})]
@@ -743,9 +746,8 @@
       (is (true? (:has-many? plan)))
       (is (true? (:fuse-unique-inserts? plan)))))
   (is (nil? (compile/compile-blind-region many-ctx [{:token "one"} {:token "one"}])))
-  (is (instance? TxPlan
-                 (compile/compile-blind-region many-ctx [{:token "one"} {:token "one"}]
-                   {:check-unique-avs? false})))
+  (is (nil? (compile/compile-blind-region many-ctx [{:token "one"} {:token "one"}]
+              {:check-unique-avs? false})))
   (is (nil? (compile/compile-blind-region many-ctx
               [{:token "one" :unindexed 1} {:token "one"}] {:check-unique-avs? false})))
   (doseq [check? [false true]]
@@ -757,6 +759,28 @@
     (is (true? (:independent-identity-upserts? plan)))
     (is (nil? (:identity-upsert-read plan))))
   (is (nil? (compile/compile-blind-region many-ctx [{:identity "one"}]))))
+
+(deftest unique-av-proofs-use-storage-equivalence-without-changing-values
+  (let [timestamp (doto (java.sql.Timestamp. 1000) (.setNanos 123456))
+        date (java.util.Date. 1000)
+        avs #(FastList/newList ^java.util.Collection %)]
+    (is (compile/blind-unique-avs-distinct? nil))
+    (doseq [values [[[:time date] [:time timestamp]]
+                   [[:time timestamp] [:time date]]
+                   [[:decimal 1.00M] [:decimal 1.0M]]]]
+      (is (false? (compile/blind-unique-avs-distinct? (avs values)))))
+    (is (compile/blind-unique-avs-distinct?
+          (avs [[:first date] [:second timestamp]])))
+    (is (compile/blind-unique-avs-distinct?
+          (avs [[:time date] [:time (java.util.Date. 1001)]])))
+    (is (= 123456 (.getNanos timestamp)))
+    (is (= 1000 (.getTime date)))
+    (let [context (prepare/->PrepareCtx
+                    {:time {:db/aid 1 :db/valueType :db.type/instant
+                            :db/unique :db.unique/value}} {} {})]
+      (doseq [check? [false true] values [[date timestamp] [timestamp date]]]
+        (is (nil? (compile/compile-blind-region context (mapv #(hash-map :time %) values)
+                    {:check-unique-avs? check?})))))))
 
 (deftest many-and-unique-lookahead-does-not-invoke-host-code
   (let [calls (atom [])
@@ -800,9 +824,8 @@
       (is (nil? (compile/compile-blind-region context [{:unique-many [1 1.9]}]
                   {:allow-small-unique? true :check-unique-avs? check?}))))
     (is (nil? (compile/compile-blind-region context [{:token 42} {:token "42"}])))
-    (is (instance? TxPlan
-          (compile/compile-blind-region context [{:token 42} {:token "42"}]
-            {:check-unique-avs? false})))
+    (is (nil? (compile/compile-blind-region context [{:token 42} {:token "42"}]
+                {:check-unique-avs? false})))
     (is (nil? (compile/compile-blind-region context
                 [{:token 42 :unindexed 1} {:token "42"}] {:check-unique-avs? false})))
     (doseq [length [100 101]]

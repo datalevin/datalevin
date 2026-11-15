@@ -641,11 +641,8 @@
 
 (defn- prepare-classified-blind-tx
   [db tx-data allow-small-unique? check-unique-avs?]
-  (or (db/prepare-compiled-request db tx-data
-        {:allow-small-unique? allow-small-unique? :check-unique-avs? check-unique-avs?})
-      (db/prepare-admitted-request db tx-data
-        {:strategy :blind :allow-small-unique? allow-small-unique?
-         :check-unique-avs? check-unique-avs?})))
+  (db/prepare-classified-blind-request db tx-data
+    {:allow-small-unique? allow-small-unique? :check-unique-avs? check-unique-avs?}))
 
 (declare transact-local-in-native-txn!)
 
@@ -837,17 +834,20 @@
 
 (defn- commit-blind-insert!
   [db prepared tx-meta fuse-unique?]
-  (if (and fuse-unique? (:fuse-unique-inserts? prepared))
-    (try
-      (commit-writing-report! db (db/stamp-prepared-request db prepared tx-meta)
-                             true :blind-insert false true)
-      (catch Exception e
-        (when-not (and (l/blind-unique-collision? e)
-                       (:unique-inserts-rolled-back? (ex-data e)))
-          (throw e))))
-    (when (db/blind-local-tx-unique-values-absent? db prepared)
-      (commit-writing-report! db (db/stamp-prepared-request db prepared tx-meta)
-                             true :blind-insert (false? (:has-many? prepared)) false))))
+  ;; Recheck the plan before either commit route, including fused writes that
+  ;; intentionally defer native-owner probes. Intra-request AVs must be distinct.
+  (when (db/blind-local-tx-valid? db prepared)
+    (if (and fuse-unique? (:fuse-unique-inserts? prepared))
+      (try
+        (commit-writing-report! db (db/stamp-prepared-request db prepared tx-meta)
+                               true :blind-insert false true)
+        (catch Exception e
+          (when-not (and (l/blind-unique-collision? e)
+                         (:unique-inserts-rolled-back? (ex-data e)))
+            (throw e))))
+      (when (db/blind-local-tx-unique-values-absent? db prepared)
+        (commit-writing-report! db (db/stamp-prepared-request db prepared tx-meta)
+                               true :blind-insert (false? (:has-many? prepared)) false)))))
 
 (defn- execute-local-request!
   [^DB db tx-data tx-meta outcome fuse-unique?]
@@ -880,13 +880,15 @@
    (let [fuse-unique? (and (not (:client-op/id tx-meta))
                            (or txcommon/*batch-prepare*
                                (s/current-write-group (.-lmdb ^Store (:store db)))))
-         outcome (or outcome (db/prepare-compiled-request db tx-data)
+         kind (or kind (when-not outcome (txcompile/literal-request-shape tx-data)))
+         outcome (or outcome
+                     (if (identical? kind :blind)
+                       (prepare-classified-blind-tx db tx-data true (not fuse-unique?))
+                       (db/prepare-compiled-request db tx-data))
                      ;; Bind operands at their admitted checkpoint, then use
                      ;; the same compiler hook. Implicit-ID and correction
                      ;; timing belong to binding, not a second execution route.
-                     (case (or kind (txcompile/literal-request-shape tx-data))
-                       :blind
-                       (prepare-classified-blind-tx db tx-data true (not fuse-unique?))
+                     (case kind
                        (:scalar :scalar-operations :scalar-aliases)
                        (db/prepare-admitted-request db tx-data {:strategy :scalar})
                        :patch

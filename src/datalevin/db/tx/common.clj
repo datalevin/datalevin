@@ -109,7 +109,7 @@
        (.put attrs (.-a datom) datom)
        (when (:db/unique props)
          (.put ^HashMap (pending-unique-index *batch-prepare*)
-               [(.-a datom) (.-v datom)] datom)))
+               (plan/unique-av-key [(.-a datom) (.-v datom)]) datom)))
      (let [^TreeSortedSet eavt (:eavt db)
            ^TreeSortedSet avet (:avet db)
            ^SortedSet cached (.subSet eavt
@@ -209,7 +209,7 @@
   ([db a v]
    (if-let [^HashMap pending (when (scalar-pending-index)
                               (pending-unique-index *batch-prepare*))]
-     (if-let [^Datom datom (.get pending [a v])]
+     (if-let [^Datom datom (.get pending (plan/unique-av-key [a v]))]
        (when (d/datom-added datom) (.-e datom))
        (i/av-first-e (:store db) a v))
      (if (resolver-index-active? db)
@@ -219,7 +219,7 @@
   ([db a v stored-eid]
    (if-let [^HashMap pending (when (scalar-pending-index)
                               (pending-unique-index *batch-prepare*))]
-     (if-let [^Datom datom (.get pending [a v])]
+     (if-let [^Datom datom (.get pending (plan/unique-av-key [a v]))]
        (when (d/datom-added datom) (.-e datom))
        stored-eid)
      (if (resolver-index-active? db)

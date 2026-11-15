@@ -485,6 +485,49 @@
     (mapv #(or (when (contains? required %) (schema %)) (actual %) (schema %) (column % :data true))
       (canonical needed check!))))
 
+(defn- conditional-union
+  "Capture optional typed interfaces for a flat positive external union.
+  Potential caller outputs are alternatives, never seeds. The selected
+  dependency schedule must supply every chosen key before execution."
+  [runtime check! compiled parent site boundary branch-outputs run-region]
+  (let [root (nth (:regions compiled) parent)
+        ids (mapv child-id (:branches site))
+        children (mapv #(nth (:regions compiled) %) ids)
+        peers (filterv #(= parent (:parent-region %)) (:sites compiled))
+        constant? (fn [{:keys [node]}]
+                    (and (instance? Function node)
+                         (#{'ground 'identity} (get-in node [:fn :symbol]))
+                         (= 1 (count (:args node)))
+                         (instance? Constant (first (:args node)))
+                         (some? (:value (first (:args node))))))
+        eligible? (and (empty? (:path root)) (empty? (:core-clauses root))
+                       (every? #(= :union (:kind %)) peers)
+                       (= :union (:kind site)) (empty? (:inputs boundary))
+                       (empty? (:required-inputs site)) (<= 1 (count ids) 8)
+                       (not-any? #(some #{(:parent-region %)} ids) (:sites compiled))
+                       (every? #(and (seq (:patterns %))
+                                     (= 1 (count (set (map :source-symbol (:patterns %)))))
+                                     (every? constant? (:core-clauses %))) children))]
+    (when eligible?
+      (let [outside (into (into (:input-vars root) (mapcat #(map :variable (:columns %))) (:patterns root))
+                          (mapcat :exports) (remove #(= (:path %) (:path site)) peers))
+            keys (into []
+                   (keep (fn [v]
+                           (let [columns (mapv #(some (fn [c] (when (= v (:variable c)) c))
+                                                     (mapcat :columns (:patterns %))) children)
+                                 c (first columns)]
+                             (when (and (contains? outside v) (every? some? columns)
+                                        (not= :data (:type c))
+                                        (every? #(= (:type c) (:type %)) columns))
+                               (assoc c :nullable? false)))))
+                   (canonical (:exports site) check!))]
+        (when (<= 1 (count keys) 3)
+          {:columns keys :branches ids
+           :build (fn [inputs]
+                    (let [b (scope/interfaces! runtime compiled (:site-index boundary) inputs branch-outputs)]
+                      {:inputs (:inputs b) :step (scope-factory runtime check! b run-region)
+                       :branches (mapv #(select-keys % [:region-id :inputs]) (:branches b))}))})))))
+
 (defrecord ^:private Program [runtime compilation planned root input regions state runner])
 
 (defn- operator-description [compiled native-specs region-id paths index {:keys [kind value]} inputs outputs]
@@ -502,6 +545,7 @@
                                              :else (:kind site)))
              :inputs inputs :outputs outputs}
       (= :core kind) (assoc :core-id (:id value) :path path)
+      (:union-estimate value) (assoc :binding-inputs (:binding-inputs value))
       (= :access kind) (assoc :source (:source-symbol options) :alternative-id (:alternative-id options)
                              :covers (:covers options))
       (or (instance? Function node) (instance? Predicate node)) (assoc :function (get-in node [:fn :symbol])))))
@@ -737,7 +781,10 @@
                                                 (negation-factory runtime check!
                                                   {:requires (:inputs boundary) :program program})))
                                         (add! (:path site) (:inputs boundary) (:columns boundary)
-                                              (scope-factory runtime check! boundary run-region)))))
+                                              (assoc (scope-factory runtime check! boundary run-region)
+                                                :conditional-union
+                                                (conditional-union runtime check! compiled id site boundary
+                                                  branch-outputs run-region))))))
                                   (swap! interfaces assoc id {:inputs inputs :operators @operators :core @core})))]
                         (when (:live? (nth (:regions compiled) root)) (region! root root-columns))
                         (vreset! tables @interfaces)
@@ -756,7 +803,7 @@
           executable
           (into {}
                 (map (fn [schedule]
-                       (let [id (:region-id schedule) inputs (get-in @tables [id :inputs])
+                       (let [id (:region-id schedule) inputs (or (:input-columns schedule) (get-in @tables [id :inputs]))
                              operators (:operators schedule)
                              _ (retain! runtime (reserve! runtime 0
                                                   (+ 2048 (* 512 (reduce + (count operators)

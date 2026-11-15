@@ -943,8 +943,8 @@
         report entity))))
 
 (defn- execute-map-operation
-  "Expand a normalized map template or a demanded compatibility map through the
-  same allocation/upsert worker. All generated work stays in the current cursor."
+  "Expand a demanded map through allocation and upsert resolution.
+  All generated work stays in the current cursor."
   [initial-report report entity entities initial-es tx-time context ordinary? implicit-ids?]
   (let [db (:db-after report) schema (:schema @context)]
     (if (or ordinary? (regular-map? schema entity))
@@ -1276,8 +1276,8 @@
       (compile/ordinary-addition-flags
         ctx entity implicit-ids?
         (and plain-map? (txprep/auto-tempid? (:db/id entity))))
-      ;; Retain the legacy driver's metadata access on an unsupported demanded
-      ;; form. Pure analysis never invokes a host IMeta implementation.
+      ;; Preserve metadata access on an unsupported form at its demand checkpoint.
+      ;; Pure compiler analysis never invokes a host IMeta implementation.
       (let [_ (meta entity)] nil))))
 
 (defn- distinct-ordinary-eas?
@@ -1369,7 +1369,7 @@
           late?)))))
 
 (defn- bind-flat-upsert-forms
-  "Retain compatibility sequence demand and eligibility without native reads.
+  "Preserve sequence demand and eligibility without native reads.
   Shared compiler form proofs determine stored-owner and syntax eligibility."
   [entities ctx]
   ;; :db/ident is implicit, but db-namespaced keys cannot enter this flat

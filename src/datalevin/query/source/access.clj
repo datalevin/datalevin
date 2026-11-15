@@ -230,9 +230,40 @@
 (defn- elapsed-cost [plan tuples limits now max-age]
   (let [e (:advisory-estimate plan) o (options plan) dependent? (seq (:requires o))
         batch (min (:binding-rows limits)
-                   (get-in o [:constraints :max-binding-rows] (:binding-rows limits)))]
+                   (get-in o [:capture :alternative :constraints :max-binding-rows] (:binding-rows limits)))]
     (when (zero? (long (first (cardinality-key plan now max-age))))
       (join-cost/access-time e tuples batch dependent?))))
+
+(defn repeatable-estimate
+  "Borrow fresh advisory quantities for a repeatable, stable branch access.
+  This does not grant an open or infer completeness from a row estimate."
+  [runtime plan planning]
+  (let [o (options plan)
+        p (permissions/planning-permission (:consumption o) (get-in o [:capture :alternative]))
+        [unknown rows] (cardinality-key plan (System/currentTimeMillis)
+                        (get planning :estimate-max-age-ms 300000))]
+    (when (and (zero? (long unknown)) (= :many (:opens p))
+               (= :identical (get-in o [:capture :alternative :properties :replay])))
+      {:rows rows :estimate (:advisory-estimate plan) :dependent? (boolean (seq (:requires o)))
+       :batch (min (:binding-rows (control/limits (:control runtime)))
+                   (get-in o [:capture :alternative :constraints :max-binding-rows]
+                     (:binding-rows (control/limits (:control runtime)))))})))
+
+(defn price-schedule
+  "Price a previously validated schedule without provider callbacks or rows."
+  [runtime schedule planning]
+  (let [now (System/currentTimeMillis)
+        max-age (get planning :estimate-max-age-ms 300000)
+        choices (mapv (fn [{:keys [kind value] :as choice}]
+                        (let [o (if (= :access kind) (options value) value)]
+                          (assoc choice :requires (:requires o) :columns (:columns o)))) (:operators schedule))]
+    (join-cost/price choices (:input-columns schedule)
+      (fn [plan] (let [[unknown rows] (cardinality-key plan now max-age)]
+                   (when (zero? (long unknown)) rows)))
+      (when (not= :cardinality (:cost-model planning))
+        {:access-cost #(elapsed-cost %1 %2 (control/limits (:control runtime)) now max-age)
+         :local-row-ns (get planning :local-row-ns 1000)
+         :local-column-ns (get planning :local-column-ns 250)}))))
 
 (defrecord ^:private CoreOperator [owner region-id id requires columns after step])
 
@@ -455,7 +486,11 @@
                                    :requires (:requires operator) :columns (:columns operator)
                                    :after (:after operator) :resources #{}})
              ordered-core (sort-by :id operators)
-             choices (into (mapv core-choice (remove deferred? ordered-core))
+             conditional (filterv :union-alternatives ordered-core)
+             ordinary (remove :union-alternatives ordered-core)
+             choices (into (mapv core-choice (remove deferred? ordinary))
+                           (concat (mapcat #(map core-choice (sort-by (comp - count :requires)
+                                                              (filter (comp seq :requires) (:union-alternatives %)))) conditional)
                            (concat (map (fn [plan]
                                   (let [o (options plan) p (:permission o)]
                                     {:kind :access :value plan :covers (work-keys plan)
@@ -463,7 +498,8 @@
                                      :requires (:requires o) :columns (:columns o) :after #{}
                                      :resources (if (= :once (:opens p)) #{(:resource p)} #{})
                                      :unavailable? (and (= :once (:opens p)) (:spent? p))})) candidates)
-                                   (map core-choice (sort-by #(get ranks (:id %)) (filter deferred? ordered-core)))))
+                                   (mapcat #(map core-choice (remove (comp seq :requires) (:union-alternatives %))) conditional)
+                                   (map core-choice (sort-by #(get ranks (:id %)) (filter deferred? ordinary))))))
              result (join-cost/select {:inputs input-columns :required-work required
                                           :required-vars live-vars :choices choices
                                           :check! check! :reserve! own-work! :max-states search-bound}
@@ -582,7 +618,7 @@
                                     :bytes (min (long (:binding-bytes (control/limits ctl)))
                                                 (long (get-in alternative [:constraints :max-binding-bytes])))}))))) plans)
             result (assoc (select-keys schedule [:region-id :policy :selection
-                                                 :estimated-access-ns :fallback-reasons :planning-time-ms :estimation :join-cost :cost-search]) :steps steps)]
+                                                 :estimated-access-ns :fallback-reasons :planning-time-ms :estimation :join-cost :cost-search :union-selection]) :steps steps)]
         (rt/own! runtime #(control/release! token))
         result)
       (catch Throwable e (control/release! token) (throw e)))))

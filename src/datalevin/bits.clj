@@ -397,7 +397,7 @@
 (defn- put-instant
   [^ByteBuffer bf x]
   (.putLong bf (code-instant
-                 (if (inst? x)
+                 (if (u/instant? x)
                    (inst-ms x)
                    (raise "Expect an inst? value" {:value x})))))
 
@@ -1377,7 +1377,7 @@
       (:db.type/keyword :keyword) (keyword? x)
       (:db.type/symbol :symbol)   (symbol? x)
       (:db.type/boolean :boolean) (boolean? x)
-      (:db.type/instant :instant) (inst? x)
+      (:db.type/instant :instant) (u/instant? x)
       (:db.type/uuid :uuid)       (uuid? x)
       :db.type/tuple              (vector? x)
       true)

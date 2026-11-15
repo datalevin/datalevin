@@ -60,7 +60,7 @@
             kv-info]])
   (:import
    [datalevin.datom Datom]
-   [datalevin.db.tx.plan TxPlan MixedOperands]
+   [datalevin.db.tx.plan TxPlan MixedOperands BlindTemplate]
    [datalevin.interface IRemoteDB IRemotePrepared IStore]
    [datalevin.storage Store WriteGroup]
    [datalevin.utl LRUCache QueryKey]
@@ -2283,7 +2283,8 @@
   (let [store (.-store db)]
     (and (identical? :blind (:strategy prepared))
          (identical? (:schema (:ctx prepared)) (schema store))
-         (identical? (:opts (:ctx prepared)) (opts store)))))
+         (identical? (:opts (:ctx prepared)) (opts store))
+         (txcompile/blind-unique-avs-distinct? (:unique-avs prepared)))))
 
 (defn ^:no-doc stamp-blind-local-upsert-tx
   "Reuse a collided blind batch's normalized scalar values. Independent maps
@@ -2381,15 +2382,12 @@
         (txcommon/with-lookup-ref-cache db (prepare-plan))))
 
     :blind
-    (when-let [kinds (txbind/blind-entity-kinds forms entity-kinds)]
+    (when (txbind/blind-entity-kinds forms entity-kinds)
       (let [ctx (binding-context db)]
-        (when-let [operands (txbind/prepare-blind-operands
-                             ctx forms allow-small-unique? check-unique-avs? kinds)]
-          (let [{:keys [entries identity-upsert-av]} operands]
-            (assoc (txplan/map->TxPlan (assoc operands :ctx ctx :strategy :blind))
-                   ::bound-operands? true
-                   :identity-upsert-read
-                   (txcompile/blind-identity-entity-read (:schema ctx) entries identity-upsert-av))))))
+        (when-let [template (txcompile/compile-blind-template
+                             ctx forms {:caller-bound? true :allow-small-unique? allow-small-unique?})]
+          (when-let [prepared (txbind/bind-blind-operands template check-unique-avs?)]
+            (assoc prepared ::bound-operands? true)))))
     :patch
     (when-let [prepared (txbind/prepare-patch-operands (binding-context db) forms)]
       (assoc prepared ::bound-operands? true))
@@ -2509,6 +2507,33 @@
                      (#{:scalar :scalar-operations :scalar-aliases :explicit-additions} shape)))
         (successful-compiled-request db forms shape {:ordered? false})))))
 
+(defn ^:no-doc prepare-classified-blind-request
+  "Prepare an admitted blind request without a failed literal probe followed by
+  another operand walk. Canonical input still produces a literal plan; runtime
+  values bind the collected template. Other families retain normal selection."
+  [db forms {:keys [allow-small-unique? check-unique-avs? ordered?]
+             :or {allow-small-unique? true check-unique-avs? true ordered? true}}]
+  (let [options {:allow-small-unique? allow-small-unique?
+                 :check-unique-avs? check-unique-avs? :ordered? ordered?}
+        attempted? (and (instance? Store (:store db))
+                        (identical? :blind (txcompile/literal-request-shape forms)))
+        candidate (when attempted?
+                    (txcompile/compile-blind-preparation
+                      (prepare/make-prepare-ctx db) forms (assoc options :request-shape :blind)))]
+    (cond
+      (instance? TxPlan candidate)
+      (do (when *tx-compiler-observer* (*tx-compiler-observer* :prepared candidate))
+          candidate)
+      (instance? BlindTemplate candidate)
+      (when-let [prepared (txbind/bind-blind-operands candidate check-unique-avs?)]
+        (assoc prepared ::bound-operands? true))
+      candidate (throw (IllegalStateException. "Unexpected blind preparation result"))
+      ;; Family selection already ran under this same context. Do not repeat
+      ;; it before the ordinary caller-binding compatibility path.
+      attempted? (prepare-admitted-request db forms (assoc options :strategy :blind))
+      :else (or (prepare-compiled-request db forms options)
+                (prepare-admitted-request db forms (assoc options :strategy :blind))))))
+
 (def ^:private fresh-request-keys
   #{:db-before :db-after :tx-data :tempids :tx-meta ::txexec/max-eid-before})
 
@@ -2623,7 +2648,7 @@
         :patch
         (when-let [report (txexec/execute-patch-region initial plan)]
           (when *tx-compiler-observer* (*tx-compiler-observer* :execute-patch plan))
-          (assoc report ::compiled-route :patch-idoc))
+          (compiled-report initial report :patch-idoc false (:ctx plan)))
 
         :mixed
         (when-let [report (txadd/execute-additions initial plan before)]

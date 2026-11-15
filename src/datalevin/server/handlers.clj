@@ -1657,7 +1657,7 @@
     ;; Retain the writer retry for binding failures, but surface unexpected
     ;; compiler failures instead of treating them as ordinary plan declines.
     (catch Exception e
-      (log/warn e "Server transaction preparation failed; retrying under the writer")
+      (log/warn e "Server transaction preparation failed; falling back to recompilation under the writer")
       nil)))
 
 (defn- execute-compiled-request!

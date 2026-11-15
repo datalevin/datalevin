@@ -1,7 +1,8 @@
 ;; Copyright (c) Huahai Yang. All rights reserved.
 ;; Distributed under the Eclipse Public License 2.0.
 (ns ^:no-doc datalevin.db.tx.compile
-  "Pure transaction analysis. No database, writer, entity allocation or pending view."
+  "Transaction analysis and owned operand lowering. compile-tx is a pure probe:
+  no database, writer, entity allocation, pending view or runtime callbacks."
   (:require [datalevin.bits :as b]
             [datalevin.custom-datalog :as cd]
             [datalevin.datom :as d]
@@ -9,19 +10,24 @@
             [datalevin.index :as idx]
             [datalevin.prepare :as prepare])
   (:import [datalevin.datom Datom]
-           [datalevin.db.tx.plan BlindEntity AttrInfo MixedInsert MixedOperands MixedUpdate
-            ScalarEntityRead]
+           [datalevin.db.tx.plan AttrInfo BlindEntity BlindSource BlindTemplate
+            MixedInsert MixedOperands MixedUpdate ScalarEntityRead]
            [datalevin.utl QueryKey$EquivSet QueryKey$KeySet]
            [clojure.lang MapEntry]
-           [java.util ArrayList HashMap HashSet Set]
+           [java.util ArrayList Collection HashMap HashSet Set]
            [org.eclipse.collections.api.block HashingStrategy]
            [org.eclipse.collections.impl.set.strategy.mutable UnifiedSetWithHashingStrategy]
+           [org.eclipse.collections.impl.set.mutable.primitive LongHashSet]
            [org.eclipse.collections.impl.list.mutable FastList]))
 
 (def ^:private ordinary-scalar-types
   #{nil :db.type/long :db.type/string :db.type/keyword :db.type/symbol
     :db.type/float :db.type/double :db.type/boolean :db.type/instant
     :db.type/uuid :db.type/bytes :db.type/bigint :db.type/bigdec})
+
+(def operand-decline
+  "Private binding result, distinct from every possible user value."
+  (Object.))
 
 (def ^:private ordinary-unique-types
   #{:db.type/boolean :db.type/instant :db.type/keyword :db.type/long
@@ -103,7 +109,8 @@
                (map? vt) (#{:db.type/vec :db.type/idoc :data} vt)))
       (boolean (#{:db.type/string :db.type/keyword :db.type/symbol} vt))
       (not (or (cd/custom-type? vt) (map? vt)
-               (identical? vt :db.type/idoc) (identical? vt :db.type/tuple))))))
+               (identical? vt :db.type/idoc) (identical? vt :db.type/tuple)))
+      nil)))
 
 (defn attribute-info!
   "Bind an attribute once in the plan's owned metadata table. No value work."
@@ -159,6 +166,17 @@
 
     true))
 
+(defn blind-unique-avs-distinct?
+  "Prove request-local uniqueness independently of native insert enforcement.
+  Match blind-value-set's instant and numeric equivalence without changing AVs."
+  [^FastList avs]
+  (or (nil? avs) (<= (.size avs) 1)
+      (let [seen (QueryKey$EquivSet.)]
+        (loop [index 0]
+          (or (= index (.size avs))
+              (and (.add seen (plan/unique-av-key (.get avs index)))
+                   (recur (unchecked-inc index))))))))
+
 (defn- collect-blind-unique-value!
   [^FastList unique-avs seen-avs set-capacity fuse-unique-inserts? ^AttrInfo info attr value]
   (let [unique? (some? (:db/unique (.-props info)))
@@ -169,23 +187,12 @@
                  (and seen-avs
                       (let [^HashSet seen (or @seen-avs
                                              (vreset! seen-avs (HashSet. (int set-capacity))))]
-                        (not (.add seen av))))))
+                        (not (.add seen (plan/unique-av-key av)))))))
       false
       (do
         (when-not inline? (vreset! fuse-unique-inserts? false))
         (when av (.add unique-avs av))
         true))))
-
-(defn append-blind-canonical-value!
-  "Collect a normalized value and its unique AV using request-owned scratch."
-  [^FastList attrs ^FastList unique-avs seen-avs set-capacity
-   fuse-unique-inserts? ^AttrInfo info attr value]
-  (if (collect-blind-unique-value!
-        unique-avs seen-avs set-capacity fuse-unique-inserts? info attr value)
-    (do (.add attrs attr)
-        (.add attrs value)
-        true)
-    false))
 
 (def ^:private instant-hashing-strategy
   ;; Storage keys retain milliseconds, unlike asymmetric Date/Timestamp
@@ -283,15 +290,95 @@
                          (plan/resolved-positive-ref? value))))
        info))))
 
+(def ^:private scalar-aliases-marker (Object.))
+
+(defn- distinct-scalar-entity!
+  "Prove E/A distinctness in compiler-owned scratch. Numeric IDs use primitive
+  sets; symbolic operands retain their original pair hashing. Caller binding
+  keeps its own existing HashSet proof."
+  [^HashMap seen e attr]
+  (if (instance? Long e)
+    (let [owners (.get seen attr)]
+      (cond
+        (nil? owners) (do (.put seen attr e) true)
+        (instance? LongHashSet owners) (.add ^LongHashSet owners (long e))
+        (== (long owners) (long e)) false
+        :else (do (.put seen attr (doto (LongHashSet.)
+                                   (.add (long owners)) (.add (long e))))
+                  true)))
+    (let [^HashSet aliases (or (.get seen scalar-aliases-marker)
+                               (let [aliases (HashSet.)]
+                                 (.put seen scalar-aliases-marker aliases) aliases))]
+      (.add aliases [e attr]))))
+
+(defn- scalar-distinct-count
+  "Count a proven raw prefix only when later operands require materialization."
+  [seen]
+  (cond
+    (nil? seen) 0
+    (instance? HashMap seen)
+    (reduce (fn [n owners]
+              (+ (long n) (if (instance? LongHashSet owners)
+                            (.size ^LongHashSet owners)
+                            (if (instance? HashSet owners) (.size ^HashSet owners) 1))))
+            0 (.values ^HashMap seen))
+    :else (.size ^HashSet seen)))
+
 (defn append-scalar-candidate!
   "Append one raw operand after eligibility and optional distinctness checks."
-  [^FastList candidates ^java.util.HashSet seen e attr value vt]
-  (when (or (nil? seen) (.add seen [e attr]))
-    (.add candidates e)
-    (.add candidates attr)
-    (.add candidates value)
-    (.add candidates vt)
+  [^FastList candidates seen e attr value vt]
+  (when (or (nil? seen)
+            (if (instance? HashMap seen) (distinct-scalar-entity! seen e attr)
+                (.add ^HashSet seen [e attr])))
+    (when candidates
+      (.add candidates e)
+      (.add candidates attr)
+      (.add candidates value)
+      (.add candidates vt))
     e))
+
+(defn collect-scalar-candidates
+  "Compile scalar source structure into owned correction operands. Entity and
+  attribute policies are explicit so caller binding preserves its demand/ID
+  checkpoints without maintaining a second source walker."
+  ([forms map-form? map-entity map-ready? append!]
+   (collect-scalar-candidates forms map-form? map-entity map-ready? append! nil))
+  ([forms map-form? map-entity map-ready? append! capacity]
+   (collect-scalar-candidates forms map-form? map-entity map-ready? append! capacity nil))
+  ([forms map-form? map-entity map-ready? append! capacity seen]
+   (let [candidates (FastList. (int (or capacity
+                                      (* 4 (if (and (counted? forms) (instance? Collection forms))
+                                             (.size ^Collection forms) 0)))))
+         forms (seq forms)]
+     (when forms
+       (loop [es forms seen seen]
+         (if es
+           (let [form (first es)]
+             (cond
+               (and (map-form? form) (nil? (meta form)) (> (count form) 1))
+               (when-let [e (map-entity (:db/id form))]
+                 (let [remaining (next es)
+                       ;; One map already has distinct attribute keys.
+                       seen (or seen (when remaining (HashSet.)))]
+                   (when (and (map-ready? e)
+                              (reduce-kv
+                                (fn [_ attr value]
+                                  (if (or (identical? attr :db/id)
+                                          (and (keyword? attr) (pos? (count (name attr)))
+                                               (not (plan/reverse-ref-attr? attr))
+                                               (append! candidates seen e attr value true)))
+                                    true (reduced false)))
+                                true form))
+                     (recur remaining seen))))
+
+               (and (sequential? form) (nil? (meta form)) (= 4 (count form))
+                    (identical? :db/add (nth form 0)))
+               (let [remaining (next es) [_ e attr value] form]
+                 (when-let [eid (append! candidates seen e attr value false)]
+                   (recur remaining (or seen (when remaining (doto (HashSet.) (.add [eid attr])))))))
+
+               :else nil))
+           candidates))))))
 
 (def ^:const scalar-entity-read-min-attrs 8)
 
@@ -445,7 +532,7 @@
          (plan/resolved-positive-ref? e))))
 
 (defn ordinary-analysis-enabled?
-  "Whether the captured context permits the interpreter's ordinary-add proof."
+  "Whether the captured context permits ordinary-addition analysis."
   [ctx]
   (and (not (:auto-entity-time? (:opts ctx)))
        (empty? (:db.type/tuple (:rschema ctx)))))
@@ -507,8 +594,8 @@
              (ordinary-value-flags schema attr value))))))))
 
 (defn ordinary-addition-proof
-  "Attach pure eligibility flags to the runtime's demanded input and staging
-  decision. This is a temporary interpreter proof, not a new execution region."
+  "Attach compiler eligibility flags to demanded input and its resolver-staging
+  decision in the dynamic executor."
   [entities flags stage-resolver?]
   (cond-> {:entities entities :has-unique? (bit-test flags 0)
            :stage-resolver? stage-resolver?}
@@ -642,138 +729,264 @@
          (pure-scalar-coercion? (.-value-type info) value)) (.-value-type info)
     :else false))
 
-(defn- collect-blind-attribute!
-  [ctx ^FastList attrs ^AttrInfo info attr raw state]
-  (let [props (.-props info)
-        many? (identical? :db.cardinality/many (:db/cardinality props))
-        append! (fn [value]
-                  (let [conversion (blind-value-conversion ctx info value)]
-                    (when-not (false? conversion)
-                      (.add attrs attr)
-                      (.add attrs value)
-                      (.add attrs conversion)
-                      true)))]
-    (when-not (.-fuse-blind? info) (vreset! (:fuse-unique-inserts? state) false))
-    (when (identical? :db.unique/identity (:db/unique props))
-      (vreset! (:identity? state) true))
-    (if (and many? (literal-many-values? raw))
-      (when-not (and (= 2 (count raw)) (keyword? (first raw))
-                     (contains? (:db.unique/identity (:rschema ctx)) (first raw)))
-        (when (seq raw) (vreset! (:has-many? state) true))
-        (reduce (fn [_ value] (if (append! value) true (reduced false))) true raw))
-      (when (append! raw)
-        (when many? (vreset! (:has-many? state) true))
-        true))))
+(def ^:private runtime-blind-value
+  "A raw caller-bound operand. Its correction runs only during binding."
+  ::runtime-blind-value)
 
-(defn- collect-blind-entity
-  [ctx ^HashMap infos ^HashSet tempids state entity]
-  (let [explicit? (contains? entity :db/id) tempid (:db/id entity)]
-    (when (or (not explicit?)
-              (when-let [key (literal-tempid-key tempid)] (.add tempids key)))
-      (let [attrs (FastList. (int (* 3 (count entity))))]
-        (when (reduce-kv
-                (fn [_ attr value]
-                  (if (identical? :db/id attr)
-                    true
-                    (if (and (keyword? attr) (pos? (count (name attr))))
-                      (let [^AttrInfo info (blind-attr-info!
-                                            infos (:schema ctx)
-                                            (:db/attrTuples (:rschema ctx)) true attr)]
-                        (if (and info
-                                 (collect-blind-attribute! ctx attrs info attr value state))
-                          true (reduced false)))
-                      (reduced false))))
-                true entity)
-          (BlindEntity. tempid attrs))))))
+(defn- blind-multiple-values?
+  "Distinguish additive many values from a single identity lookup operand."
+  [many? identity-attrs value]
+  (and many? (coll? value) (not (map? value))
+       (not (and (= 2 (count value)) (contains? identity-attrs (first value))))))
 
-(defn- normalize-blind-entity!
-  "Correct and compact owned triples to final attribute/value pairs exactly once."
-  [ctx ^HashMap infos {:keys [unique-avs seen-avs set-capacity fuse-unique-inserts?]}
-   ^BlindEntity entity]
-  (let [^FastList attrs (.-attrs entity) n (.size attrs)
-        validate? (:validate-data? (:opts ctx))]
-    (loop [read 0 write 0 previous nil seen nil]
-      (if (< read n)
-        (let [attr (.get attrs read) raw (.get attrs (inc read))
-              conversion (.get attrs (+ read 2))
-              value (if conversion
-                      (try (prepare/correct-scalar-value validate? conversion raw)
-                           (catch Exception _ nil))
-                      raw)
-              ^AttrInfo info (.get infos attr)
-              props (.-props info) unique? (some? (:db/unique props))
-              many? (identical? :db.cardinality/many (:db/cardinality props))
-              ^Set seen (when many?
-                          (if (identical? previous attr) seen (blind-value-set (.-value-type info))))
-              ^FastList avs (when unique?
-                              (or @unique-avs (vreset! unique-avs (FastList.))))]
-          (when (and (some? value)
-                     (collect-blind-unique-value! avs seen-avs set-capacity
-                                                 fuse-unique-inserts? info attr value))
-            (if (and seen (not (.add seen value)))
-              (when-not unique? (recur (+ read 3) write attr seen))
-              (do (.set attrs write attr)
-                  (.set attrs (inc write) value)
-                  (recur (+ read 3) (+ write 2) attr seen)))))
-        (do
-          (while (> (.size attrs) write)
-            (.remove attrs (int (dec (.size attrs)))))
-          true)))))
+(defn- append-blind-source-value!
+  [^FastList attrs attr value conversion]
+  (.add attrs attr)
+  (.add attrs value)
+  (.add attrs conversion)
+  true)
 
-(defn- compile-blind-plan
+(defn- compile-blind-attribute!
+  [ctx ^FastList attrs ^AttrInfo info attr raw caller-bound? literal-proof]
+  (let [many? (identical? :db.cardinality/many (:db/cardinality (.-props info)))
+        ref? (identical? :db.type/ref (.-value-type info))
+        identity-attrs (:db.unique/identity (:rschema ctx))]
+    (if (or caller-bound? (and literal-proof (not @literal-proof) (not ref?)))
+      ;; Reference eligibility precedes all correction; other nested collections
+      ;; stay undemanded until binding, in their original correction order.
+      (when (or (not ref?)
+                (if (blind-multiple-values? many? identity-attrs raw)
+                  (every? plan/resolved-positive-ref? raw)
+                  (plan/resolved-positive-ref? raw)))
+        (append-blind-source-value! attrs attr raw runtime-blind-value))
+      (let [start (when literal-proof (.size attrs))
+            literal?
+            (when-not (and many? (literal-many-values? raw) (= 2 (count raw))
+                           (contains? identity-attrs (first raw)))
+              (if (and many? (literal-many-values? raw))
+                (reduce (fn [_ value]
+                          (let [conversion (blind-value-conversion ctx info value)]
+                            (if (false? conversion) (reduced false)
+                                (append-blind-source-value! attrs attr value conversion))))
+                        true raw)
+                (let [conversion (blind-value-conversion ctx info raw)]
+                  (when-not (false? conversion)
+                    (append-blind-source-value! attrs attr raw conversion)))))]
+        ;; Runtime reference admission can demand lazy input or host IDs.
+        ;; Leave it to the normal fallback after its full ID preflight.
+        (if (or literal? (nil? literal-proof) ref?)
+          literal?
+          (do
+            ;; An admitted caller can bind runtime values. Roll back only this
+            ;; field's partial many expansion, then retain its undemanded input.
+            (.removeRange attrs (int start) (.size attrs))
+            (vreset! literal-proof false)
+            (compile-blind-attribute! ctx attrs info attr raw true nil)))))))
+
+(defn compile-blind-template
+  "Build raw operands and shared metadata once, without correcting values.
+  Literal probes prove inert IDs/values. Caller-bound forms already passed ID
+  admission; retain collections and host values for the binding checkpoint."
+  [ctx forms {:keys [caller-bound? allow-small-unique? literal-proof]}]
+  (let [n (if (and (counted? forms) (instance? Collection forms))
+            (.size ^Collection forms) 0)
+        allow-identity? (or (not caller-bound?) allow-small-unique?
+                            (>= (long (bounded-count 2 forms)) 2))
+        infos (HashMap.) tempids (when-not caller-bound? (HashSet.))
+        identity? (volatile! false) fuse? (volatile! true)
+        sources (:db/attrTuples (:rschema ctx))
+        entries
+        (reduce
+          (fn [^FastList entries source]
+            (if-not (if caller-bound? (map? source)
+                        (and (plain-map? source) (nil? (meta source))))
+              (reduced nil)
+              (let [tempid (:db/id source)
+                    id? (or caller-bound? (not (contains? source :db/id))
+                            (when-let [key (literal-tempid-key tempid)] (.add tempids key)))
+                    attrs (FastList. (int (* 3 (- (count source)
+                                                  (if (and (not caller-bound?)
+                                                           (contains? source :db/id)) 1 0)))))]
+                (if (and id?
+                         (reduce-kv
+                           (fn [_ attr raw]
+                             (if (identical? attr :db/id)
+                               true
+                               (if-let [^AttrInfo info
+                                        (when (and (keyword? attr) (pos? (count (name attr))))
+                                          (blind-attr-info! infos (:schema ctx) sources allow-identity? attr))]
+                                 (do
+                                   (when-not (.-fuse-blind? info) (vreset! fuse? false))
+                                   (when (identical? :db.unique/identity (:db/unique (.-props info)))
+                                     (vreset! identity? true))
+                                   (if (compile-blind-attribute! ctx attrs info attr raw caller-bound? literal-proof)
+                                     true (reduced false)))
+                                 (reduced false))))
+                           true source))
+                  (doto entries (.add (BlindSource. source attrs)))
+                  (reduced nil)))))
+          (FastList. (int n)) forms)]
+    (when entries (BlindTemplate. ctx entries infos @identity? @fuse?))))
+
+(defn- finish-blind-plan
+  "Finalize all blind plans from the same normalized operands and AV proof."
+  [ctx ^HashMap infos ^FastList entities ^FastList avs has-many? fuse?]
+  (let [schema #(.-props ^AttrInfo (.get infos %))
+        auto-time? (boolean (:auto-entity-time? (:opts ctx)))
+        has-unique? (boolean (and avs (not (.isEmpty avs))))
+        identity-av (when (and has-unique? (not auto-time?) (= 1 (.size entities)))
+                      (blind-identity-upsert-av schema (.get entities 0)))
+        independent-identities?
+        (boolean
+          (and has-unique? (not auto-time?) (not has-many?)
+               (= (.size entities) (.size avs))
+               (if (= 1 (.size entities)) (some? identity-av)
+                   (every? #(blind-identity-upsert-av schema %) entities))))]
+    (when (and (not (.isEmpty entities)) (blind-unique-avs-distinct? avs))
+      (assoc (plan/->TxPlan ctx :blind entities nil)
+             :auto-entity-time? auto-time? :has-unique? has-unique? :has-many? has-many?
+             :fuse-unique-inserts? (and has-unique? fuse?) :unique-avs avs
+             :independent-identity-upserts? independent-identities?
+             :identity-upsert-av identity-av
+             :identity-upsert-read (blind-identity-entity-read schema entities identity-av)))))
+
+(defn- accept-bound-blind-value!
+  "Prove one corrected value before emission. True emits, ::duplicate skips a
+  nonunique many value, and nil declines. AV collection precedes deduplication."
+  [avs seen-avs capacity fuse? ^AttrInfo info attr value ^Set seen]
+  (when (and (not (identical? operand-decline value))
+             (collect-blind-unique-value! avs seen-avs capacity fuse? info attr value))
+    (if (and seen (not (.add seen value)))
+      (when-not (:db/unique (.-props info)) ::duplicate)
+      true)))
+
+(defn- append-bound-blind-value!
+  [^FastList attrs avs seen-avs capacity fuse? info attr value seen]
+  (when-let [accepted (accept-bound-blind-value! avs seen-avs capacity fuse? info attr value seen)]
+    (when (true? accepted) (.add attrs attr) (.add attrs value))
+    accepted))
+
+(defn- lower-blind-template
+  "Lower owned triples once using explicit correction and ID-admission hooks.
+  Only a fresh private literal template may be consumed: its many values are
+  already expanded, IDs proven distinct and triples compactable into pairs.
+  Public binding preserves templates and the runtime correction checkpoints."
+  [^BlindTemplate template check-unique-avs? valid-id? correct-value consume?]
+  (let [ctx (.-ctx template) ^FastList sources (.-entries template)
+        ^HashMap infos (.-infos template)
+        auto-time? (boolean (:auto-entity-time? (:opts ctx)))
+        identity-attrs (:db.unique/identity (:rschema ctx))
+        entities (FastList. (.size sources)) tempids (when-not consume? (HashSet.))
+        avs (FastList.) seen-avs (when check-unique-avs? (volatile! nil))
+        capacity (Integer/valueOf (int (max 1 (inc (quot (* 4 (.size sources)) 3)))))
+        fuse? (volatile! (.-fuse? template)) has-many? (volatile! false)]
+    (when
+      (reduce
+        (fn [_ ^BlindSource entry]
+          (let [source (.-source entry) tempid (:db/id source)
+                ^FastList raw-attrs (.-attrs entry)
+                attrs (if consume? raw-attrs
+                          (FastList. (int (* 2 (quot (.size raw-attrs) 3)))))]
+            (if (and (valid-id? source)
+                     (loop [i 0 out 0 previous nil seen nil]
+                       (if (< i (.size raw-attrs))
+                         (let [attr (.get raw-attrs i) raw (.get raw-attrs (inc i))
+                               conversion (.get raw-attrs (+ i 2))
+                               ^AttrInfo info (.get infos attr) props (.-props info)
+                               many? (identical? :db.cardinality/many (:db/cardinality props))
+                               ^Set seen (when many?
+                                           (if (identical? previous attr) seen
+                                               (blind-value-set (.-value-type info))))
+                               multiple? (and (identical? runtime-blind-value conversion)
+                                              (blind-multiple-values? many? identity-attrs raw))
+                               values (when multiple? (seq raw))]
+                           (when (and many? (or (not multiple?) values))
+                             (vreset! has-many? true))
+                           (if multiple?
+                             (when (reduce
+                                     (fn [_ raw]
+                                       (if (append-bound-blind-value!
+                                             attrs avs seen-avs capacity fuse? info attr
+                                             (correct-value info attr source conversion raw) seen)
+                                         true (reduced false)))
+                                     true values)
+                               (recur (+ i 3) out attr seen))
+                             (let [value (correct-value info attr source conversion raw)]
+                               (when-let [accepted (accept-bound-blind-value!
+                                                     avs seen-avs capacity fuse? info attr value seen)]
+                                 (when (true? accepted)
+                                   (if consume?
+                                     ;; Both source slots have been read, and
+                                     ;; output never reaches an unread triple.
+                                     (do (.set attrs (int out) attr)
+                                         (.set attrs (int (inc out)) value))
+                                     (do (.add attrs attr) (.add attrs value))))
+                                 (recur (+ i 3) (if (true? accepted) (+ out 2) out) attr seen)))))
+                         (do (when consume?
+                               (.removeRange attrs (int out) (.size attrs))
+                               ;; Avoid retaining a large raw buffer after
+                               ;; substantial many-value deduplication.
+                               (.trimToSizeIfGreaterThanPercent attrs 0.5))
+                             true)))
+                     ;; Runtime duplicate IDs retain the correction checkpoint.
+                     (or consume? (nil? tempid) (.add tempids tempid)))
+              (do (when (or auto-time? (not (.isEmpty attrs)))
+                    (.add entities (BlindEntity. tempid attrs)))
+                  true)
+              (reduced false))))
+        true sources)
+      (finish-blind-plan ctx infos entities (when-not (.isEmpty avs) avs) @has-many? @fuse?))))
+
+(defn bind-blind-template
+  "Bind reusable raw operands without consuming them. Only compiler-private
+  literal scratch can use in-place lowering; caller callbacks retain their order."
+  [template check-unique-avs? valid-id? correct-value]
+  (lower-blind-template template check-unique-avs? valid-id? correct-value false))
+
+(defn- lower-literal-blind-template
+  [^BlindTemplate template check-unique-avs?]
+  (let [validate? (:validate-data? (:opts (.-ctx template)))]
+    (lower-blind-template
+      template check-unique-avs? (constantly true)
+      (fn [_ _ _ conversion raw]
+        (if conversion
+          (if-some [value (try (prepare/correct-scalar-value validate? conversion raw)
+                              (catch Exception _ nil))]
+            value operand-decline)
+          raw)) true)))
+
+(defn- compile-blind-candidate
   [ctx forms {:keys [allow-small-unique? check-unique-avs?]
-              :or {check-unique-avs? true}}]
+              :or {check-unique-avs? true}} binding?]
   (when (and (identical? clojure.lang.PersistentVector (class forms))
              (nil? (meta forms)) (pos? (count forms)))
-    (let [entities (FastList. (count forms)) infos (HashMap.) tempids (HashSet.)
-          auto-time? (boolean (:auto-entity-time? (:opts ctx)))
-          state {:unique-avs (volatile! nil)
-                 :seen-avs (when check-unique-avs? (volatile! nil))
-                 :set-capacity (Integer/valueOf (int (max 1 (inc (quot (* 4 (count forms)) 3)))))
-                 :identity? (volatile! false)
-                 :has-many? (volatile! false)
-                 :fuse-unique-inserts? (volatile! true)}]
-      (when (loop [index 0]
-              (if (< index (count forms))
-                (let [form (nth forms index)]
-                  (when (and (plain-map? form) (nil? (meta form)))
-                    (when-let [^BlindEntity entity (collect-blind-entity ctx infos tempids state form)]
-                      (when (or auto-time? (not (.isEmpty ^FastList (.-attrs entity))))
-                        (.add entities entity))
-                      (recur (unchecked-inc index)))))
-                true))
-        (if (and (not allow-small-unique?) (= 1 (count forms)) @(:identity? state))
-          ;; This proof suppresses ordered fallback without another input walk.
+    (let [literal-proof (when binding? (volatile! true))]
+      (when-let [^BlindTemplate template
+                 (compile-blind-template ctx forms {:literal-proof literal-proof})]
+        (cond
+          (and (not allow-small-unique?) (= 1 (count forms)) (.-identity? template))
           ::small-unique-decline
-          (when (loop [index 0]
-                  (or (= index (.size entities))
-                      (and (normalize-blind-entity! ctx infos state (.get entities index))
-                           (recur (unchecked-inc index)))))
-            (let [^FastList avs @(:unique-avs state)
-                  has-unique? (boolean (and avs (not (.isEmpty avs))))
-                  has-many? @(:has-many? state)
-                  fuse? (and has-unique? @(:fuse-unique-inserts? state))
-                  independent-identities?
-                  (boolean
-                    (and has-unique? (not auto-time?) (not has-many?)
-                         (= (.size entities) (.size avs))
-                         (loop [index 0]
-                           (or (= index (.size entities))
-                               (and (blind-identity-upsert-av (:schema ctx) (.get entities index))
-                                    (recur (unchecked-inc index)))))))
-                  identity-av (when (and independent-identities? (= 1 (.size entities)))
-                                (.get avs 0))]
-              (when (and (not (.isEmpty entities))
-                         (or check-unique-avs? fuse? (not has-unique?)
-                             (= (.size avs) (.size (HashSet. ^java.util.Collection avs)))))
-                (assoc (plan/->TxPlan ctx :blind entities nil)
-                       :auto-entity-time? auto-time?
-                       :has-unique? has-unique? :has-many? has-many?
-                       :fuse-unique-inserts? fuse? :unique-avs avs
-                       :independent-identity-upserts? independent-identities?
-                       :identity-upsert-av identity-av
-                       :identity-upsert-read
-                       (blind-identity-entity-read (:schema ctx) entities identity-av))))))))))
+          (and literal-proof (not @literal-proof)) template
+          :else (lower-literal-blind-template template check-unique-avs?))))))
+
+(defn- compile-blind-plan [ctx forms options]
+  (compile-blind-candidate ctx forms options false))
+
+(declare compile-tx)
+
+(defn compile-blind-preparation
+  "Select a literal plan or runtime-binding template in one operand walk.
+  Call only at an admitted binding checkpoint. Strict literal structure/ID
+  eligibility is retained; structural declines keep normal family selection.
+  The pure compile-tx entry never returns a runtime-binding template."
+  [ctx forms options]
+  (let [candidate (compile-blind-candidate ctx forms options true)]
+    (cond
+      (identical? ::small-unique-decline candidate) nil
+      candidate candidate
+      ;; This same captured attempt has already declined the blind rule. Keep
+      ;; normal mixed/ordered priority without rebuilding its blind operands.
+      :else (compile-tx ctx forms (assoc options :skip-blind? true)))))
 
 (defn compile-blind-region
   "Build new-map operands once, then correct, deduplicate and collect owned AVs.
@@ -961,15 +1174,15 @@
         (.add entries entry)
         info))))
 
-(defn compile-mixed-region
+(defn- compile-mixed-region*
   "Build one owned mixed operand stream, then correct it after full eligibility.
   Writer bounds, uniqueness and old values remain runtime work."
-  [ctx forms]
+  [ctx forms infos]
   (when (and (identical? clojure.lang.PersistentVector (class forms))
              (nil? (meta forms)) (pos? (count forms))
              (not (:auto-entity-time? (:opts ctx))))
     (let [validate? (:validate-data? (:opts ctx))
-          infos (HashMap.) tempids (HashSet.) updates (HashSet.)
+          infos (or infos (HashMap.)) tempids (HashSet.) updates (HashSet.)
           entries (ArrayList.) corrections? (volatile! false)]
       (loop [index 0 inserts? false required-eid 0 typed? true]
         (if (< index (count forms))
@@ -1022,6 +1235,11 @@
                                            (and typed? (> (.size updates) 1))
                                            (>= (.size infos) 8))
                            nil)))))))
+
+(defn compile-mixed-region
+  "Build a mixed plan with fresh compiler-owned attribute bindings."
+  [ctx forms]
+  (compile-mixed-region* ctx forms nil))
 
 (defn- needs-ordinary-insert-plan?
   "Select the shared ordinary loop only for reference/tuple work that
@@ -1173,19 +1391,24 @@
                   (or (positive-literal-id? id)
                       (identical? clojure.lang.PersistentVector (class id))))))))
 
+(defn- literal-patch-form
+  "Prove patch syntax once; also validate an explicitly supplied shape hint."
+  [forms]
+  (when (and (identical? clojure.lang.PersistentVector (class forms))
+             (nil? (meta forms)) (= 1 (count forms)))
+    (let [form (nth forms 0)]
+      (when (and (identical? clojure.lang.PersistentVector (class form))
+                 (= 4 (count form)) (identical? :db.fn/patchIdoc (nth form 0))
+                 (positive-literal-id? (nth form 1)) (keyword? (nth form 2))
+                 (or (nil? (nth form 3)) (sequential? (nth form 3))))
+        form))))
+
 (defn literal-request-shape
   "Recognize a materialized independent family or declarative operation program.
   Full value/schema eligibility remains in the compiler; no sequences are forced."
   [forms]
   (or (independent-request-shape forms)
-      (when (and (identical? clojure.lang.PersistentVector (class forms))
-                 (nil? (meta forms)) (= 1 (count forms)))
-        (let [form (nth forms 0)]
-          (when (and (identical? clojure.lang.PersistentVector (class form))
-                     (= 4 (count form)) (identical? :db.fn/patchIdoc (nth form 0))
-                     (positive-literal-id? (nth form 1)) (keyword? (nth form 2))
-                     (or (nil? (nth form 3)) (sequential? (nth form 3))))
-            :patch)))
+      (when (literal-patch-form forms) :patch)
       (when (and (identical? clojure.lang.PersistentVector (class forms))
                  (nil? (meta forms)) (seq forms)
                  (every? (fn [form]
@@ -1235,7 +1458,7 @@
 (defn- scalar-entity-operand
   [ctx e aliases?]
   (cond
-    (positive-literal-id? e) (long e)
+    (positive-literal-id? e) (if (instance? Long e) e (long e))
     (and aliases? (literal-scalar-alias? e) (canonical-scalar-alias? ctx e)) e))
 
 (defn- scalar-entry-plan
@@ -1266,91 +1489,182 @@
                                     (catch Exception _ nil))]
             (scalar-entry-plan ctx forms e attr corrected false aliases?)))))))
 
-(defn- correct-scalar-candidates!
-  "Apply saved conversion types to owned scratch; nil types preserve values."
-  [validate? ^FastList candidates]
+(defn correct-scalar-candidates!
+  "Lower saved conversion instructions once in owned scratch. Nil instructions
+  preserve values; the explicit decline marker distinguishes rejection from a
+  legitimate nil or false correction at a runtime binding checkpoint."
+  [^FastList candidates correct-value]
   (loop [index 0]
     (if (< index (.size candidates))
       (if-let [vt (.get candidates (+ index 3))]
-        (when-some [value (try (prepare/correct-scalar-value
-                                validate? vt (.get candidates (+ index 2)))
-                              (catch Exception _ nil))]
-          (.set candidates (+ index 2) value)
-          (recur (+ index 4)))
+        (let [value (correct-value vt (.get candidates (+ index 2)))]
+          (when-not (identical? operand-decline value)
+            (.set candidates (+ index 2) value)
+            (recur (+ index 4))))
         (recur (+ index 4)))
       true)))
 
+(defn- materialize-scalar-prefix!
+  "Copy a proven canonical prefix only when later operands need lowering.
+  Eligibility and distinctness were already checked; no value work is repeated."
+  [^FastList candidates forms n]
+  (dotimes [i n]
+    (let [form (nth forms i)]
+      (.add candidates (nth form 1))
+      (.add candidates (nth form 2))
+      (.add candidates (nth form 3))
+      (.add candidates nil))))
+
+(defn- collect-explicit-candidates
+  "Feed explicit additions directly to the scalar binder. Stamps stay in the
+  original materialized forms until final projection, without a side buffer."
+  [forms append!]
+  (let [candidates (FastList. (int (* 4 (count forms))))
+        seen (when (> (count forms) 1) (HashMap.))]
+    (when (reduce
+            (fn [_ form]
+              (if (cond
+                    (identical? Datom (class form))
+                    (and (d/datom-added form)
+                         (append! candidates seen (.-e ^Datom form) (.-a ^Datom form)
+                                  (.-v ^Datom form) false))
+                    (plain-map? form)
+                    (and (> (count form) 1)
+                         (reduce-kv
+                           (fn [_ attr value]
+                             (if (or (identical? attr :db/id)
+                                     (append! candidates seen (:db/id form) attr value false))
+                               true (reduced false)))
+                           true form))
+                    (and (sequential? form) (<= 4 (count form) 5)
+                         (identical? :db/add (nth form 0))
+                         (or (= 4 (count form)) (nil? (nth form 4))
+                             (positive-literal-id? (nth form 4))))
+                    (append! candidates seen (nth form 1) (nth form 2) (nth form 3) false))
+                true (reduced false)))
+            true forms)
+      (when-not (.isEmpty candidates) candidates))))
+
+(defn- explicit-candidate-entries
+  "Project corrected operands with their source stamps and annotations. Map
+  widths align the streams; eligibility and values are never analyzed again."
+  [^FastList candidates forms refs rebuild-reference-vectors?]
+  (loop [offset 0 source-index 0 remaining 0 form nil entries (transient [])]
+    (if (< offset (.size candidates))
+      (let [same-source? (pos? remaining)
+            form (if same-source? form (nth forms source-index))
+            source-index (if same-source? source-index (inc source-index))
+            remaining (if same-source? remaining (if (map? form) (dec (count form)) 1))
+            e (.get candidates offset) attr (.get candidates (+ offset 1))
+            value (.get candidates (+ offset 2))
+            rebuild? (and rebuild-reference-vectors? (contains? refs attr))
+            tx (cond
+                 (identical? Datom (class form)) (d/datom-tx form)
+                 (map? form) nil
+                 (not rebuild?) (when-some [tx (nth form 4 nil)] (long tx)))
+            annotations (when (and (not (map? form)) (not (identical? Datom (class form)))
+                                   (not rebuild?)) (meta form))]
+        (recur (+ offset 4) source-index (dec remaining) form
+               (conj! entries (if annotations [e attr value tx annotations] [e attr value tx]))))
+      (persistent! entries))))
+
 (defn- compile-scalar-plan
   "Bind each source operand once. Correct only the fully eligible owned buffer."
-  [ctx forms shape allow-references? allow-coercion? aliases?]
-  (when (and (seq forms) (not (:auto-entity-time? (:opts ctx))))
-    (let [n (count forms) form (nth forms 0)
-          operation? (and (sequential? form) (= 4 (count form))
-                          (nil? (meta form)) (identical? :db/add (nth form 0)))]
-      (cond
-        (and (= n 1) operation?)
-        (compile-one-scalar ctx forms (nth form 1) (nth form 2) (nth form 3)
-                            (identical? shape :scalar-operations)
-                            allow-references? allow-coercion? aliases?)
-        (and (= n 1) (plain-map? form) (nil? (meta form)) (= 2 (count form)))
-        (let [^java.util.Iterator keys (.keyIterator ^clojure.lang.IMapIterable form)
-              first-key (.next keys)
-              attr (if (identical? :db/id first-key) (.next keys) first-key)]
-          (compile-one-scalar ctx forms (:db/id form) attr (get form attr) false
-                              allow-references? allow-coercion? aliases?))
-        :else
-        (let [store-schema (:schema ctx) sources (:db/attrTuples (:rschema ctx))
-              validate? (:validate-data? (:opts ctx)) infos (HashMap.)
-              candidates (FastList. (int (* 4 n))) seen (when (> n 1) (HashSet.))
-              canonical? (volatile! true) rejected? (volatile! false) coercible? (volatile! true)
-              raw-operations? (volatile! (and (not aliases?) (identical? shape :scalar-operations)))
-              append! (fn [e attr value]
-                        (when-let [^AttrInfo info (if aliases?
+  ([ctx forms shape allow-references? allow-coercion? aliases?]
+   (compile-scalar-plan ctx forms shape allow-references? allow-coercion? aliases? nil))
+  ([ctx forms shape allow-references? allow-coercion? aliases? explicit-rebuild?]
+   (compile-scalar-plan ctx forms shape allow-references? allow-coercion? aliases? explicit-rebuild? nil))
+  ([ctx forms shape allow-references? allow-coercion? aliases? explicit-rebuild? infos]
+   (when (and (seq forms) (not (:auto-entity-time? (:opts ctx))))
+     (let [n (count forms) form (nth forms 0)
+           explicit? (some? explicit-rebuild?)
+           operation? (and (sequential? form) (= 4 (count form))
+                           (nil? (meta form)) (identical? :db/add (nth form 0)))]
+       (cond
+         (and (nil? explicit-rebuild?) (= n 1) operation?)
+         (compile-one-scalar ctx forms (nth form 1) (nth form 2) (nth form 3)
+                             (identical? shape :scalar-operations)
+                             allow-references? allow-coercion? aliases?)
+         (and (nil? explicit-rebuild?) (= n 1) (plain-map? form) (nil? (meta form)) (= 2 (count form)))
+         (let [^java.util.Iterator keys (.keyIterator ^clojure.lang.IMapIterable form)
+               first-key (.next keys)
+               attr (if (identical? :db/id first-key) (.next keys) first-key)]
+           (compile-one-scalar ctx forms (:db/id form) attr (get form attr) false
+                               allow-references? allow-coercion? aliases?))
+         :else
+         (let [store-schema (:schema ctx) sources (:db/attrTuples (:rschema ctx))
+               validate? (:validate-data? (:opts ctx)) infos (or infos (HashMap.))
+               canonical? (volatile! true) rejected? (volatile! false) coercible? (volatile! true)
+               first-attr (cond
+                            operation? (nth form 2)
+                            (and explicit? (identical? Datom (class form))) (.-a ^Datom form)
+                            (and explicit? (sequential? form)) (nth form 2 nil))
+               uniform-attr? (volatile! (boolean (and first-attr (or explicit? (not aliases?)))))
+               resolved-entities? (when explicit? (volatile! true))
+               raw-operations? (volatile! (and (not aliases?) (identical? shape :scalar-operations)))
+               append! (fn [candidates seen raw-e attr value map-form?]
+                         (let [retained? (and @canonical? @raw-operations?)]
+                           (when (and @uniform-attr? (not (identical? attr first-attr)))
+                             (vreset! uniform-attr? false))
+                           (when (and @raw-operations? (or map-form? (not (instance? Long raw-e))))
+                             (vreset! raw-operations? false))
+                           (when-let [e (if map-form? raw-e (scalar-entity-operand ctx raw-e aliases?))]
+                             (when (and resolved-entities? @resolved-entities? (not (instance? Long e)))
+                               (vreset! resolved-entities? false))
+                             (when-let [^AttrInfo info
+                                        (if aliases?
                                           (alias-value-info store-schema sources infos attr value)
                                           (literal-scalar-info store-schema sources attr value allow-references? infos))]
-                          (let [vt (.-value-type info)
-                                ready? (if aliases? (alias-value-unchanged? validate? vt value)
-                                           (canonical-scalar-value? validate? vt value))]
-                            (when-not ready?
-                              (when @canonical? (vreset! canonical? false))
-                              (when (and (not aliases?) (not @rejected?)
-                                         (scalar-validation-rejection? validate? vt value))
-                                (vreset! rejected? true))
-                              (when (and @coercible? (not (pure-scalar-coercion? vt value)))
-                                (vreset! coercible? false)))
-                            (append-scalar-candidate! candidates seen e attr value (when-not ready? vt)))))]
-          (when (reduce
-                  (fn [_ form]
-                    (let [map-form? (plain-map? form)
-                          operation? (and (sequential? form) (= 4 (count form))
-                                          (identical? :db/add (nth form 0)))]
-                      (if (and (nil? (meta form)) (or map-form? operation?))
-                        (let [raw-e (if map-form? (:db/id form) (nth form 1))
-                              e (scalar-entity-operand ctx raw-e aliases?)]
-                          (when (and @raw-operations? (or map-form? (not (instance? Long raw-e))))
-                            (vreset! raw-operations? false))
-                          (if (and e
-                                   (if map-form?
-                                     (and (> (count form) 1)
-                                          (reduce-kv (fn [_ attr value]
-                                                       (if (or (identical? :db/id attr) (append! e attr value))
-                                                         true (reduced false))) true form))
-                                     (append! e (nth form 2) (nth form 3))))
-                            true (reduced false)))
-                        (reduced false))))
-                  true forms)
-            (cond
-              @rejected? {:outcome :needs-writer :ctx ctx :input forms}
-              (and (not @canonical?) (not (and allow-coercion? @coercible?))) nil
-              :else
-              (when (or @canonical? (correct-scalar-candidates! validate? candidates))
-                (if (and @canonical? @raw-operations?)
-                  (plan/->TxPlan ctx :scalar-operations forms
-                                 (scalar-update-entity-reads store-schema forms 1))
-                  (let [entries (plan/scalar-candidate-entries candidates)]
-                    (plan/->TxPlan ctx (if aliases? :scalar-aliases :scalar) entries
-                                   (when-not aliases?
-                                     (scalar-update-entity-reads store-schema entries)))))))))))))
+                               (let [vt (.-value-type info)
+                                     ready? (if aliases? (alias-value-unchanged? validate? vt value)
+                                                (canonical-scalar-value? validate? vt value))]
+                                 (when-not ready?
+                                   (when @canonical? (vreset! canonical? false))
+                                   (when (and (not aliases?) (not @rejected?)
+                                              (scalar-validation-rejection? validate? vt value))
+                                     (vreset! rejected? true))
+                                   (when (and @coercible? (not (pure-scalar-coercion? vt value)))
+                                     (vreset! coercible? false)))
+                                 (let [retain? (and @canonical? @raw-operations?)]
+                                   (when (and retained? (not retain?))
+                                     (materialize-scalar-prefix! candidates forms
+                                                                 (scalar-distinct-count seen)))
+                                   (append-scalar-candidate! (when-not retain? candidates)
+                                                             seen e attr value (when-not ready? vt))))))))]
+           (when-let [candidates (if explicit?
+                                  (collect-explicit-candidates forms append!)
+                                  (collect-scalar-candidates
+                                    forms plain-map? #(scalar-entity-operand ctx % aliases?)
+                                    (constantly true) append! (when @raw-operations? 0)
+                                    (when (and (not aliases?) (> n 1)) (HashMap.))))]
+             (cond
+               @rejected? {:outcome :needs-writer :ctx ctx :input forms}
+               (and (not @canonical?) (not (and allow-coercion? @coercible?))) nil
+               :else
+               (when (or @canonical? (correct-scalar-candidates!
+                                        candidates
+                                        (fn [vt value]
+                                          (if-some [corrected
+                                                    (try (prepare/correct-scalar-value validate? vt value)
+                                                         (catch Exception _ nil))]
+                                            corrected operand-decline))))
+                 (if (and @canonical? @raw-operations?)
+                   (plan/->TxPlan ctx :scalar-operations forms
+                                  ;; Distinct E/A plus one attribute implies one
+                                  ;; operand per entity, so no wide read is useful.
+                                  (when-not @uniform-attr?
+                                    (scalar-update-entity-reads
+                                      #(.-props ^AttrInfo (.get infos %)) forms 1)))
+                   (let [entries (if explicit?
+                                   (explicit-candidate-entries candidates forms
+                                     (:db.type/ref (:rschema ctx)) explicit-rebuild?)
+                                   (plan/scalar-candidate-entries candidates))
+                         bind-aliases? (and aliases? (not (and resolved-entities? @resolved-entities?)))]
+                     (plan/->TxPlan ctx (if bind-aliases? :scalar-aliases :scalar) entries
+                                    (when-not (or bind-aliases? @uniform-attr?)
+                                      (scalar-update-entity-reads
+                                        #(.-props ^AttrInfo (.get infos %))
+                                        entries))))))))))))))
 
 (defn compile-scalar-region
   "Compile the protected literal scalar region using the shared operand builder."
@@ -1360,46 +1674,17 @@
    (when (#{:scalar :scalar-operations} shape)
      (compile-scalar-plan ctx forms shape allow-references? false false))))
 
-(declare compile-tx)
-
 (defn- compile-explicit-additions
-  "Normalize already-materialized additions into independent alias operands.
-  Supplied positive transaction IDs survive binding; nil uses the request ID.
-  Declines retain the caller's original forms, including metadata and errors."
-  [ctx forms]
+  "Normalize materialized additions directly into independent scalar operands.
+  Reference preprocessing can discard vector stamps/annotations; Datoms retain
+  theirs. Correction still follows complete eligibility and distinctness."
+  [ctx forms infos]
   (let [rebuild-reference-vectors? (not (and (ordinary-analysis-enabled? ctx)
                            (every? #(some? (ordinary-addition-flags ctx % true false)) forms)))
-        [operations txs metadata]
-        (reduce
-          (fn [[operations txs metadata] form]
-            (cond
-              (identical? Datom (class form))
-              [(conj operations [:db/add (.-e ^Datom form) (.-a ^Datom form) (.-v ^Datom form)])
-               (conj txs (d/datom-tx form)) (conj metadata nil)]
-              (plain-map? form)
-              (reduce-kv (fn [[operations txs metadata] attr value]
-                           (if (identical? :db/id attr) [operations txs metadata]
-                               [(conj operations [:db/add (:db/id form) attr value])
-                                (conj txs nil) (conj metadata nil)]))
-                         [operations txs metadata] form)
-              :else
-              (let [rebuild-reference? (and rebuild-reference-vectors?
-                                            (contains? (:db.type/ref (:rschema ctx)) (nth form 2)))]
-                ;; When the ordinary proof declines, the implicit-ID prepass rebuilds reference add
-                ;; vectors with four fields, dropping their stamp/metadata.
-                ;; Datoms bypass that prepass and keep their supplied stamp.
-                [(conj operations (with-meta (if (= 5 (count form)) (pop form) form) nil))
-                 (conj txs (when-not rebuild-reference?
-                             (when-some [tx (nth form 4 nil)] (long tx))))
-                 (conj metadata (when-not rebuild-reference? (meta form)))])))
-          [[] [] []] forms)
-        prepared (compile-tx ctx operations {:request-shape :scalar-aliases :ordered? false})]
+        prepared (compile-scalar-plan ctx forms :scalar-aliases true true true
+                                       rebuild-reference-vectors? infos)]
     (when (instance? datalevin.db.tx.plan.TxPlan prepared)
-      (assoc prepared :entries
-             (mapv (fn [entry tx annotations]
-                     (cond-> (conj entry tx) annotations (conj annotations)))
-                   (:entries prepared) txs metadata)
-             :explicit-tx? true))))
+      (assoc prepared :explicit-tx? true))))
 
 (defn flat-upsert-map-proof
   "Prove one already-demanded plain map using value classes only.
@@ -1433,15 +1718,20 @@
   [ctx forms]
   (plan/->TxPlan ctx :dynamic forms nil))
 
+(defn- ordered-bound-props
+  [ctx infos attr]
+  (.-props ^AttrInfo (attribute-info! infos (:schema ctx)
+                                     (:db/attrTuples (:rschema ctx)) attr)))
+
 (defn- ordered-tuple-props? [props]
   (or (identical? :db.type/tuple (:db/valueType props))
       (:db/tupleTypes props) (:db/tupleType props) (:db/tupleAttrs props)))
 
 (defn- ordered-tuple-types
-  [ctx props size]
+  [ctx infos props size]
   (or (:db/tupleTypes props)
       (when-let [sources (:db/tupleAttrs props)]
-        (mapv #(:db/valueType (get (:schema ctx) %)) sources))
+        (mapv #(:db/valueType (ordered-bound-props ctx infos %)) sources))
       (when-let [type (:db/tupleType props)] (repeat size type))))
 
 (defn- ordered-tuple-types? [types]
@@ -1452,69 +1742,78 @@
 (declare ordered-tuple-value?)
 
 (defn- ordered-lookup?
-  [ctx value]
+  [ctx infos value]
   (when (and (identical? clojure.lang.PersistentVector (class value))
              (nil? (meta value)) (= 2 (count value)) (keyword? (nth value 0)))
-    (let [props (get (:schema ctx) (nth value 0)) vt (:db/valueType props)]
+    (let [props (ordered-bound-props ctx infos (nth value 0)) vt (:db/valueType props)]
       (and (#{:db.unique/identity :db.unique/value} (:db/unique props))
            (if (ordered-tuple-props? props)
-             (ordered-tuple-value? ctx props (nth value 1))
+             (ordered-tuple-value? ctx infos props (nth value 1))
              (and (contains? ordinary-unique-types vt)
                   (canonical-scalar-value? (:validate-data? (:opts ctx)) vt (nth value 1))))))))
 
 (defn- ordered-entity?
-  [ctx e]
+  [ctx infos e]
   (or (and (inert-scalar-value? e) (integer? e)
            (try (<= Long/MIN_VALUE (long e) Long/MAX_VALUE)
                 (catch IllegalArgumentException _ false)))
       (string? e) (keyword? e)
-      (ordered-lookup? ctx e)))
+      (ordered-lookup? ctx infos e)))
 
 (defn- ordered-attribute-props
-  [ctx attr]
+  [ctx ^HashMap infos attr]
   (when (and (keyword? attr) (pos? (count (name attr)))
              (not= "db" (namespace attr)) (not (plan/reverse-ref-attr? attr)))
-    (let [props (get (:schema ctx) attr) vt (:db/valueType props)]
-      (when (and props (not (:db.attr/preds props))
-                 ;; Untyped data can decode arbitrary user values. Declarative
-                 ;; tuple flags still constrain their complete component types.
-                 (or (some? vt) (ordered-tuple-props? props))
-                 (or (not (ordered-tuple-props? props))
-                     (ordered-tuple-types? (ordered-tuple-types ctx props 8)))
-                 (or (contains? ordinary-scalar-types vt)
-                     (#{:db.type/ref :db.type/tuple} vt))
-                 (not (:db/embedding props)) (not (:db/vector props))
-                 (every? (fn [[tuple _]]
-                           (let [p (get (:schema ctx) tuple)]
-                             (and (not (:db.attr/preds p))
-                                  (not (:db/embedding p)) (not (:db/vector p))
-                                  (or (nil? (:db/valueType p))
-                                      (identical? :db.type/tuple (:db/valueType p)))
-                                  (ordered-tuple-props? p)
-                                  (ordered-tuple-types? (ordered-tuple-types ctx p 8)))))
-                         (get (:db/attrTuples (:rschema ctx)) attr)))
-        props))))
+    (let [^AttrInfo info (attribute-info! infos (:schema ctx)
+                                       (:db/attrTuples (:rschema ctx)) attr)]
+      (if-some [eligible? (.-ordered? info)]
+        (when eligible? (.-props info))
+        (let [props (.-props info) vt (.-value-type info)
+              tuple? (ordered-tuple-props? props)
+              eligible?
+              (and props (not (:db.attr/preds props))
+                   ;; Untyped values retain demanded execution. Tuple metadata
+                   ;; must prove every component type before inspecting values.
+                   (or (some? vt) tuple?)
+                   (or (not tuple?)
+                       (ordered-tuple-types? (ordered-tuple-types ctx infos props 8)))
+                   (or (contains? ordinary-scalar-types vt)
+                       (#{:db.type/ref :db.type/tuple} vt))
+                   (not (:db/embedding props)) (not (:db/vector props))
+                   (every? (fn [[tuple _]]
+                             (let [p (ordered-bound-props ctx infos tuple)]
+                               (and (not (:db.attr/preds p))
+                                    (not (:db/embedding p)) (not (:db/vector p))
+                                    (or (nil? (:db/valueType p))
+                                        (identical? :db.type/tuple (:db/valueType p)))
+                                    (ordered-tuple-props? p)
+                                    (ordered-tuple-types? (ordered-tuple-types ctx infos p 8)))))
+                           (.-tuples info)))]
+          ;; Complete the existing immutable binding in this attempt's table.
+          ;; Executors consume props and retain all writer-side obligations.
+          (.put infos attr (plan/with-ordered-proof info eligible?))
+          (when eligible? props))))))
 
 (defn- ordered-tuple-value?
-  [ctx props value]
+  [ctx infos props value]
   (when (and (identical? clojure.lang.PersistentVector (class value))
              (nil? (meta value)) (<= 1 (count value) 8))
-    (let [types (ordered-tuple-types ctx props (count value))]
+    (let [types (ordered-tuple-types ctx infos props (count value))]
       (and (ordered-tuple-types? types) (= (count types) (count value))
            (every? (fn [[type component]]
                      (or (nil? component)
                          (if (identical? type :db.type/ref)
-                           (and (not (coll? component)) (ordered-entity? ctx component))
+                           (and (not (coll? component)) (ordered-entity? ctx infos component))
                            (and (inert-scalar-value? component)
                                 (canonical-scalar-value? true type component)))))
                    (map vector types value))))))
 
 (defn- ordered-value?
-  [ctx props value]
+  [ctx infos props value]
   (let [vt (:db/valueType props)]
     (cond
-      (ordered-tuple-props? props) (ordered-tuple-value? ctx props value)
-      (identical? vt :db.type/ref) (ordered-entity? ctx value)
+      (ordered-tuple-props? props) (ordered-tuple-value? ctx infos props value)
+      (identical? vt :db.type/ref) (ordered-entity? ctx infos value)
       :else
       (and (inert-scalar-value? value) (some? value)
            ;; Date formatting and effectful custom conversions stay ordered.
@@ -1524,21 +1823,21 @@
 (declare ordered-map?)
 
 (defn- ordered-map-field?
-  [ctx props value depth]
+  [ctx infos props value depth]
   (if (and (identical? :db.type/ref (:db/valueType props)) (plain-map? value))
-    (ordered-map? ctx value (inc depth))
-    (ordered-value? ctx props value)))
+    (ordered-map? ctx infos value (inc depth))
+    (ordered-value? ctx infos props value)))
 
 (defn- ordered-map?
-  [ctx form depth]
+  [ctx infos form depth]
   (and (< depth 64) (plain-map? form)
        (or (nil? (meta form))
            (and (application-add-metadata? (meta form))
                 (or (positive-literal-id? (:db/id form))
-                    (ordered-lookup? ctx (:db/id form)))))
+                    (ordered-lookup? ctx infos (:db/id form)))))
        (or (not (contains? form :db/id))
            (let [e (:db/id form)]
-             (and (not (keyword? e)) (ordered-entity? ctx e))))
+             (and (not (keyword? e)) (ordered-entity? ctx infos e))))
        (reduce-kv
          (fn [_ attr value]
            (if (identical? attr :db/id)
@@ -1551,24 +1850,24 @@
                                                    (= (name a) (subs (name attr) 1))) a))
                                       (keys (:schema ctx)))
                                 attr)
-                     props (ordered-attribute-props ctx straight)
-                     lookup? (ordered-lookup? ctx value)]
+                     props (ordered-attribute-props ctx infos straight)
+                     lookup? (ordered-lookup? ctx infos value)]
                  (if (and props (or (not reverse?) (identical? :db.type/ref (:db/valueType props)))
                           (if (and (or reverse? (identical? :db.cardinality/many (:db/cardinality props)))
                                    (literal-many-values? value) (not lookup?))
-                            (every? #(ordered-map-field? ctx props % depth) value)
-                            (ordered-map-field? ctx props value depth)))
+                            (every? #(ordered-map-field? ctx infos props % depth) value)
+                            (ordered-map-field? ctx infos props value depth)))
                    true (reduced false)))
                (reduced false))))
          true form)))
 
 (defn- ordered-form?
-  [ctx form]
+  [ctx infos form]
   (let [form (if (identical? Datom (class form)) (datom-operation-form form) form)]
   (when (and (identical? clojure.lang.PersistentVector (class form))
              (or (nil? (meta form)) (application-add-metadata? (meta form))))
     (let [[op e attr value extra] form n (count form)]
-      (and (ordered-entity? ctx e)
+      (and (ordered-entity? ctx infos e)
            (case op
              (:db.fn/retractEntity :db/retractEntity)
              ;; Cascades may visit any attribute. Unknown/custom decoding and
@@ -1576,29 +1875,29 @@
              (and (= n 2)
                   (every? (fn [[attr _]]
                             (or (= "db" (namespace attr))
-                                (ordered-attribute-props ctx attr)))
+                                (ordered-attribute-props ctx infos attr)))
                           (:schema ctx)))
              (:db/add :db/retract :db.fn/cas :db/cas :db.fn/retractAttribute)
-             (when-let [props (ordered-attribute-props ctx attr)]
+             (when-let [props (ordered-attribute-props ctx infos attr)]
                (and (or (not (:db/isComponent props))
                         (every? (fn [[a _]]
                                   (or (= "db" (namespace a))
-                                      (ordered-attribute-props ctx a))) (:schema ctx)))
+                                      (ordered-attribute-props ctx infos a))) (:schema ctx)))
                     (case op
-                      :db/add (and (<= 4 n 5) (ordered-value? ctx props value)
+                      :db/add (and (<= 4 n 5) (ordered-value? ctx infos props value)
                                    (or (= n 4) (nil? extra) (positive-literal-id? extra)))
                       :db/retract (and (<= 3 n 4)
-                                       (or (nil? value) (ordered-value? ctx props value)))
+                                       (or (nil? value) (ordered-value? ctx infos props value)))
                       :db.fn/retractAttribute (= n 3)
                       (:db.fn/cas :db/cas)
-                      (and (= n 5) (or (nil? value) (ordered-value? ctx props value))
-                           (ordered-value? ctx props extra)))))
+                      (and (= n 5) (or (nil? value) (ordered-value? ctx infos props value))
+                           (ordered-value? ctx infos props extra)))))
              false))))))
 
 (defn- ordered-independent-prefix
   "Select a bounded, existing-EID scalar prefix. These operands cannot be a
   future value-tempid target, queue tuples or require redundant-add evidence."
-  [ctx forms]
+  [ctx infos forms]
   (let [seen (HashSet.)
         prefix (into []
                  (take-while
@@ -1609,27 +1908,28 @@
                           (instance? Long (nth form 1)) (pos? (long (nth form 1)))
                           (when-let [^AttrInfo info (literal-scalar-info
                                             (:schema ctx) (:db/attrTuples (:rschema ctx))
-                                            (nth form 2) (nth form 3) true nil)]
+                                            (nth form 2) (nth form 3) true infos)]
                             (and (.-typed? info)
                                  (not (identical? :db.type/ref (.-value-type info)))
                                  (canonical-scalar-value? true (.-value-type info) (nth form 3))
                                  (.add seen [(nth form 1) (nth form 2)]))))))
                  (take 8 forms))]
     (when (>= (count prefix) 2)
-      (when-let [prepared (compile-scalar-region ctx prefix :scalar true)]
+      (when-let [prepared (compile-scalar-plan ctx prefix :scalar true false false nil infos)]
         (when (instance? datalevin.db.tx.plan.TxPlan prepared)
           {:prefix-plan prepared :prefix-count (count prefix)})))))
 
 (defn- compile-ordered-region
   "Retain original declarative forms and an optional independent prefix proof.
   Preparation owns expansion, reference stamps, pending state and retries."
-  [ctx forms]
+  [ctx forms infos]
   (when (and (identical? clojure.lang.PersistentVector (class forms))
              (nil? (meta forms)) (seq forms)
-             (not (:auto-entity-time? (:opts ctx)))
-             (every? #(if (plain-map? %) (ordered-map? ctx % 0) (ordered-form? ctx %)) forms))
-    (merge (plan/->TxPlan ctx :ordered forms nil)
-           (ordered-independent-prefix ctx forms))))
+             (not (:auto-entity-time? (:opts ctx))))
+    (let [infos (or infos (HashMap.))]
+      (when (every? #(if (plain-map? %) (ordered-map? ctx infos % 0) (ordered-form? ctx infos %)) forms)
+        (merge (plan/->TxPlan ctx :ordered forms nil)
+               (ordered-independent-prefix ctx infos forms))))))
 
 (defn compile-tx
   "Select an independent or ordered rule from a pure structural decision.
@@ -1637,26 +1937,34 @@
   ([ctx forms] (compile-tx ctx forms {}))
   ([ctx forms {:keys [literal-shape request-shape] :as options}]
    (let [shape (or literal-shape request-shape (literal-request-shape forms))
+         ;; Reuse each multi-form independent rule's existing metadata table if
+         ;; selection proceeds to mixed/ordered rules. Singletons keep direct
+         ;; attribute binding; each table belongs to this captured context.
+         infos (when (and (identical? clojure.lang.PersistentVector (class forms))
+                          (> (count forms) 1)
+                          (#{:scalar :scalar-operations :scalar-aliases :explicit-additions :mixed} shape))
+                 (HashMap.))
          selected
          (case shape
-           :explicit-additions (compile-explicit-additions ctx forms)
+           :explicit-additions (compile-explicit-additions ctx forms infos)
            :patch
-           (when (identical? :patch (literal-request-shape forms))
-             (let [form (nth forms 0)]
-               (compile-patch-region ctx form (long (nth form 1)) (nth form 2) (nth form 3))))
+           (when-let [form (if (or literal-shape request-shape)
+                            (literal-patch-form forms)
+                            (nth forms 0))]
+             (compile-patch-region ctx form (long (nth form 1)) (nth form 2) (nth form 3)))
            (:scalar :scalar-operations)
-           (or (compile-scalar-plan ctx forms shape (nil? literal-shape) (nil? literal-shape) false)
-               (when (nil? literal-shape) (compile-mixed-region ctx forms)))
+           (or (compile-scalar-plan ctx forms shape (nil? literal-shape) (nil? literal-shape) false nil infos)
+               (when (nil? literal-shape) (compile-mixed-region* ctx forms infos)))
            :scalar-aliases
-           (compile-scalar-plan ctx forms shape true true true)
+           (compile-scalar-plan ctx forms shape true true true nil infos)
            :blind
-           (or (compile-blind-plan ctx forms options)
+           (or (when-not (:skip-blind? options) (compile-blind-plan ctx forms options))
                (when (needs-ordinary-insert-plan? ctx forms) (compile-mixed-region ctx forms)))
-           :mixed (compile-mixed-region ctx forms)
+           :mixed (compile-mixed-region* ctx forms infos)
            nil)]
      (or (when-not (identical? ::small-unique-decline selected) selected)
          (when (and (nil? literal-shape) (not= false (:ordered? options))
                     (not (identical? ::small-unique-decline selected)))
-           (compile-ordered-region ctx forms))
+           (compile-ordered-region ctx forms infos))
          (when (and (nil? literal-shape) (:dynamic? options))
            (compile-program ctx forms))))))

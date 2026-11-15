@@ -45,3 +45,26 @@
                 (assoc-in context [:schema :doc :db.attr/preds] 'user/pred?)
                 source 1 :doc operations)))
     (is (empty? @effects))))
+
+(deftest patch-shape-hints-validate-only-patch-syntax-without-binding-or-demand
+  (let [effects (atom [])
+        operations (lazy-seq (swap! effects conj :operations) (list [:set [:n] 2]))
+        host (proxy [Number] []
+               (longValue [] (swap! effects conj :id) 1)
+               (intValue [] 1) (doubleValue [] 1.0) (floatValue [] 1.0))]
+    (doseq [options [{} {:request-shape :patch} {:literal-shape :patch}]
+            eid [1 (int 1) 1N]]
+      (let [source [:db.fn/patchIdoc eid :doc operations]
+            plan (compile/compile-tx context [source] options)]
+        (is (= :patch (:strategy plan)))
+        (is (instance? Long (ffirst (:entries plan))))
+        (is (identical? source (nth (first (:entries plan)) 3)))
+        (is (identical? operations (nth (first (:entries plan)) 2)))))
+    (doseq [options [{:request-shape :patch} {:literal-shape :patch}]
+            input [[[:db.fn/patchIdoc 1 :doc {:n 1} operations]]
+                   [[:db.fn/patchIdoc 1 :doc operations] [:db.fn/patchIdoc 2 :doc operations]]
+                   [[:db/add 1 :doc operations]]
+                   [[:db.fn/patchIdoc host :doc operations]]
+                   (lazy-seq (swap! effects conj :forms) (list [:db.fn/patchIdoc 1 :doc operations]))]]
+      (is (nil? (compile/compile-tx context input (assoc options :ordered? false)))))
+    (is (empty? @effects))))

@@ -15,7 +15,7 @@
    [datalevin.index :as idx]
    [datalevin.custom-datalog :as cd]
    [datalevin.datom :as d]
-   [datalevin.util :refer [raise]]
+   [datalevin.util :refer [raise instant?]]
    [datalevin.bits :as b])
   (:import
    [datalevin.datom Datom]
@@ -38,7 +38,7 @@
   [v]
   (cond
     (instance? java.time.Instant v) (Date. (long (inst-ms v)))
-    (inst? v)    v ; java.sql.Date and java.sql.Timestamp are java.util.Date
+    (instant? v) v ; java.sql.Date and java.sql.Timestamp are java.util.Date
     (integer? v) (Date. (long v))
     :else        (raise "Expect java.util.Date" {:input v})))
 

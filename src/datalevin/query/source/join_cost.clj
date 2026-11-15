@@ -23,6 +23,43 @@
                      (finite-cost (+ (* opens (finite-cost fixed))
                                      (if dependent? (* inputs (finite-cost per-binding)) 0.0))))}))))
 
+(defn- union-price
+  [state {:keys [value requires columns]} model]
+  (let [hint (:union-estimate value)
+        known (:known state)
+        shared (set/intersection known (set (map :variable columns)))
+        key (if (seq requires) (set (map :variable requires))
+              (first (sort-by (comp - count)
+                       (filter #(set/subset? % shared) (keys (:lookups hint))))))
+        fanout (if (seq shared) (get-in hint [:lookups key]) (:scan hint))
+        branches (if (seq requires) (get-in hint [:lookups key]) (:scan hint))]
+    (when (and (seq fanout) (seq branches))
+      (let [rows #(finite-cost (reduce + 0.0 (map (fn [b] (if (zero? (compare (:rows b) 0)) 1.0
+                                                          (double (:rows b)))) %)))
+            tuples (double (:tuples state))
+            returned (max 1.0 (finite-cost (* tuples (rows fanout))))
+            read (if (seq requires) returned (rows branches))
+            priced (when model (mapv #(access-time (:estimate %) (if (seq requires) tuples 1.0)
+                                                    (:batch %) (:dependent? %)) branches))
+            sum-cost (fn [key]
+                       (when (and (some? (get state key)) (every? #(number? (get % key)) priced))
+                         (finite-cost (+ (double (get state key)) (reduce + 0.0 (map key priced))))))
+            access (when priced (sum-cost :access-ns))
+            work (finite-cost (+ tuples read returned))
+            local (finite-cost (+ (double (:local-ns state))
+                                   (* work (double (get model :local-row-ns 0)))
+                                   (* (finite-cost (+ (* tuples (count requires)) (* returned (count columns))))
+                                      (double (get model :local-column-ns 0)))))
+            opens (when (and priced (some? (:estimated-opens state)) (every? #(number? (:opens %)) priced))
+                    (finite-cost (+ (double (:estimated-opens state)) (reduce + 0.0 (map :opens priced)))))
+            requests (when (and priced (some? (:estimated-requests state)) (every? #(number? (:requests %)) priced))
+                       (finite-cost (+ (double (:estimated-requests state)) (reduce + 0.0 (map :requests priced)))))]
+        {:known (into known (map :variable columns)) :tuples returned
+         :work-rows (finite-cost (+ (double (:work-rows state)) work))
+         :peak-rows (max (double (:peak-rows state)) read returned)
+         :access-ns access :local-ns local :estimated-opens opens :estimated-requests requests
+         :estimated-ns (when (some? access) (finite-cost (+ access local)))}))))
+
 (defn price
   "Estimate returned-row work along a complete path. Counts are advisory and
   floor the propagated tuple count at one; a zero never proves emptiness. A second independent
@@ -31,14 +68,16 @@
   ([selected inputs row-count model]
   (reduce
     (fn [{:keys [known tuples work-rows peak-rows access-ns local-ns estimated-opens estimated-requests] :as state}
-         {:keys [kind value requires columns]}]
+         {:keys [kind value requires columns] :as choice}]
       (when state
         (if (= kind :core)
-          (when (set/subset? (set (map :variable columns)) known)
+          (if (:union-estimate value)
+            (union-price state choice model)
+            (when (set/subset? (set (map :variable columns)) known)
             (let [local (finite-cost (+ (double local-ns)
                                         (* (double tuples) (+ (double (get model :local-row-ns 0))
                                                                (* (double (get model :local-column-ns 0)) (count requires))))))]
-              (assoc state :local-ns local :estimated-ns (when (some? access-ns) (finite-cost (+ (double access-ns) local))))))
+              (assoc state :local-ns local :estimated-ns (when (some? access-ns) (finite-cost (+ (double access-ns) local)))))))
           (when-let [n (row-count value)]
             (let [output (set (map :variable columns))
                   dependent? (seq requires)
@@ -66,6 +105,10 @@
      :access-ns (when model 0.0) :local-ns 0.0 :estimated-ns (when model 0.0)
      :estimated-opens (when model 0.0) :estimated-requests (when model 0.0)} selected)))
 
+(defn- root-work [choice]
+  (if (= :core (:kind choice)) (:covers choice)
+    (into #{} (map #(if (vector? %) (first %) %)) (:covers choice))))
+
 (defn select
   "Keep the original feasible plan, then compare complete alternatives with a
   different first access. All attempts share the remaining 4096-state allowance
@@ -82,26 +125,26 @@
       (let [choices (:choices arguments)
             seed (into {} (map (juxt :variable identity)) (:inputs arguments))
             roots (->> choices
-                       (filter #(and (= :access (:kind %))
+                       (filter #(and (or (= :access (:kind %)) (:union-estimate (:value %)))
                                      (every? (fn [c] (dependency/supplies? (seed (:variable c)) c)) (:requires %))))
                        (sort-by #(if (:filtered? %) 0 1))
                        ;; Probe distinct starting work, not repeated scan/lookup
                        ;; variants for the same patterns. Keys contain only core IDs.
                        (reduce (fn [{:keys [seen roots] :as state} choice]
-                                 (let [source-work (into #{} (map #(if (vector? %) (first %) %)) (:covers choice))]
+                                 (let [source-work (root-work choice)]
                                    (if (seen source-work) state
                                      {:seen (conj seen source-work) :roots (conj roots choice)})))
                                {:seen #{} :roots []})
                        :roots (take 16))
             ;; The baseline already evaluated this starting work. Repeating
             ;; its scan/lookup variants cannot discover a different driver.
-            first-access (first (filter #(= :access (:kind %)) (:choices baseline)))
-            work-key #(into #{} (map (fn [id] (if (vector? id) (first id) id))) (:covers %))
+            first-access (first (filter #(or (= :access (:kind %)) (:union-estimate (:value %))) (:choices baseline)))
+            work-key root-work
             roots (remove #(= (work-key first-access) (work-key %)) roots)
             small? (and (<= (count (:required-work arguments)) 8) (<= (count choices) 32))
             budget-ns (if small? 1000000 20000000)
             maximum (if small? (min maximum (+ (long @checks) 128)) maximum)
-            early (vec (take-while #(= :core (:kind %)) choices))
+            early (vec (take-while #(and (= :core (:kind %)) (not (:union-estimate (:value %)))) choices))
             timed? (some? (:estimated-ns initial))
             row-key (if timed? (juxt :estimated-ns :work-rows :peak-rows) (juxt :work-rows :peak-rows))
             _ (when-not (pos? maximum) (throw (IllegalArgumentException. "invalid search bound")))]

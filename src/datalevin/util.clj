@@ -110,6 +110,19 @@
            (instance? Iterable x)
            (instance? java.util.Map x))))
 
+(defn instant?
+  "Recognize instants without an allocating protocol ancestry walk for the
+  standard extensions. Read the protocol registry so external extensions and
+  direct implementations retain inst?'s semantics; no registry is cached."
+  [value]
+  (or (instance? clojure.core.Inst value)
+      (let [implementations (:impls Inst)]
+        (if (and (= 2 (count implementations))
+                 (contains? implementations java.util.Date)
+                 (contains? implementations java.time.Instant))
+          (or (instance? java.util.Date value) (instance? java.time.Instant value))
+          (inst? value)))))
+
 (defmacro some-of
   ([] nil)
   ([x] x)

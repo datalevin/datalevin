@@ -8,7 +8,7 @@
 ;; You must not remove this notice, or any other, from this software.
 ;;
 (ns ^:no-doc datalevin.db.tx.add
-  "Prepare independent ordinary additions without interpreter or index mutations."
+  "Prepare independent ordinary additions from normalized compiler operands."
   (:require [datalevin.datom :refer [datom]]
             [datalevin.db.tx.common :as common]
             [datalevin.db.tx.compile :as compile]
@@ -52,7 +52,7 @@
   [^ArrayList additions ^HashMap infos options eid tx values]
   (when values
     ;; Build each new tuple once from normalized sources. Identity tuples
-    ;; and predicates retain the interpreter's ordered resolution path.
+    ;; and predicates use the dynamic executor's ordered resolution path.
     (when (seq values)
       (let [tuples (reduce-kv
                      (fn [tuples a _]

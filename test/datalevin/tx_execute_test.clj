@@ -3,10 +3,80 @@
             [datalevin.datom :as datom]
             [datalevin.db.tx.common :as common]
             [datalevin.db.tx.compile :as compile]
+            [datalevin.db.tx.plan :as plan]
             [datalevin.db.tx.execute :as execute]
             [datalevin.db.tx.bind :as binder]
             [datalevin.interface :as i]
             [datalevin.prepare :as prepare]))
+
+(deftest instant-index-ordering-matches-storage-without-changing-query-comparison
+  (let [date (java.util.Date. 1000)
+        timestamp (doto (java.sql.Timestamp. 1000) (.setNanos 123456))
+        timestamp-zero (java.sql.Timestamp. 1000)]
+    (doseq [[left right] [[date timestamp] [timestamp date]
+                         [timestamp timestamp-zero] [timestamp-zero timestamp]]]
+      (is (zero? (long (datom/compare-index-values left right)))))
+    (is (neg? (long (datom/compare-index-values timestamp (java.util.Date. 1001)))))
+    (is (pos? (long (datom/compare-with-type timestamp timestamp-zero))))))
+
+(deftest pending-unique-keys-use-the-same-instant-and-decimal-equivalence
+  (doseq [[value lookup] [[(java.sql.Timestamp. 1000) (java.util.Date. 1000)]
+                         [1.00M 1.0M]
+                         [[(doto (java.sql.Timestamp. 1000) (.setNanos 123456)) "a"]
+                          [(java.util.Date. 1000) "a"]]
+                         [[1.00M "a"] [1.0M "a"]]]]
+    (let [pending (org.eclipse.collections.impl.map.mutable.primitive.LongObjectHashMap.)
+          unique (java.util.HashMap.)
+          context (reify common/ScalarPendingIndex
+                    (pending-scalar-index [_] pending)
+                    (pending-unique-index [_] unique)
+                    (retain-pending-index? [_] false)
+                    (prepare-pending-index! [_ _])
+                    (materialize-scalar-pending! [_ _])
+                    (discard-scalar-pending! [_]))
+          database {:store (reify i/IStore
+                             (av-first-e [_ _ _] (throw (AssertionError. "Missed pending owner"))))}
+          addition (datom/datom 1 :unique value 7)]
+      (is (zero? (long (datom/compare-index-values value lookup))))
+      (is (zero? (long (datom/compare-index-values lookup value))))
+      (binding [common/*batch-prepare* context]
+        (common/stage-batch-datom! database addition {:db/unique :db.unique/identity})
+        (is (identical? addition (.get unique (plan/unique-av-key [:unique lookup]))))
+        (is (= 1 (common/av-first-e database :unique lookup)))
+        (is (= 1 (common/av-first-e database :unique lookup nil)))
+        (common/stage-batch-datom! database (datom/datom 1 :unique lookup 7 false)
+                                  {:db/unique :db.unique/identity})
+        (is (nil? (common/av-first-e database :unique value)))))))
+
+(deftest tuple-index-keys-share-recursive-instant-and-decimal-equivalence
+  (let [date (java.util.Date. 1000)
+        timestamp (doto (java.sql.Timestamp. 1000) (.setNanos 123456))
+        left [timestamp [1.00M timestamp] "a"]
+        right (list date (list 1.0M date) "a")
+        left-key (plan/unique-av-key [:pair left])
+        right-key (plan/unique-av-key [:pair right])]
+    (is (= left-key right-key))
+    (is (= (.hashCode ^Object left-key) (.hashCode ^Object right-key)))
+    (is (= (hash left-key) (hash right-key)))
+    (is (zero? (long (datom/compare-index-values left right))))
+    (is (zero? (long (datom/compare-index-values right left))))
+    (is (identical? timestamp (first left)))
+    (is (= 2 (.scale ^java.math.BigDecimal (first (second left)))))
+    ;; Millisecond precision must preserve instant versus numeric type identity.
+    (is (not= (plan/unique-av-key [:pair [date]]) (plan/unique-av-key [:pair [1000]])))
+    (is (not (zero? (long (datom/compare-index-values [date] [1000])))))
+    (let [mutable (java.util.Date. 1000)
+          key (plan/unique-av-key [:pair [mutable]])]
+      (.setTime mutable 2000)
+      (is (= key (plan/unique-av-key [:pair [date]]))))
+    (doseq [comparator [datom/cmp-datoms-eavt datom/cmp-datoms-avet]]
+      (let [rows (java.util.TreeSet. ^java.util.Comparator comparator)]
+        (.add rows (datom/datom 1 :pair left 7))
+        (.add rows (datom/datom 1 :pair right 7))
+        (is (= 1 (.size rows)))
+        (is (.contains rows (datom/datom 1 :pair right 7)))
+        (is (.remove rows (datom/datom 1 :pair right 7)))
+        (is (.isEmpty rows))))))
 
 (deftest patch-worker-consumes-owned-operands-without-publication-or-early-demand
   (let [events (atom [])
@@ -108,15 +178,20 @@
               {} {:validate-data? false})
         forms [(array-map :db/id -1 :text host :numbers [1.2 1.8 2.9])]
         kinds (binder/blind-entity-kinds forms nil)
-        parts (binder/prepare-blind-operands ctx forms true true kinds)
+        template (compile/compile-blind-template ctx forms {:caller-bound? true :allow-small-unique? true})
+        compilation-events @calls
+        parts (binder/bind-blind-operands template true)
         entity (first (:entries parts))]
     (is (= 1 kinds))
+    (is (empty? compilation-events))
+    (is (not (instance? datalevin.db.tx.plan.TxPlan template)))
     (is (= -1 (.-tempid ^datalevin.db.tx.plan.BlindEntity entity)))
     (is (= [:text "normalized" :numbers 1 :numbers 2]
            (vec (.-attrs ^datalevin.db.tx.plan.BlindEntity entity))))
     (is (true? (:has-many? parts)))
     (is (false? (:has-unique? parts)))
-    (is (not (contains? parts :ctx)))
+    (is (identical? ctx (:ctx parts)))
+    (is (instance? datalevin.db.tx.plan.TxPlan parts))
     (is (= [:correct] @calls))
     (is (identical? host (:text (first forms))))
     (is (= [1.2 1.8 2.9] (:numbers (first forms))))))
@@ -127,6 +202,61 @@
     (is (= 1 (binder/blind-entity-kinds input 1))))
   (is (false? (binder/blind-entity-kinds [{:db/id nil :value 1}] nil)))
   (is (false? (binder/blind-entity-kinds [{:value 1} {:db/id 1 :value 2}] nil))))
+
+(deftest blind-templates-defer-nested-demand-until-binding-and-reject-late-metadata
+  (let [events (atom [])
+        host (proxy [Object] [] (toString [] (swap! events conj :correct) "normalized"))
+        values (lazy-seq (swap! events conj :values) (list 1.2 1.8 2.9))
+        ctx (prepare/->PrepareCtx
+              {:text {:db/aid 1 :db/valueType :db.type/string}
+               :numbers {:db/aid 2 :db/valueType :db.type/long
+                         :db/cardinality :db.cardinality/many}}
+              {} {:validate-data? false})
+        forms [(array-map :text host :numbers values)]
+        template (compile/compile-blind-template ctx forms {:caller-bound? true})]
+    (is (empty? @events))
+    (is (nil? (compile/compile-blind-template ctx (conj forms {:unknown 1}) {:caller-bound? true})))
+    (is (empty? @events))
+    (let [prepared (binder/bind-blind-operands template true)
+          entity (first (:entries prepared))]
+      (is (= [:correct :values] @events))
+      (is (= [:text "normalized" :numbers 1 :numbers 2]
+             (vec (.-attrs ^datalevin.db.tx.plan.BlindEntity entity)))))
+    (is (identical? host (:text (first forms))))
+    (is (identical? values (:numbers (first forms))))))
+
+(deftest scalar-correction-retains-user-keywords-and-nil-results
+  (let [ctx (prepare/->PrepareCtx
+              {:token {:db/aid 1 :db/valueType :db.type/keyword}
+               :number {:db/aid 2 :db/valueType :db.type/long}}
+              {} {:validate-data? false})
+        database {:max-eid 1}]
+    (doseq [[raw expected] [[:datalevin.db.tx.compile/decline :datalevin.db.tx.compile/decline]
+                          [(Object.) nil]]]
+      (is (= [[1 :token expected] [1 :number 2]]
+             (binder/prepare-scalar-operands
+               database ctx [[:db/add 1 :token raw] [:db/add 1 :number 2.9]] false))))))
+
+(deftest blind-binding-reuses-compiled-metadata-for-identity-and-read-layouts
+  (let [binding? (atom false) reads (atom [])
+        attrs (mapv #(keyword (str "field" %)) (range 8))
+        schema (into {:key {:db/aid 1 :db/valueType :db.type/string :db/unique :db.unique/identity}}
+                     (map-indexed (fn [i attr] [attr {:db/aid (+ i 2) :db/valueType :db.type/long}]) attrs))
+        ctx (prepare/->PrepareCtx
+              (fn [attr]
+                (when @binding? (throw (AssertionError. "Metadata reread during binding")))
+                (swap! reads conj attr)
+                (schema attr))
+              {} {:validate-data? false})
+        form (into {:db/id -1 :key "one"} (map #(vector % 1.2) attrs))
+        template (compile/compile-blind-template ctx [form] {:caller-bound? true :allow-small-unique? true})]
+    (is (= (zipmap (keys schema) (repeat 1)) (frequencies @reads)))
+    (reset! binding? true)
+    (let [prepared (binder/bind-blind-operands template true)]
+      (is (= [:key "one"] (:identity-upsert-av prepared)))
+      (is (some? (:identity-upsert-read prepared)))
+      (is (= (assoc (zipmap attrs (repeat 1)) :key "one")
+             (apply hash-map (.-attrs ^datalevin.db.tx.plan.BlindEntity (first (:entries prepared)))))))))
 
 (deftest scalar-preparation-owns-correction-and-accepts-associative-views
   (let [calls (atom [])

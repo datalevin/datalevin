@@ -12,7 +12,7 @@
   (:require
    [taoensso.nippy :as nippy]
    [datalevin.constants :refer [tx0]]
-   [datalevin.util :refer [array? combine-hashes combine-cmp defcomp]])
+   [datalevin.util :refer [array? combine-hashes combine-cmp defcomp instant?]])
   (:import
    [datalevin.utl BitOps QueryKey]
    [java.util Arrays]
@@ -203,22 +203,23 @@
 (declare compare-collision-values)
 
 (defn- compare-collision-seqs
-  [xs ys]
-  (let [n (Long/compare (count xs) (count ys))]
-    (if (zero? n)
-      (if (and (indexed? xs) (indexed? ys))
-        (let [size (count xs)]
-          (loop [i 0]
-            (if (< i size)
-              (let [n (long (compare-collision-values (nth xs i) (nth ys i)))]
-                (if (zero? n) (recur (inc i)) n))
-              0)))
-        (loop [xs (seq xs) ys (seq ys)]
-          (if xs
-            (let [n (long (compare-collision-values (first xs) (first ys)))]
-              (if (zero? n) (recur (next xs) (next ys)) n))
-            0)))
-      n)))
+  ([xs ys] (compare-collision-seqs compare-collision-values xs ys))
+  ([compare-values xs ys]
+   (let [n (Long/compare (count xs) (count ys))]
+     (if (zero? n)
+       (if (and (indexed? xs) (indexed? ys))
+         (let [size (count xs)]
+           (loop [i 0]
+             (if (< i size)
+               (let [n (long (compare-values (nth xs i) (nth ys i)))]
+                 (if (zero? n) (recur (inc i)) n))
+               0)))
+         (loop [xs (seq xs) ys (seq ys)]
+           (if xs
+             (let [n (long (compare-values (first xs) (first ys)))]
+               (if (zero? n) (recur (next xs) (next ys)) n))
+             0)))
+       n))))
 
 (defn- collision-kind
   [x]
@@ -228,7 +229,7 @@
     (set? x) :set
     (sequential? x) :sequential
     (number? x) :number
-    (inst? x) :instant
+    (instant? x) :instant
     :else (class x)))
 
 (defn- numeric-kind
@@ -322,18 +323,73 @@
          ;; and ordering contract; retain its coarse type fallback.
          (compare (str (collision-kind a)) (str (collision-kind b))))))))
 
+(defn- storage-instant-millis
+  "Shared instant projection for owned hash keys and direct ordered comparison."
+  ^long [value]
+  (let [t (class value)]
+    (if (or (identical? t java.util.Date) (identical? t java.sql.Date)
+            (identical? t java.sql.Timestamp))
+      (.getTime ^java.util.Date value)
+      ;; Retain protocol semantics for custom instant implementations.
+      (long (inst-ms value)))))
+
+(defn- compare-storage-instants
+  ^long [a b]
+  (Long/compare (storage-instant-millis a) (storage-instant-millis b)))
+
+(defn storage-value-key
+  "Canonicalize scalar and sequential transaction index keys. Instants retain
+  their type with storage millisecond precision; decimals ignore scale. Tuple
+  components follow the same rules recursively. Original values stay unchanged."
+  [value]
+  (cond
+    (instant? value)
+    ;; Snapshot mutable dates in owned keys; retain the instant type so a tuple
+    ;; instant never aliases a numeric component with the same millisecond value.
+    (java.util.Date. (storage-instant-millis value))
+
+    (instance? java.math.BigDecimal value)
+    (.stripTrailingZeros ^java.math.BigDecimal value)
+
+    (vector? value)
+    (reduce-kv (fn [values i component]
+                 (let [key (storage-value-key component)]
+                   (if (identical? key component) values (assoc values i key))))
+               value value)
+
+    (sequential? value)
+    (mapv storage-value-key value)
+
+    :else value))
+
+(defn- compare-storage-components
+  "Compare tuple components directly, keeping the shared millisecond projection
+  and scale-insensitive numeric ordering without materializing normalized keys.
+  Other leaves retain the existing structural/opaque comparison contract."
+  [a b]
+  (cond
+    (identical? a b) 0
+    (and (instant? a) (instant? b)) (compare-storage-instants a b)
+    (and (sequential? a) (sequential? b))
+    (compare-collision-seqs compare-storage-components a b)
+    :else (compare-collision-values a b)))
+
 (defn compare-index-values
   "Keep numeric equality families and unequal opaque values distinct in pending
-   indexes. Query predicates still use compare-with-type's coarse fallback."
+   indexes. Compare scalar/tuple instants at storage millisecond precision and
+   decimals independently of scale, without allocating owned hash keys here.
+   Query predicates retain compare-with-type's existing comparison rules."
   [a b]
-  (if (and (not (identical? (class a) (class b)))
-           (number? a) (number? b))
-    (let [ak (numeric-kind a)
-          bk (numeric-kind b)]
-      (if (identical? ak bk)
-        (compare a b)
-        (compare (str ak) (str bk))))
-    (compare-with-type a b true)))
+  (cond
+    (identical? a b) 0
+    (and (instant? a) (instant? b)) (compare-storage-instants a b)
+    (and (sequential? a) (sequential? b))
+    (compare-collision-seqs compare-storage-components a b)
+    (and (not (identical? (class a) (class b)))
+         (number? a) (number? b))
+    (let [ak (numeric-kind a) bk (numeric-kind b)]
+      (if (identical? ak bk) (compare a b) (compare (str ak) (str bk))))
+    :else (compare-with-type a b true)))
 
 (def nil-cmp (nil-check-cmp-fn compare))
 (def nil-cmp-type (nil-check-cmp-fn compare-index-values))

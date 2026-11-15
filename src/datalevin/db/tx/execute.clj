@@ -15,6 +15,7 @@
             [datalevin.db.tx.compile :as compile]
             [datalevin.db.tx.common :as txcommon]
             [datalevin.db.tx.prepare :as txprep]
+            [datalevin.db.tx.plan :as plan]
             [datalevin.storage :as s]
             [datalevin.idoc :as idoc]
             [datalevin.index :as idx]
@@ -23,6 +24,7 @@
             [datalevin.validate :as vld])
   (:import [datalevin.datom Datom]
            [datalevin.db.tx.plan BlindEntity ScalarEntityRead]
+           [datalevin.utl QueryKey$EquivSet]
            [clojure.lang LazilyPersistentVector]
            [org.eclipse.collections.impl.list.mutable FastList]
            [org.eclipse.collections.impl.map.mutable.primitive LongObjectHashMap]
@@ -257,14 +259,15 @@
       result)))
 
 (defn blind-unique-values-absent?
-  "Check normalized unique AV operands against the caller's current view."
+  "Require distinct normalized unique AVs before probing the current view."
   [db ^FastList avs]
-  (or (nil? avs)
-      (loop [i 0]
-        (or (>= i (.size avs))
-            (let [[a v] (.get avs i)]
-              (and (nil? (txcommon/av-first-e db a v))
-                   (recur (unchecked-inc i))))))))
+  (and (compile/blind-unique-avs-distinct? avs)
+       (or (nil? avs)
+           (loop [i 0]
+             (or (>= i (.size avs))
+                 (let [[a v] (.get avs i)]
+                   (and (nil? (txcommon/av-first-e db a v))
+                        (recur (unchecked-inc i)))))))))
 
 (defn- append-blind-identity-upsert!
   [db ^BlindEntity entity identity-attr eid tx-id layout tx-data]
@@ -307,7 +310,7 @@
   [report ^FastList entities ^FastList identity-avs store-schema]
   (when (and (empty? (:tx-data report)) (empty? (:tempids report)))
     (let [db (:db-after report)
-          seen-avs (HashSet.)
+          seen-avs (QueryKey$EquivSet.)
           seen-eids (HashSet.)
           ^FastList resolutions (FastList. (.size entities))
           max-eid
@@ -318,7 +321,7 @@
                            (.get identity-avs i)
                            (compile/blind-identity-upsert-av store-schema
                              (.get entities i)))]
-                (when (.add seen-avs av)
+                (when (.add seen-avs (plan/unique-av-key av))
                   (let [stored-eid (txcommon/av-first-e db a v)
                         eid (if stored-eid (long stored-eid) (inc max-eid))]
                     (when (.add seen-eids eid)
