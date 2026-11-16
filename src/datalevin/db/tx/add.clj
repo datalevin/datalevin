@@ -12,6 +12,7 @@
   (:require [datalevin.datom :refer [datom]]
             [datalevin.db.tx.common :as common]
             [datalevin.db.tx.compile :as compile]
+            [datalevin.db.tx.plan :as plan]
             [datalevin.interface :as i]
             [datalevin.index :as idx]
             [datalevin.prepare :as prepare]
@@ -137,7 +138,7 @@
             (if (:db/unique (.-props info))
               (let [v (.-v addition)
                     ^HashSet seen (or seen (HashSet.))]
-                (when (and (.add seen [a v])
+                (when (and (.add seen (plan/unique-av-key [a v]))
                            (nil? (common/av-first-e db a v)))
                   (recur (unchecked-inc index) seen)))
               (recur (unchecked-inc index) seen)))

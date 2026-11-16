@@ -6,6 +6,7 @@
             [datalevin.parser :as dp]
             [datalevin.query.source.contract :as contract]
             [datalevin.query.source.control :as control]
+            [datalevin.query.source.expression :as expression]
             [datalevin.query.source.lowering :as lowering]
             [datalevin.query.source.runtime :as rt]
             [datalevin.query.source.value :as value :refer [fail!]])
@@ -341,10 +342,13 @@
                               (when (empty? inputs) (fail! :query-source/unsupported :planning))
                               (if (external? node inherited (volatile! #{}) 0)
                                 (do
-                                  ;; Complete positive fact bodies share the parent's
-                                  ;; acquired sessions. Negative recursion and arbitrary
-                                  ;; external operators require separate admission.
-                                  (when-not (every? #(instance? Pattern %) (:clauses node))
+                                  ;; Complete fact bodies and their bounded scalar
+                                  ;; qualifications share the parent's sessions.
+                                  ;; Other external operators need separate admission.
+                                  (when-not (every? #(or (instance? Pattern %)
+                                                        (and (instance? Predicate %)
+                                                             (expression/flat-scalar? %)))
+                                                    (:clauses node))
                                     (fail! :query-source/unsupported :clauses))
                                   (let [child (body! (:clauses node) (conj location :negative)
                                                     source inputs inputs (select-keys bindings inputs)

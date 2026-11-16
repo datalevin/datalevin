@@ -1157,7 +1157,8 @@
     report))
 
 (defn- transact-request!
-  [conn tx-data tx-meta]
+  ([conn tx-data tx-meta] (transact-request! conn tx-data tx-meta nil))
+  ([conn tx-data tx-meta submitted]
   ;; Remote preparation must run under the server's writer, including when
   ;; callers share a connection. Client-side simulated batching could otherwise
   ;; race transactions submitted by another client between prepare and commit.
@@ -1166,12 +1167,12 @@
       (observe-txlog-sync-path! :direct-remote)
       (notify-listeners! conn report)
       report)
-    (if-let [outcome (db/prepare-local-request @conn tx-data *request-origin*)]
+    (if-let [outcome (when-not submitted (db/prepare-local-request @conn tx-data *request-origin*))]
       (transact-compiled-local! conn tx-data tx-meta outcome)
       (let [owned? (local-owned-compile-eligible? conn)
-            outcome (if owned?
+            outcome (or submitted (if owned?
                       (db/prepare-compiled-request @conn tx-data)
-                      (db/prepare-local-compiled-request @conn tx-data))
+                      (db/prepare-local-compiled-request @conn tx-data)))
             kind (when-not (or outcome
                                (and (not owned?)
                                     (guarded-local-request-shape conn tx-data)))
@@ -1231,7 +1232,7 @@
                              (l/read-env-opts (.-lmdb ^Store store)))]
                   (observe-embedded-path!
                    (when (:wal? opts) (:wal-durability-profile opts)) false))
-                (run-transact-now! conn tx-data tx-meta kind outcome)))))))))
+                (run-transact-now! conn tx-data tx-meta kind outcome))))))))))
 
 (defn transact!
   ([conn tx-data] (transact! conn tx-data nil))
@@ -1243,6 +1244,18 @@
             (nil? (l/explicit-transaction-timeout)))
      (datalog/run-explicit-request! conn tx-data tx-meta transact-request!)
      (transact-request! conn tx-data tx-meta))))
+
+(defn ^:no-doc transact-prepared!
+  "Submit pure bound operands through ordinary ownership, timeout, explicit
+  transaction, publication and listener paths. Fallback input stays deferred."
+  [conn input tx-meta outcome]
+  (if (and datalog/*explicit-body*
+           (identical? conn (:connection datalog/*explicit-body*))
+           (not= :resolving @(:last-write datalog/*explicit-body*))
+           (nil? (l/explicit-transaction-timeout)))
+    (datalog/run-explicit-request!
+      conn input tx-meta #(transact-request! %1 %2 %3 outcome))
+    (transact-request! conn input tx-meta outcome)))
 
 (defn transact-ack!
   ([conn tx-data] (transact-ack! conn tx-data nil))

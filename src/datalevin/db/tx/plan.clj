@@ -7,7 +7,24 @@
 
 (defrecord TxPlan [ctx strategy entries entity-reads])
 
+(deftype TxParam [key])
+
+(defrecord WriteOp [ctx source expression params kind entity fields tx annotations])
+
+(defrecord WriteTemplate [ctx operations params batch? strategy explicit? metadata])
+
+(deftype PreparedTxInput [forms])
+
+(defn request-forms
+  "Materialize a prepared request only when ordinary preparation is required.
+  The delayed result is a vector, preserving materialized-input semantics."
+  [input]
+  (if (instance? PreparedTxInput input)
+    (force (.-forms ^PreparedTxInput input)) input))
+
 (deftype ScalarEntityRead [^objects names ^longs aids])
+
+(deftype ScalarSequence [entries ^ints slots ^long slot-count])
 
 (deftype BlindEntity [tempid ^FastList attrs])
 

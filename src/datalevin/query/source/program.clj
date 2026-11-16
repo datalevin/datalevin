@@ -191,12 +191,7 @@
         ;; A local predicate consumes bindings, including nulls, before a fact
         ;; can narrow their schema. Possible fact outputs are not its inputs.
         inputs (mapv #(column % :data true) (canonical variables check!))]
-    (when-not (and (expression/scalar-functions f)
-                  (every? #(or (instance? Variable %)
-                               ;; The native resolver evaluates list arguments
-                               ;; as nested calls. They need a separate proof;
-                               ;; accepting a Constant must not bypass admission.
-                               (and (instance? Constant %) (not (list? (:value %))))) args))
+    (when-not (expression/flat-scalar? node)
       (unsupported!))
     (cond
       (instance? Predicate node)

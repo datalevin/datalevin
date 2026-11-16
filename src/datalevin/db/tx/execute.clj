@@ -23,7 +23,7 @@
             [datalevin.prepare :as coreprep]
             [datalevin.validate :as vld])
   (:import [datalevin.datom Datom]
-           [datalevin.db.tx.plan BlindEntity ScalarEntityRead]
+           [datalevin.db.tx.plan BlindEntity ScalarEntityRead ScalarSequence]
            [datalevin.utl QueryKey$EquivSet]
            [clojure.lang LazilyPersistentVector]
            [org.eclipse.collections.impl.list.mutable FastList]
@@ -193,6 +193,33 @@
                       (txcommon/emit-transition
                         conj! out e attr old-value value tx-id annotations)))
              (persistent! out))))))))
+
+(defn execute-scalar-sequence
+  "Execute a typed, concrete-EID replacement chain. Slots forward the prepared
+  value between dependent operations; the existing pending view seeds each slot.
+  No callbacks, refs, uniqueness or tuple effects enter this region. Every
+  logical transition is retained, and no shared pending state is mutated here."
+  ([report operands tx-id]
+   (execute-scalar-sequence report operands tx-id txcommon/preparation-first-v))
+  ([report ^ScalarSequence operands tx-id read-old]
+  (let [entries (.-entries operands) ^ints slots (.-slots operands)
+        values (object-array (int (.-slot-count operands)))
+        initialized (boolean-array (alength values)) db (:db-after report)]
+    (loop [i 0 out (transient [])]
+      (if (< i (count entries))
+        (let [entry (nth entries i) e (nth entry 0) attr (nth entry 1)
+              value (nth entry 2) slot (aget slots i)
+              old (if (aget initialized slot) (aget values slot)
+                      (read-old db e attr))
+              before (count out)
+              out (txcommon/emit-transition conj! out e attr old value
+                    (long (or (nth entry 3 nil) tx-id)) (nth entry 4 nil))]
+          ;; Retain physical old-value references on a redundant addition.
+          (aset values slot (if (= before (count out)) old value))
+          (aset-boolean initialized slot true)
+          (recur (unchecked-inc i) out))
+        (assoc report :db-after (assoc db :max-tx tx-id) :tx-data (persistent! out)
+                      :tempids {:db/current-tx tx-id}))))))
 
 (defn execute-scalar-report
   "Emit already-bound scalar operands into a fresh adapter-owned report.

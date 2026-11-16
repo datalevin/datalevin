@@ -16,18 +16,36 @@
   ([run] (PreparedRead. run nil))
   ([run view-run] (PreparedRead. run view-run)))
 
+(deftype PreparedWrite [run scope-run]
+  IFn
+  (invoke [_ input] (run input nil))
+  (invoke [_ input tx-meta] (run input tx-meta))
+  (applyTo [this args] (clojure.lang.AFn/applyToHelper this args)))
+
+(defn prepared-write [run scope-run]
+  (PreparedWrite. run scope-run))
+
 (defn execute
   "Execute a prepared operation with its key, entity identifier or query inputs.
   The three-argument arity executes a local preparation against an explicit
   view, such as a transaction's DB view or KV handle, so one preparation can
   be reused across transactions."
-  ([^PreparedRead prepared input]
-   (.invoke prepared input))
-  ([^PreparedRead prepared view input]
-   (if-some [view-run (.-view-run prepared)]
-     (view-run view input)
-     (throw (ex-info "Prepared read does not support an explicit view"
-                     {:type :prepared/no-view})))))
+  ([prepared input]
+   (if (instance? PreparedWrite prepared)
+     (.invoke ^PreparedWrite prepared input)
+     (.invoke ^PreparedRead prepared input)))
+  ([prepared view input]
+   (if (instance? PreparedWrite prepared)
+     ((.-scope-run ^PreparedWrite prepared) view input nil)
+     (if-some [view-run (.-view-run ^PreparedRead prepared)]
+       (view-run view input)
+       (throw (ex-info "Prepared read does not support an explicit view"
+                       {:type :prepared/no-view})))))
+  ([prepared view input tx-meta]
+   (if (instance? PreparedWrite prepared)
+     ((.-scope-run ^PreparedWrite prepared) view input tx-meta)
+     (throw (ex-info "Transaction metadata requires a prepared write"
+                     {:type :prepared/not-write})))))
 
 (def ^:const max-handles 256)
 

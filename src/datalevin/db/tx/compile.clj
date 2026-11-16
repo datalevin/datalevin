@@ -1114,6 +1114,19 @@
                     0 entity)]
           (when end (MixedInsert. tempid attrs)))))))
 
+(defn mixed-insert-values-ready?
+  "Prove prepared insert values against captured metadata and the ordered
+  self/back-tempid set. Corrections remain deferred until the whole plan passes."
+  [ctx ^objects attrs tempids corrections?]
+  (loop [offset 0]
+    (if (< offset (alength attrs))
+      (let [^AttrInfo info (aget attrs (+ offset 2))]
+        (when (and (.-insert? info)
+                   (mixed-value-ready? (:validate-data? (:opts ctx)) (.-props info)
+                                       tempids (aget attrs (inc offset)) corrections?))
+          (recur (+ offset 3))))
+      true)))
+
 (defn- compile-mixed-insert
   [ctx ^HashMap infos ^HashSet tempids entity corrections?]
   (let [explicit? (contains? entity :db/id)
@@ -1121,15 +1134,7 @@
     (when (or (not explicit?)
               (when-let [key (literal-tempid-key tempid)] (.add tempids key)))
       (when-let [^MixedInsert entry (mixed-insert-operands ctx infos entity)]
-        (let [^objects attrs (.-attrs entry)]
-          (loop [offset 0]
-            (if (< offset (alength attrs))
-              (when (mixed-value-ready?
-                      (:validate-data? (:opts ctx))
-                      (.-props ^AttrInfo (aget attrs (+ offset 2)))
-                      tempids (aget attrs (inc offset)) corrections?)
-                (recur (+ offset 3)))
-              entry)))))))
+        (when (mixed-insert-values-ready? ctx (.-attrs entry) tempids corrections?) entry)))))
 
 (defn- independent-tuple-info? [^AttrInfo info]
   (and (.-ordinary? info) (.-insert? info)
@@ -1162,7 +1167,9 @@
                         false)))
          (MixedUpdate. e attr value))))))
 
-(defn- append-mixed-update!
+(defn append-mixed-update!
+  "Append one proven replacement using the compiler-owned metadata table.
+  Both raw compilation and prepared binding share value and distinctness rules."
   [ctx ^HashMap infos ^HashSet updates ^ArrayList entries e attr value corrections?]
   (when-let [entry (mixed-update-operand ctx infos e attr value true)]
     (let [^AttrInfo info (.get infos attr)]
@@ -1174,6 +1181,21 @@
         (.add entries entry)
         info))))
 
+(defn finish-mixed-plan
+  "Finish one owned mixed stream after all eligibility checks. The same
+  correction and read/storage decisions serve raw and reusable programs."
+  [ctx ^HashMap infos ^HashSet updates ^ArrayList entries corrections? inserts? required-eid typed?]
+  (when (and (or inserts?
+                 (some (fn [^MixedUpdate entry]
+                         (identical? :db.type/tuple (.-value-type ^AttrInfo (.get infos (.-attr entry)))))
+                       entries))
+             (or (not @corrections?)
+                 (correct-mixed-entries! (:validate-data? (:opts ctx)) infos entries)))
+    (plan/->TxPlan ctx :mixed
+                   (MixedOperands. entries infos required-eid
+                                   (and typed? (> (.size updates) 1))
+                                   (>= (.size infos) 8)) nil)))
+
 (defn- compile-mixed-region*
   "Build one owned mixed operand stream, then correct it after full eligibility.
   Writer bounds, uniqueness and old values remain runtime work."
@@ -1181,8 +1203,7 @@
   (when (and (identical? clojure.lang.PersistentVector (class forms))
              (nil? (meta forms)) (pos? (count forms))
              (not (:auto-entity-time? (:opts ctx))))
-    (let [validate? (:validate-data? (:opts ctx))
-          infos (or infos (HashMap.)) tempids (HashSet.) updates (HashSet.)
+    (let [infos (or infos (HashMap.)) tempids (HashSet.) updates (HashSet.)
           entries (ArrayList.) corrections? (volatile! false)]
       (loop [index 0 inserts? false required-eid 0 typed? true]
         (if (< index (count forms))
@@ -1219,22 +1240,7 @@
                     (recur (unchecked-inc index) inserts? (max required-eid (long e))
                            (and typed? (.-typed? info))))))
               :else nil))
-          (when (and (or inserts?
-                         ;; Scalar-only requests retain their own rules. An
-                         ;; independent tuple replacement needs this shared loop
-                         ;; even when no new entity participates in the request.
-                         (some (fn [^MixedUpdate entry]
-                                 (let [^AttrInfo info (.get infos (.-attr entry))]
-                                   (identical? :db.type/tuple (:db/valueType (.-props info)))))
-                               entries))
-                     ;; Complete all shape, metadata, tempid and E/A proofs
-                     ;; before invoking even a store-free conversion.
-                     (or (not @corrections?) (correct-mixed-entries! validate? infos entries)))
-            (plan/->TxPlan ctx :mixed
-                           (MixedOperands. entries infos required-eid
-                                           (and typed? (> (.size updates) 1))
-                                           (>= (.size infos) 8))
-                           nil)))))))
+          (finish-mixed-plan ctx infos updates entries corrections? inserts? required-eid typed?))))))
 
 (defn compile-mixed-region
   "Build a mixed plan with fresh compiler-owned attribute bindings."
@@ -1685,6 +1691,84 @@
                                        rebuild-reference-vectors? infos)]
     (when (instance? datalevin.db.tx.plan.TxPlan prepared)
       (assoc prepared :explicit-tx? true))))
+
+(defn prepared-write-attribute
+  "Bind reusable addition metadata without consulting parameter values.
+  Reference and tuple scalar preprocessing retain the ordinary fallback."
+  [ctx infos attr strategy]
+  (when (and (keyword? attr) (pos? (count (name attr))))
+    (case strategy
+      :scalar (when-let [^AttrInfo info (scalar-attribute-info
+                                        (:schema ctx) (:db/attrTuples (:rschema ctx))
+                                        attr 1 :references infos)]
+                (when-not (#{:db.type/ref :db.type/tuple} (.-value-type info)) info))
+      :blind (blind-attr-info! infos (:schema ctx) (:db/attrTuples (:rschema ctx)) true attr)
+      :mixed (let [^AttrInfo info (attribute-info! infos (:schema ctx)
+                                                 (:db/attrTuples (:rschema ctx)) attr)]
+               (when (.-insert? info) info))
+      nil)))
+
+(defn prepared-write-metadata?
+  "Whether annotations can retain the pure additive preparation route."
+  [annotations]
+  (or (nil? annotations) (application-add-metadata? annotations)))
+
+(defn append-prepared-scalar!
+  "Bind one reusable scalar instruction into fresh correction scratch.
+  All proofs are value-specific; this worker invokes no runtime callbacks."
+  [ctx ^AttrInfo info candidates seen raw-e attr value]
+  (when (and info (inert-scalar-value? value)
+             (not (and (instance? java.util.Date value)
+                       (some? (.-value-type info))
+                       (not (identical? :db.type/instant (.-value-type info))))))
+    (when-let [e (scalar-entity-operand ctx raw-e true)]
+      (let [vt (.-value-type info)
+            ready? (canonical-scalar-value? (:validate-data? (:opts ctx)) vt value)]
+        (when (or ready?
+                  (and (not (scalar-validation-rejection? (:validate-data? (:opts ctx)) vt value))
+                       (pure-scalar-coercion? vt value)))
+          (or (append-scalar-candidate! candidates seen e attr value (when-not ready? vt))
+              ;; A typed replacement chain can use execution-local value slots.
+              ;; Aliases are excluded by the template binder before selection.
+              (when (.-typed? info)
+                (append-scalar-candidate! candidates nil e attr value (when-not ready? vt))
+                ::dependent-scalar)))))))
+
+(defn correct-prepared-scalars!
+  "Correct a fully proven prepared binding, preserving ordinary rejection."
+  [ctx candidates]
+  (correct-scalar-candidates!
+    candidates (fn [vt value]
+                 (if-some [corrected (try (prepare/correct-scalar-value
+                                           (:validate-data? (:opts ctx)) vt value)
+                                         (catch Exception _ nil))]
+                   corrected operand-decline))))
+
+(defn prepared-tempid-key
+  "Prove an inert new-entity ID without host methods."
+  [value]
+  (literal-tempid-key value))
+
+(defn prepared-positive-id?
+  "Prove an inert supplied transaction or concrete entity ID."
+  [value]
+  (positive-literal-id? value))
+
+(defn prepared-literal?
+  "Prove a definition's scalar map key without invoking a host method."
+  [value]
+  (inert-scalar-value? value))
+
+(defn append-prepared-blind!
+  "Collect one parameter value with the existing blind proof/expansion rule."
+  [ctx attrs info attr value]
+  (compile-blind-attribute! ctx attrs info attr value false nil))
+
+(defn finish-prepared-blind
+  "Lower fresh, fully proven private operands with the shared uniqueness rules.
+  Sources have distinct inert tempids and no runtime correction instructions."
+  [ctx entries infos identity? fuse?]
+  (lower-literal-blind-template (BlindTemplate. ctx entries infos identity? fuse?) true))
 
 (defn flat-upsert-map-proof
   "Prove one already-demanded plain map using value classes only.

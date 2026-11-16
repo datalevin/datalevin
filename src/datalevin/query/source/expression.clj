@@ -5,13 +5,23 @@
             [datalevin.query.source.arithmetic :as arithmetic]
             [datalevin.query.source.runtime :as rt]
             [datalevin.query.source.value :as value])
-  (:import [datalevin.utl LikeFSM]))
+  (:import [datalevin.parser Constant Variable]
+           [datalevin.utl LikeFSM]))
 
 (def arithmetic-functions '#{+ - * / quot rem mod inc dec})
 (def scalar-functions
   (into arithmetic-functions
     '#{identity ground = not= < <= > >= nil? some? zero? pos? neg? even? odd?
        like not-like in not-in}))
+
+(defn flat-scalar?
+  "Whether a parsed call uses the bounded scalar subset without nested calls."
+  [node]
+  (and (scalar-functions (get-in node [:fn :symbol]))
+       (every? #(or (instance? Variable %)
+                    ;; The native resolver evaluates list constants as calls.
+                    (and (instance? Constant %) (not (list? (:value %)))))
+               (:args node))))
 
 (defn- checked [control f]
   (fn [args]

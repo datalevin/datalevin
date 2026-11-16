@@ -27,6 +27,7 @@
    [datalevin.pull-parser]
    [datalevin.pull-api :as dp]
    [datalevin.prepared :as prepared]
+   [datalevin.write :as write]
    [datalevin.query :as dq]
    [datalevin.built-ins :as dbq]
    [datalevin.entity :as de]
@@ -201,6 +202,39 @@ Only usable for debug output.
   for transaction-local reads."}
   prepare-q dq/prepare-q)
 
+(def ^{:arglists '([key])
+       :doc "Mark a named parameter in a prepared transaction definition.
+  Names are keywords; values are supplied in a parameter map at execution."}
+  tx-param write/tx-param)
+
+(def ^{:arglists '([db-or-connection operation])
+       :doc "Prepare an immutable local write operation for composition in
+  several `prepare-tx` programs. Compatible programs share its compiled metadata.
+  Schema/options changes refresh the operation when its program is refreshed."}
+  prepare-tx-op write/prepare-tx-op)
+
+(def ^{:arglists '([connection operations] [connection operations opts])
+       :doc "Prepare a reusable local Datalog transaction. Mark parameters with
+  `tx-param` and execute with a map containing each named parameter:
+
+      (def update-age
+        (prepare-tx conn [[:db/add (tx-param :eid) :age (tx-param :age)]]))
+      (execute-prepared update-age {:eid 1 :age 42})
+
+  With {:batch? true}, execute with a vector of parameter maps; all rows form
+  one atomic transaction and batch length can vary. Operations may be maps,
+  vectors or values from `prepare-tx-op`. Markers inside literal vectors and map
+  values are supported; supply a changing set as one parameter. Scalar updates
+  and new-entity maps use compiled
+  operands when eligible; other inputs retain ordinary transaction semantics.
+
+  The preparation refreshes metadata after schema/options changes and can be
+  shared across threads. Each execution owns its operands and transaction state.
+  `(execute-prepared prepared tx-conn inputs)` uses an explicit transaction's
+  connection; a fourth argument supplies transaction metadata. The callable
+  object also accepts `(prepared inputs tx-meta)` on its original connection."}
+  prepare-tx write/prepare-tx)
+
 (def ^{:arglists '([kv dbi-name] [kv dbi-name k-type]
                    [kv dbi-name k-type v-type]
                    [kv dbi-name k-type v-type ignore-key?])
@@ -214,7 +248,7 @@ Only usable for debug output.
   Prepare from the transaction's KV handle to read transaction-local changes."}
   prepare-get-value kv/prepare-get-value)
 
-(def ^{:arglists '([prepared input] [prepared view input])
+(def ^{:arglists '([prepared input] [prepared view input] [prepared connection input tx-meta])
        :doc "Execute a prepared KV read or update with a key, a prepared pull with an
   entity ID or lookup reference, or a prepared query with an input vector.
   Equivalent to invoking the prepared object.
@@ -222,6 +256,9 @@ Only usable for debug output.
   view: pass the current transaction's DB view (`@tx`) for a prepared pull or
   the transaction KV handle (`tx`) for a prepared KV read or update. A preparation made
   outside a transaction can therefore be reused inside it without re-parsing.
+  For a prepared Datalog write, input is a parameter map (or a vector of maps
+  in batch mode), and the explicit target is a connection such as `tx`.
+  The four-argument arity supplies transaction metadata for a prepared write.
   Remote preparations do not accept an explicit view.
   Prepared reads can be shared across threads; transaction-bound reads retain
   their transaction's lifetime and thread restrictions. They hold no borrowed

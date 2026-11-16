@@ -613,9 +613,21 @@ clause IDs as query-local identities and use exactly those received.
 
 Positive nonrecursive rules over external attributes and supported native rule
 participation are handled by core. Adapters do not flatten rule bodies or query
-hidden caller values. Recursive external rules, external negation, and broader
-delegation require capabilities beyond this contract. Unsupported queries fail
-rather than being approximated.
+hidden caller values. External `not` and `not-join` admit flat fact patterns
+and predicates from the same bounded scalar subset as positive external
+regions. Predicate inputs must be supplied by the declared outer interface or
+facts in that negative body. Absence means no complete qualifying match;
+incomplete reads and qualification errors propagate. Negative bodies share the
+parent's captured sessions and use bounded subtraction to preserve surviving
+outer witnesses. Recursive external rules, nested external negative operators,
+binding-producing functions inside external negation, and broader delegation
+require capabilities beyond this contract. Unsupported queries fail rather
+than being approximated.
+
+For example, `(not-join [?e] [$s ?e :item/weight ?w] [(> ?w 114)])`
+retains an outer entity when it has no weight above 114, including entities
+with no weight facts. Non-null refinements inside the negative body remain
+local to that body.
 
 <a id="attribute-terms-and-access-capabilities"></a>
 

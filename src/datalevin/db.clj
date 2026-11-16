@@ -2338,7 +2338,7 @@
   [db {:keys [entries] :as prepared} store-schema]
   (when-let [entries (txbind/resolve-scalar-update-entries db entries)]
     (assoc prepared :entries entries
-           :entity-reads (when (> (count entries) 1)
+           :entity-reads (when (and (> (count entries) 1) (not (:single-attribute? prepared)))
                            (txcompile/scalar-update-entity-reads store-schema entries)))))
 
 (def ^:dynamic *specialize-scalar-stamping?*
@@ -2628,6 +2628,14 @@
               (compiled-report initial report :compiled-scalar
                                (and txcommon/*batch-prepare* (> (count (:tx-data report)) 2)) (:ctx plan)))))
 
+        :scalar-sequence
+        (let [operands (:entries plan)]
+          (when (txexec/scalar-entities-within-bound?
+                  (.-entries ^datalevin.db.tx.plan.ScalarSequence operands) before)
+            (let [report (txexec/execute-scalar-sequence initial operands tx-id)]
+              (when *tx-compiler-observer* (*tx-compiler-observer* :execute-scalar-sequence plan))
+              (compiled-report initial report :compiled-ordered false (:ctx plan)))))
+
         :blind
         (when-let [[report upsert?]
                    (if (and identity-upsert? (:identity-upsert-av plan))
@@ -2684,7 +2692,7 @@
                 (prepare/make-prepare-ctx (if eligible? db (:db-before initial))))
         selected (when eligible?
                    (if valid? outcome
-                       (do
+                       (let [forms (txplan/request-forms forms)]
                          (when (and outcome *tx-compiler-observer*)
                            (*tx-compiler-observer* :recompile forms))
                          (let [selected (txcompile/compile-tx ctx forms {:allow-small-unique? true :dynamic? true})]
@@ -2702,7 +2710,8 @@
                  (do
                    (when (and outcome (satisfies? txcommon/ScalarPendingIndex txcommon/*batch-prepare*))
                      (txcommon/materialize-scalar-pending! txcommon/*batch-prepare* db))
-                   (let [program (txcompile/compile-program ctx forms)
+                   (let [forms (txplan/request-forms forms)
+                         program (txcompile/compile-program ctx forms)
                          report (txdynamic/execute-dynamic-region
                                   (request-execution-report initial) program tx-time)]
                      (when *tx-compiler-observer* (*tx-compiler-observer* :execute-dynamic program))
