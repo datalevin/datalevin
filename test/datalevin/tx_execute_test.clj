@@ -86,11 +86,12 @@
                      (cons [:set [:n] 2]
                            (lazy-seq (swap! events conj :tail) nil)))
         source [:db.fn/patchIdoc 1 :doc operations]
-        plan (compile/compile-patch-region ctx source 1 :doc operations)
+        plan (plan/patch-plan ctx source 1 :doc operations)
         before {:n 1 :kept [1 2]}
         store (reify i/IStore
                 (opts [_] (swap! events conj :options) {})
                 (ea-first-datom [_ _ _] (throw (AssertionError. "Document reread"))))]
+    (is (nil? (compile/compile-patch-region ctx source 1 :doc operations)))
     (is (empty? @events))
     (let [addition (execute/prepare-patch-addition ctx (first (:entries plan)) before 91 store)]
       (is (= [:head :tail :options] @events))

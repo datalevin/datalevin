@@ -94,88 +94,88 @@
 (defn- compile-operation
   [ctx source infos capture-infos?]
   (let [source (if (instance? WriteOp source) (:source source) source)
-          _ (when-not (or (plain-map? source) (literal-vector? source))
-              (throw (ex-info "A prepared transaction operation must be a map or vector"
-                              {:error :prepared/operation-shape})))
-          parameters (LinkedHashSet.)
-          compiled (expression source parameters)
-          children (:children compiled)
-          map? (plain-map? source)
-          add? (and (vector? source) (<= 4 (count source) 5) (identical? :db/add (nth source 0)))
-          cas? (and (vector? source) (= 5 (count source)) (#{:db.fn/cas :db/cas} (nth source 0)))
-          retract? (and (vector? source) (<= 3 (count source) 4) (identical? :db/retract (nth source 0)))
-          clear? (and (vector? source) (= 3 (count source)) (identical? :db.fn/retractAttribute (nth source 0)))
-          ordered? (or cas? retract? clear?)
-          kind (cond
-                 map? (if (or (not (contains? source :db/id))
-                              (instance? TxParam (:db/id source))
-                              (compile/prepared-tempid-key (:db/id source)))
-                        :blind
-                        (if (or (compile/prepared-positive-id? (:db/id source))
-                                (vector? (:db/id source))) :scalar :dynamic))
-                 add? :scalar
-                 ordered? :scalar-program
-                 :else :dynamic)
-          fields (cond
-                   map? (mapv (fn [[attr _]]
-                                [attr (:run (get children attr))
-                                 (compile/prepared-write-attribute ctx infos attr kind)])
-                              (remove #(identical? :db/id (key %)) source))
-                   add? [[(nth source 2) (:run (nth children 3))
-                          (compile/prepared-write-attribute ctx infos (nth source 2) kind)]]
-                   ordered? [[(nth source 2) (if cas? (:run (nth children 4)) (constantly nil))
-                              (let [^AttrInfo info (compile/prepared-write-attribute ctx infos (nth source 2) :scalar-program)]
-                                (when (and info (.-typed? info)) info))]]
-                   :else [])
-          mixed-form? (and (nil? (meta source))
-                           (or (and map? (> (count source) (if (contains? source :db/id) 1 0)))
-                               (and add? (= 4 (count source)))))
-          mixed-fields (when mixed-form? (fields-for ctx infos fields :mixed))
-          mixed? (and mixed-form? (every? #(some? (nth % 2)) mixed-fields))
-          program-fields (if (or map? add?) (fields-for ctx infos fields :scalar-program) fields)
-          references? (some (fn [[_ _ ^AttrInfo info]]
-                              (and info (identical? :db.type/ref (.-value-type info)))) program-fields)
-          program? (and (or map? add? ordered?) (seq program-fields)
-                        (compile/prepared-write-metadata? (meta source))
-                        ;; Reference-add preprocessing can discard stamps and
-                        ;; annotations. Keep that checkpoint on the raw route.
-                        (or (not references?) (not add?)
-                            (and (= 4 (count source)) (nil? (meta source))))
-                        (every? (fn [[_ _ ^AttrInfo info]] (and info (.-typed? info))) program-fields))
-          ordered-definition
-          (when (and (vector? source) (compile/prepared-write-metadata? (meta source))
-                     (case (nth source 0 nil)
-                       :db/add (<= 4 (count source) 5)
-                       :db/retract (<= 3 (count source) 4)
-                       (:db/cas :db.fn/cas) (= 5 (count source))
-                       :db.fn/retractAttribute (= 3 (count source))
-                       (:db/retractEntity :db.fn/retractEntity) (= 2 (count source))
-                       false))
-            (when-let [definition (compile/prepared-ordered-operation ctx infos (nth source 0) (nth source 2 nil))]
-              (let [^AttrInfo info (:info definition)]
-                (when (or (not add?) (not (and info (identical? :db.type/ref (.-value-type info))))
+        _ (when-not (or (plain-map? source) (literal-vector? source))
+            (throw (ex-info "A prepared transaction operation must be a map or vector"
+                            {:error :prepared/operation-shape})))
+        parameters (LinkedHashSet.)
+        compiled (expression source parameters)
+        children (:children compiled)
+        map? (plain-map? source)
+        add? (and (vector? source) (<= 4 (count source) 5) (identical? :db/add (nth source 0)))
+        cas? (and (vector? source) (= 5 (count source)) (#{:db.fn/cas :db/cas} (nth source 0)))
+        retract? (and (vector? source) (<= 3 (count source) 4) (identical? :db/retract (nth source 0)))
+        clear? (and (vector? source) (= 3 (count source)) (identical? :db.fn/retractAttribute (nth source 0)))
+        ordered? (or cas? retract? clear?)
+        kind (cond
+               map? (if (or (not (contains? source :db/id))
+                            (instance? TxParam (:db/id source))
+                            (compile/prepared-tempid-key (:db/id source)))
+                      :blind
+                      (if (or (compile/prepared-positive-id? (:db/id source))
+                              (vector? (:db/id source))) :scalar :dynamic))
+               add? :scalar
+               ordered? :scalar-program
+               :else :dynamic)
+        fields (cond
+                 map? (mapv (fn [[attr _]]
+                              [attr (:run (get children attr))
+                               (compile/prepared-write-attribute ctx infos attr kind)])
+                            (remove #(identical? :db/id (key %)) source))
+                 add? [[(nth source 2) (:run (nth children 3))
+                        (compile/prepared-write-attribute ctx infos (nth source 2) kind)]]
+                 ordered? [[(nth source 2) (if cas? (:run (nth children 4)) (constantly nil))
+                            (let [^AttrInfo info (compile/prepared-write-attribute ctx infos (nth source 2) :scalar-program)]
+                              (when (and info (.-typed? info)) info))]]
+                 :else [])
+        mixed-form? (and (nil? (meta source))
+                         (or (and map? (> (count source) (if (contains? source :db/id) 1 0)))
+                             (and add? (= 4 (count source)))))
+        mixed-fields (when mixed-form? (fields-for ctx infos fields :mixed))
+        mixed? (and mixed-form? (every? #(some? (nth % 2)) mixed-fields))
+        program-fields (if (or map? add?) (fields-for ctx infos fields :scalar-program) fields)
+        references? (some (fn [[_ _ ^AttrInfo info]]
+                            (and info (identical? :db.type/ref (.-value-type info)))) program-fields)
+        program? (and (or map? add? ordered?) (seq program-fields)
+                      (compile/prepared-write-metadata? (meta source))
+                      ;; Reference-add preprocessing can discard stamps and
+                      ;; annotations. Keep that checkpoint on the raw route.
+                      (or (not references?) (not add?)
                           (and (= 4 (count source)) (nil? (meta source))))
-                  (assoc definition :arity (count source) :annotations (meta source)
-                         :entity (:run (nth children 1))
-                         :value (or (:run (nth children 3 nil)) (constantly nil))
-                         :extra (or (:run (nth children 4 nil)) (constantly nil)))))))
-          ordered-map-definition (when map? (compile/prepared-ordered-map ctx infos source))
-          kind (if (and (not= :dynamic kind)
-                        (every? #(some? (nth % 2)) fields)
-                        (compile/prepared-write-metadata? (meta source))) kind :dynamic)
-          attribute-infos (when capture-infos? (into {} infos))]
-      (plan/->WriteOp
-        ctx source (:run compiled) (vec parameters) kind
-        (if map? (or (:run (get children :db/id)) (constantly nil))
-            (when (or add? ordered?) (:run (nth children 1))))
-        fields (when (and add? (= 5 (count source))) (:run (nth children 4)))
-        (when (or add? cas?) (meta source))
-        (cond cas? :cas retract? :retract clear? :clear :else :add)
-        (when (or cas? retract?) (or (:run (nth children 3 nil)) (constantly nil)))
-        (boolean program?) program-fields (boolean references?)
-        ordered-definition ordered-map-definition
-        (when (or ordered-definition ordered-map-definition) attribute-infos)
-        (boolean mixed?) mixed-fields attribute-infos)))
+                      (every? (fn [[_ _ ^AttrInfo info]] (and info (.-typed? info))) program-fields))
+        ordered-definition
+        (when (and (vector? source) (compile/prepared-write-metadata? (meta source))
+                   (case (nth source 0 nil)
+                     :db/add (<= 4 (count source) 5)
+                     :db/retract (<= 3 (count source) 4)
+                     (:db/cas :db.fn/cas) (= 5 (count source))
+                     :db.fn/retractAttribute (= 3 (count source))
+                     (:db/retractEntity :db.fn/retractEntity) (= 2 (count source))
+                     false))
+          (when-let [definition (compile/prepared-ordered-operation ctx infos (nth source 0) (nth source 2 nil))]
+            (let [^AttrInfo info (:info definition)]
+              (when (or (not add?) (not (and info (identical? :db.type/ref (.-value-type info))))
+                        (and (= 4 (count source)) (nil? (meta source))))
+                (assoc definition :arity (count source) :annotations (meta source)
+                       :entity (:run (nth children 1))
+                       :value (or (:run (nth children 3 nil)) (constantly nil))
+                       :extra (or (:run (nth children 4 nil)) (constantly nil)))))))
+        ordered-map-definition (when map? (compile/prepared-ordered-map ctx infos source))
+        kind (if (and (not= :dynamic kind)
+                      (every? #(some? (nth % 2)) fields)
+                      (compile/prepared-write-metadata? (meta source))) kind :dynamic)
+        attribute-infos (when capture-infos? (into {} infos))]
+    (plan/->WriteOp
+      ctx source (:run compiled) (vec parameters) kind
+      (if map? (or (:run (get children :db/id)) (constantly nil))
+          (when (or add? ordered?) (:run (nth children 1))))
+      fields (when (and add? (= 5 (count source))) (:run (nth children 4)))
+      (when (or add? cas?) (meta source))
+      (cond cas? :cas retract? :retract clear? :clear :else :add)
+      (when (or cas? retract?) (or (:run (nth children 3 nil)) (constantly nil)))
+      (boolean program?) program-fields (boolean references?)
+      ordered-definition ordered-map-definition
+      (when (or ordered-definition ordered-map-definition) attribute-infos)
+      (boolean mixed?) mixed-fields attribute-infos)))
 
 (defn prepare-operation
   "Compile immutable constants and schema proofs. Compatible operations retain
@@ -225,23 +225,29 @@
                     {:error :prepared/program-shape})))
   (let [metadata (meta operations)
         parameters (LinkedHashSet.)
-        scratch (HashMap.)
-        operations (mapv (fn [operation]
-                           (let [operation (if (and (instance? WriteOp operation)
-                                                    (compatible? (:ctx operation) ctx))
-                                             operation
-                                             (compile-operation ctx operation scratch false))]
-                             (.addAll parameters ^java.util.Collection (:params operation))
-                             operation)) operations)
-        operations (if (every? :mixed-infos operations)
-                     operations
-                     (let [infos (into {} scratch)]
+        scratch (volatile! nil)
+        operations (if (= 1 (count operations))
+                     (let [operation (prepare-operation ctx (nth operations 0))]
+                       (.addAll parameters ^java.util.Collection (:params operation))
+                       [operation])
+                     (mapv (fn [operation]
+                             (let [operation (if (and (instance? WriteOp operation)
+                                                      (compatible? (:ctx operation) ctx))
+                                               operation
+                                               (compile-operation
+                                                 ctx operation
+                                                 (or @scratch (vreset! scratch (HashMap.))) false))]
+                               (.addAll parameters ^java.util.Collection (:params operation))
+                               operation)) operations))
+        operations (if-let [table @scratch]
+                     (let [infos (into {} table)]
                        (mapv (fn [operation]
                                (if (nil? (:mixed-infos operation))
                                  (assoc operation :mixed-infos infos
                                         :ordered-infos (when (or (:ordered-definition operation)
                                                                 (:ordered-map-definition operation)) infos))
-                                 operation)) operations)))
+                                 operation)) operations))
+                     operations)
         kinds (set (map :kind operations))
         mixed? (and (nil? metadata) (every? :mixed? operations)
                     (or (some (fn [{:keys [source]}]

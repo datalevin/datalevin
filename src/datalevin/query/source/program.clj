@@ -316,6 +316,58 @@
               (ensure! (= output-cols (mapv key (sort-by val (:attrs result)))))
               (:tuples result))))))))
 
+(defn- core-schema [region native-specs initial produced check!]
+  (if (empty? (:core-clauses region))
+    (with-meta initial {:constant-constraints []})
+    (let [operations
+          (mapv (fn [{:keys [node path]}]
+                  (check!)
+                  (let [native? (or (instance? Pattern node) (instance? RuleExpr node) (instance? Not node))
+                        spec (if native? (get native-specs path) (pure-spec node {} check!))
+                        arg (first (:args node))
+                        copied (when (and (instance? Function node)
+                                          (#{'identity 'ground} (get-in node [:fn :symbol]))
+                                          (= 1 (count (:args node))) (instance? Variable arg))
+                                 [(:symbol arg) (get-in node [:binding :variable :symbol])])]
+                    {:node node :native? native? :spec spec :copied copied})) (:core-clauses region))
+          literal? (:literal-vars region)
+          outputs (mapcat #(get-in % [:spec :columns]) operations)
+          replaced (set/difference (set/intersection (set (keys (:bindings region)))
+                                                    (set (map :variable outputs)))
+                                   produced literal?)
+          ;; Keep type evidence until propagation finishes. A conflicting pair
+          ;; must not become an unknown that a later producer can narrow again.
+          add-column (fn [evidence {:keys [variable type nullable?]}]
+                       (check!)
+                       (update evidence variable
+                         (fn [before]
+                           {:types (cond-> (or (:types before) #{}) (not= :data type) (conj type))
+                            :nullable? (and nullable? (get before :nullable? true))})))
+          evidence (reduce add-column {} (vals (apply dissoc initial replaced)))
+          evidence (reduce add-column evidence (remove #(literal? (:variable %)) outputs))
+          copies (keep (fn [{:keys [copied]}]
+                         (when (and copied (not (literal? (second copied)))) copied)) operations)
+          propagate (fn [evidence]
+                      (loop [known evidence]
+                        (check!)
+                        (let [next (reduce (fn [known [from to]]
+                                             (check!)
+                                             (update-in known [to :types] into (get-in known [from :types]))) known copies)]
+                          (if (= known next) known (recur next)))))
+          evidence (propagate evidence)
+          ;; A caller binding can seed its own copy cycle. Keep that type when
+          ;; no independent body producer has supplied type evidence for it.
+          evidence (propagate (reduce add-column evidence
+                                (keep #(when (empty? (get-in evidence [% :types])) (get initial %)) replaced)))
+          schema (into {} (map (fn [[v {:keys [types nullable?]}]]
+                                 [v (column v (if (= 1 (count types)) (first types) :data) nullable?)])) evidence)
+          constraints
+          (into (vec (mapcat #(get-in % [:spec :constant-constraints]) operations))
+            (mapcat (fn [{:keys [node native? spec]}]
+                      (filter #(literal? (:variable %))
+                        (:columns (if native? spec (pure-spec node schema check!)))))) operations)]
+      (with-meta schema {:constant-constraints constraints}))))
+
 (defn- schemas [compiled native-specs root-columns check!]
   (reduce
     (fn [schemas r]
@@ -355,22 +407,8 @@
                                         (boolean (some :nullable? cs))))) (canonical (:exports site) check!))]
                   (add-columns schema outputs))) initial
               (filter #(and (= id (:parent-region %)) (not= :negation (:kind %))) (:sites compiled)))
-            [final _ constraints]
-            (reduce (fn [[schema produced constraints] {:keys [node path]}]
-                      (check!)
-                      (let [columns (:columns (if (or (instance? Pattern node) (instance? RuleExpr node) (instance? Not node)) (get native-specs path)
-                                                  (pure-spec node schema check!)))]
-                        [(reduce (fn [schema column]
-                                   (let [v (:variable column)]
-                                     (cond (contains? (:literal-vars r) v) schema
-                                           (and (contains? (:bindings r) v) (not (contains? produced v)))
-                                           (assoc schema v column)
-                                           :else (add-columns schema [column])))) schema columns)
-                         (into produced (map :variable) columns)
-                         (into constraints (filter #(contains? (:literal-vars r) (:variable %))) columns)]))
-                    [initial produced (vec (mapcat #(get-in native-specs [(:path %) :constant-constraints])
-                                                  (:core-clauses r)))] (:core-clauses r))]
-        (assoc schemas id (with-meta final {:constant-constraints constraints})))) {} (reverse (:regions compiled))))
+            final (core-schema r native-specs initial produced check!)]
+        (assoc schemas id final))) {} (reverse (:regions compiled))))
 
 (defn- branch-output [id schema]
   {:region-id id :columns (vec (vals schema))

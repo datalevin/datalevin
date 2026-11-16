@@ -64,7 +64,6 @@
    [datalevin.interface IRemoteDB IRemotePrepared IStore]
    [datalevin.storage Store WriteGroup]
    [datalevin.utl LRUCache QueryKey]
-   [java.nio ByteBuffer]
    [java.util Collection Comparator Date]
    [java.util.concurrent ConcurrentHashMap]
    [java.util.concurrent.atomic AtomicBoolean]
@@ -1022,7 +1021,9 @@
 (defn- tx-cache-active?
   [db]
   (and (not (tx-cache-empty? db))
-       (> (long (:max-tx db)) (long (or (max-tx (:store db)) 0)))))
+       (or (and (some? txcommon/*resolver-index*)
+                (identical? txcommon/*resolver-index* (:eavt db)))
+           (> (long (:max-tx db)) (long (or (max-tx (:store db)) 0))))))
 
 (defn ^:no-doc pending-tx-cache?
   [db]
@@ -1074,25 +1075,14 @@
     (filter (idx/datom-range-predicate kv (-schema db) start-datom end-datom)
             (case index :eav (:eavt db) :ave (:avet db) nil))))
 
-(defn- datom-eav-key
-  [^Datom datom]
-  (let [v (.-v datom)]
-    ;; Native reads decode fresh arrays; retract them by content, not identity.
-    (if (bytes? v)
-      [(.-e datom) (.-a datom) ::bytes (ByteBuffer/wrap ^bytes v)]
-      [(.-e datom) (.-a datom) v])))
-
 (defn- merge-tx-cache-datoms
   [db index base cached]
   (let [cached    (vec cached)
-        retracted (into #{} (comp (remove d/datom-added)
-                                  (map datom-eav-key))
-                        cached)
         additions (filter d/datom-added cached)]
     (sort (tx-cache-index-comparator db index)
-          (concat (if (seq retracted)
-                    (remove #(contains? retracted (datom-eav-key %)) base)
-                    base)
+          ;; Either pending polarity replaces the native E/A/V. Re-adding a
+          ;; native value must not publish both its stored and virtual datoms.
+          (concat (txcommon/visible-stored db base)
                   additions))))
 
 (defn- with-tx-cache-range
@@ -2708,7 +2698,7 @@
   (assert (not (::bound-operands? plan)) "Caller-bound plan cannot enter the compiler route")
   (execute-request-plan initial plan options))
 
-(defn- prepare-local-report
+(defn- prepare-local-report*
   [initial forms tx-time outcome {:keys [stage? route?] :as options}]
   (let [db (:db-after initial) captured (:ctx outcome)
         preserve-overlays? (txcommon/resolver-index-active? db)
@@ -2750,6 +2740,17 @@
     (cond-> report
       (not route?) (dissoc ::compiled-route)
       stage? (dissoc ::independent-scalar?))))
+
+(defn- prepare-local-report
+  [initial forms tx-time outcome options]
+  (let [view (:db-after initial)]
+    (if (and (nil? txcommon/*batch-prepare*)
+             (not (identical? txcommon/*resolver-index* (:eavt view)))
+             (pending-tx-cache? view))
+      (let [owned (txcommon/copy-resolver-indexes view)]
+        (binding [txcommon/*resolver-index* (:eavt owned)]
+          (prepare-local-report* (assoc initial :db-after owned) forms tx-time outcome options)))
+      (prepare-local-report* initial forms tx-time outcome options))))
 
 (defn ^:no-doc prepare-local-tx-data
   "Resolve one request through shared compilation and writer execution.
