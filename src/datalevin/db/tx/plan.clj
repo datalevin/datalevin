@@ -10,9 +10,17 @@
 
 (deftype TxParam [key])
 
-(defrecord WriteOp [ctx source expression params kind entity fields tx annotations])
+;; Proof metadata has a fixed layout. Construct each immutable plan once,
+;; without assembling an extension map through repeated record updates.
+(defrecord WriteOp
+  [ctx source expression params kind entity fields tx annotations
+   opcode match program? program-fields references? ordered-definition
+   ordered-map-definition ordered-infos mixed? mixed-fields mixed-infos])
 
-(defrecord WriteTemplate [ctx operations params batch? strategy explicit? metadata])
+(defrecord WriteTemplate
+  [ctx operations params batch? strategy explicit? metadata
+   infos fixed-layout reference-attrs mixed-infos ordered-infos
+   ordered-blind-fallback? single-attribute? identity? fuse?])
 
 (declare operation-form)
 

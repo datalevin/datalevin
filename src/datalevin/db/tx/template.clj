@@ -5,7 +5,7 @@
   (:require [datalevin.db.tx.compile :as compile]
             [datalevin.db.tx.plan :as plan])
   (:import [datalevin.db.tx.plan AttrInfo BlindSource BoundMap BoundOperation MixedInsert ScalarSequence TxParam WriteOp]
-           [java.util ArrayList HashMap HashSet]
+           [java.util ArrayList HashMap HashSet LinkedHashSet]
            [org.eclipse.collections.impl.list.mutable FastList]))
 
 (defn parameter [key]
@@ -30,18 +30,20 @@
 (defn- expression
   "Compile input substitution once. Literal objects are returned unchanged;
   only containers containing parameter markers are rebuilt during binding."
-  [value]
+  [value ^LinkedHashSet parameters]
   (cond
     (instance? TxParam value)
-    (let [key (.-key ^TxParam value)] {:run #(get % key) :params [key]})
+    (let [key (.-key ^TxParam value)]
+      (.add parameters key)
+      {:run #(get % key) :parameterized? true})
 
     (or (identical? clojure.lang.PersistentHashSet (class value))
         (identical? clojure.lang.PersistentTreeSet (class value)))
-    (let [children (mapv expression value)]
-      (when (some #(seq (:params %)) children)
+    (let [children (mapv #(expression % parameters) value)]
+      (when (some :parameterized? children)
         (throw (ex-info "Bind a parameterized set as one parameter value"
                         {:error :prepared/parameter-container})))
-      {:run (constantly value) :params []})
+      {:run (constantly value)})
 
     (or (plain-map? value) (literal-vector? value))
     (let [map? (plain-map? value)
@@ -49,11 +51,11 @@
               (throw (ex-info "Prepared definition map keys must be literal scalars"
                               {:error :prepared/definition-key})))
           children (if map?
-                     (into {} (map (fn [[k v]] [k (expression v)])) value)
-                     (mapv expression value))
-          params (vec (distinct (mapcat :params (if map? (vals children) children))))]
-      {:params params :children children
-       :run (if (empty? params)
+                     (reduce-kv (fn [out k v] (assoc out k (expression v parameters))) {} value)
+                     (mapv #(expression % parameters) value))
+          parameterized? (boolean (some :parameterized? (if map? (vals children) children)))]
+      {:parameterized? parameterized? :children children
+       :run (if-not parameterized?
               (constantly value)
               (let [metadata (meta value)]
                 (fn [input]
@@ -63,7 +65,16 @@
                       :else (mapv #((:run %) input) children))
                     metadata))))})
 
-    :else {:run (constantly value) :params []}))
+    :else {:run (constantly value)}))
+
+(defn- fields-for
+  "Retain a field's binder and proof when another family accepts the same
+  attribute. Copy only fields whose eligibility proof actually changes."
+  [ctx infos fields strategy]
+  (reduce-kv (fn [out i [a value info]]
+               (let [proof (compile/prepared-write-attribute ctx infos a strategy)]
+                 (if (identical? info proof) out (assoc out i [a value proof]))))
+             fields fields))
 
 (defn prepare-operation
   "Compile an operation's constants and schema metadata. Compatible operations
@@ -75,7 +86,8 @@
           _ (when-not (or (plain-map? source) (literal-vector? source))
               (throw (ex-info "A prepared transaction operation must be a map or vector"
                               {:error :prepared/operation-shape})))
-          compiled (expression source)
+          parameters (LinkedHashSet.)
+          compiled (expression source parameters)
           children (:children compiled)
           map? (plain-map? source)
           add? (and (vector? source) (<= 4 (count source) 5) (identical? :db/add (nth source 0)))
@@ -108,14 +120,9 @@
           mixed-form? (and (nil? (meta source))
                            (or (and map? (> (count source) (if (contains? source :db/id) 1 0)))
                                (and add? (= 4 (count source)))))
-          mixed-fields (when mixed-form?
-                         (mapv (fn [[a value _]]
-                                 [a value (compile/prepared-write-attribute ctx infos a :mixed)]) fields))
+          mixed-fields (when mixed-form? (fields-for ctx infos fields :mixed))
           mixed? (and mixed-form? (every? #(some? (nth % 2)) mixed-fields))
-          program-fields (if (or map? add?)
-                           (mapv (fn [[a value _]]
-                                   [a value (compile/prepared-write-attribute ctx infos a :scalar-program)]) fields)
-                           fields)
+          program-fields (if (or map? add?) (fields-for ctx infos fields :scalar-program) fields)
           references? (some (fn [[_ _ ^AttrInfo info]]
                               (and info (identical? :db.type/ref (.-value-type info)))) program-fields)
           program? (and (or map? add? ordered?) (seq program-fields)
@@ -145,19 +152,35 @@
           ordered-map-definition (when map? (compile/prepared-ordered-map ctx infos source))
           kind (if (and (not= :dynamic kind)
                         (every? #(some? (nth % 2)) fields)
-                        (compile/prepared-write-metadata? (meta source))) kind :dynamic)]
-      (assoc (plan/->WriteOp ctx source (:run compiled) (:params compiled) kind
-                            (if map? (or (:run (get children :db/id)) (constantly nil))
-                                (when (or add? ordered?) (:run (nth children 1))))
-                            fields (when (and add? (= 5 (count source))) (:run (nth children 4)))
-                            (when (or add? cas?) (meta source)))
-             :opcode (cond cas? :cas retract? :retract clear? :clear :else :add)
-             :match (when (or cas? retract?) (or (:run (nth children 3 nil)) (constantly nil)))
-             :program? (boolean program?) :program-fields program-fields
-             :references? (boolean references?)
-             :ordered-definition ordered-definition :ordered-map-definition ordered-map-definition
-             :ordered-infos (when (or ordered-definition ordered-map-definition) (into {} infos))
-             :mixed? (boolean mixed?) :mixed-fields mixed-fields :mixed-infos (into {} infos)))))
+                        (compile/prepared-write-metadata? (meta source))) kind :dynamic)
+          attribute-infos (into {} infos)]
+      (plan/->WriteOp
+        ctx source (:run compiled) (vec parameters) kind
+        (if map? (or (:run (get children :db/id)) (constantly nil))
+            (when (or add? ordered?) (:run (nth children 1))))
+        fields (when (and add? (= 5 (count source))) (:run (nth children 4)))
+        (when (or add? cas?) (meta source))
+        (cond cas? :cas retract? :retract clear? :clear :else :add)
+        (when (or cas? retract?) (or (:run (nth children 3 nil)) (constantly nil)))
+        (boolean program?) program-fields (boolean references?)
+        ordered-definition ordered-map-definition
+        (when (or ordered-definition ordered-map-definition) attribute-infos)
+        (boolean mixed?) mixed-fields attribute-infos))))
+
+(defn- merge-operation-infos [operations field]
+  ;; Shared operations often contribute the identical immutable map. Retain it
+  ;; directly; all other cases use the ordinary map merge.
+  (reduce (fn [out operation]
+            (let [infos (field operation)]
+              (cond (nil? infos) out
+                    (nil? out) infos
+                    (identical? out infos) out
+                    :else (merge out infos)))) nil operations))
+
+(defn- field-infos [operations field]
+  (reduce (fn [out operation]
+            (reduce (fn [out [attr _ info]] (if info (assoc out attr info) out))
+                    out (field operation))) {} operations))
 
 (defn- fixed-scalar-layout [operations infos batch?]
   (when (and (not batch?)
@@ -183,7 +206,11 @@
     (throw (ex-info "A prepared transaction requires a nonempty operation vector"
                     {:error :prepared/program-shape})))
   (let [metadata (meta operations)
-        operations (mapv #(prepare-operation ctx %) operations)
+        parameters (LinkedHashSet.)
+        operations (mapv (fn [operation]
+                           (let [operation (prepare-operation ctx operation)]
+                             (.addAll parameters ^java.util.Collection (:params operation))
+                             operation)) operations)
         kinds (set (map :kind operations))
         mixed? (and (nil? metadata) (every? :mixed? operations)
                     (or (some (fn [{:keys [source]}]
@@ -208,23 +235,22 @@
                    mixed? :mixed
                    (and (nil? metadata) (every? #(or (:ordered-definition %) (:ordered-map-definition %)) operations)) :ordered-program
                    :else :dynamic)
-        infos (into {} (comp (mapcat (if (= :scalar-program strategy) :program-fields :fields))
-                             (keep (fn [[a _ info]] (when info [a info])))) operations)
+        infos (field-infos operations (if (= :scalar-program strategy) :program-fields :fields))
         fixed (when (#{:scalar :scalar-program} strategy) (fixed-scalar-layout operations infos batch?))]
-    (assoc (plan/->WriteTemplate ctx operations (vec (distinct (mapcat :params operations)))
-                                (boolean batch?) strategy
-                                (boolean (some #(or (:tx %) (:annotations %)) operations)) metadata)
-           :infos infos :fixed-layout fixed
-           :reference-attrs (when (= :scalar-program strategy)
-                              (into #{} (keep (fn [[a ^AttrInfo info]]
-                                               (when (identical? :db.type/ref (.-value-type info)) a))) infos))
-           :mixed-infos (when mixed? (apply merge (map :mixed-infos operations)))
-           :ordered-infos (apply merge (map :ordered-infos operations))
-           :ordered-blind-fallback? (and (= :blind strategy) (every? :ordered-map-definition operations)
-                                         (some #(and (instance? AttrInfo %) (:db/unique (.-props ^AttrInfo %))) (vals infos)))
-           :single-attribute? (= 1 (count infos))
-           :identity? (boolean (some #(identical? :db.unique/identity (:db/unique (.-props ^AttrInfo %))) (vals infos)))
-           :fuse? (every? #(.-fuse-blind? ^AttrInfo %) (vals infos)))))
+    (plan/->WriteTemplate
+      ctx operations (vec parameters) (boolean batch?) strategy
+      (boolean (some #(or (:tx %) (:annotations %)) operations)) metadata
+      infos fixed
+      (when (= :scalar-program strategy)
+        (into #{} (keep (fn [[a ^AttrInfo info]]
+                         (when (identical? :db.type/ref (.-value-type info)) a))) infos))
+      (when mixed? (merge-operation-infos operations :mixed-infos))
+      (merge-operation-infos operations :ordered-infos)
+      (and (= :blind strategy) (every? :ordered-map-definition operations)
+           (some #(and (instance? AttrInfo %) (:db/unique (.-props ^AttrInfo %))) (vals infos)))
+      (= 1 (count infos))
+      (boolean (some #(identical? :db.unique/identity (:db/unique (.-props ^AttrInfo %))) (vals infos)))
+      (every? #(.-fuse-blind? ^AttrInfo %) (vals infos)))))
 
 (defn input-rows
   "Validate only parameter structure. Values, including lazy/host objects,

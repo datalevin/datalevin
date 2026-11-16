@@ -10,7 +10,9 @@
             [datalevin.prepared :as prepared])
   (:import [datalevin.db.tx.plan TxParam WriteOp]))
 
-(defrecord RemoteOperation [id source])
+(defrecord RemoteOperation [id source compiled definition])
+
+(def ^:private client-context (prepare/->PrepareCtx {} {} {}))
 
 (defn source [operation]
   (if (or (instance? RemoteOperation operation) (instance? WriteOp operation))
@@ -22,12 +24,8 @@
     (throw (ex-info "A prepared transaction requires an operation vector" {:error :prepared/program-shape})))
   (when (seq (dissoc options :batch?))
     (throw (ex-info "Unknown prepared transaction options" {:error :prepared/options})))
-  (template/prepare-template (prepare/->PrepareCtx {} {} {}) (mapv source operations) options))
-
-(defn operation [form]
-  (let [form (source form)]
-    (client-template [form] nil)
-    (->RemoteOperation (.-id ^datalevin.prepared.Request (prepared/request nil)) form)))
+  (template/prepare-template client-context
+    (mapv #(if (instance? RemoteOperation %) (:compiled %) (source %)) operations) options))
 
 (defn- container? [value]
   (contains? #{clojure.lang.PersistentArrayMap clojure.lang.PersistentHashMap
@@ -48,11 +46,22 @@
                 :else value))]
       (let [data (walk form [])] {:form data :parameters @parameters}))))
 
+(defn operation [form]
+  (if (instance? RemoteOperation form)
+    form
+    (let [form (source form)
+          compiled (template/prepare-operation client-context form)
+          id (.-id ^datalevin.prepared.Request (prepared/request nil))]
+      ;; Caller-owned operations retain their substitution code and portable
+      ;; definition together. Composing another program needs neither walk.
+      (->RemoteOperation id form compiled (assoc (encode-form form) :id id)))))
+
 (defn- definition* [operations options]
   {:version 1 :options options
    :operations (mapv (fn [operation]
-                       (cond-> (encode-form (source operation))
-                         (instance? RemoteOperation operation) (assoc :id (:id operation)))) operations)})
+                       (if (instance? RemoteOperation operation)
+                         (:definition operation)
+                         (encode-form (source operation)))) operations)})
 
 (defn definition [operations options]
   (client-template operations options)
