@@ -22,6 +22,7 @@
             [datalevin.query.source.expression :as expression]
             [datalevin.query.source.extrema :as extrema]
             [datalevin.query.source.input-program :as input-program]
+            [datalevin.query.source.key-demand :as key-demand]
             [datalevin.query.source.fragment :as fragment]
             [datalevin.query.source.inputs :as inputs]
             [datalevin.query.source.native :as native]
@@ -495,8 +496,7 @@
                          (= 1 (count (:args node)))
                          (instance? Constant (first (:args node)))
                          (some? (:value (first (:args node))))))
-        eligible? (and (empty? (:path root)) (empty? (:core-clauses root))
-                       (every? #(= :union (:kind %)) peers)
+        eligible? (and (empty? (:path root))
                        (= :union (:kind site)) (empty? (:inputs boundary))
                        (empty? (:required-inputs site)) (<= 1 (count ids) 8)
                        (not-any? #(some #{(:parent-region %)} ids) (:sites compiled))
@@ -720,7 +720,7 @@
         _ (doseq [proof proofs] ((:close proof)))
         tables (volatile! nil)
         planned
-          (planning/plan! runtime compilation
+          (planning/plan! runtime (assoc compilation :root-input-rows (.size ^List (get-in input [:relation :tuples])))
             (fn [runtime compiled]
                 (let [all-schemas (schemas compiled native-specs root-columns check!)
                       interfaces (atom {})]
@@ -753,7 +753,11 @@
                                                         native? (native-plan/factory! runtime snapshots (:database spec) node spec
                                                                   (:core-clauses r) (:bindings r) check! #(joined! runtime check! %1 %2))
                                                         :else (pure-factory runtime check! node spec literal-output))]
-                                      (add! path (:requires spec) (:columns spec) factory)))
+                                      (add! path (:requires spec) (:columns spec)
+                                            (cond-> factory
+                                              (and (not native?)
+                                                   (#{'identity 'ground} (get-in node [:fn :symbol])))
+                                              (assoc :scalar-estimate :at-most-one)))))
                                   (doseq [[index site] (map-indexed vector (:sites compiled))
                                           :when (= id (:parent-region site))]
                                     (let [parent (scope-parent-columns site schema seeds all-schemas region-inputs check!)
@@ -795,7 +799,9 @@
                             (assoc description :definition-id (:definition-id descriptor)
                               :definition-fingerprint (:definition-fingerprint descriptor)
                               :scope-id (get-in descriptor [:scope :id])))) descriptions))))
-          executable
+          demand (some :key-demand schedules)
+          build-executable
+          (fn [schedules program-id]
           (into {}
                 (map (fn [schedule]
                        (let [id (:region-id schedule) inputs (or (:input-columns schedule) (get-in @tables [id :inputs]))
@@ -826,9 +832,13 @@
                              _ (when (:diagnostics runtime)
                                  (diagnostics/region! runtime (assoc (access/explain! runtime schedule)
                                                                :program-id program-id :operators descriptions)))]
-                         [id {:inputs (mapv :variable inputs) :cols cols :steps steps}]))) schedules)]
-      (reset! runner
-        (fn [id input]
+                         [id {:inputs (mapv :variable inputs) :cols cols :steps steps}]))) schedules))
+          executable (build-executable schedules program-id)
+          demand-id (when demand (diagnostics/program! runtime))
+          demand-executable (when demand (build-executable (:schedules demand) demand-id))
+          make-runner
+          (fn [executable program-id]
+          (fn [id input]
           (check!)
           (let [{:keys [inputs cols steps]} (get executable id)]
             (ensure! (and inputs (= inputs (mapv key (sort-by val (:attrs input))))))
@@ -843,9 +853,16 @@
                                      (.size ^List tuples) (.size ^List result) (- (System/nanoTime) (long started))))
                                  (recur result (inc index)))))]
               (relation/relation! (zipmap cols (range)) tuples)))))
+          normal-run (make-runner executable program-id)
+          demand-run (when demand (make-runner demand-executable demand-id))]
+      (reset! runner normal-run)
       (reset! state :ready)
       (assoc (->Program runtime compilation planned root (:relation input) executable state runner)
              :program-id program-id
+             :key-demand (when demand
+                           (assoc demand
+                             :qualify! (fn [input] (reset! runner demand-run) (demand-run root input))
+                             :fallback! (fn [] (reset! runner normal-run) (normal-run root (:relation input)))))
              :native-extrema (extrema/prepare! runtime compilation (:groups planned))
              :ignore-nil-extrema (get-in compilation [:prepared :ignore-nil-extrema])
              :core-specs (into {} (map (fn [[path spec]]
@@ -876,7 +893,10 @@
   (control/check-active! (:control runtime))
   (try
     (if (get (:regions program) (:root program))
-      (@(:runner program) (:root program) (:input program))
+      (if-let [demand (:key-demand program)]
+        (key-demand/run! (:runtime program) demand (terminal-query! (get-in program [:compilation :compiled]))
+          (:qualify! demand) (:fallback! demand))
+        (@(:runner program) (:root program) (:input program)))
       (relation/relation! {} (FastList.)))
     (catch Throwable e (fail-program! (:runtime program) (:compilation program) e))
     (finally (compare-and-set! (:state program) :running :finished))))
@@ -1020,11 +1040,12 @@
                                 result (when execute? (result! child program))]
                             (if (nil? explain-options) result
                                 (diagnostics/finish! child execute? (:result-rows (control/usage (:control child)))
-                                  {:storage :memory :spill-policy :reject :replay-spools :none
+                                  (cond-> {:storage :memory :spill-policy :reject :replay-spools :none
                                    :empty-input? (.isEmpty ^List (get-in program [:input :tuples]))
                                    :join-indexes :bounded-hash :distinct :find-and-with
                                    :grouping (boolean (some parser/aggregate? (parser/find-elements (:qfind parsed))))
-                                   :result :retained}))))))))))))))
+                                   :result :retained}
+                                    (:key-demand program) (assoc :key-demand (key-demand/explanation (:key-demand program))))))))))))))))))
       (catch Throwable e
         (let [e (rt/active-error @active e)
               error (rt/redacted-error @active (or (:phase (ex-data e)) :inputs) e)]

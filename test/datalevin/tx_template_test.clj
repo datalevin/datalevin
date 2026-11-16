@@ -196,3 +196,22 @@
     (is (:deferred-entity-resolution? bound))
     (is (identical? lookup (ffirst (.-entries operands))))
     (is (nil? (.-slots operands)))))
+
+(deftest ordered-effect-instructions-retain-attribute-proofs-and-raw-operands
+  (let [reads (atom 0)
+        schema (assoc (:schema context) :code {:db/aid 3 :db/valueType :db.type/long :db/unique :db.unique/value})
+        ctx (assoc context :schema #(do (swap! reads inc) (schema %)))
+        source (with-meta [:db/cas 1 :code (template/parameter :old) (template/parameter :new)] {:source :kept})
+        op (template/prepare-operation ctx source)
+        t (template/prepare-template ctx [op] nil) before @reads
+        a (template/bind-template t [{:old 10 :new (int 11)}])
+        b (template/bind-template t [{:old 11 :new 12}])
+        ^datalevin.db.tx.plan.BoundOperation instruction (first (:entries a))]
+    (is (= :ordered-program (:strategy a)))
+    (is (identical? op (first (:operations t))))
+    (is (= before @reads))
+    (is (identical? (get-in op [:ordered-definition :info]) (.-info instruction)))
+    (is (= [:db/cas 1 :code 10 11] (plan/operation-form instruction)))
+    (is (= {:source :kept} (meta instruction)))
+    (is (instance? Integer (nth instruction 4)))
+    (is (not (identical? instruction (first (:entries b)))))))

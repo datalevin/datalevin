@@ -14,6 +14,41 @@
 
 (defrecord WriteTemplate [ctx operations params batch? strategy explicit? metadata])
 
+(declare operation-form)
+
+(deftype BoundOperation [opcode entity attr value extra info ^long arity annotations]
+  ;; Indexed operands feed the existing ordered workers without source-vector
+  ;; construction. Seq/printing are diagnostic or demanded rewrite adapters.
+  clojure.lang.Indexed
+  (nth [_ index]
+    (if (< -1 index arity)
+      (case (int index) 0 opcode 1 entity 2 attr 3 value 4 extra)
+      (throw (IndexOutOfBoundsException.))))
+  (nth [this index not-found]
+    (if (< -1 index arity) (.nth this index) not-found))
+  clojure.lang.Counted
+  (count [_] (int arity))
+  clojure.lang.IMeta
+  (meta [_] annotations)
+  clojure.lang.Seqable
+  (seq [this] (seq (operation-form this)))
+  Object
+  (toString [this] (pr-str (operation-form this))))
+
+(defn operation-form
+  "Materialize a bound instruction only for diagnostics or a demanded rewrite.
+  Existing raw forms retain their identity. Execution consumes its fields."
+  [operation]
+  (if (instance? BoundOperation operation)
+    (let [^BoundOperation operation operation]
+      (with-meta (mapv #(nth operation %) (range (.-arity operation))) (.-annotations operation)))
+    operation))
+
+(defmethod print-method BoundOperation [operation writer]
+  (print-method (operation-form operation) writer))
+
+(deftype BoundMap [data ^boolean regular? resolution ^boolean syntax-checked? ^boolean implicit?])
+
 (deftype PreparedTxInput [forms])
 
 (defn request-forms

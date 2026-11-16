@@ -27,9 +27,9 @@
 
 (defn execute
   "Execute a prepared operation with its key, entity identifier or query inputs.
-  The three-argument arity executes a local preparation against an explicit
-  view, such as a transaction's DB view or KV handle, so one preparation can
-  be reused across transactions."
+  The three-argument arity supplies an explicit view or connection. Reads and KV
+  updates accept local views; Datalog writes accept local or remote transaction
+  connections, so one preparation can be reused across transactions."
   ([prepared input]
    (if (instance? PreparedWrite prepared)
      (.invoke ^PreparedWrite prepared input)
@@ -67,7 +67,7 @@
 (deftype Request [^long id args metadata])
 
 (defn request
-  "The changing argument of point reads, pulls and queries is at wire index 2."
+  "The changing input of a prepared wire request is at argument index 2."
   [args]
   (let [id (.incrementAndGet ids)]
     (Request. id args {::id id})))

@@ -341,10 +341,10 @@
                  (into (vec (parser/find-vars (:qfind parsed))) (map :symbol) (:qwith parsed)))]
     (shape-result! runtime query vars collected)))
 
-(defn run!
+(defn- consume!
   "Consume an exact relational cursor, enforce batch/result quotas, and use
   the shared result processor for public shapes, maps, and result windows."
-  [runtime {:keys [group response request parsed]}]
+  [runtime {:keys [group response request parsed]} internal?]
   (let [ctl (:control runtime) check! #(control/check-active! ctl)
         columns (:columns response) vars (mapv :variable columns)
         descriptor (get-in request [:sources 0 :descriptor])
@@ -391,10 +391,50 @@
             (diagnostics/metrics! runtime trace (rt/invoke runtime :metrics #(source/-cursor-metrics cursor))))
           (let [query (result-query parsed columns)
                 collected (if bounded ((:rows bounded)) collected)]
-            (shape-result! runtime query vars collected))))
+            (when (and internal? (= :relational-window (:mode request)) (not= @seen (count collected)))
+              ;; Exact final windows have already applied find distinctness.
+              ;; Duplicate keys cannot certify that a source domain exhausted.
+              (fail! :query-source/invalid :fetch))
+            (if internal? collected (shape-result! runtime query vars collected)))))
       (catch Throwable e (vreset! primary e) (throw e))
       (finally
         (try
           (when-let [close @close-cursor] (close))
           (catch Throwable e (if-let [error @primary] (.addSuppressed ^Throwable error e) (throw e)))
           (finally (close-permission)))))))
+
+(defn run!
+  "Finish a delegated query through ordinary public result shaping."
+  [runtime delegation]
+  (consume! runtime delegation false))
+
+(defn rows!
+  "Borrow validated internal rows until their workspace closes. Intermediate
+  key rows consume retained storage, without charging public result quotas."
+  [runtime delegation]
+  (consume! runtime delegation true))
+
+(defn window-plan!
+  "Plan an engine-owned window in an already captured group. No acquisition or
+  reads occur here; execution reuses that group's pinned session and permits."
+  [runtime group request parsed]
+  (let [provider (get-in group [:entries 0 :source])
+        token (rt/charge-copy! runtime (dissoc request :control))
+        retained? (volatile! false)]
+    (try
+      (when (and (satisfies? source/IRelationalWindowSource provider)
+                 (satisfies? source/IRelationalQuerySession (:session group)))
+        (when-let [response (rt/invoke runtime :planning #(source/-plan-relational-window provider request))]
+          (let [borrowed (rt/charge-metadata! runtime response :planning)]
+            (try
+              (ensure! (and (value/plain-map? response) (= #{:plan :columns} (set (keys response)))
+                            (value/plain-map? (:plan response)) (vector? (:columns response))
+                            (= (:columns request) (:columns response))))
+              (retain! runtime (rt/charge-copy! runtime response))
+              (retain! runtime token)
+              (vreset! retained? true)
+              {:group group :request request :parsed parsed
+               :response (value/owned-copy response #(control/check-active! (:control runtime)))}
+              (finally (control/release! borrowed))))))
+      (finally
+        (when-not @retained? (control/release! token))))))

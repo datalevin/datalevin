@@ -18,6 +18,8 @@
    [datalevin.constants :as c]
    [datalevin.core :as d]
    [datalevin.db :as db]
+   [datalevin.db.tx.template :as template]
+   [datalevin.prepare :as prepare]
    [datalevin.ha :as dha]
    [datalevin.ha.authority :as ha-auth]
    [datalevin.ha.control :as ctrl]
@@ -1894,6 +1896,35 @@
   [deps server skey message]
   (transact-response deps server skey message cop/tx-data+db-info-response-kind))
 
+(defn tx-data-prepared
+  [deps server skey {:keys [args writing?] :as message}]
+  (let [db-name (nth args 0) {:keys [input tx-meta]} (nth args 2)]
+    (db-alter-permission!
+      deps server skey db-name "Don't have permission to alter the database"
+      (fn []
+        (when (and (:client-op-response-kind message)
+                   (not= cop/tx-data+db-info-response-kind (:client-op-response-kind message)))
+          (raise "Invalid prepared transaction response kind" {:error :ha/client-op-invalid-request}))
+        (let [{:keys [response replay?]}
+              (with-idempotent-client-op
+                deps server skey db-name writing? message
+                (fn [client-op]
+                  (let [database (get (db-state deps server db-name) (if writing? :wdt-db :dt-db))
+                        compiled (prepared/write-template! skey message (prepare/make-prepare-ctx database))
+                        rows (template/input-rows compiled input)
+                        outcome (template/bind-template compiled rows)
+                        forms (if outcome (template/request-input compiled rows) (template/materialize compiled rows))
+                        metadata (merge (when (map? tx-meta) tx-meta)
+                                        (when client-op
+                                          (cop/tx-meta (:client-op-id client-op) (:request-type client-op)
+                                                       (:request-hash client-op) (:response-kind client-op))))]
+                    (with-datalog-transaction-slot
+                      deps server skey db-name writing? false
+                      #(build-tx-response deps server skey db-name forms [db-name nil false] writing?
+                                          metadata cop/tx-data+db-info-response-kind
+                                          (when outcome [:compiled outcome forms]))))))]
+          (if replay? (write-result! deps skey response) (write-tx-response! deps skey response)))))))
+
 (defn tx-data-ack
   [deps server skey message]
   (transact-response deps server skey message cop/tx-data-ack-response-kind))
@@ -3118,6 +3149,7 @@
    :tx-data tx-data
    :db-info db-info
    :tx-data+db-info tx-data+db-info
+   :tx-data-prepared tx-data-prepared
    :tx-data-ack tx-data-ack
    :open-transact open-transact
    :close-transact close-transact

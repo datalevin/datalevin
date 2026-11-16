@@ -308,11 +308,14 @@
         (try
           (let [wire-opts (.get wire-options)
                 prepared-id (::prepared/id (meta msg))
-                enabled? (and prepared-id (:prepared-read? wire-opts)
-                              (case (:type msg)
-                                :update-kv (:prepared-update? wire-opts)
-                                :q (:prepared-query? wire-opts)
-                                true))
+                enabled? (and prepared-id
+                              (if (= :tx-data-prepared (:type msg))
+                                (:prepared-write? wire-opts)
+                                (and (:prepared-read? wire-opts)
+                                     (case (:type msg)
+                                       :update-kv (:prepared-update? wire-opts)
+                                       :q (:prepared-query? wire-opts)
+                                       true))))
                 id (when enabled? prepared-id)]
             (loop [register? (and enabled? (nil? (.get prepared-handles id)))]
               (let [wire-msg
@@ -322,13 +325,16 @@
                         (cond-> {:type :execute-prepared :handle id
                                  :value (nth (:args msg) 2)
                                  :writing? (:writing? msg)}
-                          (= :update-kv (:type msg))
+                          (#{:update-kv :tx-data-prepared} (:type msg))
                           (merge (select-keys msg [:client-op-id :client-op-hash
                                                    :client-op-response-kind]))
                           (:ha-read-min-tx msg)
                           (assoc :ha-read-min-tx (:ha-read-min-tx msg))))
                       (if prepared-id (with-meta msg nil) msg))
-                    response (.exchange ^IConnectionIO this wire-msg wire-opts)]
+                    response (if (and (= :tx-data-prepared (:type msg)) (not (:prepared-write? wire-opts)))
+                               {:type :error-response :message "Prepared writes are not supported by this peer"
+                                :err-data {:error :prepared/unsupported}}
+                               (.exchange ^IConnectionIO this wire-msg wire-opts))]
                 (if (and enabled? (not register?)
                          (= :error-response (:type response))
                          (= :prepared/missing (get-in response [:err-data :error])))
@@ -1998,6 +2004,7 @@
     :db-info
     :tx-data
     :tx-data+db-info
+    :tx-data-prepared
     :tx-data-ack
     :open-transact
     :close-transact
@@ -2245,7 +2252,7 @@
             {:kind :success
              ;; Copy-out transaction metadata lives outside :result. Decode
              ;; it before the retry API discards the response envelope.
-             :result (if (#{:tx-data :tx-data+db-info :tx-data-ack} (:type req))
+             :result (if (#{:tx-data :tx-data+db-info :tx-data-ack :tx-data-prepared} (:type req))
                        (decode-tx-response response)
                        result)}))
         (catch Exception e

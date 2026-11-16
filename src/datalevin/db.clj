@@ -2662,6 +2662,11 @@
           (when *tx-compiler-observer* (*tx-compiler-observer* :execute-ordered plan))
           (compiled-report initial report :compiled-ordered false (:ctx plan)))
 
+        :ordered-program
+        (let [report (txdynamic/execute-bound-program (request-execution-report initial) plan tx-time)]
+          (when *tx-compiler-observer* (*tx-compiler-observer* :execute-ordered-program plan))
+          (compiled-report initial report :compiled-ordered false (:ctx plan)))
+
         :patch
         (when-let [report (txexec/execute-patch-region initial plan)]
           (when *tx-compiler-observer* (*tx-compiler-observer* :execute-patch plan))
@@ -2746,6 +2751,30 @@
    (prepare-local-report (or initial (->TxReport db db [] {} tx-meta))
                          forms tx-time outcome options)))
 
+(defn ^:no-doc remote-tx-report
+  "Publish an ordinary remote transaction result through shared metadata and
+  read-cache invalidation, including failures with an indeterminate outcome."
+  [initial-report simulated? execute]
+  (let [^DB db (:db-before initial-report) store (.-store db)]
+    (try
+      (let [res (execute)
+            db-info (when (map? res) (:db-info res))
+            res (if db-info (dissoc res :db-info) res)
+            [tx-data tempids max-eid new-attributes] (remote-tx-result res)
+            info (resolved-remote-db-info store db (or db-info {}) max-eid simulated?)]
+        (when-not simulated?
+          (invalidate-cache store tx-data (:last-modified info) (:max-tx info)))
+        (cond-> (assoc initial-report
+                       :db-after (-> (carry-runtime-opts (new-db store info db) db)
+                                     (assoc :max-eid (:max-eid info))
+                                     (#(if simulated? (update % :max-tx u/long-inc) %)))
+                       :tx-data tx-data :tempids tempids)
+          (seq new-attributes) (assoc :new-attributes new-attributes)
+          simulated? mark-simulated-tx-cache!))
+      (catch Throwable e
+        (when-not simulated? (invalidate-remote-cache! store))
+        (throw e)))))
+
 (defn transact-tx-data
   "Resolve transaction data. owned-max-eid may be supplied only for a current
   local DB view whose native writer is owned by the caller."
@@ -2756,33 +2785,8 @@
          store   (.-store db)
          tx-time (System/currentTimeMillis)]
      (if (remote-store? store)
-       (try
-         (let [txs                                    (remote-tx-input initial-es)
-               res                                    (i/tx-data store txs simulated?)
-               db-info                                (when (map? res) (:db-info res))
-               res                                    (if db-info (dissoc res :db-info) res)
-               [tx-data tempids max-eid new-attributes] (remote-tx-result res)
-               info (resolved-remote-db-info
-                      store db (or db-info {}) max-eid simulated?)]
-           (when-not simulated?
-             (invalidate-cache store
-                               tx-data
-                               (:last-modified info)
-                               (:max-tx info)))
-           (cond-> (assoc initial-report
-                          :db-after (-> (carry-runtime-opts (new-db store info db) db)
-                                        (assoc :max-eid (:max-eid info))
-                                      (#(if simulated?
-                                          (update % :max-tx u/long-inc)
-                                          %)))
-                          :tx-data tx-data
-                          :tempids tempids)
-             (seq new-attributes) (assoc :new-attributes new-attributes)
-             simulated? mark-simulated-tx-cache!))
-         (catch Throwable e
-           (when-not simulated?
-             (invalidate-remote-cache! store))
-           (throw e)))
+       (remote-tx-report initial-report simulated?
+                         #(i/tx-data store (remote-tx-input initial-es) simulated?))
        (let [initial-report (cond-> initial-report
                               (some? owned-max-eid)
                               (assoc ::txexec/max-eid-before owned-max-eid))

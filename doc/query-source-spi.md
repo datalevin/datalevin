@@ -927,7 +927,9 @@ row work, and tracks peak estimated tuple count. Fractional dependent fan-out
 can reduce the propagated tuple count, which floors at one; zero never suppresses required work. Missing or expired counts,
 unmodeled local producers, and unknown selectivity for a second independent
 scan retain the original feasible plan. Regions with at most eight work items
-and 32 choices use a 1 ms optional allowance and at most 128 additional checks.
+and 32 choices use a 1 ms optional allowance and at most 128 additional checks,
+unless they contain more than two conditional unions. Those use the regular
+bound because their alternative binding interfaces can depend on each other.
 
 With `:planning :cost-model :elapsed` (the default), a baseline path whose
 accesses all have fresh cardinalities and complete time hints enables time
@@ -952,8 +954,59 @@ selectivity, transfer-byte costs, and complete backend execution prediction
 remain unmodeled; the search does not guarantee a global minimum. Opaque
 handles and sessions are never compared or hashed.
 
+Flat positive unions can retain independent and bound alternatives when the
+root also contains scoped or scalar operators. If a complete root cost is
+unavailable, the selector may compare a closed mandatory prefix: all local
+external accesses, eligible unions, and transparent `identity`/`ground`
+bindings must finish before every opaque suffix operator. The typed dependency
+scheduler validates this additional ordering; a cycle or unavailable estimate
+declines the comparison. All scoped bodies, outputs, and qualifications remain
+in execution. Scalar bindings also remain executable, including nil filtering;
+their advisory model propagates at most one row and tracks their output columns.
+This does not remove unobserved OPTIONAL bodies or infer their selectivity.
+
 Explanations expose `:join-cost` with `:work-rows`, `:peak-rows`, `:access-ns`,
 `:local-ns`, `:estimated-ns`, `:estimated-opens`, and `:estimated-requests`.
+Prefix comparisons additionally report `:cost-scope :mandatory-prefix`;
+their costs exclude the opaque suffix and are not whole-query predictions.
+`:union-selection` reports the comparison scope, original/candidate/selected
+costs, bounded candidate search, and chosen binding inputs.
+
+Small unordered relational windows can additionally select `:key-demand`.
+The initial policy requires a limit of at most 256, zero offset, plain distinct
+find variables, no `:with`, return map, aggregate or rule, and a mandatory key
+shared by at least two homogeneous positive unions. Other local work must be
+constant bindings. Every acquired group must offer snapshot consistency and
+repeatable ordinary cursor permissions; all qualification accesses must declare
+identical replay. Declining capabilities keep the ordinary complete plan.
+
+The optimizer ranks existing producer branches by captured independent row
+estimates, asks the existing exact relational-window interface for distinct
+keys, and supplies those keys to captured bound qualification interfaces.
+It retains the complete original body, including every OPTIONAL qualification
+and absence check. Final projected distinctness determines when demand is met.
+Exhaustion of one producer branch is not global exhaustion: incomplete branches
+continue with larger windows, and all branches of the selected mandatory union
+must exhaust before an undersized answer is complete. Duplicate keys in an
+advertised finalized source window are invalid, not an exhaustion certificate.
+
+Both qualification and its ordinary fallback use one descriptor capture,
+the same acquired sessions and native snapshots, binding identity space,
+authorization, cancellation, deadline and resource ledger. All query regions
+and both complete alternatives are audited before a producer cursor opens.
+Intermediate keys do not spend public result-row quotas. Per-window workspaces
+release temporary tuples while the shared bounded result collector retains
+only the requested distinct rows. A later window decline or a bounded probe
+allowance returns to the retained ordinary plan; malformed data, cancellation
+and resource failures remain query failures. Fallback uses the remaining
+invocation budget and is not a promise that additional speculative work is free.
+
+`:operators :key-demand` identifies the selected key, initial key count,
+producer regions and advisory row counts. Execution adds actual window and
+qualified-key counts and any fallback reason. The ordinary and parameterized
+region graphs have distinct program IDs in explanations. The policy composes
+the existing window, binding, qualification and distinct operators; it adds no
+provider protocol or result cache.
 `:estimated-access-ns` is the selected access-time component when known.
 `:cost-search` includes `:model :elapsed|:cardinality`, `:evaluated`, `:states`,
 `:elapsed-ns`, and `:starts`.

@@ -208,13 +208,13 @@ Only usable for debug output.
   tx-param write/tx-param)
 
 (def ^{:arglists '([db-or-connection operation])
-       :doc "Prepare an immutable local write operation for composition in
+       :doc "Prepare an immutable local or remote write operation for composition in
   several `prepare-tx` programs. Compatible programs share its compiled metadata.
   Schema/options changes refresh the operation when its program is refreshed."}
   prepare-tx-op write/prepare-tx-op)
 
 (def ^{:arglists '([connection operations] [connection operations opts])
-       :doc "Prepare a reusable local Datalog transaction. Mark parameters with
+       :doc "Prepare a reusable local or remote Datalog transaction. Mark parameters with
   `tx-param` and execute with a map containing each named parameter:
 
       (def update-age
@@ -232,7 +232,11 @@ Only usable for debug output.
   shared across threads. Each execution owns its operands and transaction state.
   `(execute-prepared prepared tx-conn inputs)` uses an explicit transaction's
   connection; a fourth argument supplies transaction metadata. The callable
-  object also accepts `(prepared inputs tx-meta)` on its original connection."}
+  object also accepts `(prepared inputs tx-meta)` on its original connection.
+  Remote execution registers a template on its first authorized use, then sends
+  bindings only. Handles refresh after schema changes, eviction or reconnect.
+  Older servers use ordinary remote transactions. An explicit remote transaction
+  target must address the same database as the preparation."}
   prepare-tx write/prepare-tx)
 
 (def ^{:arglists '([kv dbi-name] [kv dbi-name k-type]
@@ -252,14 +256,14 @@ Only usable for debug output.
        :doc "Execute a prepared KV read or update with a key, a prepared pull with an
   entity ID or lookup reference, or a prepared query with an input vector.
   Equivalent to invoking the prepared object.
-  The three-argument arity executes a local preparation against an explicit
-  view: pass the current transaction's DB view (`@tx`) for a prepared pull or
+  The three-argument arity supplies an explicit view: pass the current local
+  transaction's DB view (`@tx`) for a prepared pull or
   the transaction KV handle (`tx`) for a prepared KV read or update. A preparation made
   outside a transaction can therefore be reused inside it without re-parsing.
   For a prepared Datalog write, input is a parameter map (or a vector of maps
-  in batch mode), and the explicit target is a connection such as `tx`.
+  in batch mode), and the explicit target is a local or remote connection such as `tx`.
   The four-argument arity supplies transaction metadata for a prepared write.
-  Remote preparations do not accept an explicit view.
+  Remote reads and KV updates do not accept an explicit view.
   Prepared reads can be shared across threads; transaction-bound reads retain
   their transaction's lifetime and thread restrictions. They hold no borrowed
   buffers or open read transactions and require no separate close operation."}

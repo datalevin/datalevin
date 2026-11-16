@@ -1257,6 +1257,21 @@
       conn input tx-meta #(transact-request! %1 %2 %3 outcome))
     (transact-request! conn input tx-meta outcome)))
 
+(defn ^:no-doc transact-remote-prepared!
+  "Use the remote transaction's ordinary report publication and listener path."
+  [conn request input tx-meta]
+  (let [report (locking conn
+                 (assert (active-conn-structural? conn))
+                 (let [database ^DB @conn store (:store database)
+                       report (db/remote-tx-report
+                                (db/->TxReport database (db/transfer database store) [] {} tx-meta)
+                                false #(i/tx-data-prepared store request input tx-meta))
+                       after (db/carry-runtime-opts (:db-after report) database)]
+                   (reset! conn after)
+                   (assoc report :db-after after)))]
+    (notify-listeners! conn report)
+    report))
+
 (defn transact-ack!
   ([conn tx-data] (transact-ack! conn tx-data nil))
   ([conn tx-data tx-meta]

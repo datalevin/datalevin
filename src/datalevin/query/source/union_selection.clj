@@ -1,8 +1,11 @@
 (ns ^:no-doc datalevin.query.source.union-selection
   "Bounded selection of independent and bound flat-union interfaces.
   Reuses captured branch accesses; no provider callbacks, rows or new executor."
-  (:require [datalevin.query.source.access :as access]
+  (:require [clojure.set :as set]
+            [datalevin.query.access.dependency :as dependency]
+            [datalevin.query.source.access :as access]
             [datalevin.query.source.control :as control]
+            [datalevin.query.source.key-demand :as key-demand]
             [datalevin.query.source.runtime :as rt]))
 
 (defn- schedule! [runtime work inputs operators planning]
@@ -72,11 +75,58 @@
     (juxt :estimated-ns :work-rows :peak-rows)
     (juxt :work-rows :peak-rows)))
 
+(defn- prefix-operators
+  "Fence opaque operators behind the entire compared mandatory prefix. A
+  dependency cycle declines this optional comparison in the normal scheduler.
+  The suffix remains executable and keeps all outputs and qualifications."
+  [work operators]
+  (let [known? #(or (:union-estimate %)
+                   (= :at-most-one (get-in % [:step :scalar-estimate])))
+        region-id (get-in work [:region :region-id])
+        required (into (into #{} (map #(vector :core region-id (:id %))) (filter known? operators))
+                       (mapcat (fn [request]
+                                 (for [clause (:clauses request) :when (= :pattern (:kind clause))]
+                                   [(:source-symbol request) region-id (:id clause)]))) (:requests work))]
+    (mapv #(if (known? %) %
+             (assoc % :cost-barrier? true :after (into (:after %) required))) operators)))
+
+(defn- prefix-schedule!
+  "Preserve the baseline access choices and their order. Move only opaque
+  operators to the suffix, and validate every typed dependency and work fence
+  in that exact order. Never search for a different independent baseline."
+  [runtime schedule operators planning]
+  (let [token (control/reserve! (:control runtime)
+                {:retained-bytes (+ 2048 (* 1024 (count (:operators schedule))))})
+        _ (rt/own! runtime #(control/release! token))
+        by-id (into {} (map (juxt :id identity)) operators)
+        choices (mapv (fn [{:keys [kind value] :as choice}]
+                        (if (= :core kind)
+                          (assoc choice :value (dissoc (by-id (:id value)) :union-alternatives)) choice))
+                      (:operators schedule))
+        barrier? #(get-in % [:value :cost-barrier?])
+        ordered (into (filterv (complement barrier?) choices) (filter barrier?) choices)
+        valid (reduce
+                (fn [{:keys [known done] :as state} {:keys [kind value]}]
+                  (control/check-active! (:control runtime))
+                  (when state
+                    (let [o (if (= :access kind) (get-in value [:path :options]) value)
+                          covers (if (= :access kind) (:covers (:expr value))
+                                   #{[:core (:region-id schedule) (:id value)]})]
+                      (when (and (set/subset? (or (:after o) #{}) done)
+                                 (every? #(dependency/supplies? (known (:variable %)) %) (:requires o)))
+                        (when-let [columns (dependency/extend-columns known (:columns o))]
+                          {:known columns :done (into done covers)})))))
+                {:known (into {} (map (juxt :variable identity)) (:input-columns schedule)) :done #{}} ordered)]
+    (when valid
+      (let [prefix (assoc schedule :operators ordered :cost-search nil)]
+        (when-let [cost (access/price-schedule runtime prefix planning)]
+          (assoc prefix :join-cost cost))))))
+
 (defn- select-schedules!
   "Keep the original complete schedule as fallback. Optional branch interfaces
   share captured plans and a 128-branch planning allowance. Only homogeneous,
   repeatable flat unions supplied by the compiler enter this comparison."
-  [runtime work planning]
+  [runtime work planning context]
   (let [base (into {} (map (fn [w]
                             [(get-in w [:region :region-id])
                              (schedule! runtime w (:inputs w) (:operators w) planning)])) work)
@@ -102,9 +152,17 @@
                                    (if-let [op (get changed (get-in choice [:value :id]))]
                                      (assoc choice :value (first (:union-alternatives op))) choice)
                                    choice)) ops)))
-            original-cost (when (seq changed) (access/price-schedule runtime original planning))
+            whole-cost (when (seq changed) (access/price-schedule runtime original planning))
+            comparison-operators (if whole-cost decorated (prefix-operators root decorated))
+            prefix (when (and (seq changed) (nil? whole-cost))
+                     (prefix-schedule! runtime original
+                       (mapv (fn [op]
+                               (if-let [independent (first (:union-alternatives op))]
+                                 independent op)) comparison-operators) planning))
+            original-cost (or whole-cost (:join-cost prefix))
+            original (if original-cost (or prefix original) original)
             candidate (when original-cost
-                        (optional-schedule! #(schedule! runtime root (:inputs root) decorated planning)))
+                        (optional-schedule! #(schedule! runtime root (:inputs root) comparison-operators planning)))
             candidate-cost (:join-cost candidate)
             rank (cost-key original-cost candidate-cost)
             chosen (if (and candidate-cost (neg? (compare (rank candidate-cost) (rank original-cost)))) candidate original)
@@ -118,19 +176,25 @@
                             {:alternatives (reduce + 0 (map #(count (:union-alternatives %)) (vals changed)))
                              :original-cost (select-keys original-cost [:work-rows :peak-rows :estimated-ns])
                              :selected-cost (select-keys cost [:work-rows :peak-rows :estimated-ns])
+                             :candidate-cost (select-keys candidate-cost [:work-rows :peak-rows :estimated-ns])
+                             :candidate-search (:cost-search candidate)
+                             :cost-scope (get cost :cost-scope :complete)
                              :bindings (into {} (keep (fn [{:keys [kind value]}]
                                                        (when (and (= :core kind) (:union-estimate value))
                                                          [(:id value) (:binding-inputs value)]))) (:operators chosen))}))
-            selected (assoc selected root-id chosen)]
+            selected (assoc selected root-id chosen)
+            schedules (mapv #(selected (get-in % [:region :region-id])) work)
+            demand (when context (key-demand/select! runtime work schedules changed planning context))]
         ;; Every selected region still appears exactly once in the original order.
-        (mapv #(selected (get-in % [:region :region-id])) work)))))
+        (mapv #(cond-> % (and demand (= root-id (:region-id %))) (assoc :key-demand demand)) schedules)))))
 
 (defn select!
   "Select region schedules and account for all optional comparison work.
   Branch interfaces are planned once per candidate key, never during execution."
-  [runtime work planning]
+  ([runtime work planning] (select! runtime work planning nil))
+  ([runtime work planning context]
   (let [started (System/nanoTime)
-        schedules (select-schedules! runtime work planning)
+        schedules (select-schedules! runtime work planning context)
         elapsed (/ (double (- (System/nanoTime) started)) 1000000.0)
         accounted (reduce + 0.0 (map :planning-time-ms schedules))
         extra (max 0.0 (- elapsed accounted))
@@ -139,4 +203,4 @@
             (if (= root (:region-id schedule))
               (cond-> (update schedule :planning-time-ms + extra)
                 (:union-selection schedule) (assoc-in [:union-selection :comparison-time-ms] extra))
-              schedule)) schedules)))
+              schedule)) schedules))))

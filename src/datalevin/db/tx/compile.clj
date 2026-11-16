@@ -2006,6 +2006,61 @@
                            (ordered-value? ctx infos props extra)))))
              false))))))
 
+(defn prepared-ordered-operation
+  "Capture the ordinary ordered worker's attribute/cascade proof once. Values
+  and lookup ownership remain specific to each invocation and live operation."
+  [ctx infos opcode attr]
+  (when (and (not (:auto-entity-time? (:opts ctx)))
+             (#{:db/add :db/retract :db/cas :db.fn/cas :db.fn/retractAttribute
+                :db/retractEntity :db.fn/retractEntity} opcode))
+    (let [entity? (#{:db/retractEntity :db.fn/retractEntity} opcode)
+          props (when-not entity? (ordered-attribute-props ctx infos attr))]
+      (when (and (or entity? props)
+                 (or (not (or entity? (:db/isComponent props)))
+                     (every? (fn [[a _]]
+                               (or (= "db" (namespace a)) (ordered-attribute-props ctx infos a)))
+                             (:schema ctx))))
+        {:opcode opcode :info (when-not entity? (.get ^HashMap infos attr))}))))
+
+(defn prepared-ordered-operands?
+  "Check inert bound operands with the existing ordered value rules. No
+  correction, lookup, allocation, pending mutation or host methods occur."
+  [ctx infos {:keys [opcode info]} e value extra]
+  (and (ordered-entity? ctx infos e)
+       ;; Invalid tempid operations retain their original diagnostic form.
+       (or (identical? opcode :db/add)
+           (not (or (string? e) (and (integer? e) (neg? (long e))))))
+       (if (#{:db/retractEntity :db.fn/retractEntity} opcode)
+         true
+         (let [props (.-props ^AttrInfo info)]
+           (case opcode
+             :db/add (and (ordered-value? ctx infos props value)
+                          (or (nil? extra) (positive-literal-id? extra)))
+             :db/retract (or (nil? value) (ordered-value? ctx infos props value))
+             :db.fn/retractAttribute true
+             (:db/cas :db.fn/cas) (and (or (nil? value) (ordered-value? ctx infos props value))
+                                       (ordered-value? ctx infos props extra)))))))
+
+(defn prepared-ordered-map
+  "Capture flat map attribute proofs without inspecting parameter markers.
+  Map allocation and identity ownership remain writer-attempt operations."
+  [ctx infos source]
+  (when (and (plain-map? source) (not (:auto-entity-time? (:opts ctx)))
+             (prepared-write-metadata? (meta source))
+             (every? #(or (identical? :db/id %) (ordered-attribute-props ctx infos %)) (keys source)))
+    {:implicit? (not (contains? source :db/id))}))
+
+(defn prepared-ordered-map-operands?
+  "Check flat value containers with the shared ordered map rules. Nested
+  entity expansion retains ordinary preprocessing and private-ID assignment."
+  [ctx infos entity]
+  (and (ordered-map? ctx infos entity 0)
+       (every? (fn [[a value]]
+                 (or (identical? :db/id a)
+                     (not (identical? :db.type/ref (.-value-type ^AttrInfo (.get ^HashMap infos a))))
+                     (and (not (map? value))
+                          (or (not (literal-many-values? value)) (not-any? map? value))))) entity)))
+
 (defn- ordered-independent-prefix
   "Select a bounded, existing-EID scalar prefix. These operands cannot be a
   future value-tempid target, queue tuples or require redundant-add evidence."

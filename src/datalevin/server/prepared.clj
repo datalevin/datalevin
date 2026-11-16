@@ -6,6 +6,8 @@
   (:require [datalevin.bits :as b]
             [datalevin.kv :as kv]
             [datalevin.prepared :as prepared]
+            [datalevin.db.tx.template :as template]
+            [datalevin.db.tx.wire :as txwire]
             [datalevin.pull-api :as pull]
             [datalevin.pull-wire :as wire]
             [datalevin.query :as q]
@@ -14,6 +16,9 @@
            [java.util LinkedHashMap]))
 
 (deftype Entry [type args reader response-writer])
+
+(deftype WriteOperation [source compiled])
+(deftype WriteProgram [operations options compiled])
 
 (defn- enabled? [^SelectionKey skey]
   (true? (get-in @(.attachment skey) [:wire-opts :prepared-read?])))
@@ -35,17 +40,26 @@
             _ (check-id! id)
             ^LinkedHashMap cache (:prepared-handles @(.attachment skey))
             ^Entry entry (when (and (or (enabled? skey)
+                                     (true? (get-in @(.attachment skey) [:wire-opts :prepared-write?]))
                                      (true? (get-in @(.attachment skey)
                                                     [:wire-opts :prepared-update?])))
                                  cache) (.get cache id))]
         (when-not entry
           (raise "Prepared handle is not registered on this connection"
                  {:error :prepared/missing :handle id}))
+        (when (= :prepared-tx-op (.-type entry))
+          (raise "An operation handle cannot execute a transaction" {:error :prepared/invalid-handle}))
+        (when-not (case (.-type entry)
+                    :tx-data-prepared (true? (get-in @(.attachment skey) [:wire-opts :prepared-write?]))
+                    :update-kv (true? (get-in @(.attachment skey) [:wire-opts :prepared-update?]))
+                    :q (true? (get-in @(.attachment skey) [:wire-opts :prepared-query?]))
+                    (enabled? skey))
+          (raise "Prepared operation was not negotiated" {:error :prepared/unsupported}))
         (with-meta
           (cond-> {:type (.-type entry)
                    :args (assoc (.-args entry) 2 (:value message))
                    :writing? (:writing? message)}
-            (= :update-kv (.-type entry))
+            (#{:update-kv :tx-data-prepared} (.-type entry))
             (merge (select-keys message [:client-op-id :client-op-hash
                                          :client-op-response-kind]))
             (:ha-read-min-tx message)
@@ -104,6 +118,54 @@
           (prepared/remember! cache prepare-id
                              (Entry. :update-kv (assoc args 2 nil) f nil))))
       f)))
+
+(defn- handles! [^SelectionKey skey]
+  (let [attachment (.attachment skey)]
+    (or (:prepared-handles @attachment)
+        (let [cache (prepared/handle-cache)] (vswap! attachment assoc :prepared-handles cache) cache))))
+
+(defn- current-operation [^WriteOperation operation ctx]
+  (let [captured @(.-compiled operation)]
+    (if (and captured (template/compatible? (:ctx captured) ctx)) captured
+        (let [compiled (template/prepare-operation ctx (.-source operation))]
+          (reset! (.-compiled operation) compiled) compiled))))
+
+(defn- current-program [^WriteProgram program ctx]
+  (let [captured @(.-compiled program)]
+    (if (and captured (template/compatible? (:ctx captured) ctx)) captured
+        (let [compiled (template/prepare-template ctx
+                         (mapv #(current-operation % ctx) (.-operations program)) (.-options program))]
+          (reset! (.-compiled program) compiled) compiled))))
+
+(defn write-template!
+  "Compile/refresh only inside the authorized write handler. Explicit shared
+  operations occupy the existing bounded connection registry with templates."
+  [^SelectionKey skey {:keys [args prepare-id] :as message} ctx]
+  (if-let [^Entry entry (::entry (meta message))]
+    (current-program (.-reader entry) ctx)
+    (let [[db-name {:keys [version operations options]}] args]
+      (when-not (and (= version 1) (vector? operations) (seq operations)
+                     (empty? (dissoc options :batch?)))
+        (raise "Invalid prepared transaction definition" {:error :prepared/definition}))
+      (when-not (true? (get-in @(.attachment skey) [:wire-opts :prepared-write?]))
+        (raise "Prepared writes were not negotiated" {:error :prepared/unsupported}))
+      (let [^LinkedHashMap cache (handles! skey)
+            operations (mapv (fn [{:keys [id] :as descriptor}]
+                                (when id (check-id! id))
+                                (let [^Entry prior (when id (.get cache id))]
+                                  (if (and prior (= :prepared-tx-op (.-type prior))
+                                           (= db-name (first (.-args prior))))
+                                    (.-reader prior)
+                                    (let [operation (WriteOperation. (txwire/restore-operation descriptor) (atom nil))]
+                                      (when id
+                                        (prepared/remember! cache id (Entry. :prepared-tx-op [db-name] operation nil)))
+                                      operation)))) operations)
+            program (WriteProgram. operations options (atom nil))
+            compiled (current-program program ctx)]
+        (when prepare-id
+          (check-id! prepare-id)
+          (prepared/remember! cache prepare-id (Entry. :tx-data-prepared (assoc args 2 nil) program nil)))
+        compiled))))
 
 (defn response-written!
   "Acknowledge a layout only after writing the complete response frame."

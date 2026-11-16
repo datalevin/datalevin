@@ -129,3 +129,67 @@
     (is (= 2000.0 (:tuples scan) (:tuples bound)))
     (is (< (:estimated-ns scan) (:estimated-ns bound)))
     (is (< (:estimated-requests scan) (:estimated-requests bound)))))
+
+(deftest mandatory-prefix-selection-retains-optional-bags-and-joint-qualification
+  (let [q '{:find [?e ?v ?endpoint ?right]
+            :in [$driver $a $b $right $qual]
+            :where [[$driver ?e :row/value ?witness]
+                    (or-join [?e ?v ?endpoint]
+                      (and [$a ?e :row/value ?v] [(ground 0) ?endpoint])
+                      (and [$b ?e :row/value ?v] [(ground 1) ?endpoint]))
+                    (or-join [[?e] ?right]
+                      (and [$right ?e :row/value ?right]
+                           [$qual ?e :row/value "qualified"])
+                      (and (not-join [?e]
+                             [$right ?e :row/value ?candidate]
+                             [$qual ?e :row/value "qualified"])
+                           [(ground [nil]) [?right]]))]}
+        ps [(provider [[1 "first"] [1 "second"] [2 "third"]] {:scan-run 1})
+            (provider [[1 "v1"] [2 "v2"]] {})
+            (provider [[1 "v1"] [2 "v2"]] {})
+            (provider [[1 "r1"] [1 "r2"] [2 "unqualified"]] {})
+            (provider [[1 "qualified"]] {})]
+        inputs (mapv :source ps)
+        result (apply d/explain {:run? false} q inputs)
+        root (first (filter #(zero? (:region-id %)) (:regions result)))]
+    (is (= :mandatory-prefix (get-in root [:union-selection :cost-scope])))
+    (is (some seq (vals (get-in root [:union-selection :bindings]))))
+    (is (= #{[1 "v1" 0 "r1"] [1 "v1" 0 "r2"]
+             [1 "v1" 1 "r1"] [1 "v1" 1 "r2"]
+             [2 "v2" 0 nil] [2 "v2" 1 nil]}
+           (apply d/q q inputs)))
+    (is (= 10 (apply d/q (assoc q :find '[(count ?endpoint) .]
+                                  :with '[?witness ?right]) inputs)))
+    (let [dependent (-> q
+                        (assoc :find '[?e ?v ?endpoint ?copy])
+                        (update :where conj '[(identity ?right) ?copy]))
+          explained (apply d/explain {:run? false} dependent inputs)
+          root (first (filter #(zero? (:region-id %)) (:regions explained)))]
+      ;; The scalar needs an opaque output: the proposed fence would cycle.
+      ;; Retain the original schedule, including the copy's nil filtering.
+      (is (nil? (:union-selection root)))
+      (is (= #{[1 "v1" 0 "r1"] [1 "v1" 0 "r2"]
+               [1 "v1" 1 "r1"] [1 "v1" 1 "r2"]}
+             (apply d/q dependent inputs))))
+    (doseq [p ps]
+      (is (= (count (events p :acquire)) (count (events p :close-session)))))))
+
+(deftest transparent-copies-still-execute-and-filter-null
+  (doseq [[input expected] [["v1" #{[1 "v1" 0 "v1"] [1 "v1" 1 "v1"]}]
+                          [nil #{}]]]
+    (let [q '[:find ?e ?v ?endpoint ?copy :in $driver $a $b ?input
+              :where [$driver ?e :row/value ?label]
+              (or-join [?e ?v ?endpoint]
+                (and [$a ?e :row/value ?v] [(ground 0) ?endpoint])
+                (and [$b ?e :row/value ?v] [(ground 1) ?endpoint]))
+              [(identity ?input) ?copy]]
+          ps [(provider [[1 "first"]] {:scan-run 1})
+              (provider [[1 "v1"]] {}) (provider [[1 "v1"]] {})]
+          inputs (conj (mapv :source ps) input)]
+      (is (= expected (apply d/q q inputs))))))
+
+(deftest opaque-prefix-cost-never-pretends-to-price-later-accesses
+  (let [a {:kind :access :value {:rows 2} :requires [] :columns [{:variable '?key}]}
+        barrier {:kind :core :value {:cost-barrier? true} :requires [] :columns [{:variable '?out}]}]
+    (is (= :mandatory-prefix (:cost-scope (cost/price [a barrier barrier] [] :rows))))
+    (is (nil? (cost/price [barrier a] [] :rows)))))

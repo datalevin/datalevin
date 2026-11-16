@@ -223,21 +223,26 @@
                     (-> schedule
                         (assoc :estimation (get estimate-work (:region-id schedule)))
                         (update :planning-time-ms + (/ (double (:provider-planning-ns w)) 1000000.0))))
-                  (unions/select! runtime work (:planning prepared)) work)]
+                  (unions/select! runtime work (:planning prepared)
+                    (when (= 1 (:root-input-rows compilation)) {:compiled compiled :groups groups})) work)
+            demand (some :key-demand schedules)
+            all-schedules (into schedules (:schedules demand))]
         ;; A scoped workspace can be the first user of dependent access.
         ;; Its temporary cleanup must not close the invocation's shared IDs.
-        (when (some #(seq (get-in % [:path :options :requires])) (mapcat :plans schedules))
+        (when (some #(seq (get-in % [:path :options :requires])) (mapcat :plans all-schedules))
           @ids)
         (access/validate-query! runtime schedules)
+        (when demand (access/validate-query! runtime (:schedules demand)))
         (let [identity-key #(select-keys (get-in % [:path :options]) [:source-symbol :region-id :alternative-id])
-              selected (into #{} (map identity-key) (mapcat :plans schedules))]
+              selected (into #{} (map identity-key) (mapcat :plans all-schedules))]
           (doseq [candidate @all-candidates :when (not (contains? selected (identity-key candidate)))]
             (access/release-discarded! candidate)))
-        (doseq [[{:keys [responses]} schedule] (map vector responses schedules)
+        (doseq [{:keys [region responses]} responses
                 {:keys [request response]} responses]
           (envelope/select! runtime response
             (into [] (comp (filter #(identical? request (get-in % [:path :options :capture :request])))
-                           (map #(get-in % [:path :options :alternative-id]))) (:plans schedule))))
+                           (map #(get-in % [:path :options :alternative-id])) (distinct))
+                  (mapcat :plans (filter #(= (:region-id region) (:region-id %)) all-schedules)))))
         (reset! state :planned)
         (->Planned compilation groups schedules))
       (catch Throwable e (close-after-error! runtime close e)))))

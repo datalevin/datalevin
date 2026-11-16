@@ -1,5 +1,5 @@
 (ns ^:no-doc datalevin.query.source.join-cost
-  "Bounded lookahead over complete typed plans. No source or row access."
+  "Bounded lookahead over typed plans and fenced prefixes. No source or row access."
   (:require [clojure.set :as set]
             [datalevin.query.access.dependency :as dependency]))
 
@@ -61,7 +61,7 @@
          :estimated-ns (when (some? access) (finite-cost (+ access local)))}))))
 
 (defn price
-  "Estimate returned-row work along a complete path. Counts are advisory and
+  "Estimate returned-row work along a complete path or explicitly fenced prefix. Counts are advisory and
   floor the propagated tuple count at one; a zero never proves emptiness. A second independent
   scan sharing keys has unknown join selectivity and declines this model."
   ([selected inputs row-count] (price selected inputs row-count nil))
@@ -70,14 +70,22 @@
     (fn [{:keys [known tuples work-rows peak-rows access-ns local-ns estimated-opens estimated-requests] :as state}
          {:keys [kind value requires columns] :as choice}]
       (when state
-        (if (= kind :core)
+        (cond
+          ;; Only the selector may mark an opaque suffix. Its dependencies
+          ;; require all compared work to finish first; never price its fanout.
+          (:cost-barrier? value) (assoc state :cost-scope :mandatory-prefix)
+          (= :mandatory-prefix (:cost-scope state)) nil
+          (= kind :core)
           (if (:union-estimate value)
             (union-price state choice model)
-            (when (set/subset? (set (map :variable columns)) known)
+            (when (or (= :at-most-one (get-in value [:step :scalar-estimate]))
+                      (set/subset? (set (map :variable columns)) known))
             (let [local (finite-cost (+ (double local-ns)
                                         (* (double tuples) (+ (double (get model :local-row-ns 0))
                                                                (* (double (get model :local-column-ns 0)) (count requires))))))]
-              (assoc state :local-ns local :estimated-ns (when (some? access-ns) (finite-cost (+ (double access-ns) local)))))))
+              (assoc state :known (into known (map :variable columns))
+                           :local-ns local :estimated-ns (when (some? access-ns) (finite-cost (+ (double access-ns) local)))))))
+          :else
           (when-let [n (row-count value)]
             (let [output (set (map :variable columns))
                   dependent? (seq requires)
@@ -141,7 +149,10 @@
             first-access (first (filter #(or (= :access (:kind %)) (:union-estimate (:value %))) (:choices baseline)))
             work-key root-work
             roots (remove #(= (work-key first-access) (work-key %)) roots)
-            small? (and (<= (count (:required-work arguments)) 8) (<= (count choices) 32))
+            ;; Several conditional unions have mutually dependent interfaces.
+            ;; A short clause list can still need the regular lookahead bound.
+            small? (and (<= (count (:required-work arguments)) 8) (<= (count choices) 32)
+                        (<= (count (filter :union-estimate (map :value (:choices baseline)))) 2))
             budget-ns (if small? 1000000 20000000)
             maximum (if small? (min maximum (+ (long @checks) 128)) maximum)
             early (vec (take-while #(and (= :core (:kind %)) (not (:union-estimate (:value %)))) choices))
@@ -153,7 +164,7 @@
             (assoc best :cost-changed? (not (and (= (count (:choices best)) (count (:choices baseline)))
                                                        (every? true? (map identical? (:choices best) (:choices baseline)))))
                         :join-cost (select-keys best-price [:work-rows :peak-rows :access-ns :local-ns :estimated-ns
-                                                           :estimated-opens :estimated-requests])
+                                                           :estimated-opens :estimated-requests :cost-scope])
                         :cost-search {:model (if timed? :elapsed :cardinality)
                                       :evaluated evaluated :states @checks :starts starts
                                       :budget-ns budget-ns :max-states maximum

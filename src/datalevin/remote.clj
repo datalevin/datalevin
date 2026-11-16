@@ -19,6 +19,7 @@
    [datalevin.client :as cl]
    [datalevin.client.copy :as file-copy]
    [datalevin.prepared :as prepared]
+   [datalevin.db.tx.wire :as txwire]
    [datalevin.storage.schema :as schema]
    [datalevin.txlog.transfer :as transfer]
    [datalevin.bits :as b]
@@ -29,7 +30,7 @@
    [datalevin.client Client]
    [datalevin.interface ICustomTypes ILMDB ITxLog IList IAdmin IStore
     ISearchEngine IVectorIndex IRemoteDB IRemoteKV IRemoteReadLifecycle IRemoteReadCache
-    IRemotePrepared IRemotePreparedUpdate]
+    IRemotePrepared IRemotePreparedUpdate IRemotePreparedWrite]
    [clojure.lang Seqable IReduceInit]
    [java.lang AutoCloseable]
    [java.util Collections WeakHashMap Map]
@@ -611,6 +612,33 @@
                     #(datalog-request read-floor-tx client call args writing?)
                     nil (#{:assoc-opt :assoc-opts} call)))
 
+(defn- prepared-write-request
+  [client db-name ^datalevin.prepared.Request request input tx-meta writing? db-info]
+  (let [args (assoc (.-args request) 2 {:input input :tx-meta tx-meta})
+        normalize #(if (contains? % :tx-data) % (cl/decode-tx-response %))]
+    (cl/call-with-request client {:type :tx-data-prepared :args args :writing? writing?}
+      (fn []
+        (let [req (with-meta {:type :tx-data-prepared :args args :writing? writing?
+                              :client-op-id (cop/new-client-op-id)
+                              :client-op-hash (cop/request-hash
+                                                [:tx-data-prepared db-name
+                                                 (force (::txwire/definition-hash (.-metadata request))) input tx-meta])
+                              :client-op-response-kind cop/tx-data+db-info-response-kind}
+                             (.-metadata request))
+              send (fn [client req] (cl/request client req))
+              response (try (send client req)
+                            (catch Exception e
+                              (or (retry-ha-transport-failure client req send (cached-ha-member-endpoints db-info) e)
+                                  (throw e))))]
+          (if (= :error-response (:type response))
+            (let [data (:err-data response)]
+              (cond
+                (= :prepared/unsupported (:error data))
+                (load-datoms* client db-name (txwire/materialize request input) :txs+info false writing? db-info)
+                (:resized data) (raise (:message response) data)
+                :else (cl/retry-ha-write-request client req (:message response) data send)))
+            (normalize response)))))))
+
 (deftype+ DatalogStore [^String uri
                        ^String db-name
                        ^Client client
@@ -826,6 +854,16 @@
         (fn [id]
           (when (.get closed?) (raise "Database is closed" {:type :lmdb/closed}))
           (datalog-prepared-request read-floor-tx client operation request id writing?)))))
+
+  IRemotePreparedWrite
+  (tx-data-prepared [this request input tx-meta]
+    (i/check-remote-read-open! this)
+    (when-not (= db-name (first (.-args ^datalevin.prepared.Request request)))
+      (raise "Prepared write target is a different database" {:error :prepared/database-mismatch}))
+    (metadata-write! metadata-cache
+      #(let [result (prepared-write-request client db-name request input tx-meta writing? open-db-info)]
+         (update-read-floor-tx! read-floor-tx (get-in result [:db-info :max-tx])) result)
+      #(with-db-info %1 (:db-info %2)) false))
 
   IRemoteDB
   (defremote-forward (datalog-request read-floor-tx client)

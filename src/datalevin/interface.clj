@@ -493,6 +493,10 @@ values;")
   (prepare-remote-update [store dbi-name f k-type v-type args]
     "Prepare a reusable atomic update, executed with a key."))
 
+(defprotocol IRemotePreparedWrite
+  (tx-data-prepared [store request input tx-meta]
+    "Execute a portable prepared Datalog definition under the server writer."))
+
 (defprotocol IRemoteKV
   "Operations a remote KV store must provide to the local search/vector/idoc
   layers."

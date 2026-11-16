@@ -82,6 +82,7 @@
     :storage-read? true
     :prepared-read? true
     :prepared-update? true
+    :prepared-write? true
     :prepared-query? true
     :prepared-pull? true
     :compression-threshold (:compression-threshold opts)
@@ -118,6 +119,7 @@
        (true? (:storage-read? peer-capabilities)) (assoc :storage-read? true)
        (true? (:prepared-read? peer-capabilities)) (assoc :prepared-read? true)
        (true? (:prepared-update? peer-capabilities)) (assoc :prepared-update? true)
+       (true? (:prepared-write? peer-capabilities)) (assoc :prepared-write? true)
        (true? (:prepared-query? peer-capabilities)) (assoc :prepared-query? true)
        (and (true? (:prepared-pull? peer-capabilities))
             (true? (:prepared-read? peer-capabilities))

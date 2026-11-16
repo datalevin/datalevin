@@ -251,6 +251,16 @@
          :opens (get-in (.-groups permissions) [group :opens])
          :spent? (pos? (long (get-in @(.-state permissions) [:groups group :attempts])))}))))
 
+(defn repeatable-default?
+  "Whether a session permits repeated ordinary opens. This inspects ownership;
+  it reserves nothing and does not turn replay or consistency into permission."
+  [^Consumption permissions]
+  (locking (monitor (.-ctl permissions))
+    (control/check-active! (.-ctl permissions))
+    (and (not (:closed? @(.-state permissions)))
+         (not (.-explicit? permissions))
+         (= :many (get-in (.-groups permissions) [nil :opens])))))
+
 (defn reserve-open!
   "Reserve an attempt before calling the provider. Closing releases concurrency
   only: a failed or cancelled one-shot attempt remains spent. No replay property

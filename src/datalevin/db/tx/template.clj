@@ -4,7 +4,7 @@
   "Immutable parameterized write programs and pure, execution-local binding."
   (:require [datalevin.db.tx.compile :as compile]
             [datalevin.db.tx.plan :as plan])
-  (:import [datalevin.db.tx.plan AttrInfo BlindSource MixedInsert ScalarSequence TxParam WriteOp]
+  (:import [datalevin.db.tx.plan AttrInfo BlindSource BoundMap BoundOperation MixedInsert ScalarSequence TxParam WriteOp]
            [java.util ArrayList HashMap HashSet]
            [org.eclipse.collections.impl.list.mutable FastList]))
 
@@ -125,6 +125,24 @@
                         (or (not references?) (not add?)
                             (and (= 4 (count source)) (nil? (meta source))))
                         (every? (fn [[_ _ ^AttrInfo info]] (and info (.-typed? info))) program-fields))
+          ordered-definition
+          (when (and (vector? source) (compile/prepared-write-metadata? (meta source))
+                     (case (nth source 0 nil)
+                       :db/add (<= 4 (count source) 5)
+                       :db/retract (<= 3 (count source) 4)
+                       (:db/cas :db.fn/cas) (= 5 (count source))
+                       :db.fn/retractAttribute (= 3 (count source))
+                       (:db/retractEntity :db.fn/retractEntity) (= 2 (count source))
+                       false))
+            (when-let [definition (compile/prepared-ordered-operation ctx infos (nth source 0) (nth source 2 nil))]
+              (let [^AttrInfo info (:info definition)]
+                (when (or (not add?) (not (and info (identical? :db.type/ref (.-value-type info))))
+                          (and (= 4 (count source)) (nil? (meta source))))
+                  (assoc definition :arity (count source) :annotations (meta source)
+                         :entity (:run (nth children 1))
+                         :value (or (:run (nth children 3 nil)) (constantly nil))
+                         :extra (or (:run (nth children 4 nil)) (constantly nil)))))))
+          ordered-map-definition (when map? (compile/prepared-ordered-map ctx infos source))
           kind (if (and (not= :dynamic kind)
                         (every? #(some? (nth % 2)) fields)
                         (compile/prepared-write-metadata? (meta source))) kind :dynamic)]
@@ -137,6 +155,8 @@
              :match (when (or cas? retract?) (or (:run (nth children 3 nil)) (constantly nil)))
              :program? (boolean program?) :program-fields program-fields
              :references? (boolean references?)
+             :ordered-definition ordered-definition :ordered-map-definition ordered-map-definition
+             :ordered-infos (when (or ordered-definition ordered-map-definition) (into {} infos))
              :mixed? (boolean mixed?) :mixed-fields mixed-fields :mixed-infos (into {} infos)))))
 
 (defn- fixed-scalar-layout [operations infos batch?]
@@ -186,6 +206,7 @@
                    (and (= 1 (count kinds)) (nil? metadata)
                         (not (contains? kinds :dynamic)) (not extended?)) (first kinds)
                    mixed? :mixed
+                   (and (nil? metadata) (every? #(or (:ordered-definition %) (:ordered-map-definition %)) operations)) :ordered-program
                    :else :dynamic)
         infos (into {} (comp (mapcat (if (= :scalar-program strategy) :program-fields :fields))
                              (keep (fn [[a _ info]] (when info [a info])))) operations)
@@ -198,6 +219,9 @@
                               (into #{} (keep (fn [[a ^AttrInfo info]]
                                                (when (identical? :db.type/ref (.-value-type info)) a))) infos))
            :mixed-infos (when mixed? (apply merge (map :mixed-infos operations)))
+           :ordered-infos (apply merge (map :ordered-infos operations))
+           :ordered-blind-fallback? (and (= :blind strategy) (every? :ordered-map-definition operations)
+                                         (some #(and (instance? AttrInfo %) (:db/unique (.-props ^AttrInfo %))) (vals infos)))
            :single-attribute? (= 1 (count infos))
            :identity? (boolean (some #(identical? :db.unique/identity (:db/unique (.-props ^AttrInfo %))) (vals infos)))
            :fuse? (every? #(.-fuse-blind? ^AttrInfo %) (vals infos)))))
@@ -402,6 +426,29 @@
           @resolve? (assoc :resolve-ids? true :deferred-entity-resolution? @aliases?
                            :reference-attrs reference-attrs))))))
 
+(defn- bind-ordered-program
+  "Own prepared instructions while retaining current-operation correction,
+  live lookup ownership, tuple boundaries and shared retry responsibilities."
+  [template rows]
+  (let [ctx (:ctx template) infos (HashMap. ^java.util.Map (:ordered-infos template))
+        entries (volatile! (transient []))]
+    (when (bindings template rows
+            (fn [operation row]
+              (if-let [definition (:ordered-map-definition operation)]
+                (let [entity ((:expression operation) row)]
+                  (when (compile/prepared-ordered-map-operands? ctx infos entity)
+                    (vswap! entries conj! (BoundMap. entity
+                                            (some? (compile/ordinary-addition-flags ctx entity true false))
+                                            nil false (:implicit? definition))) true))
+                (let [{:keys [opcode info arity annotations entity value extra] :as definition}
+                      (:ordered-definition operation)
+                      e (entity row) value (value row) extra (extra row)]
+                  (when (compile/prepared-ordered-operands? ctx infos definition e value extra)
+                    (vswap! entries conj! (BoundOperation. opcode e (nth (:source operation) 2 nil)
+                                                          value extra info arity annotations))
+                    true)))))
+      (plan/->TxPlan ctx :ordered-program (persistent! @entries) nil))))
+
 (defn bind-template
   "Create an execution-owned plan using compiled metadata and fresh operands.
   Declines precede effectful correction; the original materialized program is
@@ -409,7 +456,9 @@
   [template rows]
   (case (:strategy template)
     :scalar (bind-scalar template rows)
-    :blind (bind-blind template rows)
+    :blind (or (bind-blind template rows)
+               (when (:ordered-blind-fallback? template) (bind-ordered-program template rows)))
     :mixed (bind-mixed template rows)
     :scalar-program (bind-scalar-program template rows)
+    :ordered-program (bind-ordered-program template rows)
     nil))

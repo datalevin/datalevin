@@ -15,6 +15,7 @@
             [datalevin.db.tx.compile :as compile]
             [datalevin.db.tx.common :as txcommon]
             [datalevin.db.tx.execute :as runtime]
+            [datalevin.db.tx.plan :as plan]
             [datalevin.db.tx.prepare :as txprep]
             [datalevin.idoc :as idoc]
             [datalevin.index :as idx]
@@ -24,6 +25,7 @@
             [datalevin.util :as u :refer [conjv conjs concatv cond+ raise]]
             [datalevin.validate :as vld])
   (:import [datalevin.datom Datom]
+           [datalevin.db.tx.plan AttrInfo BoundMap BoundOperation]
            [datalevin.db.tx.prepare IdentityResolution ResolvedIdentityAdd]
            [java.util ArrayList Collection HashMap HashSet List SortedSet]
            [org.eclipse.collections.impl.set.sorted.mutable TreeSortedSet]))
@@ -705,8 +707,7 @@
   [db _store schema entity report entities]
   (let [[_ e a v] entity
         tuple-attrs (get-in schema [a :db/tupleAttrs])]
-    (vld/validate-tuple-direct-write
-      (and
+    (let [match? (and
         (every? some? v)
         (= (count tuple-attrs) (count v))
         (every?
@@ -715,8 +716,8 @@
                   (or (:v (cached-ea-first-datom db e tuple-attr))
                       (txcommon/ea-first-v db e tuple-attr))]
               (= tuple-value db-value)))
-          (mapv vector tuple-attrs v)))
-      entity)
+          (mapv vector tuple-attrs v)))]
+      (vld/validate-tuple-direct-write match? (if match? entity (plan/operation-form entity))))
     [report entities]))
 
 (defn- handle-tuple-ref-tempids
@@ -957,10 +958,13 @@
           (let [[report' entities'] result] (TxStep. report' entities')))))))
 
 (defn- execute-operation
-  [initial-report report db store schema store-opts tempids op e a v entity entities
-   initial-es tx-time context]
-  (let [props          (schema a)
-        ref?           (identical? (:db/valueType props) :db.type/ref)
+  ([initial-report report db store schema store-opts tempids op e a v entity entities
+    initial-es tx-time context]
+   (execute-operation initial-report report db store schema store-opts tempids op e a v
+                      entity entities initial-es tx-time context (schema a)))
+  ([initial-report report db store schema store-opts tempids op e a v entity entities
+   initial-es tx-time context props]
+  (let [ref?           (identical? (:db/valueType props) :db.type/ref)
         unique-identity? (identical? (:db/unique props)
                                      :db.unique/identity)
         tuple-attr?    (contains? props :db/tupleAttrs)
@@ -1026,7 +1030,7 @@
             props (if identity-add? (get (:schema @context) a) props)
             entity (if (identical? v value)
                      entity
-                     (with-meta (assoc (vec entity) 3 value) (meta entity)))
+                     (with-meta (assoc (vec (plan/operation-form entity)) 3 value) (meta entity)))
             v value]
 
       (txprep/tempid? e)
@@ -1077,7 +1081,17 @@
       (handle-retract-entity report db store entity entities context)
 
       :else
-      (vld/validate-tx-op op entity))))
+      (vld/validate-tx-op op entity)))))
+
+(defn- execute-bound-operation
+  "Consume captured attribute proofs and indexed operands directly. Shared
+  ordered operators retain uniqueness, tuple effects, allocation and retries."
+  [initial-report report ^BoundOperation operation entities initial-es tx-time context]
+  (let [db (:db-after report) ctx @context ^AttrInfo info (.-info operation)]
+    (execute-operation initial-report report db (:store db) (:schema ctx) (:opts ctx)
+                       (:tempids report) (.-opcode operation) (.-entity operation)
+                       (.-attr operation) (.-value operation) operation entities
+                       initial-es tx-time context (when info (.-props info)))))
 
 (defn execute-operation-form
   "Execute one demanded form, preserving operand and validation demand order."
@@ -1256,6 +1270,29 @@
             (if (instance? TxRetry result)
               result
               (recur result entities remaining prefix)))
+
+          (instance? BoundOperation entity)
+          (let [result (execute-bound-operation initial-report report entity entities initial-es tx-time context)]
+            (cond
+              (instance? TxRetry result) result
+              (instance? TxStep result)
+              (recur (.-report ^TxStep result) (.-entities ^TxStep result) remaining prefix)
+              (map? result) result
+              :else (let [[report' es'] result]
+                      (recur report' es' remaining prefix))))
+
+          (instance? BoundMap entity)
+          (let [^BoundMap entity entity
+                result (if (and (.-regular? entity) (nil? (.-resolution entity)))
+                         (TxStep. (transact-regular-map report (.-data entity) tx-time context) entities)
+                         (handle-map-entity initial-report report db (.-data entity) entities initial-es tx-time
+                                            (.-resolution entity) context (.-syntax-checked? entity)))]
+            (cond
+              (instance? TxRetry result) result
+              (instance? TxStep result)
+              (recur (.-report ^TxStep result) (.-entities ^TxStep result) remaining prefix)
+              (map? result) result
+              :else (let [[report' es'] result] (recur report' es' remaining prefix))))
 
           :else
           (vld/validate-tx-entity-type entity))))))
@@ -1467,6 +1504,8 @@
   ([initial-report initial-es tx-time ctx ordinary-plan]
    (execute-tx-loop initial-report initial-es tx-time ctx ordinary-plan false))
   ([initial-report initial-es tx-time ctx ordinary-plan program]
+   (execute-tx-loop initial-report initial-es tx-time ctx ordinary-plan program nil))
+  ([initial-report initial-es tx-time ctx ordinary-plan program supplied-plan]
    (let [;; A supplied prefix can already contain private allocations. New
          ;; AutoTempids mark the report when their entity ID is allocated.
          initial-report
@@ -1482,9 +1521,10 @@
                     (when-not (::runtime/value-tempids initial-report)
                       (bind-ordinary-operands
                         initial-es (empty? (:tx-data initial-report)) ctx false)))
-         plan (when-not ordinary
-                (when-let [analysis (bind-flat-upsert-forms initial-es ctx)]
-                  (resolve-flat-upsert-operands db analysis ctx)))
+         plan (or supplied-plan
+                  (when-not ordinary
+                    (when-let [analysis (bind-flat-upsert-forms initial-es ctx)]
+                      (resolve-flat-upsert-operands db analysis ctx))))
          ctx (if (and plan (not (:stable-schema? plan)))
                (coreprep/make-prepare-ctx db) ctx)
          initial-es (or (:entities ordinary) (:entities plan) initial-es)
@@ -1507,6 +1547,31 @@
            result))))))
 
 (declare prepare-and-transact-tx-data)
+
+(defn execute-bound-program
+  "Run invocation-owned ordered instructions without source reconstruction.
+  Generated tuple/cascade/identity work uses the same attempt continuation."
+  [initial-report plan tx-time]
+  (let [preparation txcommon/*batch-prepare*]
+    (when (satisfies? txcommon/ScalarPendingIndex preparation)
+      (txcommon/materialize-scalar-pending! preparation (:db-after initial-report))))
+  (let [entries (mapv (fn [entry]
+                        (if (and (instance? BoundMap entry) (.-implicit? ^BoundMap entry))
+                          (BoundMap. (assoc (.-data ^BoundMap entry) :db/id (txprep/auto-tempid))
+                                     (.-regular? ^BoundMap entry) nil false false)
+                          entry)) (:entries plan))
+        ctx (:ctx plan)
+        upserts (when (every? #(instance? BoundMap %) entries)
+                  (when-let [analysis (bind-flat-upsert-forms (mapv #(.-data ^BoundMap %) entries) ctx)]
+                    (let [resolved (resolve-flat-upsert-operands (:db-before initial-report) analysis ctx)]
+                      (assoc resolved :entities
+                             (mapv (fn [^BoundMap bound source]
+                                     (if (instance? ResolvedIdentityMap source)
+                                       (let [^ResolvedIdentityMap source source]
+                                         (BoundMap. (.-entity source) (.-regular? bound)
+                                                    (.-resolution source) (.-syntax-checked? source) false))
+                                       bound)) entries (:entities resolved))))))]
+    (execute-tx-loop initial-report entries tx-time ctx false plan upserts)))
 
 (defn execute-ordered-region
   "Execute original forms with an optional independent prefix proof.

@@ -117,6 +117,7 @@
    :tx-data client-op-write
    :db-info unguarded
    :tx-data+db-info client-op-write
+   :tx-data-prepared (assoc client-op-write :db-type "datalog")
    :tx-data-ack client-op-write
    :open-transact transaction-open
    :close-transact transaction-close
