@@ -2637,12 +2637,13 @@
               (compiled-report initial report :compiled-ordered false (:ctx plan)))))
 
         :scalar-program
-        (let [operands (:entries plan)]
-          (when (txexec/scalar-entities-within-bound?
-                  (.-entries ^datalevin.db.tx.plan.ScalarSequence operands) before)
-            (let [report (txexec/execute-scalar-program initial operands tx-id)]
-              (when *tx-compiler-observer* (*tx-compiler-observer* :execute-scalar-program plan))
-              (compiled-report initial report :compiled-ordered false (:ctx plan)))))
+        (when-let [bound (if (:resolve-ids? plan) (txbind/resolve-scalar-program db plan) plan)]
+          (let [operands (:entries bound)]
+            (when (txexec/scalar-entities-within-bound?
+                    (.-entries ^datalevin.db.tx.plan.ScalarSequence operands) before)
+              (let [report (txexec/execute-scalar-program initial operands tx-id)]
+                (when *tx-compiler-observer* (*tx-compiler-observer* :execute-scalar-program bound))
+                (compiled-report initial report :compiled-ordered false (:ctx plan))))))
 
         :blind
         (when-let [[report upsert?]

@@ -1702,6 +1702,10 @@
                                         (:schema ctx) (:db/attrTuples (:rschema ctx))
                                         attr 1 :references infos)]
                 (when-not (#{:db.type/ref :db.type/tuple} (.-value-type info)) info))
+      :scalar-program (when-let [^AttrInfo info (scalar-attribute-info
+                                                (:schema ctx) (:db/attrTuples (:rschema ctx))
+                                                attr 1 :references infos)]
+                        (when (and (.-typed? info) (not (:db/isComponent (.-props info)))) info))
       :blind (blind-attr-info! infos (:schema ctx) (:db/attrTuples (:rschema ctx)) true attr)
       :mixed (let [^AttrInfo info (attribute-info! infos (:schema ctx)
                                                  (:db/attrTuples (:rschema ctx)) attr)]
@@ -1721,6 +1725,21 @@
       (and (inert-scalar-value? value)
            (or cas? (canonical-scalar-value? (:validate-data? (:opts ctx))
                                             (.-value-type info) value)))))
+
+(defn prepared-program-entity
+  "Keep existing IDs and canonical lookup operands symbolic until the writer.
+  Transaction IDs, tempids and opaque lookup values retain demanded execution."
+  [ctx value]
+  (when-not (identical? :db/current-tx value)
+    (scalar-entity-operand ctx value true)))
+
+(defn prepared-program-reference
+  "Keep canonical reference IDs and lookups. Other numeric representations
+  retain ordinary CAS diagnostics and correction through the demanded route."
+  [ctx value]
+  (when (or (instance? Long value) (keyword? value)
+            (identical? clojure.lang.PersistentVector (class value)))
+    (prepared-program-entity ctx value)))
 
 (defn append-prepared-scalar!
   "Bind one reusable scalar instruction into fresh correction scratch.

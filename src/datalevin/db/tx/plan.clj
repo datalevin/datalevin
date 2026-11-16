@@ -3,7 +3,8 @@
 (ns ^:no-doc datalevin.db.tx.plan
   "Owned transaction operands and schema-independent literal helpers."
   (:require [datalevin.datom :as datom])
-  (:import [org.eclipse.collections.impl.list.mutable FastList]))
+  (:import [java.util HashMap]
+           [org.eclipse.collections.impl.list.mutable FastList]))
 
 (defrecord TxPlan [ctx strategy entries entity-reads])
 
@@ -25,6 +26,18 @@
 (deftype ScalarEntityRead [^objects names ^longs aids])
 
 (deftype ScalarSequence [entries ^ints slots ^long slot-count])
+
+(defn scalar-sequence
+  "Assign each E/A one ordered execution slot. Entity operands must already
+  have their final identity when different aliases can name the same entity."
+  [entries]
+  (let [positions (HashMap.) slots (int-array (count entries))]
+    (dotimes [i (count entries)]
+      (let [entry (nth entries i) key [(nth entry 0) (nth entry 1)]
+            slot (or (.get positions key)
+                     (let [slot (.size positions)] (.put positions key slot) slot))]
+        (aset-int slots i (int slot))))
+    (ScalarSequence. entries slots (.size positions))))
 
 (deftype BlindEntity [tempid ^FastList attrs])
 

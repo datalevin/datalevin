@@ -340,7 +340,10 @@
       (boolean? value) (uuid? value)
       (and (vector? value) (every? immutable-lookup-value? value))))
 
-(defn- stored-entid
+(defn lookup-ref-eid
+  "Resolve a proven lookup against current pending ownership and native state.
+  The ordinary attempt cache holds only native results; pending writes always
+  override them. Callers retain lookup syntax and attribute validation."
   [db attr value]
   (let [store (:store db)
         ^LookupRefCache cache *lookup-ref-cache*]
@@ -381,11 +384,11 @@
 
         :else
         (or (cached-av-first-e db attr value)
-            (stored-entid db attr value))))
+            (lookup-ref-eid db attr value))))
 
     (keyword? eid)
     (or (cached-av-first-e db :db/ident eid)
-        (stored-entid db :db/ident eid))
+        (lookup-ref-eid db :db/ident eid))
 
     :else
     (vld/validate-entity-id-syntax eid)))

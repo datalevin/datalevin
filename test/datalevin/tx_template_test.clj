@@ -165,3 +165,34 @@
     (is (nil? (template/bind-template t [{:e 1 :old host}])))
     (is (nil? (template/bind-template t [{:e host :old 0}])))
     (is (empty? @effects))))
+
+(deftest ordered-reference-bindings-reuse-proof-and-fixed-slots
+  (let [reads (atom 0)
+        schema (assoc (:schema context) :friend {:db/aid 3 :db/valueType :db.type/ref})
+        ctx (assoc context :schema #(do (swap! reads inc) (schema %)))
+        op (template/prepare-operation ctx [:db/cas 1 :friend (template/parameter :old)
+                                            (template/parameter :new)])
+        t (template/prepare-template ctx [op [:db/retract 1 :friend]] nil)
+        before @reads
+        a (template/bind-template t [{:old 2 :new 3}])
+        b (template/bind-template t [{:old 3 :new 4}])
+        ^datalevin.db.tx.plan.ScalarSequence x (:entries a)
+        ^datalevin.db.tx.plan.ScalarSequence y (:entries b)]
+    (is (identical? op (first (:operations t))))
+    (is (= :scalar-program (:strategy a)))
+    (is (= before @reads))
+    (is (identical? (.-slots x) (.-slots y)))
+    (is (nil? (:resolve-ids? a)))
+    (is (not (identical? (.-entries x) (.-entries y))))))
+
+(deftest symbolic-ids-remain-unresolved-until-the-writer
+  (let [ctx (assoc-in context [:schema :key]
+                       {:db/aid 3 :db/valueType :db.type/string :db/unique :db.unique/identity})
+        t (template/prepare-template ctx [[:db/cas (template/parameter :e) :value 0 1]] nil)
+        lookup [:key "one"] bound (template/bind-template t [{:e lookup}])
+        ^datalevin.db.tx.plan.ScalarSequence operands (:entries bound)]
+    (is (= :scalar-program (:strategy bound)))
+    (is (:resolve-ids? bound))
+    (is (:deferred-entity-resolution? bound))
+    (is (identical? lookup (ffirst (.-entries operands))))
+    (is (nil? (.-slots operands)))))

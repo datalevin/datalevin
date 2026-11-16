@@ -17,7 +17,7 @@
             [datalevin.db.tx.prepare :as txprep]
             [datalevin.prepare :as coreprep]
             [datalevin.validate :as vld])
-  (:import [datalevin.db.tx.plan AttrInfo BlindTemplate]
+  (:import [datalevin.db.tx.plan AttrInfo BlindTemplate ScalarSequence]
            [org.eclipse.collections.impl.list.mutable FastList]
            [java.util HashMap HashSet]))
 
@@ -100,6 +100,35 @@
                       (reduced nil))
                     (reduced nil)))
                 [] entries)))))
+
+(defn resolve-scalar-program
+  "Resolve proven read-only lookup operands under the current writer. Missing
+  operands decline before execution, preserving ordinary failure ordering.
+  Resolved EIDs determine slots so different aliases share one current datom."
+  [db prepared]
+  (txcommon/with-lookup-ref-cache db
+    (let [^ScalarSequence operands (:entries prepared)
+          refs (:reference-attrs prepared)
+          resolve-id (fn [value]
+                       (cond
+                         (instance? Long value) value
+                         (keyword? value) (txcommon/lookup-ref-eid db :db/ident value)
+                         :else (txcommon/lookup-ref-eid db (nth value 0) (nth value 1))))
+          entries
+          (reduce (fn [out [e attr opcode match value tx annotations raw-value]]
+                    (let [eid (resolve-id e) reference? (contains? refs attr)
+                          expected (if (and reference? (some? match)) (resolve-id match) match)
+                          value' (if (and reference? (some? value)) (resolve-id value) value)]
+                      (if (and eid (or (nil? match) (some? expected)) (or (nil? value) (some? value')))
+                        (conj! out [eid attr opcode expected value' tx annotations (if reference? value' raw-value)])
+                        (reduced nil))))
+                  (transient []) (.-entries operands))]
+      (when entries
+        (let [entries (persistent! entries)]
+          (assoc prepared :entries
+                 (if (:deferred-entity-resolution? prepared)
+                   (plan/scalar-sequence entries)
+                   (ScalarSequence. entries (.-slots operands) (.-slot-count operands)))))))))
 
 (defn prepare-scalar-operands
   "Use the compiler's source/correction operands at the caller checkpoint.
