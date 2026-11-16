@@ -1713,6 +1713,15 @@
   [annotations]
   (or (nil? annotations) (application-add-metadata? annotations)))
 
+(defn prepared-scalar-match?
+  "Prove a scalar match operand without correction. CAS compares its original
+  expected value; native retractions require a canonical storage operand."
+  [ctx ^AttrInfo info value cas?]
+  (or (nil? value)
+      (and (inert-scalar-value? value)
+           (or cas? (canonical-scalar-value? (:validate-data? (:opts ctx))
+                                            (.-value-type info) value)))))
+
 (defn append-prepared-scalar!
   "Bind one reusable scalar instruction into fresh correction scratch.
   All proofs are value-specific; this worker invokes no runtime callbacks."

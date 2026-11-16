@@ -2636,6 +2636,14 @@
               (when *tx-compiler-observer* (*tx-compiler-observer* :execute-scalar-sequence plan))
               (compiled-report initial report :compiled-ordered false (:ctx plan)))))
 
+        :scalar-program
+        (let [operands (:entries plan)]
+          (when (txexec/scalar-entities-within-bound?
+                  (.-entries ^datalevin.db.tx.plan.ScalarSequence operands) before)
+            (let [report (txexec/execute-scalar-program initial operands tx-id)]
+              (when *tx-compiler-observer* (*tx-compiler-observer* :execute-scalar-program plan))
+              (compiled-report initial report :compiled-ordered false (:ctx plan)))))
+
         :blind
         (when-let [[report upsert?]
                    (if (and identity-upsert? (:identity-upsert-av plan))

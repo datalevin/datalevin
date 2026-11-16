@@ -79,6 +79,10 @@
           children (:children compiled)
           map? (plain-map? source)
           add? (and (vector? source) (<= 4 (count source) 5) (identical? :db/add (nth source 0)))
+          cas? (and (vector? source) (= 5 (count source)) (#{:db.fn/cas :db/cas} (nth source 0)))
+          retract? (and (vector? source) (<= 3 (count source) 4) (identical? :db/retract (nth source 0)))
+          clear? (and (vector? source) (= 3 (count source)) (identical? :db.fn/retractAttribute (nth source 0)))
+          ordered? (or cas? retract? clear?)
           kind (cond
                  map? (if (or (not (contains? source :db/id))
                               (instance? TxParam (:db/id source))
@@ -87,6 +91,7 @@
                         (if (or (compile/prepared-positive-id? (:db/id source))
                                 (vector? (:db/id source))) :scalar :dynamic))
                  add? :scalar
+                 ordered? :scalar-program
                  :else :dynamic)
           infos (HashMap.)
           fields (cond
@@ -96,6 +101,9 @@
                               (remove #(identical? :db/id (key %)) source))
                    add? [[(nth source 2) (:run (nth children 3))
                           (compile/prepared-write-attribute ctx infos (nth source 2) kind)]]
+                   ordered? [[(nth source 2) (if cas? (:run (nth children 4)) (constantly nil))
+                              (let [^AttrInfo info (compile/prepared-write-attribute ctx infos (nth source 2) :scalar)]
+                                (when (and info (.-typed? info)) info))]]
                    :else [])
           mixed-form? (and (nil? (meta source))
                            (or (and map? (> (count source) (if (contains? source :db/id) 1 0)))
@@ -104,14 +112,24 @@
                          (mapv (fn [[a value _]]
                                  [a value (compile/prepared-write-attribute ctx infos a :mixed)]) fields))
           mixed? (and mixed-form? (every? #(some? (nth % 2)) mixed-fields))
+          program-fields (if map?
+                           (mapv (fn [[a value _]]
+                                   [a value (compile/prepared-write-attribute ctx infos a :scalar)]) fields)
+                           fields)
+          program? (and (or map? add? ordered?) (seq program-fields)
+                        (compile/prepared-write-metadata? (meta source))
+                        (every? (fn [[_ _ ^AttrInfo info]] (and info (.-typed? info))) program-fields))
           kind (if (and (not= :dynamic kind)
                         (every? #(some? (nth % 2)) fields)
                         (compile/prepared-write-metadata? (meta source))) kind :dynamic)]
       (assoc (plan/->WriteOp ctx source (:run compiled) (:params compiled) kind
                             (if map? (or (:run (get children :db/id)) (constantly nil))
-                                (when add? (:run (nth children 1))))
+                                (when (or add? ordered?) (:run (nth children 1))))
                             fields (when (and add? (= 5 (count source))) (:run (nth children 4)))
-                            (when add? (meta source)))
+                            (when (or add? cas?) (meta source)))
+             :opcode (cond cas? :cas retract? :retract clear? :clear :else :add)
+             :match (when (or cas? retract?) (or (:run (nth children 3 nil)) (constantly nil)))
+             :program? (boolean program?) :program-fields program-fields
              :mixed? (boolean mixed?) :mixed-fields mixed-fields :mixed-infos (into {} infos)))))
 
 (defn- sequence-operands [entries]
@@ -162,12 +180,15 @@
                                                (.-value-type ^AttrInfo (nth % 2)))
                                             (:mixed-fields op))) operations))
         strategy (cond
+                   (and (nil? metadata) (contains? kinds :scalar-program)
+                        (every? :program? operations))
+                   :scalar-program
                    (and (= 1 (count kinds)) (nil? metadata)
                         (not (contains? kinds :dynamic)) (not extended?)) (first kinds)
                    mixed? :mixed
                    :else :dynamic)
         infos (into {} (comp (mapcat :fields) (keep (fn [[a _ info]] (when info [a info])))) operations)
-        fixed (when (= :scalar strategy) (fixed-scalar-layout operations infos batch?))]
+        fixed (when (#{:scalar :scalar-program} strategy) (fixed-scalar-layout operations infos batch?))]
     (assoc (plan/->WriteTemplate ctx operations (vec (distinct (mapcat :params operations)))
                                 (boolean batch?) strategy
                                 (boolean (some #(or (:tx %) (:annotations %)) operations)) metadata)
@@ -321,6 +342,40 @@
                              (vreset! inserts? true) true))))))))
       (compile/finish-mixed-plan ctx infos updates entries corrections? @inserts? @required-eid @typed?))))
 
+(defn- bind-scalar-program
+  "Bind ordered scalar operations without creating source forms. Match values
+  remain uncorrected; only fully proven addition operands enter correction."
+  [template rows]
+  (let [ctx (:ctx template) candidates (FastList.) entries (volatile! (transient []))]
+    (when (and (not (:auto-entity-time? (:opts ctx)))
+               (bindings template rows
+                 (fn [op row]
+                   (let [e ((:entity op) row) opcode (:opcode op)
+                         match (when-let [f (:match op)] (f row))
+                         tx (when-let [f (:tx op)] (f row))]
+                     (and (compile/prepared-positive-id? e)
+                          (or (nil? tx) (compile/prepared-positive-id? tx))
+                          (reduce (fn [_ [attr value info]]
+                                    (let [offset (.size candidates)
+                                          raw-value (when (#{:add :cas} opcode) (value row))]
+                                      (if (and (compile/prepared-scalar-match? ctx info match (= :cas opcode))
+                                               (or (#{:retract :clear} opcode)
+                                                   (compile/append-prepared-scalar!
+                                                     ctx info candidates nil e attr raw-value)))
+                                        (do (vswap! entries conj! [(long e) attr opcode match offset
+                                                                  (some-> tx long) (:annotations op) raw-value]) true)
+                                        (reduced false))))
+                                  true (:program-fields op))))))
+               (compile/correct-prepared-scalars! ctx candidates))
+      (let [entries (mapv (fn [[e a opcode match offset tx annotations raw-value]]
+                            [e a opcode match
+                             (when-not (#{:retract :clear} opcode) (.get candidates (+ offset 2)))
+                             tx annotations raw-value]) (persistent! @entries))
+            ^ScalarSequence fixed (get-in template [:fixed-layout :sequence-layout])
+            operands (if fixed (ScalarSequence. entries (.-slots fixed) (.-slot-count fixed))
+                         (sequence-operands entries))]
+        (plan/->TxPlan ctx :scalar-program operands nil)))))
+
 (defn bind-template
   "Create an execution-owned plan using compiled metadata and fresh operands.
   Declines precede effectful correction; the original materialized program is
@@ -330,4 +385,5 @@
     :scalar (bind-scalar template rows)
     :blind (bind-blind template rows)
     :mixed (bind-mixed template rows)
+    :scalar-program (bind-scalar-program template rows)
     nil))

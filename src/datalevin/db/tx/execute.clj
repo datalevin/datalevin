@@ -221,6 +221,39 @@
         (assoc report :db-after (assoc db :max-tx tx-id) :tx-data (persistent! out)
                       :tempids {:db/current-tx tx-id}))))))
 
+(defn execute-scalar-program
+  "Execute typed add/CAS/retract instructions through owned E/A datom slots.
+  Initial reads honor the writer's pending view. Forwarded datoms preserve CAS
+  diagnostics, giant retraction references and redundant-addition semantics."
+  ([report operands tx-id]
+   (execute-scalar-program report operands tx-id txcommon/preparation-first-datom))
+  ([report ^ScalarSequence operands tx-id read-old]
+   (let [entries (.-entries operands) ^ints slots (.-slots operands)
+         values (object-array (int (.-slot-count operands)))
+         initialized (boolean-array (alength values)) db (:db-after report)]
+     (loop [i 0 out (transient [])]
+       (if (< i (count entries))
+         (let [[e attr opcode match value tx annotations raw-value] (nth entries i)
+               slot (aget slots i)
+               ^Datom old (if (aget initialized slot) (aget values slot) (read-old db e attr))
+               old-value (idx/datom-prepared-value old)
+               addition? (#{:add :cas} opcode)
+               _ (when (= :cas opcode)
+                   (vld/validate-cas-value false e attr match raw-value (when old [old])))
+               before (count out)
+               out (if addition?
+                     (txcommon/emit-transition conj! out e attr old-value value
+                       (long (or tx tx-id)) annotations)
+                     (if (and old (or (= :clear opcode) (nil? match)
+                                     (zero? (d/compare-index-values (.-v old) match))))
+                       (conj! out (idx/retraction e attr old-value tx-id)) out))
+               changed? (not= before (count out))]
+           (aset values slot (if changed? (when addition? (nth out (dec (count out)))) old))
+           (aset-boolean initialized slot true)
+           (recur (unchecked-inc i) out))
+         (assoc report :db-after (assoc db :max-tx tx-id) :tx-data (persistent! out)
+                       :tempids {:db/current-tx tx-id}))))))
+
 (defn execute-scalar-report
   "Emit already-bound scalar operands into a fresh adapter-owned report.
   Caller retains epoch, ID-bound and alias admission, transaction ID binding

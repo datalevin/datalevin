@@ -189,6 +189,15 @@
        (if read-stored (read-stored e a)
            (idx/preparation-first-v (:store db) e a))))))
 
+(defn preparation-first-datom
+  "Read a scalar slot with its original stamp and metadata for CAS diagnostics.
+  Collected scalar writes are authoritative before their indexes materialize."
+  [db e a]
+  (if-let [^Datom pending (when-let [^LongObjectHashMap index (scalar-pending-index)]
+                          (some-> ^HashMap (.get index (long e)) (.get a)))]
+    (when (d/datom-added pending) pending)
+    (ea-first-datom db e a)))
+
 (defn ea-first-v
   "Resolve the logical entity/attribute value during write preparation."
   [db e a]

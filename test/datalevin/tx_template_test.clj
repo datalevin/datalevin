@@ -3,6 +3,7 @@
             [datalevin.db.tx.plan :as plan]
             [datalevin.db.tx.execute :as execute]
             [datalevin.db.tx.template :as template]
+            [datalevin.datom :as datom]
             [datalevin.prepare :as prepare]))
 
 (def context
@@ -128,4 +129,39 @@
         reference (lazy-seq (swap! effects conj :forced) (list 1))]
     (is (nil? (template/bind-template t [{:v 1 :id -1 :ref -2}])))
     (is (nil? (template/bind-template t [{:v 1 :id -1 :ref reference}])))
+    (is (empty? @effects))))
+
+(deftest ordered-scalar-operations-reuse-layouts-and-read-current-datoms-once
+  (let [reads (atom []) metadata-reads (atom 0)
+        ctx (assoc context :schema #(do (swap! metadata-reads inc) ((:schema context) %)))
+        cas (template/prepare-operation ctx [:db/cas 1 :value (template/parameter :old)
+                                             (template/parameter :new)])
+        t (template/prepare-template ctx [cas [:db/retract 1 :value]
+                                         [:db/add 1 :value 9] [:db.fn/retractAttribute 1 :value]
+                                         [:db.fn/cas 1 :value nil 10]] nil)
+        before @metadata-reads
+        a (template/bind-template t [{:old 0 :new 1}])
+        b (template/bind-template t [{:old 0 :new 2}])
+        ^datalevin.db.tx.plan.ScalarSequence x (:entries a)
+        ^datalevin.db.tx.plan.ScalarSequence y (:entries b)
+        report (execute/execute-scalar-program {:db-after {:max-tx 0}} x 7
+                 (fn [_ e attr]
+                   (swap! reads conj [e attr])
+                   (datom/datom e attr 0 2)))]
+    (is (= :scalar-program (:strategy a)))
+    (is (identical? cas (first (:operations t))))
+    (is (identical? (.-slots x) (.-slots y)))
+    (is (not (identical? (.-entries x) (.-entries y))))
+    (is (= before @metadata-reads))
+    (is (= [[1 :value]] @reads))
+    (is (= [0 1 1 9 9 10] (mapv :v (:tx-data report))))))
+
+(deftest ordered-binding-declines-host-matches-without-invoking-them
+  (let [effects (atom []) host (proxy [Object] []
+                                (hashCode [] (swap! effects conj :hash) 1)
+                                (equals [_] (swap! effects conj :equals) false))
+        t (template/prepare-template context [[:db/cas (template/parameter :e) :value
+                                               (template/parameter :old) 1]] nil)]
+    (is (nil? (template/bind-template t [{:e 1 :old host}])))
+    (is (nil? (template/bind-template t [{:e host :old 0}])))
     (is (empty? @effects))))
