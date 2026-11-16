@@ -6,6 +6,10 @@
 - [Admin] server wide administrative tool `dtlv admin` commands.
 - [Bench] TPC-C and TPC-H benchmarks.
 
+### Fixed
+- [dtlv] interpreter handling of quoted form
+  [#395](https://github.com/datalevin/datalevin/issues/395).
+
 ### Improved
 - [Storage] update dtlvnative to 1.2.2 with prepared-copy and projected EAV
   native bindings.
