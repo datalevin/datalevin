@@ -27,9 +27,9 @@
     (is (= :scalar-operations (compile/literal-request-shape [[:db/add 1 :value host]])))
     (is (empty? @effects))))
 
-(deftest patch-plans-retain-lazy-operations-without-document-reads
+(deftest patch-plans-retain-inert-operations-without-document-reads
   (let [effects (atom [])
-        operations (lazy-seq (swap! effects conj :patch) (list [:set [:n] 2]))
+        operations [[:set [:n] 2]]
         source [:db.fn/patchIdoc 1 :doc operations]
         program (compile/compile-patch-region context source 1 :doc operations)
         operation (first (:entries program))]
@@ -48,7 +48,7 @@
 
 (deftest patch-shape-hints-validate-only-patch-syntax-without-binding-or-demand
   (let [effects (atom [])
-        operations (lazy-seq (swap! effects conj :operations) (list [:set [:n] 2]))
+        operations [[:set [:n] 2]]
         host (proxy [Number] []
                (longValue [] (swap! effects conj :id) 1)
                (intValue [] 1) (doubleValue [] 1.0) (floatValue [] 1.0))]
@@ -68,3 +68,13 @@
                    (lazy-seq (swap! effects conj :forms) (list [:db.fn/patchIdoc 1 :doc operations]))]]
       (is (nil? (compile/compile-tx context input (assoc options :ordered? false)))))
     (is (empty? @effects))))
+
+(deftest lazy-patches-decline-before-demand-or-schema-authorization
+  (let [calls (atom [])
+        ops (lazy-seq (swap! calls conj :demand) (list [:set [:n] 2]))
+        source [:db.fn/patchIdoc 1 :doc ops]]
+    (is (= :patch (compile/literal-request-shape [source])))
+    (is (nil? (compile/compile-patch-region context source 1 :doc ops)))
+    (doseq [hint [{} {:request-shape :patch} {:literal-shape :patch}]]
+      (is (nil? (compile/compile-tx context [source] hint))))
+    (is (empty? @calls))))

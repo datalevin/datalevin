@@ -401,7 +401,10 @@
          _ (validate-installed-callable-write report db e a v ent)
          v (if (identical? (:db/valueType props) :db.type/ref)
              (txcommon/entid-strict db v) v)
-         value (coreprep/correct-value-with-props store-opts props a v)]
+         value (coreprep/correct-value-with-props store-opts props a v)
+         before @context
+         report (after-value-callbacks report props v context)
+         props (if (identical? before @context) props (get (:schema @context) a))]
      (when (:db.attr/preds props)
        (txcommon/flush-batch-prepare!)
        (vld/validate-attr-preds
@@ -431,6 +434,9 @@
         props     (get (:schema @context) a)
         nv'       (coreprep/correct-value-with-props
                     (:opts @context) props a nv)
+        before    @context
+        report    (after-value-callbacks report props nv context)
+        props     (if (identical? before @context) props (get (:schema @context) a))
         _         (when (:db.attr/preds props)
                     (txcommon/flush-batch-prepare!)
                     (vld/validate-attr-preds
@@ -601,14 +607,25 @@
          report db store entity e a nv (first datoms) context))
      entities]))
 
+(defn- refresh-patch-context
+  [report context a old-value]
+  (let [report (refresh-context report context)
+        props (get (:schema @context) a)]
+    (vld/validate-patch-idoc-type (idx/value-type props) a)
+    (vld/validate-patch-idoc-cardinality
+      (identical? :db.cardinality/many (:db/cardinality props)) old-value a)
+    report))
+
 (defn- handle-patch-idoc
-  [report db store schema entity entities context]
+  [report db store _schema entity entities context]
   (let [argc (count entity)]
     (vld/validate-patch-idoc-arity argc entity (first entity))
     (let [[_ e a x y] entity
           [old-v ops] (if (= argc 5) [x y] [nil x])
           e (txcommon/entid-strict db e)
-          _ (vld/validate-attr a entity)]
+          _ (vld/validate-attr a entity)
+          report (refresh-context report context)
+          schema (:schema @context)]
       (if-let [plan (when (and (nil? old-v)
                                ;; Entity binding can invoke host methods. A
                                ;; stale context cannot authorize the worker.
@@ -636,7 +653,7 @@
               _ (vld/validate-patch-idoc-cardinality many? old-v a)
               ops (or ops [])]
           (if (empty? ops)
-            [report entities]
+            [(refresh-context report context) entities]
             (if many?
               (let [old-v' (coreprep/correct-value-with-props (opts store) props a old-v)
                     old-datom (or (cached-eav-first-datom db e a old-v')
@@ -644,7 +661,8 @@
                                            db (fetch (:store db) (datom e a old-v')))))]
                 (vld/validate-patch-idoc-old-value old-datom old-v a)
                 (let [old-doc (.-v ^Datom old-datom)
-                      {:keys [doc paths]} (idoc/apply-patch old-doc ops)]
+                      {:keys [doc paths]} (idoc/apply-patch old-doc ops)
+                      report (refresh-patch-context report context a old-v)]
                   (if (= old-doc doc)
                     [report entities]
                     (let [ent (with-meta [:db/add e a doc] {:idoc/patch {:paths paths}})]
@@ -654,6 +672,7 @@
                                   (txcommon/ea-first-datom db e a))
                     old-doc (when old-datom (.-v ^Datom old-datom))
                     {:keys [doc paths]} (idoc/apply-patch (or old-doc {}) ops)
+                    report (refresh-patch-context report context a old-v)
                     ent (with-meta [:db/add e a doc] {:idoc/patch {:paths paths}})]
                 [(transact-known-old-add report db store ent e a doc old-datom context)
                  entities]))))))))
@@ -1144,7 +1163,9 @@
 
 (defn begin-tx-attempt
   "Create a fresh append buffer from the restart report, never a failed prefix."
-  [initial-report initial-es ordinary context]
+  ([initial-report initial-es ordinary context]
+   (begin-tx-attempt initial-report initial-es ordinary context false))
+  ([initial-report initial-es ordinary context preserve-overlays?]
   (let [ctx             @context
         ordinary?       (some? ordinary)
         db              (:db-before initial-report)
@@ -1171,11 +1192,11 @@
                             (cond-> (and ordinary (not (:stage-resolver? ordinary)))
                               (assoc ::runtime/skip-resolver-index? true))
                             (update :db-after
-                                    #(-> % runtime/clear-tx-cache
+                                    #(-> (if preserve-overlays? % (runtime/clear-tx-cache %))
                                          (advance-max-eid max-eid-before))))]
     {:report initial-report'
      :es (when-not tuples? initial-es)
-     :remaining (when tuples? (seq initial-es)) :root-boundaries? (boolean tuples?)}))
+     :remaining (when tuples? (seq initial-es)) :root-boundaries? (boolean tuples?)})))
 
 (defn resume-tx-attempt
   "Resume the exact live cursor and owned state within the same writer attempt.
@@ -1298,9 +1319,9 @@
           (vld/validate-tx-entity-type entity))))))
 
 (defn- execute-tx-loop*
-  [initial-report initial-es tx-time ordinary context program]
+  [initial-report initial-es tx-time ordinary context program preserve-overlays?]
   (resume-tx-attempt initial-report initial-es tx-time ordinary context program
-                     (merge (begin-tx-attempt initial-report initial-es ordinary context)
+                     (merge (begin-tx-attempt initial-report initial-es ordinary context preserve-overlays?)
                             (when (instance? datalevin.db.tx.plan.TxPlan program)
                               (select-keys program [:prefix-plan :prefix-count])))))
 
@@ -1515,12 +1536,16 @@
                              false (:tempids initial-report)))
            (update initial-report :tempids mark-auto-tempids)
            initial-report)
-         db (:db-before initial-report)
+         overlay-source (when (and (nil? txcommon/*batch-prepare*)
+                                   (txcommon/resolver-index-active? (:db-after initial-report)))
+                          (:db-after initial-report))
+         db (or overlay-source (:db-before initial-report))
          ordinary (if (some? ordinary-plan)
                     (when ordinary-plan ordinary-plan)
                     (when-not (::runtime/value-tempids initial-report)
                       (bind-ordinary-operands
                         initial-es (empty? (:tx-data initial-report)) ctx false)))
+         ordinary (when ordinary (cond-> ordinary overlay-source (assoc :stage-resolver? true)))
          plan (or supplied-plan
                   (when-not ordinary
                     (when-let [analysis (bind-flat-upsert-forms initial-es ctx)]
@@ -1537,10 +1562,12 @@
      ;; All operations share one attempt-local holder. Only user callbacks can
      ;; replace its schema snapshot; it never becomes part of the report.
      (loop [initial-report initial-report ctx ctx]
-       (let [result (binding [txcommon/*resolver-index* (:eavt (:db-after initial-report))]
+       (let [initial-report (cond-> initial-report
+                              overlay-source (update :db-after #(txcommon/copy-resolver-indexes overlay-source %)))
+             result (binding [txcommon/*resolver-index* (:eavt (:db-after initial-report))]
                       (txcommon/with-lookup-ref-cache (:db-before initial-report)
                         (execute-tx-loop* initial-report initial-es tx-time
-                                          ordinary (volatile! ctx) program)))]
+                                          ordinary (volatile! ctx) program (boolean overlay-source))))]
          (if (instance? TxRetry result)
            (recur (.-report ^TxRetry result)
                   (coreprep/make-prepare-ctx (:db-before initial-report)))
@@ -1563,7 +1590,9 @@
         ctx (:ctx plan)
         upserts (when (every? #(instance? BoundMap %) entries)
                   (when-let [analysis (bind-flat-upsert-forms (mapv #(.-data ^BoundMap %) entries) ctx)]
-                    (let [resolved (resolve-flat-upsert-operands (:db-before initial-report) analysis ctx)]
+                    (let [database (if (txcommon/resolver-index-active? (:db-after initial-report))
+                                     (:db-after initial-report) (:db-before initial-report))
+                          resolved (resolve-flat-upsert-operands database analysis ctx)]
                       (assoc resolved :entities
                              (mapv (fn [^BoundMap bound source]
                                      (if (instance? ResolvedIdentityMap source)

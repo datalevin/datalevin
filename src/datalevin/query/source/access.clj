@@ -486,11 +486,12 @@
                                    :requires (:requires operator) :columns (:columns operator)
                                    :after (:after operator) :resources #{}})
              ordered-core (sort-by :id operators)
-             conditional (filterv :union-alternatives ordered-core)
-             ordinary (remove :union-alternatives ordered-core)
+             alternatives #(or (:scope-alternatives %) (:union-alternatives %))
+             conditional (filterv alternatives ordered-core)
+             ordinary (remove alternatives ordered-core)
              choices (into (mapv core-choice (remove deferred? ordinary))
                            (concat (mapcat #(map core-choice (sort-by (comp - count :requires)
-                                                              (filter (comp seq :requires) (:union-alternatives %)))) conditional)
+                                                              (filter (comp seq :requires) (alternatives %)))) conditional)
                            (concat (map (fn [plan]
                                   (let [o (options plan) p (:permission o)]
                                     {:kind :access :value plan :covers (work-keys plan)
@@ -498,7 +499,7 @@
                                      :requires (:requires o) :columns (:columns o) :after #{}
                                      :resources (if (= :once (:opens p)) #{(:resource p)} #{})
                                      :unavailable? (and (= :once (:opens p)) (:spent? p))})) candidates)
-                                   (mapcat #(map core-choice (remove (comp seq :requires) (:union-alternatives %))) conditional)
+                                   (mapcat #(map core-choice (remove (comp seq :requires) (alternatives %))) conditional)
                                    (map core-choice (sort-by #(get ranks (:id %)) (filter deferred? ordinary))))))
              result (join-cost/select {:inputs input-columns :required-work required
                                           :required-vars live-vars :choices choices

@@ -1345,6 +1345,16 @@
           (= 2 (count forms)) (literal-scalar-shape forms)
           :else :scalar-operations)))))
 
+(defn- inert-patch-value? [value]
+  (or (nil? value) (inert-scalar-value? value)
+      (and (plain-map? value)
+           (reduce-kv (fn [_ key value]
+                        (if (and (inert-patch-value? key) (inert-patch-value? value))
+                          true (reduced false))) true value))
+      (and (or (identical? clojure.lang.PersistentVector (class value))
+               (identical? clojure.lang.APersistentVector$SubVector (class value)))
+           (every? inert-patch-value? value))))
+
 (defn patch-attribute-info
   "Select the ordinary patch worker. Caller binding and demanded execution use
   the same schema/options rule; document reads and patch operations stay deferred."
@@ -1357,7 +1367,10 @@
                (keyword? attr) (identical? :db.type/idoc (.-value-type info))
                (not (identical? :db.cardinality/many (:db/cardinality props)))
                (nil? (:db/unique props)) (not (:db.attr/preds props))
-               (or (nil? operations) (sequential? operations)))
+               ;; Lazy/host operands can change schema or options while being
+               ;; demanded. Their current constraints belong to ordered execution.
+               (or (nil? operations)
+                   (and (vector? operations) (inert-patch-value? operations))))
       info)))
 
 (defn compile-patch-region
@@ -2006,6 +2019,20 @@
                            (ordered-value? ctx infos props extra)))))
              false))))))
 
+(def ^:private ordered-schema-proof-marker (Object.))
+
+(defn- ordered-schema-proof?
+  "Prove cascade eligibility once in the existing compilation-owned metadata
+  table. No schema-wide proof or table is rebuilt for each operation."
+  [ctx ^HashMap infos]
+  (if-some [proof (.get infos ordered-schema-proof-marker)]
+    proof
+    (let [proof (boolean (every? (fn [[a _]]
+                                  (or (= "db" (namespace a)) (ordered-attribute-props ctx infos a)))
+                                (:schema ctx)))]
+      (.put infos ordered-schema-proof-marker proof)
+      proof)))
+
 (defn prepared-ordered-operation
   "Capture the ordinary ordered worker's attribute/cascade proof once. Values
   and lookup ownership remain specific to each invocation and live operation."
@@ -2017,9 +2044,7 @@
           props (when-not entity? (ordered-attribute-props ctx infos attr))]
       (when (and (or entity? props)
                  (or (not (or entity? (:db/isComponent props)))
-                     (every? (fn [[a _]]
-                               (or (= "db" (namespace a)) (ordered-attribute-props ctx infos a)))
-                             (:schema ctx))))
+                     (ordered-schema-proof? ctx infos)))
         {:opcode opcode :info (when-not entity? (.get ^HashMap infos attr))}))))
 
 (defn prepared-ordered-operands?

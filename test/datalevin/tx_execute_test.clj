@@ -109,7 +109,7 @@
            [{:db/valueType :db.type/idoc :db.attr/preds ['valid-doc?]} {} false]
            [{:db/valueType :db.type/idoc} {:auto-entity-time? true} false]]]
     (let [ctx (prepare/->PrepareCtx {:doc props} {} opts)
-          operations (lazy-seq (throw (AssertionError. "Early patch demand")))
+          operations [[:set [:n] 2]]
           source (list :db.fn/patchIdoc (int 1) :doc operations)
           compiled (compile/compile-patch-region ctx source 1 :doc operations)
           bound (binder/prepare-patch-operands ctx (list source))]

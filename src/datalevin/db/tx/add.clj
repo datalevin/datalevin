@@ -97,7 +97,7 @@
 
 (defn- pending-values?
   [db]
-  (and common/*batch-prepare*
+  (and (common/resolver-index-active? db)
        (if-let [^LongObjectHashMap pending (common/scalar-pending-index)]
          (not (.isEmpty pending))
          (not (.isEmpty ^SortedSet (:eavt db))))))

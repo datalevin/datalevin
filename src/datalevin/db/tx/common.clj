@@ -51,13 +51,28 @@
 
 (def ^:dynamic *resolver-index* nil)
 
+(defn copy-resolver-indexes
+  "Copy transaction overlays into an owned DB view, retaining its counters and
+  store. The source remains stable across execution, retries and publication."
+  ([db] (copy-resolver-indexes db db))
+  ([source target]
+   (reduce (fn [view key]
+             (let [^SortedSet index (key source)]
+               (assoc view key (doto (TreeSortedSet. (.comparator index)) (.addAll index)))))
+           target [:eavt :avet])))
+
 (defn resolver-index-active?
   "Whether this DB's indexes describe the active resolver attempt. Committed
    caches must not override native state when preparing a later request."
   [db]
   (or (boolean *batch-prepare*)
       (and (some? *resolver-index*)
-           (identical? *resolver-index* (:eavt db)))))
+           (identical? *resolver-index* (:eavt db)))
+      ;; A returned simulated DB remains a valid resolver view outside the
+      ;; invocation that produced it. Committed caches never pass this bound.
+      (let [^SortedSet index (:eavt db)]
+        (and index (not (.isEmpty index))
+             (> (long (:max-tx db)) (long (or (i/max-tx (:store db)) 0)))))))
 
 (defprotocol BatchPreparation
   (flush-preparation! [context])

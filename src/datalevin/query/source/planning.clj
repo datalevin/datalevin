@@ -15,6 +15,7 @@
             [datalevin.query.source.region :as region]
             [datalevin.query.source.runtime :as rt]
             [datalevin.query.source.scope :as scope]
+            [datalevin.query.source.scope-selection :as scopes]
             [datalevin.query.source.session :as session]
             [datalevin.query.source.union-selection :as unions]
             [datalevin.query.source.value :as value :refer [fail!]])
@@ -174,7 +175,10 @@
                       sources (set (map :source-symbol (:patterns r)))
                       ;; Every alias needs the same region boundary exports.
                       needed (into (:required-vars r)
-                                   (mapcat #(map :variable (:requires %))) operators)
+                                   (mapcat (fn [operator]
+                                             (map :variable
+                                               (concat (:requires operator)
+                                                       (get-in operator [:step :scope-bindings :columns]))))) operators)
                       requests (into []
                                      (keep (fn [entry]
                                              (when (and (:descriptor entry) (contains? sources (:symbol entry)))
@@ -223,8 +227,10 @@
                     (-> schedule
                         (assoc :estimation (get estimate-work (:region-id schedule)))
                         (update :planning-time-ms + (/ (double (:provider-planning-ns w)) 1000000.0))))
-                  (unions/select! runtime work (:planning prepared)
-                    (when (= 1 (:root-input-rows compilation)) {:compiled compiled :groups groups})) work)
+                  (if (scopes/needed? work)
+                    (scopes/select! runtime work (:planning prepared))
+                    (unions/select! runtime work (:planning prepared)
+                      (when (= 1 (:root-input-rows compilation)) {:compiled compiled :groups groups}))) work)
             demand (some :key-demand schedules)
             all-schedules (into schedules (:schedules demand))]
         ;; A scoped workspace can be the first user of dependent access.

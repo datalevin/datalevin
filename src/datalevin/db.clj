@@ -1135,6 +1135,15 @@
       (rel/single-tuples (object-array [entity attr value])))
     (s/av-tuples store attr value)))
 
+(defn- stored-datoms [db store index c1 c2 c3]
+  (wrap-cache store [:datoms index c1 c2 c3]
+    (let [value (case index :eav c3 :ave c2)
+          low (components->pattern db index c1 c2 c3 e0 v0)
+          datoms (slice store index low (components->pattern db index c1 c2 c3 emax vmax))]
+      (if (and (some? value) (full-index-value-match? db low))
+        (filterv #(d/value-equal? (:v low) (:v %)) datoms)
+        datoms))))
+
 (defrecord-updatable DB [^IStore store
                          ^long max-eid
                          ^long max-tx
@@ -1355,8 +1364,10 @@
     [db pattern]
     (.-count db pattern nil))
   (-count
-    [_ pattern cap]
-    (let [[e a v] pattern]
+    [db pattern cap]
+    (if (tx-cache-active? db)
+      (if cap (bounded-count cap (-search db pattern)) (count (-search db pattern)))
+      (let [[e a v] pattern]
       (when (nil? e) (vld/validate-indexed-attr (schema store) a))
       (wrap-cache
         store [:count e a v cap]
@@ -1375,16 +1386,18 @@
              (av-size store a v) ; _ a v
              (a-size store a) ; _ a _
              (v-size store v) ; _ _ v, for ref only
-             (datom-count store :eav)]))))) ; _ _ _
+             (datom-count store :eav)])))))) ; _ _ _
 
   IIndexAccess
   (-populated?
     [db index c1 c2 c3]
-    (wrap-cache
+    (if (tx-cache-active? db)
+      (boolean (seq (-datoms db index c1 c2 c3)))
+      (wrap-cache
       store [:populated? index c1 c2 c3]
       (populated? store index
                   (components->pattern db index c1 c2 c3 e0 v0)
-                  (components->pattern db index c1 c2 c3 emax vmax))))
+                  (components->pattern db index c1 c2 c3 emax vmax)))))
 
   (-datoms
     [db index]
@@ -1397,21 +1410,17 @@
     (-datoms db index c1 c2 nil))
   (-datoms
     [db index c1 c2 c3]
-    (wrap-cache
-      store [:datoms index c1 c2 c3]
-      (let [v  (case index :eav c3 :ave c2)
-            low (components->pattern db index c1 c2 c3 e0 v0)
-            ds (slice store index
-                      low
-                      (components->pattern db index c1 c2 c3 emax vmax))]
-        ;; Giant physical keys retain only a prefix and an allocated ID.
-        ;; Match the complete resolved value, including byte-array contents.
-        (if (and (some? v) (full-index-value-match? db low))
-          (filterv #(d/value-equal? (:v low) (:v %)) ds)
-          ds))))
+    (let [native (stored-datoms db store index c1 c2 c3)]
+      (if (tx-cache-active? db)
+        (with-tx-cache-range db index
+          (components->pattern db index c1 c2 c3 e0 v0)
+          (components->pattern db index c1 c2 c3 emax vmax) native)
+        native)))
   (-datoms
     [db index c1 c2 c3 n]
-    (wrap-cache
+    (if (tx-cache-active? db)
+      (take n (-datoms db index c1 c2 c3))
+      (wrap-cache
       store [:datoms index c1 c2 c3 n]
       (let [v (case index :eav c3 :ave c2)
             low (components->pattern db index c1 c2 c3 e0 v0)]
@@ -1419,7 +1428,7 @@
           (take n (-datoms db index c1 c2 c3))
           (slice store index low
                  (components->pattern db index c1 c2 c3 emax vmax)
-                 n)))))
+                 n))))))
 
   (-e-datoms
     [db e]
@@ -1428,9 +1437,10 @@
       (with-tx-cache-e-datoms db e (e-datoms store e))))
 
   (-av-datoms
-    [_ attr v]
+    [db attr v]
     (vld/validate-indexed-attr (schema store) attr)
-    (wrap-cache store [:av-datoms attr v] (av-datoms store attr v)))
+    (with-tx-cache-search db [nil attr v]
+      (wrap-cache store [:av-datoms attr v] (av-datoms store attr v))))
 
   (-range-datoms
     [db index start-datom end-datom]
@@ -1444,35 +1454,45 @@
 
   (-seek-datoms
     [db index c1 c2 c3]
-    (wrap-cache
+    (if (tx-cache-active? db)
+      (with-tx-cache-range db index (components->pattern db index c1 c2 c3 e0 v0) (components->end-datom db index c1 c2 c3 emax vmax)
+          (slice store index (components->pattern db index c1 c2 c3 e0 v0) (components->end-datom db index c1 c2 c3 emax vmax)))
+      (wrap-cache
       store [:seek index c1 c2 c3]
       (slice store index
              (components->pattern db index c1 c2 c3 e0 v0)
-             (components->end-datom db index c1 c2 c3 emax vmax))))
+             (components->end-datom db index c1 c2 c3 emax vmax)))))
   (-seek-datoms
     [db index c1 c2 c3 n]
-    (wrap-cache
+    (if (tx-cache-active? db)
+      (take n (-seek-datoms db index c1 c2 c3))
+      (wrap-cache
       store [:seek index c1 c2 c3 n]
       (slice store index
              (components->pattern db index c1 c2 c3 e0 v0)
              (components->end-datom db index c1 c2 c3 emax vmax)
-             n)))
+             n))))
 
   (-rseek-datoms
     [db index c1 c2 c3]
-    (wrap-cache
+    (if (tx-cache-active? db)
+      (reverse (with-tx-cache-range db index (components->end-datom db index c1 c2 c3 e0 v0) (components->pattern db index c1 c2 c3 emax vmax)
+          (slice store index (components->end-datom db index c1 c2 c3 e0 v0) (components->pattern db index c1 c2 c3 emax vmax))))
+      (wrap-cache
       store [:rseek index c1 c2 c3]
       (rslice store index
               (components->pattern db index c1 c2 c3 emax vmax)
-              (components->end-datom db index c1 c2 c3 e0 v0))))
+              (components->end-datom db index c1 c2 c3 e0 v0)))))
   (-rseek-datoms
     [db index c1 c2 c3 n]
-    (wrap-cache
+    (if (tx-cache-active? db)
+      (take n (-rseek-datoms db index c1 c2 c3))
+      (wrap-cache
       store [:rseek index c1 c2 c3 n]
       (rslice store index
               (components->pattern db index c1 c2 c3 emax vmax)
               (components->end-datom db index c1 c2 c3 e0 v0)
-              n)))
+              n))))
 
   (-cardinality
     [_ attr]
@@ -1483,11 +1503,16 @@
   (-index-range
     [db attr start end]
     (vld/validate-indexed-attr (schema store) attr)
-    (wrap-cache
+    (if (tx-cache-active? db)
+      (with-tx-cache-range db :ave
+        (resolve-datom db nil attr start e0 v0) (resolve-datom db nil attr end emax vmax)
+        (slice store :ave (resolve-datom db nil attr start e0 v0)
+               (resolve-datom db nil attr end emax vmax)))
+      (wrap-cache
       store [:index-range attr start end]
       (do (vld/validate-attr attr (list '-index-range 'db attr start end))
           (slice store :ave (resolve-datom db nil attr start e0 v0)
-                 (resolve-datom db nil attr end emax vmax)))))
+                 (resolve-datom db nil attr end emax vmax))))))
 
   (-index-range-size
     [_ attr start end]
@@ -2090,13 +2115,13 @@
 
 (defn- mark-simulated-tx-cache!
   [report]
-  (let [db      (:db-after report)
-        noindex (:db/noindex (rschema (:store db)))]
-    (doseq [^Datom datom (:tx-data report)]
-      (.add ^TreeSortedSet (:eavt db) datom)
-      (when-not (contains? noindex (.-a datom))
-        (.add ^TreeSortedSet (:avet db) datom)))
-    report))
+  (let [db (:db-after report) schema (schema (:store db))]
+    ;; Reuse the resolver's last-transition rules, including supplied stamps.
+    ;; A simulation never publishes into the enclosing writer's pending index.
+    (binding [txcommon/*batch-prepare* nil]
+      (doseq [^Datom datom (:tx-data report)]
+        (txcommon/stage-batch-datom! db datom (schema (.-a datom))))))
+  report)
 
 (defn- committed-client-op-response
   [report last-modified-ms]
@@ -2580,23 +2605,14 @@
   "Give ordered work its own resolver overlays. Collected preparation owns its
   pending indexes and restore boundary; other DB values retain their old view."
   [report]
-  (if txcommon/*batch-prepare*
+  (if (txcommon/resolver-index-active? (:db-after report))
     report
     ;; Invariant: :eavt/:avet are transaction/simulation overlays, never the
     ;; stored indexes in Store. new-db/transfer create empty sets; staging and
     ;; mark-simulated-tx-cache! populate them only from transaction datoms.
     ;; Copy size follows retained transaction data, which can itself be large.
     ;; Copies protect prior DB/report views from in-place clears and retries.
-    (let [before (:db-after report)
-          after (reduce
-                  (fn [view key]
-                    (if-let [^java.util.SortedSet index (key before)]
-                      (assoc view key
-                             (doto (TreeSortedSet. (.comparator index))
-                               (.addAll index)))
-                      view))
-                  before [:eavt :avet])]
-      (assoc report :db-after after))))
+    (update report :db-after txcommon/copy-resolver-indexes)))
 
 (defn- execute-request-plan
   "Share execution after the entry adapter has checked plan provenance."
@@ -2695,6 +2711,7 @@
 (defn- prepare-local-report
   [initial forms tx-time outcome {:keys [stage? route?] :as options}]
   (let [db (:db-after initial) captured (:ctx outcome)
+        preserve-overlays? (txcommon/resolver-index-active? db)
         valid? (and outcome
                     (identical? (:schema captured) (schema (:store db)))
                     (identical? (:opts captured) (opts (:store db))))
@@ -2720,7 +2737,7 @@
                        (execute-compiled-request initial selected options))))
         report (if prepared
                  (if (and stage? (not= :dynamic (:strategy selected)))
-                   (txexec/stage-compiled-report! prepared) prepared)
+                   (txexec/stage-compiled-report! prepared preserve-overlays?) prepared)
                  (do
                    (when (and outcome (satisfies? txcommon/ScalarPendingIndex txcommon/*batch-prepare*))
                      (txcommon/materialize-scalar-pending! txcommon/*batch-prepare* db))
@@ -2790,7 +2807,19 @@
        (let [initial-report (cond-> initial-report
                               (some? owned-max-eid)
                               (assoc ::txexec/max-eid-before owned-max-eid))
-             report (prepare-local-tx-data initial-report initial-es tx-time)]
+             report (if simulated?
+                      (do
+                        (txcommon/flush-batch-prepare!)
+                        (let [after (:db-after initial-report)
+                              source (cond (pending-tx-cache? after) after
+                                           (pending-tx-cache? db) db)
+                              owned (transfer after store)
+                              owned (if source (txcommon/copy-resolver-indexes source owned) owned)]
+                          (binding [txcommon/*batch-prepare* nil
+                                    txcommon/*resolver-index* (:eavt owned)]
+                            (prepare-local-tx-data (assoc initial-report :db-after owned)
+                                                  initial-es tx-time))))
+                      (prepare-local-tx-data initial-report initial-es tx-time))]
          (if simulated?
            (mark-simulated-tx-cache! report)
            (assoc report :db-after

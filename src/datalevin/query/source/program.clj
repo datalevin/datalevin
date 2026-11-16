@@ -523,6 +523,49 @@
                       {:inputs (:inputs b) :step (scope-factory runtime check! b run-region)
                        :branches (mapv #(select-keys % [:region-id :inputs]) (:branches b))}))})))))
 
+(defn- boundary-factory [runtime check! boundary run-region]
+  (if (= :negation (:kind boundary))
+    (let [branch (first (:branches boundary))
+          variables (mapv :variable (:inputs boundary))
+          program {:runtime runtime
+                   :run! (fn [input]
+                           (if (:empty? branch)
+                             (relation/relation! (zipmap variables (range)) (FastList.))
+                             (run-region (:region-id branch) input)))}]
+      (negation-factory runtime check! {:requires (:inputs boundary) :program program}))
+    (scope-factory runtime check! boundary run-region)))
+
+(defn- caller-bindings? [compiled]
+  (and (some #(= :rule (:kind %)) (:sites compiled))
+       (some (fn [site]
+               (let [id (:parent-region site)
+                     outside (into (into #{} (mapcat #(map :variable (:columns %)))
+                                         (get-in compiled [:regions id :patterns]))
+                                   (mapcat :exports)
+                                   (filter #(and (= id (:parent-region %)) (not= (:path site) (:path %)))
+                                     (:sites compiled)))]
+                 (seq (set/intersection outside (:exports site))))) (:sites compiled))))
+
+(defn- scope-bindings
+  [runtime check! compiled native-specs index site schema all-schemas region-inputs
+   branch-outputs boundary run-region]
+  (let [id (:parent-region site)
+        region-inputs (select-keys region-inputs (map child-id (:branches site)))
+        potential (scope-parent-columns site schema (vec (vals schema)) all-schemas region-inputs check!)
+        maximal (scope/interfaces! runtime compiled index potential branch-outputs)
+        columns (:inputs maximal)]
+    (retain! runtime (containers! runtime (inc (count region-inputs))
+                                  (+ (count columns) (reduce + 0 (map count (vals region-inputs))))))
+    {:boundary maximal
+     :columns columns :optional? (not= (set (map :variable columns)) (set (map :variable (:inputs boundary))))
+     :build (fn [inputs selected]
+              (let [seeds (core-seeds! runtime check! compiled id native-specs inputs)
+                    parent (scope-parent-columns site schema seeds all-schemas region-inputs check!)
+                    parent (vals (merge (columns-map selected) (columns-map parent)))
+                    b (scope/interfaces! runtime compiled index
+                        (vec (sort #(access/compare-keys (:variable %1) (:variable %2) check!) parent)) branch-outputs)]
+                {:boundary b :step (boundary-factory runtime check! b run-region)}))}))
+
 (defrecord ^:private Program [runtime compilation planned root input regions state runner])
 
 (defn- operator-description [compiled native-specs region-id paths index {:keys [kind value]} inputs outputs]
@@ -718,6 +761,7 @@
         proofs (boundaries! runtime check! compiled native-specs root-columns)
         compilation (planning/refine! runtime compilation proofs)
         _ (doseq [proof proofs] ((:close proof)))
+        caller-bindings? (caller-bindings? compiled)
         tables (volatile! nil)
         planned
           (planning/plan! runtime (assoc compilation :root-input-rows (.size ^List (get-in input [:relation :tuples])))
@@ -765,23 +809,20 @@
                                           (mapv (fn [b]
                                                   (let [id (child-id b)]
                                                     (branch-output id (get all-schemas id)))) (:branches site))
-                                          boundary (scope/interfaces! runtime compiled index parent branch-outputs)]
-                                      (doseq [branch (:branches boundary) :when (not (:empty? branch))]
+                                          boundary (scope/interfaces! runtime compiled index parent branch-outputs)
+                                          bindings (when caller-bindings?
+                                                     (scope-bindings runtime check! compiled native-specs index site schema
+                                                       all-schemas region-inputs branch-outputs boundary run-region))
+                                          captured (or (:boundary bindings) boundary)]
+                                      (doseq [branch (:branches captured)
+                                              :when (get-in compiled [:regions (:region-id branch) :live?])]
                                         (region! (:region-id branch) (:inputs branch)))
-                                      (if (= :negation (:kind site))
-                                        (let [branch (first (:branches boundary))
-                                              variables (mapv :variable (:inputs boundary))
-                                              program {:runtime runtime
-                                                       :run! (fn [input]
-                                                               (if (:empty? branch)
-                                                                 (relation/relation! (zipmap variables (range)) (FastList.))
-                                                                 (run-region (:region-id branch) input)))}]
-                                          (add! (:path site) (:inputs boundary) []
-                                                (negation-factory runtime check!
-                                                  {:requires (:inputs boundary) :program program})))
-                                        (add! (:path site) (:inputs boundary) (:columns boundary)
-                                              (assoc (scope-factory runtime check! boundary run-region)
-                                                :conditional-union
+                                      (add! (:path site) (:inputs boundary)
+                                            (if (= :negation (:kind site)) [] (:columns boundary))
+                                            (cond-> (boundary-factory runtime check! boundary run-region)
+                                              bindings (assoc :scope-bindings (dissoc bindings :boundary))
+                                              (not= :negation (:kind site))
+                                              (assoc :conditional-union
                                                 (conditional-union runtime check! compiled id site boundary
                                                   branch-outputs run-region))))))
                                   (swap! interfaces assoc id {:inputs inputs :operators @operators :core @core})))]

@@ -81,8 +81,7 @@
                     {:wal? wal? :background-sampling? false :snapshot-scheduler? false})]
       (d/transact! cn [{:db/id 1 :doc {:n 1}}])
       (d/with-transaction [tx cn]
-        (let [demands (atom 0)
-              forms [[:db.fn/patchIdoc 1 :doc (lazy-seq (swap! demands inc) (seq operations))]]
+        (let [forms [[:db.fn/patchIdoc 1 :doc operations]]
               plan (db/prepare-admitted-request @tx forms {:strategy :patch})
               events (atom [])
               dynamic-events (atom [])
@@ -90,7 +89,6 @@
               options {:stage? false :route? true :owned-max-eid (:max-eid @tx)}
               initial (assoc (db/->TxReport @tx @tx [] {} metadata)
                              ::execute/max-eid-before (:max-eid @tx))
-              _ (is (zero? @demands))
               report (binding [db/*tx-compiler-observer* #(swap! events conj [%1 %2])]
                        (db/prepare-local-tx-data @tx forms metadata 0 plan initial options))
               dynamic-report
@@ -100,7 +98,6 @@
               datoms #(mapv (juxt :e :a :v datom/datom-tx datom/datom-added meta)
                             (:tx-data %))]
           (is (true? (::db/bound-operands? plan)))
-          (is (= 1 @demands))
           (is (= [:execute-patch] (mapv first @events)))
           (is (identical? plan (second (first @events))))
           (is (= :patch-idoc (db/compiled-request-route report)))

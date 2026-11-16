@@ -62,7 +62,7 @@
                                   false idx/avg-buffer->prepared-value)))
                        values)))))
         (read-scalar-entity store eid layout))
-      (if txcommon/*batch-prepare*
+      (if (txcommon/resolver-index-active? db)
         (let [^TreeSortedSet eavt (:eavt db)
               ^java.util.SortedSet pending
               (.subSet eavt
@@ -353,7 +353,7 @@
   (when (and (empty? (:tx-data report)) (empty? (:tempids report)))
     (let [db (:db-after report)
           tx-id (inc (long (:max-tx db)))
-          layout (when-not txcommon/*batch-prepare* layout)
+          layout (when-not (txcommon/resolver-index-active? db) layout)
           tx-data (persistent! (append-blind-identity-upsert!
                                  db entity identity-attr eid tx-id layout (transient [])))
           tempid (.-tempid entity)
@@ -478,8 +478,10 @@
   "Populate the existing request-local EAV/AVE view from finalized logical datoms.
   Queryable preparation uses this outside batch preparation; commit-only writer
   callers retain the existing commit path's pending-state staging."
-  [report]
-  (let [db (clear-tx-cache (:db-after report))]
+  ([report] (stage-compiled-report! report false))
+  ([report preserve-overlays?]
+  (let [db (:db-after report)
+        db (if preserve-overlays? db (clear-tx-cache db))]
     (doseq [datom (:tx-data report)] (txcommon/stage-batch-datom! db datom))
-    report))
+    report)))
 

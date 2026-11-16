@@ -27,45 +27,60 @@
   (or (identical? clojure.lang.PersistentVector (class value))
       (identical? clojure.lang.APersistentVector$SubVector (class value))))
 
-(defn- expression
-  "Compile input substitution once. Literal objects are returned unchanged;
-  only containers containing parameter markers are rebuilt during binding."
+(declare substitution)
+
+(defn- substitutions [value parameters]
+  (if (plain-map? value)
+    (do
+      (when-not (every? compile/prepared-literal? (keys value))
+        (throw (ex-info "Prepared definition map keys must be literal scalars"
+                        {:error :prepared/definition-key})))
+      (reduce-kv (fn [out key child]
+                   (if-let [run (substitution child parameters)] (assoc out key run) out))
+                 nil value))
+    (loop [i 0 out nil]
+      (if (< i (count value))
+        (recur (inc i) (if-let [run (substitution (nth value i) parameters)]
+                        (assoc out i run) out))
+        out))))
+
+(defn- substitute [value children]
+  (fn [input]
+    (reduce-kv (fn [out key run] (assoc out key (run input))) value children)))
+
+(defn- substitution
+  "Return code only for parameterized subtrees. Literal leaves need neither
+  nodes nor constant functions; the original container retains their identity."
   [value ^LinkedHashSet parameters]
   (cond
     (instance? TxParam value)
     (let [key (.-key ^TxParam value)]
       (.add parameters key)
-      {:run #(get % key) :parameterized? true})
+      #(get % key))
 
     (or (identical? clojure.lang.PersistentHashSet (class value))
         (identical? clojure.lang.PersistentTreeSet (class value)))
-    (let [children (mapv #(expression % parameters) value)]
-      (when (some :parameterized? children)
-        (throw (ex-info "Bind a parameterized set as one parameter value"
-                        {:error :prepared/parameter-container})))
-      {:run (constantly value)})
+    (do
+      (doseq [child value]
+        (when (substitution child parameters)
+          (throw (ex-info "Bind a parameterized set as one parameter value"
+                          {:error :prepared/parameter-container}))))
+      nil)
 
     (or (plain-map? value) (literal-vector? value))
-    (let [map? (plain-map? value)
-          _ (when (and map? (not-every? compile/prepared-literal? (keys value)))
-              (throw (ex-info "Prepared definition map keys must be literal scalars"
-                              {:error :prepared/definition-key})))
-          children (if map?
-                     (reduce-kv (fn [out k v] (assoc out k (expression v parameters))) {} value)
-                     (mapv #(expression % parameters) value))
-          parameterized? (boolean (some :parameterized? (if map? (vals children) children)))]
-      {:parameterized? parameterized? :children children
-       :run (if-not parameterized?
-              (constantly value)
-              (let [metadata (meta value)]
-                (fn [input]
-                  (with-meta
-                    (cond
-                      map? (reduce-kv (fn [out k child] (assoc out k ((:run child) input))) (empty value) children)
-                      :else (mapv #((:run %) input) children))
-                    metadata))))})
+    (when-let [children (substitutions value parameters)] (substitute value children))
 
-    :else {:run (constantly value)}))
+    :else nil))
+
+(defn- expression [value parameters]
+  (let [runs (substitutions value parameters)
+        child (fn [key literal] {:run (or (get runs key) (constantly literal))})]
+    {:run (if runs (substitute value runs) (constantly value))
+     ;; Only the operation root needs binders for each operand. Descendant
+     ;; containers retain code solely along paths containing parameters.
+     :children (if (plain-map? value)
+                 (reduce-kv (fn [out key value] (assoc out key (child key value))) {} value)
+                 (mapv #(child % (nth value %)) (range (count value))))}))
 
 (defn- fields-for
   "Retain a field's binder and proof when another family accepts the same
@@ -76,13 +91,9 @@
                  (if (identical? info proof) out (assoc out i [a value proof]))))
              fields fields))
 
-(defn prepare-operation
-  "Compile an operation's constants and schema metadata. Compatible operations
-  are shared by identity across templates. Parameter values are never retained."
-  [ctx source]
-  (if (and (instance? WriteOp source) (compatible? (:ctx source) ctx))
-    source
-    (let [source (if (instance? WriteOp source) (:source source) source)
+(defn- compile-operation
+  [ctx source infos capture-infos?]
+  (let [source (if (instance? WriteOp source) (:source source) source)
           _ (when-not (or (plain-map? source) (literal-vector? source))
               (throw (ex-info "A prepared transaction operation must be a map or vector"
                               {:error :prepared/operation-shape})))
@@ -105,7 +116,6 @@
                  add? :scalar
                  ordered? :scalar-program
                  :else :dynamic)
-          infos (HashMap.)
           fields (cond
                    map? (mapv (fn [[attr _]]
                                 [attr (:run (get children attr))
@@ -153,7 +163,7 @@
           kind (if (and (not= :dynamic kind)
                         (every? #(some? (nth % 2)) fields)
                         (compile/prepared-write-metadata? (meta source))) kind :dynamic)
-          attribute-infos (into {} infos)]
+          attribute-infos (when capture-infos? (into {} infos))]
       (plan/->WriteOp
         ctx source (:run compiled) (vec parameters) kind
         (if map? (or (:run (get children :db/id)) (constantly nil))
@@ -165,7 +175,15 @@
         (boolean program?) program-fields (boolean references?)
         ordered-definition ordered-map-definition
         (when (or ordered-definition ordered-map-definition) attribute-infos)
-        (boolean mixed?) mixed-fields attribute-infos))))
+        (boolean mixed?) mixed-fields attribute-infos)))
+
+(defn prepare-operation
+  "Compile immutable constants and schema proofs. Compatible operations retain
+  their identity across programs; bound parameter values are never retained."
+  [ctx source]
+  (if (and (instance? WriteOp source) (compatible? (:ctx source) ctx))
+    source
+    (compile-operation ctx source (HashMap.) true)))
 
 (defn- merge-operation-infos [operations field]
   ;; Shared operations often contribute the identical immutable map. Retain it
@@ -207,10 +225,23 @@
                     {:error :prepared/program-shape})))
   (let [metadata (meta operations)
         parameters (LinkedHashSet.)
+        scratch (HashMap.)
         operations (mapv (fn [operation]
-                           (let [operation (prepare-operation ctx operation)]
+                           (let [operation (if (and (instance? WriteOp operation)
+                                                    (compatible? (:ctx operation) ctx))
+                                             operation
+                                             (compile-operation ctx operation scratch false))]
                              (.addAll parameters ^java.util.Collection (:params operation))
                              operation)) operations)
+        operations (if (every? :mixed-infos operations)
+                     operations
+                     (let [infos (into {} scratch)]
+                       (mapv (fn [operation]
+                               (if (nil? (:mixed-infos operation))
+                                 (assoc operation :mixed-infos infos
+                                        :ordered-infos (when (or (:ordered-definition operation)
+                                                                (:ordered-map-definition operation)) infos))
+                                 operation)) operations)))
         kinds (set (map :kind operations))
         mixed? (and (nil? metadata) (every? :mixed? operations)
                     (or (some (fn [{:keys [source]}]
