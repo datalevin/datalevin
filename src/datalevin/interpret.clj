@@ -90,6 +90,12 @@
       (when (instance? Class resolved)
         (symbol (.getName ^Class resolved) (name f))))))
 
+(defn- quote-form?
+  [x]
+  (and (seq? x)
+       (= 'quote (first x))
+       (= 2 (count x))))
+
 (defn- qualify-fn [x]
   (if (list? x)
     (let [[f & args] x]
@@ -105,12 +111,16 @@
             x))))
     x))
 
+(defn- qualify-code
+  [form]
+  (if (quote-form? form)
+    form
+    (w/walk qualify-code qualify-fn form)))
+
 (declare ctx inter-fn-ctx inter-fn-namespaces inter-fn-classes)
 
 (defn ^:no-doc eval-fn [ctx form]
-  (sci/eval-form ctx (if (coll? form)
-                       (w/postwalk qualify-fn form)
-                       form)))
+  (sci/eval-form ctx (qualify-code form)))
 
 (defn load-edn
   "Same as [`clojure.core/load-file`](https://clojuredocs.org/clojure.core/load-file),
@@ -298,8 +308,6 @@
 
 (def ^:private max-inter-fn-sleep-ms 1000)
 
-(declare quote-form?)
-
 (defn- class-like-namespace?
   [ns-part]
   (boolean
@@ -374,12 +382,6 @@
 
      :else nil)))
 
-(defn- qualify-code
-  [form]
-  (if (quote-form? form)
-    form
-    (w/walk qualify-code qualify-fn form)))
-
 (defn- filter-used
   "Only keep referred locals in the form"
   [locals [args & body]]
@@ -404,12 +406,6 @@
                        let-arg)]
              ~quoted-form)
       quoted-form)))
-
-(defn- quote-form?
-  [x]
-  (and (seq? x)
-       (= 'quote (first x))
-       (= 2 (count x))))
 
 (defn- fn-source-form?
   [x]

@@ -19,6 +19,7 @@
    datalevin.test.validation
    datalevin.test.subsystems
    datalevin.cache-invalidation-test
+   datalevin.interpret-quotation-test
    datalevin.leftist-heap-test
    datalevin.native-value-test
    datalevin.serialization-context-test
@@ -47,6 +48,7 @@
           'datalevin.test.validation
           'datalevin.test.subsystems
           'datalevin.cache-invalidation-test
+          'datalevin.interpret-quotation-test
           'datalevin.leftist-heap-test
           'datalevin.native-value-test
           'datalevin.serialization-context-test
