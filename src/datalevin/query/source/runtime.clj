@@ -175,7 +175,7 @@
                  (when-not (value/at-most? @bytes headroom)
                    (doseq [category categories] (check-limit! usage category @bytes))))
         observe! (fn [increment]
-                   (when-not (zero? increment)
+                   (when-not (zero? (long increment))
                      (vreset! bytes (value/add-charge (long @bytes)
                                       (if (= 1 multiplier) increment
                                         (value/multiply-charge multiplier increment)))))

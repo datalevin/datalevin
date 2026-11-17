@@ -2,7 +2,8 @@
   (:require [clojure.test :refer [deftest is]]
             [datalevin.db.tx.template :as template]
             [datalevin.db.tx.wire :as wire]
-            [datalevin.prepare :as prepare]))
+            [datalevin.prepare :as prepare]
+            [datalevin.prepared :as prepared]))
 
 (def context (prepare/->PrepareCtx {} {} {}))
 
@@ -21,8 +22,12 @@
     (is (= {:source :kept} (meta restored)))))
 
 (deftest shared-operations-have-stable-portable-identities
-  (let [operation (wire/operation [:db/add 1 :value (template/parameter :v)])
+  (let [before (prepared/request nil)
+        operation (wire/operation [:db/add 1 :value (template/parameter :v)])
+        after (prepared/request nil)
         a (wire/definition [operation] nil) b (wire/definition [operation [:db/retract 1 :other]] nil)]
+    (is (< (.-id ^datalevin.prepared.Request before) (:id operation)
+           (.-id ^datalevin.prepared.Request after)))
     (is (= (:id (first (:operations a))) (:id (first (:operations b)))))
     (is (pos? (:id operation)))
     (is (= [[[:db/add 1 :value 7]]]
@@ -63,6 +68,20 @@
     (doseq [path [[3 :host] [] [99] [1 :invalid]]]
       (is (thrown? Exception (wire/restore-operation {:form [:db/add 1 :value host] :parameters [[path :v]]}))))
     (is (empty? @calls))))
+
+(deftest vector-parameter-paths-check-bounds-without-truncating-integers
+  (doseq [index [-1 4 Long/MIN_VALUE Long/MAX_VALUE
+                 9223372036854775808N 18446744073709551619N
+                 (biginteger 18446744073709551619N)]]
+    (let [failure (try (wire/restore-operation
+                        {:form [:db/add 1 :value 0] :parameters [[[index] :value]]})
+                       nil (catch clojure.lang.ExceptionInfo e e))]
+      (is (= :prepared/definition (:error (ex-data failure))) (str index))))
+  (doseq [index [3 (int 3) 3N (biginteger 3)]]
+    (let [restored (wire/restore-operation
+                     {:form [:db/add 1 :value 0] :parameters [[[index] :value]]})
+          program (template/prepare-template context [restored] nil)]
+      (is (= [[:db/add 1 :value 17]] (template/materialize program [{:value 17}]))))))
 
 (deftest remote-definition-validation-matches-local-parameter-contracts
   (is (thrown? Exception (wire/definition [[:db/add 1 :value #{(template/parameter :v)}]] nil)))

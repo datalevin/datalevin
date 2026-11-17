@@ -75,13 +75,16 @@
     (juxt :estimated-ns :work-rows :peak-rows)
     (juxt :work-rows :peak-rows)))
 
+(defn- modeled-operator? [operator]
+  (or (:union-estimate operator)
+      (= :at-most-one (get-in operator [:step :scalar-estimate]))))
+
 (defn- prefix-operators
   "Fence opaque operators behind the entire compared mandatory prefix. A
   dependency cycle declines this optional comparison in the normal scheduler.
   The suffix remains executable and keeps all outputs and qualifications."
   [work operators]
-  (let [known? #(or (:union-estimate %)
-                   (= :at-most-one (get-in % [:step :scalar-estimate])))
+  (let [known? modeled-operator?
         region-id (get-in work [:region :region-id])
         required (into (into #{} (map #(vector :core region-id (:id %))) (filter known? operators))
                        (mapcat (fn [request]
@@ -161,11 +164,19 @@
                                  independent op)) comparison-operators) planning))
             original-cost (or whole-cost (:join-cost prefix))
             original (if original-cost (or prefix original) original)
-            candidate (when original-cost
-                        (optional-schedule! #(schedule! runtime root (:inputs root) comparison-operators planning)))
+            ;; Do not move an opaque mandatory qualification merely to
+            ;; make costing possible. Recover only a fully modeled flat body.
+            recover? (and (nil? original-cost) (seq changed)
+                          (every? modeled-operator? decorated))
+            candidate (when (or original-cost recover?)
+                        (optional-schedule!
+                          #(schedule! runtime root (:inputs root) comparison-operators
+                             (cond-> planning recover? (assoc :seed-unpriced-unions? true)))))
             candidate-cost (:join-cost candidate)
             rank (cost-key original-cost candidate-cost)
-            chosen (if (and candidate-cost (neg? (compare (rank candidate-cost) (rank original-cost)))) candidate original)
+            chosen (if (and candidate-cost
+                            (or (nil? original-cost)
+                                (neg? (compare (rank candidate-cost) (rank original-cost))))) candidate original)
             cost (if (identical? chosen candidate) candidate-cost original-cost)
             selected (reduce (fn [schedules {:keys [kind value]}]
                                (if (and (= :core kind) (:scope-plans value))
@@ -175,6 +186,7 @@
                      cost (assoc :union-selection
                             {:alternatives (reduce + 0 (map #(count (:union-alternatives %)) (vals changed)))
                              :original-cost (select-keys original-cost [:work-rows :peak-rows :estimated-ns])
+                             :baseline-unpriced? (nil? original-cost)
                              :selected-cost (select-keys cost [:work-rows :peak-rows :estimated-ns])
                              :candidate-cost (select-keys candidate-cost [:work-rows :peak-rows :estimated-ns])
                              :candidate-search (:cost-search candidate)

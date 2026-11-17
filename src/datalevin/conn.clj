@@ -14,6 +14,9 @@
    [datalevin.db :as db]
    [datalevin.db.tx.common :as txcommon]
    [datalevin.db.tx.compile :as txcompile]
+   [datalevin.db.tx.template :as txtemplate]
+   [datalevin.prepare :as prepare]
+   [datalevin.prepared :as prepared]
    [datalevin.lmdb :as l]
    [datalevin.storage :as s]
    [datalevin.async :as a]
@@ -259,7 +262,7 @@
           (when-let [listeners (:listeners (meta conn))]
             (when (instance? clojure.lang.IAtom listeners)
               (reset! listeners {})))
-          (alter-conn-meta! conn dissoc :dir :remote-store-opts-cache))
+          (alter-conn-meta! conn dissoc :dir :remote-store-opts-cache ::write-templates))
         (shutdown-transact-async-executor-if-idle!)))))
   nil)
 
@@ -1176,9 +1179,35 @@
     (notify-listeners! conn report)
     report))
 
+(defn- automatic-write-registry
+  [conn]
+  (let [state (conn-state conn)]
+    (or (::write-templates (meta state))
+        (locking state
+          (or (::write-templates (meta state))
+              (let [registry (prepared/handle-cache)]
+                (alter-meta! state assoc ::write-templates registry)
+                registry))))))
+
+(defn- prepare-automatic-request
+  [conn forms]
+  (let [database @conn]
+    ;; Match existing pure caller preparation. Guarded/timed requests retain
+    ;; their established writer/watchdog and rejection checkpoints.
+    (when (and (instance? Store (:store database))
+               (nil? (l/explicit-transaction-timeout))
+               (not (guarded-local-request? conn)))
+      (when-let [key (txtemplate/automatic-key forms)]
+        (when-let [outcome (txtemplate/automatic-plan
+                            (automatic-write-registry conn)
+                            (prepare/make-prepare-ctx database) forms key)]
+          (when db/*tx-compiler-observer* (db/*tx-compiler-observer* :prepared outcome))
+          outcome)))))
+
 (defn- transact-request!
   ([conn tx-data tx-meta] (transact-request! conn tx-data tx-meta nil))
   ([conn tx-data tx-meta submitted]
+  (let [submitted (or submitted (prepare-automatic-request conn tx-data))]
   ;; Remote preparation must run under the server's writer, including when
   ;; callers share a connection. Client-side simulated batching could otherwise
   ;; race transactions submitted by another client between prepare and commit.
@@ -1253,7 +1282,7 @@
                              (l/read-env-opts (.-lmdb ^Store store)))]
                   (observe-embedded-path!
                    (when (:wal? opts) (:wal-durability-profile opts)) false))
-                (run-transact-now! conn tx-data tx-meta kind outcome request-shape))))))))))
+                (run-transact-now! conn tx-data tx-meta kind outcome request-shape)))))))))))
 
 (defn transact!
   ([conn tx-data] (transact! conn tx-data nil))

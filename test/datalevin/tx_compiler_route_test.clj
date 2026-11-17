@@ -28,6 +28,15 @@
         (is (= [:execute-dynamic] (filterv #{:execute-dynamic} @events)))
         (is (= 2 (:value (d/entity @cn 1))))))))
 
+(deftest classified-blind-fastlists-retain-fresh-snapshot-compilation
+  (with-open [cn (d/create-conn nil {:value {:db/valueType :db.type/long}}
+                  {:wal? false :background-sampling? false :snapshot-scheduler? false})]
+    (let [forms (doto (org.eclipse.collections.impl.list.mutable.FastList.)
+                  (.add {:value 7}))
+          plan (db/prepare-classified-blind-request @cn forms {})]
+      (is (= :blind (:strategy plan)))
+      (is (not (::db/bound-operands? plan))))))
+
 (deftest compiler-is-the-only-production-request-planner
   (is (nil? (io/resource "datalevin/db/tx/engine.clj")))
   (doseq [wal? [false true]]

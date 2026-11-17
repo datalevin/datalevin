@@ -52,7 +52,7 @@
     form
     (let [form (source form)
           compiled (template/prepare-operation client-context form)
-          id (.-id ^datalevin.prepared.Request (prepared/request nil))]
+          id (prepared/next-id)]
       ;; Caller-owned operations retain their substitution code and portable
       ;; definition together. Composing another program needs neither walk.
       (->RemoteOperation id form compiled (assoc (encode-form form) :id id)))))
@@ -95,7 +95,9 @@
                 (when-not (and (container? value)
                                (if (map? value)
                                  (and (compile/prepared-literal? k) (contains? value k))
-                                 (and (integer? k) (<= 0 k) (< k (count value)))))
+                                 (and (integer? k)
+                                      (not (neg? (long (compare k 0))))
+                                      (neg? (long (compare k (count value)))))))
                   (throw (ex-info "Invalid prepared parameter path" {:error :prepared/definition})))
                 (recur (get value k) (next keys))))
             (assoc-in result path (template/parameter key))) form parameters))

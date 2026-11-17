@@ -3,7 +3,8 @@
 (ns ^:no-doc datalevin.db.tx.template
   "Immutable parameterized write programs and pure, execution-local binding."
   (:require [datalevin.db.tx.compile :as compile]
-            [datalevin.db.tx.plan :as plan])
+            [datalevin.db.tx.plan :as plan]
+            [datalevin.prepared :as prepared])
   (:import [datalevin.db.tx.plan AttrInfo BlindSource BoundMap BoundOperation MixedInsert ScalarSequence TxParam WriteOp]
            [java.util ArrayList HashMap HashSet LinkedHashSet]
            [org.eclipse.collections.impl.list.mutable FastList]))
@@ -315,8 +316,10 @@
                    (and (nil? metadata) (every? #(or (:ordered-definition %) (:ordered-map-definition %)) operations)) :ordered-program
                    :else :dynamic)
         infos (field-infos operations (if (= :scalar-program strategy) :program-fields :fields))
-        fixed (when (#{:scalar :scalar-program} strategy) (fixed-scalar-layout operations infos batch?))]
-    (plan/->WriteTemplate
+        fixed (when (#{:scalar :scalar-program} strategy) (fixed-scalar-layout operations infos batch?))
+        blind-layouts (when (= :blind strategy)
+                        (mapv #(compile/canonical-blind-layout ctx (:fields %)) operations))]
+    (cond-> (plan/->WriteTemplate
       ctx operations (vec parameters) (boolean batch?) strategy
       (boolean (some #(or (:tx %) (:annotations %)) operations)) metadata
       infos fixed
@@ -329,7 +332,15 @@
            (some #(and (instance? AttrInfo %) (:db/unique (.-props ^AttrInfo %))) (vals infos)))
       (= 1 (count infos))
       (boolean (some #(identical? :db.unique/identity (:db/unique (.-props ^AttrInfo %))) (vals infos)))
-      (every? #(.-fuse-blind? ^AttrInfo %) (vals infos)))))
+      (every? #(.-fuse-blind? ^AttrInfo %) (vals infos)))
+      (= :scalar strategy)
+      (assoc :typed-scalar? (every? #(.-typed? ^AttrInfo %) (vals infos)))
+      (and (seq blind-layouts) (every? some? blind-layouts))
+      (assoc ::direct-blind-layout
+             (if (apply = (map :identity-attr blind-layouts))
+               (first blind-layouts) {:identity-attr nil}))
+      (and (= :blind strategy) (= 1 (count operations)))
+      (assoc ::canonical-blind-layout (first blind-layouts)))))
 
 (defn input-rows
   "Validate only parameter structure. Values, including lazy/host objects,
@@ -369,64 +380,22 @@
 
 (defn- bind-scalar
   [template rows]
-  (let [ctx (:ctx template) candidates (FastList.)
-        fixed (:fixed-layout template) seen (when-not fixed (HashMap.))
-        explicit? (:explicit? template) dependent? (volatile! (boolean (:dependent? fixed)))
-        valid? (and (not (:auto-entity-time? (:opts ctx)))
-                    (bindings template rows
-                      (fn [op row]
-                        (let [e ((:entity op) row) tx (when-let [f (:tx op)] (f row))]
-                          (and (or (nil? tx) (compile/prepared-positive-id? tx))
-                               (reduce (fn [_ [attr value info]]
-                                         (if-let [result (compile/append-prepared-scalar!
-                                                           ctx info candidates seen e attr (value row))]
-                                           (do (when (= :datalevin.db.tx.compile/dependent-scalar result)
-                                                 (vreset! dependent? true)) true)
-                                           (reduced false)))
-                                       true (:fields op)))))))]
-    (when (and valid? (pos? (.size candidates))
-               (compile/correct-prepared-scalars! ctx candidates))
-      (let [offset (volatile! 0)
-            entries (persistent!
-                      (reduce (fn [out row]
-                                (reduce (fn [out op]
-                                          (let [tx (when-let [f (:tx op)] (some-> (f row) long))
-                                                annotations (:annotations op)]
-                                            (reduce (fn [out _]
-                                                      (let [i @offset
-                                                            e (.get candidates i) a (.get candidates (+ i 1))
-                                                            v (.get candidates (+ i 2))]
-                                                        (vswap! offset + 4)
-                                                        (conj! out (if explicit?
-                                                                     (cond-> [e a v tx] annotations (conj annotations))
-                                                                     [e a v]))))
-                                                    out (:fields op))))
-                                        out (:operations template)))
-                              (transient []) rows))
-            aliases? (some #(not (instance? Long (nth % 0))) entries)
-            infos (:infos template)
-            sequence (when (and @dependent? (not aliases?))
-                       (if fixed
-                         (let [^ScalarSequence layout (:sequence-layout fixed)]
-                           (ScalarSequence. entries (.-slots layout) (.-slot-count layout)))
-                         (plan/scalar-sequence entries)))
-            plan (plan/->TxPlan ctx (cond sequence :scalar-sequence aliases? :scalar-aliases :else :scalar)
-                                (or sequence entries)
-                                (when-not aliases?
-                                  (when-not (or sequence (:single-attribute? template))
-                                    (if fixed (:entity-reads fixed)
-                                        (compile/scalar-update-entity-reads
-                                          #(.-props ^AttrInfo (get infos %)) entries)))))]
-        (when-not (and @dependent?
-                       (or aliases?
-                           (some (fn [op] (some #(not (.-typed? ^AttrInfo (nth % 2))) (:fields op)))
-                                 (:operations template))))
-          (cond-> plan
-            explicit? (assoc :explicit-tx? true)
-            (:single-attribute? template) (assoc :single-attribute? true)))))))
+  (or (when (and (nil? (:fixed-layout template)) (not (:explicit? template)))
+        (compile/bind-canonical-scalar-rows
+          (:ctx template) rows (:operations template) nil
+          (:infos template) (:single-attribute? template)))
+      (compile/bind-prepared-scalar-rows template rows)))
 
 (defn- bind-blind
   [template rows]
+  (or (when (= 1 (count (:operations template)))
+        (let [operation (first (:operations template))]
+          (compile/bind-canonical-blind-rows
+            (:ctx template) rows (:fields operation) (:entity operation)
+            (contains? (:source operation) :db/id) nil (:infos template)
+            (::canonical-blind-layout template) (:fuse? template))))
+      (when-let [layout (::direct-blind-layout template)]
+        (compile/bind-prepared-blind-rows template rows layout))
   (let [ctx (:ctx template) sources (FastList.) seen (HashSet.)
         infos (HashMap. ^java.util.Map (:infos template))]
     (when (bindings template rows
@@ -441,7 +410,7 @@
                                  true (reduced false)))
                              true (:fields op))
                      (do (.add sources (BlindSource. (if explicit? {:db/id e} {}) attrs)) true)))))
-      (compile/finish-prepared-blind ctx sources infos (:identity? template) (:fuse? template)))))
+      (compile/finish-prepared-blind ctx sources infos (:identity? template) (:fuse? template))))))
 
 (defn- bind-mixed
   [template rows]
@@ -520,7 +489,7 @@
             entries (mapv (fn [[e a opcode match operand tx annotations raw-value]]
                             [e a opcode match
                              (when-not (#{:retract :clear} opcode)
-                               (if (contains? reference-attrs a) operand (.get candidates (+ operand 2))))
+                               (if (contains? reference-attrs a) operand (.get candidates (+ (long operand) 2))))
                              tx annotations raw-value]) (persistent! @entries))
             ^ScalarSequence fixed (get-in template [:fixed-layout :sequence-layout])
             operands (cond
@@ -567,3 +536,128 @@
     :scalar-program (bind-scalar-program template rows)
     :ordered-program (bind-ordered-program template rows)
     nil))
+
+(def ^:dynamic *automatic-observer*
+  "Optional request-level observer of automatic :compiled, :hit and :declined
+  decisions. No changing input is retained by a compiled template."
+  nil)
+
+(defn- automatic-container? [forms]
+  (or (identical? FastList (class forms))
+      (and (identical? clojure.lang.PersistentVector (class forms)) (nil? (meta forms)))))
+
+(defn- automatic-first [forms]
+  (when (automatic-container? forms)
+    (if (identical? FastList (class forms))
+      (when-not (.isEmpty ^FastList forms) (.get ^FastList forms 0))
+      (nth forms 0 nil))))
+
+(defn- automatic-map-kind [row]
+  (if-not (contains? row :db/id)
+    :blind
+    (let [e (:db/id row)]
+      (cond
+        (and (instance? Long e) (pos? (long e))) :scalar
+        (or (string? e) (and (instance? Long e) (neg? (long e)))) :blind))))
+
+(defn automatic-key
+  "Describe only an eager first row's operation/attribute layout. Values are
+  excluded from hashing, and the binder proves the remaining rows match."
+  [forms]
+  (let [row (automatic-first forms)]
+    (cond
+      (and (plain-map? row) (nil? (meta row))
+           (every? keyword? (keys row)))
+      (when-let [kind (automatic-map-kind row)]
+        (when (> (count row) (if (contains? row :db/id) 1 0))
+          [:map kind (vec (keys row))]))
+
+      (and (identical? clojure.lang.PersistentVector (class row))
+           (nil? (meta row)) (= 4 (count row))
+           (identical? :db/add (nth row 0)) (keyword? (nth row 2))
+           (instance? Long (nth row 1)) (pos? (long (nth row 1)))
+           ;; A different second instruction already disproves a repeated-row
+           ;; program; leave heterogeneous update/insert programs to selection.
+           (or (= 1 (count forms))
+               (let [next-row (nth forms 1)]
+                 (and (identical? clojure.lang.PersistentVector (class next-row))
+                      (nil? (meta next-row)) (= 4 (count next-row))
+                      (identical? :db/add (nth next-row 0))
+                      (= (nth row 2) (nth next-row 2))))))
+      [:add (nth row 2)])))
+
+(defn- automatic-row-matcher [key]
+  (if (identical? :map (nth key 0))
+    (let [kind (nth key 1) names (nth key 2) size (count names)]
+      (fn [row]
+        (and (plain-map? row) (nil? (meta row)) (= size (count row))
+             (= size (reduce-kv (fn [index attr _]
+                                 (if (and (keyword? attr) (= attr (nth names index)))
+                                   (inc (long index)) (reduced -1)))
+                               0 row))
+             (= kind (automatic-map-kind row)))))
+    (let [attr (nth key 1)]
+      (fn [row]
+        (and (identical? clojure.lang.PersistentVector (class row))
+             (nil? (meta row)) (= 4 (count row))
+             (identical? :db/add (nth row 0)) (= attr (nth row 2)))))))
+
+(defn- prepare-automatic-template [ctx key]
+  (when-not (:auto-entity-time? (:opts ctx))
+    (let [map? (identical? :map (nth key 0))
+          kind (if map? (nth key 1) :scalar)
+          names (when map? (nth key 2))
+          fields (when map? (remove #{:db/id} names))
+          operations
+          (if map?
+            (if (identical? kind :blind)
+              [(apply array-map (mapcat (fn [name] [name (parameter name)]) names))]
+              (mapv (fn [attr] [:db/add (parameter :db/id) attr (parameter attr)]) fields))
+            (let [operation (prepare-operation ctx [:db/add (parameter ::entity) (nth key 1) (parameter ::value)])]
+              [(assoc operation :entity #(nth % 1)
+                                :fields [[(nth key 1) #(nth % 3) (nth (first (:fields operation)) 2)]])]))
+          template (prepare-template ctx operations {:batch? true})]
+      (when (and (= kind (:strategy template))
+                 (every? #(compile/canonical-binding-fields? (:fields %)) (:operations template)))
+        (assoc template ::row-matches? (automatic-row-matcher key)
+                        ::raw-operations? (not map?))))))
+
+(defn- bind-automatic-template [template forms]
+  (case (:strategy template)
+    :blind
+    (let [operation (first (:operations template))]
+      (compile/bind-canonical-blind-rows
+        (:ctx template) forms (:fields operation) (:entity operation)
+        (contains? (:source operation) :db/id) (::row-matches? template)
+        (:infos template) (::canonical-blind-layout template) (:fuse? template)))
+    :scalar
+    (if (::raw-operations? template)
+      (compile/bind-canonical-scalar-operations
+        (:ctx template) forms (nth (first (:fields (first (:operations template)))) 2)
+        (::row-matches? template))
+      (compile/bind-canonical-scalar-rows
+        (:ctx template) forms (:operations template) (::row-matches? template)
+        (:infos template) (:single-attribute? template)))
+    nil))
+
+(defn automatic-plan
+  "Select a retained immutable template and bind directly from ordinary input.
+  The connection owns one bounded registry; binding and operands are invocation
+  local. Stale schema/options refresh metadata; a decline retains original input."
+  [registry ctx forms key]
+  (when key
+    (let [cached (locking registry (.get ^java.util.Map registry key))
+          hit? (and cached (compatible? (:ctx cached) ctx))
+          template (if hit? cached
+                       (locking registry
+                         (let [cached (.get ^java.util.Map registry key)]
+                           (if (and cached (compatible? (:ctx cached) ctx)) cached
+                               (when-let [compiled (prepare-automatic-template ctx key)]
+                                 ;; Retain the valid program, never the outcome of
+                                 ;; binding these particular values or row shapes.
+                                 (prepared/remember! registry key compiled))))))
+          outcome (when template (bind-automatic-template template forms))]
+      (when *automatic-observer*
+        (*automatic-observer* (if outcome (if hit? :hit :compiled) :declined) template))
+      (when outcome
+        outcome))))

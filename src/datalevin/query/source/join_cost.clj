@@ -5,7 +5,7 @@
 
 (defn finite-cost
   "Saturate nonnegative advisory work at a finite double. Never wrap costs."
-  [n]
+  ^double [n]
   (let [n (double n)] (if (Double/isNaN n) Double/MAX_VALUE (min Double/MAX_VALUE n))))
 
 (defn access-time
@@ -13,7 +13,7 @@
   splitting is already included in per-binding hints, not extra cursor opens."
   [estimate tuples batch dependent?]
   (let [start (:startup-ns estimate) run (get estimate (if dependent? :per-binding-ns :run-ns))]
-    (when (and (number? start) (number? run) (pos? batch))
+    (when (and (number? start) (number? run) (pos? (long (compare batch 0))))
       (let [opens (if dependent? (Math/ceil (/ (double tuples) (double batch))) 1.0)
             inputs (if dependent? (double tuples) 1.0)
             fixed (:requests-per-open estimate) per-binding (:requests-per-binding estimate)]
@@ -37,13 +37,13 @@
       (let [rows #(finite-cost (reduce + 0.0 (map (fn [b] (if (zero? (compare (:rows b) 0)) 1.0
                                                           (double (:rows b)))) %)))
             tuples (double (:tuples state))
-            returned (max 1.0 (finite-cost (* tuples (rows fanout))))
-            read (if (seq requires) returned (rows branches))
+            returned (max 1.0 (finite-cost (* tuples (double (rows fanout)))))
+            read (if (seq requires) returned (double (rows branches)))
             priced (when model (mapv #(access-time (:estimate %) (if (seq requires) tuples 1.0)
                                                     (:batch %) (:dependent? %)) branches))
             sum-cost (fn [key]
                        (when (and (some? (get state key)) (every? #(number? (get % key)) priced))
-                         (finite-cost (+ (double (get state key)) (reduce + 0.0 (map key priced))))))
+                         (finite-cost (+ (double (get state key)) (double (reduce + 0.0 (map key priced)))))))
             access (when priced (sum-cost :access-ns))
             work (finite-cost (+ tuples read returned))
             local (finite-cost (+ (double (:local-ns state))
@@ -51,14 +51,14 @@
                                    (* (finite-cost (+ (* tuples (count requires)) (* returned (count columns))))
                                       (double (get model :local-column-ns 0)))))
             opens (when (and priced (some? (:estimated-opens state)) (every? #(number? (:opens %)) priced))
-                    (finite-cost (+ (double (:estimated-opens state)) (reduce + 0.0 (map :opens priced)))))
+                    (finite-cost (+ (double (:estimated-opens state)) (double (reduce + 0.0 (map :opens priced))))))
             requests (when (and priced (some? (:estimated-requests state)) (every? #(number? (:requests %)) priced))
-                       (finite-cost (+ (double (:estimated-requests state)) (reduce + 0.0 (map :requests priced)))))]
+                       (finite-cost (+ (double (:estimated-requests state)) (double (reduce + 0.0 (map :requests priced))))))]
         {:known (into known (map :variable columns)) :tuples returned
          :work-rows (finite-cost (+ (double (:work-rows state)) work))
          :peak-rows (max (double (:peak-rows state)) read returned)
          :access-ns access :local-ns local :estimated-opens opens :estimated-requests requests
-         :estimated-ns (when (some? access) (finite-cost (+ access local)))}))))
+         :estimated-ns (when (some? access) (finite-cost (+ (double access) local)))}))))
 
 (defn price
   "Estimate returned-row work along a complete path or explicitly fenced prefix. Counts are advisory and
@@ -118,9 +118,9 @@
     (into #{} (map #(if (vector? %) (first %) %)) (:covers choice))))
 
 (defn- qualification-model
-  "Recognize cheap mandatory leaf reads from captured schemas. A leaf's value
-  is not used by another work item, but its existence still qualifies the key.
-  Do not infer uniqueness, emptiness, or selectivity from this preference."
+  "Recognize cheap mandatory leaf reads and checks of already supplied keys.
+  A key check can retain repeated witnesses without introducing new key values.
+  Counts are advisory: never infer uniqueness, emptiness or selectivity."
   [choices row-count]
   (let [mandatory (filter #(or (= :access (:kind %)) (:union-estimate (:value %))) choices)
         uses (reduce (fn [m choice]
@@ -135,7 +135,12 @@
                         (set/subset? (set/intersection joins (set (map :variable columns)))
                                      (set (map :variable requires)))
                         (let [rows (row-count value)]
-                          (and (number? rows) (<= 0 rows 1)))))
+                          (and (number? rows) (<= 0 rows 8)
+                               (or (not (pos? (long (compare rows 1))))
+                                   ;; Preserve bag witnesses even though this
+                                   ;; read can only constrain existing keys.
+                                   (set/subset? (set (map :variable columns))
+                                                (set (map :variable requires))))))))
         leaves (filter qualify? mandatory)
         components
         (into #{}
@@ -171,7 +176,7 @@
   ([arguments row-count] (select arguments row-count nil))
   ([arguments row-count model]
   (let [checks (volatile! 0) check! (:check! arguments)
-        visit! #(vswap! checks inc)
+        visit! #(vreset! checks (inc (long @checks)))
         baseline (dependency/schedule (assoc arguments :visit! visit!))
         initial (when (= :complete (:status baseline)) (price (:choices baseline) (:inputs arguments) row-count model))
         started (System/nanoTime) maximum (long (:max-states arguments))]
@@ -252,7 +257,7 @@
                                (cond
                                  (and (risky? best-price) (not (risky? priced))) true
                                  (and (not (risky? best-price)) (risky? priced)) false
-                                 (and prefix-comparison (not (zero? prefix-comparison))) (neg? prefix-comparison)
+                                 (and prefix-comparison (not (zero? (long prefix-comparison)))) (neg? (long prefix-comparison))
                                  :else (neg? (compare (row-key priced) (row-key best-price)))))]
               (recur (next pending) (if better? attempt best) (if better? priced best-price)
                      (if better? candidate-prefix best-prefix) (inc evaluated)

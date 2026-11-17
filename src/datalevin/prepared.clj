@@ -64,10 +64,15 @@
 
 (defonce ^:private ^AtomicLong ids (AtomicLong.))
 
+(defn next-id
+  "Allocate an id shared by prepared requests and operations."
+  ^long []
+  (.incrementAndGet ids))
+
 (deftype Request [^long id args metadata])
 
 (defn request
   "The changing input of a prepared wire request is at argument index 2."
   [args]
-  (let [id (.incrementAndGet ids)]
+  (let [id (next-id)]
     (Request. id args {::id id})))

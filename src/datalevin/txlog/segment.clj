@@ -16,11 +16,12 @@
    [datalevin.util :as u :refer [raise]])
   (:import
    [datalevin.io PosixFsync]
-   [java.io File]
+   [java.io File IOException]
    [java.nio ByteBuffer]
    [java.nio.channels FileChannel FileLock OverlappingFileLockException]
-   [java.nio.file Files Path StandardCopyOption StandardOpenOption
-    AtomicMoveNotSupportedException]))
+   [java.nio.file Files Path StandardCopyOption StandardOpenOption LinkOption
+    AtomicMoveNotSupportedException]
+   [java.nio.file.attribute BasicFileAttributes]))
 
 (def ^:private segment-pattern #"^segment-(\d{16})\.wal$")
 (def ^:private prepared-segment-pattern #"^segment-(\d{16})\.wal\.tmp$")
@@ -818,6 +819,29 @@
   (when (some? v)
     (vreset! v (+ ^long @v ^long (long (or delta 0))))))
 
+(defn- prepared-file-attributes
+  "Bind a completed preparation to its regular file. Without filesystem
+  identity support, activation keeps the ordinary validating scan."
+  ^BasicFileAttributes [^String path]
+  (try
+    (let [^"[Ljava.nio.file.LinkOption;" options
+          (into-array LinkOption [LinkOption/NOFOLLOW_LINKS])
+          ^BasicFileAttributes attrs
+          (Files/readAttributes (.toPath (io/file path)) BasicFileAttributes options)]
+      (when (and (.isRegularFile attrs) (some? (.fileKey attrs))) attrs))
+    (catch IOException _ nil)
+    (catch SecurityException _ nil)
+    (catch UnsupportedOperationException _ nil)))
+
+(defn take-prepared-segment-proof!
+  "Consume one live owner's preparation proof before attempting activation.
+  Failed activations and retries conservatively revert to scanning."
+  [state segment-id]
+  (when-let [prepared (:prepared-next-segment state)]
+    (let [proof @prepared]
+      (vreset! prepared nil)
+      (when (= segment-id (:segment-id proof)) (:attributes proof)))))
+
 (defn ensure-next-segment-prepared!
   [state]
   (when (preallocation-enabled-state? state)
@@ -830,8 +854,15 @@
         (.exists tmp-file)   true
         :else
         (try
-          (prepare-next-segment! dir next-id
-                                 (long (:segment-prealloc-bytes state)))
+          (when-let [prepared (:prepared-next-segment state)]
+            (vreset! prepared nil))
+          (let [path (prepare-next-segment! dir next-id
+                                           (long (:segment-prealloc-bytes state)))]
+            ;; This is a one-file ownership proof, not recovered metadata.
+            ;; Existing temporary files never acquire it merely by inspection.
+            (when-let [prepared (:prepared-next-segment state)]
+              (when-let [attributes (prepared-file-attributes path)]
+                (vreset! prepared {:segment-id next-id :attributes attributes}))))
           (inc-volatile-long! (:segment-prealloc-success-count state))
           true
           (catch Exception _
@@ -839,17 +870,28 @@
             false))))))
 
 (defn activated-segment-offset
-  [^String path preserve-preallocated-tail?]
-  (let [scan (scan-segment path {:allow-preallocated-tail? true
-                                 :collect-records?         false})]
-    (cond
-      (and preserve-preallocated-tail?
-           (:preallocated-tail? scan))
-      (:valid-end scan)
+  "Skip the zero-tail scan only for an unchanged file prepared by this owner.
+  Recovery, existing segments and stale/changed files retain full validation."
+  ([path preserve-preallocated-tail?]
+   (activated-segment-offset path preserve-preallocated-tail? nil))
+  ([^String path preserve-preallocated-tail? ^BasicFileAttributes prepared]
+   (if (and preserve-preallocated-tail? prepared
+            (when-let [current (prepared-file-attributes path)]
+              (and (= (.fileKey prepared) (.fileKey current))
+                   (= (.size prepared) (.size current))
+                   (= (.lastModifiedTime prepared) (.lastModifiedTime current))
+                   (= (.creationTime prepared) (.creationTime current)))))
+     0
+     (let [scan (scan-segment path {:allow-preallocated-tail? true
+                                  :collect-records?         false})]
+       (cond
+         (and preserve-preallocated-tail?
+              (:preallocated-tail? scan))
+         (:valid-end scan)
 
-      (:partial-tail? scan)
-      (segment-end-offset
-       (truncate-partial-tail! path {:allow-preallocated-tail? true}))
+         (:partial-tail? scan)
+         (segment-end-offset
+          (truncate-partial-tail! path {:allow-preallocated-tail? true}))
 
-      :else
-      (:valid-end scan))))
+         :else
+         (:valid-end scan))))))

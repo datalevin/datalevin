@@ -2534,9 +2534,9 @@
   values bind the collected template. Other families retain normal selection."
   [db forms {:keys [allow-small-unique? check-unique-avs? ordered? request-shape]
              :or {allow-small-unique? true check-unique-avs? true ordered? true}}]
-  (let [shape (or request-shape (txcompile/literal-request-shape forms))
+  (let [shape (or request-shape (txcompile/stable-request-shape forms))
         options {:allow-small-unique? allow-small-unique?
-                 :request-shape (or shape :dynamic)
+                 :request-shape shape
                  :check-unique-avs? check-unique-avs? :ordered? ordered?}
         attempted? (and (instance? Store (:store db))
                         (identical? :blind shape))

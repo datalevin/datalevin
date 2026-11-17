@@ -229,8 +229,8 @@
 
 (defn- elapsed-cost [plan tuples limits now max-age]
   (let [e (:advisory-estimate plan) o (options plan) dependent? (seq (:requires o))
-        batch (min (:binding-rows limits)
-                   (get-in o [:capture :alternative :constraints :max-binding-rows] (:binding-rows limits)))]
+        batch (min (long (:binding-rows limits))
+                   (long (get-in o [:capture :alternative :constraints :max-binding-rows] (:binding-rows limits))))]
     (when (zero? (long (first (cardinality-key plan now max-age))))
       (join-cost/access-time e tuples batch dependent?))))
 
@@ -245,9 +245,9 @@
     (when (and (zero? (long unknown)) (= :many (:opens p))
                (= :identical (get-in o [:capture :alternative :properties :replay])))
       {:rows rows :estimate (:advisory-estimate plan) :dependent? (boolean (seq (:requires o)))
-       :batch (min (:binding-rows (control/limits (:control runtime)))
-                   (get-in o [:capture :alternative :constraints :max-binding-rows]
-                     (:binding-rows (control/limits (:control runtime)))))})))
+       :batch (min (long (:binding-rows (control/limits (:control runtime))))
+                   (long (get-in o [:capture :alternative :constraints :max-binding-rows]
+                           (:binding-rows (control/limits (:control runtime))))))})))
 
 (defn price-schedule
   "Price a previously validated schedule without provider callbacks or rows."
@@ -356,6 +356,29 @@
           (catch Throwable e (control/release! output-token) (throw e))))
       (finally (control/release! token)
                (when-let [token @workspace] (control/release! token))))))
+
+(defn- key-seeded-choices
+  "Recover an unpriced flat-union comparison with one small constant lookup.
+  Use only captured caller keys; the scheduler still validates all work,
+  dependencies, types and permissions before selecting an executable plan."
+  [choices region-id planning count-key]
+  (if-not (and (zero? (long region-id)) (:seed-unpriced-unions? planning))
+    choices
+    (let [union-keys (into #{}
+                      (mapcat #(map :variable (get-in % [:value :step :conditional-union :columns])))
+                      (filter #(get-in % [:value :union-estimate]) choices))
+          seed (when (seq union-keys)
+                 (first
+                   (filter
+                     (fn [choice]
+                       (and (= :access (:kind choice)) (not (:unavailable? choice))
+                            (empty? (:requires choice))
+                            (= :value-lookup
+                               (get-in choice [:value :path :options :capture :alternative :access :kind]))
+                            (some #(contains? union-keys (:variable %)) (:columns choice))
+                            (let [[unknown rows] (count-key (:value choice))]
+                              (and (zero? (long unknown)) (<= 0 rows 8))))) choices)))]
+      (if seed (into [seed] (remove #(identical? seed %) choices)) choices))))
 
 (defn schedule!
   "Validate complete region-local coverage and schedule typed AccessPlans.
@@ -501,6 +524,7 @@
                                      :unavailable? (and (= :once (:opens p)) (:spent? p))})) candidates)
                                    (mapcat #(map core-choice (remove (comp seq :requires) (alternatives %))) conditional)
                                    (map core-choice (sort-by #(get ranks (:id %)) (filter deferred? ordinary))))))
+             choices (key-seeded-choices choices region-id planning count-key)
              result (join-cost/select {:inputs input-columns :required-work required
                                           :required-vars live-vars :choices choices
                                           :intermediate-row-limit

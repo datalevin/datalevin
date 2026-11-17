@@ -245,7 +245,7 @@
                      (txcommon/emit-transition conj! out e attr old-value value
                        (long (or tx tx-id)) annotations)
                      (if (and old (or (= :clear opcode) (nil? match)
-                                     (zero? (d/compare-index-values (.-v old) match))))
+                                     (zero? (long (d/compare-index-values (.-v old) match)))))
                        (conj! out (idx/retraction e attr old-value tx-id)) out))
                changed? (not= before (count out))]
            (aset values slot (if changed? (when addition? (nth out (dec (count out)))) old))

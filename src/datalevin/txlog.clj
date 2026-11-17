@@ -428,6 +428,9 @@
          :segment-created-ms     (volatile! now)
          :segment-channel        (volatile! ch)
          :segment-offset         (volatile! active-offset)
+         ;; Only completed preparation in this live owner can prove a next
+         ;; segment empty. Reopening never restores this single-use proof.
+         :prepared-next-segment  (volatile! nil)
          :append-lock            (Object.)
          :runtime-control        (volatile! nil)
          :segment-roll-lock      (ReentrantLock.)
@@ -781,6 +784,7 @@
                       next-file (io/file next-path)
                       tmp-exists? (.exists tmp-file)
                       next-exists? (.exists next-file)
+                      prepared (tseg/take-prepared-segment-proof! state next-id)
                       final-path (activate-next-segment! dir next-id)
                       preserve-preallocated-tail?
                       (and (preallocation-enabled-state? state)
@@ -788,7 +792,8 @@
                            (not next-exists?))
                       next-offset (activated-segment-offset
                                    final-path
-                                   preserve-preallocated-tail?)
+                                   preserve-preallocated-tail?
+                                   prepared)
                       ^FileChannel next-ch (open-segment-channel
                                             next-path
                                             (boolean (:sync-on-write? state)))

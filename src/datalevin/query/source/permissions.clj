@@ -82,7 +82,8 @@
   (let [^LinkedList history (.-history limiter)]
     (loop []
       (when-let [^RequestStart start (.peekFirst history)]
-        (when (not (pos? (long (.compareTo (.add (.-at start) (.-interval limiter)) now))))
+        (when (not (pos? (long (.compareTo (.add ^BigInteger (.-at start)
+                                               ^BigInteger (.-interval limiter)) now))))
           (.removeFirst history)
           (control/release! (.-reservation start))
           (recur))))))
@@ -92,7 +93,9 @@
   ;; concurrency using the ordinary ledger API. Cancellation/release notify the
   ;; monitor immediately; the bounded wait is a fallback, not a busy loop.
   (if-let [^RequestStart first-start (.peekFirst ^LinkedList (.-history limiter))]
-    (let [remaining (.subtract (.add (.-at first-start) (.-interval limiter)) now)]
+    (let [^BigInteger remaining
+          (.subtract (.add ^BigInteger (.-at first-start)
+                           ^BigInteger (.-interval limiter)) now)]
       (max 1 (.longValue (.min (biginteger 50)
                                (.divide (.add remaining (biginteger 999999)) (biginteger 1000000))))))
     50))

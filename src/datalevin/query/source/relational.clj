@@ -64,8 +64,10 @@
   [compiled sites variables types]
   (let [regions (:regions compiled) by-parent (group-by :parent-region sites)
         root (:root-region compiled) visited (volatile! #{}) remaining (volatile! 128)]
-    (letfn [(union [site depth visible]
-              (when (and (<= depth 14) (not (neg? (vswap! remaining - (inc (count (:branches site))))))
+    (letfn [(union [site ^long depth visible]
+              (when (and (<= depth 14)
+                         (not (neg? (long (vreset! remaining
+                                           (- (long @remaining) (inc (count (:branches site))))))))
                          (= :union (:kind site)) (<= 1 (count (:branches site)) 32)
                          (set/subset? (:exports site) visible))
                 (let [branches
@@ -77,7 +79,8 @@
                                     children (when predicates
                                                (mapv #(union % (+ 2 depth) visible) (by-parent id)))]
                                 (when (and predicates (every? some? children)
-                                           (not (neg? (vswap! remaining - (count predicates)))))
+                                           (not (neg? (long (vreset! remaining
+                                                             (- (long @remaining) (count predicates)))))))
                                   {:kind :boolean :operator :and :clauses (into predicates children)})))
                             (:branches site))]
                   (when (every? some? branches)
