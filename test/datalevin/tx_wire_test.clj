@@ -28,6 +28,26 @@
     (is (= [[[:db/add 1 :value 7]]]
            [(wire/materialize (wire/request "db" [operation] nil) {:v 7})]))))
 
+(deftest remote-definitions-reject-unsupported-metadata-before-serialization
+  (let [effects (atom [])
+        marker (template/parameter :metadata)
+        host (proxy [Object] []
+               (hashCode [] (swap! effects conj :hash) 0)
+               (toString [] (swap! effects conj :string) "host"))
+        lazy-value (lazy-seq (swap! effects conj :realized) (list 7))]
+    (doseq [value [marker host lazy-value]
+            form [(with-meta [:db/add 1 :value 7] {:value value})
+                  [:db/add 1 :value (with-meta {:nested 7} {:value value})]]
+            prepare [#(wire/operation form)
+                     #(wire/definition [form] nil)
+                     #(wire/request "db" [form] nil)]]
+      (let [failure (try (prepare) nil (catch clojure.lang.ExceptionInfo e e))]
+        (is (= :prepared/metadata (:error (ex-data failure))))))
+    (let [operations (with-meta [[:db/add 1 :value 7]] {:value marker})]
+      (is (thrown? clojure.lang.ExceptionInfo (wire/definition operations nil)))
+      (is (thrown? clojure.lang.ExceptionInfo (wire/request "db" operations nil))))
+    (is (empty? @effects))))
+
 (deftest preparing-a-wire-definition-does-not-serialize-host-values
   (let [calls (atom []) host (proxy [Object] []
                                 (hashCode [] (swap! calls conj :hash) 0)

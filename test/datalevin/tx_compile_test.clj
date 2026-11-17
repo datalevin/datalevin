@@ -39,6 +39,72 @@
      :reference {:db/aid 6 :db/valueType :db.type/ref}}
     {} {:validate-data? true}))
 
+(deftest stable-shape-decisions-retain-negative-results-without-demand
+  (let [effects (atom [])
+        lazy-input (lazy-seq (swap! effects conj :demand) (list [:db/add 1 :value 7]))
+        host (proxy [Object] [] (toString [] (swap! effects conj :string) "host"))
+        forms [[:db/add 1 :text host]]
+        mutable (doto (FastList.) (.add [:db/add 1 :value 7]))]
+    (is (= :scalar-operations (compile/stable-request-shape forms)))
+    (is (= :dynamic (compile/stable-request-shape lazy-input)))
+    (is (= :dynamic (compile/stable-request-shape [[:db.fn/call host]])))
+    (is (nil? (compile/stable-request-shape mutable)))
+    (is (empty? @effects))))
+
+(deftest known-dynamic-shapes-enter-the-dynamic-driver-directly
+  (let [forms [[:db/add 1 :value 7]]
+        selected (compile/compile-tx ctx forms {:request-shape :dynamic :dynamic? true})]
+    (is (= :scalar-operations (:strategy (compile/compile-tx ctx forms))))
+    (is (= :dynamic (:strategy selected)))
+    (is (identical? forms (:entries selected)))
+    (is (nil? (compile/compile-tx ctx forms {:request-shape :dynamic})))))
+
+(deftest fastlist-planning-snapshots-only-the-outer-container
+  (let [calls (atom 0)
+        tail (lazy-seq (swap! calls inc) (list :tail))
+        row {:value 7}
+        forms (doto (FastList.) (.add row) (.add tail))
+        snapshot (compile/snapshot-request forms)
+        custom (proxy [FastList] []
+                 (iterator [] (swap! calls inc) (throw (Exception. "iterator"))))]
+    (is (vector? snapshot))
+    (is (identical? row (first snapshot)))
+    (is (identical? tail (second snapshot)))
+    (.set forms 0 {:value 8})
+    (is (identical? row (first snapshot)))
+    (is (identical? snapshot (compile/snapshot-request snapshot)))
+    (is (identical? custom (compile/snapshot-request custom)))
+    (is (identical? custom (:entries (compile/compile-tx ctx custom {:dynamic? true}))))
+    (is (zero? @calls))))
+
+(deftest fastlist-input-reuses-independent-and-ordered-compilers
+  (let [context (assoc-in ctx [:schema :doc] {:db/aid 7 :db/valueType :db.type/idoc})]
+    (doseq [[expected forms]
+            [[:scalar-operations [[:db/add 1 :value 7] [:db/add 2 :value 8]]]
+             [:blind [{:value 1} {:text "two"}]]
+             [:mixed [[:db/add 1 :value 7] {:text "new"}]]
+             [:ordered [[:db/cas 1 :value 7 8] [:db/retract 2 :value]]]
+             [:patch [[:db.fn/patchIdoc 1 :doc [[:set [:n] 2]]]]]]]
+      (let [batch (FastList. ^java.util.Collection forms)
+            plan (compile/compile-tx context batch)]
+        (is (instance? TxPlan plan))
+        (is (= expected (:strategy plan)))
+        (is (= expected (:strategy (compile/compile-tx context forms))))))))
+
+(deftest fastlist-declines-retain-the-original-dynamic-input
+  (let [effects (atom [])
+        host (proxy [Object clojure.lang.IMeta] []
+               (meta [] (swap! effects conj :meta) nil)
+               (hashCode [] (swap! effects conj :hash) 0)
+               (toString [] (swap! effects conj :string) "host"))
+        tail (lazy-seq (swap! effects conj :tail) (list :later))]
+    (doseq [row [{:text host} {:value tail} [:db.fn/call (fn [_] (swap! effects conj :call) [])]]]
+      (let [batch (doto (FastList.) (.add row))
+            plan (compile/compile-tx ctx batch {:dynamic? true})]
+        (is (= :dynamic (:strategy plan)))
+        (is (identical? batch (:entries plan)))))
+    (is (empty? @effects))))
+
 (deftest attribute-bindings-share-one-representation-and-identity-across-roles
   (let [infos (HashMap.) schema (:schema ctx)
         ^AttrInfo info (compile/attribute-info! infos schema {} :value)]

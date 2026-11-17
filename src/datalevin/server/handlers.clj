@@ -18,6 +18,7 @@
    [datalevin.constants :as c]
    [datalevin.core :as d]
    [datalevin.db :as db]
+   [datalevin.db.tx.compile :as txcompile]
    [datalevin.db.tx.template :as template]
    [datalevin.prepare :as prepare]
    [datalevin.ha :as dha]
@@ -1648,36 +1649,42 @@
                 (:db-after report) (:tx-data report) report independent?))))))
 
 (defn- ^:redef prepare-server-tx
-  [db txs]
-  (try
-    (when-let [plan (or (db/prepare-compiled-request db txs)
-                       (db/prepare-admitted-request
+  ([db txs] (prepare-server-tx db txs (txcompile/stable-request-shape txs)))
+  ([db txs request-shape]
+  ;; Pure compilation returns ordinary declines; exceptions are defects and
+  ;; must reach the caller. Only runtime operand binding retains a writer retry.
+  (when-let [plan
+             (or (db/prepare-compiled-request db txs {:request-shape request-shape})
+                 (try
+                   (or (db/prepare-admitted-request
                          db txs {:strategy :scalar :defer-entity-resolution? true})
                        (db/prepare-admitted-request
-                         db txs {:strategy :blind :allow-small-unique? true}))]
-      [:compiled plan txs])
-    ;; Retain the writer retry for binding failures, but surface unexpected
-    ;; compiler failures instead of treating them as ordinary plan declines.
-    (catch Exception e
-      (log/warn e "Server transaction preparation failed; falling back to recompilation under the writer")
-      nil)))
+                         db txs {:strategy :blind :allow-small-unique? true}))
+                   (catch Exception e
+                     (when db/*tx-compiler-observer*
+                       (db/*tx-compiler-observer*
+                         :compiler-exception {:phase :server-binding :exception e}))
+                     (log/warn e "Server transaction operand binding failed; retrying under the writer")
+                     nil)))]
+    [:compiled plan txs request-shape])))
 
 (defn- execute-compiled-request!
-  [db prepared forms tx-meta]
+  [db prepared forms tx-meta request-shape]
   (let [report (db/prepare-local-tx-data
                  db forms tx-meta (System/currentTimeMillis) prepared nil
-                 {:stage? false :route? true :owned-max-eid (:max-eid db)})
+                 {:stage? false :route? true :owned-max-eid (:max-eid db)
+                  :request-shape request-shape})
         ordered? (= :blind-insert (db/compiled-request-route report))
         independent? (db/request-storage-independent? report)]
     (commit-stamped-report (db/clear-compiled-request-route report) ordered? independent?)))
 
 (defn- ^:redef transact-prepared
-  [db [kind prepared forms] tx-meta]
+  [db [kind prepared forms request-shape] tx-meta]
   (case kind
     :compiled
     (do
       (db/seed-request-storage-attributes! db prepared)
-      (execute-compiled-request! db prepared forms tx-meta))
+      (execute-compiled-request! db prepared forms tx-meta request-shape))
 
     nil))
 
@@ -1689,9 +1696,13 @@
 
 (defn- transact*
   ([deps db0 txs tx-meta s? server db-name writing?]
-   (transact* deps db0 txs tx-meta s? server db-name writing?
-              (when-not s? (prepare-server-tx db0 txs))))
+   (let [request-shape (when-not s? (txcompile/stable-request-shape txs))]
+     (transact* deps db0 txs tx-meta s? server db-name writing?
+                (when-not s? (prepare-server-tx db0 txs request-shape)) request-shape)))
   ([deps db0 txs tx-meta s? server db-name writing? prepared]
+   (transact* deps db0 txs tx-meta s? server db-name writing? prepared
+              (or (nth prepared 3 nil) (when-not s? (txcompile/stable-request-shape txs)))))
+  ([deps db0 txs tx-meta s? server db-name writing? prepared request-shape]
    (try
      ;; Non-simulated paths already supply a private writer DB. Preserve its
      ;; pending indexes so general resolution sees preceding batch writes.
@@ -1701,12 +1712,13 @@
                             (or (transact-prepared db prepared (or tx-meta {}))
                                 ;; A declined caller snapshot may become eligible
                                 ;; under this writer's current schema/options.
-                                (when-let [outcome (db/prepare-compiled-request db txs)]
-                                  (transact-prepared db [:compiled outcome txs] (or tx-meta {})))))
+                                (when-let [outcome (db/prepare-compiled-request
+                                                     db txs {:request-shape request-shape})]
+                                  (transact-prepared db [:compiled outcome txs request-shape] (or tx-meta {})))))
                           (db/transact-tx-data
                             (db/->TxReport db (if s? (db/transfer db (:store db)) db)
                                            [] {} (or tx-meta {}))
-                            txs s?)))]
+                            txs s? nil request-shape)))]
        (cond
          *datalog-write-control*
          (let [conn (atom db0)
@@ -1794,11 +1806,11 @@
        (throw e)))))
 
 (defn- build-tx-response
-  [deps server skey db-name txs args writing? tx-meta response-kind prepared]
+  [deps server skey db-name txs args writing? tx-meta response-kind prepared request-shape]
   (let [db0 (get-in (db-state deps server db-name)
                     [(if writing? :wdt-db :dt-db)])
         s?  (last args)
-        rp  (transact* deps db0 txs tx-meta s? server db-name writing? prepared)
+        rp  (transact* deps db0 txs tx-meta s? server db-name writing? prepared request-shape)
         db1 (:db-after rp)
         ;; Simulated overlays belong only to the report, never to later requests.
         _   (when-not (or s? (::group-committed? rp))
@@ -1855,11 +1867,12 @@
                               :copy-in ((:copy-in deps) server skey)
                               :request (nth args 1)
                               (raise "Missing :mode when transact data" {}))
+                        request-shape (when-not (last args) (txcompile/stable-request-shape txs))
                         prepared
                         (when-not (last args)
                           (prepare-server-tx
                             (get (db-state deps server db-name)
-                                 (if writing? :wdt-db :dt-db)) txs))]
+                                 (if writing? :wdt-db :dt-db)) txs request-shape))]
                     (with-datalog-transaction-slot
                       deps server skey db-name writing? (last args)
                       (fn []
@@ -1871,7 +1884,7 @@
                               (:request-type client-op)
                               (:request-hash client-op)
                               (:response-kind client-op)))
-                          response-kind prepared))))))]
+                          response-kind prepared request-shape))))))]
           (if (or replay? (= response-kind cop/tx-data-ack-response-kind))
             (write-result! deps skey response)
             (write-tx-response! deps skey response)))))))
@@ -1922,7 +1935,7 @@
                       deps server skey db-name writing? false
                       #(build-tx-response deps server skey db-name forms [db-name nil false] writing?
                                           metadata cop/tx-data+db-info-response-kind
-                                          (when outcome [:compiled outcome forms]))))))]
+                                          (when outcome [:compiled outcome forms]) nil)))))]
           (if replay? (write-result! deps skey response) (write-tx-response! deps skey response)))))))
 
 (defn tx-data-ack

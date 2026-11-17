@@ -24,6 +24,7 @@
     (throw (ex-info "A prepared transaction requires an operation vector" {:error :prepared/program-shape})))
   (when (seq (dissoc options :batch?))
     (throw (ex-info "Unknown prepared transaction options" {:error :prepared/options})))
+  (template/validate-definition-metadata! (meta operations))
   (template/prepare-template client-context
     (mapv #(if (instance? RemoteOperation %) (:compiled %) (source %)) operations) options))
 

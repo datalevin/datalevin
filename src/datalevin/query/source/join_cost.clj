@@ -117,20 +117,69 @@
   (if (= :core (:kind choice)) (:covers choice)
     (into #{} (map #(if (vector? %) (first %) %)) (:covers choice))))
 
+(defn- qualification-model
+  "Recognize cheap mandatory leaf reads from captured schemas. A leaf's value
+  is not used by another work item, but its existence still qualifies the key.
+  Do not infer uniqueness, emptiness, or selectivity from this preference."
+  [choices row-count]
+  (let [mandatory (filter #(or (= :access (:kind %)) (:union-estimate (:value %))) choices)
+        uses (reduce (fn [m choice]
+                       (let [work (root-work choice)]
+                         (if (= 1 (count work))
+                           (reduce #(update %1 (:variable %2) (fnil into #{}) work)
+                                   m (:columns choice)) m))) {} mandatory)
+        joins (into #{} (keep (fn [[v work]] (when (< 1 (count work)) v))) uses)
+        qualify? (fn [{:keys [kind value requires columns]}]
+                   (and (= :access kind) (seq requires)
+                        (every? #(contains? uses (:variable %)) columns)
+                        (set/subset? (set/intersection joins (set (map :variable columns)))
+                                     (set (map :variable requires)))
+                        (let [rows (row-count value)]
+                          (and (number? rows) (<= 0 rows 1)))))
+        leaves (filter qualify? mandatory)
+        components
+        (into #{}
+          (keep (fn [[_ work]]
+                  (when (<= 3 (count work) 8)
+                    (let [variables (into #{} (mapcat #(map :variable (:columns %)))
+                                          (filter #(seq (set/intersection work (root-work %))) mandatory))
+                          attached (filter #(some (comp variables :variable) (:requires %)) leaves)
+                          component (into work (mapcat root-work) attached)]
+                      (when (and (seq attached) (<= (count component) 8)) component))))) uses)]
+    {:qualify? qualify? :components components}))
+
+(defn- qualification-prefix
+  "Price completion of a small mandatory neighborhood. This is an advisory
+  alternative driver only when full-plan estimates exceed tuple capacity."
+  [selected inputs row-count model components]
+  (loop [remaining (seq selected) done #{} prefix []]
+    (when-let [choice (first remaining)]
+      (when-not (get-in choice [:value :cost-barrier?])
+        (let [done (into done (root-work choice)) prefix (conj prefix choice)]
+          (if-let [component (some #(when (set/subset? % done) %) components)]
+            (when-let [cost (price prefix inputs row-count model)]
+              (assoc (select-keys cost [:estimated-ns :work-rows :peak-rows]) :work component))
+            (recur (next remaining) done prefix)))))))
+
 (defn select
   "Keep the original feasible plan, then compare complete alternatives with a
-  different first access. All attempts share the remaining 4096-state allowance
-  and a 20 ms optional CPU budget. Small plans use at most 128 additional
-  states and 1 ms. Unknown estimates retain the original plan."
+  different first access. Account admitted search states separately from
+  cancellation checks, and share the remaining allowance across starting work.
+  All attempts share 4096 states and a 20 ms optional CPU budget. Small plans
+  use at most 128 additional states and 1 ms. Unknown estimates retain the
+  original plan."
   ([arguments row-count] (select arguments row-count nil))
   ([arguments row-count model]
   (let [checks (volatile! 0) check! (:check! arguments)
-        counted! #(do (vreset! checks (inc (long @checks))) (check!))
-        baseline (dependency/schedule (assoc arguments :check! counted!))
+        visit! #(vswap! checks inc)
+        baseline (dependency/schedule (assoc arguments :visit! visit!))
         initial (when (= :complete (:status baseline)) (price (:choices baseline) (:inputs arguments) row-count model))
         started (System/nanoTime) maximum (long (:max-states arguments))]
     (if-not initial baseline
       (let [choices (:choices arguments)
+            qualification (qualification-model choices row-count)
+            qualification? (:qualify? qualification)
+            qualifications? (boolean (seq (:components qualification)))
             seed (into {} (map (juxt :variable identity)) (:inputs arguments))
             roots (->> choices
                        (filter #(and (or (= :access (:kind %)) (:union-estimate (:value %)))
@@ -148,7 +197,8 @@
             ;; its scan/lookup variants cannot discover a different driver.
             first-access (first (filter #(or (= :access (:kind %)) (:union-estimate (:value %))) (:choices baseline)))
             work-key root-work
-            roots (remove #(= (work-key first-access) (work-key %)) roots)
+            roots (if qualifications? roots
+                      (remove #(= (work-key first-access) (work-key %)) roots))
             ;; Several conditional unions have mutually dependent interfaces.
             ;; A short clause list can still need the regular lookahead bound.
             small? (and (<= (count (:required-work arguments)) 8) (<= (count choices) 32)
@@ -158,8 +208,12 @@
             early (vec (take-while #(and (= :core (:kind %)) (not (:union-estimate (:value %)))) choices))
             timed? (some? (:estimated-ns initial))
             row-key (if timed? (juxt :estimated-ns :work-rows :peak-rows) (juxt :work-rows :peak-rows))
+            row-limit (:intermediate-row-limit arguments)
+            risky? #(and row-limit (> (double (:peak-rows %)) (double row-limit)))
+            prefix #(qualification-prefix (:choices %) (:inputs arguments) row-count model (:components qualification))
+            initial-prefix (when (risky? initial) (prefix baseline))
             _ (when-not (pos? maximum) (throw (IllegalArgumentException. "invalid search bound")))]
-        (loop [pending (seq roots) best baseline best-price initial evaluated 1 starts []]
+        (loop [pending (seq roots) best baseline best-price initial best-prefix initial-prefix evaluated 1 starts []]
           (if (or (nil? pending) (>= (long @checks) maximum) (>= (- (System/nanoTime) started) budget-ns))
             (assoc best :cost-changed? (not (and (= (count (:choices best)) (count (:choices baseline)))
                                                        (every? true? (map identical? (:choices best) (:choices baseline)))))
@@ -168,28 +222,40 @@
                         :cost-search {:model (if timed? :elapsed :cardinality)
                                       :evaluated evaluated :states @checks :starts starts
                                       :budget-ns budget-ns :max-states maximum
+                                      :qualification-prefix best-prefix
                                       :elapsed-ns (- (System/nanoTime) started)})
             (let [root (first pending)
+                  allowance (max 1 (quot (- maximum (long @checks)) (count pending)))
                   remaining (remove #(identical? root %) (drop (count early) choices))
-                  ;; Keep optional lookahead connected: bind-dependent accesses
-                  ;; precede additional independent scans once their inputs exist.
-                  ordered (into early (cons root (concat (filter #(seq (:requires %)) remaining)
-                                                          (remove #(seq (:requires %)) remaining))))
+                  ;; Qualify an already bound entity before following another
+                  ;; expanding edge. The typed scheduler still supplies every
+                  ;; input and preserves all work, fences and resource rules.
+                  ordered (into early
+                            (cons root
+                              (concat (filter qualification? remaining)
+                                      (filter #(and (seq (:requires %)) (not (qualification? %))) remaining)
+                                      (remove #(seq (:requires %)) remaining))))
                   attempt (try
                             (dependency/schedule
-                              (assoc arguments :choices ordered :max-states (max 1 (- maximum (long @checks)))
+                              (assoc arguments :choices ordered :max-states allowance :visit! visit!
                                      :check! #(do (check!)
-                                                  (let [n (inc (long @checks))]
-                                                    (vreset! checks n)
-                                                    (when (>= n maximum)
-                                                      (throw (ex-info "Cost search budget" {::budget true}))))
                                                   (when (>= (- (System/nanoTime) started) budget-ns)
                                                     (throw (ex-info "Cost search budget" {::budget true}))))))
                             (catch clojure.lang.ExceptionInfo e (when-not (::budget (ex-data e)) (throw e))))
                   priced (when (= :complete (:status attempt)) (price (:choices attempt) (:inputs arguments) row-count model))
+                  candidate-prefix (when (and priced (risky? priced)) (prefix attempt))
+                  prefix-comparison (when (and priced (risky? best-price) (risky? priced)
+                                               candidate-prefix best-prefix
+                                               (or (not timed?) (and (:estimated-ns candidate-prefix) (:estimated-ns best-prefix))))
+                                      (compare (row-key candidate-prefix) (row-key best-prefix)))
                   better? (and priced (or (not timed?) (some? (:estimated-ns priced)))
-                               (neg? (compare (row-key priced) (row-key best-price))))]
-              (recur (next pending) (if better? attempt best) (if better? priced best-price) (inc evaluated)
+                               (cond
+                                 (and (risky? best-price) (not (risky? priced))) true
+                                 (and (not (risky? best-price)) (risky? priced)) false
+                                 (and prefix-comparison (not (zero? prefix-comparison))) (neg? prefix-comparison)
+                                 :else (neg? (compare (row-key priced) (row-key best-price)))))]
+              (recur (next pending) (if better? attempt best) (if better? priced best-price)
+                     (if better? candidate-prefix best-prefix) (inc evaluated)
                      (conj starts (merge {:covers (:covers root) :status (:status attempt)}
                                          (select-keys priced [:work-rows :peak-rows :access-ns :local-ns :estimated-ns
                                                              :estimated-opens :estimated-requests]))))))))))))

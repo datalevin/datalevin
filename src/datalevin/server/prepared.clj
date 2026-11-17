@@ -4,6 +4,7 @@
   "Connection-local prepared operations. Expansion precedes authorization,
   admission and transaction routing; functions are installed after those checks."
   (:require [datalevin.bits :as b]
+            [datalevin.client-op :as cop]
             [datalevin.kv :as kv]
             [datalevin.prepared :as prepared]
             [datalevin.db.tx.template :as template]
@@ -17,7 +18,7 @@
 
 (deftype Entry [type args reader response-writer])
 
-(deftype WriteOperation [source compiled])
+(deftype WriteOperation [source definition-hash compiled])
 (deftype WriteProgram [operations options compiled])
 
 (defn- enabled? [^SelectionKey skey]
@@ -139,7 +140,8 @@
 
 (defn write-template!
   "Compile/refresh only inside the authorized write handler. Explicit shared
-  operations occupy the existing bounded connection registry with templates."
+  operations occupy the existing bounded connection registry with templates.
+  Reusing an operation id in one database requires the same encoded definition."
   [^SelectionKey skey {:keys [args prepare-id] :as message} ctx]
   (if-let [^Entry entry (::entry (meta message))]
     (current-program (.-reader entry) ctx)
@@ -152,11 +154,19 @@
       (let [^LinkedHashMap cache (handles! skey)
             operations (mapv (fn [{:keys [id] :as descriptor}]
                                 (when id (check-id! id))
-                                (let [^Entry prior (when id (.get cache id))]
+                                (let [definition-hash (when id
+                                                        (cop/request-hash
+                                                          [(:form descriptor) (:parameters descriptor)]))
+                                      ^Entry prior (when id (.get cache id))]
                                   (if (and prior (= :prepared-tx-op (.-type prior))
                                            (= db-name (first (.-args prior))))
-                                    (.-reader prior)
-                                    (let [operation (WriteOperation. (txwire/restore-operation descriptor) (atom nil))]
+                                    (let [^WriteOperation operation (.-reader prior)]
+                                      (when-not (= definition-hash (.-definition-hash operation))
+                                        (raise "Prepared operation id already has a different definition"
+                                               {:error :prepared/operation-conflict :handle id}))
+                                      operation)
+                                    (let [operation (WriteOperation. (txwire/restore-operation descriptor)
+                                                                     definition-hash (atom nil))]
                                       (when id
                                         (prepared/remember! cache id (Entry. :prepared-tx-op [db-name] operation nil)))
                                       operation)))) operations)

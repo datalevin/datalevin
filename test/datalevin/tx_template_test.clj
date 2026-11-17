@@ -52,6 +52,52 @@
     (is (= forms (plan/request-forms input)))
     (is (identical? (plan/request-forms input) (plan/request-forms input)))))
 
+(deftest definition-metadata-is-sealed-literal-data
+  (let [annotations {:source :kept :details {:values [nil false 7] :tags #{:a :b}
+                                          :history '(1 2 3)}}
+        nested (with-meta {:value (template/parameter :v)} {:nested :kept})
+        source (with-meta [:db/add 1 :value nested] annotations)
+        program (template/prepare-template context [source] nil)
+        forms (template/materialize program [{:v 42}])]
+    (is (identical? annotations (meta (first forms))))
+    (is (= {:nested :kept} (meta (get-in forms [0 3]))))
+    (is (= 42 (get-in forms [0 3 :value])))))
+
+(deftest metadata-parameters-are-rejected-at-every-literal-boundary
+  (let [marker (template/parameter :metadata)
+        bad {:nested [marker]}
+        forms [(with-meta [:db/add 1 :value 7] bad)
+               [:db/add 1 :value (with-meta {:nested 7} bad)]
+               [:db/add 1 :value (with-meta [7] bad)]
+               [:db/add 1 :value (with-meta #{7} bad)]
+               [:db/add 1 :value (with-meta '(7) bad)]
+               [:db/add 1 :value (with-meta 'literal bad)]
+               [:db/add 1 :value {(with-meta 'key bad) 7}]
+               (with-meta [:db/add 1 :value 7]
+                 {:nested (with-meta {:value 1} bad)})]]
+    (doseq [form forms]
+      (let [failure (try (template/prepare-operation context form)
+                         nil (catch clojure.lang.ExceptionInfo e e))]
+        (is (= :prepared/metadata (:error (ex-data failure))))))
+    (is (thrown? clojure.lang.ExceptionInfo
+          (template/prepare-template context
+            (with-meta [[:db/add 1 :value 7]] bad) nil)))))
+
+(deftest metadata-validation-neither-demands-lazy-data-nor-calls-host-methods
+  (let [effects (atom [])
+        host (proxy [Object clojure.lang.IMeta] []
+               (meta [] (swap! effects conj :meta) {})
+               (hashCode [] (swap! effects conj :hash) 0)
+               (toString [] (swap! effects conj :string) "host"))
+        lazy-value (lazy-seq (swap! effects conj :realized) (list 7))]
+    (doseq [value [host lazy-value]
+            annotations [{:value value} {:nested [{:value value}]}]]
+      (let [failure (try (template/prepare-operation context
+                          (with-meta [:db/add 1 :value 7] annotations))
+                         nil (catch clojure.lang.ExceptionInfo e e))]
+        (is (= :prepared/metadata (:error (ex-data failure))))))
+    (is (empty? @effects))))
+
 (deftest compatible-binding-does-not-revisit-schema-or-host-values
   (let [reads (atom 0) effects (atom [])
         schema (fn [a] (swap! reads inc) ((:schema context) a))

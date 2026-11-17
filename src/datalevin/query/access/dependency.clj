@@ -41,8 +41,10 @@
   includes local operators as well as accesses. check! and reserve! run before
   retaining search state; the caller releases all workspace on return/failure.
   Iterative DFS avoids consuming the JVM stack for long dependency chains.
-  Returns :complete, :infeasible, or :bound without executing any choice."
-  [{:keys [inputs required-work required-vars choices check! reserve! max-states]}]
+  Optional visit! accounts for each admitted search frame, independently of
+  cancellation checks while scanning choices. Returns :complete, :infeasible,
+  or :bound without executing any choice."
+  [{:keys [inputs required-work required-vars choices check! reserve! max-states visit!]}]
   (check!)
   ;; One admitted scratch envelope covers transitions and memo probes, including
   ;; transitions immediately discarded without retaining a new search frame.
@@ -56,6 +58,7 @@
   (let [frame! (fn [known done used index choice]
                  (check!)
                  (reserve! (+ 512 (* 256 (count known)) (* 64 (count done)) (* 128 (count used))))
+                 (when visit! (visit!))
                  {:known known :done done :used used :index index :choice choice})
         initial (frame! (into {} (map (juxt :variable identity)) inputs) #{} #{} 0 nil)]
     (loop [stack [initial] failed #{} visited 1]

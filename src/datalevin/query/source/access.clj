@@ -503,6 +503,9 @@
                                    (map core-choice (sort-by #(get ranks (:id %)) (filter deferred? ordinary))))))
              result (join-cost/select {:inputs input-columns :required-work required
                                           :required-vars live-vars :choices choices
+                                          :intermediate-row-limit
+                                          (quot (long (:retained-bytes (control/limits ctl)))
+                                                (+ 96 (* 16 (max 1 (count live-vars)))))
                                           :check! check! :reserve! own-work! :max-states search-bound}
                                       (fn [plan] (let [[unknown rows] (count-key plan)] (when (zero? (long unknown)) rows)))
                                       (when (not= :cardinality (:cost-model planning))

@@ -224,7 +224,9 @@ Only usable for debug output.
   With {:batch? true}, execute with a vector of parameter maps; all rows form
   one atomic transaction and batch length can vary. Operations may be maps,
   vectors or values from `prepare-tx-op`. Markers inside literal vectors and map
-  values are supported; supply a changing set as one parameter. Scalar updates
+  values are supported; supply a changing set or list as one parameter.
+  Definition metadata is constant literal data; parameters, lazy sequences and
+  host objects in metadata are rejected during preparation. Scalar updates
   and new-entity maps use compiled
   operands when eligible; other inputs retain ordinary transaction semantics.
 

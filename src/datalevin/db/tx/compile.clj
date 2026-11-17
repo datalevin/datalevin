@@ -1447,6 +1447,13 @@
                          forms))
         :ordered)))
 
+(defn stable-request-shape
+  "Carry an immutable request's structural decision across admission. :dynamic
+  records an ordinary decline. Mutable FastLists need a fresh writer snapshot."
+  [forms]
+  (when-not (identical? FastList (class forms))
+    (or (literal-request-shape forms) :dynamic)))
+
 (defn- canonical-scalar-alias?
   [ctx e]
   (or (keyword? e)
@@ -2123,12 +2130,20 @@
         (merge (plan/->TxPlan ctx :ordered forms nil)
                (ordered-independent-prefix ctx infos forms))))))
 
+(defn snapshot-request
+  "Snapshot an exact FastList for planning without inspecting its elements.
+  Custom and lazy containers retain their original identity and demand order."
+  [forms]
+  (if (identical? FastList (class forms)) (vec forms) forms))
+
 (defn compile-tx
   "Select an independent or ordered rule from a pure structural decision.
   With :dynamic? true, retain all remaining input for demanded execution."
   ([ctx forms] (compile-tx ctx forms {}))
   ([ctx forms {:keys [literal-shape request-shape] :as options}]
-   (let [shape (or literal-shape request-shape (literal-request-shape forms))
+   (let [original forms
+         forms (snapshot-request forms)
+         shape (or literal-shape request-shape (literal-request-shape forms))
          ;; Reuse each multi-form independent rule's existing metadata table if
          ;; selection proceeds to mixed/ordered rules. Singletons keep direct
          ;; attribute binding; each table belongs to this captured context.
@@ -2155,8 +2170,10 @@
            :mixed (compile-mixed-region* ctx forms infos)
            nil)]
      (or (when-not (identical? ::small-unique-decline selected) selected)
-         (when (and (nil? literal-shape) (not= false (:ordered? options))
+         (when (and (nil? literal-shape) (not (identical? :dynamic shape))
+                    (not= false (:ordered? options))
                     (not (identical? ::small-unique-decline selected)))
            (compile-ordered-region ctx forms infos))
          (when (and (nil? literal-shape) (:dynamic? options))
-           (compile-program ctx forms))))))
+           ;; A declined snapshot must not freeze the live dynamic cursor.
+           (compile-program ctx original))))))

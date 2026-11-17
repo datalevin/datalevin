@@ -27,12 +27,47 @@
   (or (identical? clojure.lang.PersistentVector (class value))
       (identical? clojure.lang.APersistentVector$SubVector (class value))))
 
+(defn- literal-list? [value]
+  (or (identical? clojure.lang.PersistentList (class value))
+      (identical? clojure.lang.PersistentList$EmptyList (class value))))
+
+(defn- metadata-literal?
+  "Inspect eager literal data only, including metadata on nested literals."
+  [value]
+  (cond
+    (nil? value) true
+    (plain-map? value)
+    (and (metadata-literal? (meta value))
+         (reduce-kv (fn [_ key child]
+                      (if (and (metadata-literal? key) (metadata-literal? child))
+                        true (reduced false)))
+                    true value))
+    (or (literal-vector? value) (literal-list? value)
+        (identical? clojure.lang.PersistentHashSet (class value)))
+    (and (metadata-literal? (meta value)) (every? metadata-literal? value))
+    (compile/prepared-literal? value)
+    (or (not (identical? clojure.lang.Symbol (class value)))
+        (metadata-literal? (meta value)))
+    :else false))
+
+(defn validate-definition-metadata!
+  "Metadata is sealed literal data, never a parameter substitution site."
+  [metadata]
+  (when-not (metadata-literal? metadata)
+    (throw (ex-info "Prepared definition metadata cannot contain parameters, lazy sequences or host objects"
+                    {:error :prepared/metadata})))
+  metadata)
+
 (declare substitution)
 
 (defn- substitutions [value parameters]
+  (validate-definition-metadata! (meta value))
   (if (plain-map? value)
     (do
-      (when-not (every? compile/prepared-literal? (keys value))
+      (when-not (every? (fn [key]
+                          (when (compile/prepared-literal? key)
+                            (validate-definition-metadata! (meta key))
+                            true)) (keys value))
         (throw (ex-info "Prepared definition map keys must be literal scalars"
                         {:error :prepared/definition-key})))
       (reduce-kv (fn [out key child]
@@ -59,18 +94,24 @@
       #(get % key))
 
     (or (identical? clojure.lang.PersistentHashSet (class value))
-        (identical? clojure.lang.PersistentTreeSet (class value)))
+        (identical? clojure.lang.PersistentTreeSet (class value))
+        (literal-list? value))
     (do
+      (validate-definition-metadata! (meta value))
       (doseq [child value]
         (when (substitution child parameters)
-          (throw (ex-info "Bind a parameterized set as one parameter value"
+          (throw (ex-info "Bind a parameterized set or list as one parameter value"
                           {:error :prepared/parameter-container}))))
       nil)
 
     (or (plain-map? value) (literal-vector? value))
     (when-let [children (substitutions value parameters)] (substitute value children))
 
-    :else nil))
+    :else
+    (do
+      (when (identical? clojure.lang.Symbol (class value))
+        (validate-definition-metadata! (meta value)))
+      nil)))
 
 (defn- expression [value parameters]
   (let [runs (substitutions value parameters)
@@ -179,7 +220,8 @@
 
 (defn prepare-operation
   "Compile immutable constants and schema proofs. Compatible operations retain
-  their identity across programs; bound parameter values are never retained."
+  their identity across programs; bound parameter values are never retained.
+  Metadata is constant literal data and cannot contain parameter markers."
   [ctx source]
   (if (and (instance? WriteOp source) (compatible? (:ctx source) ctx))
     source
@@ -223,7 +265,7 @@
   (when-not (and (literal-vector? operations) (seq operations))
     (throw (ex-info "A prepared transaction requires a nonempty operation vector"
                     {:error :prepared/program-shape})))
-  (let [metadata (meta operations)
+  (let [metadata (validate-definition-metadata! (meta operations))
         parameters (LinkedHashSet.)
         scratch (volatile! nil)
         operations (if (= 1 (count operations))

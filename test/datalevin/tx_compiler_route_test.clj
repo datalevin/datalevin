@@ -10,6 +10,24 @@
 
 (use-fixtures :each db-fixture)
 
+(deftest declined-request-shapes-preserve-callback-order-and-writer-state
+  (doseq [wal? [false true]]
+    (with-open [cn (d/create-conn nil {:value {:db/valueType :db.type/long}}
+                    {:wal? wal? :background-sampling? false :snapshot-scheduler? false})]
+      (d/transact! cn [{:db/id 1 :value 0}])
+      (let [callbacks (atom [])
+            forms [[:db/add 1 :value 1]
+                   [:db.fn/call (fn [database]
+                                  (swap! callbacks conj (:value (d/entity database 1)))
+                                  [[:db/add 1 :value 2]])]]
+            events (atom [])
+            report (binding [db/*tx-compiler-observer* (fn [event _] (swap! events conj event))]
+                     (d/transact! cn forms))]
+        (is (= [1] @callbacks))
+        (is (= [0 1 1 2] (mapv :v (:tx-data report))))
+        (is (= [:execute-dynamic] (filterv #{:execute-dynamic} @events)))
+        (is (= 2 (:value (d/entity @cn 1))))))))
+
 (deftest compiler-is-the-only-production-request-planner
   (is (nil? (io/resource "datalevin/db/tx/engine.clj")))
   (doseq [wal? [false true]]

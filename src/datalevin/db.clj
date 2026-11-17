@@ -135,7 +135,9 @@
 (defrecord TxReport [db-before db-after tx-data tempids tx-meta])
 
 (def ^:dynamic *tx-compiler-observer*
-  "Optional diagnostic observer, outside compilation and uninstrumented timings."
+  "Optional diagnostic observer, outside compilation and uninstrumented timings.
+  Server binding retries emit :compiler-exception with :phase and :exception;
+  an observer may throw to reject the retry during tests or diagnostics."
   nil)
 
 ;; (defmethod print-method TxReport [^TxReport rp, ^java.io.Writer w]
@@ -2501,37 +2503,43 @@
   "Capture one pure decision for materialized local/server input. Writer
   admission and error isolation remain the caller's existing responsibility.
   Blind callers may retain their small-unique and unique-value collection policy;
-  request shape always comes from the forms."
+  :request-shape may carry a structural decision from the same immutable forms."
   ([db forms] (prepare-compiled-request db forms nil))
   ([db forms options]
    (when (instance? Store (:store db))
-     (when-let [shape (txcompile/literal-request-shape forms)]
-       (successful-compiled-request db forms shape options)))))
+     (let [forms (txcompile/snapshot-request forms)]
+       (when-let [shape (or (:request-shape options) (txcompile/literal-request-shape forms))]
+         (when-not (identical? :dynamic shape)
+           (successful-compiled-request db forms shape options)))))))
 
 (defn ^:no-doc prepare-local-compiled-request
   "Capture inert plans before caller binding. Timed scalar requests retain their
   pre-writer preparation phase; provisional rejections retain caller correction."
-  [db forms]
+  ([db forms] (prepare-local-compiled-request db forms nil))
+  ([db forms request-shape]
   (when (and (instance? Store (:store db))
              (let [lmdb (.-lmdb ^Store (:store db))]
                (and (not (l/writing? lmdb))
                     (not (Thread/holdsLock (l/write-txn lmdb))))))
-    (when-let [shape (txcompile/literal-request-shape forms)]
-      (when (and (not (identical? :ordered shape))
-                 (or (nil? (l/explicit-transaction-timeout))
-                     (#{:scalar :scalar-operations :scalar-aliases :explicit-additions} shape)))
-        (successful-compiled-request db forms shape {:ordered? false})))))
+    (let [forms (txcompile/snapshot-request forms)]
+      (when-let [shape (or request-shape (txcompile/literal-request-shape forms))]
+        (when (and (not (#{:ordered :dynamic} shape))
+                   (or (nil? (l/explicit-transaction-timeout))
+                       (#{:scalar :scalar-operations :scalar-aliases :explicit-additions} shape)))
+          (successful-compiled-request db forms shape {:ordered? false})))))))
 
 (defn ^:no-doc prepare-classified-blind-request
   "Prepare an admitted blind request without a failed literal probe followed by
   another operand walk. Canonical input still produces a literal plan; runtime
   values bind the collected template. Other families retain normal selection."
-  [db forms {:keys [allow-small-unique? check-unique-avs? ordered?]
+  [db forms {:keys [allow-small-unique? check-unique-avs? ordered? request-shape]
              :or {allow-small-unique? true check-unique-avs? true ordered? true}}]
-  (let [options {:allow-small-unique? allow-small-unique?
+  (let [shape (or request-shape (txcompile/literal-request-shape forms))
+        options {:allow-small-unique? allow-small-unique?
+                 :request-shape (or shape :dynamic)
                  :check-unique-avs? check-unique-avs? :ordered? ordered?}
         attempted? (and (instance? Store (:store db))
-                        (identical? :blind (txcompile/literal-request-shape forms)))
+                        (identical? :blind shape))
         candidate (when attempted?
                     (txcompile/compile-blind-preparation
                       (prepare/make-prepare-ctx db) forms (assoc options :request-shape :blind)))]
@@ -2583,12 +2591,13 @@
       (:store db) (:schema (:ctx plan)) (.-infos ^MixedOperands (:entries plan)))))
 
 (defn- compiled-report
+  "Preserve executor extensions and caller context, clearing attempt-local state."
   [initial report route independent? ctx]
   (when report
-    (cond-> (-> initial
-                (dissoc ::txexec/max-eid-before)
-                (assoc :db-after (:db-after report) :tx-data (:tx-data report)
-                       :tempids (:tempids report) ::compiled-route route))
+    (cond-> (-> (merge initial report)
+                (dissoc ::txexec/max-eid-before ::independent-scalar?)
+                (assoc :db-before (:db-before initial) :tx-meta (:tx-meta initial)
+                       ::compiled-route route))
       independent? (assoc ::independent-scalar? [(:schema ctx) (:tx-data report)]))))
 
 (defn- request-execution-report
@@ -2716,7 +2725,11 @@
                        (let [forms (txplan/request-forms forms)]
                          (when (and outcome *tx-compiler-observer*)
                            (*tx-compiler-observer* :recompile forms))
-                         (let [selected (txcompile/compile-tx ctx forms {:allow-small-unique? true :dynamic? true})]
+                         (let [selected (txcompile/compile-tx
+                                          ctx forms
+                                          (cond-> {:allow-small-unique? true :dynamic? true}
+                                            (:request-shape options)
+                                            (assoc :request-shape (:request-shape options))))]
                            (when (and selected (nil? outcome) *tx-compiler-observer*)
                              (*tx-compiler-observer* :prepared selected))
                            selected))))
@@ -2799,6 +2812,8 @@
   ([initial-report initial-es simulated?]
    (transact-tx-data initial-report initial-es simulated? nil))
   ([initial-report initial-es simulated? owned-max-eid]
+   (transact-tx-data initial-report initial-es simulated? owned-max-eid nil))
+  ([initial-report initial-es simulated? owned-max-eid request-shape]
    (let [^DB db  (:db-before initial-report)
          store   (.-store db)
          tx-time (System/currentTimeMillis)]
@@ -2818,9 +2833,11 @@
                               owned (if source (txcommon/copy-resolver-indexes source owned) owned)]
                           (binding [txcommon/*batch-prepare* nil
                                     txcommon/*resolver-index* (:eavt owned)]
-                            (prepare-local-tx-data (assoc initial-report :db-after owned)
-                                                  initial-es tx-time))))
-                      (prepare-local-tx-data initial-report initial-es tx-time))]
+                            (prepare-local-report (assoc initial-report :db-after owned)
+                                                  initial-es tx-time nil
+                                                  {:stage? true :request-shape request-shape}))))
+                      (prepare-local-report initial-report initial-es tx-time nil
+                                            {:stage? true :request-shape request-shape}))]
          (if simulated?
            (mark-simulated-tx-cache! report)
            (assoc report :db-after
