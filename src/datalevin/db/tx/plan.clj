@@ -122,7 +122,7 @@
 
 (defn unique-av-key
   "Canonicalize unique keys with the pending indexes' scalar/tuple equivalence.
-  Instants use storage milliseconds and decimals ignore scale; operands remain."
+  Date-backed instants use storage milliseconds and decimals ignore scale."
   [[attr value :as av]]
   (let [key (datom/storage-value-key value)]
     (if (identical? key value) av [attr key])))

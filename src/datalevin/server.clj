@@ -2375,6 +2375,16 @@
                       (when snapshot? (server-db-state server db-name)) snapshot?)
     shared))
 
+(defn- invoke-message-handler
+  [handler deps server skey message]
+  (if (or (p/native-request? message)
+          ;; Native values may arrive in copy-in batches.
+          (= :copy-in (:mode message)))
+    (binding [nv/*wire-reader* (native-request-reader deps server skey message)]
+      (handler deps server skey
+               (prepared/expand-message skey (p/resolve-native-request message))))
+    (handler deps server skey message)))
+
 (def ^:private message-handler-map
   (into {}
         (map (fn [[type handler]]
@@ -2384,15 +2394,10 @@
                     (let [shared (prepare-connection-context server skey message)
                           deps (:deps shared)]
                       (try
-                        (if (or (p/native-request? message)
-                                ;; Native values may arrive in copy-in batches.
-                                (= :copy-in (:mode message)))
-                          (binding [nv/*wire-reader*
-                                    (native-request-reader deps server skey message)]
-                            (handler deps server skey
-                                     (prepared/expand-message
-                                       skey (p/resolve-native-request message))))
-                          (handler deps server skey message))
+                        (if-let [observe (::tx-compiler-observer (.-execution ^Server server))]
+                          (binding [db/*tx-compiler-observer* observe]
+                            (invoke-message-handler handler deps server skey message))
+                          (invoke-message-handler handler deps server skey message))
                         (finally
                           (context/clear! (:context shared)))))
                     (catch Exception e
@@ -2743,6 +2748,7 @@
                     dispatcher background sys-conn clients dbs
                     {:background background
                      :copy-options (select-keys opts [:copy-phase-observer :copy-timeout-ms])
+                     ::tx-compiler-observer (::tx-compiler-observer opts)
                      :connection-limits connection-limits
                      :connection-maintenance connection-maintenance
                      :session-maintenance maintenance

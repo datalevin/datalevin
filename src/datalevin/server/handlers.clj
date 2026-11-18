@@ -1666,6 +1666,8 @@
                          :compiler-exception {:phase :server-binding :exception e}))
                      (log/warn e "Server transaction operand binding failed; retrying under the writer")
                      nil)))]
+    (when db/*tx-compiler-observer*
+      (db/*tx-compiler-observer* :server-prepared {:db db :forms txs :plan plan}))
     [:compiled plan txs request-shape])))
 
 (defn- execute-compiled-request!

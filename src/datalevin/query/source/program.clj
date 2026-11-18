@@ -593,7 +593,7 @@
         maximal (scope/interfaces! runtime compiled index potential branch-outputs)
         columns (:inputs maximal)]
     (retain! runtime (containers! runtime (inc (count region-inputs))
-                                  (+ (count columns) (reduce + 0 (map count (vals region-inputs))))))
+                                  (+ (count columns) (long (reduce + 0 (map count (vals region-inputs)))))))
     {:boundary maximal
      :columns columns :optional? (not= (set (map :variable columns)) (set (map :variable (:inputs boundary))))
      :build (fn [inputs selected]
@@ -886,10 +886,10 @@
                        (let [id (:region-id schedule) inputs (or (:input-columns schedule) (get-in @tables [id :inputs]))
                              operators (:operators schedule)
                              _ (retain! runtime (reserve! runtime 0
-                                                  (+ 2048 (* 512 (reduce + (count operators)
+                                                  (+ 2048 (* 512 (long (reduce + (count operators)
                                                                     (map (fn [{:keys [kind value]}]
                                                                            (let [o (if (= :access kind) (get-in value [:path :options]) value)]
-                                                                             (+ (count (:requires o)) (count (:columns o))))) operators))))))
+                                                                             (+ (count (:requires o)) (count (:columns o))))) operators)))))))
                              live (boundary-variables operators (get-in compiled [:regions id :required-vars]))
                              paths (when (:diagnostics runtime) (into {} (map (fn [[path id]] [id path])) (get-in @tables [id :core])))
                              [cols steps descriptions]

@@ -5,11 +5,11 @@ embedded JVM `d/q` and `d/explain`. An adapter exposes typed entityâ€“attributeâ
 (EAV) facts and access paths for retrieving them. Datalevin handles joins,
 residual predicates, supported rules, aggregation, and query results.
 
-This reference targets **Datalevin 1.2.10** and **SPI revision 2**. The SPI was
+This reference targets **Datalevin 1.2.11** and **SPI revision 2**. The SPI was
 introduced in Datalevin 1.2.8; version 1.2.9 adds same-entity fusion and fixes
 boxed-integer interoperability. Revision 2 is the only accepted revision. Fresh cardinalities and bounded
 complete-path lookahead guide fact accesses. Time and transfer estimates remain
-advisory. Version 1.2.10 adds
+advisory. Version 1.2.11 adds
 eligible scalar-predicate export and the optional relational protocols described
 below, plus cost-budgeted estimate preparation and optional dependent regional
 join planning and explicitly requested native text extrema. Existing EAV adapters
@@ -49,8 +49,9 @@ inside a type descriptor are part of that type's identity.
 
 The [1.2.8 release](../CHANGELOG.md#128-2026-10-26) includes the external-source
 protocols, EAV scans and dependent lookups, shared resource controls, and
-embedded `d/q`/`d/explain` entry points. Adapter artifacts have their own versions
-in the federation project.
+embedded `d/q`/`d/explain` entry points. Starting with 1.2.11, adapter artifacts
+in the federation project share Datalevin's release version. Use matching
+versions of Datalevin, federation core, and the adapters in an application.
 
 | Capability | Datalevin 1.2.8 | Datalevin 1.2.9 |
 |---|---|---|
@@ -68,8 +69,8 @@ Datalevin version with your adapter. The
 See the [changelog](../CHANGELOG.md) for the release changes.
 
 The optional `IRelationalQuerySource` and `IRelationalQuerySession` protocols
-require the matching 1.2.10 development build. They are absent from 1.2.8 and
-1.2.9; SPI revision 2 by itself does not advertise their availability.
+and parameterized fragment protocols require Datalevin 1.2.11. SPI revision 2
+by itself does not advertise their availability.
 
 <a id="1-project-boundary"></a>
 <a id="11-four-shape-revision-target"></a>

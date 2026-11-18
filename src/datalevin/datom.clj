@@ -16,6 +16,7 @@
   (:import
    [datalevin.utl BitOps QueryKey]
    [java.util Arrays]
+   [java.time Instant]
    [java.io DataInput DataOutput]))
 
 (declare hash-datom equiv-datom seq-datom nth-datom assoc-datom
@@ -221,6 +222,11 @@
              0)))
        n))))
 
+(defn- millisecond-instant? [x]
+  ;; Typed Instant inputs are coerced to Date before staging. Generic data
+  ;; keeps Instant itself, including values outside the epoch-millisecond range.
+  (and (instant? x) (not (instance? Instant x))))
+
 (defn- collision-kind
   [x]
   (cond
@@ -229,7 +235,7 @@
     (set? x) :set
     (sequential? x) :sequential
     (number? x) :number
-    (instant? x) :instant
+    (millisecond-instant? x) :instant
     :else (class x)))
 
 (defn- numeric-kind
@@ -338,12 +344,12 @@
   (Long/compare (storage-instant-millis a) (storage-instant-millis b)))
 
 (defn storage-value-key
-  "Canonicalize scalar and sequential transaction index keys. Instants retain
-  their type with storage millisecond precision; decimals ignore scale. Tuple
-  components follow the same rules recursively. Original values stay unchanged."
+  "Canonicalize transaction index keys. Date-backed instants compare in
+  milliseconds and decimals ignore scale. Serialized Java time Instants
+  retain full precision, including in sequential values."
   [value]
   (cond
-    (instant? value)
+    (millisecond-instant? value)
     ;; Snapshot mutable dates in owned keys; retain the instant type so a tuple
     ;; instant never aliases a numeric component with the same millisecond value.
     (java.util.Date. (storage-instant-millis value))
@@ -369,20 +375,19 @@
   [a b]
   (cond
     (identical? a b) 0
-    (and (instant? a) (instant? b)) (compare-storage-instants a b)
+    (and (millisecond-instant? a) (millisecond-instant? b)) (compare-storage-instants a b)
     (and (sequential? a) (sequential? b))
     (compare-collision-seqs compare-storage-components a b)
     :else (compare-collision-values a b)))
 
 (defn compare-index-values
-  "Keep numeric equality families and unequal opaque values distinct in pending
-   indexes. Compare scalar/tuple instants at storage millisecond precision and
-   decimals independently of scale, without allocating owned hash keys here.
-   Query predicates retain compare-with-type's existing comparison rules."
+  "Compare pending values without allocating normalized keys. Date-backed
+   instants compare in milliseconds. Serialized Java time Instants retain
+   nanosecond precision, and decimals compare independently of scale."
   [a b]
   (cond
     (identical? a b) 0
-    (and (instant? a) (instant? b)) (compare-storage-instants a b)
+    (and (millisecond-instant? a) (millisecond-instant? b)) (compare-storage-instants a b)
     (and (sequential? a) (sequential? b))
     (compare-collision-seqs compare-storage-components a b)
     (and (not (identical? (class a) (class b)))

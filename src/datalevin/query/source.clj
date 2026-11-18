@@ -4,8 +4,8 @@
   Sources are caller-owned. Sessions and owned-batch cursors belong to one
   invocation. See doc/query-source-spi.md for the current contract and the
   Datalevin 1.2.9 requirements for fusion and boxed-integer interoperability.
-  Optional whole-conjunction relational protocols are available in 1.2.10.
-  Parameterized fragment protocols require the matching development build."
+  Optional whole-conjunction relational and parameterized fragment protocols
+  are available in 1.2.11."
   (:require [datalevin.query.dispatch :as dispatch]
             [datalevin.query.source.contract :as contract]
             [datalevin.query.source.control :as control]

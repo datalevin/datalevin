@@ -27,10 +27,10 @@
         root (some #(when (empty? (get-in % [:region :path])) %) work)
         variants (volatile! 0)
         check! #(control/check-active! (:control runtime))
-        admit! (fn [width]
+        admit! (fn [^long width]
                  (check!)
-                 (when (>= (long @variants) max-variants) (fail! :query-source/limit :planning))
-                 (vswap! variants inc)
+                 (when (>= (long @variants) (long max-variants)) (fail! :query-source/limit :planning))
+                 (vreset! variants (inc (long @variants)))
                  (let [token (control/reserve! (:control runtime)
                                {:retained-bytes (+ 2048 (* 256 width))})]
                    (rt/own! runtime #(control/release! token))))]
@@ -63,7 +63,7 @@
                                                              (:inputs boundary)
                                                              (if (= :negation (:kind boundary)) [] (:columns boundary))
                                                              (:after operator) step)
-                                                    size (reduce + 0 (map count children))
+                                                    size (long (reduce + 0 (map count children)))
                                                     token (control/reserve! (:control runtime)
                                                             {:retained-bytes (+ 1024 (* 64 size))})]
                                                 (rt/own! runtime #(control/release! token))

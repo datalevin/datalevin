@@ -130,10 +130,10 @@
         key (:key demand) vars (vec (parser/find-vars (:qfind parsed)))
         collector (window/collector! runtime parsed)
         sufficient? #(>= (count ((:rows collector))) (long (:limit demand)))
-        initial-requests (:external-requests (control/usage ctl))
-        request-budget (min 2048 (max 8 (quot (:external-requests (control/limits ctl)) 8)))
-        spent? #(or (>= (:windows @(:stats demand)) 8)
-                    (>= (- (:external-requests (control/usage ctl)) initial-requests) request-budget))
+        initial-requests (long (:external-requests (control/usage ctl)))
+        request-budget (min 2048 (max 8 (quot (long (:external-requests (control/limits ctl))) 8)))
+        spent? #(or (>= (long (:windows @(:stats demand))) 8)
+                    (>= (- (long (:external-requests (control/usage ctl))) initial-requests) request-budget))
         outcome
         (loop [size (long (:size demand)) pending (:producers demand)]
           (check!)

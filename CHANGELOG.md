@@ -5,6 +5,9 @@
 ### Added
 - [Admin] server wide administrative tool `dtlv admin` commands.
 - [Bench] TPC-C and TPC-H benchmarks.
+- [Federation] optional relational delegation and parameterized fragment
+  protocols. Federation adapter artifacts share the Datalevin release version,
+  starting with 1.2.11.
 
 ### Fixed
 - [dtlv] interpreter handling of quoted form

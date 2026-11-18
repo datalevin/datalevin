@@ -48,6 +48,18 @@
                                   {:db/unique :db.unique/identity})
         (is (nil? (common/av-first-e database :unique value)))))))
 
+(deftest generic-instant-index-values-preserve-nanoseconds-and-full-range
+  (let [a (java.time.Instant/ofEpochSecond 1 1)
+        b (java.time.Instant/ofEpochSecond 1 2)
+        date (java.util.Date. 1000)]
+    (doseq [wrap [identity vector]]
+      (is (neg? (long (datom/compare-index-values (wrap a) (wrap b)))))
+      (is (neg? (long (datom/compare-index-values
+                        (wrap java.time.Instant/MIN) (wrap java.time.Instant/MAX)))))
+      (is (not (zero? (long (datom/compare-index-values (wrap a) (wrap date))))))
+      (is (not= (plan/unique-av-key [:value (wrap a)]) (plan/unique-av-key [:value (wrap b)])))
+      (is (not= (plan/unique-av-key [:value (wrap a)]) (plan/unique-av-key [:value (wrap date)]))))))
+
 (deftest tuple-index-keys-share-recursive-instant-and-decimal-equivalence
   (let [date (java.util.Date. 1000)
         timestamp (doto (java.sql.Timestamp. 1000) (.setNanos 123456))

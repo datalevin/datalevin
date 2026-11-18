@@ -44,8 +44,8 @@
               (keep
                 (fn [keys]
                   (control/check-active! (:control runtime))
-                  (when (<= (count branches) @allowance)
-                    (vswap! allowance - (count branches))
+                  (when (<= (count branches) (long @allowance))
+                    (vreset! allowance (- (long @allowance) (count branches)))
                     (let [interface (build keys)
                           schedules
                           (optional-schedule!
@@ -137,8 +137,8 @@
         operators (:operators root)
         conditional (filterv #(get-in % [:step :conditional-union]) operators)
         ;; Leave room for final validation/executable assembly under small caps.
-        remaining (- (:retained-bytes (control/limits (:control runtime)))
-                     (:retained-bytes (control/usage (:control runtime))))]
+        remaining (- (long (:retained-bytes (control/limits (:control runtime))))
+                     (long (:retained-bytes (control/usage (:control runtime)))))]
     (if (or (empty? conditional) (< remaining 16777216))
       (mapv #(base (get-in % [:region :region-id])) work)
       (let [by-id (into {} (map #(vector (get-in % [:region :region-id]) %)) work)
@@ -208,7 +208,7 @@
   (let [started (System/nanoTime)
         schedules (select-schedules! runtime work planning context)
         elapsed (/ (double (- (System/nanoTime) started)) 1000000.0)
-        accounted (reduce + 0.0 (map :planning-time-ms schedules))
+        accounted (double (reduce + 0.0 (map :planning-time-ms schedules)))
         extra (max 0.0 (- elapsed accounted))
         root (some #(when (empty? (get-in % [:region :path])) (get-in % [:region :region-id])) work)]
     (mapv (fn [schedule]
