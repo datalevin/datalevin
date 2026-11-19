@@ -173,18 +173,18 @@
                       _ (ensure! (every? (set (map :id operators)) (vals core)))
                       available (access/available-inputs! runtime r inputs operators)
                       sources (set (map :source-symbol (:patterns r)))
-                      ;; Every alias needs the same region boundary exports.
+                      ;; Shared operator outputs can be join keys for sibling
+                      ;; accesses even when the final result omits them.
                       needed (into (:required-vars r)
                                    (mapcat (fn [operator]
                                              (map :variable
                                                (concat (:requires operator)
+                                                       (:columns operator)
                                                        (get-in operator [:step :scope-bindings :columns]))))) operators)
                       requests (into []
                                      (keep (fn [entry]
                                              (when (and (:descriptor entry) (contains? sources (:symbol entry)))
                                                (let [context (:request (prepared-groups (:symbol entry)))
-                                                     ;; Scoped operators may consume a fact identity
-                                                     ;; that is absent from the final projection.
                                                      request (region/request! runtime (assoc r :required-vars needed) entry context available
                                                                 (get-in prepared [:planning :max-alternatives]))]
                                                  (envelope/captured-request! runtime request entries))))) entries)]

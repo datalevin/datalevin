@@ -3,12 +3,14 @@
   (:refer-clojure :exclude [run!])
   (:require [clojure.set :as set]
             [datalevin.parser :as parser]
+            [datalevin.query.aggregate :as aggregate]
             [datalevin.query.execute :as execute]
             [datalevin.query.source :as source]
             [datalevin.query.source.batch :as batch]
             [datalevin.query.source.contract :as contract]
             [datalevin.query.source.control :as control]
             [datalevin.query.source.diagnostics :as diagnostics]
+            [datalevin.query.source.expression :as expression]
             [datalevin.query.source.extrema :as extrema]
             [datalevin.query.source.permissions :as permissions]
             [datalevin.query.source.region :as region]
@@ -17,7 +19,7 @@
             [datalevin.query.source.session :as session]
             [datalevin.query.source.value :as value :refer [fail!]]
             [datalevin.spill :as spill])
-  (:import [datalevin.parser Aggregate FindColl FindRel FindScalar FindTuple Pattern Predicate Variable]
+  (:import [datalevin.parser Aggregate Constant FindColl FindRel FindScalar FindTuple Pattern Predicate Variable]
            [java.io Closeable]
            [java.util List]))
 
@@ -32,6 +34,15 @@
          (#{'count 'count-distinct 'sum 'min 'max} (get-in element [:fn :symbol])))
     {:kind :aggregate :operator (keyword (name (get-in element [:fn :symbol])))
      :variable (:symbol (first (:args element)))}))
+
+(defn- local-having? [having elements]
+  (or (empty? having)
+      (let [aggregates (into #{} (filter #(= :aggregate (:kind %))) elements)]
+        (every? (fn [predicate]
+                  (and (expression/scalar-functions (get-in predicate [:fn :symbol]))
+                       (every? #(or (instance? Constant %) (contains? aggregates (projection %)))
+                               (:args predicate))))
+                having))))
 
 (defn- whole-predicates
   "Flatten a completely represented scalar conjunction for SQL. Chained scalar
@@ -207,7 +218,7 @@
                (set/subset? ignore-nil (into #{} (keep #(when (#{:min :max} (:operator %)) (:variable %))) elements))
                (every? #(or (not (nullable (:variable %))) (= :variable (:kind %))
                             (and (#{:min :max} (:operator %)) (contains? ignore-nil (:variable %)))) elements)
-               (empty? (:rules compiled)) (empty? (:qhaving parsed))
+               (empty? (:rules compiled)) (local-having? (:qhaving parsed) elements)
                (not (and (:qreturn-map parsed) (seq (:qorder parsed))))
                (nil? *math-context*)
                (every? #(or (instance? Pattern %) (instance? Predicate %)
@@ -255,7 +266,10 @@
       (when-let [request (request compilation input)]
         (let [request-token (rt/charge-copy! runtime (dissoc request :control))
               _ (retain! runtime request-token)
-              window (window/specification (get-in compilation [:compiled :parsed]))
+              parsed (:parsed input)
+              ;; An exact window must apply HAVING before offset and limit.
+              window (when-not (seq (:qhaving parsed))
+                       (window/specification (get-in compilation [:compiled :parsed])))
               _ (when window (retain! runtime (rt/charge-copy! runtime window)))
               bounded (when (and window (satisfies? source/IRelationalWindowSource provider))
                         (rt/invoke runtime :planning
@@ -301,7 +315,7 @@
                           :access {:kind :relational} :columns (:columns request)}]
                  :operators [] :result-window (when bounded window)}))
             {:group group :response response :request request
-             :parsed (cond-> (get-in input [:parsed]) bounded (assoc :qoffset 0))})))))))
+             :parsed (cond-> parsed bounded (assoc :qoffset 0))})))))))
 
 (defn- result-query [parsed columns]
   (let [elements (mapv #(parser/->Variable (:variable %)) columns)
@@ -350,6 +364,9 @@
   [runtime {:keys [group response request parsed]} internal?]
   (let [ctl (:control runtime) check! #(control/check-active! ctl)
         columns (:columns response) vars (mapv :variable columns)
+        keep-group? (when-let [having (seq (:qhaving parsed))]
+                      (aggregate/compile-having having (parser/find-elements (:qfind parsed))
+                        {:check! check! :prepare-call (partial expression/prepare-call runtime)}))
         descriptor (get-in request [:sources 0 :descriptor])
         open (merge (:context group)
                     {:source-symbol (get-in request [:sources 0 :symbol]) :region-id 0
@@ -383,10 +400,11 @@
                       (vreset! seen n)
                       (when (> n (long (get-in request [:window :limit])))
                         (fail! :query-source/invalid :fetch))))
-                  (if bounded ((:add! bounded) row)
-                    (do (retain! runtime (rt/charge-copy! runtime row))
-                        (retain! runtime (control/reserve! ctl {:retained-bytes 128}))
-                        (.cons ^clojure.lang.IPersistentCollection collected (value/owned-copy row check!)))))
+                  (when (or (nil? keep-group?) (keep-group? row))
+                    (if bounded ((:add! bounded) row)
+                      (do (retain! runtime (rt/charge-copy! runtime row))
+                          (retain! runtime (control/reserve! ctl {:retained-bytes 128}))
+                          (.cons ^clojure.lang.IPersistentCollection collected (value/owned-copy row check!))))))
                 (diagnostics/batch! runtime trace (:row-count batch) (:byte-count batch))
                 (finally (control/release! (:reservation batch))))
               (when-not (:exhausted? batch) (recur))))

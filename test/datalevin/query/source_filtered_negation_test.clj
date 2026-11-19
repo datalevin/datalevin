@@ -30,6 +30,53 @@
       (is (= #{[1] [2] [5]} (d/q q s [1 2 3 4 5 6 2])))
       (is (closed? s)))))
 
+(deftest keyed-witnesses-use-the-complete-negative-correlation
+  (let [outer (fake/source (fake/info {:late {:entity-type :long :value-type :long}})
+                [[1 :late 10] [1 :late 20] [2 :late 10] [3 :late 20]])
+        facts (fake/info {:supplier {:entity-type :long :value-type :long}})
+        inner (fake/source facts [[1 :supplier 10] [2 :supplier 10] [2 :supplier 20]]
+                           {:mode :lookup :replay :unstable
+                            :consumption {:opens :once :max-open-cursors 1}})
+        q '[:find ?order ?supplier ?tag :in $outer $inner [?tag ...]
+            :where [$outer ?order :late ?supplier]
+            (not-join [?order ?supplier]
+              [$inner ?order :supplier ?other] [(not= ?supplier ?other)])]
+        tags [:first :second]
+        plan (d/explain {:run? true} q outer inner tags)
+        step (some #(when (= :witness-lookup (:kind %)) %)
+                   (mapcat :operators (:regions plan)))]
+    (is (= 4 (:result-rows plan)))
+    ;; One lookup key can have two supplier correlations. Preserve both
+    ;; unrelated outer tags for each correlation that has no witness.
+    (is (= #{[1 10 :first] [1 10 :second] [3 20 :first] [3 20 :second]}
+           (d/q q outer inner tags)))
+    (is (= ['not=] (:predicates step)))
+    (is (= 4 (get-in step [:actual :input-rows])))
+    (is (= 2 (get-in step [:actual :output-rows])))
+    (is (closed? outer))
+    (is (closed? inner))))
+
+(deftest keyed-witness-still-observes-a-late-fetch-failure
+  (let [outer (fake/source (fake/info {:late {:entity-type :long :value-type :long}}) [[1 :late 10]])
+        pages (atom 0)
+        inner (fake/source (fake/info {:supplier {:entity-type :long :value-type :long}})
+                [[1 :supplier 20] [1 :supplier 30]]
+                {:mode :lookup
+                 :hooks {:fetch (fn [_]
+                                  (when (= 2 (swap! pages inc))
+                                    (throw (ex-info "late fetch failure" {:error :query-source/invalid}))))}})
+        q '[:find ?order :in $outer $inner :query-source {:limits {:batch-rows 1}}
+            :where [$outer ?order :late ?supplier]
+            (not-join [?order ?supplier]
+              [$inner ?order :supplier ?other] [(not= ?supplier ?other)])]
+        plan (d/explain {:run? false} q outer inner)
+        failure (try (d/q q outer inner) nil
+                     (catch clojure.lang.ExceptionInfo e (ex-data e)))]
+    (is (some #(= :witness-lookup (:kind %)) (mapcat :operators (:regions plan))))
+    (is (= 2 @pages))
+    (is (= :query-source/invalid (:error failure)))
+    (is (closed? inner))))
+
 (deftest optional-filter-retains-unmatched-and-below-threshold-rows
   (let [s (provider)
         q '[:find ?e ?w ?witness :in $s [[?e ?witness]]

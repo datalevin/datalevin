@@ -17,6 +17,7 @@
             [datalevin.query.source.arithmetic :as arithmetic]
             [datalevin.query.source.collection :as collection]
             [datalevin.query.source.control :as control]
+            [datalevin.query.source.cursor :as cursor]
             [datalevin.query.source.context :as context]
             [datalevin.query.source.diagnostics :as diagnostics]
             [datalevin.query.source.expression :as expression]
@@ -24,8 +25,10 @@
             [datalevin.query.source.input-program :as input-program]
             [datalevin.query.source.key-demand :as key-demand]
             [datalevin.query.source.fragment :as fragment]
+            [datalevin.query.source.grouped :as grouped]
             [datalevin.query.source.inputs :as inputs]
             [datalevin.query.source.native :as native]
+            [datalevin.query.source.normalize :as normalize]
             [datalevin.query.source.native-plan :as native-plan]
             [datalevin.query.source.native-rules :as native-rules]
             [datalevin.query.source.planning :as planning]
@@ -316,6 +319,27 @@
               (ensure! (= output-cols (mapv key (sort-by val (:attrs result)))))
               (:tuples result))))))))
 
+(declare finish-relation!)
+
+(defn- grouped-factory [runtime check! site run-region]
+  (let [variables (:outputs site)
+        child (first (:branches site))]
+    (->StepFactory #{} variables
+      (fn [input-cols]
+        (->MaterializedStep (set input-cols) (into input-cols (remove (set input-cols)) variables)
+          (fn [outer]
+            (check!)
+            (if (.isEmpty ^List outer)
+              outer
+              (let [seed (relation/relation! {} (doto (FastList.) (.add (object-array 0))))
+                    rows (finish-relation! runtime (:query site) (run-region child seed) nil)
+                    _ (retain! runtime (containers! runtime (count rows) (count variables)))
+                    tuples (FastList. (count rows))]
+                (doseq [row rows] (check!) (.add tuples (object-array row)))
+                (:tuples (joined! runtime check!
+                           (relation/relation! (zipmap input-cols (range)) outer)
+                           (relation/relation! (zipmap variables (range)) tuples)))))))))))
+
 (defn- core-schema [region native-specs initial produced check!]
   (if (empty? (:core-clauses region))
     (with-meta initial {:constant-constraints []})
@@ -387,25 +411,27 @@
             initial
             (reduce
               (fn [schema site]
-                (let [branches
-                      (mapv (fn [branch]
-                              (let [body (get schemas (child-id branch))]
-                                (if (= :rule (:kind site))
-                                  (reduce (fn [m [v [tag actual]]]
-                                            (if (= :var tag)
-                                              (update m actual merge-column
-                                                      (assoc (or (body v) (column v :data true)) :variable actual)) m))
-                                          {} (:arguments branch))
-                                  (add-columns body
-                                    (map (fn [[v _]] (column v :keyword false))
-                                         (get-in compiled [:regions (child-id branch) :patterns 0 :restore]))))))
-                            (filter #(get-in compiled [:regions (child-id %) :live?]) (:branches site)))
-                      outputs
-                      (mapv (fn [v]
-                              (let [cs (mapv #(or (get % v) (get schema v) (column v :data true)) branches)]
-                                (column v (if (and (seq cs) (apply = (map :type cs))) (:type (first cs)) :data)
-                                        (boolean (some :nullable? cs))))) (canonical (:exports site) check!))]
-                  (add-columns schema outputs))) initial
+                (if (= :grouped-query (:kind site))
+                  (add-columns schema (grouped/columns site (get schemas (first (:branches site)))))
+                  (let [branches
+                        (mapv (fn [branch]
+                                (let [body (get schemas (child-id branch))]
+                                  (if (= :rule (:kind site))
+                                    (reduce (fn [m [v [tag actual]]]
+                                              (if (= :var tag)
+                                                (update m actual merge-column
+                                                        (assoc (or (body v) (column v :data true)) :variable actual)) m))
+                                            {} (:arguments branch))
+                                    (add-columns body
+                                      (map (fn [[v _]] (column v :keyword false))
+                                           (get-in compiled [:regions (child-id branch) :patterns 0 :restore]))))))
+                              (filter #(get-in compiled [:regions (child-id %) :live?]) (:branches site)))
+                        outputs
+                        (mapv (fn [v]
+                                (let [cs (mapv #(or (get % v) (get schema v) (column v :data true)) branches)]
+                                  (column v (if (and (seq cs) (apply = (map :type cs))) (:type (first cs)) :data)
+                                          (boolean (some :nullable? cs))))) (canonical (:exports site) check!))]
+                    (add-columns schema outputs)))) initial
               (filter #(and (= id (:parent-region %)) (not= :negation (:kind %))) (:sites compiled)))
             final (core-schema r native-specs initial produced check!)]
         (assoc schemas id final))) {} (reverse (:regions compiled))))
@@ -606,6 +632,51 @@
 
 (defrecord ^:private Program [runtime compilation planned root input regions state runner])
 
+(defn- witness-comparison [runtime inputs returned node]
+  (let [operand (fn [{v :symbol}]
+                  ;; Ordinary access unifies shared cells, then uses the
+                  ;; returned representation when applying residuals.
+                  (if-some [i (returned v)]
+                    (fn [_ row] (nth row i))
+                    (let [i (int (inputs v))]
+                      (fn [^objects outer _] (aget outer i)))))
+        [left right] (mapv operand (:args node))
+        compare-values (resolve/resolve-pred (get-in node [:fn :symbol]) {})]
+    (fn [outer row]
+      (control/check-active! (:control runtime))
+      (compare-values (left outer row) (right outer row)))))
+
+(defn- witness-lookup [runtime region core input-cols operators]
+  ;; Subtraction observes only the correlation keys of a negative body.
+  ;; A single keyed access followed by row comparisons needs no materialized
+  ;; provider relation. All other selected schedules keep their normal steps.
+  (when (= :negative (peek (:path region)))
+    (let [[first-op & residual] operators
+          access (:value first-op)
+          options (get-in access [:path :options])
+          method (get-in access [:path :implementation])
+          nodes (into {} (map (fn [{:keys [path node]}] [(core path) node])) (:core-clauses region))
+          preds (mapv #(when (= :core (:kind %)) (nodes (get-in % [:value :id]))) residual)]
+      (when (and (= :access (:kind first-op)) (seq (:requires options))
+                 (satisfies? cursor/IWitnessLookup method)
+                 (= (set input-cols) (:required-vars region))
+                 (seq preds)
+                 (every? #(and (instance? Predicate %)
+                               (#{'= 'not= '< '<= '> '>=} (get-in % [:fn :symbol]))
+                               (= 2 (count (:args %)))
+                               (every? (fn [arg] (instance? Variable arg)) (:args %))) preds))
+        (let [inputs (zipmap input-cols (range))
+              returned (zipmap (map :variable (:columns options)) (range))
+              step (->MaterializedStep (set input-cols) input-cols
+                     (fn [tuples]
+                       (let [checks (mapv #(witness-comparison runtime inputs returned %) preds)]
+                         (cursor/-matching-inputs! method access input-cols tuples
+                           (fn [outer row] (every? #(% outer row) checks))))))]
+          [input-cols [step]
+           [{:operator-id 0 :kind :witness-lookup :inputs input-cols :outputs input-cols
+             :source (:source-symbol options) :alternative-id (:alternative-id options)
+             :covers (:covers options) :predicates (mapv #(get-in % [:fn :symbol]) preds)}]])))))
+
 (defn- operator-description [compiled native-specs region-id paths index {:keys [kind value]} inputs outputs]
   (let [path (get paths (:id value))
         node (:node (some #(when (= path (:path %)) %) (get-in compiled [:regions region-id :core-clauses])))
@@ -683,12 +754,14 @@
                         seeds (core-seeds! runtime check! compiled id native-specs inputs)]
                     (doseq [[index site] (map-indexed vector (:sites compiled))
                             :when (and (= id (:parent-region site)) (seq (:branches site)))]
-                      (let [parent (scope-parent-columns site schema seeds all-schemas region-inputs check!)
-                            outputs (mapv (fn [b] (branch-output (child-id b) (get all-schemas (child-id b)))) (:branches site))
-                            boundary (scope/interfaces! runtime compiled index parent outputs)]
-                        (vswap! boundaries conj boundary)
-                        (doseq [branch (:branches boundary) :when (not (:empty? branch))]
-                          (region! (:region-id branch) (:inputs branch)))))))]
+                      (if (= :grouped-query (:kind site))
+                        (region! (first (:branches site)) [])
+                        (let [parent (scope-parent-columns site schema seeds all-schemas region-inputs check!)
+                              outputs (mapv (fn [b] (branch-output (child-id b) (get all-schemas (child-id b)))) (:branches site))
+                              boundary (scope/interfaces! runtime compiled index parent outputs)]
+                          (vswap! boundaries conj boundary)
+                          (doseq [branch (:branches boundary) :when (not (:empty? branch))]
+                            (region! (:region-id branch) (:inputs branch))))))))]
           (when (get-in compiled [:regions (:root-region compiled) :live?])
             (region! (:root-region compiled) root-columns))
           @boundaries)))))
@@ -842,27 +915,32 @@
                                               (assoc :scalar-estimate :at-most-one)))))
                                   (doseq [[index site] (map-indexed vector (:sites compiled))
                                           :when (= id (:parent-region site))]
-                                    (let [parent (scope-parent-columns site schema seeds all-schemas region-inputs check!)
-                                          branch-outputs
-                                          (mapv (fn [b]
-                                                  (let [id (child-id b)]
-                                                    (branch-output id (get all-schemas id)))) (:branches site))
-                                          boundary (scope/interfaces! runtime compiled index parent branch-outputs)
-                                          bindings (when caller-bindings?
-                                                     (scope-bindings runtime check! compiled native-specs index site schema
-                                                       all-schemas region-inputs branch-outputs boundary run-region))
-                                          captured (or (:boundary bindings) boundary)]
-                                      (doseq [branch (:branches captured)
-                                              :when (get-in compiled [:regions (:region-id branch) :live?])]
-                                        (region! (:region-id branch) (:inputs branch)))
-                                      (add! (:path site) (:inputs boundary)
-                                            (if (= :negation (:kind site)) [] (:columns boundary))
-                                            (cond-> (boundary-factory runtime check! boundary run-region)
-                                              bindings (assoc :scope-bindings (dissoc bindings :boundary))
-                                              (not= :negation (:kind site))
-                                              (assoc :conditional-union
-                                                (conditional-union runtime check! compiled id site boundary
-                                                  branch-outputs run-region))))))
+                                    (if (= :grouped-query (:kind site))
+                                      (let [child-id (first (:branches site))]
+                                        (region! child-id [])
+                                        (add! (:path site) [] (grouped/columns site (get all-schemas child-id))
+                                              (grouped-factory runtime check! site run-region)))
+                                      (let [parent (scope-parent-columns site schema seeds all-schemas region-inputs check!)
+                                            branch-outputs
+                                            (mapv (fn [b]
+                                                    (let [id (child-id b)]
+                                                      (branch-output id (get all-schemas id)))) (:branches site))
+                                            boundary (scope/interfaces! runtime compiled index parent branch-outputs)
+                                            bindings (when caller-bindings?
+                                                       (scope-bindings runtime check! compiled native-specs index site schema
+                                                         all-schemas region-inputs branch-outputs boundary run-region))
+                                            captured (or (:boundary bindings) boundary)]
+                                        (doseq [branch (:branches captured)
+                                                :when (get-in compiled [:regions (:region-id branch) :live?])]
+                                          (region! (:region-id branch) (:inputs branch)))
+                                        (add! (:path site) (:inputs boundary)
+                                              (if (= :negation (:kind site)) [] (:columns boundary))
+                                              (cond-> (boundary-factory runtime check! boundary run-region)
+                                                bindings (assoc :scope-bindings (dissoc bindings :boundary))
+                                                (not= :negation (:kind site))
+                                                (assoc :conditional-union
+                                                  (conditional-union runtime check! compiled id site boundary
+                                                    branch-outputs run-region)))))))
                                   (swap! interfaces assoc id {:inputs inputs :operators @operators :core @core})))]
                         (when (:live? (nth (:regions compiled) root)) (region! root root-columns))
                         (vreset! tables @interfaces)
@@ -893,7 +971,9 @@
                              live (boundary-variables operators (get-in compiled [:regions id :required-vars]))
                              paths (when (:diagnostics runtime) (into {} (map (fn [[path id]] [id path])) (get-in @tables [id :core])))
                              [cols steps descriptions]
-                             (reduce (fn [[cols steps descriptions] [index {:keys [kind value] :as operator}]]
+                             (or (witness-lookup runtime (get-in compiled [:regions id]) (get-in @tables [id :core])
+                                                 (mapv :variable inputs) operators)
+                                 (reduce (fn [[cols steps descriptions] [index {:keys [kind value] :as operator}]]
                                        (let [step (if (= :access kind)
                                                     (plan/access-step (:expr value) (:path value)
                                                       (query-access/complete-demand :exact nil)
@@ -907,7 +987,7 @@
                                          [(:cols step) (conj steps step)
                                           (cond-> descriptions (:diagnostics runtime)
                                             (conj (operator-description compiled native-specs id paths index operator cols (:cols step))))]))
-                                     [(mapv :variable inputs) [] []] (map-indexed vector operators))
+                                     [(mapv :variable inputs) [] []] (map-indexed vector operators)))
                              _ (when (:diagnostics runtime)
                                  (diagnostics/region! runtime (assoc (access/explain! runtime schedule)
                                                                :program-id program-id :operators descriptions)))]
@@ -980,18 +1060,11 @@
     (catch Throwable e (fail-program! (:runtime program) (:compilation program) e))
     (finally (compare-and-set! (:state program) :running :finished))))
 
-(defn result!
-  "Complete a compiled query through the shared collector, aggregates, windows
-  and return-shape processor. Realize all lazy work and own public values before
-  the invocation closes. No external rows or session plans enter native caches."
-  [runtime program]
-  (ensure! (and (instance? Program program)
-                (identical? (:control runtime) (get-in program [:runtime :control]))
-                (= (:query-id runtime) (get-in program [:runtime :query-id]))))
-  (try
-   (let [rel (execute! runtime program) runtime (:runtime program)
-        parsed (terminal-query! (get-in program [:compilation :compiled]))
-        find (:qfind parsed)
+(defn- finish-relation!
+  "Apply the same witness projection and grouping to derived and public rows.
+  Only a public result has a terminal program and consumes the result quota."
+  [runtime parsed rel public-program]
+  (let [find (:qfind parsed)
         all-vars (into (vec (parser/find-vars find)) (map :symbol) (:qwith parsed))
         check! #(control/check-active! (:control runtime))
         ^List tuples (:tuples rel) n (.size tuples) width (count all-vars)
@@ -1018,14 +1091,14 @@
             (first (result/tuples->return-map return-map [(first tuples)] {:spill-threshold Long/MAX_VALUE}))
             :else (execute/-post-process find return-map tuples)))
         process (execute/result-processor parsed
-                  {:check! check! :wrap-aggregate #(extrema/wrap runtime (:native-extrema program) (:ignore-nil-extrema program) %1
+                  {:check! check! :wrap-aggregate #(extrema/wrap runtime (:native-extrema public-program) (:ignore-nil-extrema public-program) %1
                                      (arithmetic/wrap-aggregate runtime %1 %2))
                    :prepare-call (partial expression/prepare-call runtime)
                    :post-process post-process})
         raw (process parsed context)
         own-row! (fn [row]
                    (check!)
-                   (retain! runtime (rt/charge-result! runtime row))
+                   (when public-program (retain! runtime (rt/charge-result! runtime row)))
                    (retain! runtime (rt/charge-copy! runtime row))
                    (value/owned-copy row check!))]
     (check!)
@@ -1035,7 +1108,18 @@
       (instance? FindColl find) (mapv #(first (own-row! [%])) raw)
       (set? raw) (into (spill/new-spillable-set nil {:spill-threshold Long/MAX_VALUE :initial-capacity n})
                       (map own-row!) raw)
-      :else (mapv own-row! raw)))
+      :else (mapv own-row! raw))))
+
+(defn result!
+  "Finish an executed query and own all public values before closing its sessions."
+  [runtime program]
+  (ensure! (and (instance? Program program)
+                (identical? (:control runtime) (get-in program [:runtime :control]))
+                (= (:query-id runtime) (get-in program [:runtime :query-id]))))
+  (try
+   (let [rel (execute! runtime program)
+         parsed (terminal-query! (get-in program [:compilation :compiled]))]
+     (finish-relation! (:runtime program) parsed rel program))
    (catch Throwable e (fail-program! (:runtime program) (:compilation program) e))))
 
 (defn run!
@@ -1074,7 +1158,10 @@
                     _ (retain! child (rt/charge-copy! child options))
                     options (value/owned-copy options check!)
                     _ (retain! child (rt/charge-copy! child query))
-                    parsed (input-program/parse! parser/parse-query (value/owned-copy query check!))
+                    parsed (input-program/parse!
+                             #(parser/parse-query
+                                (normalize/normalize child % check!))
+                             (value/owned-copy query check!))
                     _ (session/validate-options! child options
                         (into #{} (keep #(when (instance? SrcVar (:variable %)) (get-in % [:variable :symbol]))) (:qin parsed)))
                     _ (when (some? explain-options)

@@ -630,6 +630,15 @@ retains an outer entity when it has no weight above 114, including entities
 with no weight facts. Non-null refinements inside the negative body remain
 local to that body.
 
+A negative body with one dependent access followed solely by binary
+comparisons between variables can report `:witness-lookup` in its region's
+`:operators`. The operator checks each returned row and marks the full outer
+correlation key when all comparisons pass. It exhausts every opened cursor,
+including later batches for keys that already matched. Its actual input and
+output counts measure distinct correlation keys. The cursor counters report
+provider rows, and the parent negation counts outer tuples with their original
+multiplicity.
+
 <a id="attribute-terms-and-access-capabilities"></a>
 
 ### Attribute-term lowering
@@ -974,12 +983,16 @@ their costs exclude the opaque suffix and are not whole-query predictions.
 costs, bounded candidate search, and chosen binding inputs.
 
 Small unordered relational windows can additionally select `:key-demand`.
-The initial policy requires a limit of at most 256, zero offset, plain distinct
-find variables, no `:with`, return map, aggregate or rule, and a mandatory key
-shared by at least two homogeneous positive unions. Other local work must be
-constant bindings. Every acquired group must offer snapshot consistency and
-repeatable ordinary cursor permissions; all qualification accesses must declare
-identical replay. Declining capabilities keep the ordinary complete plan.
+The policy requires zero offset, plain distinct find variables, and no `:with`,
+return map, aggregate or rule. With a limit of at most 256, it can use a
+mandatory key shared by at least two homogeneous positive unions. With a limit
+of at most 512, it can also use all output columns of the first independent
+access when the rest of the selected plan consists of dependent accesses,
+bound positive unions and supported scalar bindings. This keeps related
+values together when later unions require different keys. Every acquired group
+must offer snapshot consistency and repeatable ordinary cursor permissions.
+Qualification accesses must declare identical replay. Declining capabilities
+keep the ordinary complete plan.
 
 The optimizer ranks existing producer branches by captured independent row
 estimates, asks the existing exact relational-window interface for distinct
@@ -1002,7 +1015,7 @@ allowance returns to the retained ordinary plan; malformed data, cancellation
 and resource failures remain query failures. Fallback uses the remaining
 invocation budget and is not a promise that additional speculative work is free.
 
-`:operators :key-demand` identifies the selected key, initial key count,
+`:operators :key-demand` identifies the selected key or tuple columns, initial window size,
 producer regions and advisory row counts. Execution adds actual window and
 qualified-key counts and any fallback reason. The ordinary and parameterized
 region graphs have distinct program IDs in explanations. The policy composes
@@ -1387,8 +1400,10 @@ adapters retain the ordinary EAV path. A source opts in by implementing
 `IRelationalQuerySession/-open-relational-cursor`.
 
 By default, core considers this path for a flat conjunction whose sources all
-belong to one physical session group, with no rules, scoped branches, host
-functions, or `:having`. The opt-in scalar Boolean extension described below
+belong to one physical session group, with no rules, scoped branches, or host
+functions. A `:having` predicate can run in core when all its arguments are
+constants or projected aggregates and its operator is a supported scalar call.
+The opt-in scalar Boolean extension described below
 also admits completely represented filter branches. Inputs must consist entirely of captured scalar values in a
 single input tuple. A source may decline any shape by returning `nil`, before
 acquisition or reads. Ordering combined with return maps currently uses the
@@ -1468,7 +1483,9 @@ reserves one open through the standard consumption ledger.
 The returned cursor implements `IQuerySourceCursor` and emits ordinary owned,
 typed, nondependent batches. Existing row/byte bounds, request admission,
 cancellation, reservation transfer, and close rules all apply. Core applies
-the shared final result processor for shapes, return maps, ordering, offset,
+`HAVING` to each validated group before retaining it. When core applies
+`HAVING`, it also owns the result window. Core uses the shared final result
+processor for shapes, return maps, ordering, offset,
 and limit, and enforces final result and retained-memory quotas. Plan-only
 explain acquires the read view but never opens an execution cursor. Explanations
 identify this path with `:policy :relational-v1` and retain structural metadata

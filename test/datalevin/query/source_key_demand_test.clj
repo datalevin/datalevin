@@ -52,11 +52,11 @@
              (-open-relational-cursor [_ open]
                (swap! events conj [:window-open (:plan open)])
                (when-let [f (:on-window config)] (f))
-               (let [position (atom 0) key (:key (:plan open))
+               (let [position (atom 0) positions (:positions (:plan open))
                      limit (get-in open [:plan :window :limit])
                      keys (reduce (fn [out x]
-                                    (if (some #(QueryKey/equals [%] [x]) out) out (conj out x))) []
-                                  (map #(if (= key :entity) (first %) (nth % 2)) @(:snapshot delegate)))
+                                    (if (some #(QueryKey/equals % x) out) out (conj out x))) []
+                                  (map (fn [fact] (mapv #(nth fact %) positions)) @(:snapshot delegate)))
                      keys (if (:duplicate-keys? config) (mapcat #(repeat 2 %) keys) keys)
                      keys (vec (take (if (:oversize? config) (inc limit) limit) keys))]
                  (reify source/IQuerySourceCursor
@@ -66,7 +66,7 @@
                      (when (:cancel? config) (control/cancel! (:control request) {:error :query-source/cancelled :phase :fetch}))
                      (with-open [_permit ^Closeable (source/acquire-request! (:limiter delegate))]
                        (let [end (min (count keys) (+ @position (:max-rows fetch)))
-                             rows (mapv vector (subvec keys @position end))
+                             rows (into [] (subvec keys @position end))
                              columns (:columns open) bytes (source/batch-charge-bytes columns rows)
                              token (source/reserve! (:control request) {:retained-bytes bytes :in-flight-batches 1})]
                          (reset! position end)
@@ -80,9 +80,10 @@
          (swap! events conj [:window-plan (get-in request [:window :limit])])
          (when (and (not (:decline? config))
                     (<= (get-in request [:window :limit]) (get config :max-window Long/MAX_VALUE)))
-           (let [key (get-in request [:find 0 :variable]) term (get-in request [:clauses 0 :terms 0])]
+           (let [[entity _ value] (get-in request [:clauses 0 :terms])
+                 positions (mapv {entity 0 value 2} (map #(vector :var (:variable %)) (:find request)))]
              {:columns (:columns request)
-              :plan {:window (:window request) :key (if (= term [:var key]) :entity :value)}}))))}))
+              :plan {:window (:window request) :positions positions}}))))}))
 
 (defn fixtures [rows configs]
   (mapv provider rows (concat configs (repeat {}))))
@@ -110,6 +111,29 @@
     (doseq [p ps]
       (is (= (count (filter #(= :plan (first %)) @(:events (:base p))))
              (count (set (map #(get-in % [1 :region-id]) (filter #(= :plan (first %)) @(:events (:base p)))))))))
+    (released! ps)))
+
+(deftest a-single-anchor-preserves-paired-keys-through-different-bound-unions
+  (let [q '{:find [?e ?spouse ?name ?title ?a-tag ?b-tag] :in [$anchor $a $b $c $d] :limit 500
+            :where [[$anchor ?e :row/value ?spouse]
+                    (or-join [?e ?name ?a-tag]
+                      (and [$a ?e :row/value ?name] [(ground 0) ?a-tag])
+                      (and [$b ?e :row/value ?name] [(ground 1) ?a-tag]))
+                    (or-join [?spouse ?title ?b-tag]
+                      (and [$c ?spouse :row/value ?title] [(ground 0) ?b-tag])
+                      (and [$d ?spouse :row/value ?title] [(ground 1) ?b-tag]))
+                    [(identity ?spouse) ?copy]]}
+        rows [[[1 10] [1 11] [2 12] [3 12] [3 99]]
+              [[1 "a"] [2 "b"]] [[1 "a"]]
+              [[10 "p"] [11 "q"] [99 "unmatched"]] [[12 "r"]]]
+        ps (fixtures rows (cons {:value-type :long :estimated-rows 1024}
+                               (repeat {:estimated-rows 10000})))
+        expected #{[1 10 "a" "p" 0 0] [1 10 "a" "p" 1 0]
+                   [1 11 "a" "q" 0 0] [1 11 "a" "q" 1 0] [2 12 "b" "r" 0 1]}]
+    (is (= expected (set (apply d/q q (sources ps)))))
+    (is (some #(and (= :window-open (first %)) (= #{0 2} (set (:positions (second %)))))
+              @(:events (first ps))))
+    (is (not-any? #(= :open (first %)) @(:events (:base (first ps)))))
     (released! ps)))
 
 (deftest insufficient-windows-grow-and-exhaust-with-global-distinctness

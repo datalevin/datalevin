@@ -15,7 +15,7 @@
             [datalevin.relation :as relation])
   (:import [datalevin.utl QueryKey]
            [java.io Closeable]
-           [java.util Iterator List]
+           [java.util BitSet Iterator List]
            [org.eclipse.collections.impl.list.mutable FastList]))
 
 (def ^:private common-keys
@@ -324,6 +324,49 @@
           (finally (doseq [token @input-tokens] (control/release! token)))))
       (finally (when-not @success? (doseq [token @tokens] (control/release! token)))))))
 
+(defprotocol IWitnessLookup
+  (-matching-inputs! [method plan input-cols tuples qualifies?]
+    "Exhaust a captured dependent lookup and return the borrowed input tuples
+     with a qualifying witness. qualifies? borrows the outer tuple and the
+     returned row only during delivery of the current batch."))
+
+(defn- matching-inputs! [runtime group ids plan input-cols ^List tuples qualifies?]
+  (let [options (get-in plan [:path :options])
+        returned (mapv :variable (:columns options))
+        positions (zipmap input-cols (range))
+        required (mapv (comp positions :variable) (:requires options))
+        shared (into [] (keep-indexed (fn [j v] (when-some [i (positions v)] [i j]))) returned)
+        n (.size tuples)
+        ctl (:control runtime)
+        ;; One bit and at most one borrowed output slot per input. Reserve the
+        ;; output list, bitmap and key projection scratch before allocating.
+        token (control/reserve! ctl {:retained-bytes (+ 2048 (* 16 n)
+                                                        (* 128 (+ (count input-cols) (count returned))))})]
+    (rt/own! runtime #(control/release! token))
+    (let [matched (BitSet. n)]
+      (lookup-keys! runtime group plan ids
+        (fn [_ keys _]
+          (dotimes [i n]
+            (control/check-active! ctl)
+            ;; Input is the materialized, distinct correlation relation owned
+            ;; by the enclosing negation. Only its index crosses the collector.
+            (let [^objects tuple (.get tuples i)]
+              (binding/add! keys (mapv #(aget tuple (int %)) required) i))))
+        (fn [i row]
+          (let [idx (int i) ^objects outer (.get tuples idx)]
+            ;; Run residual checks even after a match. Errors on later rows
+            ;; and incomplete cursors must still fail the invocation.
+            (when (and (every? (fn [[a b]] (QueryKey/equals (aget outer (int a)) (nth row b))) shared)
+                       (qualifies? outer row))
+              (.set matched idx)))))
+      (let [output (FastList. (.cardinality matched))]
+        (loop [i (.nextSetBit matched 0)]
+          (when (<= 0 i)
+            (control/check-active! ctl)
+            (.add output (.get tuples i))
+            (recur (.nextSetBit matched (inc i)))))
+        output))))
+
 (defn method
   "Shared AccessStep implementation for already acquired/captured v2 paths.
   Pass the SAME delay of binding/id-space! to all methods in one invocation.
@@ -334,6 +377,9 @@
     (-access-plans [_ _] (fail! :query-source/unsupported :planning))
     (-open-access [_ _ _ _ _ _] (fail! :query-source/unsupported :open))
     (-frontier-satisfies? [_ _ _ _ _] false)
+    IWitnessLookup
+    (-matching-inputs! [_ plan input-cols tuples qualifies?]
+      (matching-inputs! runtime group ids plan input-cols tuples qualifies?))
     access/IBatchedAccessMethod
     (-execute-batched-access [_ path demand bounds work _ input-cols output-cols tuples]
       (execute-shared! runtime group path demand bounds work ids input-cols output-cols tuples))))

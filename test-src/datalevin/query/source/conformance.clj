@@ -1067,7 +1067,7 @@
           (is (= (reduce + 0 (map second batches)) (reduce + 0 (map #(get-in % [:metrics :rows]) (:cursors result)))))
           (is (= (reduce + 0 (map #(nth % 2) batches)) (reduce + 0 (map #(get-in % [:metrics :charged-bytes]) (:cursors result)))))
           (is (every? #(selected ((juxt :source-symbol :region-id :alternative-id) %)) (:cursors result)))
-          (is (every? #(zero? (get-in % [:metrics :external-requests])) (:cursors result)))
+          (is (every? #(= 0 (get-in % [:metrics :external-requests])) (:cursors result)))
           (is (every? #(= intermediate? (contains? % :actual)) (:cursors result)))
           (when (= :empty-input scenario) (is (empty? (:cursors result))))
           (when (= :limit scenario) (is (= 3 (get-in result [:cursors 0 :metrics :rows]))))
@@ -1143,8 +1143,8 @@
                   ;; Real batch acquisition succeeds; core's row/join state
                   ;; encounters the retained limit on its next reservation.
                   (let [ctl (:control payload)
-                        available (- (:retained-bytes (control/limits ctl))
-                                     (:retained-bytes (control/usage ctl)))]
+                        available (- (long (:retained-bytes (control/limits ctl)))
+                                     (long (:retained-bytes (control/usage ctl))))]
                     (spi/reserve! ctl {:retained-bytes available})))
                 (when (and (= :external-requests category) (= :fetch phase))
                   ;; Request budget is cumulative, even after release.

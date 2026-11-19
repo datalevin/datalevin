@@ -7,6 +7,7 @@
             [datalevin.query.source.contract :as contract]
             [datalevin.query.source.control :as control]
             [datalevin.query.source.expression :as expression]
+            [datalevin.query.source.grouped :as grouped]
             [datalevin.query.source.lowering :as lowering]
             [datalevin.query.source.runtime :as rt]
             [datalevin.query.source.value :as value :refer [fail!]])
@@ -276,6 +277,13 @@
                               outside (reduce-kv (fn [s j vs] (if (= i j) s (set/union s vs))) input-vars variables)]
                           (cond
                             (instance? Pattern node) (pattern! id node location inherited outside bindings literals)
+                            (and (empty? path) (grouped/call? node))
+                            (let [{:keys [query clauses outputs] :as spec}
+                                  (grouped/capture! runtime node (:qtimeout parsed) entries-by-source)
+                                  live (node-vars [(:qfind query) (:qwith query)])
+                                  child (body! clauses (conj location :grouped) source #{} live {} #{} #{} (inc (long depth)))]
+                              (site! (assoc (dissoc spec :clauses) :kind :grouped-query :path location
+                                            :parent-region id :branches [child] :exports (set outputs))))
                             (instance? And node)
                             ;; And is grouping, so its clauses belong to this same
                             ;; conjunction. The parser only emits And under Or.

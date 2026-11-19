@@ -17,7 +17,11 @@
 (defn flat-scalar?
   "Whether a parsed call uses the bounded scalar subset without nested calls."
   [node]
-  (and (scalar-functions (get-in node [:fn :symbol]))
+  (and (or (scalar-functions (get-in node [:fn :symbol]))
+           (and (= 'contains? (get-in node [:fn :symbol]))
+                (= 2 (count (:args node)))
+                (set? (:value (first (:args node))))
+                (<= (count (:value (first (:args node)))) 256)))
        (every? #(or (instance? Variable %)
                     ;; The native resolver evaluates list constants as calls.
                     (and (instance? Constant %) (not (list? (:value %)))))

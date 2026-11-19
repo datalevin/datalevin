@@ -1342,6 +1342,16 @@ variables, is evaluated once and materialized before it is joined with other
 relations. A nested query that receives outer logic variables is correlated and
 may be evaluated once per input tuple.
 
+Federated queries can bind a grouped subquery as a relation in the outer
+`:where` clause. Pass the source handles as the subquery's only arguments and
+bind each output column to a distinct variable. The inner query can group
+flat fact patterns and scalar calculations with `sum`, `count`,
+`count-distinct`, or `avg`. Its `:with` variables participate in aggregate
+multiplicity. The grouped rows and the outer joins share the source sessions
+and retained-memory budget. The public result quota applies to the final
+answer. This form currently requires an inner query without `:having`,
+ordering or a result window.
+
 ## Benchmarks
 
 We conducted several benchmarks to test Datalevin query engine.
