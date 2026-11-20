@@ -146,6 +146,10 @@
     "Pure planning of a parameterized flat fragment within one source session.
     Return nil or {:plan owned-value :columns request-columns :constraints
     {:max-binding-rows positive-integer :max-binding-bytes positive-integer}}.
+    A provider can advertise :datalevin.query.source/independent-rows-upper-bound?
+    on its descriptor. When the request also sets that flag, the response can
+    include :datalevin.query.source/independent-rows-upper-bound, a nonnegative
+    integer bounding the filtered conjunction without prefix bindings.
     Typed :inputs are supplied as distinct owned :bindings on each open.
     No data I/O, resources, callbacks, or acquisition is permitted here."))
 

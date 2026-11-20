@@ -1168,7 +1168,7 @@
       (or (partial-aggregate/try-plan! runtime compilation input execute? finish!)
           (semijoin/try-plan! runtime compilation input execute? join! finish!)
           (site-join/try-plan! runtime compilation input execute? join! finish! nil)
-          (fragment/try! runtime compilation input execute?
+          (fragment/try! runtime compilation input snapshots execute?
             (fn [prefix-runtime shape run?]
               (let [prefix (planning/capture! prefix-runtime (:native-entries shape) (:prefix-query shape) []
                              (:bindings input) (set (map :variable (:columns input))) nil)
@@ -1231,22 +1231,26 @@
                                :result :retained})))
                     (native/with-views (filter db/db? (keep :native (:entries compilation)))
                       (fn [snapshots]
-                        (if-let [delegated (placed-relation! child compilation input snapshots execute? check!)]
-                          (if (nil? explain-options) (:result delegated)
-                              (diagnostics/finish! child execute? (:result-rows (control/usage (:control child)))
-                                {:storage :memory :spill-policy :reject :relational-fragment? (boolean (:fragment? delegated))
-                                 :distinct :find-and-with :grouping (boolean (some parser/aggregate? (parser/find-elements (:qfind parsed))))
-                                 :result :retained}))
-                          (let [program (compile-program! child compilation nil nil snapshots (select-keys input [:columns :relation]))
-                                result (when execute? (result! child program))]
-                            (if (nil? explain-options) result
+                        (let [delegated (placed-relation! child compilation input snapshots execute? check!)
+                              independent (:independent-driver delegated)]
+                          (if (and delegated (not independent))
+                            (if (nil? explain-options) (:result delegated)
                                 (diagnostics/finish! child execute? (:result-rows (control/usage (:control child)))
-                                  (cond-> {:storage :memory :spill-policy :reject :replay-spools :none
-                                   :empty-input? (.isEmpty ^List (get-in program [:input :tuples]))
-                                   :join-indexes :bounded-hash :distinct :find-and-with
-                                   :grouping (boolean (some parser/aggregate? (parser/find-elements (:qfind parsed))))
-                                   :result :retained}
-                                    (:key-demand program) (assoc :key-demand (key-demand/explanation (:key-demand program))))))))))))))))))
+                                  {:storage :memory :spill-policy :reject :relational-fragment? (boolean (:fragment? delegated))
+                                   :distinct :find-and-with :grouping (boolean (some parser/aggregate? (parser/find-elements (:qfind parsed))))
+                                   :result :retained}))
+                            (let [compilation (cond-> compilation independent
+                                                (assoc-in [:prepared :planning :independent-driver] independent))
+                                  program (compile-program! child compilation nil nil snapshots (select-keys input [:columns :relation]))
+                                  result (when execute? (result! child program))]
+                              (if (nil? explain-options) result
+                                  (diagnostics/finish! child execute? (:result-rows (control/usage (:control child)))
+                                    (cond-> {:storage :memory :spill-policy :reject :replay-spools :none
+                                     :empty-input? (.isEmpty ^List (get-in program [:input :tuples]))
+                                     :join-indexes :bounded-hash :distinct :find-and-with
+                                     :grouping (boolean (some parser/aggregate? (parser/find-elements (:qfind parsed))))
+                                     :result :retained}
+                                      (:key-demand program) (assoc :key-demand (key-demand/explanation (:key-demand program)))))))))))))))))))
       (catch Throwable e
         (let [e (rt/active-error @active e)
               error (rt/redacted-error @active (or (:phase (ex-data e)) :inputs) e)]

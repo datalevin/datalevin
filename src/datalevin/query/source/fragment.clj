@@ -7,6 +7,7 @@
             [datalevin.query.source.contract :as contract]
             [datalevin.query.source.control :as control]
             [datalevin.query.source.diagnostics :as diagnostics]
+            [datalevin.query.source.native-plan :as native-plan]
             [datalevin.query.source.permissions :as permissions]
             [datalevin.query.source.region :as region]
             [datalevin.query.source.relational :as relational]
@@ -112,6 +113,9 @@
                                         :qin [] :qwhere (:native clauses)})
        :provider (:source (first external))
        :request (merge (:request (first (:groups prepared)))
+                  (when (and (not aggregate?) (= 1 (count native) (count external))
+                             (true? (get-in external [0 :descriptor :datalevin.query.source/independent-rows-upper-bound?])))
+                    {:datalevin.query.source/independent-rows-upper-bound? true})
                   {:mode :relational-fragment :semantics-version 1
                    :sources (mapv #(select-keys % [:symbol :descriptor]) external)
                    :clauses (:remote clauses) :bindings (select-keys (:bindings input) remote-vars)
@@ -134,7 +138,13 @@
             (if-let [response (rt/invoke runtime :planning
                                 #(source/-plan-relational-fragment (:provider shape) (:request shape)))]
               (do
-                (ensure! (and (value/plain-map? response) (= #{:plan :columns :constraints} (set (keys response)))
+                (ensure! (and (value/plain-map? response)
+                              (= #{:plan :columns :constraints}
+                                 (disj (set (keys response)) :datalevin.query.source/independent-rows-upper-bound))
+                              (or (not (contains? response :datalevin.query.source/independent-rows-upper-bound))
+                                  (let [n (:datalevin.query.source/independent-rows-upper-bound response)]
+                                    (and (get-in shape [:request :datalevin.query.source/independent-rows-upper-bound?])
+                                         (integer? n) (<= 0 n Long/MAX_VALUE))))
                               (value/plain-map? (:plan response)) (= (:columns (:request shape)) (:columns response))
                               (= #{:max-binding-rows :max-binding-bytes} (set (keys (:constraints response))))
                               (every? #(and (integer? %) (<= 1 % Long/MAX_VALUE)) (vals (:constraints response)))))
@@ -144,6 +154,21 @@
               (do (control/release! token) nil))
             (catch Throwable e (control/release! token) (throw e)))))
       (finally (control/release! workspace))))))
+
+(defn- independent-driver [runtime shape input snapshots]
+  (let [{:keys [aggregate? native-entries prefix-query request response]} shape
+        rows (:datalevin.query.source/independent-rows-upper-bound response)
+        bindings (:bindings input)]
+    (when (and rows (not aggregate?) (= 1 (count native-entries))
+               (= 1 (count (:sources request)))
+               (every? #(contains? bindings (:variable %)) (:columns input)))
+      (let [keys (into #{} (map :variable) (:inputs request))
+            native-rows (native-plan/prefix-seed-rows runtime snapshots
+                          (:native (first native-entries)) (:qwhere prefix-query) bindings keys)]
+        ;; Require a margin for native probe work and rough seed counts. The
+        ;; bound is advisory for placement, including when it happens to be zero.
+        (when (and native-rows (pos? native-rows) (<= (*' 2 (max 1 rows)) native-rows))
+          (get-in request [:sources 0 :symbol]))))))
 
 (defn- prepare-groups! [runtime shape relation]
   (let [{:keys [prefix-vars native-find native-with aggregate? request]} shape
@@ -263,8 +288,10 @@
   "Compile the native prefix through the shared compiler. Return nil before
   acquisition on decline or an oversized complete aggregate group; never split
   such groups or merge partial aggregates. Pins are owned by the caller."
-  [runtime compilation input execute? compile-prefix]
+  [runtime compilation input snapshots execute? compile-prefix]
   (when-let [shape (plan! runtime compilation input)]
+    (or (when-let [driver (independent-driver runtime shape input snapshots)]
+          {:independent-driver driver})
     (let [prefix-runtime (assoc runtime :cleanup (atom []))
           close (rt/own! runtime #(close-scope! prefix-runtime)) primary (volatile! nil)]
       (try
@@ -303,4 +330,4 @@
                              (mapv #(hash-map :variable (symbol (str "?fragment_final_" %))) (range (count elements)))
                              (if bounded ((:rows bounded)) collected) (:aggregate? shape))})))))
         (catch Throwable e (vreset! primary e) (throw e))
-        (finally (close-after! @primary close))))))
+        (finally (close-after! @primary close)))))))

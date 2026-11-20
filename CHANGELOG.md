@@ -10,6 +10,7 @@
 - [Bench] TPC-C and TPC-H benchmarks.
 
 ### Fixed
+- [Datalog] a concurrent scan sorting race.
 - [dtlv] interpreter handling of quoted form
   [#395](https://github.com/datalevin/datalevin/issues/395).
 

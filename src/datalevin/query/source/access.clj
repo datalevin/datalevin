@@ -470,6 +470,16 @@
                                              :else (compare-keys (:canonical-key a)
                                                                  (:canonical-key b) check!))) work))))
                              (mapv :plan))
+             driver-symbol (:independent-driver planning)
+             driver (when driver-symbol
+                      (some (fn [candidate]
+                              (let [o (options candidate)]
+                                (when (and (= driver-symbol (:source-symbol o))
+                                           (= required (work-keys candidate))
+                                           (empty? (:requires o))
+                                           (seq (get-in o [:capture :alternative :prefilters]))
+                                           (not (get-in o [:permission :spent?])))
+                                  candidate))) candidates))
              local-work (into #{} (map #(vector :core region-id (:id %))) operators)
              required (set/union required local-work)
              _ (doseq [operator operators]
@@ -478,14 +488,14 @@
              early? (fn [operator]
                       (let [keys (:binding-inputs (:step operator))
                             outputs (set (map :variable (:columns operator)))]
-                        (or (empty? keys) (:binding-bound? (:step operator))
-                            (seq (set/intersection keys seeded))
-                            ;; Keep producers ahead of scans when they can
-                            ;; enable a provider's preferred dependent path.
-                            (and (not (:binding-enumerate? (:step operator)))
-                                 (some (fn [plan]
-                                         (some #(contains? outputs (:variable %)) (:requires (options plan))))
-                                       candidates)))))
+                        (or (empty? keys) (seq (set/intersection keys seeded))
+                            (and (nil? driver)
+                                 (or (:binding-bound? (:step operator))
+                                     ;; A native producer can enable a dependent provider access.
+                                     (and (not (:binding-enumerate? (:step operator)))
+                                          (some (fn [plan]
+                                                  (some #(contains? outputs (:variable %)) (:requires (options plan))))
+                                                candidates)))))))
              ;; Optional native keys only affect preference. Propagate the
              ;; preference through native producers, so a reference read can
              ;; bind a later payload read. The typed scheduler still proves
@@ -524,7 +534,10 @@
                                      :unavailable? (and (= :once (:opens p)) (:spent? p))})) candidates)
                                    (mapcat #(map core-choice (remove (comp seq :requires) (alternatives %))) conditional)
                                    (map core-choice (sort-by #(get ranks (:id %)) (filter deferred? ordinary))))))
-             choices (key-seeded-choices choices region-id planning count-key)
+             choices (if driver
+                       (let [[before after] (split-with #(not (identical? driver (:value %))) choices)]
+                         (into [(first after)] (concat before (rest after))))
+                       (key-seeded-choices choices region-id planning count-key))
              result (join-cost/select {:inputs input-columns :required-work required
                                           :required-vars live-vars :choices choices
                                           :intermediate-row-limit

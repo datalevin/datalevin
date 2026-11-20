@@ -1,7 +1,8 @@
 (ns ^:no-doc datalevin.query.source.native-plan
   "Controlled execution of existing native attribute plans inside a v2
   region. The native planner and storage scan driver remain authoritative."
-  (:require [datalevin.query.optimizer.plan-build :as plan-build]
+  (:require [datalevin.interface :as i]
+            [datalevin.query.optimizer.plan-build :as plan-build]
             [datalevin.query.optimizer.range :as query-range]
             [datalevin.query.plan :as plan]
             [datalevin.query.resolve :as resolve]
@@ -12,7 +13,7 @@
             [datalevin.relation :as relation]
             [datalevin.storage.scan :as scans])
   (:import [datalevin.db DB]
-           [datalevin.parser Constant Placeholder Predicate Variable]
+           [datalevin.parser Constant Pattern Placeholder Predicate Variable]
            [datalevin.query.plan InitStep LinkStep MergeScanStep]
            [datalevin.utl QueryKey QueryKey$KeySet]
            [java.util List]
@@ -78,6 +79,32 @@
             (value/matches-type? logical x)
             (if (and (#{:db.type/float :db.type/double} type) (zero? (double x)))
               (if (= type :db.type/float) (float 0.0) 0.0) x)))))
+
+(defn prefix-seed-rows
+  "Estimate the cheapest independent native seed if a remote key can instead
+  drive an indexed native read. Use existing index counts without decoding rows."
+  [runtime snapshots database nodes bindings join-vars]
+  (when (and (instance? DB database) (every? #(instance? Pattern %) nodes))
+    (let [store (.-store ^DB database)
+          snapshot (get snapshots store)
+          ctl (:control runtime)
+          indexed (keep (fn [{[e a v] :pattern}]
+                          (let [attribute (:value a) props (get-in snapshot [:schema attribute])]
+                            (when (and (instance? Constant a) props (not (:db/noindex props)))
+                              [e attribute v props]))) nodes)
+          fixed? #(or (instance? Constant %) (contains? bindings (:symbol %)))]
+      (when (some (fn [[e _ v]] (or (join-vars (:symbol e)) (join-vars (:symbol v)))) indexed)
+        (reduce (fn [smallest [e a v props]]
+                  (native/check-view! ctl snapshot)
+                  (min smallest
+                       (cond
+                         (fixed? e) 1
+                         (fixed? v) (if-some [x (bound-value props
+                                                 (if (instance? Constant v) (:value v) (bindings (:symbol v)))
+                                                 (instance? Constant v))]
+                                      (i/av-size store a x) 0)
+                         :else (i/a-size store a))))
+                Long/MAX_VALUE indexed)))))
 
 (defn- predicate-constraints [node core-clauses props bindings check!]
   (let [v (:symbol (nth (:pattern node) 2))]
