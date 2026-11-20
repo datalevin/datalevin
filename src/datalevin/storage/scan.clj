@@ -304,8 +304,9 @@
           (.add out (object-array [e])))))))
 
 (defn sort-tuples-by-eid
+  "Sort a private list of tuples that may be shared by query plans."
   [^List tuples ^long eid-idx]
-  (doto tuples
+  (doto (FastList. ^Collection tuples)
     (TupleSort/sortByLong (int eid-idx))))
 
 (defn sort-tuples-by-val
@@ -313,7 +314,7 @@
   (if (or (identical? vt :db.type/ref)
           (identical? vt :db.type/long))
     (sort-tuples-by-eid tuples v-idx)
-    (doto tuples
+    (doto (FastList. ^Collection tuples)
       (.sort (reify Comparator
                (compare [_ a b]
                  (d/compare-with-type (aget ^objects a v-idx)
