@@ -109,6 +109,17 @@
                  {:type (:value-type types) :nullable? false}]))
        (fail! :query-source/unsupported :clauses)))))
 
+(defn variable-types
+  "Collect the logical types of every variable in a set of scoped patterns.
+  A planner moving an equality can require that all occurrences agree."
+  [entries patterns]
+  (let [descriptors (into {} (map (juxt :symbol :descriptor)) entries)]
+    (reduce (fn [types {:keys [source-symbol terms] :as pattern}]
+              (reduce (fn [types [[kind v] column]]
+                        (if (= kind :var) (update types v (fnil conj #{}) (:type column)) types))
+                      types (map vector terms (pattern-columns (descriptors source-symbol) pattern))))
+            {} patterns)))
+
 (defn variables [clause]
   (into #{} (keep #(when (= :var (first %)) (second %)))
         (or (:terms clause) (:args clause))))

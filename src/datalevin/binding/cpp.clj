@@ -80,6 +80,13 @@
       (raise "Unable to read VERSION file"
              {:msg (.getMessage e)}))))
 
+(defn needs-migration?
+  "Check the version marker for startup scheduling. The actual open rechecks it."
+  [dir]
+  (when (and c/require-migration? (.isFile (io/file dir c/data-file-name)))
+    (when-let [version (some-> (read-version-file (io/file dir)) c/parse-version)]
+      (neg? (long (c/compare-storage-versions version (c/parse-version c/version)))))))
+
 (def ^:dynamic *before-write-commit-fn*
   nil)
 

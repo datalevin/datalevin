@@ -1373,6 +1373,9 @@
   [root db-name]
   (str root u/+separator+ (u/hexify-string db-name)))
 
+(defn- needs-migration? [root db-name]
+  (cpp/needs-migration? (db-dir root db-name)))
+
 (defn- db-exists?
   [^Server server db-name]
   (u/file-exists
@@ -1823,8 +1826,8 @@
   (sess/load-sessions sys-conn))
 
 (defn- reopen-dbs
-  [root clients ^ConcurrentHashMap dbs]
-  (sess/reopen-dbs session-deps root clients dbs))
+  [root clients ^ConcurrentHashMap dbs migration-threads]
+  (sess/reopen-dbs session-deps root clients dbs migration-threads))
 
 (defn- authenticate
   [^Server server ^SelectionKey skey {:keys [username password]}]
@@ -2604,6 +2607,7 @@
      :user-eid-fn #'user-eid
      :perm-tgt-name-fn #'perm-tgt-name
      :open-store-fn #'open-store
+     :needs-migration-fn #'needs-migration?
      :close-store-fn #'close-store
      :consensus-ha-opts-fn #'deps-consensus-ha-opts
      :resolved-runtime-opts-fn #'resolved-runtime-opts
@@ -2701,19 +2705,23 @@
   stop or a failed start, create a new instance with the same root to restart."
   [{:keys [host port root idle-timeout verbose
            worker-threads worker-queue-size transaction-threads
-           background-threads transaction-lock-timeout-ms]
+           background-threads migration-threads transaction-lock-timeout-ms]
     :as   opts
     :or   {host         default-bind-host
            port         8898
            root         "/var/lib/datalevin"
            idle-timeout c/default-idle-timeout
            verbose      false
+           migration-threads (max 1 (quot (.availableProcessors (Runtime/getRuntime)) 2))
            transaction-lock-timeout-ms 1000}}]
   {:pre [(int? port) (not (s/blank? host)) (not (s/blank? root))]}
   (try
     (when (contains? opts :verbose)
       (log/set-min-level! (if verbose :debug :info)))
     (require-safe-bind-password! host)
+    (when-not (and (pos-int? migration-threads) (<= (long migration-threads) Integer/MAX_VALUE))
+      (raise "Server migration thread count must be a positive 32-bit integer"
+             {:migration-threads migration-threads}))
     (when-not (nat-int? transaction-lock-timeout-ms)
       (raise "Transaction lock timeout must be a nonnegative integer"
              {:transaction-lock-timeout-ms transaction-lock-timeout-ms}))
@@ -2741,7 +2749,7 @@
               sys-conn (own! (init-sys-db root (get-default-password)) d/close)
               clients  (load-sessions sys-conn)
               dbs      (own! (ConcurrentHashMap.) close-reopened-dbs!)]
-          (reopen-dbs root clients dbs)
+          (reopen-dbs root clients dbs migration-threads)
           (.register server-socket selector SelectionKey/OP_ACCEPT)
           (->Server (AtomicBoolean. false) port root idle-timeout
                     server-socket selector (ConcurrentLinkedQueue.)

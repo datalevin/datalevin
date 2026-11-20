@@ -189,7 +189,9 @@
                                                                 (get-in prepared [:planning :max-alternatives]))]
                                                  (envelope/captured-request! runtime request entries))))) entries)]
                   {:region r :inputs inputs :operators operators :requests requests})) live)
-            groups (session/acquire! runtime prepared)
+            ;; A deferred two-site placement can retain the ordinary plan after
+            ;; inspecting real keys. Continue on the same authorized snapshots.
+            groups (or (:acquired-groups compilation) (session/acquire! runtime prepared))
             by-alias (into {} (mapcat (fn [group] (map #(vector % group) (:aliases group)))) groups)
             estimate-work (estimation/prepare! runtime regions by-alias (:planning prepared))
             ids (delay (binding/id-space! runtime))

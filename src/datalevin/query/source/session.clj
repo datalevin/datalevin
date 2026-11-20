@@ -54,13 +54,16 @@
       (fields! override #{:consistency} #{} :context)
       (ensure! (contains? rank (:consistency override)) :context))
     (fields! planning #{} #{:max-alternatives :estimate-max-age-ms :estimate-budget-ms :estimate-max-requests
-                           :local-row-ns :local-column-ns :cost-model} :context)
+                           :local-row-ns :local-column-ns :cost-model :link-rtt-ns :transfer-ns-per-byte :source-ns-per-cost-unit} :context)
     (ensure! (and (positive? (get planning :max-alternatives 32))
                   (nonnegative? (get planning :estimate-max-age-ms 300000))
                   (nonnegative? (get planning :estimate-budget-ms 100))
                   (nonnegative? (get planning :estimate-max-requests 8))
                   (nonnegative? (get planning :local-row-ns 1000))
                   (nonnegative? (get planning :local-column-ns 250))
+                  (nonnegative? (get planning :link-rtt-ns 0))
+                  (positive? (get planning :source-ns-per-cost-unit 1))
+                  (nonnegative? (get planning :transfer-ns-per-byte 0))
                   (#{:elapsed :cardinality} (get planning :cost-model :elapsed))) :context)
     (let [specs (get options :native-extrema {})]
       (ensure! (value/plain-map? specs) :context)
@@ -85,13 +88,14 @@
      :ignore-nil-extrema (get options :ignore-nil-extrema #{})
      :requirements (into {} (map (fn [alias] [alias (get-in overrides [alias :consistency] default)])) aliases)
      :authorization (get options :authorization {:principal-id :application})
-     :planning {:max-alternatives (get planning :max-alternatives 32)
+     :planning (merge (select-keys planning [:link-rtt-ns :transfer-ns-per-byte :source-ns-per-cost-unit])
+                {:max-alternatives (get planning :max-alternatives 32)
                 :estimate-max-age-ms (get planning :estimate-max-age-ms 300000)
                 :estimate-budget-ms (get planning :estimate-budget-ms 100)
                 :estimate-max-requests (get planning :estimate-max-requests 8)
                 :local-row-ns (get planning :local-row-ns 1000)
                 :local-column-ns (get planning :local-column-ns 250)
-                :cost-model (get planning :cost-model :elapsed)}}))
+                :cost-model (get planning :cost-model :elapsed)})}))
 
 (defn validate-options!
   "Check already admitted invocation options against declared source aliases
@@ -242,6 +246,9 @@
          (catch Throwable e
            (.addSuppressed ^Throwable primary (rt/redacted-error runtime :close e)))))
   (throw primary))
+
+(defn groups-by-alias [groups]
+  (into {} (mapcat (fn [group] (map #(vector % group) (:aliases group)))) groups))
 
 (defn acquire!
   "Acquire and validate every prepared group eagerly, once. Own a returned

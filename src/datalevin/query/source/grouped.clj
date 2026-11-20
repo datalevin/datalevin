@@ -8,7 +8,8 @@
             [datalevin.query.source.normalize :as normalize]
             [datalevin.query.source.runtime :as rt]
             [datalevin.query.source.value :refer [fail!]])
-  (:import [datalevin.parser Aggregate BindColl BindTuple Constant
+  (:import [java.math MathContext RoundingMode]
+           [datalevin.parser Aggregate BindColl BindTuple Constant
             DefaultSrc FindRel Function Pattern Predicate SrcVar Variable]))
 
 (defn call? [node]
@@ -86,3 +87,35 @@
             {:variable variable :nullable? false
              :type (if (#{'count 'count-distinct} (get-in element [:fn :symbol])) :long :data)}))
         (parser/find-elements (:qfind (:query site))) (:outputs site)))
+
+(defn- total-aggregate? [element schema]
+  (let [type (get-in schema [(get-in element [:args 0 :symbol]) :type])]
+    (case (get-in element [:fn :symbol])
+      (count count-distinct) true
+      (sum avg)
+      ;; Checked long addition may overflow. Exact decimal division may throw
+      ;; even in a group which the outer join would eventually discard.
+      (or (#{:bigint :double :float} type)
+          (and (= :bigdec type) *math-context*
+               (pos? (.getPrecision ^MathContext *math-context*))
+               (not= RoundingMode/UNNECESSARY (.getRoundingMode ^MathContext *math-context*))))
+      false)))
+
+(defn lookup-key
+  "A mandatory literal EAV restriction can supply the single grouping key.
+  Match the caller's binding by position. Aggregate results and :with witnesses
+  never become lookup keys. The cost comparison still needs an actual lookup."
+  [site parent child schema]
+  (let [elements (parser/find-elements (:qfind (:query site)))
+        keys (keep-indexed #(when (instance? Variable %2) %1) elements)]
+    (when (and (= 1 (count keys)) (seq (:patterns child)) (empty? (:core-clauses child))
+               (every? #(total-aggregate? % schema) (filter parser/aggregate? elements)))
+      (let [i (first keys) inner (:symbol (nth elements i)) outer (nth (:outputs site) i)
+            column (schema inner)]
+        (when (and column (not= :data (:type column))
+                   (some (fn [{:keys [clause columns]}]
+                           (let [[e _ v] (:terms clause)]
+                             (and (= e [:var outer]) (= :const (first v))
+                                  (= (:type column) (:type (first columns))))))
+                         (:patterns parent)))
+          {:inner column :outer (assoc column :variable outer)})))))

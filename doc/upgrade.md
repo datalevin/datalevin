@@ -93,6 +93,20 @@ staging database created by the newer version.
 This process may take a long time if the database is big, so some down time is
 expected for now.
 
+On server restart, the system database migrates first so the server can read
+its saved sessions. Databases those sessions need can then migrate in parallel.
+Each database migrates once, even when several sessions use it. The server
+waits for these migrations before serving requests. Other databases migrate
+on first open. Consensus HA databases marked in a session wait for an explicit
+open with their node-local options.
+
+The default startup migration limit is half the processors available to the
+JVM, rounded down, with a minimum of one. A 32-CPU JVM can migrate up to 16
+databases at once. Each active migration runs an exporter JVM and writes a
+staging database. Tune the limit for available memory and disk throughput
+with `dtlv --migration-threads 8 serv` or `:migration-threads` in
+`datalevin.server/create`. Set it to `1` for serial startup migration.
+
 The auto migration detects the presence of the `datalevin/eav` DBI. For a
 Datalog store, it migrates the schema and datoms together with any user KV DBIs
 in the same environment. Datalog-owned internal and secondary-index DBIs are

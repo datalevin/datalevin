@@ -19,7 +19,7 @@
    [datalevin.interface :as if]
    [datalevin.util :as u :refer [raise]])
   (:import
-   [java.io BufferedInputStream DataInputStream File]
+   [java.io BufferedInputStream DataInputStream File RandomAccessFile]
    [java.net URL]
    [java.nio.file AtomicMoveNotSupportedException Files Paths Path
     StandardCopyOption]
@@ -35,21 +35,46 @@
     "https://github.com/juji-io/datalevin/releases/download/%s/datalevin-%s-standalone.jar"
     version version))
 
+(defn- move-path
+  [source target]
+  (try
+    (Files/move source target
+                (into-array StandardCopyOption
+                            [StandardCopyOption/ATOMIC_MOVE]))
+    (catch AtomicMoveNotSupportedException _
+      (Files/move source target (make-array StandardCopyOption 0)))))
+
+(defonce ^:private jar-download-lock (Object.))
+
+(defn- cache-jar!
+  [^File jar source]
+  (when-not (.isFile jar)
+    (locking jar-download-lock
+      (let [dir (.getParentFile jar)]
+        (u/create-dirs (.getPath dir))
+        ;; Other server processes may share the same temporary directory.
+        (with-open [lock-file (RandomAccessFile. (io/file dir "download.lock") "rw")
+                    _lock (.lock (.getChannel lock-file))]
+          (when-not (.isFile jar)
+            (let [temp (File/createTempFile "download-" ".part" dir)]
+              (try
+                (with-open [in (io/input-stream source)
+                            out (io/output-stream temp)]
+                  (io/copy in out))
+                (move-path (.toPath temp) (.toPath jar))
+                (finally (Files/deleteIfExists (.toPath temp))))))))))
+  (.getAbsolutePath jar))
+
 (defn ensure-jar
   [major minor patch]
   (let [version (str major "." minor "." patch)
-        ^File jar-dir (io/file (u/tmp-dir "datalevin-migrate") "jars" version)
-        jar     (io/file jar-dir (str "datalevin-" version "-standalone.jar"))]
-    (u/create-dirs (.getPath jar-dir))
-    (when-not (.exists jar)
-      (try
-        (with-open [in  (.openStream (URL. ^String (jar-url version)))
-                    out (io/output-stream jar)]
-          (io/copy in out))
-        (catch Exception e
-          (raise "Failed to download Datalevin uberjar: " (.getMessage e)
-                 {:version version}))))
-    (.getAbsolutePath jar)))
+        jar (io/file (u/tmp-dir "datalevin-migrate") "jars" version
+                     (str "datalevin-" version "-standalone.jar"))]
+    (try
+      (cache-jar! jar (URL. ^String (jar-url version)))
+      (catch Exception e
+        (throw (ex-info (str "Failed to download Datalevin uberjar: " (.getMessage e))
+                        {:version version} e))))))
 
 (defn run-cmd
   [cmd]
@@ -136,15 +161,6 @@
 (defn- path [s] (Paths/get s (make-array String 0)))
 
 (defn- backup-path [dir] (str dir ".bak-" (System/currentTimeMillis)))
-
-(defn- move-path
-  [source target]
-  (try
-    (Files/move source target
-                (into-array StandardCopyOption
-                            [StandardCopyOption/ATOMIC_MOVE]))
-    (catch AtomicMoveNotSupportedException _
-      (Files/move source target (make-array StandardCopyOption 0)))))
 
 (defn- backup-dir
   [dir]

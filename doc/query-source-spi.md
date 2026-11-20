@@ -982,6 +982,22 @@ their costs exclude the opaque suffix and are not whole-query predictions.
 `:union-selection` reports the comparison scope, original/candidate/selected
 costs, bounded candidate search, and chosen binding inputs.
 
+A nested grouped `q` can use a batched lookup when a mandatory outer EAV
+pattern restricts its single group key by a literal attribute value. The
+compiler maps the outer binding to the inner key by its position in `:find`.
+It compares an independent scan with the cost of fetching all witnesses for
+the distinct keys. A selected lookup retains the inner `:with` variables,
+aggregates each group once, and joins the results back to the original outer
+rows. Filters on aggregate results still run after grouping.
+
+This comparison applies to a single grouped site with a fact-only body,
+repeatable snapshot access, and fresh estimates for both the scan and the
+lookup. The compiler skips the comparison for checked-long sums and averages,
+untyped arithmetic, and exact decimal averages, where evaluating a discarded
+group could raise an arithmetic error. In `d/explain`, `:grouped-selection`
+reports the cost comparison and the grouped operator's `:binding-inputs`
+identifies the selected outer key.
+
 Small unordered relational windows can additionally select `:key-demand`.
 The policy requires zero offset, plain distinct find variables, and no `:with`,
 return map, aggregate or rule. With a limit of at most 256, it can use a
@@ -1598,3 +1614,88 @@ still undergo normal external acquisition/definition checks. Plan-only explain
 compiles the native prefix and acquires the source session but opens no cursor.
 It marks the plan `:policy :relational-fragment-v1` and `:conditional-inputs true`,
 since binding group sizes cannot be proven without execution.
+
+### Placement across relational sources
+
+After whole-query negotiation, the planner can compose exact, site-local
+relations from the captured source groups. Each group uses its own authorized
+session and snapshot. The normal result processor owns the final distinctness,
+grouping, ordering and limit. The following access IDs appear in public
+`d/explain` output.
+
+| Shape | Planner decision |
+|---|---|
+| Two to four filtered dimensions with distinct integer join keys | Read dimension keys and projected witnesses, then apply independent membership predicates at the fact site. Rejoin the complete dimensions. An oversized domain or declined predicate can leave the fact access unrestricted on that axis. The region reports `:eligible-keys` and, after execution, `:applied-keys`. |
+| An equality key with correlated integer ranges | A parameterized fragment can take a complete public input relation. Each input tuple carries its key and all its comparison bounds together. The usual binding limits and aggregate-group boundary apply. |
+| Two sites sharing one integer or string key | Compare both driving directions. After reading the driver, use the actual distinct domain to choose one independent receiver read or batched restrictions. An empty domain skips the receiver read. |
+| A site needed only to establish existence for a key | Project just the key. PostgreSQL can lower a bounded integer restriction on a single table to correlated `EXISTS`, retaining validation of qualifying witnesses. |
+| Decimal SUM across tagged `or-join` branches | If each branch is site-local and a distinct constant channel tag contributes to `:with`, group and sum each branch with its local witnesses. The final sum includes the tag so equal subtotals from different branches both count. |
+
+For the multi-site key rules, the PostgreSQL adapter advertises
+`:datalevin.query.source/integer-domain-limit` (8,192). The two-site rule
+admits up to 256 text keys per request. An optional
+`IRelationalEstimateSession/-estimate-relational` call prices an already
+negotiated relation on its acquired source group. It returns nil or a map with
+nonnegative `:rows` and `:row-bytes`, positive `:request-ns` and
+`:fetch-rows`. One call can issue one admitted metadata request. PostgreSQL
+uses `EXPLAIN` without executing the SELECT. Group-count estimation can use
+the underlying equality key and the same authorized filters.
+
+A provider implementing `IRelationalFanoutSession` may also return
+`:source-cost`, `:startup-cost` and `:join-rows` when a metadata request
+includes `:receiver-work? true`. The first two use the receiver's own planner
+units. The third estimates rows before final projection or reduction. Existing
+four-field hints remain valid. A receiver can decline to provide a hint.
+
+After the driver produces its distinct keys, the planner prices a bounded
+batch and an independent receiver read. The PostgreSQL adapter can sample
+up to 256 hash-ordered driver keys when the two costs disagree, a reduction
+hides join rows, or a joined receiver needs several batches. The sample counts
+each key's matching rows before projection and at the direct lookup tables
+under the acquired authorization and snapshot. Stage zero describes the joined
+fragment. Direct lookup stages carry the corresponding source alias. When a filter on
+the key's identity table precedes a filter on a nonunique relation, an
+additional stage measures the joined rows after the identity-table predicates
+and carries their clause IDs. Missing keys contribute zero. The
+session returns the sum and sum of squares for each stage, without exposing
+individual keys in diagnostics. The planner projects to the actual key count
+and uses finite-population sampling error to widen its cost comparison. These
+intervals guide placement under skew and are not guarantees on unseen keys.
+
+`-sample-relational` receives the remaining planning time in `:budget-ms`.
+PostgreSQL encloses the query in a savepoint, sets a local statement timeout
+and restores the transaction after the probe. A sample consumes up to three
+admitted requests and also counts against the invocation's request ledger.
+A planning budget of zero disables optional probes. The optional positive
+integer `:source-ns-per-cost-unit` calibrates receiver cost units to nanoseconds
+for comparisons at that receiver. Supply it only when appropriate for the
+source being priced. Without calibration the planner compares transfer and
+source cost separately. If uncertainty leaves the route unresolved, the
+existing route takes precedence.
+
+A PostgreSQL group advertising `:datalevin.query.source/integer-reference-key?`
+can negotiate a private integer projection of a hidden, single-integer entity
+reference. Both sources must declare the same complete reference type. This
+also admits a two-site plan for ungrouped native text extrema when a filtered,
+connected producer joins multiple co-located relations, exactly one equality
+key crosses the boundary, and all aggregate values have the same owning site.
+The original extrema session supplies the final collation. If the planner
+retains ordinary execution after reading the driver, it reuses the acquired
+sessions and the remaining estimate allowance. Before opening a speculative producer,
+the planner can retain ordinary execution when transferring a complete filtered
+multi-relation receiver is estimated cheaper than reading one full producer
+key batch. A speculative driver read can close its
+cursor early if its transfer cost already exceeds the estimated cost of reading
+a filtered receiver. The ordinary plan receives no partial driver result.
+
+Under `:query-source {:planning {...}}`, `:link-rtt-ns` overrides the
+observed per-request time and `:transfer-ns-per-byte` prices both the keys
+sent and the rows received (default 1 ns/byte). The elapsed-cost model includes
+projected cursor opens, paged fetches and local row work. The cardinality model
+uses projected returned rows. `:estimate-max-requests` and
+`:estimate-budget-ms` bound additional estimate calls. With incomplete
+estimates, the planner can still use an admitted exact restriction. Plan-only
+explanation reports the chosen driver and a deferred receiver decision.
+Executed explanation also reports the mode, distinct driving keys, batch count,
+and the two costs when available. These estimates never establish emptiness,
+uniqueness or the validity of a partial aggregate.

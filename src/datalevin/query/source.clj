@@ -116,6 +116,23 @@
     snapshot. Return an ordinary owned-batch IQuerySourceCursor. Implementers
     validate plan scope against this session; SQL is never part of the SPI."))
 
+(defprotocol IRelationalEstimateSession
+  (-estimate-relational [session request]
+    "Estimate a negotiated site-local relation in this session. Return nil or
+    {:rows n :row-bytes n :request-ns n :fetch-rows n}. One admitted metadata
+    request at most. With :receiver-work? true, may also return :source-cost
+    and :join-rows together, and optionally :startup-cost in the same source
+    units. Estimates never establish emptiness or uniqueness."))
+
+(defprotocol IRelationalFanoutSession
+  (-sample-relational [session request]
+    "Optional bounded read on real keys in a negotiated membership plan. Under
+    :budget-ms and at most three round trips, return nil or a vector of
+    [stage sum-count sum-squared-count label] over distinct sampled keys. Stage zero
+    counts joined witnesses. Later stages identify direct lookup relations or
+    partial predicate sets via the :kind, :source-symbol or :clause-ids in label.
+    Missing keys contribute zero. Hints never establish query results."))
+
 (defprotocol IRelationalWindowSource
   (-plan-relational-window [source request]
     "Optional exact final result window, after find/with distinctness and any

@@ -4,16 +4,17 @@
 
 ### Added
 - [Admin] server wide administrative tool `dtlv admin` commands.
-- [Bench] TPC-C and TPC-H benchmarks.
 - [Federation] optional relational delegation and parameterized fragment
   protocols. Federation adapter artifacts share the Datalevin release version,
   starting with 1.2.11.
+- [Bench] TPC-C and TPC-H benchmarks.
 
 ### Fixed
 - [dtlv] interpreter handling of quoted form
   [#395](https://github.com/datalevin/datalevin/issues/395).
 
 ### Improved
+- [Server] parallel migration of all DBs on server.
 - [Storage] update dtlvnative to 1.2.2 with prepared-copy and projected EAV
   native bindings.
 - [Datalog] templated compiled transaction paths to gain higher throughput.

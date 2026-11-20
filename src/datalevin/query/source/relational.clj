@@ -361,7 +361,7 @@
 (defn- consume!
   "Consume an exact relational cursor, enforce batch/result quotas, and use
   the shared result processor for public shapes, maps, and result windows."
-  [runtime {:keys [group response request parsed]} internal?]
+  [runtime {:keys [group response request parsed retain-row? abandon? row-releases]} internal?]
   (let [ctl (:control runtime) check! #(control/check-active! ctl)
         columns (:columns response) vars (mapv :variable columns)
         keep-group? (when-let [having (seq (:qhaving parsed))]
@@ -385,29 +385,46 @@
         (vreset! close-cursor (rt/own! runtime #(source/-close-cursor! cursor)))
         (let [bounded (window/collector! runtime (result-query parsed columns))
               collected (when-not bounded (spill/new-spillable-set nil {:spill-threshold Long/MAX_VALUE}))
-              seen (volatile! 0)
+              seen (volatile! 0) abandoned (volatile! false)
+              keep! (fn [token]
+                      (let [release (retain! runtime token)]
+                        (when row-releases (vswap! row-releases conj release))))
               fetch {:control ctl :max-rows (get-in request [:limits :batch-rows])
                      :max-bytes (get-in request [:limits :batch-bytes])}]
-          (retain! runtime (control/reserve! ctl {:retained-bytes 4096}))
+          (keep! (control/reserve! ctl {:retained-bytes 4096}))
           (loop []
             (let [batch (batch/accept! runtime columns false fetch
                           (rt/invoke runtime :fetch #(source/-next-batch! cursor fetch)) identity)]
               (try
-                (doseq [row (:rows batch)]
-                  (check!)
-                  (when (= :relational-window (:mode request))
-                    (let [n (inc (long @seen))]
-                      (vreset! seen n)
-                      (when (> n (long (get-in request [:window :limit])))
-                        (fail! :query-source/invalid :fetch))))
-                  (when (or (nil? keep-group?) (keep-group? row))
-                    (if bounded ((:add! bounded) row)
-                      (do (retain! runtime (rt/charge-copy! runtime row))
-                          (retain! runtime (control/reserve! ctl {:retained-bytes 128}))
-                          (.cons ^clojure.lang.IPersistentCollection collected (value/owned-copy row check!))))))
+                (if (and internal? (nil? bounded) (nil? keep-group?)
+                         (not= :relational-window (:mode request)))
+                  (let [rows (:rows batch)
+                        scratch (control/reserve! ctl {:retained-bytes (+ 64 (* 16 (count rows)))})]
+                    (try
+                      (let [kept (if retain-row? (filterv #(do (check!) (retain-row? %)) rows) rows)]
+                        (when (seq kept)
+                          (keep! (rt/charge-copy! runtime kept))
+                          (keep! (control/reserve! ctl {:retained-bytes (* 128 (count kept))}))
+                          (doseq [row kept]
+                            (.cons ^clojure.lang.IPersistentCollection collected (value/owned-copy row check!)))))
+                      (finally (control/release! scratch))))
+                  (doseq [row (:rows batch)]
+                    (check!)
+                    (when (= :relational-window (:mode request))
+                      (let [n (inc (long @seen))]
+                        (vreset! seen n)
+                        (when (> n (long (get-in request [:window :limit])))
+                          (fail! :query-source/invalid :fetch))))
+                    (when (and (or (nil? retain-row?) (retain-row? row)) (or (nil? keep-group?) (keep-group? row)))
+                      (if bounded ((:add! bounded) row)
+                        (do (retain! runtime (rt/charge-copy! runtime row))
+                            (retain! runtime (control/reserve! ctl {:retained-bytes 128}))
+                            (.cons ^clojure.lang.IPersistentCollection collected (value/owned-copy row check!)))))))
                 (diagnostics/batch! runtime trace (:row-count batch) (:byte-count batch))
                 (finally (control/release! (:reservation batch))))
-              (when-not (:exhausted? batch) (recur))))
+              (cond
+                (and abandon? (not (:exhausted? batch)) (abandon? (count collected))) (vreset! abandoned true)
+                (not (:exhausted? batch)) (recur))))
           (when (:diagnostics runtime)
             (diagnostics/metrics! runtime trace (rt/invoke runtime :metrics #(source/-cursor-metrics cursor))))
           (let [query (result-query parsed columns)
@@ -416,7 +433,7 @@
               ;; Exact final windows have already applied find distinctness.
               ;; Duplicate keys cannot certify that a source domain exhausted.
               (fail! :query-source/invalid :fetch))
-            (if internal? collected (shape-result! runtime query vars collected)))))
+            (if internal? (when-not @abandoned collected) (shape-result! runtime query vars collected)))))
       (catch Throwable e (vreset! primary e) (throw e))
       (finally
         (try
@@ -431,31 +448,110 @@
 
 (defn rows!
   "Borrow validated internal rows until their workspace closes. Intermediate
-  key rows consume retained storage, without charging public result quotas."
+  key rows consume retained storage, without charging public result quotas.
+  An optional :abandon? on an unwindowed speculative read discards its entire
+  result and returns nil. Cursor close still runs on the original session."
   [runtime delegation]
   (consume! runtime delegation true))
 
-(defn window-plan!
-  "Plan an engine-owned window in an already captured group. No acquisition or
-  reads occur here; execution reuses that group's pinned session and permits."
-  [runtime group request parsed]
-  (let [provider (get-in group [:entries 0 :source])
-        token (rt/charge-copy! runtime (dissoc request :control))
+(defn- scoped-plan!
+  [runtime group request parsed negotiate]
+  (let [token (rt/charge-copy! runtime (dissoc request :control))
         retained? (volatile! false)]
     (try
-      (when (and (satisfies? source/IRelationalWindowSource provider)
-                 (satisfies? source/IRelationalQuerySession (:session group)))
-        (when-let [response (rt/invoke runtime :planning #(source/-plan-relational-window provider request))]
-          (let [borrowed (rt/charge-metadata! runtime response :planning)]
-            (try
-              (ensure! (and (value/plain-map? response) (= #{:plan :columns} (set (keys response)))
-                            (value/plain-map? (:plan response)) (vector? (:columns response))
-                            (= (:columns request) (:columns response))))
-              (retain! runtime (rt/charge-copy! runtime response))
-              (retain! runtime token)
-              (vreset! retained? true)
-              {:group group :request request :parsed parsed
-               :response (value/owned-copy response #(control/check-active! (:control runtime)))}
-              (finally (control/release! borrowed))))))
-      (finally
-        (when-not @retained? (control/release! token))))))
+      (when-let [response (rt/invoke runtime :planning negotiate)]
+        (let [borrowed (rt/charge-metadata! runtime response :planning)]
+          (try
+            (ensure! (and (value/plain-map? response) (= #{:plan :columns} (set (keys response)))
+                          (value/plain-map? (:plan response)) (vector? (:columns response))
+                          (= (:columns request) (:columns response))))
+            (retain! runtime (rt/charge-copy! runtime response))
+            (retain! runtime token)
+            (vreset! retained? true)
+            {:group group :request request :parsed parsed
+             :response (value/owned-copy response #(control/check-active! (:control runtime)))}
+            (finally (control/release! borrowed)))))
+      (finally (when-not @retained? (control/release! token))))))
+
+(defn window-plan!
+  "Plan an engine-owned window in an acquired group."
+  [runtime group request parsed]
+  (let [provider (get-in group [:entries 0 :source])]
+    (when (and (satisfies? source/IRelationalWindowSource provider)
+               (satisfies? source/IRelationalQuerySession (:session group)))
+      (scoped-plan! runtime group request parsed #(source/-plan-relational-window provider request)))))
+
+(defn local-plan!
+  "Negotiate an exact site-local relation without opening a session or cursor."
+  [runtime group provider request parsed]
+  (when (satisfies? source/IRelationalQuerySource provider)
+    (scoped-plan! runtime group request parsed #(source/-plan-relational provider request))))
+
+(defn- valid-stage? [stage request]
+  (and (value/plain-map? stage)
+       (case (:kind stage)
+         :joined (= #{:kind} (set (keys stage)))
+         :lookup (and (= #{:kind :source-symbol} (set (keys stage)))
+                      (some #(= (:source-symbol stage) (:symbol %)) (:sources request)))
+         :filtered-join (and (= #{:kind :clause-ids} (set (keys stage)))
+                             (vector? (:clause-ids stage)) (<= 1 (count (:clause-ids stage)) 48)
+                             (every? (set (map :id (:clauses request))) (:clause-ids stage)))
+         false)))
+
+(defn estimator
+  "Build an optional estimator for one placement decision. Only time spent on
+  estimates consumes the planning allowance, including calls made after the
+  driver has run. Source reads share the invocation's normal request limit."
+  [runtime planning]
+  (let [requests (volatile! (:estimate-max-requests planning))
+        nanos (volatile! (min Long/MAX_VALUE (*' 1000000 (:estimate-budget-ms planning))))
+        ctl (:control runtime)]
+    (fn estimate
+      ([] {:estimate-max-requests @requests :estimate-budget-ms (max 0 (quot @nanos 1000000))})
+      ([group plan] (estimate group plan false))
+      ([group {:keys [request response]} sample?]
+       (let [session (:session group) descriptor (get-in request [:sources 0 :descriptor])
+             needed (if sample? 3 1)
+             budget (quot @nanos 1000000)]
+         (when (and response (>= @requests needed) (pos? budget)
+                    (if sample? (satisfies? source/IRelationalFanoutSession session)
+                        (satisfies? source/IRelationalEstimateSession session)))
+           (let [start (System/nanoTime)]
+             (vswap! requests - needed)
+             (try
+               (when-let [scratch (try (control/reserve! ctl {:retained-bytes 1048576})
+                                       (catch clojure.lang.ExceptionInfo e
+                                         (when-not (= :query-source/limit (:error (ex-data e))) (throw e))))]
+                 (try
+                   (let [open (merge (:context group)
+                                {:source-symbol (get-in request [:sources 0 :symbol]) :region-id 0
+                                 :scope-id (get-in descriptor [:scope :id])
+                                 :definition-fingerprint (:definition-fingerprint descriptor)
+                                 :columns (:columns response) :plan (:plan response)})
+                         hint (rt/invoke runtime :planning
+                                #(if sample? (source/-sample-relational session (assoc open :budget-ms budget))
+                                   (source/-estimate-relational session
+                                     (cond-> open (satisfies? source/IRelationalFanoutSession session)
+                                       (assoc :receiver-work? true)))))
+                         finite? #(and (number? %) (Double/isFinite (double %)) (not (neg? %)))]
+                     (when hint
+                       (if sample?
+                         (ensure! (and (vector? hint) (<= 1 (count hint) 65)
+                                       (every? (fn [row]
+                                                 (and (vector? row) (= 4 (count row)) (integer? (first row))
+                                                      (every? finite? (take 3 row)) (valid-stage? (peek row) request)
+                                                      (= (zero? (first row)) (= :joined (:kind (peek row))))))
+                                               hint)
+                                       (= (set (range (count hint))) (set (map first hint)))))
+                         (ensure! (and (value/plain-map? hint)
+                                       (set/subset? #{:rows :row-bytes :request-ns :fetch-rows} (set (keys hint)))
+                                       (every? #{:rows :row-bytes :request-ns :fetch-rows :source-cost :startup-cost :join-rows} (keys hint))
+                                       (every? finite? (vals hint))
+                                       (= (contains? hint :source-cost) (contains? hint :join-rows))
+                                       (<= (get hint :startup-cost 0) (get hint :source-cost 0))
+                                       (pos? (:fetch-rows hint)) (pos? (:request-ns hint)))))
+                       (value/owned-copy hint)))
+                   (finally (control/release! scratch))))
+               (catch clojure.lang.ExceptionInfo e
+                 (when (or sample? (not= :query-source/limit (:error (ex-data e)))) (throw e)))
+               (finally (vswap! nanos - (- (System/nanoTime) start)))))))))))

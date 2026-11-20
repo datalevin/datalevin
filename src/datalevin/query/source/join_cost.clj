@@ -37,8 +37,15 @@
       (let [rows #(finite-cost (reduce + 0.0 (map (fn [b] (if (zero? (compare (:rows b) 0)) 1.0
                                                           (double (:rows b)))) %)))
             tuples (double (:tuples state))
-            returned (max 1.0 (finite-cost (* tuples (double (rows fanout)))))
-            read (if (seq requires) returned (double (rows branches)))
+            matches (max 1.0 (finite-cost (* tuples (double (rows fanout)))))
+            read (if (seq requires) matches (double (rows branches)))
+            ;; A grouped lookup consumes every witness but emits at most one
+            ;; group per outer key. Estimate independent groups from fanout.
+            returned (cond
+                       (not (:grouped? hint)) matches
+                       (seq shared) tuples
+                       :else (let [rows-per-group (double (rows (first (vals (:lookups hint)))))]
+                               (finite-cost (* tuples (max 1.0 (/ read rows-per-group))))))
             priced (when model (mapv #(access-time (:estimate %) (if (seq requires) tuples 1.0)
                                                     (:batch %) (:dependent? %)) branches))
             sum-cost (fn [key]

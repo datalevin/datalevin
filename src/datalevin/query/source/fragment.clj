@@ -41,12 +41,25 @@
         native-vars (set/union (set (map :variable (:columns input))) (into #{} (mapcat vars) native-nodes))
         remote-vars (into #{} (mapcat contract/variables) patterns)
         elements (mapv relational/projection (parser/find-elements (:qfind parsed)))
+        input-types (into {} (comp (remove :nullable?) (map (juxt :variable :type))) (:columns input))
         types (reduce (fn [out {:keys [source-symbol terms] :as clause}]
                         (reduce (fn [out [term c]]
                                   (if (= :var (first term))
                                     (update out (second term) #(if (or (nil? %) (= % (:type c))) (:type c) ::mixed)) out))
                                 out (map vector terms (contract/pattern-columns (descriptors source-symbol) clause)))) {} patterns)
-        exported (into {} (map (juxt :id identity)) (region/predicate-clauses root remote-vars))
+        ;; Range bounds come from one captured input tuple. Keep its columns
+        ;; together through projection, deduplication and every provider batch.
+        range-inputs (into #{} (keep (fn [[v t]] (when (= :long t) v))) input-types)
+        exported (into {} (map (juxt :id identity))
+                       (filter (fn [clause]
+                                 (let [vs (contract/variables clause)]
+                                   (or (set/subset? vs remote-vars)
+                                       (and (#{:< :<= :> :>=} (:operator clause))
+                                            (some remote-vars vs)
+                                            (every? #(= :long (get types % (input-types %))) vs)))))
+                               (region/predicate-clauses root (set/union remote-vars range-inputs))))
+        anchors (set/difference (set/intersection native-vars remote-vars) (set (keys (:bindings input))))
+        parameters (set/difference (into #{} (mapcat contract/variables) (vals exported)) remote-vars)
         base (inc (long (reduce max -1 (map :id patterns))))
         clauses (reduce (fn [out [i {:keys [node]}]]
                           (cond
@@ -63,7 +76,7 @@
         with (mapv :symbol (:qwith parsed))
         native-find (vec (distinct (keep #(when (and (= :variable (:kind %)) (native-vars (:variable %))) (:variable %)) elements)))
         native-with (filterv #(and (native-vars %) (not (remote-vars %))) with)
-        boundary (vec (sort (set/difference (set/intersection native-vars remote-vars) (set (keys (:bindings input))))))
+        boundary (vec (sort (set/difference (set/union parameters (set/intersection native-vars remote-vars)) (set (keys (:bindings input))))))
         prefix-vars (vec (distinct (concat native-find (filter native-vars with) boundary)))
         taken (set/union native-vars remote-vars)
         group-var (fresh taken "group") witness-var (fresh (conj taken group-var) "witness")
@@ -72,7 +85,7 @@
                       (mapv #(hash-map :kind :variable :variable %)
                             (distinct (remove native-vars (concat (map :variable elements) with)))))
         remote-find (into [{:kind :variable :variable group-var}] (distinct remote-find))
-        inputs (into (mapv #(hash-map :variable % :type (types %) :nullable? false) boundary)
+        inputs (into (mapv #(hash-map :variable % :type (get types % (input-types %)) :nullable? false) boundary)
                      (cond-> [{:variable group-var :type :long :nullable? false}]
                        (and aggregate? (seq native-with)) (conj {:variable witness-var :type :long :nullable? false})))
         columns (mapv (fn [i element]
@@ -80,7 +93,11 @@
                          :type (if (= :variable (:kind element)) (if (= group-var (:variable element)) :long (types (:variable element)))
                                    (if (#{:count :count-distinct} (:operator element)) :long :data))
                          :nullable? (boolean (#{:min :max} (:operator element)))}) (range) remote-find)]
-    (when (and (= 1 (count (:groups prepared))) (seq external) (seq native) (seq native-nodes)
+    (when (and (= 1 (count (:groups prepared))) (seq external)
+               (or (and (seq native) (seq native-nodes))
+                   (and (empty? native) (empty? (:native clauses)) (seq parameters)
+                        (every? #(= (input-types %) (types %)) (set/intersection native-vars remote-vars))))
+               (or (empty? parameters) (seq anchors))
                (every? #(satisfies? source/IRelationalFragmentSource (:source %)) external)
                (= 1 (count (:regions compiled))) (empty? (:sites compiled)) (empty? (:rules compiled))
                (not (or (seq (:qhaving parsed)) (seq (:qorder parsed)))) (nil? *math-context*)
@@ -104,7 +121,7 @@
 
 (defn- plan! [runtime compilation input]
   (when (and (= 1 (count (get-in compilation [:prepared :groups])))
-             (some :native (:entries compilation))
+             (or (some :native (:entries compilation)) (seq (:columns input)))
              (every? #(satisfies? source/IRelationalFragmentSource (:source %)) (filter :descriptor (:entries compilation))))
    (let [compiled (:compiled compilation)
         n (+ (count (get-in compiled [:regions 0 :patterns])) (count (get-in compiled [:regions 0 :core-clauses]))
@@ -251,7 +268,9 @@
     (let [prefix-runtime (assoc runtime :cleanup (atom []))
           close (rt/own! runtime #(close-scope! prefix-runtime)) primary (volatile! nil)]
       (try
-        (let [relation (compile-prefix prefix-runtime shape execute?)
+        (let [relation (if (and (empty? (:native-entries shape)) (empty? (get-in shape [:prefix-query :qwhere])))
+                         (:relation input)
+                         (compile-prefix prefix-runtime shape execute?))
               groups (when execute? (prepare-groups! prefix-runtime shape relation))
               batches (when execute? (batches shape groups))]
           (when (or (not execute?) (some? batches))

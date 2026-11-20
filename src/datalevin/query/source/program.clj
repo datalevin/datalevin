@@ -32,11 +32,14 @@
             [datalevin.query.source.native-plan :as native-plan]
             [datalevin.query.source.native-rules :as native-rules]
             [datalevin.query.source.planning :as planning]
+            [datalevin.query.source.partial-aggregate :as partial-aggregate]
             [datalevin.query.source.region :as region]
             [datalevin.query.source.relational :as relational]
             [datalevin.query.source.runtime :as rt]
             [datalevin.query.source.scope :as scope]
             [datalevin.query.source.session :as session]
+            [datalevin.query.source.semijoin :as semijoin]
+            [datalevin.query.source.site-join :as site-join]
             [datalevin.query.source.value :as value :refer [fail!]]
             [datalevin.relation :as relation]
             [datalevin.spill :as spill]
@@ -272,6 +275,7 @@
 
 (defn- branch-input! [runtime check! boundary branch input-cols ^List tuples]
   (let [columns (:inputs branch) width (count columns)
+        renamed? (#{:rule :grouped-query} (:kind boundary))
         token (containers! runtime (.size tuples) width)
         success? (volatile! false)]
     (try
@@ -287,10 +291,10 @@
                     (mapv (fn [{:keys [variable type nullable?]}]
                             (check!)
                             (let [[tag actual] (get (:arguments branch) variable)
-                                  source (if (= :rule (:kind boundary)) actual variable)
+                                  source (if renamed? actual variable)
                                   x (if (contains? (:bindings branch) variable)
                                       (get (:bindings branch) variable)
-                                      (do (ensure! (and (or (not= :rule (:kind boundary)) (= :var tag))
+                                      (do (ensure! (and (or (not renamed?) (= :var tag))
                                                        (contains? attrs source)))
                                           (aget outer (int (attrs source)))))]
                               (ensure! (if (nil? x) nullable? (value/matches-type? type x check!))) x)) columns)]
@@ -321,17 +325,18 @@
 
 (declare finish-relation!)
 
-(defn- grouped-factory [runtime check! site run-region]
+(defn- grouped-factory [runtime check! site run-region branch]
   (let [variables (:outputs site)
         child (first (:branches site))]
-    (->StepFactory #{} variables
+    (->StepFactory (set (map second (vals (:arguments branch)))) variables
       (fn [input-cols]
         (->MaterializedStep (set input-cols) (into input-cols (remove (set input-cols)) variables)
           (fn [outer]
             (check!)
             (if (.isEmpty ^List outer)
               outer
-              (let [seed (relation/relation! {} (doto (FastList.) (.add (object-array 0))))
+              (let [seed (if branch (branch-input! runtime check! site branch input-cols outer)
+                             (relation/relation! {} (doto (FastList.) (.add (object-array 0)))))
                     rows (finish-relation! runtime (:query site) (run-region child seed) nil)
                     _ (retain! runtime (containers! runtime (count rows) (count variables)))
                     tuples (FastList. (count rows))]
@@ -339,6 +344,15 @@
                 (:tuples (joined! runtime check!
                            (relation/relation! (zipmap input-cols (range)) outer)
                            (relation/relation! (zipmap variables (range)) tuples)))))))))))
+
+(defn- conditional-group [runtime check! site parent child schema run-region]
+  (when-let [{:keys [inner outer]} (grouped/lookup-key site parent child schema)]
+    (let [branch {:region-id (:region-id child) :inputs [inner]
+                  :arguments {(:variable inner) [:var (:variable outer)]}}]
+      {:columns [outer] :branches [(:region-id child)]
+       :build (fn [inputs]
+                {:inputs inputs :branches [branch]
+                 :step (grouped-factory runtime check! site run-region branch)})})))
 
 (defn- core-schema [region native-specs initial produced check!]
   (if (empty? (:core-clauses region))
@@ -919,7 +933,12 @@
                                       (let [child-id (first (:branches site))]
                                         (region! child-id [])
                                         (add! (:path site) [] (grouped/columns site (get all-schemas child-id))
-                                              (grouped-factory runtime check! site run-region)))
+                                              (cond-> (grouped-factory runtime check! site run-region nil)
+                                                (= 1 (count (:sites compiled)))
+                                                (assoc :conditional-group
+                                                  (conditional-group runtime check! site r
+                                                    (nth (:regions compiled) child-id)
+                                                    (get all-schemas child-id) run-region)))))
                                       (let [parent (scope-parent-columns site schema seeds all-schemas region-inputs check!)
                                             branch-outputs
                                             (mapv (fn [b]
@@ -1134,6 +1153,29 @@
         (result! runtime (compile! runtime compilation input-columns input-tuples snapshots))))
     (catch Throwable e (fail-program! (:runtime compilation) compilation e))))
 
+(defn- placed-relation! [runtime compilation input snapshots execute? check!]
+  (let [join! #(joined! runtime check! %1 %2)
+        finish! (fn
+                  ([q r] (finish-relation! runtime q r {}))
+                  ([q r ordering] (finish-relation! runtime q r {:native-extrema ordering})))]
+    (if (seq (get-in compilation [:prepared :native-extrema]))
+      (site-join/try-plan! runtime compilation input execute? join! finish!
+        (fn [groups remaining]
+          (let [ordinary (-> compilation (assoc :acquired-groups groups)
+                             (update-in [:prepared :planning] merge remaining))
+                program (compile-program! runtime ordinary nil nil snapshots (select-keys input [:columns :relation]))]
+            (when execute? (result! runtime program)))))
+      (or (partial-aggregate/try-plan! runtime compilation input execute? finish!)
+          (semijoin/try-plan! runtime compilation input execute? join! finish!)
+          (site-join/try-plan! runtime compilation input execute? join! finish! nil)
+          (fragment/try! runtime compilation input execute?
+            (fn [prefix-runtime shape run?]
+              (let [prefix (planning/capture! prefix-runtime (:native-entries shape) (:prefix-query shape) []
+                             (:bindings input) (set (map :variable (:columns input))) nil)
+                    program (compile-program! prefix-runtime prefix nil nil snapshots
+                                              (select-keys input [:columns :relation]))]
+                (when run? (execute! prefix-runtime program)))))))))
+
 (defn- invoke-query!
   [runtime query arguments options explain-options]
   (let [child (assoc runtime :cleanup (atom [])) primary (volatile! nil)
@@ -1189,17 +1231,10 @@
                                :result :retained})))
                     (native/with-views (filter db/db? (keep :native (:entries compilation)))
                       (fn [snapshots]
-                        (if-let [delegated
-                                 (when-not (seq (get-in compilation [:prepared :native-extrema]))
-                                 (fragment/try! child compilation input execute?
-                                   (fn [prefix-runtime shape execute?]
-                                     (let [prefix (planning/capture! prefix-runtime (:native-entries shape) (:prefix-query shape) []
-                                                    (:bindings input) (set (map :variable (:columns input))) nil)
-                                           program (compile-program! prefix-runtime prefix nil nil snapshots (select-keys input [:columns :relation]))]
-                                       (when execute? (execute! prefix-runtime program))))))]
+                        (if-let [delegated (placed-relation! child compilation input snapshots execute? check!)]
                           (if (nil? explain-options) (:result delegated)
                               (diagnostics/finish! child execute? (:result-rows (control/usage (:control child)))
-                                {:storage :memory :spill-policy :reject :relational-fragment? true
+                                {:storage :memory :spill-policy :reject :relational-fragment? (boolean (:fragment? delegated))
                                  :distinct :find-and-with :grouping (boolean (some parser/aggregate? (parser/find-elements (:qfind parsed))))
                                  :result :retained}))
                           (let [program (compile-program! child compilation nil nil snapshots (select-keys input [:columns :relation]))

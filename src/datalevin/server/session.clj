@@ -18,7 +18,7 @@
   (:import
    [java.nio.channels SelectionKey]
    [java.util Map UUID]
-   [java.util.concurrent ConcurrentHashMap]
+   [java.util.concurrent CompletableFuture ConcurrentHashMap Executors]
    [java.util.function BiFunction]))
 
 (def session-dbi "datalevin-server/sessions")
@@ -29,7 +29,7 @@
    #{:cleanup-connection-transactions-fn :clients-fn :close-conn-fn
      :close-store-fn :consensus-ha-opts-fn :current-runtime-opts-fn
      :ensure-ha-runtime-fn :get-ip-fn :idle-timeout-fn :new-runtime-db-fn
-     :now-ms-fn :open-store-fn :password-matches?-fn :perm-tgt-name-fn
+     :needs-migration-fn :now-ms-fn :open-store-fn :password-matches?-fn :perm-tgt-name-fn
      :pull-user-fn :resolved-runtime-opts-fn :connection-keys-fn :sys-conn-fn
      :user-eid-fn :user-permissions-fn :user-roles-fn}})
 
@@ -183,64 +183,89 @@
                              (with-meta session nil) :uuid :data)])
                  session))))))))
 
+(defn- merge-saved-store
+  [a b]
+  {:dbis          (into (set (:dbis a)) (:dbis b))
+   :datalog?      (or (:datalog? a) (:datalog? b))
+   :consensus-ha? (or (:consensus-ha? a) (:consensus-ha? b))})
+
+(defn- reopen-store!
+  [deps root ^ConcurrentHashMap dbs [db-name {:keys [dbis datalog? consensus-ha?]}]]
+  (if consensus-ha?
+    ;; HA runtime identity is node-local and must come from an explicit open.
+    (log/info "Skipping automatic reopen of consensus HA database"
+              {:db-name db-name :root root})
+    (resources/with-acquired
+      (fn [own!]
+        (let [m (get dbs db-name {})
+              dt-db-v (volatile! nil)
+              store (own! ((:open-store-fn deps) root db-name dbis datalog?)
+                          #(if-let [dt-db @dt-db-v]
+                             (db/close-db dt-db)
+                             ((:close-store-fn deps) %)))]
+          (if (and datalog? (some? ((:consensus-ha-opts-fn deps) store)))
+            (do
+              ;; Legacy sessions may lack the saved HA flag.
+              ((:close-store-fn deps) store)
+              (log/info "Skipping automatic reopen of consensus HA database"
+                        {:db-name db-name :root root}))
+            (let [opts ((:resolved-runtime-opts-fn deps) nil db-name store m)
+                  state (cond-> (assoc m :store store :runtime-opts opts)
+                          datalog? (assoc :dt-db
+                                          (vreset! dt-db-v
+                                                   ((:new-runtime-db-fn deps)
+                                                    store opts))))]
+              (.put dbs db-name
+                    ((:ensure-ha-runtime-fn deps) root db-name state store)))))))))
+
+(defn- reopen-migrations!
+  [open! stores threads]
+  (if (<= (min (long threads) (count stores)) 1)
+    (run! open! stores)
+    (let [failure (atom nil)
+          migrate! (bound-fn [store]
+                     (when-not @failure
+                       (try
+                         (open! store)
+                         (catch Throwable t
+                           (let [[prior _] (swap-vals! failure #(or % t))]
+                             (when (and prior (not (identical? prior t)))
+                               (.addSuppressed ^Throwable prior t)))))))]
+      (with-open [pool (Executors/newFixedThreadPool
+                         (int (min (long threads) (count stores))))]
+        (let [tasks (mapv (fn [store]
+                            (CompletableFuture/runAsync #(migrate! store) pool))
+                          stores)]
+          ;; All active stores must finish publishing or rolling back before
+          ;; failed server construction starts closing their resources.
+          (doseq [^CompletableFuture task tasks] (.join task))))
+      (when-let [t @failure] (throw t)))))
+
 (defn reopen-dbs
-  "Restore saved stores and database handles. Search engines and vector indexes open
-  lazily via :reopen so clients can supply options absent from session records."
-  [deps root clients ^ConcurrentHashMap dbs]
-  (doseq [[_ {:keys [stores dt-dbs]}] clients]
-    (doseq [[db-name {:keys [datalog? dbis consensus-ha?]}]
-            stores
-            :when (not (get-in dbs [db-name :store]))
-            :let  [m (get dbs db-name {})]]
-      (if consensus-ha?
-        ;; Consensus HA runtime identity is node-local. Persist the
-        ;; classification at explicit open time so restart can skip automatic
-        ;; reopen entirely, instead of probing the store and triggering txlog
-        ;; recovery before the fresh HA peer open happens.
-        (log/info "Skipping automatic reopen of consensus HA database"
-                  {:db-name db-name
-                   :root root})
-        (resources/with-acquired
-          (fn [own!]
-            (let [dt-db-v (volatile! nil)
-                  store (own! ((:open-store-fn deps) root db-name dbis datalog?)
-                              #(if-let [dt-db @dt-db-v]
-                                 (db/close-db dt-db)
-                                 ((:close-store-fn deps) %)))
-                  consensus-ha? (and datalog?
-                                     (some? ((:consensus-ha-opts-fn deps) store)))]
-              (if consensus-ha?
-                (do
-                  ;; Backward compatibility for persisted sessions created before
-                  ;; the stored `:consensus-ha?` flag existed.
-                  ((:close-store-fn deps) store)
-                  (log/info "Skipping automatic reopen of consensus HA database"
-                            {:db-name db-name
-                             :root root}))
-                (let [runtime-opts ((:resolved-runtime-opts-fn deps) nil db-name store m)
-                      next-m       ((:ensure-ha-runtime-fn deps)
-                                    root
-                                    db-name
-                                    (cond-> (assoc m
-                                                   :store store
-                                                   :runtime-opts runtime-opts)
-                                      datalog?
-                                      (assoc :dt-db
-                                             (vreset! dt-db-v
-                                                      ((:new-runtime-db-fn deps)
-                                                       store
-                                                       runtime-opts))))
-                                    store)]
-                  (.put dbs db-name next-m))))))))
-    (doseq [db-name dt-dbs
-            :when   (and (not (get-in dbs [db-name :dt-db]))
-                         (get-in dbs [db-name :store]))
-            :let    [m (get dbs db-name {})]]
-      (.put dbs db-name
-            (assoc m :dt-db
-                   ((:new-runtime-db-fn deps)
-                    (get-in dbs [db-name :store])
-                    ((:current-runtime-opts-fn deps) m)))))))
+  "Restore each saved store once. Only opens requiring migration use workers.
+  Search engines and vector indexes open lazily with client-supplied options."
+  ([deps root clients dbs]
+   (reopen-dbs deps root clients dbs 1))
+  ([deps root clients ^ConcurrentHashMap dbs migration-threads]
+   (let [sessions (vals clients)
+         stores (reduce #(merge-with merge-saved-store %1 (:stores %2)) {} sessions)
+         open! #(reopen-store! deps root dbs %)
+         pending (remove #(get-in dbs [(key %) :store]) stores)
+         {ordinary false migrations true}
+         (group-by (fn [[db-name {:keys [consensus-ha?]}]]
+                     (boolean (and (> (long migration-threads) 1)
+                                   (not consensus-ha?)
+                                   ((:needs-migration-fn deps) root db-name))))
+                   pending)]
+     (run! open! ordinary)
+     (reopen-migrations! open! migrations migration-threads)
+     (doseq [db-name (into #{} (mapcat :dt-dbs) sessions)
+             :let [m (get dbs db-name)]
+             :when (and (:store m) (not (:dt-db m)))]
+       (.put dbs db-name
+             (assoc m :dt-db
+                    ((:new-runtime-db-fn deps)
+                     (:store m) ((:current-runtime-opts-fn deps) m))))))))
 
 (defn authenticate
   [deps server skey {:keys [username password]}]

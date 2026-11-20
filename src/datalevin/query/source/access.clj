@@ -646,7 +646,8 @@
                                     :bytes (min (long (:binding-bytes (control/limits ctl)))
                                                 (long (get-in alternative [:constraints :max-binding-bytes])))}))))) plans)
             result (assoc (select-keys schedule [:region-id :policy :selection
-                                                 :estimated-access-ns :fallback-reasons :planning-time-ms :estimation :join-cost :cost-search :union-selection]) :steps steps)]
+                                                 :estimated-access-ns :fallback-reasons :planning-time-ms :estimation :join-cost :cost-search
+                                                 :union-selection :grouped-selection]) :steps steps)]
         (rt/own! runtime #(control/release! token))
         result)
       (catch Throwable e (control/release! token) (throw e)))))

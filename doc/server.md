@@ -214,6 +214,10 @@ stops the server; restarting requires a new instance.
   opens are rejected immediately when this limit is reached.
 * `:background-threads`: maximum simultaneous HA and replica background tasks,
   with the same default. Allow capacity for all configured tasks.
+* `:migration-threads` limits simultaneous database migrations when restoring
+  saved sessions at startup. The default is half the CPU count visible to the
+  JVM, rounded down, with a minimum of one. The CLI accepts
+  `--migration-threads COUNT`.
 * `:transaction-lock-timeout-ms`: maximum wait to acquire database write access,
   default `1000` milliseconds. Use `0` for immediate rejection.
 

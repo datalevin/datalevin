@@ -86,6 +86,66 @@
     (is (= #{[1 2] [2 2] [3 1]} (d/q q s)))
     (is (= 2 (count (filter #{:close-session} (events s)))))))
 
+(defn- priced-facts [info facts scan-rows lookup-rows]
+  (let [s (fake/source info facts {:mode :both})]
+    (reify source/IQuerySource
+      (-source-info [_] (source/-source-info s))
+      (-open-session [_ request] (source/-open-session s request))
+      (-plan-source [_ session request]
+        (update (source/-plan-source s session request) :alternatives
+          (fn [alternatives]
+            (mapv (fn [alt]
+                    (let [bound? (seq (:requires alt))]
+                      (update alt :estimate assoc
+                        (if bound? :rows-per-binding :rows) (if bound? lookup-rows scan-rows)
+                        :confidence :high :provenance {:kind :statistics :id nil
+                                                       :observed-at-ms (System/currentTimeMillis)
+                                                       :valid-for-ms nil}))) alternatives)))))))
+
+(deftest grouped-lookup-follows-cost-and-preserves-witnesses
+  (let [q '[:find ?key ?n :in $parts $lines :where
+            [$parts ?key :row/value "selected"]
+            [(q [:find (count ?p) ?p :with ?w :in $facts :where
+                 [$facts ?w :line/part ?p]] $lines) [[?n ?key]]]]
+        parts (priced-facts row-info [[1 :row/value "selected"] [2 :row/value "other"]] 1 1)
+        info (fake/info {:line/part {:entity-type :long :value-type :long}})
+        facts [[10 :line/part 1] [11 :line/part 1] [12 :line/part 2]]
+        group-step (fn [plan] (some #(when (= :grouped-query (:kind %)) %)
+                                    (get-in plan [:regions 0 :operators])))]
+    (doseq [[scan lookup keys] [[10000 2 '[?key]] [3 10000 []]]]
+      (let [lines (priced-facts info facts scan lookup)
+            plan (d/explain {:run? true} q parts lines)]
+        (is (= #{[1 2]} (d/q q parts lines)))
+        (is (= keys (vec (:binding-inputs (group-step plan)))))
+        (is (= (if (seq keys) 2 3)
+               (get-in plan [:regions 1 :operators 0 :actual :output-rows])))))
+    (let [lines (priced-facts info facts 10000 2)
+          weak-view (conj q :query-source {:consistency :statement})]
+      (is (nil? (get-in (d/explain {:run? false} weak-view parts lines)
+                        [:regions 0 :grouped-selection])))
+      (is (= #{[1 2]} (d/q weak-view parts lines)))
+      (let [q '[:find ?key ?n :in $parts $lines :where
+                [$parts ?n :row/value "selected"]
+                [(q [:find (count ?w) ?p :in $s :where [$s ?w :line/part ?p]]
+                    $lines) [[?n ?key]]]]]
+        (is (nil? (get-in (d/explain {:run? false} q parts lines) [:regions 0 :grouped-selection])))
+        (is (= #{[2 1]} (d/q q parts lines)))))))
+
+(deftest grouped-lookup-keeps-failing-aggregates-observable
+  (let [parts (priced-facts row-info [[1 :row/value "selected"]] 1 1)
+        q '[:find ?part ?mean :in $parts $lines :where
+            [$parts ?part :row/value "selected"]
+            [(q [:find ?k (avg ?x) :in $s :where [$s ?k :row/value ?x]]
+                $lines) [[?part ?mean]]]]]
+    (doseq [[type facts] [[:bigdec [[1 1M] [2 1M] [2 2M] [2 4M]]]
+                          [:long [[1 1] [2 2] [2 Long/MAX_VALUE]]]]]
+      (let [lines (priced-facts (fake/row-info type) (fake/row-facts facts) 10000 2)]
+        (binding [*math-context* nil]
+          (is (nil? (get-in (d/explain {:run? false} q parts lines) [:regions 0 :grouped-selection])))
+          (is (= :query-source/provider
+                 (try (d/q q parts lines) nil
+                      (catch clojure.lang.ExceptionInfo e (:error (ex-data e)))))))))))
+
 (deftest grouped-query-rejects-correlated-inputs-and-tighter-inner-limits
   (let [s (pair-source row-info [[1 "a"]])]
     (doseq [q ['[:find ?v ?n :in $s :where [$s ?id :row/value ?v]

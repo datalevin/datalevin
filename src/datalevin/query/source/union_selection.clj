@@ -1,11 +1,12 @@
 (ns ^:no-doc datalevin.query.source.union-selection
-  "Bounded selection of independent and bound flat-union interfaces.
+  "Bounded selection of independent and bound flat unions and grouped relations.
   Reuses captured branch accesses; no provider callbacks, rows or new executor."
   (:require [clojure.set :as set]
             [datalevin.query.access.dependency :as dependency]
             [datalevin.query.source.access :as access]
             [datalevin.query.source.control :as control]
             [datalevin.query.source.key-demand :as key-demand]
+            [datalevin.query.source.permissions :as permissions]
             [datalevin.query.source.runtime :as rt]))
 
 (defn- schedule! [runtime work inputs operators planning]
@@ -32,7 +33,8 @@
            (throw e)))))
 
 (defn- variants! [runtime operator by-id base planning allowance]
-  (let [{:keys [columns branches build]} (:conditional-union (:step operator))
+  (let [group (get-in operator [:step :conditional-group])
+        {:keys [columns branches build]} (or group (:conditional-union (:step operator)))
         token (control/reserve! (:control runtime)
                 {:retained-bytes (+ 16384 (* 4096 (count branches) (bit-shift-left 1 (count columns))))})
         _ (rt/own! runtime #(control/release! token))
@@ -62,7 +64,7 @@
               (key-sets columns))
             lookups (into {} (map (juxt :key :models)) bound)]
         (when (seq bound)
-          (let [hint {:scan scan :lookups lookups}
+          (let [hint (cond-> {:scan scan :lookups lookups} group (assoc :grouped? true))
                 independent (assoc operator :union-estimate hint :scope-plans independent :binding-inputs [])
                 choices (into [independent]
                           (map (fn [{:keys [operator schedules]}]
@@ -127,15 +129,20 @@
 
 (defn- select-schedules!
   "Keep the original complete schedule as fallback. Optional branch interfaces
-  share captured plans and a 128-branch planning allowance. Only homogeneous,
-  repeatable flat unions supplied by the compiler enter this comparison."
+  share captured plans and a 128-branch planning allowance. A bound group
+  and a bound union both need a repeatable lookup with a fresh estimate."
   [runtime work planning context]
   (let [base (into {} (map (fn [w]
                             [(get-in w [:region :region-id])
                              (schedule! runtime w (:inputs w) (:operators w) planning)])) work)
         root (some #(when (empty? (get-in % [:region :path])) %) work)
         operators (:operators root)
-        conditional (filterv #(get-in % [:step :conditional-union]) operators)
+        conditional (filterv #(or (get-in % [:step :conditional-union])
+                                (and (get-in % [:step :conditional-group]) context
+                                     (every? (fn [g] (and (= :snapshot (:actual-consistency g))
+                                                          (permissions/repeatable-default? (:consumption g))))
+                                             (:groups context)))) operators)
+        grouped? (some #(get-in % [:step :conditional-group]) conditional)
         ;; Leave room for final validation/executable assembly under small caps.
         remaining (- (long (:retained-bytes (control/limits (:control runtime))))
                      (long (:retained-bytes (control/usage (:control runtime)))))]
@@ -183,7 +190,7 @@
                                  (reduce #(assoc %1 (:region-id %2) %2) schedules (:scope-plans value))
                                  schedules)) base (:operators chosen))
             chosen (cond-> chosen
-                     cost (assoc :union-selection
+                     cost (assoc (if grouped? :grouped-selection :union-selection)
                             {:alternatives (reduce + 0 (map #(count (:union-alternatives %)) (vals changed)))
                              :original-cost (select-keys original-cost [:work-rows :peak-rows :estimated-ns])
                              :baseline-unpriced? (nil? original-cost)
@@ -196,7 +203,8 @@
                                                          [(:id value) (:binding-inputs value)]))) (:operators chosen))}))
             selected (assoc selected root-id chosen)
             schedules (mapv #(selected (get-in % [:region :region-id])) work)
-            demand (when context (key-demand/select! runtime work schedules changed planning context))]
+            demand (when (and context (not grouped?))
+                     (key-demand/select! runtime work schedules changed planning context))]
         ;; Every selected region still appears exactly once in the original order.
         (mapv #(cond-> % (and demand (= root-id (:region-id %))) (assoc :key-demand demand)) schedules)))))
 
@@ -214,5 +222,6 @@
     (mapv (fn [schedule]
             (if (= root (:region-id schedule))
               (cond-> (update schedule :planning-time-ms + extra)
-                (:union-selection schedule) (assoc-in [:union-selection :comparison-time-ms] extra))
+                (:union-selection schedule) (assoc-in [:union-selection :comparison-time-ms] extra)
+                (:grouped-selection schedule) (assoc-in [:grouped-selection :comparison-time-ms] extra))
               schedule)) schedules))))

@@ -51,6 +51,7 @@
       -p --port        Listening port, default is 8898
       -r --root        Root data directory, default is /var/lib/datalevin
       -v --verbose     Show detailed logging messages
+         --migration-threads COUNT  Maximum concurrent database migrations at startup
 
   Examples:
       dtlv -p 8899 -v serv
@@ -250,6 +251,9 @@
     :default c/default-idle-timeout
     :parse-fn #(Long/parseLong %)
     :validate [#(<= 0 ^long %) "Must be a natural number"]]
+   [nil "--migration-threads COUNT" "Maximum concurrent database migrations at startup"
+    :parse-fn #(Integer/parseInt %)
+    :validate [pos-int? "Must be positive"]]
    [nil "--max-connections COUNT" "Maximum admitted server connections"
     :default c/default-server-max-connections
     :parse-fn #(Integer/parseInt %)
