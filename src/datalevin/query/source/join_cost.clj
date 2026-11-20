@@ -41,11 +41,12 @@
             read (if (seq requires) matches (double (rows branches)))
             ;; A grouped lookup consumes every witness but emits at most one
             ;; group per outer key. Estimate independent groups from fanout.
-            returned (cond
-                       (not (:grouped? hint)) matches
-                       (seq shared) tuples
-                       :else (let [rows-per-group (double (rows (first (vals (:lookups hint)))))]
-                               (finite-cost (* tuples (max 1.0 (/ read rows-per-group))))))
+            returned (double
+                       (cond
+                         (not (:grouped? hint)) matches
+                         (seq shared) tuples
+                         :else (let [rows-per-group (double (rows (first (vals (:lookups hint)))))]
+                                 (finite-cost (* tuples (max 1.0 (/ read rows-per-group)))))))
             priced (when model (mapv #(access-time (:estimate %) (if (seq requires) tuples 1.0)
                                                     (:batch %) (:dependent? %)) branches))
             sum-cost (fn [key]

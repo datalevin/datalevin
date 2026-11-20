@@ -21,7 +21,8 @@
             [datalevin.spill :as spill])
   (:import [datalevin.parser Aggregate Constant FindColl FindRel FindScalar FindTuple Pattern Predicate Variable]
            [java.io Closeable]
-           [java.util List]))
+           [java.util List]
+           [java.util.concurrent TimeUnit]))
 
 (defn- ensure! [ok] (when-not ok (fail! :query-source/invalid :planning)))
 (defn- retain! [runtime token] (rt/own! runtime #(control/release! token)))
@@ -503,21 +504,21 @@
   estimates consumes the planning allowance, including calls made after the
   driver has run. Source reads share the invocation's normal request limit."
   [runtime planning]
-  (let [requests (volatile! (:estimate-max-requests planning))
-        nanos (volatile! (min Long/MAX_VALUE (*' 1000000 (:estimate-budget-ms planning))))
+  (let [requests (volatile! (long (:estimate-max-requests planning)))
+        nanos (volatile! (.toNanos TimeUnit/MILLISECONDS (long (:estimate-budget-ms planning))))
         ctl (:control runtime)]
     (fn estimate
-      ([] {:estimate-max-requests @requests :estimate-budget-ms (max 0 (quot @nanos 1000000))})
+      ([] {:estimate-max-requests @requests :estimate-budget-ms (max 0 (quot (long @nanos) 1000000))})
       ([group plan] (estimate group plan false))
       ([group {:keys [request response]} sample?]
        (let [session (:session group) descriptor (get-in request [:sources 0 :descriptor])
              needed (if sample? 3 1)
-             budget (quot @nanos 1000000)]
-         (when (and response (>= @requests needed) (pos? budget)
+             budget (quot (long @nanos) 1000000)]
+         (when (and response (>= (long @requests) needed) (pos? budget)
                     (if sample? (satisfies? source/IRelationalFanoutSession session)
                         (satisfies? source/IRelationalEstimateSession session)))
            (let [start (System/nanoTime)]
-             (vswap! requests - needed)
+             (vreset! requests (- (long @requests) needed))
              (try
                (when-let [scratch (try (control/reserve! ctl {:retained-bytes 1048576})
                                        (catch clojure.lang.ExceptionInfo e
@@ -533,14 +534,14 @@
                                    (source/-estimate-relational session
                                      (cond-> open (satisfies? source/IRelationalFanoutSession session)
                                        (assoc :receiver-work? true)))))
-                         finite? #(and (number? %) (Double/isFinite (double %)) (not (neg? %)))]
+                         finite? #(and (number? %) (Double/isFinite (double %)) (not (neg? (compare % 0))))]
                      (when hint
                        (if sample?
                          (ensure! (and (vector? hint) (<= 1 (count hint) 65)
                                        (every? (fn [row]
                                                  (and (vector? row) (= 4 (count row)) (integer? (first row))
                                                       (every? finite? (take 3 row)) (valid-stage? (peek row) request)
-                                                      (= (zero? (first row)) (= :joined (:kind (peek row))))))
+                                                      (= (zero? (compare (first row) 0)) (= :joined (:kind (peek row))))))
                                                hint)
                                        (= (set (range (count hint))) (set (map first hint)))))
                          (ensure! (and (value/plain-map? hint)
@@ -548,10 +549,10 @@
                                        (every? #{:rows :row-bytes :request-ns :fetch-rows :source-cost :startup-cost :join-rows} (keys hint))
                                        (every? finite? (vals hint))
                                        (= (contains? hint :source-cost) (contains? hint :join-rows))
-                                       (<= (get hint :startup-cost 0) (get hint :source-cost 0))
-                                       (pos? (:fetch-rows hint)) (pos? (:request-ns hint)))))
+                                       (not (pos? (compare (get hint :startup-cost 0) (get hint :source-cost 0))))
+                                       (pos? (compare (:fetch-rows hint) 0)) (pos? (compare (:request-ns hint) 0)))))
                        (value/owned-copy hint)))
                    (finally (control/release! scratch))))
                (catch clojure.lang.ExceptionInfo e
                  (when (or sample? (not= :query-source/limit (:error (ex-data e)))) (throw e)))
-               (finally (vswap! nanos - (- (System/nanoTime) start)))))))))))
+               (finally (vreset! nanos (- (long @nanos) (- (System/nanoTime) start))))))))))))

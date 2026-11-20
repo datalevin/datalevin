@@ -57,7 +57,7 @@
                            (= (set predicates) (into #{} (mapcat :filters) (cons fact leaves)))
                            (set/subset? terminal (set (clojure.core/keys types))))
                   {:fact fact :leaves leaves :keys keys :types (update-vals types first)
-                   :terminal terminal :next-id (inc (reduce max -1 (map :id (concat patterns predicates))))}))) groups))))
+                   :terminal terminal :next-id (inc (long (reduce max -1 (map :id (concat patterns predicates)))))}))) groups))))
 
 (defn- local-plan! [runtime groups shape part filters]
   (let [entries (:entries part) leader (first entries) group (groups (:symbol leader))
@@ -85,7 +85,7 @@
       (.add tuples (object-array row)))
     (relation/relation! (zipmap vars (range)) tuples)))
 
-(defn- domain [runtime rel key cap]
+(defn- domain [runtime rel key ^long cap]
   (let [i (int ((:attrs rel) key))]
     (reduce (fn [ks ^objects row]
               (control/check-active! (:control runtime))
@@ -100,7 +100,7 @@
   (let [groups (:groups prepared) parsed (:parsed compiled) root (first (:regions compiled))
         caps (map #(get-in % [:descriptor :datalevin.query.source/integer-domain-limit]) entries)]
     (when (and (<= 2 (count groups) 5) (<= 3 (count entries) 8)
-               (every? #(and (int? %) (pos? %)) caps)
+               (every? #(and (int? %) (pos? (long %))) caps)
                (empty? (:columns input)) (= 1 (count (get-in input [:relation :tuples])))
                (= 1 (count (:regions compiled))) (empty? (:rules compiled)) (empty? (:sites compiled))
                (empty? (:native-extrema prepared)) (empty? (:ignore-nil-extrema prepared))
@@ -117,7 +117,7 @@
               check (mapv #(membership %1 %2 [0]) (iterate inc (:next-id shape)) (:keys shape))]
           (when (and (every? some? leaves) plain (plan (:fact shape) check))
             (let [sessions (session/acquire! runtime prepared) acquired (session/groups-by-alias sessions)
-                  cap (min 8192 (apply min caps))
+                  cap (min 8192 (long (apply min caps)))
                   applied (volatile! nil)
                   result (when execute?
                            (let [dims (mapv #(rows! runtime acquired %) leaves)

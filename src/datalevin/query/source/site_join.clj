@@ -97,7 +97,7 @@
       (let [wanted (conj (if sum? vars (set/union vars with)) k)]
         {:key k :type (if reference? :long key-type) :sum? sum? :native? (boolean native?)
          :driver-index (when native? (if (= a native-owner) 1 0))
-         :next-id (inc (reduce max -1 (map :id (concat ps preds))))
+         :next-id (inc (long (reduce max -1 (map :id (concat ps preds)))))
          :parts (mapv (fn [p]
                         (let [exports (vec (sort (set/intersection wanted (:vars p))))
                               reduction? (and sum? (= p owner))
@@ -128,31 +128,34 @@
   bytes, uploaded bytes and local work. One open has three fixed exchanges."
   [estimate rows opens input-bytes planning]
   (if (= :cardinality (:cost-model planning)) rows
-    (let [rtt (get planning :link-rtt-ns (:request-ns estimate))
-          pages (Math/ceil (/ (double rows) (double (:fetch-rows estimate))))]
-      (+ (* (double rtt) (+ (* 3.0 opens) pages))
-         (* (double (get planning :transfer-ns-per-byte 1)) (+ input-bytes (* rows (:row-bytes estimate))))
+    (let [rows (double rows)
+          rtt (double (get planning :link-rtt-ns (:request-ns estimate)))
+          pages (Math/ceil (/ rows (double (:fetch-rows estimate))))
+          bytes (+ (double input-bytes) (* rows (double (:row-bytes estimate))))]
+      (+ (* rtt (+ (* 3.0 (double opens)) pages))
+         (* (double (get planning :transfer-ns-per-byte 1)) bytes)
          (* rows (double (get planning :local-row-ns 1000)))))))
 
-(defn- batch-cap [p type]
+(defn- batch-cap ^long [p type]
   (if (= type :string) 256
-    (reduce min 8192 (map #(get-in % [:descriptor :datalevin.query.source/integer-domain-limit])
-                          (get-in p [:group :entries])))))
+    (long (reduce min 8192 (map #(get-in % [:descriptor :datalevin.query.source/integer-domain-limit])
+                               (get-in p [:group :entries]))))))
 
 (defn- probe-cost [base sample key-count sample-count cap bytes planning]
-  (when (and sample (pos? key-count))
-    (let [opens (Math/ceil (/ (double key-count) cap))
-          rows (* (double (:rows sample)) (/ (double key-count) sample-count))]
-      (transfer-cost (assoc base :row-bytes (:row-bytes sample)) (min rows (:rows base)) opens bytes planning))))
+  (when (and sample (pos? (compare key-count 0)))
+    (let [opens (Math/ceil (/ (double key-count) (double cap)))
+          rows (* (double (:rows sample)) (/ (double key-count) (double sample-count)))]
+      (transfer-cost (assoc base :row-bytes (:row-bytes sample)) (min rows (double (:rows base))) opens bytes planning))))
 
 (defn- driver-index [parts type plain-hints bound-hints bound planning]
   (let [score (fn [i]
-                (let [j (- 1 i) driver (plain-hints i) target (plain-hints j)
+                (let [j (- 1 (long i)) driver (plain-hints i) target (plain-hints j)
                       keys (:rows driver) cap (batch-cap (parts j) type)
-                      bulk (transfer-cost target (:rows target) 1 0 planning)
-                      probe (probe-cost target (bound-hints j) keys 1 cap
-                                        (* keys (if (= type :long) 8 (:row-bytes driver))) planning)]
-                  (+ (transfer-cost driver keys 1 0 planning) (if probe (min bulk probe) bulk))))]
+                      bulk (double (transfer-cost target (:rows target) 1 0 planning))
+                      key-bytes (if (= type :long) 8.0 (double (:row-bytes driver)))
+                      probe (probe-cost target (bound-hints j) keys 1 cap (* (double keys) key-bytes) planning)]
+                  (+ (double (transfer-cost driver keys 1 0 planning))
+                     (double (if probe (min bulk (double probe)) bulk)))))]
     (cond
       (every? some? plain-hints)
       (first (sort-by (fn [i] [(score i) (:rows (plain-hints i)) (:existence? (parts i)) i]) [0 1]))
@@ -189,8 +192,9 @@
   "Scale per-key counts (including zeroes) with a finite-population standard
   error. The interval is an uncertainty indicator, not an execution bound."
   [population sample-size total squares]
-  (let [n (double sample-size) mean (/ total n)
-        variance (if (> n 1) (/ (max 0.0 (- squares (* n mean mean))) (dec n)) 0.0)
+  (let [population (double population)
+        n (double sample-size) mean (/ (double total) n)
+        variance (double (if (> n 1) (/ (max 0.0 (- (double squares) (* n mean mean))) (dec n)) 0.0))
         error (* 2.0 (Math/sqrt (* (/ variance n) (max 0.0 (- 1.0 (/ n population))))))]
     {:rows (* population mean) :low (* population (max 0.0 (- mean error)))
      :high (* population (+ mean error))}))
@@ -199,30 +203,33 @@
   "Compare source-local planner costs and transfer nanoseconds. Without a
   calibration, conflicting rankings leave the existing route in place."
   [bound-link bulk-link bound-work bulk-work calibration]
-  (cond
-    calibration (if (< (+ bound-link (* calibration bound-work))
-                       (+ bulk-link (* calibration bulk-work))) :bound :independent)
-    (and (< bound-link bulk-link) (<= bound-work bulk-work)) :bound
-    (and (>= bound-link bulk-link) (>= bound-work bulk-work)) :independent))
+  (let [bound-link (double bound-link) bulk-link (double bulk-link)
+        bound-work (double bound-work) bulk-work (double bulk-work)]
+    (cond
+      calibration (let [scale (double calibration)]
+                    (if (< (+ bound-link (* scale bound-work)) (+ bulk-link (* scale bulk-work)))
+                      :bound :independent))
+      (and (< bound-link bulk-link) (<= bound-work bulk-work)) :bound
+      (and (>= bound-link bulk-link) (>= bound-work bulk-work)) :independent)))
 
 (defn- receiver-choice [target domain first-batch keys small sample estimate planning]
   (let [{:keys [hint session]} target
         n (count domain) width (count first-batch) measured (count keys) opens (Math/ceil (/ (double n) width))
-        bytes (reduce (fn [total k] (+ total (if (string? k) (+ 8 (* 3 (count k))) 8))) 0 domain)
+        bytes (reduce (fn [total k] (+ (long total) (long (if (string? k) (+ 8 (* 3 (count k))) 8)))) 0 domain)
         bulk-link (transfer-cost hint (:rows hint) 1 0 planning)
         bound-link (probe-cost hint (or sample (:per-key target)) n (if sample measured 1) width bytes planning)
-        previous (if (or (nil? bound-link) (< bound-link bulk-link)) :bound :independent)
+        previous (if (or (nil? bound-link) (neg? (compare bound-link bulk-link))) :bound :independent)
         compared? (and (not= :cardinality (:cost-model planning)) (:source-cost sample) (:source-cost hint))
-        fixed (when compared? (* opens (get sample :startup-cost 0.0)))
-        bound-work (when compared? (+ fixed (* (/ (double n) measured)
-                                               (- (:source-cost sample) (get sample :startup-cost 0.0)))))
+        startup (double (get sample :startup-cost 0.0))
+        fixed (* opens startup)
+        bound-work (when compared? (+ fixed (* (/ (double n) measured) (- (double (:source-cost sample)) startup))))
         bulk-work (:source-cost hint)
         calibration (:source-ns-per-cost-unit planning)
         choice (when compared? (receiver-route bound-link bulk-link bound-work bulk-work calibration))
         ;; Ask the receiver only when its two cost components disagree, or a
         ;; reduction hides intermediate rows. Charge the probe to this decision.
         refine? (and compared?
-                     (or (nil? choice) (> (:join-rows sample) (:rows sample))
+                     (or (nil? choice) (pos? (compare (:join-rows sample) (:rows sample)))
                          (and (> n width) (next (get-in target [:group :entries])))))
         stages (when (and small refine?) (estimate session small true))
         fanout (when (seq stages)
@@ -231,20 +238,20 @@
         ;; Use sampled witnesses to reprice the variable component. Fixed
         ;; source work and all network opens are paid even for a zero-match key.
         projected (first fanout)
-        expected (when compared? (* (/ (double n) measured) (:join-rows sample)))
-        costs (when (and projected (pos? expected))
-                (let [variable (max 0.0 (- bound-work fixed))
+        expected (when compared? (* (/ (double n) measured) (double (:join-rows sample))))
+        costs (when (and projected (pos? (double expected)))
+                (let [variable (max 0.0 (- (double bound-work) fixed))
                       ;; A precise final join count can mask highly skewed
                       ;; first lookups. Widen the decision interval by the
                       ;; relative sampling error of each direct lookup stage.
-                      direct (filter #(pos? (:rows %)) (rest fanout))
-                      low (* (/ (:low projected) expected)
-                             (reduce min 1.0 (map #(/ (:low %) (:rows %)) direct)))
-                      high (* (/ (:high projected) expected)
-                              (reduce max 1.0 (map #(/ (:high %) (:rows %)) direct)))]
+                      direct (filter #(pos? (double (:rows %))) (rest fanout))
+                      low (* (/ (double (:low projected)) (double expected))
+                             (double (reduce min 1.0 (map #(/ (double (:low %)) (double (:rows %))) direct))))
+                      high (* (/ (double (:high projected)) (double expected))
+                              (double (reduce max 1.0 (map #(/ (double (:high %)) (double (:rows %))) direct))))]
                   [(+ fixed (* variable low)) (+ fixed (* variable high))]))
         choices (when costs (mapv #(receiver-route bound-link bulk-link % bulk-work calibration) costs))
-        decided (when-not (and projected (< measured n) (zero? (:rows projected)))
+        decided (when-not (and projected (< measured n) (zero? (double (:rows projected))))
                   (if (seq choices) (when (apply = choices) (first choices)) choice))]
     (cond-> {:mode (or decided (if (:ordinary-fallback? target) :ordinary previous))
              :independent-cost bulk-link :bound-cost bound-link
@@ -284,8 +291,8 @@
   ;; producer batch, preserve the planner's ability to start at that filter.
   (let [a (:hint driver) b (:hint target)]
     (and a b (seq (:filters target)) (next (get-in target [:group :entries]))
-         (< (transfer-cost b (:rows b) 1 0 planning)
-            (transfer-cost a (batch-cap target type) 1 0 planning)))))
+         (neg? (compare (transfer-cost b (:rows b) 1 0 planning)
+                        (transfer-cost a (batch-cap target type) 1 0 planning))))))
 
 (defn- execute-join! [runtime {:keys [key type next-id sum? native? ordering]} parsed driver target planning estimate join! finish!]
   (let [driver-hint (:hint driver) target-hint (:hint target)
@@ -296,7 +303,7 @@
         abandon? (when (and native? driver-hint target-hint (seq (:filters target)))
                    (let [bulk (transfer-cost target-hint (:rows target-hint) 1 0 planning)]
                      (fn [observed]
-                       (when (> (transfer-cost driver-hint observed 1 0 planning) bulk)
+                       (when (pos? (compare (transfer-cost driver-hint observed 1 0 planning) bulk))
                          (vreset! counter observed) true))))
         row-releases (when native? (volatile! []))
         rows (relational/rows! runtime (assoc (:plain driver) :group (:session driver)
@@ -349,8 +356,8 @@
         entries (mapcat :entries groups)
         planning (:planning prepared)]
     (when (and (or (empty? (:native-extrema prepared))
-                   (and (= :elapsed (:cost-model planning)) (pos? (:estimate-max-requests planning))
-                        (pos? (:estimate-budget-ms planning))))
+                   (and (= :elapsed (:cost-model planning)) (pos? (long (:estimate-max-requests planning)))
+                        (pos? (long (:estimate-budget-ms planning)))))
                (= 2 (count groups)) (<= 2 (count entries) 12)
                (= (count entries) (count (:entries input)))
                (every? #(pos-int? (get-in % [:descriptor :datalevin.query.source/integer-domain-limit])) entries)
@@ -373,7 +380,7 @@
                   i (or (:driver-index shape) (driver-index parts type estimates per-key bound planning))
                   sites (mapv (fn [p s a b h k] (assoc p :session s :plain a :bound b :hint h :per-key k))
                               parts sessions plain bound estimates per-key)
-                  driver (sites i) target (assoc (sites (- 1 i)) :ordinary-fallback? (:native? shape))
+                  driver (sites i) target (assoc (sites (- 1 (long i))) :ordinary-fallback? (:native? shape))
                   skip-driver? (and (:native? shape) (prefer-ordinary-start? driver target type planning))
                   result (cond skip-driver? {:mode :ordinary :reason :filtered-receiver-transfer}
                                execute? (execute-join! runtime (assoc shape :ordering ordering) parsed

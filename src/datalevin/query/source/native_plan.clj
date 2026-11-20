@@ -96,14 +96,14 @@
       (when (some (fn [[e _ v]] (or (join-vars (:symbol e)) (join-vars (:symbol v)))) indexed)
         (reduce (fn [smallest [e a v props]]
                   (native/check-view! ctl snapshot)
-                  (min smallest
-                       (cond
-                         (fixed? e) 1
-                         (fixed? v) (if-some [x (bound-value props
-                                                 (if (instance? Constant v) (:value v) (bindings (:symbol v)))
-                                                 (instance? Constant v))]
-                                      (i/av-size store a x) 0)
-                         :else (i/a-size store a))))
+                  (let [rows (cond
+                               (fixed? e) 1
+                               (fixed? v) (if-some [x (bound-value props
+                                                       (if (instance? Constant v) (:value v) (bindings (:symbol v)))
+                                                       (instance? Constant v))]
+                                            (i/av-size store a x) 0)
+                               :else (i/a-size store a))]
+                    (min (long smallest) (long rows))))
                 Long/MAX_VALUE indexed)))))
 
 (defn- predicate-constraints [node core-clauses props bindings check!]

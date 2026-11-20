@@ -28,7 +28,7 @@
                    (and (contains? limits k) (not (#{:result-rows :result-bytes} k))
                         (integer? n) (<= (limits k) n Long/MAX_VALUE)))
                  (:limits options))
-         (or (nil? timeout) (and outer-timeout (<= outer-timeout timeout))))))
+         (or (nil? timeout) (and outer-timeout (<= (long outer-timeout) (long timeout)))))))
 
 (defn- projection? [element]
   (or (instance? Variable element)

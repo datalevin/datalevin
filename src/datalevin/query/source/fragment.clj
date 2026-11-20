@@ -167,7 +167,7 @@
                           (:native (first native-entries)) (:qwhere prefix-query) bindings keys)]
         ;; Require a margin for native probe work and rough seed counts. The
         ;; bound is advisory for placement, including when it happens to be zero.
-        (when (and native-rows (pos? native-rows) (<= (*' 2 (max 1 rows)) native-rows))
+        (when (and native-rows (<= (max 1 (long rows)) (quot (long native-rows) 2)))
           (get-in request [:sources 0 :symbol]))))))
 
 (defn- prepare-groups! [runtime shape relation]

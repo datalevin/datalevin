@@ -21,6 +21,15 @@
             "allPublicMethods": true
         },
         {
+            "type": "java.math.BigInteger",
+            "methods": [
+                {
+                    "name": "<init>",
+                    "parameterTypes": ["java.lang.String"]
+                }
+            ]
+        },
+        {
             "type": "java.lang.Thread",
             "methods": [
                 {
@@ -195,6 +204,15 @@
         },
         {
             "type": "datalevin.compress.ICompressor"
+        },
+        {
+            "type": "datalevin.conn.CloseableConn",
+            "methods": [
+                {
+                    "name": "close",
+                    "parameterTypes": []
+                }
+            ]
         },
         {
             "type": "datalevin.core.AsyncDLTx"
