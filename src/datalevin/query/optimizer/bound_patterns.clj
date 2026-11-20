@@ -256,7 +256,7 @@
                       (qu/binding-var? entity-sym)
                       (qu/binding-var? value-sym)
                       (not= entity-sym value-sym)
-                      (not (bound-relation? context value-sym))
+                             (nil? (rel-for-var context value-sym))
                       (some? (get-in (db/-schema source) [attr :db/aid])))))
              vec)]
     (some
@@ -288,6 +288,9 @@
                        (db/ref? source attr)
                        (qu/binding-var? entity-sym)
                        (not= entity-sym value-sym)
+                       ;; The scan appends a new column. An entity in a larger
+                       ;; relation still needs to be joined with the matches.
+                       (nil? (rel-for-var context entity-sym))
                        (some? (get-in (db/-schema source) [attr :db/aid]))
                        (let [rel (rel-for-var context value-sym)
                              idx (int (get (:attrs rel) value-sym))]

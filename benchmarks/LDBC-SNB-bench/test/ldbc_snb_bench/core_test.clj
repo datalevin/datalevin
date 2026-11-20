@@ -304,7 +304,7 @@
   (testing "IC14: Trusted connection paths"
     (let [result (run-query-with-params ic/ic14 {:person1-id 100
                                                   :person2-id 6597069770569})]
-      (is (< 0 (row-count result)))
+      (is (= (:ic14 sut/sample-result-counts) (row-count result)))
       ;; Results: [p1-id m1-id m2-id p2-id count weight]
       (let [row (first-row result)]
         (is (= 100 (nth row 0)))  ; p1-id
