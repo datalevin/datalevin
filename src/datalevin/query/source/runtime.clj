@@ -36,7 +36,9 @@
                                   :else :query-source/provider)
                      :phase (if (phases phase) phase :execution) :query-id (:query-id runtime)}
                     (:location runtime)
-                    (when (= :query/timeout (:error data)) {:type :query/timeout})
+                    (when (= :query/timeout (:error data))
+                      (cond-> {:type :query/timeout}
+                        (= :statement-timeout (:limit data)) (assoc :limit :statement-timeout)))
                     (when (= :closed (:state data)) {:state :closed})
                     (when (and (contains? control/default-limits (:category data))
                                (integer? (:maximum data)) (integer? (:attempted data)))
