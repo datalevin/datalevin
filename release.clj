@@ -112,8 +112,7 @@
 
   (println "\n\n[ Running JavaScript binding tests ]\n")
   (sh "npm" "ci" :dir "bindings/javascript")
-  ;; Each integration test worker starts a JVM; bound simultaneous startups.
-  (sh "npm" "test" "--" "--test-concurrency=2" :dir "bindings/javascript")
+  (sh "npm" "test" :dir "bindings/javascript")
 
   (println "\n\n[ Running Python binding tests ]\n")
   (let [python "bindings/python/.venv/bin/python"]

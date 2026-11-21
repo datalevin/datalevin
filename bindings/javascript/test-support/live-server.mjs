@@ -9,7 +9,7 @@ import { resolveClasspath } from "../src/jvm.js";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
 const clojureBin = process.env.CLOJURE_BIN || "clojure";
-const serverStartTimeoutMs = 30000;
+const serverStartTimeoutMs = 60000;
 const serverStopTimeoutMs = 10000;
 const outputLimit = 20000;
 const serverPortMarker = "__DTLV_PORT__=";
@@ -101,9 +101,10 @@ async function waitForServer(proc, getPort, readOutput, getStartupError) {
         `Datalevin server failed to start.\n${startupError.message}\n${readOutput()}`
       );
     }
-    if (proc.exitCode !== null) {
+    if (proc.exitCode !== null || proc.signalCode !== null) {
+      const status = proc.signalCode === null ? `code ${proc.exitCode}` : `signal ${proc.signalCode}`;
       throw new Error(
-        `Datalevin server exited before becoming ready (code ${proc.exitCode}).\n${readOutput()}`
+        `Datalevin server exited before becoming ready (${status}).\n${readOutput()}`
       );
     }
     const port = getPort();

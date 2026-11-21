@@ -752,7 +752,7 @@ test("rule sets validate branch arity and expose asData", () => {
 
 test(
   "composed queries and transactions execute through the JVM bridge",
-  { skip: !runtimeAvailable, timeout: 30000 },
+  { skip: !runtimeAvailable, timeout: 60000 },
   async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dtlv-js-composition-"));
     const conn = await connect(dir, {

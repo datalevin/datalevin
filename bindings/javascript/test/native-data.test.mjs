@@ -53,7 +53,8 @@ class Task {
 }
 
 test("native values use independent server and caller runtimes", {
-  skip: !available || !clojureCliAvailable(), timeout: 60000
+  // The timeout includes booting the separate server.
+  skip: !available || !clojureCliAvailable(), timeout: 120000
 }, async () => {
   const server = await startLiveServer({ nativeValues: true });
   const { registry, definition, opts } = await taskType();
