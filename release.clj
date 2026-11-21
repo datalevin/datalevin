@@ -23,11 +23,12 @@
 
 (def ^:dynamic *env* {})
 (def dtlvtest-dir "../dtlvtest")
+(def federation-dir "../federation")
 (def cljdoc-dir "../cljdoc")
 (def repo-dir (.getCanonicalPath (File. ".")))
 
 (defn sh [& args]
-  (apply println "Running" (if (empty? *env*) "" (str :env " " *env*)) args)
+  (apply println "Running" (if (empty? *env*) "" (str :env " " (sort (keys *env*)))) args)
   (let [res (apply sh/sh
                    (concat args [:env (merge (into {} (System/getenv)) *env*)]))]
     (if (== 0 (:exit res))
@@ -122,7 +123,29 @@
         "--editable" "./bindings/python[dev]")
     (sh python "-m" "pytest" "bindings/python/tests" "-q")))
 
-(defn run-tests []
+(defn- postgres-test-url! []
+  (let [url (System/getenv "POSTGRES_TEST_URL")]
+    (when (str/blank? url)
+      (throw (ex-info "Set POSTGRES_TEST_URL to a disposable PostgreSQL database for the release tests" {})))
+    url))
+
+(defn- run-tpc-and-federation-tests [postgres-url]
+  ;; Each test alias loads its own Clojure dependencies.
+  (println "\n\n[ Preparing Java classes for TPC and federation tests ]\n")
+  (sh "clojure" "-T:build" "compile-java")
+
+  (println "\n\n[ Running TPC-C benchmark tests ]\n")
+  (binding [*env* (assoc *env* "TPCC_TEST_PG_URL"
+                         (or (System/getenv "TPCC_TEST_PG_URL") postgres-url))]
+    (sh "clojure" "-M:test" :dir "benchmarks/tpcc-bench"))
+
+  (println "\n\n[ Running TPC-H benchmark tests ]\n")
+  (sh "clojure" "-M:test" :dir "benchmarks/tpch-bench")
+
+  (println "\n\n[ Running federation tests ]\n")
+  (sh "clojure" "-M:test" :dir federation-dir))
+
+(defn run-tests [postgres-url]
   (println "\n\n[ Running lein tests ]\n")
   (sh "./lein-test" :dir "script")
 
@@ -152,6 +175,8 @@
 
   (println "\n\n[ Running write benchmark tests ]\n")
   (sh "clojure" "-M:test" :dir "benchmarks/write-bench")
+
+  (run-tpc-and-federation-tests postgres-url)
 
   (println "\n\n[ Testing jar ]\n")
   (sh "./jar" :dir "script")
@@ -205,7 +230,7 @@
         "https://api.github.com/repos/datalevin/datalevin/releases")))
 
 (defn -main []
-  (run-tests)
+  (run-tests (postgres-test-url!))
   (update-version)
   (cljdoc-check)
   (make-commit)
