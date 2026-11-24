@@ -32,7 +32,7 @@ and runs a small Java benchmark that compares the wrapper layer against direct
 
 Done with `test-uber.sh`.
 
-## Compile Clojure project into native image with Datalein libary as a dependency
+## Compile Clojure project into native image with Datalevin library as a dependency
 
 Done with `test-native.sh`.
 
