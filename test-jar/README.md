@@ -3,7 +3,7 @@
 This directory contains a simple Clojure project to test the usage of Datalevin
 release artifacts in these scenarios:
 
-## Using Datalevin libary as a dependency in JVM Clojure project
+## Using Datalevin library as a dependency in JVM Clojure project
 
 Done with `test.sh`.
 
@@ -32,7 +32,7 @@ and runs a small Java benchmark that compares the wrapper layer against direct
 
 Done with `test-uber.sh`.
 
-## Compile Clojure project into native image with Datalein libary as a dependency
+## Compile Clojure project into native image with Datalevin library as a dependency
 
 Done with `test-native.sh`.
 
