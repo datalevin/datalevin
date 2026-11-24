@@ -3,7 +3,7 @@
 This directory contains a simple Clojure project to test the usage of Datalevin
 release artifacts in these scenarios:
 
-## Using Datalevin libary as a dependency in JVM Clojure project
+## Using Datalevin library as a dependency in JVM Clojure project
 
 Done with `test.sh`.
 
